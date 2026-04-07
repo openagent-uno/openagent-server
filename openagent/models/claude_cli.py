@@ -14,7 +14,8 @@ class ClaudeCLI(BaseModel):
 
     Requires `claude` to be installed and authenticated.
     Uses `claude -p` (--print) for non-interactive single-shot responses.
-    The prompt is passed as a positional argument.
+    Prompt is piped via stdin to avoid shell escaping issues with long prompts.
+    Uses --no-session-persistence to avoid loading old session context.
     """
 
     def __init__(self, model: str | None = None, allowed_tools: list[str] | None = None):
@@ -29,8 +30,6 @@ class ClaudeCLI(BaseModel):
     ) -> ModelResponse:
         # Build the prompt from messages
         prompt_parts = []
-        if system:
-            prompt_parts.append(f"[System] {system}")
         for msg in messages:
             role = msg["role"]
             content = msg.get("content", "")
@@ -41,20 +40,23 @@ class ClaudeCLI(BaseModel):
 
         prompt = "\n\n".join(prompt_parts)
 
-        # Build command: claude -p --output-format json "prompt"
-        cmd = ["claude", "-p", "--output-format", "json"]
+        # Build command
+        cmd = ["claude", "-p", "--output-format", "json", "--no-session-persistence"]
         if self.model:
             cmd.extend(["--model", self.model])
+        if system:
+            cmd.extend(["--append-system-prompt", system])
         for tool in self.allowed_tools:
             cmd.extend(["--allowedTools", tool])
-        cmd.append(prompt)  # positional argument, not --prompt
 
+        # Pipe prompt via stdin (avoids shell escaping issues)
         proc = await asyncio.create_subprocess_exec(
             *cmd,
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await proc.communicate()
+        stdout, stderr = await proc.communicate(input=prompt.encode("utf-8"))
 
         if proc.returncode != 0:
             error_msg = stderr.decode().strip() if stderr else f"claude CLI exited with code {proc.returncode}"
@@ -79,24 +81,29 @@ class ClaudeCLI(BaseModel):
         tools: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[str]:
         prompt_parts = []
-        if system:
-            prompt_parts.append(f"[System] {system}")
         for msg in messages:
             if msg["role"] == "user":
                 prompt_parts.append(msg.get("content", ""))
 
         prompt = "\n\n".join(prompt_parts)
 
-        cmd = ["claude", "-p", "--output-format", "stream-json"]
+        cmd = ["claude", "-p", "--output-format", "stream-json", "--no-session-persistence"]
         if self.model:
             cmd.extend(["--model", self.model])
-        cmd.append(prompt)  # positional argument
+        if system:
+            cmd.extend(["--append-system-prompt", system])
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+
+        # Send prompt and close stdin
+        proc.stdin.write(prompt.encode("utf-8"))
+        await proc.stdin.drain()
+        proc.stdin.close()
 
         async for line in proc.stdout:
             text = line.decode().strip()

@@ -223,11 +223,27 @@ class KnowledgeBase:
         await self._db.execute("DELETE FROM knowledge_index WHERE file_path = ?", (rel,))
         await self._db.commit()
 
+    def _sanitize_fts_query(self, query: str) -> str:
+        """Sanitize query for FTS5 — remove special chars that cause syntax errors."""
+        # FTS5 special chars: * " ( ) : ^ OR AND NOT
+        sanitized = re.sub(r'[^\w\s]', ' ', query)
+        # Collapse whitespace and strip
+        sanitized = re.sub(r'\s+', ' ', sanitized).strip()
+        if not sanitized:
+            return '""'
+        # Quote each word for exact matching
+        words = sanitized.split()
+        return " ".join(f'"{w}"' for w in words[:20])  # limit to 20 words
+
     async def search(self, query: str, topic: str | None = None, limit: int = 20) -> list[dict]:
         """Search memories using FTS5 full-text search.
 
         Returns list of {file_path, title, topic, tags, snippet, rank}.
         """
+        fts_query = self._sanitize_fts_query(query)
+        if not fts_query:
+            return []
+
         if topic:
             cursor = await self._db.execute(
                 """
@@ -238,10 +254,11 @@ class KnowledgeBase:
                 JOIN knowledge_index ki ON ki.rowid = knowledge_fts.rowid
                 WHERE knowledge_fts MATCH ?
                 AND ki.topic = ?
+
                 ORDER BY rank
                 LIMIT ?
                 """,
-                (query, topic, limit),
+                (fts_query, topic, limit),
             )
         else:
             cursor = await self._db.execute(
@@ -255,7 +272,7 @@ class KnowledgeBase:
                 ORDER BY rank
                 LIMIT ?
                 """,
-                (query, limit),
+                (fts_query, limit),
             )
 
         rows = await cursor.fetchall()
