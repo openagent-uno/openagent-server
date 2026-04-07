@@ -37,6 +37,18 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
         "build": ["npm", "run", "build"],
         "install": ["npm", "install"],
     },
+    "web-search": {
+        "dir": "web-search",
+        "command": ["node", "dist/index.js"],
+        "build": ["npm", "run", "build"],
+        "install": ["npm", "install"],
+    },
+    "editor": {
+        "dir": "editor",
+        "command": ["node", "dist/index.js"],
+        "build": ["npm", "run", "build"],
+        "install": ["npm", "install"],
+    },
 }
 
 # ── Default MCPs (always injected unless disabled) ──
@@ -50,10 +62,15 @@ DEFAULT_MCPS: list[dict[str, Any]] = [
         "args": ["."],  # default to cwd, user can override
         "_default": True,
     },
-    # Official MCP: web fetch with HTML-to-markdown (Python, cross-platform)
+    # Bundled MCP: surgical file editing, grep, glob
     {
-        "name": "fetch",
-        "command": ["uvx", "mcp-server-fetch"],
+        "builtin": "editor",
+        "_default": True,
+    },
+    # Bundled MCP: web search + page content extraction, no API key needed
+    # Uses Bing > Brave > DuckDuckGo with Playwright for content extraction
+    {
+        "builtin": "web-search",
         "_default": True,
     },
     # Custom MCP: cross-platform shell execution
