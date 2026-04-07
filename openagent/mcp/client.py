@@ -49,6 +49,12 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
         "build": ["npm", "run", "build"],
         "install": ["npm", "install"],
     },
+    "messaging": {
+        "dir": "messaging",
+        "command": ["python3", "server.py"],
+        "python": True,  # Python MCP — skip npm install/build
+        "install": ["pip", "install", "-r", "requirements.txt"],
+    },
 }
 
 # ── Default MCPs (always injected unless disabled) ──
@@ -83,6 +89,12 @@ DEFAULT_MCPS: list[dict[str, Any]] = [
         "builtin": "computer-use",
         "_default": True,
     },
+    # Official Chrome DevTools MCP: browser automation, performance, DOM inspection
+    {
+        "name": "chrome-devtools",
+        "command": ["npx", "-y", "chrome-devtools-mcp@latest"],
+        "_default": True,
+    },
 ]
 
 
@@ -103,17 +115,29 @@ def _resolve_builtin(name: str, env: dict[str, str] | None = None) -> MCPTools:
     if not mcp_dir.exists():
         raise FileNotFoundError(f"Built-in MCP '{name}' directory not found at {mcp_dir}")
 
-    # Auto-install if node_modules missing
-    node_modules = mcp_dir / "node_modules"
-    if not node_modules.exists():
-        logger.info(f"Installing built-in MCP '{name}'...")
-        subprocess.run(spec["install"], cwd=mcp_dir, check=True, capture_output=True)
+    is_python = spec.get("python", False)
 
-    # Auto-build if dist missing
-    dist_dir = mcp_dir / "dist"
-    if not dist_dir.exists():
-        logger.info(f"Building built-in MCP '{name}'...")
-        subprocess.run(spec["build"], cwd=mcp_dir, check=True, capture_output=True)
+    if is_python:
+        # Python MCP: install deps if requirements.txt exists
+        reqs = mcp_dir / "requirements.txt"
+        if reqs.exists() and "install" in spec:
+            # Check if deps are already installed by looking for a marker
+            marker = mcp_dir / ".installed"
+            if not marker.exists():
+                logger.info(f"Installing built-in MCP '{name}' dependencies...")
+                subprocess.run(spec["install"], cwd=mcp_dir, check=True, capture_output=True)
+                marker.touch()
+    else:
+        # Node MCP: install + build
+        node_modules = mcp_dir / "node_modules"
+        if not node_modules.exists():
+            logger.info(f"Installing built-in MCP '{name}'...")
+            subprocess.run(spec["install"], cwd=mcp_dir, check=True, capture_output=True)
+
+        dist_dir = mcp_dir / "dist"
+        if not dist_dir.exists() and "build" in spec:
+            logger.info(f"Building built-in MCP '{name}'...")
+            subprocess.run(spec["build"], cwd=mcp_dir, check=True, capture_output=True)
 
     # Resolve the entry point path
     full_command = [str(mcp_dir / c) if "/" in c else c for c in spec["command"]]

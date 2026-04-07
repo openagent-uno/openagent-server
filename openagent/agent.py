@@ -88,6 +88,7 @@ class Agent:
         message: str,
         user_id: str = "",
         session_id: str | None = None,
+        attachments: list[dict] | None = None,
     ) -> str:
         """Run the agent with a user message. Returns the final text response.
 
@@ -112,7 +113,11 @@ class Agent:
             if mem_context:
                 system = f"{system}\n\n{mem_context}"
 
-        # Build messages
+        # Build messages — prepend attachment descriptions if present
+        if attachments:
+            att_desc = " ".join(f"[Attached {a.get('type','file')}: {a.get('filename','')}]" for a in attachments)
+            message = f"{att_desc}\n{message}" if message else att_desc
+
         messages = list(history)
         messages.append({"role": "user", "content": message})
 

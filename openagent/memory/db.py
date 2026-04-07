@@ -51,6 +51,20 @@ CREATE TABLE IF NOT EXISTS memories (
 CREATE INDEX IF NOT EXISTS idx_memories_agent_user ON memories(agent_id, user_id);
 CREATE INDEX IF NOT EXISTS idx_memories_agent_user_topic ON memories(agent_id, user_id, topic);
 CREATE INDEX IF NOT EXISTS idx_memories_updated ON memories(updated_at);
+
+CREATE TABLE IF NOT EXISTS scheduled_tasks (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    cron_expression TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    last_run REAL,
+    next_run REAL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tasks_enabled ON scheduled_tasks(enabled);
+CREATE INDEX IF NOT EXISTS idx_tasks_next_run ON scheduled_tasks(next_run);
 """
 
 
@@ -266,6 +280,62 @@ class MemoryDB:
             "SELECT * FROM memories WHERE agent_id = ? AND user_id = ? AND content LIKE ? "
             "ORDER BY updated_at DESC LIMIT ?",
             (agent_id, user_id, f"%{query}%", limit),
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    # ── Scheduled Tasks ──
+
+    async def add_task(self, name: str, cron_expression: str, prompt: str, next_run: float | None = None) -> str:
+        conn = await self._ensure_connected()
+        task_id = str(uuid.uuid4())
+        now = time.time()
+        await conn.execute(
+            "INSERT INTO scheduled_tasks (id, name, cron_expression, prompt, enabled, next_run, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
+            (task_id, name, cron_expression, prompt, next_run or now, now, now),
+        )
+        await conn.commit()
+        return task_id
+
+    async def get_tasks(self, enabled_only: bool = False) -> list[dict]:
+        conn = await self._ensure_connected()
+        if enabled_only:
+            cursor = await conn.execute("SELECT * FROM scheduled_tasks WHERE enabled = 1 ORDER BY next_run ASC")
+        else:
+            cursor = await conn.execute("SELECT * FROM scheduled_tasks ORDER BY created_at DESC")
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def get_task(self, task_id: str) -> dict | None:
+        conn = await self._ensure_connected()
+        cursor = await conn.execute("SELECT * FROM scheduled_tasks WHERE id = ?", (task_id,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def update_task(self, task_id: str, **kwargs: Any) -> None:
+        conn = await self._ensure_connected()
+        allowed = {"name", "cron_expression", "prompt", "enabled", "last_run", "next_run"}
+        updates = {k: v for k, v in kwargs.items() if k in allowed}
+        if not updates:
+            return
+        updates["updated_at"] = time.time()
+        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        values = list(updates.values()) + [task_id]
+        await conn.execute(f"UPDATE scheduled_tasks SET {set_clause} WHERE id = ?", values)
+        await conn.commit()
+
+    async def delete_task(self, task_id: str) -> None:
+        conn = await self._ensure_connected()
+        await conn.execute("DELETE FROM scheduled_tasks WHERE id = ?", (task_id,))
+        await conn.commit()
+
+    async def get_due_tasks(self, now: float) -> list[dict]:
+        """Get all enabled tasks whose next_run is <= now."""
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            "SELECT * FROM scheduled_tasks WHERE enabled = 1 AND next_run <= ? ORDER BY next_run ASC",
+            (now,),
         )
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]

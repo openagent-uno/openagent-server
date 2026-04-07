@@ -1,16 +1,14 @@
-"""WhatsApp channel using Green API (no business account required).
-
-Green API provides a free tier — just scan a QR code with your phone.
-Sign up at https://green-api.com, create an instance, and get your ID + token.
-"""
+"""WhatsApp channel using Green API. Supports text, images, files, voice."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import tempfile
+from pathlib import Path
 from typing import TYPE_CHECKING
 
-from openagent.channels.base import BaseChannel
+from openagent.channels.base import BaseChannel, Attachment, parse_response_markers
 
 if TYPE_CHECKING:
     from openagent.agent import Agent
@@ -19,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 class WhatsAppChannel(BaseChannel):
-    """WhatsApp channel via Green API.
+    """WhatsApp channel via Green API with full media support.
 
     Usage:
         channel = WhatsAppChannel(
@@ -27,7 +25,7 @@ class WhatsAppChannel(BaseChannel):
             instance_id="YOUR_INSTANCE_ID",
             api_token="YOUR_API_TOKEN",
         )
-        await channel.start()  # Polls for incoming messages
+        await channel.start()
     """
 
     def __init__(self, agent: Agent, instance_id: str, api_token: str):
@@ -53,7 +51,6 @@ class WhatsAppChannel(BaseChannel):
 
         while self._running:
             try:
-                # Receive notification (incoming message)
                 response = await asyncio.to_thread(
                     self._greenapi.receiving.receiveNotification
                 )
@@ -67,35 +64,8 @@ class WhatsAppChannel(BaseChannel):
                 type_webhook = body.get("typeWebhook")
 
                 if type_webhook == "incomingMessageReceived":
-                    message_data = body.get("messageData", {})
-                    text_data = message_data.get("textMessageData") or message_data.get("extendedTextMessageData")
+                    await self._handle_incoming(body)
 
-                    if text_data:
-                        text = text_data.get("textMessage") or text_data.get("text", "")
-                        sender_data = body.get("senderData", {})
-                        chat_id = sender_data.get("chatId", "")
-                        sender = sender_data.get("sender", "")
-
-                        # Extract user ID from chat ID (remove @c.us)
-                        user_id = chat_id.replace("@c.us", "").replace("@g.us", "")
-                        session_id = self._user_session_id("whatsapp", user_id)
-
-                        if text:
-                            try:
-                                reply = await self.agent.run(
-                                    message=text,
-                                    user_id=user_id,
-                                    session_id=session_id,
-                                )
-                                await asyncio.to_thread(
-                                    self._greenapi.sending.sendMessage,
-                                    chat_id,
-                                    reply,
-                                )
-                            except Exception as e:
-                                logger.error(f"WhatsApp handler error: {e}")
-
-                # Delete processed notification
                 if receipt_id:
                     await asyncio.to_thread(
                         self._greenapi.receiving.deleteNotification,
@@ -105,6 +75,122 @@ class WhatsAppChannel(BaseChannel):
             except Exception as e:
                 logger.error(f"WhatsApp polling error: {e}")
                 await asyncio.sleep(5)
+
+    async def _handle_incoming(self, body: dict) -> None:
+        """Handle an incoming message (text, image, file, voice)."""
+        message_data = body.get("messageData", {})
+        sender_data = body.get("senderData", {})
+        chat_id = sender_data.get("chatId", "")
+        user_id = chat_id.replace("@c.us", "").replace("@g.us", "")
+        session_id = self._user_session_id("whatsapp", user_id)
+
+        text = ""
+        attachments: list[dict] = []
+        msg_type = message_data.get("typeMessage", "")
+
+        # Text messages
+        if msg_type == "textMessage":
+            text_data = message_data.get("textMessageData", {})
+            text = text_data.get("textMessage", "")
+        elif msg_type == "extendedTextMessage":
+            text_data = message_data.get("extendedTextMessageData", {})
+            text = text_data.get("text", "")
+
+        # Image messages
+        elif msg_type == "imageMessage":
+            file_data = message_data.get("fileMessageData", {})
+            text = file_data.get("caption", "")
+            download_url = file_data.get("downloadUrl", "")
+            if download_url:
+                path = await self._download_file(download_url, file_data.get("fileName", "image.jpg"))
+                if path:
+                    attachments.append({"type": "image", "path": path, "filename": Path(path).name})
+
+        # Document messages
+        elif msg_type == "documentMessage":
+            file_data = message_data.get("fileMessageData", {})
+            text = file_data.get("caption", "")
+            download_url = file_data.get("downloadUrl", "")
+            if download_url:
+                fname = file_data.get("fileName", "document")
+                path = await self._download_file(download_url, fname)
+                if path:
+                    attachments.append({"type": "file", "path": path, "filename": fname})
+
+        # Audio/voice messages
+        elif msg_type in ("audioMessage", "voiceMessage"):
+            file_data = message_data.get("fileMessageData", {})
+            download_url = file_data.get("downloadUrl", "")
+            if download_url:
+                path = await self._download_file(download_url, "voice.ogg")
+                if path:
+                    attachments.append({"type": "voice", "path": path, "filename": "voice.ogg"})
+
+        # Video messages
+        elif msg_type == "videoMessage":
+            file_data = message_data.get("fileMessageData", {})
+            text = file_data.get("caption", "")
+            download_url = file_data.get("downloadUrl", "")
+            if download_url:
+                fname = file_data.get("fileName", "video.mp4")
+                path = await self._download_file(download_url, fname)
+                if path:
+                    attachments.append({"type": "video", "path": path, "filename": fname})
+
+        if not text and not attachments:
+            return
+
+        try:
+            reply = await self.agent.run(
+                message=text,
+                user_id=user_id,
+                session_id=session_id,
+                attachments=attachments if attachments else None,
+            )
+            await self._send_response(chat_id, reply)
+        except Exception as e:
+            logger.error(f"WhatsApp handler error: {e}")
+
+    async def _download_file(self, url: str, filename: str) -> str | None:
+        """Download a file from URL to temp dir."""
+        try:
+            import urllib.request
+            tmp_dir = tempfile.mkdtemp(prefix="openagent_wa_")
+            path = str(Path(tmp_dir) / filename)
+            await asyncio.to_thread(urllib.request.urlretrieve, url, path)
+            return path
+        except Exception as e:
+            logger.error(f"Failed to download WhatsApp file: {e}")
+            return None
+
+    async def _send_response(self, chat_id: str, response: str) -> None:
+        """Send agent response, handling file markers."""
+        clean_text, attachments = parse_response_markers(response)
+
+        # Send attachments
+        for att in attachments:
+            try:
+                path = Path(att.path)
+                if not path.exists():
+                    continue
+                with open(path, "rb") as f:
+                    await asyncio.to_thread(
+                        self._greenapi.sending.sendFileByUpload,
+                        chat_id,
+                        str(path),
+                        att.filename,
+                        att.caption or "",
+                    )
+            except Exception as e:
+                logger.error(f"Failed to send WhatsApp attachment {att.filename}: {e}")
+
+        # Send text
+        if clean_text:
+            await asyncio.to_thread(
+                self._greenapi.sending.sendMessage,
+                chat_id,
+                clean_text,
+            )
 
     async def stop(self) -> None:
         self._running = False
