@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "openagent"
+version = "0.1.0"
+description = "Simplified LLM agent framework with MCP, memory, and multi-channel support"
+readme = "docs/README.md"
+requires-python = ">=3.11"
+license = "MIT"
+
+dependencies = [
+    "anthropic>=0.40.0",
+    "openai>=1.50.0",
+    "mcp>=1.0.0",
+    "click>=8.1.0",
+    "rich>=13.0.0",
+    "pyyaml>=6.0",
+    "aiosqlite>=0.20.0",
+]
+
+[project.optional-dependencies]
+telegram = ["python-telegram-bot>=21.0"]
+discord = ["discord.py>=2.3.0"]
+whatsapp = ["whatsapp-api-client-python>=0.0.46"]
+all = [
+    "python-telegram-bot>=21.0",
+    "discord.py>=2.3.0",
+    "whatsapp-api-client-python>=0.0.46",
+]
+
+[project.scripts]
+openagent = "openagent.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["openagent*"]
