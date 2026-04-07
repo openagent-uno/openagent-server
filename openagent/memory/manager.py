@@ -155,14 +155,28 @@ class MemoryManager:
             existing=existing_text,
         )
 
-        response = await model.generate([{"role": "user", "content": prompt}])
+        try:
+            response = await model.generate([{"role": "user", "content": prompt}])
+        except Exception as e:
+            logger.warning(f"Memory extraction model call failed: {e}")
+            return []
 
         try:
             content = response.content.strip()
+            if not content or content.startswith("Error"):
+                return []
             if content.startswith("```"):
                 content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+            # Find JSON array in response (might be wrapped in other text)
+            start = content.find("[")
+            end = content.rfind("]")
+            if start == -1 or end == -1:
+                return []
+            content = content[start:end + 1]
             facts = json.loads(content)
-        except (json.JSONDecodeError, IndexError):
+            if not isinstance(facts, list):
+                return []
+        except (json.JSONDecodeError, IndexError, ValueError):
             return []
 
         stored = []
