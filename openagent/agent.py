@@ -80,7 +80,31 @@ class Agent:
             await self._db.connect()
         if self._memory:
             await self._memory.initialize_knowledge()
+
+        # For Claude CLI: pass MCP server configs so CLI can use them
+        from openagent.models.claude_cli import ClaudeCLI
+        if isinstance(self.model, ClaudeCLI):
+            mcp_configs = self._build_cli_mcp_configs()
+            if mcp_configs:
+                self.model.set_mcp_servers(mcp_configs)
+
         self._initialized = True
+
+    def _build_cli_mcp_configs(self) -> dict[str, dict]:
+        """Build MCP server configs in Claude CLI format for --mcp-config."""
+        configs = {}
+        for server in self._mcp._servers:
+            if server.command:
+                full_cmd = server.command + server.args
+                configs[server.name] = {
+                    "command": full_cmd[0],
+                    "args": full_cmd[1:],
+                }
+                if server.env:
+                    configs[server.name]["env"] = server.env
+                if server._cwd:
+                    configs[server.name]["cwd"] = server._cwd
+        return configs
 
     async def shutdown(self) -> None:
         """Close all connections."""

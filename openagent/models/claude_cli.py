@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import tempfile
+from pathlib import Path
 from typing import Any, AsyncIterator
 
 from openagent.models.base import BaseModel, ModelResponse, ToolCall
@@ -14,13 +16,63 @@ class ClaudeCLI(BaseModel):
 
     Requires `claude` to be installed and authenticated.
     Uses `claude -p` (--print) for non-interactive single-shot responses.
-    Prompt is piped via stdin to avoid shell escaping issues with long prompts.
+    Prompt is piped via stdin to avoid shell escaping issues.
     Uses --no-session-persistence to avoid loading old session context.
+
+    MCP servers from OpenAgent are passed via --mcp-config so Claude CLI
+    can use them alongside its own built-in MCPs.
     """
 
-    def __init__(self, model: str | None = None, allowed_tools: list[str] | None = None):
+    def __init__(
+        self,
+        model: str | None = None,
+        allowed_tools: list[str] | None = None,
+        mcp_servers: dict[str, dict] | None = None,
+    ):
         self.model = model
         self.allowed_tools = allowed_tools or []
+        self.mcp_servers = mcp_servers or {}
+        self._mcp_config_path: str | None = None
+
+    def set_mcp_servers(self, servers: dict[str, dict]) -> None:
+        """Set MCP server configs to pass to Claude CLI.
+
+        Format: {"name": {"command": "node", "args": ["/path/to/server.js"]}, ...}
+        """
+        self.mcp_servers = servers
+        self._mcp_config_path = None  # invalidate cached config file
+
+    def _get_mcp_config_path(self) -> str | None:
+        """Write MCP config to a temp file and return path."""
+        if not self.mcp_servers:
+            return None
+        if self._mcp_config_path and Path(self._mcp_config_path).exists():
+            return self._mcp_config_path
+
+        config = {"mcpServers": self.mcp_servers}
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", prefix="openagent_mcp_",
+            delete=False,
+        )
+        json.dump(config, tmp, indent=2)
+        tmp.close()
+        self._mcp_config_path = tmp.name
+        return self._mcp_config_path
+
+    def _build_cmd(self, output_format: str = "json") -> list[str]:
+        """Build the base claude command."""
+        cmd = ["claude", "-p", "--output-format", output_format, "--no-session-persistence"]
+        if self.model:
+            cmd.extend(["--model", self.model])
+        for tool in self.allowed_tools:
+            cmd.extend(["--allowedTools", tool])
+
+        # Pass OpenAgent MCP servers to Claude CLI
+        mcp_config = self._get_mcp_config_path()
+        if mcp_config:
+            cmd.extend(["--mcp-config", mcp_config])
+
+        return cmd
 
     async def generate(
         self,
@@ -40,16 +92,10 @@ class ClaudeCLI(BaseModel):
 
         prompt = "\n\n".join(prompt_parts)
 
-        # Build command
-        cmd = ["claude", "-p", "--output-format", "json", "--no-session-persistence"]
-        if self.model:
-            cmd.extend(["--model", self.model])
+        cmd = self._build_cmd("json")
         if system:
             cmd.extend(["--append-system-prompt", system])
-        for tool in self.allowed_tools:
-            cmd.extend(["--allowedTools", tool])
 
-        # Pipe prompt via stdin (avoids shell escaping issues)
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
@@ -87,9 +133,7 @@ class ClaudeCLI(BaseModel):
 
         prompt = "\n\n".join(prompt_parts)
 
-        cmd = ["claude", "-p", "--output-format", "stream-json", "--no-session-persistence"]
-        if self.model:
-            cmd.extend(["--model", self.model])
+        cmd = self._build_cmd("stream-json")
         if system:
             cmd.extend(["--append-system-prompt", system])
 
@@ -100,7 +144,6 @@ class ClaudeCLI(BaseModel):
             stderr=asyncio.subprocess.PIPE,
         )
 
-        # Send prompt and close stdin
         proc.stdin.write(prompt.encode("utf-8"))
         await proc.stdin.drain()
         proc.stdin.close()
