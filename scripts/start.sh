@@ -52,18 +52,20 @@ screen -dmS "$SCREEN_NAME" bash -c "exec $VENV -c $CONFIG serve --channel telegr
 
 sleep 15
 
-# 6. Verify
-if pgrep -f "openagent serve" > /dev/null 2>&1; then
-    PID=$(pgrep -f "openagent serve" | head -1)
-    INSTANCES=$(pgrep -f "openagent serve" | wc -l)
-    echo "OpenAgent running (PID: $PID, instances: $INSTANCES)"
-    if [ "$INSTANCES" -gt 1 ]; then
-        echo "WARNING: Multiple instances detected!"
+# 6. Verify (check screen session is alive)
+if screen -ls 2>/dev/null | grep -q "$SCREEN_NAME"; then
+    echo "OpenAgent running in screen session '$SCREEN_NAME'"
+    # Also check the actual process
+    if pgrep -f "openagent.*serve" > /dev/null 2>&1; then
+        PID=$(pgrep -f "openagent.*serve" | head -1)
+        echo "Process PID: $PID"
     fi
     echo "Log: $LOG"
     tail -5 "$LOG"
+    echo ""
+    echo "Attach with: screen -r $SCREEN_NAME"
 else
-    echo "ERROR: OpenAgent failed to start. Log:"
+    echo "ERROR: Screen session not found. Log:"
     cat "$LOG"
     exit 1
 fi
