@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import tempfile
 from pathlib import Path
@@ -147,7 +148,13 @@ class TelegramChannel(BaseChannel):
         await self._app.start()
         await self._app.updater.start_polling()
 
+        # Keep alive until stopped
+        self._stop_event = asyncio.Event()
+        await self._stop_event.wait()
+
     async def stop(self) -> None:
+        if hasattr(self, '_stop_event'):
+            self._stop_event.set()
         if self._app:
             await self._app.updater.stop()
             await self._app.stop()
