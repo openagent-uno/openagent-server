@@ -30,6 +30,7 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
         "command": ["node", "dist/main.js"],
         "build": ["npm", "run", "build"],
         "install": ["npm", "install"],
+        "env": {"DISPLAY": ":1"},  # needed for X11 screen capture on headless VPS
     },
     "shell": {
         "dir": "shell",
@@ -142,10 +143,13 @@ def _resolve_builtin(name: str, env: dict[str, str] | None = None) -> MCPTools:
     # Resolve the entry point path
     full_command = [str(mcp_dir / c) if "/" in c else c for c in spec["command"]]
 
+    # Merge env from spec + caller
+    merged_env = {**(spec.get("env") or {}), **(env or {})}
+
     return MCPTools(
         name=name,
         command=full_command,
-        env=env,
+        env=merged_env if merged_env else None,
         _cwd=str(mcp_dir),
     )
 
