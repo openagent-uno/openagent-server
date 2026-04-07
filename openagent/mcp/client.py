@@ -1,13 +1,16 @@
 """MCP client: connect to any MCP server (local or remote), list tools, call them.
 
 Configure MCP servers once in openagent.yaml, they get injected into all models.
+Includes built-in MCPs that ship with OpenAgent (e.g. computer-use).
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import subprocess
 from contextlib import AsyncExitStack
+from pathlib import Path
 from typing import Any
 
 from mcp import ClientSession, StdioServerParameters
@@ -15,6 +18,53 @@ from mcp.client.stdio import stdio_client
 from mcp.client.sse import sse_client
 
 logger = logging.getLogger(__name__)
+
+# Built-in MCPs that ship with OpenAgent under mcps/
+BUILTIN_MCPS_DIR = Path(__file__).resolve().parent.parent.parent / "mcps"
+
+BUILTIN_MCP_REGISTRY: dict[str, dict[str, Any]] = {
+    "computer-use": {
+        "dir": "computer-use",
+        "command": ["node", "dist/main.js"],
+        "build": ["npm", "run", "build"],
+        "install": ["npm", "install"],
+    },
+}
+
+
+def _resolve_builtin(name: str, env: dict[str, str] | None = None) -> MCPTools:
+    """Resolve a built-in MCP by name. Ensures it's installed and built."""
+    if name not in BUILTIN_MCP_REGISTRY:
+        available = ", ".join(BUILTIN_MCP_REGISTRY.keys())
+        raise ValueError(f"Unknown built-in MCP: {name}. Available: {available}")
+
+    spec = BUILTIN_MCP_REGISTRY[name]
+    mcp_dir = BUILTIN_MCPS_DIR / spec["dir"]
+
+    if not mcp_dir.exists():
+        raise FileNotFoundError(f"Built-in MCP '{name}' directory not found at {mcp_dir}")
+
+    # Auto-install if node_modules missing
+    node_modules = mcp_dir / "node_modules"
+    if not node_modules.exists():
+        logger.info(f"Installing built-in MCP '{name}'...")
+        subprocess.run(spec["install"], cwd=mcp_dir, check=True, capture_output=True)
+
+    # Auto-build if dist missing
+    dist_dir = mcp_dir / "dist"
+    if not dist_dir.exists():
+        logger.info(f"Building built-in MCP '{name}'...")
+        subprocess.run(spec["build"], cwd=mcp_dir, check=True, capture_output=True)
+
+    # Return MCPTools with the resolved command
+    full_command = [str(mcp_dir / c) if c == "dist/main.js" else c for c in spec["command"]]
+
+    return MCPTools(
+        name=name,
+        command=full_command,
+        env=env,
+        _cwd=str(mcp_dir),
+    )
 
 
 class MCPTools:
@@ -35,12 +85,14 @@ class MCPTools:
         args: list[str] | None = None,
         url: str | None = None,
         env: dict[str, str] | None = None,
+        _cwd: str | None = None,
     ):
         self.name = name or (command[0] if command else url or "mcp")
         self.command = command
         self.args = args or []
         self.url = url
         self.env = env
+        self._cwd = _cwd  # working directory for the server process
 
         self._session: ClientSession | None = None
         self._exit_stack: AsyncExitStack | None = None
@@ -55,10 +107,14 @@ class MCPTools:
 
         if self.command:
             full_command = self.command + self.args
+            env = self.env or {}
+            if self._cwd:
+                env = {**env, "CWD": self._cwd}
             server_params = StdioServerParameters(
                 command=full_command[0],
                 args=full_command[1:],
-                env=self.env,
+                env=env if env else None,
+                cwd=self._cwd,
             )
             stdio_transport = await self._exit_stack.enter_async_context(
                 stdio_client(server_params)
@@ -187,17 +243,26 @@ class MCPRegistry:
             [
                 {"name": "fs", "command": ["npx", "-y", "@anthropic/mcp-filesystem"], "args": ["/data"]},
                 {"name": "search", "url": "http://localhost:8080/sse"},
+                {"builtin": "computer-use"},
             ]
         """
         registry = cls()
         for entry in mcp_config:
-            registry.add(MCPTools(
-                name=entry.get("name", ""),
-                command=entry.get("command"),
-                args=entry.get("args"),
-                url=entry.get("url"),
-                env=entry.get("env"),
-            ))
+            if "builtin" in entry:
+                # Built-in MCP that ships with OpenAgent
+                server = _resolve_builtin(
+                    entry["builtin"],
+                    env=entry.get("env"),
+                )
+                registry.add(server)
+            else:
+                registry.add(MCPTools(
+                    name=entry.get("name", ""),
+                    command=entry.get("command"),
+                    args=entry.get("args"),
+                    url=entry.get("url"),
+                    env=entry.get("env"),
+                ))
         return registry
 
     def __repr__(self) -> str:
