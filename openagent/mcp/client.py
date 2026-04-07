@@ -43,6 +43,7 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
         "command": ["node", "dist/index.js"],
         "build": ["npm", "run", "build"],
         "install": ["npm", "install"],
+        "env": {"NODE_TLS_REJECT_UNAUTHORIZED": "0"},  # some VPS lack updated CA certs
     },
     "editor": {
         "dir": "editor",
@@ -224,13 +225,17 @@ class MCPTools:
 
         if self.command:
             full_command = self.command + self.args
-            env = self.env or {}
+            # Merge custom env with system env (MCP SDK replaces entirely if env is set)
+            import os
+            merged_env: dict[str, str] | None = None
+            if self.env:
+                merged_env = {**os.environ, **self.env}
             if self._cwd:
-                env = {**env, "CWD": self._cwd}
+                merged_env = {**(merged_env or os.environ), "CWD": self._cwd}
             server_params = StdioServerParameters(
                 command=full_command[0],
                 args=full_command[1:],
-                env=env if env else None,
+                env=merged_env,
                 cwd=self._cwd,
             )
             stdio_transport = await self._exit_stack.enter_async_context(
