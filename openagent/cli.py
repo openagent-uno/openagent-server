@@ -25,9 +25,15 @@ def _build_agent_from_config(config: dict) -> Agent:
     """Build an Agent from a config dict."""
     model = build_model_from_config(config)
 
-    # MCP
+    # MCP: defaults are always loaded, user MCPs merged on top
     mcp_config = config.get("mcp", [])
-    mcp_registry = MCPRegistry.from_config(mcp_config) if mcp_config else MCPRegistry()
+    include_defaults = config.get("mcp_defaults", True)
+    mcp_disable = config.get("mcp_disable", [])
+    mcp_registry = MCPRegistry.from_config(
+        mcp_config=mcp_config,
+        include_defaults=include_defaults,
+        disable=mcp_disable,
+    )
 
     # Memory
     memory_cfg = config.get("memory", {})

@@ -1,13 +1,14 @@
 """MCP client: connect to any MCP server (local or remote), list tools, call them.
 
 Configure MCP servers once in openagent.yaml, they get injected into all models.
-Includes built-in MCPs that ship with OpenAgent (e.g. computer-use).
+Includes default MCPs (filesystem, fetch, shell, computer-use) that are always
+loaded unless explicitly disabled. User MCPs are merged on top.
 """
 
 from __future__ import annotations
 
-import json
 import logging
+import shutil
 import subprocess
 from contextlib import AsyncExitStack
 from pathlib import Path
@@ -19,26 +20,67 @@ from mcp.client.sse import sse_client
 
 logger = logging.getLogger(__name__)
 
-# Built-in MCPs that ship with OpenAgent under mcps/
+# ── Built-in MCPs (custom, ship under mcps/) ──
+
 BUILTIN_MCPS_DIR = Path(__file__).resolve().parent.parent.parent / "mcps"
 
-BUILTIN_MCP_REGISTRY: dict[str, dict[str, Any]] = {
+BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
     "computer-use": {
         "dir": "computer-use",
         "command": ["node", "dist/main.js"],
         "build": ["npm", "run", "build"],
         "install": ["npm", "install"],
     },
+    "shell": {
+        "dir": "shell",
+        "command": ["node", "dist/index.js"],
+        "build": ["npm", "run", "build"],
+        "install": ["npm", "install"],
+    },
 }
+
+# ── Default MCPs (always injected unless disabled) ──
+# Order: defaults first, then user MCPs (like { ...defaults, ...userConfig })
+
+DEFAULT_MCPS: list[dict[str, Any]] = [
+    # Official MCP: filesystem read/write/list/search (Node, cross-platform)
+    {
+        "name": "filesystem",
+        "command": ["npx", "-y", "@modelcontextprotocol/server-filesystem"],
+        "args": ["."],  # default to cwd, user can override
+        "_default": True,
+    },
+    # Official MCP: web fetch with HTML-to-markdown (Python, cross-platform)
+    {
+        "name": "fetch",
+        "command": ["uvx", "mcp-server-fetch"],
+        "_default": True,
+    },
+    # Custom MCP: cross-platform shell execution
+    {
+        "builtin": "shell",
+        "_default": True,
+    },
+    # Custom MCP: cross-platform computer use (screenshot, mouse, keyboard)
+    {
+        "builtin": "computer-use",
+        "_default": True,
+    },
+]
+
+
+def _check_command_exists(cmd: str) -> bool:
+    """Check if a command is available on PATH."""
+    return shutil.which(cmd) is not None
 
 
 def _resolve_builtin(name: str, env: dict[str, str] | None = None) -> MCPTools:
-    """Resolve a built-in MCP by name. Ensures it's installed and built."""
-    if name not in BUILTIN_MCP_REGISTRY:
-        available = ", ".join(BUILTIN_MCP_REGISTRY.keys())
+    """Resolve a built-in MCP by name. Auto-installs and builds if needed."""
+    if name not in BUILTIN_MCP_SPECS:
+        available = ", ".join(BUILTIN_MCP_SPECS.keys())
         raise ValueError(f"Unknown built-in MCP: {name}. Available: {available}")
 
-    spec = BUILTIN_MCP_REGISTRY[name]
+    spec = BUILTIN_MCP_SPECS[name]
     mcp_dir = BUILTIN_MCPS_DIR / spec["dir"]
 
     if not mcp_dir.exists():
@@ -56,14 +98,44 @@ def _resolve_builtin(name: str, env: dict[str, str] | None = None) -> MCPTools:
         logger.info(f"Building built-in MCP '{name}'...")
         subprocess.run(spec["build"], cwd=mcp_dir, check=True, capture_output=True)
 
-    # Return MCPTools with the resolved command
-    full_command = [str(mcp_dir / c) if c == "dist/main.js" else c for c in spec["command"]]
+    # Resolve the entry point path
+    full_command = [str(mcp_dir / c) if "/" in c else c for c in spec["command"]]
 
     return MCPTools(
         name=name,
         command=full_command,
         env=env,
         _cwd=str(mcp_dir),
+    )
+
+
+def _resolve_default_entry(entry: dict[str, Any]) -> MCPTools | None:
+    """Try to resolve a default MCP entry. Returns None if prerequisites are missing."""
+    name = entry.get("name") or entry.get("builtin", "")
+
+    if "builtin" in entry:
+        # Custom built-in — needs Node.js
+        if not _check_command_exists("node"):
+            logger.warning(f"Skipping default MCP '{name}': Node.js not found")
+            return None
+        try:
+            return _resolve_builtin(entry["builtin"], env=entry.get("env"))
+        except Exception as e:
+            logger.warning(f"Skipping default MCP '{name}': {e}")
+            return None
+
+    # External package — check if the command exists
+    cmd = entry.get("command", [None])[0]
+    if cmd and not _check_command_exists(cmd):
+        logger.warning(f"Skipping default MCP '{name}': '{cmd}' not found")
+        return None
+
+    return MCPTools(
+        name=entry.get("name", ""),
+        command=entry.get("command"),
+        args=entry.get("args"),
+        url=entry.get("url"),
+        env=entry.get("env"),
     )
 
 
@@ -92,7 +164,7 @@ class MCPTools:
         self.args = args or []
         self.url = url
         self.env = env
-        self._cwd = _cwd  # working directory for the server process
+        self._cwd = _cwd
 
         self._session: ClientSession | None = None
         self._exit_stack: AsyncExitStack | None = None
@@ -168,7 +240,6 @@ class MCPTools:
 
         result = await self._session.call_tool(name, arguments)
 
-        # Combine all content blocks into a string
         parts = []
         for block in result.content:
             if hasattr(block, "text"):
@@ -185,14 +256,15 @@ class MCPTools:
 class MCPRegistry:
     """Registry of all MCP servers. Configure once, inject into all agents.
 
-    Usage:
-        registry = MCPRegistry()
-        registry.add(MCPTools(name="fs", command=["npx", "-y", "@anthropic/mcp-filesystem", "/data"]))
-        registry.add(MCPTools(name="search", url="http://localhost:8080/sse"))
+    Default MCPs (filesystem, fetch, shell, computer-use) are always loaded
+    unless disabled. User-configured MCPs are merged on top:
 
-        await registry.connect_all()
-        tools = registry.all_tools()       # Flat list of all tool definitions
-        result = await registry.call("tool_name", {"arg": "val"})
+        { ...default_mcps, ...user_mcps }
+
+    Disable defaults:
+        - In YAML: set `mcp_defaults: false`
+        - In code: `MCPRegistry.from_config(config, include_defaults=False)`
+        - Disable specific ones: `mcp_disable: ["computer-use", "fetch"]`
     """
 
     def __init__(self):
@@ -236,25 +308,52 @@ class MCPRegistry:
         return await server.call_tool(name, arguments)
 
     @classmethod
-    def from_config(cls, mcp_config: list[dict]) -> MCPRegistry:
-        """Build registry from config list.
+    def from_config(
+        cls,
+        mcp_config: list[dict] | None = None,
+        include_defaults: bool = True,
+        disable: list[str] | None = None,
+    ) -> MCPRegistry:
+        """Build registry: defaults first, then user MCPs merged on top.
 
-        Example config:
-            [
-                {"name": "fs", "command": ["npx", "-y", "@anthropic/mcp-filesystem"], "args": ["/data"]},
-                {"name": "search", "url": "http://localhost:8080/sse"},
-                {"builtin": "computer-use"},
-            ]
+        Args:
+            mcp_config: User-configured MCP entries from openagent.yaml
+            include_defaults: Whether to include default MCPs (filesystem, fetch, shell, computer-use)
+            disable: List of default MCP names to skip (e.g. ["computer-use", "fetch"])
         """
         registry = cls()
-        for entry in mcp_config:
+        disabled = set(disable or [])
+        user_names = set()
+
+        # Collect user MCP names so defaults don't duplicate them
+        for entry in (mcp_config or []):
+            name = entry.get("name") or entry.get("builtin", "")
+            if name:
+                user_names.add(name)
+
+        # 1. Load defaults (skipping disabled and user-overridden ones)
+        if include_defaults:
+            for default_entry in DEFAULT_MCPS:
+                name = default_entry.get("name") or default_entry.get("builtin", "")
+                if name in disabled:
+                    logger.info(f"Default MCP '{name}' disabled by config")
+                    continue
+                if name in user_names:
+                    logger.info(f"Default MCP '{name}' overridden by user config")
+                    continue
+
+                server = _resolve_default_entry(default_entry)
+                if server:
+                    registry.add(server)
+
+        # 2. Load user MCPs on top
+        for entry in (mcp_config or []):
             if "builtin" in entry:
-                # Built-in MCP that ships with OpenAgent
-                server = _resolve_builtin(
-                    entry["builtin"],
-                    env=entry.get("env"),
-                )
-                registry.add(server)
+                try:
+                    server = _resolve_builtin(entry["builtin"], env=entry.get("env"))
+                    registry.add(server)
+                except Exception as e:
+                    logger.error(f"Failed to load built-in MCP '{entry['builtin']}': {e}")
             else:
                 registry.add(MCPTools(
                     name=entry.get("name", ""),
@@ -263,6 +362,7 @@ class MCPRegistry:
                     url=entry.get("url"),
                     env=entry.get("env"),
                 ))
+
         return registry
 
     def __repr__(self) -> str:
