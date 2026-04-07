@@ -60,7 +60,10 @@ def build_model_from_config(config: dict):
             api_key=model_cfg.get("api_key"),
         )
     elif provider == "claude-cli":
-        return ClaudeCLI(model=model_cfg.get("model_id"))
+        return ClaudeCLI(
+            model=model_cfg.get("model_id"),
+            permission_mode=model_cfg.get("permission_mode", "bypass"),
+        )
     elif provider == "zhipu":
         return ZhipuGLM(
             model=model_cfg.get("model_id", "glm-4"),

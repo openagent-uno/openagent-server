@@ -28,10 +28,12 @@ class ClaudeCLI(BaseModel):
         model: str | None = None,
         allowed_tools: list[str] | None = None,
         mcp_servers: dict[str, dict] | None = None,
+        permission_mode: str = "auto",
     ):
         self.model = model
         self.allowed_tools = allowed_tools or []
         self.mcp_servers = mcp_servers or {}
+        self.permission_mode = permission_mode  # "auto", "bypass", or "default"
         self._mcp_config_path: str | None = None
 
     def set_mcp_servers(self, servers: dict[str, dict]) -> None:
@@ -64,6 +66,11 @@ class ClaudeCLI(BaseModel):
         cmd = ["claude", "-p", "--output-format", output_format, "--no-session-persistence"]
         if self.model:
             cmd.extend(["--model", self.model])
+
+        # Permission mode: bypass all tool confirmations for agent use
+        if self.permission_mode == "bypass":
+            cmd.append("--dangerously-skip-permissions")
+
         for tool in self.allowed_tools:
             cmd.extend(["--allowedTools", tool])
 
