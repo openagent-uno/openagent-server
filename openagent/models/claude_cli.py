@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import uuid
 from typing import Any, AsyncIterator
 
 from openagent.models.base import BaseModel, ModelResponse, ToolCall
@@ -14,7 +13,8 @@ class ClaudeCLI(BaseModel):
     """Claude via the `claude` CLI tool.
 
     Requires `claude` to be installed and authenticated.
-    Runs claude as a subprocess with --print / --output-format json.
+    Uses `claude -p` (--print) for non-interactive single-shot responses.
+    The prompt is passed as a positional argument.
     """
 
     def __init__(self, model: str | None = None, allowed_tools: list[str] | None = None):
@@ -27,7 +27,7 @@ class ClaudeCLI(BaseModel):
         system: str | None = None,
         tools: list[dict[str, Any]] | None = None,
     ) -> ModelResponse:
-        # Build the prompt from messages (CLI doesn't support multi-turn directly)
+        # Build the prompt from messages
         prompt_parts = []
         if system:
             prompt_parts.append(f"[System] {system}")
@@ -41,12 +41,13 @@ class ClaudeCLI(BaseModel):
 
         prompt = "\n\n".join(prompt_parts)
 
-        cmd = ["claude", "--print", "--output-format", "json"]
+        # Build command: claude -p --output-format json "prompt"
+        cmd = ["claude", "-p", "--output-format", "json"]
         if self.model:
             cmd.extend(["--model", self.model])
         for tool in self.allowed_tools:
             cmd.extend(["--allowedTools", tool])
-        cmd.extend(["--prompt", prompt])
+        cmd.append(prompt)  # positional argument, not --prompt
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -77,7 +78,6 @@ class ClaudeCLI(BaseModel):
         system: str | None = None,
         tools: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[str]:
-        # Build prompt
         prompt_parts = []
         if system:
             prompt_parts.append(f"[System] {system}")
@@ -87,10 +87,10 @@ class ClaudeCLI(BaseModel):
 
         prompt = "\n\n".join(prompt_parts)
 
-        cmd = ["claude", "--print", "--output-format", "stream-json"]
+        cmd = ["claude", "-p", "--output-format", "stream-json"]
         if self.model:
             cmd.extend(["--model", self.model])
-        cmd.extend(["--prompt", prompt])
+        cmd.append(prompt)  # positional argument
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
