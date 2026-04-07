@@ -39,6 +39,7 @@ class Agent:
         memory: MemoryDB | str | None = None,
         auto_extract_memory: bool = True,
         history_limit: int = 50,
+        knowledge_dir: str = "./memories",
     ):
         self.name = name
         self.model = model
@@ -63,7 +64,10 @@ class Agent:
 
         self._memory: MemoryManager | None = None
         if self._db:
-            self._memory = MemoryManager(self._db, auto_extract=auto_extract_memory, history_limit=history_limit)
+            self._memory = MemoryManager(
+                self._db, auto_extract=auto_extract_memory,
+                history_limit=history_limit, knowledge_dir=knowledge_dir,
+            )
 
         self._initialized = False
 
@@ -74,6 +78,8 @@ class Agent:
         await self._mcp.connect_all()
         if self._db:
             await self._db.connect()
+        if self._memory:
+            await self._memory.initialize_knowledge()
         self._initialized = True
 
     async def shutdown(self) -> None:
@@ -108,8 +114,8 @@ class Agent:
             current_session_id = await self._memory.ensure_session(self.name, user_id, session_id)
             history = await self._memory.get_history(current_session_id)
 
-            # Inject long-term memories into system prompt
-            mem_context = await self._memory.build_memory_context(self.name, user_id)
+            # Inject long-term memories + relevant knowledge into system prompt
+            mem_context = await self._memory.build_memory_context(self.name, user_id, query=message)
             if mem_context:
                 system = f"{system}\n\n{mem_context}"
 

@@ -39,6 +39,7 @@ def _build_agent_from_config(config: dict) -> Agent:
     memory_cfg = config.get("memory", {})
     db_path = memory_cfg.get("db_path", "openagent.db")
     auto_extract = memory_cfg.get("auto_extract", True)
+    knowledge_dir = memory_cfg.get("knowledge_dir", "./memories")
 
     db = MemoryDB(db_path)
 
@@ -49,6 +50,7 @@ def _build_agent_from_config(config: dict) -> Agent:
         mcp_registry=mcp_registry,
         memory=db,
         auto_extract_memory=auto_extract,
+        knowledge_dir=knowledge_dir,
     )
 
 
