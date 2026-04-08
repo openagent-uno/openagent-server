@@ -20,6 +20,34 @@ from openagent.mcp.client import MCPRegistry
 
 console = Console()
 
+DREAM_MODE_TASK_NAME = "dream-mode"
+
+DREAM_MODE_PROMPT = """\
+You are running in Dream Mode — a nightly maintenance routine.
+Perform the following tasks and log a summary of each:
+
+1. **Clean temp files**: List and remove files in /tmp that are older than 24 hours.
+   Use `find /tmp -maxdepth 1 -type f -mtime +1 -delete` (or equivalent).
+   Report how many files were removed and how much space was freed.
+
+2. **Consolidate memory files**: Review all .md files in the knowledge/memories directory.
+   - Identify and merge duplicate entries that cover the same topic.
+   - Update any outdated information you can verify.
+   - Remove empty or trivially short files (< 10 words) that add no value.
+   Report what was merged, updated, or removed.
+
+3. **System health check**: Check and report:
+   - Disk usage (df -h) — warn if any partition is above 85%.
+   - Memory usage (free -m or vm_stat on macOS).
+   - Top 5 processes by CPU usage.
+   Report any anomalies or concerns.
+
+4. **Log results**: Write a concise summary of everything done to a memory file
+   named `dream-log-{date}.md` so there is an audit trail.
+
+Be thorough but non-destructive. When in doubt, skip rather than delete.
+"""
+
 
 def _build_agent_from_config(config: dict) -> Agent:
     """Build an Agent from a config dict."""
@@ -172,6 +200,47 @@ def serve(ctx, channel: tuple[str, ...]):
                             cron_expression=task_cfg["cron"],
                             prompt=task_cfg["prompt"],
                         )
+
+                # Dream Mode — auto-register/sync the built-in maintenance task
+                dream_cfg = config.get("dream_mode", {})
+                dream_enabled = dream_cfg.get("enabled", False)
+                existing = await agent._db.get_tasks()
+                dream_task = next(
+                    (t for t in existing if t["name"] == DREAM_MODE_TASK_NAME), None
+                )
+
+                if dream_enabled:
+                    # Build cron expression from config
+                    dream_cron = dream_cfg.get("cron", None)
+                    if not dream_cron:
+                        # Parse "HH:MM" time shorthand into cron
+                        dream_time = dream_cfg.get("time", "3:00")
+                        parts = str(dream_time).split(":")
+                        hour = int(parts[0])
+                        minute = int(parts[1]) if len(parts) > 1 else 0
+                        dream_cron = f"{minute} {hour} * * *"
+
+                    if dream_task is None:
+                        await scheduler.add_task(
+                            name=DREAM_MODE_TASK_NAME,
+                            cron_expression=dream_cron,
+                            prompt=DREAM_MODE_PROMPT,
+                        )
+                        console.print("[magenta]Dream Mode enabled[/magenta]")
+                    else:
+                        # Re-enable if it was disabled, and update cron if changed
+                        if not dream_task["enabled"] or dream_task["cron_expression"] != dream_cron:
+                            await scheduler.disable_task(dream_task["id"])
+                            await scheduler.enable_task(dream_task["id"])
+                            if dream_task["cron_expression"] != dream_cron:
+                                await agent._db.update_task(
+                                    dream_task["id"], cron_expression=dream_cron
+                                )
+                        console.print("[magenta]Dream Mode enabled[/magenta]")
+                elif dream_task is not None and dream_task["enabled"]:
+                    # Dream mode disabled in config — disable the task
+                    await scheduler.disable_task(dream_task["id"])
+                    console.print("[dim]Dream Mode disabled[/dim]")
 
                 await scheduler.start()
                 console.print("[green]Scheduler started[/green]")
