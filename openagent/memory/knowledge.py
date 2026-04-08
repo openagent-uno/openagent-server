@@ -231,9 +231,9 @@ class KnowledgeBase:
         sanitized = re.sub(r'\s+', ' ', sanitized).strip()
         if not sanitized:
             return '""'
-        # Quote each word for exact matching
+        # Use OR between words so any match counts (not all required)
         words = sanitized.split()
-        return " ".join(f'"{w}"' for w in words[:20])  # limit to 20 words
+        return " OR ".join(f'"{w}"' for w in words[:20])
 
     async def search(self, query: str, topic: str | None = None, limit: int = 20) -> list[dict]:
         """Search memories using FTS5 full-text search.
@@ -322,7 +322,7 @@ class KnowledgeBase:
             raise FileNotFoundError(f"Memory file not found: {file_path}")
         return path.read_text(encoding="utf-8")
 
-    async def build_context(self, query: str, max_results: int = 3, max_chars: int = 2000) -> str:
+    async def build_context(self, query: str, max_results: int = 5, max_chars: int = 3000) -> str:
         """Build a compact context from FTS5 snippets (NOT full files).
 
         Only injects short, relevant snippets — not entire documents.
