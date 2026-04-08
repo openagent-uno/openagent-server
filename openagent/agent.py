@@ -150,8 +150,23 @@ class Agent:
                 try:
                     await on_status(msg)
                 except Exception:
-                    pass  # never let status updates break the flow
+                    pass
 
+        try:
+            return await self._run_inner(message, user_id, session_id, attachments, _status)
+        except BaseException as e:
+            logger.error(f"Agent.run() fatal error: {e}")
+            return f"Error: {e}"
+
+    async def _run_inner(
+        self,
+        message: str,
+        user_id: str,
+        session_id: str | None,
+        attachments: list[dict] | None,
+        _status,
+    ) -> str:
+        """Inner run logic, wrapped by run() for crash protection."""
         await _status("Loading context...")
 
         # Session + history

@@ -57,15 +57,47 @@ class ClaudeCLI(BaseModel):
 
         return opts
 
+    async def _query_with_retry(self, prompt: str, opts: dict) -> str:
+        """Run SDK query with retry on session errors."""
+        from claude_agent_sdk import query, ClaudeAgentOptions, ResultMessage, SystemMessage
+
+        for attempt in range(2):
+            try:
+                options = ClaudeAgentOptions(**opts)
+                result_text = ""
+
+                async for message in query(prompt=prompt, options=options):
+                    if isinstance(message, SystemMessage) and hasattr(message, 'data'):
+                        data = message.data if isinstance(message.data, dict) else {}
+                        if 'session_id' in data:
+                            self._session_id = data['session_id']
+
+                    if isinstance(message, ResultMessage):
+                        result_text = message.result or ""
+
+                return result_text
+
+            except BaseException as e:
+                error_msg = str(e)
+                logger.error(f"Claude Agent SDK error (attempt {attempt + 1}): {error_msg}")
+
+                # If session resume failed, reset and retry without resume
+                if self._session_id and attempt == 0:
+                    logger.info("Resetting session and retrying...")
+                    self._session_id = None
+                    opts.pop("resume", None)
+                    continue
+
+                return f"Error: {error_msg}"
+
+        return "Error: max retries exceeded"
+
     async def generate(
         self,
         messages: list[dict[str, Any]],
         system: str | None = None,
         tools: list[dict[str, Any]] | None = None,
     ) -> ModelResponse:
-        from claude_agent_sdk import query, ClaudeAgentOptions, ResultMessage, SystemMessage
-
-        # Build prompt from messages
         prompt_parts = []
         if system:
             prompt_parts.append(f"<system>\n{system}\n</system>")
@@ -78,26 +110,9 @@ class ClaudeCLI(BaseModel):
                 prompt_parts.append(f"[Previous assistant response] {content}")
 
         prompt = "\n\n".join(prompt_parts)
-
         opts = self._build_options()
-        options = ClaudeAgentOptions(**opts)
 
-        result_text = ""
-        try:
-            async for message in query(prompt=prompt, options=options):
-                # Capture session ID for resume
-                if isinstance(message, SystemMessage) and hasattr(message, 'data'):
-                    data = message.data if isinstance(message.data, dict) else {}
-                    if 'session_id' in data:
-                        self._session_id = data['session_id']
-
-                if isinstance(message, ResultMessage):
-                    result_text = message.result or ""
-
-        except Exception as e:
-            logger.error(f"Claude Agent SDK error: {e}")
-            result_text = f"Error: {e}"
-
+        result_text = await self._query_with_retry(prompt, opts)
         return ModelResponse(content=result_text)
 
     async def stream(
@@ -116,7 +131,6 @@ class ClaudeCLI(BaseModel):
                 prompt_parts.append(msg.get("content", ""))
 
         prompt = "\n\n".join(prompt_parts)
-
         opts = self._build_options()
         options = ClaudeAgentOptions(**opts)
 
@@ -136,6 +150,7 @@ class ClaudeCLI(BaseModel):
                     if message.result:
                         yield message.result
 
-        except Exception as e:
+        except BaseException as e:
             logger.error(f"Claude Agent SDK stream error: {e}")
+            self._session_id = None  # reset session on error
             yield f"Error: {e}"
