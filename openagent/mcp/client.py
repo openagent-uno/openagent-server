@@ -1,7 +1,7 @@
 """MCP client: connect to any MCP server (local or remote), list tools, call them.
 
 Configure MCP servers once in openagent.yaml, they get injected into all models.
-Includes default MCPs (filesystem, fetch, shell, computer-use) that are always
+Includes default MCPs (filesystem, fetch, shell, computer-control) that are always
 loaded unless explicitly disabled. User MCPs are merged on top.
 """
 
@@ -26,8 +26,8 @@ logger = logging.getLogger(__name__)
 BUILTIN_MCPS_DIR = Path(__file__).resolve().parent.parent / "mcps"
 
 BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
-    "computer-use": {
-        "dir": "computer-use",
+    "computer-control": {
+        "dir": "computer-control",
         "command": ["node", "dist/main.js"],
         "build": ["npm", "run", "build"],
         "install": ["npm", "install"],
@@ -89,7 +89,7 @@ DEFAULT_MCPS: list[dict[str, Any]] = [
     },
     # Custom MCP: cross-platform computer use (screenshot, mouse, keyboard)
     {
-        "builtin": "computer-use",
+        "builtin": "computer-control",
         "_default": True,
     },
     # Official Chrome DevTools MCP: browser automation, performance, DOM inspection
@@ -360,7 +360,7 @@ class MCPTools:
 class MCPRegistry:
     """Registry of all MCP servers. Configure once, inject into all agents.
 
-    Default MCPs (filesystem, fetch, shell, computer-use) are always loaded
+    Default MCPs (filesystem, fetch, shell, computer-control) are always loaded
     unless disabled. User-configured MCPs are merged on top:
 
         { ...default_mcps, ...user_mcps }
@@ -368,7 +368,7 @@ class MCPRegistry:
     Disable defaults:
         - In YAML: set `mcp_defaults: false`
         - In code: `MCPRegistry.from_config(config, include_defaults=False)`
-        - Disable specific ones: `mcp_disable: ["computer-use", "fetch"]`
+        - Disable specific ones: `mcp_disable: ["computer-control", "fetch"]`
     """
 
     def __init__(self):
@@ -422,8 +422,8 @@ class MCPRegistry:
 
         Args:
             mcp_config: User-configured MCP entries from openagent.yaml
-            include_defaults: Whether to include default MCPs (filesystem, fetch, shell, computer-use)
-            disable: List of default MCP names to skip (e.g. ["computer-use", "fetch"])
+            include_defaults: Whether to include default MCPs (filesystem, fetch, shell, computer-control)
+            disable: List of default MCP names to skip (e.g. ["computer-control", "fetch"])
         """
         registry = cls()
         disabled = set(disable or [])

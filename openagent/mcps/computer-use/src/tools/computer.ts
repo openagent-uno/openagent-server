@@ -27,7 +27,7 @@ async function grabScreen(): Promise<ReturnType<typeof imageToJimp>> {
 		return imageToJimp(await screen.grab());
 	} catch {
 		// Fallback: use screencapture CLI (macOS only)
-		const tmpPath = join(tmpdir(), `computer-use-crossp-mcp-${Date.now()}.png`);
+		const tmpPath = join(tmpdir(), `computer-control-crossp-mcp-${Date.now()}.png`);
 		try {
 			execFileSync('screencapture', ['-x', tmpPath]);
 			const buffer = readFileSync(tmpPath);

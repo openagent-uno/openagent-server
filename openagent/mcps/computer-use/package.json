@@ -1,7 +1,7 @@
 {
-  "name": "computer-use-mcp",
+  "name": "computer-control-mcp",
   "version": "1.0.0",
-  "description": "Cross-platform computer-use MCP server (screenshot, mouse, keyboard)",
+  "description": "Cross-platform computer-control MCP server (screenshot, mouse, keyboard)",
   "license": "MIT",
   "type": "module",
   "main": "dist/main.js",

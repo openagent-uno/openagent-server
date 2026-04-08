@@ -4,7 +4,7 @@ import {registerAll} from './tools/index.js';
 
 export function createServer(): McpServer {
 	const server = new McpServer({
-		name: 'computer-use-crossp-mcp',
+		name: 'computer-control-crossp-mcp',
 		version: '1.0.0',
 	});
 
