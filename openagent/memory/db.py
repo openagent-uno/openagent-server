@@ -1,7 +1,10 @@
-"""SQLite-based storage for sessions, messages, and memories.
+"""SQLite storage for sessions, messages, and scheduled tasks.
 
-All data lives in SQLite — no files, no scattered storage.
-WAL mode + proper indexes for fast concurrent access.
+Long-term memory and knowledge base are in the Obsidian vault
+(managed by MCPVault MCP). SQLite handles only:
+- Session tracking
+- Conversation messages (high-frequency, concurrent writes)
+- Scheduled tasks (cron queries)
 """
 
 from __future__ import annotations
@@ -38,19 +41,6 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
 CREATE INDEX IF NOT EXISTS idx_messages_session_time ON messages(session_id, created_at);
-
-CREATE TABLE IF NOT EXISTS memories (
-    id TEXT PRIMARY KEY,
-    agent_id TEXT NOT NULL,
-    user_id TEXT NOT NULL DEFAULT '',
-    content TEXT NOT NULL,
-    topic TEXT NOT NULL DEFAULT '',
-    created_at REAL NOT NULL,
-    updated_at REAL NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_memories_agent_user ON memories(agent_id, user_id);
-CREATE INDEX IF NOT EXISTS idx_memories_agent_user_topic ON memories(agent_id, user_id, topic);
-CREATE INDEX IF NOT EXISTS idx_memories_updated ON memories(updated_at);
 
 CREATE TABLE IF NOT EXISTS scheduled_tasks (
     id TEXT PRIMARY KEY,
@@ -216,73 +206,8 @@ class MemoryDB:
             result.append(msg)
         return result
 
-    # ── Memories ──
-
-    async def add_memory(self, agent_id: str, user_id: str, content: str, topic: str = "") -> str:
-        conn = await self._ensure_connected()
-        mem_id = str(uuid.uuid4())
-        now = time.time()
-        await conn.execute(
-            "INSERT INTO memories (id, agent_id, user_id, content, topic, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (mem_id, agent_id, user_id, content, topic, now, now),
-        )
-        await conn.commit()
-        return mem_id
-
-    async def update_memory(self, memory_id: str, content: str, topic: str | None = None) -> None:
-        conn = await self._ensure_connected()
-        if topic is not None:
-            await conn.execute(
-                "UPDATE memories SET content = ?, topic = ?, updated_at = ? WHERE id = ?",
-                (content, topic, time.time(), memory_id),
-            )
-        else:
-            await conn.execute(
-                "UPDATE memories SET content = ?, updated_at = ? WHERE id = ?",
-                (content, time.time(), memory_id),
-            )
-        await conn.commit()
-
-    async def delete_memory(self, memory_id: str) -> None:
-        conn = await self._ensure_connected()
-        await conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
-        await conn.commit()
-
-    async def get_memories(
-        self,
-        agent_id: str,
-        user_id: str = "",
-        topic: str | None = None,
-        limit: int = 20,
-    ) -> list[dict]:
-        """Retrieve memories for an agent/user pair, optionally filtered by topic."""
-        conn = await self._ensure_connected()
-        if topic:
-            cursor = await conn.execute(
-                "SELECT * FROM memories WHERE agent_id = ? AND user_id = ? AND topic = ? "
-                "ORDER BY updated_at DESC LIMIT ?",
-                (agent_id, user_id, topic, limit),
-            )
-        else:
-            cursor = await conn.execute(
-                "SELECT * FROM memories WHERE agent_id = ? AND user_id = ? "
-                "ORDER BY updated_at DESC LIMIT ?",
-                (agent_id, user_id, limit),
-            )
-        rows = await cursor.fetchall()
-        return [dict(row) for row in rows]
-
-    async def search_memories(self, agent_id: str, user_id: str, query: str, limit: int = 10) -> list[dict]:
-        """Simple text search in memory content."""
-        conn = await self._ensure_connected()
-        cursor = await conn.execute(
-            "SELECT * FROM memories WHERE agent_id = ? AND user_id = ? AND content LIKE ? "
-            "ORDER BY updated_at DESC LIMIT ?",
-            (agent_id, user_id, f"%{query}%", limit),
-        )
-        rows = await cursor.fetchall()
-        return [dict(row) for row in rows]
+    # Note: long-term memory and knowledge base are handled by the Obsidian vault
+    # via MCPVault MCP. The agent searches/reads/writes .md files directly.
 
     # ── Scheduled Tasks ──
 

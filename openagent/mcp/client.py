@@ -69,6 +69,14 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
 # Order: defaults first, then user MCPs (like { ...defaults, ...userConfig })
 
 DEFAULT_MCPS: list[dict[str, Any]] = [
+    # MCPVault: Obsidian-compatible knowledge base (search, read, write .md files)
+    # The vault path is set at runtime from memory.knowledge_dir config (default: ./memories)
+    {
+        "name": "vault",
+        "command": ["npx", "-y", "@bitbonsai/mcpvault@latest"],
+        "args": [],  # populated at runtime with vault path
+        "_default": True,
+    },
     # Official MCP: filesystem read/write/list/search (Node, cross-platform)
     {
         "name": "filesystem",
@@ -200,11 +208,14 @@ def _resolve_default_entry(entry: dict[str, Any]) -> MCPTools | None:
         logger.warning(f"Skipping default MCP '{name}': '{cmd}' not found")
         return None
 
-    # Expand home dir for filesystem MCP
     import os
     args = entry.get("args") or []
+    # Expand home dir for filesystem MCP
     if name == "filesystem" and not args:
         args = [os.path.expanduser("~")]
+    # Expand vault path for MCPVault
+    if name == "vault" and not args:
+        args = [os.path.join(os.getcwd(), "memories")]
 
     return MCPTools(
         name=entry.get("name", ""),

@@ -55,9 +55,6 @@ def _build_agent_from_config(config: dict) -> Agent:
     # Memory
     memory_cfg = config.get("memory", {})
     db_path = memory_cfg.get("db_path", "openagent.db")
-    auto_extract = memory_cfg.get("auto_extract", True)
-    knowledge_dir = memory_cfg.get("knowledge_dir", "./memories")
-
     db = MemoryDB(db_path)
 
     return Agent(
@@ -66,8 +63,6 @@ def _build_agent_from_config(config: dict) -> Agent:
         system_prompt=config.get("system_prompt", "You are a helpful assistant."),
         mcp_registry=mcp_registry,
         memory=db,
-        auto_extract_memory=auto_extract,
-        knowledge_dir=knowledge_dir,
     )
 
 

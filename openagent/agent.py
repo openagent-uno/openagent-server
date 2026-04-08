@@ -40,14 +40,11 @@ class Agent:
         mcp_tools: list[MCPTools] | None = None,
         mcp_registry: MCPRegistry | None = None,
         memory: MemoryDB | str | None = None,
-        auto_extract_memory: bool = True,
         history_limit: int = 50,
-        knowledge_dir: str = "./memories",
     ):
         self.name = name
         self.model = model
         self.system_prompt = system_prompt
-        self.auto_extract_memory = auto_extract_memory
 
         # MCP
         if mcp_registry:
@@ -57,7 +54,7 @@ class Agent:
             for tool in (mcp_tools or []):
                 self._mcp.add(tool)
 
-        # Memory
+        # Memory (SQLite for sessions + tasks only; knowledge base in Obsidian vault via MCPVault)
         if isinstance(memory, str):
             self._db = MemoryDB(memory)
         elif isinstance(memory, MemoryDB):
@@ -67,10 +64,7 @@ class Agent:
 
         self._memory: MemoryManager | None = None
         if self._db:
-            self._memory = MemoryManager(
-                self._db, auto_extract=auto_extract_memory,
-                history_limit=history_limit, knowledge_dir=knowledge_dir,
-            )
+            self._memory = MemoryManager(self._db, history_limit=history_limit)
 
         self._initialized = False
 
@@ -81,8 +75,6 @@ class Agent:
         await self._mcp.connect_all()
         if self._db:
             await self._db.connect()
-        if self._memory:
-            await self._memory.initialize_knowledge()
 
         # For Claude CLI: pass MCP server configs
         from openagent.models.claude_cli import ClaudeCLI
@@ -235,15 +227,6 @@ class Agent:
             else:
                 if self._memory and current_session_id:
                     await self._memory.store_message(current_session_id, "assistant", response.content)
-
-                if self._memory and self.auto_extract_memory:
-                    try:
-                        await self._memory.extract_and_store_memories(
-                            self.model, self.name, user_id, messages,
-                        )
-                    except Exception as e:
-                        logger.warning(f"Memory extraction failed: {e}")
-
                 return response.content
 
         return response.content if response else "I wasn't able to complete the request."
