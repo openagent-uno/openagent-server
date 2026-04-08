@@ -149,7 +149,12 @@ def _resolve_builtin(name: str, env: dict[str, str] | None = None) -> MCPTools:
             subprocess.run(spec["build"], cwd=mcp_dir, check=True, capture_output=True)
 
     # Resolve the entry point path
-    full_command = [str(mcp_dir / c) if "/" in c else c for c in spec["command"]]
+    # For Python MCPs, use sys.executable to ensure we use the same Python/venv
+    import sys
+    cmd_list = spec["command"]
+    if is_python and cmd_list and cmd_list[0] in ("python3", "python"):
+        cmd_list = [sys.executable] + cmd_list[1:]
+    full_command = [str(mcp_dir / c) if "/" in c else c for c in cmd_list]
 
     # Merge env from spec + caller
     merged_env = {**(spec.get("env") or {}), **(env or {})}
