@@ -30,6 +30,17 @@ class WhatsAppChannel(BaseChannel):
         self._greenapi = None
 
     async def start(self) -> None:
+        self._should_stop = False
+        while not self._should_stop:
+            try:
+                await self._start_inner()
+            except Exception as e:
+                if self._should_stop:
+                    break
+                logger.error(f"WhatsApp channel crashed: {e}, restarting in 45s...")
+                await asyncio.sleep(45)
+
+    async def _start_inner(self) -> None:
         try:
             from whatsapp_api_client_python import API as GreenAPI
         except ImportError:
@@ -190,4 +201,5 @@ class WhatsAppChannel(BaseChannel):
             )
 
     async def stop(self) -> None:
+        self._should_stop = True
         self._running = False
