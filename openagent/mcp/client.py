@@ -27,7 +27,7 @@ BUILTIN_MCPS_DIR = Path(__file__).resolve().parent.parent / "mcps"
 
 BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
     "computer-control": {
-        "dir": "computer-use",  # directory name unchanged, only MCP name is "computer-control"
+        "dir": "computer-control",
         "command": ["node", "dist/main.js"],
         "build": ["npm", "run", "build"],
         "install": ["npm", "install"],
