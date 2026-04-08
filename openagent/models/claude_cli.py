@@ -87,8 +87,10 @@ class ClaudeCLI(BaseModel):
         system: str | None = None,
         tools: list[dict[str, Any]] | None = None,
     ) -> ModelResponse:
-        # Build the prompt from messages
+        # Build the prompt: system context + messages, all piped via stdin
         prompt_parts = []
+        if system:
+            prompt_parts.append(f"<system>\n{system}\n</system>")
         for msg in messages:
             role = msg["role"]
             content = msg.get("content", "")
@@ -100,8 +102,6 @@ class ClaudeCLI(BaseModel):
         prompt = "\n\n".join(prompt_parts)
 
         cmd = self._build_cmd("json")
-        if system:
-            cmd.extend(["--append-system-prompt", system])
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -134,6 +134,8 @@ class ClaudeCLI(BaseModel):
         tools: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[str]:
         prompt_parts = []
+        if system:
+            prompt_parts.append(f"<system>\n{system}\n</system>")
         for msg in messages:
             if msg["role"] == "user":
                 prompt_parts.append(msg.get("content", ""))
@@ -141,8 +143,6 @@ class ClaudeCLI(BaseModel):
         prompt = "\n\n".join(prompt_parts)
 
         cmd = self._build_cmd("stream-json")
-        if system:
-            cmd.extend(["--append-system-prompt", system])
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
