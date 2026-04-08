@@ -616,8 +616,8 @@ def setup_cmd(ctx):
 
     try:
         info = setup_service()
-        console.print(f"[green]{info[chr(39)+'message'+chr(39)]}[/green]")
-        console.print(f"[dim]Service file:[/dim] {info[chr(39)+'service_file'+chr(39)]}")
+        console.print(f"[green]{info['message']}[/green]")
+        console.print(f"[dim]Service file:[/dim] {info['service_file']}")
         console.print()
         console.print("[bold]Service status:[/bold]")
         console.print(info["status"])

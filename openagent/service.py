@@ -1,9 +1,12 @@
 """Cross-platform service installer for OpenAgent.
 
-Registers OpenAgent as a system service that auto-starts on boot.
-- macOS: launchd plist in ~/Library/LaunchAgents/
-- Linux: systemd user unit in ~/.config/systemd/user/
-- Windows: Task Scheduler via schtasks
+Registers OpenAgent as a system service that auto-starts on boot,
+survives reboots, and auto-restarts on crash.
+
+- Linux: systemd user service with Restart=always, RestartSec=5,
+  DISPLAY=:1 for VNC/computer-use on headless VPS
+- macOS: launchd plist with KeepAlive + RunAtLoad
+- Windows: .bat startup script + Task Scheduler entry with auto-restart
 """
 
 from __future__ import annotations
@@ -13,24 +16,26 @@ import platform
 import shutil
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 SERVICE_NAME = "com.openagent.serve"
 SERVICE_LABEL = "OpenAgent"
+SYSTEMD_UNIT = "openagent.service"
 
 
 def _get_python() -> str:
-    """Get the current Python executable path."""
+    """Get the absolute path to the current Python executable."""
     return sys.executable
 
 
 def _get_openagent_cmd() -> list[str]:
-    """Get the command to run openagent serve."""
+    """Get the command to run ``openagent serve``."""
     return [_get_python(), "-m", "openagent.cli", "serve"]
 
 
 def _get_working_dir() -> str:
-    """Get the working directory (where openagent.yaml is expected)."""
+    """Get the working directory (where openagent.yaml lives)."""
     return os.getcwd()
 
 
@@ -41,54 +46,83 @@ def _get_log_dir() -> Path:
     return log_dir
 
 
-# ── macOS (launchd) ──
+def _get_env_path() -> str:
+    """Return the current PATH (or a sane default)."""
+    return os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")
+
+
+# ---------------------------------------------------------------------------
+# macOS  (launchd)
+# ---------------------------------------------------------------------------
 
 def _macos_plist_path() -> Path:
     return Path.home() / "Library" / "LaunchAgents" / f"{SERVICE_NAME}.plist"
 
 
-def _macos_install() -> None:
+def _macos_install() -> str:
     cmd = _get_openagent_cmd()
     log_dir = _get_log_dir()
-    plist = f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{SERVICE_NAME}</string>
-    <key>ProgramArguments</key>
-    <array>
-        {"".join(f"<string>{c}</string>" for c in cmd)}
-    </array>
-    <key>WorkingDirectory</key>
-    <string>{_get_working_dir()}</string>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>{log_dir / "openagent.out.log"}</string>
-    <key>StandardErrorPath</key>
-    <string>{log_dir / "openagent.err.log"}</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>{os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")}</string>
-    </dict>
-</dict>
-</plist>"""
+    args_xml = "\n        ".join(f"<string>{c}</string>" for c in cmd)
+
+    plist = textwrap.dedent(f"""\
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+          "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+            <key>Label</key>
+            <string>{SERVICE_NAME}</string>
+
+            <key>ProgramArguments</key>
+            <array>
+                {args_xml}
+            </array>
+
+            <key>WorkingDirectory</key>
+            <string>{_get_working_dir()}</string>
+
+            <key>RunAtLoad</key>
+            <true/>
+
+            <key>KeepAlive</key>
+            <dict>
+                <key>SuccessfulExit</key>
+                <false/>
+            </dict>
+
+            <key>ThrottleInterval</key>
+            <integer>5</integer>
+
+            <key>StandardOutPath</key>
+            <string>{log_dir / "openagent.out.log"}</string>
+            <key>StandardErrorPath</key>
+            <string>{log_dir / "openagent.err.log"}</string>
+
+            <key>EnvironmentVariables</key>
+            <dict>
+                <key>PATH</key>
+                <string>{_get_env_path()}</string>
+            </dict>
+        </dict>
+        </plist>
+    """)
 
     path = _macos_plist_path()
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Unload first if already loaded (idempotent)
+    subprocess.run(["launchctl", "unload", str(path)],
+                   capture_output=True, check=False)
     path.write_text(plist)
     subprocess.run(["launchctl", "load", str(path)], check=True)
+    return f"Installed launchd service at {path}"
 
 
-def _macos_uninstall() -> None:
+def _macos_uninstall() -> str:
     path = _macos_plist_path()
     if path.exists():
         subprocess.run(["launchctl", "unload", str(path)], check=False)
         path.unlink()
+    return "Service removed"
 
 
 def _macos_status() -> str:
@@ -101,72 +135,131 @@ def _macos_status() -> str:
     return "Not running"
 
 
-# ── Linux (systemd user) ──
+# ---------------------------------------------------------------------------
+# Linux  (systemd user service)
+# ---------------------------------------------------------------------------
 
 def _linux_unit_path() -> Path:
-    return Path.home() / ".config" / "systemd" / "user" / "openagent.service"
+    return (Path.home() / ".config" / "systemd" / "user" / SYSTEMD_UNIT)
 
 
-def _linux_install() -> None:
+def _linux_install() -> str:
     cmd = " ".join(_get_openagent_cmd())
     log_dir = _get_log_dir()
-    unit = f"""[Unit]
-Description={SERVICE_LABEL}
-After=network.target
 
-[Service]
-Type=simple
-ExecStart={cmd}
-WorkingDirectory={_get_working_dir()}
-Restart=always
-RestartSec=10
-Environment=PATH={os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")}
+    unit = textwrap.dedent(f"""\
+        [Unit]
+        Description={SERVICE_LABEL} - AI agent service
+        After=network-online.target
+        Wants=network-online.target
 
-[Install]
-WantedBy=default.target
-"""
+        [Service]
+        Type=simple
+        ExecStart={cmd}
+        WorkingDirectory={_get_working_dir()}
+        Restart=always
+        RestartSec=5
+        StartLimitIntervalSec=60
+        StartLimitBurst=5
+
+        # Environment
+        Environment=PATH={_get_env_path()}
+        Environment=DISPLAY=:1
+        Environment=OPENAGENT_LOG_DIR={log_dir}
+
+        # Logging
+        StandardOutput=append:{log_dir / "openagent.out.log"}
+        StandardError=append:{log_dir / "openagent.err.log"}
+
+        [Install]
+        WantedBy=default.target
+    """)
+
     path = _linux_unit_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(unit)
+
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
-    subprocess.run(["systemctl", "--user", "enable", "openagent"], check=True)
-    subprocess.run(["systemctl", "--user", "start", "openagent"], check=True)
+    subprocess.run(["systemctl", "--user", "enable", SYSTEMD_UNIT], check=True)
+    subprocess.run(["systemctl", "--user", "stop", SYSTEMD_UNIT],
+                   capture_output=True, check=False)
+    subprocess.run(["systemctl", "--user", "start", SYSTEMD_UNIT], check=True)
+
+    # Enable lingering so the user service survives logout on a VPS
+    user = os.environ.get("USER", os.environ.get("LOGNAME", ""))
+    if user:
+        subprocess.run(["loginctl", "enable-linger", user],
+                       capture_output=True, check=False)
+
+    return f"Installed systemd user service at {path}"
 
 
-def _linux_uninstall() -> None:
-    subprocess.run(["systemctl", "--user", "stop", "openagent"], check=False)
-    subprocess.run(["systemctl", "--user", "disable", "openagent"], check=False)
+def _linux_uninstall() -> str:
+    subprocess.run(["systemctl", "--user", "stop", SYSTEMD_UNIT], check=False)
+    subprocess.run(["systemctl", "--user", "disable", SYSTEMD_UNIT], check=False)
     path = _linux_unit_path()
     if path.exists():
         path.unlink()
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+    return "Service removed"
 
 
 def _linux_status() -> str:
     result = subprocess.run(
-        ["systemctl", "--user", "status", "openagent"],
+        ["systemctl", "--user", "status", SYSTEMD_UNIT],
         capture_output=True, text=True,
     )
     return result.stdout.strip() if result.stdout else "Not running"
 
 
-# ── Windows (Task Scheduler) ──
+# ---------------------------------------------------------------------------
+# Windows  (Task Scheduler + .bat wrapper)
+# ---------------------------------------------------------------------------
 
-def _windows_install() -> None:
-    cmd = " ".join(f'"{c}"' for c in _get_openagent_cmd())
+def _windows_bat_path() -> Path:
+    return Path.home() / ".openagent" / "openagent-serve.bat"
+
+
+def _windows_install() -> str:
+    cmd = _get_openagent_cmd()
+    bat_path = _windows_bat_path()
+    bat_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Build a .bat that sets the working directory and runs the command
+    quoted_cmd = " ".join(f'"{c}"' for c in cmd)
+    bat_content = textwrap.dedent(f"""\
+        @echo off
+        cd /d "{_get_working_dir()}"
+        :loop
+        {quoted_cmd}
+        echo OpenAgent exited with code %ERRORLEVEL%, restarting in 5s...
+        timeout /t 5 /nobreak >nul
+        goto loop
+    """)
+    bat_path.write_text(bat_content)
+
+    # Create a Task Scheduler entry that runs on logon
     subprocess.run([
         "schtasks", "/Create", "/F",
         "/TN", SERVICE_LABEL,
         "/SC", "ONLOGON",
-        "/TR", cmd,
+        "/TR", str(bat_path),
         "/RL", "HIGHEST",
     ], check=True)
-    # Also start it now
+
+    # Start the task now
     subprocess.run(["schtasks", "/Run", "/TN", SERVICE_LABEL], check=False)
 
+    return f"Installed Windows task '{SERVICE_LABEL}' with wrapper at {bat_path}"
 
-def _windows_uninstall() -> None:
-    subprocess.run(["schtasks", "/Delete", "/TN", SERVICE_LABEL, "/F"], check=False)
+
+def _windows_uninstall() -> str:
+    subprocess.run(["schtasks", "/Delete", "/TN", SERVICE_LABEL, "/F"],
+                   check=False)
+    bat = _windows_bat_path()
+    if bat.exists():
+        bat.unlink()
+    return "Service removed"
 
 
 def _windows_status() -> str:
@@ -179,46 +272,63 @@ def _windows_status() -> str:
     return "Not installed"
 
 
-# ── Public API ──
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+_DISPATCH = {
+    "Darwin": (_macos_install, _macos_uninstall, _macos_status),
+    "Linux":  (_linux_install, _linux_uninstall, _linux_status),
+    "Windows": (_windows_install, _windows_uninstall, _windows_status),
+}
+
+
+def _get_handlers():
+    system = platform.system()
+    handlers = _DISPATCH.get(system)
+    if handlers is None:
+        raise RuntimeError(f"Unsupported platform: {system}")
+    return handlers
+
 
 def install_service() -> str:
     """Install OpenAgent as a system service. Returns status message."""
-    system = platform.system()
-    if system == "Darwin":
-        _macos_install()
-        return f"Installed launchd service at {_macos_plist_path()}"
-    elif system == "Linux":
-        _linux_install()
-        return f"Installed systemd user service at {_linux_unit_path()}"
-    elif system == "Windows":
-        _windows_install()
-        return f"Installed Windows Task Scheduler entry '{SERVICE_LABEL}'"
-    else:
-        raise RuntimeError(f"Unsupported platform: {system}")
+    install_fn, _, _ = _get_handlers()
+    return install_fn()
 
 
 def uninstall_service() -> str:
     """Remove the OpenAgent system service."""
-    system = platform.system()
-    if system == "Darwin":
-        _macos_uninstall()
-    elif system == "Linux":
-        _linux_uninstall()
-    elif system == "Windows":
-        _windows_uninstall()
-    else:
-        raise RuntimeError(f"Unsupported platform: {system}")
-    return "Service removed"
+    _, uninstall_fn, _ = _get_handlers()
+    return uninstall_fn()
 
 
 def get_service_status() -> str:
     """Check if the OpenAgent service is running."""
+    _, _, status_fn = _get_handlers()
+    return status_fn()
+
+
+def setup_service() -> dict[str, str]:
+    """Full setup: detect platform, install service, return details.
+
+    Returns a dict with keys: platform, message, service_file, status.
+    """
     system = platform.system()
+    msg = install_service()
+    status = get_service_status()
+
+    service_file = ""
     if system == "Darwin":
-        return _macos_status()
+        service_file = str(_macos_plist_path())
     elif system == "Linux":
-        return _linux_status()
+        service_file = str(_linux_unit_path())
     elif system == "Windows":
-        return _windows_status()
-    else:
-        return f"Unsupported platform: {system}"
+        service_file = str(_windows_bat_path())
+
+    return {
+        "platform": system,
+        "message": msg,
+        "service_file": service_file,
+        "status": status,
+    }
