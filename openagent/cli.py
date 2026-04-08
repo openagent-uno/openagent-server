@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import click
@@ -21,6 +23,10 @@ from openagent.mcp.client import MCPRegistry
 console = Console()
 
 DREAM_MODE_TASK_NAME = "dream-mode"
+AUTO_UPDATE_TASK_NAME = "auto-update"
+
+# Exit code that signals the OS service manager to restart the process
+RESTART_EXIT_CODE = 75
 
 DREAM_MODE_PROMPT = """\
 You are running in Dream Mode — a nightly maintenance routine.
@@ -47,6 +53,38 @@ Perform the following tasks and log a summary of each:
 
 Be thorough but non-destructive. When in doubt, skip rather than delete.
 """
+
+PACKAGE_NAME = "openagent-framework"
+
+log = logging.getLogger("openagent.updater")
+
+
+def _get_installed_version() -> str:
+    """Return the currently installed version of openagent-framework."""
+    try:
+        from importlib.metadata import version
+        return version(PACKAGE_NAME)
+    except Exception:
+        return "unknown"
+
+
+def _run_pip_upgrade() -> tuple[str, str]:
+    """Run pip install --upgrade and return (old_version, new_version)."""
+    old = _get_installed_version()
+    subprocess.check_call(
+        [sys.executable, "-m", "pip", "install", "--upgrade", PACKAGE_NAME],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    # Re-read version after upgrade (invalidate cache)
+    from importlib.metadata import version
+    try:
+        from importlib import invalidate_caches
+        invalidate_caches()
+    except Exception:
+        pass
+    new = version(PACKAGE_NAME)
+    return old, new
 
 
 def _build_agent_from_config(config: dict) -> Agent:
@@ -92,6 +130,41 @@ def _build_agent_from_config(config: dict) -> Agent:
         mcp_registry=mcp_registry,
         memory=db,
     )
+
+
+async def _do_auto_update(agent: Agent, mode: str) -> None:
+    """Check for updates and act according to *mode* (auto/notify/manual)."""
+    try:
+        old_ver, new_ver = _run_pip_upgrade()
+    except Exception as exc:
+        log.error("Auto-update check failed: %s", exc)
+        return
+
+    if old_ver == new_ver:
+        log.info("openagent-framework is up-to-date (%s)", old_ver)
+        return
+
+    log.info("openagent-framework updated: %s -> %s", old_ver, new_ver)
+
+    if mode == "notify" or mode == "auto":
+        # Try sending a notification via the messaging MCP
+        try:
+            msg = f"OpenAgent updated: {old_ver} -> {new_ver}"
+            tools = agent._mcp.all_tools()
+            has_messaging = any(t["name"].startswith("send_") for t in tools)
+            if has_messaging:
+                await agent.run(
+                    message=f"Send a notification: {msg}",
+                    user_id="system",
+                )
+        except Exception:
+            log.debug("Could not send update notification via messaging MCP")
+
+    if mode == "auto":
+        log.info("Restarting for update (exit code %d)...", RESTART_EXIT_CODE)
+        raise SystemExit(RESTART_EXIT_CODE)
+
+    # mode == "manual" — just log, nothing else to do
 
 
 @click.group()
@@ -241,6 +314,58 @@ def serve(ctx, channel: tuple[str, ...]):
                     # Dream mode disabled in config — disable the task
                     await scheduler.disable_task(dream_task["id"])
                     console.print("[dim]Dream Mode disabled[/dim]")
+
+                # Auto-update — register/sync the scheduled update-check task
+                update_cfg = config.get("auto_update", {})
+                update_enabled = update_cfg.get("enabled", False)
+                update_mode = update_cfg.get("mode", "auto")
+                update_cron = update_cfg.get("check_interval", "0 4 * * *")
+
+                existing = await agent._db.get_tasks()
+                update_task = next(
+                    (t for t in existing if t["name"] == AUTO_UPDATE_TASK_NAME), None
+                )
+
+                # Build a prompt that the scheduler will execute
+                update_prompt = (
+                    "Run a pip upgrade check for openagent-framework. "
+                    "Execute: pip install --upgrade openagent-framework. "
+                    "Compare the version before and after. "
+                    "If updated, log the new version."
+                )
+
+                if update_enabled:
+                    if update_task is None:
+                        await scheduler.add_task(
+                            name=AUTO_UPDATE_TASK_NAME,
+                            cron_expression=update_cron,
+                            prompt=update_prompt,
+                        )
+                        console.print(f"[cyan]Auto-update enabled (mode={update_mode})[/cyan]")
+                    else:
+                        if not update_task["enabled"] or update_task["cron_expression"] != update_cron:
+                            await scheduler.disable_task(update_task["id"])
+                            await scheduler.enable_task(update_task["id"])
+                            if update_task["cron_expression"] != update_cron:
+                                await agent._db.update_task(
+                                    update_task["id"], cron_expression=update_cron
+                                )
+                        console.print(f"[cyan]Auto-update enabled (mode={update_mode})[/cyan]")
+
+                    # Override the scheduler callback to use our direct pip logic
+                    original_run = scheduler.run_task
+
+                    async def _auto_update_run(task, _orig=original_run):
+                        if task["name"] == AUTO_UPDATE_TASK_NAME:
+                            await _do_auto_update(agent, update_mode)
+                        else:
+                            await _orig(task)
+
+                    scheduler.run_task = _auto_update_run
+
+                elif update_task is not None and update_task["enabled"]:
+                    await scheduler.disable_task(update_task["id"])
+                    console.print("[dim]Auto-update disabled[/dim]")
 
                 await scheduler.start()
                 console.print("[green]Scheduler started[/green]")
@@ -474,17 +599,47 @@ def mcp_cmd(ctx, action: str):
 
 # ── Service management ──
 
+@main.command("setup")
+@click.pass_context
+def setup_cmd(ctx):
+    """Detect platform, install OpenAgent as a system service, and report status.
+
+    Sets up auto-start on boot, auto-restart on crash, and proper environment
+    variables (including DISPLAY=:1 on Linux for VNC/computer-use).
+    """
+    import platform as _platform
+    from openagent.service import setup_service
+
+    console.print(f"[bold]Detected platform:[/bold] {_platform.system()}")
+    console.print("Installing OpenAgent as a system service...")
+    console.print()
+
+    try:
+        info = setup_service()
+        console.print(f"[green]{info[chr(39)+'message'+chr(39)]}[/green]")
+        console.print(f"[dim]Service file:[/dim] {info[chr(39)+'service_file'+chr(39)]}")
+        console.print()
+        console.print("[bold]Service status:[/bold]")
+        console.print(info["status"])
+        console.print()
+        console.print(
+            "[green]OpenAgent will now auto-start on boot "
+            "and restart on crash.[/green]"
+        )
+    except Exception as e:
+        console.print(f"[red]Setup failed: {e}[/red]")
+        raise SystemExit(1)
+
+
 @main.command("install")
 @click.pass_context
 def install_cmd(ctx):
-    """Install OpenAgent as a system service (auto-start on boot)."""
-    from openagent.service import install_service
-    try:
-        result = install_service()
-        console.print(f"[green]{result}[/green]")
-        console.print("OpenAgent will now start automatically on boot.")
-    except Exception as e:
-        console.print(f"[red]Failed to install service: {e}[/red]")
+    """Install OpenAgent as a system service (auto-start on boot).
+
+    Alias for openagent setup. Installs a platform-appropriate service
+    that survives reboots and auto-restarts on crash.
+    """
+    ctx.invoke(setup_cmd)
 
 
 @main.command("uninstall")
@@ -506,6 +661,32 @@ def status_cmd(ctx):
     from openagent.service import get_service_status
     status = get_service_status()
     console.print(status)
+
+
+# ── Manual update ──
+
+@main.command("update")
+@click.pass_context
+def update_cmd(ctx):
+    """Manually check for and install updates to openagent-framework."""
+    console.print(f"[bold]Current version:[/bold] {_get_installed_version()}")
+    console.print("Checking for updates...")
+
+    try:
+        old_ver, new_ver = _run_pip_upgrade()
+    except subprocess.CalledProcessError as exc:
+        console.print(f"[red]Update failed: {exc}[/red]")
+        raise SystemExit(1)
+
+    if old_ver == new_ver:
+        console.print(f"[green]Already up-to-date ({old_ver}).[/green]")
+    else:
+        console.print(
+            f"[green]Updated openagent-framework: {old_ver} -> {new_ver}[/green]"
+        )
+        console.print(
+            "Restart the agent with [bold]openagent serve[/bold] to use the new version."
+        )
 
 
 if __name__ == "__main__":
