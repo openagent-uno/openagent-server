@@ -105,6 +105,7 @@ class Agent:
             if server.command:
                 full_cmd = server.command + server.args
                 entry: dict = {
+                    "type": "stdio",
                     "command": full_cmd[0],
                     "args": full_cmd[1:],
                 }
