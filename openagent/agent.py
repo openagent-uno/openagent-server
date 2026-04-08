@@ -86,10 +86,10 @@ class Agent:
         self._initialized = True
 
     def _build_cli_mcp_configs(self) -> dict[str, dict]:
-        """Build MCP server configs in Claude CLI format for --mcp-config.
+        """Build MCP server configs for the Claude Agent SDK.
 
-        All OpenAgent MCPs are passed to Claude CLI so every model gets
-        the same tools — model-agnostic, no provider-specific differences.
+        All OpenAgent MCPs are passed so every model gets the same tools.
+        Format: {"name": {"command": "...", "args": [...], "env": {...}}}
         """
         import os
         configs = {}
@@ -97,12 +97,10 @@ class Agent:
             if server.command:
                 full_cmd = server.command + server.args
                 entry: dict = {
-                    "type": "stdio",
                     "command": full_cmd[0],
                     "args": full_cmd[1:],
                 }
 
-                # Build env: start with server's own env vars
                 env = dict(server.env) if server.env else {}
 
                 # For messaging MCP: inject channel tokens from os.environ
@@ -114,9 +112,6 @@ class Agent:
 
                 if env:
                     entry["env"] = env
-                # NOTE: do NOT pass "cwd" — Claude CLI --mcp-config silently
-                # ignores servers with "cwd" field. Instead, use absolute paths
-                # in the command/args (which we already do via _resolve_builtin).
 
                 configs[server.name] = entry
         return configs

@@ -1,85 +1,61 @@
-"""Claude model via the Claude Code CLI (subprocess)."""
+"""Claude model via the Claude Agent SDK (persistent sessions, MCP support)."""
 
 from __future__ import annotations
 
 import asyncio
-import json
-import tempfile
-from pathlib import Path
+import logging
 from typing import Any, AsyncIterator
 
 from openagent.models.base import BaseModel, ModelResponse, ToolCall
 
+logger = logging.getLogger(__name__)
+
 
 class ClaudeCLI(BaseModel):
-    """Claude via the `claude` CLI tool.
+    """Claude via the Claude Agent SDK.
 
-    Requires `claude` to be installed and authenticated.
-    Uses `claude -p` (--print) for non-interactive single-shot responses.
-    Prompt is piped via stdin to avoid shell escaping issues.
-    Uses --no-session-persistence to avoid loading old session context.
+    Uses persistent sessions — MCP servers connect once and stay connected
+    across multiple messages. No subprocess spawning per message.
 
-    MCP servers from OpenAgent are passed via --mcp-config so Claude CLI
-    can use them alongside its own built-in MCPs.
+    Requires `claude-agent-sdk` installed and Claude CLI authenticated.
+    Works with Claude Pro/Max membership (no API key needed).
     """
 
     def __init__(
         self,
         model: str | None = None,
         allowed_tools: list[str] | None = None,
+        permission_mode: str = "bypass",
         mcp_servers: dict[str, dict] | None = None,
-        permission_mode: str = "auto",
     ):
         self.model = model
         self.allowed_tools = allowed_tools or []
-        self.mcp_servers = mcp_servers or {}
-        self.permission_mode = permission_mode  # "auto", "bypass", or "default"
-        self._mcp_config_path: str | None = None
+        self.permission_mode = permission_mode
+        self.mcp_servers: dict[str, dict] = mcp_servers or {}
+        self._session_id: str | None = None
 
     def set_mcp_servers(self, servers: dict[str, dict]) -> None:
-        """Set MCP server configs to pass to Claude CLI.
-
-        Format: {"name": {"command": "node", "args": ["/path/to/server.js"]}, ...}
-        """
+        """Set MCP server configs. Called by Agent during initialization."""
         self.mcp_servers = servers
-        self._mcp_config_path = None  # invalidate cached config file
 
-    def _get_mcp_config_path(self) -> str | None:
-        """Write MCP config to a temp file and return path."""
-        if not self.mcp_servers:
-            return None
-        if self._mcp_config_path and Path(self._mcp_config_path).exists():
-            return self._mcp_config_path
+    def _build_options(self) -> dict[str, Any]:
+        """Build ClaudeAgentOptions kwargs."""
+        from claude_agent_sdk import ClaudeAgentOptions
 
-        config = {"mcpServers": self.mcp_servers}
-        tmp = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".json", prefix="openagent_mcp_",
-            delete=False,
-        )
-        json.dump(config, tmp, indent=2)
-        tmp.close()
-        self._mcp_config_path = tmp.name
-        return self._mcp_config_path
+        opts: dict[str, Any] = {}
 
-    def _build_cmd(self, output_format: str = "json") -> list[str]:
-        """Build the base claude command."""
-        cmd = ["claude", "-p", "--output-format", output_format, "--no-session-persistence"]
-        if self.model:
-            cmd.extend(["--model", self.model])
-
-        # Permission mode: bypass all tool confirmations for agent use
         if self.permission_mode == "bypass":
-            cmd.append("--dangerously-skip-permissions")
+            opts["permission_mode"] = "bypassPermissions"
+        elif self.permission_mode == "auto":
+            opts["permission_mode"] = "acceptEdits"
 
-        for tool in self.allowed_tools:
-            cmd.extend(["--allowedTools", tool])
+        if self.mcp_servers:
+            opts["mcp_servers"] = self.mcp_servers
 
-        # Pass OpenAgent MCP servers to Claude CLI
-        mcp_config = self._get_mcp_config_path()
-        if mcp_config:
-            cmd.extend(["--mcp-config", mcp_config])
+        if self._session_id:
+            opts["resume"] = self._session_id
 
-        return cmd
+        return opts
 
     async def generate(
         self,
@@ -87,7 +63,9 @@ class ClaudeCLI(BaseModel):
         system: str | None = None,
         tools: list[dict[str, Any]] | None = None,
     ) -> ModelResponse:
-        # Build the prompt: system context + messages, all piped via stdin
+        from claude_agent_sdk import query, ClaudeAgentOptions, ResultMessage, SystemMessage
+
+        # Build prompt from messages
         prompt_parts = []
         if system:
             prompt_parts.append(f"<system>\n{system}\n</system>")
@@ -101,31 +79,26 @@ class ClaudeCLI(BaseModel):
 
         prompt = "\n\n".join(prompt_parts)
 
-        cmd = self._build_cmd("json")
+        opts = self._build_options()
+        options = ClaudeAgentOptions(**opts)
 
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate(input=prompt.encode("utf-8"))
-
-        if proc.returncode != 0:
-            error_msg = stderr.decode().strip() if stderr else f"claude CLI exited with code {proc.returncode}"
-            return ModelResponse(content=f"Error: {error_msg}")
-
-        output = stdout.decode().strip()
+        result_text = ""
         try:
-            data = json.loads(output)
-            text = data.get("result", output)
-            return ModelResponse(
-                content=text,
-                input_tokens=data.get("input_tokens", 0),
-                output_tokens=data.get("output_tokens", 0),
-            )
-        except json.JSONDecodeError:
-            return ModelResponse(content=output)
+            async for message in query(prompt=prompt, options=options):
+                # Capture session ID for resume
+                if isinstance(message, SystemMessage) and hasattr(message, 'data'):
+                    data = message.data if isinstance(message.data, dict) else {}
+                    if 'session_id' in data:
+                        self._session_id = data['session_id']
+
+                if isinstance(message, ResultMessage):
+                    result_text = message.result or ""
+
+        except Exception as e:
+            logger.error(f"Claude Agent SDK error: {e}")
+            result_text = f"Error: {e}"
+
+        return ModelResponse(content=result_text)
 
     async def stream(
         self,
@@ -133,6 +106,8 @@ class ClaudeCLI(BaseModel):
         system: str | None = None,
         tools: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[str]:
+        from claude_agent_sdk import query, ClaudeAgentOptions, ResultMessage, SystemMessage, AssistantMessage
+
         prompt_parts = []
         if system:
             prompt_parts.append(f"<system>\n{system}\n</system>")
@@ -142,28 +117,25 @@ class ClaudeCLI(BaseModel):
 
         prompt = "\n\n".join(prompt_parts)
 
-        cmd = self._build_cmd("stream-json")
+        opts = self._build_options()
+        options = ClaudeAgentOptions(**opts)
 
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        try:
+            async for message in query(prompt=prompt, options=options):
+                if isinstance(message, SystemMessage) and hasattr(message, 'data'):
+                    data = message.data if isinstance(message.data, dict) else {}
+                    if 'session_id' in data:
+                        self._session_id = data['session_id']
 
-        proc.stdin.write(prompt.encode("utf-8"))
-        await proc.stdin.drain()
-        proc.stdin.close()
+                if isinstance(message, AssistantMessage):
+                    for block in (message.content or []):
+                        if hasattr(block, 'text'):
+                            yield block.text
 
-        async for line in proc.stdout:
-            text = line.decode().strip()
-            if not text:
-                continue
-            try:
-                event = json.loads(text)
-                if event.get("type") == "assistant" and "content" in event:
-                    yield event["content"]
-            except json.JSONDecodeError:
-                yield text
+                if isinstance(message, ResultMessage):
+                    if message.result:
+                        yield message.result
 
-        await proc.wait()
+        except Exception as e:
+            logger.error(f"Claude Agent SDK stream error: {e}")
+            yield f"Error: {e}"
