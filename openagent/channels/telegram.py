@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -14,6 +15,39 @@ if TYPE_CHECKING:
     from openagent.agent import Agent
 
 logger = logging.getLogger(__name__)
+
+
+async def _transcribe_voice(file_path: str) -> str | None:
+    """Transcribe a voice .ogg file using OpenAI Whisper API.
+
+    Returns the transcribed text, or None if transcription is unavailable.
+    Requires OPENAI_API_KEY environment variable to be set.
+    """
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        logger.debug("OPENAI_API_KEY not set — skipping voice transcription")
+        return None
+
+    try:
+        import httpx
+    except ImportError:
+        logger.debug("httpx not available — skipping voice transcription")
+        return None
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            with open(file_path, "rb") as f:
+                resp = await client.post(
+                    "https://api.openai.com/v1/audio/transcriptions",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    files={"file": (Path(file_path).name, f, "audio/ogg")},
+                    data={"model": "whisper-1"},
+                )
+            resp.raise_for_status()
+            return resp.json().get("text", "").strip() or None
+    except Exception as e:
+        logger.warning(f"Voice transcription failed: {e}")
+        return None
 
 
 class TelegramChannel(BaseChannel):
@@ -58,7 +92,15 @@ class TelegramChannel(BaseChannel):
                 file = await msg.voice.get_file()
                 path = str(Path(tmp_dir) / f"voice_{msg.voice.file_unique_id}.ogg")
                 await file.download_to_drive(path)
-                attachments.append({"type": "voice", "path": path, "filename": Path(path).name})
+                transcription = await _transcribe_voice(path)
+                if transcription:
+                    # Use transcribed text as the message content
+                    text = transcription if not text else f"{text}\n{transcription}"
+                    logger.info(f"Voice transcribed ({msg.voice.duration}s): {transcription[:80]}...")
+                else:
+                    # No transcription available — fall back to attachment
+                    text = "[Voice message received]" if not text else text
+                    attachments.append({"type": "voice", "path": path, "filename": Path(path).name})
 
             if msg.audio:
                 file = await msg.audio.get_file()
