@@ -1,0 +1,22 @@
+{
+  "name": "openagent-messaging-mcp",
+  "version": "1.0.0",
+  "description": "Proactive messaging MCP — send to Telegram, Discord, WhatsApp",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": "dist/index.js",
+  "scripts": {
+    "start": "npm run build && node dist/index.js",
+    "build": "tsc",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.24.3",
+    "zod": "^3.22.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "typescript": "^5.9.3"
+  }
+}

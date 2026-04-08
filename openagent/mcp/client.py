@@ -59,9 +59,9 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
     },
     "messaging": {
         "dir": "messaging",
-        "command": ["python3", "server.py"],
-        "python": True,  # Python MCP — skip npm install/build
-        "install": ["pip", "install", "-r", "requirements.txt"],
+        "command": ["node", "dist/index.js"],
+        "build": ["npm", "run", "build"],
+        "install": ["npm", "install"],
     },
 }
 
