@@ -84,7 +84,7 @@ class Agent:
         if self._memory:
             await self._memory.initialize_knowledge()
 
-        # For Claude CLI: pass MCP server configs so CLI can use them
+        # For Claude CLI: pass MCP server configs
         from openagent.models.claude_cli import ClaudeCLI
         if isinstance(self.model, ClaudeCLI):
             mcp_configs = self._build_cli_mcp_configs()
