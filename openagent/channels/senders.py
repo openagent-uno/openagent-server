@@ -1,6 +1,5 @@
 """Shared send logic for all channels.
 
-Used by both channel handlers (responding) and the messaging MCP (proactive send).
 Each sender is stateless — just needs credentials + target.
 """
 
