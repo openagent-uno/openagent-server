@@ -99,18 +99,32 @@ class Agent:
         All OpenAgent MCPs are passed to Claude CLI so every model gets
         the same tools — model-agnostic, no provider-specific differences.
         """
+        import os
         configs = {}
         for server in self._mcp._servers:
             if server.command:
                 full_cmd = server.command + server.args
-                configs[server.name] = {
+                entry: dict = {
                     "command": full_cmd[0],
                     "args": full_cmd[1:],
                 }
-                if server.env:
-                    configs[server.name]["env"] = server.env
+
+                # Build env: start with server's own env vars
+                env = dict(server.env) if server.env else {}
+
+                # For messaging MCP: inject channel tokens from os.environ
+                if server.name == "messaging":
+                    for var in ("TELEGRAM_BOT_TOKEN", "DISCORD_BOT_TOKEN", "GREEN_API_ID", "GREEN_API_TOKEN"):
+                        val = os.environ.get(var)
+                        if val:
+                            env[var] = val
+
+                if env:
+                    entry["env"] = env
                 if server._cwd:
-                    configs[server.name]["cwd"] = server._cwd
+                    entry["cwd"] = server._cwd
+
+                configs[server.name] = entry
         return configs
 
     async def shutdown(self) -> None:
