@@ -92,12 +92,8 @@ DEFAULT_MCPS: list[dict[str, Any]] = [
         "builtin": "computer-control",
         "_default": True,
     },
-    # Official Chrome DevTools MCP: browser automation, performance, DOM inspection
-    {
-        "name": "chrome-devtools",
-        "command": ["npx", "-y", "chrome-devtools-mcp@latest"],
-        "_default": True,
-    },
+    # NOTE: Chrome DevTools is a built-in Claude CLI plugin — no need to pass via MCP config.
+    # For non-Claude models, add it as a user MCP in openagent.yaml.
     # Bundled MCP: proactive messaging (Telegram, Discord, WhatsApp send)
     # Auto-detects available tokens from channel config env vars
     {
