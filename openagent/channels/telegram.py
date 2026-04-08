@@ -188,6 +188,17 @@ class TelegramChannel(BaseChannel):
         )
 
     async def start(self) -> None:
+        self._should_stop = False
+        while not self._should_stop:
+            try:
+                await self._start_inner()
+            except Exception as e:
+                if self._should_stop:
+                    break
+                logger.error(f"Telegram channel crashed: {e}, restarting in 45s...")
+                await asyncio.sleep(45)
+
+    async def _start_inner(self) -> None:
         try:
             from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters
         except ImportError:
@@ -213,6 +224,7 @@ class TelegramChannel(BaseChannel):
         await self._stop_event.wait()
 
     async def stop(self) -> None:
+        self._should_stop = True
         if hasattr(self, '_stop_event'):
             self._stop_event.set()
         if self._app:
