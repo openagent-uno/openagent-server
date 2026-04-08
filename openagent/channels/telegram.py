@@ -1,4 +1,4 @@
-"""Telegram channel using python-telegram-bot. Supports text, images, files, voice."""
+"""Telegram channel using python-telegram-bot. Supports text, images, files, voice, live status."""
 
 from __future__ import annotations
 
@@ -17,11 +17,10 @@ logger = logging.getLogger(__name__)
 
 
 class TelegramChannel(BaseChannel):
-    """Telegram bot channel with full media support.
+    """Telegram bot channel with full media support and live status updates.
 
-    Usage:
-        channel = TelegramChannel(agent=agent, token="BOT_TOKEN")
-        await channel.start()
+    When the agent is processing, sends a status message that updates in real-time:
+      "⏳ Thinking..." → "🔧 Using shell_exec..." → "⏳ Thinking..." → final response
     """
 
     def __init__(self, agent: Agent, token: str):
@@ -30,7 +29,6 @@ class TelegramChannel(BaseChannel):
         self._app = None
 
     async def _handle_message(self, update, context) -> None:
-        """Handle any incoming message (text, photo, voice, file, video)."""
         if not update.message:
             return
 
@@ -40,12 +38,11 @@ class TelegramChannel(BaseChannel):
         text = msg.caption or msg.text or ""
         attachments: list[dict] = []
 
-        # Download media to temp dir
         tmp_dir = tempfile.mkdtemp(prefix="openagent_tg_")
 
         try:
             if msg.photo:
-                photo = msg.photo[-1]  # highest resolution
+                photo = msg.photo[-1]
                 file = await photo.get_file()
                 path = str(Path(tmp_dir) / f"photo_{photo.file_unique_id}.jpg")
                 await file.download_to_drive(path)
@@ -81,24 +78,42 @@ class TelegramChannel(BaseChannel):
             if not text and not attachments:
                 return
 
+            # Send initial status message
+            status_msg = await msg.reply_text("⏳ Thinking...")
+
+            # Status callback: updates the status message in-place
+            async def on_status(status: str) -> None:
+                try:
+                    await status_msg.edit_text(f"⏳ {status}")
+                except Exception:
+                    pass  # ignore edit failures (message unchanged, rate limit, etc.)
+
             response = await self.agent.run(
                 message=text,
                 user_id=user_id,
                 session_id=session_id,
                 attachments=attachments if attachments else None,
+                on_status=on_status,
             )
+
+            # Delete status message
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
 
             await self._send_response(msg, response)
 
         except Exception as e:
             logger.error(f"Telegram handler error: {e}")
-            await msg.reply_text("Sorry, something went wrong.")
+            try:
+                await msg.reply_text(f"Error: {e}")
+            except Exception:
+                pass
 
     async def _send_response(self, msg, response: str) -> None:
-        """Send agent response, handling file markers."""
         clean_text, attachments = parse_response_markers(response)
 
-        # Send attachments
         for att in attachments:
             try:
                 path = Path(att.path)
@@ -115,7 +130,6 @@ class TelegramChannel(BaseChannel):
             except Exception as e:
                 logger.error(f"Failed to send attachment {att.filename}: {e}")
 
-        # Send text (split on 4096 char limit)
         if clean_text:
             for i in range(0, len(clean_text), 4096):
                 await msg.reply_text(clean_text[i:i + 4096])
@@ -131,12 +145,11 @@ class TelegramChannel(BaseChannel):
         except ImportError:
             raise ImportError(
                 "python-telegram-bot is required for Telegram channel. "
-                "Install it with: pip install openagent[telegram]"
+                "Install it with: pip install openagent-framework[telegram]"
             )
 
         self._app = ApplicationBuilder().token(self.token).build()
         self._app.add_handler(CommandHandler("start", self._handle_start))
-        # Handle all content types
         self._app.add_handler(MessageHandler(
             filters.TEXT | filters.PHOTO | filters.VOICE | filters.AUDIO |
             filters.Document.ALL | filters.VIDEO,
@@ -148,7 +161,6 @@ class TelegramChannel(BaseChannel):
         await self._app.start()
         await self._app.updater.start_polling()
 
-        # Keep alive until stopped
         self._stop_event = asyncio.Event()
         await self._stop_event.wait()
 

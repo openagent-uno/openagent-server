@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable, Awaitable
 
 from openagent.models.base import BaseModel, ModelResponse
 from openagent.memory.db import MemoryDB
@@ -13,6 +13,9 @@ from openagent.mcp.client import MCPRegistry, MCPTools
 logger = logging.getLogger(__name__)
 
 MAX_TOOL_ITERATIONS = 10
+
+# Status callback type: async def on_status(status: str) -> None
+StatusCallback = Callable[[str], Awaitable[None]]
 
 
 class Agent:
@@ -119,15 +122,28 @@ class Agent:
         user_id: str = "",
         session_id: str | None = None,
         attachments: list[dict] | None = None,
+        on_status: StatusCallback | None = None,
     ) -> str:
         """Run the agent with a user message. Returns the final text response.
 
-        Handles the full tool-use loop: send -> tool call -> execute -> send result -> repeat.
+        Args:
+            on_status: Optional async callback for live status updates.
+                Called with status strings like "Thinking...", "Using shell_exec...", etc.
+                Channels use this to update a live status message.
         """
         if not self.model:
             raise RuntimeError("No model configured. Set agent.model before calling run().")
 
         await self.initialize()
+
+        async def _status(msg: str) -> None:
+            if on_status:
+                try:
+                    await on_status(msg)
+                except Exception:
+                    pass  # never let status updates break the flow
+
+        await _status("Loading context...")
 
         # Session + history
         current_session_id = None
@@ -138,12 +154,11 @@ class Agent:
             current_session_id = await self._memory.ensure_session(self.name, user_id, session_id)
             history = await self._memory.get_history(current_session_id)
 
-            # Inject long-term memories + relevant knowledge into system prompt
             mem_context = await self._memory.build_memory_context(self.name, user_id, query=message)
             if mem_context:
                 system = f"{system}\n\n{mem_context}"
 
-        # Build messages — prepend attachment descriptions if present
+        # Build messages
         if attachments:
             att_desc = " ".join(f"[Attached {a.get('type','file')}: {a.get('filename','')}]" for a in attachments)
             message = f"{att_desc}\n{message}" if message else att_desc
@@ -151,19 +166,19 @@ class Agent:
         messages = list(history)
         messages.append({"role": "user", "content": message})
 
-        # Store user message
         if self._memory and current_session_id:
             await self._memory.store_message(current_session_id, "user", message)
 
-        # Get available tools
         tools = self._mcp.all_tools() or None
 
+        await _status("Thinking...")
+
         # Tool-use loop
-        for _ in range(MAX_TOOL_ITERATIONS):
+        response = None
+        for iteration in range(MAX_TOOL_ITERATIONS):
             response = await self.model.generate(messages, system=system, tools=tools)
 
             if response.tool_calls:
-                # Add assistant message with tool calls
                 assistant_msg: dict[str, Any] = {
                     "role": "assistant",
                     "content": response.content,
@@ -179,8 +194,9 @@ class Agent:
                         tool_calls=assistant_msg["tool_calls"],
                     )
 
-                # Execute each tool call
                 for tc in response.tool_calls:
+                    await _status(f"Using {tc.name}...")
+
                     try:
                         result = await self._mcp.call_tool(tc.name, tc.arguments)
                     except Exception as e:
@@ -197,12 +213,13 @@ class Agent:
                         await self._memory.store_message(
                             current_session_id, "tool", result, tool_call_id=tc.id,
                         )
+
+                if iteration < MAX_TOOL_ITERATIONS - 1:
+                    await _status("Thinking...")
             else:
-                # No tool calls — we have the final response
                 if self._memory and current_session_id:
                     await self._memory.store_message(current_session_id, "assistant", response.content)
 
-                # Extract memories in background
                 if self._memory and self.auto_extract_memory:
                     try:
                         await self._memory.extract_and_store_memories(
@@ -213,7 +230,6 @@ class Agent:
 
                 return response.content
 
-        # Exceeded max iterations
         return response.content if response else "I wasn't able to complete the request."
 
     async def stream_run(

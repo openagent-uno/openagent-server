@@ -1,7 +1,8 @@
-"""Discord channel using discord.py. Supports text, images, files, attachments."""
+"""Discord channel using discord.py. Supports text, images, files, live status."""
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import tempfile
 from pathlib import Path
@@ -16,11 +17,10 @@ logger = logging.getLogger(__name__)
 
 
 class DiscordChannel(BaseChannel):
-    """Discord bot channel with full media support.
+    """Discord bot channel with full media support and live status updates.
 
-    Usage:
-        channel = DiscordChannel(agent=agent, token="BOT_TOKEN")
-        await channel.start()
+    When processing, sends a status message that updates in real-time:
+      "⏳ Thinking..." → "🔧 Using shell_exec..." → final response
     """
 
     def __init__(self, agent: Agent, token: str):
@@ -34,7 +34,7 @@ class DiscordChannel(BaseChannel):
         except ImportError:
             raise ImportError(
                 "discord.py is required for Discord channel. "
-                "Install it with: pip install openagent[discord]"
+                "Install it with: pip install openagent-framework[discord]"
             )
 
         intents = discord.Intents.default()
@@ -64,7 +64,6 @@ class DiscordChannel(BaseChannel):
             session_id = self._user_session_id("discord", user_id)
             attachments: list[dict] = []
 
-            # Download attachments
             if message.attachments:
                 tmp_dir = tempfile.mkdtemp(prefix="openagent_dc_")
                 for att in message.attachments:
@@ -88,29 +87,43 @@ class DiscordChannel(BaseChannel):
                 return
 
             try:
+                # Send initial status message
+                status_msg = await message.channel.send("⏳ Thinking...")
+
+                async def on_status(status: str) -> None:
+                    try:
+                        await status_msg.edit(content=f"⏳ {status}")
+                    except Exception:
+                        pass
+
                 async with message.channel.typing():
                     response = await self.agent.run(
                         message=content,
                         user_id=user_id,
                         session_id=session_id,
                         attachments=attachments if attachments else None,
+                        on_status=on_status,
                     )
+
+                # Delete status message
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
 
                 await self._send_response(message.channel, response)
             except Exception as e:
                 logger.error(f"Discord handler error: {e}")
-                await message.channel.send("Sorry, something went wrong.")
+                await message.channel.send(f"Error: {e}")
 
         logger.info(f"Starting Discord bot for agent '{self.agent.name}'")
         await client.start(self.token)
 
     async def _send_response(self, channel, response: str) -> None:
-        """Send agent response, handling file markers."""
         import discord
 
         clean_text, attachments = parse_response_markers(response)
 
-        # Send attachments
         files = []
         for att in attachments:
             path = Path(att.path)
@@ -118,7 +131,6 @@ class DiscordChannel(BaseChannel):
                 files.append(discord.File(str(path), filename=att.filename))
 
         if files:
-            # Discord allows up to 10 files per message
             for i in range(0, len(files), 10):
                 batch = files[i:i + 10]
                 text_chunk = clean_text[:2000] if i == 0 and clean_text else None
@@ -126,7 +138,6 @@ class DiscordChannel(BaseChannel):
                 if i == 0 and clean_text:
                     clean_text = clean_text[2000:]
 
-        # Send remaining text
         if clean_text:
             for i in range(0, len(clean_text), 2000):
                 await channel.send(clean_text[i:i + 2000])
