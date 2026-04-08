@@ -52,6 +52,11 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
         "build": ["npm", "run", "build"],
         "install": ["npm", "install"],
     },
+    "chrome-devtools": {
+        "dir": "chrome-devtools",
+        "command": ["node", "node_modules/chrome-devtools-mcp/build/src/index.js"],
+        "install": ["npm", "install"],
+    },
     "messaging": {
         "dir": "messaging",
         "command": ["python3", "server.py"],
@@ -92,8 +97,11 @@ DEFAULT_MCPS: list[dict[str, Any]] = [
         "builtin": "computer-control",
         "_default": True,
     },
-    # NOTE: Chrome DevTools is a built-in Claude CLI plugin — no need to pass via MCP config.
-    # For non-Claude models, add it as a user MCP in openagent.yaml.
+    # Chrome DevTools MCP: browser automation, performance, DOM inspection
+    {
+        "builtin": "chrome-devtools",
+        "_default": True,
+    },
     # Bundled MCP: proactive messaging (Telegram, Discord, WhatsApp send)
     # Auto-detects available tokens from channel config env vars
     {

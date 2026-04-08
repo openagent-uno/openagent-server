@@ -1,0 +1,12 @@
+{
+  "name": "openagent-chrome-devtools-wrapper",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Wrapper to install chrome-devtools-mcp as a local dependency",
+  "dependencies": {
+    "chrome-devtools-mcp": "latest"
+  },
+  "scripts": {
+    "start": "node node_modules/chrome-devtools-mcp/build/src/index.js"
+  }
+}
