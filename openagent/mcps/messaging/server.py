@@ -15,10 +15,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import sys
-
-# Add parent packages to path so we can import from openagent
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from mcp.server import Server
 from mcp.types import TextContent, Tool
