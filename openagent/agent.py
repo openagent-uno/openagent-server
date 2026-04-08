@@ -122,8 +122,9 @@ class Agent:
 
                 if env:
                     entry["env"] = env
-                if server._cwd:
-                    entry["cwd"] = server._cwd
+                # NOTE: do NOT pass "cwd" — Claude CLI --mcp-config silently
+                # ignores servers with "cwd" field. Instead, use absolute paths
+                # in the command/args (which we already do via _resolve_builtin).
 
                 configs[server.name] = entry
         return configs
