@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 
 from openagent.models.base import BaseModel, ModelResponse, ToolCall
 
@@ -57,9 +57,14 @@ class ClaudeCLI(BaseModel):
 
         return opts
 
-    async def _query_with_retry(self, prompt: str, opts: dict) -> str:
+    async def _query_with_retry(
+        self,
+        prompt: str,
+        opts: dict,
+        on_status: Optional[Callable[[str], Awaitable[None]]] = None,
+    ) -> str:
         """Run SDK query with retry on session errors."""
-        from claude_agent_sdk import query, ClaudeAgentOptions, ResultMessage, SystemMessage
+        from claude_agent_sdk import query, ClaudeAgentOptions, ResultMessage, SystemMessage, AssistantMessage
 
         for attempt in range(2):
             try:
@@ -71,6 +76,17 @@ class ClaudeCLI(BaseModel):
                         data = message.data if isinstance(message.data, dict) else {}
                         if 'session_id' in data:
                             self._session_id = data['session_id']
+
+                    # Detect tool use from SDK stream and emit status updates
+                    if isinstance(message, AssistantMessage) and on_status:
+                        for block in (message.content or []):
+                            if hasattr(block, 'type') and block.type == 'tool_use':
+                                tool_name = getattr(block, 'name', None)
+                                if tool_name:
+                                    try:
+                                        await on_status(f"Using {tool_name}...")
+                                    except Exception:
+                                        pass
 
                     if isinstance(message, ResultMessage):
                         result_text = message.result or ""
@@ -97,6 +113,7 @@ class ClaudeCLI(BaseModel):
         messages: list[dict[str, Any]],
         system: str | None = None,
         tools: list[dict[str, Any]] | None = None,
+        on_status: Optional[Callable[[str], Awaitable[None]]] = None,
     ) -> ModelResponse:
         prompt_parts = []
         if system:
@@ -112,7 +129,7 @@ class ClaudeCLI(BaseModel):
         prompt = "\n\n".join(prompt_parts)
         opts = self._build_options()
 
-        result_text = await self._query_with_retry(prompt, opts)
+        result_text = await self._query_with_retry(prompt, opts, on_status=on_status)
         return ModelResponse(content=result_text)
 
     async def stream(
