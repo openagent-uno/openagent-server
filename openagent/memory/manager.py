@@ -100,8 +100,8 @@ class MemoryManager:
         return await self.db.get_recent_messages(session_id, limit=self.history_limit)
 
     async def get_memories_for_context(self, agent_id: str, user_id: str = "") -> list[dict]:
-        """Retrieve all relevant memories to inject into system prompt."""
-        return await self.db.get_memories(agent_id, user_id, limit=20)
+        """Retrieve most recent relevant memories (compact, not all)."""
+        return await self.db.get_memories(agent_id, user_id, limit=10)
 
     async def build_memory_context(self, agent_id: str, user_id: str = "", query: str = "") -> str:
         """Build a context string from SQL memories + knowledge base."""

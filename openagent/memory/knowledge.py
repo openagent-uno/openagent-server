@@ -322,32 +322,29 @@ class KnowledgeBase:
             raise FileNotFoundError(f"Memory file not found: {file_path}")
         return path.read_text(encoding="utf-8")
 
-    async def build_context(self, query: str, max_tokens: int = 4000) -> str:
-        """Build a context string from relevant memories for prompt injection.
+    async def build_context(self, query: str, max_results: int = 3, max_chars: int = 2000) -> str:
+        """Build a compact context from FTS5 snippets (NOT full files).
 
-        Searches, reads top files, concatenates until max_tokens (approx).
+        Only injects short, relevant snippets — not entire documents.
+        Full documents can be read on demand via the filesystem MCP.
         """
-        results = await self.search(query, limit=10)
+        results = await self.search(query, limit=max_results)
         if not results:
             return ""
 
         parts = ["## Relevant Knowledge:"]
-        total_chars = 0
-        max_chars = max_tokens * 4  # rough char-to-token ratio
-
+        total = 0
         for r in results:
-            try:
-                content = await self.read_file(r["file_path"])
-                _, body = _parse_frontmatter(content)
-                body = body.strip()
-                if total_chars + len(body) > max_chars:
-                    break
-                parts.append(f"### {r['title']}\n{body}")
-                total_chars += len(body)
-            except FileNotFoundError:
+            snippet = r.get("snippet", "")
+            if not snippet:
                 continue
+            entry = f"- **{r['title']}** ({r['file_path']}): {snippet}"
+            if total + len(entry) > max_chars:
+                break
+            parts.append(entry)
+            total += len(entry)
 
-        return "\n\n".join(parts) if len(parts) > 1 else ""
+        return "\n".join(parts) if len(parts) > 1 else ""
 
     # ── Internal indexing ──
 
