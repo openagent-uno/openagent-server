@@ -149,12 +149,19 @@ def _resolve_builtin(name: str, env: dict[str, str] | None = None) -> MCPTools:
             subprocess.run(spec["build"], cwd=mcp_dir, check=True, capture_output=True)
 
     # Resolve the entry point path
-    # For Python MCPs, use sys.executable to ensure we use the same Python/venv
     import sys
-    cmd_list = spec["command"]
+    cmd_list = list(spec["command"])
     if is_python and cmd_list and cmd_list[0] in ("python3", "python"):
-        cmd_list = [sys.executable] + cmd_list[1:]
-    full_command = [str(mcp_dir / c) if "/" in c else c for c in cmd_list]
+        cmd_list[0] = sys.executable  # use venv Python
+
+    # Resolve relative paths (like "dist/index.js") to absolute under mcp_dir
+    # but skip already-absolute paths (like sys.executable)
+    full_command = []
+    for c in cmd_list:
+        if "/" in c and not Path(c).is_absolute():
+            full_command.append(str(mcp_dir / c))
+        else:
+            full_command.append(c)
 
     # Merge env from spec + caller
     merged_env = {**(spec.get("env") or {}), **(env or {})}
