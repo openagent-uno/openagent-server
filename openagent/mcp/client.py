@@ -199,8 +199,11 @@ class MCPTools:
         # Local server (stdio transport)
         mcp = MCPTools(name="fs", command=["npx", "-y", "@anthropic/mcp-filesystem", "/data"])
 
-        # Remote server (SSE transport)
+        # Remote server (SSE/HTTP transport)
         mcp = MCPTools(name="search", url="http://localhost:8080/sse")
+
+        # Remote server with OAuth (e.g. Quo, ClickUp official)
+        mcp = MCPTools(name="quo", url="https://mcp.quo.com/sse", oauth=True)
     """
 
     def __init__(
@@ -210,6 +213,8 @@ class MCPTools:
         args: list[str] | None = None,
         url: str | None = None,
         env: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+        oauth: bool = False,
         _cwd: str | None = None,
     ):
         self.name = name or (command[0] if command else url or "mcp")
@@ -217,6 +222,8 @@ class MCPTools:
         self.args = args or []
         self.url = url
         self.env = env
+        self.headers = headers
+        self.oauth = oauth
         self._cwd = _cwd
 
         self._session: ClientSession | None = None
@@ -253,31 +260,34 @@ class MCPTools:
                 ClientSession(read_stream, write_stream)
             )
         elif self.url:
+            # Build auth provider for OAuth-enabled MCPs
+            auth = None
+            if self.oauth:
+                from openagent.mcp.oauth import create_oauth_provider
+                auth = create_oauth_provider(self.name, self.url)
+
             # Try Streamable HTTP first, fallback to SSE
-            connected = False
             try:
                 http_transport = await self._exit_stack.enter_async_context(
-                    streamablehttp_client(self.url)
+                    streamablehttp_client(self.url, headers=self.headers)
                 )
                 read_stream, write_stream = http_transport[0], http_transport[1]
                 self._session = await self._exit_stack.enter_async_context(
                     ClientSession(read_stream, write_stream)
                 )
-                connected = True
             except Exception:
                 # Fallback to SSE
-                self._exit_stack = AsyncExitStack()  # reset stack
+                self._exit_stack = AsyncExitStack()
                 try:
                     sse_transport = await self._exit_stack.enter_async_context(
-                        sse_client(self.url)
+                        sse_client(self.url, headers=self.headers, auth=auth)
                     )
                     read_stream, write_stream = sse_transport
                     self._session = await self._exit_stack.enter_async_context(
                         ClientSession(read_stream, write_stream)
                     )
-                    connected = True
                 except Exception as e:
-                    raise ConnectionError(f"Failed to connect to {self.url} via HTTP or SSE: {e}")
+                    raise ConnectionError(f"Failed to connect to {self.url}: {e}")
         else:
             raise ValueError("MCPTools requires either 'command' (stdio) or 'url' (HTTP/SSE)")
 
@@ -436,6 +446,8 @@ class MCPRegistry:
                     args=entry.get("args"),
                     url=entry.get("url"),
                     env=entry.get("env"),
+                    headers=entry.get("headers"),
+                    oauth=entry.get("oauth", False),
                 ))
 
         return registry
