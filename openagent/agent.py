@@ -93,22 +93,14 @@ class Agent:
 
         self._initialized = True
 
-    # MCPs that Claude CLI already has built-in — don't pass via --mcp-config
-    _CLI_BUILTIN_MCPS = {"filesystem", "editor", "shell", "web-search", "chrome-devtools"}
-
     def _build_cli_mcp_configs(self) -> dict[str, dict]:
         """Build MCP server configs in Claude CLI format for --mcp-config.
 
-        Skips MCPs that Claude CLI already provides natively (filesystem, editor,
-        shell, web-search, chrome-devtools) to avoid redundancy and timeouts.
-        Only passes MCPs that add new capabilities: computer-use, github,
-        google-play, appstore-connect, clickup, messaging, etc.
+        All OpenAgent MCPs are passed to Claude CLI so every model gets
+        the same tools — model-agnostic, no provider-specific differences.
         """
         configs = {}
         for server in self._mcp._servers:
-            # Skip MCPs that Claude CLI has built-in
-            if server.name in self._CLI_BUILTIN_MCPS:
-                continue
             if server.command:
                 full_cmd = server.command + server.args
                 configs[server.name] = {
