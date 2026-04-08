@@ -223,47 +223,21 @@ class KnowledgeBase:
         await self._db.execute("DELETE FROM knowledge_index WHERE file_path = ?", (rel,))
         await self._db.commit()
 
-    # Common stop words to filter from FTS5 queries
-    _STOP_WORDS = {
-        "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
-        "have", "has", "had", "do", "does", "did", "will", "would", "could",
-        "should", "may", "might", "shall", "can", "need", "dare", "ought",
-        "to", "of", "in", "for", "on", "with", "at", "by", "from", "as",
-        "into", "through", "during", "before", "after", "above", "below",
-        "between", "out", "off", "over", "under", "again", "further", "then",
-        "once", "here", "there", "when", "where", "why", "how", "all", "both",
-        "each", "few", "more", "most", "other", "some", "such", "no", "nor",
-        "not", "only", "own", "same", "so", "than", "too", "very", "just",
-        "because", "but", "and", "or", "if", "while", "about", "up", "down",
-        "it", "its", "he", "she", "they", "them", "his", "her", "their",
-        "this", "that", "these", "those", "what", "which", "who", "whom",
-        "i", "me", "my", "we", "us", "our", "you", "your",
-        # Italian stop words
-        "il", "lo", "la", "le", "gli", "un", "una", "uno", "di", "da", "del",
-        "dei", "della", "delle", "che", "non", "per", "con", "su", "tra",
-        "fra", "al", "alla", "alle", "nel", "nella", "nelle", "è", "sono",
-        "ha", "ho", "hai", "hanno", "mi", "ti", "ci", "si", "vi", "li",
-        "ma", "se", "come", "cosa", "questo", "quello", "anche", "più",
-        "poi", "già", "ora", "ancora", "sempre", "mai", "solo", "tutto",
-        "tutti", "molto", "bene", "male", "qui", "dove", "quando",
-        "manda", "mandare", "mandami", "scrivi", "scrivere", "dimmi",
-        "fai", "fare", "fammi", "usa", "usando", "vai", "controlla",
-    }
-
     def _sanitize_fts_query(self, query: str) -> str:
-        """Extract meaningful keywords from query for FTS5 search."""
+        """Sanitize query for FTS5. Uses the longest words (most likely
+        to be meaningful names/keywords) with OR for broad matching.
+        FTS5 BM25 ranking handles relevance automatically."""
         sanitized = re.sub(r'[^\w\s]', ' ', query)
-        sanitized = re.sub(r'\s+', ' ', sanitized).strip()
+        sanitized = re.sub(r'\s+', ' ', sanitized).strip().lower()
         if not sanitized:
             return '""'
-        # Filter stop words and short words, keep meaningful keywords
-        words = [w for w in sanitized.lower().split()
-                 if w not in self._STOP_WORDS and len(w) > 2]
-        if not words:
+        # Take the longest words (names, technical terms > common words)
+        words = sorted(set(sanitized.split()), key=len, reverse=True)
+        # Keep top 5 longest words (min 3 chars)
+        keywords = [w for w in words if len(w) >= 3][:5]
+        if not keywords:
             return '""'
-        # Limit to 5 most meaningful words, use OR
-        words = words[:5]
-        return " OR ".join(f'"{w}"' for w in words)
+        return " OR ".join(f'"{w}"' for w in keywords)
 
     async def search(self, query: str, topic: str | None = None, limit: int = 20) -> list[dict]:
         """Search memories using FTS5 full-text search.
