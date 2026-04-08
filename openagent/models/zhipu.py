@@ -89,6 +89,7 @@ class ZhipuGLM(BaseModel):
         messages: list[dict[str, Any]],
         system: str | None = None,
         tools: list[dict[str, Any]] | None = None,
+        on_status=None,
     ) -> ModelResponse:
         kwargs: dict[str, Any] = {
             "model": self.model,
