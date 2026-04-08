@@ -68,7 +68,7 @@ DEFAULT_MCPS: list[dict[str, Any]] = [
     {
         "name": "filesystem",
         "command": ["npx", "-y", "@modelcontextprotocol/server-filesystem"],
-        "args": ["."],  # default to cwd, user can override
+        "args": [],  # populated at runtime with home dir
         "_default": True,
     },
     # Bundled MCP: surgical file editing, grep, glob
@@ -177,10 +177,16 @@ def _resolve_default_entry(entry: dict[str, Any]) -> MCPTools | None:
         logger.warning(f"Skipping default MCP '{name}': '{cmd}' not found")
         return None
 
+    # Expand home dir for filesystem MCP
+    import os
+    args = entry.get("args") or []
+    if name == "filesystem" and not args:
+        args = [os.path.expanduser("~")]
+
     return MCPTools(
         name=entry.get("name", ""),
         command=entry.get("command"),
-        args=entry.get("args"),
+        args=args,
         url=entry.get("url"),
         env=entry.get("env"),
     )

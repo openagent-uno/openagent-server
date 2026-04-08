@@ -23,9 +23,10 @@ class TelegramChannel(BaseChannel):
       "⏳ Thinking..." → "🔧 Using shell_exec..." → "⏳ Thinking..." → final response
     """
 
-    def __init__(self, agent: Agent, token: str):
+    def __init__(self, agent: Agent, token: str, allowed_users: list[str] | None = None):
         super().__init__(agent)
         self.token = token
+        self.allowed_users = set(allowed_users) if allowed_users else None
         self._app = None
 
     async def _handle_message(self, update, context) -> None:
@@ -34,6 +35,11 @@ class TelegramChannel(BaseChannel):
 
         msg = update.message
         user_id = str(msg.from_user.id)
+
+        # Whitelist check
+        if self.allowed_users and user_id not in self.allowed_users:
+            await msg.reply_text("Unauthorized. Contact the admin.")
+            return
         session_id = self._user_session_id("telegram", user_id)
         text = msg.caption or msg.text or ""
         attachments: list[dict] = []

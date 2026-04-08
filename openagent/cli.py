@@ -174,7 +174,8 @@ def serve(ctx, channel: tuple[str, ...]):
                     if not token:
                         console.print("[red]Telegram token not configured.[/red]")
                         continue
-                    ch = TelegramChannel(agent=agent, token=token)
+                    allowed = ch_config.get("allowed_users")
+                    ch = TelegramChannel(agent=agent, token=token, allowed_users=allowed)
                     console.print("[green]Starting Telegram channel...[/green]")
                     tasks.append(asyncio.create_task(ch.start()))
 
