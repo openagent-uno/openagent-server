@@ -17,6 +17,7 @@ from typing import Any
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.sse import sse_client
+from mcp.client.streamable_http import streamablehttp_client
 
 logger = logging.getLogger(__name__)
 
@@ -246,15 +247,33 @@ class MCPTools:
                 ClientSession(read_stream, write_stream)
             )
         elif self.url:
-            sse_transport = await self._exit_stack.enter_async_context(
-                sse_client(self.url)
-            )
-            read_stream, write_stream = sse_transport
-            self._session = await self._exit_stack.enter_async_context(
-                ClientSession(read_stream, write_stream)
-            )
+            # Try Streamable HTTP first, fallback to SSE
+            connected = False
+            try:
+                http_transport = await self._exit_stack.enter_async_context(
+                    streamablehttp_client(self.url)
+                )
+                read_stream, write_stream = http_transport[0], http_transport[1]
+                self._session = await self._exit_stack.enter_async_context(
+                    ClientSession(read_stream, write_stream)
+                )
+                connected = True
+            except Exception:
+                # Fallback to SSE
+                self._exit_stack = AsyncExitStack()  # reset stack
+                try:
+                    sse_transport = await self._exit_stack.enter_async_context(
+                        sse_client(self.url)
+                    )
+                    read_stream, write_stream = sse_transport
+                    self._session = await self._exit_stack.enter_async_context(
+                        ClientSession(read_stream, write_stream)
+                    )
+                    connected = True
+                except Exception as e:
+                    raise ConnectionError(f"Failed to connect to {self.url} via HTTP or SSE: {e}")
         else:
-            raise ValueError("MCPTools requires either 'command' (stdio) or 'url' (SSE)")
+            raise ValueError("MCPTools requires either 'command' (stdio) or 'url' (HTTP/SSE)")
 
         await self._session.initialize()
 
