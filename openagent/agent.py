@@ -7,7 +7,6 @@ from typing import Any, AsyncIterator, Callable, Awaitable
 
 from openagent.models.base import BaseModel, ModelResponse
 from openagent.memory.db import MemoryDB
-from openagent.memory.manager import MemoryManager
 from openagent.mcp.client import MCPRegistry, MCPTools
 
 logger = logging.getLogger(__name__)
@@ -20,6 +19,10 @@ StatusCallback = Callable[[str], Awaitable[None]]
 
 class Agent:
     """Main agent class. Ties together a model, MCP tools, and memory.
+
+    Session history is handled by the Claude Agent SDK (resume=session_id).
+    Long-term memory is handled by MCPVault (Obsidian vault).
+    SQLite (MemoryDB) is only used for scheduled tasks.
 
     Usage:
         agent = Agent(
@@ -40,7 +43,6 @@ class Agent:
         mcp_tools: list[MCPTools] | None = None,
         mcp_registry: MCPRegistry | None = None,
         memory: MemoryDB | str | None = None,
-        history_limit: int = 50,
     ):
         self.name = name
         self.model = model
@@ -54,17 +56,13 @@ class Agent:
             for tool in (mcp_tools or []):
                 self._mcp.add(tool)
 
-        # Memory (SQLite for sessions + tasks only; knowledge base in Obsidian vault via MCPVault)
+        # Memory (SQLite for scheduled tasks only; knowledge base in Obsidian vault via MCPVault)
         if isinstance(memory, str):
             self._db = MemoryDB(memory)
         elif isinstance(memory, MemoryDB):
             self._db = memory
         else:
             self._db = None
-
-        self._memory: MemoryManager | None = None
-        if self._db:
-            self._memory = MemoryManager(self._db, history_limit=history_limit)
 
         self._initialized = False
 
@@ -136,6 +134,8 @@ class Agent:
         """Run the agent with a user message. Returns the final text response.
 
         Args:
+            session_id: Kept for API compatibility. Session continuity is
+                handled by the Claude Agent SDK's resume=session_id.
             on_status: Optional async callback for live status updates.
                 Called with status strings like "Thinking...", "Using shell_exec...", etc.
                 Channels use this to update a live status message.
@@ -153,7 +153,7 @@ class Agent:
                     pass
 
         try:
-            return await self._run_inner(message, user_id, session_id, attachments, _status)
+            return await self._run_inner(message, attachments, _status)
         except BaseException as e:
             logger.error(f"Agent.run() fatal error: {e}")
             return f"Error: {e}"
@@ -161,33 +161,20 @@ class Agent:
     async def _run_inner(
         self,
         message: str,
-        user_id: str,
-        session_id: str | None,
         attachments: list[dict] | None,
         _status,
     ) -> str:
         """Inner run logic, wrapped by run() for crash protection."""
         await _status("Loading context...")
 
-        # Session + history
-        current_session_id = None
-        history: list[dict[str, Any]] = []
         system = self.system_prompt
-
-        if self._memory:
-            current_session_id = await self._memory.ensure_session(self.name, user_id, session_id)
-            history = await self._memory.get_history(current_session_id)
 
         # Build messages
         if attachments:
             att_desc = " ".join(f"[Attached {a.get('type','file')}: {a.get('filename','')}]" for a in attachments)
             message = f"{att_desc}\n{message}" if message else att_desc
 
-        messages = list(history)
-        messages.append({"role": "user", "content": message})
-
-        if self._memory and current_session_id:
-            await self._memory.store_message(current_session_id, "user", message)
+        messages: list[dict[str, Any]] = [{"role": "user", "content": message}]
 
         tools = self._mcp.all_tools() or None
 
@@ -208,11 +195,6 @@ class Agent:
                     ],
                 }
                 messages.append(assistant_msg)
-                if self._memory and current_session_id:
-                    await self._memory.store_message(
-                        current_session_id, "assistant", response.content,
-                        tool_calls=assistant_msg["tool_calls"],
-                    )
 
                 for tc in response.tool_calls:
                     await _status(f"Using {tc.name}...")
@@ -229,16 +211,10 @@ class Agent:
                         "tool_call_id": tc.id,
                     }
                     messages.append(tool_msg)
-                    if self._memory and current_session_id:
-                        await self._memory.store_message(
-                            current_session_id, "tool", result, tool_call_id=tc.id,
-                        )
 
                 if iteration < MAX_TOOL_ITERATIONS - 1:
                     await _status("Thinking...")
             else:
-                if self._memory and current_session_id:
-                    await self._memory.store_message(current_session_id, "assistant", response.content)
                 return response.content
 
         return response.content if response else "I wasn't able to complete the request."
@@ -255,31 +231,11 @@ class Agent:
 
         await self.initialize()
 
-        history: list[dict[str, Any]] = []
         system = self.system_prompt
-        current_session_id = None
+        messages: list[dict[str, Any]] = [{"role": "user", "content": message}]
 
-        if self._memory:
-            current_session_id = await self._memory.ensure_session(self.name, user_id, session_id)
-            history = await self._memory.get_history(current_session_id)
-            mem_context = await self._memory.build_memory_context(self.name, user_id)
-            if mem_context:
-                system = f"{system}\n\n{mem_context}"
-
-        messages = list(history)
-        messages.append({"role": "user", "content": message})
-
-        if self._memory and current_session_id:
-            await self._memory.store_message(current_session_id, "user", message)
-
-        full_response = []
         async for chunk in self.model.stream(messages, system=system):
-            full_response.append(chunk)
             yield chunk
-
-        content = "".join(full_response)
-        if self._memory and current_session_id:
-            await self._memory.store_message(current_session_id, "assistant", content)
 
     async def __aenter__(self):
         await self.initialize()
