@@ -156,7 +156,7 @@ class KnowledgeBase:
         await self._db.execute("DROP TABLE IF EXISTS knowledge_fts")
         await self._db.executescript(KNOWLEDGE_SCHEMA)
         await self._db.commit()
-        await self.reindex()
+        await self.reindex(force=True)
 
     async def add(
         self,
@@ -349,7 +349,7 @@ class KnowledgeBase:
 
     # ── Internal indexing ──
 
-    async def _index_file(self, path: Path) -> None:
+    async def _index_file(self, path: Path, force: bool = False) -> None:
         """Index a single file into SQLite + FTS5."""
         content = path.read_text(encoding="utf-8")
         rel_path = str(path.relative_to(self.base_dir))
@@ -361,7 +361,7 @@ class KnowledgeBase:
             "SELECT content_hash FROM knowledge_index WHERE file_path = ?", (rel_path,)
         )
         existing = await cursor.fetchone()
-        if existing and existing[0] == c_hash:
+        if existing and existing[0] == c_hash and not force:
             return  # unchanged
 
         title = _extract_title(body)
@@ -399,14 +399,19 @@ class KnowledgeBase:
 
         await self._db.commit()
 
-    async def reindex(self) -> None:
-        """Full reindex: scan all .md files and update index. Skip unchanged files."""
+    async def reindex(self, force: bool = False) -> None:
+        """Full reindex: scan all .md files and update index.
+
+        Args:
+            force: If True, reindex all files regardless of content_hash.
+                   Used after DROP TABLE to repopulate FTS5.
+        """
         if not self.base_dir.exists():
             return
 
         indexed_paths = set()
         for md_file in self.base_dir.rglob("*.md"):
-            await self._index_file(md_file)
+            await self._index_file(md_file, force=force)
             indexed_paths.add(str(md_file.relative_to(self.base_dir)))
 
         # Remove index entries for deleted files
