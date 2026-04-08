@@ -1,5 +1,5 @@
 from openagent.agent import Agent
 from openagent.config import load_config
 
-__version__ = "0.1.20"
+__version__ = "0.1.21"
 __all__ = ["Agent", "load_config"]
