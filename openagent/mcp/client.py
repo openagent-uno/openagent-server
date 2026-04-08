@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 # ── Built-in MCPs (custom, ship under mcps/) ──
 
-BUILTIN_MCPS_DIR = Path(__file__).resolve().parent.parent.parent / "mcps"
+BUILTIN_MCPS_DIR = Path(__file__).resolve().parent.parent / "mcps"
 
 BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
     "computer-use": {

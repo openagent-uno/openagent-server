@@ -36,3 +36,13 @@ openagent = "openagent.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["openagent*"]
+
+[tool.setuptools.package-data]
+openagent = [
+    "mcps/**/*.ts",
+    "mcps/**/*.json",
+    "mcps/**/*.py",
+    "mcps/**/*.txt",
+    "mcps/**/.gitignore",
+    "scripts/*.sh",
+]

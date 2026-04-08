@@ -1,0 +1,28 @@
+{
+  "name": "openagent-web-search-mcp",
+  "version": "1.0.0",
+  "description": "Web search MCP server with multi-engine search and content extraction (no API key needed)",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": "dist/index.js",
+  "scripts": {
+    "start": "npm run build && node dist/index.js",
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "postinstall": "npx playwright install chromium"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.15.0",
+    "axios": "^1.6.8",
+    "cheerio": "^1.0.0-rc.12",
+    "p-limit": "^6.2.0",
+    "p-retry": "^6.2.1",
+    "playwright": "^1.48.0",
+    "zod": "^3.22.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "typescript": "^5.9.3"
+  }
+}
