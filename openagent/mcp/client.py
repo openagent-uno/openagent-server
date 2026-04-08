@@ -54,7 +54,7 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
     },
     "chrome-devtools": {
         "dir": "chrome-devtools",
-        "command": ["node", "node_modules/chrome-devtools-mcp/build/src/index.js"],
+        "command": ["node", "node_modules/chrome-devtools-mcp/build/src/bin/chrome-devtools-mcp.js"],
         "install": ["npm", "install"],
     },
     "messaging": {
