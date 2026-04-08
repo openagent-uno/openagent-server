@@ -98,6 +98,12 @@ DEFAULT_MCPS: list[dict[str, Any]] = [
         "command": ["npx", "-y", "chrome-devtools-mcp@latest"],
         "_default": True,
     },
+    # Bundled MCP: proactive messaging (Telegram, Discord, WhatsApp send)
+    # Auto-detects available tokens from channel config env vars
+    {
+        "builtin": "messaging",
+        "_default": True,
+    },
 ]
 
 
@@ -161,8 +167,9 @@ def _resolve_default_entry(entry: dict[str, Any]) -> MCPTools | None:
     name = entry.get("name") or entry.get("builtin", "")
 
     if "builtin" in entry:
-        # Custom built-in — needs Node.js
-        if not _check_command_exists("node"):
+        spec = BUILTIN_MCP_SPECS.get(entry["builtin"])
+        is_python = spec.get("python", False) if spec else False
+        if not is_python and not _check_command_exists("node"):
             logger.warning(f"Skipping default MCP '{name}': Node.js not found")
             return None
         try:

@@ -25,6 +25,23 @@ def _build_agent_from_config(config: dict) -> Agent:
     """Build an Agent from a config dict."""
     model = build_model_from_config(config)
 
+    # Export channel tokens as env vars so the messaging MCP can pick them up
+    channels_config = config.get("channels", {})
+    if "telegram" in channels_config:
+        token = channels_config["telegram"].get("token") or os.environ.get("TELEGRAM_BOT_TOKEN")
+        if token:
+            os.environ["TELEGRAM_BOT_TOKEN"] = token
+    if "discord" in channels_config:
+        token = channels_config["discord"].get("token") or os.environ.get("DISCORD_BOT_TOKEN")
+        if token:
+            os.environ["DISCORD_BOT_TOKEN"] = token
+    if "whatsapp" in channels_config:
+        wa = channels_config["whatsapp"]
+        if wa.get("green_api_id"):
+            os.environ["GREEN_API_ID"] = wa["green_api_id"]
+        if wa.get("green_api_token"):
+            os.environ["GREEN_API_TOKEN"] = wa["green_api_token"]
+
     # MCP: defaults are always loaded, user MCPs merged on top
     mcp_config = config.get("mcp", [])
     include_defaults = config.get("mcp_defaults", True)
