@@ -114,7 +114,7 @@ class Agent:
                 configs[server.name] = entry
 
             elif server.url:
-                configs[server.name] = {"url": server.url}
+                configs[server.name] = {"type": "http", "url": server.url}
 
         return configs
 
