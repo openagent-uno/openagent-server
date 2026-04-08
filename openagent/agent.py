@@ -174,10 +174,6 @@ class Agent:
             current_session_id = await self._memory.ensure_session(self.name, user_id, session_id)
             history = await self._memory.get_history(current_session_id)
 
-            mem_context = await self._memory.build_memory_context(self.name, user_id, query=message)
-            if mem_context:
-                system = f"{system}\n\n{mem_context}"
-
         # Build messages
         if attachments:
             att_desc = " ".join(f"[Attached {a.get('type','file')}: {a.get('filename','')}]" for a in attachments)
