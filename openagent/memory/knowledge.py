@@ -54,9 +54,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5(
     title,
     topic,
     tags,
-    body,
-    content='knowledge_index',
-    content_rowid='rowid'
+    body
 );
 """
 
@@ -154,6 +152,8 @@ class KnowledgeBase:
     async def initialize(self) -> None:
         """Create tables and sync index with filesystem."""
         self.base_dir.mkdir(parents=True, exist_ok=True)
+        # Drop and recreate FTS5 to handle schema changes between versions
+        await self._db.execute("DROP TABLE IF EXISTS knowledge_fts")
         await self._db.executescript(KNOWLEDGE_SCHEMA)
         await self._db.commit()
         await self.reindex()
@@ -251,14 +251,12 @@ class KnowledgeBase:
         if topic:
             cursor = await self._db.execute(
                 """
-                SELECT ki.file_path, ki.title, ki.topic, ki.tags, ki.links,
+                SELECT file_path, title, topic, tags, '',
                        snippet(knowledge_fts, 4, '<b>', '</b>', '...', 32) as snippet,
                        rank
                 FROM knowledge_fts
-                JOIN knowledge_index ki ON ki.rowid = knowledge_fts.rowid
                 WHERE knowledge_fts MATCH ?
-                AND ki.topic = ?
-
+                AND topic = ?
                 ORDER BY rank
                 LIMIT ?
                 """,
@@ -267,11 +265,10 @@ class KnowledgeBase:
         else:
             cursor = await self._db.execute(
                 """
-                SELECT ki.file_path, ki.title, ki.topic, ki.tags, ki.links,
+                SELECT file_path, title, topic, tags, '',
                        snippet(knowledge_fts, 4, '<b>', '</b>', '...', 32) as snippet,
                        rank
                 FROM knowledge_fts
-                JOIN knowledge_index ki ON ki.rowid = knowledge_fts.rowid
                 WHERE knowledge_fts MATCH ?
                 ORDER BY rank
                 LIMIT ?
@@ -391,17 +388,14 @@ class KnowledgeBase:
                 (str(uuid.uuid4()), rel_path, title, topic, tags, links_str, c_hash, now, now),
             )
 
-        # Rebuild FTS for this entry
-        rowid_cursor = await self._db.execute(
-            "SELECT rowid FROM knowledge_index WHERE file_path = ?", (rel_path,)
+        # Update FTS index (standalone — delete old, insert new)
+        await self._db.execute(
+            "DELETE FROM knowledge_fts WHERE file_path = ?", (rel_path,)
         )
-        row = await rowid_cursor.fetchone()
-        if row:
-            rowid = row[0]
-            await self._db.execute(
-                "INSERT OR REPLACE INTO knowledge_fts(rowid, file_path, title, topic, tags, body) VALUES (?, ?, ?, ?, ?, ?)",
-                (rowid, rel_path, title, topic, tags, body),
-            )
+        await self._db.execute(
+            "INSERT INTO knowledge_fts(file_path, title, topic, tags, body) VALUES (?, ?, ?, ?, ?)",
+            (rel_path, title, topic, tags, body),
+        )
 
         await self._db.commit()
 
