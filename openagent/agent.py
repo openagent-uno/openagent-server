@@ -88,8 +88,7 @@ class Agent:
     def _build_cli_mcp_configs(self) -> dict[str, dict]:
         """Build MCP server configs for the Claude Agent SDK.
 
-        All OpenAgent MCPs are passed so every model gets the same tools.
-        Format: {"name": {"command": "...", "args": [...], "env": {...}}}
+        Supports stdio (command), SSE (url), and HTTP (url) MCP servers.
         """
         import os
         configs = {}
@@ -103,7 +102,6 @@ class Agent:
 
                 env = dict(server.env) if server.env else {}
 
-                # For messaging MCP: inject channel tokens from os.environ
                 if server.name == "messaging":
                     for var in ("TELEGRAM_BOT_TOKEN", "DISCORD_BOT_TOKEN", "GREEN_API_ID", "GREEN_API_TOKEN"):
                         val = os.environ.get(var)
@@ -114,6 +112,10 @@ class Agent:
                     entry["env"] = env
 
                 configs[server.name] = entry
+
+            elif server.url:
+                configs[server.name] = {"url": server.url}
+
         return configs
 
     async def shutdown(self) -> None:
