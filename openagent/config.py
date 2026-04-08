@@ -66,9 +66,9 @@ def build_model_from_config(config: dict):
         )
     elif provider == "zhipu":
         return ZhipuGLM(
-            model=model_cfg.get("model_id", "glm-4"),
+            model=model_cfg.get("model_id", "glm-5"),
             api_key=model_cfg.get("api_key"),
-            base_url=model_cfg.get("base_url", "https://open.bigmodel.cn/api/paas/v4"),
+            base_url=model_cfg.get("base_url", "https://api.z.ai/api/paas/v4"),
         )
     else:
         raise ValueError(f"Unknown model provider: {provider}")

@@ -1,6 +1,12 @@
 """Z.ai GLM model via OpenAI-compatible API.
 
 Also serves as the base for any OpenAI-compatible provider (Ollama, vLLM, etc.).
+
+Supported Z.ai models (as of 2026-04):
+  - glm-5        (latest flagship)
+  - glm-4-plus
+  - glm-4-flash
+  - glm-4
 """
 
 from __future__ import annotations
@@ -22,15 +28,16 @@ class ZhipuGLM(BaseModel):
 
     def __init__(
         self,
-        model: str = "glm-4",
+        model: str = "glm-5",
         api_key: str | None = None,
-        base_url: str = "https://open.bigmodel.cn/api/paas/v4",
+        base_url: str = "https://api.z.ai/api/paas/v4",
         max_tokens: int = 4096,
     ):
         self.model = model
         self.max_tokens = max_tokens
         self._client = AsyncOpenAI(
-            api_key=api_key or os.environ.get("ZHIPU_API_KEY", ""),
+            api_key=api_key or os.environ.get("ZAI_API_KEY")
+            or os.environ.get("ZHIPU_API_KEY", ""),
             base_url=base_url,
         )
 
