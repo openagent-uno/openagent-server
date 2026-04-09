@@ -152,19 +152,23 @@ def _build_channels(agent: Agent, config: dict, only: list[str] | None = None) -
 def _build_aux_services(config: dict) -> ServiceManager:
     """Build the ServiceManager from the `services:` section of the config."""
     mgr = ServiceManager()
-    svc_config = config.get("services", {})
+    svc_config = config.get("services", {}) or {}
 
-    obs_cfg = svc_config.get("obsidian_web", {})
-    if obs_cfg.get("enabled"):
-        from openagent.services.obsidian import ObsidianWebService
-        memory_cfg = config.get("memory", {})
+    sync_cfg = svc_config.get("syncthing", {}) or {}
+    if sync_cfg.get("enabled"):
+        from openagent.services.syncthing import (
+            SyncthingService,
+            DEFAULT_FOLDER_ID,
+            DEFAULT_FOLDER_LABEL,
+            DEFAULT_GUI_BIND,
+        )
+        memory_cfg = config.get("memory", {}) or {}
         default_vault = memory_cfg.get("vault_path", "./memories")
-        password = obs_cfg.get("password") or os.environ.get("OBSIDIAN_PASSWORD", "")
-        mgr.add(ObsidianWebService(
-            vault_path=obs_cfg.get("vault_path", default_vault),
-            port=int(obs_cfg.get("port", 8200)),
-            username=obs_cfg.get("username", "admin"),
-            password=password,
+        mgr.add(SyncthingService(
+            vault_path=sync_cfg.get("vault_path", default_vault),
+            folder_id=sync_cfg.get("folder_id", DEFAULT_FOLDER_ID),
+            folder_label=sync_cfg.get("folder_label", DEFAULT_FOLDER_LABEL),
+            gui_bind=sync_cfg.get("gui_bind", DEFAULT_GUI_BIND),
         ))
 
     return mgr
