@@ -25,6 +25,14 @@ DEFAULT_CONTAINER_NAME = "openagent-obsidian"
 DEFAULT_PORT = 8200
 DEFAULT_USERNAME = "admin"
 
+# linuxserver/obsidian exposes KasmVNC on:
+#   3000 → HTTP  (newer KasmVNC refuses with "requires a secure connection")
+#   3001 → HTTPS (self-signed cert; browser warning on first visit)
+# We map the user's `port` to 3001 so the UI actually loads in a modern
+# browser. The trade-off is an "untrusted certificate" warning that the
+# user accepts once.
+CONTAINER_PORT = 3001
+
 
 class ObsidianWebService(AuxService):
     """Run linuxserver/obsidian as a managed Docker container.
@@ -117,12 +125,12 @@ class ObsidianWebService(AuxService):
             await self._run("start", self.container_name)
             return
 
-        logger.info(f"{self.name}: creating container on port {self.port}")
+        logger.info(f"{self.name}: creating container on https://0.0.0.0:{self.port}")
         args = [
             "run", "-d",
             "--name", self.container_name,
             "--restart", "unless-stopped",
-            "-p", f"{self.port}:3000",
+            "-p", f"{self.port}:{CONTAINER_PORT}",
             "-e", f"CUSTOM_USER={self.username}",
             "-e", f"PASSWORD={self.password}",
             "-e", "PUID=1000",
@@ -135,8 +143,9 @@ class ObsidianWebService(AuxService):
         ]
         await self._run(*args)
         logger.info(
-            f"{self.name}: started on http://0.0.0.0:{self.port} "
-            f"(user={self.username})"
+            f"{self.name}: started on https://0.0.0.0:{self.port} "
+            f"(user={self.username}) — self-signed cert, accept the "
+            f"browser warning on first visit"
         )
 
     async def stop(self) -> None:
@@ -151,7 +160,7 @@ class ObsidianWebService(AuxService):
         if shutil.which("docker") is None:
             return "docker not installed"
         if await self._container_running():
-            return f"running on port {self.port}"
+            return f"running on https://0.0.0.0:{self.port}"
         if await self._container_exists():
             return "stopped"
         return "not created"

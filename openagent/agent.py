@@ -87,14 +87,39 @@ class Agent:
         """Build MCP server configs for the Claude Agent SDK.
 
         Supports stdio (command), SSE (url), and HTTP (url) MCP servers.
+
+        Claude CLI silently drops stdio MCP servers whose `command` cannot
+        be resolved in the subprocess's PATH. When OpenAgent runs under a
+        systemd unit, `$PATH` is minimal and relative names like `firebase`
+        or `github-mcp-server` stop resolving — even when `shutil.which()`
+        finds them at process startup. To avoid this footgun, every stdio
+        command is resolved to an absolute path here before being handed
+        off to the SDK.
         """
         import os
+        import shutil
+
         configs = {}
         for server in self._mcp._servers:
             if server.command:
                 full_cmd = server.command + server.args
+                cmd_name = full_cmd[0]
+
+                # Resolve to absolute path so Claude CLI doesn't silently
+                # drop the server when its minimal PATH can't find it.
+                if not os.path.isabs(cmd_name):
+                    resolved = shutil.which(cmd_name)
+                    if resolved:
+                        cmd_name = resolved
+                    else:
+                        logger.warning(
+                            "MCP '%s': command %r not found on PATH — "
+                            "Claude CLI will likely drop this server",
+                            server.name, cmd_name,
+                        )
+
                 entry: dict = {
-                    "command": full_cmd[0],
+                    "command": cmd_name,
                     "args": full_cmd[1:],
                 }
 
