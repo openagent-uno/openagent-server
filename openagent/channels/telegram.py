@@ -57,6 +57,8 @@ class TelegramChannel(BaseChannel):
       "⏳ Thinking..." → "🔧 Using shell_exec..." → "⏳ Thinking..." → final response
     """
 
+    name = "telegram"
+
     def __init__(self, agent: Agent, token: str, allowed_users: list[str] | None = None):
         super().__init__(agent)
         self.token = token
@@ -187,18 +189,7 @@ class TelegramChannel(BaseChannel):
             f"Hello! I'm {self.agent.name}. Send me a message, photo, voice, or file."
         )
 
-    async def start(self) -> None:
-        self._should_stop = False
-        while not self._should_stop:
-            try:
-                await self._start_inner()
-            except Exception as e:
-                if self._should_stop:
-                    break
-                logger.error(f"Telegram channel crashed: {e}, restarting in 45s...")
-                await asyncio.sleep(45)
-
-    async def _start_inner(self) -> None:
+    async def _run(self) -> None:
         try:
             from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters
         except ImportError:
@@ -220,14 +211,15 @@ class TelegramChannel(BaseChannel):
         await self._app.start()
         await self._app.updater.start_polling()
 
-        self._stop_event = asyncio.Event()
+        # Block until stop() is called
+        assert self._stop_event is not None
         await self._stop_event.wait()
 
-    async def stop(self) -> None:
-        self._should_stop = True
-        if hasattr(self, '_stop_event'):
-            self._stop_event.set()
+    async def _shutdown(self) -> None:
         if self._app:
-            await self._app.updater.stop()
-            await self._app.stop()
-            await self._app.shutdown()
+            try:
+                await self._app.updater.stop()
+                await self._app.stop()
+                await self._app.shutdown()
+            finally:
+                self._app = None

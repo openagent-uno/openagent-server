@@ -22,25 +22,15 @@ class WhatsAppChannel(BaseChannel):
     Sends an initial "⏳ Thinking..." message that updates as the agent works.
     """
 
+    name = "whatsapp"
+
     def __init__(self, agent: Agent, instance_id: str, api_token: str):
         super().__init__(agent)
         self.instance_id = instance_id
         self.api_token = api_token
-        self._running = False
         self._greenapi = None
 
-    async def start(self) -> None:
-        self._should_stop = False
-        while not self._should_stop:
-            try:
-                await self._start_inner()
-            except Exception as e:
-                if self._should_stop:
-                    break
-                logger.error(f"WhatsApp channel crashed: {e}, restarting in 45s...")
-                await asyncio.sleep(45)
-
-    async def _start_inner(self) -> None:
+    async def _run(self) -> None:
         try:
             from whatsapp_api_client_python import API as GreenAPI
         except ImportError:
@@ -50,11 +40,10 @@ class WhatsAppChannel(BaseChannel):
             )
 
         self._greenapi = GreenAPI.GreenApi(self.instance_id, self.api_token)
-        self._running = True
 
         logger.info(f"Starting WhatsApp bot for agent '{self.agent.name}'")
 
-        while self._running:
+        while not self._should_stop:
             try:
                 response = await asyncio.to_thread(
                     self._greenapi.receiving.receiveNotification
@@ -200,6 +189,7 @@ class WhatsAppChannel(BaseChannel):
                 clean_text,
             )
 
-    async def stop(self) -> None:
-        self._should_stop = True
-        self._running = False
+    async def _shutdown(self) -> None:
+        # Green API is pure HTTP; nothing to close. The polling loop exits
+        # when `_should_stop` flips to True.
+        self._greenapi = None
