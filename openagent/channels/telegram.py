@@ -30,6 +30,7 @@ from openagent.channels.base import (
     split_preserving_code_blocks,
 )
 from openagent.channels.commands import CommandDispatcher
+from openagent.channels.formatting import markdown_to_telegram_html
 from openagent.channels.queue import UserQueueManager
 
 if TYPE_CHECKING:
@@ -93,6 +94,31 @@ class TelegramChannel(BaseChannel):
             return True  # no whitelist configured
         return user_id in self.allowed_users
 
+    # ── rich-text rendering ────────────────────────────────────────────
+
+    async def _reply_rich(self, msg, text: str, **kwargs) -> None:
+        """Send *text* as Telegram HTML, falling back to plain on parse errors.
+
+        The agent's output is markdown — ``**bold**``, ``*italic*``,
+        fenced code blocks, links. We convert each chunk to Telegram HTML
+        and send with ``parse_mode="HTML"``. If Telegram rejects the
+        markup (broken nesting, length, etc.) we retry once without parse
+        mode so the user still gets the content, just unstyled.
+        """
+        if not text:
+            return
+        for chunk in split_preserving_code_blocks(text, TELEGRAM_MSG_LIMIT):
+            rendered = markdown_to_telegram_html(chunk)
+            try:
+                await msg.reply_text(rendered, parse_mode="HTML",
+                                     disable_web_page_preview=True, **kwargs)
+            except Exception as e:
+                logger.debug("HTML parse failed, falling back to plain: %s", e)
+                try:
+                    await msg.reply_text(chunk, **kwargs)
+                except Exception as e2:
+                    logger.error("Telegram reply failed: %s", e2)
+
     # ── command handlers ──────────────────────────────────────────────
 
     async def _handle_command(self, update, context, cmd: str) -> None:
@@ -107,8 +133,7 @@ class TelegramChannel(BaseChannel):
         if result is None:
             await update.message.reply_text("Comando sconosciuto. Usa /help.")
             return
-        for chunk in split_preserving_code_blocks(result.text, TELEGRAM_MSG_LIMIT):
-            await update.message.reply_text(chunk)
+        await self._reply_rich(update.message, result.text)
 
     async def _handle_start(self, update, context) -> None:
         await update.message.reply_text(
@@ -157,8 +182,7 @@ class TelegramChannel(BaseChannel):
                 and not msg.audio and not msg.voice and not msg.video:
             result = await self._commands.dispatch(text, user_id)
             if result is not None:
-                for chunk in split_preserving_code_blocks(result.text, TELEGRAM_MSG_LIMIT):
-                    await msg.reply_text(chunk)
+                await self._reply_rich(msg, result.text)
                 return
             # Unknown slash command: CommandHandler already handles known
             # ones, fall through and ignore here.
@@ -311,8 +335,7 @@ class TelegramChannel(BaseChannel):
                 logger.error(f"Failed to send attachment {att.filename}: {e}")
 
         if clean_text:
-            for chunk in split_preserving_code_blocks(clean_text, TELEGRAM_MSG_LIMIT):
-                await msg.reply_text(chunk)
+            await self._reply_rich(msg, clean_text)
 
     # ── lifecycle ──────────────────────────────────────────────────────
 

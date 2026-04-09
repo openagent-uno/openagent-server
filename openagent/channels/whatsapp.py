@@ -33,6 +33,7 @@ from openagent.channels.base import (
     split_preserving_code_blocks,
 )
 from openagent.channels.commands import CommandDispatcher
+from openagent.channels.formatting import markdown_to_whatsapp
 from openagent.channels.queue import UserQueueManager
 
 if TYPE_CHECKING:
@@ -220,14 +221,18 @@ class WhatsAppChannel(BaseChannel):
     # ── sending helpers ───────────────────────────────────────────────
 
     async def _send_text(self, chat_id: str, text: str) -> None:
+        """Send text to the user, converting markdown to WhatsApp syntax."""
         if not text:
             return
         try:
+            # Split first in markdown form so code fences stay balanced, then
+            # convert each chunk to WhatsApp's single-marker syntax.
             for chunk in split_preserving_code_blocks(text, WHATSAPP_MSG_LIMIT):
+                rendered = markdown_to_whatsapp(chunk)
                 await asyncio.to_thread(
                     self._greenapi.sending.sendMessage,
                     chat_id,
-                    chunk,
+                    rendered,
                 )
         except Exception as e:
             logger.error(f"Failed to send WhatsApp text: {e}")
