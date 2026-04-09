@@ -8,6 +8,7 @@ from typing import Any, AsyncIterator, Callable, Awaitable
 from openagent.models.base import BaseModel, ModelResponse
 from openagent.memory.db import MemoryDB
 from openagent.mcp.client import MCPRegistry, MCPTools
+from openagent.prompts import FRAMEWORK_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -192,7 +193,9 @@ class Agent:
         """Inner run logic, wrapped by run() for crash protection."""
         await _status("Loading context...")
 
-        system = self.system_prompt
+        # Combine OpenAgent's framework-level guidelines with the user's
+        # project-specific system prompt from openagent.yaml.
+        system = self._combined_system_prompt()
 
         # Build messages
         if attachments:
@@ -244,6 +247,17 @@ class Agent:
 
         return response.content if response else "I wasn't able to complete the request."
 
+    def _combined_system_prompt(self) -> str:
+        """Prepend the framework-level prompt to the user's system prompt."""
+        user = (self.system_prompt or "").strip()
+        if not user:
+            return FRAMEWORK_SYSTEM_PROMPT
+        return (
+            FRAMEWORK_SYSTEM_PROMPT
+            + "\n\n── User-specific identity and project context ──\n\n"
+            + user
+        )
+
     async def stream_run(
         self,
         message: str,
@@ -256,7 +270,7 @@ class Agent:
 
         await self.initialize()
 
-        system = self.system_prompt
+        system = self._combined_system_prompt()
         messages: list[dict[str, Any]] = [{"role": "user", "content": message}]
 
         async for chunk in self.model.stream(messages, system=system):
