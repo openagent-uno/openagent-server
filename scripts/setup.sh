@@ -1,18 +1,26 @@
 #!/bin/bash
-# First-time setup for OpenAgent on a fresh VPS.
+# First-time bootstrap for OpenAgent on a fresh machine.
 #
-# Usage: ./scripts/setup.sh
+# This script only handles what `openagent setup` cannot do itself — create
+# the Python venv and install the package — and then delegates everything
+# else (Docker, OS service registration, image pulls, checks) to
+# `openagent setup --full`.
 #
-# Prerequisites: Python 3.11+, Node.js 20+, npm
+# Usage:
+#   ./scripts/setup.sh            # minimal: venv + pip install + doctor
+#   ./scripts/setup.sh --full     # also run `openagent setup --full`
+#
+# Prerequisites: Python 3.11+
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-
-echo "=== OpenAgent Setup ==="
+MODE="${1:-}"
 
 cd "$PROJECT_DIR"
+
+echo "=== OpenAgent bootstrap ==="
 
 # 1. Python venv
 if [ ! -d "venv" ]; then
@@ -20,46 +28,43 @@ if [ ! -d "venv" ]; then
     python3 -m venv venv
 fi
 
-echo "Installing Python dependencies..."
-venv/bin/pip install --upgrade pip setuptools wheel > /dev/null 2>&1
-venv/bin/pip install -e ".[all]" croniter > /dev/null 2>&1
-echo "Python deps installed."
+echo "Upgrading pip/setuptools/wheel..."
+venv/bin/pip install --quiet --upgrade pip setuptools wheel
 
-# 2. Build bundled MCPs
-for mcp_dir in mcps/*/; do
-    mcp_name=$(basename "$mcp_dir")
+echo "Installing openagent-framework..."
+if [ -f "pyproject.toml" ]; then
+    venv/bin/pip install --quiet -e ".[all]"
+else
+    venv/bin/pip install --quiet "openagent-framework[all]"
+fi
 
-    # Skip Python-based MCPs (no npm)
-    if [ -f "$mcp_dir/requirements.txt" ] && [ ! -f "$mcp_dir/package.json" ]; then
-        echo "Skipping Python MCP: $mcp_name"
-        continue
-    fi
-
-    if [ -f "$mcp_dir/package.json" ]; then
-        if [ ! -d "$mcp_dir/node_modules" ]; then
-            echo "Installing MCP: $mcp_name..."
-            (cd "$mcp_dir" && npm install > /dev/null 2>&1)
-        fi
-        if [ ! -d "$mcp_dir/dist" ] && grep -q '"build"' "$mcp_dir/package.json"; then
-            echo "Building MCP: $mcp_name..."
-            (cd "$mcp_dir" && npm run build > /dev/null 2>&1)
-        fi
-        echo "MCP ready: $mcp_name"
-    fi
-done
-
-# 3. Create memories dir
+# 2. Memories dir
 mkdir -p memories
 
-# 4. Config check
+# 3. Config check
 if [ ! -f "openagent.yaml" ]; then
     echo ""
-    echo "WARNING: No openagent.yaml found."
-    echo "Copy the example and edit it:"
-    echo "  cp openagent.yaml.example openagent.yaml"
-    echo "  nano openagent.yaml"
+    echo "WARNING: no openagent.yaml found."
+    echo "Create one before running 'openagent serve'."
 fi
 
 echo ""
-echo "=== Setup complete ==="
-echo "Start with: ./scripts/start.sh"
+echo "=== Running openagent doctor ==="
+venv/bin/openagent doctor || true
+
+# 4. Optional: full platform setup (Docker, OS service, image pulls)
+if [ "$MODE" = "--full" ] || [ "$MODE" = "full" ]; then
+    echo ""
+    echo "=== Running openagent setup --full ==="
+    venv/bin/openagent setup --full || {
+        echo "openagent setup --full reported errors — see above."
+    }
+fi
+
+echo ""
+echo "=== Bootstrap complete ==="
+echo ""
+echo "Next steps:"
+echo "  openagent doctor            # verify environment"
+echo "  openagent setup --full      # install Docker + OS service + pull images"
+echo "  ./scripts/start.sh          # start OpenAgent in a screen session"
