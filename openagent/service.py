@@ -152,6 +152,8 @@ def _linux_install() -> str:
         Description={SERVICE_LABEL} - AI agent service
         After=network-online.target
         Wants=network-online.target
+        StartLimitIntervalSec=60
+        StartLimitBurst=5
 
         [Service]
         Type=simple
@@ -159,8 +161,7 @@ def _linux_install() -> str:
         WorkingDirectory={_get_working_dir()}
         Restart=always
         RestartSec=5
-        StartLimitIntervalSec=60
-        StartLimitBurst=5
+        SuccessExitStatus=75
 
         # Environment
         Environment=PATH={_get_env_path()}
