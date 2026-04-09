@@ -197,10 +197,29 @@ class Agent:
         # project-specific system prompt from openagent.yaml.
         system = self._combined_system_prompt()
 
-        # Build messages
+        # Build messages. For each attachment we include the LOCAL PATH
+        # in the prompt so the agent can actually read the file — Claude
+        # Code's Read tool handles images natively, and MCP tools like
+        # filesystem/editor can open text files. Without the path, the
+        # agent would see only "[Attached image: photo.jpg]" and spin
+        # trying to locate the file.
         if attachments:
-            att_desc = " ".join(f"[Attached {a.get('type','file')}: {a.get('filename','')}]" for a in attachments)
-            message = f"{att_desc}\n{message}" if message else att_desc
+            lines = ["The user attached the following files:"]
+            for a in attachments:
+                a_type = a.get("type", "file")
+                a_name = a.get("filename", "")
+                a_path = a.get("path", "")
+                if a_path:
+                    lines.append(f"- {a_type}: {a_name} — local path: {a_path}")
+                else:
+                    lines.append(f"- {a_type}: {a_name}")
+            lines.append(
+                "Use the Read tool (or an MCP tool) with the local path to "
+                "inspect each file. For images, Read returns the image "
+                "content for you to see directly."
+            )
+            att_block = "\n".join(lines)
+            message = f"{att_block}\n\n{message}" if message else att_block
 
         messages: list[dict[str, Any]] = [{"role": "user", "content": message}]
 

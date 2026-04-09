@@ -40,6 +40,7 @@ from openagent.channels.base import (
 )
 from openagent.channels.commands import CommandDispatcher
 from openagent.channels.queue import UserQueueManager
+from openagent.channels.voice import transcribe as transcribe_voice
 
 if TYPE_CHECKING:
     from openagent.agent import Agent
@@ -47,6 +48,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DISCORD_MSG_LIMIT = 2000
+
+VOICE_FALLBACK_MSG = (
+    "[The user sent a voice/audio file but transcription is currently "
+    "unavailable on this deployment. Politely ask them to send it as "
+    "text instead — don't claim you can't understand audio in general, "
+    "just explain that voice transcription isn't configured.]"
+)
 
 
 class DiscordChannel(BaseChannel):
@@ -204,14 +212,31 @@ class DiscordChannel(BaseChannel):
                     path = str(Path(tmp_dir) / att.filename)
                     await att.save(path)
                     ct = att.content_type or ""
+                    is_voice = ct.startswith("audio/") or att.filename.lower().endswith(
+                        (".ogg", ".mp3", ".wav", ".m4a", ".opus", ".flac")
+                    )
                     if ct.startswith("image/"):
                         att_type = "image"
-                    elif ct.startswith("audio/") or att.filename.endswith((".ogg", ".mp3", ".wav")):
+                    elif is_voice:
                         att_type = "voice"
                     elif ct.startswith("video/"):
                         att_type = "video"
                     else:
                         att_type = "file"
+
+                    if is_voice:
+                        # Try to transcribe in-line. On success the text is
+                        # merged into the prompt; on failure we inject the
+                        # fallback hint so the model doesn't claim to be
+                        # "text-only".
+                        transcription = await transcribe_voice(path)
+                        if transcription:
+                            content = f"{content}\n{transcription}" if content else transcription
+                            logger.info("Discord voice transcribed: %s...", transcription[:80])
+                            continue
+                        content = f"{content}\n{VOICE_FALLBACK_MSG}" if content else VOICE_FALLBACK_MSG
+                        continue
+
                     attachments.append({"type": att_type, "path": path, "filename": att.filename})
                 except Exception as e:  # noqa: BLE001
                     logger.error("Failed to download Discord attachment: %s", e)

@@ -35,6 +35,7 @@ from openagent.channels.base import (
 from openagent.channels.commands import CommandDispatcher
 from openagent.channels.formatting import markdown_to_whatsapp
 from openagent.channels.queue import UserQueueManager
+from openagent.channels.voice import transcribe as transcribe_voice
 
 if TYPE_CHECKING:
     from openagent.agent import Agent
@@ -42,6 +43,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 WHATSAPP_MSG_LIMIT = 4000
+
+VOICE_FALLBACK_MSG = (
+    "[The user sent a voice/audio message but transcription is currently "
+    "unavailable on this deployment. Politely ask them to send it as "
+    "text instead — don't claim you can't understand audio in general, "
+    "just explain that voice transcription isn't configured.]"
+)
 
 
 class WhatsAppChannel(BaseChannel):
@@ -157,7 +165,12 @@ class WhatsAppChannel(BaseChannel):
             if download_url:
                 path = await self._download_file(download_url, "voice.ogg")
                 if path:
-                    attachments.append({"type": "voice", "path": path, "filename": "voice.ogg"})
+                    transcription = await transcribe_voice(path)
+                    if transcription:
+                        text = transcription if not text else f"{text}\n{transcription}"
+                        logger.info("WhatsApp voice transcribed: %s...", transcription[:80])
+                    else:
+                        text = VOICE_FALLBACK_MSG if not text else f"{text}\n{VOICE_FALLBACK_MSG}"
         elif msg_type == "videoMessage":
             file_data = message_data.get("fileMessageData", {})
             text = file_data.get("caption", "")

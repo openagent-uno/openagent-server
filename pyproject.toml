@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openagent-framework"
-version = "0.2.9"
+version = "0.2.10"
 description = "Simplified LLM agent framework with MCP, memory, and multi-channel support"
 readme = "docs/README.md"
 requires-python = ">=3.11"
@@ -26,10 +26,16 @@ dependencies = [
 telegram = ["python-telegram-bot>=21.0"]
 discord = ["discord.py>=2.3.0"]
 whatsapp = ["whatsapp-api-client-python>=0.0.46"]
+# Local voice transcription via faster-whisper (CTranslate2). Runs offline
+# on CPU, no API key needed. First call downloads the model (~150 MB for
+# the default 'base'). Set OPENAGENT_WHISPER_MODEL to pick a different
+# size (tiny, base, small, medium, large-v3).
+voice = ["faster-whisper>=1.0.0"]
 all = [
     "python-telegram-bot>=21.0",
     "discord.py>=2.3.0",
     "whatsapp-api-client-python>=0.0.46",
+    "faster-whisper>=1.0.0",
 ]
 
 [project.scripts]
