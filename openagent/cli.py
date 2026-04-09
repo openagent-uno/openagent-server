@@ -331,41 +331,152 @@ def services_cmd(ctx, action: str):
     asyncio.run(_run())
 
 
+# ── Doctor: environment checks ──
+
+_STATUS_STYLE = {
+    "ok":   "[green]✓[/green]",
+    "warn": "[yellow]![/yellow]",
+    "fail": "[red]✗[/red]",
+    "skip": "[dim]·[/dim]",
+}
+
+
+def _print_report(report) -> None:
+    from rich.table import Table as _Table
+    tbl = _Table(show_header=True, header_style="bold")
+    tbl.add_column("", width=2)
+    tbl.add_column("Check", style="cyan")
+    tbl.add_column("Status")
+    tbl.add_column("Fix", style="dim")
+    for c in report.checks:
+        icon = _STATUS_STYLE.get(c.status, "?")
+        tbl.add_row(icon, c.name, c.message, c.fix_hint or "")
+    console.print(tbl)
+
+
+@main.command("doctor")
+@click.pass_context
+def doctor_cmd(ctx):
+    """Check the environment: Python, Docker, config, enabled services."""
+    from pathlib import Path
+    from openagent.bootstrap import run_doctor, current_platform
+
+    config = ctx.obj["config"]
+    config_path = Path(ctx.obj["config_path"]).expanduser()
+
+    console.print(f"[bold]Platform:[/bold] {current_platform()}")
+    console.print()
+
+    report = run_doctor(config, config_path)
+    _print_report(report)
+
+    console.print()
+    if report.has_failures:
+        console.print("[red]Some checks failed.[/red] Fix the issues above and re-run `openagent doctor`.")
+        raise SystemExit(1)
+    if report.has_warnings:
+        console.print("[yellow]All critical checks passed, with warnings.[/yellow]")
+    else:
+        console.print("[green]All checks passed. You're good to go.[/green]")
+
+
 # ── Service management (OS-level systemd/launchd) ──
 
 @main.command("setup")
+@click.option("--with-docker", is_flag=True,
+              help="Install Docker (Linux: via apt/dnf/pacman; Mac/Win: via brew/winget).")
+@click.option("--pull-images", is_flag=True,
+              help="Pre-pull Docker images for every enabled aux service.")
+@click.option("--full", is_flag=True,
+              help="Everything: doctor, install Docker if missing, pull images, register OS service.")
+@click.option("--no-service", is_flag=True,
+              help="Skip OS service registration (systemd/launchd/Task Scheduler).")
 @click.pass_context
-def setup_cmd(ctx):
-    """Detect platform, install OpenAgent as a system service, and report status."""
-    import platform as _platform
+def setup_cmd(ctx, with_docker: bool, pull_images: bool, full: bool, no_service: bool):
+    """First-time setup: check environment, install deps, register OS service.
+
+    By default only registers OpenAgent as an OS service. Pass --full to also
+    install Docker (where automatable) and pre-pull images for the services
+    enabled in your config.
+    """
+    from pathlib import Path
+    from openagent.bootstrap import (
+        run_doctor, install_docker, pull_service_images,
+        check_docker, current_platform,
+    )
     from openagent.service import setup_service
 
-    console.print(f"[bold]Detected platform:[/bold] {_platform.system()}")
-    console.print("Installing OpenAgent as a system service...")
+    config = ctx.obj["config"]
+    config_path = Path(ctx.obj["config_path"]).expanduser()
+
+    if full:
+        with_docker = True
+        pull_images = True
+
+    console.print(f"[bold]Platform:[/bold] {current_platform()}")
     console.print()
 
-    try:
-        info = setup_service()
-        console.print(f"[green]{info['message']}[/green]")
-        console.print(f"[dim]Service file:[/dim] {info['service_file']}")
+    # 1. Doctor pass 1
+    console.print("[bold]Step 1 — environment check[/bold]")
+    report = run_doctor(config, config_path)
+    _print_report(report)
+    console.print()
+
+    # 2. Install Docker if requested and missing
+    if with_docker:
+        console.print("[bold]Step 2 — Docker[/bold]")
+        docker_chk = check_docker()
+        if docker_chk.status == "ok":
+            console.print(f"[green]Docker already OK:[/green] {docker_chk.message}")
+        else:
+            try:
+                msg = install_docker()
+                console.print(f"[green]{msg}[/green]")
+            except Exception as e:
+                console.print(f"[red]Docker install failed:[/red] {e}")
         console.print()
-        console.print("[bold]Service status:[/bold]")
-        console.print(info["status"])
+
+    # 3. Pull images for enabled services
+    if pull_images:
+        console.print("[bold]Step 3 — pulling service images[/bold]")
+        results = asyncio.run(pull_service_images(config))
+        if not results:
+            console.print("[dim]No services with pullable images are enabled.[/dim]")
+        else:
+            for name, ok, msg in results:
+                icon = "[green]✓[/green]" if ok else "[red]✗[/red]"
+                console.print(f"  {icon} {name}: {msg}")
         console.print()
-        console.print(
-            "[green]OpenAgent will now auto-start on boot "
-            "and restart on crash.[/green]"
-        )
-    except Exception as e:
-        console.print(f"[red]Setup failed: {e}[/red]")
+
+    # 4. Register OS service
+    if not no_service:
+        console.print("[bold]Step 4 — register OS service[/bold]")
+        try:
+            info = setup_service()
+            console.print(f"[green]{info['message']}[/green]")
+            console.print(f"[dim]Service file:[/dim] {info['service_file']}")
+        except Exception as e:
+            console.print(f"[red]Service registration failed:[/red] {e}")
+            raise SystemExit(1)
+        console.print()
+
+    # 5. Final re-check
+    console.print("[bold]Final check[/bold]")
+    final = run_doctor(config, config_path)
+    _print_report(final)
+    console.print()
+
+    if final.has_failures:
+        console.print("[red]Setup finished with failures.[/red] See above.")
         raise SystemExit(1)
+    console.print("[green]Setup complete.[/green]")
 
 
 @main.command("install")
 @click.pass_context
 def install_cmd(ctx):
-    """Alias for openagent setup."""
-    ctx.invoke(setup_cmd)
+    """Alias for `openagent setup --full`."""
+    ctx.invoke(setup_cmd, with_docker=True, pull_images=True, full=True, no_service=False)
 
 
 @main.command("uninstall")
