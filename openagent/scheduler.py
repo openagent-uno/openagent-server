@@ -69,24 +69,29 @@ class Scheduler:
                 logger.error(f"Scheduler error: {e}")
             await asyncio.sleep(CHECK_INTERVAL)
 
+    async def run_task(self, task: dict) -> None:
+        """Execute a single task. Extension point: override or monkey-patch
+        this to intercept specific tasks (e.g. auto-update, which uses a
+        direct pip subprocess instead of going through the agent)."""
+        task_name = task["name"]
+        try:
+            response = await self.agent.run(
+                message=task["prompt"],
+                user_id="scheduler",
+                session_id=f"scheduler:{task['id']}",
+            )
+            logger.info(f"Task '{task_name}' completed: {response[:100]}...")
+        except Exception as e:
+            logger.error(f"Task '{task_name}' failed: {e}")
+
     async def _check_and_run(self) -> None:
         """Check for due tasks and execute them."""
         now = time.time()
         due_tasks = await self.db.get_due_tasks(now)
 
         for task in due_tasks:
-            task_name = task["name"]
-            logger.info(f"Running scheduled task: {task_name}")
-
-            try:
-                response = await self.agent.run(
-                    message=task["prompt"],
-                    user_id="scheduler",
-                    session_id=f"scheduler:{task['id']}",
-                )
-                logger.info(f"Task '{task_name}' completed: {response[:100]}...")
-            except Exception as e:
-                logger.error(f"Task '{task_name}' failed: {e}")
+            logger.info(f"Running scheduled task: {task['name']}")
+            await self.run_task(task)
 
             # Update last_run and compute next_run
             try:
@@ -98,7 +103,7 @@ class Scheduler:
                     next_run=next_run,
                 )
             except (ValueError, KeyError) as e:
-                logger.error(f"Failed to update next_run for '{task_name}': {e}")
+                logger.error(f"Failed to update next_run for '{task['name']}': {e}")
 
     # ── Task management helpers ──
 
