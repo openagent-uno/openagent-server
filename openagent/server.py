@@ -33,28 +33,48 @@ AUTO_UPDATE_TASK_NAME = "auto-update"
 
 DREAM_MODE_PROMPT = """\
 You are running in Dream Mode — a nightly maintenance routine.
-Perform the following tasks and log a summary of each:
+Perform these tasks and write a concise audit log at the end.
 
-1. **Clean temp files**: List and remove files in /tmp that are older than 24 hours.
-   Use `find /tmp -maxdepth 1 -type f -mtime +1 -delete` (or equivalent).
-   Report how many files were removed and how much space was freed.
+1. **Clean temp files**: List and remove files in /tmp older than 24 hours.
+   Use `find /tmp -maxdepth 1 -type f -mtime +1 -delete` (or the OS
+   equivalent). Report how many files were removed and how much space
+   was freed.
 
-2. **Consolidate memory files**: Review all .md files in the knowledge/memories directory.
-   - Identify and merge duplicate entries that cover the same topic.
-   - Update any outdated information you can verify.
-   - Remove empty or trivially short files (< 10 words) that add no value.
-   Report what was merged, updated, or removed.
+2. **Curate the memory vault (via the mcpvault MCP — do NOT cat/grep
+   the .md files)**:
+   - Use `list_notes` and `search_notes` to survey the vault.
+   - Identify notes that cover the same topic and **merge duplicates**
+     into a single canonical note with `write_note` or `patch_note`,
+     then `delete_note` the redundant ones.
+   - Update any outdated information you can verify from the
+     environment (tool versions, paths, hosts that no longer exist,
+     etc.).
+   - Remove trivially short or empty notes (< 20 words) that add no
+     value.
+   - **Cross-link related notes with `[[wikilinks]]`**. For every note
+     you touch, search the vault for related topics and add backlinks
+     where the relationship is meaningful. If a group of notes shares a
+     theme, make sure each one links to the others. Prefer
+     `patch_note` to add links in place rather than rewriting whole
+     notes.
+   - Update frontmatter `tags:` so related notes share consistent
+     tags and surface together in future searches.
+   Report what was merged, updated, cross-linked, or removed.
 
-3. **System health check**: Check and report:
-   - Disk usage (df -h) — warn if any partition is above 85%.
-   - Memory usage (free -m or vm_stat on macOS).
+3. **System health check**:
+   - Disk usage (`df -h`) — warn if any partition is above 85%.
+   - Memory usage (`free -m` on Linux, `vm_stat` on macOS).
    - Top 5 processes by CPU usage.
    Report any anomalies or concerns.
 
-4. **Log results**: Write a concise summary of everything done to a memory file
-   named `dream-log-{date}.md` so there is an audit trail.
+4. **Log results**: Use `write_note` to save a concise summary under
+   `dream-logs/dream-log-YYYY-MM-DD.md` with frontmatter `type: dream-log`
+   and `date:` set to today, so there is an audit trail linkable from
+   other notes.
 
-Be thorough but non-destructive. When in doubt, skip rather than delete.
+Be thorough but non-destructive. When in doubt, skip rather than
+delete, and always use mcpvault tools instead of raw filesystem access
+for anything under the memory vault.
 """
 
 
