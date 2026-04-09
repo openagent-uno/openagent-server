@@ -63,6 +63,14 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
         "build": ["npm", "run", "build"],
         "install": ["npm", "install"],
     },
+    # Python MCP: inspect/create/update/delete OpenAgent's own scheduled
+    # tasks from inside the agent loop. Shares the same SQLite DB as
+    # openagent.scheduler.Scheduler via the OPENAGENT_DB_PATH env var.
+    "scheduler": {
+        "dir": "scheduler",
+        "command": ["python", "-m", "openagent.mcps.scheduler.server"],
+        "python": True,
+    },
 }
 
 # ── Default MCPs (always injected unless disabled) ──
@@ -114,6 +122,13 @@ DEFAULT_MCPS: list[dict[str, Any]] = [
     # Auto-detects available tokens from channel config env vars
     {
         "builtin": "messaging",
+        "_default": True,
+    },
+    # Bundled MCP: read/create/update/delete the agent's own scheduled tasks.
+    # The OPENAGENT_DB_PATH env var is injected at runtime so the MCP points
+    # at the exact same SQLite file as openagent.scheduler.Scheduler.
+    {
+        "builtin": "scheduler",
         "_default": True,
     },
 ]
@@ -178,6 +193,19 @@ def _resolve_builtin(name: str, env: dict[str, str] | None = None) -> MCPTools:
     # Merge env from spec + caller
     merged_env = {**(spec.get("env") or {}), **(env or {})}
 
+    # Python MCPs invoked via `python -m openagent.mcps.<name>.server`
+    # need to find the `openagent` package on sys.path. When OpenAgent is
+    # pip-installed it already is, but when running from a source checkout
+    # the subprocess's cwd (the mcp dir) doesn't contain it. Prepend the
+    # package parent dir to PYTHONPATH so both cases work.
+    if is_python:
+        import os as _os
+        package_parent = str(BUILTIN_MCPS_DIR.parent.parent)
+        existing_pp = merged_env.get("PYTHONPATH") or _os.environ.get("PYTHONPATH", "")
+        merged_env["PYTHONPATH"] = (
+            package_parent + (_os.pathsep + existing_pp if existing_pp else "")
+        )
+
     return MCPTools(
         name=name,
         command=full_command,
@@ -186,7 +214,10 @@ def _resolve_builtin(name: str, env: dict[str, str] | None = None) -> MCPTools:
     )
 
 
-def _resolve_default_entry(entry: dict[str, Any]) -> MCPTools | None:
+def _resolve_default_entry(
+    entry: dict[str, Any],
+    db_path: str | None = None,
+) -> MCPTools | None:
     """Try to resolve a default MCP entry. Returns None if prerequisites are missing."""
     name = entry.get("name") or entry.get("builtin", "")
 
@@ -196,8 +227,16 @@ def _resolve_default_entry(entry: dict[str, Any]) -> MCPTools | None:
         if not is_python and not _check_command_exists("node"):
             logger.warning(f"Skipping default MCP '{name}': Node.js not found")
             return None
+
+        # Per-builtin runtime env injection: the scheduler MCP needs to
+        # point at the same SQLite file as the in-process Scheduler.
+        extra_env: dict[str, str] = dict(entry.get("env") or {})
+        if entry["builtin"] == "scheduler" and db_path:
+            import os as _os
+            extra_env["OPENAGENT_DB_PATH"] = _os.path.abspath(db_path)
+
         try:
-            return _resolve_builtin(entry["builtin"], env=entry.get("env"))
+            return _resolve_builtin(entry["builtin"], env=extra_env or None)
         except Exception as e:
             logger.warning(f"Skipping default MCP '{name}': {e}")
             return None
@@ -432,6 +471,7 @@ class MCPRegistry:
         mcp_config: list[dict] | None = None,
         include_defaults: bool = True,
         disable: list[str] | None = None,
+        db_path: str | None = None,
     ) -> MCPRegistry:
         """Build registry: defaults first, then user MCPs merged on top.
 
@@ -439,6 +479,9 @@ class MCPRegistry:
             mcp_config: User-configured MCP entries from openagent.yaml
             include_defaults: Whether to include default MCPs (filesystem, fetch, shell, computer-control)
             disable: List of default MCP names to skip (e.g. ["computer-control", "fetch"])
+            db_path: Path to the OpenAgent SQLite DB. Forwarded to the
+                scheduler MCP so it reads and writes the same scheduled_tasks
+                table as the in-process Scheduler.
         """
         registry = cls()
         disabled = set(disable or [])
@@ -461,7 +504,7 @@ class MCPRegistry:
                     logger.info(f"Default MCP '{name}' overridden by user config")
                     continue
 
-                server = _resolve_default_entry(default_entry)
+                server = _resolve_default_entry(default_entry, db_path=db_path)
                 if server:
                     registry.add(server)
 

@@ -102,15 +102,17 @@ def _build_agent(config: dict) -> Agent:
     mcp_config = config.get("mcp", [])
     include_defaults = config.get("mcp_defaults", True)
     mcp_disable = config.get("mcp_disable", [])
-    mcp_registry = MCPRegistry.from_config(
-        mcp_config=mcp_config,
-        include_defaults=include_defaults,
-        disable=mcp_disable,
-    )
 
     memory_cfg = config.get("memory", {})
     db_path = memory_cfg.get("db_path", "openagent.db")
     db = MemoryDB(db_path)
+
+    mcp_registry = MCPRegistry.from_config(
+        mcp_config=mcp_config,
+        include_defaults=include_defaults,
+        disable=mcp_disable,
+        db_path=db_path,
+    )
 
     return Agent(
         name=config.get("name", "openagent"),

@@ -132,6 +132,15 @@ class Agent:
                         if val:
                             env[var] = val
 
+                # The scheduler MCP needs to point at the same SQLite file
+                # as the in-process Scheduler. _resolve_default_entry already
+                # sets this when MCPRegistry was built with db_path, but fall
+                # back to the agent's own DB path here so alternative wiring
+                # paths (e.g. direct MCPTools instantiation) still work.
+                if server.name == "scheduler" and "OPENAGENT_DB_PATH" not in env:
+                    if self._db and getattr(self._db, "db_path", None):
+                        env["OPENAGENT_DB_PATH"] = os.path.abspath(self._db.db_path)
+
                 if env:
                     entry["env"] = env
 

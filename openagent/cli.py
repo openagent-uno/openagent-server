@@ -288,7 +288,12 @@ def mcp_cmd(ctx, action: str):
         mcp_disable = config.get("mcp_disable", [])
 
         async def _list():
-            registry = MCPRegistry.from_config(mcp_config, include_defaults, mcp_disable)
+            registry = MCPRegistry.from_config(
+                mcp_config,
+                include_defaults,
+                mcp_disable,
+                db_path=config.get("memory", {}).get("db_path", "openagent.db"),
+            )
             await registry.connect_all()
             tools = registry.all_tools()
             console.print(f"\n[bold]MCP Servers:[/bold] {len(registry._servers)}")
