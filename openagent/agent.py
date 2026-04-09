@@ -153,6 +153,14 @@ class Agent:
 
     async def shutdown(self) -> None:
         """Close all connections."""
+        # Persistent models (e.g. Claude SDK client) need an explicit
+        # shutdown to flush their subprocess cleanly.
+        shutdown = getattr(self.model, "shutdown", None)
+        if callable(shutdown):
+            try:
+                await shutdown()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Model shutdown error: %s", e)
         await self._mcp.close_all()
         if self._db:
             await self._db.close()
