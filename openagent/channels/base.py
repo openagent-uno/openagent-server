@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import re
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from openagent.agent import Agent
+
+logger = logging.getLogger(__name__)
+
+# Retry cooldown between channel crashes
+CHANNEL_RETRY_SECONDS = 45
 
 
 @dataclass
@@ -70,20 +77,67 @@ def format_attachments_for_prompt(attachments: list[Attachment], caption: str = 
 class BaseChannel(ABC):
     """Abstract base for messaging channels (Telegram, Discord, WhatsApp, etc.).
 
-    Each channel manages per-user sessions via the agent's memory system.
+    Subclasses implement `_run()` (the actual listen loop) and `_shutdown()`
+    (cleanup). `start()` handles the supervised retry loop automatically:
+    on crash it waits CHANNEL_RETRY_SECONDS and restarts, until `stop()` is
+    called.
     """
+
+    name: str = "channel"  # override in subclass for logging
 
     def __init__(self, agent: Agent):
         self.agent = agent
+        self._should_stop = False
+        self._stop_event: asyncio.Event | None = None
+
+    async def start(self) -> None:
+        """Supervised start. Retries on crash until stop() is called."""
+        self._should_stop = False
+        self._stop_event = asyncio.Event()
+        while not self._should_stop:
+            try:
+                await self._run()
+                if self._should_stop:
+                    break
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                if self._should_stop:
+                    break
+                logger.error(
+                    f"{self.name} channel crashed: {e}, "
+                    f"restarting in {CHANNEL_RETRY_SECONDS}s..."
+                )
+                try:
+                    await asyncio.wait_for(
+                        self._stop_event.wait(),
+                        timeout=CHANNEL_RETRY_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    pass
+
+    async def stop(self) -> None:
+        """Request stop. Calls subclass shutdown then signals the retry loop."""
+        self._should_stop = True
+        try:
+            await self._shutdown()
+        except Exception as e:
+            logger.warning(f"{self.name} shutdown error: {e}")
+        if self._stop_event is not None:
+            self._stop_event.set()
 
     @abstractmethod
-    async def start(self) -> None:
-        """Start listening for messages."""
+    async def _run(self) -> None:
+        """Run the channel listener. Subclasses implement this.
+
+        Should block until the channel stops listening or an error occurs.
+        The base class handles retry on exceptions.
+        """
         ...
 
     @abstractmethod
-    async def stop(self) -> None:
-        """Stop the channel."""
+    async def _shutdown(self) -> None:
+        """Clean up channel resources (close client, stop polling, etc.)."""
         ...
 
     def _user_session_id(self, platform: str, user_id: str) -> str:

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import tempfile
 from pathlib import Path
@@ -23,23 +22,14 @@ class DiscordChannel(BaseChannel):
       "⏳ Thinking..." → "🔧 Using shell_exec..." → final response
     """
 
+    name = "discord"
+
     def __init__(self, agent: Agent, token: str):
         super().__init__(agent)
         self.token = token
         self._client = None
 
-    async def start(self) -> None:
-        self._should_stop = False
-        while not self._should_stop:
-            try:
-                await self._start_inner()
-            except Exception as e:
-                if self._should_stop:
-                    break
-                logger.error(f"Discord channel crashed: {e}, restarting in 45s...")
-                await asyncio.sleep(45)
-
-    async def _start_inner(self) -> None:
+    async def _run(self) -> None:
         try:
             import discord
         except ImportError:
@@ -153,7 +143,9 @@ class DiscordChannel(BaseChannel):
             for i in range(0, len(clean_text), 2000):
                 await channel.send(clean_text[i:i + 2000])
 
-    async def stop(self) -> None:
-        self._should_stop = True
+    async def _shutdown(self) -> None:
         if self._client:
-            await self._client.close()
+            try:
+                await self._client.close()
+            finally:
+                self._client = None

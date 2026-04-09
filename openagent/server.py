@@ -1,0 +1,483 @@
+"""AgentServer: unified lifecycle for agent + channels + scheduler + aux services.
+
+This is the single entry point used by `openagent serve`. It owns the
+lifecycle of every long-running piece so there is exactly one place that
+starts, supervises and shuts everything down.
+
+    server = AgentServer.from_config(config)
+    async with server:
+        await server.wait()   # blocks until Ctrl-C / SIGTERM
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import signal
+from typing import Awaitable, Callable
+
+from openagent.agent import Agent
+from openagent.config import build_model_from_config
+from openagent.mcp.client import MCPRegistry
+from openagent.memory.db import MemoryDB
+from openagent.services.manager import ServiceManager
+
+logger = logging.getLogger(__name__)
+
+# Exit code that signals the OS service manager to restart the process
+RESTART_EXIT_CODE = 75
+
+DREAM_MODE_TASK_NAME = "dream-mode"
+AUTO_UPDATE_TASK_NAME = "auto-update"
+
+DREAM_MODE_PROMPT = """\
+You are running in Dream Mode — a nightly maintenance routine.
+Perform the following tasks and log a summary of each:
+
+1. **Clean temp files**: List and remove files in /tmp that are older than 24 hours.
+   Use `find /tmp -maxdepth 1 -type f -mtime +1 -delete` (or equivalent).
+   Report how many files were removed and how much space was freed.
+
+2. **Consolidate memory files**: Review all .md files in the knowledge/memories directory.
+   - Identify and merge duplicate entries that cover the same topic.
+   - Update any outdated information you can verify.
+   - Remove empty or trivially short files (< 10 words) that add no value.
+   Report what was merged, updated, or removed.
+
+3. **System health check**: Check and report:
+   - Disk usage (df -h) — warn if any partition is above 85%.
+   - Memory usage (free -m or vm_stat on macOS).
+   - Top 5 processes by CPU usage.
+   Report any anomalies or concerns.
+
+4. **Log results**: Write a concise summary of everything done to a memory file
+   named `dream-log-{date}.md` so there is an audit trail.
+
+Be thorough but non-destructive. When in doubt, skip rather than delete.
+"""
+
+
+def _build_agent(config: dict) -> Agent:
+    """Build an Agent from a config dict (factored out of cli.py)."""
+    model = build_model_from_config(config)
+
+    # Export channel tokens as env vars so the messaging MCP can pick them up
+    channels_config = config.get("channels", {})
+    if "telegram" in channels_config:
+        token = channels_config["telegram"].get("token") or os.environ.get("TELEGRAM_BOT_TOKEN")
+        if token:
+            os.environ["TELEGRAM_BOT_TOKEN"] = token
+    if "discord" in channels_config:
+        token = channels_config["discord"].get("token") or os.environ.get("DISCORD_BOT_TOKEN")
+        if token:
+            os.environ["DISCORD_BOT_TOKEN"] = token
+    if "whatsapp" in channels_config:
+        wa = channels_config["whatsapp"]
+        if wa.get("green_api_id"):
+            os.environ["GREEN_API_ID"] = wa["green_api_id"]
+        if wa.get("green_api_token"):
+            os.environ["GREEN_API_TOKEN"] = wa["green_api_token"]
+
+    mcp_config = config.get("mcp", [])
+    include_defaults = config.get("mcp_defaults", True)
+    mcp_disable = config.get("mcp_disable", [])
+    mcp_registry = MCPRegistry.from_config(
+        mcp_config=mcp_config,
+        include_defaults=include_defaults,
+        disable=mcp_disable,
+    )
+
+    memory_cfg = config.get("memory", {})
+    db_path = memory_cfg.get("db_path", "openagent.db")
+    db = MemoryDB(db_path)
+
+    return Agent(
+        name=config.get("name", "openagent"),
+        model=model,
+        system_prompt=config.get("system_prompt", "You are a helpful assistant."),
+        mcp_registry=mcp_registry,
+        memory=db,
+    )
+
+
+def _build_channels(agent: Agent, config: dict, only: list[str] | None = None) -> list:
+    """Instantiate channels from config. `only` filters by name."""
+    channels_config = config.get("channels", {})
+    wanted = only or list(channels_config.keys())
+    out = []
+
+    for ch_name in wanted:
+        ch_config = channels_config.get(ch_name, {})
+
+        if ch_name == "telegram":
+            from openagent.channels.telegram import TelegramChannel
+            token = ch_config.get("token") or os.environ.get("TELEGRAM_BOT_TOKEN")
+            if not token:
+                logger.warning("Telegram token not configured; skipping")
+                continue
+            out.append(TelegramChannel(
+                agent=agent,
+                token=token,
+                allowed_users=ch_config.get("allowed_users"),
+            ))
+
+        elif ch_name == "discord":
+            from openagent.channels.discord import DiscordChannel
+            token = ch_config.get("token") or os.environ.get("DISCORD_BOT_TOKEN")
+            if not token:
+                logger.warning("Discord token not configured; skipping")
+                continue
+            out.append(DiscordChannel(agent=agent, token=token))
+
+        elif ch_name == "whatsapp":
+            from openagent.channels.whatsapp import WhatsAppChannel
+            instance_id = ch_config.get("green_api_id") or os.environ.get("GREEN_API_ID")
+            api_token = ch_config.get("green_api_token") or os.environ.get("GREEN_API_TOKEN")
+            if not instance_id or not api_token:
+                logger.warning("WhatsApp Green API credentials not configured; skipping")
+                continue
+            out.append(WhatsAppChannel(
+                agent=agent,
+                instance_id=instance_id,
+                api_token=api_token,
+            ))
+
+        else:
+            logger.warning(f"Unknown channel: {ch_name}")
+
+    return out
+
+
+def _build_aux_services(config: dict) -> ServiceManager:
+    """Build the ServiceManager from the `services:` section of the config."""
+    mgr = ServiceManager()
+    svc_config = config.get("services", {})
+
+    obs_cfg = svc_config.get("obsidian_web", {})
+    if obs_cfg.get("enabled"):
+        from openagent.services.obsidian import ObsidianWebService
+        memory_cfg = config.get("memory", {})
+        default_vault = memory_cfg.get("vault_path", "./memories")
+        password = obs_cfg.get("password") or os.environ.get("OBSIDIAN_PASSWORD", "")
+        mgr.add(ObsidianWebService(
+            vault_path=obs_cfg.get("vault_path", default_vault),
+            port=int(obs_cfg.get("port", 8200)),
+            username=obs_cfg.get("username", "admin"),
+            password=password,
+        ))
+
+    return mgr
+
+
+class AgentServer:
+    """Owns the lifecycle of agent + channels + scheduler + aux services.
+
+    Usage:
+        server = AgentServer.from_config(config)
+        async with server:
+            await server.wait()
+    """
+
+    def __init__(
+        self,
+        agent: Agent,
+        channels: list,
+        aux_services: ServiceManager,
+        config: dict,
+    ) -> None:
+        self.agent = agent
+        self.channels = channels
+        self.aux_services = aux_services
+        self.config = config
+
+        self._channel_tasks: list[asyncio.Task] = []
+        self._scheduler = None
+        self._stop_event: asyncio.Event | None = None
+
+    @classmethod
+    def from_config(cls, config: dict, only_channels: list[str] | None = None) -> AgentServer:
+        agent = _build_agent(config)
+        channels = _build_channels(agent, config, only=only_channels)
+        aux = _build_aux_services(config)
+        return cls(agent=agent, channels=channels, aux_services=aux, config=config)
+
+    # ── Lifecycle ──
+
+    async def start(self) -> None:
+        """Start aux services, agent, scheduler, and channels."""
+        self._stop_event = asyncio.Event()
+
+        # 1. Aux services first (they might be dependencies — e.g. Obsidian
+        #    web UI mounting the vault before the agent writes to it).
+        if len(self.aux_services) > 0:
+            await self.aux_services.start_all()
+
+        # 2. Agent (connects MCPs, opens DB)
+        await self.agent.initialize()
+
+        # 3. Scheduler (with dream mode + auto-update hooks)
+        await self._start_scheduler()
+
+        # 4. Channels (each runs in its own supervised task)
+        for ch in self.channels:
+            self._channel_tasks.append(asyncio.create_task(
+                ch.start(), name=f"channel:{ch.name}"
+            ))
+
+    async def stop(self) -> None:
+        """Stop channels, scheduler, agent, and aux services (in reverse)."""
+        # 1. Signal channels to stop
+        for ch in self.channels:
+            try:
+                await ch.stop()
+            except Exception as e:
+                logger.warning(f"Channel {ch.name} stop error: {e}")
+
+        # 2. Cancel channel supervisor tasks
+        for t in self._channel_tasks:
+            if not t.done():
+                t.cancel()
+        for t in self._channel_tasks:
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._channel_tasks.clear()
+
+        # 3. Scheduler
+        if self._scheduler is not None:
+            try:
+                await self._scheduler.stop()
+            except Exception as e:
+                logger.warning(f"Scheduler stop error: {e}")
+            self._scheduler = None
+
+        # 4. Agent
+        try:
+            await self.agent.shutdown()
+        except Exception as e:
+            logger.warning(f"Agent shutdown error: {e}")
+
+        # 5. Aux services last
+        if len(self.aux_services) > 0:
+            await self.aux_services.stop_all()
+
+        if self._stop_event is not None:
+            self._stop_event.set()
+
+    async def wait(self) -> None:
+        """Block until stop() is called or a termination signal arrives."""
+        assert self._stop_event is not None, "Call start() first"
+
+        loop = asyncio.get_running_loop()
+        stop_event = self._stop_event
+
+        def _signal_handler() -> None:
+            stop_event.set()
+
+        handled = []
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, _signal_handler)
+                handled.append(sig)
+            except (NotImplementedError, RuntimeError):
+                # Windows / non-main thread: fall back to KeyboardInterrupt
+                pass
+
+        try:
+            if self._channel_tasks:
+                done, pending = await asyncio.wait(
+                    [*self._channel_tasks, asyncio.create_task(stop_event.wait())],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for t in pending:
+                    t.cancel()
+            else:
+                await stop_event.wait()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            for sig in handled:
+                try:
+                    loop.remove_signal_handler(sig)
+                except Exception:
+                    pass
+
+    async def __aenter__(self) -> AgentServer:
+        await self.start()
+        return self
+
+    async def __aexit__(self, *_exc) -> None:
+        await self.stop()
+
+    # ── Scheduler setup (dream mode + auto-update) ──
+
+    async def _start_scheduler(self) -> None:
+        scheduler_cfg = self.config.get("scheduler", {})
+        if not scheduler_cfg.get("enabled", True):
+            return
+        if self.agent._db is None:
+            return
+
+        from openagent.scheduler import Scheduler
+        scheduler = Scheduler(self.agent._db, self.agent)
+
+        # User-defined cron tasks
+        for task_cfg in scheduler_cfg.get("tasks", []):
+            existing = await self.agent._db.get_tasks()
+            if not any(t["name"] == task_cfg["name"] for t in existing):
+                await scheduler.add_task(
+                    name=task_cfg["name"],
+                    cron_expression=task_cfg["cron"],
+                    prompt=task_cfg["prompt"],
+                )
+
+        await self._sync_dream_mode(scheduler)
+        await self._sync_auto_update(scheduler)
+
+        await scheduler.start()
+        self._scheduler = scheduler
+
+    async def _sync_dream_mode(self, scheduler) -> None:
+        dream_cfg = self.config.get("dream_mode", {})
+        enabled = dream_cfg.get("enabled", False)
+        tasks = await self.agent._db.get_tasks()
+        existing = next((t for t in tasks if t["name"] == DREAM_MODE_TASK_NAME), None)
+
+        if enabled:
+            cron_expr = dream_cfg.get("cron")
+            if not cron_expr:
+                time_str = str(dream_cfg.get("time", "3:00"))
+                parts = time_str.split(":")
+                hour = int(parts[0])
+                minute = int(parts[1]) if len(parts) > 1 else 0
+                cron_expr = f"{minute} {hour} * * *"
+
+            if existing is None:
+                await scheduler.add_task(
+                    name=DREAM_MODE_TASK_NAME,
+                    cron_expression=cron_expr,
+                    prompt=DREAM_MODE_PROMPT,
+                )
+            elif not existing["enabled"] or existing["cron_expression"] != cron_expr:
+                await scheduler.disable_task(existing["id"])
+                await scheduler.enable_task(existing["id"])
+                if existing["cron_expression"] != cron_expr:
+                    await self.agent._db.update_task(
+                        existing["id"], cron_expression=cron_expr
+                    )
+        elif existing is not None and existing["enabled"]:
+            await scheduler.disable_task(existing["id"])
+
+    async def _sync_auto_update(self, scheduler) -> None:
+        update_cfg = self.config.get("auto_update", {})
+        enabled = update_cfg.get("enabled", False)
+        mode = update_cfg.get("mode", "auto")
+        cron_expr = update_cfg.get("check_interval", "0 4 * * *")
+
+        tasks = await self.agent._db.get_tasks()
+        existing = next((t for t in tasks if t["name"] == AUTO_UPDATE_TASK_NAME), None)
+
+        prompt = (
+            "Run a pip upgrade check for openagent-framework. "
+            "Execute: pip install --upgrade openagent-framework. "
+            "Compare the version before and after. "
+            "If updated, log the new version."
+        )
+
+        if enabled:
+            if existing is None:
+                await scheduler.add_task(
+                    name=AUTO_UPDATE_TASK_NAME,
+                    cron_expression=cron_expr,
+                    prompt=prompt,
+                )
+            elif not existing["enabled"] or existing["cron_expression"] != cron_expr:
+                await scheduler.disable_task(existing["id"])
+                await scheduler.enable_task(existing["id"])
+                if existing["cron_expression"] != cron_expr:
+                    await self.agent._db.update_task(
+                        existing["id"], cron_expression=cron_expr
+                    )
+
+            # Override run_task so auto-update uses the direct pip logic
+            agent = self.agent
+            original_run = scheduler.run_task
+
+            async def _auto_update_run(task, _orig=original_run):
+                if task["name"] == AUTO_UPDATE_TASK_NAME:
+                    await _do_auto_update(agent, mode)
+                else:
+                    await _orig(task)
+
+            scheduler.run_task = _auto_update_run  # type: ignore[method-assign]
+
+        elif existing is not None and existing["enabled"]:
+            await scheduler.disable_task(existing["id"])
+
+
+# ── Auto-update helpers (used by AgentServer and the manual `update` command) ──
+
+PACKAGE_NAME = "openagent-framework"
+
+
+def get_installed_version() -> str:
+    try:
+        from importlib.metadata import version
+        return version(PACKAGE_NAME)
+    except Exception:
+        return "unknown"
+
+
+def run_pip_upgrade() -> tuple[str, str]:
+    """Run pip install --upgrade and return (old_version, new_version)."""
+    import subprocess
+    import sys
+
+    old = get_installed_version()
+    subprocess.check_call(
+        [sys.executable, "-m", "pip", "install", "--upgrade", PACKAGE_NAME],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    from importlib.metadata import version
+    try:
+        from importlib import invalidate_caches
+        invalidate_caches()
+    except Exception:
+        pass
+    new = version(PACKAGE_NAME)
+    return old, new
+
+
+async def _do_auto_update(agent: Agent, mode: str) -> None:
+    """Check for updates and act according to *mode* (auto/notify/manual)."""
+    try:
+        old_ver, new_ver = run_pip_upgrade()
+    except Exception as exc:
+        logger.error("Auto-update check failed: %s", exc)
+        return
+
+    if old_ver == new_ver:
+        logger.info("openagent-framework is up-to-date (%s)", old_ver)
+        return
+
+    logger.info("openagent-framework updated: %s -> %s", old_ver, new_ver)
+
+    if mode in ("notify", "auto"):
+        try:
+            msg = f"OpenAgent updated: {old_ver} -> {new_ver}"
+            tools = agent._mcp.all_tools()
+            has_messaging = any(t["name"].startswith("send_") for t in tools)
+            if has_messaging:
+                await agent.run(
+                    message=f"Send a notification: {msg}",
+                    user_id="system",
+                )
+        except Exception:
+            logger.debug("Could not send update notification via messaging MCP")
+
+    if mode == "auto":
+        logger.info("Restarting for update (exit code %d)...", RESTART_EXIT_CODE)
+        raise SystemExit(RESTART_EXIT_CODE)
