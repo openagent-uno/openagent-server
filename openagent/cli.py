@@ -384,25 +384,36 @@ def doctor_cmd(ctx):
 
 @main.command("setup")
 @click.option("--with-docker", is_flag=True,
-              help="Install Docker (Linux: via apt/dnf/pacman; Mac/Win: via brew/winget).")
-@click.option("--pull-images", is_flag=True,
-              help="Pre-pull Docker images for every enabled aux service.")
+              help="Install Docker (Linux: apt/dnf/pacman; Mac/Win: brew/winget).")
+@click.option("--with-syncthing", is_flag=True,
+              help="Install Syncthing and register the vault folder for sync.")
 @click.option("--full", is_flag=True,
-              help="Everything: doctor, install Docker if missing, pull images, register OS service.")
+              help="Everything: doctor, install Syncthing, register OS service.")
 @click.option("--no-service", is_flag=True,
               help="Skip OS service registration (systemd/launchd/Task Scheduler).")
 @click.pass_context
-def setup_cmd(ctx, with_docker: bool, pull_images: bool, full: bool, no_service: bool):
+def setup_cmd(
+    ctx,
+    with_docker: bool,
+    with_syncthing: bool,
+    full: bool,
+    no_service: bool,
+):
     """First-time setup: check environment, install deps, register OS service.
 
     By default only registers OpenAgent as an OS service. Pass --full to also
-    install Docker (where automatable) and pre-pull images for the services
-    enabled in your config.
+    install Syncthing (for the vault sync) and everything else needed.
     """
     from pathlib import Path
     from openagent.bootstrap import (
-        run_doctor, install_docker, pull_service_images,
-        check_docker, current_platform,
+        run_doctor, install_docker, install_syncthing,
+        configure_syncthing_folder,
+        check_docker, check_syncthing, current_platform,
+    )
+    from openagent.services.syncthing import (
+        DEFAULT_FOLDER_ID,
+        DEFAULT_FOLDER_LABEL,
+        DEFAULT_GUI_BIND,
     )
     from openagent.service import setup_service
 
@@ -410,8 +421,7 @@ def setup_cmd(ctx, with_docker: bool, pull_images: bool, full: bool, no_service:
     config_path = Path(ctx.obj["config_path"]).expanduser()
 
     if full:
-        with_docker = True
-        pull_images = True
+        with_syncthing = True
 
     console.print(f"[bold]Platform:[/bold] {current_platform()}")
     console.print()
@@ -422,7 +432,7 @@ def setup_cmd(ctx, with_docker: bool, pull_images: bool, full: bool, no_service:
     _print_report(report)
     console.print()
 
-    # 2. Install Docker if requested and missing
+    # 2. Docker (optional, only if asked)
     if with_docker:
         console.print("[bold]Step 2 — Docker[/bold]")
         docker_chk = check_docker()
@@ -436,19 +446,56 @@ def setup_cmd(ctx, with_docker: bool, pull_images: bool, full: bool, no_service:
                 console.print(f"[red]Docker install failed:[/red] {e}")
         console.print()
 
-    # 3. Pull images for enabled services
-    if pull_images:
-        console.print("[bold]Step 3 — pulling service images[/bold]")
-        results = asyncio.run(pull_service_images(config))
-        if not results:
-            console.print("[dim]No services with pullable images are enabled.[/dim]")
+    # 3. Syncthing
+    if with_syncthing:
+        console.print("[bold]Step 3 — Syncthing[/bold]")
+        chk = check_syncthing()
+        if chk.status == "ok":
+            console.print(f"[green]Already installed:[/green] {chk.message}")
         else:
-            for name, ok, msg in results:
-                icon = "[green]✓[/green]" if ok else "[red]✗[/red]"
-                console.print(f"  {icon} {name}: {msg}")
+            try:
+                msg = install_syncthing()
+                console.print(f"[green]{msg}[/green]")
+            except Exception as e:
+                console.print(f"[red]Syncthing install failed:[/red] {e}")
+                console.print()
+
+        # Configure the vault folder if the config asks for it
+        sync_cfg = (config.get("services") or {}).get("syncthing") or {}
+        if sync_cfg.get("enabled"):
+            mem_cfg = config.get("memory") or {}
+            vault = sync_cfg.get("vault_path") or mem_cfg.get("vault_path", "./memories")
+            folder_id = sync_cfg.get("folder_id", DEFAULT_FOLDER_ID)
+            folder_label = sync_cfg.get("folder_label", DEFAULT_FOLDER_LABEL)
+            gui_bind = sync_cfg.get("gui_bind", DEFAULT_GUI_BIND)
+
+            device_id, msg = asyncio.run(configure_syncthing_folder(
+                vault_path=vault,
+                folder_id=folder_id,
+                folder_label=folder_label,
+                gui_bind=gui_bind,
+            ))
+            if device_id:
+                console.print(f"[green]Syncthing ready:[/green] {msg}")
+                console.print()
+                console.print(Panel(
+                    f"[bold]Device ID (paste into your Mac/other machine):[/bold]\n\n"
+                    f"[cyan]{device_id}[/cyan]\n\n"
+                    f"[bold]Folder:[/bold] {folder_id} → {vault}\n"
+                    f"[bold]GUI (local only):[/bold] http://{gui_bind}\n\n"
+                    f"To pair a remote machine:\n"
+                    f"  1. Install Syncthing on the other machine.\n"
+                    f"  2. Open its GUI (http://127.0.0.1:8384 by default).\n"
+                    f"  3. Click [cyan]Add Remote Device[/cyan] and paste the ID above.\n"
+                    f"  4. Accept the folder share prompt that will appear here.",
+                    border_style="cyan",
+                    title="Syncthing pairing",
+                ))
+            else:
+                console.print(f"[yellow]Syncthing folder not ready yet:[/yellow] {msg}")
         console.print()
 
-    # 4. Register OS service
+    # 4. OS service
     if not no_service:
         console.print("[bold]Step 4 — register OS service[/bold]")
         try:
@@ -476,7 +523,13 @@ def setup_cmd(ctx, with_docker: bool, pull_images: bool, full: bool, no_service:
 @click.pass_context
 def install_cmd(ctx):
     """Alias for `openagent setup --full`."""
-    ctx.invoke(setup_cmd, with_docker=True, pull_images=True, full=True, no_service=False)
+    ctx.invoke(
+        setup_cmd,
+        with_docker=False,
+        with_syncthing=True,
+        full=True,
+        no_service=False,
+    )
 
 
 @main.command("uninstall")

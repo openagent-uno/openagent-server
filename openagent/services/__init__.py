@@ -1,7 +1,7 @@
-"""Auxiliary services for OpenAgent (Obsidian web UI, future: VNC, Caddy, etc.)."""
+"""Auxiliary services managed by AgentServer (Syncthing, future additions)."""
 
 from openagent.services.base import AuxService
 from openagent.services.manager import ServiceManager
-from openagent.services.obsidian import ObsidianWebService
+from openagent.services.syncthing import SyncthingService
 
-__all__ = ["AuxService", "ServiceManager", "ObsidianWebService"]
+__all__ = ["AuxService", "ServiceManager", "SyncthingService"]
