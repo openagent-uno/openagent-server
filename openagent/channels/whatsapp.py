@@ -1,4 +1,22 @@
-"""WhatsApp channel using Green API. Supports text, images, files, voice, live status."""
+"""WhatsApp channel via Green API.
+
+Features (cross-channel parity with Telegram/Discord where the API allows):
+
+- Optional user whitelist via ``allowed_users`` (phone numbers without
+  the ``@c.us`` suffix).
+- Per-user FIFO message queue with cancellation via ``/stop``.
+- Slash commands: ``/new /reset /stop /status /queue /help /usage`` parsed
+  from plain text (Green API has no native command menu, so commands are
+  text-driven only).
+- Code-block-aware message splitting.
+- Executable attachment blocking.
+
+WhatsApp/Green API limitations we can't work around:
+
+- No message editing → no live status updates (only an initial "Thinking"
+  acknowledgement).
+- No inline buttons → no stop button, users use ``/stop`` text command.
+"""
 
 from __future__ import annotations
 
@@ -8,27 +26,51 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from openagent.channels.base import BaseChannel, Attachment, parse_response_markers
+from openagent.channels.base import (
+    BaseChannel,
+    is_blocked_attachment,
+    parse_response_markers,
+    split_preserving_code_blocks,
+)
+from openagent.channels.commands import CommandDispatcher
+from openagent.channels.queue import UserQueueManager
 
 if TYPE_CHECKING:
     from openagent.agent import Agent
 
 logger = logging.getLogger(__name__)
 
+WHATSAPP_MSG_LIMIT = 4000
+
 
 class WhatsAppChannel(BaseChannel):
-    """WhatsApp channel via Green API with full media support and live status.
-
-    Sends an initial "⏳ Thinking..." message that updates as the agent works.
-    """
+    """WhatsApp channel via Green API with queue and slash commands."""
 
     name = "whatsapp"
 
-    def __init__(self, agent: Agent, instance_id: str, api_token: str):
+    def __init__(
+        self,
+        agent: Agent,
+        instance_id: str,
+        api_token: str,
+        allowed_users: list[str] | None = None,
+    ):
         super().__init__(agent)
         self.instance_id = instance_id
         self.api_token = api_token
+        self.allowed_users = {str(u) for u in allowed_users} if allowed_users else None
         self._greenapi = None
+        self._queue = UserQueueManager(platform="whatsapp", agent_name=agent.name)
+        self._commands = CommandDispatcher(agent, self._queue)
+
+    # ── authorization ──────────────────────────────────────────────────
+
+    def _is_authorized(self, user_id: str) -> bool:
+        if self.allowed_users is None:
+            return True
+        return user_id in self.allowed_users
+
+    # ── main loop ──────────────────────────────────────────────────────
 
     async def _run(self) -> None:
         try:
@@ -75,18 +117,20 @@ class WhatsAppChannel(BaseChannel):
         sender_data = body.get("senderData", {})
         chat_id = sender_data.get("chatId", "")
         user_id = chat_id.replace("@c.us", "").replace("@g.us", "")
-        session_id = self._user_session_id("whatsapp", user_id)
+
+        if not self._is_authorized(user_id):
+            # Silence — no "unauthorized" reply to avoid probing.
+            return
 
         text = ""
         attachments: list[dict] = []
+        blocked: list[str] = []
         msg_type = message_data.get("typeMessage", "")
 
         if msg_type == "textMessage":
-            text_data = message_data.get("textMessageData", {})
-            text = text_data.get("textMessage", "")
+            text = message_data.get("textMessageData", {}).get("textMessage", "")
         elif msg_type == "extendedTextMessage":
-            text_data = message_data.get("extendedTextMessageData", {})
-            text = text_data.get("text", "")
+            text = message_data.get("extendedTextMessageData", {}).get("text", "")
         elif msg_type == "imageMessage":
             file_data = message_data.get("fileMessageData", {})
             text = file_data.get("caption", "")
@@ -99,8 +143,10 @@ class WhatsAppChannel(BaseChannel):
             file_data = message_data.get("fileMessageData", {})
             text = file_data.get("caption", "")
             download_url = file_data.get("downloadUrl", "")
-            if download_url:
-                fname = file_data.get("fileName", "document")
+            fname = file_data.get("fileName", "document")
+            if is_blocked_attachment(fname):
+                blocked.append(fname)
+            elif download_url:
                 path = await self._download_file(download_url, fname)
                 if path:
                     attachments.append({"type": "file", "path": path, "filename": fname})
@@ -115,43 +161,76 @@ class WhatsAppChannel(BaseChannel):
             file_data = message_data.get("fileMessageData", {})
             text = file_data.get("caption", "")
             download_url = file_data.get("downloadUrl", "")
-            if download_url:
-                fname = file_data.get("fileName", "video.mp4")
+            fname = file_data.get("fileName", "video.mp4")
+            if is_blocked_attachment(fname):
+                blocked.append(fname)
+            elif download_url:
                 path = await self._download_file(download_url, fname)
                 if path:
                     attachments.append({"type": "video", "path": path, "filename": fname})
 
+        if blocked:
+            await self._send_text(chat_id, "⚠️ Attachment bloccati: " + ", ".join(blocked))
+
+        # Slash commands (only when the message is pure text — attachments
+        # with commands in captions would be a rare edge case).
+        if not attachments and CommandDispatcher.is_command(text):
+            result = await self._commands.dispatch(text, user_id)
+            if result is not None:
+                await self._send_text(chat_id, result.text)
+                return
+            await self._send_text(chat_id, "Comando sconosciuto. Usa /help.")
+            return
+
         if not text and not attachments:
             return
 
+        async def handler():
+            await self._process(chat_id, user_id, text, attachments)
+
+        position = await self._queue.enqueue(user_id, handler)
+        if position > 0:
+            await self._send_text(chat_id, f"🕒 In coda (posizione {position}).")
+
+    async def _process(self, chat_id: str, user_id: str, text: str, attachments: list[dict]) -> None:
         try:
-            # Send initial status message
-            status_result = await asyncio.to_thread(
-                self._greenapi.sending.sendMessage,
-                chat_id,
-                "⏳ Thinking...",
-            )
-            status_msg_id = None
-            if hasattr(status_result, 'data') and isinstance(status_result.data, dict):
-                status_msg_id = status_result.data.get("idMessage")
+            await self._send_text(chat_id, "⏳ Thinking...")
 
-            # Status callback (WhatsApp doesn't support editing messages easily,
-            # so we just log status changes — the initial message shows "Thinking")
+            # WhatsApp doesn't allow message editing via Green API — status
+            # updates are logged locally but not pushed to the user.
             async def on_status(status: str) -> None:
-                pass  # WhatsApp doesn't support message editing via Green API
+                logger.debug("WhatsApp status (%s): %s", user_id, status)
 
-            reply = await self.agent.run(
-                message=text,
-                user_id=user_id,
-                session_id=session_id,
-                attachments=attachments if attachments else None,
-                on_status=on_status,
-            )
+            try:
+                reply = await self.agent.run(
+                    message=text,
+                    user_id=user_id,
+                    session_id=self._queue.get_session_id(user_id),
+                    attachments=attachments if attachments else None,
+                    on_status=on_status,
+                )
+            except Exception as e:
+                logger.error(f"WhatsApp agent run failed: {e}")
+                reply = f"Error: {e}"
 
             await self._send_response(chat_id, reply)
-
         except Exception as e:
             logger.error(f"WhatsApp handler error: {e}")
+
+    # ── sending helpers ───────────────────────────────────────────────
+
+    async def _send_text(self, chat_id: str, text: str) -> None:
+        if not text:
+            return
+        try:
+            for chunk in split_preserving_code_blocks(text, WHATSAPP_MSG_LIMIT):
+                await asyncio.to_thread(
+                    self._greenapi.sending.sendMessage,
+                    chat_id,
+                    chunk,
+                )
+        except Exception as e:
+            logger.error(f"Failed to send WhatsApp text: {e}")
 
     async def _download_file(self, url: str, filename: str) -> str | None:
         try:
@@ -183,13 +262,11 @@ class WhatsAppChannel(BaseChannel):
                 logger.error(f"Failed to send WhatsApp attachment {att.filename}: {e}")
 
         if clean_text:
-            await asyncio.to_thread(
-                self._greenapi.sending.sendMessage,
-                chat_id,
-                clean_text,
-            )
+            await self._send_text(chat_id, clean_text)
 
     async def _shutdown(self) -> None:
-        # Green API is pure HTTP; nothing to close. The polling loop exits
-        # when `_should_stop` flips to True.
+        try:
+            await self._queue.shutdown()
+        except Exception:
+            pass
         self._greenapi = None

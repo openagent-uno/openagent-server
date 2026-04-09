@@ -148,7 +148,21 @@ def _build_channels(agent: Agent, config: dict, only: list[str] | None = None) -
             if not token:
                 logger.warning("Discord token not configured; skipping")
                 continue
-            out.append(DiscordChannel(agent=agent, token=token))
+            allowed_users = ch_config.get("allowed_users")
+            if not allowed_users:
+                logger.warning(
+                    "Discord channel has no 'allowed_users' — refusing to start. "
+                    "Add at least one Discord user ID to openagent.yaml."
+                )
+                continue
+            out.append(DiscordChannel(
+                agent=agent,
+                token=token,
+                allowed_users=allowed_users,
+                allowed_guilds=ch_config.get("allowed_guilds"),
+                listen_channels=ch_config.get("listen_channels"),
+                dm_only=bool(ch_config.get("dm_only", False)),
+            ))
 
         elif ch_name == "whatsapp":
             from openagent.channels.whatsapp import WhatsAppChannel
@@ -161,6 +175,7 @@ def _build_channels(agent: Agent, config: dict, only: list[str] | None = None) -
                 agent=agent,
                 instance_id=instance_id,
                 api_token=api_token,
+                allowed_users=ch_config.get("allowed_users"),
             ))
 
         else:

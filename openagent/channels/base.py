@@ -74,6 +74,86 @@ def format_attachments_for_prompt(attachments: list[Attachment], caption: str = 
     return prefix
 
 
+# File extensions we refuse to download from any channel for basic safety.
+# Shell scripts are NOT on this list — an agent is expected to deal with them
+# legitimately. This is about Windows executables and obviously malicious
+# droppers, not about blocking all code.
+BLOCKED_EXTENSIONS: frozenset[str] = frozenset({
+    ".exe", ".bat", ".cmd", ".com", ".msi", ".scr", ".pif",
+    ".vbs", ".vbe", ".jse", ".ws", ".wsf", ".wsh", ".ps1", ".hta",
+    ".cpl", ".lnk", ".reg", ".jar",
+})
+
+
+def is_blocked_attachment(filename: str | None) -> bool:
+    """Return True if the filename has a blocked extension (case-insensitive)."""
+    if not filename:
+        return False
+    return Path(filename).suffix.lower() in BLOCKED_EXTENSIONS
+
+
+def split_preserving_code_blocks(text: str, max_len: int) -> list[str]:
+    """Split *text* into chunks of ≤ ``max_len`` characters, preserving
+    fenced ``` code blocks so no chunk ends with a dangling fence.
+
+    Strategy:
+
+    1. Walk the text in windows of at most ``max_len`` chars, cutting on a
+       newline when possible.
+    2. For each chunk, count the unescaped ``` fences. If odd, close with a
+       trailing ``` and prepend ``` to the next chunk so the code style
+       carries over to the reader.
+
+    This loses the original language tag after a mid-block split — Discord
+    and Telegram render ``` (no lang) as a plain monospace block, which is
+    still the right thing for long output.
+    """
+    if max_len <= 0:
+        return [text] if text else []
+    if len(text) <= max_len:
+        return [text] if text.strip() else []
+
+    chunks: list[str] = []
+    carry_prefix = ""
+    i = 0
+    n = len(text)
+
+    while i < n:
+        budget = max_len - len(carry_prefix)
+        if budget <= 16:
+            # carry_prefix too large vs max_len; fall back to hard cut
+            budget = max(max_len // 2, 16)
+        end = min(i + budget, n)
+        if end < n:
+            # prefer newline cut, then space, else hard cut
+            nl = text.rfind("\n", i, end)
+            if nl > i + budget // 4:
+                end = nl
+            else:
+                sp = text.rfind(" ", i, end)
+                if sp > i + budget // 4:
+                    end = sp
+
+        body = text[i:end]
+        chunk = carry_prefix + body
+
+        fence_total = chunk.count("```")
+        if fence_total % 2 == 1:
+            chunk = chunk + "\n```"
+            carry_prefix = "```\n"
+        else:
+            carry_prefix = ""
+
+        if chunk.strip():
+            chunks.append(chunk)
+
+        i = end
+        while i < n and text[i] in ("\n", " "):
+            i += 1
+
+    return chunks
+
+
 class BaseChannel(ABC):
     """Abstract base for messaging channels (Telegram, Discord, WhatsApp, etc.).
 

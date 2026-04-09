@@ -1,3 +1,22 @@
-from openagent.channels.base import BaseChannel
+from openagent.channels.base import (
+    Attachment,
+    BLOCKED_EXTENSIONS,
+    BaseChannel,
+    is_blocked_attachment,
+    parse_response_markers,
+    split_preserving_code_blocks,
+)
+from openagent.channels.commands import CommandDispatcher, CommandResult
+from openagent.channels.queue import UserQueueManager
 
-__all__ = ["BaseChannel"]
+__all__ = [
+    "Attachment",
+    "BLOCKED_EXTENSIONS",
+    "BaseChannel",
+    "CommandDispatcher",
+    "CommandResult",
+    "UserQueueManager",
+    "is_blocked_attachment",
+    "parse_response_markers",
+    "split_preserving_code_blocks",
+]
