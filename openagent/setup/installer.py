@@ -24,19 +24,48 @@ SERVICE_LABEL = "OpenAgent"
 SYSTEMD_UNIT = "openagent.service"
 
 
+def _openagent_home() -> Path:
+    """Return ~/.openagent/ (or platform equivalent)."""
+    from openagent.core.paths import config_dir
+    return config_dir()
+
+
+def _ensure_venv() -> Path:
+    """Create a venv at ~/.openagent/venv/ if it doesn't exist, install
+    openagent-framework into it, and return the Python path inside it."""
+    venv_dir = _openagent_home() / "venv"
+    python = venv_dir / ("Scripts" / "python.exe" if platform.system() == "Windows" else "bin" / "python")
+
+    if not python.exists():
+        import venv as _venv
+        _venv.create(str(venv_dir), with_pip=True, system_site_packages=False)
+        # Install openagent-framework into the new venv
+        subprocess.run(
+            [str(python), "-m", "pip", "install", "--upgrade", "openagent-framework[all]"],
+            check=True, capture_output=True,
+        )
+
+    return python
+
+
 def _get_python() -> str:
-    """Get the absolute path to the current Python executable."""
-    return sys.executable
+    """Get the Python executable inside ~/.openagent/venv/."""
+    return str(_ensure_venv())
 
 
 def _get_openagent_cmd() -> list[str]:
     """Get the command to run ``openagent serve``."""
-    return [_get_python(), "-m", "openagent.cli", "serve"]
+    config_path = _openagent_home() / "openagent.yaml"
+    cmd = [_get_python(), "-m", "openagent.cli"]
+    if config_path.exists():
+        cmd.extend(["-c", str(config_path)])
+    cmd.append("serve")
+    return cmd
 
 
 def _get_working_dir() -> str:
-    """Get the working directory (where openagent.yaml lives)."""
-    return os.getcwd()
+    """Working directory = ~/.openagent/."""
+    return str(_openagent_home())
 
 
 def _get_log_dir() -> Path:
