@@ -2,8 +2,6 @@
   <img src="assets/openagent-logo.png" alt="OpenAgent" width="360" />
 </p>
 
-<h1 align="center">OpenAgent</h1>
-
 <p align="center">
   Persistent AI agent framework with MCP tools, long-term memory, and multi-channel support.
   <br />
