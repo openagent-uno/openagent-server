@@ -92,8 +92,9 @@ class WebSocketChannel(BaseChannel):
                     resp = await handler(request)
                 except web.HTTPException as ex:
                     resp = ex
-                except Exception:
-                    resp = web.Response(status=500, text="Internal Server Error")
+                except Exception as exc:
+                    logger.exception("REST handler error: %s", exc)
+                    resp = web.Response(status=500, text=str(exc))
             resp.headers["Access-Control-Allow-Origin"] = "*"
             resp.headers["Access-Control-Allow-Methods"] = "GET, PUT, DELETE, OPTIONS"
             resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
