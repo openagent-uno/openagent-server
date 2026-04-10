@@ -3,8 +3,8 @@ set -euo pipefail
 
 # ── OpenAgent Release ──
 # Bumps version in ALL projects, tags, pushes → GitHub Actions builds:
-#   - openagent-framework → PyPI
-#   - openagent-cli → PyPI
+#   - openagent-framework → PyPI + GitHub Release
+#   - openagent-cli → PyPI + GitHub Release
 #   - OpenAgent Desktop (macOS, Windows, Linux) → GitHub Release assets
 #
 # Usage:
@@ -74,8 +74,8 @@ echo ""
 echo "=== Released v$NEW ==="
 echo ""
 echo "GitHub Actions will now build & publish:"
-echo "  1. openagent-framework  → PyPI"
-echo "  2. openagent-cli        → PyPI"
+echo "  1. openagent-framework  → PyPI + GitHub Release"
+echo "  2. openagent-cli        → PyPI + GitHub Release"
 echo "  3. OpenAgent Desktop    → GitHub Release (macOS/Windows/Linux)"
 echo ""
 echo "Track: https://github.com/geroale/OpenAgent/actions"

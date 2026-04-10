@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "openagent-framework"
 version = "0.3.1"
 description = "Simplified LLM agent framework with MCP, memory, and multi-channel support"
-readme = "docs/README.md"
+readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 

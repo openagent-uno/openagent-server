@@ -7,7 +7,7 @@
 <p align="center">
   Persistent AI agent framework with MCP tools, long-term memory, and multi-channel support.
   <br />
-  One runtime for desktop, CLI, chat channels, scheduled tasks, and an Obsidian-compatible memory vault.
+  Model agnostic by design, with three independent apps: Agent Server, CLI Client, and Desktop App.
 </p>
 
 <p align="center">
@@ -28,7 +28,7 @@
 
 ## Overview
 
-OpenAgent turns an LLM into a persistent agent that can remember, act, and stay reachable across different client surfaces. The same runtime can power the Electron desktop app, CLI sessions, Telegram, Discord, WhatsApp, and scheduled background tasks while sharing the same MCP tools and memory model.
+OpenAgent turns an LLM into a persistent agent that can remember, act, and stay reachable across different client surfaces. It is model agnostic by design: Claude CLI/API, Z.ai GLM, Ollama, LM Studio, vLLM, and OpenAI-compatible providers all use the same MCP tools, memory model, channels, and clients.
 
 ## Why OpenAgent
 
@@ -37,6 +37,14 @@ OpenAgent turns an LLM into a persistent agent that can remember, act, and stay 
 - Obsidian-compatible markdown memory with wikilinks, frontmatter, and graph-friendly notes
 - Native service installation, cron scheduling, dream mode maintenance, and auto-update support
 - Shared desktop app built with Electron and React Native Web for chat, configuration, MCPs, and memory exploration
+
+## Three Independent Apps
+
+- **Agent Server**: the persistent runtime in `openagent/`, installed as `openagent-framework`
+- **CLI Client**: the terminal client, installed as `openagent-cli`
+- **Desktop App**: the Electron UI, distributed as platform-specific binaries
+
+Tagged GitHub releases are the shared download point for all three.
 
 ## Quick Start
 
