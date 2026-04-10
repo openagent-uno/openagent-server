@@ -25,7 +25,6 @@ from openagent.core.server import (
 
 console = Console()
 
-
 @click.group()
 @click.option("--config", "-c", default="openagent.yaml", help="Config file path")
 @click.option("--verbose", "-v", is_flag=True, help="Enable debug logging")
@@ -38,7 +37,6 @@ def main(ctx, config: str, verbose: bool):
 
     level = logging.DEBUG if verbose else logging.WARNING
     logging.basicConfig(level=level, format="%(name)s: %(message)s")
-
 
 @main.command()
 @click.option("--model", "-m", help="Override model provider (claude-api, claude-cli, zhipu)")
@@ -99,7 +97,6 @@ def chat(ctx, model: str | None, model_id: str | None, session: str | None):
 
     asyncio.run(_chat())
 
-
 @main.command()
 @click.option("--channel", "-ch", multiple=True, help="Channels to start (telegram, discord, whatsapp)")
 @click.pass_context
@@ -137,7 +134,6 @@ def serve(ctx, channel: tuple[str, ...]):
 
     asyncio.run(_serve())
 
-
 # ── Task management ──
 
 @main.group("task")
@@ -145,7 +141,6 @@ def serve(ctx, channel: tuple[str, ...]):
 def task_group(ctx):
     """Manage scheduled tasks."""
     pass
-
 
 @task_group.command("add")
 @click.option("--name", "-n", required=True, help="Task name")
@@ -170,7 +165,6 @@ def task_add(ctx, name: str, cron: str, prompt: str):
         await db.close()
 
     asyncio.run(_add())
-
 
 @task_group.command("list")
 @click.pass_context
@@ -208,7 +202,6 @@ def task_list(ctx):
 
     asyncio.run(_list())
 
-
 @task_group.command("remove")
 @click.argument("task_id")
 @click.pass_context
@@ -230,7 +223,6 @@ def task_remove(ctx, task_id: str):
         await db.close()
 
     asyncio.run(_remove())
-
 
 @task_group.command("enable")
 @click.argument("task_id")
@@ -254,7 +246,6 @@ def task_enable(ctx, task_id: str):
 
     asyncio.run(_enable())
 
-
 @task_group.command("disable")
 @click.argument("task_id")
 @click.pass_context
@@ -276,7 +267,6 @@ def task_disable(ctx, task_id: str):
         await db.close()
 
     asyncio.run(_disable())
-
 
 # ── MCP management ──
 
@@ -309,7 +299,6 @@ def mcp_cmd(ctx, action: str):
 
         asyncio.run(_list())
 
-
 # ── Aux services management ──
 
 @main.command("services")
@@ -340,7 +329,6 @@ def services_cmd(ctx, action: str):
 
     asyncio.run(_run())
 
-
 # ── Doctor: environment checks ──
 
 _STATUS_STYLE = {
@@ -349,7 +337,6 @@ _STATUS_STYLE = {
     "fail": "[red]✗[/red]",
     "skip": "[dim]·[/dim]",
 }
-
 
 def _print_report(report) -> None:
     from rich.table import Table as _Table
@@ -362,7 +349,6 @@ def _print_report(report) -> None:
         icon = _STATUS_STYLE.get(c.status, "?")
         tbl.add_row(icon, c.name, c.message, c.fix_hint or "")
     console.print(tbl)
-
 
 @main.command("doctor")
 @click.pass_context
@@ -389,49 +375,36 @@ def doctor_cmd(ctx):
     else:
         console.print("[green]All checks passed. You're good to go.[/green]")
 
-
 # ── Service management (OS-level systemd/launchd) ──
 
 @main.command("setup")
 @click.option("--with-docker", is_flag=True,
               help="Install Docker (Linux: apt/dnf/pacman; Mac/Win: brew/winget).")
-@click.option("--with-syncthing", is_flag=True,
-              help="Install Syncthing and register the vault folder for sync.")
 @click.option("--full", is_flag=True,
-              help="Everything: doctor, install Syncthing, register OS service.")
+              help="Everything: doctor, register OS service.")
 @click.option("--no-service", is_flag=True,
               help="Skip OS service registration (systemd/launchd/Task Scheduler).")
 @click.pass_context
 def setup_cmd(
     ctx,
     with_docker: bool,
-    with_syncthing: bool,
     full: bool,
     no_service: bool,
 ):
     """First-time setup: check environment, install deps, register OS service.
 
     By default only registers OpenAgent as an OS service. Pass --full to also
-    install Syncthing (for the vault sync) and everything else needed.
+    register OS service and everything else needed.
     """
     from pathlib import Path
     from openagent.setup.bootstrap import (
-        run_doctor, install_docker, install_syncthing,
-        configure_syncthing_folder,
-        check_docker, check_syncthing, current_platform,
-    )
-    from openagent.services.syncthing import (
-        DEFAULT_FOLDER_ID,
-        DEFAULT_FOLDER_LABEL,
-        DEFAULT_GUI_BIND,
+        run_doctor, install_docker,
+        check_docker, current_platform,
     )
     from openagent.setup.installer import setup_service
 
     config = ctx.obj["config"]
     config_path = Path(ctx.obj["config_path"]).expanduser()
-
-    if full:
-        with_syncthing = True
 
     console.print(f"[bold]Platform:[/bold] {current_platform()}")
     console.print()
@@ -454,55 +427,6 @@ def setup_cmd(
                 console.print(f"[green]{msg}[/green]")
             except Exception as e:
                 console.print(f"[red]Docker install failed:[/red] {e}")
-        console.print()
-
-    # 3. Syncthing
-    if with_syncthing:
-        console.print("[bold]Step 3 — Syncthing[/bold]")
-        chk = check_syncthing()
-        if chk.status == "ok":
-            console.print(f"[green]Already installed:[/green] {chk.message}")
-        else:
-            try:
-                msg = install_syncthing()
-                console.print(f"[green]{msg}[/green]")
-            except Exception as e:
-                console.print(f"[red]Syncthing install failed:[/red] {e}")
-                console.print()
-
-        # Configure the vault folder if the config asks for it
-        sync_cfg = (config.get("services") or {}).get("syncthing") or {}
-        if sync_cfg.get("enabled"):
-            mem_cfg = config.get("memory") or {}
-            vault = sync_cfg.get("vault_path") or mem_cfg.get("vault_path", "./memories")
-            folder_id = sync_cfg.get("folder_id", DEFAULT_FOLDER_ID)
-            folder_label = sync_cfg.get("folder_label", DEFAULT_FOLDER_LABEL)
-            gui_bind = sync_cfg.get("gui_bind", DEFAULT_GUI_BIND)
-
-            device_id, msg = asyncio.run(configure_syncthing_folder(
-                vault_path=vault,
-                folder_id=folder_id,
-                folder_label=folder_label,
-                gui_bind=gui_bind,
-            ))
-            if device_id:
-                console.print(f"[green]Syncthing ready:[/green] {msg}")
-                console.print()
-                console.print(Panel(
-                    f"[bold]Device ID (paste into your Mac/other machine):[/bold]\n\n"
-                    f"[cyan]{device_id}[/cyan]\n\n"
-                    f"[bold]Folder:[/bold] {folder_id} → {vault}\n"
-                    f"[bold]GUI (local only):[/bold] http://{gui_bind}\n\n"
-                    f"To pair a remote machine:\n"
-                    f"  1. Install Syncthing on the other machine.\n"
-                    f"  2. Open its GUI (http://127.0.0.1:8384 by default).\n"
-                    f"  3. Click [cyan]Add Remote Device[/cyan] and paste the ID above.\n"
-                    f"  4. Accept the folder share prompt that will appear here.",
-                    border_style="cyan",
-                    title="Syncthing pairing",
-                ))
-            else:
-                console.print(f"[yellow]Syncthing folder not ready yet:[/yellow] {msg}")
         console.print()
 
     # 4. OS service
@@ -528,7 +452,6 @@ def setup_cmd(
         raise SystemExit(1)
     console.print("[green]Setup complete.[/green]")
 
-
 @main.command("install")
 @click.pass_context
 def install_cmd(ctx):
@@ -536,11 +459,9 @@ def install_cmd(ctx):
     ctx.invoke(
         setup_cmd,
         with_docker=False,
-        with_syncthing=True,
         full=True,
         no_service=False,
     )
-
 
 @main.command("uninstall")
 @click.pass_context
@@ -553,7 +474,6 @@ def uninstall_cmd(ctx):
     except Exception as e:
         console.print(f"[red]Failed to uninstall service: {e}[/red]")
 
-
 @main.command("status")
 @click.pass_context
 def status_cmd(ctx):
@@ -561,7 +481,6 @@ def status_cmd(ctx):
     from openagent.setup.installer import get_service_status
     status = get_service_status()
     console.print(status)
-
 
 # ── Manual update ──
 
@@ -587,7 +506,6 @@ def update_cmd(ctx):
         console.print(
             "Restart the agent with [bold]openagent serve[/bold] to use the new version."
         )
-
 
 if __name__ == "__main__":
     main()

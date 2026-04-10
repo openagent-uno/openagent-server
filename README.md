@@ -23,7 +23,7 @@ OpenAgent is a framework that turns an LLM into a **persistent agent** — one t
 - **Multi-model** — Claude (CLI membership or API), Z.ai GLM, any OpenAI-compatible endpoint (Ollama, vLLM, LM Studio)
 - **MCP tools** — 8 bundled tool servers (filesystem, editor, shell, web search, browser, computer control, messaging, scheduler) + plug in any community MCP
 - **Multi-channel** — Telegram, Discord, WhatsApp, WebSocket (desktop app) — all with slash commands, message queue, stop button, voice transcription
-- **Long-term memory** — Obsidian-compatible markdown vault with wikilinks, tags, and graph view. Open the same vault with Obsidian desktop via Syncthing
+- **Long-term memory** — Obsidian-compatible markdown vault with wikilinks, tags, and graph view. View and edit notes in the desktop app's graph viewer
 - **Desktop app** — Electron + React Native Web client (macOS, Windows, Linux) with chat, vault editor, and config management
 - **Scheduler** — Cron tasks stored in SQLite, survive reboots. Dream mode for nightly maintenance
 - **Auto-update** — checks PyPI on schedule, upgrades in place, restarts via OS service manager
@@ -95,10 +95,10 @@ OpenAgent/
 | [Memory & Vault](docs/guide/memory.md) | How the markdown vault works, Obsidian integration |
 | [Desktop App](docs/guide/desktop-app.md) | Install, build, auto-update, architecture |
 | [Scheduler & Dream Mode](docs/guide/scheduler.md) | Cron tasks, dream mode, CLI management |
-| [Services](docs/guide/services.md) | Syncthing vault sync, auxiliary service pattern |
+| [Services](docs/guide/services.md) | Auxiliary service pattern |
 | [Setup & Deployment](docs/guide/deployment.md) | VPS setup, OS service, doctor, auto-update |
 | [Configuration Reference](docs/guide/config-reference.md) | Full YAML reference + CLI reference |
-| [Examples](docs/examples/) | Production config, systemd unit, Syncthing setup |
+| [Examples](docs/examples/) | Production config, systemd unit |
 
 ---
 
