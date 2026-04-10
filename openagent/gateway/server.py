@@ -102,7 +102,12 @@ class Gateway:
     # ── File upload ──
 
     async def _handle_upload(self, request):
-        """POST /api/upload — save uploaded file, return local path."""
+        """POST /api/upload — save file, auto-transcribe if audio.
+
+        Returns {path, filename, transcription?}. If the file is audio
+        (webm, ogg, mp3, wav, m4a), it's transcribed via faster-whisper
+        or OpenAI Whisper and the text is returned in `transcription`.
+        """
         from aiohttp import web
         import tempfile
 
@@ -121,7 +126,20 @@ class Gateway:
                     break
                 f.write(chunk)
 
-        return web.json_response({"path": path, "filename": filename})
+        result: dict = {"path": path, "filename": filename}
+
+        # Auto-transcribe audio files
+        audio_exts = ('.webm', '.ogg', '.mp3', '.wav', '.m4a', '.opus', '.flac')
+        if any(filename.lower().endswith(ext) for ext in audio_exts):
+            try:
+                from openagent.channels.voice import transcribe
+                text = await transcribe(path)
+                if text:
+                    result["transcription"] = text
+            except Exception as e:
+                logger.warning("Voice transcription failed: %s", e)
+
+        return web.json_response(result)
 
     # ── WebSocket ──
 
