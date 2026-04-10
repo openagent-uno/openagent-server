@@ -10,8 +10,8 @@ permissions:
   id-token: write
 
 jobs:
-  # ── Python package → PyPI ──
-  python:
+  # ── openagent-framework → PyPI ──
+  framework:
     runs-on: ubuntu-latest
     environment: release
     steps:
@@ -19,17 +19,37 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Build package
+      - name: Build
         run: pip install build && python -m build
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
-      - name: Upload Python artifacts
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: python-dist
+          name: framework-dist
           path: dist/*
 
-  # ── Electron app → GitHub Release (macOS, Windows, Linux) ──
+  # ── openagent-cli → PyPI ──
+  cli:
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build CLI
+        working-directory: cli
+        run: pip install build && python -m build
+      - name: Publish CLI to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: cli/dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-dist
+          path: cli/dist/*
+
+  # ── Desktop app → GitHub Release (macOS, Windows, Linux) ──
   desktop:
     strategy:
       matrix:
@@ -46,16 +66,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-
-      # Build the web app (universal/)
       - name: Install universal deps
         working-directory: app/universal
         run: npm ci
       - name: Build web app
         working-directory: app/universal
         run: npx expo export --platform web
-
-      # Build Electron app (desktop/)
       - name: Install desktop deps
         working-directory: app/desktop
         run: npm ci
@@ -68,9 +84,7 @@ jobs:
         run: npx electron-builder ${{ matrix.build_flag }} --publish never
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload desktop artifacts
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: desktop-${{ matrix.os }}
           path: |
@@ -82,19 +96,17 @@ jobs:
             app/desktop/release/*.yml
             app/desktop/release/*.yaml
 
-  # ── Create GitHub Release with all artifacts ──
+  # ── GitHub Release with all artifacts ──
   release:
-    needs: [python, desktop]
+    needs: [framework, cli, desktop]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
-
       - name: List artifacts
-        run: find artifacts -type f | head -30
-
+        run: find artifacts -type f | head -40
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
