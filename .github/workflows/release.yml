@@ -10,28 +10,102 @@ permissions:
   id-token: write
 
 jobs:
-  release:
+  # ── Python package → PyPI ──
+  python:
     runs-on: ubuntu-latest
     environment: release
-
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
-      - name: Install build tools
-        run: pip install build
-
       - name: Build package
-        run: python -m build
-
+        run: pip install build && python -m build
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+      - name: Upload Python artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-dist
+          path: dist/*
+
+  # ── Electron app → GitHub Release (macOS, Windows, Linux) ──
+  desktop:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            build_flag: --mac
+          - os: windows-latest
+            build_flag: --win
+          - os: ubuntu-latest
+            build_flag: --linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # Build the web app (universal/)
+      - name: Install universal deps
+        working-directory: app/universal
+        run: npm ci
+      - name: Build web app
+        working-directory: app/universal
+        run: npx expo export --platform web
+
+      # Build Electron app (desktop/)
+      - name: Install desktop deps
+        working-directory: app/desktop
+        run: npm ci
+      - name: Copy web build
+        run: |
+          rm -rf app/desktop/web-build
+          cp -r app/universal/dist app/desktop/web-build
+      - name: Build Electron app
+        working-directory: app/desktop
+        run: npx electron-builder ${{ matrix.build_flag }} --publish never
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload desktop artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.os }}
+          path: |
+            app/desktop/release/*.dmg
+            app/desktop/release/*.zip
+            app/desktop/release/*.exe
+            app/desktop/release/*.AppImage
+            app/desktop/release/*.deb
+            app/desktop/release/*.yml
+            app/desktop/release/*.yaml
+
+  # ── Create GitHub Release with all artifacts ──
+  release:
+    needs: [python, desktop]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: find artifacts -type f | head -30
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          files: |
+            artifacts/**/*.whl
+            artifacts/**/*.tar.gz
+            artifacts/**/*.dmg
+            artifacts/**/*.zip
+            artifacts/**/*.exe
+            artifacts/**/*.AppImage
+            artifacts/**/*.deb
+            artifacts/**/*.yml
+            artifacts/**/*.yaml
           generate_release_notes: true
