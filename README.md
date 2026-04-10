@@ -64,22 +64,34 @@ cd app && ./setup.sh && ./start.sh macos
 
 ---
 
+### CLI Client
+
+```bash
+pip install openagent-cli
+openagent-cli connect localhost:8765 --token mysecret
+```
+
+Interactive REPL with multi-session chat, vault browsing, config viewing, and task management.
+
+---
+
 ### Repository Layout
 
 ```
 OpenAgent/
-├── openagent/          # Python framework (pip install)
+├── openagent/          # Python framework (pip install openagent-framework)
+│   ├── gateway/        #   Public WS + REST server (single entry point)
+│   ├── bridges/        #   Telegram, Discord, WhatsApp adapters
 │   ├── core/           #   Agent loop, server, scheduler, config
-│   ├── channels/       #   Telegram, Discord, WhatsApp, WebSocket
 │   ├── models/         #   Claude CLI/API, Zhipu/OpenAI-compat
 │   ├── mcps/           #   8 bundled MCP tool servers
-│   └── ...
-├── app/                # Desktop & mobile app
-│   ├── universal/      #   React Native Web (shared codebase)
+│   └── channels/       #   Shared utils (formatting, voice, parsing)
+├── app/                # Desktop & mobile app (Electron + React Native)
+│   ├── universal/      #   Shared codebase (web, iOS, Android)
 │   └── desktop/        #   Electron wrapper + auto-updater
+├── cli/                # CLI client (pip install openagent-cli)
 ├── scripts/            # Ops scripts (setup, start, stop, release)
 └── docs/               # Full documentation
-    └── guide/          #   Detailed usage guides
 ```
 
 ---
@@ -91,11 +103,11 @@ OpenAgent/
 | [Getting Started](docs/guide/getting-started.md) | Installation, first config, first run |
 | [Models](docs/guide/models.md) | Claude CLI/API, Zhipu, Ollama, OpenAI-compat |
 | [MCP Tools](docs/guide/mcp.md) | Bundled MCPs, adding your own, disabling defaults |
-| [Channels](docs/guide/channels.md) | Telegram, Discord, WhatsApp, WebSocket setup |
+| [Channels & Bridges](docs/guide/channels.md) | Telegram, Discord, WhatsApp bridges |
 | [Memory & Vault](docs/guide/memory.md) | How the markdown vault works, Obsidian integration |
 | [Desktop App](docs/guide/desktop-app.md) | Install, build, auto-update, architecture |
 | [Scheduler & Dream Mode](docs/guide/scheduler.md) | Cron tasks, dream mode, CLI management |
-| [Services](docs/guide/services.md) | Auxiliary service pattern |
+| [Architecture](docs/guide/services.md) | Gateway, bridges, WS protocol, custom bridges |
 | [Setup & Deployment](docs/guide/deployment.md) | VPS setup, OS service, doctor, auto-update |
 | [Configuration Reference](docs/guide/config-reference.md) | Full YAML reference + CLI reference |
 | [Examples](docs/examples/) | Production config, systemd unit |

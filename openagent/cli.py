@@ -39,65 +39,6 @@ def main(ctx, config: str, verbose: bool):
     logging.basicConfig(level=level, format="%(name)s: %(message)s")
 
 @main.command()
-@click.option("--model", "-m", help="Override model provider (claude-api, claude-cli, zhipu)")
-@click.option("--model-id", help="Override model ID")
-@click.option("--session", "-s", help="Resume a specific session ID")
-@click.pass_context
-def chat(ctx, model: str | None, model_id: str | None, session: str | None):
-    """Start an interactive chat session."""
-    config = ctx.obj["config"]
-
-    if model:
-        config.setdefault("model", {})["provider"] = model
-    if model_id:
-        config.setdefault("model", {})["model_id"] = model_id
-
-    agent = _build_agent(config)
-
-    async def _chat():
-        async with agent:
-            provider = config.get("model", {}).get("provider", "claude-api")
-            mid = config.get("model", {}).get("model_id", "default")
-            console.print(Panel(
-                f"[bold]OpenAgent Chat[/bold]\n"
-                f"Model: {provider} / {mid}\n"
-                f"MCP tools: {len(agent._mcp.all_tools())}\n"
-                f"Type [bold cyan]quit[/bold cyan] or [bold cyan]exit[/bold cyan] to end.",
-                border_style="cyan",
-            ))
-
-            while True:
-                try:
-                    user_input = console.input("[bold green]You:[/bold green] ")
-                except (EOFError, KeyboardInterrupt):
-                    console.print("\nBye!")
-                    break
-
-                if user_input.strip().lower() in ("quit", "exit"):
-                    console.print("Bye!")
-                    break
-
-                if not user_input.strip():
-                    continue
-
-                with console.status("[cyan]Thinking...[/cyan]"):
-                    try:
-                        response = await agent.run(
-                            message=user_input,
-                            user_id="cli-user",
-                            session_id=session,
-                        )
-                    except Exception as e:
-                        console.print(f"[red]Error: {e}[/red]")
-                        continue
-
-                console.print()
-                console.print(Markdown(response))
-                console.print()
-
-    asyncio.run(_chat())
-
-@main.command()
 @click.option("--channel", "-ch", multiple=True, help="Channels to start (telegram, discord, whatsapp)")
 @click.pass_context
 def serve(ctx, channel: tuple[str, ...]):
