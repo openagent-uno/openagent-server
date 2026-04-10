@@ -113,8 +113,8 @@ def serve(ctx, channel: tuple[str, ...]):
             active = []
             if server._gateway:
                 active.append(f"gateway:{server._gateway.port}")
-            if server.channels:
-                active.extend(ch.name for ch in server.channels)
+            if server._bridges:
+                active.extend(f"bridge:{b.name}" for b in server._bridges)
             if server._scheduler is not None:
                 active.append("scheduler")
             if len(server.aux_services) > 0:

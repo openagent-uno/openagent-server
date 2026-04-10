@@ -1,11 +1,12 @@
-"""Multi-channel communication (Telegram, Discord, WhatsApp).
+"""Shared channel utilities — formatting, voice transcription, response parsing.
 
-Import concrete channels directly from their modules:
-    from openagent.channels.telegram import TelegramChannel
-    from openagent.channels.discord import DiscordChannel
-    from openagent.channels.whatsapp import WhatsAppChannel
+The actual platform implementations are in openagent/bridges/.
 """
 
-from openagent.channels.base import BaseChannel
+from openagent.channels.base import (
+    parse_response_markers,
+    split_preserving_code_blocks,
+    is_blocked_attachment,
+)
 
-__all__ = ["BaseChannel"]
+__all__ = ["parse_response_markers", "split_preserving_code_blocks", "is_blocked_attachment"]

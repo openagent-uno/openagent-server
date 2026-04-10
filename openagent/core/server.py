@@ -123,69 +123,66 @@ def _build_agent(config: dict) -> Agent:
     )
 
 
-def _build_channels(agent: Agent, config: dict, only: list[str] | None = None) -> list:
-    """Instantiate channels from config. `only` filters by name."""
+def _build_bridges(config: dict, gateway_port: int = 8765, gateway_token: str | None = None) -> list:
+    """Build platform bridges from config. Each connects to the Gateway via WS."""
     channels_config = config.get("channels", {})
-    wanted = only or list(channels_config.keys())
+    gw_url = f"ws://localhost:{gateway_port}/ws"
     out = []
 
-    for ch_name in wanted:
-        ch_config = channels_config.get(ch_name, {})
+    for name, cfg in channels_config.items():
+        if name == "websocket":
+            continue  # handled by Gateway directly
 
-        if ch_name == "telegram":
-            from openagent.channels.telegram import TelegramChannel
-            token = ch_config.get("token") or os.environ.get("TELEGRAM_BOT_TOKEN")
+        if name == "telegram":
+            from openagent.bridges.telegram import TelegramBridge
+            token = cfg.get("token") or os.environ.get("TELEGRAM_BOT_TOKEN")
             if not token:
                 logger.warning("Telegram token not configured; skipping")
                 continue
-            out.append(TelegramChannel(
-                agent=agent,
+            out.append(TelegramBridge(
                 token=token,
-                allowed_users=ch_config.get("allowed_users"),
+                allowed_users=cfg.get("allowed_users"),
+                gateway_url=gw_url,
+                gateway_token=gateway_token,
             ))
 
-        elif ch_name == "discord":
-            from openagent.channels.discord import DiscordChannel
-            token = ch_config.get("token") or os.environ.get("DISCORD_BOT_TOKEN")
+        elif name == "discord":
+            from openagent.bridges.discord import DiscordBridge
+            token = cfg.get("token") or os.environ.get("DISCORD_BOT_TOKEN")
             if not token:
                 logger.warning("Discord token not configured; skipping")
                 continue
-            allowed_users = ch_config.get("allowed_users")
-            if not allowed_users:
-                logger.warning(
-                    "Discord channel has no 'allowed_users' — refusing to start. "
-                    "Add at least one Discord user ID to openagent.yaml."
-                )
+            allowed = cfg.get("allowed_users")
+            if not allowed:
+                logger.warning("Discord needs allowed_users; skipping")
                 continue
-            out.append(DiscordChannel(
-                agent=agent,
+            out.append(DiscordBridge(
                 token=token,
-                allowed_users=allowed_users,
-                allowed_guilds=ch_config.get("allowed_guilds"),
-                listen_channels=ch_config.get("listen_channels"),
-                dm_only=bool(ch_config.get("dm_only", False)),
+                allowed_users=allowed,
+                allowed_guilds=cfg.get("allowed_guilds"),
+                listen_channels=cfg.get("listen_channels"),
+                dm_only=bool(cfg.get("dm_only", False)),
+                gateway_url=gw_url,
+                gateway_token=gateway_token,
             ))
 
-        elif ch_name == "whatsapp":
-            from openagent.channels.whatsapp import WhatsAppChannel
-            instance_id = ch_config.get("green_api_id") or os.environ.get("GREEN_API_ID")
-            api_token = ch_config.get("green_api_token") or os.environ.get("GREEN_API_TOKEN")
-            if not instance_id or not api_token:
-                logger.warning("WhatsApp Green API credentials not configured; skipping")
+        elif name == "whatsapp":
+            from openagent.bridges.whatsapp import WhatsAppBridge
+            iid = cfg.get("green_api_id") or os.environ.get("GREEN_API_ID")
+            tok = cfg.get("green_api_token") or os.environ.get("GREEN_API_TOKEN")
+            if not iid or not tok:
+                logger.warning("WhatsApp credentials not configured; skipping")
                 continue
-            out.append(WhatsAppChannel(
-                agent=agent,
-                instance_id=instance_id,
-                api_token=api_token,
-                allowed_users=ch_config.get("allowed_users"),
+            out.append(WhatsAppBridge(
+                instance_id=iid,
+                api_token=tok,
+                allowed_users=cfg.get("allowed_users"),
+                gateway_url=gw_url,
+                gateway_token=gateway_token,
             ))
-
-        elif ch_name == "websocket":
-            # Handled by Gateway, not as a channel
-            continue
 
         else:
-            logger.warning(f"Unknown channel: {ch_name}")
+            logger.warning(f"Unknown channel: {name}")
 
     return out
 
@@ -217,6 +214,8 @@ class AgentServer:
         self.config = config
 
         self._channel_tasks: list[asyncio.Task] = []
+        self._bridge_tasks: list[asyncio.Task] = []
+        self._bridges: list = []
         self._scheduler = None
         self._gateway = None
         self._stop_event: asyncio.Event | None = None
@@ -224,22 +223,25 @@ class AgentServer:
     @classmethod
     def from_config(cls, config: dict, only_channels: list[str] | None = None) -> AgentServer:
         agent = _build_agent(config)
-        channels = _build_channels(agent, config, only=only_channels)
         aux = _build_aux_services(config)
-        server = cls(agent=agent, channels=channels, aux_services=aux, config=config)
+        server = cls(agent=agent, channels=[], aux_services=aux, config=config)
         # Build Gateway if websocket channel is configured
         ws_cfg = config.get("channels", {}).get("websocket", {})
         if ws_cfg or (only_channels and "websocket" in only_channels):
             from openagent.gateway.server import Gateway
             memory_cfg = config.get("memory", {}) or {}
+            gw_token = ws_cfg.get("token") or os.environ.get("OPENAGENT_WS_TOKEN")
+            gw_port = int(ws_cfg.get("port", 8765))
             server._gateway = Gateway(
                 agent=agent,
                 host=ws_cfg.get("host", "0.0.0.0"),
-                port=int(ws_cfg.get("port", 8765)),
-                token=ws_cfg.get("token") or os.environ.get("OPENAGENT_WS_TOKEN"),
+                port=gw_port,
+                token=gw_token,
                 vault_path=memory_cfg.get("vault_path"),
                 config_path=config.get("_config_path"),
             )
+            # Build bridges (Telegram, Discord, WhatsApp) — they connect to Gateway
+            server._bridges = _build_bridges(config, gateway_port=gw_port, gateway_token=gw_token)
         return server
 
     # ── Lifecycle ──
@@ -263,31 +265,29 @@ class AgentServer:
         # 4. Scheduler (with dream mode + auto-update hooks)
         await self._start_scheduler()
 
-        # 5. Channels / bridges (each runs in its own supervised task)
-        for ch in self.channels:
-            self._channel_tasks.append(asyncio.create_task(
-                ch.start(), name=f"channel:{ch.name}"
+        # 5. Bridges (connect to Gateway as internal WS clients)
+        for bridge in self._bridges:
+            self._bridge_tasks.append(asyncio.create_task(
+                bridge.start(), name=f"bridge:{bridge.name}"
             ))
 
     async def stop(self) -> None:
-        """Stop channels, scheduler, agent, and aux services (in reverse)."""
-        # 1. Signal channels to stop
-        for ch in self.channels:
+        """Stop bridges, gateway, scheduler, agent (in reverse)."""
+        # 1. Stop bridges
+        for bridge in self._bridges:
             try:
-                await ch.stop()
+                await bridge.stop()
             except Exception as e:
-                logger.warning(f"Channel {ch.name} stop error: {e}")
-
-        # 2. Cancel channel supervisor tasks
-        for t in self._channel_tasks:
+                logger.warning(f"Bridge {bridge.name} stop error: {e}")
+        for t in self._bridge_tasks:
             if not t.done():
                 t.cancel()
-        for t in self._channel_tasks:
+        for t in self._bridge_tasks:
             try:
                 await t
             except (asyncio.CancelledError, Exception):
                 pass
-        self._channel_tasks.clear()
+        self._bridge_tasks.clear()
 
         # 3. Gateway
         if self._gateway:
