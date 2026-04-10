@@ -320,7 +320,13 @@ class AgentServer:
             self._stop_event.set()
 
     async def wait(self) -> None:
-        """Block until stop() is called or a termination signal arrives."""
+        """Block until stop() is called or a termination signal arrives.
+
+        If a channel task crashes, the error is logged and the server
+        continues to run with the remaining channels.  The server only
+        shuts down when the stop event fires, all channels have exited,
+        or a KeyboardInterrupt is received.
+        """
         assert self._stop_event is not None, "Call start() first"
 
         loop = asyncio.get_running_loop()
@@ -339,15 +345,41 @@ class AgentServer:
                 pass
 
         try:
-            if self._channel_tasks:
-                done, pending = await asyncio.wait(
-                    [*self._channel_tasks, asyncio.create_task(stop_event.wait())],
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                for t in pending:
-                    t.cancel()
-            else:
+            if not self._channel_tasks:
                 await stop_event.wait()
+                return
+
+            stop_task = asyncio.create_task(stop_event.wait(), name="stop_event")
+            pending: set[asyncio.Task] = set(self._channel_tasks) | {stop_task}
+
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in done:
+                    if task is stop_task:
+                        # Normal shutdown signal — cancel remaining tasks
+                        for p in pending:
+                            p.cancel()
+                        return
+
+                    # A channel task finished
+                    name = task.get_name()
+                    if task.exception():
+                        logger.error(
+                            "Channel %s crashed: %s — remaining channels continue.",
+                            name, task.exception(),
+                        )
+                    else:
+                        logger.warning("Channel %s exited unexpectedly.", name)
+
+                # If only the stop_task remains, just wait for the signal
+                if pending == {stop_task}:
+                    logger.warning(
+                        "All channels have exited. Waiting for stop signal..."
+                    )
+                    await stop_event.wait()
+                    return
         except KeyboardInterrupt:
             pass
         finally:
