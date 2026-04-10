@@ -79,10 +79,21 @@ class WebSocketChannel(BaseChannel):
                 "Install it with: pip install openagent-framework[websocket]"
             )
 
-        # CORS middleware for browser/Electron access
+        # CORS middleware — must handle both normal responses AND HTTP
+        # exceptions (404, 500, etc.) which aiohttp raises as exceptions
+        # that bypass the normal return path.
         @middleware
         async def cors_middleware(request, handler):
-            resp = await handler(request)
+            # Handle preflight immediately
+            if request.method == 'OPTIONS':
+                resp = web.Response(status=204)
+            else:
+                try:
+                    resp = await handler(request)
+                except web.HTTPException as ex:
+                    resp = ex
+                except Exception:
+                    resp = web.Response(status=500, text="Internal Server Error")
             resp.headers["Access-Control-Allow-Origin"] = "*"
             resp.headers["Access-Control-Allow-Methods"] = "GET, PUT, DELETE, OPTIONS"
             resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
