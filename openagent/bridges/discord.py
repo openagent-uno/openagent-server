@@ -134,6 +134,16 @@ class DiscordBridge(BaseBridge):
             resp_text = response.get("text", "")
             clean, attachments = parse_response_markers(resp_text)
 
+            # Send file attachments
+            import discord as _dc
+            for att in attachments:
+                p = Path(att.path)
+                if p.exists():
+                    try:
+                        await message.channel.send(file=_dc.File(str(p), filename=att.filename))
+                    except Exception as e:
+                        logger.error("Discord file send error: %s", e)
+
             if clean:
                 for chunk in split_preserving_code_blocks(clean, DISCORD_MSG_LIMIT):
                     await message.channel.send(chunk)

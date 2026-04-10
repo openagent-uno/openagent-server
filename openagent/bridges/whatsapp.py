@@ -76,6 +76,8 @@ class WhatsAppBridge(BaseBridge):
         msg_type = msg_data.get("typeMessage", "")
         text = ""
 
+        files_info = []
+
         if msg_type == "textMessage":
             text = msg_data.get("textMessageData", {}).get("textMessage", "")
         elif msg_type == "extendedTextMessage":
@@ -88,6 +90,37 @@ class WhatsAppBridge(BaseBridge):
                 if path:
                     t = await transcribe_voice(path)
                     text = t if t else VOICE_FALLBACK
+        elif msg_type == "imageMessage":
+            file_data = msg_data.get("fileMessageData", {})
+            text = file_data.get("caption", "")
+            url = file_data.get("downloadUrl", "")
+            if url:
+                fname = file_data.get("fileName", "image.jpg")
+                path = await self._download(url, fname)
+                if path:
+                    files_info.append(f"- image: {fname} — local path: {path}")
+        elif msg_type == "documentMessage":
+            file_data = msg_data.get("fileMessageData", {})
+            text = file_data.get("caption", "")
+            url = file_data.get("downloadUrl", "")
+            fname = file_data.get("fileName", "document")
+            if url and not is_blocked_attachment(fname):
+                path = await self._download(url, fname)
+                if path:
+                    files_info.append(f"- file: {fname} — local path: {path}")
+        elif msg_type == "videoMessage":
+            file_data = msg_data.get("fileMessageData", {})
+            text = file_data.get("caption", "")
+            url = file_data.get("downloadUrl", "")
+            fname = file_data.get("fileName", "video.mp4")
+            if url:
+                path = await self._download(url, fname)
+                if path:
+                    files_info.append(f"- video: {fname} — local path: {path}")
+
+        if files_info:
+            header = "The user attached files:\n" + "\n".join(files_info) + "\nUse Read to inspect them."
+            text = f"{header}\n\n{text}" if text else header
 
         if not text:
             return

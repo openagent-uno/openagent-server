@@ -81,6 +81,7 @@ class Gateway:
         app.router.add_get("/api/config", config.handle_get)
         app.router.add_put("/api/config", config.handle_put)
         app.router.add_patch("/api/config/{section}", config.handle_patch)
+        app.router.add_post("/api/upload", self._handle_upload)
         app.router.add_route("OPTIONS", "/{path:.*}", self._handle_options)
 
         runner = web.AppRunner(app)
@@ -97,6 +98,30 @@ class Gateway:
             await self._runner.cleanup()
             self._runner = None
         self.clients.clear()
+
+    # ── File upload ──
+
+    async def _handle_upload(self, request):
+        """POST /api/upload — save uploaded file, return local path."""
+        from aiohttp import web
+        import tempfile
+
+        reader = await request.multipart()
+        field = await reader.next()
+        if not field:
+            return web.json_response({"error": "No file"}, status=400)
+
+        filename = field.filename or "upload"
+        tmp = tempfile.mkdtemp(prefix="oa_upload_")
+        path = f"{tmp}/{filename}"
+        with open(path, "wb") as f:
+            while True:
+                chunk = await field.read_chunk()
+                if not chunk:
+                    break
+                f.write(chunk)
+
+        return web.json_response({"path": path, "filename": filename})
 
     # ── WebSocket ──
 
