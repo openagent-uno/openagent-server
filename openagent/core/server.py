@@ -182,12 +182,14 @@ def _build_channels(agent: Agent, config: dict, only: list[str] | None = None) -
 
         elif ch_name == "websocket":
             from openagent.channels.websocket import WebSocketChannel
+            memory_cfg = config.get("memory", {}) or {}
             out.append(WebSocketChannel(
                 agent=agent,
                 host=ch_config.get("host", "0.0.0.0"),
                 port=int(ch_config.get("port", 8765)),
                 token=ch_config.get("token") or os.environ.get("OPENAGENT_WS_TOKEN"),
                 allowed_origins=ch_config.get("allowed_origins"),
+                vault_path=memory_cfg.get("vault_path"),
             ))
 
         else:
