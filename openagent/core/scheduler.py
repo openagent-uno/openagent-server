@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 from croniter import croniter
 
 if TYPE_CHECKING:
-    from openagent.agent import Agent
+    from openagent.core.agent import Agent
     from openagent.memory.db import MemoryDB
 
 logger = logging.getLogger(__name__)

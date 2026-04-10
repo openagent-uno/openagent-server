@@ -12,10 +12,10 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
 
-from openagent.config import load_config
+from openagent.core.config import load_config
 from openagent.memory.db import MemoryDB
 from openagent.mcp.client import MCPRegistry
-from openagent.server import (
+from openagent.core.server import (
     AgentServer,
     _build_agent,
     get_installed_version,
@@ -156,7 +156,7 @@ def task_add(ctx, name: str, cron: str, prompt: str):
         db = MemoryDB(db_path)
         await db.connect()
         agent = _build_agent(config)
-        from openagent.scheduler import Scheduler
+        from openagent.core.scheduler import Scheduler
         scheduler = Scheduler(db, agent)
         task_id = await scheduler.add_task(name, cron, prompt)
         console.print(f"[green]Task added:[/green] {name} (id: {task_id[:8]}...)")
@@ -312,7 +312,7 @@ def mcp_cmd(ctx, action: str):
 @click.pass_context
 def services_cmd(ctx, action: str):
     """Manage auxiliary services (Obsidian web, etc.)."""
-    from openagent.server import _build_aux_services
+    from openagent.core.server import _build_aux_services
 
     config = ctx.obj["config"]
     mgr = _build_aux_services(config)
@@ -364,7 +364,7 @@ def _print_report(report) -> None:
 def doctor_cmd(ctx):
     """Check the environment: Python, Docker, config, enabled services."""
     from pathlib import Path
-    from openagent.bootstrap import run_doctor, current_platform
+    from openagent.setup.bootstrap import run_doctor, current_platform
 
     config = ctx.obj["config"]
     config_path = Path(ctx.obj["config_path"]).expanduser()
@@ -410,7 +410,7 @@ def setup_cmd(
     install Syncthing (for the vault sync) and everything else needed.
     """
     from pathlib import Path
-    from openagent.bootstrap import (
+    from openagent.setup.bootstrap import (
         run_doctor, install_docker, install_syncthing,
         configure_syncthing_folder,
         check_docker, check_syncthing, current_platform,
@@ -420,7 +420,7 @@ def setup_cmd(
         DEFAULT_FOLDER_LABEL,
         DEFAULT_GUI_BIND,
     )
-    from openagent.installer import setup_service
+    from openagent.setup.installer import setup_service
 
     config = ctx.obj["config"]
     config_path = Path(ctx.obj["config_path"]).expanduser()
@@ -541,7 +541,7 @@ def install_cmd(ctx):
 @click.pass_context
 def uninstall_cmd(ctx):
     """Remove OpenAgent system service."""
-    from openagent.installer import uninstall_service
+    from openagent.setup.installer import uninstall_service
     try:
         result = uninstall_service()
         console.print(f"[green]{result}[/green]")
@@ -553,7 +553,7 @@ def uninstall_cmd(ctx):
 @click.pass_context
 def status_cmd(ctx):
     """Check if OpenAgent service is running."""
-    from openagent.installer import get_service_status
+    from openagent.setup.installer import get_service_status
     status = get_service_status()
     console.print(status)
 

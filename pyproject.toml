@@ -51,4 +51,5 @@ openagent = [
     "mcps/**/*.py",
     "mcps/**/*.txt",
     "mcps/**/.gitignore",
+    "scripts/*.sh",
 ]

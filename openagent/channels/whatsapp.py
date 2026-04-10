@@ -38,7 +38,7 @@ from openagent.channels.queue import UserQueueManager
 from openagent.channels.voice import transcribe as transcribe_voice
 
 if TYPE_CHECKING:
-    from openagent.agent import Agent
+    from openagent.core.agent import Agent
 
 logger = logging.getLogger(__name__)
 

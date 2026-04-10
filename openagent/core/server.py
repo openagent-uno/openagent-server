@@ -17,8 +17,8 @@ import os
 import signal
 from typing import Awaitable, Callable
 
-from openagent.agent import Agent
-from openagent.config import build_model_from_config
+from openagent.core.agent import Agent
+from openagent.core.config import build_model_from_config
 from openagent.mcp.client import MCPRegistry
 from openagent.memory.db import MemoryDB
 from openagent.services.manager import ServiceManager
@@ -361,7 +361,7 @@ class AgentServer:
         if self.agent._db is None:
             return
 
-        from openagent.scheduler import Scheduler
+        from openagent.core.scheduler import Scheduler
         scheduler = Scheduler(self.agent._db, self.agent)
 
         # User-defined cron tasks

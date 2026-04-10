@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from openagent.agent import Agent
+    from openagent.core.agent import Agent
 
 logger = logging.getLogger(__name__)
 

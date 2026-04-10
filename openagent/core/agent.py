@@ -8,7 +8,7 @@ from typing import Any, AsyncIterator, Callable, Awaitable
 from openagent.models.base import BaseModel, ModelResponse
 from openagent.memory.db import MemoryDB
 from openagent.mcp.client import MCPRegistry, MCPTools
-from openagent.prompts import FRAMEWORK_SYSTEM_PROMPT
+from openagent.core.prompts import FRAMEWORK_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
