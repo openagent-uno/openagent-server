@@ -181,17 +181,8 @@ def _build_channels(agent: Agent, config: dict, only: list[str] | None = None) -
             ))
 
         elif ch_name == "websocket":
-            from openagent.channels.websocket import WebSocketChannel
-            memory_cfg = config.get("memory", {}) or {}
-            out.append(WebSocketChannel(
-                agent=agent,
-                host=ch_config.get("host", "0.0.0.0"),
-                port=int(ch_config.get("port", 8765)),
-                token=ch_config.get("token") or os.environ.get("OPENAGENT_WS_TOKEN"),
-                allowed_origins=ch_config.get("allowed_origins"),
-                vault_path=memory_cfg.get("vault_path"),
-                config_path=config.get("_config_path"),
-            ))
+            # Handled by Gateway, not as a channel
+            continue
 
         else:
             logger.warning(f"Unknown channel: {ch_name}")
@@ -201,27 +192,7 @@ def _build_channels(agent: Agent, config: dict, only: list[str] | None = None) -
 
 def _build_aux_services(config: dict) -> ServiceManager:
     """Build the ServiceManager from the `services:` section of the config."""
-    mgr = ServiceManager()
-    svc_config = config.get("services", {}) or {}
-
-    sync_cfg = svc_config.get("syncthing", {}) or {}
-    if sync_cfg.get("enabled"):
-        from openagent.services.syncthing import (
-            SyncthingService,
-            DEFAULT_FOLDER_ID,
-            DEFAULT_FOLDER_LABEL,
-            DEFAULT_GUI_BIND,
-        )
-        memory_cfg = config.get("memory", {}) or {}
-        default_vault = memory_cfg.get("vault_path", "./memories")
-        mgr.add(SyncthingService(
-            vault_path=sync_cfg.get("vault_path", default_vault),
-            folder_id=sync_cfg.get("folder_id", DEFAULT_FOLDER_ID),
-            folder_label=sync_cfg.get("folder_label", DEFAULT_FOLDER_LABEL),
-            gui_bind=sync_cfg.get("gui_bind", DEFAULT_GUI_BIND),
-        ))
-
-    return mgr
+    return ServiceManager()  # no built-in services currently
 
 
 class AgentServer:
@@ -247,6 +218,7 @@ class AgentServer:
 
         self._channel_tasks: list[asyncio.Task] = []
         self._scheduler = None
+        self._gateway = None
         self._stop_event: asyncio.Event | None = None
 
     @classmethod
@@ -254,7 +226,21 @@ class AgentServer:
         agent = _build_agent(config)
         channels = _build_channels(agent, config, only=only_channels)
         aux = _build_aux_services(config)
-        return cls(agent=agent, channels=channels, aux_services=aux, config=config)
+        server = cls(agent=agent, channels=channels, aux_services=aux, config=config)
+        # Build Gateway if websocket channel is configured
+        ws_cfg = config.get("channels", {}).get("websocket", {})
+        if ws_cfg or (only_channels and "websocket" in only_channels):
+            from openagent.gateway.server import Gateway
+            memory_cfg = config.get("memory", {}) or {}
+            server._gateway = Gateway(
+                agent=agent,
+                host=ws_cfg.get("host", "0.0.0.0"),
+                port=int(ws_cfg.get("port", 8765)),
+                token=ws_cfg.get("token") or os.environ.get("OPENAGENT_WS_TOKEN"),
+                vault_path=memory_cfg.get("vault_path"),
+                config_path=config.get("_config_path"),
+            )
+        return server
 
     # ── Lifecycle ──
 
@@ -270,10 +256,14 @@ class AgentServer:
         # 2. Agent (connects MCPs, opens DB)
         await self.agent.initialize()
 
-        # 3. Scheduler (with dream mode + auto-update hooks)
+        # 3. Gateway (public WS + REST interface)
+        if self._gateway:
+            await self._gateway.start()
+
+        # 4. Scheduler (with dream mode + auto-update hooks)
         await self._start_scheduler()
 
-        # 4. Channels (each runs in its own supervised task)
+        # 5. Channels / bridges (each runs in its own supervised task)
         for ch in self.channels:
             self._channel_tasks.append(asyncio.create_task(
                 ch.start(), name=f"channel:{ch.name}"
@@ -299,7 +289,14 @@ class AgentServer:
                 pass
         self._channel_tasks.clear()
 
-        # 3. Scheduler
+        # 3. Gateway
+        if self._gateway:
+            try:
+                await self._gateway.stop()
+            except Exception as e:
+                logger.warning(f"Gateway stop error: {e}")
+
+        # 4. Scheduler
         if self._scheduler is not None:
             try:
                 await self._scheduler.stop()

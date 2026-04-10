@@ -1,7 +1,6 @@
-"""Auxiliary services managed by AgentServer (Syncthing, future additions)."""
+"""Auxiliary services managed by AgentServer."""
 
 from openagent.services.base import AuxService
 from openagent.services.manager import ServiceManager
-from openagent.services.syncthing import SyncthingService
 
-__all__ = ["AuxService", "ServiceManager", "SyncthingService"]
+__all__ = ["AuxService", "ServiceManager"]

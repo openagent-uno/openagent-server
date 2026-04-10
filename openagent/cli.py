@@ -114,6 +114,8 @@ def serve(ctx, channel: tuple[str, ...]):
     async def _serve():
         async with server:
             active = []
+            if server._gateway:
+                active.append(f"gateway:{server._gateway.port}")
             if server.channels:
                 active.extend(ch.name for ch in server.channels)
             if server._scheduler is not None:
