@@ -420,7 +420,7 @@ def setup_cmd(
         DEFAULT_FOLDER_LABEL,
         DEFAULT_GUI_BIND,
     )
-    from openagent.service import setup_service
+    from openagent.installer import setup_service
 
     config = ctx.obj["config"]
     config_path = Path(ctx.obj["config_path"]).expanduser()
@@ -541,7 +541,7 @@ def install_cmd(ctx):
 @click.pass_context
 def uninstall_cmd(ctx):
     """Remove OpenAgent system service."""
-    from openagent.service import uninstall_service
+    from openagent.installer import uninstall_service
     try:
         result = uninstall_service()
         console.print(f"[green]{result}[/green]")
@@ -553,7 +553,7 @@ def uninstall_cmd(ctx):
 @click.pass_context
 def status_cmd(ctx):
     """Check if OpenAgent service is running."""
-    from openagent.service import get_service_status
+    from openagent.installer import get_service_status
     status = get_service_status()
     console.print(status)
 

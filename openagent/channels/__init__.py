@@ -1,28 +1,11 @@
-from openagent.channels.base import (
-    Attachment,
-    BLOCKED_EXTENSIONS,
-    BaseChannel,
-    is_blocked_attachment,
-    parse_response_markers,
-    split_preserving_code_blocks,
-)
-from openagent.channels.commands import CommandDispatcher, CommandResult
-from openagent.channels.formatting import (
-    markdown_to_telegram_html,
-    markdown_to_whatsapp,
-)
-from openagent.channels.queue import UserQueueManager
+"""Multi-channel communication (Telegram, Discord, WhatsApp).
 
-__all__ = [
-    "Attachment",
-    "BLOCKED_EXTENSIONS",
-    "BaseChannel",
-    "CommandDispatcher",
-    "CommandResult",
-    "UserQueueManager",
-    "is_blocked_attachment",
-    "markdown_to_telegram_html",
-    "markdown_to_whatsapp",
-    "parse_response_markers",
-    "split_preserving_code_blocks",
-]
+Import concrete channels directly from their modules:
+    from openagent.channels.telegram import TelegramChannel
+    from openagent.channels.discord import DiscordChannel
+    from openagent.channels.whatsapp import WhatsAppChannel
+"""
+
+from openagent.channels.base import BaseChannel
+
+__all__ = ["BaseChannel"]
