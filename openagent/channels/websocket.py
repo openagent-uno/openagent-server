@@ -255,6 +255,17 @@ class WebSocketChannel(BaseChannel):
 
     # ── REST: vault ────────────────────────────────────────────────────
 
+    @staticmethod
+    def _sanitize_meta(obj):
+        """Convert non-JSON-serializable values (datetime, date) to strings."""
+        if isinstance(obj, dict):
+            return {k: WebSocketChannel._sanitize_meta(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [WebSocketChannel._sanitize_meta(v) for v in obj]
+        if hasattr(obj, 'isoformat'):  # datetime, date
+            return obj.isoformat()
+        return obj
+
     def _parse_frontmatter(self, content: str) -> tuple[dict, str]:
         """Extract YAML frontmatter from markdown. Returns (meta, body)."""
         if content.startswith("---"):
@@ -265,7 +276,7 @@ class WebSocketChannel(BaseChannel):
                     meta = yaml.safe_load(parts[1]) or {}
                 except Exception:
                     meta = {}
-                return meta, parts[2].strip()
+                return self._sanitize_meta(meta), parts[2].strip()
         return {}, content
 
     def _scan_wikilinks(self, content: str) -> list[str]:
