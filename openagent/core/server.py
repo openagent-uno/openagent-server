@@ -180,6 +180,16 @@ def _build_channels(agent: Agent, config: dict, only: list[str] | None = None) -
                 allowed_users=ch_config.get("allowed_users"),
             ))
 
+        elif ch_name == "websocket":
+            from openagent.channels.websocket import WebSocketChannel
+            out.append(WebSocketChannel(
+                agent=agent,
+                host=ch_config.get("host", "0.0.0.0"),
+                port=int(ch_config.get("port", 8765)),
+                token=ch_config.get("token") or os.environ.get("OPENAGENT_WS_TOKEN"),
+                allowed_origins=ch_config.get("allowed_origins"),
+            ))
+
         else:
             logger.warning(f"Unknown channel: {ch_name}")
 

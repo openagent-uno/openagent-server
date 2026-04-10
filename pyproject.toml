@@ -31,11 +31,13 @@ whatsapp = ["whatsapp-api-client-python>=0.0.46"]
 # the default 'base'). Set OPENAGENT_WHISPER_MODEL to pick a different
 # size (tiny, base, small, medium, large-v3).
 voice = ["faster-whisper>=1.0.0"]
+websocket = ["aiohttp>=3.9"]
 all = [
     "python-telegram-bot>=21.0",
     "discord.py>=2.3.0",
     "whatsapp-api-client-python>=0.0.46",
     "faster-whisper>=1.0.0",
+    "aiohttp>=3.9",
 ]
 
 [project.scripts]
