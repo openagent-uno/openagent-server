@@ -82,23 +82,35 @@ class DiscordBridge(BaseBridge):
             if client.user:
                 content = content.replace(f"<@{client.user.id}>", "").replace(f"<@!{client.user.id}>", "").strip()
 
-            # Blocked attachments
-            blocked = [a.filename for a in message.attachments if is_blocked_attachment(a.filename)]
-            if blocked:
-                await message.channel.send(f"⚠️ Blocked: {', '.join(blocked)}")
-
-            # Voice attachments
+            # Process attachments
+            blocked = []
+            files_info = []
+            tmp = tempfile.mkdtemp(prefix="oa_dc_")
             for att in message.attachments:
+                if is_blocked_attachment(att.filename):
+                    blocked.append(att.filename)
+                    continue
                 ct = att.content_type or ""
-                if ct.startswith("audio/") or att.filename.lower().endswith((".ogg", ".mp3", ".wav", ".m4a")):
-                    tmp = tempfile.mkdtemp(prefix="oa_dc_")
-                    path = str(Path(tmp) / att.filename)
-                    await att.save(path)
-                    transcription = await transcribe_voice(path)
-                    if transcription:
-                        content = f"{content}\n{transcription}" if content else transcription
+                is_voice = ct.startswith("audio/") or att.filename.lower().endswith((".ogg",".mp3",".wav",".m4a"))
+                path = str(Path(tmp) / att.filename)
+                await att.save(path)
+
+                if is_voice:
+                    t = await transcribe_voice(path)
+                    if t:
+                        content = f"{content}\n{t}" if content else t
                     else:
                         content = f"{content}\n{VOICE_FALLBACK}" if content else VOICE_FALLBACK
+                elif ct.startswith("image/"):
+                    files_info.append(f"- image: {att.filename} — local path: {path}")
+                else:
+                    files_info.append(f"- file: {att.filename} — local path: {path}")
+
+            if blocked:
+                await message.channel.send(f"⚠️ Blocked: {', '.join(blocked)}")
+            if files_info:
+                header = "The user attached files:\n" + "\n".join(files_info) + "\nUse Read to inspect them."
+                content = f"{header}\n\n{content}" if content else header
 
             if not content:
                 return

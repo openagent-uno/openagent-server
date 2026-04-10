@@ -1,9 +1,4 @@
-"""Telegram bridge — translates Telegram Bot API ↔ Gateway WS protocol.
-
-Thin adapter: receives Telegram messages, forwards to Gateway, sends
-responses back to the user. All heavy lifting (queue, sessions, agent,
-voice transcription) is done by the Gateway.
-"""
+"""Telegram bridge — translates Telegram Bot API ↔ Gateway WS protocol."""
 
 from __future__ import annotations
 
@@ -20,74 +15,43 @@ from openagent.channels.voice import transcribe as transcribe_voice
 logger = logging.getLogger(__name__)
 
 TELEGRAM_MSG_LIMIT = 4096
-
-VOICE_FALLBACK_MSG = (
-    "[The user sent a voice message but transcription is currently "
-    "unavailable. Ask them to send it as text instead.]"
-)
+VOICE_FALLBACK = "[Voice message not transcribed. Ask the user to type it.]"
 
 
 class TelegramBridge(BaseBridge):
-    """Telegram ↔ Gateway bridge."""
-
     name = "telegram"
 
-    def __init__(
-        self,
-        token: str,
-        allowed_users: list[str] | None = None,
-        gateway_url: str = "ws://localhost:8765/ws",
-        gateway_token: str | None = None,
-    ):
+    def __init__(self, token: str, allowed_users: list[str] | None = None,
+                 gateway_url: str = "ws://localhost:8765/ws", gateway_token: str | None = None):
         super().__init__(gateway_url, gateway_token)
         self.token = token
         self.allowed_users = set(allowed_users) if allowed_users else None
         self._app = None
 
-    def _is_authorized(self, user_id: str) -> bool:
-        if self.allowed_users is None:
-            return True
-        return user_id in self.allowed_users
+    def _is_authorized(self, uid: str) -> bool:
+        return self.allowed_users is None or uid in self.allowed_users
 
     async def _run(self) -> None:
-        try:
-            from telegram.ext import (
-                ApplicationBuilder, CommandHandler, MessageHandler,
-                CallbackQueryHandler, filters,
-            )
-        except ImportError:
-            raise ImportError(
-                "python-telegram-bot is required. "
-                "Install with: pip install openagent-framework[telegram]"
-            )
+        from telegram.ext import (
+            ApplicationBuilder, CommandHandler, MessageHandler,
+            CallbackQueryHandler, filters,
+        )
 
         self._app = ApplicationBuilder().token(self.token).build()
-
-        # /start welcome
-        self._app.add_handler(CommandHandler("start", self._handle_start))
-
-        # Slash commands via Gateway
+        self._app.add_handler(CommandHandler("start", self._on_start))
         for cmd in ("new", "reset", "stop", "status", "queue", "help", "usage"):
-            self._app.add_handler(
-                CommandHandler(cmd, lambda u, c, _c=cmd: self._handle_command(u, c, _c))
-            )
-
-        # Stop button callback
-        self._app.add_handler(CallbackQueryHandler(self._handle_stop_callback, pattern=r"^stop:"))
-
-        # Messages
+            self._app.add_handler(CommandHandler(cmd, lambda u, c, _c=cmd: self._on_command(u, c, _c)))
+        self._app.add_handler(CallbackQueryHandler(self._on_stop_cb, pattern=r"^stop:"))
         self._app.add_handler(MessageHandler(
             filters.TEXT | filters.PHOTO | filters.VOICE | filters.AUDIO |
             filters.Document.ALL | filters.VIDEO,
-            self._handle_message,
+            self._on_message,
         ))
 
         logger.info("Telegram bridge started")
         await self._app.initialize()
         await self._app.start()
         await self._app.updater.start_polling()
-
-        # Block until stopped
         while not self._should_stop:
             await asyncio.sleep(1)
 
@@ -104,101 +68,127 @@ class TelegramBridge(BaseBridge):
 
     # ── Handlers ──
 
-    async def _handle_start(self, update, context):
+    async def _on_start(self, update, context):
         await update.message.reply_text(
-            "Ciao! Mandami un messaggio, una foto, un vocale o un file.\n"
-            "Usa /help per la lista dei comandi."
+            "Mandami un messaggio, foto, vocale o file.\nUsa /help per i comandi."
         )
 
-    async def _handle_command(self, update, context, cmd: str):
+    async def _on_command(self, update, context, cmd):
         if not update.message:
             return
-        user_id = str(update.message.from_user.id)
-        if not self._is_authorized(user_id):
-            await update.message.reply_text("Unauthorized.")
-            return
+        if not self._is_authorized(str(update.message.from_user.id)):
+            return await update.message.reply_text("Unauthorized.")
         result = await self.send_command(cmd)
         await self._reply_rich(update.message, result)
 
-    async def _handle_stop_callback(self, update, context):
-        query = update.callback_query
-        if not query or not query.data.startswith("stop:"):
+    async def _on_stop_cb(self, update, context):
+        q = update.callback_query
+        if not q or not q.data.startswith("stop:"):
             return
-        target = query.data.split(":", 1)[1]
-        if str(query.from_user.id) != target:
-            await query.answer("Non puoi fermare l'operazione di un altro utente.", show_alert=True)
-            return
+        if str(q.from_user.id) != q.data.split(":", 1)[1]:
+            return await q.answer("Not your operation.", show_alert=True)
         result = await self.send_command("stop")
-        await query.answer(result, show_alert=False)
+        await q.answer(result, show_alert=False)
 
-    async def _handle_message(self, update, context):
-        if not update.message:
-            return
+    async def _on_message(self, update, context):
         msg = update.message
-        user_id = str(msg.from_user.id)
-
-        if not self._is_authorized(user_id):
-            await msg.reply_text("Unauthorized.")
+        if not msg:
             return
+        uid = str(msg.from_user.id)
+        if not self._is_authorized(uid):
+            return await msg.reply_text("Unauthorized.")
 
         text = msg.caption or msg.text or ""
-        tmp_dir = tempfile.mkdtemp(prefix="oa_tg_")
+        tmp = tempfile.mkdtemp(prefix="oa_tg_")
+        files_info: list[str] = []
 
-        # Voice transcription
+        # Photo
+        if msg.photo:
+            photo = msg.photo[-1]
+            f = await photo.get_file()
+            path = str(Path(tmp) / f"photo_{photo.file_unique_id}.jpg")
+            await f.download_to_drive(path)
+            files_info.append(f"- image: photo.jpg — local path: {path}")
+
+        # Voice
         if msg.voice:
-            file = await msg.voice.get_file()
-            path = str(Path(tmp_dir) / f"voice_{msg.voice.file_unique_id}.ogg")
-            await file.download_to_drive(path)
+            f = await msg.voice.get_file()
+            path = str(Path(tmp) / f"voice_{msg.voice.file_unique_id}.ogg")
+            await f.download_to_drive(path)
             transcription = await transcribe_voice(path)
             if transcription:
                 text = transcription if not text else f"{text}\n{transcription}"
             else:
-                fallback = VOICE_FALLBACK_MSG
-                text = fallback if not text else f"{text}\n{fallback}"
+                text = VOICE_FALLBACK if not text else f"{text}\n{VOICE_FALLBACK}"
+
+        # Audio
+        if msg.audio:
+            fname = msg.audio.file_name or f"audio_{msg.audio.file_unique_id}"
+            if not is_blocked_attachment(fname):
+                f = await msg.audio.get_file()
+                path = str(Path(tmp) / fname)
+                await f.download_to_drive(path)
+                files_info.append(f"- file: {fname} — local path: {path}")
+
+        # Document
+        if msg.document:
+            fname = msg.document.file_name or f"doc_{msg.document.file_unique_id}"
+            if is_blocked_attachment(fname):
+                await msg.reply_text(f"⚠️ Blocked: {fname}")
+            else:
+                f = await msg.document.get_file()
+                path = str(Path(tmp) / fname)
+                await f.download_to_drive(path)
+                files_info.append(f"- file: {fname} — local path: {path}")
+
+        # Video
+        if msg.video:
+            fname = msg.video.file_name or f"video_{msg.video.file_unique_id}.mp4"
+            if not is_blocked_attachment(fname):
+                f = await msg.video.get_file()
+                path = str(Path(tmp) / fname)
+                await f.download_to_drive(path)
+                files_info.append(f"- video: {fname} — local path: {path}")
+
+        # Prepend file info so the agent can Read them
+        if files_info:
+            header = "The user attached files:\n" + "\n".join(files_info)
+            header += "\nUse the Read tool with the local path to inspect each file."
+            text = f"{header}\n\n{text}" if text else header
 
         if not text:
             return
 
-        # Session ID = per-user
-        session_id = f"tg:{user_id}"
+        session_id = f"tg:{uid}"
 
-        # Status message with stop button
+        # Status message
         try:
             from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-            kb = InlineKeyboardMarkup(
-                [[InlineKeyboardButton("⏹ Stop", callback_data=f"stop:{user_id}")]]
-            )
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏹ Stop", callback_data=f"stop:{uid}")]])
             status_msg = await msg.reply_text("⏳ Thinking...", reply_markup=kb)
         except Exception:
-            status_msg = None
-            kb = None
+            status_msg, kb = None, None
 
-        async def on_status(status: str):
+        async def on_status(s):
             if status_msg and kb:
                 try:
-                    await status_msg.edit_text(f"⏳ {status}", reply_markup=kb)
+                    await status_msg.edit_text(f"⏳ {s}", reply_markup=kb)
                 except Exception:
                     pass
 
-        # Send through Gateway
         response = await self.send_message(text, session_id, on_status=on_status)
 
-        # Delete status message
         if status_msg:
             try:
                 await status_msg.delete()
             except Exception:
                 pass
 
-        # Send response
-        response_text = response.get("text", "")
-        await self._send_response(msg, response_text)
+        await self._send_response(msg, response.get("text", ""))
 
     # ── Sending ──
 
-    async def _reply_rich(self, msg, text: str) -> None:
-        if not text:
-            return
+    async def _reply_rich(self, msg, text):
         for chunk in split_preserving_code_blocks(text, TELEGRAM_MSG_LIMIT):
             rendered = markdown_to_telegram_html(chunk)
             try:
@@ -209,24 +199,22 @@ class TelegramBridge(BaseBridge):
                 except Exception:
                     pass
 
-    async def _send_response(self, msg, response: str) -> None:
-        clean_text, attachments = parse_response_markers(response)
-
+    async def _send_response(self, msg, response):
+        clean, attachments = parse_response_markers(response)
         for att in attachments:
             try:
-                path = Path(att.path)
-                if not path.exists():
+                p = Path(att.path)
+                if not p.exists():
                     continue
                 if att.type == "image":
-                    await msg.reply_photo(photo=open(path, "rb"), caption=att.caption)
+                    await msg.reply_photo(photo=open(p, "rb"))
                 elif att.type == "voice":
-                    await msg.reply_voice(voice=open(path, "rb"))
+                    await msg.reply_voice(voice=open(p, "rb"))
                 elif att.type == "video":
-                    await msg.reply_video(video=open(path, "rb"), caption=att.caption)
+                    await msg.reply_video(video=open(p, "rb"))
                 else:
-                    await msg.reply_document(document=open(path, "rb"), filename=att.filename)
+                    await msg.reply_document(document=open(p, "rb"), filename=att.filename)
             except Exception as e:
-                logger.error("Failed to send attachment %s: %s", att.filename, e)
-
-        if clean_text:
-            await self._reply_rich(msg, clean_text)
+                logger.error("Attachment send error: %s", e)
+        if clean:
+            await self._reply_rich(msg, clean)
