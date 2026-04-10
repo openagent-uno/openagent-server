@@ -105,6 +105,8 @@ def chat(ctx, model: str | None, model_id: str | None, session: str | None):
 def serve(ctx, channel: tuple[str, ...]):
     """Start agent, channels, scheduler and aux services."""
     config = ctx.obj["config"]
+    # Store the resolved config path so the websocket channel can read/write it
+    config["_config_path"] = str(Path(ctx.obj["config_path"]).resolve())
     only = list(channel) if channel else None
     server = AgentServer.from_config(config, only_channels=only)
 

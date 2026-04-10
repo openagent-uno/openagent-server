@@ -190,6 +190,7 @@ def _build_channels(agent: Agent, config: dict, only: list[str] | None = None) -
                 token=ch_config.get("token") or os.environ.get("OPENAGENT_WS_TOKEN"),
                 allowed_origins=ch_config.get("allowed_origins"),
                 vault_path=memory_cfg.get("vault_path"),
+                config_path=config.get("_config_path"),
             ))
 
         else:

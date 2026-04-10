@@ -50,6 +50,7 @@ class WebSocketChannel(BaseChannel):
         token: str | None = None,
         allowed_origins: list[str] | None = None,
         vault_path: str | None = None,
+        config_path: str | None = None,
     ):
         super().__init__(agent)
         self.host = host
@@ -57,6 +58,7 @@ class WebSocketChannel(BaseChannel):
         self.token = token
         self.allowed_origins = set(allowed_origins) if allowed_origins else None
         self.vault_path = vault_path
+        self.config_path = config_path
         self._queue = UserQueueManager(platform="websocket", agent_name=agent.name)
         self._commands = CommandDispatcher(agent, self._queue)
         self._app = None
@@ -110,6 +112,10 @@ class WebSocketChannel(BaseChannel):
         app.router.add_get("/api/vault/notes/{path:.+}", self._handle_vault_read)
         app.router.add_put("/api/vault/notes/{path:.+}", self._handle_vault_write)
         app.router.add_delete("/api/vault/notes/{path:.+}", self._handle_vault_delete)
+        # Config API
+        app.router.add_get("/api/config", self._handle_config_get)
+        app.router.add_put("/api/config", self._handle_config_put)
+        app.router.add_patch("/api/config/{section}", self._handle_config_patch)
         # OPTIONS preflight
         app.router.add_route("OPTIONS", "/{path:.*}", self._handle_options)
         self._app = app
@@ -411,3 +417,59 @@ class WebSocketChannel(BaseChannel):
                     edges.append({"source": rel, "target": target_path})
 
         return web.json_response({"nodes": nodes, "edges": edges})
+
+    # ── REST: config ───────────────────────────────────────────────────
+
+    def _resolve_config_path(self) -> Path:
+        if self.config_path:
+            return Path(self.config_path).expanduser().resolve()
+        from openagent.core.paths import default_config_path
+        return default_config_path()
+
+    def _read_raw_config(self) -> dict:
+        """Read YAML without resolving env vars (preserves ${VAR} strings)."""
+        import yaml
+        p = self._resolve_config_path()
+        if not p.exists():
+            return {}
+        with open(p) as f:
+            return yaml.safe_load(f) or {}
+
+    def _write_raw_config(self, config: dict) -> None:
+        """Write config dict back to YAML, preserving key order."""
+        import yaml
+        p = self._resolve_config_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "w") as f:
+            yaml.dump(config, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+
+    async def _handle_config_get(self, request):
+        """Return the full config as JSON (env vars NOT resolved)."""
+        from aiohttp import web
+        config = self._read_raw_config()
+        # Sanitize: don't expose raw config (it may have tokens inline).
+        # But the user explicitly wants to edit it, so we return it.
+        # The _sanitize_meta helper handles datetime objects.
+        config = self._sanitize_meta(config)
+        return web.json_response(config)
+
+    async def _handle_config_put(self, request):
+        """Replace the entire config."""
+        from aiohttp import web
+        data = await request.json()
+        self._write_raw_config(data)
+        return web.json_response({"ok": True, "restart_required": True})
+
+    async def _handle_config_patch(self, request):
+        """Update a single config section (e.g. 'model', 'dream_mode')."""
+        from aiohttp import web
+        section = request.match_info["section"]
+        patch = await request.json()
+        config = self._read_raw_config()
+        config[section] = patch
+        self._write_raw_config(config)
+        return web.json_response({
+            "ok": True,
+            "restart_required": True,
+            section: self._sanitize_meta(patch),
+        })
