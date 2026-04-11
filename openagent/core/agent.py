@@ -196,7 +196,7 @@ class Agent:
                     pass
 
         try:
-            return await self._run_inner(message, attachments, _status)
+            return await self._run_inner(message, attachments, _status, session_id=session_id)
         except BaseException as e:
             logger.error(f"Agent.run() fatal error: {e}")
             return f"Error: {e}"
@@ -206,6 +206,7 @@ class Agent:
         message: str,
         attachments: list[dict] | None,
         _status,
+        session_id: str | None = None,
     ) -> str:
         """Inner run logic, wrapped by run() for crash protection."""
         await _status("Loading context...")
