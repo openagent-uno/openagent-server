@@ -9,11 +9,11 @@
 </p>
 
 <p align="center">
-  <a href="https://geroale.github.io/OpenAgent/">Website</a>
+  <a href="https://openagent.uno/">Website</a>
   ·
-  <a href="https://geroale.github.io/OpenAgent/downloads">Downloads</a>
+  <a href="https://openagent.uno/downloads">Downloads</a>
   ·
-  <a href="https://geroale.github.io/OpenAgent/guide/">Documentation</a>
+  <a href="https://openagent.uno/guide/">Documentation</a>
   ·
   <a href="https://github.com/geroale/OpenAgent/releases">Releases</a>
 </p>
@@ -69,7 +69,7 @@ openagent serve
 
 ## Desktop App
 
-Download packaged desktop builds from [GitHub Releases](https://github.com/geroale/OpenAgent/releases) or from the [OpenAgent downloads page](https://geroale.github.io/OpenAgent/downloads). To build locally:
+Download packaged desktop builds from [GitHub Releases](https://github.com/geroale/OpenAgent/releases) or from the [OpenAgent downloads page](https://openagent.uno/downloads). To build locally:
 
 ```bash
 cd app
@@ -81,12 +81,12 @@ cd app
 
 The canonical documentation now lives on the website:
 
-- [Getting Started](https://geroale.github.io/OpenAgent/guide/getting-started)
-- [Desktop App](https://geroale.github.io/OpenAgent/guide/desktop-app)
-- [Models](https://geroale.github.io/OpenAgent/guide/models)
-- [MCP Tools](https://geroale.github.io/OpenAgent/guide/mcp)
-- [Memory & Vault](https://geroale.github.io/OpenAgent/guide/memory)
-- [Configuration Reference](https://geroale.github.io/OpenAgent/guide/config-reference)
+- [Getting Started](https://openagent.uno/guide/getting-started)
+- [Desktop App](https://openagent.uno/guide/desktop-app)
+- [Models](https://openagent.uno/guide/models)
+- [MCP Tools](https://openagent.uno/guide/mcp)
+- [Memory & Vault](https://openagent.uno/guide/memory)
+- [Configuration Reference](https://openagent.uno/guide/config-reference)
 
 ## Repository Layout
 
