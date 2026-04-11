@@ -247,7 +247,7 @@ class Agent:
         # Tool-use loop
         response = None
         for iteration in range(MAX_TOOL_ITERATIONS):
-            response = await self.model.generate(messages, system=system, tools=tools, on_status=_status)
+            response = await self.model.generate(messages, system=system, tools=tools, on_status=_status, session_id=session_id)
 
             if response.tool_calls:
                 assistant_msg: dict[str, Any] = {

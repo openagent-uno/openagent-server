@@ -39,6 +39,7 @@ class BaseModel(ABC):
         system: str | None = None,
         tools: list[dict[str, Any]] | None = None,
         on_status: Optional[Callable[[str], Awaitable[None]]] = None,
+        session_id: str | None = None,
     ) -> ModelResponse:
         """Generate a response from the model.
 
