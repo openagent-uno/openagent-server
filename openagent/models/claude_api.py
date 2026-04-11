@@ -76,6 +76,7 @@ class ClaudeAPI(BaseModel):
         system: str | None = None,
         tools: list[dict[str, Any]] | None = None,
         on_status=None,
+        session_id: str | None = None,
     ) -> ModelResponse:
         kwargs: dict[str, Any] = {
             "model": self.model,
