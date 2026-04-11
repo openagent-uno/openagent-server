@@ -19,6 +19,8 @@ from openagent.models.base import BaseModel, ModelResponse, ToolCall
 
 logger = logging.getLogger(__name__)
 
+RECEIVE_TIMEOUT = 300  # seconds — generous to allow long tool runs
+
 
 class ClaudeCLI(BaseModel):
     """Claude backed by per-session ``ClaudeSDKClient`` subprocesses."""
@@ -111,18 +113,23 @@ class ClaudeCLI(BaseModel):
         await client.query(prompt, session_id=session_id)
 
         result_text = ""
-        async for message in client.receive_response():
-            if isinstance(message, AssistantMessage) and on_status:
-                for block in (message.content or []):
-                    if getattr(block, "type", None) == "tool_use":
-                        name = getattr(block, "name", None)
-                        if name:
-                            try:
-                                await on_status(f"Using {name}...")
-                            except Exception:
-                                pass
-            if isinstance(message, ResultMessage):
-                result_text = message.result or ""
+        try:
+            async with asyncio.timeout(RECEIVE_TIMEOUT):
+                async for message in client.receive_response():
+                    if isinstance(message, AssistantMessage) and on_status:
+                        for block in (message.content or []):
+                            if getattr(block, "type", None) == "tool_use":
+                                name = getattr(block, "name", None)
+                                if name:
+                                    try:
+                                        await on_status(f"Using {name}...")
+                                    except Exception:
+                                        pass
+                    if isinstance(message, ResultMessage):
+                        result_text = message.result or ""
+        except TimeoutError:
+            logger.error("receive_response() timed out after %ds — forcing reconnect", RECEIVE_TIMEOUT)
+            raise
         return result_text
 
     async def generate(
@@ -177,14 +184,19 @@ class ClaudeCLI(BaseModel):
         client = await self._get_client(sid, system)
         try:
             await client.query(prompt, session_id=sid)
-            async for message in client.receive_response():
-                if isinstance(message, AssistantMessage):
-                    for block in (message.content or []):
-                        if hasattr(block, "text"):
-                            yield block.text
-                elif isinstance(message, ResultMessage):
-                    if message.result:
-                        yield message.result
+            async with asyncio.timeout(RECEIVE_TIMEOUT):
+                async for message in client.receive_response():
+                    if isinstance(message, AssistantMessage):
+                        for block in (message.content or []):
+                            if hasattr(block, "text"):
+                                yield block.text
+                    elif isinstance(message, ResultMessage):
+                        if message.result:
+                            yield message.result
+        except TimeoutError:
+            logger.error("receive_response() timed out after %ds — forcing reconnect", RECEIVE_TIMEOUT)
+            await self._drop_session(sid)
+            yield "Error: receive_response() timed out"
         except BaseException as e:
             logger.error("Stream error session %s: %s", sid, e)
             await self._drop_session(sid)
