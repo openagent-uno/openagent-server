@@ -1,13 +1,13 @@
-"""Claude model via the Claude Agent SDK with a single persistent subprocess.
+"""Claude model via the Claude Agent SDK.
 
-Uses ONE shared ``ClaudeSDKClient`` subprocess for all sessions. Session
-isolation is achieved by passing unique ``session_id`` values to the SDK's
-``query()`` method — the SDK routes each session to a separate conversation
-thread within the same subprocess.
+Uses a single persistent ``ClaudeSDKClient`` subprocess at a time.
+When the session_id changes, the client is disconnected and a fresh
+one is connected — this guarantees conversation isolation without
+spawning multiple subprocesses simultaneously (which caused OOM).
 
-This avoids the OOM problem of spawning one subprocess (+ ~18 MCP child
-processes) per session. A single subprocess uses ~300-500 MB regardless of
-how many sessions are active.
+The subprocess is reused for consecutive messages within the same
+session (supporting multi-turn tool use). When a different session
+sends a message, the current subprocess is recycled.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 
 class ClaudeCLI(BaseModel):
-    """Claude backed by a single persistent ``ClaudeSDKClient`` subprocess."""
+    """Claude backed by a recycled ``ClaudeSDKClient`` subprocess."""
 
     def __init__(
         self,
@@ -36,12 +36,12 @@ class ClaudeCLI(BaseModel):
         self.permission_mode = permission_mode
         self.mcp_servers: dict[str, dict] = mcp_servers or {}
         self._client: Any | None = None
+        self._current_session: str | None = None
         self._lock = asyncio.Lock()
+        self._system: str | None = None
 
     def set_mcp_servers(self, servers: dict[str, dict]) -> None:
         self.mcp_servers = servers
-
-    # ── options ──
 
     def _build_options(self, system: str | None = None) -> Any:
         from claude_agent_sdk import ClaudeAgentOptions
@@ -58,14 +58,25 @@ class ClaudeCLI(BaseModel):
             opts["system_prompt"] = system
         return ClaudeAgentOptions(**opts)
 
-    # ── persistent client ──
-
-    async def _ensure_connected(self, system: str | None) -> None:
+    async def _get_client(self, session_id: str, system: str | None) -> Any:
+        """Return a client for this session. Recycles if session changed."""
         async with self._lock:
+            # Same session → reuse existing client (multi-turn)
+            if self._client is not None and self._current_session == session_id:
+                return self._client
+
+            # Different session → disconnect old, connect new
             if self._client is not None:
-                return
+                logger.info("Recycling Claude client (session %s → %s)",
+                            (self._current_session or "?")[-8:], session_id[-8:])
+                try:
+                    await self._client.disconnect()
+                except Exception as e:
+                    logger.debug("Disconnect: %s", e)
+                self._client = None
+
             from claude_agent_sdk import ClaudeSDKClient
-            logger.info("Starting persistent Claude client...")
+            logger.info("Connecting Claude client for session %s", session_id[-8:])
             client = ClaudeSDKClient(options=self._build_options(system=system))
             try:
                 await client.connect()
@@ -73,46 +84,26 @@ class ClaudeCLI(BaseModel):
                 logger.exception("ClaudeSDKClient.connect() failed")
                 raise
             self._client = client
-            logger.info("Persistent Claude client connected.")
-
-    async def _reconnect(self, system: str | None) -> None:
-        async with self._lock:
-            old = self._client
-            self._client = None
-        if old:
-            try:
-                await old.disconnect()
-            except Exception as e:
-                logger.debug("Old client disconnect: %s", e)
-        await self._ensure_connected(system)
+            self._current_session = session_id
+            self._system = system
+            return client
 
     async def shutdown(self) -> None:
         async with self._lock:
             client = self._client
             self._client = None
+            self._current_session = None
         if client:
             try:
                 await client.disconnect()
             except Exception as e:
-                logger.debug("Client disconnect: %s", e)
+                logger.debug("Shutdown disconnect: %s", e)
 
-    # ── execution ──
-
-    async def _run_once(
-        self,
-        prompt: str,
-        session_id: str,
-        on_status: Optional[Callable[[str], Awaitable[None]]] = None,
-    ) -> str:
+    async def _run_once(self, client, prompt, session_id, on_status=None):
         from claude_agent_sdk import AssistantMessage, ResultMessage
-        assert self._client is not None
-
-        # Pass session_id to the SDK — this is how the SDK isolates
-        # conversations within the same persistent subprocess.
-        await self._client.query(prompt, session_id=session_id)
-
+        await client.query(prompt, session_id=session_id)
         result_text = ""
-        async for message in self._client.receive_response():
+        async for message in client.receive_response():
             if isinstance(message, AssistantMessage) and on_status:
                 for block in (message.content or []):
                     if getattr(block, "type", None) == "tool_use":
@@ -135,8 +126,7 @@ class ClaudeCLI(BaseModel):
         session_id: str | None = None,
     ) -> ModelResponse:
         sid = session_id or "default"
-
-        prompt_parts: list[str] = []
+        prompt_parts = []
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content", "")
@@ -146,24 +136,19 @@ class ClaudeCLI(BaseModel):
                 prompt_parts.append(f"[Previous assistant response] {content}")
         prompt = "\n\n".join(prompt_parts)
 
-        await self._ensure_connected(system)
-
         for attempt in range(2):
             try:
-                result = await self._run_once(prompt, sid, on_status)
+                client = await self._get_client(sid, system)
+                result = await self._run_once(client, prompt, sid, on_status)
                 return ModelResponse(content=result)
             except BaseException as e:
-                logger.error("Session %s error (attempt %d): %s", sid[-12:], attempt + 1, e)
+                logger.error("Session %s error (attempt %d): %s", sid[-8:], attempt + 1, e)
                 if attempt == 0:
-                    logger.info("Reconnecting Claude client...")
-                    try:
-                        await self._reconnect(system)
-                    except Exception as e2:
-                        logger.error("Reconnect failed: %s", e2)
-                        return ModelResponse(content=f"Error: {e}")
+                    async with self._lock:
+                        self._client = None
+                        self._current_session = None
                     continue
                 return ModelResponse(content=f"Error: {e}")
-
         return ModelResponse(content="Error: max retries exceeded")
 
     async def stream(
@@ -174,16 +159,13 @@ class ClaudeCLI(BaseModel):
         session_id: str | None = None,
     ) -> AsyncIterator[str]:
         from claude_agent_sdk import AssistantMessage, ResultMessage
-
         sid = session_id or "default"
         prompt_parts = [m.get("content", "") for m in messages if m.get("role") == "user"]
         prompt = "\n\n".join(prompt_parts)
-
-        await self._ensure_connected(system)
         try:
-            assert self._client is not None
-            await self._client.query(prompt, session_id=sid)
-            async for message in self._client.receive_response():
+            client = await self._get_client(sid, system)
+            await client.query(prompt, session_id=sid)
+            async for message in client.receive_response():
                 if isinstance(message, AssistantMessage):
                     for block in (message.content or []):
                         if hasattr(block, "text"):
@@ -192,6 +174,8 @@ class ClaudeCLI(BaseModel):
                     if message.result:
                         yield message.result
         except BaseException as e:
-            logger.error("Stream error session %s: %s", sid, e)
-            await self._reconnect(system)
+            logger.error("Stream error: %s", e)
+            async with self._lock:
+                self._client = None
+                self._current_session = None
             yield f"Error: {e}"
