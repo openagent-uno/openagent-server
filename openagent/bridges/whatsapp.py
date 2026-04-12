@@ -82,6 +82,26 @@ class WhatsAppBridge(BaseBridge):
             text = msg_data.get("textMessageData", {}).get("textMessage", "")
         elif msg_type == "extendedTextMessage":
             text = msg_data.get("extendedTextMessageData", {}).get("text", "")
+
+        # Handle slash commands (text-only, no buttons on WhatsApp)
+        if text.startswith("/"):
+            cmd = text.strip()[1:].split()[0].lower()
+            if cmd in ("new", "reset", "stop", "status", "queue", "clear", "help", "start"):
+                if cmd == "start":
+                    await self._send_text(chat_id,
+                        "👋 Hi! I'm your OpenAgent assistant.\n\n"
+                        "Send me a message, photo, voice note, or file.\n\n"
+                        "Commands:\n"
+                        "/new — fresh conversation\n"
+                        "/stop — cancel current operation\n"
+                        "/status — agent status\n"
+                        "/clear — clear queue\n"
+                        "/help — all commands"
+                    )
+                else:
+                    result = await self.send_command(cmd)
+                    await self._send_text(chat_id, result)
+                return
         elif msg_type in ("audioMessage", "voiceMessage"):
             file_data = msg_data.get("fileMessageData", {})
             url = file_data.get("downloadUrl", "")

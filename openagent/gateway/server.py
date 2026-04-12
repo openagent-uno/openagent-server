@@ -236,8 +236,19 @@ class Gateway:
             text = f"{'Busy' if busy else 'Idle'} | Queue: {depth} | Sessions: {len(sessions)}"
         elif name == "queue":
             text = f"Queue depth: {sm.queue_depth(client_id)}"
+        elif name == "clear":
+            n = sm.clear_queue(client_id)
+            text = f"Queue cleared ({n} messages removed)." if n else "Queue already empty."
         elif name == "help":
-            text = "Commands: /new /stop /status /queue /help /usage"
+            text = (
+                "Available commands:\n"
+                "• /new — start a fresh conversation (clears context)\n"
+                "• /stop — cancel the current operation\n"
+                "• /status — show agent status and queue depth\n"
+                "• /queue — show pending messages\n"
+                "• /clear — clear the message queue\n"
+                "• /help — show this help message"
+            )
         else:
             text = f"Unknown command: {name}"
         await ws.send_json({"type": P.COMMAND_RESULT, "text": text})

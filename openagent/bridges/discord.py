@@ -1,7 +1,7 @@
 """Discord bridge — translates Discord Bot API ↔ Gateway WS protocol.
 
-Security: allowed_users is mandatory. Unauthorized messages are ignored
-in silence. Supports DM, mention, and listen_channels modes.
+Registers native Discord slash commands and handles messages via
+the Gateway WebSocket protocol. Authorized users only.
 """
 
 from __future__ import annotations
@@ -22,8 +22,6 @@ VOICE_FALLBACK = "[Voice message could not be transcribed. Ask the user to type 
 
 
 class DiscordBridge(BaseBridge):
-    """Discord ↔ Gateway bridge."""
-
     name = "discord"
 
     def __init__(
@@ -47,17 +45,54 @@ class DiscordBridge(BaseBridge):
     async def _run(self) -> None:
         try:
             import discord
+            from discord import app_commands
         except ImportError:
             raise ImportError("discord.py required. Install: pip install openagent-framework[discord]")
 
         intents = discord.Intents.default()
         intents.message_content = True
         client = discord.Client(intents=intents)
+        tree = app_commands.CommandTree(client)
         self._client = client
+
+        # ── Register slash commands ──
+
+        @tree.command(name="new", description="Start a new conversation (fresh context)")
+        async def _cmd_new(interaction: discord.Interaction):
+            await self._handle_slash(interaction, "new")
+
+        @tree.command(name="stop", description="Cancel the current operation")
+        async def _cmd_stop(interaction: discord.Interaction):
+            await self._handle_slash(interaction, "stop")
+
+        @tree.command(name="status", description="Show agent status and queue")
+        async def _cmd_status(interaction: discord.Interaction):
+            await self._handle_slash(interaction, "status")
+
+        @tree.command(name="clear", description="Clear the message queue")
+        async def _cmd_clear(interaction: discord.Interaction):
+            await self._handle_slash(interaction, "clear")
+
+        @tree.command(name="help", description="Show available commands")
+        async def _cmd_help(interaction: discord.Interaction):
+            await self._handle_slash(interaction, "help")
+
+        # ── Events ──
 
         @client.event
         async def on_ready():
             logger.info("Discord bridge connected as %s", client.user)
+            try:
+                if self.allowed_guilds:
+                    for gid in self.allowed_guilds:
+                        guild = discord.Object(id=int(gid))
+                        tree.copy_global_to(guild=guild)
+                        await tree.sync(guild=guild)
+                else:
+                    await tree.sync()
+                logger.info("Discord slash commands synced")
+            except Exception as e:
+                logger.warning("Slash command sync failed: %s", e)
 
         @client.event
         async def on_message(message):
@@ -91,7 +126,7 @@ class DiscordBridge(BaseBridge):
                     blocked.append(att.filename)
                     continue
                 ct = att.content_type or ""
-                is_voice = ct.startswith("audio/") or att.filename.lower().endswith((".ogg",".mp3",".wav",".m4a"))
+                is_voice = ct.startswith("audio/") or att.filename.lower().endswith((".ogg", ".mp3", ".wav", ".m4a"))
                 path = str(Path(tmp) / att.filename)
                 await att.save(path)
 
@@ -149,6 +184,16 @@ class DiscordBridge(BaseBridge):
                     await message.channel.send(chunk)
 
         await client.start(self.token)
+
+    async def _handle_slash(self, interaction, cmd: str) -> None:
+        """Handle a Discord slash command via the Gateway."""
+        uid = str(interaction.user.id)
+        if uid not in self.allowed_users:
+            await interaction.response.send_message("Unauthorized.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        result = await self.send_command(cmd)
+        await interaction.followup.send(result, ephemeral=True)
 
     async def stop(self) -> None:
         self._should_stop = True

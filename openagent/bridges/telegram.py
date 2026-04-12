@@ -17,6 +17,15 @@ logger = logging.getLogger(__name__)
 TELEGRAM_MSG_LIMIT = 4096
 VOICE_FALLBACK = "[Voice message not transcribed. Ask the user to type it.]"
 
+# Bot menu commands — shown in Telegram's command picker
+BOT_COMMANDS = [
+    ("new", "Start a new conversation (fresh context)"),
+    ("stop", "Cancel the current operation"),
+    ("status", "Show agent status and queue"),
+    ("clear", "Clear the message queue"),
+    ("help", "Show available commands"),
+]
+
 
 class TelegramBridge(BaseBridge):
     name = "telegram"
@@ -32,16 +41,23 @@ class TelegramBridge(BaseBridge):
         return self.allowed_users is None or uid in self.allowed_users
 
     async def _run(self) -> None:
+        from telegram import BotCommand
         from telegram.ext import (
             ApplicationBuilder, CommandHandler, MessageHandler,
             CallbackQueryHandler, filters,
         )
 
         self._app = ApplicationBuilder().token(self.token).build()
+
+        # Register commands
         self._app.add_handler(CommandHandler("start", self._on_start))
-        for cmd in ("new", "reset", "stop", "status", "queue", "help", "usage"):
+        for cmd in ("new", "reset", "stop", "status", "queue", "clear", "help"):
             self._app.add_handler(CommandHandler(cmd, lambda u, c, _c=cmd: self._on_command(u, c, _c)))
+
+        # Stop button callback
         self._app.add_handler(CallbackQueryHandler(self._on_stop_cb, pattern=r"^stop:"))
+
+        # Messages (text, photo, voice, audio, documents, video)
         self._app.add_handler(MessageHandler(
             filters.TEXT | filters.PHOTO | filters.VOICE | filters.AUDIO |
             filters.Document.ALL | filters.VIDEO,
@@ -51,6 +67,16 @@ class TelegramBridge(BaseBridge):
         logger.info("Telegram bridge started")
         await self._app.initialize()
         await self._app.start()
+
+        # Set bot menu commands so they appear in Telegram's "/" picker
+        try:
+            await self._app.bot.set_my_commands([
+                BotCommand(cmd, desc) for cmd, desc in BOT_COMMANDS
+            ])
+            logger.info("Telegram bot commands menu set (%d commands)", len(BOT_COMMANDS))
+        except Exception as e:
+            logger.warning("Failed to set bot commands: %s", e)
+
         await self._app.updater.start_polling()
         while not self._should_stop:
             await asyncio.sleep(1)
@@ -69,8 +95,16 @@ class TelegramBridge(BaseBridge):
     # ── Handlers ──
 
     async def _on_start(self, update, context):
+        name = update.message.from_user.first_name or "there"
         await update.message.reply_text(
-            "Mandami un messaggio, foto, vocale o file.\nUsa /help per i comandi."
+            f"👋 Hi {name}! I'm your OpenAgent assistant.\n\n"
+            "Send me a message, photo, voice note, or file and I'll help.\n\n"
+            "Commands:\n"
+            "/new — fresh conversation\n"
+            "/stop — cancel current operation\n"
+            "/status — agent status\n"
+            "/clear — clear queue\n"
+            "/help — all commands"
         )
 
     async def _on_command(self, update, context, cmd):
@@ -150,7 +184,7 @@ class TelegramBridge(BaseBridge):
                 await f.download_to_drive(path)
                 files_info.append(f"- video: {fname} — local path: {path}")
 
-        # Prepend file info so the agent can Read them
+        # Prepend file info
         if files_info:
             header = "The user attached files:\n" + "\n".join(files_info)
             header += "\nUse the Read tool with the local path to inspect each file."
@@ -161,7 +195,7 @@ class TelegramBridge(BaseBridge):
 
         session_id = f"tg:{uid}"
 
-        # Status message
+        # Status message with stop button
         try:
             from telegram import InlineKeyboardButton, InlineKeyboardMarkup
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏹ Stop", callback_data=f"stop:{uid}")]])
