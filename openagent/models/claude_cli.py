@@ -22,7 +22,7 @@ from openagent.core.logging import elog
 
 logger = logging.getLogger(__name__)
 
-RECEIVE_TIMEOUT = 300  # seconds — generous to allow long tool runs
+RECEIVE_TIMEOUT = 600  # seconds — allow long multi-tool runs
 MAX_SESSIONS = 3  # max concurrent Claude subprocesses
 
 
