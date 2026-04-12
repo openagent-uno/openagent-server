@@ -1,19 +1,20 @@
-"""Claude model via the Claude Agent SDK.
+"""Claude model via the Claude Agent SDK with bounded session pool.
 
-Uses a single persistent ``ClaudeSDKClient`` subprocess at a time.
-When the session_id changes, the client is disconnected and a fresh
-one is connected — this guarantees conversation isolation without
-spawning multiple subprocesses simultaneously (which caused OOM).
+Maintains up to MAX_SESSIONS persistent ``ClaudeSDKClient`` instances.
+Each session_id gets its own subprocess with isolated conversation.
+When the pool is full, the least-recently-used session is evicted
+(disconnected) to make room.
 
-The subprocess is reused for consecutive messages within the same
-session (supporting multi-turn tool use). When a different session
-sends a message, the current subprocess is recycled.
+With MAX_SESSIONS=3 and ~18 MCP processes per client, the worst case
+is ~54 child processes — fits comfortably in 4 GB RAM.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from collections import OrderedDict
 from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 
 from openagent.models.base import BaseModel, ModelResponse, ToolCall
@@ -21,10 +22,11 @@ from openagent.models.base import BaseModel, ModelResponse, ToolCall
 logger = logging.getLogger(__name__)
 
 RECEIVE_TIMEOUT = 300  # seconds — generous to allow long tool runs
+MAX_SESSIONS = 3  # max concurrent Claude subprocesses
 
 
 class ClaudeCLI(BaseModel):
-    """Claude backed by a recycled ``ClaudeSDKClient`` subprocess."""
+    """Claude backed by a bounded pool of ``ClaudeSDKClient`` subprocesses."""
 
     def __init__(
         self,
@@ -37,10 +39,8 @@ class ClaudeCLI(BaseModel):
         self.allowed_tools = allowed_tools or []
         self.permission_mode = permission_mode
         self.mcp_servers: dict[str, dict] = mcp_servers or {}
-        self._client: Any | None = None
-        self._current_session: str | None = None
+        self._pool: OrderedDict[str, Any] = OrderedDict()  # session_id → client (LRU)
         self._lock = asyncio.Lock()
-        self._system: str | None = None
 
     def set_mcp_servers(self, servers: dict[str, dict]) -> None:
         self.mcp_servers = servers
@@ -61,45 +61,53 @@ class ClaudeCLI(BaseModel):
         return ClaudeAgentOptions(**opts)
 
     async def _get_client(self, session_id: str, system: str | None) -> Any:
-        """Return a client for this session. Recycles if session changed."""
+        """Get or create a client for this session. LRU eviction if pool full."""
         async with self._lock:
-            # Same session → reuse existing client (multi-turn)
-            if self._client is not None and self._current_session == session_id:
-                return self._client
+            # Hit: move to end (most recent)
+            if session_id in self._pool:
+                self._pool.move_to_end(session_id)
+                return self._pool[session_id]
 
-            # Different session → disconnect old, connect new
-            if self._client is not None:
-                logger.info("Recycling Claude client (session %s → %s)",
-                            (self._current_session or "?")[-8:], session_id[-8:])
+            # Evict oldest if at capacity
+            while len(self._pool) >= MAX_SESSIONS:
+                evict_sid, evict_client = self._pool.popitem(last=False)
+                logger.info("Evicting session %s (pool full)", evict_sid[-12:])
                 try:
-                    await self._client.disconnect()
+                    await evict_client.disconnect()
                 except Exception as e:
-                    logger.debug("Disconnect: %s", e)
-                self._client = None
+                    logger.debug("Evict disconnect: %s", e)
 
+            # Create new
             from claude_agent_sdk import ClaudeSDKClient
-            logger.info("Connecting Claude client for session %s", session_id[-8:])
+            logger.info("Creating session %s (%d/%d in pool)",
+                        session_id[-12:], len(self._pool) + 1, MAX_SESSIONS)
             client = ClaudeSDKClient(options=self._build_options(system=system))
             try:
                 await client.connect()
             except Exception:
-                logger.exception("ClaudeSDKClient.connect() failed")
+                logger.exception("ClaudeSDKClient.connect() failed for %s", session_id)
                 raise
-            self._client = client
-            self._current_session = session_id
-            self._system = system
+            self._pool[session_id] = client
             return client
 
-    async def shutdown(self) -> None:
+    async def _drop_session(self, session_id: str) -> None:
         async with self._lock:
-            client = self._client
-            self._client = None
-            self._current_session = None
+            client = self._pool.pop(session_id, None)
         if client:
             try:
                 await client.disconnect()
             except Exception as e:
-                logger.debug("Shutdown disconnect: %s", e)
+                logger.debug("Drop session %s: %s", session_id, e)
+
+    async def shutdown(self) -> None:
+        async with self._lock:
+            pool = dict(self._pool)
+            self._pool.clear()
+        for sid, client in pool.items():
+            try:
+                await client.disconnect()
+            except Exception as e:
+                logger.debug("Shutdown %s: %s", sid, e)
 
     async def _run_once(self, client, prompt, session_id, on_status=None):
         from claude_agent_sdk import AssistantMessage, ResultMessage
@@ -151,9 +159,7 @@ class ClaudeCLI(BaseModel):
             except BaseException as e:
                 logger.error("Session %s error (attempt %d): %s", sid[-8:], attempt + 1, e)
                 if attempt == 0:
-                    async with self._lock:
-                        self._client = None
-                        self._current_session = None
+                    await self._drop_session(sid)
                     continue
                 return ModelResponse(content=f"Error: {e}")
         return ModelResponse(content="Error: max retries exceeded")
@@ -186,8 +192,6 @@ class ClaudeCLI(BaseModel):
             await self._drop_session(sid)
             yield "Error: receive_response() timed out"
         except BaseException as e:
-            logger.error("Stream error: %s", e)
-            async with self._lock:
-                self._client = None
-                self._current_session = None
+            logger.error("Stream error %s: %s", sid, e)
+            await self._drop_session(sid)
             yield f"Error: {e}"
