@@ -7,6 +7,7 @@ on:
     paths:
       - ".github/workflows/pages.yml"
       - "docs/**"
+      - "app/universal/**"
       - "package.json"
       - "package-lock.json"
   workflow_dispatch:
@@ -36,11 +37,28 @@ jobs:
       - name: Configure Pages
         uses: actions/configure-pages@v5
 
-      - name: Install dependencies
+      - name: Install docs dependencies
         run: npm ci
 
       - name: Build VitePress site
         run: npm run docs:build
+
+      - name: Install app dependencies
+        working-directory: app/universal
+        run: npm install --no-audit --no-fund
+
+      - name: Build Expo web app (baseUrl=/app)
+        working-directory: app/universal
+        env:
+          EXPO_BASE_URL: /app
+        run: npx expo export --platform web
+
+      - name: Merge app into Pages artifact
+        run: |
+          mkdir -p docs/.vitepress/dist/app
+          cp -r app/universal/dist/. docs/.vitepress/dist/app/
+          # SPA fallback for deep links under /app/* on GitHub Pages
+          cp docs/.vitepress/dist/app/index.html docs/.vitepress/dist/app/404.html
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
