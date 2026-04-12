@@ -169,8 +169,14 @@ class ClaudeCLI(BaseModel):
                 return ModelResponse(content=result)
             except Exception as e:
                 logger.error("Session %s error (attempt %d): %s", sid[-8:], attempt + 1, e)
+                is_timeout = isinstance(e, TimeoutError)
                 if attempt == 0:
-                    # Retry on same client first — don't destroy session history
+                    if is_timeout:
+                        # Client is stuck — drop it and retry with a fresh
+                        # subprocess. The SDK may resume history via session_id.
+                        await self._drop_session(sid)
+                    # For non-timeout errors, retry on the same client
+                    # (transient issue, session history still intact).
                     continue
                 # Second failure — drop session and return error
                 await self._drop_session(sid)
