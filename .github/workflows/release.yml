@@ -87,11 +87,25 @@ jobs:
           sed -i.bak 's|href="/|href="./|g; s|src="/|src="./|g' app/desktop/web-build/index.html
           rm -f app/desktop/web-build/index.html.bak
         shell: bash
+      - name: Import macOS signing certificate
+        if: runner.os == 'macOS'
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+        run: |
+          if [ -z "$CSC_LINK" ]; then
+            echo "⚠️  CSC_LINK not set — build will be unsigned"
+          fi
       - name: Build Electron app
         working-directory: app/desktop
         run: npx tsc && npx electron-builder ${{ matrix.build_flag }} --publish never
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_LINK: ${{ runner.os == 'macOS' && secrets.CSC_LINK || '' }}
+          CSC_KEY_PASSWORD: ${{ runner.os == 'macOS' && secrets.CSC_KEY_PASSWORD || '' }}
+          APPLE_ID: ${{ runner.os == 'macOS' && secrets.APPLE_ID || '' }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ runner.os == 'macOS' && secrets.APPLE_APP_SPECIFIC_PASSWORD || '' }}
+          APPLE_TEAM_ID: ${{ runner.os == 'macOS' && secrets.APPLE_TEAM_ID || '' }}
       - uses: actions/upload-artifact@v4
         with:
           name: desktop-${{ matrix.os }}
