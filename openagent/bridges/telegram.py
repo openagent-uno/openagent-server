@@ -240,14 +240,15 @@ class TelegramBridge(BaseBridge):
                 p = Path(att.path)
                 if not p.exists():
                     continue
-                if att.type == "image":
-                    await msg.reply_photo(photo=open(p, "rb"))
-                elif att.type == "voice":
-                    await msg.reply_voice(voice=open(p, "rb"))
-                elif att.type == "video":
-                    await msg.reply_video(video=open(p, "rb"))
-                else:
-                    await msg.reply_document(document=open(p, "rb"), filename=att.filename)
+                with open(p, "rb") as f:
+                    if att.type == "image":
+                        await msg.reply_photo(photo=f)
+                    elif att.type == "voice":
+                        await msg.reply_voice(voice=f)
+                    elif att.type == "video":
+                        await msg.reply_video(video=f)
+                    else:
+                        await msg.reply_document(document=f, filename=att.filename)
             except Exception as e:
                 logger.error("Attachment send error: %s", e)
         if clean:

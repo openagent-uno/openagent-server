@@ -29,6 +29,8 @@ class BaseBridge:
         self.gateway_url = gateway_url
         self.gateway_token = gateway_token
         self._ws = None
+        self._ws_session = None  # aiohttp.ClientSession — must be closed
+        self._listener_task: asyncio.Task | None = None
         self._should_stop = False
         self._pending: dict[str, asyncio.Future] = {}  # session_id → response future
         self._status_callbacks: dict[str, Callable] = {}  # session_id → on_status
@@ -50,13 +52,34 @@ class BaseBridge:
 
     async def stop(self) -> None:
         self._should_stop = True
+        if self._listener_task and not self._listener_task.done():
+            self._listener_task.cancel()
+            try:
+                await self._listener_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._listener_task = None
         if self._ws:
             await self._ws.close()
+            self._ws = None
+        if self._ws_session:
+            await self._ws_session.close()
+            self._ws_session = None
 
     async def _connect_gateway(self) -> None:
         """Connect to the Gateway WebSocket and authenticate."""
         import aiohttp
+
+        # Close any previous session/ws from a prior connection attempt
+        if self._ws:
+            await self._ws.close()
+            self._ws = None
+        if self._ws_session:
+            await self._ws_session.close()
+            self._ws_session = None
+
         session = aiohttp.ClientSession()
+        self._ws_session = session
         self._ws = await session.ws_connect(self.gateway_url)
 
         # Authenticate
@@ -69,8 +92,10 @@ class BaseBridge:
             raise ConnectionError(f"Gateway auth failed: {resp.get('reason')}")
         logger.info("%s bridge connected to Gateway", self.name)
 
-        # Start response listener
-        asyncio.create_task(self._listen_gateway())
+        # Start response listener — store the task so exceptions are not lost
+        self._listener_task = asyncio.create_task(
+            self._listen_gateway(), name=f"{self.name}:gw-listener"
+        )
 
     async def _listen_gateway(self) -> None:
         """Listen for Gateway responses and dispatch to pending futures."""
@@ -107,7 +132,7 @@ class BaseBridge:
         on_status: Callable[[str], Awaitable[None]] | None = None,
     ) -> dict:
         """Send a message through the Gateway and wait for the response."""
-        future: asyncio.Future = asyncio.get_event_loop().create_future()
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[session_id] = future
         if on_status:
             self._status_callbacks[session_id] = on_status
@@ -122,7 +147,7 @@ class BaseBridge:
 
     async def send_command(self, name: str) -> str:
         """Send a command and wait for the result."""
-        future: asyncio.Future = asyncio.get_event_loop().create_future()
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending["__cmd__"] = future
         await self._ws.send_json({"type": P.COMMAND, "name": name})
         result = await future

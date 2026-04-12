@@ -13,11 +13,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from collections import OrderedDict
-from typing import Any, AsyncIterator, Awaitable, Callable, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable
 
-from openagent.models.base import BaseModel, ModelResponse, ToolCall
+from openagent.models.base import BaseModel, ModelResponse
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +136,7 @@ class ClaudeCLI(BaseModel):
         messages: list[dict[str, Any]],
         system: str | None = None,
         tools: list[dict[str, Any]] | None = None,
-        on_status: Optional[Callable[[str], Awaitable[None]]] = None,
+        on_status: Callable[[str], Awaitable[None]] | None = None,
         session_id: str | None = None,
     ) -> ModelResponse:
         sid = session_id or "default"

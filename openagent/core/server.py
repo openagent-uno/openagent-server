@@ -15,8 +15,6 @@ import asyncio
 import logging
 import os
 import signal
-from typing import Awaitable, Callable
-
 from openagent.core.agent import Agent
 from openagent.core.config import build_model_from_config
 from openagent.mcp.client import MCPRegistry
@@ -441,45 +439,59 @@ class AgentServer:
         await scheduler.start()
         self._scheduler = scheduler
 
-    async def _sync_dream_mode(self, scheduler) -> None:
-        dream_cfg = self.config.get("dream_mode", {})
-        enabled = dream_cfg.get("enabled", False)
+    async def _sync_scheduled_task(
+        self, scheduler, *, name: str, enabled: bool, cron_expr: str, prompt: str,
+    ) -> dict | None:
+        """Ensure a built-in scheduled task matches the desired state.
+
+        Creates, re-enables/updates, or disables the task as needed.
+        Returns the existing task row (if any) for further customization.
+        """
         tasks = await self.agent._db.get_tasks()
-        existing = next((t for t in tasks if t["name"] == DREAM_MODE_TASK_NAME), None)
+        existing = next((t for t in tasks if t["name"] == name), None)
 
         if enabled:
-            cron_expr = dream_cfg.get("cron")
-            if not cron_expr:
-                time_str = str(dream_cfg.get("time", "3:00"))
-                parts = time_str.split(":")
-                hour = int(parts[0])
-                minute = int(parts[1]) if len(parts) > 1 else 0
-                cron_expr = f"{minute} {hour} * * *"
-
             if existing is None:
                 await scheduler.add_task(
-                    name=DREAM_MODE_TASK_NAME,
-                    cron_expression=cron_expr,
-                    prompt=DREAM_MODE_PROMPT,
+                    name=name, cron_expression=cron_expr, prompt=prompt,
                 )
             elif not existing["enabled"] or existing["cron_expression"] != cron_expr:
                 await scheduler.disable_task(existing["id"])
                 await scheduler.enable_task(existing["id"])
                 if existing["cron_expression"] != cron_expr:
                     await self.agent._db.update_task(
-                        existing["id"], cron_expression=cron_expr
+                        existing["id"], cron_expression=cron_expr,
                     )
         elif existing is not None and existing["enabled"]:
             await scheduler.disable_task(existing["id"])
+
+        return existing
+
+    async def _sync_dream_mode(self, scheduler) -> None:
+        dream_cfg = self.config.get("dream_mode", {})
+        enabled = dream_cfg.get("enabled", False)
+
+        cron_expr = dream_cfg.get("cron")
+        if not cron_expr:
+            time_str = str(dream_cfg.get("time", "3:00"))
+            parts = time_str.split(":")
+            hour = int(parts[0])
+            minute = int(parts[1]) if len(parts) > 1 else 0
+            cron_expr = f"{minute} {hour} * * *"
+
+        await self._sync_scheduled_task(
+            scheduler,
+            name=DREAM_MODE_TASK_NAME,
+            enabled=enabled,
+            cron_expr=cron_expr,
+            prompt=DREAM_MODE_PROMPT,
+        )
 
     async def _sync_auto_update(self, scheduler) -> None:
         update_cfg = self.config.get("auto_update", {})
         enabled = update_cfg.get("enabled", False)
         mode = update_cfg.get("mode", "auto")
         cron_expr = update_cfg.get("check_interval", "0 4 * * *")
-
-        tasks = await self.agent._db.get_tasks()
-        existing = next((t for t in tasks if t["name"] == AUTO_UPDATE_TASK_NAME), None)
 
         prompt = (
             "Run a pip upgrade check for openagent-framework. "
@@ -488,21 +500,15 @@ class AgentServer:
             "If updated, log the new version."
         )
 
-        if enabled:
-            if existing is None:
-                await scheduler.add_task(
-                    name=AUTO_UPDATE_TASK_NAME,
-                    cron_expression=cron_expr,
-                    prompt=prompt,
-                )
-            elif not existing["enabled"] or existing["cron_expression"] != cron_expr:
-                await scheduler.disable_task(existing["id"])
-                await scheduler.enable_task(existing["id"])
-                if existing["cron_expression"] != cron_expr:
-                    await self.agent._db.update_task(
-                        existing["id"], cron_expression=cron_expr
-                    )
+        await self._sync_scheduled_task(
+            scheduler,
+            name=AUTO_UPDATE_TASK_NAME,
+            enabled=enabled,
+            cron_expr=cron_expr,
+            prompt=prompt,
+        )
 
+        if enabled:
             # Override run_task so auto-update uses the direct pip logic
             agent = self.agent
             stop_event = self._stop_event
@@ -515,9 +521,6 @@ class AgentServer:
                     await _orig(task)
 
             scheduler.run_task = _auto_update_run  # type: ignore[method-assign]
-
-        elif existing is not None and existing["enabled"]:
-            await scheduler.disable_task(existing["id"])
 
 
 # ── Auto-update helpers (used by AgentServer and the manual `update` command) ──

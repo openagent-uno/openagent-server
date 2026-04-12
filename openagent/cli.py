@@ -120,14 +120,16 @@ def task_add(ctx, name: str, cron: str, prompt: str):
     async def _add():
         db = MemoryDB(db_path)
         await db.connect()
-        agent = _build_agent(config)
-        from openagent.core.scheduler import Scheduler
-        scheduler = Scheduler(db, agent)
-        task_id = await scheduler.add_task(name, cron, prompt)
-        console.print(f"[green]Task added:[/green] {name} (id: {task_id[:8]}...)")
-        console.print(f"  Cron: {cron}")
-        console.print(f"  Prompt: {prompt}")
-        await db.close()
+        try:
+            agent = _build_agent(config)
+            from openagent.core.scheduler import Scheduler
+            scheduler = Scheduler(db, agent)
+            task_id = await scheduler.add_task(name, cron, prompt)
+            console.print(f"[green]Task added:[/green] {name} (id: {task_id[:8]}...)")
+            console.print(f"  Cron: {cron}")
+            console.print(f"  Prompt: {prompt}")
+        finally:
+            await db.close()
 
     asyncio.run(_add())
 
@@ -141,29 +143,30 @@ def task_list(ctx):
     async def _list():
         db = MemoryDB(db_path)
         await db.connect()
-        tasks = await db.get_tasks()
-        if not tasks:
-            console.print("[yellow]No scheduled tasks.[/yellow]")
+        try:
+            tasks = await db.get_tasks()
+            if not tasks:
+                console.print("[yellow]No scheduled tasks.[/yellow]")
+                return
+
+            table = Table(title="Scheduled Tasks")
+            table.add_column("ID", style="dim", max_width=8)
+            table.add_column("Name")
+            table.add_column("Cron")
+            table.add_column("Enabled")
+            table.add_column("Prompt", max_width=40)
+
+            for t in tasks:
+                table.add_row(
+                    t["id"][:8],
+                    t["name"],
+                    t["cron_expression"],
+                    "[green]yes[/green]" if t["enabled"] else "[red]no[/red]",
+                    t["prompt"][:40],
+                )
+            console.print(table)
+        finally:
             await db.close()
-            return
-
-        table = Table(title="Scheduled Tasks")
-        table.add_column("ID", style="dim", max_width=8)
-        table.add_column("Name")
-        table.add_column("Cron")
-        table.add_column("Enabled")
-        table.add_column("Prompt", max_width=40)
-
-        for t in tasks:
-            table.add_row(
-                t["id"][:8],
-                t["name"],
-                t["cron_expression"],
-                "[green]yes[/green]" if t["enabled"] else "[red]no[/red]",
-                t["prompt"][:40],
-            )
-        console.print(table)
-        await db.close()
 
     asyncio.run(_list())
 
@@ -178,14 +181,16 @@ def task_remove(ctx, task_id: str):
     async def _remove():
         db = MemoryDB(db_path)
         await db.connect()
-        tasks = await db.get_tasks()
-        match = [t for t in tasks if t["id"].startswith(task_id)]
-        if not match:
-            console.print(f"[red]No task matching '{task_id}'[/red]")
-        else:
-            await db.delete_task(match[0]["id"])
-            console.print(f"[green]Removed task: {match[0]['name']}[/green]")
-        await db.close()
+        try:
+            tasks = await db.get_tasks()
+            match = [t for t in tasks if t["id"].startswith(task_id)]
+            if not match:
+                console.print(f"[red]No task matching '{task_id}'[/red]")
+            else:
+                await db.delete_task(match[0]["id"])
+                console.print(f"[green]Removed task: {match[0]['name']}[/green]")
+        finally:
+            await db.close()
 
     asyncio.run(_remove())
 
@@ -200,14 +205,16 @@ def task_enable(ctx, task_id: str):
     async def _enable():
         db = MemoryDB(db_path)
         await db.connect()
-        tasks = await db.get_tasks()
-        match = [t for t in tasks if t["id"].startswith(task_id)]
-        if match:
-            await db.update_task(match[0]["id"], enabled=1)
-            console.print(f"[green]Enabled: {match[0]['name']}[/green]")
-        else:
-            console.print(f"[red]No task matching '{task_id}'[/red]")
-        await db.close()
+        try:
+            tasks = await db.get_tasks()
+            match = [t for t in tasks if t["id"].startswith(task_id)]
+            if match:
+                await db.update_task(match[0]["id"], enabled=1)
+                console.print(f"[green]Enabled: {match[0]['name']}[/green]")
+            else:
+                console.print(f"[red]No task matching '{task_id}'[/red]")
+        finally:
+            await db.close()
 
     asyncio.run(_enable())
 
@@ -222,14 +229,16 @@ def task_disable(ctx, task_id: str):
     async def _disable():
         db = MemoryDB(db_path)
         await db.connect()
-        tasks = await db.get_tasks()
-        match = [t for t in tasks if t["id"].startswith(task_id)]
-        if match:
-            await db.update_task(match[0]["id"], enabled=0)
-            console.print(f"[yellow]Disabled: {match[0]['name']}[/yellow]")
-        else:
-            console.print(f"[red]No task matching '{task_id}'[/red]")
-        await db.close()
+        try:
+            tasks = await db.get_tasks()
+            match = [t for t in tasks if t["id"].startswith(task_id)]
+            if match:
+                await db.update_task(match[0]["id"], enabled=0)
+                console.print(f"[yellow]Disabled: {match[0]['name']}[/yellow]")
+            else:
+                console.print(f"[red]No task matching '{task_id}'[/red]")
+        finally:
+            await db.close()
 
     asyncio.run(_disable())
 
@@ -255,12 +264,14 @@ def mcp_cmd(ctx, action: str):
                 db_path=config.get("memory", {}).get("db_path", "openagent.db"),
             )
             await registry.connect_all()
-            tools = registry.all_tools()
-            console.print(f"\n[bold]MCP Servers:[/bold] {len(registry._servers)}")
-            console.print(f"[bold]Total Tools:[/bold] {len(tools)}\n")
-            for tool in tools:
-                console.print(f"  [cyan]{tool['name']}[/cyan] - {tool.get('description', '')[:80]}")
-            await registry.close_all()
+            try:
+                tools = registry.all_tools()
+                console.print(f"\n[bold]MCP Servers:[/bold] {len(registry._servers)}")
+                console.print(f"[bold]Total Tools:[/bold] {len(tools)}\n")
+                for tool in tools:
+                    console.print(f"  [cyan]{tool['name']}[/cyan] - {tool.get('description', '')[:80]}")
+            finally:
+                await registry.close_all()
 
         asyncio.run(_list())
 
