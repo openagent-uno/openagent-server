@@ -117,13 +117,12 @@ class ClaudeCLI(BaseModel):
                 async for message in client.receive_response():
                     if isinstance(message, AssistantMessage) and on_status:
                         for block in (message.content or []):
-                            if getattr(block, "type", None) == "tool_use":
-                                name = getattr(block, "name", None)
-                                if name:
-                                    try:
-                                        await on_status(f"Using {name}...")
-                                    except Exception:
-                                        pass
+                            tool = getattr(block, "name", None)
+                            if tool and hasattr(block, "input"):
+                                try:
+                                    await on_status(f"Using {tool}...")
+                                except Exception:
+                                    pass
                     if isinstance(message, ResultMessage):
                         result_text = message.result or ""
         except TimeoutError:
