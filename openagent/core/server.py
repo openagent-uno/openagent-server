@@ -271,14 +271,19 @@ class AgentServer:
                 bridge.start(), name=f"bridge:{bridge.name}"
             ))
 
-    async def stop(self) -> None:
-        """Stop bridges, gateway, scheduler, agent (in reverse)."""
+    async def stop(self, timeout: float = 30) -> None:
+        """Stop bridges, gateway, scheduler, agent (in reverse).
+
+        Each phase gets up to *timeout* seconds.  If the agent shutdown
+        (which closes MCP subprocesses) hangs, we log a warning and
+        move on so the process can still exit.
+        """
         # 1. Stop bridges
         for bridge in self._bridges:
             try:
-                await bridge.stop()
-            except Exception as e:
-                logger.warning(f"Bridge {bridge.name} stop error: {e}")
+                await asyncio.wait_for(bridge.stop(), timeout=10)
+            except (asyncio.TimeoutError, Exception) as e:
+                logger.warning("Bridge %s stop error: %s", bridge.name, e)
         for t in self._bridge_tasks:
             if not t.done():
                 t.cancel()
@@ -289,30 +294,44 @@ class AgentServer:
                 pass
         self._bridge_tasks.clear()
 
-        # 3. Gateway
+        # 2. Gateway
         if self._gateway:
             try:
-                await self._gateway.stop()
-            except Exception as e:
-                logger.warning(f"Gateway stop error: {e}")
+                await asyncio.wait_for(self._gateway.stop(), timeout=10)
+            except (asyncio.TimeoutError, Exception) as e:
+                logger.warning("Gateway stop error: %s", e)
 
-        # 4. Scheduler
+        # 3. Scheduler
         if self._scheduler is not None:
             try:
-                await self._scheduler.stop()
-            except Exception as e:
-                logger.warning(f"Scheduler stop error: {e}")
+                await asyncio.wait_for(self._scheduler.stop(), timeout=10)
+            except (asyncio.TimeoutError, Exception) as e:
+                logger.warning("Scheduler stop error: %s", e)
             self._scheduler = None
 
-        # 4. Agent
+        # 4. Agent (MCP subprocess cleanup can hang because the anyio-
+        #    based MCP client waits for subprocesses that may ignore
+        #    SIGTERM).  Give it a deadline; if it doesn't finish, log
+        #    and move on — orphaned subprocesses will be reaped when we
+        #    exit.  The MCP SDK uses anyio cancel scopes which can leak
+        #    CancelledError into our asyncio tasks, so we catch broadly.
         try:
-            await self.agent.shutdown()
+            await asyncio.wait_for(self.agent.shutdown(), timeout=timeout)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            logger.warning(
+                "Agent shutdown did not complete cleanly within %ds", timeout,
+            )
         except Exception as e:
-            logger.warning(f"Agent shutdown error: {e}")
+            logger.warning("Agent shutdown error: %s", e)
 
         # 5. Aux services last
         if len(self.aux_services) > 0:
-            await self.aux_services.stop_all()
+            try:
+                await asyncio.wait_for(
+                    self.aux_services.stop_all(), timeout=10,
+                )
+            except (asyncio.TimeoutError, Exception) as e:
+                logger.warning("Aux services stop error: %s", e)
 
         if self._stop_event is not None:
             self._stop_event.set()
@@ -486,11 +505,12 @@ class AgentServer:
 
             # Override run_task so auto-update uses the direct pip logic
             agent = self.agent
+            stop_event = self._stop_event
             original_run = scheduler.run_task
 
             async def _auto_update_run(task, _orig=original_run):
                 if task["name"] == AUTO_UPDATE_TASK_NAME:
-                    await _do_auto_update(agent, mode)
+                    await _do_auto_update(agent, mode, stop_event=stop_event)
                 else:
                     await _orig(task)
 
@@ -534,8 +554,18 @@ def run_pip_upgrade() -> tuple[str, str]:
     return old, new
 
 
-async def _do_auto_update(agent: Agent, mode: str) -> None:
-    """Check for updates and act according to *mode* (auto/notify/manual)."""
+async def _do_auto_update(
+    agent: Agent,
+    mode: str,
+    stop_event: asyncio.Event | None = None,
+) -> None:
+    """Check for updates and act according to *mode* (auto/notify/manual).
+
+    When *mode* is ``"auto"`` and an update was installed, signals the
+    server to shut down gracefully via *stop_event* and stores the
+    restart exit code on the agent so the CLI can pick it up **after**
+    cleanup has finished.
+    """
     try:
         old_ver, new_ver = run_pip_upgrade()
     except Exception as exc:
@@ -548,7 +578,22 @@ async def _do_auto_update(agent: Agent, mode: str) -> None:
 
     logger.info("openagent-framework updated: %s -> %s", old_ver, new_ver)
 
-    if mode in ("notify", "auto"):
+    if mode == "auto":
+        logger.warning("Restarting for update %s -> %s (exit code %d)...",
+                        old_ver, new_ver, RESTART_EXIT_CODE)
+        # Store the desired exit code so the CLI can use it after clean
+        # shutdown instead of raising SystemExit here (which would skip
+        # server.stop() and leave bridges/gateway in a dirty state).
+        agent._restart_exit_code = RESTART_EXIT_CODE
+        if stop_event is not None:
+            stop_event.set()
+        else:
+            raise SystemExit(RESTART_EXIT_CODE)
+        # Don't try to send a notification when we're about to restart —
+        # it would block the shutdown while the LLM processes the request.
+        return
+
+    if mode == "notify":
         try:
             msg = f"OpenAgent updated: {old_ver} -> {new_ver}"
             tools = agent._mcp.all_tools()
@@ -560,7 +605,3 @@ async def _do_auto_update(agent: Agent, mode: str) -> None:
                 )
         except Exception:
             logger.debug("Could not send update notification via messaging MCP")
-
-    if mode == "auto":
-        logger.info("Restarting for update (exit code %d)...", RESTART_EXIT_CODE)
-        raise SystemExit(RESTART_EXIT_CODE)

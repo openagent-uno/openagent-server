@@ -50,28 +50,52 @@ def serve(ctx, channel: tuple[str, ...]):
     server = AgentServer.from_config(config, only_channels=only)
 
     async def _serve():
-        async with server:
-            active = []
-            if server._gateway:
-                active.append(f"gateway:{server._gateway.port}")
-            if server._bridges:
-                active.extend(f"bridge:{b.name}" for b in server._bridges)
-            if server._scheduler is not None:
-                active.append("scheduler")
-            if len(server.aux_services) > 0:
-                active.extend(svc.name for svc in server.aux_services)
+        restart_code = 0
+        try:
+            async with server:
+                active = []
+                if server._gateway:
+                    active.append(f"gateway:{server._gateway.port}")
+                if server._bridges:
+                    active.extend(f"bridge:{b.name}" for b in server._bridges)
+                if server._scheduler is not None:
+                    active.append("scheduler")
+                if len(server.aux_services) > 0:
+                    active.extend(svc.name for svc in server.aux_services)
 
-            if active:
-                console.print(Panel(
-                    f"[bold]Serving[/bold]: {', '.join(active)}",
-                    border_style="green",
-                ))
-            else:
-                console.print("[yellow]Nothing to serve. Configure channels, scheduler, or services.[/yellow]")
-                return
+                if active:
+                    console.print(Panel(
+                        f"[bold]Serving[/bold]: {', '.join(active)}",
+                        border_style="green",
+                    ))
+                else:
+                    console.print("[yellow]Nothing to serve. Configure channels, scheduler, or services.[/yellow]")
+                    return
 
-            await server.wait()
-            console.print("\nShutting down...")
+                await server.wait()
+                console.print("\nShutting down...")
+
+                # Capture the restart code *before* stop() runs.
+                restart_code = getattr(server.agent, "_restart_exit_code", 0)
+        except (asyncio.CancelledError, Exception) as exc:
+            # MCP cleanup can crash with CancelledError from anyio.
+            # Capture the restart code even on error.
+            restart_code = getattr(server.agent, "_restart_exit_code", 0)
+            if not restart_code:
+                raise  # re-raise if this wasn't an expected update-restart
+
+        if restart_code:
+            console.print(
+                f"[bold]Restarting (exit code {restart_code})...[/bold]"
+            )
+            # Use os._exit() instead of SystemExit because asyncio.run()
+            # tries to cancel all remaining tasks on exit.  The MCP SDK
+            # uses anyio cancel scopes that hang indefinitely during
+            # this cleanup, preventing the process from ever exiting.
+            # os._exit() is safe here because server.stop() has already
+            # run, flushing the DB and closing the gateway.
+            import os as _os
+            _os._exit(restart_code)
 
     asyncio.run(_serve())
 
