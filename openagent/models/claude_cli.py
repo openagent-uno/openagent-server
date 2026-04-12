@@ -198,9 +198,18 @@ class ClaudeCLI(BaseModel):
                 await self._drop_client(sid)
                 if attempt == 0:
                     continue
-                # Second failure — clear SDK session too (force fresh start)
-                self._sdk_sessions.pop(sid, None)
-                return ModelResponse(content=f"Error: {e}")
+                # Second failure — only clear SDK session for non-timeout
+                # errors (connection failures, etc.). Timeouts mean the SDK
+                # session is still valid on disk; the request was just too
+                # complex. Clearing it would destroy conversation history.
+                if not isinstance(e, TimeoutError):
+                    self._sdk_sessions.pop(sid, None)
+                return ModelResponse(
+                    content="I'm sorry, that request took too long to process. "
+                    "Please try again with a simpler request."
+                    if isinstance(e, TimeoutError)
+                    else f"Error: {e}"
+                )
         return ModelResponse(content="Error: max retries exceeded")
 
     async def stream(
