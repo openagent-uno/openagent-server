@@ -68,6 +68,7 @@ class Agent:
             self._db = None
 
         self._initialized = False
+        self._idle_cleanup_task: asyncio.Task | None = None
 
     async def initialize(self) -> None:
         """Connect MCP servers and initialize memory DB."""
@@ -77,14 +78,24 @@ class Agent:
         if self._db:
             await self._db.connect()
 
-        # For Claude CLI: pass MCP server configs
+        # For Claude CLI: pass MCP server configs and start idle cleanup
         from openagent.models.claude_cli import ClaudeCLI
         if isinstance(self.model, ClaudeCLI):
             mcp_configs = self._build_cli_mcp_configs()
             if mcp_configs:
                 self.model.set_mcp_servers(mcp_configs)
+            self._idle_cleanup_task = asyncio.create_task(self._run_idle_cleanup())
 
         self._initialized = True
+
+    async def _run_idle_cleanup(self) -> None:
+        """Periodically close idle ClaudeCLI sessions to free resources."""
+        while True:
+            await asyncio.sleep(60)
+            try:
+                await self.model.cleanup_idle()
+            except Exception as e:
+                logger.debug("Idle cleanup error: %s", e)
 
     def _build_cli_mcp_configs(self) -> dict[str, dict]:
         """Build MCP server configs for the Claude Agent SDK.
@@ -155,6 +166,9 @@ class Agent:
 
     async def shutdown(self) -> None:
         """Close all connections."""
+        if self._idle_cleanup_task:
+            self._idle_cleanup_task.cancel()
+            self._idle_cleanup_task = None
         # Persistent models (e.g. Claude SDK client) need an explicit
         # shutdown to flush their subprocess cleanly.
         shutdown = getattr(self.model, "shutdown", None)

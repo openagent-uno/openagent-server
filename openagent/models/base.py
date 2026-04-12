@@ -32,6 +32,11 @@ class BaseModel(ABC):
     generate() and optionally stream(). No changes needed in agent or MCP layer.
     """
 
+    manages_history: bool = False
+    """True if the model manages its own conversation history (e.g. Claude SDK
+    with session resume).  When False, the agent layer must supply full
+    conversation history in the messages list."""
+
     @abstractmethod
     async def generate(
         self,
