@@ -18,6 +18,8 @@ from typing import Any, AsyncIterator, Awaitable, Callable
 
 from openagent.models.base import BaseModel, ModelResponse
 
+from openagent.core.logging import elog
+
 logger = logging.getLogger(__name__)
 
 RECEIVE_TIMEOUT = 300  # seconds — generous to allow long tool runs
@@ -71,6 +73,7 @@ class ClaudeCLI(BaseModel):
             while len(self._pool) >= MAX_SESSIONS:
                 evict_sid, evict_client = self._pool.popitem(last=False)
                 logger.info("Evicting session %s (pool full)", evict_sid[-12:])
+                elog("model.session_evict", session_id=evict_sid)
                 try:
                     await evict_client.disconnect()
                 except Exception as e:
@@ -80,11 +83,13 @@ class ClaudeCLI(BaseModel):
             from claude_agent_sdk import ClaudeSDKClient
             logger.info("Creating session %s (%d/%d in pool)",
                         session_id[-12:], len(self._pool) + 1, MAX_SESSIONS)
+            elog("model.session_create", session_id=session_id, pool_size=len(self._pool) + 1)
             client = ClaudeSDKClient(options=self._build_options(system=system))
             try:
                 await client.connect()
-            except Exception:
+            except Exception as e:
                 logger.exception("ClaudeSDKClient.connect() failed for %s", session_id)
+                elog("model.connect_error", session_id=session_id, error=str(e))
                 raise
             self._pool[session_id] = client
             return client
@@ -120,13 +125,20 @@ class ClaudeCLI(BaseModel):
                             tool = getattr(block, "name", None)
                             if tool and hasattr(block, "input"):
                                 try:
-                                    await on_status(f"Using {tool}...")
+                                    import json as _json
+                                    params = getattr(block, "input", {})
+                                    await on_status(_json.dumps({
+                                        "tool": tool,
+                                        "params": params if isinstance(params, dict) else {},
+                                        "status": "running",
+                                    }))
                                 except Exception:
                                     pass
                     if isinstance(message, ResultMessage):
                         result_text = message.result or ""
         except TimeoutError:
             logger.error("receive_response() timed out after %ds — forcing reconnect", RECEIVE_TIMEOUT)
+            elog("model.timeout", session_id=session_id, timeout=RECEIVE_TIMEOUT)
             raise
         return result_text
 
@@ -139,6 +151,7 @@ class ClaudeCLI(BaseModel):
         session_id: str | None = None,
     ) -> ModelResponse:
         sid = session_id or "default"
+        elog("model.generate", session_id=sid)
         prompt_parts = []
         for msg in messages:
             role = msg.get("role", "user")

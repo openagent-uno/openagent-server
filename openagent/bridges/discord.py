@@ -15,6 +15,8 @@ from openagent.bridges.base import BaseBridge
 from openagent.channels.base import split_preserving_code_blocks, is_blocked_attachment, parse_response_markers
 from openagent.channels.voice import transcribe as transcribe_voice
 
+from openagent.core.logging import elog
+
 logger = logging.getLogger(__name__)
 
 DISCORD_MSG_LIMIT = 2000
@@ -73,6 +75,14 @@ class DiscordBridge(BaseBridge):
         async def _cmd_clear(interaction: discord.Interaction):
             await self._handle_slash(interaction, "clear")
 
+        @tree.command(name="update", description="Check for updates and install")
+        async def _cmd_update(interaction: discord.Interaction):
+            await self._handle_slash(interaction, "update")
+
+        @tree.command(name="restart", description="Restart OpenAgent")
+        async def _cmd_restart(interaction: discord.Interaction):
+            await self._handle_slash(interaction, "restart")
+
         @tree.command(name="help", description="Show available commands")
         async def _cmd_help(interaction: discord.Interaction):
             await self._handle_slash(interaction, "help")
@@ -113,6 +123,7 @@ class DiscordBridge(BaseBridge):
                 if not mentioned and not in_listen:
                     return
 
+            elog("bridge.message", bridge="discord", user_id=uid)
             content = message.content or ""
             if client.user:
                 content = content.replace(f"<@{client.user.id}>", "").replace(f"<@!{client.user.id}>", "").strip()

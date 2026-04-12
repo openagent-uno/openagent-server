@@ -29,6 +29,8 @@ import logging
 import os
 from pathlib import Path
 
+from openagent.core.logging import elog
+
 logger = logging.getLogger(__name__)
 
 _WHISPER_MODEL: object | None = None
@@ -44,6 +46,7 @@ async def transcribe(file_path: str) -> str | None:
     if not file_path or not Path(file_path).exists():
         return None
 
+    elog("voice.transcribe", filename=Path(file_path).name)
     # 1. Local faster-whisper
     text = await _transcribe_local(file_path)
     if text is not None:

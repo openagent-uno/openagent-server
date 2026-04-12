@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from openagent.core.logging import elog
 from .vault import _sanitize  # reuse datetime sanitizer
 
 
@@ -46,6 +47,7 @@ async def handle_put(request):
     from aiohttp import web
     data = await request.json()
     _write_raw(request, data)
+    elog("config.update", section="full")
     return web.json_response({"ok": True, "restart_required": True})
 
 
@@ -56,4 +58,5 @@ async def handle_patch(request):
     config = _read_raw(request)
     config[section] = patch
     _write_raw(request, config)
+    elog("config.update", section=section)
     return web.json_response({"ok": True, "restart_required": True, section: _sanitize(patch)})

@@ -14,6 +14,8 @@ from typing import Callable, Awaitable
 
 from openagent.gateway import protocol as P
 
+from openagent.core.logging import elog
+
 logger = logging.getLogger(__name__)
 
 # Retry cooldown between bridge crashes
@@ -38,6 +40,7 @@ class BaseBridge:
     async def start(self) -> None:
         """Connect to Gateway and start the platform polling loop with retry."""
         self._should_stop = False
+        elog("bridge.start", name=self.name)
         while not self._should_stop:
             try:
                 await self._connect_gateway()
@@ -48,9 +51,11 @@ class BaseBridge:
                 if self._should_stop:
                     break
                 logger.error("%s bridge crashed: %s, retrying in %ds...", self.name, e, BRIDGE_RETRY_SECONDS)
+                elog("bridge.error", name=self.name, error=str(e))
                 await asyncio.sleep(BRIDGE_RETRY_SECONDS)
 
     async def stop(self) -> None:
+        elog("bridge.stop", name=self.name)
         self._should_stop = True
         if self._listener_task and not self._listener_task.done():
             self._listener_task.cancel()

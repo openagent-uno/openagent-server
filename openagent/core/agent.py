@@ -10,6 +10,8 @@ from openagent.memory.db import MemoryDB
 from openagent.mcp.client import MCPRegistry, MCPTools
 from openagent.core.prompts import FRAMEWORK_SYSTEM_PROMPT
 
+from openagent.core.logging import elog
+
 logger = logging.getLogger(__name__)
 
 MAX_TOOL_ITERATIONS = 10
@@ -262,13 +264,34 @@ class Agent:
                 messages.append(assistant_msg)
 
                 for tc in response.tool_calls:
-                    await _status(f"Using {tc.name}...")
+                    import json as _json
+                    # Send structured tool event: running
+                    await _status(_json.dumps({
+                        "tool": tc.name,
+                        "params": tc.arguments,
+                        "status": "running",
+                    }))
+                    elog("tool.start", tool=tc.name, params=tc.arguments)
 
+                    error = None
                     try:
                         result = await self._mcp.call_tool(tc.name, tc.arguments)
                     except Exception as e:
                         result = f"Error calling tool {tc.name}: {e}"
+                        error = str(e)
                         logger.error(result)
+
+                    # Send structured tool event: done/error
+                    await _status(_json.dumps({
+                        "tool": tc.name,
+                        "status": "error" if error else "done",
+                        "result": (result or "")[:500],
+                        "error": error,
+                    }))
+                    if error:
+                        elog("tool.error", tool=tc.name, error=error)
+                    else:
+                        elog("tool.done", tool=tc.name, result_len=len(result or ""))
 
                     tool_msg = {
                         "role": "tool",

@@ -14,10 +14,12 @@ from typing import TYPE_CHECKING
 
 from openagent.gateway import protocol as P
 from openagent.gateway.sessions import SessionManager
-from openagent.gateway.api import vault, config, health
+from openagent.gateway.api import vault, config, health, logs, control
 
 if TYPE_CHECKING:
     from openagent.core.agent import Agent
+
+from openagent.core.logging import elog
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +35,7 @@ class Gateway:
         token: str | None = None,
         vault_path: str | None = None,
         config_path: str | None = None,
+        stop_event: asyncio.Event | None = None,
     ):
         self.agent = agent
         self.host = host
@@ -40,6 +43,7 @@ class Gateway:
         self.token = token
         self.vault_path = vault_path
         self.config_path = config_path
+        self._stop_event = stop_event
         self.sessions = SessionManager(agent_name=agent.name)
         self.clients: dict[str, object] = {}  # client_id → WebSocketResponse
         self._runner = None
@@ -82,6 +86,10 @@ class Gateway:
         app.router.add_put("/api/config", config.handle_put)
         app.router.add_patch("/api/config/{section}", config.handle_patch)
         app.router.add_post("/api/upload", self._handle_upload)
+        app.router.add_get("/api/logs", logs.handle_get)
+        app.router.add_delete("/api/logs", logs.handle_delete)
+        app.router.add_post("/api/update", control.handle_update)
+        app.router.add_post("/api/restart", control.handle_restart)
         app.router.add_route("OPTIONS", "/{path:.*}", self._handle_options)
 
         runner = web.AppRunner(app)
@@ -91,6 +99,7 @@ class Gateway:
         site = web.TCPSite(runner, self.host, self.port)
         await site.start()
         logger.info("Gateway listening on ws://%s:%d/ws", self.host, self.port)
+        elog("gateway.start", host=self.host, port=self.port)
 
     async def stop(self) -> None:
         await self.sessions.shutdown()
@@ -171,6 +180,7 @@ class Gateway:
                 # Auth
                 if t == P.AUTH:
                     if self.token and data.get("token") != self.token:
+                        elog("auth.fail", client_id=data.get("client_id"))
                         await ws.send_json({"type": P.AUTH_ERROR, "reason": "Invalid token"})
                         await ws.close()
                         return ws
@@ -178,6 +188,7 @@ class Gateway:
                     authed = True
                     self.clients[client_id] = ws
                     import openagent
+                    elog("gateway.client_connect", client_id=client_id)
                     await ws.send_json({
                         "type": P.AUTH_OK,
                         "agent_name": self.agent.name,
@@ -219,6 +230,7 @@ class Gateway:
         finally:
             if client_id and client_id in self.clients:
                 del self.clients[client_id]
+                elog("gateway.client_disconnect", client_id=client_id)
         return ws
 
     async def _handle_command(self, ws, client_id: str, name: str) -> None:
@@ -239,6 +251,29 @@ class Gateway:
         elif name == "clear":
             n = sm.clear_queue(client_id)
             text = f"Queue cleared ({n} messages removed)." if n else "Queue already empty."
+        elif name == "update":
+            try:
+                from openagent.core.server import run_pip_upgrade, RESTART_EXIT_CODE
+                old, new = run_pip_upgrade()
+                if old == new:
+                    text = f"Already up-to-date (v{old})."
+                    elog("update.check", version=old, updated=False)
+                else:
+                    text = f"Updated: v{old} → v{new}. Restarting..."
+                    elog("update.installed", old=old, new=new)
+                    self.agent._restart_exit_code = RESTART_EXIT_CODE
+                    if self._stop_event:
+                        self._stop_event.set()
+            except Exception as e:
+                text = f"Update failed: {e}"
+                elog("update.error", error=str(e))
+        elif name == "restart":
+            from openagent.core.server import RESTART_EXIT_CODE
+            text = "Restarting..."
+            elog("server.restart", source="ws_command")
+            self.agent._restart_exit_code = RESTART_EXIT_CODE
+            if self._stop_event:
+                self._stop_event.set()
         elif name == "help":
             text = (
                 "Available commands:\n"
@@ -247,6 +282,8 @@ class Gateway:
                 "• /status — show agent status and queue depth\n"
                 "• /queue — show pending messages\n"
                 "• /clear — clear the message queue\n"
+                "• /update — check for updates and install\n"
+                "• /restart — restart OpenAgent\n"
                 "• /help — show this help message"
             )
         else:
@@ -255,6 +292,8 @@ class Gateway:
 
     async def _process_message(self, ws, client_id: str, text: str, session_id: str) -> None:
         try:
+            elog("message.received", client_id=client_id, session_id=session_id, length=len(text))
+
             async def on_status(status: str) -> None:
                 try:
                     await ws.send_json({"type": P.STATUS, "text": status, "session_id": session_id})
@@ -272,6 +311,7 @@ class Gateway:
             clean, attachments = parse_response_markers(response)
             att_list = [{"type": a.type, "path": a.path, "filename": a.filename} for a in attachments]
 
+            elog("message.response", client_id=client_id, session_id=session_id, length=len(clean))
             await ws.send_json({
                 "type": P.RESPONSE,
                 "text": clean,
@@ -280,6 +320,7 @@ class Gateway:
             })
         except Exception as e:
             logger.error("Process error for %s: %s", client_id, e)
+            elog("message.error", client_id=client_id, session_id=session_id, error=str(e))
             try:
                 await ws.send_json({"type": P.ERROR, "text": str(e)})
             except Exception:

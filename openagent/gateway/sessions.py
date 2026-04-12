@@ -13,6 +13,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
+from openagent.core.logging import elog
+
 logger = logging.getLogger(__name__)
 
 Handler = Callable[[], Awaitable[None]]
@@ -49,6 +51,7 @@ class SessionManager:
     def create_session(self, client_id: str) -> str:
         sid = f"{self.agent_name}:{client_id}:{uuid.uuid4().hex[:8]}"
         self._state(client_id).sessions[sid] = Session(id=sid, client_id=client_id)
+        elog("session.create", client_id=client_id, session_id=sid)
         return sid
 
     def get_or_create_session(self, client_id: str, session_id: str) -> str:

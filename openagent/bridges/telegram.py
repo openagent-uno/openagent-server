@@ -12,6 +12,8 @@ from openagent.channels.formatting import markdown_to_telegram_html
 from openagent.channels.base import split_preserving_code_blocks, is_blocked_attachment, parse_response_markers
 from openagent.channels.voice import transcribe as transcribe_voice
 
+from openagent.core.logging import elog
+
 logger = logging.getLogger(__name__)
 
 TELEGRAM_MSG_LIMIT = 4096
@@ -23,6 +25,8 @@ BOT_COMMANDS = [
     ("stop", "Cancel the current operation"),
     ("status", "Show agent status and queue"),
     ("clear", "Clear the message queue"),
+    ("update", "Check for updates and install"),
+    ("restart", "Restart OpenAgent"),
     ("help", "Show available commands"),
 ]
 
@@ -51,7 +55,7 @@ class TelegramBridge(BaseBridge):
 
         # Register commands
         self._app.add_handler(CommandHandler("start", self._on_start))
-        for cmd in ("new", "reset", "stop", "status", "queue", "clear", "help"):
+        for cmd in ("new", "reset", "stop", "status", "queue", "clear", "update", "restart", "help"):
             self._app.add_handler(CommandHandler(cmd, lambda u, c, _c=cmd: self._on_command(u, c, _c)))
 
         # Stop button callback
@@ -132,6 +136,7 @@ class TelegramBridge(BaseBridge):
         if not self._is_authorized(uid):
             return await msg.reply_text("Unauthorized.")
 
+        elog("bridge.message", bridge="telegram", user_id=uid)
         text = msg.caption or msg.text or ""
         tmp = tempfile.mkdtemp(prefix="oa_tg_")
         files_info: list[str] = []

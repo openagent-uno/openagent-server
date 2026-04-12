@@ -19,6 +19,8 @@ from mcp.client.stdio import stdio_client
 from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamablehttp_client
 
+from openagent.core.logging import elog
+
 logger = logging.getLogger(__name__)
 
 # ── Built-in MCPs (custom, ship under mcps/) ──
@@ -439,8 +441,10 @@ class MCPRegistry:
                 await server.connect()
                 for tool in server.tools:
                     self._tool_map[tool["name"]] = server
+                elog("mcp.connect", name=server.name, tools=len(server.tools))
             except Exception as e:
                 logger.error(f"Failed to connect MCP '{server.name}': {e}")
+                elog("mcp.error", name=server.name, error=str(e))
 
     async def close_all(self) -> None:
         """Close all connections."""

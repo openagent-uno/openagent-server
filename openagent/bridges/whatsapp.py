@@ -12,6 +12,8 @@ from openagent.channels.base import parse_response_markers, is_blocked_attachmen
 from openagent.channels.formatting import markdown_to_whatsapp
 from openagent.channels.voice import transcribe as transcribe_voice
 
+from openagent.core.logging import elog
+
 logger = logging.getLogger(__name__)
 
 VOICE_FALLBACK = "[Voice not transcribed. Ask the user to type it.]"
@@ -72,6 +74,7 @@ class WhatsAppBridge(BaseBridge):
         if self.allowed_users and user_id not in self.allowed_users:
             return
 
+        elog("bridge.message", bridge="whatsapp", user_id=user_id)
         msg_data = body.get("messageData", {})
         msg_type = msg_data.get("typeMessage", "")
         text = ""
@@ -86,7 +89,7 @@ class WhatsAppBridge(BaseBridge):
         # Handle slash commands (text-only, no buttons on WhatsApp)
         if text.startswith("/"):
             cmd = text.strip()[1:].split()[0].lower()
-            if cmd in ("new", "reset", "stop", "status", "queue", "clear", "help", "start"):
+            if cmd in ("new", "reset", "stop", "status", "queue", "clear", "update", "restart", "help", "start"):
                 if cmd == "start":
                     await self._send_text(chat_id,
                         "👋 Hi! I'm your OpenAgent assistant.\n\n"

@@ -37,4 +37,4 @@ PING = "ping"
 PONG = "pong"
 
 # Commands
-COMMANDS = ("new", "reset", "stop", "status", "queue", "help", "usage")
+COMMANDS = ("new", "reset", "stop", "status", "queue", "help", "usage", "update", "restart")

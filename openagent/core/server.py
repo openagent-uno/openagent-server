@@ -21,6 +21,8 @@ from openagent.mcp.client import MCPRegistry
 from openagent.memory.db import MemoryDB
 from openagent.services.manager import ServiceManager
 
+from openagent.core.logging import elog
+
 logger = logging.getLogger(__name__)
 
 # Exit code that signals the OS service manager to restart the process
@@ -247,6 +249,7 @@ class AgentServer:
     async def start(self) -> None:
         """Start aux services, agent, scheduler, and channels."""
         self._stop_event = asyncio.Event()
+        elog("server.start", agent=self.agent.name)
 
         # 1. Aux services first (they might be dependencies — e.g. Obsidian
         #    web UI mounting the vault before the agent writes to it).
@@ -258,6 +261,7 @@ class AgentServer:
 
         # 3. Gateway (public WS + REST interface)
         if self._gateway:
+            self._gateway._stop_event = self._stop_event
             await self._gateway.start()
 
         # 4. Scheduler (with dream mode + auto-update hooks)
@@ -276,6 +280,7 @@ class AgentServer:
         (which closes MCP subprocesses) hangs, we log a warning and
         move on so the process can still exit.
         """
+        elog("server.stop", agent=self.agent.name)
         # 1. Stop bridges
         for bridge in self._bridges:
             try:
@@ -487,6 +492,24 @@ class AgentServer:
             prompt=DREAM_MODE_PROMPT,
         )
 
+        if enabled:
+            # Wrap run_task to clear event log after dream mode completes
+            original_run = scheduler.run_task
+
+            async def _dream_run(task, _orig=original_run):
+                if task["name"] == DREAM_MODE_TASK_NAME:
+                    elog("dream.start")
+                    await _orig(task)
+                    elog("dream.done")
+                    # Clear the event log daily
+                    from openagent.core.logging import EventLogger
+                    EventLogger.get().clear()
+                    elog("dream.log_cleared")
+                else:
+                    await _orig(task)
+
+            scheduler.run_task = _dream_run  # type: ignore[method-assign]
+
     async def _sync_auto_update(self, scheduler) -> None:
         update_cfg = self.config.get("auto_update", {})
         enabled = update_cfg.get("enabled", False)
@@ -577,9 +600,11 @@ async def _do_auto_update(
 
     if old_ver == new_ver:
         logger.info("openagent-framework is up-to-date (%s)", old_ver)
+        elog("update.check", version=old_ver, updated=False)
         return
 
     logger.info("openagent-framework updated: %s -> %s", old_ver, new_ver)
+    elog("update.installed", old=old_ver, new=new_ver)
 
     if mode == "auto":
         logger.warning("Restarting for update %s -> %s (exit code %d)...",
