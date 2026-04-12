@@ -167,11 +167,13 @@ class ClaudeCLI(BaseModel):
                 client = await self._get_client(sid, system)
                 result = await self._run_once(client, prompt, sid, on_status)
                 return ModelResponse(content=result)
-            except BaseException as e:
+            except Exception as e:
                 logger.error("Session %s error (attempt %d): %s", sid[-8:], attempt + 1, e)
                 if attempt == 0:
-                    await self._drop_session(sid)
+                    # Retry on same client first — don't destroy session history
                     continue
+                # Second failure — drop session and return error
+                await self._drop_session(sid)
                 return ModelResponse(content=f"Error: {e}")
         return ModelResponse(content="Error: max retries exceeded")
 
