@@ -11,7 +11,7 @@ import logging
 import tempfile
 from pathlib import Path
 
-from openagent.bridges.base import BaseBridge
+from openagent.bridges.base import BaseBridge, format_tool_status
 from openagent.channels.base import split_preserving_code_blocks, is_blocked_attachment, parse_response_markers
 from openagent.channels.voice import transcribe as transcribe_voice
 
@@ -166,7 +166,7 @@ class DiscordBridge(BaseBridge):
 
             async def on_status(status):
                 try:
-                    await status_msg.edit(content=f"⏳ {status}")
+                    await status_msg.edit(content=f"⏳ {format_tool_status(status)}")
                 except Exception:
                     pass
 

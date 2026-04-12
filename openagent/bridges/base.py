@@ -22,6 +22,32 @@ logger = logging.getLogger(__name__)
 BRIDGE_RETRY_SECONDS = 30
 
 
+def format_tool_status(raw: str) -> str:
+    """Convert a raw status string (possibly JSON tool event) into a
+    human-readable line suitable for Telegram/Discord/WhatsApp.
+
+    Structured events look like: ``{"tool":"bash","status":"running",...}``
+    Plain strings like ``"Thinking..."`` are returned unchanged.
+    """
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict) or "tool" not in data:
+            return raw
+    except (json.JSONDecodeError, TypeError):
+        return raw
+
+    tool = data["tool"]
+    status = data.get("status", "running")
+
+    if status == "running":
+        return f"Using {tool}..."
+    if status == "error":
+        err = data.get("error", "unknown error")
+        return f"✗ {tool} failed: {err}"
+    # done
+    return f"✓ {tool} done"
+
+
 class BaseBridge:
     """Abstract base for platform bridges."""
 

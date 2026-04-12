@@ -7,7 +7,7 @@ import logging
 import tempfile
 from pathlib import Path
 
-from openagent.bridges.base import BaseBridge
+from openagent.bridges.base import BaseBridge, format_tool_status
 from openagent.channels.formatting import markdown_to_telegram_html
 from openagent.channels.base import split_preserving_code_blocks, is_blocked_attachment, parse_response_markers
 from openagent.channels.voice import transcribe as transcribe_voice
@@ -211,7 +211,7 @@ class TelegramBridge(BaseBridge):
         async def on_status(s):
             if status_msg and kb:
                 try:
-                    await status_msg.edit_text(f"⏳ {s}", reply_markup=kb)
+                    await status_msg.edit_text(f"⏳ {format_tool_status(s)}", reply_markup=kb)
                 except Exception:
                     pass
 
