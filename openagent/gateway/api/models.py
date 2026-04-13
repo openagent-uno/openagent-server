@@ -162,6 +162,35 @@ async def handle_delete(request: web.Request) -> web.Response:
     return _web.json_response({"ok": True})
 
 
+async def handle_available_providers(request: web.Request) -> web.Response:
+    """GET /api/models/providers — available LLM providers from litellm."""
+    from aiohttp import web as _web
+
+    try:
+        from litellm import model_cost
+    except ImportError:
+        return _web.json_response({"providers": ["anthropic"]})
+
+    # Extract unique provider prefixes from model_cost keys
+    provider_set: set[str] = set()
+    for model_id, info in model_cost.items():
+        # Skip models with no pricing
+        if not (info.get("input_cost_per_token") or info.get("output_cost_per_token")):
+            continue
+        # Provider is the prefix before the first dot or slash
+        for sep in (".", "/"):
+            if sep in model_id:
+                provider_set.add(model_id.split(sep, 1)[0])
+                break
+
+    # Always include anthropic (has special CLI adapter)
+    provider_set.add("anthropic")
+
+    # Sort and return
+    providers = sorted(provider_set)
+    return _web.json_response({"providers": providers})
+
+
 async def handle_catalog(request: web.Request) -> web.Response:
     """GET /api/models/catalog?provider=anthropic — available models with pricing."""
     from aiohttp import web as _web

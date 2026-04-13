@@ -113,6 +113,7 @@ class Gateway:
         app.router.add_get("/api/providers", providers.handle_list)
         app.router.add_post("/api/providers/test", providers.handle_test)
         app.router.add_get("/api/models/catalog", models.handle_catalog)
+        app.router.add_get("/api/models/providers", models.handle_available_providers)
         # Model management (CRUD for providers + active model)
         app.router.add_get("/api/models", models.handle_list)
         app.router.add_post("/api/models", models.handle_create)
