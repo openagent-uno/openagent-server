@@ -186,7 +186,12 @@ def _resolve_builtin(name: str, env: dict[str, str] | None = None) -> MCPTools:
     import sys
     cmd_list = list(spec["command"])
     if is_python and cmd_list and cmd_list[0] in ("python3", "python"):
-        cmd_list[0] = sys.executable  # use venv Python
+        if is_frozen():
+            # In frozen mode, sys.executable is the openagent binary, not Python.
+            # Use the hidden `_mcp-server <name>` subcommand instead of `python -m ...`
+            cmd_list = [sys.executable, "_mcp-server", name]
+        else:
+            cmd_list[0] = sys.executable  # use venv Python
 
     # Resolve relative paths (like "dist/index.js") to absolute under mcp_dir
     # but skip already-absolute paths (like sys.executable)
@@ -454,7 +459,8 @@ class MCPRegistry:
                     self._tool_map[tool["name"]] = server
                 elog("mcp.connect", name=server.name, tools=len(server.tools))
             except Exception as e:
-                logger.error(f"Failed to connect MCP '{server.name}': {e}")
+                # Downgrade to debug for expected failures (no tokens, etc.)
+                logger.debug(f"Skipping MCP '{server.name}': {e}")
                 elog("mcp.error", name=server.name, error=str(e))
 
     async def close_all(self) -> None:

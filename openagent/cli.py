@@ -810,5 +810,19 @@ def migrate_cmd(ctx, dest: str):
     console.print(f"\nStart with: [bold]openagent serve {dest_path}[/bold]")
 
 
+# ── Hidden: run a bundled Python MCP server (used by frozen executable) ──
+
+@main.command("_mcp-server", hidden=True)
+@click.argument("name")
+def mcp_server_cmd(name: str):
+    """Run a bundled Python MCP server (internal use by frozen executable)."""
+    if name == "scheduler":
+        from openagent.mcps.scheduler.server import main as scheduler_main
+        scheduler_main()
+    else:
+        click.echo(f"Unknown MCP server: {name}", err=True)
+        raise SystemExit(1)
+
+
 if __name__ == "__main__":
     main()
