@@ -239,13 +239,8 @@ async def handle_test(request: web.Request) -> web.Response:
             {"ok": False, "error": f"Provider '{name}' not configured"}, status=400
         )
 
-    test_models = {
-        "anthropic": "anthropic/claude-haiku-4-5",
-        "openai": "openai/gpt-4o-mini",
-        "google": "google/gemini-2.5-flash",
-        "z.ai": "zhipu/glm-5",
-    }
-    model_id = body.get("model_id") or test_models.get(name, f"{name}/default")
+    from openagent.models.litellm_provider import get_cheapest_model
+    model_id = body.get("model_id") or get_cheapest_model(name) or f"{name}/default"
 
     try:
         import litellm

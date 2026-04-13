@@ -837,13 +837,9 @@ def model_test(ctx, name: str):
     if not cfg:
         console.print(f"[red]Provider '{name}' not configured.[/red]")
         return
-    test_models = {
-        "anthropic": "anthropic/claude-haiku-4-5",
-        "openai": "openai/gpt-4o-mini",
-        "google": "google/gemini-2.5-flash",
-        "z.ai": "zhipu/glm-5",
-    }
-    model_id = test_models.get(name, f"{name}/default")
+
+    from openagent.models.litellm_provider import get_cheapest_model
+    model_id = get_cheapest_model(name) or f"{name}/default"
 
     async def _test():
         try:
@@ -1044,13 +1040,8 @@ def provider_test(ctx, name: str):
         console.print(f"[red]Provider '{name}' not configured.[/red]")
         return
 
-    test_models = {
-        "anthropic": "anthropic/claude-haiku-4-5",
-        "openai": "openai/gpt-4o-mini",
-        "google": "google/gemini-2.5-flash",
-        "z.ai": "zhipu/glm-5",
-    }
-    model_id = test_models.get(name, f"{name}/default")
+    from openagent.models.litellm_provider import get_cheapest_model
+    model_id = get_cheapest_model(name) or f"{name}/default"
 
     async def _test():
         try:

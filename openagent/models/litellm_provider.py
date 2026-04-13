@@ -21,6 +21,29 @@ logger = logging.getLogger(__name__)
 litellm.suppress_debug_info = True
 
 
+def get_cheapest_model(provider: str) -> str | None:
+    """Return the cheapest model for a provider from litellm's catalog."""
+    try:
+        from litellm import model_cost
+    except ImportError:
+        return None
+
+    best_id = None
+    best_cost = float("inf")
+    prefix = f"{provider}."  # litellm uses dots: "anthropic.claude-haiku-4-5"
+    prefix_slash = f"{provider}/"
+
+    for model_id, info in model_cost.items():
+        if not (model_id.startswith(prefix) or model_id.startswith(prefix_slash)):
+            continue
+        cost = info.get("input_cost_per_token") or 0
+        if 0 < cost < best_cost:
+            best_cost = cost
+            best_id = model_id
+
+    return best_id
+
+
 class LiteLLMProvider(BaseModel):
     """Unified API provider powered by LiteLLM.
 
