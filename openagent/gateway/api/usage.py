@@ -12,7 +12,7 @@ async def handle_get(request: web.Request) -> web.Response:
 
     gw = request.app["gateway"]
     agent = gw.agent
-    model = agent._model
+    model = agent.model
 
     # Check if the model has budget tracking
     from openagent.models.smart_router import SmartRouter

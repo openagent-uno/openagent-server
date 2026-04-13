@@ -186,8 +186,10 @@ def _resolve_builtin(name: str, env: dict[str, str] | None = None) -> MCPTools:
     import sys
     cmd_list = list(spec["command"])
     if is_python and cmd_list and cmd_list[0] in ("python3", "python"):
-        if is_frozen():
-            # In frozen mode, sys.executable is the openagent binary, not Python.
+        import os as _os2
+        exe_basename = _os2.path.basename(sys.executable).lower()
+        if is_frozen() or "python" not in exe_basename:
+            # sys.executable is the openagent binary, not Python.
             # Use the hidden `_mcp-server <name>` subcommand instead of `python -m ...`
             cmd_list = [sys.executable, "_mcp-server", name]
         else:
@@ -384,16 +386,19 @@ class MCPTools:
 
         await self._session.initialize()
 
-        # Discover tools
-        tools_result = await self._session.list_tools()
-        self._tools = [
-            {
-                "name": tool.name,
-                "description": tool.description or "",
-                "input_schema": tool.inputSchema if hasattr(tool, 'inputSchema') else {"type": "object", "properties": {}},
-            }
-            for tool in tools_result.tools
-        ]
+        # Discover tools (some servers don't advertise tools capability)
+        try:
+            tools_result = await self._session.list_tools()
+            self._tools = [
+                {
+                    "name": tool.name,
+                    "description": tool.description or "",
+                    "input_schema": tool.inputSchema if hasattr(tool, 'inputSchema') else {"type": "object", "properties": {}},
+                }
+                for tool in tools_result.tools
+            ]
+        except Exception:
+            self._tools = []
         logger.info(f"MCP '{self.name}': discovered {len(self._tools)} tools")
 
     async def close(self) -> None:
