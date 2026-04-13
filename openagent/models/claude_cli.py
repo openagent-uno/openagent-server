@@ -249,13 +249,17 @@ class ClaudeCLI(BaseModel):
                 await self._drop_client(sid)
                 if attempt == 0:
                     continue
+                stop_reason = "timeout" if isinstance(e, TimeoutError) else "error"
+                elog("model.generate_error", session_id=sid, attempt=attempt + 1, error=str(e), stop_reason=stop_reason)
                 return ModelResponse(
                     content="I'm sorry, that request took too long to process. "
                     "Please try again with a simpler request."
                     if isinstance(e, TimeoutError)
-                    else f"Error: {e}"
+                    else f"Error: {e}",
+                    stop_reason=stop_reason,
                 )
-        return ModelResponse(content="Error: max retries exceeded")
+        elog("model.generate_error", session_id=sid, attempt=2, error="max retries exceeded", stop_reason="error")
+        return ModelResponse(content="Error: max retries exceeded", stop_reason="error")
 
     async def stream(
         self,

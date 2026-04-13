@@ -70,33 +70,68 @@ class Agent:
 
         self._initialized = False
         self._idle_cleanup_task: asyncio.Task | None = None
+        self._runtime_models: list[BaseModel] = []
+
+    def _register_runtime_model(self, model: BaseModel | None) -> None:
+        """Track every model instance that may need lifecycle management."""
+        if model is None:
+            return
+        if any(existing is model for existing in self._runtime_models):
+            return
+        self._runtime_models.append(model)
+
+    def _prepare_model_runtime(self, model: BaseModel | None) -> None:
+        """Wire MCP server config into models that support it."""
+        if model is None:
+            return
+        self._register_runtime_model(model)
+        set_mcp_servers = getattr(model, "set_mcp_servers", None)
+        if callable(set_mcp_servers):
+            mcp_configs = self._build_cli_mcp_configs()
+            if mcp_configs:
+                set_mcp_servers(mcp_configs)
+
+    def _ensure_idle_cleanup_task(self) -> None:
+        """Start the idle cleanup loop if any runtime model supports it."""
+        if self._idle_cleanup_task and not self._idle_cleanup_task.done():
+            return
+        if any(callable(getattr(model, "cleanup_idle", None)) for model in self._runtime_models):
+            self._idle_cleanup_task = asyncio.create_task(self._run_idle_cleanup())
 
     async def initialize(self) -> None:
         """Connect MCP servers and initialize memory DB."""
         if self._initialized:
             return
+        elog("agent.initialize.start", agent=self.name, model_class=type(self.model).__name__)
         await self._mcp.connect_all()
         if self._db:
             await self._db.connect()
 
-        # For Claude CLI: pass MCP server configs and start idle cleanup
-        from openagent.models.claude_cli import ClaudeCLI
-        if isinstance(self.model, ClaudeCLI):
-            mcp_configs = self._build_cli_mcp_configs()
-            if mcp_configs:
-                self.model.set_mcp_servers(mcp_configs)
-            self._idle_cleanup_task = asyncio.create_task(self._run_idle_cleanup())
+        self._prepare_model_runtime(self.model)
+        self._ensure_idle_cleanup_task()
 
         self._initialized = True
+        elog(
+            "agent.initialize.done",
+            agent=self.name,
+            model_class=type(self.model).__name__,
+            mcp_servers=len(self._mcp._servers),
+            tools=len(self._mcp.all_tools()),
+            has_db=bool(self._db),
+        )
 
     async def _run_idle_cleanup(self) -> None:
         """Periodically close idle ClaudeCLI sessions to free resources."""
         while True:
             await asyncio.sleep(60)
-            try:
-                await self.model.cleanup_idle()
-            except Exception as e:
-                logger.debug("Idle cleanup error: %s", e)
+            for model in list(self._runtime_models):
+                cleanup_idle = getattr(model, "cleanup_idle", None)
+                if not callable(cleanup_idle):
+                    continue
+                try:
+                    await cleanup_idle()
+                except Exception as e:
+                    logger.debug("Idle cleanup error: %s", e)
 
     def _build_cli_mcp_configs(self) -> dict[str, dict]:
         """Build MCP server configs for the Claude Agent SDK.
@@ -167,21 +202,29 @@ class Agent:
 
     async def shutdown(self) -> None:
         """Close all connections."""
+        elog("agent.shutdown.start", agent=self.name)
         if self._idle_cleanup_task:
             self._idle_cleanup_task.cancel()
             self._idle_cleanup_task = None
         # Persistent models (e.g. Claude SDK client) need an explicit
         # shutdown to flush their subprocess cleanly.
-        shutdown = getattr(self.model, "shutdown", None)
-        if callable(shutdown):
-            try:
-                await shutdown()
-            except Exception as e:  # noqa: BLE001
-                logger.warning("Model shutdown error: %s", e)
+        seen: set[int] = set()
+        for model in [self.model, *self._runtime_models]:
+            if model is None or id(model) in seen:
+                continue
+            seen.add(id(model))
+            shutdown = getattr(model, "shutdown", None)
+            if callable(shutdown):
+                try:
+                    await shutdown()
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("Model shutdown error: %s", e)
         await self._mcp.close_all()
         if self._db:
             await self._db.close()
         self._initialized = False
+        self._runtime_models.clear()
+        elog("agent.shutdown.done", agent=self.name)
 
     async def run(
         self,
@@ -205,6 +248,8 @@ class Agent:
             raise RuntimeError("No model configured. Set agent.model before calling run().")
 
         await self.initialize()
+        self._prepare_model_runtime(model_override)
+        self._ensure_idle_cleanup_task()
 
         async def _status(msg: str) -> None:
             if on_status:
@@ -214,9 +259,18 @@ class Agent:
                     pass
 
         try:
+            elog(
+                "agent.run.start",
+                agent=self.name,
+                user_id=user_id,
+                session_id=session_id,
+                model_class=type(model_override or self.model).__name__,
+                attachments=len(attachments or []),
+            )
             return await self._run_inner(message, attachments, _status, session_id=session_id, model_override=model_override)
         except BaseException as e:
             logger.error(f"Agent.run() fatal error: {e}")
+            elog("agent.run.error", agent=self.name, user_id=user_id, session_id=session_id, error=str(e))
             return f"Error: {e}"
 
     async def _run_inner(
@@ -267,10 +321,26 @@ class Agent:
         # Tool-use loop
         active_model = model_override or self.model
         response = None
+        tool_calls_total = 0
         for iteration in range(MAX_TOOL_ITERATIONS):
+            elog(
+                "agent.run.iteration",
+                agent=self.name,
+                session_id=session_id,
+                iteration=iteration + 1,
+                model_class=type(active_model).__name__,
+            )
             response = await active_model.generate(messages, system=system, tools=tools, on_status=_status, session_id=session_id)
 
             if response.tool_calls:
+                tool_calls_total += len(response.tool_calls)
+                elog(
+                    "agent.run.tool_cycle",
+                    agent=self.name,
+                    session_id=session_id,
+                    iteration=iteration + 1,
+                    tool_calls=len(response.tool_calls),
+                )
                 assistant_msg: dict[str, Any] = {
                     "role": "assistant",
                     "content": response.content,
@@ -321,8 +391,24 @@ class Agent:
                 if iteration < MAX_TOOL_ITERATIONS - 1:
                     await _status("Thinking...")
             else:
+                elog(
+                    "agent.run.done",
+                    agent=self.name,
+                    session_id=session_id,
+                    iterations=iteration + 1,
+                    tool_calls=tool_calls_total,
+                    response_len=len(response.content or ""),
+                )
                 return response.content
 
+        elog(
+            "agent.run.max_iterations",
+            agent=self.name,
+            session_id=session_id,
+            iterations=MAX_TOOL_ITERATIONS,
+            tool_calls=tool_calls_total,
+            response_len=len(response.content or "") if response else 0,
+        )
         return response.content if response else "I wasn't able to complete the request."
 
     def _combined_system_prompt(self) -> str:

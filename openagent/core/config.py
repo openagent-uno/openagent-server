@@ -112,6 +112,7 @@ def build_model_from_config(config: dict):
             monthly_budget=float(model_cfg.get("monthly_budget", 0)),
             classifier_model=model_cfg.get("classifier_model"),
             providers_config=config.get("providers", {}),
+            claude_permission_mode=model_cfg.get("permission_mode", "bypass"),
         )
     else:
         raise ValueError(f"Unknown model provider: {provider}")

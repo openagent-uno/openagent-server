@@ -30,6 +30,12 @@ class Session:
 
 
 @dataclass
+class _QueuedItem:
+    handler: Handler
+    session_id: str | None = None
+
+
+@dataclass
 class _ClientState:
     sessions: dict[str, Session] = field(default_factory=dict)
     pending: asyncio.Queue = field(default_factory=asyncio.Queue)
@@ -59,8 +65,11 @@ class SessionManager:
 
     def get_or_create_session(self, client_id: str, session_id: str) -> str:
         st = self._state(client_id)
+        created = False
         if session_id not in st.sessions:
             st.sessions[session_id] = Session(id=session_id, client_id=client_id)
+            created = True
+        elog("session.attach", client_id=client_id, session_id=session_id, created=created)
         return session_id
 
     def reset_session(self, client_id: str, session_id: str) -> str:
@@ -94,9 +103,11 @@ class SessionManager:
                 count += 1
             except asyncio.QueueEmpty:
                 break
+        if count:
+            elog("queue.clear", client_id=client_id, removed=count)
         return count
 
-    async def enqueue(self, client_id: str, handler: Handler) -> int:
+    async def enqueue(self, client_id: str, handler: Handler, session_id: str | None = None) -> int:
         """Enqueue a message handler. Returns queue position (0 = running now),
         or -1 if the queue is full and the message was rejected."""
         st = self._state(client_id)
@@ -106,7 +117,15 @@ class SessionManager:
             return -1
         running = 1 if self.is_busy(client_id) else 0
         position = st.pending.qsize() + running
-        await st.pending.put(handler)
+        await st.pending.put(_QueuedItem(handler=handler, session_id=session_id))
+        elog(
+            "queue.enqueue",
+            client_id=client_id,
+            session_id=session_id,
+            position=position,
+            depth=st.pending.qsize(),
+            busy=bool(running),
+        )
         if st.worker_task is None or st.worker_task.done():
             st.worker_task = asyncio.create_task(self._worker(client_id))
         return position
@@ -115,25 +134,35 @@ class SessionManager:
         st = self._clients[client_id]
         while True:
             try:
-                handler = st.pending.get_nowait()
+                item = st.pending.get_nowait()
             except asyncio.QueueEmpty:
                 return
-            task = asyncio.create_task(handler())
+            elog(
+                "queue.start",
+                client_id=client_id,
+                session_id=item.session_id,
+                remaining=st.pending.qsize(),
+            )
+            task = asyncio.create_task(item.handler())
             st.current_task = task
             try:
                 await task
             except asyncio.CancelledError:
                 logger.info("Task cancelled for %s", client_id)
+                elog("queue.cancel", client_id=client_id, session_id=item.session_id)
             except Exception as e:
                 logger.error("Handler error for %s: %s", client_id, e)
+                elog("queue.error", client_id=client_id, session_id=item.session_id, error=str(e))
             finally:
                 st.current_task = None
+                elog("queue.done", client_id=client_id, session_id=item.session_id, remaining=st.pending.qsize())
 
     def stop_current(self, client_id: str) -> bool:
         st = self._clients.get(client_id)
         if not st or st.current_task is None or st.current_task.done():
             return False
         st.current_task.cancel()
+        elog("queue.stop_requested", client_id=client_id)
         return True
 
     async def shutdown(self) -> None:

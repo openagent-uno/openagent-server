@@ -77,7 +77,10 @@ class LiteLLMProvider(BaseModel):
             "anthropic": "ANTHROPIC_API_KEY",
             "openai": "OPENAI_API_KEY",
             "google": "GEMINI_API_KEY",
+            "gemini": "GEMINI_API_KEY",
             "openrouter": "OPENROUTER_API_KEY",
+            "zai": "ZAI_API_KEY",
+            "zhipu": "ZAI_API_KEY",
         }
         for provider_name, cfg in self._providers_config.items():
             env_var = env_map.get(provider_name)
@@ -162,8 +165,35 @@ class LiteLLMProvider(BaseModel):
         on_status=None,
         session_id: str | None = None,
     ) -> ModelResponse:
+        from openagent.core.logging import elog
+
         kwargs = self._build_kwargs(messages, system, tools)
-        resp = await litellm.acompletion(**kwargs)
+        n_tools = len(kwargs.get("tools", []))
+        n_msgs = len(kwargs.get("messages", []))
+        logger.debug("LiteLLM generate: model=%s msgs=%d tools=%d", self.model, n_msgs, n_tools)
+        elog(
+            "litellm.request",
+            model=self.model,
+            session_id=session_id,
+            messages=n_msgs,
+            tools=n_tools,
+            has_base_url=bool(self._base_url),
+            has_api_key=bool(self._api_key),
+        )
+
+        try:
+            resp = await litellm.acompletion(**kwargs)
+        except Exception as e:
+            logger.error("LiteLLM generate failed: model=%s error=%s", self.model, e)
+            elog(
+                "litellm.error",
+                model=self.model,
+                session_id=session_id,
+                messages=n_msgs,
+                tools=n_tools,
+                error=str(e),
+            )
+            raise
 
         choice = resp.choices[0]
         message = choice.message
@@ -180,11 +210,25 @@ class LiteLLMProvider(BaseModel):
                     arguments=args,
                 ))
 
+        in_tok = resp.usage.prompt_tokens if resp.usage else 0
+        out_tok = resp.usage.completion_tokens if resp.usage else 0
+        logger.info("LiteLLM response: model=%s in=%d out=%d tools=%d stop=%s",
+                     self.model, in_tok, out_tok, len(tool_calls), choice.finish_reason)
+        elog(
+            "litellm.generate",
+            model=self.model,
+            session_id=session_id,
+            input_tokens=in_tok,
+            output_tokens=out_tok,
+            tool_calls=len(tool_calls),
+            stop_reason=choice.finish_reason,
+        )
+
         return ModelResponse(
             content=message.content or "",
             tool_calls=tool_calls,
-            input_tokens=resp.usage.prompt_tokens if resp.usage else 0,
-            output_tokens=resp.usage.completion_tokens if resp.usage else 0,
+            input_tokens=in_tok,
+            output_tokens=out_tok,
             stop_reason=choice.finish_reason,
         )
 
@@ -194,9 +238,22 @@ class LiteLLMProvider(BaseModel):
         system: str | None = None,
         tools: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[str]:
+        from openagent.core.logging import elog
+
         kwargs = self._build_kwargs(messages, system, tools)
         kwargs["stream"] = True
-        resp = await litellm.acompletion(**kwargs)
-        async for chunk in resp:
-            if chunk.choices and chunk.choices[0].delta.content:
-                yield chunk.choices[0].delta.content
+        elog(
+            "litellm.stream.start",
+            model=self.model,
+            messages=len(kwargs.get("messages", [])),
+            tools=len(kwargs.get("tools", [])),
+        )
+        try:
+            resp = await litellm.acompletion(**kwargs)
+            async for chunk in resp:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    yield chunk.choices[0].delta.content
+            elog("litellm.stream.done", model=self.model)
+        except Exception as e:
+            elog("litellm.stream.error", model=self.model, error=str(e))
+            raise

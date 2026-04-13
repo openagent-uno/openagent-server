@@ -83,6 +83,7 @@ class Gateway:
                     resp = ex
                 except Exception as exc:
                     logger.exception("REST error: %s", exc)
+                    elog("gateway.rest_error", path=request.path, method=request.method, error=str(exc))
                     resp = web.Response(status=500, text=str(exc))
             resp.headers["Access-Control-Allow-Origin"] = "*"
             resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
@@ -198,6 +199,7 @@ class Gateway:
             return web.json_response({"error": "No file"}, status=400)
 
         filename = field.filename or "upload"
+        elog("upload.received", filename=filename)
         tmp = tempfile.mkdtemp(prefix="oa_upload_")
         path = f"{tmp}/{filename}"
         with open(path, "wb") as f:
@@ -217,9 +219,12 @@ class Gateway:
                 text = await transcribe(path)
                 if text:
                     result["transcription"] = text
+                    elog("upload.transcribed", filename=filename, chars=len(text))
             except Exception as e:
                 logger.warning("Voice transcription failed: %s", e)
+                elog("upload.transcribe_error", filename=filename, error=str(e))
 
+        elog("upload.saved", filename=filename, path=path, transcribed=bool(result.get("transcription")))
         return web.json_response(result)
 
     # ── WebSocket ──
@@ -281,6 +286,7 @@ class Gateway:
 
                 # Command
                 elif t == P.COMMAND:
+                    elog("command.received", client_id=client_id, name=data.get("name", ""))
                     await self._handle_command(ws, client_id, data.get("name", ""))
 
                 # Message
@@ -293,14 +299,16 @@ class Gateway:
                         async def handler(_t=text, _s=sid, _c=client_id, _w=ws):
                             await self._process_message(_w, _c, _t, _s)
 
-                        pos = await self.sessions.enqueue(client_id, handler)
+                        pos = await self.sessions.enqueue(client_id, handler, session_id=sid)
                         if pos < 0:
                             await ws.send_json({"type": P.ERROR, "text": "Too many messages queued. Please wait.", "session_id": sid})
                         elif pos > 0:
+                            elog("message.queued", client_id=client_id, session_id=sid, position=pos)
                             await ws.send_json({"type": P.QUEUED, "position": pos})
 
         except Exception as e:
             logger.error("WS error for %s: %s", client_id, e)
+            elog("gateway.ws_error", client_id=client_id, error=str(e))
         finally:
             if client_id and client_id in self.clients:
                 del self.clients[client_id]
@@ -368,11 +376,13 @@ class Gateway:
             )
         else:
             text = f"Unknown command: {name}"
+        elog("command.result", client_id=client_id, name=name, text=text)
         await ws.send_json({"type": P.COMMAND_RESULT, "text": text})
 
     def _resolve_channel_model(self, client_id: str):
         """Resolve per-channel model override from config."""
         channel = client_id.split(":", 1)[1] if client_id.startswith("bridge:") else "websocket"
+        logger.debug("Resolving model for channel=%s (client_id=%s)", channel, client_id)
 
         # Read channels config from YAML
         if not self.config_path:
@@ -390,33 +400,43 @@ class Gateway:
             model_spec = channels_cfg.get(channel, {}).get("model")
             if not model_spec:
                 return None
+            elog("channel.model_override", client_id=client_id, channel=channel, spec=model_spec)
             return self._get_or_create_model(model_spec, _resolve_env_vars(raw.get("providers", {})))
         except Exception as e:
             logger.debug("Channel model resolution failed: %s", e)
+            elog("channel.model_override_error", client_id=client_id, channel=channel, error=str(e))
             return None
 
     def _get_or_create_model(self, spec: str, providers_config: dict = None):
         """Get or create a cached model instance for a spec string."""
         if spec in self._model_cache:
+            elog("model.override_cache_hit", spec=spec)
             return self._model_cache[spec]
 
         from openagent.models.litellm_provider import LiteLLMProvider
         from openagent.models.smart_router import SmartRouter
 
+        anthropic_cfg = (providers_config or {}).get("anthropic", {})
+
         if spec == "smart":
             model = SmartRouter(
                 providers_config=providers_config or {},
                 monthly_budget=0,
+                claude_permission_mode=anthropic_cfg.get("permission_mode", "bypass"),
             )
             if self.agent._db:
                 model.set_db(self.agent._db)
-        elif spec == "claude-cli":
+        elif spec == "claude-cli" or spec.startswith("claude-cli/"):
             from openagent.models.claude_cli import ClaudeCLI
-            model = ClaudeCLI()
+            model = ClaudeCLI(
+                model=spec.split("/", 1)[1] if "/" in spec else None,
+                permission_mode=anthropic_cfg.get("permission_mode", "bypass"),
+            )
         else:
             model = LiteLLMProvider(model=spec, providers_config=providers_config or {})
 
         self._model_cache[spec] = model
+        elog("model.override_create", spec=spec, kind=type(model).__name__)
         return model
 
     async def _process_message(self, ws, client_id: str, text: str, session_id: str) -> None:
@@ -430,6 +450,14 @@ class Gateway:
                     pass
 
             channel_model = self._resolve_channel_model(client_id)
+            active_model = channel_model or self.agent.model
+            elog(
+                "message.process_start",
+                client_id=client_id,
+                session_id=session_id,
+                model_class=type(active_model).__name__,
+                model_override=bool(channel_model),
+            )
             response = await self.agent.run(
                 message=text,
                 user_id=client_id,
