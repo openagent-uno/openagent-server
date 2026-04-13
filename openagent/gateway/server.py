@@ -222,7 +222,9 @@ class Gateway:
                             await self._process_message(_w, _c, _t, _s)
 
                         pos = await self.sessions.enqueue(client_id, handler)
-                        if pos > 0:
+                        if pos < 0:
+                            await ws.send_json({"type": P.ERROR, "text": "Too many messages queued. Please wait.", "session_id": sid})
+                        elif pos > 0:
                             await ws.send_json({"type": P.QUEUED, "position": pos})
 
         except Exception as e:
@@ -240,7 +242,13 @@ class Gateway:
             text = f"New session: {sid[-8:]}"
         elif name == "stop":
             stopped = sm.stop_current(client_id)
-            text = "Stopped." if stopped else "Nothing running."
+            cleared = sm.clear_queue(client_id)
+            parts = []
+            if stopped:
+                parts.append("Stopped current operation")
+            if cleared:
+                parts.append(f"cleared {cleared} queued message{'s' if cleared != 1 else ''}")
+            text = ". ".join(parts) + "." if parts else "Nothing running."
         elif name == "status":
             busy = sm.is_busy(client_id)
             depth = sm.queue_depth(client_id)
@@ -322,6 +330,6 @@ class Gateway:
             logger.error("Process error for %s: %s", client_id, e)
             elog("message.error", client_id=client_id, session_id=session_id, error=str(e))
             try:
-                await ws.send_json({"type": P.ERROR, "text": str(e)})
+                await ws.send_json({"type": P.ERROR, "text": str(e), "session_id": session_id})
             except Exception:
-                pass
+                pass  # WS is dead — bridge timeout will handle cleanup

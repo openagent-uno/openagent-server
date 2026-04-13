@@ -133,8 +133,42 @@ class ClaudeCLI(BaseModel):
             except Exception as e:
                 logger.debug("Shutdown %s: %s", sid, e)
 
+    async def _drain_stale(self, client: Any) -> int:
+        """Drain any stale messages left in the SDK buffer from a prior query.
+
+        The Claude Agent SDK uses a shared ``anyio`` memory stream (capacity
+        100) for all subprocess messages.  If a previous ``receive_response()``
+        was interrupted (timeout, error) or left residual data, those messages
+        sit in the buffer and would be returned by the *next*
+        ``receive_response()`` call — causing the "penultimate message" bug
+        where the agent responds to the wrong query.
+
+        This method does a non-blocking drain (50 ms cap) before each new
+        query to guarantee a clean buffer.
+        """
+        from claude_agent_sdk import ResultMessage
+        count = 0
+        try:
+            async with asyncio.timeout(0.05):
+                async for msg in client.receive_response():
+                    count += 1
+                    logger.warning("Drained stale %s from SDK buffer", type(msg).__name__)
+                    if isinstance(msg, ResultMessage):
+                        break
+        except (TimeoutError, StopAsyncIteration, Exception):
+            pass
+        if count:
+            elog("model.stale_drain", count=count)
+        return count
+
     async def _run_once(self, client: Any, prompt: str, session_id: str, on_status: Any = None) -> str:
         from claude_agent_sdk import AssistantMessage, ResultMessage
+
+        # Drain any residual messages from a prior query to prevent
+        # responding to the wrong message (the "penultimate message" bug).
+        await self._drain_stale(client)
+
+        t0 = time.monotonic()
         await client.query(prompt, session_id=session_id)
         result_text = ""
         try:
@@ -160,10 +194,25 @@ class ClaudeCLI(BaseModel):
                         if sdk_sid:
                             self._sdk_sessions[session_id] = sdk_sid
                             elog("model.session_stored", session_id=session_id, sdk_session_id=sdk_sid)
+                        break  # Never read past the response boundary
         except TimeoutError:
             logger.error("receive_response() timed out after %ds", RECEIVE_TIMEOUT)
             elog("model.timeout", session_id=session_id, timeout=RECEIVE_TIMEOUT)
             raise
+
+        # Defense-in-depth: if a substantial response arrived in under 1s,
+        # it's almost certainly stale data from the SDK buffer, not a real
+        # LLM response. Raise so the retry logic in generate() drops the
+        # client and retries with a fresh subprocess.
+        elapsed = time.monotonic() - t0
+        if elapsed < 1.0 and len(result_text) > 10:
+            logger.warning(
+                "Stale response detected (%.0fms, %d chars) — will retry with fresh client",
+                elapsed * 1000, len(result_text),
+            )
+            elog("model.stale_response", session_id=session_id, elapsed_ms=int(elapsed * 1000))
+            raise RuntimeError("Stale response detected")
+
         return result_text
 
     async def generate(
@@ -221,6 +270,7 @@ class ClaudeCLI(BaseModel):
         prompt = "\n\n".join(prompt_parts)
         try:
             client = await self._get_client(sid, system)
+            await self._drain_stale(client)
             await client.query(prompt, session_id=sid)
             async with asyncio.timeout(RECEIVE_TIMEOUT):
                 async for message in client.receive_response():
@@ -234,6 +284,7 @@ class ClaudeCLI(BaseModel):
                             self._sdk_sessions[sid] = sdk_sid
                         if message.result:
                             yield message.result
+                        break  # Never read past the response boundary
         except TimeoutError:
             logger.error("Stream timed out after %ds", RECEIVE_TIMEOUT)
             await self._drop_client(sid)

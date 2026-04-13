@@ -20,6 +20,9 @@ logger = logging.getLogger(__name__)
 
 # Retry cooldown between bridge crashes
 BRIDGE_RETRY_SECONDS = 30
+# Maximum time to wait for a gateway response before giving up.
+# Generous to accommodate tool-heavy queries (Claude SDK timeout is 300s × 2 retries).
+BRIDGE_RESPONSE_TIMEOUT = 660
 
 
 def format_tool_status(raw: str) -> str:
@@ -62,6 +65,7 @@ class BaseBridge:
         self._should_stop = False
         self._pending: dict[str, asyncio.Future] = {}  # session_id → response future
         self._status_callbacks: dict[str, Callable] = {}  # session_id → on_status
+        self._session_locks: dict[str, asyncio.Lock] = {}  # per-session serialization
 
     async def start(self) -> None:
         """Connect to Gateway and start the platform polling loop with retry."""
@@ -97,9 +101,29 @@ class BaseBridge:
             await self._ws_session.close()
             self._ws_session = None
 
+    def _resolve_orphaned_futures(self, reason: str) -> None:
+        """Resolve all pending futures with an error so callers don't hang."""
+        orphaned = list(self._pending.items())
+        self._pending.clear()
+        self._status_callbacks.clear()
+        for sid, future in orphaned:
+            if not future.done():
+                future.set_result({"type": "error", "text": reason})
+                logger.warning("Resolved orphaned future for %s: %s", sid, reason)
+
+    def _get_session_lock(self, session_id: str) -> asyncio.Lock:
+        """Get or create a per-session lock to serialize message sending."""
+        if session_id not in self._session_locks:
+            self._session_locks[session_id] = asyncio.Lock()
+        return self._session_locks[session_id]
+
     async def _connect_gateway(self) -> None:
         """Connect to the Gateway WebSocket and authenticate."""
         import aiohttp
+
+        # Clean up stale state from any previous connection
+        self._resolve_orphaned_futures("Reconnecting to gateway")
+        self._session_locks.clear()
 
         # Close any previous session/ws from a prior connection attempt
         if self._ws:
@@ -131,30 +155,39 @@ class BaseBridge:
     async def _listen_gateway(self) -> None:
         """Listen for Gateway responses and dispatch to pending futures."""
         import aiohttp
-        async for msg in self._ws:
-            if msg.type == aiohttp.WSMsgType.TEXT:
-                data = json.loads(msg.data)
-                t = data.get("type")
-                sid = data.get("session_id")
+        try:
+            async for msg in self._ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    data = json.loads(msg.data)
+                    t = data.get("type")
+                    sid = data.get("session_id")
 
-                if t == P.STATUS and sid in self._status_callbacks:
-                    try:
-                        await self._status_callbacks[sid](data.get("text", ""))
-                    except Exception:
-                        pass
-                elif t == P.RESPONSE and sid in self._pending:
-                    self._pending[sid].set_result(data)
-                    del self._pending[sid]
-                    self._status_callbacks.pop(sid, None)
-                elif t == P.ERROR and sid in self._pending:
-                    self._pending[sid].set_result(data)
-                    del self._pending[sid]
-                elif t == P.COMMAND_RESULT and "__cmd__" in self._pending:
-                    self._pending["__cmd__"].set_result(data)
-                    del self._pending["__cmd__"]
+                    if t == P.STATUS and sid in self._status_callbacks:
+                        try:
+                            await self._status_callbacks[sid](data.get("text", ""))
+                        except Exception:
+                            pass
+                    elif t == P.RESPONSE and sid in self._pending:
+                        self._pending[sid].set_result(data)
+                        del self._pending[sid]
+                        self._status_callbacks.pop(sid, None)
+                    elif t == P.ERROR:
+                        # Errors may or may not have a session_id.  Try to
+                        # route to the matching pending future; if no match,
+                        # just log it.
+                        if sid and sid in self._pending:
+                            self._pending[sid].set_result(data)
+                            del self._pending[sid]
+                            self._status_callbacks.pop(sid, None)
+                    elif t == P.COMMAND_RESULT and "__cmd__" in self._pending:
+                        self._pending["__cmd__"].set_result(data)
+                        del self._pending["__cmd__"]
 
-            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                break
+                elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                    break
+        finally:
+            # Resolve any futures still waiting so callers don't hang forever
+            self._resolve_orphaned_futures("Gateway connection lost")
 
     async def send_message(
         self,
@@ -162,19 +195,32 @@ class BaseBridge:
         session_id: str,
         on_status: Callable[[str], Awaitable[None]] | None = None,
     ) -> dict:
-        """Send a message through the Gateway and wait for the response."""
-        future: asyncio.Future = asyncio.get_running_loop().create_future()
-        self._pending[session_id] = future
-        if on_status:
-            self._status_callbacks[session_id] = on_status
+        """Send a message through the Gateway and wait for the response.
 
-        await self._ws.send_json({
-            "type": P.MESSAGE,
-            "text": text,
-            "session_id": session_id,
-        })
+        Per-session locking ensures only one message is in-flight per user,
+        preventing the ``_pending`` dict from being overwritten by a second
+        concurrent message for the same session.  A generous timeout prevents
+        the caller from hanging forever if the gateway drops.
+        """
+        async with self._get_session_lock(session_id):
+            future: asyncio.Future = asyncio.get_running_loop().create_future()
+            self._pending[session_id] = future
+            if on_status:
+                self._status_callbacks[session_id] = on_status
 
-        return await future
+            await self._ws.send_json({
+                "type": P.MESSAGE,
+                "text": text,
+                "session_id": session_id,
+            })
+
+            try:
+                return await asyncio.wait_for(future, timeout=BRIDGE_RESPONSE_TIMEOUT)
+            except asyncio.TimeoutError:
+                self._pending.pop(session_id, None)
+                self._status_callbacks.pop(session_id, None)
+                logger.error("Bridge response timeout for %s after %ds", session_id, BRIDGE_RESPONSE_TIMEOUT)
+                return {"type": "error", "text": "Request timed out. Please try again."}
 
     async def send_command(self, name: str) -> str:
         """Send a command and wait for the result."""

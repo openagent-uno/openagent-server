@@ -19,6 +19,9 @@ logger = logging.getLogger(__name__)
 
 Handler = Callable[[], Awaitable[None]]
 
+# Maximum pending messages per client before new messages are rejected.
+MAX_QUEUE_SIZE = 20
+
 
 @dataclass
 class Session:
@@ -94,7 +97,13 @@ class SessionManager:
         return count
 
     async def enqueue(self, client_id: str, handler: Handler) -> int:
+        """Enqueue a message handler. Returns queue position (0 = running now),
+        or -1 if the queue is full and the message was rejected."""
         st = self._state(client_id)
+        if st.pending.qsize() >= MAX_QUEUE_SIZE:
+            logger.warning("Queue full for %s (%d), rejecting message", client_id, MAX_QUEUE_SIZE)
+            elog("queue.full", client_id=client_id, max=MAX_QUEUE_SIZE)
+            return -1
         running = 1 if self.is_busy(client_id) else 0
         position = st.pending.qsize() + running
         await st.pending.put(handler)
