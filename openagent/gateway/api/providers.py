@@ -83,7 +83,7 @@ async def handle_test(request: web.Request) -> web.Response:
         "anthropic": "anthropic/claude-haiku-4-5",
         "openai": "openai/gpt-4o-mini",
         "google": "google/gemini-2.5-flash",
-        "openrouter": "openrouter/anthropic/claude-haiku-4-5",
+        "z.ai": "zhipu/glm-5",
     }
     model_id = body.get("model_id") or test_models.get(provider_name, f"{provider_name}/default")
 

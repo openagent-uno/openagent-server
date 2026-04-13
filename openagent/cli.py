@@ -612,13 +612,322 @@ def update_cmd(ctx):
             "Restart the agent with [bold]openagent serve[/bold] to use the new version."
         )
 
-# ── Provider management ──
+# ── Gateway HTTP helpers ──
 
-@main.group("provider")
+def _gateway_base(ctx) -> str | None:
+    """Return the gateway base URL if the agent is running, else None."""
+    agent_dir = paths.get_agent_dir()
+    if agent_dir is None:
+        # Try from config path parent
+        config_path = Path(ctx.obj.get("config_path", "")).resolve()
+        agent_dir = config_path.parent if config_path.exists() else None
+    if agent_dir is None:
+        return None
+    port_file = Path(agent_dir) / ".port"
+    if not port_file.exists():
+        return None
+    try:
+        port = int(port_file.read_text().strip())
+        import urllib.request
+        urllib.request.urlopen(f"http://localhost:{port}/api/health", timeout=1)
+        return f"http://localhost:{port}"
+    except Exception:
+        return None
+
+
+def _gw_get(base: str, path: str) -> dict:
+    import urllib.request, json
+    req = urllib.request.Request(f"{base}{path}")
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read())
+
+
+def _gw_post(base: str, path: str, body: dict | None = None) -> dict:
+    import urllib.request, json
+    data = json.dumps(body or {}).encode()
+    req = urllib.request.Request(f"{base}{path}", data=data, method="POST",
+                                headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read())
+
+
+def _gw_put(base: str, path: str, body: dict) -> dict:
+    import urllib.request, json
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(f"{base}{path}", data=data, method="PUT",
+                                headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read())
+
+
+def _gw_delete(base: str, path: str) -> dict:
+    import urllib.request, json
+    req = urllib.request.Request(f"{base}{path}", method="DELETE")
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read())
+
+
+# ── Model management ──
+
+@main.group("model")
+@click.pass_context
+def model_group(ctx):
+    """Manage models and API keys."""
+    pass
+
+
+@model_group.command("list")
+@click.pass_context
+def model_list(ctx):
+    """List configured models and the active model."""
+    gw = _gateway_base(ctx)
+    if gw:
+        data = _gw_get(gw, "/api/models")
+        # Active model
+        active = data.get("active", {})
+        if active:
+            console.print(Panel(
+                f"[cyan]Provider:[/cyan] {active.get('provider', '—')}\n"
+                f"[cyan]Model ID:[/cyan] {active.get('model_id', '—')}\n"
+                f"[cyan]API Key:[/cyan]  {active.get('api_key_display', '—')}",
+                title="Active Model",
+            ))
+        # Providers table
+        models = data.get("models", {})
+        if models:
+            table = Table(title="API Keys")
+            table.add_column("Provider", style="cyan")
+            table.add_column("API Key")
+            table.add_column("Base URL", style="dim")
+            for name, cfg in models.items():
+                table.add_row(name, cfg.get("api_key_display", "—"), cfg.get("base_url", "—"))
+            console.print(table)
+        elif not active:
+            console.print("[yellow]No models configured.[/yellow]")
+        return
+
+    # Fallback: read YAML directly
+    config = ctx.obj["config"]
+    active = config.get("model", {})
+    if active:
+        console.print(Panel(
+            f"[cyan]Provider:[/cyan] {active.get('provider', '—')}\n"
+            f"[cyan]Model ID:[/cyan] {active.get('model_id', '—')}",
+            title="Active Model",
+        ))
+    providers = config.get("providers", {})
+    if not providers:
+        if not active:
+            console.print("[yellow]No models configured.[/yellow]")
+            console.print("Add one with: openagent model add <name> --key=<api-key>")
+        return
+    table = Table(title="API Keys")
+    table.add_column("Provider", style="cyan")
+    table.add_column("API Key")
+    table.add_column("Base URL", style="dim")
+    for name, cfg in providers.items():
+        key = cfg.get("api_key", "")
+        if key.startswith("${"):
+            display_key = key
+        elif len(key) > 4:
+            display_key = "****" + key[-4:]
+        else:
+            display_key = "****"
+        table.add_row(name, display_key, cfg.get("base_url", "—"))
+    console.print(table)
+
+
+@model_group.command("add")
+@click.argument("name")
+@click.option("--key", "-k", default=None, help="API key (or use interactive prompt)")
+@click.option("--base-url", "-u", default=None, help="Custom base URL (for Ollama, vLLM, etc.)")
+@click.pass_context
+def model_add(ctx, name: str, key: str | None, base_url: str | None):
+    """Add or update a model provider. Example: openagent model add anthropic --key=sk-..."""
+    # Interactive prompts if not provided
+    if key is None and base_url is None:
+        key = click.prompt(f"API key for {name}", hide_input=True, default="", show_default=False)
+        if name in ("ollama", "vllm", "lm-studio"):
+            base_url = click.prompt("Base URL", default="http://localhost:11434/v1")
+
+    entry: dict = {}
+    if key:
+        entry["api_key"] = key
+    if base_url:
+        entry["base_url"] = base_url
+
+    gw = _gateway_base(ctx)
+    if gw:
+        _gw_post(gw, "/api/models", {"name": name, **entry})
+        console.print(f"[green]Provider '{name}' saved.[/green]")
+        console.print("[dim]Restart the agent for changes to take effect.[/dim]")
+        return
+
+    # Fallback: write YAML directly
+    import yaml
+    config_path = Path(ctx.obj["config_path"]).resolve()
+    if not config_path.exists():
+        console.print(f"[red]Config file not found: {config_path}[/red]")
+        return
+    with open(config_path) as f:
+        raw = yaml.safe_load(f) or {}
+    if "providers" not in raw:
+        raw["providers"] = {}
+    raw["providers"][name] = entry
+    with open(config_path, "w") as f:
+        yaml.dump(raw, f, default_flow_style=False, sort_keys=False)
+    console.print(f"[green]Provider '{name}' saved to {config_path}[/green]")
+    console.print("[dim]Restart the agent for changes to take effect.[/dim]")
+
+
+@model_group.command("remove")
+@click.argument("name")
+@click.pass_context
+def model_remove(ctx, name: str):
+    """Remove a model provider from the config."""
+    gw = _gateway_base(ctx)
+    if gw:
+        try:
+            _gw_delete(gw, f"/api/models/{name}")
+            console.print(f"[green]Provider '{name}' removed.[/green]")
+        except Exception as e:
+            console.print(f"[red]{e}[/red]")
+        return
+
+    # Fallback: write YAML directly
+    import yaml
+    config_path = Path(ctx.obj["config_path"]).resolve()
+    if not config_path.exists():
+        console.print(f"[red]Config file not found: {config_path}[/red]")
+        return
+    with open(config_path) as f:
+        raw = yaml.safe_load(f) or {}
+    providers = raw.get("providers", {})
+    if name not in providers:
+        console.print(f"[red]Provider '{name}' not found.[/red]")
+        return
+    del providers[name]
+    raw["providers"] = providers
+    with open(config_path, "w") as f:
+        yaml.dump(raw, f, default_flow_style=False, sort_keys=False)
+    console.print(f"[green]Provider '{name}' removed.[/green]")
+
+
+@model_group.command("test")
+@click.argument("name")
+@click.pass_context
+def model_test(ctx, name: str):
+    """Test a model provider by sending a simple prompt."""
+    gw = _gateway_base(ctx)
+    if gw:
+        try:
+            result = _gw_post(gw, f"/api/models/{name}/test")
+            if result.get("ok"):
+                console.print(f"[green]Success![/green] Model: {result.get('model', '—')}")
+            else:
+                console.print(f"[red]Failed:[/red] {result.get('error', 'unknown error')}")
+        except Exception as e:
+            console.print(f"[red]Failed:[/red] {e}")
+        return
+
+    # Fallback: test directly
+    config = ctx.obj["config"]
+    providers = config.get("providers", {})
+    cfg = providers.get(name)
+    if not cfg:
+        console.print(f"[red]Provider '{name}' not configured.[/red]")
+        return
+    test_models = {
+        "anthropic": "anthropic/claude-haiku-4-5",
+        "openai": "openai/gpt-4o-mini",
+        "google": "google/gemini-2.5-flash",
+        "z.ai": "zhipu/glm-5",
+    }
+    model_id = test_models.get(name, f"{name}/default")
+
+    async def _test():
+        try:
+            import litellm
+            console.print(f"Testing [cyan]{name}[/cyan] with model [cyan]{model_id}[/cyan]...")
+            resp = await litellm.acompletion(
+                model=model_id,
+                messages=[{"role": "user", "content": "Say 'ok' and nothing else."}],
+                max_tokens=5,
+                api_key=cfg.get("api_key"),
+                api_base=cfg.get("base_url"),
+            )
+            console.print(f"[green]Success![/green] Response: {resp.choices[0].message.content}")
+        except Exception as e:
+            console.print(f"[red]Failed:[/red] {e}")
+
+    asyncio.run(_test())
+
+
+@model_group.command("active")
+@click.pass_context
+def model_active(ctx):
+    """Show the currently active model configuration."""
+    gw = _gateway_base(ctx)
+    if gw:
+        data = _gw_get(gw, "/api/models/active")
+        active = data.get("active", {})
+    else:
+        active = ctx.obj["config"].get("model", {})
+
+    if not active:
+        console.print("[yellow]No active model configured.[/yellow]")
+        return
+    console.print(Panel(
+        f"[cyan]Provider:[/cyan]        {active.get('provider', '—')}\n"
+        f"[cyan]Model ID:[/cyan]        {active.get('model_id', '—')}\n"
+        f"[cyan]Permission Mode:[/cyan] {active.get('permission_mode', '—')}\n"
+        f"[cyan]API Key:[/cyan]         {active.get('api_key_display', '—')}",
+        title="Active Model",
+    ))
+
+
+@model_group.command("set-active")
+@click.option("--provider", "-p", type=click.Choice(["claude-cli", "litellm", "smart"]), prompt=True)
+@click.option("--model-id", "-m", default=None, help="Model ID (e.g. anthropic/claude-sonnet-4-6)")
+@click.pass_context
+def model_set_active(ctx, provider: str, model_id: str | None):
+    """Set the active model configuration."""
+    if model_id is None and provider != "smart":
+        model_id = click.prompt("Model ID")
+
+    model: dict = {"provider": provider}
+    if model_id:
+        model["model_id"] = model_id
+
+    gw = _gateway_base(ctx)
+    if gw:
+        _gw_put(gw, "/api/models/active", model)
+        console.print(f"[green]Active model set to {provider}/{model_id or '—'}.[/green]")
+        console.print("[dim]Restart the agent for changes to take effect.[/dim]")
+        return
+
+    # Fallback: write YAML directly
+    import yaml
+    config_path = Path(ctx.obj["config_path"]).resolve()
+    if not config_path.exists():
+        console.print(f"[red]Config file not found: {config_path}[/red]")
+        return
+    with open(config_path) as f:
+        raw = yaml.safe_load(f) or {}
+    raw["model"] = model
+    with open(config_path, "w") as f:
+        yaml.dump(raw, f, default_flow_style=False, sort_keys=False)
+    console.print(f"[green]Active model set to {provider}/{model_id or '—'}.[/green]")
+    console.print("[dim]Restart the agent for changes to take effect.[/dim]")
+
+
+# ── Provider management (deprecated — use 'model' instead) ──
+
+@main.group("provider", deprecated=True)
 @click.pass_context
 def provider_group(ctx):
-    """Manage LLM providers (API keys and endpoints)."""
-    pass
+    """[Deprecated: use 'model' instead] Manage LLM providers."""
+    console.print("[yellow]Warning: 'openagent provider' is deprecated. Use 'openagent model' instead.[/yellow]")
 
 
 @provider_group.command("list")
@@ -739,7 +1048,7 @@ def provider_test(ctx, name: str):
         "anthropic": "anthropic/claude-haiku-4-5",
         "openai": "openai/gpt-4o-mini",
         "google": "google/gemini-2.5-flash",
-        "openrouter": "openrouter/anthropic/claude-haiku-4-5",
+        "z.ai": "zhipu/glm-5",
     }
     model_id = test_models.get(name, f"{name}/default")
 
