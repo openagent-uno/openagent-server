@@ -993,6 +993,21 @@ def provider_add(ctx, name: str, key: str | None, base_url: str | None):
     if base_url:
         entry["base_url"] = base_url
 
+    # Auto-populate models from litellm catalog
+    try:
+        from litellm import model_cost
+        models = [
+            mid.replace(f"{name}/", "")
+            for mid in model_cost
+            if mid.startswith(f"{name}/")
+            and (model_cost[mid].get("output_cost_per_token") or 0) > 0
+        ]
+        if models:
+            entry["models"] = models[:20]  # top 20 to keep config clean
+            console.print(f"[dim]Found {len(models)} models for {name} (saving top 20)[/dim]")
+    except ImportError:
+        pass
+
     raw["providers"][name] = entry
 
     with open(config_path, "w") as f:
