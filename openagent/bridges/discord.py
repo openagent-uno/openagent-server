@@ -12,8 +12,15 @@ import tempfile
 from pathlib import Path
 
 from openagent.bridges.base import BaseBridge, format_tool_status
-from openagent.channels.base import split_preserving_code_blocks, is_blocked_attachment, parse_response_markers
-from openagent.channels.voice import transcribe as transcribe_voice
+from openagent.channels.base import (
+    build_attachment_context,
+    is_blocked_attachment,
+    parse_response_markers,
+    prepend_context_block,
+    split_preserving_code_blocks,
+)
+from openagent.channels.voice import is_audio_file, transcribe as transcribe_voice
+from openagent.gateway.commands import BOT_COMMANDS
 
 from openagent.core.logging import elog
 
@@ -59,33 +66,12 @@ class DiscordBridge(BaseBridge):
 
         # ── Register slash commands ──
 
-        @tree.command(name="new", description="Start a new conversation (fresh context)")
-        async def _cmd_new(interaction: discord.Interaction):
-            await self._handle_slash(interaction, "new")
+        for command_name, description in BOT_COMMANDS:
+            async def _handler(interaction: discord.Interaction, _command_name=command_name):
+                await self._handle_slash(interaction, _command_name)
 
-        @tree.command(name="stop", description="Cancel the current operation")
-        async def _cmd_stop(interaction: discord.Interaction):
-            await self._handle_slash(interaction, "stop")
-
-        @tree.command(name="status", description="Show agent status and queue")
-        async def _cmd_status(interaction: discord.Interaction):
-            await self._handle_slash(interaction, "status")
-
-        @tree.command(name="clear", description="Clear the message queue")
-        async def _cmd_clear(interaction: discord.Interaction):
-            await self._handle_slash(interaction, "clear")
-
-        @tree.command(name="update", description="Check for updates and install")
-        async def _cmd_update(interaction: discord.Interaction):
-            await self._handle_slash(interaction, "update")
-
-        @tree.command(name="restart", description="Restart OpenAgent")
-        async def _cmd_restart(interaction: discord.Interaction):
-            await self._handle_slash(interaction, "restart")
-
-        @tree.command(name="help", description="Show available commands")
-        async def _cmd_help(interaction: discord.Interaction):
-            await self._handle_slash(interaction, "help")
+            _handler.__name__ = f"_cmd_{command_name.replace('-', '_')}"
+            tree.command(name=command_name, description=description)(_handler)
 
         # ── Events ──
 
@@ -137,7 +123,7 @@ class DiscordBridge(BaseBridge):
                     blocked.append(att.filename)
                     continue
                 ct = att.content_type or ""
-                is_voice = ct.startswith("audio/") or att.filename.lower().endswith((".ogg", ".mp3", ".wav", ".m4a"))
+                is_voice = is_audio_file(att.filename, ct)
                 path = str(Path(tmp) / att.filename)
                 await att.save(path)
 
@@ -155,8 +141,7 @@ class DiscordBridge(BaseBridge):
             if blocked:
                 await message.channel.send(f"⚠️ Blocked: {', '.join(blocked)}")
             if files_info:
-                header = "The user attached files:\n" + "\n".join(files_info) + "\nUse Read to inspect them."
-                content = f"{header}\n\n{content}" if content else header
+                content = prepend_context_block(content, build_attachment_context(files_info))
 
             if not content:
                 return

@@ -21,13 +21,27 @@ def _resolve_config_path(request) -> Path:
     return default_config_path()
 
 
-def _read_raw(request) -> dict:
+def _load_raw_config(path: Path) -> dict:
     import yaml
-    p = _resolve_config_path(request)
-    if not p.exists():
+
+    if not path.exists():
         return {}
-    with open(p) as f:
+    with open(path) as f:
         return yaml.safe_load(f) or {}
+
+
+def _load_resolved_config(path: Path) -> dict:
+    from openagent.core.config import _resolve_env_vars
+
+    return _resolve_env_vars(_load_raw_config(path))
+
+
+def _read_raw(request) -> dict:
+    return _load_raw_config(_resolve_config_path(request))
+
+
+def _read_resolved(request) -> dict:
+    return _load_resolved_config(_resolve_config_path(request))
 
 
 def _write_raw(request, config: dict) -> None:

@@ -2,15 +2,13 @@
 
 Exposes OpenAgent's scheduled-task database over MCP so the agent can
 inspect, create, update and delete its own cron-scheduled prompts at
-runtime, instead of needing an operator to run `openagent task add` by
-hand.
+runtime, without relying on a separate operator CLI flow.
 
 Transport: stdio (launched as a subprocess by MCPRegistry).
 Storage: the same SQLite DB used by openagent.scheduler.Scheduler and
 openagent.memory.db.MemoryDB. The DB path is read from the
 OPENAGENT_DB_PATH env var — injected by the Agent at startup — falling
-back to `./openagent.db` to match the default in openagent.cli and
-openagent.server.
+back to `./openagent.db` to match the default local runtime database.
 
 Writes go straight to the `scheduled_tasks` table; the long-running
 Scheduler loop picks up new/updated rows on its next CHECK_INTERVAL tick
@@ -67,7 +65,7 @@ def _db_path() -> str:
     Precedence:
       1. OPENAGENT_DB_PATH env var (set by the Agent at launch).
       2. ./openagent.db relative to the current working directory — this
-         matches the default in openagent.cli / openagent.server so a
+         matches the default local runtime database so a
          standalone `python -m openagent.mcps.scheduler.server` run still
          points at the same file.
     """

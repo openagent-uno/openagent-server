@@ -29,6 +29,8 @@ SUPPORTED_PROVIDERS = [
     "zai",
 ]
 
+CLAUDE_CLI_PROVIDER = "claude-cli"
+
 
 @dataclass(frozen=True)
 class CatalogModel:
@@ -71,13 +73,13 @@ def build_runtime_model_id(provider_name: str, model_id: str) -> str:
     raw = str(model_id or "").strip()
     if not raw:
         return raw
-    if raw == "claude-cli" or raw.startswith("claude-cli/"):
+    if is_claude_cli_model(raw):
         return raw
     if ":" in raw:
         return raw
     if "/" in raw:
         prefix, rest = raw.split("/", 1)
-        if prefix == "claude-cli":
+        if prefix == CLAUDE_CLI_PROVIDER:
             return raw
         return f"{prefix}:{rest}"
     return f"{provider_name}:{raw}"
@@ -87,13 +89,13 @@ def normalize_runtime_model_id(model_ref: str, providers_config: dict | None = N
     raw = str(model_ref or "").strip()
     if not raw:
         return raw
-    if raw == "claude-cli" or raw.startswith("claude-cli/"):
+    if is_claude_cli_model(raw):
         return raw
     if ":" in raw:
         return raw
     if "/" in raw:
         prefix, rest = raw.split("/", 1)
-        if prefix == "claude-cli":
+        if prefix == CLAUDE_CLI_PROVIDER:
             return raw
         if prefix in SUPPORTED_PROVIDERS or prefix in (providers_config or {}):
             return f"{prefix}:{rest}"
@@ -105,9 +107,19 @@ def normalize_runtime_model_id(model_ref: str, providers_config: dict | None = N
     return raw
 
 
+def is_claude_cli_model(model_ref: str | None) -> bool:
+    raw = str(model_ref or "").strip()
+    return raw == CLAUDE_CLI_PROVIDER or raw.startswith(f"{CLAUDE_CLI_PROVIDER}/")
+
+
+def claude_cli_model_spec(model_id: str | None = None) -> str:
+    raw = str(model_id or "").strip()
+    return f"{CLAUDE_CLI_PROVIDER}/{raw}" if raw else CLAUDE_CLI_PROVIDER
+
+
 def model_history_mode(model_ref: str, providers_config: dict | None = None) -> str:
     runtime_id = normalize_runtime_model_id(model_ref, providers_config)
-    if runtime_id == "claude-cli" or runtime_id.startswith("claude-cli/"):
+    if is_claude_cli_model(runtime_id):
         return "provider"
     return "platform"
 

@@ -11,9 +11,11 @@ import asyncio
 import json
 import logging
 import socket
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from openagent.gateway import protocol as P
+from openagent.gateway.commands import command_help_text
 from openagent.gateway.sessions import SessionManager
 from openagent.gateway.api import vault, config, health, logs, control, usage, providers, models
 
@@ -92,43 +94,7 @@ class Gateway:
 
         app = web.Application(middlewares=[cors])
         app["gateway"] = self  # accessible in handlers via request.app["gateway"]
-
-        # WebSocket
-        app.router.add_get("/ws", self._handle_ws)
-        # REST
-        app.router.add_get("/api/health", health.handle_health)
-        app.router.add_get("/api/vault/notes", vault.handle_list)
-        app.router.add_get("/api/vault/graph", vault.handle_graph)
-        app.router.add_get("/api/vault/search", vault.handle_search)
-        app.router.add_get("/api/vault/notes/{path:.+}", vault.handle_read)
-        app.router.add_put("/api/vault/notes/{path:.+}", vault.handle_write)
-        app.router.add_delete("/api/vault/notes/{path:.+}", vault.handle_delete)
-        app.router.add_get("/api/config", config.handle_get)
-        app.router.add_put("/api/config", config.handle_put)
-        app.router.add_patch("/api/config/{section}", config.handle_patch)
-        app.router.add_post("/api/upload", self._handle_upload)
-        app.router.add_get("/api/logs", logs.handle_get)
-        app.router.add_get("/api/usage", usage.handle_get)
-        app.router.add_get("/api/usage/daily", usage.handle_daily)
-        app.router.add_get("/api/usage/pricing", usage.handle_pricing)
-        app.router.add_get("/api/providers", providers.handle_list)
-        app.router.add_post("/api/providers/test", providers.handle_test)
-        app.router.add_get("/api/models/catalog", models.handle_catalog)
-        app.router.add_get("/api/models/providers", models.handle_available_providers)
-        # Model management (CRUD for providers + active model)
-        app.router.add_get("/api/models", models.handle_list)
-        app.router.add_post("/api/models", models.handle_create)
-        app.router.add_get("/api/models/active", models.handle_get_active)
-        app.router.add_put("/api/models/active", models.handle_set_active)
-        app.router.add_put("/api/models/{name}", models.handle_update)
-        app.router.add_delete("/api/models/{name}", models.handle_delete)
-        app.router.add_post("/api/models/{name}/test", models.handle_test)
-        app.router.add_delete("/api/logs", logs.handle_delete)
-        app.router.add_post("/api/update", control.handle_update)
-        app.router.add_post("/api/restart", control.handle_restart)
-        # Agent info endpoint (for multi-agent discovery)
-        app.router.add_get("/api/agent-info", self._handle_agent_info)
-        app.router.add_route("OPTIONS", "/{path:.*}", self._handle_options)
+        self._register_routes(app)
 
         runner = web.AppRunner(app)
         await runner.setup()
@@ -150,6 +116,46 @@ class Gateway:
         self.clients.clear()
         self._remove_port_file()
 
+    def _register_routes(self, app) -> None:
+        """Register the gateway WebSocket endpoint and REST API routes."""
+        app.router.add_get("/ws", self._handle_ws)
+        app.router.add_post("/api/upload", self._handle_upload)
+        app.router.add_get("/api/agent-info", self._handle_agent_info)
+
+        routes = (
+            ("GET", "/api/health", health.handle_health),
+            ("GET", "/api/vault/notes", vault.handle_list),
+            ("GET", "/api/vault/graph", vault.handle_graph),
+            ("GET", "/api/vault/search", vault.handle_search),
+            ("GET", "/api/vault/notes/{path:.+}", vault.handle_read),
+            ("PUT", "/api/vault/notes/{path:.+}", vault.handle_write),
+            ("DELETE", "/api/vault/notes/{path:.+}", vault.handle_delete),
+            ("GET", "/api/config", config.handle_get),
+            ("PUT", "/api/config", config.handle_put),
+            ("PATCH", "/api/config/{section}", config.handle_patch),
+            ("GET", "/api/logs", logs.handle_get),
+            ("DELETE", "/api/logs", logs.handle_delete),
+            ("GET", "/api/usage", usage.handle_get),
+            ("GET", "/api/usage/daily", usage.handle_daily),
+            ("GET", "/api/usage/pricing", usage.handle_pricing),
+            ("GET", "/api/providers", providers.handle_list),
+            ("POST", "/api/providers/test", providers.handle_test),
+            ("GET", "/api/models/catalog", models.handle_catalog),
+            ("GET", "/api/models/providers", models.handle_available_providers),
+            ("GET", "/api/models", models.handle_list),
+            ("POST", "/api/models", models.handle_create),
+            ("GET", "/api/models/active", models.handle_get_active),
+            ("PUT", "/api/models/active", models.handle_set_active),
+            ("PUT", "/api/models/{name}", models.handle_update),
+            ("DELETE", "/api/models/{name}", models.handle_delete),
+            ("POST", "/api/models/{name}/test", models.handle_test),
+            ("POST", "/api/update", control.handle_update),
+            ("POST", "/api/restart", control.handle_restart),
+        )
+        for method, path, handler in routes:
+            app.router.add_route(method, path, handler)
+        app.router.add_route("OPTIONS", "/{path:.*}", self._handle_options)
+
     def _write_port_file(self) -> None:
         """Write a .port file to the agent dir for discovery by CLI/app."""
         from openagent.core.paths import get_agent_dir
@@ -167,18 +173,29 @@ class Gateway:
             except OSError:
                 pass
 
-    async def _handle_agent_info(self, request):
-        """GET /api/agent-info — agent name, dir, port, version."""
-        from aiohttp import web
+    def runtime_info(self) -> dict:
+        """Return shared gateway/agent metadata exposed by REST endpoints."""
         import openagent
         from openagent.core.paths import get_agent_dir
 
         agent_dir = get_agent_dir()
-        return web.json_response({
-            "name": self.agent.name,
+        return {
+            "agent": self.agent.name,
             "agent_dir": str(agent_dir) if agent_dir else None,
             "port": self.port,
             "version": getattr(openagent, "__version__", "?"),
+        }
+
+    async def _handle_agent_info(self, request):
+        """GET /api/agent-info — agent name, dir, port, version."""
+        from aiohttp import web
+
+        info = self.runtime_info()
+        return web.json_response({
+            "name": info["agent"],
+            "agent_dir": info["agent_dir"],
+            "port": info["port"],
+            "version": info["version"],
         })
 
     # ── File upload ──
@@ -212,8 +229,9 @@ class Gateway:
         result: dict = {"path": path, "filename": filename}
 
         # Auto-transcribe audio files
-        audio_exts = ('.webm', '.ogg', '.mp3', '.wav', '.m4a', '.opus', '.flac')
-        if any(filename.lower().endswith(ext) for ext in audio_exts):
+        from openagent.channels.voice import is_audio_file
+
+        if is_audio_file(filename):
             try:
                 from openagent.channels.voice import transcribe
                 text = await transcribe(path)
@@ -339,41 +357,30 @@ class Gateway:
         elif name == "clear":
             n = sm.clear_queue(client_id)
             text = f"Queue cleared ({n} messages removed)." if n else "Queue already empty."
+        elif name == "usage":
+            from openagent.gateway.api.usage import _usage_summary_for_agent
+
+            summary = await _usage_summary_for_agent(self.agent)
+            spend = float(summary.get("monthly_spend", 0) or 0)
+            budget = summary.get("monthly_budget")
+            by_model = summary.get("by_model", {}) or {}
+            if budget:
+                text = f"Usage: ${spend:.4f} / ${float(budget):.4f} this month across {len(by_model)} model(s)."
+            else:
+                text = f"Usage tracking available for {len(by_model)} model(s); monthly spend is ${spend:.4f}."
         elif name == "update":
-            try:
-                from openagent.core.server import run_upgrade, RESTART_EXIT_CODE
-                old, new = run_upgrade()
-                if old == new:
-                    text = f"Already up-to-date (v{old})."
-                    elog("update.check", version=old, updated=False)
-                else:
-                    text = f"Updated: v{old} → v{new}. Restarting..."
-                    elog("update.installed", old=old, new=new)
-                    self.agent._restart_exit_code = RESTART_EXIT_CODE
-                    if self._stop_event:
-                        self._stop_event.set()
-            except Exception as e:
-                text = f"Update failed: {e}"
-                elog("update.error", error=str(e))
+            result = control.perform_update(self)
+            if not result["ok"]:
+                text = f"Update failed: {result['error']}"
+            elif result["updated"]:
+                text = f"Updated: v{result['old']} → v{result['new']}. Restarting..."
+            else:
+                text = f"Already up-to-date (v{result['version']})."
         elif name == "restart":
-            from openagent.core.server import RESTART_EXIT_CODE
             text = "Restarting..."
-            elog("server.restart", source="ws_command")
-            self.agent._restart_exit_code = RESTART_EXIT_CODE
-            if self._stop_event:
-                self._stop_event.set()
+            control.request_restart(self, source="ws_command")
         elif name == "help":
-            text = (
-                "Available commands:\n"
-                "• /new — start a fresh conversation (clears context)\n"
-                "• /stop — cancel the current operation\n"
-                "• /status — show agent status and queue depth\n"
-                "• /queue — show pending messages\n"
-                "• /clear — clear the message queue\n"
-                "• /update — check for updates and install\n"
-                "• /restart — restart OpenAgent\n"
-                "• /help — show this help message"
-            )
+            text = command_help_text()
         else:
             text = f"Unknown command: {name}"
         elog("command.result", client_id=client_id, name=name, text=text)
@@ -388,20 +395,15 @@ class Gateway:
         if not self.config_path:
             return None
         try:
-            from pathlib import Path
-            import yaml
-            from openagent.core.config import _resolve_env_vars
-            path = Path(self.config_path)
-            if not path.exists():
-                return None
-            with open(path) as f:
-                raw = yaml.safe_load(f) or {}
-            channels_cfg = _resolve_env_vars(raw.get("channels", {}))
+            from openagent.gateway.api.config import _load_resolved_config
+
+            raw = _load_resolved_config(Path(self.config_path))
+            channels_cfg = raw.get("channels", {})
             model_spec = channels_cfg.get(channel, {}).get("model")
             if not model_spec:
                 return None
             elog("channel.model_override", client_id=client_id, channel=channel, spec=model_spec)
-            return self._get_or_create_model(model_spec, _resolve_env_vars(raw.get("providers", {})))
+            return self._get_or_create_model(model_spec, raw.get("providers", {}))
         except Exception as e:
             logger.debug("Channel model resolution failed: %s", e)
             elog("channel.model_override_error", client_id=client_id, channel=channel, error=str(e))
@@ -413,34 +415,15 @@ class Gateway:
             elog("model.override_cache_hit", spec=spec)
             return self._model_cache[spec]
 
-        from openagent.models.agno_provider import AgnoProvider
-        from openagent.models.smart_router import SmartRouter
+        from openagent.models.runtime import create_model_from_spec
 
-        anthropic_cfg = (providers_config or {}).get("anthropic", {})
-
-        if spec == "smart":
-            model = SmartRouter(
-                providers_config=providers_config or {},
-                monthly_budget=0,
-                claude_permission_mode=anthropic_cfg.get("permission_mode", "bypass"),
-            )
-            if self.agent._db:
-                model.set_db(self.agent._db)
-        elif spec == "claude-cli" or spec.startswith("claude-cli/"):
-            from openagent.models.claude_cli import ClaudeCLI
-            model = ClaudeCLI(
-                model=spec.split("/", 1)[1] if "/" in spec else None,
-                permission_mode=anthropic_cfg.get("permission_mode", "bypass"),
-            )
-        else:
-            model = AgnoProvider(model=spec, providers_config=providers_config or {})
-
-        set_db = getattr(model, "set_db", None)
-        if callable(set_db) and self.agent._db:
-            set_db(self.agent._db)
-        set_mcp_registry = getattr(model, "set_mcp_registry", None)
-        if callable(set_mcp_registry):
-            set_mcp_registry(self.agent._mcp)
+        model = create_model_from_spec(
+            spec,
+            providers_config=providers_config or {},
+            db=self.agent._db,
+            mcp_registry=self.agent._mcp,
+            mcp_servers=getattr(self.agent._mcp, "_servers", None),
+        )
 
         self._model_cache[spec] = model
         elog("model.override_create", spec=spec, kind=type(model).__name__)

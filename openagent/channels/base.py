@@ -40,11 +40,30 @@ BLOCKED_EXTENSIONS = frozenset({
     ".cpl", ".lnk", ".reg", ".jar",
 })
 
+ATTACHMENT_READ_HINT = "Use the Read tool with the local path to inspect each file."
+
 
 def is_blocked_attachment(filename: str | None) -> bool:
     if not filename:
         return False
     return Path(filename).suffix.lower() in BLOCKED_EXTENSIONS
+
+
+def build_attachment_context(
+    files_info: list[str],
+    *,
+    read_hint: str = ATTACHMENT_READ_HINT,
+) -> str:
+    """Build a consistent context block for local files attached by the user."""
+    lines = ["The user attached files:", *files_info]
+    if read_hint:
+        lines.append(read_hint)
+    return "\n".join(lines)
+
+
+def prepend_context_block(text: str, context: str) -> str:
+    """Prepend a context block to user text with a blank-line separator."""
+    return f"{context}\n\n{text}" if text else context
 
 
 def split_preserving_code_blocks(text: str, max_len: int) -> list[str]:

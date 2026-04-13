@@ -15,23 +15,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from aiohttp import web
 
-from openagent.gateway.api.config import _read_raw, _write_raw
-from openagent.gateway.api.providers import _mask_key
-
-
-def _mask_providers(providers: dict) -> dict:
-    """Return providers dict with API keys masked."""
-    masked = {}
-    for name, cfg in providers.items():
-        entry = dict(cfg)
-        if "api_key" in entry:
-            raw = entry.pop("api_key")
-            if isinstance(raw, str) and raw.startswith("${"):
-                entry["api_key_display"] = raw
-            else:
-                entry["api_key_display"] = _mask_key(raw)
-        masked[name] = entry
-    return masked
+from openagent.gateway.api.config import _read_raw, _read_resolved, _write_raw
+from openagent.gateway.api.providers import _mask_key, mask_providers
 
 
 async def handle_list(request: web.Request) -> web.Response:
@@ -52,7 +37,7 @@ async def handle_list(request: web.Request) -> web.Response:
             active_masked["api_key_display"] = _mask_key(k)
 
     return _web.json_response({
-        "models": _mask_providers(providers),
+        "models": mask_providers(providers),
         "active": active_masked,
     })
 
@@ -174,23 +159,19 @@ async def handle_delete(request: web.Request) -> web.Response:
 async def handle_available_providers(request: web.Request) -> web.Response:
     """GET /api/models/providers — provider catalog exposed by OpenAgent."""
     from aiohttp import web as _web
-    from openagent.core.config import _resolve_env_vars
     from openagent.models.catalog import supported_providers
 
-    raw = _read_raw(request)
-    providers_cfg = _resolve_env_vars(raw.get("providers", {}))
+    providers_cfg = _read_resolved(request).get("providers", {})
     return _web.json_response({"providers": supported_providers(providers_cfg)})
 
 
 async def handle_catalog(request: web.Request) -> web.Response:
     """GET /api/models/catalog?provider=openai — configured models with pricing."""
     from aiohttp import web as _web
-    from openagent.core.config import _resolve_env_vars
     from openagent.models.catalog import iter_configured_models
 
     provider_filter = request.query.get("provider", "")
-    raw = _read_raw(request)
-    providers_cfg = _resolve_env_vars(raw.get("providers", {}))
+    providers_cfg = _read_resolved(request).get("providers", {})
     results = []
     for entry in iter_configured_models(providers_cfg):
         if provider_filter and entry.provider != provider_filter:
@@ -212,35 +193,18 @@ async def handle_catalog(request: web.Request) -> web.Response:
 async def handle_test(request: web.Request) -> web.Response:
     """Test a configured provider by sending a simple prompt via the runtime."""
     from aiohttp import web as _web
-    from openagent.core.config import _resolve_env_vars
-    from openagent.models.agno_provider import AgnoProvider
-    from openagent.models.catalog import get_default_model_for_provider, normalize_runtime_model_id
+    from openagent.models.runtime import run_provider_smoke_test
 
     name = request.match_info["name"]
     body = await request.json() if request.can_read_body else {}
 
-    raw = _read_raw(request)
-    providers = _resolve_env_vars(raw.get("providers", {}))
-    cfg = providers.get(name)
-    if not cfg:
-        return _web.json_response(
-            {"ok": False, "error": f"Provider '{name}' not configured"}, status=400
-        )
-
-    runtime_model = body.get("model_id") or get_default_model_for_provider(name, providers)
-    if not runtime_model:
-        return _web.json_response({"ok": False, "error": f"No models configured for provider '{name}'"}, status=400)
-    runtime_model = normalize_runtime_model_id(runtime_model, providers)
+    providers = _read_resolved(request).get("providers", {})
 
     try:
-        provider = AgnoProvider(
-            model=runtime_model,
-            api_key=cfg.get("api_key"),
-            base_url=cfg.get("base_url"),
-            providers_config=providers,
-        )
-        resp = await provider.generate(
-            messages=[{"role": "user", "content": "Say 'ok' and nothing else."}],
+        runtime_model, resp = await run_provider_smoke_test(
+            name,
+            providers,
+            model_id=body.get("model_id"),
             session_id="provider-test",
         )
         return _web.json_response({"ok": True, "model": runtime_model, "response": resp.content})

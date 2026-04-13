@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 
-from openagent.models.agno_provider import AgnoProvider
 from openagent.models.base import BaseModel, ModelResponse
 from openagent.models.budget import BudgetTracker
 from openagent.models.catalog import (
@@ -13,6 +12,7 @@ from openagent.models.catalog import (
     model_history_mode,
     normalize_runtime_model_id,
 )
+from openagent.models.runtime import create_model_from_spec, wire_model_runtime
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +29,6 @@ TIERS = ("simple", "medium", "hard")
 class SmartRouter(BaseModel):
     """Cost-aware router for platform-managed API-backed model sessions."""
 
-    manages_history = True
     history_mode = "platform"
 
     def __init__(
@@ -108,23 +107,17 @@ class SmartRouter(BaseModel):
         self._db = db
         self._budget = BudgetTracker(db, self._monthly_budget)
         for model in self._providers.values():
-            setter = getattr(model, "set_db", None)
-            if callable(setter):
-                setter(db)
+            wire_model_runtime(model, db=db)
 
     def set_mcp_servers(self, servers: dict[str, dict]) -> None:
         self._mcp_servers = servers
         for model in self._providers.values():
-            setter = getattr(model, "set_mcp_servers", None)
-            if callable(setter):
-                setter(servers)
+            wire_model_runtime(model, mcp_servers=servers)
 
     def set_mcp_registry(self, registry) -> None:
         self._mcp_registry = registry
         for model in self._providers.values():
-            setter = getattr(model, "set_mcp_registry", None)
-            if callable(setter):
-                setter(registry)
+            wire_model_runtime(model, mcp_registry=registry)
 
     async def cleanup_idle(self) -> None:
         for model in self._providers.values():
@@ -140,29 +133,15 @@ class SmartRouter(BaseModel):
 
     def _get_provider(self, model: str) -> BaseModel:
         if model not in self._providers:
-            if model == "claude-cli" or model.startswith("claude-cli/"):
-                from openagent.models.claude_cli import ClaudeCLI
-
-                claude_model = model.split("/", 1)[1] if "/" in model else None
-                routed_model: BaseModel = ClaudeCLI(
-                    model=claude_model,
-                    permission_mode=self._providers_config.get("anthropic", {}).get("permission_mode")
-                    or self._claude_permission_mode,
-                    mcp_servers=self._mcp_servers or None,
-                )
-            else:
-                routed_model = AgnoProvider(
-                    model=model,
-                    api_key=self._api_key,
-                    providers_config=self._providers_config,
-                    db_path=getattr(self._db, "db_path", None),
-                )
-                if self._mcp_registry is not None:
-                    routed_model.set_mcp_registry(self._mcp_registry)
-            setter = getattr(routed_model, "set_db", None)
-            if callable(setter) and self._db is not None:
-                setter(self._db)
-            self._providers[model] = routed_model
+            self._providers[model] = create_model_from_spec(
+                model,
+                providers_config=self._providers_config,
+                api_key=self._api_key,
+                claude_permission_mode=self._claude_permission_mode,
+                db=self._db,
+                mcp_registry=self._mcp_registry,
+                mcp_servers=self._mcp_servers or None,
+            )
         return self._providers[model]
 
     async def _classify(self, messages: list[dict[str, Any]], session_id: str | None = None) -> str:

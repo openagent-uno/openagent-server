@@ -32,8 +32,16 @@ class Scheduler:
         self.agent = agent
         self._task: asyncio.Task | None = None
 
+    def _next_run(self, cron_expression: str, base: float | None = None) -> float:
+        try:
+            return croniter(cron_expression, base or time.time()).get_next(float)
+        except (ValueError, KeyError) as e:
+            raise ValueError(f"Invalid cron expression: {e}") from e
+
     async def start(self) -> None:
         """Start the scheduler background loop."""
+        if self._task and not self._task.done():
+            return
         await self.db.connect()
         await self._recalculate_next_runs()
         self._task = asyncio.create_task(self._loop())
@@ -56,10 +64,8 @@ class Scheduler:
         now = time.time()
         for task in tasks:
             try:
-                cron = croniter(task["cron_expression"], now)
-                next_run = cron.get_next(float)
-                await self.db.update_task(task["id"], next_run=next_run)
-            except (ValueError, KeyError) as e:
+                await self.db.update_task(task["id"], next_run=self._next_run(task["cron_expression"], now))
+            except ValueError as e:
                 logger.error(f"Invalid cron for task '{task['name']}': {e}")
 
     async def _loop(self) -> None:
@@ -100,30 +106,20 @@ class Scheduler:
 
             # Update last_run and compute next_run
             try:
-                cron = croniter(task["cron_expression"], now)
-                next_run = cron.get_next(float)
                 await self.db.update_task(
                     task["id"],
                     last_run=now,
-                    next_run=next_run,
+                    next_run=self._next_run(task["cron_expression"], now),
                 )
-            except (ValueError, KeyError) as e:
+            except ValueError as e:
                 logger.error(f"Failed to update next_run for '{task['name']}': {e}")
 
     # ── Task management helpers ──
 
     async def add_task(self, name: str, cron_expression: str, prompt: str) -> str:
         """Add a new scheduled task."""
-        # Validate cron expression
-        try:
-            croniter(cron_expression)
-        except (ValueError, KeyError) as e:
-            raise ValueError(f"Invalid cron expression: {e}")
-
         now = time.time()
-        cron = croniter(cron_expression, now)
-        next_run = cron.get_next(float)
-        return await self.db.add_task(name, cron_expression, prompt, next_run)
+        return await self.db.add_task(name, cron_expression, prompt, self._next_run(cron_expression, now))
 
     async def list_tasks(self) -> list[dict]:
         return await self.db.get_tasks()
@@ -132,12 +128,16 @@ class Scheduler:
         await self.db.delete_task(task_id)
 
     async def enable_task(self, task_id: str) -> None:
+        await self.reschedule_task(task_id, enabled=1)
+
+    async def reschedule_task(self, task_id: str, *, enabled: int | None = None) -> None:
         now = time.time()
         task = await self.db.get_task(task_id)
         if task:
-            cron = croniter(task["cron_expression"], now)
-            next_run = cron.get_next(float)
-            await self.db.update_task(task_id, enabled=1, next_run=next_run)
+            updates = {"next_run": self._next_run(task["cron_expression"], now)}
+            if enabled is not None:
+                updates["enabled"] = enabled
+            await self.db.update_task(task_id, **updates)
 
     async def disable_task(self, task_id: str) -> None:
         await self.db.update_task(task_id, enabled=0)

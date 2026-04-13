@@ -35,6 +35,16 @@ logger = logging.getLogger(__name__)
 
 _WHISPER_MODEL: object | None = None
 _WHISPER_LOCK = asyncio.Lock()
+AUDIO_EXTENSIONS = frozenset({".webm", ".ogg", ".mp3", ".wav", ".m4a", ".opus", ".flac"})
+
+
+def is_audio_file(filename: str | None, content_type: str | None = None) -> bool:
+    """Return True when a file should be treated as an audio upload."""
+    if content_type and content_type.startswith("audio/"):
+        return True
+    if not filename:
+        return False
+    return Path(filename).suffix.lower() in AUDIO_EXTENSIONS
 
 
 async def transcribe(file_path: str) -> str | None:

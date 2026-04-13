@@ -64,6 +64,8 @@ class BaseBridge:
         self._listener_task: asyncio.Task | None = None
         self._should_stop = False
         self._pending: dict[str, asyncio.Future] = {}  # session_id → response future
+        self._command_future: asyncio.Future | None = None
+        self._command_lock = asyncio.Lock()
         self._status_callbacks: dict[str, Callable] = {}  # session_id → on_status
         self._session_locks: dict[str, asyncio.Lock] = {}  # per-session serialization
 
@@ -110,6 +112,9 @@ class BaseBridge:
             if not future.done():
                 future.set_result({"type": "error", "text": reason})
                 logger.warning("Resolved orphaned future for %s: %s", sid, reason)
+        if self._command_future and not self._command_future.done():
+            self._command_future.set_result({"type": "error", "text": reason})
+        self._command_future = None
 
     def _get_session_lock(self, session_id: str) -> asyncio.Lock:
         """Get or create a per-session lock to serialize message sending."""
@@ -179,9 +184,9 @@ class BaseBridge:
                             self._pending[sid].set_result(data)
                             del self._pending[sid]
                             self._status_callbacks.pop(sid, None)
-                    elif t == P.COMMAND_RESULT and "__cmd__" in self._pending:
-                        self._pending["__cmd__"].set_result(data)
-                        del self._pending["__cmd__"]
+                    elif t == P.COMMAND_RESULT and self._command_future and not self._command_future.done():
+                        self._command_future.set_result(data)
+                        self._command_future = None
 
                 elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                     break
@@ -224,11 +229,21 @@ class BaseBridge:
 
     async def send_command(self, name: str) -> str:
         """Send a command and wait for the result."""
-        future: asyncio.Future = asyncio.get_running_loop().create_future()
-        self._pending["__cmd__"] = future
-        await self._ws.send_json({"type": P.COMMAND, "name": name})
-        result = await future
-        return result.get("text", "")
+        async with self._command_lock:
+            future: asyncio.Future = asyncio.get_running_loop().create_future()
+            self._command_future = future
+            await self._ws.send_json({"type": P.COMMAND, "name": name})
+            try:
+                result = await asyncio.wait_for(future, timeout=BRIDGE_RESPONSE_TIMEOUT)
+            except asyncio.TimeoutError:
+                if self._command_future is future:
+                    self._command_future = None
+                logger.error("Bridge command timeout for %s after %ds", name, BRIDGE_RESPONSE_TIMEOUT)
+                return "Command timed out. Please try again."
+            finally:
+                if self._command_future is future:
+                    self._command_future = None
+            return result.get("text", "")
 
     async def _run(self) -> None:
         """Platform-specific polling loop. Override in subclass."""

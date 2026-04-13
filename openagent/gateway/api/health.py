@@ -9,12 +9,12 @@ if TYPE_CHECKING:
 
 async def handle_health(request: web.Request) -> web.Response:
     from aiohttp import web as _web
-    import openagent
 
     gw = request.app["gateway"]
+    info = gw.runtime_info()
     return _web.json_response({
         "status": "ok",
-        "agent": gw.agent.name,
-        "version": getattr(openagent, "__version__", "?"),
+        "agent": info["agent"],
+        "version": info["version"],
         "connected_clients": len(gw.clients),
     })

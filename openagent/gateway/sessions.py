@@ -186,9 +186,14 @@ class SessionManager:
         return True
 
     async def shutdown(self) -> None:
+        tasks: list[asyncio.Task] = []
         for st in self._clients.values():
             if st.current_task and not st.current_task.done():
                 st.current_task.cancel()
+                tasks.append(st.current_task)
             if st.worker_task and not st.worker_task.done():
                 st.worker_task.cancel()
+                tasks.append(st.worker_task)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         self._clients.clear()

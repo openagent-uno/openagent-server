@@ -8,9 +8,15 @@ import tempfile
 from pathlib import Path
 
 from openagent.bridges.base import BaseBridge
-from openagent.channels.base import parse_response_markers, is_blocked_attachment
+from openagent.channels.base import (
+    build_attachment_context,
+    is_blocked_attachment,
+    parse_response_markers,
+    prepend_context_block,
+)
 from openagent.channels.formatting import markdown_to_whatsapp
 from openagent.channels.voice import transcribe as transcribe_voice
+from openagent.gateway.commands import BRIDGE_COMMANDS, bridge_welcome_text
 
 from openagent.core.logging import elog
 
@@ -89,18 +95,9 @@ class WhatsAppBridge(BaseBridge):
         # Handle slash commands (text-only, no buttons on WhatsApp)
         if text.startswith("/"):
             cmd = text.strip()[1:].split()[0].lower()
-            if cmd in ("new", "reset", "stop", "status", "queue", "clear", "update", "restart", "help", "start"):
+            if cmd in (*BRIDGE_COMMANDS, "start"):
                 if cmd == "start":
-                    await self._send_text(chat_id,
-                        "👋 Hi! I'm your OpenAgent assistant.\n\n"
-                        "Send me a message, photo, voice note, or file.\n\n"
-                        "Commands:\n"
-                        "/new — fresh conversation\n"
-                        "/stop — cancel current operation\n"
-                        "/status — agent status\n"
-                        "/clear — clear queue\n"
-                        "/help — all commands"
-                    )
+                    await self._send_text(chat_id, bridge_welcome_text())
                 else:
                     result = await self.send_command(cmd)
                     await self._send_text(chat_id, result)
@@ -142,8 +139,7 @@ class WhatsAppBridge(BaseBridge):
                     files_info.append(f"- video: {fname} — local path: {path}")
 
         if files_info:
-            header = "The user attached files:\n" + "\n".join(files_info) + "\nUse Read to inspect them."
-            text = f"{header}\n\n{text}" if text else header
+            text = prepend_context_block(text, build_attachment_context(files_info))
 
         if not text:
             return
