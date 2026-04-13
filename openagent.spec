@@ -54,12 +54,24 @@ hiddenimports = [
 # Bundle the entire mcps/ directory (built-in MCP servers)
 # Each Node MCP needs its dist/ and node_modules/ directories.
 
+from PyInstaller.utils.hooks import collect_data_files
+
 mcps_dir = Path("openagent/mcps")
 
 datas = []
 if mcps_dir.exists():
     # Bundle the entire mcps directory tree
     datas.append((str(mcps_dir), "openagent/mcps"))
+
+# litellm needs its JSON data files (model prices, cost maps, etc.)
+datas += collect_data_files("litellm", includes=["**/*.json", "**/*.yaml", "**/*.yml"])
+# tiktoken needs its encoding data
+datas += collect_data_files("tiktoken")
+datas += collect_data_files("tiktoken_ext")
+# certifi CA bundle for HTTPS requests
+datas += collect_data_files("certifi")
+# mcp package data
+datas += collect_data_files("mcp")
 
 # ── Analysis ──
 
