@@ -37,6 +37,14 @@ class BaseModel(ABC):
     with session resume).  When False, the agent layer must supply full
     conversation history in the messages list."""
 
+    history_mode: str = "caller"
+    """How chat history is owned for a session.
+
+    - ``caller``: the caller must pass the relevant history every run
+    - ``platform``: OpenAgent/runtime manages persisted chat history
+    - ``provider``: the upstream provider manages history internally
+    """
+
     @abstractmethod
     async def generate(
         self,

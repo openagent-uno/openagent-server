@@ -413,7 +413,7 @@ class Gateway:
             elog("model.override_cache_hit", spec=spec)
             return self._model_cache[spec]
 
-        from openagent.models.litellm_provider import LiteLLMProvider
+        from openagent.models.agno_provider import AgnoProvider
         from openagent.models.smart_router import SmartRouter
 
         anthropic_cfg = (providers_config or {}).get("anthropic", {})
@@ -433,7 +433,14 @@ class Gateway:
                 permission_mode=anthropic_cfg.get("permission_mode", "bypass"),
             )
         else:
-            model = LiteLLMProvider(model=spec, providers_config=providers_config or {})
+            model = AgnoProvider(model=spec, providers_config=providers_config or {})
+
+        set_db = getattr(model, "set_db", None)
+        if callable(set_db) and self.agent._db:
+            set_db(self.agent._db)
+        set_mcp_registry = getattr(model, "set_mcp_registry", None)
+        if callable(set_mcp_registry):
+            set_mcp_registry(self.agent._mcp)
 
         self._model_cache[spec] = model
         elog("model.override_create", spec=spec, kind=type(model).__name__)
@@ -451,6 +458,19 @@ class Gateway:
 
             channel_model = self._resolve_channel_model(client_id)
             active_model = channel_model or self.agent.model
+            history_mode = getattr(active_model, "history_mode", None)
+            try:
+                self.sessions.bind_history_mode(client_id, session_id, history_mode)
+            except ValueError as e:
+                elog(
+                    "session.history_mode_conflict",
+                    client_id=client_id,
+                    session_id=session_id,
+                    history_mode=history_mode,
+                    error=str(e),
+                )
+                await ws.send_json({"type": P.ERROR, "text": str(e), "session_id": session_id})
+                return
             elog(
                 "message.process_start",
                 client_id=client_id,

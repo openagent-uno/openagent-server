@@ -838,21 +838,25 @@ def model_test(ctx, name: str):
         console.print(f"[red]Provider '{name}' not configured.[/red]")
         return
 
-    from openagent.models.litellm_provider import get_cheapest_model
-    model_id = get_cheapest_model(name) or f"{name}/default"
+    from openagent.models.agno_provider import AgnoProvider
+    from openagent.models.catalog import get_default_model_for_provider, normalize_runtime_model_id
+    model_id = get_default_model_for_provider(name, providers) or f"{name}:default"
+    model_id = normalize_runtime_model_id(model_id, providers)
 
     async def _test():
         try:
-            import litellm
             console.print(f"Testing [cyan]{name}[/cyan] with model [cyan]{model_id}[/cyan]...")
-            resp = await litellm.acompletion(
+            provider = AgnoProvider(
                 model=model_id,
-                messages=[{"role": "user", "content": "Say 'ok' and nothing else."}],
-                max_tokens=5,
                 api_key=cfg.get("api_key"),
-                api_base=cfg.get("base_url"),
+                base_url=cfg.get("base_url"),
+                providers_config=providers,
             )
-            console.print(f"[green]Success![/green] Response: {resp.choices[0].message.content}")
+            resp = await provider.generate(
+                messages=[{"role": "user", "content": "Say 'ok' and nothing else."}],
+                session_id="cli-provider-test",
+            )
+            console.print(f"[green]Success![/green] Response: {resp.content}")
         except Exception as e:
             console.print(f"[red]Failed:[/red] {e}")
 
@@ -883,7 +887,7 @@ def model_active(ctx):
 
 
 @model_group.command("set-active")
-@click.option("--provider", "-p", type=click.Choice(["claude-cli", "litellm", "smart"]), prompt=True)
+@click.option("--provider", "-p", type=click.Choice(["claude-cli", "agno", "smart"]), prompt=True)
 @click.option("--model-id", "-m", default=None, help="Model ID (e.g. anthropic/claude-sonnet-4-6)")
 @click.pass_context
 def model_set_active(ctx, provider: str, model_id: str | None):
@@ -1040,21 +1044,25 @@ def provider_test(ctx, name: str):
         console.print(f"[red]Provider '{name}' not configured.[/red]")
         return
 
-    from openagent.models.litellm_provider import get_cheapest_model
-    model_id = get_cheapest_model(name) or f"{name}/default"
+    from openagent.models.agno_provider import AgnoProvider
+    from openagent.models.catalog import get_default_model_for_provider, normalize_runtime_model_id
+    model_id = get_default_model_for_provider(name, providers) or f"{name}:default"
+    model_id = normalize_runtime_model_id(model_id, providers)
 
     async def _test():
         try:
-            import litellm
             console.print(f"Testing [cyan]{name}[/cyan] with model [cyan]{model_id}[/cyan]...")
-            resp = await litellm.acompletion(
+            provider = AgnoProvider(
                 model=model_id,
-                messages=[{"role": "user", "content": "Say 'ok' and nothing else."}],
-                max_tokens=5,
                 api_key=cfg.get("api_key"),
-                api_base=cfg.get("base_url"),
+                base_url=cfg.get("base_url"),
+                providers_config=providers,
             )
-            console.print(f"[green]Success![/green] Response: {resp.choices[0].message.content}")
+            resp = await provider.generate(
+                messages=[{"role": "user", "content": "Say 'ok' and nothing else."}],
+                session_id="cli-provider-test",
+            )
+            console.print(f"[green]Success![/green] Response: {resp.content}")
         except Exception as e:
             console.print(f"[red]Failed:[/red] {e}")
 

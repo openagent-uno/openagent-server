@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from aiohttp import web
 
+from openagent.gateway.api.config import _read_raw
+
 
 async def handle_get(request: web.Request) -> web.Response:
     from aiohttp import web as _web
@@ -47,24 +49,22 @@ async def handle_daily(request: web.Request) -> web.Response:
 async def handle_pricing(request: web.Request) -> web.Response:
     """GET /api/usage/pricing — pricing info for models in usage history."""
     from aiohttp import web as _web
-
-    try:
-        from litellm import model_cost
-    except ImportError:
-        return _web.json_response({"pricing": {}})
+    from openagent.core.config import _resolve_env_vars
+    from openagent.models.catalog import get_model_pricing
 
     gw = request.app["gateway"]
     db = gw.agent._db
     if not db:
         return _web.json_response({"pricing": {}})
 
+    providers_config = {}
+    if gw.config_path:
+        raw = _read_raw(request)
+        providers_config = _resolve_env_vars(raw.get("providers", {}))
+
     summary = await db.get_usage_summary()
     pricing = {}
     for model_id in summary.get("by_model", {}).keys():
-        info = model_cost.get(model_id, {})
-        pricing[model_id] = {
-            "input_cost_per_million": (info.get("input_cost_per_token", 0) or 0) * 1_000_000,
-            "output_cost_per_million": (info.get("output_cost_per_token", 0) or 0) * 1_000_000,
-        }
+        pricing[model_id] = get_model_pricing(model_id, providers_config)
 
     return _web.json_response({"pricing": pricing})

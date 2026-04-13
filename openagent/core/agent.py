@@ -31,7 +31,7 @@ class Agent:
     Usage:
         agent = Agent(
             name="assistant",
-            model=LiteLLMProvider(model="anthropic/claude-sonnet-4-6"),
+            model=AgnoProvider(model="anthropic:claude-sonnet-4-20250514"),
             system_prompt="You are a helpful assistant.",
             mcp_tools=[MCPTools(command=["npx", "..."])],
             memory=MemoryDB("agent.db"),
@@ -85,6 +85,9 @@ class Agent:
         if model is None:
             return
         self._register_runtime_model(model)
+        set_mcp_registry = getattr(model, "set_mcp_registry", None)
+        if callable(set_mcp_registry):
+            set_mcp_registry(self._mcp)
         set_mcp_servers = getattr(model, "set_mcp_servers", None)
         if callable(set_mcp_servers):
             mcp_configs = self._build_cli_mcp_configs()

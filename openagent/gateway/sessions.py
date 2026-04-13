@@ -27,6 +27,7 @@ MAX_QUEUE_SIZE = 20
 class Session:
     id: str
     client_id: str
+    history_mode: str | None = None
 
 
 @dataclass
@@ -76,6 +77,25 @@ class SessionManager:
         st = self._state(client_id)
         st.sessions.pop(session_id, None)
         return self.create_session(client_id)
+
+    def bind_history_mode(self, client_id: str, session_id: str, history_mode: str | None) -> str | None:
+        """Lock a session to a history ownership mode once it starts running."""
+        if not history_mode:
+            return None
+        st = self._state(client_id)
+        session = st.sessions.get(session_id)
+        if not session:
+            session = Session(id=session_id, client_id=client_id)
+            st.sessions[session_id] = session
+        if session.history_mode and session.history_mode != history_mode:
+            raise ValueError(
+                f"Session '{session_id}' is locked to {session.history_mode}-managed history "
+                f"and cannot switch to {history_mode}-managed history."
+            )
+        if session.history_mode != history_mode:
+            session.history_mode = history_mode
+            elog("session.history_mode", client_id=client_id, session_id=session_id, history_mode=history_mode)
+        return session.history_mode
 
     def list_sessions(self, client_id: str) -> list[str]:
         return list(self._state(client_id).sessions.keys())

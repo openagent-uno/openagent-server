@@ -66,43 +66,44 @@ def load_config(path: str | Path | None = None) -> dict:
 def build_model_from_config(config: dict):
     """Instantiate a model from config dict."""
     import logging
+    from openagent.models.agno_provider import AgnoProvider
     from openagent.models.claude_cli import ClaudeCLI
-    from openagent.models.litellm_provider import LiteLLMProvider
 
     _logger = logging.getLogger(__name__)
     model_cfg = config.get("model", {})
-    provider = model_cfg.get("provider", "litellm")
+    provider = model_cfg.get("provider", "agno")
+    providers_config = config.get("providers", {})
 
-    # Backward compat: map legacy provider names to litellm
+    # Backward compat: map legacy provider names to the Agno-backed API runtime.
     if provider == "claude-api":
-        _logger.info("provider 'claude-api' mapped to 'litellm' with model 'anthropic/%s'",
+        _logger.info("provider 'claude-api' mapped to 'agno' with model 'anthropic:%s'",
                       model_cfg.get("model_id", "claude-sonnet-4-6"))
-        return LiteLLMProvider(
-            model=f"anthropic/{model_cfg.get('model_id', 'claude-sonnet-4-6')}",
+        return AgnoProvider(
+            model=f"anthropic:{model_cfg.get('model_id', 'claude-sonnet-4-6')}",
             api_key=model_cfg.get("api_key"),
-            providers_config=config.get("providers", {}),
+            providers_config=providers_config,
         )
-    elif provider == "zhipu":
+    elif provider in ("zhipu", "zai"):
         model_id = model_cfg.get("model_id", "glm-5")
         base_url = model_cfg.get("base_url", "https://api.z.ai/api/paas/v4")
-        _logger.info("provider 'zhipu' mapped to 'litellm' with model '%s'", model_id)
-        return LiteLLMProvider(
-            model=f"openai/{model_id}",
+        _logger.info("provider '%s' mapped to 'agno' with model 'zai:%s'", provider, model_id)
+        return AgnoProvider(
+            model=f"zai:{model_id}",
             api_key=model_cfg.get("api_key"),
             base_url=base_url,
-            providers_config=config.get("providers", {}),
+            providers_config=providers_config,
         )
     elif provider == "claude-cli":
         return ClaudeCLI(
             model=model_cfg.get("model_id"),
             permission_mode=model_cfg.get("permission_mode", "bypass"),
         )
-    elif provider == "litellm":
-        return LiteLLMProvider(
-            model=model_cfg.get("model_id", "anthropic/claude-sonnet-4-6"),
+    elif provider in ("litellm", "agno"):
+        return AgnoProvider(
+            model=model_cfg.get("model_id", "anthropic:claude-sonnet-4-20250514"),
             api_key=model_cfg.get("api_key"),
             base_url=model_cfg.get("base_url"),
-            providers_config=config.get("providers", {}),
+            providers_config=providers_config,
         )
     elif provider == "smart":
         from openagent.models.smart_router import SmartRouter
@@ -111,7 +112,7 @@ def build_model_from_config(config: dict):
             api_key=model_cfg.get("api_key"),
             monthly_budget=float(model_cfg.get("monthly_budget", 0)),
             classifier_model=model_cfg.get("classifier_model"),
-            providers_config=config.get("providers", {}),
+            providers_config=providers_config,
             claude_permission_mode=model_cfg.get("permission_mode", "bypass"),
         )
     else:

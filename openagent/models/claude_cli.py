@@ -30,6 +30,7 @@ class ClaudeCLI(BaseModel):
     """Claude backed by ``ClaudeSDKClient`` with lazy lifecycle and session resume."""
 
     manages_history = True
+    history_mode = "provider"
 
     def __init__(
         self,

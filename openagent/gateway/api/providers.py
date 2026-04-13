@@ -51,7 +51,8 @@ async def handle_list(request: web.Request) -> web.Response:
 async def handle_test(request: web.Request) -> web.Response:
     """Test a provider by sending a simple prompt."""
     from aiohttp import web as _web
-    import json
+    from openagent.models.agno_provider import AgnoProvider
+    from openagent.models.catalog import get_default_model_for_provider, normalize_runtime_model_id
 
     body = await request.json()
     provider_name = body.get("provider", "")
@@ -78,19 +79,22 @@ async def handle_test(request: web.Request) -> web.Response:
     if not cfg:
         return _web.json_response({"ok": False, "error": f"Provider '{provider_name}' not configured"}, status=400)
 
-    # Pick cheapest model dynamically from litellm catalog
-    from openagent.models.litellm_provider import get_cheapest_model
-    model_id = body.get("model_id") or get_cheapest_model(provider_name) or f"{provider_name}/default"
+    runtime_model = body.get("model_id") or get_default_model_for_provider(provider_name, providers)
+    if not runtime_model:
+        return _web.json_response({"ok": False, "error": f"No models configured for provider '{provider_name}'"}, status=400)
+    runtime_model = normalize_runtime_model_id(runtime_model, providers)
 
     try:
-        import litellm
-        resp = await litellm.acompletion(
-            model=model_id,
-            messages=[{"role": "user", "content": "Say 'ok' and nothing else."}],
-            max_tokens=5,
+        provider = AgnoProvider(
+            model=runtime_model,
             api_key=cfg.get("api_key"),
-            api_base=cfg.get("base_url"),
+            base_url=cfg.get("base_url"),
+            providers_config=providers,
         )
-        return _web.json_response({"ok": True, "model": model_id})
+        resp = await provider.generate(
+            messages=[{"role": "user", "content": "Say 'ok' and nothing else."}],
+            session_id="provider-test",
+        )
+        return _web.json_response({"ok": True, "model": runtime_model, "response": resp.content})
     except Exception as e:
         return _web.json_response({"ok": False, "error": str(e)}, status=400)
