@@ -92,15 +92,8 @@ def _system() -> str:
     return platform.system()  # "Darwin", "Linux", "Windows"
 
 
-def config_dir() -> Path:
-    """Return the config directory, creating it if needed.
-
-    When an agent dir is set, returns the agent dir itself.
-    Otherwise returns the platform-standard location:
-    - macOS:   ~/Library/Application Support/OpenAgent/
-    - Linux:   ~/.config/openagent/
-    - Windows: %APPDATA%\\OpenAgent\\
-    """
+def _platform_dir(kind: str) -> Path:
+    """Resolve the base config/data directory for the current platform."""
     if _agent_dir is not None:
         _agent_dir.mkdir(parents=True, exist_ok=True)
         return _agent_dir
@@ -111,35 +104,22 @@ def config_dir() -> Path:
     elif system == "Windows":
         base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")) / "OpenAgent"
     else:
-        xdg = os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
+        env_name = "XDG_CONFIG_HOME" if kind == "config" else "XDG_DATA_HOME"
+        default = Path.home() / ".config" if kind == "config" else Path.home() / ".local" / "share"
+        xdg = os.environ.get(env_name, str(default))
         base = Path(xdg) / APP_NAME
     base.mkdir(parents=True, exist_ok=True)
     return base
+
+
+def config_dir() -> Path:
+    """Return the config directory, creating it if needed."""
+    return _platform_dir("config")
 
 
 def data_dir() -> Path:
-    """Return the data directory.
-
-    When an agent dir is set, returns the agent dir itself.
-    Otherwise returns the platform-standard location:
-    - macOS:   ~/Library/Application Support/OpenAgent/
-    - Linux:   ~/.local/share/openagent/
-    - Windows: %APPDATA%\\OpenAgent\\
-    """
-    if _agent_dir is not None:
-        _agent_dir.mkdir(parents=True, exist_ok=True)
-        return _agent_dir
-
-    system = _system()
-    if system == "Darwin":
-        base = Path.home() / "Library" / "Application Support" / "OpenAgent"
-    elif system == "Windows":
-        base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")) / "OpenAgent"
-    else:
-        xdg = os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share"))
-        base = Path(xdg) / APP_NAME
-    base.mkdir(parents=True, exist_ok=True)
-    return base
+    """Return the data directory, creating it if needed."""
+    return _platform_dir("data")
 
 
 def log_dir() -> Path:

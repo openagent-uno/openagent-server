@@ -32,10 +32,13 @@ class BaseModel(ABC):
     generate() and optionally stream(). No changes needed in agent or MCP layer.
     """
 
-    manages_history: bool = False
-    """True if the model manages its own conversation history (e.g. Claude SDK
-    with session resume).  When False, the agent layer must supply full
-    conversation history in the messages list."""
+    history_mode: str = "caller"
+    """How chat history is owned for a session.
+
+    - ``caller``: the caller must pass the relevant history every run
+    - ``platform``: OpenAgent/runtime manages persisted chat history
+    - ``provider``: the upstream provider manages history internally
+    """
 
     @abstractmethod
     async def generate(

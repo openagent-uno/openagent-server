@@ -489,7 +489,14 @@ class MCPRegistry:
         server = self._tool_map.get(name)
         if not server:
             raise ValueError(f"Unknown tool: {name}. Available: {list(self._tool_map.keys())}")
-        return await server.call_tool(name, arguments)
+        elog("mcp.tool.start", tool=name, server=server.name, params=arguments)
+        try:
+            result = await server.call_tool(name, arguments)
+        except Exception as exc:
+            elog("mcp.tool.error", tool=name, server=server.name, error=str(exc))
+            raise
+        elog("mcp.tool.done", tool=name, server=server.name, result_len=len(result or ""))
+        return result
 
     @classmethod
     def from_config(

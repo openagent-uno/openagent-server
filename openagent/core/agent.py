@@ -6,10 +6,12 @@ import asyncio
 import logging
 from typing import Any, AsyncIterator, Callable, Awaitable
 
+from openagent.channels.base import build_attachment_context, prepend_context_block
 from openagent.models.base import BaseModel, ModelResponse
 from openagent.memory.db import MemoryDB
 from openagent.mcp.client import MCPRegistry, MCPTools
 from openagent.core.prompts import FRAMEWORK_SYSTEM_PROMPT
+from openagent.models.runtime import wire_model_runtime
 
 from openagent.core.logging import elog
 
@@ -24,14 +26,18 @@ StatusCallback = Callable[[str], Awaitable[None]]
 class Agent:
     """Main agent class. Ties together a model, MCP tools, and memory.
 
-    Session history is handled by the Claude Agent SDK (resume=session_id).
-    Long-term memory is handled by MCPVault (Obsidian vault).
-    SQLite (MemoryDB) is only used for scheduled tasks.
+    OpenAgent owns the MCP topology and the orchestration loop.
+    Chat history can be caller-managed, platform-managed, or provider-managed
+    depending on the active model's ``history_mode``.
+
+    Long-term memory lives in the Obsidian-style vault exposed through MCP.
+    The SQLite database is used for runtime state such as scheduler tasks,
+    platform-managed chat sessions, and usage tracking.
 
     Usage:
         agent = Agent(
             name="assistant",
-            model=LiteLLMProvider(model="anthropic/claude-sonnet-4-6"),
+            model=AgnoProvider(model="anthropic:claude-sonnet-4-20250514"),
             system_prompt="You are a helpful assistant.",
             mcp_tools=[MCPTools(command=["npx", "..."])],
             memory=MemoryDB("agent.db"),
@@ -60,7 +66,7 @@ class Agent:
             for tool in (mcp_tools or []):
                 self._mcp.add(tool)
 
-        # Memory (SQLite for scheduled tasks only; knowledge base in Obsidian vault via MCPVault)
+        # Runtime DB; the long-term knowledge base still lives in the Obsidian vault via MCP.
         if isinstance(memory, str):
             self._db = MemoryDB(memory)
         elif isinstance(memory, MemoryDB):
@@ -81,15 +87,15 @@ class Agent:
         self._runtime_models.append(model)
 
     def _prepare_model_runtime(self, model: BaseModel | None) -> None:
-        """Wire MCP server config into models that support it."""
+        """Wire shared runtime dependencies into models that support them."""
         if model is None:
             return
         self._register_runtime_model(model)
-        set_mcp_servers = getattr(model, "set_mcp_servers", None)
-        if callable(set_mcp_servers):
-            mcp_configs = self._build_cli_mcp_configs()
-            if mcp_configs:
-                set_mcp_servers(mcp_configs)
+        wire_model_runtime(
+            model,
+            mcp_registry=self._mcp,
+            mcp_servers=self._build_mcp_server_configs() or None,
+        )
 
     def _ensure_idle_cleanup_task(self) -> None:
         """Start the idle cleanup loop if any runtime model supports it."""
@@ -121,7 +127,7 @@ class Agent:
         )
 
     async def _run_idle_cleanup(self) -> None:
-        """Periodically close idle ClaudeCLI sessions to free resources."""
+        """Periodically release idle provider resources."""
         while True:
             await asyncio.sleep(60)
             for model in list(self._runtime_models):
@@ -133,8 +139,8 @@ class Agent:
                 except Exception as e:
                     logger.debug("Idle cleanup error: %s", e)
 
-    def _build_cli_mcp_configs(self) -> dict[str, dict]:
-        """Build MCP server configs for the Claude Agent SDK.
+    def _build_mcp_server_configs(self) -> dict[str, dict]:
+        """Build MCP server configs for runtime models that consume them.
 
         Supports stdio (command), SSE (url), and HTTP (url) MCP servers.
 
@@ -206,8 +212,8 @@ class Agent:
         if self._idle_cleanup_task:
             self._idle_cleanup_task.cancel()
             self._idle_cleanup_task = None
-        # Persistent models (e.g. Claude SDK client) need an explicit
-        # shutdown to flush their subprocess cleanly.
+        # Persistent model runtimes may need an explicit shutdown to
+        # release subprocesses or cached sessions cleanly.
         seen: set[int] = set()
         for model in [self.model, *self._runtime_models]:
             if model is None or id(model) in seen:
@@ -238,8 +244,8 @@ class Agent:
         """Run the agent with a user message. Returns the final text response.
 
         Args:
-            session_id: Kept for API compatibility. Session continuity is
-                handled by the Claude Agent SDK's resume=session_id.
+            session_id: Session key passed through to whichever history mode
+                the active model uses.
             on_status: Optional async callback for live status updates.
                 Called with status strings like "Thinking...", "Using shell_exec...", etc.
                 Channels use this to update a live status message.
@@ -288,29 +294,27 @@ class Agent:
         # project-specific system prompt from openagent.yaml.
         system = self._combined_system_prompt()
 
-        # Build messages. For each attachment we include the LOCAL PATH
-        # in the prompt so the agent can actually read the file — Claude
-        # Code's Read tool handles images natively, and MCP tools like
-        # filesystem/editor can open text files. Without the path, the
-        # agent would see only "[Attached image: photo.jpg]" and spin
-        # trying to locate the file.
+        # Include local paths for attachments so the tool layer can inspect them.
         if attachments:
-            lines = ["The user attached the following files:"]
+            files_info: list[str] = []
             for a in attachments:
                 a_type = a.get("type", "file")
                 a_name = a.get("filename", "")
                 a_path = a.get("path", "")
                 if a_path:
-                    lines.append(f"- {a_type}: {a_name} — local path: {a_path}")
+                    files_info.append(f"- {a_type}: {a_name} — local path: {a_path}")
                 else:
-                    lines.append(f"- {a_type}: {a_name}")
-            lines.append(
-                "Use the Read tool (or an MCP tool) with the local path to "
-                "inspect each file. For images, Read returns the image "
-                "content for you to see directly."
+                    files_info.append(f"- {a_type}: {a_name}")
+            message = prepend_context_block(
+                message,
+                build_attachment_context(
+                    files_info,
+                    read_hint=(
+                        "Use the Read tool (or an MCP tool) with the local path to inspect each file. "
+                        "For images, Read returns the image content for you to see directly."
+                    ),
+                ),
             )
-            att_block = "\n".join(lines)
-            message = f"{att_block}\n\n{message}" if message else att_block
 
         messages: list[dict[str, Any]] = [{"role": "user", "content": message}]
 

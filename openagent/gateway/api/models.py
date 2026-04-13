@@ -15,23 +15,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from aiohttp import web
 
-from openagent.gateway.api.config import _read_raw, _write_raw
-from openagent.gateway.api.providers import _mask_key
-
-
-def _mask_providers(providers: dict) -> dict:
-    """Return providers dict with API keys masked."""
-    masked = {}
-    for name, cfg in providers.items():
-        entry = dict(cfg)
-        if "api_key" in entry:
-            raw = entry.pop("api_key")
-            if isinstance(raw, str) and raw.startswith("${"):
-                entry["api_key_display"] = raw
-            else:
-                entry["api_key_display"] = _mask_key(raw)
-        masked[name] = entry
-    return masked
+from openagent.gateway.api.config import _read_raw, _read_resolved, _write_raw
+from openagent.gateway.api.providers import _mask_key, mask_providers
 
 
 async def handle_list(request: web.Request) -> web.Response:
@@ -52,7 +37,7 @@ async def handle_list(request: web.Request) -> web.Response:
             active_masked["api_key_display"] = _mask_key(k)
 
     return _web.json_response({
-        "models": _mask_providers(providers),
+        "models": mask_providers(providers),
         "active": active_masked,
     })
 
@@ -75,6 +60,10 @@ async def handle_create(request: web.Request) -> web.Response:
         entry["api_key"] = body["api_key"]
     if body.get("base_url"):
         entry["base_url"] = body["base_url"]
+    if "models" in body:
+        entry["models"] = body["models"]
+    if body.get("disabled_models"):
+        entry["disabled_models"] = body["disabled_models"]
 
     raw["providers"][name] = entry
     _write_raw(request, raw)
@@ -137,6 +126,11 @@ async def handle_update(request: web.Request) -> web.Response:
             entry["disabled_models"] = body["disabled_models"]
         else:
             entry.pop("disabled_models", None)
+    if "models" in body:
+        if body["models"]:
+            entry["models"] = body["models"]
+        else:
+            entry.pop("models", None)
 
     raw["providers"][name] = entry
     _write_raw(request, raw)
@@ -163,94 +157,56 @@ async def handle_delete(request: web.Request) -> web.Response:
 
 
 async def handle_available_providers(request: web.Request) -> web.Response:
-    """GET /api/models/providers — available LLM providers from litellm."""
+    """GET /api/models/providers — provider catalog exposed by OpenAgent."""
     from aiohttp import web as _web
+    from openagent.models.catalog import supported_providers
 
-    try:
-        from litellm import model_cost
-    except ImportError:
-        return _web.json_response({"providers": ["anthropic"]})
-
-    # Extract unique provider prefixes from model_cost keys
-    provider_set: set[str] = set()
-    for model_id, info in model_cost.items():
-        # Skip models with no pricing
-        if not (info.get("input_cost_per_token") or info.get("output_cost_per_token")):
-            continue
-        # Provider is the prefix before the first dot or slash
-        for sep in (".", "/"):
-            if sep in model_id:
-                provider_set.add(model_id.split(sep, 1)[0])
-                break
-
-    # Always include anthropic (has special CLI adapter)
-    provider_set.add("anthropic")
-
-    # Sort and return
-    providers = sorted(provider_set)
-    return _web.json_response({"providers": providers})
+    providers_cfg = _read_resolved(request).get("providers", {})
+    return _web.json_response({"providers": supported_providers(providers_cfg)})
 
 
 async def handle_catalog(request: web.Request) -> web.Response:
-    """GET /api/models/catalog?provider=anthropic — available models with pricing."""
+    """GET /api/models/catalog?provider=openai — configured models with pricing."""
     from aiohttp import web as _web
+    from openagent.models.catalog import iter_configured_models
 
     provider_filter = request.query.get("provider", "")
-
-    try:
-        from litellm import model_cost
-    except ImportError:
-        return _web.json_response({"models": []})
-
+    providers_cfg = _read_resolved(request).get("providers", {})
     results = []
-    for model_id, info in model_cost.items():
-        # Filter by provider prefix if specified
-        if provider_filter and not model_id.startswith(provider_filter):
+    for entry in iter_configured_models(providers_cfg):
+        if provider_filter and entry.provider != provider_filter:
             continue
-        input_cost = (info.get("input_cost_per_token", 0) or 0) * 1_000_000
-        output_cost = (info.get("output_cost_per_token", 0) or 0) * 1_000_000
-        if input_cost == 0 and output_cost == 0:
-            continue  # skip models with no pricing info
-        results.append({
-            "model_id": model_id,
-            "input_cost_per_million": round(input_cost, 4),
-            "output_cost_per_million": round(output_cost, 4),
-        })
-
-    # Sort by input cost ascending
-    results.sort(key=lambda x: x["input_cost_per_million"])
-
+        results.append(
+            {
+                "provider": entry.provider,
+                "model_id": entry.model_id,
+                "runtime_id": entry.runtime_id,
+                "history_mode": entry.history_mode,
+                "input_cost_per_million": round(float(entry.input_cost_per_million or 0.0), 4),
+                "output_cost_per_million": round(float(entry.output_cost_per_million or 0.0), 4),
+            }
+        )
+    results.sort(key=lambda item: (item["provider"], item["input_cost_per_million"], item["model_id"]))
     return _web.json_response({"models": results})
 
 
 async def handle_test(request: web.Request) -> web.Response:
-    """Test a provider by sending a simple prompt via litellm."""
+    """Test a configured provider by sending a simple prompt via the runtime."""
     from aiohttp import web as _web
-    from openagent.core.config import _resolve_env_vars
+    from openagent.models.runtime import run_provider_smoke_test
 
     name = request.match_info["name"]
     body = await request.json() if request.can_read_body else {}
 
-    raw = _read_raw(request)
-    providers = _resolve_env_vars(raw.get("providers", {}))
-    cfg = providers.get(name)
-    if not cfg:
-        return _web.json_response(
-            {"ok": False, "error": f"Provider '{name}' not configured"}, status=400
-        )
-
-    from openagent.models.litellm_provider import get_cheapest_model
-    model_id = body.get("model_id") or get_cheapest_model(name) or f"{name}/default"
+    providers = _read_resolved(request).get("providers", {})
 
     try:
-        import litellm
-        resp = await litellm.acompletion(
-            model=model_id,
-            messages=[{"role": "user", "content": "Say 'ok' and nothing else."}],
-            max_tokens=5,
-            api_key=cfg.get("api_key"),
-            api_base=cfg.get("base_url"),
+        runtime_model, resp = await run_provider_smoke_test(
+            name,
+            providers,
+            model_id=body.get("model_id"),
+            session_id="provider-test",
         )
-        return _web.json_response({"ok": True, "model": model_id})
+        return _web.json_response({"ok": True, "model": runtime_model, "response": resp.content})
     except Exception as e:
         return _web.json_response({"ok": False, "error": str(e)}, status=400)

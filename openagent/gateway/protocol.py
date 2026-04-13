@@ -7,7 +7,7 @@ Client → Server::
 
     {"type": "auth",    "token": "...", "client_id": "..."}
     {"type": "message", "text": "...", "session_id": "..."}
-    {"type": "command", "name": "new|stop|status|queue|help|usage"}
+    {"type": "command", "name": "<gateway command>"}
     {"type": "ping"}
 
 Server → Client::
@@ -36,5 +36,4 @@ QUEUED = "queued"
 PING = "ping"
 PONG = "pong"
 
-# Commands
-COMMANDS = ("new", "reset", "stop", "status", "queue", "help", "usage", "update", "restart")
+from openagent.gateway.commands import COMMANDS

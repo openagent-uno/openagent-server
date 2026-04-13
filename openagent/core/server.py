@@ -1,4 +1,4 @@
-"""AgentServer: unified lifecycle for agent + channels + scheduler + aux services.
+"""AgentServer: unified lifecycle for agent, gateway, bridges, and scheduler.
 
 This is the single entry point used by `openagent serve`. It owns the
 lifecycle of every long-running piece so there is exactly one place that
@@ -16,11 +16,9 @@ import logging
 import os
 import signal
 from openagent.core.agent import Agent
-from openagent.core.config import build_model_from_config
 from openagent.mcp.client import MCPRegistry
 from openagent.memory.db import MemoryDB
-from openagent.services.manager import ServiceManager
-
+from openagent.models.runtime import create_model_from_config, wire_model_runtime
 from openagent.core.logging import elog
 
 logger = logging.getLogger(__name__)
@@ -82,7 +80,7 @@ def _build_agent(config: dict) -> Agent:
     """Build an Agent from a config dict (factored out of cli.py)."""
     from openagent.core.paths import default_db_path
 
-    model = build_model_from_config(config)
+    model = create_model_from_config(config)
 
     # Export channel tokens as env vars so the messaging MCP can pick them up
     channels_config = config.get("channels", {})
@@ -109,10 +107,8 @@ def _build_agent(config: dict) -> Agent:
     db_path = memory_cfg.get("db_path", str(default_db_path()))
     db = MemoryDB(db_path)
 
-    # Wire budget tracking for SmartRouter (needs the shared DB instance)
-    from openagent.models.smart_router import SmartRouter
-    if isinstance(model, SmartRouter):
-        model.set_db(db)
+    # Wire the shared DB into models that need session history or budgeting.
+    wire_model_runtime(model, db=db)
 
     mcp_registry = MCPRegistry.from_config(
         mcp_config=mcp_config,
@@ -194,13 +190,8 @@ def _build_bridges(config: dict, gateway_port: int = 8765, gateway_token: str | 
     return out
 
 
-def _build_aux_services(config: dict) -> ServiceManager:
-    """Build the ServiceManager from the `services:` section of the config."""
-    return ServiceManager()  # no built-in services currently
-
-
 class AgentServer:
-    """Owns the lifecycle of agent + channels + scheduler + aux services.
+    """Owns the lifecycle of agent, gateway, bridges, and scheduler.
 
     Usage:
         server = AgentServer.from_config(config)
@@ -211,16 +202,11 @@ class AgentServer:
     def __init__(
         self,
         agent: Agent,
-        channels: list,
-        aux_services: ServiceManager,
         config: dict,
     ) -> None:
         self.agent = agent
-        self.channels = channels
-        self.aux_services = aux_services
         self.config = config
 
-        self._channel_tasks: list[asyncio.Task] = []
         self._bridge_tasks: list[asyncio.Task] = []
         self._bridges: list = []
         self._scheduler = None
@@ -230,8 +216,7 @@ class AgentServer:
     @classmethod
     def from_config(cls, config: dict, only_channels: list[str] | None = None) -> AgentServer:
         agent = _build_agent(config)
-        aux = _build_aux_services(config)
-        server = cls(agent=agent, channels=[], aux_services=aux, config=config)
+        server = cls(agent=agent, config=config)
         # Build Gateway if websocket channel is configured
         ws_cfg = config.get("channels", {}).get("websocket", {})
         if ws_cfg or (only_channels and "websocket" in only_channels):
@@ -254,27 +239,22 @@ class AgentServer:
     # ── Lifecycle ──
 
     async def start(self) -> None:
-        """Start aux services, agent, scheduler, and channels."""
+        """Start agent, gateway, scheduler, and bridges."""
         self._stop_event = asyncio.Event()
         elog("server.start", agent=self.agent.name)
 
-        # 1. Aux services first (they might be dependencies — e.g. Obsidian
-        #    web UI mounting the vault before the agent writes to it).
-        if len(self.aux_services) > 0:
-            await self.aux_services.start_all()
-
-        # 2. Agent (connects MCPs, opens DB)
+        # 1. Agent (connects MCPs, opens DB)
         await self.agent.initialize()
 
-        # 3. Gateway (public WS + REST interface)
+        # 2. Gateway (public WS + REST interface)
         if self._gateway:
             self._gateway._stop_event = self._stop_event
             await self._gateway.start()
 
-        # 4. Scheduler (with dream mode + auto-update hooks)
+        # 3. Scheduler (with dream mode + auto-update hooks)
         await self._start_scheduler()
 
-        # 5. Bridges (connect to Gateway as internal WS clients)
+        # 4. Bridges (connect to Gateway as internal WS clients)
         for bridge in self._bridges:
             self._bridge_tasks.append(asyncio.create_task(
                 bridge.start(), name=f"bridge:{bridge.name}"
@@ -334,26 +314,11 @@ class AgentServer:
         except Exception as e:
             logger.warning("Agent shutdown error: %s", e)
 
-        # 5. Aux services last
-        if len(self.aux_services) > 0:
-            try:
-                await asyncio.wait_for(
-                    self.aux_services.stop_all(), timeout=10,
-                )
-            except (asyncio.TimeoutError, Exception) as e:
-                logger.warning("Aux services stop error: %s", e)
-
         if self._stop_event is not None:
             self._stop_event.set()
 
     async def wait(self) -> None:
-        """Block until stop() is called or a termination signal arrives.
-
-        If a channel task crashes, the error is logged and the server
-        continues to run with the remaining channels.  The server only
-        shuts down when the stop event fires, all channels have exited,
-        or a KeyboardInterrupt is received.
-        """
+        """Block until stop() is called or a termination signal arrives."""
         assert self._stop_event is not None, "Call start() first"
 
         loop = asyncio.get_running_loop()
@@ -372,41 +337,7 @@ class AgentServer:
                 pass
 
         try:
-            if not self._channel_tasks:
-                await stop_event.wait()
-                return
-
-            stop_task = asyncio.create_task(stop_event.wait(), name="stop_event")
-            pending: set[asyncio.Task] = set(self._channel_tasks) | {stop_task}
-
-            while pending:
-                done, pending = await asyncio.wait(
-                    pending, return_when=asyncio.FIRST_COMPLETED,
-                )
-                for task in done:
-                    if task is stop_task:
-                        # Normal shutdown signal — cancel remaining tasks
-                        for p in pending:
-                            p.cancel()
-                        return
-
-                    # A channel task finished
-                    name = task.get_name()
-                    if task.exception():
-                        logger.error(
-                            "Channel %s crashed: %s — remaining channels continue.",
-                            name, task.exception(),
-                        )
-                    else:
-                        logger.warning("Channel %s exited unexpectedly.", name)
-
-                # If only the stop_task remains, just wait for the signal
-                if pending == {stop_task}:
-                    logger.warning(
-                        "All channels have exited. Waiting for stop signal..."
-                    )
-                    await stop_event.wait()
-                    return
+            await stop_event.wait()
         except KeyboardInterrupt:
             pass
         finally:
@@ -453,12 +384,8 @@ class AgentServer:
 
     async def _sync_scheduled_task(
         self, scheduler, *, name: str, enabled: bool, cron_expr: str, prompt: str,
-    ) -> dict | None:
-        """Ensure a built-in scheduled task matches the desired state.
-
-        Creates, re-enables/updates, or disables the task as needed.
-        Returns the existing task row (if any) for further customization.
-        """
+    ) -> None:
+        """Ensure a built-in scheduled task matches the desired state."""
         tasks = await self.agent._db.get_tasks()
         existing = next((t for t in tasks if t["name"] == name), None)
 
@@ -467,17 +394,31 @@ class AgentServer:
                 await scheduler.add_task(
                     name=name, cron_expression=cron_expr, prompt=prompt,
                 )
-            elif not existing["enabled"] or existing["cron_expression"] != cron_expr:
-                await scheduler.disable_task(existing["id"])
+                return
+
+            updates = {}
+            if existing["cron_expression"] != cron_expr:
+                updates["cron_expression"] = cron_expr
+            if existing["prompt"] != prompt:
+                updates["prompt"] = prompt
+            if updates:
+                await self.agent._db.update_task(existing["id"], **updates)
+            if not existing["enabled"]:
                 await scheduler.enable_task(existing["id"])
-                if existing["cron_expression"] != cron_expr:
-                    await self.agent._db.update_task(
-                        existing["id"], cron_expression=cron_expr,
-                    )
+            elif "cron_expression" in updates:
+                await scheduler.reschedule_task(existing["id"])
         elif existing is not None and existing["enabled"]:
             await scheduler.disable_task(existing["id"])
 
-        return existing
+    @staticmethod
+    def _wrap_scheduler_run_task(scheduler, wrapper) -> None:
+        """Compose a task wrapper around the scheduler run_task hook."""
+        original_run = scheduler.run_task
+
+        async def _wrapped(task, _orig=original_run):
+            await wrapper(task, _orig)
+
+        scheduler.run_task = _wrapped  # type: ignore[method-assign]
 
     async def _sync_dream_mode(self, scheduler) -> None:
         dream_cfg = self.config.get("dream_mode", {})
@@ -500,10 +441,7 @@ class AgentServer:
         )
 
         if enabled:
-            # Wrap run_task to clear event log after dream mode completes
-            original_run = scheduler.run_task
-
-            async def _dream_run(task, _orig=original_run):
+            async def _dream_run(task, _orig):
                 if task["name"] == DREAM_MODE_TASK_NAME:
                     elog("dream.start")
                     await _orig(task)
@@ -515,7 +453,7 @@ class AgentServer:
                 else:
                     await _orig(task)
 
-            scheduler.run_task = _dream_run  # type: ignore[method-assign]
+            self._wrap_scheduler_run_task(scheduler, _dream_run)
 
     async def _sync_auto_update(self, scheduler) -> None:
         update_cfg = self.config.get("auto_update", {})
@@ -538,18 +476,16 @@ class AgentServer:
         )
 
         if enabled:
-            # Override run_task so auto-update uses the direct pip logic
             agent = self.agent
             stop_event = self._stop_event
-            original_run = scheduler.run_task
 
-            async def _auto_update_run(task, _orig=original_run):
+            async def _auto_update_run(task, _orig):
                 if task["name"] == AUTO_UPDATE_TASK_NAME:
                     await _do_auto_update(agent, mode, stop_event=stop_event)
                 else:
                     await _orig(task)
 
-            scheduler.run_task = _auto_update_run  # type: ignore[method-assign]
+            self._wrap_scheduler_run_task(scheduler, _auto_update_run)
 
 
 # ── Auto-update helpers (used by AgentServer and the manual `update` command) ──

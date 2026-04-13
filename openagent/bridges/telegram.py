@@ -9,8 +9,15 @@ from pathlib import Path
 
 from openagent.bridges.base import BaseBridge, format_tool_status
 from openagent.channels.formatting import markdown_to_telegram_html
-from openagent.channels.base import split_preserving_code_blocks, is_blocked_attachment, parse_response_markers
+from openagent.channels.base import (
+    build_attachment_context,
+    is_blocked_attachment,
+    parse_response_markers,
+    prepend_context_block,
+    split_preserving_code_blocks,
+)
 from openagent.channels.voice import transcribe as transcribe_voice
+from openagent.gateway.commands import BOT_COMMANDS, BRIDGE_COMMANDS, bridge_welcome_text
 
 from openagent.core.logging import elog
 
@@ -18,17 +25,6 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_MSG_LIMIT = 4096
 VOICE_FALLBACK = "[Voice message not transcribed. Ask the user to type it.]"
-
-# Bot menu commands — shown in Telegram's command picker
-BOT_COMMANDS = [
-    ("new", "Start a new conversation (fresh context)"),
-    ("stop", "Cancel the current operation"),
-    ("status", "Show agent status and queue"),
-    ("clear", "Clear the message queue"),
-    ("update", "Check for updates and install"),
-    ("restart", "Restart OpenAgent"),
-    ("help", "Show available commands"),
-]
 
 
 class TelegramBridge(BaseBridge):
@@ -55,7 +51,7 @@ class TelegramBridge(BaseBridge):
 
         # Register commands
         self._app.add_handler(CommandHandler("start", self._on_start))
-        for cmd in ("new", "reset", "stop", "status", "queue", "clear", "update", "restart", "help"):
+        for cmd in BRIDGE_COMMANDS:
             self._app.add_handler(CommandHandler(cmd, lambda u, c, _c=cmd: self._on_command(u, c, _c)))
 
         # Stop button callback
@@ -100,16 +96,7 @@ class TelegramBridge(BaseBridge):
 
     async def _on_start(self, update, context):
         name = update.message.from_user.first_name or "there"
-        await update.message.reply_text(
-            f"👋 Hi {name}! I'm your OpenAgent assistant.\n\n"
-            "Send me a message, photo, voice note, or file and I'll help.\n\n"
-            "Commands:\n"
-            "/new — fresh conversation\n"
-            "/stop — cancel current operation\n"
-            "/status — agent status\n"
-            "/clear — clear queue\n"
-            "/help — all commands"
-        )
+        await update.message.reply_text(bridge_welcome_text(name))
 
     async def _on_command(self, update, context, cmd):
         if not update.message:
@@ -191,9 +178,7 @@ class TelegramBridge(BaseBridge):
 
         # Prepend file info
         if files_info:
-            header = "The user attached files:\n" + "\n".join(files_info)
-            header += "\nUse the Read tool with the local path to inspect each file."
-            text = f"{header}\n\n{text}" if text else header
+            text = prepend_context_block(text, build_attachment_context(files_info))
 
         if not text:
             return
