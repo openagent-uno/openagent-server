@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 
 from openagent.gateway import protocol as P
 from openagent.gateway.sessions import SessionManager
-from openagent.gateway.api import vault, config, health, logs, control, usage, providers
+from openagent.gateway.api import vault, config, health, logs, control, usage, providers, models
 
 if TYPE_CHECKING:
     from openagent.core.agent import Agent
@@ -66,6 +66,7 @@ class Gateway:
         self.clients: dict[str, object] = {}  # client_id → WebSocketResponse
         self._runner = None
         self._port_file = None
+        self._model_cache: dict[str, object] = {}  # model_spec → BaseModel instance
 
     async def start(self) -> None:
         from aiohttp import web
@@ -84,7 +85,7 @@ class Gateway:
                     logger.exception("REST error: %s", exc)
                     resp = web.Response(status=500, text=str(exc))
             resp.headers["Access-Control-Allow-Origin"] = "*"
-            resp.headers["Access-Control-Allow-Methods"] = "GET, PUT, PATCH, DELETE, OPTIONS"
+            resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
             resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
             return resp
 
@@ -107,8 +108,19 @@ class Gateway:
         app.router.add_post("/api/upload", self._handle_upload)
         app.router.add_get("/api/logs", logs.handle_get)
         app.router.add_get("/api/usage", usage.handle_get)
+        app.router.add_get("/api/usage/daily", usage.handle_daily)
+        app.router.add_get("/api/usage/pricing", usage.handle_pricing)
         app.router.add_get("/api/providers", providers.handle_list)
         app.router.add_post("/api/providers/test", providers.handle_test)
+        app.router.add_get("/api/models/catalog", models.handle_catalog)
+        # Model management (CRUD for providers + active model)
+        app.router.add_get("/api/models", models.handle_list)
+        app.router.add_post("/api/models", models.handle_create)
+        app.router.add_get("/api/models/active", models.handle_get_active)
+        app.router.add_put("/api/models/active", models.handle_set_active)
+        app.router.add_put("/api/models/{name}", models.handle_update)
+        app.router.add_delete("/api/models/{name}", models.handle_delete)
+        app.router.add_post("/api/models/{name}/test", models.handle_test)
         app.router.add_delete("/api/logs", logs.handle_delete)
         app.router.add_post("/api/update", control.handle_update)
         app.router.add_post("/api/restart", control.handle_restart)
@@ -357,6 +369,55 @@ class Gateway:
             text = f"Unknown command: {name}"
         await ws.send_json({"type": P.COMMAND_RESULT, "text": text})
 
+    def _resolve_channel_model(self, client_id: str):
+        """Resolve per-channel model override from config."""
+        channel = client_id.split(":", 1)[1] if client_id.startswith("bridge:") else "websocket"
+
+        # Read channels config from YAML
+        if not self.config_path:
+            return None
+        try:
+            from pathlib import Path
+            import yaml
+            from openagent.core.config import _resolve_env_vars
+            path = Path(self.config_path)
+            if not path.exists():
+                return None
+            with open(path) as f:
+                raw = yaml.safe_load(f) or {}
+            channels_cfg = _resolve_env_vars(raw.get("channels", {}))
+            model_spec = channels_cfg.get(channel, {}).get("model")
+            if not model_spec:
+                return None
+            return self._get_or_create_model(model_spec, _resolve_env_vars(raw.get("providers", {})))
+        except Exception as e:
+            logger.debug("Channel model resolution failed: %s", e)
+            return None
+
+    def _get_or_create_model(self, spec: str, providers_config: dict = None):
+        """Get or create a cached model instance for a spec string."""
+        if spec in self._model_cache:
+            return self._model_cache[spec]
+
+        from openagent.models.litellm_provider import LiteLLMProvider
+        from openagent.models.smart_router import SmartRouter
+
+        if spec == "smart":
+            model = SmartRouter(
+                providers_config=providers_config or {},
+                monthly_budget=0,
+            )
+            if self.agent._db:
+                model.set_db(self.agent._db)
+        elif spec == "claude-cli":
+            from openagent.models.claude_cli import ClaudeCLI
+            model = ClaudeCLI()
+        else:
+            model = LiteLLMProvider(model=spec, providers_config=providers_config or {})
+
+        self._model_cache[spec] = model
+        return model
+
     async def _process_message(self, ws, client_id: str, text: str, session_id: str) -> None:
         try:
             elog("message.received", client_id=client_id, session_id=session_id, length=len(text))
@@ -367,11 +428,13 @@ class Gateway:
                 except Exception:
                     pass
 
+            channel_model = self._resolve_channel_model(client_id)
             response = await self.agent.run(
                 message=text,
                 user_id=client_id,
                 session_id=session_id,
                 on_status=on_status,
+                model_override=channel_model,
             )
 
             from openagent.channels.base import parse_response_markers

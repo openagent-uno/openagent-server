@@ -27,3 +27,44 @@ async def handle_get(request: web.Request) -> web.Response:
         "remaining": None,
         "by_model": {},
     })
+
+
+async def handle_daily(request: web.Request) -> web.Response:
+    """GET /api/usage/daily?days=7 — day-by-day cost breakdown."""
+    from aiohttp import web as _web
+
+    days = int(request.query.get("days", "7"))
+    gw = request.app["gateway"]
+    db = gw.agent._db
+
+    if not db:
+        return _web.json_response({"entries": []})
+
+    entries = await db.get_daily_usage(days)
+    return _web.json_response({"entries": entries})
+
+
+async def handle_pricing(request: web.Request) -> web.Response:
+    """GET /api/usage/pricing — pricing info for models in usage history."""
+    from aiohttp import web as _web
+
+    try:
+        from litellm import model_cost
+    except ImportError:
+        return _web.json_response({"pricing": {}})
+
+    gw = request.app["gateway"]
+    db = gw.agent._db
+    if not db:
+        return _web.json_response({"pricing": {}})
+
+    summary = await db.get_usage_summary()
+    pricing = {}
+    for model_id in summary.get("by_model", {}).keys():
+        info = model_cost.get(model_id, {})
+        pricing[model_id] = {
+            "input_cost_per_million": (info.get("input_cost_per_token", 0) or 0) * 1_000_000,
+            "output_cost_per_million": (info.get("output_cost_per_token", 0) or 0) * 1_000_000,
+        }
+
+    return _web.json_response({"pricing": pricing})

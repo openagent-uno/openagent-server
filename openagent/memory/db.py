@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS usage_log (
     year_month TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_usage_year_month ON usage_log(year_month);
+CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON usage_log(timestamp);
 """
 
 
@@ -184,3 +185,18 @@ class MemoryDB:
             by_model[r["model"]] = round(r["total_cost"], 6)
             total += r["total_cost"]
         return {"total": round(total, 6), "by_model": by_model}
+
+    async def get_daily_usage(self, days: int = 7) -> list[dict]:
+        """Day-by-day usage breakdown grouped by model."""
+        conn = await self._ensure_connected()
+        cutoff = time.time() - (days * 86400)
+        cursor = await conn.execute(
+            "SELECT date(timestamp, 'unixepoch') as date, model, "
+            "SUM(cost) as cost, SUM(input_tokens) as input_tokens, "
+            "SUM(output_tokens) as output_tokens, COUNT(*) as request_count "
+            "FROM usage_log WHERE timestamp >= ? "
+            "GROUP BY date, model ORDER BY date DESC, cost DESC",
+            (cutoff,),
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]

@@ -28,29 +28,72 @@ TIERS = ("simple", "medium", "hard")
 class SmartRouter(BaseModel):
     """Routes requests to the best model based on task difficulty and budget.
 
-    Config example:
-        routing:
-          simple: anthropic/claude-haiku-4-5
-          medium: anthropic/claude-sonnet-4-6
-          hard: anthropic/claude-opus-4-6
-          fallback: google/gemini-2.5-flash
+    Supports two modes:
+    1. Manual routing: explicit routing dict mapping tiers to models
+    2. Auto-pricing: builds routing from all models in providers_config,
+       sorted by price (cheapest for simple, mid for medium, most expensive for hard)
     """
 
     def __init__(
         self,
-        routing: dict[str, str],
+        routing: dict[str, str] | None = None,
         api_key: str | None = None,
         monthly_budget: float = 0.0,
         classifier_model: str | None = None,
         providers_config: dict | None = None,
     ):
-        self._routing = routing
+        self._providers_config = providers_config or {}
         self._api_key = api_key
         self._monthly_budget = monthly_budget
-        self._classifier_model = classifier_model or routing.get("simple", "anthropic/claude-haiku-4-5")
-        self._providers_config = providers_config or {}
         self._budget: BudgetTracker | None = None
         self._providers: dict[str, LiteLLMProvider] = {}
+
+        # Build routing: use explicit dict if provided, else auto-price from providers
+        if routing:
+            self._routing = routing
+        else:
+            self._routing = self._build_auto_routing()
+
+        self._classifier_model = classifier_model or self._routing.get("simple", "anthropic/claude-haiku-4-5")
+
+    def _build_auto_routing(self) -> dict[str, str]:
+        """Build routing dict automatically from providers config, sorted by price."""
+        models_with_price = []
+        try:
+            from litellm import model_cost
+        except ImportError:
+            model_cost = {}
+
+        for provider_name, cfg in self._providers_config.items():
+            for model_id in cfg.get("models", []):
+                if model_id == "claude-cli":
+                    continue  # skip subscription-based; not API-callable via litellm
+                full_id = f"{provider_name}/{model_id}"
+                info = model_cost.get(full_id, {})
+                # Use output cost as the price signal (higher = more capable)
+                price = (info.get("output_cost_per_token", 0) or 0)
+                models_with_price.append((full_id, price))
+
+        if not models_with_price:
+            logger.warning("SmartRouter: no models found in providers config, using defaults")
+            return {
+                "simple": "anthropic/claude-haiku-4-5",
+                "medium": "anthropic/claude-sonnet-4-6",
+                "hard": "anthropic/claude-opus-4-6",
+                "fallback": "anthropic/claude-haiku-4-5",
+            }
+
+        models_with_price.sort(key=lambda x: x[1])
+        n = len(models_with_price)
+
+        routing = {
+            "simple": models_with_price[0][0],
+            "medium": models_with_price[n // 2][0],
+            "hard": models_with_price[-1][0],
+            "fallback": models_with_price[0][0],
+        }
+        logger.info("SmartRouter auto-routing: %s", routing)
+        return routing
 
     def set_db(self, db) -> None:
         """Wire up budget tracking after DB is available."""

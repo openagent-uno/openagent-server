@@ -107,7 +107,7 @@ def build_model_from_config(config: dict):
     elif provider == "smart":
         from openagent.models.smart_router import SmartRouter
         return SmartRouter(
-            routing=model_cfg.get("routing", {}),
+            routing=model_cfg.get("routing") or None,
             api_key=model_cfg.get("api_key"),
             monthly_budget=float(model_cfg.get("monthly_budget", 0)),
             classifier_model=model_cfg.get("classifier_model"),

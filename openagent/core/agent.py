@@ -190,6 +190,7 @@ class Agent:
         session_id: str | None = None,
         attachments: list[dict] | None = None,
         on_status: StatusCallback | None = None,
+        model_override: BaseModel | None = None,
     ) -> str:
         """Run the agent with a user message. Returns the final text response.
 
@@ -213,7 +214,7 @@ class Agent:
                     pass
 
         try:
-            return await self._run_inner(message, attachments, _status, session_id=session_id)
+            return await self._run_inner(message, attachments, _status, session_id=session_id, model_override=model_override)
         except BaseException as e:
             logger.error(f"Agent.run() fatal error: {e}")
             return f"Error: {e}"
@@ -224,6 +225,7 @@ class Agent:
         attachments: list[dict] | None,
         _status,
         session_id: str | None = None,
+        model_override: BaseModel | None = None,
     ) -> str:
         """Inner run logic, wrapped by run() for crash protection."""
         await _status("Loading context...")
@@ -263,9 +265,10 @@ class Agent:
         await _status("Thinking...")
 
         # Tool-use loop
+        active_model = model_override or self.model
         response = None
         for iteration in range(MAX_TOOL_ITERATIONS):
-            response = await self.model.generate(messages, system=system, tools=tools, on_status=_status, session_id=session_id)
+            response = await active_model.generate(messages, system=system, tools=tools, on_status=_status, session_id=session_id)
 
             if response.tool_calls:
                 assistant_msg: dict[str, Any] = {
