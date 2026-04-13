@@ -112,14 +112,13 @@ class Gateway:
         app.router.add_delete("/api/logs", logs.handle_delete)
         app.router.add_post("/api/update", control.handle_update)
         app.router.add_post("/api/restart", control.handle_restart)
+        # Agent info endpoint (for multi-agent discovery)
+        app.router.add_get("/api/agent-info", self._handle_agent_info)
         app.router.add_route("OPTIONS", "/{path:.*}", self._handle_options)
 
         runner = web.AppRunner(app)
         await runner.setup()
         self._runner = runner
-
-        # Agent info endpoint (for multi-agent discovery)
-        app.router.add_get("/api/agent-info", self._handle_agent_info)
 
         site = web.TCPSite(runner, self.host, self.port)
         await site.start()
