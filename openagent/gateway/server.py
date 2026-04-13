@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 from openagent.gateway import protocol as P
 from openagent.gateway.sessions import SessionManager
-from openagent.gateway.api import vault, config, health, logs, control
+from openagent.gateway.api import vault, config, health, logs, control, usage, providers
 
 if TYPE_CHECKING:
     from openagent.core.agent import Agent
@@ -87,6 +87,9 @@ class Gateway:
         app.router.add_patch("/api/config/{section}", config.handle_patch)
         app.router.add_post("/api/upload", self._handle_upload)
         app.router.add_get("/api/logs", logs.handle_get)
+        app.router.add_get("/api/usage", usage.handle_get)
+        app.router.add_get("/api/providers", providers.handle_list)
+        app.router.add_post("/api/providers/test", providers.handle_test)
         app.router.add_delete("/api/logs", logs.handle_delete)
         app.router.add_post("/api/update", control.handle_update)
         app.router.add_post("/api/restart", control.handle_restart)

@@ -483,5 +483,154 @@ def update_cmd(ctx):
             "Restart the agent with [bold]openagent serve[/bold] to use the new version."
         )
 
+# ── Provider management ──
+
+@main.group("provider")
+@click.pass_context
+def provider_group(ctx):
+    """Manage LLM providers (API keys and endpoints)."""
+    pass
+
+
+@provider_group.command("list")
+@click.pass_context
+def provider_list(ctx):
+    """List configured LLM providers."""
+    config = ctx.obj["config"]
+    providers = config.get("providers", {})
+
+    if not providers:
+        console.print("[yellow]No providers configured.[/yellow]")
+        console.print("Add one with: openagent provider add <name> --key=<api-key>")
+        return
+
+    table = Table(title="LLM Providers")
+    table.add_column("Provider", style="cyan")
+    table.add_column("API Key")
+    table.add_column("Base URL", style="dim")
+
+    for name, cfg in providers.items():
+        key = cfg.get("api_key", "")
+        if key.startswith("${"):
+            display_key = key
+        elif len(key) > 4:
+            display_key = "****" + key[-4:]
+        else:
+            display_key = "****"
+        base_url = cfg.get("base_url", "—")
+        table.add_row(name, display_key, base_url)
+
+    console.print(table)
+
+
+@provider_group.command("add")
+@click.argument("name")
+@click.option("--key", "-k", default=None, help="API key (or use interactive prompt)")
+@click.option("--base-url", "-u", default=None, help="Custom base URL (for Ollama, vLLM, etc.)")
+@click.pass_context
+def provider_add(ctx, name: str, key: str | None, base_url: str | None):
+    """Add or update a provider. Example: openagent provider add anthropic --key=sk-..."""
+    import yaml
+
+    config_path = Path(ctx.obj["config_path"]).resolve()
+    if not config_path.exists():
+        console.print(f"[red]Config file not found: {config_path}[/red]")
+        return
+
+    # Interactive prompts if not provided
+    if key is None and base_url is None:
+        key = click.prompt(f"API key for {name}", hide_input=True, default="", show_default=False)
+        if name in ("ollama", "vllm", "lm-studio"):
+            base_url = click.prompt("Base URL", default="http://localhost:11434/v1")
+
+    with open(config_path) as f:
+        raw = yaml.safe_load(f) or {}
+
+    if "providers" not in raw:
+        raw["providers"] = {}
+
+    entry: dict = {}
+    if key:
+        entry["api_key"] = key
+    if base_url:
+        entry["base_url"] = base_url
+
+    raw["providers"][name] = entry
+
+    with open(config_path, "w") as f:
+        yaml.dump(raw, f, default_flow_style=False, sort_keys=False)
+
+    console.print(f"[green]Provider '{name}' saved to {config_path}[/green]")
+    console.print("[dim]Restart the agent for changes to take effect.[/dim]")
+
+
+@provider_group.command("remove")
+@click.argument("name")
+@click.pass_context
+def provider_remove(ctx, name: str):
+    """Remove a provider from the config."""
+    import yaml
+
+    config_path = Path(ctx.obj["config_path"]).resolve()
+    if not config_path.exists():
+        console.print(f"[red]Config file not found: {config_path}[/red]")
+        return
+
+    with open(config_path) as f:
+        raw = yaml.safe_load(f) or {}
+
+    providers = raw.get("providers", {})
+    if name not in providers:
+        console.print(f"[red]Provider '{name}' not found.[/red]")
+        return
+
+    del providers[name]
+    raw["providers"] = providers
+
+    with open(config_path, "w") as f:
+        yaml.dump(raw, f, default_flow_style=False, sort_keys=False)
+
+    console.print(f"[green]Provider '{name}' removed.[/green]")
+
+
+@provider_group.command("test")
+@click.argument("name")
+@click.pass_context
+def provider_test(ctx, name: str):
+    """Test a provider by sending a simple prompt."""
+    config = ctx.obj["config"]
+    providers = config.get("providers", {})
+    cfg = providers.get(name)
+
+    if not cfg:
+        console.print(f"[red]Provider '{name}' not configured.[/red]")
+        return
+
+    test_models = {
+        "anthropic": "anthropic/claude-haiku-4-5",
+        "openai": "openai/gpt-4o-mini",
+        "google": "google/gemini-2.5-flash",
+        "openrouter": "openrouter/anthropic/claude-haiku-4-5",
+    }
+    model_id = test_models.get(name, f"{name}/default")
+
+    async def _test():
+        try:
+            import litellm
+            console.print(f"Testing [cyan]{name}[/cyan] with model [cyan]{model_id}[/cyan]...")
+            resp = await litellm.acompletion(
+                model=model_id,
+                messages=[{"role": "user", "content": "Say 'ok' and nothing else."}],
+                max_tokens=5,
+                api_key=cfg.get("api_key"),
+                api_base=cfg.get("base_url"),
+            )
+            console.print(f"[green]Success![/green] Response: {resp.choices[0].message.content}")
+        except Exception as e:
+            console.print(f"[red]Failed:[/red] {e}")
+
+    asyncio.run(_test())
+
+
 if __name__ == "__main__":
     main()

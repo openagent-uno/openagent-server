@@ -11,8 +11,7 @@ requires-python = ">=3.11"
 license = "MIT"
 
 dependencies = [
-    "anthropic>=0.40.0",
-    "openai>=1.50.0",
+    "litellm>=1.40.0",
     "mcp>=1.0.0",
     "click>=8.1.0",
     "rich>=13.0.0",

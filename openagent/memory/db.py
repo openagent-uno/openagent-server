@@ -31,6 +31,18 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_enabled ON scheduled_tasks(enabled);
 CREATE INDEX IF NOT EXISTS idx_tasks_next_run ON scheduled_tasks(next_run);
+
+CREATE TABLE IF NOT EXISTS usage_log (
+    id TEXT PRIMARY KEY,
+    timestamp REAL NOT NULL,
+    model TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL,
+    output_tokens INTEGER NOT NULL,
+    cost REAL NOT NULL,
+    session_id TEXT,
+    year_month TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_usage_year_month ON usage_log(year_month);
 """
 
 
@@ -115,3 +127,60 @@ class MemoryDB:
         )
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
+
+    # ── Usage Tracking ──
+
+    async def record_usage(
+        self,
+        model: str,
+        input_tokens: int,
+        output_tokens: int,
+        cost: float,
+        session_id: str | None = None,
+    ) -> str:
+        conn = await self._ensure_connected()
+        row_id = str(uuid.uuid4())
+        now = time.time()
+        from datetime import datetime, timezone
+        ym = datetime.now(timezone.utc).strftime("%Y-%m")
+        await conn.execute(
+            "INSERT INTO usage_log (id, timestamp, model, input_tokens, output_tokens, cost, session_id, year_month) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (row_id, now, model, input_tokens, output_tokens, cost, session_id, ym),
+        )
+        await conn.commit()
+        return row_id
+
+    async def get_monthly_usage(self, year_month: str | None = None) -> float:
+        """Total cost for a given month (default: current month)."""
+        conn = await self._ensure_connected()
+        if year_month is None:
+            from datetime import datetime, timezone
+            year_month = datetime.now(timezone.utc).strftime("%Y-%m")
+        cursor = await conn.execute(
+            "SELECT COALESCE(SUM(cost), 0) FROM usage_log WHERE year_month = ?",
+            (year_month,),
+        )
+        row = await cursor.fetchone()
+        return float(row[0])
+
+    async def get_usage_summary(self, year_month: str | None = None) -> dict[str, Any]:
+        """Per-model breakdown for a given month."""
+        conn = await self._ensure_connected()
+        if year_month is None:
+            from datetime import datetime, timezone
+            year_month = datetime.now(timezone.utc).strftime("%Y-%m")
+        cursor = await conn.execute(
+            "SELECT model, SUM(cost) as total_cost, SUM(input_tokens) as total_in, "
+            "SUM(output_tokens) as total_out, COUNT(*) as calls "
+            "FROM usage_log WHERE year_month = ? GROUP BY model",
+            (year_month,),
+        )
+        rows = await cursor.fetchall()
+        by_model = {}
+        total = 0.0
+        for row in rows:
+            r = dict(row)
+            by_model[r["model"]] = round(r["total_cost"], 6)
+            total += r["total_cost"]
+        return {"total": round(total, 6), "by_model": by_model}

@@ -1,48 +1,69 @@
-"""Z.ai GLM model via OpenAI-compatible API.
+"""Unified LLM provider via LiteLLM.
 
-Also serves as the base for any OpenAI-compatible provider (Ollama, vLLM, etc.).
-
-Supported Z.ai models (as of 2026-04):
-  - glm-5        (latest flagship)
-  - glm-4-plus
-  - glm-4-flash
-  - glm-4
+Supports 140+ models (Anthropic, OpenAI, Google, Ollama, etc.) through a
+single interface. Replaces per-provider SDK wrappers with one class.
 """
 
 from __future__ import annotations
 
+import json
+import logging
 import os
-import uuid
 from typing import Any, AsyncIterator
 
-from openai import AsyncOpenAI
+import litellm
 
 from openagent.models.base import BaseModel, ModelResponse, ToolCall
 
+logger = logging.getLogger(__name__)
 
-class ZhipuGLM(BaseModel):
-    """Z.ai GLM via their OpenAI-compatible API.
+# Suppress litellm's verbose logging
+litellm.suppress_debug_info = True
 
-    Can be reused for any OpenAI-compatible endpoint by setting base_url.
+
+class LiteLLMProvider(BaseModel):
+    """Unified API provider powered by LiteLLM.
+
+    Model string uses litellm format:
+      - "anthropic/claude-sonnet-4-6"
+      - "openai/gpt-4o"
+      - "google/gemini-2.5-pro"
+      - "ollama/llama3"
     """
 
     def __init__(
         self,
-        model: str = "glm-5",
+        model: str = "anthropic/claude-sonnet-4-6",
         api_key: str | None = None,
-        base_url: str = "https://api.z.ai/api/paas/v4",
+        base_url: str | None = None,
         max_tokens: int = 4096,
+        providers_config: dict | None = None,
     ):
         self.model = model
         self.max_tokens = max_tokens
-        self._client = AsyncOpenAI(
-            api_key=api_key or os.environ.get("ZAI_API_KEY")
-            or os.environ.get("ZHIPU_API_KEY", ""),
-            base_url=base_url,
-        )
+        self._api_key = api_key
+        self._base_url = base_url
+        self._providers_config = providers_config or {}
+
+        # Set provider-specific env vars from providers config
+        self._inject_provider_keys()
+
+    def _inject_provider_keys(self) -> None:
+        """Set API key env vars from the providers config section."""
+        env_map = {
+            "anthropic": "ANTHROPIC_API_KEY",
+            "openai": "OPENAI_API_KEY",
+            "google": "GEMINI_API_KEY",
+            "openrouter": "OPENROUTER_API_KEY",
+        }
+        for provider_name, cfg in self._providers_config.items():
+            env_var = env_map.get(provider_name)
+            key = cfg.get("api_key")
+            if env_var and key and not os.environ.get(env_var):
+                os.environ[env_var] = key
 
     def _convert_tools(self, tools: list[dict[str, Any]] | None) -> list[dict] | None:
-        """Convert neutral tool format to OpenAI function calling format."""
+        """Convert neutral MCP tool format to OpenAI function calling format."""
         if not tools:
             return None
         return [
@@ -58,7 +79,7 @@ class ZhipuGLM(BaseModel):
         ]
 
     def _convert_messages(self, messages: list[dict[str, Any]], system: str | None) -> list[dict]:
-        """Convert neutral message format to OpenAI format."""
+        """Convert neutral message format to OpenAI format (litellm's common format)."""
         result = []
         if system:
             result.append({"role": "system", "content": system})
@@ -73,13 +94,12 @@ class ZhipuGLM(BaseModel):
             elif role == "assistant" and msg.get("tool_calls"):
                 tool_calls = []
                 for tc in msg["tool_calls"]:
-                    import json as _json
                     tool_calls.append({
                         "id": tc["id"],
                         "type": "function",
                         "function": {
                             "name": tc["name"],
-                            "arguments": _json.dumps(tc["arguments"]),
+                            "arguments": json.dumps(tc["arguments"]),
                         },
                     })
                 result.append({
@@ -91,14 +111,12 @@ class ZhipuGLM(BaseModel):
                 result.append({"role": role, "content": msg.get("content", "")})
         return result
 
-    async def generate(
+    def _build_kwargs(
         self,
         messages: list[dict[str, Any]],
-        system: str | None = None,
-        tools: list[dict[str, Any]] | None = None,
-        on_status=None,
-        session_id: str | None = None,
-    ) -> ModelResponse:
+        system: str | None,
+        tools: list[dict[str, Any]] | None,
+    ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "model": self.model,
             "max_tokens": self.max_tokens,
@@ -107,19 +125,36 @@ class ZhipuGLM(BaseModel):
         converted_tools = self._convert_tools(tools)
         if converted_tools:
             kwargs["tools"] = converted_tools
+        if self._api_key:
+            kwargs["api_key"] = self._api_key
+        if self._base_url:
+            kwargs["api_base"] = self._base_url
+        return kwargs
 
-        resp = await self._client.chat.completions.create(**kwargs)
+    async def generate(
+        self,
+        messages: list[dict[str, Any]],
+        system: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        on_status=None,
+        session_id: str | None = None,
+    ) -> ModelResponse:
+        kwargs = self._build_kwargs(messages, system, tools)
+        resp = await litellm.acompletion(**kwargs)
+
         choice = resp.choices[0]
         message = choice.message
 
         tool_calls = []
         if message.tool_calls:
-            import json as _json
             for tc in message.tool_calls:
+                args = tc.function.arguments
+                if isinstance(args, str):
+                    args = json.loads(args)
                 tool_calls.append(ToolCall(
                     id=tc.id,
                     name=tc.function.name,
-                    arguments=_json.loads(tc.function.arguments),
+                    arguments=args,
                 ))
 
         return ModelResponse(
@@ -136,17 +171,9 @@ class ZhipuGLM(BaseModel):
         system: str | None = None,
         tools: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[str]:
-        kwargs: dict[str, Any] = {
-            "model": self.model,
-            "max_tokens": self.max_tokens,
-            "messages": self._convert_messages(messages, system),
-            "stream": True,
-        }
-        converted_tools = self._convert_tools(tools)
-        if converted_tools:
-            kwargs["tools"] = converted_tools
-
-        stream = await self._client.chat.completions.create(**kwargs)
-        async for chunk in stream:
+        kwargs = self._build_kwargs(messages, system, tools)
+        kwargs["stream"] = True
+        resp = await litellm.acompletion(**kwargs)
+        async for chunk in resp:
             if chunk.choices and chunk.choices[0].delta.content:
                 yield chunk.choices[0].delta.content

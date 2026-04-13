@@ -1,6 +1,11 @@
 from openagent.models.base import BaseModel, ModelResponse, ToolCall
-from openagent.models.claude_api import ClaudeAPI
 from openagent.models.claude_cli import ClaudeCLI
-from openagent.models.zhipu import ZhipuGLM
+from openagent.models.litellm_provider import LiteLLMProvider
+from openagent.models.smart_router import SmartRouter
+from openagent.models.budget import BudgetTracker
 
-__all__ = ["BaseModel", "ModelResponse", "ToolCall", "ClaudeAPI", "ClaudeCLI", "ZhipuGLM"]
+__all__ = [
+    "BaseModel", "ModelResponse", "ToolCall",
+    "ClaudeCLI",
+    "LiteLLMProvider", "SmartRouter", "BudgetTracker",
+]

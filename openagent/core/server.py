@@ -107,6 +107,11 @@ def _build_agent(config: dict) -> Agent:
     db_path = memory_cfg.get("db_path", "openagent.db")
     db = MemoryDB(db_path)
 
+    # Wire budget tracking for SmartRouter (needs the shared DB instance)
+    from openagent.models.smart_router import SmartRouter
+    if isinstance(model, SmartRouter):
+        model.set_db(db)
+
     mcp_registry = MCPRegistry.from_config(
         mcp_config=mcp_config,
         include_defaults=include_defaults,

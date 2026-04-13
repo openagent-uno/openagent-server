@@ -31,7 +31,7 @@ class Agent:
     Usage:
         agent = Agent(
             name="assistant",
-            model=ClaudeAPI(model="claude-sonnet-4-6"),
+            model=LiteLLMProvider(model="anthropic/claude-sonnet-4-6"),
             system_prompt="You are a helpful assistant.",
             mcp_tools=[MCPTools(command=["npx", "..."])],
             memory=MemoryDB("agent.db"),
