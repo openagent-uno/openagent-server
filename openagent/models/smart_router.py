@@ -65,9 +65,12 @@ class SmartRouter(BaseModel):
             model_cost = {}
 
         for provider_name, cfg in self._providers_config.items():
+            disabled = set(cfg.get("disabled_models", []))
             for model_id in cfg.get("models", []):
                 if model_id == "claude-cli":
                     continue  # skip subscription-based; not API-callable via litellm
+                if model_id in disabled:
+                    continue
                 full_id = f"{provider_name}/{model_id}"
                 info = model_cost.get(full_id, {})
                 # Use output cost as the price signal (higher = more capable)

@@ -132,6 +132,11 @@ async def handle_update(request: web.Request) -> web.Response:
             entry["base_url"] = body["base_url"]
         else:
             entry.pop("base_url", None)
+    if "disabled_models" in body:
+        if body["disabled_models"]:
+            entry["disabled_models"] = body["disabled_models"]
+        else:
+            entry.pop("disabled_models", None)
 
     raw["providers"][name] = entry
     _write_raw(request, raw)
