@@ -3,6 +3,7 @@ set -euo pipefail
 
 # ── OpenAgent Release ──
 # Bumps version in ALL projects, tags, pushes → GitHub Actions builds:
+#   - openagent standalone executables (macOS, Linux, Windows) → GitHub Release
 #   - openagent-framework → PyPI + GitHub Release
 #   - openagent-cli → PyPI + GitHub Release
 #   - OpenAgent Desktop (macOS, Windows, Linux) → GitHub Release assets
@@ -68,14 +69,16 @@ git add pyproject.toml openagent/__init__.py \
        app/desktop/package.json app/universal/package.json
 git commit -m "release: v$NEW"
 git tag "v$NEW"
-git push origin main "v$NEW"
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
+git push origin "$BRANCH" "v$NEW"
 
 echo ""
 echo "=== Released v$NEW ==="
 echo ""
 echo "GitHub Actions will now build & publish:"
-echo "  1. openagent-framework  → PyPI + GitHub Release"
-echo "  2. openagent-cli        → PyPI + GitHub Release"
-echo "  3. OpenAgent Desktop    → GitHub Release (macOS/Windows/Linux)"
+echo "  1. openagent executables → GitHub Release (macOS/Linux/Windows)"
+echo "  2. openagent-framework   → PyPI + GitHub Release"
+echo "  3. openagent-cli         → PyPI + GitHub Release"
+echo "  4. OpenAgent Desktop     → GitHub Release (macOS/Windows/Linux)"
 echo ""
 echo "Track: https://github.com/geroale/OpenAgent/actions"

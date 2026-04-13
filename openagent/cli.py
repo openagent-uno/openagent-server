@@ -14,35 +14,97 @@ from rich.panel import Panel
 from rich.table import Table
 
 from openagent.core.config import load_config
+from openagent.core import paths
 from openagent.memory.db import MemoryDB
 from openagent.mcp.client import MCPRegistry
 from openagent.core.server import (
     AgentServer,
     _build_agent,
     get_installed_version,
-    run_pip_upgrade,
+    run_upgrade,
 )
 
 console = Console()
 
+
+def _setup_agent_dir(agent_dir: str | None) -> None:
+    """Configure the agent directory singleton if provided."""
+    if agent_dir is not None:
+        p = Path(agent_dir)
+        paths.set_agent_dir(p)
+        paths.ensure_agent_dir(p)
+
+
+def _startup_cleanup() -> None:
+    """Run cleanup tasks on startup (e.g. post-update file swap)."""
+    from openagent._frozen import is_frozen, executable_path
+
+    if not is_frozen():
+        return
+
+    exe = executable_path()
+
+    # Clean up old executable from previous update
+    old = exe.with_suffix(exe.suffix + ".old") if exe.suffix else exe.parent / (exe.name + ".old")
+    if old.exists():
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+    # Windows: apply pending update if present
+    import platform
+    if platform.system() == "Windows":
+        pending = exe.parent / (exe.stem + ".pending.exe")
+        if pending.exists():
+            try:
+                import shutil
+                shutil.move(str(pending), str(exe))
+            except OSError:
+                pass
+
+
 @click.group()
 @click.option("--config", "-c", default="openagent.yaml", help="Config file path")
+@click.option("--agent-dir", "-d", default=None, help="Agent data directory (isolates config, DB, memories, logs)")
 @click.option("--verbose", "-v", is_flag=True, help="Enable debug logging")
 @click.pass_context
-def main(ctx, config: str, verbose: bool):
+def main(ctx, config: str, agent_dir: str | None, verbose: bool):
     """OpenAgent - Simplified LLM agent framework."""
     ctx.ensure_object(dict)
-    ctx.obj["config_path"] = config
-    ctx.obj["config"] = load_config(config)
 
     level = logging.DEBUG if verbose else logging.WARNING
     logging.basicConfig(level=level, format="%(name)s: %(message)s")
 
+    # Set up agent directory if provided (affects all path resolution)
+    _setup_agent_dir(agent_dir)
+    _startup_cleanup()
+
+    # If agent dir is set and no explicit --config, load from agent dir
+    if agent_dir is not None and config == "openagent.yaml":
+        config = str(paths.default_config_path())
+
+    ctx.obj["config_path"] = config
+    ctx.obj["config"] = load_config(config)
+
 @main.command()
+@click.argument("agent_dir", required=False, default=None)
 @click.option("--channel", "-ch", multiple=True, help="Channels to start (telegram, discord, whatsapp)")
 @click.pass_context
-def serve(ctx, channel: tuple[str, ...]):
-    """Start agent, channels, scheduler and aux services."""
+def serve(ctx, agent_dir: str | None, channel: tuple[str, ...]):
+    """Start agent, channels, scheduler and aux services.
+
+    Optionally pass AGENT_DIR to serve from a specific directory.
+    If the directory doesn't exist, it will be created with defaults.
+    """
+    # Allow agent_dir as positional arg (shorthand for --agent-dir on serve)
+    if agent_dir is not None and paths.get_agent_dir() is None:
+        _setup_agent_dir(agent_dir)
+        # Reload config from agent dir
+        config_path = str(paths.default_config_path())
+        ctx.obj["config_path"] = config_path
+        ctx.obj["config"] = load_config(config_path)
+
     config = ctx.obj["config"]
     # Store the resolved config path so the websocket channel can read/write it
     config["_config_path"] = str(Path(ctx.obj["config_path"]).resolve())
@@ -115,7 +177,7 @@ def task_group(ctx):
 def task_add(ctx, name: str, cron: str, prompt: str):
     """Add a new scheduled task."""
     config = ctx.obj["config"]
-    db_path = config.get("memory", {}).get("db_path", "openagent.db")
+    db_path = config.get("memory", {}).get("db_path", str(paths.default_db_path()))
 
     async def _add():
         db = MemoryDB(db_path)
@@ -138,7 +200,7 @@ def task_add(ctx, name: str, cron: str, prompt: str):
 def task_list(ctx):
     """List all scheduled tasks."""
     config = ctx.obj["config"]
-    db_path = config.get("memory", {}).get("db_path", "openagent.db")
+    db_path = config.get("memory", {}).get("db_path", str(paths.default_db_path()))
 
     async def _list():
         db = MemoryDB(db_path)
@@ -176,7 +238,7 @@ def task_list(ctx):
 def task_remove(ctx, task_id: str):
     """Remove a scheduled task by ID (prefix match)."""
     config = ctx.obj["config"]
-    db_path = config.get("memory", {}).get("db_path", "openagent.db")
+    db_path = config.get("memory", {}).get("db_path", str(paths.default_db_path()))
 
     async def _remove():
         db = MemoryDB(db_path)
@@ -200,7 +262,7 @@ def task_remove(ctx, task_id: str):
 def task_enable(ctx, task_id: str):
     """Enable a scheduled task."""
     config = ctx.obj["config"]
-    db_path = config.get("memory", {}).get("db_path", "openagent.db")
+    db_path = config.get("memory", {}).get("db_path", str(paths.default_db_path()))
 
     async def _enable():
         db = MemoryDB(db_path)
@@ -224,7 +286,7 @@ def task_enable(ctx, task_id: str):
 def task_disable(ctx, task_id: str):
     """Disable a scheduled task."""
     config = ctx.obj["config"]
-    db_path = config.get("memory", {}).get("db_path", "openagent.db")
+    db_path = config.get("memory", {}).get("db_path", str(paths.default_db_path()))
 
     async def _disable():
         db = MemoryDB(db_path)
@@ -261,7 +323,7 @@ def mcp_cmd(ctx, action: str):
                 mcp_config,
                 include_defaults,
                 mcp_disable,
-                db_path=config.get("memory", {}).get("db_path", "openagent.db"),
+                db_path=config.get("memory", {}).get("db_path", str(paths.default_db_path())),
             )
             await registry.connect_all()
             try:
@@ -409,7 +471,8 @@ def setup_cmd(
     if not no_service:
         console.print("[bold]Step 4 — register OS service[/bold]")
         try:
-            info = setup_service()
+            agent_dir = paths.get_agent_dir()
+            info = setup_service(agent_dir)
             console.print(f"[green]{info['message']}[/green]")
             console.print(f"[dim]Service file:[/dim] {info['service_file']}")
         except Exception as e:
@@ -444,8 +507,9 @@ def install_cmd(ctx):
 def uninstall_cmd(ctx):
     """Remove OpenAgent system service."""
     from openagent.setup.installer import uninstall_service
+    agent_dir = paths.get_agent_dir()
     try:
-        result = uninstall_service()
+        result = uninstall_service(agent_dir)
         console.print(f"[green]{result}[/green]")
     except Exception as e:
         console.print(f"[red]Failed to uninstall service: {e}[/red]")
@@ -455,8 +519,73 @@ def uninstall_cmd(ctx):
 def status_cmd(ctx):
     """Check if OpenAgent service is running."""
     from openagent.setup.installer import get_service_status
-    status = get_service_status()
+    agent_dir = paths.get_agent_dir()
+    status = get_service_status(agent_dir)
     console.print(status)
+
+
+@main.command("list")
+def list_cmd():
+    """List running OpenAgent instances by scanning for .port files."""
+    import json as _json
+
+    # Scan known locations for .port files
+    candidates: list[Path] = []
+
+    # Check platform data dir for legacy single-agent
+    try:
+        platform_dir = paths.data_dir()
+        port_file = platform_dir / ".port"
+        if port_file.exists():
+            candidates.append(platform_dir)
+    except Exception:
+        pass
+
+    # Check ~/.openagent/agents.json registry if it exists
+    registry = Path.home() / ".openagent" / "agents.json"
+    if registry.exists():
+        try:
+            for entry in _json.loads(registry.read_text()):
+                p = Path(entry)
+                if p.is_dir() and (p / ".port").exists():
+                    candidates.append(p)
+        except Exception:
+            pass
+
+    # Also scan current directory for agent-like subdirs
+    for child in Path.cwd().iterdir():
+        if child.is_dir() and (child / ".port").exists() and child not in candidates:
+            candidates.append(child)
+
+    if not candidates:
+        console.print("[yellow]No running agents found.[/yellow]")
+        console.print("[dim]Start an agent with: openagent serve ./my-agent[/dim]")
+        return
+
+    table = Table(title="Running Agents")
+    table.add_column("Directory", style="cyan")
+    table.add_column("Port")
+    table.add_column("Name", style="dim")
+
+    for agent_path in candidates:
+        port_file = agent_path / ".port"
+        port = port_file.read_text().strip() if port_file.exists() else "?"
+
+        # Try to read name from config
+        cfg_file = agent_path / "openagent.yaml"
+        name = "—"
+        if cfg_file.exists():
+            try:
+                import yaml
+                with open(cfg_file) as f:
+                    cfg = yaml.safe_load(f) or {}
+                name = cfg.get("name", "—")
+            except Exception:
+                pass
+
+        table.add_row(str(agent_path), port, name)
+
+    console.print(table)
 
 # ── Manual update ──
 
@@ -468,7 +597,7 @@ def update_cmd(ctx):
     console.print("Checking for updates...")
 
     try:
-        old_ver, new_ver = run_pip_upgrade()
+        old_ver, new_ver = run_upgrade()
     except subprocess.CalledProcessError as exc:
         console.print(f"[red]Update failed: {exc}[/red]")
         raise SystemExit(1)
@@ -630,6 +759,55 @@ def provider_test(ctx, name: str):
             console.print(f"[red]Failed:[/red] {e}")
 
     asyncio.run(_test())
+
+
+# ── Migration ──
+
+@main.command("migrate")
+@click.option("--to", "dest", required=True, help="Target agent directory")
+@click.pass_context
+def migrate_cmd(ctx, dest: str):
+    """Copy config, database, and memories from global paths to an agent directory."""
+    import shutil
+
+    dest_path = Path(dest).resolve()
+    if dest_path.exists() and any(dest_path.iterdir()):
+        console.print(f"[red]Destination '{dest_path}' already exists and is not empty.[/red]")
+        raise SystemExit(1)
+
+    dest_path.mkdir(parents=True, exist_ok=True)
+
+    # Source paths (global platform defaults — agent_dir is NOT set here)
+    src_config = paths.default_config_path()
+    src_db = paths.default_db_path()
+    src_vault = paths.default_vault_path()
+
+    copied = []
+
+    if src_config.exists():
+        shutil.copy2(str(src_config), str(dest_path / "openagent.yaml"))
+        copied.append(f"Config: {src_config}")
+
+    if src_db.exists():
+        shutil.copy2(str(src_db), str(dest_path / "openagent.db"))
+        copied.append(f"Database: {src_db}")
+
+    if src_vault.is_dir():
+        shutil.copytree(str(src_vault), str(dest_path / "memories"), dirs_exist_ok=True)
+        copied.append(f"Memories: {src_vault}")
+
+    (dest_path / "logs").mkdir(exist_ok=True)
+
+    if copied:
+        console.print(f"[green]Migrated to {dest_path}:[/green]")
+        for item in copied:
+            console.print(f"  {item}")
+    else:
+        console.print("[yellow]No existing data found to migrate.[/yellow]")
+        paths.ensure_agent_dir(dest_path)
+        console.print(f"[green]Created new agent directory at {dest_path}[/green]")
+
+    console.print(f"\nStart with: [bold]openagent serve {dest_path}[/bold]")
 
 
 if __name__ == "__main__":

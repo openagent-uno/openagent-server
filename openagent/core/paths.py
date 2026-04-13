@@ -4,11 +4,17 @@ Follows platform conventions (XDG on Linux, Application Support on macOS,
 %APPDATA% on Windows). Every function returns a :class:`Path` and ensures
 the directory exists.
 
+When an **agent directory** is set (via :func:`set_agent_dir`), all paths
+are resolved relative to that directory instead of platform defaults. This
+enables running multiple independent agents in parallel, each with its own
+config, database, memories, and logs.
+
 Precedence for config loading (handled by :func:`config.load_config`):
 
 1. Explicit ``--config`` / ``-c`` CLI flag — highest priority.
-2. ``openagent.yaml`` in the current working directory.
-3. ``<config_dir>/openagent.yaml`` — XDG/system default.
+2. ``<agent_dir>/openagent.yaml`` — if agent dir is set.
+3. ``openagent.yaml`` in the current working directory.
+4. ``<config_dir>/openagent.yaml`` — XDG/system default.
 
 For data (DB, vault), the default is ``<data_dir>/`` unless overridden in
 the YAML config via ``memory.db_path`` / ``memory.vault_path``.
@@ -18,22 +24,87 @@ from __future__ import annotations
 
 import os
 import platform
+import textwrap
 from pathlib import Path
 
 APP_NAME = "openagent"
 
+# ── Agent directory singleton ──
+# When set, all path functions return paths relative to this directory
+# instead of platform-standard locations.
+
+_agent_dir: Path | None = None
+
+
+def set_agent_dir(path: Path | None) -> None:
+    """Set the active agent directory. Pass ``None`` to reset to defaults."""
+    global _agent_dir
+    _agent_dir = path.resolve() if path is not None else None
+
+
+def get_agent_dir() -> Path | None:
+    """Return the active agent directory, or ``None`` if using defaults."""
+    return _agent_dir
+
+
+_DEFAULT_YAML = textwrap.dedent("""\
+    # OpenAgent agent configuration
+    # See https://github.com/geroale/OpenAgent for full reference.
+
+    name: agent
+
+    model:
+      provider: claude-cli
+      model_id: claude-sonnet-4-6
+
+    channels:
+      websocket:
+        port: 8765
+""")
+
+
+def ensure_agent_dir(path: Path) -> Path:
+    """Create an agent directory with default structure if it doesn't exist.
+
+    Creates:
+      <path>/openagent.yaml   (minimal config)
+      <path>/memories/         (memory vault)
+      <path>/logs/             (log files)
+
+    Returns the resolved absolute path.
+    """
+    path = path.resolve()
+    path.mkdir(parents=True, exist_ok=True)
+
+    config_file = path / "openagent.yaml"
+    if not config_file.exists():
+        config_file.write_text(_DEFAULT_YAML)
+
+    (path / "memories").mkdir(exist_ok=True)
+    (path / "logs").mkdir(exist_ok=True)
+
+    return path
+
+
+# ── Platform path helpers ──
 
 def _system() -> str:
     return platform.system()  # "Darwin", "Linux", "Windows"
 
 
 def config_dir() -> Path:
-    """Return the platform-standard config directory, creating it if needed.
+    """Return the config directory, creating it if needed.
 
+    When an agent dir is set, returns the agent dir itself.
+    Otherwise returns the platform-standard location:
     - macOS:   ~/Library/Application Support/OpenAgent/
     - Linux:   ~/.config/openagent/
     - Windows: %APPDATA%\\OpenAgent\\
     """
+    if _agent_dir is not None:
+        _agent_dir.mkdir(parents=True, exist_ok=True)
+        return _agent_dir
+
     system = _system()
     if system == "Darwin":
         base = Path.home() / "Library" / "Application Support" / "OpenAgent"
@@ -47,12 +118,18 @@ def config_dir() -> Path:
 
 
 def data_dir() -> Path:
-    """Return the platform-standard data directory.
+    """Return the data directory.
 
+    When an agent dir is set, returns the agent dir itself.
+    Otherwise returns the platform-standard location:
     - macOS:   ~/Library/Application Support/OpenAgent/
     - Linux:   ~/.local/share/openagent/
     - Windows: %APPDATA%\\OpenAgent\\
     """
+    if _agent_dir is not None:
+        _agent_dir.mkdir(parents=True, exist_ok=True)
+        return _agent_dir
+
     system = _system()
     if system == "Darwin":
         base = Path.home() / "Library" / "Application Support" / "OpenAgent"

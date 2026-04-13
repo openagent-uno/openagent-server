@@ -1,6 +1,6 @@
 """Control REST API — update and restart OpenAgent.
 
-POST /api/update  → trigger pip upgrade + restart if updated
+POST /api/update  → trigger upgrade (pip or executable) + restart if updated
 POST /api/restart → restart OpenAgent processes
 """
 
@@ -12,11 +12,11 @@ from openagent.core.logging import elog
 async def handle_update(request):
     """Check for updates and install if available."""
     from aiohttp import web
-    from openagent.core.server import run_pip_upgrade, RESTART_EXIT_CODE
+    from openagent.core.server import run_upgrade, RESTART_EXIT_CODE
 
     gw = request.app["gateway"]
     try:
-        old, new = run_pip_upgrade()
+        old, new = run_upgrade()
     except Exception as exc:
         elog("update.error", error=str(exc))
         return web.json_response({"error": str(exc)}, status=500)

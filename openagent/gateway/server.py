@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import socket
 from typing import TYPE_CHECKING
 
 from openagent.gateway import protocol as P
@@ -22,6 +23,21 @@ if TYPE_CHECKING:
 from openagent.core.logging import elog
 
 logger = logging.getLogger(__name__)
+
+
+def _find_available_port(preferred: int, host: str = "0.0.0.0") -> int:
+    """Try the preferred port, then scan +1..+99 for an available one."""
+    for port in range(preferred, preferred + 100):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind((host, port))
+                return port
+        except OSError:
+            continue
+    raise RuntimeError(
+        f"No available port found in range {preferred}–{preferred + 99}"
+    )
 
 
 class Gateway:
@@ -39,7 +55,9 @@ class Gateway:
     ):
         self.agent = agent
         self.host = host
-        self.port = port
+        self.port = _find_available_port(port, host)
+        if self.port != port:
+            logger.info("Port %d busy, using %d instead", port, self.port)
         self.token = token
         self.vault_path = vault_path
         self.config_path = config_path
@@ -47,6 +65,7 @@ class Gateway:
         self.sessions = SessionManager(agent_name=agent.name)
         self.clients: dict[str, object] = {}  # client_id → WebSocketResponse
         self._runner = None
+        self._port_file = None
 
     async def start(self) -> None:
         from aiohttp import web
@@ -99,10 +118,16 @@ class Gateway:
         await runner.setup()
         self._runner = runner
 
+        # Agent info endpoint (for multi-agent discovery)
+        app.router.add_get("/api/agent-info", self._handle_agent_info)
+
         site = web.TCPSite(runner, self.host, self.port)
         await site.start()
         logger.info("Gateway listening on ws://%s:%d/ws", self.host, self.port)
         elog("gateway.start", host=self.host, port=self.port)
+
+        # Write .port file for agent discovery
+        self._write_port_file()
 
     async def stop(self) -> None:
         await self.sessions.shutdown()
@@ -110,6 +135,38 @@ class Gateway:
             await self._runner.cleanup()
             self._runner = None
         self.clients.clear()
+        self._remove_port_file()
+
+    def _write_port_file(self) -> None:
+        """Write a .port file to the agent dir for discovery by CLI/app."""
+        from openagent.core.paths import get_agent_dir
+        agent_dir = get_agent_dir()
+        if agent_dir is not None:
+            port_file = agent_dir / ".port"
+            port_file.write_text(str(self.port))
+            self._port_file = port_file
+
+    def _remove_port_file(self) -> None:
+        """Remove the .port file on shutdown."""
+        if self._port_file and self._port_file.exists():
+            try:
+                self._port_file.unlink()
+            except OSError:
+                pass
+
+    async def _handle_agent_info(self, request):
+        """GET /api/agent-info — agent name, dir, port, version."""
+        from aiohttp import web
+        import openagent
+        from openagent.core.paths import get_agent_dir
+
+        agent_dir = get_agent_dir()
+        return web.json_response({
+            "name": self.agent.name,
+            "agent_dir": str(agent_dir) if agent_dir else None,
+            "port": self.port,
+            "version": getattr(openagent, "__version__", "?"),
+        })
 
     # ── File upload ──
 
@@ -264,8 +321,8 @@ class Gateway:
             text = f"Queue cleared ({n} messages removed)." if n else "Queue already empty."
         elif name == "update":
             try:
-                from openagent.core.server import run_pip_upgrade, RESTART_EXIT_CODE
-                old, new = run_pip_upgrade()
+                from openagent.core.server import run_upgrade, RESTART_EXIT_CODE
+                old, new = run_upgrade()
                 if old == new:
                     text = f"Already up-to-date (v{old})."
                     elog("update.check", version=old, updated=False)

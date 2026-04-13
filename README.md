@@ -38,7 +38,7 @@ OpenAgent turns an LLM into a persistent agent that can remember, act, and stay 
 
 ## Three Independent Apps
 
-- **Agent Server**: the persistent runtime in `openagent/`, installed as `openagent-framework`
+- **Agent Server**: the persistent runtime in `openagent/`, available as a standalone executable or pip package (`openagent-framework`)
 - **CLI Client**: the terminal client, installed as `openagent-cli`
 - **Desktop App**: the Electron UI, distributed as platform-specific binaries
 
@@ -46,26 +46,33 @@ Tagged GitHub releases are the shared download point for all three.
 
 ## Quick Start
 
+### Option A: Standalone Executable (recommended)
+
+Download the latest executable for your platform from [GitHub Releases](https://github.com/geroale/OpenAgent/releases) and run:
+
+```bash
+./openagent serve ./my-agent
+```
+
+This creates a self-contained agent directory at `./my-agent` with default config, database, and memory vault. No Python required.
+
+### Option B: pip install
+
 ```bash
 pip install openagent-framework[all]
-```
-
-```yaml
-name: my-agent
-
-model:
-  provider: claude-cli
-  model_id: claude-sonnet-4-6
-
-channels:
-  websocket:
-    port: 8765
-    token: ${OPENAGENT_WS_TOKEN}
-```
-
-```bash
 openagent serve
 ```
+
+### Multi-Agent
+
+Run multiple independent agents in parallel, each with its own data directory:
+
+```bash
+./openagent serve ./agent-work
+./openagent serve ./agent-home
+```
+
+Each directory contains its own `openagent.yaml`, database, memories, and logs. Ports are auto-allocated to avoid conflicts.
 
 ## Desktop App
 

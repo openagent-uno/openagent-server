@@ -80,6 +80,8 @@ for anything under the memory vault.
 
 def _build_agent(config: dict) -> Agent:
     """Build an Agent from a config dict (factored out of cli.py)."""
+    from openagent.core.paths import default_db_path
+
     model = build_model_from_config(config)
 
     # Export channel tokens as env vars so the messaging MCP can pick them up
@@ -104,7 +106,7 @@ def _build_agent(config: dict) -> Agent:
     mcp_disable = config.get("mcp_disable", [])
 
     memory_cfg = config.get("memory", {})
-    db_path = memory_cfg.get("db_path", "openagent.db")
+    db_path = memory_cfg.get("db_path", str(default_db_path()))
     db = MemoryDB(db_path)
 
     # Wire budget tracking for SmartRouter (needs the shared DB instance)
@@ -522,8 +524,7 @@ class AgentServer:
         cron_expr = update_cfg.get("check_interval", "0 4 * * *")
 
         prompt = (
-            "Run a pip upgrade check for openagent-framework. "
-            "Execute: pip install --upgrade openagent-framework. "
+            "Check for updates to openagent-framework. "
             "Compare the version before and after. "
             "If updated, log the new version."
         )
@@ -557,6 +558,10 @@ PACKAGE_NAME = "openagent-framework"
 
 
 def get_installed_version() -> str:
+    from openagent._frozen import is_frozen
+    if is_frozen():
+        import openagent
+        return getattr(openagent, "__version__", "unknown")
     try:
         from importlib.metadata import version
         return version(PACKAGE_NAME)
@@ -564,7 +569,7 @@ def get_installed_version() -> str:
         return "unknown"
 
 
-def run_pip_upgrade() -> tuple[str, str]:
+def _run_pip_upgrade() -> tuple[str, str]:
     """Run pip install --upgrade and return (old_version, new_version)."""
     import subprocess
     import sys
@@ -585,6 +590,23 @@ def run_pip_upgrade() -> tuple[str, str]:
     return old, new
 
 
+def run_upgrade() -> tuple[str, str]:
+    """Upgrade OpenAgent and return (old_version, new_version).
+
+    Dispatches to executable self-update when running from a frozen
+    binary, or to pip upgrade when running from a pip installation.
+    """
+    from openagent._frozen import is_frozen
+    if is_frozen():
+        from openagent.updater import perform_self_update_sync
+        return perform_self_update_sync()
+    return _run_pip_upgrade()
+
+
+# Backward compat alias
+run_pip_upgrade = run_upgrade
+
+
 async def _do_auto_update(
     agent: Agent,
     mode: str,
@@ -598,7 +620,7 @@ async def _do_auto_update(
     cleanup has finished.
     """
     try:
-        old_ver, new_ver = run_pip_upgrade()
+        old_ver, new_ver = run_upgrade()
     except Exception as exc:
         logger.error("Auto-update check failed: %s", exc)
         return

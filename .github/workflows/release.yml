@@ -118,10 +118,74 @@ jobs:
             app/desktop/release/*.yml
             app/desktop/release/*.yaml
 
+  # ── Standalone executable (macOS, Linux, Windows) ──
+  executable:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            archive_ext: tar.gz
+          - os: ubuntu-latest
+            archive_ext: tar.gz
+          - os: windows-latest
+            archive_ext: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install Python deps + PyInstaller
+        run: pip install -e ".[all]" pyinstaller
+      - name: Build Node MCPs
+        shell: bash
+        run: |
+          for mcp_dir in openagent/mcps/computer-control openagent/mcps/shell openagent/mcps/web-search openagent/mcps/editor openagent/mcps/chrome-devtools openagent/mcps/messaging; do
+            if [ -d "$mcp_dir" ]; then
+              echo "Building $mcp_dir..."
+              (cd "$mcp_dir" && npm install --silent && npm run build --silent 2>/dev/null || true)
+            fi
+          done
+      - name: Build executable
+        run: pyinstaller openagent.spec --clean --noconfirm
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cd dist
+          VERSION=$(python -c "import openagent; print(openagent.__version__)")
+          OS_NAME=$(echo "$RUNNER_OS" | tr '[:upper:]' '[:lower:]')
+          ARCH=$(uname -m)
+          case "$ARCH" in x86_64) ARCH=x64;; aarch64|arm64) ARCH=arm64;; esac
+          case "$OS_NAME" in macos) ;; linux) ;; *) ;; esac
+          ARCHIVE="openagent-${VERSION}-${OS_NAME}-${ARCH}.tar.gz"
+          tar czf "$ARCHIVE" openagent/
+          shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cd dist
+          $version = python -c "import openagent; print(openagent.__version__)"
+          $archive = "openagent-${version}-windows-x64.zip"
+          Compress-Archive -Path openagent -DestinationPath $archive
+          (Get-FileHash -Algorithm SHA256 $archive).Hash + "  " + $archive | Out-File "${archive}.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: executable-${{ matrix.os }}
+          path: |
+            dist/openagent-*.tar.gz
+            dist/openagent-*.zip
+            dist/openagent-*.sha256
+
   # ── GitHub Release with all artifacts ──
   release:
-    needs: [framework, cli, desktop]
-    if: always() && needs.framework.result == 'success'
+    needs: [framework, cli, desktop, executable]
+    if: always() && needs.framework.result == 'success' && needs.executable.result != 'failure'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -141,6 +205,7 @@ jobs:
             artifacts/**/*.exe
             artifacts/**/*.AppImage
             artifacts/**/*.deb
+            artifacts/**/*.sha256
             artifacts/**/*.yml
             artifacts/**/*.yaml
           generate_release_notes: true

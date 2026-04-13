@@ -25,7 +25,12 @@ logger = logging.getLogger(__name__)
 
 # ── Built-in MCPs (custom, ship under mcps/) ──
 
-BUILTIN_MCPS_DIR = Path(__file__).resolve().parent.parent / "mcps"
+from openagent._frozen import is_frozen, bundle_dir
+
+if is_frozen():
+    BUILTIN_MCPS_DIR = bundle_dir() / "openagent" / "mcps"
+else:
+    BUILTIN_MCPS_DIR = Path(__file__).resolve().parent.parent / "mcps"
 
 BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
     "computer-control": {
@@ -233,9 +238,13 @@ def _resolve_default_entry(
         # Per-builtin runtime env injection: the scheduler MCP needs to
         # point at the same SQLite file as the in-process Scheduler.
         extra_env: dict[str, str] = dict(entry.get("env") or {})
-        if entry["builtin"] == "scheduler" and db_path:
+        if entry["builtin"] == "scheduler":
             import os as _os
-            extra_env["OPENAGENT_DB_PATH"] = _os.path.abspath(db_path)
+            if db_path:
+                extra_env["OPENAGENT_DB_PATH"] = _os.path.abspath(db_path)
+            else:
+                from openagent.core.paths import default_db_path
+                extra_env["OPENAGENT_DB_PATH"] = str(default_db_path())
 
         try:
             return _resolve_builtin(entry["builtin"], env=extra_env or None)
@@ -250,13 +259,15 @@ def _resolve_default_entry(
         return None
 
     import os
+    from openagent.core.paths import default_vault_path
+
     args = entry.get("args") or []
     # Expand home dir for filesystem MCP
     if name == "filesystem" and not args:
         args = [os.path.expanduser("~")]
-    # Expand vault path for MCPVault
+    # Expand vault path for MCPVault (respects agent dir if set)
     if name == "vault" and not args:
-        args = [os.path.join(os.getcwd(), "memories")]
+        args = [str(default_vault_path())]
 
     return MCPTools(
         name=entry.get("name", ""),
