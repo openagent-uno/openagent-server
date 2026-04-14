@@ -112,12 +112,16 @@ jobs:
       - name: Package (Unix)
         if: runner.os != 'Windows'
         shell: bash
+        # Read the version BEFORE cd'ing into dist/ — the PyInstaller output
+        # directory ``dist/openagent/`` has no ``__init__.py`` and shadows
+        # the installed package when Python prepends CWD to sys.path for
+        # ``-c`` invocations, so importing openagent from inside dist fails.
         run: |
-          cd dist
           VERSION=$(python -c "import openagent; print(openagent.__version__)")
           OS_NAME=$(echo "$RUNNER_OS" | tr '[:upper:]' '[:lower:]')
           ARCH=$(uname -m)
           case "$ARCH" in x86_64) ARCH=x64;; aarch64|arm64) ARCH=arm64;; esac
+          cd dist
           ARCHIVE="openagent-${VERSION}-${OS_NAME}-${ARCH}.tar.gz"
           tar czf "$ARCHIVE" openagent/
           shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
@@ -125,8 +129,8 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          cd dist
           $version = python -c "import openagent; print(openagent.__version__)"
+          cd dist
           $archive = "openagent-${version}-windows-x64.zip"
           Compress-Archive -Path openagent -DestinationPath $archive
           (Get-FileHash -Algorithm SHA256 $archive).Hash + "  " + $archive | Out-File "${archive}.sha256"
@@ -161,12 +165,16 @@ jobs:
       - name: Package (Unix)
         if: runner.os != 'Windows'
         shell: bash
+        # Read the version BEFORE cd'ing into dist/ — keeps behaviour
+        # consistent with the server job, even though the CLI's output
+        # directory name (``openagent-cli/``) contains a hyphen and
+        # doesn't currently shadow the ``openagent_cli`` module.
         run: |
-          cd dist
           VERSION=$(python -c "import openagent_cli; print(openagent_cli.__version__)")
           OS_NAME=$(echo "$RUNNER_OS" | tr '[:upper:]' '[:lower:]')
           ARCH=$(uname -m)
           case "$ARCH" in x86_64) ARCH=x64;; aarch64|arm64) ARCH=arm64;; esac
+          cd dist
           ARCHIVE="openagent-cli-${VERSION}-${OS_NAME}-${ARCH}.tar.gz"
           tar czf "$ARCHIVE" openagent-cli/
           shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
@@ -174,8 +182,8 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          cd dist
           $version = python -c "import openagent_cli; print(openagent_cli.__version__)"
+          cd dist
           $archive = "openagent-cli-${version}-windows-x64.zip"
           Compress-Archive -Path openagent-cli -DestinationPath $archive
           (Get-FileHash -Algorithm SHA256 $archive).Hash + "  " + $archive | Out-File "${archive}.sha256"
