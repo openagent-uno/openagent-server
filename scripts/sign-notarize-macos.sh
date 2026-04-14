@@ -4,16 +4,18 @@
 #
 # Usage:
 #   scripts/sign-notarize-macos.sh <binary>
-#   scripts/sign-notarize-macos.sh <binary> <pkg-identifier> <install-path> <output-pkg>
+#   scripts/sign-notarize-macos.sh <binary> <pkg-identifier> <install-path>
 #
 # Examples:
-#   # Sign + notarize the bare binary only (what users extract from tar.gz):
+#   # Sign + notarize the bare binary only (no .pkg):
 #   scripts/sign-notarize-macos.sh dist/openagent
 #
-#   # Sign + notarize AND produce a .pkg that installs into /usr/local/bin:
+#   # Sign + notarize AND produce a .pkg that installs into /usr/local/bin.
+#   # Output path is derived as
+#   #   dist/<binary-basename>-<version>-macos-<arch>.pkg
+#   # where <version> comes from the Python module matching the binary name.
 #   scripts/sign-notarize-macos.sh dist/openagent \
-#       com.openagent.server /usr/local/bin \
-#       dist/openagent-0.5.4-macos-arm64.pkg
+#       com.openagent.server /usr/local/bin
 #
 # Env vars (identical to the desktop electron-builder job so both flows
 # share one set of GitHub Actions secrets):
@@ -55,10 +57,9 @@ set -euo pipefail
 BINARY="${1:-}"
 PKG_IDENTIFIER="${2:-}"
 PKG_INSTALL_PATH="${3:-}"
-PKG_OUTPUT="${4:-}"
 
 if [ -z "$BINARY" ]; then
-    echo "usage: $0 <binary> [pkg-identifier pkg-install-path pkg-output]" >&2
+    echo "usage: $0 <binary> [pkg-identifier pkg-install-path]" >&2
     exit 2
 fi
 if [ ! -f "$BINARY" ]; then
@@ -67,12 +68,30 @@ if [ ! -f "$BINARY" ]; then
 fi
 
 WANT_PKG=false
-if [ -n "$PKG_IDENTIFIER" ] || [ -n "$PKG_INSTALL_PATH" ] || [ -n "$PKG_OUTPUT" ]; then
-    if [ -z "$PKG_IDENTIFIER" ] || [ -z "$PKG_INSTALL_PATH" ] || [ -z "$PKG_OUTPUT" ]; then
-        echo "pkg mode requires all three: identifier, install-path, output" >&2
+if [ -n "$PKG_IDENTIFIER" ] || [ -n "$PKG_INSTALL_PATH" ]; then
+    if [ -z "$PKG_IDENTIFIER" ] || [ -z "$PKG_INSTALL_PATH" ]; then
+        echo "pkg mode requires both: identifier and install-path" >&2
         exit 2
     fi
     WANT_PKG=true
+fi
+
+# Compute the pkg output path here so callers don't have to duplicate
+# version/arch detection. Filename follows the release convention:
+#   <binary-dir>/<binary-basename>-<version>-macos-<arch>.pkg
+# e.g. dist/openagent-0.5.7-macos-arm64.pkg.
+if [ "$WANT_PKG" = true ]; then
+    BINARY_DIR="$(dirname "$BINARY")"
+    BINARY_NAME="$(basename "$BINARY")"
+    MODULE="${BINARY_NAME//-/_}"
+    PKG_VERSION="$(python -c "import ${MODULE}; print(${MODULE}.__version__)")"
+    PKG_ARCH_RAW="$(uname -m)"
+    case "$PKG_ARCH_RAW" in
+        x86_64|amd64)  PKG_ARCH="x64" ;;
+        aarch64|arm64) PKG_ARCH="arm64" ;;
+        *) PKG_ARCH="$PKG_ARCH_RAW" ;;
+    esac
+    PKG_OUTPUT="${BINARY_DIR}/${BINARY_NAME}-${PKG_VERSION}-macos-${PKG_ARCH}.pkg"
 fi
 
 # ── Skip cleanly when the binary-signing secrets are missing ──────────
@@ -226,7 +245,7 @@ echo "→ Building unsigned .pkg with identifier $PKG_IDENTIFIER"
 # already so the installer writes into $PKG_INSTALL_PATH.
 pkgbuild \
     --identifier "$PKG_IDENTIFIER" \
-    --version "$(basename "$PKG_OUTPUT" .pkg | awk -F- '{for (i=2; i<=NF; i++) if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+$/) { print $i; exit }}')" \
+    --version "$PKG_VERSION" \
     --install-location / \
     --root "$PKG_ROOT" \
     "$UNSIGNED_PKG"

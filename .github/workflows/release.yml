@@ -120,61 +120,13 @@ jobs:
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         shell: bash
-        # Produce BOTH a signed/notarized bare binary (for the tar.gz
-        # that install.sh streams) AND a signed+notarized+stapled .pkg
-        # (for Finder double-click users who'd otherwise hit Gatekeeper).
-        run: |
-          VERSION=$(python -c "import openagent; print(openagent.__version__)")
-          ARCH=$(uname -m); case "$ARCH" in x86_64) ARCH=x64;; aarch64|arm64) ARCH=arm64;; esac
-          bash scripts/sign-notarize-macos.sh \
-            dist/openagent \
-            com.openagent.server \
-            /usr/local/bin \
-            "dist/openagent-${VERSION}-macos-${ARCH}.pkg"
-      - name: Package (Linux)
-        if: runner.os == 'Linux'
+        # Produces a signed + notarized bare binary PLUS a
+        # signed + notarized + stapled .pkg installer. The pkg filename
+        # is derived inside the script from the module version.
+        run: bash scripts/sign-notarize-macos.sh dist/openagent com.openagent.server /usr/local/bin
+      - name: Package + checksum
         shell: bash
-        # On macOS we ship ONLY the stapled .pkg (built in the Sign step).
-        # The bare tar.gz would be redundant on macOS and its only purpose
-        # was working around the very Gatekeeper dialog the .pkg fixes.
-        # Linux still gets the tar.gz — no signing infrastructure required.
-        run: |
-          VERSION=$(python -c "import openagent; print(openagent.__version__)")
-          ARCH=$(uname -m); case "$ARCH" in x86_64) ARCH=x64;; aarch64|arm64) ARCH=arm64;; esac
-          chmod +x dist/openagent
-          ARCHIVE="openagent-${VERSION}-linux-${ARCH}.tar.gz"
-          tar czf "dist/$ARCHIVE" -C dist openagent
-          (cd dist && shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256")
-      - name: Checksum macOS .pkg
-        if: runner.os == 'macOS'
-        shell: bash
-        # Shasum whatever .pkg files the sign step produced. Globbing
-        # rather than reconstructing the exact filename from $VERSION
-        # avoids a class of bugs (Python import shadowing, wrong
-        # version source, etc) and works whether the job is server or CLI.
-        run: |
-          cd dist
-          ls -la *.pkg 2>&1 || true
-          found=0
-          for pkg in *.pkg; do
-            [ -f "$pkg" ] || continue
-            shasum -a 256 "$pkg" > "${pkg}.sha256"
-            echo "checksummed: $pkg"
-            found=$((found + 1))
-          done
-          if [ "$found" -eq 0 ]; then
-            echo "ERROR: no .pkg produced by the sign step" >&2
-            ls -la
-            exit 1
-          fi
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $version = python -c "import openagent; print(openagent.__version__)"
-          $archive = "openagent-${version}-windows-x64.zip"
-          Compress-Archive -Path dist/openagent.exe -DestinationPath "dist/$archive"
-          (Get-FileHash -Algorithm SHA256 "dist/$archive").Hash + "  " + $archive | Out-File "dist/${archive}.sha256"
+        run: bash scripts/package-release.sh openagent dist
       - uses: actions/upload-artifact@v4
         with:
           name: executable-${{ matrix.os }}
@@ -215,40 +167,10 @@ jobs:
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         shell: bash
-        run: |
-          VERSION=$(python -c "import openagent_cli; print(openagent_cli.__version__)")
-          ARCH=$(uname -m); case "$ARCH" in x86_64) ARCH=x64;; aarch64|arm64) ARCH=arm64;; esac
-          bash scripts/sign-notarize-macos.sh \
-            dist/openagent-cli \
-            com.openagent.cli \
-            /usr/local/bin \
-            "dist/openagent-cli-${VERSION}-macos-${ARCH}.pkg"
-      - name: Package (Linux)
-        if: runner.os == 'Linux'
+        run: bash scripts/sign-notarize-macos.sh dist/openagent-cli com.openagent.cli /usr/local/bin
+      - name: Package + checksum
         shell: bash
-        run: |
-          VERSION=$(python -c "import openagent_cli; print(openagent_cli.__version__)")
-          ARCH=$(uname -m); case "$ARCH" in x86_64) ARCH=x64;; aarch64|arm64) ARCH=arm64;; esac
-          chmod +x dist/openagent-cli
-          ARCHIVE="openagent-cli-${VERSION}-linux-${ARCH}.tar.gz"
-          tar czf "dist/$ARCHIVE" -C dist openagent-cli
-          (cd dist && shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256")
-      - name: Checksum macOS .pkg
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          VERSION=$(python -c "import openagent_cli; print(openagent_cli.__version__)")
-          ARCH=$(uname -m); case "$ARCH" in x86_64) ARCH=x64;; aarch64|arm64) ARCH=arm64;; esac
-          PKG="openagent-cli-${VERSION}-macos-${ARCH}.pkg"
-          (cd dist && shasum -a 256 "$PKG" > "${PKG}.sha256")
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $version = python -c "import openagent_cli; print(openagent_cli.__version__)"
-          $archive = "openagent-cli-${version}-windows-x64.zip"
-          Compress-Archive -Path dist/openagent-cli.exe -DestinationPath "dist/$archive"
-          (Get-FileHash -Algorithm SHA256 "dist/$archive").Hash + "  " + $archive | Out-File "dist/${archive}.sha256"
+        run: bash scripts/package-release.sh openagent-cli dist
       - uses: actions/upload-artifact@v4
         with:
           name: cli-${{ matrix.os }}
