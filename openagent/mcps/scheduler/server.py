@@ -21,38 +21,23 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import time
 import uuid
 from typing import Any
 
 import aiosqlite
-from croniter import croniter
 from mcp.server.fastmcp import FastMCP
-from openagent.memory.db import (
+from openagent.memory.db import SCHEMA_SQL
+from openagent.memory.schedule import (
     build_one_shot_expression,
+    decorate_scheduled_task,
+    epoch_to_iso,
     is_one_shot_expression,
-    parse_one_shot_expression,
+    next_run_for_expression,
+    validate_schedule_expression,
 )
+import time
 
 logger = logging.getLogger(__name__)
-
-# Must match openagent.memory.db.SCHEMA_SQL exactly so a bare run against
-# a fresh DB (no OpenAgent running yet) still works.
-_SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS scheduled_tasks (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    cron_expression TEXT NOT NULL,
-    prompt TEXT NOT NULL,
-    enabled INTEGER NOT NULL DEFAULT 1,
-    last_run REAL,
-    next_run REAL,
-    created_at REAL NOT NULL,
-    updated_at REAL NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_tasks_enabled ON scheduled_tasks(enabled);
-CREATE INDEX IF NOT EXISTS idx_tasks_next_run ON scheduled_tasks(next_run);
-"""
 
 _ALLOWED_UPDATE_COLUMNS = {
     "name",
@@ -92,7 +77,7 @@ async def _get_conn() -> aiosqlite.Connection:
             conn = await aiosqlite.connect(path)
             conn.row_factory = aiosqlite.Row
             await conn.execute("PRAGMA journal_mode=WAL")
-            await conn.executescript(_SCHEMA_SQL)
+            await conn.executescript(SCHEMA_SQL)
             await conn.commit()
             _conn = conn
             logger.info("scheduler MCP connected to %s", path)
@@ -100,41 +85,19 @@ async def _get_conn() -> aiosqlite.Connection:
 
 
 def _row_to_dict(row: aiosqlite.Row) -> dict[str, Any]:
-    d = dict(row)
-    # Normalise bool + expose pretty timestamps for the agent's benefit.
-    d["enabled"] = bool(d.get("enabled"))
-    d["run_once"] = is_one_shot_expression(d.get("cron_expression"))
-    if d["run_once"]:
-        run_at = parse_one_shot_expression(d["cron_expression"])
-        d["run_at"] = run_at
-        d["run_at_iso"] = _iso(run_at)
-    for ts_col in ("last_run", "next_run", "created_at", "updated_at"):
-        val = d.get(ts_col)
-        if isinstance(val, (int, float)):
-            d[f"{ts_col}_iso"] = _iso(val)
-    return d
+    return decorate_scheduled_task(row)
 
 
 def _iso(epoch: float) -> str:
-    import datetime as _dt
-
-    return _dt.datetime.fromtimestamp(epoch).isoformat(timespec="seconds")
+    return epoch_to_iso(epoch)
 
 
 def _validate_cron(expr: str) -> None:
-    if is_one_shot_expression(expr):
-        parse_one_shot_expression(expr)
-        return
-    try:
-        croniter(expr)
-    except (ValueError, KeyError) as e:
-        raise ValueError(f"Invalid cron expression {expr!r}: {e}")
+    validate_schedule_expression(expr)
 
 
 def _next_run(expr: str, base: float | None = None) -> float:
-    if is_one_shot_expression(expr):
-        return parse_one_shot_expression(expr)
-    return croniter(expr, base or time.time()).get_next(float)
+    return next_run_for_expression(expr, base)
 
 
 async def _resolve_task_id(conn: aiosqlite.Connection, task_id: str) -> str:

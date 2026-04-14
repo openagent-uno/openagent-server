@@ -1,8 +1,8 @@
-"""Per-client session management with FIFO message queue.
+"""Per-client session tracking with a FIFO message queue.
 
-Each client can have multiple chat sessions. Messages within a session
-are processed sequentially (one at a time) to prevent race conditions.
-Sessions are RAM-only — lost on restart.
+Each client can have multiple chat sessions, but queueing/stop semantics
+are currently owned at the client level: one active run plus one pending
+FIFO queue per client. Session metadata is RAM-only and lost on restart.
 """
 
 from __future__ import annotations

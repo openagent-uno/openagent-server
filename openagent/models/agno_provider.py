@@ -12,6 +12,7 @@ session history persistence. No Agno memory or knowledge stores are configured.
 
 from __future__ import annotations
 
+import importlib
 import inspect
 import keyword
 import logging
@@ -26,6 +27,31 @@ from openagent.models.catalog import normalize_runtime_model_id
 
 logger = logging.getLogger(__name__)
 DEFAULT_ZAI_BASE_URL = "https://api.z.ai/api/paas/v4"
+PROVIDER_ENV_VARS = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "google": "GOOGLE_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+    "zai": "ZAI_API_KEY",
+    "zhipu": "ZAI_API_KEY",
+    "groq": "GROQ_API_KEY",
+    "mistral": "MISTRAL_API_KEY",
+    "xai": "XAI_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "cerebras": "CEREBRAS_API_KEY",
+}
+AGNO_PROVIDER_CLASSES: dict[str, tuple[str, str, dict[str, Any]]] = {
+    "anthropic": ("agno.models.anthropic", "Claude", {}),
+    "openai": ("agno.models.openai", "OpenAIChat", {}),
+    "google": ("agno.models.google", "Gemini", {}),
+    "openrouter": ("agno.models.openrouter", "OpenRouter", {}),
+    "groq": ("agno.models.groq", "Groq", {}),
+    "mistral": ("agno.models.mistral", "MistralChat", {}),
+    "xai": ("agno.models.xai", "xAI", {}),
+    "deepseek": ("agno.models.deepseek", "DeepSeek", {}),
+    "cerebras": ("agno.models.cerebras", "Cerebras", {}),
+    "zai": ("agno.models.openai.like", "OpenAILike", {"name": "ZAI"}),
+}
 
 
 class AgnoProvider(BaseModel):
@@ -63,31 +89,21 @@ class AgnoProvider(BaseModel):
         self._tool_cache = None
         self._agno_agents.clear()
 
-    def _inject_provider_keys(self) -> None:
-        env_map = {
-            "anthropic": "ANTHROPIC_API_KEY",
-            "openai": "OPENAI_API_KEY",
-            "google": "GOOGLE_API_KEY",
-            "openrouter": "OPENROUTER_API_KEY",
-            "zai": "ZAI_API_KEY",
-            "zhipu": "ZAI_API_KEY",
-            "groq": "GROQ_API_KEY",
-            "mistral": "MISTRAL_API_KEY",
-            "xai": "XAI_API_KEY",
-            "deepseek": "DEEPSEEK_API_KEY",
-            "cerebras": "CEREBRAS_API_KEY",
-        }
+    def _provider_name(self) -> str:
         runtime_id = self.model
-        provider_name = runtime_id.split(":", 1)[0] if ":" in runtime_id else runtime_id.split("/", 1)[0]
+        return runtime_id.split(":", 1)[0] if ":" in runtime_id else runtime_id.split("/", 1)[0]
+
+    def _inject_provider_keys(self) -> None:
+        provider_name = self._provider_name()
         if self._api_key:
-            env_var = env_map.get(provider_name)
+            env_var = PROVIDER_ENV_VARS.get(provider_name)
             if env_var and not os.environ.get(env_var):
                 os.environ[env_var] = self._api_key
             if provider_name == "google" and not os.environ.get("GEMINI_API_KEY"):
                 os.environ["GEMINI_API_KEY"] = self._api_key
 
         for name, cfg in self._providers_config.items():
-            env_var = env_map.get(name)
+            env_var = PROVIDER_ENV_VARS.get(name)
             key = cfg.get("api_key")
             if env_var and key and not os.environ.get(env_var):
                 os.environ[env_var] = key
@@ -174,10 +190,12 @@ class AgnoProvider(BaseModel):
             return runtime_id.split("/", 1)
         return runtime_id, runtime_id
 
-    def _provider_setting(self, key: str) -> str | None:
+    def _provider_config(self) -> dict[str, Any]:
         provider_name, _ = self._runtime_parts()
-        provider_cfg = self._providers_config.get(provider_name, {})
-        value = provider_cfg.get(key)
+        return self._providers_config.get(provider_name, {})
+
+    def _provider_setting(self, key: str) -> str | None:
+        value = self._provider_config().get(key)
         return str(value).strip() if value is not None else None
 
     def _resolved_api_key(self) -> str | None:
@@ -196,56 +214,26 @@ class AgnoProvider(BaseModel):
         filtered = {k: v for k, v in kwargs.items() if v is not None and k in accepted}
         return cls(**filtered)
 
+    def _load_agno_model_class(self, provider_name: str) -> tuple[type | None, dict[str, Any]]:
+        spec = AGNO_PROVIDER_CLASSES.get(provider_name)
+        if not spec:
+            return None, {}
+        module_name, class_name, extra_kwargs = spec
+        module = importlib.import_module(module_name)
+        return getattr(module, class_name), dict(extra_kwargs)
+
     def _build_agno_model(self) -> Any:
         provider_name, model_id = self._runtime_parts()
         api_key = self._resolved_api_key()
         base_url = self._resolved_base_url()
-
-        if provider_name == "anthropic":
-            from agno.models.anthropic import Claude
-
-            return self._construct_model(Claude, id=model_id, api_key=api_key, base_url=base_url)
-        if provider_name == "openai":
-            from agno.models.openai import OpenAIChat
-
-            return self._construct_model(OpenAIChat, id=model_id, api_key=api_key, base_url=base_url)
-        if provider_name == "google":
-            from agno.models.google import Gemini
-
-            return self._construct_model(Gemini, id=model_id, api_key=api_key)
-        if provider_name == "openrouter":
-            from agno.models.openrouter import OpenRouter
-
-            return self._construct_model(OpenRouter, id=model_id, api_key=api_key, base_url=base_url)
-        if provider_name == "groq":
-            from agno.models.groq import Groq
-
-            return self._construct_model(Groq, id=model_id, api_key=api_key, base_url=base_url)
-        if provider_name == "mistral":
-            from agno.models.mistral import MistralChat
-
-            return self._construct_model(MistralChat, id=model_id, api_key=api_key, base_url=base_url)
-        if provider_name == "xai":
-            from agno.models.xai import xAI
-
-            return self._construct_model(xAI, id=model_id, api_key=api_key, base_url=base_url)
-        if provider_name == "deepseek":
-            from agno.models.deepseek import DeepSeek
-
-            return self._construct_model(DeepSeek, id=model_id, api_key=api_key, base_url=base_url)
-        if provider_name == "cerebras":
-            from agno.models.cerebras import Cerebras
-
-            return self._construct_model(Cerebras, id=model_id, api_key=api_key, base_url=base_url)
-        if provider_name == "zai":
-            from agno.models.openai.like import OpenAILike
-
+        model_class, extra_kwargs = self._load_agno_model_class(provider_name)
+        if model_class is not None:
             return self._construct_model(
-                OpenAILike,
+                model_class,
                 id=model_id,
-                name="ZAI",
                 api_key=api_key,
-                base_url=base_url or DEFAULT_ZAI_BASE_URL,
+                base_url=base_url,
+                **extra_kwargs,
             )
 
         from agno.models.utils import get_model

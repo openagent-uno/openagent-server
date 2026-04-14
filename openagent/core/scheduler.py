@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from typing import TYPE_CHECKING
 
-from croniter import croniter
-from openagent.memory.db import is_one_shot_expression, parse_one_shot_expression
+import time
+
+from openagent.memory.schedule import (
+    is_one_shot_expression,
+    next_run_for_expression,
+)
 
 if TYPE_CHECKING:
     from openagent.core.agent import Agent
@@ -34,12 +37,7 @@ class Scheduler:
         self._task: asyncio.Task | None = None
 
     def _next_run(self, cron_expression: str, base: float | None = None) -> float:
-        if is_one_shot_expression(cron_expression):
-            return parse_one_shot_expression(cron_expression)
-        try:
-            return croniter(cron_expression, base or time.time()).get_next(float)
-        except (ValueError, KeyError) as e:
-            raise ValueError(f"Invalid cron expression: {e}") from e
+        return next_run_for_expression(cron_expression, base)
 
     async def start(self) -> None:
         """Start the scheduler background loop."""

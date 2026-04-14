@@ -1,12 +1,4 @@
-"""SQLite storage for scheduled tasks.
-
-Session history is handled by the Claude Agent SDK (resume=session_id).
-Long-term memory and knowledge base are in the Obsidian vault
-(managed by MCPVault MCP).
-
-SQLite handles only:
-- Scheduled tasks (cron queries, persistence across reboots)
-"""
+"""SQLite storage for scheduled tasks and usage logs."""
 
 from __future__ import annotations
 
@@ -15,25 +7,12 @@ import uuid
 from typing import Any
 
 import aiosqlite
-
-ONE_SHOT_PREFIX = "@once:"
-
-
-def is_one_shot_expression(expr: str | None) -> bool:
-    return bool(expr and str(expr).startswith(ONE_SHOT_PREFIX))
-
-
-def build_one_shot_expression(run_at: float) -> str:
-    return f"{ONE_SHOT_PREFIX}{float(run_at)}"
-
-
-def parse_one_shot_expression(expr: str) -> float:
-    if not is_one_shot_expression(expr):
-        raise ValueError(f"Not a one-shot schedule expression: {expr!r}")
-    try:
-        return float(str(expr)[len(ONE_SHOT_PREFIX):])
-    except ValueError as exc:
-        raise ValueError(f"Invalid one-shot schedule expression: {expr!r}") from exc
+from openagent.memory.schedule import (
+    ONE_SHOT_PREFIX,
+    build_one_shot_expression,
+    is_one_shot_expression,
+    parse_one_shot_expression,
+)
 
 
 SCHEMA_SQL = """

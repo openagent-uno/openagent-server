@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 
 from openagent.models.base import BaseModel, ModelResponse
@@ -39,6 +40,15 @@ HARD_HINTS = (
     "modello migliore",
     "modello più potente",
 )
+
+
+@dataclass(frozen=True)
+class RoutingDecision:
+    requested_tier: str
+    effective_tier: str
+    reason: str
+    primary_model: str
+    candidates: list[str]
 
 
 class SmartRouter(BaseModel):
@@ -262,6 +272,15 @@ class SmartRouter(BaseModel):
 
         return [model_id for model_id in candidates if model_history_mode(model_id, self._providers_config) == primary_mode]
 
+    async def _budget_ratio(self, session_id: str | None = None) -> float:
+        from openagent.core.logging import elog
+
+        ratio = 1.0
+        if self._budget:
+            ratio = await self._budget.get_budget_ratio()
+            elog("router.budget", session_id=session_id, budget_ratio=round(ratio, 3))
+        return ratio
+
     def _remember_tier(self, session_id: str | None, tier: str) -> None:
         if session_id:
             self._last_tier_by_session[session_id] = tier
@@ -280,6 +299,35 @@ class SmartRouter(BaseModel):
     def _is_tool_continuation(self, messages: list[dict[str, Any]]) -> bool:
         return bool(messages and messages[-1].get("role") == "tool")
 
+    async def _resolve_requested_tier(self, messages: list[dict[str, Any]], session_id: str | None) -> str:
+        from openagent.core.logging import elog
+
+        if self._is_tool_continuation(messages):
+            tier = self._recall_tier(session_id)
+            elog("router.continuation", session_id=session_id, tier=tier)
+            return tier
+
+        tier = await self._classify(messages, session_id=session_id)
+        self._remember_tier(session_id, tier)
+        return tier
+
+    async def _routing_decision(
+        self,
+        messages: list[dict[str, Any]],
+        session_id: str | None,
+        budget_ratio: float,
+    ) -> RoutingDecision:
+        requested_tier = await self._resolve_requested_tier(messages, session_id)
+        primary_model, effective_tier, reason = self._pick_model(requested_tier, budget_ratio)
+        candidates = self._candidate_models(requested_tier, effective_tier, primary_model)
+        return RoutingDecision(
+            requested_tier=requested_tier,
+            effective_tier=effective_tier,
+            reason=reason,
+            primary_model=primary_model,
+            candidates=candidates,
+        )
+
     async def generate(
         self,
         messages: list[dict[str, Any]],
@@ -290,10 +338,7 @@ class SmartRouter(BaseModel):
     ) -> ModelResponse:
         from openagent.core.logging import elog
 
-        budget_ratio = 1.0
-        if self._budget:
-            budget_ratio = await self._budget.get_budget_ratio()
-            elog("router.budget", session_id=session_id, budget_ratio=round(budget_ratio, 3))
+        budget_ratio = await self._budget_ratio(session_id)
 
         if budget_ratio <= 0 and self._monthly_budget > 0:
             elog("router.budget_exceeded", session_id=session_id, monthly_budget=self._monthly_budget)
@@ -302,34 +347,26 @@ class SmartRouter(BaseModel):
                 stop_reason="budget_exceeded",
             )
 
-        if self._is_tool_continuation(messages):
-            tier = self._recall_tier(session_id)
-            elog("router.continuation", session_id=session_id, tier=tier)
-        else:
-            tier = await self._classify(messages, session_id=session_id)
-            self._remember_tier(session_id, tier)
-
-        model_id, effective_tier, route_reason = self._pick_model(tier, budget_ratio)
-        if not model_id:
-            elog("router.error", session_id=session_id, tier=tier, routing=self._routing)
+        decision = await self._routing_decision(messages, session_id, budget_ratio)
+        if not decision.primary_model:
+            elog("router.error", session_id=session_id, tier=decision.requested_tier, routing=self._routing)
             return ModelResponse(content="No model configured for this task tier.", stop_reason="error")
 
         elog(
             "router.route",
             session_id=session_id,
-            requested_tier=tier,
-            effective_tier=effective_tier,
-            reason=route_reason,
-            model=model_id,
+            requested_tier=decision.requested_tier,
+            effective_tier=decision.effective_tier,
+            reason=decision.reason,
+            model=decision.primary_model,
             budget_ratio=round(budget_ratio, 3),
         )
-        candidates = self._candidate_models(tier, effective_tier, model_id)
-        elog("router.candidates", session_id=session_id, models=candidates)
+        elog("router.candidates", session_id=session_id, models=decision.candidates)
 
         resp = None
-        active_model_id = model_id
+        active_model_id = decision.primary_model
         last_error: Exception | None = None
-        for attempt, candidate_model in enumerate(candidates, start=1):
+        for attempt, candidate_model in enumerate(decision.candidates, start=1):
             provider = self._get_provider(candidate_model)
             if attempt > 1:
                 elog(
@@ -358,7 +395,7 @@ class SmartRouter(BaseModel):
                     session_id=session_id,
                     failed_model=candidate_model,
                     error=str(e),
-                    next_model=candidates[attempt] if attempt < len(candidates) else None,
+                    next_model=decision.candidates[attempt] if attempt < len(decision.candidates) else None,
                     attempt=attempt,
                 )
 
