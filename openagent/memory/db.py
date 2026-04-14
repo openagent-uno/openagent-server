@@ -16,6 +16,25 @@ from typing import Any
 
 import aiosqlite
 
+ONE_SHOT_PREFIX = "@once:"
+
+
+def is_one_shot_expression(expr: str | None) -> bool:
+    return bool(expr and str(expr).startswith(ONE_SHOT_PREFIX))
+
+
+def build_one_shot_expression(run_at: float) -> str:
+    return f"{ONE_SHOT_PREFIX}{float(run_at)}"
+
+
+def parse_one_shot_expression(expr: str) -> float:
+    if not is_one_shot_expression(expr):
+        raise ValueError(f"Not a one-shot schedule expression: {expr!r}")
+    try:
+        return float(str(expr)[len(ONE_SHOT_PREFIX):])
+    except ValueError as exc:
+        raise ValueError(f"Invalid one-shot schedule expression: {expr!r}") from exc
+
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS scheduled_tasks (

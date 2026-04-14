@@ -8,16 +8,26 @@ loaded unless explicitly disabled. User MCPs are merged on top.
 from __future__ import annotations
 
 import logging
+import asyncio
 import shutil
 import subprocess
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
 
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+import anyio
+from anyio.streams.text import TextReceiveStream
+from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.sse import sse_client
+from mcp.client.stdio import (
+    PROCESS_TERMINATION_TIMEOUT,
+    _create_platform_compatible_process,
+    _get_executable_command,
+    _terminate_process_tree,
+    get_default_environment,
+)
 from mcp.client.streamable_http import streamablehttp_client
+from mcp.shared.message import SessionMessage
 
 from openagent.core.logging import elog
 
@@ -146,6 +156,36 @@ def _check_command_exists(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
 
+def _node_version() -> tuple[int, int, int] | None:
+    if not _check_command_exists("node"):
+        return None
+    try:
+        result = subprocess.run(
+            ["node", "--version"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return None
+    raw = result.stdout.strip().lstrip("v")
+    parts = raw.split(".")
+    try:
+        major = int(parts[0])
+        minor = int(parts[1]) if len(parts) > 1 else 0
+        patch = int(parts[2]) if len(parts) > 2 else 0
+    except ValueError:
+        return None
+    return major, minor, patch
+
+
+def _node_meets_minimum(major: int, minor: int, patch: int = 0) -> bool:
+    current = _node_version()
+    if current is None:
+        return False
+    return current >= (major, minor, patch)
+
+
 def _resolve_builtin(name: str, env: dict[str, str] | None = None) -> MCPTools:
     """Resolve a built-in MCP by name. Auto-installs and builds if needed."""
     if name not in BUILTIN_MCP_SPECS:
@@ -241,6 +281,15 @@ def _resolve_default_entry(
         if not is_python and not _check_command_exists("node"):
             logger.warning(f"Skipping default MCP '{name}': Node.js not found")
             return None
+        if entry["builtin"] == "chrome-devtools" and not _node_meets_minimum(22, 12, 0):
+            version = _node_version()
+            rendered = ".".join(map(str, version)) if version else "unknown"
+            logger.warning(
+                "Skipping default MCP '%s': Node 22.12.0+ required (found %s)",
+                name,
+                rendered,
+            )
+            return None
 
         # Per-builtin runtime env injection: the scheduler MCP needs to
         # point at the same SQLite file as the in-process Scheduler.
@@ -285,6 +334,135 @@ def _resolve_default_entry(
     )
 
 
+class _ManagedStdioTransport:
+    """Explicit stdio transport lifecycle for MCP subprocesses.
+
+    We avoid the upstream stdio async context manager here because its
+    anyio cancel scopes are sensitive to cross-task shutdown on asyncio.
+    Keeping the transport lifecycle explicit makes stop() predictable.
+    """
+
+    def __init__(self, server: StdioServerParameters):
+        self.server = server
+        self.process: Any | None = None
+        self._task_group: anyio.abc.TaskGroup | None = None
+        self.read_stream = None
+        self.write_stream = None
+        self._read_stream_writer = None
+        self._write_stream_reader = None
+
+    async def start(self):
+        self._read_stream_writer, self.read_stream = anyio.create_memory_object_stream(0)
+        self.write_stream, self._write_stream_reader = anyio.create_memory_object_stream(0)
+
+        command = _get_executable_command(self.server.command)
+        env = (
+            {**get_default_environment(), **self.server.env}
+            if self.server.env is not None
+            else get_default_environment()
+        )
+        self.process = await _create_platform_compatible_process(
+            command=command,
+            args=self.server.args,
+            env=env,
+            cwd=self.server.cwd,
+        )
+        self._task_group = anyio.create_task_group()
+        await self._task_group.__aenter__()
+        self._task_group.start_soon(self._stdout_reader)
+        self._task_group.start_soon(self._stdin_writer)
+        return self.read_stream, self.write_stream
+
+    async def _stdout_reader(self) -> None:
+        assert self.process is not None and self.process.stdout is not None
+        assert self._read_stream_writer is not None
+        try:
+            async with self._read_stream_writer:
+                buffer = ""
+                async for chunk in TextReceiveStream(
+                    self.process.stdout,
+                    encoding=self.server.encoding,
+                    errors=self.server.encoding_error_handler,
+                ):
+                    lines = (buffer + chunk).split("\n")
+                    buffer = lines.pop()
+                    for line in lines:
+                        try:
+                            message = types.JSONRPCMessage.model_validate_json(line)
+                        except Exception as exc:
+                            logger.exception("Failed to parse JSONRPC message from server")
+                            await self._read_stream_writer.send(exc)
+                            continue
+                        await self._read_stream_writer.send(SessionMessage(message))
+        except anyio.ClosedResourceError:
+            await anyio.lowlevel.checkpoint()
+
+    async def _stdin_writer(self) -> None:
+        assert self.process is not None and self.process.stdin is not None
+        assert self._write_stream_reader is not None
+        try:
+            async with self._write_stream_reader:
+                async for session_message in self._write_stream_reader:
+                    payload = session_message.message.model_dump_json(by_alias=True, exclude_none=True)
+                    await self.process.stdin.send(
+                        (payload + "\n").encode(
+                            encoding=self.server.encoding,
+                            errors=self.server.encoding_error_handler,
+                        )
+                    )
+        except anyio.ClosedResourceError:
+            await anyio.lowlevel.checkpoint()
+
+    async def aclose(self) -> None:
+        process = self.process
+        task_group = self._task_group
+        read_stream = self.read_stream
+        write_stream = self.write_stream
+        read_writer = self._read_stream_writer
+        write_reader = self._write_stream_reader
+
+        self.process = None
+        self._task_group = None
+        self.read_stream = None
+        self.write_stream = None
+        self._read_stream_writer = None
+        self._write_stream_reader = None
+
+        try:
+            if process and process.stdin:
+                try:
+                    await process.stdin.aclose()
+                except Exception:
+                    pass
+        finally:
+            if task_group is not None:
+                task_group.cancel_scope.cancel()
+                try:
+                    await task_group.__aexit__(None, None, None)
+                except Exception:
+                    pass
+            if process is not None and process.returncode is None:
+                try:
+                    await _terminate_process_tree(process, timeout_seconds=1.0)
+                except Exception:
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
+            for stream in (read_stream, write_stream, read_writer, write_reader):
+                if stream is None:
+                    continue
+                try:
+                    await stream.aclose()
+                except Exception:
+                    pass
+            if process is not None:
+                try:
+                    await process.aclose()
+                except Exception:
+                    pass
+
+
 class MCPTools:
     """Single MCP server connection.
 
@@ -321,14 +499,13 @@ class MCPTools:
 
         self._session: ClientSession | None = None
         self._exit_stack: AsyncExitStack | None = None
+        self._stdio_transport: _ManagedStdioTransport | None = None
         self._tools: list[dict[str, Any]] = []
 
     async def connect(self) -> None:
         """Connect to the MCP server and discover tools."""
         if self._session:
             return
-
-        self._exit_stack = AsyncExitStack()
 
         if self.command:
             full_command = self.command + self.args
@@ -345,14 +522,17 @@ class MCPTools:
                 env=merged_env,
                 cwd=self._cwd,
             )
-            stdio_transport = await self._exit_stack.enter_async_context(
-                stdio_client(server_params)
-            )
-            read_stream, write_stream = stdio_transport
-            self._session = await self._exit_stack.enter_async_context(
-                ClientSession(read_stream, write_stream)
-            )
+            self._stdio_transport = _ManagedStdioTransport(server_params)
+            try:
+                read_stream, write_stream = await self._stdio_transport.start()
+                self._session = ClientSession(read_stream, write_stream)
+                await self._session.__aenter__()
+            except Exception:
+                await self._stdio_transport.aclose()
+                self._stdio_transport = None
+                raise
         elif self.url:
+            self._exit_stack = AsyncExitStack()
             # Build auth provider for OAuth-enabled MCPs
             auth = None
             if self.oauth:
@@ -403,11 +583,22 @@ class MCPTools:
 
     async def close(self) -> None:
         """Close the connection."""
-        if self._exit_stack:
-            await self._exit_stack.aclose()
-            self._exit_stack = None
-            self._session = None
-            self._tools = []
+        stack = self._exit_stack
+        stdio_transport = self._stdio_transport
+        self._session = None
+        self._exit_stack = None
+        self._stdio_transport = None
+        self._tools = []
+        if stdio_transport is not None:
+            try:
+                await asyncio.wait_for(stdio_transport.aclose(), timeout=3)
+            except Exception as e:
+                logger.debug("Best-effort MCP stdio close for '%s': %s", self.name, e)
+        if stack is not None:
+            try:
+                await asyncio.wait_for(stack.aclose(), timeout=3)
+            except Exception as e:
+                logger.debug("Best-effort MCP close for '%s': %s", self.name, e)
 
     @property
     def tools(self) -> list[dict[str, Any]]:
@@ -470,11 +661,13 @@ class MCPRegistry:
 
     async def close_all(self) -> None:
         """Close all connections."""
-        for server in self._servers:
+        async def _close_server(server: MCPTools) -> None:
             try:
                 await server.close()
             except Exception as e:
                 logger.error(f"Failed to close MCP '{server.name}': {e}")
+
+        await asyncio.gather(*(_close_server(server) for server in self._servers), return_exceptions=True)
         self._tool_map.clear()
 
     def all_tools(self) -> list[dict[str, Any]]:

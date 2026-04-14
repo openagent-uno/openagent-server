@@ -8,6 +8,7 @@ import time
 from typing import TYPE_CHECKING
 
 from croniter import croniter
+from openagent.memory.db import is_one_shot_expression, parse_one_shot_expression
 
 if TYPE_CHECKING:
     from openagent.core.agent import Agent
@@ -33,6 +34,8 @@ class Scheduler:
         self._task: asyncio.Task | None = None
 
     def _next_run(self, cron_expression: str, base: float | None = None) -> float:
+        if is_one_shot_expression(cron_expression):
+            return parse_one_shot_expression(cron_expression)
         try:
             return croniter(cron_expression, base or time.time()).get_next(float)
         except (ValueError, KeyError) as e:
@@ -64,6 +67,10 @@ class Scheduler:
         now = time.time()
         for task in tasks:
             try:
+                if is_one_shot_expression(task["cron_expression"]):
+                    if task.get("last_run"):
+                        await self.db.update_task(task["id"], enabled=0, next_run=None)
+                    continue
                 await self.db.update_task(task["id"], next_run=self._next_run(task["cron_expression"], now))
             except ValueError as e:
                 logger.error(f"Invalid cron for task '{task['name']}': {e}")
@@ -106,11 +113,19 @@ class Scheduler:
 
             # Update last_run and compute next_run
             try:
-                await self.db.update_task(
-                    task["id"],
-                    last_run=now,
-                    next_run=self._next_run(task["cron_expression"], now),
-                )
+                if is_one_shot_expression(task["cron_expression"]):
+                    await self.db.update_task(
+                        task["id"],
+                        last_run=now,
+                        next_run=None,
+                        enabled=0,
+                    )
+                else:
+                    await self.db.update_task(
+                        task["id"],
+                        last_run=now,
+                        next_run=self._next_run(task["cron_expression"], now),
+                    )
             except ValueError as e:
                 logger.error(f"Failed to update next_run for '{task['name']}': {e}")
 

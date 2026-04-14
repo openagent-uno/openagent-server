@@ -28,6 +28,11 @@ from typing import Any
 import aiosqlite
 from croniter import croniter
 from mcp.server.fastmcp import FastMCP
+from openagent.memory.db import (
+    build_one_shot_expression,
+    is_one_shot_expression,
+    parse_one_shot_expression,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +103,11 @@ def _row_to_dict(row: aiosqlite.Row) -> dict[str, Any]:
     d = dict(row)
     # Normalise bool + expose pretty timestamps for the agent's benefit.
     d["enabled"] = bool(d.get("enabled"))
+    d["run_once"] = is_one_shot_expression(d.get("cron_expression"))
+    if d["run_once"]:
+        run_at = parse_one_shot_expression(d["cron_expression"])
+        d["run_at"] = run_at
+        d["run_at_iso"] = _iso(run_at)
     for ts_col in ("last_run", "next_run", "created_at", "updated_at"):
         val = d.get(ts_col)
         if isinstance(val, (int, float)):
@@ -112,6 +122,9 @@ def _iso(epoch: float) -> str:
 
 
 def _validate_cron(expr: str) -> None:
+    if is_one_shot_expression(expr):
+        parse_one_shot_expression(expr)
+        return
     try:
         croniter(expr)
     except (ValueError, KeyError) as e:
@@ -119,6 +132,8 @@ def _validate_cron(expr: str) -> None:
 
 
 def _next_run(expr: str, base: float | None = None) -> float:
+    if is_one_shot_expression(expr):
+        return parse_one_shot_expression(expr)
     return croniter(expr, base or time.time()).get_next(float)
 
 
@@ -196,6 +211,9 @@ async def create_scheduled_task(
     standard 5-field expression (minute hour day month weekday), e.g.
     '0 9 * * *' for every day at 09:00 server time. Use the
     describe_cron tool first if you are unsure the expression is valid.
+
+    Use this ONLY for repeating schedules. If the user wants something
+    to happen once, use create_one_shot_task instead.
     """
     if not name or not name.strip():
         raise ValueError("name is required")
@@ -213,6 +231,60 @@ async def create_scheduled_task(
         "(id, name, cron_expression, prompt, enabled, next_run, created_at, updated_at) "
         "VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
         (task_id, name, cron_expression, prompt, nr, now, now),
+    )
+    await conn.commit()
+
+    cursor = await conn.execute(
+        "SELECT * FROM scheduled_tasks WHERE id = ?", (task_id,)
+    )
+    row = await cursor.fetchone()
+    return _row_to_dict(row)  # type: ignore[arg-type]
+
+
+@mcp.tool()
+async def create_one_shot_task(
+    name: str,
+    prompt: str,
+    delay_seconds: int | None = None,
+    run_at_iso: str | None = None,
+) -> dict[str, Any]:
+    """Create a task that runs exactly once.
+
+    Prefer this when the user says things like "once", "one time",
+    "in 10 minutes", or gives a specific future timestamp.
+
+    Pass exactly one of:
+      - delay_seconds: seconds from now
+      - run_at_iso: absolute local timestamp like 2026-04-14T09:30:00
+    """
+    if not name or not name.strip():
+        raise ValueError("name is required")
+    if not prompt or not prompt.strip():
+        raise ValueError("prompt is required")
+    if (delay_seconds is None) == (run_at_iso is None):
+        raise ValueError("Pass exactly one of delay_seconds or run_at_iso")
+
+    now = time.time()
+    if delay_seconds is not None:
+        run_at = now + max(1, int(delay_seconds))
+    else:
+        import datetime as _dt
+
+        try:
+            run_at = _dt.datetime.fromisoformat(str(run_at_iso)).timestamp()
+        except ValueError as exc:
+            raise ValueError(f"Invalid run_at_iso value: {run_at_iso!r}") from exc
+    if run_at <= now:
+        raise ValueError("One-shot task must be scheduled in the future")
+
+    conn = await _get_conn()
+    task_id = str(uuid.uuid4())
+    cron_expression = build_one_shot_expression(run_at)
+    await conn.execute(
+        "INSERT INTO scheduled_tasks "
+        "(id, name, cron_expression, prompt, enabled, next_run, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
+        (task_id, name, cron_expression, prompt, run_at, now, now),
     )
     await conn.commit()
 

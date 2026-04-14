@@ -122,6 +122,7 @@ def serve(ctx, agent_dir: str | None, channel: tuple[str, ...]):
 
     async def _serve():
         restart_code = 0
+        served = False
         try:
             async with server:
                 active: list[str] = []
@@ -136,6 +137,7 @@ def serve(ctx, agent_dir: str | None, channel: tuple[str, ...]):
                     console.print("[yellow]Nothing to serve. Configure channels or the scheduler.[/yellow]")
                     return
 
+                served = True
                 console.print(Panel(f"[bold]Serving[/bold]: {', '.join(active)}", border_style="green"))
                 await server.wait()
                 console.print("\nShutting down...")
@@ -145,10 +147,11 @@ def serve(ctx, agent_dir: str | None, channel: tuple[str, ...]):
             if not restart_code:
                 raise
 
-        if restart_code:
-            console.print(f"[bold]Restarting (exit code {restart_code})...[/bold]")
+        if served:
             import os as _os
 
+            if restart_code:
+                console.print(f"[bold]Restarting (exit code {restart_code})...[/bold]")
             _os._exit(restart_code)
 
     asyncio.run(_serve())

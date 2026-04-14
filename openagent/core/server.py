@@ -260,7 +260,7 @@ class AgentServer:
                 bridge.start(), name=f"bridge:{bridge.name}"
             ))
 
-    async def stop(self, timeout: float = 30) -> None:
+    async def stop(self, timeout: float = 5) -> None:
         """Stop bridges, gateway, scheduler, agent (in reverse).
 
         Each phase gets up to *timeout* seconds.  If the agent shutdown
@@ -306,11 +306,10 @@ class AgentServer:
         #    exit.  The MCP SDK uses anyio cancel scopes which can leak
         #    CancelledError into our asyncio tasks, so we catch broadly.
         try:
-            await asyncio.wait_for(self.agent.shutdown(), timeout=timeout)
+            shutdown_task = asyncio.create_task(self.agent.shutdown(), name="agent-shutdown")
+            await asyncio.wait_for(asyncio.shield(shutdown_task), timeout=timeout)
         except (asyncio.TimeoutError, asyncio.CancelledError):
-            logger.warning(
-                "Agent shutdown did not complete cleanly within %ds", timeout,
-            )
+            logger.debug("Agent shutdown still in progress after %ss; exiting best-effort", timeout)
         except Exception as e:
             logger.warning("Agent shutdown error: %s", e)
 
