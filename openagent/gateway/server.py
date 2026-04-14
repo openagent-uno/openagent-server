@@ -236,6 +236,7 @@ class Gateway:
         or OpenAI Whisper and the text is returned in `transcription`.
         """
         from aiohttp import web
+        import os
         import tempfile
 
         reader = await request.multipart()
@@ -254,6 +255,15 @@ class Gateway:
                     break
                 f.write(chunk)
 
+        # On macOS ``tempfile.mkdtemp()`` returns a path under
+        # ``/var/folders/...`` — a symlink to ``/private/var/folders/...``.
+        # The reference ``@modelcontextprotocol/server-filesystem`` compares
+        # tool-call paths to its allowlist by string-prefix against
+        # realpaths, so a caller who hands the logical ``/var/folders/...``
+        # path to ``read_text_file`` gets "Access denied — path outside
+        # allowed directories" even though the realpath IS allowed. Resolve
+        # here so the returned path matches what filesystem MCP will accept.
+        path = os.path.realpath(path)
         result: dict = {"path": path, "filename": filename}
 
         # Auto-transcribe audio files

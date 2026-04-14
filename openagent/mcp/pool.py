@@ -51,6 +51,14 @@ _MESSAGING_TOKEN_ENV_VARS = (
     "GREEN_API_TOKEN",
 )
 
+# Per-MCP-call timeout. Agno's MCPTools defaults to 10s, which is too tight
+# for cold-start tool calls against npx-launched servers like the reference
+# ``@modelcontextprotocol/server-filesystem`` — the first ``read_text_file``
+# after a fresh spawn routinely takes 5-15s while npm resolves the command.
+# Bumping to 30s gives those calls enough headroom without masking genuine
+# hangs.
+_MCP_TIMEOUT_SECONDS = 30
+
 
 def _safe_prefix(name: str) -> str:
     """Coerce a server name into a valid Python identifier prefix.
@@ -318,6 +326,7 @@ class MCPPool:
                     server_params=params,
                     transport="stdio",
                     tool_name_prefix=_safe_prefix(spec.name),
+                    timeout_seconds=_MCP_TIMEOUT_SECONDS,
                 )
             elif spec.url:
                 # Streamable HTTP is Agno's default for URL-based servers.
@@ -325,6 +334,7 @@ class MCPPool:
                     url=spec.url,
                     transport="streamable-http",
                     tool_name_prefix=_safe_prefix(spec.name),
+                    timeout_seconds=_MCP_TIMEOUT_SECONDS,
                 )
             else:
                 logger.warning("MCP spec '%s' has neither command nor url — skipping", spec.name)
