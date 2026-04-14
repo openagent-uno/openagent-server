@@ -109,6 +109,16 @@ jobs:
           done
       - name: Build executable
         run: pyinstaller openagent.spec --clean --noconfirm
+      - name: Sign + notarize macOS binary
+        if: runner.os == 'macOS'
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        shell: bash
+        run: bash scripts/sign-notarize-macos.sh dist/openagent
       - name: Package (Unix)
         if: runner.os != 'Windows'
         shell: bash
@@ -162,6 +172,16 @@ jobs:
         run: pip install -e . pyinstaller
       - name: Build CLI executable
         run: pyinstaller cli.spec --clean --noconfirm
+      - name: Sign + notarize macOS CLI binary
+        if: runner.os == 'macOS'
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        shell: bash
+        run: bash scripts/sign-notarize-macos.sh dist/openagent-cli
       - name: Package (Unix)
         if: runner.os != 'Windows'
         shell: bash
