@@ -286,8 +286,14 @@ class AgnoProvider(BaseModel):
         self._agno_agents[cache_key] = agent
         return agent
 
-    def _flatten_messages(self, messages: list[dict[str, Any]]) -> str:
+    def _flatten_messages(
+        self,
+        messages: list[dict[str, Any]],
+        system: str | None = None,
+    ) -> str:
         parts: list[str] = []
+        if system:
+            parts.append(f"[System Instructions]\n{system.strip()}")
         for msg in messages:
             role = msg.get("role", "user")
             content = str(msg.get("content", "") or "")
@@ -319,7 +325,7 @@ class AgnoProvider(BaseModel):
         on_status: Callable[[str], Awaitable[None]] | None = None,
         session_id: str | None = None,
     ) -> ModelResponse:
-        prompt = self._flatten_messages(messages)
+        prompt = self._flatten_messages(messages, system=system)
         sid = session_id or "default"
         agent = self._ensure_agent(tools)
         elog(
@@ -337,8 +343,6 @@ class AgnoProvider(BaseModel):
                 pass
 
         try:
-            response = await agent.arun(prompt, session_id=sid, system_message=system)
-        except TypeError:
             response = await agent.arun(prompt, session_id=sid)
         except Exception as e:
             elog("agno.error", model=self.model, session_id=sid, error=str(e))

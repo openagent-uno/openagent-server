@@ -24,6 +24,21 @@ Classify this task as simple, medium, or hard.
 Reply with ONLY one word: simple, medium, or hard."""
 
 TIERS = ("simple", "medium", "hard")
+HARD_HINTS = (
+    "powerful model",
+    "strong model",
+    "stronger model",
+    "best model",
+    "top model",
+    "most capable model",
+    "use a powerful model",
+    "use the best model",
+    "use the strongest model",
+    "modello potente",
+    "modello forte",
+    "modello migliore",
+    "modello più potente",
+)
 
 
 class SmartRouter(BaseModel):
@@ -157,6 +172,11 @@ class SmartRouter(BaseModel):
             elog("router.classify_default", session_id=session_id, tier="medium", reason="empty_user_message")
             return "medium"
 
+        lowered = user_msg.lower()
+        if any(hint in lowered for hint in HARD_HINTS):
+            elog("router.classify_hint", session_id=session_id, tier="hard", reason="explicit_capability_request")
+            return "hard"
+
         try:
             elog(
                 "router.classify_start",
@@ -166,9 +186,13 @@ class SmartRouter(BaseModel):
             )
             provider = self._get_provider(self._classifier_model)
             classifier_session_id = f"{session_id}:classifier" if session_id else "router-classifier"
+            classifier_input = (
+                f"{CLASSIFIER_PROMPT}\n\n"
+                f"Task to classify:\n{user_msg}\n\n"
+                "Answer:"
+            )
             resp = await provider.generate(
-                messages=[{"role": "user", "content": user_msg}],
-                system=CLASSIFIER_PROMPT,
+                messages=[{"role": "user", "content": classifier_input}],
                 session_id=classifier_session_id,
             )
             text = resp.content.strip().lower()
