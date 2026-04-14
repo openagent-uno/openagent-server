@@ -16,6 +16,7 @@ import hashlib
 import logging
 import platform
 import shutil
+import subprocess
 import tarfile
 import tempfile
 import zipfile
@@ -38,7 +39,13 @@ class UpdateInfo(NamedTuple):
 
 
 def _asset_suffix() -> str:
-    """Return the expected archive suffix for this platform/arch."""
+    """Return the expected archive suffix for this platform/arch.
+
+    - macOS → .pkg (signed + notarized + stapled; we extract the binary
+      out of it with ``pkgutil --expand-full`` — no sudo needed)
+    - Linux → .tar.gz
+    - Windows → .zip
+    """
     system = platform.system().lower()
     machine = platform.machine().lower()
 
@@ -58,7 +65,12 @@ def _asset_suffix() -> str:
     else:
         arch = machine
 
-    ext = "zip" if os_name == "windows" else "tar.gz"
+    if os_name == "macos":
+        ext = "pkg"
+    elif os_name == "windows":
+        ext = "zip"
+    else:
+        ext = "tar.gz"
     return f"{os_name}-{arch}.{ext}"
 
 
@@ -152,20 +164,28 @@ def download_update(url: str, checksum_url: str | None = None) -> Path:
     extract_dir = tmp_dir / "extracted"
     extract_dir.mkdir()
 
-    if str(archive_path).endswith(".zip") or url.endswith(".zip"):
+    lower = str(archive_path).lower() + " " + url.lower()
+    if ".pkg" in lower:
+        # macOS distribution. ``pkgutil --expand-full`` unpacks the xar +
+        # Payload tree into a directory — no sudo needed. The binary we
+        # want sits at <expanded>/<component>.pkg/Payload/<install-path>/<name>.
+        subprocess.run(
+            ["pkgutil", "--expand-full", str(archive_path), str(extract_dir / "pkg")],
+            check=True,
+        )
+    elif ".zip" in lower:
         with zipfile.ZipFile(archive_path) as zf:
             zf.extractall(extract_dir)
     else:
         with tarfile.open(archive_path) as tf:
             tf.extractall(extract_dir)
 
-    # Find the new binary. onefile archives contain a single executable
-    # (``openagent`` on macOS/Linux, ``openagent.exe`` on Windows) — larger
-    # than ~10 MB, never inside a nested directory. If an older onedir
-    # archive is encountered (pre-v0.5.2), fall back to the bundled binary.
+    # Find the new binary. One executable per archive — pick the biggest
+    # file named ``openagent*`` (the PyInstaller onefile binary is tens
+    # of megabytes; pkg metadata files are all small).
     candidates = sorted(
         (p for p in extract_dir.rglob("openagent*")
-         if p.is_file() and not p.name.endswith(".sha256")),
+         if p.is_file() and not p.name.endswith(".sha256") and not p.suffix == ".plist"),
         key=lambda p: p.stat().st_size,
         reverse=True,
     )

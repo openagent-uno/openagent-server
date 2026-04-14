@@ -109,33 +109,50 @@ jobs:
           done
       - name: Build executable
         run: pyinstaller openagent.spec --clean --noconfirm
-      - name: Sign + notarize macOS binary
+      - name: Sign + notarize macOS binary (+ build stapled .pkg)
         if: runner.os == 'macOS'
         env:
           CSC_LINK: ${{ secrets.CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          CSC_LINK_INSTALLER: ${{ secrets.CSC_LINK_INSTALLER }}
+          CSC_KEY_PASSWORD_INSTALLER: ${{ secrets.CSC_KEY_PASSWORD_INSTALLER }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         shell: bash
-        run: bash scripts/sign-notarize-macos.sh dist/openagent
-      - name: Package (Unix)
-        if: runner.os != 'Windows'
-        shell: bash
-        # PyInstaller onefile mode writes a single binary to ``dist/openagent``.
-        # We tar just the binary (no folder wrapping) so the archive extracts to
-        # one executable file — no ``_internal/`` sibling directory, nothing for
-        # the user to explore. ``tar -C dist openagent`` is the idiomatic way
-        # to include a single file without its parent-directory prefix.
+        # Produce BOTH a signed/notarized bare binary (for the tar.gz
+        # that install.sh streams) AND a signed+notarized+stapled .pkg
+        # (for Finder double-click users who'd otherwise hit Gatekeeper).
         run: |
           VERSION=$(python -c "import openagent; print(openagent.__version__)")
-          OS_NAME=$(echo "$RUNNER_OS" | tr '[:upper:]' '[:lower:]')
-          ARCH=$(uname -m)
-          case "$ARCH" in x86_64) ARCH=x64;; aarch64|arm64) ARCH=arm64;; esac
+          ARCH=$(uname -m); case "$ARCH" in x86_64) ARCH=x64;; aarch64|arm64) ARCH=arm64;; esac
+          bash scripts/sign-notarize-macos.sh \
+            dist/openagent \
+            com.openagent.server \
+            /usr/local/bin \
+            "dist/openagent-${VERSION}-macos-${ARCH}.pkg"
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        # On macOS we ship ONLY the stapled .pkg (built in the Sign step).
+        # The bare tar.gz would be redundant on macOS and its only purpose
+        # was working around the very Gatekeeper dialog the .pkg fixes.
+        # Linux still gets the tar.gz — no signing infrastructure required.
+        run: |
+          VERSION=$(python -c "import openagent; print(openagent.__version__)")
+          ARCH=$(uname -m); case "$ARCH" in x86_64) ARCH=x64;; aarch64|arm64) ARCH=arm64;; esac
           chmod +x dist/openagent
-          ARCHIVE="openagent-${VERSION}-${OS_NAME}-${ARCH}.tar.gz"
+          ARCHIVE="openagent-${VERSION}-linux-${ARCH}.tar.gz"
           tar czf "dist/$ARCHIVE" -C dist openagent
           (cd dist && shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256")
+      - name: Checksum macOS .pkg
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          VERSION=$(python -c "import openagent; print(openagent.__version__)")
+          ARCH=$(uname -m); case "$ARCH" in x86_64) ARCH=x64;; aarch64|arm64) ARCH=arm64;; esac
+          PKG="openagent-${VERSION}-macos-${ARCH}.pkg"
+          (cd dist && shasum -a 256 "$PKG" > "${PKG}.sha256")
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -151,6 +168,7 @@ jobs:
             dist/openagent-*.tar.gz
             dist/openagent-*.zip
             dist/openagent-*.sha256
+            dist/openagent-*.pkg
 
   # ── openagent-cli standalone executable (macOS, Linux, Windows) ──
   cli:
@@ -172,28 +190,43 @@ jobs:
         run: pip install -e . pyinstaller
       - name: Build CLI executable
         run: pyinstaller cli.spec --clean --noconfirm
-      - name: Sign + notarize macOS CLI binary
+      - name: Sign + notarize macOS CLI binary (+ build stapled .pkg)
         if: runner.os == 'macOS'
         env:
           CSC_LINK: ${{ secrets.CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          CSC_LINK_INSTALLER: ${{ secrets.CSC_LINK_INSTALLER }}
+          CSC_KEY_PASSWORD_INSTALLER: ${{ secrets.CSC_KEY_PASSWORD_INSTALLER }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         shell: bash
-        run: bash scripts/sign-notarize-macos.sh dist/openagent-cli
-      - name: Package (Unix)
-        if: runner.os != 'Windows'
+        run: |
+          VERSION=$(python -c "import openagent_cli; print(openagent_cli.__version__)")
+          ARCH=$(uname -m); case "$ARCH" in x86_64) ARCH=x64;; aarch64|arm64) ARCH=arm64;; esac
+          bash scripts/sign-notarize-macos.sh \
+            dist/openagent-cli \
+            com.openagent.cli \
+            /usr/local/bin \
+            "dist/openagent-cli-${VERSION}-macos-${ARCH}.pkg"
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           VERSION=$(python -c "import openagent_cli; print(openagent_cli.__version__)")
-          OS_NAME=$(echo "$RUNNER_OS" | tr '[:upper:]' '[:lower:]')
-          ARCH=$(uname -m)
-          case "$ARCH" in x86_64) ARCH=x64;; aarch64|arm64) ARCH=arm64;; esac
+          ARCH=$(uname -m); case "$ARCH" in x86_64) ARCH=x64;; aarch64|arm64) ARCH=arm64;; esac
           chmod +x dist/openagent-cli
-          ARCHIVE="openagent-cli-${VERSION}-${OS_NAME}-${ARCH}.tar.gz"
+          ARCHIVE="openagent-cli-${VERSION}-linux-${ARCH}.tar.gz"
           tar czf "dist/$ARCHIVE" -C dist openagent-cli
           (cd dist && shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256")
+      - name: Checksum macOS .pkg
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          VERSION=$(python -c "import openagent_cli; print(openagent_cli.__version__)")
+          ARCH=$(uname -m); case "$ARCH" in x86_64) ARCH=x64;; aarch64|arm64) ARCH=arm64;; esac
+          PKG="openagent-cli-${VERSION}-macos-${ARCH}.pkg"
+          (cd dist && shasum -a 256 "$PKG" > "${PKG}.sha256")
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -209,6 +242,7 @@ jobs:
             dist/openagent-cli-*.tar.gz
             dist/openagent-cli-*.zip
             dist/openagent-cli-*.sha256
+            dist/openagent-cli-*.pkg
 
   # ── GitHub Release with all artifacts ──
   release:
@@ -233,6 +267,7 @@ jobs:
             artifacts/**/*.exe
             artifacts/**/*.AppImage
             artifacts/**/*.deb
+            artifacts/**/*.pkg
             artifacts/**/*.yml
             artifacts/**/*.yaml
           generate_release_notes: true
