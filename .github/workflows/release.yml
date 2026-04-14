@@ -10,46 +10,6 @@ permissions:
   id-token: write
 
 jobs:
-  # ── openagent-framework → PyPI ──
-  framework:
-    runs-on: ubuntu-latest
-    environment: release
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Build
-        run: pip install build && python -m build
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
-      - uses: actions/upload-artifact@v4
-        with:
-          name: framework-dist
-          path: dist/*
-
-  # ── openagent-cli → build only (PyPI publish when project exists) ──
-  cli:
-    runs-on: ubuntu-latest
-    environment: release
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Build CLI
-        working-directory: cli
-        run: pip install build && python -m build
-      - name: Publish CLI to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: cli/dist/
-        continue-on-error: true  # first publish needs PyPI project setup
-      - uses: actions/upload-artifact@v4
-        with:
-          name: cli-dist
-          path: cli/dist/*
-
   # ── Desktop app → GitHub Release (macOS, Windows, Linux) ──
   desktop:
     strategy:
@@ -118,18 +78,15 @@ jobs:
             app/desktop/release/*.yml
             app/desktop/release/*.yaml
 
-  # ── Standalone executable (macOS, Linux, Windows) ──
+  # ── openagent server standalone executable (macOS, Linux, Windows) ──
   executable:
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: macos-latest
-            archive_ext: tar.gz
           - os: ubuntu-latest
-            archive_ext: tar.gz
           - os: windows-latest
-            archive_ext: zip
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -161,7 +118,6 @@ jobs:
           OS_NAME=$(echo "$RUNNER_OS" | tr '[:upper:]' '[:lower:]')
           ARCH=$(uname -m)
           case "$ARCH" in x86_64) ARCH=x64;; aarch64|arm64) ARCH=arm64;; esac
-          case "$OS_NAME" in macos) ;; linux) ;; *) ;; esac
           ARCHIVE="openagent-${VERSION}-${OS_NAME}-${ARCH}.tar.gz"
           tar czf "$ARCHIVE" openagent/
           shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
@@ -182,10 +138,59 @@ jobs:
             dist/openagent-*.zip
             dist/openagent-*.sha256
 
+  # ── openagent-cli standalone executable (macOS, Linux, Windows) ──
+  cli:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+          - os: ubuntu-latest
+          - os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install CLI deps + PyInstaller
+        working-directory: cli
+        run: pip install -e . pyinstaller
+      - name: Build CLI executable
+        run: pyinstaller cli.spec --clean --noconfirm
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cd dist
+          VERSION=$(python -c "import openagent_cli; print(openagent_cli.__version__)")
+          OS_NAME=$(echo "$RUNNER_OS" | tr '[:upper:]' '[:lower:]')
+          ARCH=$(uname -m)
+          case "$ARCH" in x86_64) ARCH=x64;; aarch64|arm64) ARCH=arm64;; esac
+          ARCHIVE="openagent-cli-${VERSION}-${OS_NAME}-${ARCH}.tar.gz"
+          tar czf "$ARCHIVE" openagent-cli/
+          shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cd dist
+          $version = python -c "import openagent_cli; print(openagent_cli.__version__)"
+          $archive = "openagent-cli-${version}-windows-x64.zip"
+          Compress-Archive -Path openagent-cli -DestinationPath $archive
+          (Get-FileHash -Algorithm SHA256 $archive).Hash + "  " + $archive | Out-File "${archive}.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.os }}
+          path: |
+            dist/openagent-cli-*.tar.gz
+            dist/openagent-cli-*.zip
+            dist/openagent-cli-*.sha256
+
   # ── GitHub Release with all artifacts ──
   release:
-    needs: [framework, cli, desktop, executable]
-    if: always() && needs.framework.result == 'success' && needs.executable.result != 'failure'
+    needs: [desktop, executable, cli]
+    if: always() && needs.executable.result == 'success' && needs.cli.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -198,14 +203,13 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            artifacts/**/*.whl
             artifacts/**/*.tar.gz
-            artifacts/**/*.dmg
             artifacts/**/*.zip
+            artifacts/**/*.sha256
+            artifacts/**/*.dmg
             artifacts/**/*.exe
             artifacts/**/*.AppImage
             artifacts/**/*.deb
-            artifacts/**/*.sha256
             artifacts/**/*.yml
             artifacts/**/*.yaml
           generate_release_notes: true
