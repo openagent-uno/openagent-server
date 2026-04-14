@@ -118,9 +118,12 @@ def check_for_update() -> UpdateInfo | None:
 
 
 def download_update(url: str, checksum_url: str | None = None) -> Path:
-    """Download the update archive and verify its checksum.
+    """Download and verify the update archive. Returns the path to the new
+    executable file (onefile format — a single binary, not a directory).
 
-    Returns the path to the extracted directory containing the new executable.
+    Since v0.5.2 the release archives contain ONE executable each:
+        openagent-<ver>-<platform>-<arch>.tar.gz → openagent (or .exe)
+    We pick that one file out of the archive and return its path.
     """
     tmp_dir = Path(tempfile.mkdtemp(prefix="openagent_update_"))
     archive_path = tmp_dir / "update_archive"
@@ -146,7 +149,6 @@ def download_update(url: str, checksum_url: str | None = None) -> Path:
         except Exception as e:
             logger.warning("Could not verify checksum: %s", e)
 
-    # Extract
     extract_dir = tmp_dir / "extracted"
     extract_dir.mkdir()
 
@@ -157,63 +159,51 @@ def download_update(url: str, checksum_url: str | None = None) -> Path:
         with tarfile.open(archive_path) as tf:
             tf.extractall(extract_dir)
 
-    # Find the openagent executable in the extracted directory
-    for candidate in extract_dir.rglob("openagent*"):
-        if candidate.is_file() and candidate.stat().st_size > 1_000_000:
-            return candidate.parent
+    # Find the new binary. onefile archives contain a single executable
+    # (``openagent`` on macOS/Linux, ``openagent.exe`` on Windows) — larger
+    # than ~10 MB, never inside a nested directory. If an older onedir
+    # archive is encountered (pre-v0.5.2), fall back to the bundled binary.
+    candidates = sorted(
+        (p for p in extract_dir.rglob("openagent*")
+         if p.is_file() and not p.name.endswith(".sha256")),
+        key=lambda p: p.stat().st_size,
+        reverse=True,
+    )
+    if candidates:
+        return candidates[0]
+    raise RuntimeError("Could not locate executable in downloaded archive")
 
-    # Fallback: look for the openagent/ directory
-    openagent_dir = extract_dir / "openagent"
-    if openagent_dir.is_dir():
-        return openagent_dir
 
-    return extract_dir
+def apply_update(new_exe: Path) -> None:
+    """Replace the running executable with the new onefile binary.
 
-
-def apply_update(new_dir: Path) -> None:
-    """Replace the running executable with the new version.
-
-    - macOS/Linux: rename current to .old, copy new into place
-    - Windows: save as .pending.exe (applied at next startup)
+    - macOS/Linux: rename current → .old, move new into place, chmod +x
+    - Windows: save as ``<name>.pending.exe`` next to the current binary;
+      the startup hook (see ``_frozen.swap_pending_if_any``) promotes it on
+      the next launch since a running .exe can't be overwritten on Windows.
     """
     from openagent._frozen import executable_path
 
     current_exe = executable_path()
-    current_dir = current_exe.parent
     system = platform.system()
 
     if system == "Windows":
-        # Can't replace a running .exe on Windows.
-        # Copy the new directory alongside and mark for swap at startup.
-        pending_dir = current_dir.parent / (current_dir.name + ".pending")
-        if pending_dir.exists():
-            shutil.rmtree(pending_dir)
-        shutil.copytree(str(new_dir), str(pending_dir))
-
-        # Create a marker so startup knows to swap
-        pending_exe = current_dir / (current_exe.stem + ".pending.exe")
-        # Copy just the main executable as the marker
-        new_exe = new_dir / current_exe.name
-        if new_exe.exists():
-            shutil.copy2(str(new_exe), str(pending_exe))
-        logger.info("Update staged at %s (will apply on next restart)", pending_dir)
+        pending = current_exe.with_name(current_exe.stem + ".pending.exe")
+        if pending.exists():
+            pending.unlink()
+        shutil.copy2(str(new_exe), str(pending))
+        logger.info("Update staged at %s (will apply on next restart)", pending)
     else:
-        # macOS/Linux: rename current dir to .old, move new into place
-        old_dir = current_dir.parent / (current_dir.name + ".old")
-        if old_dir.exists():
-            shutil.rmtree(old_dir)
-
-        # Rename current to .old (running process keeps file descriptors)
-        current_dir.rename(old_dir)
-
-        # Move new into place
-        shutil.copytree(str(new_dir), str(current_dir))
-        # Ensure executable permission
-        new_exe = current_dir / current_exe.name
-        if new_exe.exists():
-            new_exe.chmod(0o755)
-
-        logger.info("Update applied. Old version at %s", old_dir)
+        # Rename the running binary to .old — the OS keeps the file open for
+        # the live process, and the new file is installed in its place so
+        # the next launch picks up the upgrade.
+        old = current_exe.with_suffix(current_exe.suffix + ".old")
+        if old.exists():
+            old.unlink()
+        current_exe.rename(old)
+        shutil.copy2(str(new_exe), str(current_exe))
+        current_exe.chmod(0o755)
+        logger.info("Update applied. Old version at %s", old)
 
 
 def perform_self_update_sync() -> tuple[str, str]:
@@ -232,7 +222,7 @@ def perform_self_update_sync() -> tuple[str, str]:
         "Update available: %s → %s", info.current_version, info.new_version
     )
 
-    new_dir = download_update(info.download_url, info.checksum_url)
-    apply_update(new_dir)
+    new_exe = download_update(info.download_url, info.checksum_url)
+    apply_update(new_exe)
 
     return info.current_version, info.new_version

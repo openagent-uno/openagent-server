@@ -10,7 +10,14 @@ MCPs in openagent/mcp/servers/ have been built first (npm install + npm run
 build for each), then:
     pyinstaller openagent.spec --clean --noconfirm
 
-Output: dist/openagent/ (onedir bundle)
+Output: dist/openagent (single-file binary).
+
+onefile mode is intentional: shipping a single ``openagent`` binary keeps
+the downloads UX trivial ("drag it onto your PATH and run") and hides the
+``_internal/`` directory PyInstaller normally exposes in onedir mode.
+First launch pays a one-time cost (~5-10s) while the bundled archive
+extracts into the OS temp dir (``$TMPDIR/_MEI_xxxxx``). Subsequent runs
+reuse that cache and start in under a second.
 """
 
 import sys
@@ -107,31 +114,28 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
+# onefile mode: every binary/data file gets packed INTO the executable
+# (not emitted alongside it), so the user downloads ONE self-contained
+# file. Dropping COLLECT removes the "dist/openagent/ + _internal/" folder
+# structure. PyInstaller writes directly to ``dist/openagent``.
 exe = EXE(
     pyz,
     a.scripts,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
     [],
-    exclude_binaries=True,
     name="openagent",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
+    upx_exclude=[],
+    runtime_tmpdir=None,
     console=True,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-)
-
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    strip=False,
-    upx=True,
-    upx_exclude=[],
-    name="openagent",
 )
