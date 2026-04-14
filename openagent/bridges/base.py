@@ -122,6 +122,14 @@ class BaseBridge:
             self._session_locks[session_id] = asyncio.Lock()
         return self._session_locks[session_id]
 
+    @staticmethod
+    def append_model_feedback(text: str, model: str | None) -> str:
+        """Append a compact model footer to a response body."""
+        if not model:
+            return text
+        footer = f"Model: {model}"
+        return f"{text}\n\n{footer}" if text else footer
+
     async def _connect_gateway(self) -> None:
         """Connect to the Gateway WebSocket and authenticate."""
         import aiohttp

@@ -164,6 +164,7 @@ class DiscordBridge(BaseBridge):
 
             resp_text = response.get("text", "")
             clean, attachments = parse_response_markers(resp_text)
+            clean = self.append_model_feedback(clean, response.get("model"))
 
             # Send file attachments
             import discord as _dc

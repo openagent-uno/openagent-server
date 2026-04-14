@@ -426,6 +426,7 @@ class SmartRouter(BaseModel):
                 session_id=session_id,
             )
 
+        resp.model = active_model_id
         return resp
 
     async def stream(

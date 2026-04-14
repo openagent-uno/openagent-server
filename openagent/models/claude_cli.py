@@ -239,7 +239,7 @@ class ClaudeCLI(BaseModel):
             try:
                 client = await self._get_client(sid, system)
                 result = await self._run_once(client, prompt, sid, on_status)
-                return ModelResponse(content=result)
+                return ModelResponse(content=result, model=f"claude-cli:{self.model}" if self.model else "claude-cli")
             except Exception as e:
                 logger.error("Session %s error (attempt %d): %s", sid[-8:], attempt + 1, e)
                 # Drop the broken client — next attempt creates a fresh one
@@ -257,9 +257,14 @@ class ClaudeCLI(BaseModel):
                     if isinstance(e, TimeoutError)
                     else f"Error: {e}",
                     stop_reason=stop_reason,
+                    model=f"claude-cli:{self.model}" if self.model else "claude-cli",
                 )
         elog("model.generate_error", session_id=sid, attempt=2, error="max retries exceeded", stop_reason="error")
-        return ModelResponse(content="Error: max retries exceeded", stop_reason="error")
+        return ModelResponse(
+            content="Error: max retries exceeded",
+            stop_reason="error",
+            model=f"claude-cli:{self.model}" if self.model else "claude-cli",
+        )
 
     async def stream(
         self,

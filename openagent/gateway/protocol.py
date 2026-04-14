@@ -15,7 +15,7 @@ Server → Client::
     {"type": "auth_ok",        "agent_name": "...", "version": "..."}
     {"type": "auth_error",     "reason": "..."}
     {"type": "status",         "text": "...",  "session_id": "..."}
-    {"type": "response",       "text": "...",  "session_id": "...", "attachments": [...]}
+    {"type": "response",       "text": "...",  "session_id": "...", "attachments": [...], "model": "..."}
     {"type": "error",          "text": "..."}
     {"type": "queued",         "position": N}
     {"type": "command_result", "text": "..."}

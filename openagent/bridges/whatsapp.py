@@ -152,6 +152,7 @@ class WhatsAppBridge(BaseBridge):
 
         resp_text = response.get("text", "")
         clean, attachments = parse_response_markers(resp_text)
+        clean = self.append_model_feedback(clean, response.get("model"))
 
         for att in attachments:
             try:

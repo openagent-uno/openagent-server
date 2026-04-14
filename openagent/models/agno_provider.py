@@ -355,4 +355,5 @@ class AgnoProvider(BaseModel):
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             stop_reason=stop_reason or "stop",
+            model=self.model,
         )

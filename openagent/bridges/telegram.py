@@ -208,7 +208,7 @@ class TelegramBridge(BaseBridge):
             except Exception:
                 pass
 
-        await self._send_response(msg, response.get("text", ""))
+        await self._send_response(msg, response.get("text", ""), response.get("model"))
 
     # ── Sending ──
 
@@ -223,7 +223,7 @@ class TelegramBridge(BaseBridge):
                 except Exception:
                     pass
 
-    async def _send_response(self, msg, response):
+    async def _send_response(self, msg, response, model: str | None = None):
         clean, attachments = parse_response_markers(response)
         for att in attachments:
             try:
@@ -241,5 +241,5 @@ class TelegramBridge(BaseBridge):
                         await msg.reply_document(document=f, filename=att.filename)
             except Exception as e:
                 logger.error("Attachment send error: %s", e)
-        if clean:
-            await self._reply_rich(msg, clean)
+        if clean or model:
+            await self._reply_rich(msg, self.append_model_feedback(clean, model))

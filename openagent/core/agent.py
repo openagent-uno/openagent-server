@@ -77,6 +77,21 @@ class Agent:
         self._initialized = False
         self._idle_cleanup_task: asyncio.Task | None = None
         self._runtime_models: list[BaseModel] = []
+        self._last_response_meta: dict[str, dict[str, Any]] = {}
+
+    @staticmethod
+    def _response_meta_key(session_id: str | None) -> str:
+        return session_id or "__default__"
+
+    def _store_response_meta(self, session_id: str | None, response: ModelResponse | None) -> None:
+        key = self._response_meta_key(session_id)
+        if response is None or not response.model:
+            self._last_response_meta.pop(key, None)
+            return
+        self._last_response_meta[key] = {"model": response.model}
+
+    def last_response_meta(self, session_id: str | None) -> dict[str, Any]:
+        return dict(self._last_response_meta.get(self._response_meta_key(session_id), {}))
 
     def _register_runtime_model(self, model: BaseModel | None) -> None:
         """Track every model instance that may need lifecycle management."""
@@ -265,6 +280,7 @@ class Agent:
                     pass
 
         try:
+            self._store_response_meta(session_id, None)
             elog(
                 "agent.run.start",
                 agent=self.name,
@@ -395,6 +411,7 @@ class Agent:
                 if iteration < MAX_TOOL_ITERATIONS - 1:
                     await _status("Thinking...")
             else:
+                self._store_response_meta(session_id, response)
                 elog(
                     "agent.run.done",
                     agent=self.name,
@@ -413,6 +430,7 @@ class Agent:
             tool_calls=tool_calls_total,
             response_len=len(response.content or "") if response else 0,
         )
+        self._store_response_meta(session_id, response)
         return response.content if response else "I wasn't able to complete the request."
 
     def _combined_system_prompt(self) -> str:

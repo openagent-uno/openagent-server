@@ -472,6 +472,7 @@ class Gateway:
             from openagent.channels.base import parse_response_markers
             clean, attachments = parse_response_markers(response)
             att_list = [{"type": a.type, "path": a.path, "filename": a.filename} for a in attachments]
+            response_meta = self.agent.last_response_meta(session_id)
 
             elog("message.response", client_id=client_id, session_id=session_id, length=len(clean))
             await ws.send_json({
@@ -479,6 +480,7 @@ class Gateway:
                 "text": clean,
                 "session_id": session_id,
                 "attachments": att_list or None,
+                "model": response_meta.get("model"),
             })
         except Exception as e:
             logger.error("Process error for %s: %s", client_id, e)

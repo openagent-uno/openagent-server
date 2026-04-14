@@ -23,6 +23,7 @@ class ModelResponse:
     input_tokens: int = 0
     output_tokens: int = 0
     stop_reason: str | None = None
+    model: str | None = None
 
 
 class BaseModel(ABC):
