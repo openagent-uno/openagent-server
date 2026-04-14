@@ -1,4 +1,4 @@
-"""Core Agent class: orchestrates model, MCP tools, and memory."""
+"""Core Agent class: orchestrates model, MCP pool, and memory."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from typing import Any, AsyncIterator, Callable, Awaitable
 from openagent.channels.base import build_attachment_context, prepend_context_block
 from openagent.models.base import BaseModel, ModelResponse
 from openagent.memory.db import MemoryDB
-from openagent.mcp.client import MCPRegistry, MCPTools
+from openagent.mcp.pool import MCPPool
 from openagent.core.prompts import FRAMEWORK_SYSTEM_PROMPT
 from openagent.models.runtime import wire_model_runtime
 
@@ -17,32 +17,41 @@ from openagent.core.logging import elog
 
 logger = logging.getLogger(__name__)
 
-MAX_TOOL_ITERATIONS = 10
-
 # Status callback type: async def on_status(status: str) -> None
 StatusCallback = Callable[[str], Awaitable[None]]
 
 
 class Agent:
-    """Main agent class. Ties together a model, MCP tools, and memory.
+    """Main agent class. Ties together a model, MCP pool, and memory.
 
-    OpenAgent owns the MCP topology and the orchestration loop.
-    Chat history can be caller-managed, platform-managed, or provider-managed
-    depending on the active model's ``history_mode``.
+    OpenAgent owns the *product* layer (catalog, pricing, gateway, channels,
+    memory vault, dormant-MCP detection). Tool execution and the per-call
+    tool loop are delegated to the active provider:
+
+      - ``AgnoProvider`` consumes ``MCPPool.agno_toolkits`` (Agno ``MCPTools``
+        instances) and Agno's ``Agent`` runs the loop internally, including
+        proper image-artifact handling for binary tool results.
+      - ``ClaudeCLI`` consumes ``MCPPool.claude_sdk_servers()`` (raw stdio
+        config) and the Claude Agent SDK manages everything itself.
+
+    Either way, ``Agent.run`` is a single ``model.generate`` call — the
+    provider returns the final content after running its own tool loop.
 
     Long-term memory lives in the Obsidian-style vault exposed through MCP.
     The SQLite database is used for runtime state such as scheduler tasks,
     platform-managed chat sessions, and usage tracking.
 
     Usage:
+        pool = MCPPool.from_config(mcp_config=cfg.get("mcp"), ...)
         agent = Agent(
             name="assistant",
             model=AgnoProvider(model="anthropic:claude-sonnet-4-20250514"),
             system_prompt="You are a helpful assistant.",
-            mcp_tools=[MCPTools(command=["npx", "..."])],
+            mcp_pool=pool,
             memory=MemoryDB("agent.db"),
         )
-        response = await agent.run("Hello!", user_id="user-1")
+        async with agent:
+            response = await agent.run("Hello!", user_id="user-1")
     """
 
     def __init__(
@@ -50,21 +59,17 @@ class Agent:
         name: str = "agent",
         model: BaseModel | None = None,
         system_prompt: str = "You are a helpful assistant.",
-        mcp_tools: list[MCPTools] | None = None,
-        mcp_registry: MCPRegistry | None = None,
+        mcp_pool: MCPPool | None = None,
         memory: MemoryDB | str | None = None,
     ):
         self.name = name
         self.model = model
         self.system_prompt = system_prompt
 
-        # MCP
-        if mcp_registry:
-            self._mcp = mcp_registry
-        else:
-            self._mcp = MCPRegistry()
-            for tool in (mcp_tools or []):
-                self._mcp.add(tool)
+        # MCPPool — owns the lifecycle of all MCP servers for the process.
+        # Pass an empty pool if not provided so dormant detection / system
+        # prompt building still work without crashing.
+        self._mcp = mcp_pool if mcp_pool is not None else MCPPool([])
 
         # Runtime DB; the long-term knowledge base still lives in the Obsidian vault via MCP.
         if isinstance(memory, str):
@@ -78,6 +83,12 @@ class Agent:
         self._idle_cleanup_task: asyncio.Task | None = None
         self._runtime_models: list[BaseModel] = []
         self._last_response_meta: dict[str, dict[str, Any]] = {}
+
+        # Per-model in-flight counters + drain events. Keyed by id(model).
+        # Used by swap_model() to hold old models alive until their last
+        # generate() call returns, then shutdown them asynchronously.
+        self._inflight_counts: dict[int, int] = {}
+        self._drain_events: dict[int, asyncio.Event] = {}
 
     @staticmethod
     def _response_meta_key(session_id: str | None) -> str:
@@ -101,16 +112,73 @@ class Agent:
             return
         self._runtime_models.append(model)
 
+    def _unregister_runtime_model(self, model: BaseModel | None) -> None:
+        """Remove *model* from the runtime registry (no-op if absent)."""
+        if model is None:
+            return
+        self._runtime_models = [m for m in self._runtime_models if m is not model]
+
     def _prepare_model_runtime(self, model: BaseModel | None) -> None:
         """Wire shared runtime dependencies into models that support them."""
         if model is None:
             return
         self._register_runtime_model(model)
-        wire_model_runtime(
-            model,
-            mcp_registry=self._mcp,
-            mcp_servers=self._build_mcp_server_configs() or None,
-        )
+        wire_model_runtime(model, db=self._db, mcp_pool=self._mcp)
+
+    def _acquire_model_slot(self, model: BaseModel | None) -> BaseModel | None:
+        """Increment the in-flight counter for *model*. Returns *model* unchanged."""
+        if model is None:
+            return None
+        key = id(model)
+        self._inflight_counts[key] = self._inflight_counts.get(key, 0) + 1
+        return model
+
+    def _release_model_slot(self, model: BaseModel | None) -> None:
+        """Decrement the in-flight counter for *model*; fire drain event at zero."""
+        if model is None:
+            return
+        key = id(model)
+        remaining = self._inflight_counts.get(key, 0) - 1
+        if remaining <= 0:
+            self._inflight_counts.pop(key, None)
+            ev = self._drain_events.pop(key, None)
+            if ev is not None:
+                ev.set()
+        else:
+            self._inflight_counts[key] = remaining
+
+    def swap_model(self, new_model: BaseModel) -> tuple[BaseModel | None, asyncio.Event]:
+        """Atomically replace ``self.model`` with *new_model*.
+
+        Returns ``(old_model, drain_event)``. The caller should
+        ``await drain_event.wait()`` in a background task and then call
+        ``old_model.shutdown()`` to release its resources after its last
+        in-flight ``generate()`` call has completed.
+
+        If the old model had no in-flight calls, ``drain_event`` is already
+        set so the caller can shut down immediately.
+        """
+        old = self.model
+        self._prepare_model_runtime(new_model)
+        self.model = new_model
+        self._ensure_idle_cleanup_task()
+
+        if old is None or old is new_model:
+            ev = asyncio.Event()
+            ev.set()
+            return old, ev
+
+        key = id(old)
+        if self._inflight_counts.get(key, 0) <= 0:
+            ev = asyncio.Event()
+            ev.set()
+        else:
+            ev = self._drain_events.setdefault(key, asyncio.Event())
+
+        # Keep *old* in the runtime registry so Agent.shutdown() will
+        # still clean it up if the process exits before drain completes.
+        # Caller must call _unregister_runtime_model(old) after shutdown.
+        return old, ev
 
     def _ensure_idle_cleanup_task(self) -> None:
         """Start the idle cleanup loop if any runtime model supports it."""
@@ -124,9 +192,9 @@ class Agent:
         if self._initialized:
             return
         elog("agent.initialize.start", agent=self.name, model_class=type(self.model).__name__)
-        await self._mcp.connect_all()
         if self._db:
             await self._db.connect()
+        await self._mcp.connect_all()
 
         self._prepare_model_runtime(self.model)
         self._ensure_idle_cleanup_task()
@@ -136,8 +204,8 @@ class Agent:
             "agent.initialize.done",
             agent=self.name,
             model_class=type(self.model).__name__,
-            mcp_servers=len(self._mcp._servers),
-            tools=len(self._mcp.all_tools()),
+            mcp_servers=self._mcp.server_count,
+            tools=self._mcp.total_tool_count,
             has_db=bool(self._db),
         )
 
@@ -153,73 +221,6 @@ class Agent:
                     await cleanup_idle()
                 except Exception as e:
                     logger.debug("Idle cleanup error: %s", e)
-
-    def _build_mcp_server_configs(self) -> dict[str, dict]:
-        """Build MCP server configs for runtime models that consume them.
-
-        Supports stdio (command), SSE (url), and HTTP (url) MCP servers.
-
-        Claude CLI silently drops stdio MCP servers whose `command` cannot
-        be resolved in the subprocess's PATH. When OpenAgent runs under a
-        systemd unit, `$PATH` is minimal and relative names like `firebase`
-        or `github-mcp-server` stop resolving — even when `shutil.which()`
-        finds them at process startup. To avoid this footgun, every stdio
-        command is resolved to an absolute path here before being handed
-        off to the SDK.
-        """
-        import os
-        import shutil
-
-        configs = {}
-        for server in self._mcp._servers:
-            if server.command:
-                full_cmd = server.command + server.args
-                cmd_name = full_cmd[0]
-
-                # Resolve to absolute path so Claude CLI doesn't silently
-                # drop the server when its minimal PATH can't find it.
-                if not os.path.isabs(cmd_name):
-                    resolved = shutil.which(cmd_name)
-                    if resolved:
-                        cmd_name = resolved
-                    else:
-                        logger.warning(
-                            "MCP '%s': command %r not found on PATH — "
-                            "Claude CLI will likely drop this server",
-                            server.name, cmd_name,
-                        )
-
-                entry: dict = {
-                    "command": cmd_name,
-                    "args": full_cmd[1:],
-                }
-
-                env = dict(server.env) if server.env else {}
-
-                if server.name == "messaging":
-                    for var in ("TELEGRAM_BOT_TOKEN", "DISCORD_BOT_TOKEN", "GREEN_API_ID", "GREEN_API_TOKEN"):
-                        val = os.environ.get(var)
-                        if val:
-                            env[var] = val
-
-                # The scheduler MCP needs to point at the same SQLite file
-                # as the in-process Scheduler. _resolve_default_entry already
-                # sets this when MCPRegistry was built with db_path, but fall
-                # back to the agent's own DB path here so alternative wiring
-                # paths (e.g. direct MCPTools instantiation) still work.
-                if server.name == "scheduler" and "OPENAGENT_DB_PATH" not in env:
-                    if self._db and getattr(self._db, "db_path", None):
-                        env["OPENAGENT_DB_PATH"] = os.path.abspath(self._db.db_path)
-
-                if env:
-                    entry["env"] = env
-
-                configs[server.name] = entry
-
-            elif server.url:
-                configs[server.name] = {"type": "http", "url": server.url}
-
-        return configs
 
     async def shutdown(self) -> None:
         """Close all connections."""
@@ -303,7 +304,14 @@ class Agent:
         session_id: str | None = None,
         model_override: BaseModel | None = None,
     ) -> str:
-        """Inner run logic, wrapped by run() for crash protection."""
+        """Inner run logic, wrapped by run() for crash protection.
+
+        Providers handle the tool-use loop internally (Agno via its Agent,
+        Claude SDK via its native MCP support), so this method is now a
+        single ``model.generate`` call. The provider returns the final
+        post-tool-loop content; we just package the prompt and unpack the
+        response.
+        """
         await _status("Loading context...")
 
         # Combine OpenAgent's framework-level guidelines with the user's
@@ -334,107 +342,31 @@ class Agent:
 
         messages: list[dict[str, Any]] = [{"role": "user", "content": message}]
 
-        tools = self._mcp.all_tools() or None
-
         await _status("Thinking...")
 
-        # Tool-use loop
-        active_model = model_override or self.model
-        response = None
-        tool_calls_total = 0
-        for iteration in range(MAX_TOOL_ITERATIONS):
-            elog(
-                "agent.run.iteration",
-                agent=self.name,
+        active_model = self._acquire_model_slot(model_override or self.model)
+        try:
+            response = await active_model.generate(
+                messages,
+                system=system,
+                on_status=_status,
                 session_id=session_id,
-                iteration=iteration + 1,
-                model_class=type(active_model).__name__,
             )
-            response = await active_model.generate(messages, system=system, tools=tools, on_status=_status, session_id=session_id)
+        finally:
+            self._release_model_slot(active_model)
 
-            if response.tool_calls:
-                tool_calls_total += len(response.tool_calls)
-                elog(
-                    "agent.run.tool_cycle",
-                    agent=self.name,
-                    session_id=session_id,
-                    iteration=iteration + 1,
-                    tool_calls=len(response.tool_calls),
-                )
-                assistant_msg: dict[str, Any] = {
-                    "role": "assistant",
-                    "content": response.content,
-                    "tool_calls": [
-                        {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
-                        for tc in response.tool_calls
-                    ],
-                }
-                messages.append(assistant_msg)
-
-                for tc in response.tool_calls:
-                    import json as _json
-                    # Send structured tool event: running
-                    await _status(_json.dumps({
-                        "tool": tc.name,
-                        "params": tc.arguments,
-                        "status": "running",
-                    }))
-                    elog("tool.start", tool=tc.name, params=tc.arguments)
-
-                    error = None
-                    try:
-                        result = await self._mcp.call_tool(tc.name, tc.arguments)
-                    except Exception as e:
-                        result = f"Error calling tool {tc.name}: {e}"
-                        error = str(e)
-                        logger.error(result)
-
-                    # Send structured tool event: done/error
-                    await _status(_json.dumps({
-                        "tool": tc.name,
-                        "status": "error" if error else "done",
-                        "result": (result or "")[:500],
-                        "error": error,
-                    }))
-                    if error:
-                        elog("tool.error", tool=tc.name, error=error)
-                    else:
-                        elog("tool.done", tool=tc.name, result_len=len(result or ""))
-
-                    tool_msg = {
-                        "role": "tool",
-                        "content": result,
-                        "tool_call_id": tc.id,
-                    }
-                    messages.append(tool_msg)
-
-                if iteration < MAX_TOOL_ITERATIONS - 1:
-                    await _status("Thinking...")
-            else:
-                self._store_response_meta(session_id, response)
-                elog(
-                    "agent.run.done",
-                    agent=self.name,
-                    session_id=session_id,
-                    iterations=iteration + 1,
-                    tool_calls=tool_calls_total,
-                    response_len=len(response.content or ""),
-                )
-                return response.content
-
+        self._store_response_meta(session_id, response)
         elog(
-            "agent.run.max_iterations",
+            "agent.run.done",
             agent=self.name,
             session_id=session_id,
-            iterations=MAX_TOOL_ITERATIONS,
-            tool_calls=tool_calls_total,
-            response_len=len(response.content or "") if response else 0,
+            model_class=type(active_model).__name__,
+            response_len=len(response.content or ""),
         )
-        self._store_response_meta(session_id, response)
         return response.content if response else "I wasn't able to complete the request."
 
     def _combined_system_prompt(self) -> str:
-        """Prepend the framework-level prompt to the user's system prompt."""
+        """Concatenate the framework prompt with the user's project-specific one."""
         user = (self.system_prompt or "").strip()
         if not user:
             return FRAMEWORK_SYSTEM_PROMPT

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Awaitable, Callable, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 
 @dataclass
@@ -47,7 +47,7 @@ class BaseModel(ABC):
         messages: list[dict[str, Any]],
         system: str | None = None,
         tools: list[dict[str, Any]] | None = None,
-        on_status: Optional[Callable[[str], Awaitable[None]]] = None,
+        on_status: Callable[[str], Awaitable[None]] | None = None,
         session_id: str | None = None,
     ) -> ModelResponse:
         """Generate a response from the model.

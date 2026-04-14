@@ -1,32 +1,44 @@
-"""Agno-backed provider for API models with session-managed history.
+"""Agno-backed provider for API models.
 
-OpenAgent continues to own:
-- the product gateway
+OpenAgent owns the *product* layer:
 - provider/model catalog
-- pricing/reporting
-- Obsidian/wiki memory and MCP topology
+- pricing / budget reporting
+- gateway, channels, memory vault
 
-Agno is used here strictly as the execution engine for API-backed models plus
-session history persistence. No Agno memory or knowledge stores are configured.
+Agno owns the *runtime* layer:
+- API call execution
+- session history persistence
+- MCP tool orchestration (via ``agno.tools.mcp.MCPTools`` instances supplied
+  by the OpenAgent ``MCPPool`` — see ``openagent.mcp.pool``)
+
+Tool wiring: this provider does NOT wrap MCP tools manually. It receives a
+list of pre-connected Agno ``MCPTools`` instances from the pool and passes
+them straight to the Agno ``Agent``. Agno handles the tool loop, content-type
+serialisation (image artifacts, embedded resources, etc.), and per-call
+scheduling. We only need to compute and mirror cost back into the metrics so
+``agno_sessions.runs[*].metrics.cost`` stays queryable.
 """
 
 from __future__ import annotations
 
 import importlib
 import inspect
-import keyword
 import logging
 import os
-import re
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from openagent.core.logging import elog
 from openagent.models.base import BaseModel, ModelResponse
-from openagent.models.catalog import normalize_runtime_model_id
+from openagent.models.catalog import (
+    DEFAULT_ZAI_BASE_URL,
+    compute_cost,
+    model_id_from_runtime,
+    normalize_runtime_model_id,
+    split_runtime_id,
+)
 
 logger = logging.getLogger(__name__)
-DEFAULT_ZAI_BASE_URL = "https://api.z.ai/api/paas/v4"
 PROVIDER_ENV_VARS = {
     "anthropic": "ANTHROPIC_API_KEY",
     "openai": "OPENAI_API_KEY",
@@ -74,26 +86,47 @@ class AgnoProvider(BaseModel):
         self._base_url = base_url
         self._db_path = db_path
         self._history_runs = history_runs
-        self._mcp_registry = None
-        self._agno_agents: dict[tuple[str, ...], Any] = {}
-        self._tool_cache: dict[str, Callable[..., Awaitable[str]]] | None = None
+        # Pre-connected Agno MCPTools instances supplied by MCPPool. Shared
+        # across all AgnoProvider instances under the same SmartRouter so we
+        # don't spawn duplicate MCP server processes per tier.
+        self._mcp_toolkits: list[Any] = []
+        # One Agno Agent per (system_message) so the framework prompt is sent
+        # as a real ``system`` role message — not buried inside the user
+        # prompt. Without this, gpt-4o-mini ignores procedural instructions
+        # like "introspect your tool list and group by prefix" and just
+        # confabulates ("vault, functions"). Cache stays small in practice:
+        # the classifier uses ``""`` (no system); the main call uses the
+        # static framework+user prompt; that's two entries.
+        self._agno_agents: dict[str, Any] = {}
 
         self._inject_provider_keys()
 
     def set_db(self, db) -> None:
         self._db_path = getattr(db, "db_path", self._db_path)
+        # Force agent rebuild so the new SqliteDb path takes effect.
         self._agno_agents.clear()
 
-    def set_mcp_registry(self, registry) -> None:
-        self._mcp_registry = registry
-        self._tool_cache = None
+    def set_mcp_toolkits(self, toolkits: list[Any]) -> None:
+        """Receive the pool's pre-connected Agno ``MCPTools`` instances.
+
+        Called by ``wire_model_runtime``. The pool owns lifecycle (entered
+        once at agent startup, exited at shutdown); we just hold references.
+        """
+        self._mcp_toolkits = list(toolkits)
+        # Force agent rebuild so the new tool list is picked up.
         self._agno_agents.clear()
 
     def _provider_name(self) -> str:
-        runtime_id = self.model
-        return runtime_id.split(":", 1)[0] if ":" in runtime_id else runtime_id.split("/", 1)[0]
+        return split_runtime_id(self.model)[0]
 
     def _inject_provider_keys(self) -> None:
+        # NOTE: this mutates ``os.environ`` from a constructor — surprising but
+        # intentional. Agno's provider classes (``Claude``, ``OpenAIChat``,
+        # ``Gemini``, …) read API keys from process env vars, not from
+        # constructor args we pass through. We export keys here so Agno can find
+        # them. Two ``AgnoProvider`` instances with different keys for the same
+        # provider will race; in practice OpenAgent uses one key per provider so
+        # it's fine. Keys already in the env are not overwritten.
         provider_name = self._provider_name()
         if self._api_key:
             env_var = PROVIDER_ENV_VARS.get(provider_name)
@@ -120,75 +153,8 @@ class AgnoProvider(BaseModel):
 
         return str(default_db_path())
 
-    def _sanitize_param_name(self, value: str) -> str:
-        candidate = re.sub(r"\W+", "_", value).strip("_") or "arg"
-        if candidate[0].isdigit():
-            candidate = f"arg_{candidate}"
-        if keyword.iskeyword(candidate):
-            candidate = f"{candidate}_arg"
-        return candidate
-
-    def _build_tool_function(self, tool_def: dict[str, Any]) -> Callable[..., Awaitable[str]]:
-        tool_name = tool_def["name"]
-        schema = tool_def.get("input_schema") or {}
-        properties = schema.get("properties") or {}
-        required = set(schema.get("required") or [])
-
-        async def _tool_handler(name: str, arguments: dict[str, Any]) -> str:
-            if not self._mcp_registry:
-                raise RuntimeError("MCP registry is not available for Agno tool execution")
-            return await self._mcp_registry.call_tool(name, arguments)
-
-        params: list[str] = []
-        assignments: list[str] = ["    arguments = {}"]
-        used_names: set[str] = set()
-        for original_name in properties.keys():
-            param_name = self._sanitize_param_name(original_name)
-            while param_name in used_names:
-                param_name = f"{param_name}_arg"
-            used_names.add(param_name)
-            default = "" if original_name in required else " = None"
-            params.append(f"{param_name}{default}")
-            assignments.append(f"    if {param_name} is not None:")
-            assignments.append(f"        arguments[{original_name!r}] = {param_name}")
-
-        signature = ", ".join(params)
-        func_name = self._sanitize_param_name(tool_name)
-        source_lines = [f"async def {func_name}({signature}):" if signature else f"async def {func_name}():", *assignments]
-        source_lines.append(f"    return await _tool_handler({tool_name!r}, arguments)")
-        namespace: dict[str, Any] = {}
-        exec("\n".join(source_lines), {"_tool_handler": _tool_handler}, namespace)
-        func = namespace[func_name]
-        func.__name__ = func_name
-        func.__doc__ = tool_def.get("description") or f"MCP tool: {tool_name}"
-        return func
-
-    def _build_tools(self) -> dict[str, Callable[..., Awaitable[str]]]:
-        if self._tool_cache is not None:
-            return self._tool_cache
-        if not self._mcp_registry:
-            self._tool_cache = {}
-            return self._tool_cache
-        self._tool_cache = {
-            tool_def["name"]: self._build_tool_function(tool_def)
-            for tool_def in self._mcp_registry.all_tools()
-        }
-        return self._tool_cache
-
-    def _selected_tools(self, tools: list[dict[str, Any]] | None) -> list[Callable[..., Awaitable[str]]]:
-        if not tools:
-            return []
-        requested_names = {str(tool.get("name", "")).strip() for tool in tools if tool.get("name")}
-        available = self._build_tools()
-        return [available[name] for name in requested_names if name in available]
-
     def _runtime_parts(self) -> tuple[str, str]:
-        runtime_id = self.model
-        if ":" in runtime_id:
-            return runtime_id.split(":", 1)
-        if "/" in runtime_id:
-            return runtime_id.split("/", 1)
-        return runtime_id, runtime_id
+        return split_runtime_id(self.model)
 
     def _provider_config(self) -> dict[str, Any]:
         provider_name, _ = self._runtime_parts()
@@ -249,10 +215,61 @@ class AgnoProvider(BaseModel):
             f"and retry. Original import error: {detail}"
         )
 
-    def _ensure_agent(self, tools: list[dict[str, Any]] | None = None):
-        selected_tools = self._selected_tools(tools)
-        cache_key = tuple(sorted(func.__name__ for func in selected_tools))
-        cached = self._agno_agents.get(cache_key)
+    def _build_list_mcps_tool(self) -> Callable[..., str]:
+        """Return a callable the LLM can invoke to discover MCP servers.
+
+        Weak models (e.g. gpt-4o-mini) reliably fail to introspect 75+
+        function definitions and group them by their ``<server>_`` prefix —
+        empirically they confabulate ("vault, functions") even with the
+        full tool list and proper system role. Giving them a callable that
+        returns the authoritative server inventory means they don't need
+        to introspect at all: they call this tool, then relay the result.
+
+        The callable's docstring is its description for the LLM, which IS
+        the appropriate place to describe a tool (this isn't injecting MCP
+        names into the system prompt — server names are computed from the
+        live toolkit list at call time, not baked into any string).
+        """
+        toolkits = self._mcp_toolkits
+
+        def list_mcp_servers() -> str:
+            """List every MCP server wired to this agent and how many tools each provides.
+
+            Call this when the user asks ANY of: which MCPs do you have, what MCPs
+            are available, what can you do, what tools do you have, list your
+            capabilities, or anything semantically similar — in any language.
+            Returns a JSON array of ``{"server": str, "tools": int}`` items. Each
+            server's tools appear in your function list as ``<server>_<tool>``.
+            Use the returned data verbatim; do not invent or omit servers.
+            """
+            import json
+            result = []
+            for tk in toolkits:
+                prefix = (
+                    getattr(tk, "tool_name_prefix", None)
+                    or getattr(tk, "name", None)
+                    or "?"
+                )
+                count = len(getattr(tk, "functions", {}) or {})
+                result.append({"server": prefix, "tools": count})
+            return json.dumps(result, indent=2)
+
+        return list_mcp_servers
+
+    def _ensure_agent(self, system: str | None = None):
+        """Lazily construct one Agno Agent per unique system prompt.
+
+        ``system_message`` is set at construction time so OpenAgent's framework
+        prompt reaches OpenAI as a real ``system`` role message, not as user
+        text. Agents are cached by the system string so we don't rebuild on
+        every call. ``set_db`` and ``set_mcp_toolkits`` flush the cache.
+
+        Tools passed to AgnoAgent: every connected MCPTools toolkit plus a
+        ``list_mcp_servers`` meta-callable for inventory questions (see
+        :meth:`_build_list_mcps_tool`).
+        """
+        sys_key = (system or "").strip()
+        cached = self._agno_agents.get(sys_key)
         if cached is not None:
             return cached
         try:
@@ -263,25 +280,30 @@ class AgnoProvider(BaseModel):
 
         db_path = Path(self._runtime_db_path())
         db_path.parent.mkdir(parents=True, exist_ok=True)
+        agent_tools: list[Any] = list(self._mcp_toolkits)
+        agent_tools.append(self._build_list_mcps_tool())
         agent = AgnoAgent(
             model=self._build_agno_model(),
             db=SqliteDb(db_file=str(db_path)),
-            tools=selected_tools,
+            tools=agent_tools,
+            system_message=sys_key or None,
             add_history_to_context=True,
             num_history_runs=self._history_runs,
             markdown=False,
         )
-        self._agno_agents[cache_key] = agent
+        self._agno_agents[sys_key] = agent
         return agent
 
-    def _flatten_messages(
-        self,
-        messages: list[dict[str, Any]],
-        system: str | None = None,
-    ) -> str:
+    def _flatten_messages(self, messages: list[dict[str, Any]]) -> str:
+        """Render conversation turns as a single user-side prompt for ``arun``.
+
+        The system prompt is NOT included here — it's set on the AgnoAgent via
+        ``system_message`` (see ``_ensure_agent``) so OpenAI receives it as a
+        real ``system`` role message. Including it here would duplicate it as
+        user text, undoing the fix that makes procedural instructions
+        authoritative for weak models.
+        """
         parts: list[str] = []
-        if system:
-            parts.append(f"[System Instructions]\n{system.strip()}")
         for msg in messages:
             role = msg.get("role", "user")
             content = str(msg.get("content", "") or "")
@@ -293,11 +315,38 @@ class AgnoProvider(BaseModel):
                 parts.append(f"[Tool:{msg.get('name', 'tool')}] {content}")
         return "\n\n".join(part for part in parts if part).strip()
 
+    def _metrics_to_dict(self, metrics: Any) -> dict[str, Any]:
+        """Coerce Agno's metrics (dataclass / Pydantic / dict / object) into a dict.
+
+        Agno 2.x returns ``response.metrics`` as a ``RunMetrics`` dataclass;
+        older versions returned a dict or a Pydantic model. Normalise so token
+        and cost extraction works across versions.
+        """
+        if metrics is None:
+            return {}
+        if isinstance(metrics, dict):
+            return metrics
+        if hasattr(metrics, "model_dump"):
+            try:
+                return metrics.model_dump()
+            except Exception:
+                pass
+        if hasattr(metrics, "__dataclass_fields__"):
+            from dataclasses import asdict
+            try:
+                return asdict(metrics)
+            except Exception:
+                pass
+        if hasattr(metrics, "__dict__"):
+            return {k: v for k, v in vars(metrics).items() if not k.startswith("_")}
+        return {}
+
     def _extract_metric(self, metrics: Any, *names: str) -> int:
-        if not isinstance(metrics, dict):
+        data = metrics if isinstance(metrics, dict) else self._metrics_to_dict(metrics)
+        if not data:
             return 0
         for name in names:
-            value = metrics.get(name)
+            value = data.get(name)
             if value is not None:
                 try:
                     return int(value)
@@ -313,15 +362,23 @@ class AgnoProvider(BaseModel):
         on_status: Callable[[str], Awaitable[None]] | None = None,
         session_id: str | None = None,
     ) -> ModelResponse:
-        prompt = self._flatten_messages(messages, system=system)
+        """Run a single turn through Agno.
+
+        Note: ``tools`` is accepted for ``BaseModel`` compatibility but
+        ignored — Agno's Agent already holds the configured ``MCPTools``
+        instances via ``_mcp_toolkits`` and runs the full tool loop
+        internally (including image-artifact extraction so screenshots no
+        longer blow up the context).
+        """
+        prompt = self._flatten_messages(messages)
         sid = session_id or "default"
-        agent = self._ensure_agent(tools)
+        agent = self._ensure_agent(system=system)
         elog(
             "agno.request",
             model=self.model,
             session_id=sid,
             prompt_len=len(prompt),
-            tools=len(self._selected_tools(tools)),
+            mcp_toolkits=len(self._mcp_toolkits),
         )
 
         if on_status:
@@ -337,10 +394,30 @@ class AgnoProvider(BaseModel):
             raise
 
         content = getattr(response, "content", None) or str(response)
-        metrics = getattr(response, "metrics", {}) or {}
-        input_tokens = self._extract_metric(metrics, "input_tokens", "prompt_tokens", "input")
-        output_tokens = self._extract_metric(metrics, "output_tokens", "completion_tokens", "output")
-        stop_reason = metrics.get("stop_reason") if isinstance(metrics, dict) else None
+        metrics_obj = getattr(response, "metrics", None)
+        metrics_dict = self._metrics_to_dict(metrics_obj)
+
+        # Trace event so we can debug if Agno changes the metrics shape again.
+        elog(
+            "agno.metrics.shape",
+            model=self.model,
+            session_id=sid,
+            type=type(metrics_obj).__name__ if metrics_obj is not None else "None",
+            keys=sorted(metrics_dict.keys())[:12] if metrics_dict else [],
+        )
+
+        input_tokens = self._extract_metric(metrics_dict, "input_tokens", "prompt_tokens", "input")
+        output_tokens = self._extract_metric(metrics_dict, "output_tokens", "completion_tokens", "output")
+        stop_reason = metrics_dict.get("stop_reason") if isinstance(metrics_dict, dict) else None
+
+        # Compute cost from OpenAgent's catalog and mirror it back into Agno's
+        # metrics so SessionMetrics.cost aggregation works for free.
+        cost = self._compute_and_mirror_cost(
+            metrics_obj=metrics_obj,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            session_id=sid,
+        )
 
         elog(
             "agno.generate",
@@ -348,6 +425,7 @@ class AgnoProvider(BaseModel):
             session_id=sid,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cost_usd=cost,
             stop_reason=stop_reason or "stop",
         )
         return ModelResponse(
@@ -357,3 +435,85 @@ class AgnoProvider(BaseModel):
             stop_reason=stop_reason or "stop",
             model=self.model,
         )
+
+    def _compute_and_mirror_cost(
+        self,
+        *,
+        metrics_obj: Any,
+        input_tokens: int,
+        output_tokens: int,
+        session_id: str,
+    ) -> float:
+        """Compute cost from OpenAgent's catalog and write it onto Agno's metrics.
+
+        Agno propagates the ``cost`` field through ``MessageMetrics → RunMetrics
+        → SessionMetrics``, but never populates it (provider SDKs don't return
+        cost). By mutating ``metrics_obj.cost`` (and the per-(provider, id)
+        entries in ``metrics.details``) we make Agno's session-level cost
+        aggregation work — so ``agno_sessions.runs[*].metrics.cost`` becomes
+        directly queryable and ``SessionMetrics`` sums correctly across runs.
+
+        The canonical cost record still lives in OpenAgent's ``usage_log``
+        (written by ``SmartRouter``); this is the queryable mirror.
+        """
+        cost = compute_cost(
+            model_ref=self.model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            providers_config=self._providers_config,
+        )
+
+        if input_tokens == 0 and output_tokens == 0:
+            elog(
+                "agno.cost_skipped",
+                model=self.model,
+                session_id=session_id,
+                reason="zero_tokens",
+            )
+            return cost
+
+        if metrics_obj is None:
+            elog(
+                "agno.cost_skipped",
+                model=self.model,
+                session_id=session_id,
+                reason="no_metrics_object",
+                cost_usd=cost,
+            )
+            return cost
+
+        bare_id = model_id_from_runtime(self.model)
+        mirrored_targets: list[str] = []
+
+        # 1. Top-level RunMetrics.cost
+        try:
+            setattr(metrics_obj, "cost", cost)
+            mirrored_targets.append("run")
+        except (AttributeError, TypeError):
+            pass
+
+        # 2. Per-(provider, id) ModelMetrics.cost in details["model"], details["output_model"], …
+        details = getattr(metrics_obj, "details", None)
+        if isinstance(details, dict):
+            for model_type, entries in details.items():
+                if not entries:
+                    continue
+                for entry in entries:
+                    entry_id = getattr(entry, "id", None)
+                    if entry_id and (entry_id == bare_id or entry_id == self.model):
+                        try:
+                            setattr(entry, "cost", cost)
+                            mirrored_targets.append(f"details.{model_type}[{entry_id}]")
+                        except (AttributeError, TypeError):
+                            pass
+
+        elog(
+            "agno.cost_mirrored",
+            model=self.model,
+            session_id=session_id,
+            cost_usd=cost,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            targets=mirrored_targets,
+        )
+        return cost

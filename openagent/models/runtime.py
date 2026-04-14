@@ -6,14 +6,15 @@ from typing import Any
 
 from openagent.models.base import BaseModel, ModelResponse
 from openagent.models.catalog import (
+    DEFAULT_ZAI_BASE_URL,
     claude_cli_model_spec,
     get_default_model_for_provider,
     is_claude_cli_model,
+    model_id_from_runtime,
     normalize_runtime_model_id,
 )
 
 DEFAULT_API_MODEL = "anthropic:claude-sonnet-4-20250514"
-DEFAULT_ZAI_BASE_URL = "https://api.z.ai/api/paas/v4"
 LEGACY_PROVIDER_ALIASES = {
     "claude-api": "anthropic",
     "litellm": "agno",
@@ -60,22 +61,33 @@ def wire_model_runtime(
     model: BaseModel,
     *,
     db: Any = None,
-    mcp_registry: Any = None,
-    mcp_servers: dict[str, dict] | None = None,
+    mcp_pool: Any = None,
 ) -> BaseModel:
-    """Attach runtime dependencies to a model when it supports them."""
+    """Attach runtime dependencies to a model when it supports them.
+
+    Both providers consume from a single ``MCPPool`` that owns MCP
+    lifecycle for the process. AgnoProvider gets pre-connected Agno
+    ``MCPTools`` instances; ClaudeCLI gets the raw stdio config dict
+    that the Claude Agent SDK accepts as its ``mcp_servers`` parameter.
+    """
     if db is not None:
         set_db = getattr(model, "set_db", None)
         if callable(set_db):
             set_db(db)
-    if mcp_registry is not None:
-        set_mcp_registry = getattr(model, "set_mcp_registry", None)
-        if callable(set_mcp_registry):
-            set_mcp_registry(mcp_registry)
-    if mcp_servers is not None:
+    if mcp_pool is not None:
+        # AgnoProvider / SmartRouter: pre-connected Agno MCPTools instances.
+        set_mcp_toolkits = getattr(model, "set_mcp_toolkits", None)
+        if callable(set_mcp_toolkits):
+            set_mcp_toolkits(mcp_pool.agno_toolkits)
+        # ClaudeCLI: raw stdio config for the Claude Agent SDK.
         set_mcp_servers = getattr(model, "set_mcp_servers", None)
         if callable(set_mcp_servers):
-            set_mcp_servers(mcp_servers)
+            set_mcp_servers(mcp_pool.claude_sdk_servers())
+        # SmartRouter holds the pool itself so it can re-wire newly created
+        # tier providers as they're lazily instantiated.
+        set_mcp_pool = getattr(model, "set_mcp_pool", None)
+        if callable(set_mcp_pool):
+            set_mcp_pool(mcp_pool)
     return model
 
 
@@ -90,8 +102,7 @@ def create_model_from_spec(
     classifier_model: str | None = None,
     claude_permission_mode: str | None = None,
     db: Any = None,
-    mcp_registry: Any = None,
-    mcp_servers: dict[str, dict] | None = None,
+    mcp_pool: Any = None,
 ) -> BaseModel:
     """Create a model instance from a compact OpenAgent runtime spec."""
     providers_config = providers_config or {}
@@ -111,10 +122,13 @@ def create_model_from_spec(
     elif is_claude_cli_model(spec):
         from openagent.models.claude_cli import ClaudeCLI
 
+        bare = model_id_from_runtime(spec)
+        # ClaudeCLI receives mcp_servers via wire_model_runtime below from the
+        # pool; constructor mcp_servers stays None to avoid double-wiring.
         model = ClaudeCLI(
-            model=spec.split("/", 1)[1] if "/" in spec else None,
+            model=bare if bare and bare != spec else None,
             permission_mode=permission_mode,
-            mcp_servers=mcp_servers or None,
+            providers_config=providers_config,
         )
     else:
         from openagent.models.agno_provider import AgnoProvider
@@ -127,12 +141,7 @@ def create_model_from_spec(
             db_path=getattr(db, "db_path", None),
         )
 
-    return wire_model_runtime(
-        model,
-        db=db,
-        mcp_registry=mcp_registry,
-        mcp_servers=mcp_servers,
-    )
+    return wire_model_runtime(model, db=db, mcp_pool=mcp_pool)
 
 
 def create_model_from_config(config: dict) -> BaseModel:

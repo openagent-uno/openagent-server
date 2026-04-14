@@ -15,9 +15,20 @@ from openagent._frozen import bundle_dir, is_frozen
 logger = logging.getLogger(__name__)
 
 if is_frozen():
-    BUILTIN_MCPS_DIR = bundle_dir() / "openagent" / "mcps"
+    BUILTIN_MCPS_DIR = bundle_dir() / "openagent" / "mcp" / "servers"
+    # Frozen layout: <bundle>/openagent/, so bundle_dir() is the parent of `openagent/`.
+    PACKAGE_PARENT_DIR = bundle_dir()
 else:
-    BUILTIN_MCPS_DIR = Path(__file__).resolve().parent.parent / "mcps"
+    BUILTIN_MCPS_DIR = Path(__file__).resolve().parent / "servers"
+    # Dev layout: this file is openagent/mcp/builtins.py, so .parent.parent.parent
+    # is the directory containing the `openagent/` package (the repo root).
+    PACKAGE_PARENT_DIR = Path(__file__).resolve().parent.parent.parent
+
+# CRITICAL: ``PACKAGE_PARENT_DIR`` is exported as PYTHONPATH for Python MCP
+# subprocesses so they can ``import openagent.mcp.servers.*``. It MUST be the
+# directory that *contains* ``openagent/`` — never ``openagent/`` itself, since
+# that would expose ``openagent.mcp`` as a top-level ``mcp`` and shadow the
+# third-party MCP SDK, causing a circular import in openagent/mcp/client.py.
 
 BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
     "computer-control": {
@@ -59,7 +70,7 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
     },
     "scheduler": {
         "dir": "scheduler",
-        "command": ["python", "-m", "openagent.mcps.scheduler.server"],
+        "command": ["python", "-m", "openagent.mcp.servers.scheduler.server"],
         "python": True,
     },
 }
@@ -154,7 +165,7 @@ def resolve_builtin_entry(name: str, env: dict[str, str] | None = None) -> dict[
 
     merged_env = {**(spec.get("env") or {}), **(env or {})}
     if is_python:
-        package_parent = str(BUILTIN_MCPS_DIR.parent.parent)
+        package_parent = str(PACKAGE_PARENT_DIR)
         existing_pp = merged_env.get("PYTHONPATH") or os.environ.get("PYTHONPATH", "")
         merged_env["PYTHONPATH"] = package_parent + (os.pathsep + existing_pp if existing_pp else "")
 

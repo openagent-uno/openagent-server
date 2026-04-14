@@ -20,7 +20,7 @@ from openagent.channels.base import (
     split_preserving_code_blocks,
 )
 from openagent.channels.voice import is_audio_file, transcribe as transcribe_voice
-from openagent.gateway.commands import BOT_COMMANDS
+from openagent.gateway.commands import BOT_COMMANDS, bridge_welcome_text
 
 from openagent.core.logging import elog
 
@@ -72,6 +72,19 @@ class DiscordBridge(BaseBridge):
 
             _handler.__name__ = f"_cmd_{command_name.replace('-', '_')}"
             tree.command(name=command_name, description=description)(_handler)
+
+        # Welcome message — symmetric with Telegram /start.  Not part of
+        # BOT_COMMANDS because the gateway has no /start command; this is
+        # a bridge-local convenience.
+        async def _start_handler(interaction: discord.Interaction):
+            uid = str(interaction.user.id)
+            if uid not in self.allowed_users:
+                await interaction.response.send_message("Unauthorized.", ephemeral=True)
+                return
+            name = interaction.user.display_name or interaction.user.name
+            await interaction.response.send_message(bridge_welcome_text(name), ephemeral=True)
+
+        tree.command(name="start", description="Show welcome and command list")(_start_handler)
 
         # ── Events ──
 

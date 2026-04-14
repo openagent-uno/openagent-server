@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Awaitable, Callable, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable
 
+from openagent.core.logging import elog
 from openagent.models.base import BaseModel, ModelResponse
 from openagent.models.budget import BudgetTracker
 from openagent.models.catalog import (
+    is_claude_cli_model,
     iter_configured_models,
     model_history_mode,
     normalize_runtime_model_id,
@@ -25,6 +27,17 @@ Classify this task as simple, medium, or hard.
 Reply with ONLY one word: simple, medium, or hard."""
 
 TIERS = ("simple", "medium", "hard")
+
+# Fallback routing used when no platform-managed models are configured. Kept as
+# a constant so the next "GPT-X is out, swap defaults" change is one edit.
+DEFAULT_AUTO_ROUTING: dict[str, str] = {
+    "simple": "openai:gpt-4o-mini",
+    "medium": "openai:gpt-4.1-mini",
+    "hard": "openai:gpt-4.1",
+    "fallback": "openai:gpt-4o-mini",
+}
+DEFAULT_CLASSIFIER_MODEL = "openai:gpt-4o-mini"
+
 HARD_HINTS = (
     "powerful model",
     "strong model",
@@ -71,25 +84,41 @@ class SmartRouter(BaseModel):
         self._budget: BudgetTracker | None = None
         self._db = None
         self._providers: dict[str, BaseModel] = {}
-        self._mcp_servers: dict[str, dict] = {}
-        self._mcp_registry = None
+        # Single shared MCPPool — wired to every tier provider as it's lazily
+        # created so all tiers reuse the same MCP server processes.
+        self._mcp_pool: Any = None
         self._claude_permission_mode = claude_permission_mode
         self._last_tier_by_session: dict[str, str] = {}
 
         if routing:
-            self._routing = {
-                tier: normalize_runtime_model_id(model_id, self._providers_config)
-                for tier, model_id in routing.items()
-            }
+            normalised: dict[str, str] = {}
+            stripped: list[tuple[str, str]] = []
+            for tier, model_id in routing.items():
+                runtime_id = normalize_runtime_model_id(model_id, self._providers_config)
+                if is_claude_cli_model(runtime_id):
+                    # claude-cli is a standalone provider; sessions stay on it for
+                    # their lifetime. SmartRouter is contractually platform-mode
+                    # (``history_mode = "platform"``), so we strip claude-cli from
+                    # any routing tier rather than silently violating the contract.
+                    stripped.append((tier, runtime_id))
+                    continue
+                normalised[tier] = runtime_id
+            if stripped:
+                elog("router.routing_stripped", stripped=stripped)
+                logger.warning(
+                    "SmartRouter: stripped claude-cli model(s) from routing %s — "
+                    "claude-cli is a standalone provider and cannot be mixed with "
+                    "Agno-routed models in the same session.",
+                    stripped,
+                )
+            self._routing = normalised or self._build_auto_routing()
         else:
             self._routing = self._build_auto_routing()
 
         self._classifier_model = normalize_runtime_model_id(
-            classifier_model or self._routing.get("simple", "openai:gpt-4o-mini"),
+            classifier_model or self._routing.get("simple", DEFAULT_CLASSIFIER_MODEL),
             self._providers_config,
         )
-        from openagent.core.logging import elog
-
         elog(
             "router.config",
             routing=self._routing,
@@ -99,8 +128,6 @@ class SmartRouter(BaseModel):
 
     def _build_auto_routing(self) -> dict[str, str]:
         """Build routing from configured platform-managed models and their costs."""
-        from openagent.core.logging import elog
-
         models_with_price: list[tuple[str, float]] = []
         for entry in iter_configured_models(self._providers_config, history_mode="platform"):
             price = float(entry.output_cost_per_million or 0.0)
@@ -108,12 +135,7 @@ class SmartRouter(BaseModel):
 
         if not models_with_price:
             logger.warning("SmartRouter: no API-backed models found in providers config, using defaults")
-            routing = {
-                "simple": "openai:gpt-4o-mini",
-                "medium": "openai:gpt-4.1-mini",
-                "hard": "openai:gpt-4.1",
-                "fallback": "openai:gpt-4o-mini",
-            }
+            routing = dict(DEFAULT_AUTO_ROUTING)
             elog("router.auto_routing_default", routing=routing)
             return routing
 
@@ -134,15 +156,11 @@ class SmartRouter(BaseModel):
         for model in self._providers.values():
             wire_model_runtime(model, db=db)
 
-    def set_mcp_servers(self, servers: dict[str, dict]) -> None:
-        self._mcp_servers = servers
+    def set_mcp_pool(self, pool: Any) -> None:
+        """Receive the process-wide MCPPool. Re-wires already-created tier providers."""
+        self._mcp_pool = pool
         for model in self._providers.values():
-            wire_model_runtime(model, mcp_servers=servers)
-
-    def set_mcp_registry(self, registry) -> None:
-        self._mcp_registry = registry
-        for model in self._providers.values():
-            wire_model_runtime(model, mcp_registry=registry)
+            wire_model_runtime(model, mcp_pool=pool)
 
     async def cleanup_idle(self) -> None:
         for model in self._providers.values():
@@ -157,6 +175,16 @@ class SmartRouter(BaseModel):
                 await shutdown()
 
     def _get_provider(self, model: str) -> BaseModel:
+        if is_claude_cli_model(model):
+            # Defence-in-depth: claude-cli is a standalone provider with its own
+            # history_mode ("provider") and its own usage_log writer. The routing
+            # input is already filtered (see __init__ stripping), so reaching
+            # here implies a programming bug — fail loudly rather than violate
+            # the SmartRouter ↔ ClaudeCLI isolation invariant.
+            raise RuntimeError(
+                f"SmartRouter cannot dispatch to claude-cli model '{model}'. "
+                "Switch the agent's model.provider to 'claude-cli' instead."
+            )
         if model not in self._providers:
             self._providers[model] = create_model_from_spec(
                 model,
@@ -164,14 +192,11 @@ class SmartRouter(BaseModel):
                 api_key=self._api_key,
                 claude_permission_mode=self._claude_permission_mode,
                 db=self._db,
-                mcp_registry=self._mcp_registry,
-                mcp_servers=self._mcp_servers or None,
+                mcp_pool=self._mcp_pool,
             )
         return self._providers[model]
 
     async def _classify(self, messages: list[dict[str, Any]], session_id: str | None = None) -> str:
-        from openagent.core.logging import elog
-
         user_msg = ""
         for msg in reversed(messages):
             if msg["role"] == "user":
@@ -273,8 +298,6 @@ class SmartRouter(BaseModel):
         return [model_id for model_id in candidates if model_history_mode(model_id, self._providers_config) == primary_mode]
 
     async def _budget_ratio(self, session_id: str | None = None) -> float:
-        from openagent.core.logging import elog
-
         ratio = 1.0
         if self._budget:
             ratio = await self._budget.get_budget_ratio()
@@ -300,8 +323,6 @@ class SmartRouter(BaseModel):
         return bool(messages and messages[-1].get("role") == "tool")
 
     async def _resolve_requested_tier(self, messages: list[dict[str, Any]], session_id: str | None) -> str:
-        from openagent.core.logging import elog
-
         if self._is_tool_continuation(messages):
             tier = self._recall_tier(session_id)
             elog("router.continuation", session_id=session_id, tier=tier)
@@ -333,11 +354,9 @@ class SmartRouter(BaseModel):
         messages: list[dict[str, Any]],
         system: str | None = None,
         tools: list[dict[str, Any]] | None = None,
-        on_status: Optional[Callable[[str], Awaitable[None]]] = None,
+        on_status: Callable[[str], Awaitable[None]] | None = None,
         session_id: str | None = None,
     ) -> ModelResponse:
-        from openagent.core.logging import elog
-
         budget_ratio = await self._budget_ratio(session_id)
 
         if budget_ratio <= 0 and self._monthly_budget > 0:
@@ -410,20 +429,35 @@ class SmartRouter(BaseModel):
                 resp.output_tokens,
                 providers_config=self._providers_config,
             )
+            try:
+                await self._budget.record(
+                    model=active_model_id,
+                    input_tokens=resp.input_tokens,
+                    output_tokens=resp.output_tokens,
+                    cost=cost,
+                    session_id=session_id,
+                )
+                elog(
+                    "router.cost_recorded",
+                    session_id=session_id,
+                    model=active_model_id,
+                    input_tokens=resp.input_tokens,
+                    output_tokens=resp.output_tokens,
+                    cost_usd=cost,
+                )
+            except Exception as e:
+                elog(
+                    "router.cost_record_error",
+                    session_id=session_id,
+                    model=active_model_id,
+                    error=str(e),
+                )
+        else:
             elog(
-                "router.usage",
+                "router.cost_skipped",
                 session_id=session_id,
                 model=active_model_id,
-                input_tokens=resp.input_tokens,
-                output_tokens=resp.output_tokens,
-                cost=cost,
-            )
-            await self._budget.record(
-                model=active_model_id,
-                input_tokens=resp.input_tokens,
-                output_tokens=resp.output_tokens,
-                cost=cost,
-                session_id=session_id,
+                reason="no_budget_tracker",
             )
 
         resp.model = active_model_id

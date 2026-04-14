@@ -16,7 +16,7 @@ import logging
 import os
 import signal
 from openagent.core.agent import Agent
-from openagent.mcp.client import MCPRegistry
+from openagent.mcp.pool import MCPPool
 from openagent.memory.db import MemoryDB
 from openagent.models.runtime import create_model_from_config, wire_model_runtime
 from openagent.core.logging import elog
@@ -107,21 +107,25 @@ def _build_agent(config: dict) -> Agent:
     db_path = memory_cfg.get("db_path", str(default_db_path()))
     db = MemoryDB(db_path)
 
-    # Wire the shared DB into models that need session history or budgeting.
-    wire_model_runtime(model, db=db)
-
-    mcp_registry = MCPRegistry.from_config(
+    # Pool resolves and (later, on agent.initialize) connects every MCP server.
+    # Built once per process, shared across all providers (AgnoProvider tiers
+    # via SmartRouter, ClaudeCLI). Channel tokens were exported to os.environ
+    # above; the pool's spec resolution copies them into per-server env dicts.
+    mcp_pool = MCPPool.from_config(
         mcp_config=mcp_config,
         include_defaults=include_defaults,
         disable=mcp_disable,
         db_path=db_path,
     )
 
+    # Wire the shared DB and MCP pool into the model.
+    wire_model_runtime(model, db=db, mcp_pool=mcp_pool)
+
     return Agent(
         name=config.get("name", "openagent"),
         model=model,
         system_prompt=config.get("system_prompt", "You are a helpful assistant."),
-        mcp_registry=mcp_registry,
+        mcp_pool=mcp_pool,
         memory=db,
     )
 

@@ -1,0 +1,58 @@
+{
+  "_comment": "Bundled default pricing for common models. Prices are USD per 1M tokens. User config in openagent.yaml overrides these. Keys use OpenAgent runtime format: 'provider:model_id'. To add a model, use the same shape. Bare model_id keys (without provider prefix) are accepted as a fallback.",
+  "_source": "Public provider pricing pages, last reviewed 2026-04. Prices change; verify against your invoice.",
+
+  "openai:gpt-4o":         {"input_cost_per_million": 2.50,  "output_cost_per_million": 10.00},
+  "openai:gpt-4o-mini":    {"input_cost_per_million": 0.15,  "output_cost_per_million": 0.60},
+  "openai:gpt-4.1":        {"input_cost_per_million": 2.00,  "output_cost_per_million": 8.00},
+  "openai:gpt-4.1-mini":   {"input_cost_per_million": 0.40,  "output_cost_per_million": 1.60},
+  "openai:gpt-4.1-nano":   {"input_cost_per_million": 0.10,  "output_cost_per_million": 0.40},
+  "openai:o1":             {"input_cost_per_million": 15.00, "output_cost_per_million": 60.00},
+  "openai:o1-mini":        {"input_cost_per_million": 1.10,  "output_cost_per_million": 4.40},
+  "openai:o3":             {"input_cost_per_million": 2.00,  "output_cost_per_million": 8.00},
+  "openai:o3-mini":        {"input_cost_per_million": 1.10,  "output_cost_per_million": 4.40},
+  "openai:o4-mini":        {"input_cost_per_million": 1.10,  "output_cost_per_million": 4.40},
+
+  "anthropic:claude-opus-4-6":               {"input_cost_per_million": 15.00, "output_cost_per_million": 75.00},
+  "anthropic:claude-opus-4-5":               {"input_cost_per_million": 15.00, "output_cost_per_million": 75.00},
+  "anthropic:claude-opus-4-20250514":        {"input_cost_per_million": 15.00, "output_cost_per_million": 75.00},
+  "anthropic:claude-sonnet-4-6":             {"input_cost_per_million": 3.00,  "output_cost_per_million": 15.00},
+  "anthropic:claude-sonnet-4-5":             {"input_cost_per_million": 3.00,  "output_cost_per_million": 15.00},
+  "anthropic:claude-sonnet-4-5-20250929":    {"input_cost_per_million": 3.00,  "output_cost_per_million": 15.00},
+  "anthropic:claude-sonnet-4-20250514":      {"input_cost_per_million": 3.00,  "output_cost_per_million": 15.00},
+  "anthropic:claude-haiku-4-5":              {"input_cost_per_million": 0.80,  "output_cost_per_million": 4.00},
+  "anthropic:claude-haiku-4-5-20251001":     {"input_cost_per_million": 0.80,  "output_cost_per_million": 4.00},
+  "anthropic:claude-3-5-sonnet-20241022":    {"input_cost_per_million": 3.00,  "output_cost_per_million": 15.00},
+  "anthropic:claude-3-5-haiku-20241022":     {"input_cost_per_million": 0.80,  "output_cost_per_million": 4.00},
+  "anthropic:claude-3-opus-20240229":        {"input_cost_per_million": 15.00, "output_cost_per_million": 75.00},
+
+  "google:gemini-2.5-pro":         {"input_cost_per_million": 1.25,  "output_cost_per_million": 10.00},
+  "google:gemini-2.5-flash":       {"input_cost_per_million": 0.30,  "output_cost_per_million": 2.50},
+  "google:gemini-2.5-flash-lite":  {"input_cost_per_million": 0.10,  "output_cost_per_million": 0.40},
+  "google:gemini-2.0-flash":       {"input_cost_per_million": 0.10,  "output_cost_per_million": 0.40},
+  "google:gemini-2.0-flash-lite":  {"input_cost_per_million": 0.075, "output_cost_per_million": 0.30},
+
+  "groq:llama-3.3-70b-versatile":  {"input_cost_per_million": 0.59,  "output_cost_per_million": 0.79},
+  "groq:llama-3.1-70b-versatile":  {"input_cost_per_million": 0.59,  "output_cost_per_million": 0.79},
+  "groq:llama-3.1-8b-instant":     {"input_cost_per_million": 0.05,  "output_cost_per_million": 0.08},
+  "groq:mixtral-8x7b-32768":       {"input_cost_per_million": 0.24,  "output_cost_per_million": 0.24},
+
+  "xai:grok-4":  {"input_cost_per_million": 3.00, "output_cost_per_million": 15.00},
+  "xai:grok-3":  {"input_cost_per_million": 3.00, "output_cost_per_million": 15.00},
+  "xai:grok-2":  {"input_cost_per_million": 2.00, "output_cost_per_million": 10.00},
+
+  "deepseek:deepseek-chat":      {"input_cost_per_million": 0.27, "output_cost_per_million": 1.10},
+  "deepseek:deepseek-reasoner":  {"input_cost_per_million": 0.55, "output_cost_per_million": 2.19},
+
+  "mistral:mistral-large-latest":  {"input_cost_per_million": 2.00, "output_cost_per_million": 6.00},
+  "mistral:mistral-small-latest":  {"input_cost_per_million": 0.20, "output_cost_per_million": 0.60},
+  "mistral:codestral-latest":      {"input_cost_per_million": 0.30, "output_cost_per_million": 0.90},
+
+  "cerebras:llama-3.3-70b":  {"input_cost_per_million": 0.85, "output_cost_per_million": 1.20},
+  "cerebras:llama3.1-8b":    {"input_cost_per_million": 0.10, "output_cost_per_million": 0.10},
+
+  "zai:glm-4.5":  {"input_cost_per_million": 0.60, "output_cost_per_million": 2.20},
+  "zai:glm-5":    {"input_cost_per_million": 0.60, "output_cost_per_million": 2.20},
+
+  "claude-cli":  {"input_cost_per_million": 3.00, "output_cost_per_million": 15.00}
+}

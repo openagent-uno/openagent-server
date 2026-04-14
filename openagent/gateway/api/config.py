@@ -73,4 +73,12 @@ async def handle_patch(request):
     config[section] = patch
     _write_raw(request, config)
     elog("config.update", section=section)
-    return web.json_response({"ok": True, "restart_required": True, section: _sanitize(patch)})
+    # model/providers are hot-reloaded by the Gateway on the next message;
+    # other sections (mcp, scheduler, channels, system_prompt) still need
+    # a restart to take effect.
+    hot_reloadable = section in ("model", "providers")
+    return web.json_response({
+        "ok": True,
+        "restart_required": not hot_reloadable,
+        section: _sanitize(patch),
+    })

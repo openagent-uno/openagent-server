@@ -17,6 +17,63 @@ const server = new McpServer({
 	version: '1.0.0',
 });
 
+// ── Status (always registered) ──
+//
+// The MCP SDK only advertises the `tools` capability when at least one tool
+// has been registered. If we conditionally register Telegram/Discord/WhatsApp
+// tools and none of their env vars are set, the server starts but `list_tools`
+// fails ("method not supported"), which clients log as a hard error.
+//
+// Registering one always-available status tool guarantees the capability is
+// advertised, gives the LLM an affordance for "how do I enable messaging?",
+// and keeps the dormant-MCP detection in the OpenAgent agent meaningful.
+
+const TG_TOKEN_PRESENT = !!process.env.TELEGRAM_BOT_TOKEN;
+const DC_TOKEN_PRESENT = !!process.env.DISCORD_BOT_TOKEN;
+const WA_CREDS_PRESENT = !!process.env.GREEN_API_ID && !!process.env.GREEN_API_TOKEN;
+
+server.registerTool(
+	'status',
+	{
+		title: 'Messaging MCP status',
+		description:
+			'Return which messaging platforms (Telegram, Discord, WhatsApp) are currently ' +
+			'enabled in this MCP server, and how to enable the disabled ones via the ' +
+			'OpenAgent config.',
+		inputSchema: z.object({}).strict(),
+	},
+	async () => {
+		const status = {
+			telegram: TG_TOKEN_PRESENT
+				? { enabled: true, tools: ['telegram_send_message', 'telegram_send_file'] }
+				: {
+						enabled: false,
+						how_to_enable:
+							'Add `channels.telegram.token: <bot-token>` to openagent.yaml ' +
+							'(and restart the agent).',
+				  },
+			discord: DC_TOKEN_PRESENT
+				? { enabled: true, tools: ['discord_send_message'] }
+				: {
+						enabled: false,
+						how_to_enable:
+							'Add `channels.discord.token: <bot-token>` to openagent.yaml ' +
+							'(and restart the agent).',
+				  },
+			whatsapp: WA_CREDS_PRESENT
+				? { enabled: true, tools: ['whatsapp_send_message'] }
+				: {
+						enabled: false,
+						how_to_enable:
+							'Add `channels.whatsapp.green_api_id` and ' +
+							'`channels.whatsapp.green_api_token` to openagent.yaml ' +
+							'(and restart the agent).',
+				  },
+		};
+		return { content: [{ type: 'text', text: JSON.stringify(status, null, 2) }] };
+	},
+);
+
 // ── Telegram ──
 
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;

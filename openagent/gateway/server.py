@@ -8,8 +8,10 @@ connect through this server.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import os
 import socket
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -70,6 +72,11 @@ class Gateway:
         self._port_file = None
         self._model_cache: dict[str, object] = {}  # model_spec → BaseModel instance
 
+        # Hot-reload state. Fingerprint = (mtime_ns, first 8 bytes of sha256).
+        # Recomputed on each message in _process_message.
+        self._config_fingerprint: tuple[int, bytes] | None = None
+        self._reload_lock = asyncio.Lock()
+
     async def start(self) -> None:
         from aiohttp import web
         from aiohttp.web import middleware
@@ -107,6 +114,10 @@ class Gateway:
 
         # Write .port file for agent discovery
         self._write_port_file()
+
+        # Seed the config fingerprint so the first message doesn't trigger
+        # a spurious reload just because we've never sampled the file before.
+        self._config_fingerprint = self._compute_config_fingerprint()
 
     async def stop(self) -> None:
         await self.sessions.shutdown()
@@ -172,6 +183,23 @@ class Gateway:
                 self._port_file.unlink()
             except OSError:
                 pass
+
+    def _compute_config_fingerprint(self) -> tuple[int, bytes] | None:
+        """Return ``(mtime_ns, sha256[:8])`` or ``None`` if the file is missing."""
+        if not self.config_path:
+            return None
+        try:
+            st = os.stat(self.config_path, follow_symlinks=True)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            return None
+        try:
+            with open(self.config_path, "rb") as f:
+                digest = hashlib.sha256(f.read()).digest()[:8]
+        except OSError:
+            return None
+        return (st.st_mtime_ns, digest)
 
     def runtime_info(self) -> dict:
         """Return shared gateway/agent metadata exposed by REST endpoints."""
@@ -386,6 +414,79 @@ class Gateway:
         elog("command.result", client_id=client_id, name=name, text=text)
         await ws.send_json({"type": P.COMMAND_RESULT, "text": text})
 
+    async def _maybe_reload_agent_model(self) -> None:
+        """If the YAML fingerprint changed since the last check, rebuild the
+        primary agent model and swap it onto the agent.
+
+        Scope: only the ``model:`` and ``providers:`` sections drive
+        which model we rebuild. Other sections (channels, mcp, scheduler,
+        system_prompt) are not reread here and still require a restart.
+
+        Safe to call from concurrent messages — the lock serializes the
+        actual rebuild.
+        """
+        if not self.config_path or not self.agent._initialized:
+            return
+
+        current = self._compute_config_fingerprint()
+        if current is None or current == self._config_fingerprint:
+            return
+
+        async with self._reload_lock:
+            # Double-check under lock: another task may have just reloaded.
+            current = self._compute_config_fingerprint()
+            if current is None or current == self._config_fingerprint:
+                return
+
+            try:
+                from openagent.core.config import load_config
+                new_config = load_config(self.config_path)
+            except Exception as e:
+                logger.warning("Config reload: YAML parse failed, skipping: %s", e)
+                elog("gateway.config_reload_parse_error", error=str(e))
+                return
+
+            try:
+                from openagent.models.runtime import create_model_from_config, wire_model_runtime
+                new_model = create_model_from_config(new_config)
+                wire_model_runtime(new_model, db=self.agent._db, mcp_pool=self.agent._mcp)
+            except Exception as e:
+                logger.warning("Config reload: model build failed, skipping: %s", e)
+                elog("gateway.config_reload_build_error", error=str(e))
+                return
+
+            old_model, drain_event = self.agent.swap_model(new_model)
+
+            # Invalidate per-channel override cache — specs may resolve
+            # to different provider configs after the reload.
+            self._model_cache.clear()
+            self._config_fingerprint = current
+
+            elog(
+                "gateway.config_reload",
+                old_class=type(old_model).__name__ if old_model else None,
+                new_class=type(new_model).__name__,
+            )
+
+            if old_model is not None and old_model is not new_model:
+                asyncio.create_task(self._drain_and_shutdown_model(old_model, drain_event))
+
+    async def _drain_and_shutdown_model(self, model, drain_event) -> None:
+        """Wait for *model*'s last in-flight call to finish, then shut it down."""
+        try:
+            await drain_event.wait()
+        except Exception:
+            pass
+        try:
+            shutdown = getattr(model, "shutdown", None)
+            if callable(shutdown):
+                await shutdown()
+        except Exception as e:
+            logger.debug("Drain shutdown error (ignored): %s", e)
+        finally:
+            self.agent._unregister_runtime_model(model)
+            elog("gateway.config_reload_drained", model_class=type(model).__name__)
+
     def _resolve_channel_model(self, client_id: str):
         """Resolve per-channel model override from config."""
         channel = client_id.split(":", 1)[1] if client_id.startswith("bridge:") else "websocket"
@@ -432,6 +533,7 @@ class Gateway:
     async def _process_message(self, ws, client_id: str, text: str, session_id: str) -> None:
         try:
             elog("message.received", client_id=client_id, session_id=session_id, length=len(text))
+            await self._maybe_reload_agent_model()
 
             async def on_status(status: str) -> None:
                 try:

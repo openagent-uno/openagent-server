@@ -144,7 +144,7 @@ jobs:
       - name: Build Node MCPs
         shell: bash
         run: |
-          for mcp_dir in openagent/mcps/computer-control openagent/mcps/shell openagent/mcps/web-search openagent/mcps/editor openagent/mcps/chrome-devtools openagent/mcps/messaging; do
+          for mcp_dir in openagent/mcp/servers/computer-control openagent/mcp/servers/shell openagent/mcp/servers/web-search openagent/mcp/servers/editor openagent/mcp/servers/chrome-devtools openagent/mcp/servers/messaging; do
             if [ -d "$mcp_dir" ]; then
               echo "Building $mcp_dir..."
               (cd "$mcp_dir" && npm install --silent && npm run build --silent 2>/dev/null || true)

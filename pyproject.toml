@@ -51,9 +51,9 @@ include = ["openagent*"]
 
 [tool.setuptools.package-data]
 openagent = [
-    "mcps/**/*.ts",
-    "mcps/**/*.json",
-    "mcps/**/*.py",
-    "mcps/**/*.txt",
-    "mcps/**/.gitignore",
+    "mcp/servers/**/*.ts",
+    "mcp/servers/**/*.json",
+    "mcp/servers/**/*.py",
+    "mcp/servers/**/*.txt",
+    "mcp/servers/**/.gitignore",
 ]

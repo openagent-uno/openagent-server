@@ -33,7 +33,7 @@ echo "→ Building built-in Node MCPs..."
 
 NODE_MCPS=(computer-control shell web-search editor chrome-devtools messaging)
 for mcp in "${NODE_MCPS[@]}"; do
-    mcp_dir="openagent/mcps/$mcp"
+    mcp_dir="openagent/mcp/servers/$mcp"
     if [ ! -d "$mcp_dir" ]; then
         echo "  ⚠ Skipping $mcp (directory not found)"
         continue

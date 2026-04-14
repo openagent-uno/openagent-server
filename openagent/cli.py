@@ -201,7 +201,7 @@ def migrate_cmd(dest: str):
 def mcp_server_cmd(name: str):
     """Run a bundled Python MCP server (internal use by the frozen executable)."""
     if name == "scheduler":
-        from openagent.mcps.scheduler.server import main as scheduler_main
+        from openagent.mcp.servers.scheduler.server import main as scheduler_main
 
         scheduler_main()
         return

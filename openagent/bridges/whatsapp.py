@@ -7,12 +7,13 @@ import logging
 import tempfile
 from pathlib import Path
 
-from openagent.bridges.base import BaseBridge
+from openagent.bridges.base import BaseBridge, format_tool_status
 from openagent.channels.base import (
     build_attachment_context,
     is_blocked_attachment,
     parse_response_markers,
     prepend_context_block,
+    split_preserving_code_blocks,
 )
 from openagent.channels.formatting import markdown_to_whatsapp
 from openagent.channels.voice import transcribe as transcribe_voice
@@ -23,6 +24,13 @@ from openagent.core.logging import elog
 logger = logging.getLogger(__name__)
 
 VOICE_FALLBACK = "[Voice not transcribed. Ask the user to type it.]"
+# WhatsApp message size limit (Green API allows up to 65 536 chars; keep
+# generous headroom for our own framing).
+WHATSAPP_MSG_LIMIT = 4096
+# Throttle: at most one progress message every N seconds, to avoid
+# spamming the user (WhatsApp can't edit messages, so each status is a
+# brand-new chat bubble).
+WA_STATUS_THROTTLE_SECS = 8
 
 
 class WhatsAppBridge(BaseBridge):
@@ -146,9 +154,27 @@ class WhatsAppBridge(BaseBridge):
 
         session_id = f"wa:{user_id}"
 
-        # Send "thinking" (WA can't edit messages)
+        # Send "thinking" (WA can't edit messages, so we throttle updates
+        # to avoid spam — only post a new status if the message changed
+        # AND at least WA_STATUS_THROTTLE_SECS have passed.)
         await self._send_text(chat_id, "⏳ Thinking...")
-        response = await self.send_message(text, session_id)
+        last_status = {"text": "", "ts": 0.0}
+
+        async def on_status(raw: str):
+            line = format_tool_status(raw)
+            now = asyncio.get_event_loop().time()
+            if line == last_status["text"]:
+                return
+            if now - last_status["ts"] < WA_STATUS_THROTTLE_SECS:
+                return
+            last_status["text"] = line
+            last_status["ts"] = now
+            try:
+                await self._send_text(chat_id, f"⏳ {line}")
+            except Exception:
+                pass
+
+        response = await self.send_message(text, session_id, on_status=on_status)
 
         resp_text = response.get("text", "")
         clean, attachments = parse_response_markers(resp_text)
@@ -165,7 +191,9 @@ class WhatsAppBridge(BaseBridge):
                 logger.error("WA attachment error: %s", e)
 
         if clean:
-            await self._send_text(chat_id, markdown_to_whatsapp(clean))
+            wa_text = markdown_to_whatsapp(clean)
+            for chunk in split_preserving_code_blocks(wa_text, WHATSAPP_MSG_LIMIT):
+                await self._send_text(chat_id, chunk)
 
     async def _send_text(self, chat_id: str, text: str) -> None:
         try:

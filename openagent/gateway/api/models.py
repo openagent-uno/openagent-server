@@ -98,7 +98,8 @@ async def handle_set_active(request: web.Request) -> web.Response:
     _write_raw(request, raw)
     elog("config.update", section="model")
 
-    return _web.json_response({"ok": True, "restart_required": True})
+    # The `model:` section is hot-reloaded on the next message.
+    return _web.json_response({"ok": True, "restart_required": False})
 
 
 async def handle_update(request: web.Request) -> web.Response:

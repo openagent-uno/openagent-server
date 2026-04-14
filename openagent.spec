@@ -3,7 +3,11 @@
 
 Usage:
     pip install pyinstaller
-    ./scripts/build-mcps.sh          # pre-build Node MCPs
+    ./scripts/build-executable.sh    # installs deps + builds Node MCPs + runs pyinstaller
+
+To run pyinstaller directly (skipping the helper) make sure the bundled Node
+MCPs in openagent/mcp/servers/ have been built first (npm install + npm run
+build for each), then:
     pyinstaller openagent.spec --clean --noconfirm
 
 Output: dist/openagent/ (onedir bundle)
@@ -51,17 +55,17 @@ hiddenimports = [
 ]
 
 # ── Data files ──
-# Bundle the entire mcps/ directory (built-in MCP servers)
+# Bundle the entire mcp/servers/ directory (built-in MCP servers).
 # Each Node MCP needs its dist/ and node_modules/ directories.
 
 from PyInstaller.utils.hooks import collect_data_files
 
-mcps_dir = Path("openagent/mcps")
+mcps_dir = Path("openagent/mcp/servers")
 
 datas = []
 if mcps_dir.exists():
-    # Bundle the entire mcps directory tree
-    datas.append((str(mcps_dir), "openagent/mcps"))
+    # Bundle the entire mcp/servers directory tree
+    datas.append((str(mcps_dir), "openagent/mcp/servers"))
 
 # litellm needs its JSON data files (model prices, cost maps, etc.)
 datas += collect_data_files("litellm", includes=["**/*.json", "**/*.yaml", "**/*.yml"])

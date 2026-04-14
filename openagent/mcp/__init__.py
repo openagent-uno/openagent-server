@@ -1,4 +1,4 @@
 from openagent.mcp.builtins import BUILTIN_MCP_SPECS
-from openagent.mcp.client import MCPTools, MCPRegistry
+from openagent.mcp.pool import MCPPool
 
-__all__ = ["MCPTools", "MCPRegistry", "BUILTIN_MCP_SPECS"]
+__all__ = ["MCPPool", "BUILTIN_MCP_SPECS"]
