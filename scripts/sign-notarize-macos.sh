@@ -110,10 +110,24 @@ security set-key-partition-list \
     -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
 # ── Also import the Installer cert (same keychain) if we're building pkg ─
+#
+# When the caller asked for a .pkg but the Installer cert secret is
+# missing we fail HARD rather than silently producing only the tar.gz
+# artifact — the downstream workflow expects a .pkg and dropping to
+# "tar.gz only" would confuse everyone. The error message names the
+# two secrets so whoever's configuring the repo knows exactly what to
+# add.
 
 INSTALLER_CERT_FILE="${RUNNER_TEMP:-/tmp}/openagent-installer-cert.p12"
 HAVE_INSTALLER_CERT=false
-if [ "$WANT_PKG" = true ] && [ -n "${CSC_LINK_INSTALLER:-}" ]; then
+if [ "$WANT_PKG" = true ]; then
+    if [ -z "${CSC_LINK_INSTALLER:-}" ]; then
+        echo "ERROR: .pkg build requested but CSC_LINK_INSTALLER is not set." >&2
+        echo "  Add these two GitHub Actions repository secrets:" >&2
+        echo "    CSC_LINK_INSTALLER          base64-encoded Developer ID Installer .p12" >&2
+        echo "    CSC_KEY_PASSWORD_INSTALLER  password for the .p12" >&2
+        exit 1
+    fi
     INSTALLER_PASSWORD="${CSC_KEY_PASSWORD_INSTALLER:-$CSC_KEY_PASSWORD}"
     echo "→ Importing Installer cert into same keychain"
     echo -n "$CSC_LINK_INSTALLER" | base64 --decode > "$INSTALLER_CERT_FILE"
