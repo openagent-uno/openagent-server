@@ -77,6 +77,22 @@ class Gateway:
         self._config_fingerprint: tuple[int, bytes] | None = None
         self._reload_lock = asyncio.Lock()
 
+    @staticmethod
+    async def _safe_ws_send_json(ws, payload: dict) -> bool:
+        """Best-effort websocket send that tolerates closing transports."""
+        if ws is None or getattr(ws, "closed", False):
+            return False
+        try:
+            await ws.send_json(payload)
+            return True
+        except Exception as e:
+            if "closing transport" in str(e).lower():
+                logger.debug("WS send skipped on closing transport")
+                return False
+            if getattr(ws, "closed", False):
+                return False
+            raise
+
     async def start(self) -> None:
         from aiohttp import web
         from aiohttp.web import middleware
@@ -305,7 +321,7 @@ class Gateway:
                 try:
                     data = json.loads(msg.data)
                 except json.JSONDecodeError:
-                    await ws.send_json({"type": P.ERROR, "text": "Invalid JSON"})
+                    await self._safe_ws_send_json(ws, {"type": P.ERROR, "text": "Invalid JSON"})
                     continue
 
                 t = data.get("type", "")
@@ -314,7 +330,7 @@ class Gateway:
                 if t == P.AUTH:
                     if self.token and data.get("token") != self.token:
                         elog("auth.fail", client_id=data.get("client_id"))
-                        await ws.send_json({"type": P.AUTH_ERROR, "reason": "Invalid token"})
+                        await self._safe_ws_send_json(ws, {"type": P.AUTH_ERROR, "reason": "Invalid token"})
                         await ws.close()
                         return ws
                     client_id = data.get("client_id") or f"ws-{id(ws)}"
@@ -322,7 +338,7 @@ class Gateway:
                     self.clients[client_id] = ws
                     import openagent
                     elog("gateway.client_connect", client_id=client_id)
-                    await ws.send_json({
+                    await self._safe_ws_send_json(ws, {
                         "type": P.AUTH_OK,
                         "agent_name": self.agent.name,
                         "version": getattr(openagent, "__version__", "?"),
@@ -330,7 +346,7 @@ class Gateway:
                     continue
 
                 if not authed:
-                    await ws.send_json({"type": P.AUTH_ERROR, "reason": "Not authenticated"})
+                    await self._safe_ws_send_json(ws, {"type": P.AUTH_ERROR, "reason": "Not authenticated"})
                     continue
                 if client_id is None:
                     client_id = f"ws-{id(ws)}"
@@ -338,7 +354,7 @@ class Gateway:
 
                 # Ping
                 if t == P.PING:
-                    await ws.send_json({"type": P.PONG})
+                    await self._safe_ws_send_json(ws, {"type": P.PONG})
 
                 # Command
                 elif t == P.COMMAND:
@@ -357,10 +373,13 @@ class Gateway:
 
                         pos = await self.sessions.enqueue(client_id, handler, session_id=sid)
                         if pos < 0:
-                            await ws.send_json({"type": P.ERROR, "text": "Too many messages queued. Please wait.", "session_id": sid})
+                            await self._safe_ws_send_json(
+                                ws,
+                                {"type": P.ERROR, "text": "Too many messages queued. Please wait.", "session_id": sid},
+                            )
                         elif pos > 0:
                             elog("message.queued", client_id=client_id, session_id=sid, position=pos)
-                            await ws.send_json({"type": P.QUEUED, "position": pos})
+                            await self._safe_ws_send_json(ws, {"type": P.QUEUED, "position": pos})
 
         except Exception as e:
             logger.error("WS error for %s: %s", client_id, e)
@@ -422,7 +441,7 @@ class Gateway:
         else:
             text = f"Unknown command: {name}"
         elog("command.result", client_id=client_id, name=name, text=text)
-        await ws.send_json({"type": P.COMMAND_RESULT, "text": text})
+        await self._safe_ws_send_json(ws, {"type": P.COMMAND_RESULT, "text": text})
 
     async def _maybe_reload_agent_model(self) -> None:
         """If the YAML fingerprint changed since the last check, rebuild the
@@ -547,7 +566,10 @@ class Gateway:
 
             async def on_status(status: str) -> None:
                 try:
-                    await ws.send_json({"type": P.STATUS, "text": status, "session_id": session_id})
+                    await self._safe_ws_send_json(
+                        ws,
+                        {"type": P.STATUS, "text": status, "session_id": session_id},
+                    )
                 except Exception:
                     pass
 
@@ -564,7 +586,7 @@ class Gateway:
                     history_mode=history_mode,
                     error=str(e),
                 )
-                await ws.send_json({"type": P.ERROR, "text": str(e), "session_id": session_id})
+                await self._safe_ws_send_json(ws, {"type": P.ERROR, "text": str(e), "session_id": session_id})
                 return
             elog(
                 "message.process_start",
@@ -593,7 +615,7 @@ class Gateway:
                     reason="server_shutdown",
                 )
                 try:
-                    await ws.send_json({
+                    await self._safe_ws_send_json(ws, {
                         "type": P.ERROR,
                         "text": "Server is restarting, please try your message again in a moment.",
                         "session_id": session_id,
@@ -608,7 +630,7 @@ class Gateway:
             response_meta = self.agent.last_response_meta(session_id)
 
             elog("message.response", client_id=client_id, session_id=session_id, length=len(clean))
-            await ws.send_json({
+            await self._safe_ws_send_json(ws, {
                 "type": P.RESPONSE,
                 "text": clean,
                 "session_id": session_id,
@@ -627,6 +649,9 @@ class Gateway:
                 error=str(e) or repr(e),
             )
             try:
-                await ws.send_json({"type": P.ERROR, "text": str(e) or type(e).__name__, "session_id": session_id})
+                await self._safe_ws_send_json(
+                    ws,
+                    {"type": P.ERROR, "text": str(e) or type(e).__name__, "session_id": session_id},
+                )
             except Exception:
                 pass  # WS is dead — bridge timeout will handle cleanup

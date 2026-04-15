@@ -101,6 +101,9 @@ def create_model_from_spec(
     routing: dict[str, str] | None = None,
     classifier_model: str | None = None,
     claude_permission_mode: str | None = None,
+    claude_idle_timeout_seconds: int | None = None,
+    claude_hard_timeout_seconds: int | None = None,
+    claude_idle_ttl_seconds: int | None = None,
     db: Any = None,
     mcp_pool: Any = None,
 ) -> BaseModel:
@@ -129,6 +132,9 @@ def create_model_from_spec(
             model=bare if bare and bare != spec else None,
             permission_mode=permission_mode,
             providers_config=providers_config,
+            idle_timeout_seconds=claude_idle_timeout_seconds,
+            hard_timeout_seconds=claude_hard_timeout_seconds,
+            idle_ttl_seconds=claude_idle_ttl_seconds,
         )
     else:
         from openagent.models.agno_provider import AgnoProvider
@@ -151,6 +157,9 @@ def create_model_from_config(config: dict) -> BaseModel:
     permission_mode = model_cfg.get("permission_mode", "bypass")
     api_key = model_cfg.get("api_key")
     provider = _canonical_provider_name(model_cfg.get("provider"))
+    idle_timeout = model_cfg.get("idle_timeout_seconds")
+    hard_timeout = model_cfg.get("hard_timeout_seconds")
+    idle_ttl = model_cfg.get("idle_ttl_seconds")
 
     if provider == "smart":
         return create_model_from_spec(
@@ -171,6 +180,9 @@ def create_model_from_config(config: dict) -> BaseModel:
         api_key=api_key,
         base_url=base_url,
         claude_permission_mode=permission_mode,
+        claude_idle_timeout_seconds=idle_timeout,
+        claude_hard_timeout_seconds=hard_timeout,
+        claude_idle_ttl_seconds=idle_ttl,
     )
 
 

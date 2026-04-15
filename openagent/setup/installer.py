@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import platform
+import shlex
 import shutil
 import subprocess
 import sys
@@ -121,6 +122,107 @@ def _get_env_path() -> str:
     return os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")
 
 
+def _load_service_config(agent_dir: Path | None = None) -> dict:
+    """Load config for service generation when available.
+
+    Service install should stay robust even when the config file is missing or
+    temporarily invalid, so failures here fall back to an empty config.
+    """
+    try:
+        from openagent.core.config import load_config
+
+        if agent_dir is not None:
+            cfg_path = agent_dir / "openagent.yaml"
+            if not cfg_path.exists():
+                return {}
+            return load_config(cfg_path)
+        return load_config()
+    except Exception:
+        return {}
+
+
+def _systemd_service_overrides(agent_dir: Path | None = None) -> dict[str, str]:
+    """Return optional raw ``[Service]`` directives from YAML config.
+
+    Example:
+
+    ```yaml
+    service:
+      systemd:
+        MemoryHigh: 2500M
+        MemoryMax: 3500M
+        MemorySwapMax: 1G
+    ```
+
+    Omit the section entirely, or set a key to ``null`` / empty string, to
+    leave the corresponding systemd limit unset.
+    """
+    cfg = _load_service_config(agent_dir)
+    raw = ((cfg.get("service") or {}).get("systemd") or {})
+    if not isinstance(raw, dict):
+        return {}
+
+    rendered: dict[str, str] = {}
+    for key, value in raw.items():
+        name = str(key or "").strip()
+        if not name or any(ch in name for ch in "\r\n"):
+            continue
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            rendered[name] = "yes" if value else "no"
+            continue
+        if isinstance(value, (list, tuple)):
+            text = " ".join(str(part).strip() for part in value if str(part).strip())
+        else:
+            text = str(value).strip()
+        if not text:
+            continue
+        rendered[name] = text
+    return rendered
+
+
+def _build_linux_unit(agent_dir: Path | None = None) -> str:
+    """Render the systemd user unit for this agent."""
+    _, label, _ = _service_names(agent_dir)
+    cmd = shlex.join(_get_openagent_cmd(agent_dir))
+    log_dir = _get_log_dir(agent_dir)
+    overrides = _systemd_service_overrides(agent_dir)
+    override_lines = "\n        ".join(
+        f"{key}={value}" for key, value in overrides.items()
+    )
+    if override_lines:
+        override_lines = f"\n        # Optional operator overrides\n        {override_lines}\n"
+
+    return textwrap.dedent(f"""\
+        [Unit]
+        Description={label} - AI agent service
+        After=network-online.target
+        Wants=network-online.target
+        StartLimitIntervalSec=60
+        StartLimitBurst=5
+
+        [Service]
+        Type=simple
+        ExecStart={cmd}
+        WorkingDirectory={_get_working_dir(agent_dir)}
+        Restart=always
+        RestartSec=5
+        SuccessExitStatus=75
+
+        # Environment
+        Environment=PATH={_get_env_path()}
+        Environment=DISPLAY=:1
+        Environment=OPENAGENT_LOG_DIR={log_dir}{override_lines}
+        # Logging
+        StandardOutput=append:{log_dir / "openagent.out.log"}
+        StandardError=append:{log_dir / "openagent.err.log"}
+
+        [Install]
+        WantedBy=default.target
+    """)
+
+
 # ---------------------------------------------------------------------------
 # macOS  (launchd)
 # ---------------------------------------------------------------------------
@@ -218,38 +320,8 @@ def _linux_unit_path(agent_dir: Path | None = None) -> Path:
 
 
 def _linux_install(agent_dir: Path | None = None) -> str:
-    _, label, unit_name = _service_names(agent_dir)
-    cmd = " ".join(_get_openagent_cmd(agent_dir))
-    log_dir = _get_log_dir(agent_dir)
-
-    unit = textwrap.dedent(f"""\
-        [Unit]
-        Description={label} - AI agent service
-        After=network-online.target
-        Wants=network-online.target
-        StartLimitIntervalSec=60
-        StartLimitBurst=5
-
-        [Service]
-        Type=simple
-        ExecStart={cmd}
-        WorkingDirectory={_get_working_dir(agent_dir)}
-        Restart=always
-        RestartSec=5
-        SuccessExitStatus=75
-
-        # Environment
-        Environment=PATH={_get_env_path()}
-        Environment=DISPLAY=:1
-        Environment=OPENAGENT_LOG_DIR={log_dir}
-
-        # Logging
-        StandardOutput=append:{log_dir / "openagent.out.log"}
-        StandardError=append:{log_dir / "openagent.err.log"}
-
-        [Install]
-        WantedBy=default.target
-    """)
+    _, _, unit_name = _service_names(agent_dir)
+    unit = _build_linux_unit(agent_dir)
 
     path = _linux_unit_path(agent_dir)
     path.parent.mkdir(parents=True, exist_ok=True)

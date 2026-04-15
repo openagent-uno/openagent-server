@@ -66,12 +66,18 @@ class DiscordBridge(BaseBridge):
 
         # ── Register slash commands ──
 
-        for command_name, description in BOT_COMMANDS:
-            async def _handler(interaction: discord.Interaction, _command_name=command_name):
-                await self._handle_slash(interaction, _command_name)
+        def _make_command_handler(command_name: str):
+            async def _handler(interaction: discord.Interaction) -> None:
+                await self._handle_slash(interaction, command_name)
 
             _handler.__name__ = f"_cmd_{command_name.replace('-', '_')}"
-            tree.command(name=command_name, description=description)(_handler)
+            return _handler
+
+        for command_name, description in BOT_COMMANDS:
+            tree.command(
+                name=command_name,
+                description=description,
+            )(_make_command_handler(command_name))
 
         # Welcome message — symmetric with Telegram /start.  Not part of
         # BOT_COMMANDS because the gateway has no /start command; this is

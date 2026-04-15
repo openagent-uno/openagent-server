@@ -124,6 +124,17 @@ class BaseBridge:
             self._session_locks[session_id] = asyncio.Lock()
         return self._session_locks[session_id]
 
+    async def _send_gateway_json(self, payload: dict) -> None:
+        """Write to the gateway websocket, tolerating reconnect races."""
+        if self._ws is None or getattr(self._ws, "closed", False):
+            raise ConnectionError("Gateway websocket is not connected")
+        try:
+            await self._ws.send_json(payload)
+        except Exception as e:
+            if "closing transport" in str(e).lower():
+                raise ConnectionError("Gateway websocket is closing") from e
+            raise
+
     @staticmethod
     def append_model_feedback(text: str, model: str | None) -> str:
         """Append a compact model footer to a response body."""
@@ -154,7 +165,7 @@ class BaseBridge:
 
         # Authenticate
         auth_msg = {"type": P.AUTH, "token": self.gateway_token or "", "client_id": f"bridge:{self.name}"}
-        await self._ws.send_json(auth_msg)
+        await self._send_gateway_json(auth_msg)
 
         # Wait for auth response
         resp = await self._ws.receive_json()
@@ -183,16 +194,18 @@ class BaseBridge:
                         except Exception:
                             pass
                     elif t == P.RESPONSE and sid in self._pending:
-                        self._pending[sid].set_result(data)
-                        del self._pending[sid]
+                        future = self._pending.pop(sid)
+                        if not future.done():
+                            future.set_result(data)
                         self._status_callbacks.pop(sid, None)
                     elif t == P.ERROR:
                         # Errors may or may not have a session_id.  Try to
                         # route to the matching pending future; if no match,
                         # just log it.
                         if sid and sid in self._pending:
-                            self._pending[sid].set_result(data)
-                            del self._pending[sid]
+                            future = self._pending.pop(sid)
+                            if not future.done():
+                                future.set_result(data)
                             self._status_callbacks.pop(sid, None)
                     elif t == P.COMMAND_RESULT and self._command_future and not self._command_future.done():
                         self._command_future.set_result(data)
@@ -223,11 +236,16 @@ class BaseBridge:
             if on_status:
                 self._status_callbacks[session_id] = on_status
 
-            await self._ws.send_json({
-                "type": P.MESSAGE,
-                "text": text,
-                "session_id": session_id,
-            })
+            try:
+                await self._send_gateway_json({
+                    "type": P.MESSAGE,
+                    "text": text,
+                    "session_id": session_id,
+                })
+            except Exception:
+                self._pending.pop(session_id, None)
+                self._status_callbacks.pop(session_id, None)
+                raise
 
             try:
                 return await asyncio.wait_for(future, timeout=BRIDGE_RESPONSE_TIMEOUT)
@@ -242,7 +260,12 @@ class BaseBridge:
         async with self._command_lock:
             future: asyncio.Future = asyncio.get_running_loop().create_future()
             self._command_future = future
-            await self._ws.send_json({"type": P.COMMAND, "name": name})
+            try:
+                await self._send_gateway_json({"type": P.COMMAND, "name": name})
+            except Exception:
+                if self._command_future is future:
+                    self._command_future = None
+                raise
             try:
                 result = await asyncio.wait_for(future, timeout=BRIDGE_RESPONSE_TIMEOUT)
             except asyncio.TimeoutError:

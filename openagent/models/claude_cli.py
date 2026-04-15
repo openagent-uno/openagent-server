@@ -41,9 +41,9 @@ os.environ.setdefault("CLAUDE_CODE_STREAM_CLOSE_TIMEOUT", "300000")  # 5 min
 # messages, so the loop was silent the whole time). Resetting the timeout per
 # message lets big tool calls finish while still catching genuinely stuck
 # subprocesses.
-IDLE_TIMEOUT = 900  # 15 min without any SDK message → something is wrong
+DEFAULT_IDLE_TIMEOUT = 900  # 15 min without any SDK message → something is wrong
 # Absolute ceiling per query. Retries kick in after this.
-HARD_TIMEOUT = 1800  # 30 min
+DEFAULT_HARD_TIMEOUT = 1800  # 30 min
 
 # Close idle clients after 24h — was 10 min, which caused user-visible
 # "lost memory" bugs on Telegram/Discord bridges where the next message after
@@ -52,7 +52,48 @@ HARD_TIMEOUT = 1800  # 30 min
 # transcript. Keeping the subprocess alive side-steps --resume entirely for
 # active users; the mapping is also persisted to the db (``sdk_sessions``
 # table) so the 24h+ case still survives a restart.
-IDLE_TTL = 86400
+DEFAULT_IDLE_TTL = 86400
+
+
+class _ClaudeSDKNoiseFilter(logging.Filter):
+    """Drop expected SDK noise produced during intentional shutdown/cancel."""
+
+    _NOISY_FRAGMENTS = (
+        "Fatal error in message reader: Command failed with exit code 143",
+        "Fatal error in message reader: Cannot write to terminated process (exit code: 143)",
+        "Fatal error in message reader: Cannot write to closing transport",
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not any(
+            fragment in record.getMessage()
+            for fragment in self._NOISY_FRAGMENTS
+        )
+
+
+def _install_sdk_log_filters() -> None:
+    marker = "_openagent_expected_shutdown_filter"
+    for logger_name in (
+        "claude_agent_sdk",
+        "claude_agent_sdk._internal.query",
+        "claude_agent_sdk._internal.transport.subprocess_cli",
+    ):
+        sdk_logger = logging.getLogger(logger_name)
+        if getattr(sdk_logger, marker, False):
+            continue
+        sdk_logger.addFilter(_ClaudeSDKNoiseFilter())
+        setattr(sdk_logger, marker, True)
+
+
+def _coerce_timeout_seconds(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+_install_sdk_log_filters()
 
 
 class ClaudeCLI(BaseModel):
@@ -67,12 +108,24 @@ class ClaudeCLI(BaseModel):
         permission_mode: str = "bypass",
         mcp_servers: dict[str, dict] | None = None,
         providers_config: dict | None = None,
+        idle_timeout_seconds: int | None = None,
+        hard_timeout_seconds: int | None = None,
+        idle_ttl_seconds: int | None = None,
     ):
         self.model = model
         self.allowed_tools = allowed_tools or []
         self.permission_mode = permission_mode
         self.mcp_servers: dict[str, dict] = mcp_servers or {}
         self._providers_config = providers_config or {}
+        self._idle_timeout = _coerce_timeout_seconds(
+            idle_timeout_seconds, DEFAULT_IDLE_TIMEOUT
+        )
+        self._hard_timeout = _coerce_timeout_seconds(
+            hard_timeout_seconds, DEFAULT_HARD_TIMEOUT
+        )
+        self._idle_ttl = _coerce_timeout_seconds(
+            idle_ttl_seconds, DEFAULT_IDLE_TTL
+        )
         self._db: Any = None
         self._clients: dict[str, Any] = {}  # our_sid → ClaudeSDKClient
         self._sdk_sessions: dict[str, str] = {}  # our_sid → sdk_session_id
@@ -236,7 +289,7 @@ class ClaudeCLI(BaseModel):
         to_close: list[tuple[str, Any]] = []
         async with self._lock:
             for sid, last in list(self._last_active.items()):
-                if now - last > IDLE_TTL:
+                if now - last > self._idle_ttl:
                     client = self._clients.pop(sid, None)
                     self._last_active.pop(sid, None)
                     if client:
@@ -320,10 +373,12 @@ class ClaudeCLI(BaseModel):
             # `tool_result` with no SDK messages in between.
             iterator = client.receive_response().__aiter__()
             while True:
-                if time.monotonic() - t0 > HARD_TIMEOUT:
-                    raise TimeoutError(f"query exceeded {HARD_TIMEOUT}s hard limit")
+                if time.monotonic() - t0 > self._hard_timeout:
+                    raise TimeoutError(
+                        f"query exceeded {self._hard_timeout}s hard limit"
+                    )
                 try:
-                    async with asyncio.timeout(IDLE_TIMEOUT):
+                    async with asyncio.timeout(self._idle_timeout):
                         message = await iterator.__anext__()
                 except StopAsyncIteration:
                     break
@@ -362,8 +417,6 @@ class ClaudeCLI(BaseModel):
                     }
                     break  # Never read past the response boundary
         except TimeoutError:
-            logger.error("receive_response() timed out (idle=%ds, hard=%ds)", IDLE_TIMEOUT, HARD_TIMEOUT)
-            elog("model.timeout", session_id=session_id, idle_timeout=IDLE_TIMEOUT, hard_timeout=HARD_TIMEOUT)
             raise
 
         # Defense-in-depth: if a substantial response arrived in under 1s,
@@ -433,7 +486,31 @@ class ClaudeCLI(BaseModel):
                     model=self._model_id_for_billing(),
                 )
             except Exception as e:
-                logger.error("Session %s error (attempt %d): %s", sid[-8:], attempt + 1, e)
+                is_timeout = isinstance(e, TimeoutError)
+                if is_timeout:
+                    event = "model.timeout_retry" if attempt == 0 else "model.timeout"
+                    elog(
+                        event,
+                        session_id=sid,
+                        attempt=attempt + 1,
+                        idle_timeout=self._idle_timeout,
+                        hard_timeout=self._hard_timeout,
+                    )
+                    log_fn = logger.warning if attempt == 0 else logger.error
+                    log_fn(
+                        "Session %s timed out on attempt %d (idle=%ds, hard=%ds)",
+                        sid[-8:],
+                        attempt + 1,
+                        self._idle_timeout,
+                        self._hard_timeout,
+                    )
+                else:
+                    logger.error(
+                        "Session %s error (attempt %d): %s",
+                        sid[-8:],
+                        attempt + 1,
+                        e,
+                    )
                 # Drop the broken client — next attempt creates a fresh one
                 # with resume, recovering history from disk.
                 # Never clear _sdk_sessions: the session is persisted on disk
@@ -441,12 +518,12 @@ class ClaudeCLI(BaseModel):
                 await self._drop_client(sid)
                 if attempt == 0:
                     continue
-                stop_reason = "timeout" if isinstance(e, TimeoutError) else "error"
+                stop_reason = "timeout" if is_timeout else "error"
                 elog("model.generate_error", session_id=sid, attempt=attempt + 1, error=str(e), stop_reason=stop_reason)
                 return ModelResponse(
                     content="I'm sorry, that request took too long to process. "
                     "Please try again with a simpler request."
-                    if isinstance(e, TimeoutError)
+                    if is_timeout
                     else f"Error: {e}",
                     stop_reason=stop_reason,
                     model=self._model_id_for_billing(),
@@ -604,10 +681,12 @@ class ClaudeCLI(BaseModel):
             t0 = time.monotonic()
             iterator = client.receive_response().__aiter__()
             while True:
-                if time.monotonic() - t0 > HARD_TIMEOUT:
-                    raise TimeoutError(f"stream exceeded {HARD_TIMEOUT}s hard limit")
+                if time.monotonic() - t0 > self._hard_timeout:
+                    raise TimeoutError(
+                        f"stream exceeded {self._hard_timeout}s hard limit"
+                    )
                 try:
-                    async with asyncio.timeout(IDLE_TIMEOUT):
+                    async with asyncio.timeout(self._idle_timeout):
                         message = await iterator.__anext__()
                 except StopAsyncIteration:
                     break
@@ -624,7 +703,11 @@ class ClaudeCLI(BaseModel):
                         yield message.result
                     break  # Never read past the response boundary
         except TimeoutError:
-            logger.error("Stream timed out (idle=%ds, hard=%ds)", IDLE_TIMEOUT, HARD_TIMEOUT)
+            logger.error(
+                "Stream timed out (idle=%ds, hard=%ds)",
+                self._idle_timeout,
+                self._hard_timeout,
+            )
             await self._drop_client(sid)
             yield "Error: request timed out"
         except Exception as e:

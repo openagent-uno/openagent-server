@@ -50,6 +50,7 @@ from scripts.tests._setup import build_test_config, cleanup_extras  # noqa: E402
 _TEST_MODULES: tuple[str, ...] = (
     # 1. Lightweight / pure-unit (no fixtures needed)
     "test_imports",
+    "test_setup",
     "test_catalog",
     "test_channels",
     "test_formatting",
