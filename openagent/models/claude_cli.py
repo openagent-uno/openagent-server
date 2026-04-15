@@ -365,6 +365,13 @@ class ClaudeCLI(BaseModel):
         t0 = time.monotonic()
         await client.query(prompt, session_id=session_id)
         result_text = ""
+        # Accumulate TextBlock content from streamed AssistantMessages as a
+        # fallback for when ResultMessage.result arrives empty. Production
+        # traces on lyra-agent showed ``model.empty_result`` events with
+        # 1300+ output_tokens, meaning the CLI generated substantial text
+        # but didn't echo it in the final ``result`` field. Before this fix
+        # the caller just saw "(Done — no final message was returned.)".
+        streamed_text_parts: list[str] = []
         usage_meta: dict[str, Any] = {}
         try:
             # Per-message idle timeout + absolute ceiling. A wrap-around loop
@@ -382,10 +389,19 @@ class ClaudeCLI(BaseModel):
                         message = await iterator.__anext__()
                 except StopAsyncIteration:
                     break
-                if isinstance(message, AssistantMessage) and on_status:
+                if isinstance(message, AssistantMessage):
                     for block in (message.content or []):
+                        # Capture text from TextBlocks for the empty-result
+                        # fallback below. The SDK's ``TextBlock.text`` is a
+                        # ``str``; guard against unexpected non-string
+                        # payloads so we don't concatenate "None" or repr().
+                        block_text = getattr(block, "text", None)
+                        if isinstance(block_text, str) and block_text:
+                            streamed_text_parts.append(block_text)
+                        # Emit status for tool calls so bridges can surface
+                        # "running: <tool>" indicators.
                         tool = getattr(block, "name", None)
-                        if tool and hasattr(block, "input"):
+                        if tool and hasattr(block, "input") and on_status:
                             try:
                                 params = getattr(block, "input", {})
                                 await on_status(_json.dumps({
@@ -432,11 +448,32 @@ class ClaudeCLI(BaseModel):
             elog("model.stale_response", session_id=session_id, elapsed_ms=int(elapsed * 1000))
             raise RuntimeError("Stale response detected")
 
-        # Some Claude turns finish with tool calls but no final text (e.g.
-        # "I've done X, Y, Z" lost to a length cap or an edge in the SDK).
-        # The bridge would otherwise forward a zero-length message to the
-        # user. Log it structured so we can spot frequency, and substitute a
-        # non-empty placeholder so the caller actually sees *something*.
+        # Some Claude turns finish with an empty ``ResultMessage.result``
+        # despite the CLI having streamed substantial text in earlier
+        # ``AssistantMessage`` blocks. Recover it from what we captured
+        # during the stream before falling through to the placeholder.
+        if not result_text and streamed_text_parts:
+            result_text = "".join(streamed_text_parts)
+            num_turns = usage_meta.get("num_turns")
+            out_tokens = (usage_meta.get("usage") or {}).get("output_tokens")
+            logger.info(
+                "ResultMessage.result empty — recovered %d chars from streamed "
+                "AssistantMessage TextBlocks (turns=%s, output_tokens=%s) for session %s",
+                len(result_text), num_turns, out_tokens, session_id,
+            )
+            elog(
+                "model.result_recovered_from_stream",
+                session_id=session_id,
+                num_turns=num_turns,
+                output_tokens=out_tokens,
+                recovered_chars=len(result_text),
+            )
+
+        # Some Claude turns finish with tool calls and zero text anywhere
+        # (rare SDK edge case, or a turn that ran only tool calls and
+        # nothing else). The bridge would otherwise forward zero bytes to
+        # the user. Log it structured so we can spot frequency, and
+        # substitute a non-empty placeholder so the caller sees *something*.
         if not result_text:
             num_turns = usage_meta.get("num_turns")
             out_tokens = (usage_meta.get("usage") or {}).get("output_tokens")

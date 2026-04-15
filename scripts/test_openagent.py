@@ -78,6 +78,8 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_bridges",
     # 7. Optional Claude CLI path (needs --include-claude)
     "test_claude_cli",
+    # 8. Unit tests for claude_cli text-recovery regression
+    "test_claude_cli_text_recovery",
 )
 
 
