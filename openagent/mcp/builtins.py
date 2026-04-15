@@ -88,6 +88,70 @@ DEFAULT_MCPS: list[dict[str, Any]] = [
 ]
 
 
+def _default_filesystem_roots() -> list[str]:
+    """Roots handed to ``@modelcontextprotocol/server-filesystem`` by default.
+
+    The MCP spec lets clients announce *Roots* dynamically (``roots/list``),
+    but the Claude Agent SDK we ship with doesn't advertise the capability
+    yet, so the reference filesystem server falls back to the directory
+    arguments we pass at launch. Those arguments form a hard allowlist:
+    every tool-call path is rejected unless its realpath starts with one of
+    the roots.
+
+    **Default: the whole filesystem (``/``).** Rationale:
+    - The MCP's allowlist is a *second* security layer. The first layer —
+      file ownership, TCC on macOS, SIP, Linux user caps — still applies
+      and is what actually protects the user. An extra in-MCP allowlist
+      that only covers ``$HOME`` creates false negatives (agent can't read
+      ``/etc/hosts`` for a diagnostic, can't open ``/tmp/foo`` from an
+      attachment, can't inspect a project outside ``$HOME``) without
+      adding any real protection against a compromised tool call.
+    - LLM UX: the Claude / Agno tools see stable, uniform descriptions
+      regardless of which machine the agent runs on. There's no "oops,
+      the path is outside the sandbox" surprise that forces a
+      re-prompt.
+
+    **Override**: set ``OPENAGENT_FILESYSTEM_ROOTS`` to a
+    ``os.pathsep``-separated list of absolute directories to tighten the
+    sandbox (e.g. ``/Users/alice:/projects/work``). Each entry is
+    ``os.path.expanduser``-expanded and must exist on disk — missing
+    entries are dropped with a warning rather than failing the launch.
+    Alternatively, set an explicit ``args:`` list on the ``filesystem``
+    entry in ``openagent.yaml`` — that takes priority over this default.
+
+    The implementation follows the MCP standard: we pass directory
+    arguments exactly as the reference server expects, and we don't
+    replace its tool surface — ``read_text_file``, ``write_file``,
+    ``list_directory``, etc. remain the same canonical names LLMs have
+    been trained on.
+    """
+    override = os.environ.get("OPENAGENT_FILESYSTEM_ROOTS", "").strip()
+    if override:
+        roots: list[str] = []
+        for raw in override.split(os.pathsep):
+            raw = raw.strip()
+            if not raw:
+                continue
+            expanded = os.path.expanduser(raw)
+            if os.path.isdir(expanded):
+                roots.append(expanded)
+            else:
+                logger.warning(
+                    "OPENAGENT_FILESYSTEM_ROOTS entry %r is not an existing "
+                    "directory — skipping", raw,
+                )
+        if roots:
+            logger.info("filesystem MCP roots (from env): %s", roots)
+            return roots
+        logger.warning(
+            "OPENAGENT_FILESYSTEM_ROOTS set but no entry resolved to a valid "
+            "directory — falling back to default (/)",
+        )
+
+    # Unbounded: the whole filesystem.
+    return ["/"]
+
+
 def command_exists(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
@@ -216,19 +280,7 @@ def resolve_default_entry(entry: dict[str, Any], db_path: str | None = None) -> 
 
     args = entry.get("args") or []
     if name == "filesystem" and not args:
-        # Default: expose the whole filesystem. The ``@modelcontextprotocol/
-        # server-filesystem`` reference implementation requires at least one
-        # root argument, so we can't simply "not sandbox" — we must name
-        # explicit roots. Passing "/" means "everything the user running
-        # OpenAgent can already see", which matches user expectations when
-        # the agent pipes attached files, asks to read /etc, or inspects
-        # project paths outside $HOME. The actual OS-level permission model
-        # (file ownership, TCC on macOS, SIP, etc.) still enforces real
-        # security — the MCP's allowlist was just an extra layer that got in
-        # the way more often than it helped. Users can override by setting
-        # an explicit ``args:`` list on the filesystem entry in openagent.yaml
-        # if they want a tighter sandbox.
-        args = ["/"]
+        args = _default_filesystem_roots()
     if name == "vault" and not args:
         args = [str(default_vault_path())]
 
