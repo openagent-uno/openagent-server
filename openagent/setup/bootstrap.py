@@ -108,9 +108,11 @@ def check_docker() -> Check:
         return Check("docker", "skip", "docker not installed (not required)", "")
 
     try:
+        # ``docker info`` can take 10-20 s on a cold Docker Desktop that just
+        # launched; 5 s falsely reports the daemon as unreachable.
         proc = subprocess.run(
             ["docker", "info", "--format", "{{.ServerVersion}}"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=20,
         )
         if proc.returncode != 0:
             hint = "Start the Docker daemon."

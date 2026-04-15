@@ -264,7 +264,7 @@ class AgentServer:
                 bridge.start(), name=f"bridge:{bridge.name}"
             ))
 
-    async def stop(self, timeout: float = 5) -> None:
+    async def stop(self, timeout: float = 15) -> None:
         """Stop bridges, gateway, scheduler, agent (in reverse).
 
         Each phase gets up to *timeout* seconds.  If the agent shutdown

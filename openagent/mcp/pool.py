@@ -51,13 +51,16 @@ _MESSAGING_TOKEN_ENV_VARS = (
     "GREEN_API_TOKEN",
 )
 
-# Per-MCP-call timeout. Agno's MCPTools defaults to 10s, which is too tight
-# for cold-start tool calls against npx-launched servers like the reference
-# ``@modelcontextprotocol/server-filesystem`` — the first ``read_text_file``
-# after a fresh spawn routinely takes 5-15s while npm resolves the command.
-# Bumping to 30s gives those calls enough headroom without masking genuine
-# hangs.
-_MCP_TIMEOUT_SECONDS = 30
+# Per-MCP-call timeout. Agno's MCPTools defaults to 10s, which was too tight
+# for cold-start tool calls against npx-launched servers; we bumped to 30s
+# and then hit the opposite problem — 30s is *catastrophically* tight for
+# tools that legitimately run for minutes, like ``shell_exec`` driving a
+# macOS Electron build. A 30-min ceiling matches the shell MCP's own
+# MAX_TIMEOUT so the Agno wrapper doesn't cut the call off before the tool
+# itself would. Individual MCP tools still enforce their own shorter bounds
+# (web-search: 6-10s per fetch, search-engine: 10s per query), so this cap
+# only kicks in when a tool is genuinely stuck past its own limit.
+_MCP_TIMEOUT_SECONDS = 1800
 
 
 def _safe_prefix(name: str) -> str:

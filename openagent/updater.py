@@ -142,7 +142,10 @@ def download_update(url: str, checksum_url: str | None = None) -> Path:
 
     logger.info("Downloading update from %s", url)
     req = Request(url)
-    with urlopen(req, timeout=120) as resp:
+    # Generous timeout because release assets are large and residential
+    # networks/VPNs occasionally cap throughput well below GitHub Releases'
+    # CDN speed, stretching a 100 MB archive past 2 minutes.
+    with urlopen(req, timeout=600) as resp:
         archive_path.write_bytes(resp.read())
 
     # Verify checksum
