@@ -573,13 +573,34 @@ class Gateway:
                 model_class=type(active_model).__name__,
                 model_override=bool(channel_model),
             )
-            response = await self.agent.run(
-                message=text,
-                user_id=client_id,
-                session_id=session_id,
-                on_status=on_status,
-                model_override=channel_model,
-            )
+            try:
+                response = await self.agent.run(
+                    message=text,
+                    user_id=client_id,
+                    session_id=session_id,
+                    on_status=on_status,
+                    model_override=channel_model,
+                )
+            except asyncio.CancelledError:
+                # Server is shutting down (restart for config update, launchd
+                # stop, etc.). Send a user-facing message so the client knows
+                # it wasn't a silent failure, log the cancellation, and
+                # re-raise so the surrounding cancel scope propagates.
+                elog(
+                    "message.cancelled",
+                    client_id=client_id,
+                    session_id=session_id,
+                    reason="server_shutdown",
+                )
+                try:
+                    await ws.send_json({
+                        "type": P.ERROR,
+                        "text": "Server is restarting, please try your message again in a moment.",
+                        "session_id": session_id,
+                    })
+                except Exception:
+                    pass  # WS may already be half-closed
+                raise
 
             from openagent.channels.base import parse_response_markers
             clean, attachments = parse_response_markers(response)
@@ -594,10 +615,18 @@ class Gateway:
                 "attachments": att_list or None,
                 "model": response_meta.get("model"),
             })
+        except asyncio.CancelledError:
+            raise  # already handled above or a separate cancel scope
         except Exception as e:
-            logger.error("Process error for %s: %s", client_id, e)
-            elog("message.error", client_id=client_id, session_id=session_id, error=str(e))
+            logger.error("Process error for %s: %s: %r", client_id, type(e).__name__, e)
+            elog(
+                "message.error",
+                client_id=client_id,
+                session_id=session_id,
+                error_type=type(e).__name__,
+                error=str(e) or repr(e),
+            )
             try:
-                await ws.send_json({"type": P.ERROR, "text": str(e), "session_id": session_id})
+                await ws.send_json({"type": P.ERROR, "text": str(e) or type(e).__name__, "session_id": session_id})
             except Exception:
                 pass  # WS is dead — bridge timeout will handle cleanup

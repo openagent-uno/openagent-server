@@ -31,6 +31,22 @@ GITHUB_REPO = "geroale/OpenAgent"
 GITHUB_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
 
+def _ssl_context():
+    """Return an SSLContext that uses certifi's CA bundle when available.
+
+    PyInstaller-frozen binaries on macOS/Linux don't ship the OS CA bundle,
+    so ``urlopen`` against github.com fails with ``CERTIFICATE_VERIFY_FAILED:
+    unable to get local issuer certificate``. Fall back to the system
+    context when certifi isn't bundled (e.g. pip installs).
+    """
+    import ssl
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
+
+
 class UpdateInfo(NamedTuple):
     current_version: str
     new_version: str
@@ -86,7 +102,7 @@ def check_for_update() -> UpdateInfo | None:
 
     try:
         req = Request(GITHUB_API, headers={"Accept": "application/vnd.github+json"})
-        with urlopen(req, timeout=15) as resp:
+        with urlopen(req, timeout=15, context=_ssl_context()) as resp:
             data = json.loads(resp.read())
     except Exception as e:
         logger.error("Failed to check for updates: %s", e)
@@ -145,13 +161,14 @@ def download_update(url: str, checksum_url: str | None = None) -> Path:
     # Generous timeout because release assets are large and residential
     # networks/VPNs occasionally cap throughput well below GitHub Releases'
     # CDN speed, stretching a 100 MB archive past 2 minutes.
-    with urlopen(req, timeout=600) as resp:
+    ctx = _ssl_context()
+    with urlopen(req, timeout=600, context=ctx) as resp:
         archive_path.write_bytes(resp.read())
 
     # Verify checksum
     if checksum_url:
         try:
-            with urlopen(Request(checksum_url), timeout=15) as resp:
+            with urlopen(Request(checksum_url), timeout=15, context=ctx) as resp:
                 expected = resp.read().decode().strip().split()[0]
             actual = hashlib.sha256(archive_path.read_bytes()).hexdigest()
             if actual != expected:

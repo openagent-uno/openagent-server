@@ -372,6 +372,26 @@ class ClaudeCLI(BaseModel):
             elog("model.stale_response", session_id=session_id, elapsed_ms=int(elapsed * 1000))
             raise RuntimeError("Stale response detected")
 
+        # Some Claude turns finish with tool calls but no final text (e.g.
+        # "I've done X, Y, Z" lost to a length cap or an edge in the SDK).
+        # The bridge would otherwise forward a zero-length message to the
+        # user. Log it structured so we can spot frequency, and substitute a
+        # non-empty placeholder so the caller actually sees *something*.
+        if not result_text:
+            num_turns = usage_meta.get("num_turns")
+            out_tokens = (usage_meta.get("usage") or {}).get("output_tokens")
+            logger.warning(
+                "Claude produced no final text (turns=%s, output_tokens=%s) for session %s",
+                num_turns, out_tokens, session_id,
+            )
+            elog(
+                "model.empty_result",
+                session_id=session_id,
+                num_turns=num_turns,
+                output_tokens=out_tokens,
+            )
+            result_text = "(Done — no final message was returned.)"
+
         return result_text, usage_meta
 
     async def generate(

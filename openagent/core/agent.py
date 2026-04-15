@@ -291,10 +291,41 @@ class Agent:
                 attachments=len(attachments or []),
             )
             return await self._run_inner(message, attachments, _status, session_id=session_id, model_override=model_override)
+        except asyncio.CancelledError:
+            # Shutdown or task-level cancellation is NOT a fatal error — it's
+            # the runtime telling us to stop cleanly. Log it as such, tell the
+            # caller something useful (empty ``str(CancelledError)`` used to
+            # surface as "Error:" with nothing after), and re-raise so the
+            # caller's cancellation semantics are preserved.
+            elog(
+                "agent.run.cancelled",
+                agent=self.name,
+                user_id=user_id,
+                session_id=session_id,
+            )
+            logger.info("Agent.run() cancelled for session %s", session_id)
+            raise
         except BaseException as e:
-            logger.error(f"Agent.run() fatal error: {e}")
-            elog("agent.run.error", agent=self.name, user_id=user_id, session_id=session_id, error=str(e))
-            return f"Error: {e}"
+            # Log the exception TYPE and repr so we can tell a KeyError from a
+            # ConnectionResetError from a RuntimeError. The old ``f"{e}"``
+            # format swallowed the type and printed empty strings for
+            # exceptions whose ``__str__`` is "" (CancelledError, SystemExit…),
+            # which is why these have been appearing as "fatal error: " in
+            # the logs.
+            logger.error(
+                "Agent.run() fatal error: %s: %r",
+                type(e).__name__, e,
+                exc_info=True,
+            )
+            elog(
+                "agent.run.error",
+                agent=self.name,
+                user_id=user_id,
+                session_id=session_id,
+                error_type=type(e).__name__,
+                error=str(e) or repr(e),
+            )
+            return f"Error: {type(e).__name__}: {e}" if str(e) else f"Error: {type(e).__name__}"
 
     async def _run_inner(
         self,
