@@ -87,18 +87,24 @@ class Scheduler:
         this to intercept specific tasks (e.g. auto-update, which uses a
         direct pip subprocess instead of going through the agent)."""
         task_name = task["name"]
+        session_id = f"scheduler:{task['id']}"
         elog("task.run", name=task_name)
         try:
             response = await self.agent.run(
                 message=task["prompt"],
                 user_id="scheduler",
-                session_id=f"scheduler:{task['id']}",
+                session_id=session_id,
             )
             logger.info(f"Task '{task_name}' completed: {response[:100]}...")
             elog("task.done", name=task_name)
         except Exception as e:
             logger.error(f"Task '{task_name}' failed: {e}")
             elog("task.error", name=task_name, error=str(e))
+        finally:
+            try:
+                await self.agent.release_session(session_id)
+            except Exception as e:
+                logger.debug("Task '%s' session release failed: %s", task_name, e)
 
     async def _check_and_run(self) -> None:
         """Check for due tasks and execute them."""

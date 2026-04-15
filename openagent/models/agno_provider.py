@@ -116,6 +116,10 @@ class AgnoProvider(BaseModel):
         # Force agent rebuild so the new tool list is picked up.
         self._agno_agents.clear()
 
+    async def close_session(self, session_id: str) -> None:
+        """Agno persists session history in DB but keeps no per-session subprocess."""
+        return None
+
     def _provider_name(self) -> str:
         return split_runtime_id(self.model)[0]
 

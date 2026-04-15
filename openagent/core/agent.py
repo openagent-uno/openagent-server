@@ -187,6 +187,24 @@ class Agent:
         if any(callable(getattr(model, "cleanup_idle", None)) for model in self._runtime_models):
             self._idle_cleanup_task = asyncio.create_task(self._run_idle_cleanup())
 
+    async def release_session(
+        self,
+        session_id: str | None,
+        *,
+        model_override: BaseModel | None = None,
+    ) -> None:
+        """Release live runtime resources tied to one session, if supported."""
+        if not session_id:
+            return
+        model = model_override or self.model
+        if model is None:
+            return
+        self._prepare_model_runtime(model)
+        close_session = getattr(model, "close_session", None)
+        if not callable(close_session):
+            return
+        await close_session(session_id)
+
     async def initialize(self) -> None:
         """Connect MCP servers and initialize memory DB."""
         if self._initialized:

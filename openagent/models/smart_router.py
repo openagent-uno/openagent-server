@@ -174,6 +174,15 @@ class SmartRouter(BaseModel):
             if callable(shutdown):
                 await shutdown()
 
+    async def close_session(self, session_id: str) -> None:
+        if not session_id:
+            return
+        self._last_tier_by_session.pop(session_id, None)
+        for model in self._providers.values():
+            close_session = getattr(model, "close_session", None)
+            if callable(close_session):
+                await close_session(session_id)
+
     def _get_provider(self, model: str) -> BaseModel:
         if is_claude_cli_model(model):
             # Defence-in-depth: claude-cli is a standalone provider with its own

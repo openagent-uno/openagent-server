@@ -70,3 +70,13 @@ class BaseModel(ABC):
         """Stream response text chunks. Default: falls back to generate()."""
         response = await self.generate(messages, system=system, tools=tools)
         yield response.content
+
+    async def close_session(self, session_id: str) -> None:
+        """Release any live runtime resources for one session.
+
+        Provider-managed models may keep per-session subprocesses or sockets
+        alive between turns. The default implementation is a no-op because
+        caller-managed and platform-managed models often have nothing live to
+        tear down.
+        """
+        return None

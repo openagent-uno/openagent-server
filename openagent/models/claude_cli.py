@@ -249,6 +249,13 @@ class ClaudeCLI(BaseModel):
             except Exception as e:
                 logger.debug("Idle close %s: %s", sid, e)
 
+    async def close_session(self, session_id: str) -> None:
+        """Explicitly release one Claude subprocess while keeping resume state."""
+        if not session_id:
+            return
+        await self._drop_client(session_id)
+        elog("model.session_release", session_id=session_id)
+
     async def shutdown(self) -> None:
         async with self._lock:
             clients = dict(self._clients)
