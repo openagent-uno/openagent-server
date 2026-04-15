@@ -216,7 +216,19 @@ def resolve_default_entry(entry: dict[str, Any], db_path: str | None = None) -> 
 
     args = entry.get("args") or []
     if name == "filesystem" and not args:
-        args = [os.path.expanduser("~")]
+        # Default: expose the whole filesystem. The ``@modelcontextprotocol/
+        # server-filesystem`` reference implementation requires at least one
+        # root argument, so we can't simply "not sandbox" — we must name
+        # explicit roots. Passing "/" means "everything the user running
+        # OpenAgent can already see", which matches user expectations when
+        # the agent pipes attached files, asks to read /etc, or inspects
+        # project paths outside $HOME. The actual OS-level permission model
+        # (file ownership, TCC on macOS, SIP, etc.) still enforces real
+        # security — the MCP's allowlist was just an extra layer that got in
+        # the way more often than it helped. Users can override by setting
+        # an explicit ``args:`` list on the filesystem entry in openagent.yaml
+        # if they want a tighter sandbox.
+        args = ["/"]
     if name == "vault" and not args:
         args = [str(default_vault_path())]
 
