@@ -54,6 +54,64 @@ class UpdateInfo(NamedTuple):
     checksum_url: str | None
 
 
+def _expected_asset_name(version: str) -> str:
+    """Return the exact server asset filename for this platform."""
+    return f"openagent-{version}-{_asset_suffix()}"
+
+
+def _select_release_assets(
+    assets: list[dict[str, object]],
+    *,
+    version: str,
+) -> tuple[str | None, str | None]:
+    """Pick the server archive + checksum from a GitHub release asset list.
+
+    Prefer an exact match like ``openagent-0.5.17-linux-x64.tar.gz`` so we
+    never confuse the server binary with sibling artifacts such as
+    ``openagent-cli-*`` or ``openagent-app-*`` that happen to share the same
+    platform suffix.
+    """
+    exact_name = _expected_asset_name(version)
+    checksum_name = f"{exact_name}.sha256"
+
+    download_url = None
+    checksum_url = None
+
+    for asset in assets:
+        name = str(asset.get("name", ""))
+        url = str(asset.get("browser_download_url", ""))
+        if name == exact_name:
+            download_url = url
+        elif name == checksum_name:
+            checksum_url = url
+
+    if download_url:
+        return download_url, checksum_url
+
+    # Backward-compatible fallback for older release layouts: keep the server
+    # prefix explicit so ``openagent-cli`` / ``openagent-app`` are ignored.
+    suffix = _asset_suffix()
+    server_prefix = "openagent-"
+    excluded_prefixes = ("openagent-cli-", "openagent-app-")
+    for asset in assets:
+        name = str(asset.get("name", ""))
+        url = str(asset.get("browser_download_url", ""))
+        if (
+            name.startswith(server_prefix)
+            and not name.startswith(excluded_prefixes)
+            and name.endswith(suffix)
+        ):
+            download_url = url
+        elif (
+            name.startswith(server_prefix)
+            and not name.startswith(excluded_prefixes)
+            and name.endswith(f"{suffix}.sha256")
+        ):
+            checksum_url = url
+
+    return download_url, checksum_url
+
+
 def _asset_suffix() -> str:
     """Return the expected archive suffix for this platform/arch.
 
@@ -120,21 +178,15 @@ def check_for_update() -> UpdateInfo | None:
         # If version parsing fails, skip update
         return None
 
-    # Find matching asset
-    suffix = _asset_suffix()
-    download_url = None
-    checksum_url = None
-
-    for asset in data.get("assets", []):
-        name = asset.get("name", "")
-        url = asset.get("browser_download_url", "")
-        if name.endswith(suffix):
-            download_url = url
-        elif name.endswith(f"{suffix}.sha256"):
-            checksum_url = url
+    # Find matching server asset. Releases also ship desktop and CLI artifacts,
+    # so matching on platform suffix alone is not enough.
+    download_url, checksum_url = _select_release_assets(
+        list(data.get("assets", [])),
+        version=new_version,
+    )
 
     if not download_url:
-        logger.warning("No matching release asset for %s", suffix)
+        logger.warning("No matching release asset for %s", _expected_asset_name(new_version))
         return None
 
     return UpdateInfo(
@@ -200,17 +252,30 @@ def download_update(url: str, checksum_url: str | None = None) -> Path:
         with tarfile.open(archive_path) as tf:
             tf.extractall(extract_dir)
 
-    # Find the new binary. One executable per archive — pick the biggest
-    # file named ``openagent*`` (the PyInstaller onefile binary is tens
-    # of megabytes; pkg metadata files are all small).
+    # Find the server binary, not any sibling artifact such as openagent-cli.
+    # Releases are supposed to contain one executable per archive, but we keep
+    # the selection exact as defence-in-depth.
     candidates = sorted(
-        (p for p in extract_dir.rglob("openagent*")
-         if p.is_file() and not p.name.endswith(".sha256") and not p.suffix == ".plist"),
+        (
+            p
+            for p in extract_dir.rglob("openagent*")
+            if p.is_file()
+            and not p.name.endswith(".sha256")
+            and p.suffix != ".plist"
+        ),
         key=lambda p: p.stat().st_size,
         reverse=True,
     )
+    expected_names = {"openagent.exe"} if platform.system() == "Windows" else {"openagent"}
+    exact = [p for p in candidates if p.name in expected_names]
+    if exact:
+        return exact[0]
     if candidates:
-        return candidates[0]
+        found = ", ".join(sorted({p.name for p in candidates[:5]}))
+        raise RuntimeError(
+            "Downloaded archive did not contain the OpenAgent server executable "
+            f"(found: {found})"
+        )
     raise RuntimeError("Could not locate executable in downloaded archive")
 
 
