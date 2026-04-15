@@ -20,7 +20,12 @@ const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 
 const DEFAULT_TIMEOUT = 120_000; // 2 minutes
-const MAX_TIMEOUT = 600_000; // 10 minutes
+// Upper bound the agent can opt into. A macOS Electron build (expo export +
+// electron-builder with signing + notarization) can easily take 20+ minutes,
+// and the old 10-min cap was hitting before the build finished even when the
+// agent asked for more. Raise the ceiling to 30 min to match the model-side
+// HARD_TIMEOUT; the agent still has to opt in by passing ``timeout`` explicitly.
+const MAX_TIMEOUT = 1_800_000; // 30 minutes
 const MAX_OUTPUT = 1_000_000; // 1MB output cap
 
 function getDefaultShell(): string {

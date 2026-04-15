@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json as _json
 import logging
+import os
 import time
 from typing import Any, AsyncIterator, Awaitable, Callable
 
@@ -22,7 +23,27 @@ from openagent.models.catalog import claude_cli_model_spec, compute_cost
 
 logger = logging.getLogger(__name__)
 
-RECEIVE_TIMEOUT = 300  # seconds per query
+# Give the Claude Agent SDK more than its default 60 s to finish the
+# ``initialize`` control-request handshake when spawning a subprocess. The
+# handshake waits for every configured MCP server (shell, web-search, custom
+# ones) to finish booting; on a cold npm cache or when several MCPs are
+# attached, 60 s is not enough and the SDK raises
+# ``Exception: Control request timeout: initialize``. The env var is read
+# inside ``ClaudeSDKClient.connect()``; setting it at import time means every
+# subprocess we spawn (including retry-after-drop) uses the larger value.
+# We only set it if the user hasn't overridden it in the environment.
+os.environ.setdefault("CLAUDE_CODE_STREAM_CLOSE_TIMEOUT", "300000")  # 5 min
+
+# Idle timeout: abort if the SDK produces no message for this long. The old
+# code wrapped the whole receive loop in a single 300 s timeout, which killed
+# legitimate long-running tool calls (an Electron DMG build runs 5–10 min
+# entirely between `tool_use` and `tool_result` with no intermediate SDK
+# messages, so the loop was silent the whole time). Resetting the timeout per
+# message lets big tool calls finish while still catching genuinely stuck
+# subprocesses.
+IDLE_TIMEOUT = 900  # 15 min without any SDK message → something is wrong
+# Absolute ceiling per query. Retries kick in after this.
+HARD_TIMEOUT = 1800  # 30 min
 
 # Close idle clients after 24h — was 10 min, which caused user-visible
 # "lost memory" bugs on Telegram/Discord bridges where the next message after
@@ -286,45 +307,56 @@ class ClaudeCLI(BaseModel):
         result_text = ""
         usage_meta: dict[str, Any] = {}
         try:
-            async with asyncio.timeout(RECEIVE_TIMEOUT):
-                async for message in client.receive_response():
-                    if isinstance(message, AssistantMessage) and on_status:
-                        for block in (message.content or []):
-                            tool = getattr(block, "name", None)
-                            if tool and hasattr(block, "input"):
-                                try:
-                                    params = getattr(block, "input", {})
-                                    await on_status(_json.dumps({
-                                        "tool": tool,
-                                        "params": params if isinstance(params, dict) else {},
-                                        "status": "running",
-                                    }))
-                                except Exception:
-                                    pass
-                    if isinstance(message, ResultMessage):
-                        result_text = message.result or ""
-                        # Capture SDK session ID for future resume
-                        sdk_sid = getattr(message, "session_id", None)
-                        if sdk_sid:
-                            self._sdk_sessions[session_id] = sdk_sid
-                            self._persist_sdk_session(session_id, sdk_sid)
-                            elog("model.session_stored", session_id=session_id, sdk_session_id=sdk_sid)
-                        # Capture cost + token usage. ``total_cost_usd`` is the
-                        # SDK-provided dollar figure (preferred); ``usage`` is the
-                        # raw token dict; ``model_usage`` is per-model breakdown
-                        # when the SDK invoked multiple models internally.
-                        usage_meta = {
-                            "total_cost_usd": getattr(message, "total_cost_usd", None),
-                            "usage": getattr(message, "usage", None),
-                            "model_usage": getattr(message, "model_usage", None),
-                            "duration_ms": getattr(message, "duration_ms", None),
-                            "duration_api_ms": getattr(message, "duration_api_ms", None),
-                            "num_turns": getattr(message, "num_turns", None),
-                        }
-                        break  # Never read past the response boundary
+            # Per-message idle timeout + absolute ceiling. A wrap-around loop
+            # timeout would kill long tool calls (Electron builds etc.) that
+            # legitimately spend many minutes between `tool_use` and
+            # `tool_result` with no SDK messages in between.
+            iterator = client.receive_response().__aiter__()
+            while True:
+                if time.monotonic() - t0 > HARD_TIMEOUT:
+                    raise TimeoutError(f"query exceeded {HARD_TIMEOUT}s hard limit")
+                try:
+                    async with asyncio.timeout(IDLE_TIMEOUT):
+                        message = await iterator.__anext__()
+                except StopAsyncIteration:
+                    break
+                if isinstance(message, AssistantMessage) and on_status:
+                    for block in (message.content or []):
+                        tool = getattr(block, "name", None)
+                        if tool and hasattr(block, "input"):
+                            try:
+                                params = getattr(block, "input", {})
+                                await on_status(_json.dumps({
+                                    "tool": tool,
+                                    "params": params if isinstance(params, dict) else {},
+                                    "status": "running",
+                                }))
+                            except Exception:
+                                pass
+                if isinstance(message, ResultMessage):
+                    result_text = message.result or ""
+                    # Capture SDK session ID for future resume
+                    sdk_sid = getattr(message, "session_id", None)
+                    if sdk_sid:
+                        self._sdk_sessions[session_id] = sdk_sid
+                        self._persist_sdk_session(session_id, sdk_sid)
+                        elog("model.session_stored", session_id=session_id, sdk_session_id=sdk_sid)
+                    # Capture cost + token usage. ``total_cost_usd`` is the
+                    # SDK-provided dollar figure (preferred); ``usage`` is the
+                    # raw token dict; ``model_usage`` is per-model breakdown
+                    # when the SDK invoked multiple models internally.
+                    usage_meta = {
+                        "total_cost_usd": getattr(message, "total_cost_usd", None),
+                        "usage": getattr(message, "usage", None),
+                        "model_usage": getattr(message, "model_usage", None),
+                        "duration_ms": getattr(message, "duration_ms", None),
+                        "duration_api_ms": getattr(message, "duration_api_ms", None),
+                        "num_turns": getattr(message, "num_turns", None),
+                    }
+                    break  # Never read past the response boundary
         except TimeoutError:
-            logger.error("receive_response() timed out after %ds", RECEIVE_TIMEOUT)
-            elog("model.timeout", session_id=session_id, timeout=RECEIVE_TIMEOUT)
+            logger.error("receive_response() timed out (idle=%ds, hard=%ds)", IDLE_TIMEOUT, HARD_TIMEOUT)
+            elog("model.timeout", session_id=session_id, idle_timeout=IDLE_TIMEOUT, hard_timeout=HARD_TIMEOUT)
             raise
 
         # Defense-in-depth: if a substantial response arrived in under 1s,
@@ -540,22 +572,32 @@ class ClaudeCLI(BaseModel):
             client = await self._get_client(sid, system)
             await self._drain_stale(client)
             await client.query(prompt, session_id=sid)
-            async with asyncio.timeout(RECEIVE_TIMEOUT):
-                async for message in client.receive_response():
-                    if isinstance(message, AssistantMessage):
-                        for block in (message.content or []):
-                            if hasattr(block, "text"):
-                                yield block.text
-                    elif isinstance(message, ResultMessage):
-                        sdk_sid = getattr(message, "session_id", None)
-                        if sdk_sid:
-                            self._sdk_sessions[sid] = sdk_sid
-                            self._persist_sdk_session(sid, sdk_sid)
-                        if message.result:
-                            yield message.result
-                        break  # Never read past the response boundary
+            # Mirror ``_run_once``: per-message idle timeout + hard cap so
+            # long tool calls aren't cut off mid-stream.
+            t0 = time.monotonic()
+            iterator = client.receive_response().__aiter__()
+            while True:
+                if time.monotonic() - t0 > HARD_TIMEOUT:
+                    raise TimeoutError(f"stream exceeded {HARD_TIMEOUT}s hard limit")
+                try:
+                    async with asyncio.timeout(IDLE_TIMEOUT):
+                        message = await iterator.__anext__()
+                except StopAsyncIteration:
+                    break
+                if isinstance(message, AssistantMessage):
+                    for block in (message.content or []):
+                        if hasattr(block, "text"):
+                            yield block.text
+                elif isinstance(message, ResultMessage):
+                    sdk_sid = getattr(message, "session_id", None)
+                    if sdk_sid:
+                        self._sdk_sessions[sid] = sdk_sid
+                        self._persist_sdk_session(sid, sdk_sid)
+                    if message.result:
+                        yield message.result
+                    break  # Never read past the response boundary
         except TimeoutError:
-            logger.error("Stream timed out after %ds", RECEIVE_TIMEOUT)
+            logger.error("Stream timed out (idle=%ds, hard=%ds)", IDLE_TIMEOUT, HARD_TIMEOUT)
             await self._drop_client(sid)
             yield "Error: request timed out"
         except Exception as e:

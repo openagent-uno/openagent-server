@@ -20,9 +20,11 @@ logger = logging.getLogger(__name__)
 
 # Retry cooldown between bridge crashes
 BRIDGE_RETRY_SECONDS = 30
-# Maximum time to wait for a gateway response before giving up.
-# Generous to accommodate tool-heavy queries (Claude SDK timeout is 300s × 2 retries).
-BRIDGE_RESPONSE_TIMEOUT = 660
+# Maximum time to wait for a gateway response before giving up. Must exceed
+# the model's HARD_TIMEOUT (30 min) × 2 retry attempts with headroom so the
+# bridge doesn't cut the caller off mid-retry on a legitimately long query
+# (e.g. a multi-minute Electron DMG build triggered via a shell tool).
+BRIDGE_RESPONSE_TIMEOUT = 3900  # 65 min
 
 
 def format_tool_status(raw: str) -> str:
