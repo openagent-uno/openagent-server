@@ -390,10 +390,36 @@ class AgnoProvider(BaseModel):
         try:
             response = await agent.arun(prompt, session_id=sid)
         except Exception as e:
-            elog("agno.error", model=self.model, session_id=sid, error=str(e))
+            elog(
+                "agno.error",
+                model=self.model,
+                session_id=sid,
+                error_type=type(e).__name__,
+                error=str(e) or repr(e),
+            )
             raise
 
-        content = getattr(response, "content", None) or str(response)
+        # Agno occasionally returns a response whose ``.content`` is None or
+        # empty string (tool-only turn, provider returned an empty choice,
+        # length cap hit mid-text). Surface it as a structured event and
+        # substitute a non-empty placeholder so bridges don't forward zero
+        # bytes to the user. Symmetrical with claude_cli.py's empty-result
+        # handling.
+        raw_content = getattr(response, "content", None)
+        if raw_content:
+            content = raw_content
+        else:
+            logger.warning(
+                "Agno returned empty content (model=%s, session=%s, response=%r)",
+                self.model, sid, response,
+            )
+            elog(
+                "agno.empty_result",
+                model=self.model,
+                session_id=sid,
+                response_type=type(response).__name__,
+            )
+            content = "(Done — no final message was returned.)"
         metrics_obj = getattr(response, "metrics", None)
         metrics_dict = self._metrics_to_dict(metrics_obj)
 
