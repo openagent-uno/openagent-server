@@ -23,7 +23,15 @@ from openagent.models.catalog import claude_cli_model_spec, compute_cost
 logger = logging.getLogger(__name__)
 
 RECEIVE_TIMEOUT = 300  # seconds per query
-IDLE_TTL = 600  # seconds — close idle clients after 10 min
+
+# Close idle clients after 24h — was 10 min, which caused user-visible
+# "lost memory" bugs on Telegram/Discord bridges where the next message after
+# the idle close would land with ``--resume <prior_sdk_sid>`` but Claude CLI
+# sometimes silently creates a fresh session instead of replaying the prior
+# transcript. Keeping the subprocess alive side-steps --resume entirely for
+# active users; the mapping is also persisted to the db (``sdk_sessions``
+# table) so the 24h+ case still survives a restart.
+IDLE_TTL = 86400
 
 
 class ClaudeCLI(BaseModel):
@@ -60,8 +68,64 @@ class ClaudeCLI(BaseModel):
         through ``SmartRouter``, so it must record its own usage rows. This
         keeps the ``usage_log`` table the single source of truth for billing
         regardless of which provider handled the turn.
+
+        Also triggers a one-time hydration of ``_sdk_sessions`` from the
+        ``sdk_sessions`` table so a freshly-started process can resume
+        conversations that existed before the restart. Scheduled as a
+        background task so ``set_db`` itself stays synchronous.
         """
         self._db = db
+        if db is not None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is not None:
+                loop.create_task(self._hydrate_sdk_sessions())
+
+    async def _hydrate_sdk_sessions(self) -> None:
+        """Load persisted ``session_id → sdk_session_id`` map into memory.
+
+        Merges on top of whatever's already in ``_sdk_sessions`` — in-memory
+        values win over disk values so a stored-in-this-process session is
+        never demoted to a stale disk row.
+        """
+        if self._db is None:
+            return
+        try:
+            stored = await self._db.get_all_sdk_sessions(provider="claude-cli")
+        except Exception as e:
+            logger.debug("SDK session hydration skipped: %s", e)
+            return
+        async with self._lock:
+            for sid, sdk_sid in stored.items():
+                self._sdk_sessions.setdefault(sid, sdk_sid)
+        elog("model.sessions_hydrated", count=len(stored))
+
+    def _persist_sdk_session(self, session_id: str, sdk_sid: str) -> None:
+        """Fire-and-forget write of the mapping to disk.
+
+        Called from the ResultMessage hot path, so the write is scheduled as
+        a background task rather than awaited inline. Failures are logged but
+        never raised — losing a disk write is survivable (in-memory cache is
+        still updated), crashing the turn for a db write isn't.
+        """
+        if self._db is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        async def _write() -> None:
+            try:
+                await self._db.set_sdk_session(
+                    session_id, sdk_sid, provider="claude-cli"
+                )
+            except Exception as e:
+                logger.debug("Persist sdk_session failed: %s", e)
+
+        loop.create_task(_write())
 
     def _build_options(self, system: str | None = None, session_id: str | None = None) -> Any:
         from claude_agent_sdk import ClaudeAgentOptions
@@ -93,6 +157,28 @@ class ClaudeCLI(BaseModel):
     async def _get_client(self, session_id: str, system: str | None) -> Any:
         """Get or create a client for this session. No cap — idle cleanup handles limits."""
         async with self._lock:
+            if session_id in self._clients:
+                self._last_active[session_id] = time.time()
+                return self._clients[session_id]
+
+        # Fallback db lookup in case hydration in ``set_db`` hasn't completed
+        # yet (first few turns after a cold start). Avoid doing this if the
+        # in-memory cache already knows the mapping — hot path stays fast.
+        if (
+            self._db is not None
+            and session_id not in self._sdk_sessions
+        ):
+            try:
+                sdk_sid = await self._db.get_sdk_session(session_id)
+            except Exception as e:
+                logger.debug("SDK session db lookup failed: %s", e)
+                sdk_sid = None
+            if sdk_sid:
+                self._sdk_sessions[session_id] = sdk_sid
+
+        async with self._lock:
+            # Re-check: a concurrent task may have created the client while
+            # we were querying the db outside the lock.
             if session_id in self._clients:
                 self._last_active[session_id] = time.time()
                 return self._clients[session_id]
@@ -221,6 +307,7 @@ class ClaudeCLI(BaseModel):
                         sdk_sid = getattr(message, "session_id", None)
                         if sdk_sid:
                             self._sdk_sessions[session_id] = sdk_sid
+                            self._persist_sdk_session(session_id, sdk_sid)
                             elog("model.session_stored", session_id=session_id, sdk_session_id=sdk_sid)
                         # Capture cost + token usage. ``total_cost_usd`` is the
                         # SDK-provided dollar figure (preferred); ``usage`` is the
@@ -463,6 +550,7 @@ class ClaudeCLI(BaseModel):
                         sdk_sid = getattr(message, "session_id", None)
                         if sdk_sid:
                             self._sdk_sessions[sid] = sdk_sid
+                            self._persist_sdk_session(sid, sdk_sid)
                         if message.result:
                             yield message.result
                         break  # Never read past the response boundary

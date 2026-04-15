@@ -42,6 +42,20 @@ CREATE TABLE IF NOT EXISTS usage_log (
 );
 CREATE INDEX IF NOT EXISTS idx_usage_year_month ON usage_log(year_month);
 CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON usage_log(timestamp);
+
+-- Mapping from OpenAgent session_id (e.g. "tg:155490357") to the
+-- provider-native session_id (e.g. Claude SDK UUID) so the provider can
+-- --resume the correct transcript after a process restart. Without this
+-- the in-memory mapping is wiped by any restart (OOM kill, auto-update,
+-- manual restart) and the user's next message starts a brand-new
+-- conversation — which presents as "agent forgot everything".
+CREATE TABLE IF NOT EXISTS sdk_sessions (
+    session_id TEXT PRIMARY KEY,
+    sdk_session_id TEXT NOT NULL,
+    provider TEXT,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sdk_sessions_updated ON sdk_sessions(updated_at);
 """
 
 
@@ -183,6 +197,59 @@ class MemoryDB:
             by_model[r["model"]] = round(r["total_cost"], 6)
             total += r["total_cost"]
         return {"total": round(total, 6), "by_model": by_model}
+
+    # ── SDK Session Mapping ──
+
+    async def set_sdk_session(
+        self,
+        session_id: str,
+        sdk_session_id: str,
+        provider: str | None = None,
+    ) -> None:
+        """Persist the ``session_id → sdk_session_id`` mapping for resume
+        after restart. Callers typically fire-and-forget so provider latency
+        isn't affected.
+        """
+        conn = await self._ensure_connected()
+        await conn.execute(
+            "INSERT INTO sdk_sessions (session_id, sdk_session_id, provider, updated_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(session_id) DO UPDATE SET "
+            "sdk_session_id = excluded.sdk_session_id, "
+            "provider = excluded.provider, "
+            "updated_at = excluded.updated_at",
+            (session_id, sdk_session_id, provider, time.time()),
+        )
+        await conn.commit()
+
+    async def get_sdk_session(self, session_id: str) -> str | None:
+        """Look up the provider-native session_id previously stored for ``session_id``."""
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            "SELECT sdk_session_id FROM sdk_sessions WHERE session_id = ?",
+            (session_id,),
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+    async def get_all_sdk_sessions(self, provider: str | None = None) -> dict[str, str]:
+        """Return ``{session_id: sdk_session_id}`` for all (or one provider's) rows.
+
+        Used on provider startup to hydrate the in-memory cache from disk so
+        the first user message after a restart can resume the right transcript.
+        """
+        conn = await self._ensure_connected()
+        if provider is None:
+            cursor = await conn.execute(
+                "SELECT session_id, sdk_session_id FROM sdk_sessions"
+            )
+        else:
+            cursor = await conn.execute(
+                "SELECT session_id, sdk_session_id FROM sdk_sessions WHERE provider = ?",
+                (provider,),
+            )
+        rows = await cursor.fetchall()
+        return {row[0]: row[1] for row in rows}
 
     async def get_daily_usage(self, days: int = 7) -> list[dict]:
         """Day-by-day usage breakdown grouped by model."""
