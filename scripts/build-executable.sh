@@ -28,10 +28,14 @@ echo "→ Installing Python dependencies..."
 pip install -e ".[all]" --quiet
 pip install pyinstaller --quiet
 
-# ── Step 2: Build Node.js MCPs ──
+# ── Step 2a: Build Rust computer-control MCP ──
+echo "→ Building Rust computer-control MCP..."
+bash "$SCRIPT_DIR/build-computer-control.sh"
+
+# ── Step 2b: Build Node.js MCPs ──
 echo "→ Building built-in Node MCPs..."
 
-NODE_MCPS=(computer-control shell web-search editor chrome-devtools messaging)
+NODE_MCPS=(shell web-search editor chrome-devtools messaging)
 for mcp in "${NODE_MCPS[@]}"; do
     mcp_dir="openagent/mcp/servers/$mcp"
     if [ ! -d "$mcp_dir" ]; then
