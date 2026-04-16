@@ -3,6 +3,7 @@ use rmcp::{ServerHandler, ServiceExt, transport::stdio};
 use tracing_subscriber::{EnvFilter, fmt};
 
 mod capture;
+mod input;
 mod keys;
 mod scaling;
 
