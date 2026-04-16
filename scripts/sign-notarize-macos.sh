@@ -278,18 +278,65 @@ mkdir -p "$PKG_ROOT$PKG_INSTALL_PATH"
 cp "$BINARY" "$PKG_ROOT$PKG_INSTALL_PATH/$(basename "$BINARY")"
 chmod +x "$PKG_ROOT$PKG_INSTALL_PATH/$(basename "$BINARY")"
 
-# Sidecar binary (optional, already-signed). Copied verbatim so its
-# Developer-ID signature with ``com.openagent.computer-control`` stays
-# intact — that stable identifier is what makes macOS TCC grants for
-# Accessibility / Screen Recording survive openagent updates. The
-# .pkg notarization below covers this binary too (notarytool walks
-# the pkg payload and notarizes every embedded Mach-O).
+# Sidecar binary (optional, already-signed). Wrapped in a minimal
+# ``.app`` bundle so macOS TCC treats it as a full app — the bare CLI
+# form silently fails every permission prompt and never registers in
+# Privacy & Security → Accessibility.
+#
+# Bundle layout:
+#   <basename>.app/
+#   ├── Contents/
+#   │   ├── Info.plist           — CFBundleIdentifier=com.openagent.computer-control,
+#   │   │                          NSAccessibilityUsageDescription, etc.
+#   │   └── MacOS/
+#   │       └── <basename>       — the signed Rust binary (moved in,
+#   │                              keeping its Developer-ID signature
+#   │                              with the stable com.openagent.computer-control
+#   │                              identifier set upstream)
+#
+# We re-sign the entire bundle with ``--deep`` after assembly so
+# codesign recalculates the signature over the new Contents/ tree.
+# The inner binary keeps the same identifier because we pass it
+# explicitly; the outer bundle gets the same identifier so
+# ``codesign --verify --strict`` passes with no identifier mismatch.
 if [ -n "$EXTRA_SIDECAR" ]; then
-    echo "→ Adding sidecar to pkg payload: $(basename "$EXTRA_SIDECAR")"
-    cp "$EXTRA_SIDECAR" "$PKG_ROOT$PKG_INSTALL_PATH/$(basename "$EXTRA_SIDECAR")"
-    chmod +x "$PKG_ROOT$PKG_INSTALL_PATH/$(basename "$EXTRA_SIDECAR")"
-    codesign -dvv "$PKG_ROOT$PKG_INSTALL_PATH/$(basename "$EXTRA_SIDECAR")" 2>&1 \
+    SIDECAR_NAME=$(basename "$EXTRA_SIDECAR")
+    APP_NAME="${SIDECAR_NAME}.app"
+    APP_STAGE="${RUNNER_TEMP:-/tmp}/$APP_NAME-stage-$(uuidgen)"
+    rm -rf "$APP_STAGE"
+    mkdir -p "$APP_STAGE/$APP_NAME/Contents/MacOS"
+
+    # Info.plist — the key that unlocks TCC for a bare binary.
+    INFO_PLIST="buildResources/${SIDECAR_NAME}-Info.plist"
+    if [ ! -f "$INFO_PLIST" ]; then
+        echo "ERROR: Info.plist template missing: $INFO_PLIST" >&2
+        exit 1
+    fi
+    cp "$INFO_PLIST" "$APP_STAGE/$APP_NAME/Contents/Info.plist"
+
+    # Move the signed Rust binary into Contents/MacOS. The upstream
+    # computer-control-binary CI job signed it as
+    # ``com.openagent.computer-control`` — preserve that.
+    cp "$EXTRA_SIDECAR" "$APP_STAGE/$APP_NAME/Contents/MacOS/$SIDECAR_NAME"
+    chmod +x "$APP_STAGE/$APP_NAME/Contents/MacOS/$SIDECAR_NAME"
+
+    # Re-sign the whole bundle, deep, with the same stable identifier.
+    echo "→ Wrapping sidecar in .app bundle + re-signing"
+    codesign --force --deep \
+        --sign "$APP_IDENTITY" \
+        --identifier "com.openagent.${SIDECAR_NAME#openagent-}" \
+        --options runtime \
+        --timestamp \
+        --entitlements buildResources/entitlements.mac.plist \
+        "$APP_STAGE/$APP_NAME"
+    codesign --verify --strict --verbose=2 "$APP_STAGE/$APP_NAME"
+    codesign -dvv "$APP_STAGE/$APP_NAME/Contents/MacOS/$SIDECAR_NAME" 2>&1 \
         | grep -E '^(Identifier|TeamIdentifier|Authority)=' || true
+
+    # Ship the whole .app bundle in the pkg payload (next to the
+    # primary openagent binary).
+    echo "→ Adding $APP_NAME to pkg payload at $PKG_INSTALL_PATH"
+    cp -R "$APP_STAGE/$APP_NAME" "$PKG_ROOT$PKG_INSTALL_PATH/$APP_NAME"
 fi
 
 UNSIGNED_PKG="${RUNNER_TEMP:-/tmp}/$(basename "$PKG_OUTPUT" .pkg)-unsigned.pkg"

@@ -82,7 +82,30 @@ def _resolve_native_binary(name: str) -> str:
     target = _native_binary_target()
     bin_name = "openagent-" + name + (".exe" if platform.system() == "Windows" else "")
 
-    # 1. Sidecar next to sys.executable (packaged release).
+    # 1a. macOS: ``.app`` bundle sidecar next to sys.executable. This is
+    #     the preferred layout on macOS because TCC (Transparency,
+    #     Consent, Control) only triggers permission prompts and
+    #     registers persistent grants for processes that look like a
+    #     proper app bundle. A bare CLI binary, even with a reverse-DNS
+    #     code-sign identifier, silently fails TCC checks when spawned
+    #     by launchd and never appears in Privacy & Security settings.
+    #     Bundle layout: ``<prefix>/openagent-<name>.app/Contents/MacOS/openagent-<name>``.
+    try:
+        if platform.system() == "Darwin":
+            app_binary = (
+                Path(sys.executable).resolve().parent
+                / f"openagent-{name}.app"
+                / "Contents"
+                / "MacOS"
+                / f"openagent-{name}"
+            )
+            if app_binary.is_file():
+                return str(app_binary)
+    except Exception:  # noqa: BLE001 — sys.executable resolution is best-effort
+        pass
+
+    # 1b. Sidecar bare binary next to sys.executable (Linux / Windows,
+    #     or macOS installs from before the .app bundle layout).
     try:
         sidecar = Path(sys.executable).resolve().parent / bin_name
         if sidecar.is_file():
