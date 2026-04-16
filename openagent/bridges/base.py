@@ -20,10 +20,12 @@ logger = logging.getLogger(__name__)
 
 # Retry cooldown between bridge crashes
 BRIDGE_RETRY_SECONDS = 30
-# Maximum time to wait for a gateway response before giving up. Must exceed
-# the model's HARD_TIMEOUT (30 min) × 2 retry attempts with headroom so the
-# bridge doesn't cut the caller off mid-retry on a legitimately long query
-# (e.g. a multi-minute Electron DMG build triggered via a shell tool).
+# Maximum time the bridge will wait for a gateway response before giving up.
+# This is the sole per-turn timeout in the stack now that claude_cli.py no
+# longer enforces its own idle/hard timeouts — legitimately long workloads
+# (Electron builds, gradle assembleRelease, Maestro suites) can run as long
+# as they keep making progress, but a truly hung tool will get unstuck when
+# the bridge cancels the task and asyncio.CancelledError unwinds.
 BRIDGE_RESPONSE_TIMEOUT = 3900  # 65 min
 
 

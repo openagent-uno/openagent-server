@@ -51,13 +51,9 @@ class _FakeResultMessage:
 
 
 class _FakeSDKClient:
-    """Minimal stand-in for ``ClaudeSDKClient`` exposing only what ``_run_once`` uses.
+    """Minimal stand-in for ``ClaudeSDKClient`` exposing only what ``_run_once`` uses."""
 
-    Waits 1.1 s before the first yield so the stale-response guard in
-    ``_run_once`` (which fires on `<1s elapsed` responses) doesn't trip.
-    """
-
-    def __init__(self, messages: list[Any], startup_delay: float = 1.1) -> None:
+    def __init__(self, messages: list[Any], startup_delay: float = 0.0) -> None:
         self._messages = messages
         self._startup_delay = startup_delay
 
@@ -96,9 +92,7 @@ async def _run_once_with(messages: list[Any], *, session_id: str = "test-sess") 
     from openagent.models.claude_cli import ClaudeCLI
 
     cli = ClaudeCLI(model=None, providers_config={"anthropic": {"models": ["claude-cli"]}})
-    client = _FakeSDKClient(messages)
-    # `_drain_stale` reads client._stale_queue; stub it so the drain is a no-op.
-    cli._drain_stale = lambda _c: asyncio.sleep(0)  # type: ignore[assignment]
+    client = _FakeSDKClient(messages, startup_delay=0.0)
     return await cli._run_once(client, "hi", session_id, on_status=None)
 
 
@@ -168,7 +162,6 @@ class _RecordingCLI:
         from openagent.models.claude_cli import ClaudeCLI
 
         self.cli = ClaudeCLI(model=None, providers_config={"anthropic": {"models": ["claude-cli"]}})
-        self.cli._drain_stale = lambda _c: asyncio.sleep(0)  # type: ignore[assignment]
         self.cli._get_client = self._fake_get_client  # type: ignore[assignment]
         self.cli._drop_client = self._fake_drop_client  # type: ignore[assignment]
         self.cli._record_usage = self._fake_record_usage  # type: ignore[assignment]
@@ -199,34 +192,39 @@ class _RecordingCLI:
         return self._calls
 
 
-@test("claude_cli_text_recovery", "generate does NOT retry on TimeoutError")
-async def t_no_retry_on_timeout(ctx: TestContext) -> None:
-    harness = _RecordingCLI([TimeoutError("idle timeout")])
-    resp = await harness.cli.generate(
-        [{"role": "user", "content": "ciao"}], session_id="t1"
-    )
-    assert harness.attempts == 1, f"expected 1 call, got {harness.attempts}"
-    assert harness.dropped == 1, f"expected client dropped once, got {harness.dropped}"
-    assert "took too long" in resp.content.lower() or "timeout" in resp.content.lower(), resp.content
-
-
-@test("claude_cli_text_recovery", "generate retries once on non-timeout Exception")
-async def t_retry_on_generic_error(ctx: TestContext) -> None:
-    harness = _RecordingCLI([RuntimeError("transient network blip"), ("recovered", {})])
-    resp = await harness.cli.generate(
-        [{"role": "user", "content": "ciao"}], session_id="t2"
-    )
-    assert harness.attempts == 2, f"expected 2 calls, got {harness.attempts}"
-    assert resp.content == "recovered", resp.content
-
-
-@test("claude_cli_text_recovery", "non-timeout error exhausts retries and reports error")
+@test("claude_cli_text_recovery", "generate retries once on generic Exception and surfaces the error")
 async def t_retry_exhausted_on_error(ctx: TestContext) -> None:
     harness = _RecordingCLI(
         [RuntimeError("first fail"), RuntimeError("second fail")]
     )
     resp = await harness.cli.generate(
-        [{"role": "user", "content": "ciao"}], session_id="t3"
+        [{"role": "user", "content": "ciao"}], session_id="t-err-retry"
     )
     assert harness.attempts == 2, f"expected 2 calls, got {harness.attempts}"
+    assert harness.dropped == 2, f"client dropped {harness.dropped} times"
     assert resp.content.startswith("Error:"), resp.content
+    assert resp.stop_reason == "error", resp.stop_reason
+
+
+@test("claude_cli_text_recovery", "generate succeeds on retry after a transient failure")
+async def t_retry_recovers(ctx: TestContext) -> None:
+    harness = _RecordingCLI([RuntimeError("transient blip"), ("recovered", {})])
+    resp = await harness.cli.generate(
+        [{"role": "user", "content": "ciao"}], session_id="t-recover"
+    )
+    assert harness.attempts == 2, f"expected 2 calls, got {harness.attempts}"
+    assert resp.content == "recovered", resp.content
+
+
+@test("claude_cli_text_recovery", "CancelledError propagates out of generate")
+async def t_cancel_propagates(ctx: TestContext) -> None:
+    harness = _RecordingCLI([asyncio.CancelledError()])
+    raised: BaseException | None = None
+    try:
+        await harness.cli.generate(
+            [{"role": "user", "content": "ciao"}], session_id="t-cancel"
+        )
+    except asyncio.CancelledError as e:
+        raised = e
+    assert raised is not None, "CancelledError was swallowed"
+    assert harness.attempts == 1, f"cancel should not retry, got {harness.attempts}"

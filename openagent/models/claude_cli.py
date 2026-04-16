@@ -34,15 +34,6 @@ logger = logging.getLogger(__name__)
 # We only set it if the user hasn't overridden it in the environment.
 os.environ.setdefault("CLAUDE_CODE_STREAM_CLOSE_TIMEOUT", "300000")  # 5 min
 
-# Idle timeout: abort if the SDK produces no message for this long. Reset per
-# message so a legitimately long single tool call (Electron build, gradle
-# assembleRelease, npm install on a cold cache) can finish as long as the
-# subprocess is actually making progress.
-DEFAULT_IDLE_TIMEOUT = 1800  # 30 min without any SDK message → something is wrong
-# Absolute ceiling per query. The bridge layer gives up at 65 min (see
-# openagent.bridges.base.BRIDGE_RESPONSE_TIMEOUT), so keep headroom under that.
-DEFAULT_HARD_TIMEOUT = 3600  # 60 min
-
 # Close idle clients after 24h — was 10 min, which caused user-visible
 # "lost memory" bugs on Telegram/Discord bridges where the next message after
 # the idle close would land with ``--resume <prior_sdk_sid>`` but Claude CLI
@@ -51,6 +42,14 @@ DEFAULT_HARD_TIMEOUT = 3600  # 60 min
 # active users; the mapping is also persisted to the db (``sdk_sessions``
 # table) so the 24h+ case still survives a restart.
 DEFAULT_IDLE_TTL = 86400
+
+# The per-turn receive loop no longer enforces its own timeouts. The bridge
+# layer already caps each turn at BRIDGE_RESPONSE_TIMEOUT (65 min); when it
+# fires it cancels the asyncio task and asyncio.CancelledError unwinds the
+# loop naturally. Removing the nested idle/hard checks here means legitimately
+# long tool calls (Electron builds, gradle assembleRelease on cold caches,
+# long-running Maestro suites orchestrated via a backgrounded bash) run to
+# completion as long as the subprocess keeps making progress.
 
 
 class _ClaudeSDKNoiseFilter(logging.Filter):
@@ -83,7 +82,8 @@ def _install_sdk_log_filters() -> None:
         setattr(sdk_logger, marker, True)
 
 
-def _coerce_timeout_seconds(value: Any, default: int) -> int:
+def _coerce_idle_ttl(value: Any, default: int) -> int:
+    """Clamp ``idle_ttl_seconds`` from config to a positive int."""
     try:
         parsed = int(value)
     except (TypeError, ValueError):
@@ -106,24 +106,19 @@ class ClaudeCLI(BaseModel):
         permission_mode: str = "bypass",
         mcp_servers: dict[str, dict] | None = None,
         providers_config: dict | None = None,
-        idle_timeout_seconds: int | None = None,
-        hard_timeout_seconds: int | None = None,
         idle_ttl_seconds: int | None = None,
+        # Legacy knobs retained for backward compatibility with older yaml
+        # configs that still specify these — they are no longer honoured
+        # since the per-turn timeout layer was removed.
+        idle_timeout_seconds: int | None = None,  # noqa: ARG002
+        hard_timeout_seconds: int | None = None,  # noqa: ARG002
     ):
         self.model = model
         self.allowed_tools = allowed_tools or []
         self.permission_mode = permission_mode
         self.mcp_servers: dict[str, dict] = mcp_servers or {}
         self._providers_config = providers_config or {}
-        self._idle_timeout = _coerce_timeout_seconds(
-            idle_timeout_seconds, DEFAULT_IDLE_TIMEOUT
-        )
-        self._hard_timeout = _coerce_timeout_seconds(
-            hard_timeout_seconds, DEFAULT_HARD_TIMEOUT
-        )
-        self._idle_ttl = _coerce_timeout_seconds(
-            idle_ttl_seconds, DEFAULT_IDLE_TTL
-        )
+        self._idle_ttl = _coerce_idle_ttl(idle_ttl_seconds, DEFAULT_IDLE_TTL)
         self._db: Any = None
         self._clients: dict[str, Any] = {}  # our_sid → ClaudeSDKClient
         self._sdk_sessions: dict[str, str] = {}  # our_sid → sdk_session_id
@@ -318,34 +313,6 @@ class ClaudeCLI(BaseModel):
             except Exception as e:
                 logger.debug("Shutdown %s: %s", sid, e)
 
-    async def _drain_stale(self, client: Any) -> int:
-        """Drain any stale messages left in the SDK buffer from a prior query.
-
-        The Claude Agent SDK uses a shared ``anyio`` memory stream (capacity
-        100) for all subprocess messages.  If a previous ``receive_response()``
-        was interrupted (timeout, error) or left residual data, those messages
-        sit in the buffer and would be returned by the *next*
-        ``receive_response()`` call — causing the "penultimate message" bug
-        where the agent responds to the wrong query.
-
-        This method does a non-blocking drain (50 ms cap) before each new
-        query to guarantee a clean buffer.
-        """
-        from claude_agent_sdk import ResultMessage
-        count = 0
-        try:
-            async with asyncio.timeout(0.05):
-                async for msg in client.receive_response():
-                    count += 1
-                    logger.warning("Drained stale %s from SDK buffer", type(msg).__name__)
-                    if isinstance(msg, ResultMessage):
-                        break
-        except (TimeoutError, StopAsyncIteration, Exception):
-            pass
-        if count:
-            elog("model.stale_drain", count=count)
-        return count
-
     async def _emit_tool_status(
         self, block: Any, on_status: Callable[[str], Awaitable[None]]
     ) -> None:
@@ -386,38 +353,24 @@ class ClaudeCLI(BaseModel):
     async def _run_once(
         self, client: Any, prompt: str, session_id: str, on_status: Any = None
     ) -> tuple[str, dict[str, Any]]:
-        """Send ``prompt``, consume the SDK stream, return ``(text, usage_meta)``.
+        """Send ``prompt`` and consume the SDK stream; return ``(text, usage_meta)``.
 
-        Shape of the receive loop:
-
-        - Per-message ``idle_timeout`` — a single silent gap longer than this
-          means the subprocess is stuck.
-        - Overall ``hard_timeout`` — last-resort ceiling. The bridge layer
-          tolerates up to 65 min (BRIDGE_RESPONSE_TIMEOUT), so defaults stay
-          comfortably under that.
-        - Text gets captured two ways: ``ResultMessage.result`` when the CLI
-          populates it, or accumulated ``TextBlock.text`` chunks as a fallback
-          when the final result field arrives empty (observed in production
-          with 1000+ output tokens of real text otherwise thrown away).
+        The loop is deliberately minimal. Turn-level timeouts live one layer
+        up (the bridge's ``BRIDGE_RESPONSE_TIMEOUT``); letting
+        ``asyncio.CancelledError`` propagate into the iterator is enough to
+        unwind cleanly. Text is taken from ``ResultMessage.result`` when the
+        CLI populates it, otherwise from accumulated ``TextBlock.text``
+        chunks (observed in production with 1000+ output tokens of real
+        text that would otherwise be thrown away).
         """
         from claude_agent_sdk import AssistantMessage, ResultMessage
 
-        t0 = time.monotonic()
         await client.query(prompt, session_id=session_id)
         streamed_text_parts: list[str] = []
         result_text = ""
         usage_meta: dict[str, Any] = {}
-        iterator = client.receive_response().__aiter__()
 
-        while True:
-            if time.monotonic() - t0 > self._hard_timeout:
-                raise TimeoutError(f"query exceeded {self._hard_timeout}s hard limit")
-            try:
-                async with asyncio.timeout(self._idle_timeout):
-                    message = await iterator.__anext__()
-            except StopAsyncIteration:
-                break
-
+        async for message in client.receive_response():
             if isinstance(message, AssistantMessage):
                 for block in (message.content or []):
                     block_text = getattr(block, "text", None)
@@ -425,8 +378,7 @@ class ClaudeCLI(BaseModel):
                         streamed_text_parts.append(block_text)
                     if on_status is not None:
                         await self._emit_tool_status(block, on_status)
-
-            if isinstance(message, ResultMessage):
+            elif isinstance(message, ResultMessage):
                 result_text, usage_meta = self._capture_result(message, session_id)
                 break  # Never read past the response boundary.
 
@@ -473,16 +425,12 @@ class ClaudeCLI(BaseModel):
                 prompt_parts.append(f"[Previous assistant response] {content}")
         prompt = "\n\n".join(prompt_parts)
 
-        # Retry semantics:
-        #   - TimeoutError: do NOT retry. A hung subprocess won't recover by
-        #     spawning a fresh one that immediately re-enters the same long
-        #     tool call; the second attempt just burns another hard_timeout.
-        #     Return a friendly timeout message so the bridge surface is fast.
-        #   - Other exceptions (transient network, SDK decode errors): one
-        #     retry with a fresh client, then give up.
+        # Retry semantics: one retry on any non-CancelledError. A hung
+        # subprocess that took so long the *bridge* cancelled us is handled
+        # by CancelledError unwinding naturally, not by a retry — the bridge
+        # already decided the turn is done.
         MAX_RETRIES_ON_ERROR = 1
-        attempt = 0
-        while True:
+        for attempt in range(MAX_RETRIES_ON_ERROR + 1):
             try:
                 client = await self._get_client(sid, system)
                 result, usage_meta = await self._run_once(client, prompt, sid, on_status)
@@ -493,25 +441,8 @@ class ClaudeCLI(BaseModel):
                     output_tokens=output_tokens,
                     model=self._model_id_for_billing(),
                 )
-            except TimeoutError as e:
-                elog(
-                    "model.timeout",
-                    session_id=sid,
-                    attempt=attempt + 1,
-                    idle_timeout=self._idle_timeout,
-                    hard_timeout=self._hard_timeout,
-                )
-                logger.error(
-                    "Session %s timed out (idle=%ds, hard=%ds): %s",
-                    sid[-8:], self._idle_timeout, self._hard_timeout, e,
-                )
-                await self._drop_client(sid)
-                return ModelResponse(
-                    content="I'm sorry, that request took too long to process. "
-                    "Please try again with a simpler request.",
-                    stop_reason="timeout",
-                    model=self._model_id_for_billing(),
-                )
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.error(
                     "Session %s error (attempt %d): %s",
@@ -519,7 +450,6 @@ class ClaudeCLI(BaseModel):
                 )
                 await self._drop_client(sid)
                 if attempt < MAX_RETRIES_ON_ERROR:
-                    attempt += 1
                     continue
                 elog(
                     "model.generate_error",
@@ -673,26 +603,13 @@ class ClaudeCLI(BaseModel):
         prompt = "\n\n".join(prompt_parts)
         try:
             client = await self._get_client(sid, system)
-            await self._drain_stale(client)
             await client.query(prompt, session_id=sid)
-            # Mirror ``_run_once``: per-message idle timeout + hard cap so
-            # long tool calls aren't cut off mid-stream.
-            t0 = time.monotonic()
-            iterator = client.receive_response().__aiter__()
-            while True:
-                if time.monotonic() - t0 > self._hard_timeout:
-                    raise TimeoutError(
-                        f"stream exceeded {self._hard_timeout}s hard limit"
-                    )
-                try:
-                    async with asyncio.timeout(self._idle_timeout):
-                        message = await iterator.__anext__()
-                except StopAsyncIteration:
-                    break
+            async for message in client.receive_response():
                 if isinstance(message, AssistantMessage):
                     for block in (message.content or []):
-                        if hasattr(block, "text"):
-                            yield block.text
+                        block_text = getattr(block, "text", None)
+                        if isinstance(block_text, str) and block_text:
+                            yield block_text
                 elif isinstance(message, ResultMessage):
                     sdk_sid = getattr(message, "session_id", None)
                     if sdk_sid:
@@ -700,15 +617,9 @@ class ClaudeCLI(BaseModel):
                         self._persist_sdk_session(sid, sdk_sid)
                     if message.result:
                         yield message.result
-                    break  # Never read past the response boundary
-        except TimeoutError:
-            logger.error(
-                "Stream timed out (idle=%ds, hard=%ds)",
-                self._idle_timeout,
-                self._hard_timeout,
-            )
-            await self._drop_client(sid)
-            yield "Error: request timed out"
+                    break  # Never read past the response boundary.
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.error("Stream error %s: %s", sid, e)
             await self._drop_client(sid)
