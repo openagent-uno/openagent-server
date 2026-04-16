@@ -18,15 +18,15 @@ from openagent.core.logging import elog
 
 logger = logging.getLogger(__name__)
 
-# Retry cooldown between bridge crashes
+# Retry cooldown between bridge crashes.
 BRIDGE_RETRY_SECONDS = 30
-# Maximum time the bridge will wait for a gateway response before giving up.
-# This is the sole per-turn timeout in the stack now that claude_cli.py no
-# longer enforces its own idle/hard timeouts — legitimately long workloads
-# (Electron builds, gradle assembleRelease, Maestro suites) can run as long
-# as they keep making progress, but a truly hung tool will get unstuck when
-# the bridge cancels the task and asyncio.CancelledError unwinds.
-BRIDGE_RESPONSE_TIMEOUT = 3900  # 65 min
+
+# No per-turn timeout. A runaway or legitimately-long turn is ended by the
+# user sending ``/stop`` (which routes to ``sessions.stop_current`` and cancels
+# the in-flight asyncio task — see openagent/gateway/server.py), or by
+# ``systemctl restart openagent``. Automatic "give up after N minutes" timeouts
+# break long workflows like gradle assembleRelease, Electron builds, and
+# Maestro suites that legitimately run an hour-plus.
 
 
 def format_tool_status(raw: str) -> str:
@@ -227,10 +227,12 @@ class BaseBridge:
     ) -> dict:
         """Send a message through the Gateway and wait for the response.
 
-        Per-session locking ensures only one message is in-flight per user,
-        preventing the ``_pending`` dict from being overwritten by a second
-        concurrent message for the same session.  A generous timeout prevents
-        the caller from hanging forever if the gateway drops.
+        Per-session locking keeps only one message in-flight per user so a
+        second concurrent message doesn't clobber ``_pending[session_id]``.
+        The awaited future is resolved when the Gateway replies, cancelled
+        when the user issues ``/stop`` (see ``sessions.stop_current``), or
+        raised on gateway disconnect (``_resolve_orphaned_futures``). No
+        wall-clock timeout — long tool calls are the point.
         """
         async with self._get_session_lock(session_id):
             future: asyncio.Future = asyncio.get_running_loop().create_future()
@@ -250,12 +252,12 @@ class BaseBridge:
                 raise
 
             try:
-                return await asyncio.wait_for(future, timeout=BRIDGE_RESPONSE_TIMEOUT)
-            except asyncio.TimeoutError:
+                return await future
+            finally:
+                # Defensive cleanup — the normal path resolves _pending via
+                # on_response(), but cancellation (e.g. /stop) unwinds here.
                 self._pending.pop(session_id, None)
                 self._status_callbacks.pop(session_id, None)
-                logger.error("Bridge response timeout for %s after %ds", session_id, BRIDGE_RESPONSE_TIMEOUT)
-                return {"type": "error", "text": "Request timed out. Please try again."}
 
     async def send_command(self, name: str) -> str:
         """Send a command and wait for the result."""
@@ -269,12 +271,7 @@ class BaseBridge:
                     self._command_future = None
                 raise
             try:
-                result = await asyncio.wait_for(future, timeout=BRIDGE_RESPONSE_TIMEOUT)
-            except asyncio.TimeoutError:
-                if self._command_future is future:
-                    self._command_future = None
-                logger.error("Bridge command timeout for %s after %ds", name, BRIDGE_RESPONSE_TIMEOUT)
-                return "Command timed out. Please try again."
+                result = await future
             finally:
                 if self._command_future is future:
                     self._command_future = None
