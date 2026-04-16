@@ -115,18 +115,23 @@ class TelegramBridge(BaseBridge):
     async def _on_command(self, update, context, cmd):
         if not update.message:
             return
-        if not self._is_authorized(str(update.message.from_user.id)):
+        user_id = str(update.message.from_user.id)
+        if not self._is_authorized(user_id):
             return await update.message.reply_text("Unauthorized.")
-        result = await self.send_command(cmd)
+        # Scope scope-sensitive commands (/stop, /clear, /new, /reset) to
+        # just the user who issued them. Other users on the same bot keep
+        # their own conversations.
+        result = await self.send_command(cmd, session_id=f"tg:{user_id}")
         await self._reply_rich(update.message, result)
 
     async def _on_stop_cb(self, update, context):
         q = update.callback_query
         if not q or not q.data.startswith("stop:"):
             return
-        if str(q.from_user.id) != q.data.split(":", 1)[1]:
+        uid = q.data.split(":", 1)[1]
+        if str(q.from_user.id) != uid:
             return await q.answer("Not your operation.", show_alert=True)
-        result = await self.send_command("stop")
+        result = await self.send_command("stop", session_id=f"tg:{uid}")
         await q.answer(result, show_alert=False)
 
     async def _on_message(self, update, context):

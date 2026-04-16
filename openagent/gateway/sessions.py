@@ -41,6 +41,12 @@ class _ClientState:
     sessions: dict[str, Session] = field(default_factory=dict)
     pending: asyncio.Queue = field(default_factory=asyncio.Queue)
     current_task: asyncio.Task | None = None
+    # Session id the currently running ``current_task`` is handling (if any).
+    # Tracked separately from the task so per-session ``/stop`` can decide
+    # whether to cancel: telegram/discord bridges multiplex many users onto
+    # a single ``client_id``, so we only want to interrupt the user who
+    # actually issued the command.
+    current_session_id: str | None = None
     worker_task: asyncio.Task | None = None
 
 
@@ -165,6 +171,7 @@ class SessionManager:
             )
             task = asyncio.create_task(item.handler())
             st.current_task = task
+            st.current_session_id = item.session_id
             try:
                 await task
             except asyncio.CancelledError:
@@ -175,15 +182,64 @@ class SessionManager:
                 elog("queue.error", client_id=client_id, session_id=item.session_id, error=str(e))
             finally:
                 st.current_task = None
+                st.current_session_id = None
                 elog("queue.done", client_id=client_id, session_id=item.session_id, remaining=st.pending.qsize())
 
-    def stop_current(self, client_id: str) -> bool:
+    def stop_current(self, client_id: str, session_id: str | None = None) -> bool:
+        """Cancel the currently-running handler for ``client_id``.
+
+        When ``session_id`` is provided, only cancels if the running task
+        belongs to that session — used by bridges (telegram, discord) where
+        one gateway client multiplexes many users, so ``/stop`` from user A
+        must not cancel user B's turn. ``session_id=None`` preserves the
+        legacy "cancel whatever is running" behaviour used by direct ws
+        clients and by administrative shutdowns.
+        """
         st = self._clients.get(client_id)
         if not st or st.current_task is None or st.current_task.done():
             return False
+        if session_id is not None and st.current_session_id != session_id:
+            elog(
+                "queue.stop_skipped",
+                client_id=client_id,
+                session_id=session_id,
+                running_session_id=st.current_session_id,
+            )
+            return False
         st.current_task.cancel()
-        elog("queue.stop_requested", client_id=client_id)
+        elog("queue.stop_requested", client_id=client_id, session_id=session_id)
         return True
+
+    def clear_queue_for_session(self, client_id: str, session_id: str) -> int:
+        """Drop queued handlers whose ``session_id`` matches.
+
+        Counterpart to :meth:`stop_current`'s session scoping — leaves other
+        users' queued messages alone. Returns the number of items removed.
+        """
+        st = self._clients.get(client_id)
+        if not st:
+            return 0
+        kept: list[_QueuedItem] = []
+        removed = 0
+        while True:
+            try:
+                item = st.pending.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if item.session_id == session_id:
+                removed += 1
+            else:
+                kept.append(item)
+        for item in kept:
+            st.pending.put_nowait(item)
+        if removed:
+            elog(
+                "queue.clear_session",
+                client_id=client_id,
+                session_id=session_id,
+                removed=removed,
+            )
+        return removed
 
     async def shutdown(self) -> None:
         tasks: list[asyncio.Task] = []

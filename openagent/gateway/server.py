@@ -358,8 +358,15 @@ class Gateway:
 
                 # Command
                 elif t == P.COMMAND:
-                    elog("command.received", client_id=client_id, name=data.get("name", ""))
-                    await self._handle_command(ws, client_id, data.get("name", ""))
+                    cmd_name = data.get("name", "")
+                    cmd_sid = data.get("session_id")
+                    elog(
+                        "command.received",
+                        client_id=client_id,
+                        name=cmd_name,
+                        session_id=cmd_sid,
+                    )
+                    await self._handle_command(ws, client_id, cmd_name, cmd_sid)
 
                 # Message
                 elif t == P.MESSAGE:
@@ -390,20 +397,33 @@ class Gateway:
                 elog("gateway.client_disconnect", client_id=client_id)
         return ws
 
-    async def _handle_command(self, ws, client_id: str, name: str) -> None:
+    async def _handle_command(
+        self, ws, client_id: str, name: str, session_id: str | None = None
+    ) -> None:
+        """Dispatch a WS command.
+
+        When ``session_id`` is provided, scope-sensitive commands (``stop``,
+        ``clear``, ``new``, ``reset``) act only on that conversation. Bridges
+        that multiplex many users onto one ``client_id`` (telegram, discord,
+        whatsapp) and UI clients that host many independent chat tabs on one
+        websocket (desktop app) MUST pass this — otherwise a ``/clear`` from
+        one user/tab wipes everyone else on the same ``client_id``.
+        """
         sm = self.sessions
         if name in ("new", "reset", "clear"):
             # /new, /reset, /clear: full wipe — stop anything running, drop
-            # the queue, AND forget every session's provider-native resume
-            # state. Previously /clear only cleared the queue, which meant
-            # the next user message on the same channel session id (e.g.
-            # ``tg:<user_id>``) silently resumed the prior transcript — the
-            # agent would pick up whatever maestro/gradle chain it had been
-            # on before the "clear".
-            stopped = sm.stop_current(client_id)
-            cleared = sm.clear_queue(client_id)
-            forgotten = await self._forget_all_client_sessions(client_id)
-            sid = sm.create_session(client_id)
+            # the queue, AND forget provider-native resume state. Scoped to
+            # ``session_id`` when given; falls back to client-wide wipe
+            # otherwise.
+            if session_id:
+                stopped = sm.stop_current(client_id, session_id=session_id)
+                cleared = sm.clear_queue_for_session(client_id, session_id)
+                forgotten = await self._forget_one_session(session_id)
+            else:
+                stopped = sm.stop_current(client_id)
+                cleared = sm.clear_queue(client_id)
+                forgotten = await self._forget_all_client_sessions(client_id)
+            fresh_sid = sm.create_session(client_id)
             parts = []
             if stopped:
                 parts.append("stopped current operation")
@@ -411,11 +431,15 @@ class Gateway:
                 parts.append(f"cleared {cleared} queued message{'s' if cleared != 1 else ''}")
             if forgotten:
                 parts.append(f"forgot {forgotten} prior conversation{'s' if forgotten != 1 else ''}")
-            parts.append(f"fresh session: {sid[-8:]}")
+            parts.append(f"fresh session: {fresh_sid[-8:]}")
             text = ". ".join(p.capitalize() if i == 0 else p for i, p in enumerate(parts)) + "."
         elif name == "stop":
-            stopped = sm.stop_current(client_id)
-            cleared = sm.clear_queue(client_id)
+            if session_id:
+                stopped = sm.stop_current(client_id, session_id=session_id)
+                cleared = sm.clear_queue_for_session(client_id, session_id)
+            else:
+                stopped = sm.stop_current(client_id)
+                cleared = sm.clear_queue(client_id)
             parts = []
             if stopped:
                 parts.append("Stopped current operation")
@@ -458,11 +482,29 @@ class Gateway:
         elog("command.result", client_id=client_id, name=name, text=text)
         await self._safe_ws_send_json(ws, {"type": P.COMMAND_RESULT, "text": text})
 
+    # Prefix used by each bridge when naming its per-user session ids.
+    # Used ONLY for the legacy, unscoped fallback path of /clear (no
+    # ``session_id`` in the command payload). Keep in sync with the
+    # bridge sources:
+    #   - bridges/telegram.py: ``f"tg:{uid}"``
+    #   - bridges/discord.py: ``f"dc:{uid}"``
+    #   - bridges/whatsapp.py: ``f"wa:{uid}"``
     _BRIDGE_SESSION_PREFIXES: dict[str, str] = {
         "bridge:telegram": "tg:",
-        "bridge:discord": "discord:",
-        "bridge:whatsapp": "whatsapp:",
+        "bridge:discord": "dc:",
+        "bridge:whatsapp": "wa:",
     }
+
+    async def _forget_one_session(self, session_id: str) -> int:
+        """Forget just one session. Returns 1 on success, 0 on failure."""
+        try:
+            await self.agent.forget_session(session_id)
+        except Exception as e:
+            logger.debug("forget_session(%s) failed: %s", session_id, e)
+            elog("session.forget_one", session_id=session_id, forgotten=0)
+            return 0
+        elog("session.forget_one", session_id=session_id, forgotten=1)
+        return 1
 
     async def _forget_all_client_sessions(self, client_id: str) -> int:
         """Erase provider-native resume state for every session tied to ``client_id``.

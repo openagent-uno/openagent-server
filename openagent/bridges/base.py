@@ -259,13 +259,24 @@ class BaseBridge:
                 self._pending.pop(session_id, None)
                 self._status_callbacks.pop(session_id, None)
 
-    async def send_command(self, name: str) -> str:
-        """Send a command and wait for the result."""
+    async def send_command(self, name: str, session_id: str | None = None) -> str:
+        """Send a command and wait for the result.
+
+        ``session_id`` is forwarded to the gateway so scope-sensitive
+        commands (``stop``, ``clear``, ``new``, ``reset``) can be limited to
+        the specific bridge user who issued them. Bridges that multiplex
+        many users onto a single ``client_id`` (telegram, discord) MUST
+        pass the user's session_id here; otherwise a ``/clear`` from one
+        user wipes everyone else's conversation.
+        """
         async with self._command_lock:
             future: asyncio.Future = asyncio.get_running_loop().create_future()
             self._command_future = future
+            payload: dict = {"type": P.COMMAND, "name": name}
+            if session_id is not None:
+                payload["session_id"] = session_id
             try:
-                await self._send_gateway_json({"type": P.COMMAND, "name": name})
+                await self._send_gateway_json(payload)
             except Exception:
                 if self._command_future is future:
                     self._command_future = None
