@@ -15,12 +15,12 @@ class GatewayCommandSpec:
 
 
 COMMAND_SPECS = (
-    GatewayCommandSpec("new", "Start a new conversation (fresh context)", "start a fresh conversation (clears context)"),
-    GatewayCommandSpec("reset", "Start a new conversation (fresh context)", "start a fresh conversation (clears context)", menu_visible=False, help_visible=False),
-    GatewayCommandSpec("stop", "Cancel the current operation", "cancel the current operation"),
+    GatewayCommandSpec("new", "Forget everything and start a fresh conversation", "wipe context, clear queue, start fresh"),
+    GatewayCommandSpec("reset", "Forget everything and start a fresh conversation", "wipe context, clear queue, start fresh", menu_visible=False, help_visible=False),
+    GatewayCommandSpec("clear", "Forget everything and start a fresh conversation", "wipe context, clear queue, start fresh"),
+    GatewayCommandSpec("stop", "Cancel the current operation (keeps context)", "cancel the current operation, keep conversation memory"),
     GatewayCommandSpec("status", "Show agent status and queue", "show agent status and queue depth"),
     GatewayCommandSpec("queue", "Show pending messages", "show pending messages", menu_visible=False),
-    GatewayCommandSpec("clear", "Clear the message queue", "clear the message queue"),
     GatewayCommandSpec("usage", "Show current usage and budget", "show current usage and budget"),
     GatewayCommandSpec("update", "Check for updates and install", "check for updates and install"),
     GatewayCommandSpec("restart", "Restart OpenAgent", "restart OpenAgent"),
@@ -48,9 +48,9 @@ def bridge_welcome_text(name: str | None = None) -> str:
         f"{greeting}\n\n"
         "Send me a message, photo, voice note, or file and I'll help.\n\n"
         "Commands:\n"
-        "/new — fresh conversation\n"
-        "/stop — cancel current operation\n"
+        "/stop — cancel the current operation (keeps context)\n"
+        "/clear — wipe everything and start a fresh conversation\n"
+        "/new — same as /clear\n"
         "/status — agent status\n"
-        "/clear — clear queue\n"
         "/help — all commands"
     )

@@ -302,6 +302,27 @@ class ClaudeCLI(BaseModel):
         await self._drop_client(session_id)
         elog("model.session_release", session_id=session_id)
 
+    async def forget_session(self, session_id: str) -> None:
+        """Drop the subprocess AND erase resume state for ``session_id``.
+
+        After this, the next ``generate()`` on the same ``session_id`` creates
+        a brand-new subprocess with no ``--resume`` and no prior transcript.
+        Wired up behind the gateway's ``/clear`` and ``/new`` commands so the
+        user can actually wipe a conversation (the earlier ``close_session``
+        only tore down the live client, not the SDK session id mapping, which
+        meant ``--resume`` kept reconstituting the old context).
+        """
+        if not session_id:
+            return
+        await self._drop_client(session_id)
+        self._sdk_sessions.pop(session_id, None)
+        if self._db is not None:
+            try:
+                await self._db.delete_sdk_session(session_id)
+            except Exception as e:
+                logger.debug("forget_session db delete %s: %s", session_id, e)
+        elog("model.session_forget", session_id=session_id)
+
     async def shutdown(self) -> None:
         async with self._lock:
             clients = dict(self._clients)

@@ -392,9 +392,27 @@ class Gateway:
 
     async def _handle_command(self, ws, client_id: str, name: str) -> None:
         sm = self.sessions
-        if name in ("new", "reset"):
+        if name in ("new", "reset", "clear"):
+            # /new, /reset, /clear: full wipe — stop anything running, drop
+            # the queue, AND forget every session's provider-native resume
+            # state. Previously /clear only cleared the queue, which meant
+            # the next user message on the same channel session id (e.g.
+            # ``tg:<user_id>``) silently resumed the prior transcript — the
+            # agent would pick up whatever maestro/gradle chain it had been
+            # on before the "clear".
+            stopped = sm.stop_current(client_id)
+            cleared = sm.clear_queue(client_id)
+            forgotten = await self._forget_all_client_sessions(client_id)
             sid = sm.create_session(client_id)
-            text = f"New session: {sid[-8:]}"
+            parts = []
+            if stopped:
+                parts.append("stopped current operation")
+            if cleared:
+                parts.append(f"cleared {cleared} queued message{'s' if cleared != 1 else ''}")
+            if forgotten:
+                parts.append(f"forgot {forgotten} prior conversation{'s' if forgotten != 1 else ''}")
+            parts.append(f"fresh session: {sid[-8:]}")
+            text = ". ".join(p.capitalize() if i == 0 else p for i, p in enumerate(parts)) + "."
         elif name == "stop":
             stopped = sm.stop_current(client_id)
             cleared = sm.clear_queue(client_id)
@@ -411,9 +429,6 @@ class Gateway:
             text = f"{'Busy' if busy else 'Idle'} | Queue: {depth} | Sessions: {len(sessions)}"
         elif name == "queue":
             text = f"Queue depth: {sm.queue_depth(client_id)}"
-        elif name == "clear":
-            n = sm.clear_queue(client_id)
-            text = f"Queue cleared ({n} messages removed)." if n else "Queue already empty."
         elif name == "usage":
             from openagent.gateway.api.usage import _usage_summary_for_agent
 
@@ -442,6 +457,24 @@ class Gateway:
             text = f"Unknown command: {name}"
         elog("command.result", client_id=client_id, name=name, text=text)
         await self._safe_ws_send_json(ws, {"type": P.COMMAND_RESULT, "text": text})
+
+    async def _forget_all_client_sessions(self, client_id: str) -> int:
+        """Erase provider-native resume state for every session tied to ``client_id``.
+
+        Returns the number of sessions whose resume state was dropped. Any
+        per-session failure is swallowed so one bad session doesn't stop the
+        others from being forgotten.
+        """
+        sids = list(self.sessions.list_sessions(client_id))
+        forgotten = 0
+        for sid in sids:
+            try:
+                await self.agent.forget_session(sid)
+                forgotten += 1
+            except Exception as e:
+                logger.debug("forget_session(%s) failed: %s", sid, e)
+        elog("session.forget_all", client_id=client_id, forgotten=forgotten, total=len(sids))
+        return forgotten
 
     async def _maybe_reload_agent_model(self) -> None:
         """If the YAML fingerprint changed since the last check, rebuild the

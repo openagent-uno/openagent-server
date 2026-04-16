@@ -80,6 +80,8 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_claude_cli",
     # 8. Unit tests for claude_cli text-recovery regression
     "test_claude_cli_text_recovery",
+    # 9. Gateway /stop, /clear, /new command semantics
+    "test_gateway_commands",
 )
 
 

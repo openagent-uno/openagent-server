@@ -251,6 +251,21 @@ class MemoryDB:
         rows = await cursor.fetchall()
         return {row[0]: row[1] for row in rows}
 
+    async def delete_sdk_session(self, session_id: str) -> None:
+        """Remove the stored ``session_id → sdk_session_id`` row.
+
+        Called when the user explicitly asks to forget a conversation
+        (``/clear``, ``/new``) so that the next message spawns a fresh
+        subprocess without ``--resume`` instead of picking the old
+        transcript back up.
+        """
+        conn = await self._ensure_connected()
+        await conn.execute(
+            "DELETE FROM sdk_sessions WHERE session_id = ?",
+            (session_id,),
+        )
+        await conn.commit()
+
     async def get_daily_usage(self, days: int = 7) -> list[dict]:
         """Day-by-day usage breakdown grouped by model."""
         conn = await self._ensure_connected()

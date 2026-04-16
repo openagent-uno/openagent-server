@@ -80,3 +80,17 @@ class BaseModel(ABC):
         tear down.
         """
         return None
+
+    async def forget_session(self, session_id: str) -> None:
+        """Drop the subprocess AND erase any resume state for this session.
+
+        Semantically stronger than ``close_session``: after a ``forget_session``,
+        the next message on this ``session_id`` must spawn a fresh subprocess
+        with no ``--resume`` and no memory of the prior transcript. Used by the
+        gateway's ``/clear`` and ``/new`` commands so the user can truly wipe
+        the conversation.
+
+        Default implementation falls back to ``close_session`` — caller- and
+        platform-managed models have no hidden resume state to erase.
+        """
+        await self.close_session(session_id)

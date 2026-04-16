@@ -205,6 +205,35 @@ class Agent:
             return
         await close_session(session_id)
 
+    async def forget_session(
+        self,
+        session_id: str | None,
+        *,
+        model_override: BaseModel | None = None,
+    ) -> None:
+        """Erase all resume state for ``session_id`` so the next run starts fresh.
+
+        Stronger than :meth:`release_session`: also drops the provider-native
+        session id mapping, so the next message spawns a new subprocess
+        without ``--resume``. Gateway ``/clear`` and ``/new`` call this so
+        users can actually wipe the conversation.
+        """
+        if not session_id:
+            return
+        model = model_override or self.model
+        if model is None:
+            return
+        self._prepare_model_runtime(model)
+        forget_session = getattr(model, "forget_session", None)
+        if callable(forget_session):
+            await forget_session(session_id)
+            return
+        # Fallback: release live resources even if provider lacks explicit
+        # forget support — best-effort; SDK-side resume state may linger.
+        close_session = getattr(model, "close_session", None)
+        if callable(close_session):
+            await close_session(session_id)
+
     async def initialize(self) -> None:
         """Connect MCP servers and initialize memory DB."""
         if self._initialized:
