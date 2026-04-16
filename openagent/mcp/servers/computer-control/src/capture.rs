@@ -23,10 +23,22 @@ pub struct CaptureResult {
 }
 
 pub fn capture_primary_display() -> Result<CaptureResult> {
-    let image = try_xcap().or_else(|e| {
-        tracing::warn!("xcap capture failed: {e}, trying fallback");
-        try_fallback()
-    })?;
+    let image = try_xcap()
+        .or_else(|e| {
+            tracing::warn!("xcap capture failed: {e}, trying fallback");
+            #[cfg(target_os = "macos")]
+            if is_permission_error(&e) {
+                return Err(anyhow!(MAC_SCREEN_RECORDING_HINT));
+            }
+            try_fallback()
+        })
+        .map_err(|e| {
+            #[cfg(target_os = "macos")]
+            if is_permission_error(&e) {
+                return anyhow!(MAC_SCREEN_RECORDING_HINT);
+            }
+            e
+        })?;
     Ok(image)
 }
 
@@ -145,6 +157,19 @@ pub fn draw_crosshair(img: &mut RgbaImage, cx: i32, cy: i32) {
         }
     }
 }
+
+#[cfg(target_os = "macos")]
+fn is_permission_error(e: &anyhow::Error) -> bool {
+    let s = format!("{e:#}").to_lowercase();
+    s.contains("screen recording")
+        || s.contains("not authorized")
+        || s.contains("cgrequestscreencaptureaccess")
+        || s.contains("kcgerror")
+}
+
+#[cfg(target_os = "macos")]
+pub const MAC_SCREEN_RECORDING_HINT: &str =
+    "macOS Screen Recording permission required. Open System Settings → Privacy & Security → Screen Recording and enable 'openagent', then restart the app.";
 
 #[cfg(test)]
 mod tests {

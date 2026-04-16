@@ -4,6 +4,16 @@
 use anyhow::{Context, Result, anyhow};
 use enigo::{Axis, Button, Coordinate, Direction, Enigo, Keyboard, Mouse, Settings};
 
+#[cfg(target_os = "macos")]
+pub const MAC_ACCESSIBILITY_HINT: &str =
+    "macOS Accessibility permission required. Open System Settings → Privacy & Security → Accessibility and enable 'openagent', then restart the app.";
+
+#[cfg(target_os = "macos")]
+fn is_accessibility_error(e: &anyhow::Error) -> bool {
+    let s = format!("{e:#}").to_lowercase();
+    s.contains("accessibility") || s.contains("not trusted") || s.contains("axiserror")
+}
+
 use crate::keys;
 
 pub struct InputController {
@@ -12,7 +22,14 @@ pub struct InputController {
 
 impl InputController {
     pub fn new() -> Result<Self> {
-        let enigo = Enigo::new(&Settings::default()).context("enigo init failed")?;
+        let enigo = Enigo::new(&Settings::default()).map_err(|e| {
+            let err: anyhow::Error = e.into();
+            #[cfg(target_os = "macos")]
+            if is_accessibility_error(&err) {
+                return anyhow!(MAC_ACCESSIBILITY_HINT);
+            }
+            err.context("enigo init failed")
+        })?;
         Ok(Self { enigo })
     }
 
