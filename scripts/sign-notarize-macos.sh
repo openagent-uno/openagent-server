@@ -108,7 +108,14 @@ fi
 if [ "$WANT_PKG" = true ]; then
     BINARY_DIR="$(dirname "$BINARY")"
     BINARY_NAME="$(basename "$BINARY")"
-    MODULE="${BINARY_NAME//-/_}"
+    # The pkg filename is derived from the binary name without the
+    # trailing ``.app`` suffix when we're packaging an app bundle
+    # (dist/openagent.app → openagent-<ver>-macos-arm64.pkg). The Python
+    # module lookup must also strip the suffix — otherwise
+    # ``import openagent.app`` tries to resolve a non-existent
+    # ``openagent.app`` submodule and the build fails.
+    PKG_BASE="${BINARY_NAME%.app}"
+    MODULE="${PKG_BASE//-/_}"
     PKG_VERSION="$(python -c "import ${MODULE}; print(${MODULE}.__version__)")"
     PKG_ARCH_RAW="$(uname -m)"
     case "$PKG_ARCH_RAW" in
@@ -116,7 +123,7 @@ if [ "$WANT_PKG" = true ]; then
         aarch64|arm64) PKG_ARCH="arm64" ;;
         *) PKG_ARCH="$PKG_ARCH_RAW" ;;
     esac
-    PKG_OUTPUT="${BINARY_DIR}/${BINARY_NAME}-${PKG_VERSION}-macos-${PKG_ARCH}.pkg"
+    PKG_OUTPUT="${BINARY_DIR}/${PKG_BASE}-${PKG_VERSION}-macos-${PKG_ARCH}.pkg"
 fi
 
 # ── Skip cleanly when the binary-signing secrets are missing ──────────
