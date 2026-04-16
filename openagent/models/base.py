@@ -94,3 +94,12 @@ class BaseModel(ABC):
         platform-managed models have no hidden resume state to erase.
         """
         await self.close_session(session_id)
+
+    def known_session_ids(self) -> list[str]:
+        """Return every session_id the provider currently has resume state for.
+
+        Provider-managed models (e.g. ClaudeCLI) override this to expose their
+        internal map so the gateway can wipe conversations across restarts.
+        The default implementation returns an empty list — nothing to list.
+        """
+        return []

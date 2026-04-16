@@ -458,14 +458,37 @@ class Gateway:
         elog("command.result", client_id=client_id, name=name, text=text)
         await self._safe_ws_send_json(ws, {"type": P.COMMAND_RESULT, "text": text})
 
+    _BRIDGE_SESSION_PREFIXES: dict[str, str] = {
+        "bridge:telegram": "tg:",
+        "bridge:discord": "discord:",
+        "bridge:whatsapp": "whatsapp:",
+    }
+
     async def _forget_all_client_sessions(self, client_id: str) -> int:
         """Erase provider-native resume state for every session tied to ``client_id``.
 
-        Returns the number of sessions whose resume state was dropped. Any
-        per-session failure is swallowed so one bad session doesn't stop the
-        others from being forgotten.
+        Uses two sources because SessionManager is RAM-only and starts empty
+        after every restart: any session attached before the latest restart
+        would otherwise be invisible here, and /clear would silently keep
+        the prior transcript alive (the model rehydrates ``_sdk_sessions``
+        from sqlite on startup and ``--resume`` keeps reconstituting it).
+
+        Sources:
+          1. ``SessionManager.list_sessions`` — what the gateway has seen
+             since the current process started.
+          2. The model's own ``known_session_ids()`` filtered by the bridge
+             prefix for this client (``tg:`` for telegram, ``discord:`` for
+             discord, ``whatsapp:`` for whatsapp). Catches any resume state
+             that outlived the restart.
+
+        Returns the number of sessions whose resume state was dropped.
         """
-        sids = list(self.sessions.list_sessions(client_id))
+        sids: set[str] = set(self.sessions.list_sessions(client_id))
+        prefix = self._BRIDGE_SESSION_PREFIXES.get(client_id)
+        if prefix:
+            for sid in self.agent.known_model_session_ids():
+                if sid.startswith(prefix):
+                    sids.add(sid)
         forgotten = 0
         for sid in sids:
             try:
@@ -473,7 +496,12 @@ class Gateway:
                 forgotten += 1
             except Exception as e:
                 logger.debug("forget_session(%s) failed: %s", sid, e)
-        elog("session.forget_all", client_id=client_id, forgotten=forgotten, total=len(sids))
+        elog(
+            "session.forget_all",
+            client_id=client_id,
+            forgotten=forgotten,
+            total=len(sids),
+        )
         return forgotten
 
     async def _maybe_reload_agent_model(self) -> None:

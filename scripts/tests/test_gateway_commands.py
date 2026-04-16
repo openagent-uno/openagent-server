@@ -24,11 +24,16 @@ from ._framework import TestContext, test
 
 
 class _FakeModel:
-    """Records close_session / forget_session calls so tests can assert."""
+    """Records close_session / forget_session calls so tests can assert.
 
-    def __init__(self) -> None:
+    ``known_ids`` simulates the provider's hydrated map of session_ids — the
+    real ClaudeCLI populates this from sqlite on startup.
+    """
+
+    def __init__(self, known_ids: list[str] | None = None) -> None:
         self.closed: list[str] = []
         self.forgotten: list[str] = []
+        self.known_ids: list[str] = list(known_ids or [])
 
     async def close_session(self, session_id: str) -> None:
         self.closed.append(session_id)
@@ -37,17 +42,25 @@ class _FakeModel:
         # Forget = close + erase resume state; simulate both effects.
         self.closed.append(session_id)
         self.forgotten.append(session_id)
+        if session_id in self.known_ids:
+            self.known_ids.remove(session_id)
+
+    def known_session_ids(self) -> list[str]:
+        return list(self.known_ids)
 
 
 class _FakeAgent:
     """Just enough Agent surface for ``_handle_command`` to run."""
 
-    def __init__(self) -> None:
-        self.model = _FakeModel()
+    def __init__(self, known_ids: list[str] | None = None) -> None:
+        self.model = _FakeModel(known_ids=known_ids)
         self._initialized = True
 
     def _prepare_model_runtime(self, _m: Any) -> None:
         return None
+
+    def known_model_session_ids(self) -> list[str]:
+        return list(self.model.known_session_ids())
 
     async def forget_session(self, session_id: str | None) -> None:
         if not session_id:
@@ -82,12 +95,12 @@ class _FakeWS:
 class _Harness:
     """Wire up SessionManager + fake agent + the real ``_handle_command``."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, known_ids: list[str] | None = None) -> None:
         from openagent.gateway.sessions import SessionManager
         from openagent.gateway.server import Gateway
 
         self.sessions = SessionManager(agent_name="test-agent")
-        self.agent = _FakeAgent()
+        self.agent = _FakeAgent(known_ids=known_ids)
 
         # Build a minimal Gateway object without going through __init__.
         server = Gateway.__new__(Gateway)
@@ -201,3 +214,55 @@ async def t_clear_no_sessions(ctx: TestContext) -> None:
     assert "forgot" not in text.lower(), text
     assert "fresh session" in text.lower(), text
     assert h.agent.model.forgotten == []
+
+
+@test(
+    "gateway_commands",
+    "/clear reaches sessions the model hydrated from disk that SessionManager never saw "
+    "(the restart bug)",
+)
+async def t_clear_hydrated_sessions(ctx: TestContext) -> None:
+    """Regression for the 2026-04-16 bug.
+
+    Scenario: openagent was restarted (service update or manual restart).
+    ``SessionManager.sessions`` is RAM-only so it starts empty. Meanwhile
+    ``ClaudeCLI._sdk_sessions`` rehydrates from sqlite (seen in
+    ``model.sessions_hydrated`` events). The user then types /clear in
+    Telegram. Previously ``_forget_all_client_sessions`` only looked at
+    ``SessionManager.list_sessions`` — which was empty — so forgot
+    nothing. The next message came in on ``tg:<user_id>``, ClaudeCLI
+    found the rehydrated mapping, spawned claude with
+    ``--resume <old_sid>``, and the prior transcript was back.
+
+    Fix: the gateway also iterates ``agent.known_model_session_ids()``
+    filtered by the bridge prefix (``tg:`` for telegram, etc.) so resume
+    state that outlived the restart still gets wiped.
+    """
+    h = _Harness(
+        known_ids=[
+            "tg:155490357",        # belongs to the telegram user
+            "tg:7295922443",       # another telegram user
+            "discord:99999",       # belongs to discord — must NOT be forgotten by a telegram /clear
+            "scheduler:f2cd26cd",  # internal scheduler session — must NOT be forgotten
+        ],
+    )
+    client = "bridge:telegram"
+    # Crucially, do NOT attach any session to SessionManager — simulates
+    # the state immediately after a process restart where the in-memory
+    # list is empty but the model has rehydrated resume state.
+    assert h.sessions.list_sessions(client) == [], (
+        "precondition: session manager must be empty to simulate restart"
+    )
+
+    text = await h.run_command(client, "clear")
+
+    assert "tg:155490357" in h.agent.model.forgotten, h.agent.model.forgotten
+    assert "tg:7295922443" in h.agent.model.forgotten, h.agent.model.forgotten
+    assert "discord:99999" not in h.agent.model.forgotten, (
+        "discord session forgotten by a telegram /clear — wrong prefix filter"
+    )
+    assert "scheduler:f2cd26cd" not in h.agent.model.forgotten, (
+        "scheduler session must not be wiped by /clear"
+    )
+    assert "forgot 2 prior" in text.lower(), text
+    assert "fresh session" in text.lower(), text

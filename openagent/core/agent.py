@@ -205,6 +205,27 @@ class Agent:
             return
         await close_session(session_id)
 
+    def known_model_session_ids(
+        self, *, model_override: BaseModel | None = None
+    ) -> list[str]:
+        """Return every session_id the primary model has resume state for.
+
+        Used by the gateway's ``/clear`` code path to reach past its own
+        in-memory SessionManager (which starts empty after a restart) and
+        forget conversations whose bridge session ids were hydrated back
+        into the model from disk.
+        """
+        model = model_override or self.model
+        if model is None:
+            return []
+        known = getattr(model, "known_session_ids", None)
+        if not callable(known):
+            return []
+        try:
+            return list(known())
+        except Exception:
+            return []
+
     async def forget_session(
         self,
         session_id: str | None,
