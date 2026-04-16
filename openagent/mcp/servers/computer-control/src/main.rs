@@ -2,6 +2,7 @@ use anyhow::Result;
 use rmcp::{ServerHandler, ServiceExt, transport::stdio};
 use tracing_subscriber::{EnvFilter, fmt};
 
+mod keys;
 mod scaling;
 
 #[derive(Clone, Default)]
