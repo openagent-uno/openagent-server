@@ -37,12 +37,9 @@ fn try_xcap() -> Result<CaptureResult> {
         .find(|m| m.is_primary().unwrap_or(false))
         .ok_or_else(|| anyhow!("no primary monitor found"))?;
 
-    let rgba = primary.capture_image().context("xcap capture_image failed")?;
+    let rgba: RgbaImage = primary.capture_image().context("xcap capture_image failed")?;
     let logical_w = rgba.width();
     let logical_h = rgba.height();
-    // xcap::Monitor::capture_image() returns image::RgbaImage directly
-    let rgba: RgbaImage = RgbaImage::from_raw(logical_w, logical_h, rgba.into_raw())
-        .ok_or_else(|| anyhow!("xcap returned invalid buffer"))?;
     let (png_bytes, w, h) = downsample_and_encode(rgba)?;
     Ok(CaptureResult {
         png_bytes,
@@ -67,10 +64,12 @@ fn try_fallback() -> Result<CaptureResult> {
         .status()
         .context("spawn screencapture")?;
     if !status.success() {
+        let _ = std::fs::remove_file(&tmp);
         return Err(anyhow!("screencapture exited with {status}"));
     }
-    let bytes = std::fs::read(&tmp).context("read screencapture png")?;
+    let bytes = std::fs::read(&tmp);
     let _ = std::fs::remove_file(&tmp);
+    let bytes = bytes.context("read screencapture png")?;
     let img = image::load_from_memory(&bytes)?.to_rgba8();
     let logical_w = img.width();
     let logical_h = img.height();
