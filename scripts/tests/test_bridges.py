@@ -112,3 +112,108 @@ async def t_send_message_cancelled(ctx: TestContext) -> None:
     assert raised is not None, "CancelledError was swallowed"
     # Defensive cleanup should have popped the entry.
     assert "s-cancel" not in fb._real._pending, "pending future leaked"
+
+
+@test("bridges", "telegram bridge wires ApplicationBuilder().concurrent_updates(True)")
+async def t_telegram_concurrent_updates(ctx: TestContext) -> None:
+    """Without concurrent_updates(True), python-telegram-bot dispatches
+    Updates for the same chat strictly sequentially. That means a user
+    stuck inside ``send_message`` (waiting on a long agent turn) can't
+    fire /stop or the stop-button callback — the second Update is queued
+    behind the first handler's future and never reaches our code.
+
+    This test inspects the fake builder chain to confirm the fix stays
+    in place. Breaking this one silently brings back the "stop doesn't
+    work mid-turn" bug.
+    """
+    from openagent.bridges.telegram import TelegramBridge
+
+    calls: list[tuple[str, tuple, dict]] = []
+
+    class _FakeApp:
+        async def initialize(self): pass
+        async def start(self): pass
+        async def shutdown(self): pass
+        async def stop(self): pass
+        updater = None
+        bot = None
+
+        def add_handler(self, *_a, **_kw): pass
+
+    class _FakeBuilder:
+        def __init__(self):
+            self._steps: list[str] = []
+
+        def token(self, *a, **k):
+            calls.append(("token", a, k))
+            return self
+
+        def concurrent_updates(self, *a, **k):
+            calls.append(("concurrent_updates", a, k))
+            return self
+
+        def build(self):
+            calls.append(("build", (), {}))
+            return _FakeApp()
+
+    import sys
+    import types
+
+    fake_ext = types.ModuleType("telegram.ext")
+    fake_ext.ApplicationBuilder = _FakeBuilder  # type: ignore[attr-defined]
+    fake_ext.CommandHandler = lambda *a, **k: None  # type: ignore[attr-defined]
+    fake_ext.MessageHandler = lambda *a, **k: None  # type: ignore[attr-defined]
+    fake_ext.CallbackQueryHandler = lambda *a, **k: None  # type: ignore[attr-defined]
+    fake_ext.filters = types.SimpleNamespace(
+        TEXT=0, PHOTO=0, VOICE=0, AUDIO=0, VIDEO=0,
+        Document=types.SimpleNamespace(ALL=0),
+    )
+    fake_tg = types.ModuleType("telegram")
+    fake_tg.BotCommand = lambda *a, **k: None  # type: ignore[attr-defined]
+
+    saved = {k: sys.modules.get(k) for k in ("telegram", "telegram.ext")}
+    sys.modules["telegram"] = fake_tg
+    sys.modules["telegram.ext"] = fake_ext
+
+    try:
+        bridge = TelegramBridge(token="fake", allowed_users=["1"])
+        # _run will build the Application up to updater.start_polling. We only
+        # need the builder chain to run; raise a sentinel right after to
+        # short-circuit the rest.
+        class _Sentinel(RuntimeError):
+            pass
+
+        async def _stop_early(*_a, **_k):
+            raise _Sentinel
+
+        bridge._app = None
+
+        async def _start_polling_stub():
+            raise _Sentinel
+
+        _FakeApp.start = _stop_early  # type: ignore[assignment]
+
+        try:
+            await bridge._run()
+        except _Sentinel:
+            pass
+        except Exception as e:
+            # Anything else should at least still let the builder chain finish.
+            pass
+    finally:
+        for k, v in saved.items():
+            if v is not None:
+                sys.modules[k] = v
+            else:
+                sys.modules.pop(k, None)
+
+    names = [step[0] for step in calls]
+    assert "token" in names, f"ApplicationBuilder.token not called: {names}"
+    assert "concurrent_updates" in names, (
+        "ApplicationBuilder.concurrent_updates(True) is missing — "
+        "/stop will stop working mid-turn again. Calls seen: %r" % names
+    )
+    for step in calls:
+        if step[0] == "concurrent_updates":
+            assert step[1] == (True,), f"expected concurrent_updates(True), got {step}"
+            break

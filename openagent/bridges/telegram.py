@@ -47,7 +47,21 @@ class TelegramBridge(BaseBridge):
             CallbackQueryHandler, filters,
         )
 
-        self._app = ApplicationBuilder().token(self.token).build()
+        # concurrent_updates(True) is NOT optional: without it python-telegram-bot
+        # dispatches Updates for the same chat strictly sequentially, so a
+        # user whose message is blocked inside ``send_message`` (waiting on
+        # a long agent turn — gradle, docker build, maestro suite, ...) can
+        # NOT get a second command through. /stop, the stop-button callback,
+        # or any text message just piles up behind the first handler's
+        # ``await future`` and never reaches us. With concurrent_updates the
+        # second Update gets its own task, hits _on_command, flows through
+        # send_command, and ``sm.stop_current`` cancels the original task.
+        self._app = (
+            ApplicationBuilder()
+            .token(self.token)
+            .concurrent_updates(True)
+            .build()
+        )
 
         # Register commands
         self._app.add_handler(CommandHandler("start", self._on_start))
