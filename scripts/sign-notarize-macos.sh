@@ -5,6 +5,7 @@
 # Usage:
 #   scripts/sign-notarize-macos.sh <binary>
 #   scripts/sign-notarize-macos.sh <binary> <pkg-identifier> <install-path>
+#   scripts/sign-notarize-macos.sh <binary> <pkg-identifier> <install-path> <extra-sidecar-binary>
 #
 # Examples:
 #   # Sign + notarize the bare binary only (no .pkg):
@@ -16,6 +17,15 @@
 #   # where <version> comes from the Python module matching the binary name.
 #   scripts/sign-notarize-macos.sh dist/openagent \
 #       com.openagent.server /usr/local/bin
+#
+#   # Same as above, PLUS bundle an already-signed sidecar binary into the
+#   # .pkg at the same install path. Used for openagent-computer-control
+#   # (signed with a stable TCC identifier in its own CI job). The sidecar
+#   # is NOT re-signed here — its existing Developer-ID signature must be
+#   # preserved verbatim so macOS can record a persistent TCC grant.
+#   scripts/sign-notarize-macos.sh dist/openagent \
+#       com.openagent.server /usr/local/bin \
+#       dist/openagent-computer-control
 #
 # Env vars (identical to the desktop electron-builder job so both flows
 # share one set of GitHub Actions secrets):
@@ -57,13 +67,18 @@ set -euo pipefail
 BINARY="${1:-}"
 PKG_IDENTIFIER="${2:-}"
 PKG_INSTALL_PATH="${3:-}"
+EXTRA_SIDECAR="${4:-}"
 
 if [ -z "$BINARY" ]; then
-    echo "usage: $0 <binary> [pkg-identifier pkg-install-path]" >&2
+    echo "usage: $0 <binary> [pkg-identifier pkg-install-path [extra-sidecar-binary]]" >&2
     exit 2
 fi
 if [ ! -f "$BINARY" ]; then
     echo "not a file: $BINARY" >&2
+    exit 2
+fi
+if [ -n "$EXTRA_SIDECAR" ] && [ ! -f "$EXTRA_SIDECAR" ]; then
+    echo "sidecar binary not a file: $EXTRA_SIDECAR" >&2
     exit 2
 fi
 
@@ -237,6 +252,20 @@ rm -rf "$PKG_ROOT"
 mkdir -p "$PKG_ROOT$PKG_INSTALL_PATH"
 cp "$BINARY" "$PKG_ROOT$PKG_INSTALL_PATH/$(basename "$BINARY")"
 chmod +x "$PKG_ROOT$PKG_INSTALL_PATH/$(basename "$BINARY")"
+
+# Sidecar binary (optional, already-signed). Copied verbatim so its
+# Developer-ID signature with ``com.openagent.computer-control`` stays
+# intact — that stable identifier is what makes macOS TCC grants for
+# Accessibility / Screen Recording survive openagent updates. The
+# .pkg notarization below covers this binary too (notarytool walks
+# the pkg payload and notarizes every embedded Mach-O).
+if [ -n "$EXTRA_SIDECAR" ]; then
+    echo "→ Adding sidecar to pkg payload: $(basename "$EXTRA_SIDECAR")"
+    cp "$EXTRA_SIDECAR" "$PKG_ROOT$PKG_INSTALL_PATH/$(basename "$EXTRA_SIDECAR")"
+    chmod +x "$PKG_ROOT$PKG_INSTALL_PATH/$(basename "$EXTRA_SIDECAR")"
+    codesign -dvv "$PKG_ROOT$PKG_INSTALL_PATH/$(basename "$EXTRA_SIDECAR")" 2>&1 \
+        | grep -E '^(Identifier|TeamIdentifier|Authority)=' || true
+fi
 
 UNSIGNED_PKG="${RUNNER_TEMP:-/tmp}/$(basename "$PKG_OUTPUT" .pkg)-unsigned.pkg"
 echo "→ Building unsigned .pkg with identifier $PKG_IDENTIFIER"

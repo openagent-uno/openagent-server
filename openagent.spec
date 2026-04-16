@@ -71,8 +71,29 @@ mcps_dir = Path("openagent/mcp/servers")
 
 datas = []
 if mcps_dir.exists():
-    # Bundle the entire mcp/servers directory tree
-    datas.append((str(mcps_dir), "openagent/mcp/servers"))
+    # Bundle every MCP EXCEPT computer-control. The Rust binary for
+    # computer-control must ship as a *sidecar* next to the openagent
+    # executable — never inside the PyInstaller archive — because
+    # PyInstaller's macOS bundling strips the Developer-ID signature
+    # from nested Mach-O binaries and re-signs them ad-hoc. An ad-hoc
+    # signature has no stable Team ID or bundle identifier, so macOS
+    # TCC (Accessibility, Screen Recording) can prompt the user but
+    # can't record a persistent grant. Every openagent update then
+    # produces a new ad-hoc identifier and the user has to re-grant —
+    # or worse, as observed on v0.6.4, the prompt fires but the
+    # Accessibility toggle never appears in System Settings at all.
+    #
+    # The sidecar's signature stays intact on disk, TCC uses its
+    # stable ``com.openagent.computer-control`` identifier, and
+    # permission grants survive across updates. See
+    # ``scripts/sign-notarize-macos.sh`` (bundles the sidecar into
+    # the .pkg alongside the onefile) and
+    # ``openagent/mcp/builtins.py::_resolve_native_binary`` (looks
+    # for the sidecar next to ``sys.executable`` first).
+    for child in mcps_dir.iterdir():
+        if child.name == "computer-control":
+            continue
+        datas.append((str(child), f"openagent/mcp/servers/{child.name}"))
 
 # litellm needs its JSON data files (model prices, cost maps, etc.)
 datas += collect_data_files("litellm", includes=["**/*.json", "**/*.yaml", "**/*.yml"])

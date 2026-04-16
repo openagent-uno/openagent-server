@@ -81,20 +81,38 @@ case "$OS" in
         BIN="$APP"
         [ -f "$BIN" ] || { echo "ERROR: $PWD/$BIN missing (PyInstaller output)" >&2; ls -la; exit 1; }
         chmod +x "$BIN"
+        # Bundle the computer-control sidecar alongside the openagent
+        # server. The sidecar lives outside the PyInstaller archive so
+        # its Developer-ID signature (macOS) or ad-hoc bits (Linux) stay
+        # intact. Only applies to the server — ``openagent-cli`` has no
+        # MCP runtime and doesn't need it.
+        FILES=("$BIN")
+        if [ "$APP" = "openagent" ] && [ -f "openagent-computer-control" ]; then
+            chmod +x "openagent-computer-control"
+            FILES+=("openagent-computer-control")
+        fi
         ARCHIVE="${APP}-${VERSION}-${OS}-${ARCH}.tar.gz"
-        tar czf "$ARCHIVE" "$BIN"
+        tar czf "$ARCHIVE" "${FILES[@]}"
         sha256 "$ARCHIVE" > "${ARCHIVE}.sha256"
-        echo "✓ $ARCHIVE (+.sha256)"
+        echo "✓ $ARCHIVE (+.sha256) with: ${FILES[*]}"
         ;;
     windows)
         BIN="${APP}.exe"
         [ -f "$BIN" ] || { echo "ERROR: $PWD/$BIN missing (PyInstaller output)" >&2; ls -la; exit 1; }
+        # Same sidecar inclusion as linux. PowerShell's Compress-Archive
+        # accepts a comma-separated path list via ``-Path``.
+        FILES=("$BIN")
+        if [ "$APP" = "openagent" ] && [ -f "openagent-computer-control.exe" ]; then
+            FILES+=("openagent-computer-control.exe")
+        fi
         ARCHIVE="${APP}-${VERSION}-${OS}-${ARCH}.zip"
         # Git Bash doesn't ship a ``zip`` binary on GHA's windows-latest,
         # but PowerShell's Compress-Archive is always there. One round-
         # trip is cheaper than installing a zip CLI.
-        powershell.exe -NoProfile -Command "Compress-Archive -Path '$BIN' -DestinationPath '$ARCHIVE' -Force"
+        PS_PATHS=$(printf "'%s'," "${FILES[@]}")
+        PS_PATHS="${PS_PATHS%,}"
+        powershell.exe -NoProfile -Command "Compress-Archive -Path $PS_PATHS -DestinationPath '$ARCHIVE' -Force"
         sha256 "$ARCHIVE" > "${ARCHIVE}.sha256"
-        echo "✓ $ARCHIVE (+.sha256)"
+        echo "✓ $ARCHIVE (+.sha256) with: ${FILES[*]}"
         ;;
 esac

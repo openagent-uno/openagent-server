@@ -55,44 +55,72 @@ def _native_binary_target() -> str:
 def _resolve_native_binary(name: str) -> str:
     """Resolve a prebuilt native MCP binary for the host. Returns abs path.
 
-    If the prebuilt binary is missing AND a Cargo.toml exists (dev workflow),
-    auto-run ``cargo build --release`` and stage the artifact into bin/<target>/.
+    Resolution order:
+
+    1. **Sidecar** next to ``sys.executable``. In a packaged release the
+       ``openagent`` PyInstaller binary lives at e.g. ``/usr/local/bin/
+       openagent`` and the ``openagent-<name>`` sidecar lives right
+       beside it. This path is deliberately *outside* the PyInstaller
+       archive so its Developer-ID signature on macOS stays intact —
+       PyInstaller strips signatures from nested Mach-O binaries and
+       re-signs them ad-hoc, which makes TCC unable to record a
+       persistent Accessibility / Screen Recording grant. (Observed
+       on v0.6.4: the Accessibility prompt fires but no toggle ever
+       appears in System Settings because the per-build ad-hoc
+       identifier has no stable TCC identity.) See ``openagent.spec``
+       for the matching exclude.
+
+    2. **Bundled** under ``openagent/mcp/servers/<name>/bin/<target>/``.
+       Used by dev installs that ``pip install -e .`` from source and
+       have run ``bash scripts/build-<name>.sh`` to stage the artifact.
+
+    3. **Cargo build from source**. Only fires when a ``Cargo.toml``
+       exists *and* the host has ``cargo`` available — i.e. a source
+       checkout on a dev machine. Never triggered inside a release
+       build because the sidecar is always present there.
     """
     target = _native_binary_target()
     bin_name = "openagent-" + name + (".exe" if platform.system() == "Windows" else "")
+
+    # 1. Sidecar next to sys.executable (packaged release).
+    try:
+        sidecar = Path(sys.executable).resolve().parent / bin_name
+        if sidecar.is_file():
+            return str(sidecar)
+    except Exception:  # noqa: BLE001 — sys.executable resolution is best-effort
+        pass
+
+    # 2. Staged under openagent/mcp/servers/<name>/bin/<target>/.
     path = BUILTIN_MCPS_DIR / name / "bin" / target / bin_name
-    if not path.exists():
-        cargo_toml = BUILTIN_MCPS_DIR / name / "Cargo.toml"
-        if cargo_toml.exists() and command_exists("cargo"):
-            logger.info("Native MCP '%s' binary missing — building from source...", name)
-            subprocess.run(
-                ["cargo", "build", "--release"],
-                cwd=BUILTIN_MCPS_DIR / name,
-                check=True,
-            )
-            host_info = subprocess.run(
-                ["rustc", "-vV"], check=True, capture_output=True, text=True
-            ).stdout
-            triple = ""
-            for line in host_info.splitlines():
-                if line.startswith("host:"):
-                    triple = line.split(": ", 1)[1].strip()
-                    break
-            built = BUILTIN_MCPS_DIR / name / "target" / "release" / bin_name
-            if built.exists():
-                path.parent.mkdir(parents=True, exist_ok=True)
-                import shutil as _sh
-                _sh.copy2(built, path)
-                try:
-                    path.chmod(0o755)
-                except Exception:  # noqa: BLE001 — chmod harmless on platforms that refuse
-                    pass
-        if not path.exists():
-            raise FileNotFoundError(
-                f"Native MCP '{name}' binary not found at {path}. "
-                f"Run: bash scripts/build-{name}.sh"
-            )
-    return str(path)
+    if path.exists():
+        return str(path)
+
+    # 3. Build from source (dev-machine fallback only).
+    cargo_toml = BUILTIN_MCPS_DIR / name / "Cargo.toml"
+    if cargo_toml.exists() and command_exists("cargo"):
+        logger.info("Native MCP '%s' binary missing — building from source...", name)
+        subprocess.run(
+            ["cargo", "build", "--release"],
+            cwd=BUILTIN_MCPS_DIR / name,
+            check=True,
+        )
+        built = BUILTIN_MCPS_DIR / name / "target" / "release" / bin_name
+        if built.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            import shutil as _sh
+            _sh.copy2(built, path)
+            try:
+                path.chmod(0o755)
+            except Exception:  # noqa: BLE001 — chmod harmless on platforms that refuse
+                pass
+            return str(path)
+
+    raise FileNotFoundError(
+        f"Native MCP '{name}' binary not found. Checked:\n"
+        f"  - sidecar: {Path(sys.executable).resolve().parent / bin_name}\n"
+        f"  - bundled: {path}\n"
+        f"Run: bash scripts/build-{name}.sh"
+    )
 
 
 BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {

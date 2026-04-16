@@ -202,7 +202,23 @@ jobs:
           done
       - name: Build executable
         run: pyinstaller openagent.spec --clean --noconfirm
-      - name: Sign + notarize macOS binary (+ build stapled .pkg)
+      - name: Stage computer-control sidecar next to dist/openagent
+        shell: bash
+        # The Rust binary must ship SEPARATELY from the PyInstaller
+        # onefile — not inside it. Bundling it as data (the old layout)
+        # caused PyInstaller to strip the Developer-ID signature on
+        # macOS arm64 and re-sign ad-hoc, which breaks TCC persistence
+        # for Accessibility / Screen Recording. openagent.spec now
+        # excludes the computer-control dir; at runtime,
+        # ``builtins._resolve_native_binary`` looks for
+        # ``<sys.executable>/../openagent-computer-control[.exe]``.
+        run: |
+          set -euo pipefail
+          src="openagent/mcp/servers/computer-control/bin/${{ matrix.cc_target }}/openagent-computer-control${{ matrix.cc_ext }}"
+          dst="dist/openagent-computer-control${{ matrix.cc_ext }}"
+          cp "$src" "$dst"
+          chmod +x "$dst" || true
+      - name: Sign + notarize macOS binary (+ build stapled .pkg with sidecar)
         if: runner.os == 'macOS'
         env:
           CSC_LINK: ${{ secrets.CSC_LINK }}
@@ -213,10 +229,20 @@ jobs:
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         shell: bash
-        # Produces a signed + notarized bare binary PLUS a
-        # signed + notarized + stapled .pkg installer. The pkg filename
-        # is derived inside the script from the module version.
-        run: bash scripts/sign-notarize-macos.sh dist/openagent com.openagent.server /usr/local/bin
+        # Produces a signed + notarized bare openagent binary AND a
+        # signed + notarized + stapled .pkg installer that contains
+        # BOTH openagent and openagent-computer-control at
+        # /usr/local/bin. The Rust sidecar was signed in its own
+        # upstream job with a stable ``com.openagent.computer-control``
+        # identifier; we preserve that signature verbatim so macOS TCC
+        # (Accessibility, Screen Recording) keeps the user's grant
+        # across updates.
+        run: |
+          bash scripts/sign-notarize-macos.sh \
+            dist/openagent \
+            com.openagent.server \
+            /usr/local/bin \
+            dist/openagent-computer-control
       - name: Package + checksum
         shell: bash
         run: bash scripts/package-release.sh openagent dist
