@@ -23,6 +23,9 @@ use enigo::Key;
 /// Parse a xdotool-style key spec into an ordered list of keys to press together.
 /// Example: `"ctrl+shift+a"` → `[Key::LControl, Key::LShift, Key::Unicode('a')]`.
 pub fn parse(spec: &str) -> Result<Vec<Key>, String> {
+    if spec.trim().is_empty() {
+        return Err("empty key spec".to_string());
+    }
     spec.split('+')
         .map(str::trim)
         .filter(|p| !p.is_empty())
@@ -68,9 +71,10 @@ fn lookup(name: &str) -> Option<Key> {
         "f19" => Key::F19,
         "f20" => Key::F20,
         // F21–F24 are windows/linux only in enigo; on macOS they compile away.
-        // The TS source maps them too, so we keep them — a macOS caller that
-        // tries these will get a compile error on that platform (no-op on
-        // others). We guard with cfg so the module still compiles everywhere.
+        // The TS source maps them too, so we keep them — F21–F24 are not exposed
+        // by enigo on macOS; the arms are excluded by cfg there
+        // so parse("f21") returns Err("Unknown key: f21") at runtime. On Windows/Linux
+        // the arms are active and work normally.
         #[cfg(any(target_os = "windows", all(unix, not(target_os = "macos"))))]
         "f21" => Key::F21,
         #[cfg(any(target_os = "windows", all(unix, not(target_os = "macos"))))]
@@ -349,5 +353,31 @@ mod tests {
         assert_eq!(parse("audio_pause").unwrap(), vec![Key::MediaPlayPause]);
         assert_eq!(parse("audio_prev").unwrap(), vec![Key::MediaPrevTrack]);
         assert_eq!(parse("audio_next").unwrap(), vec![Key::MediaNextTrack]);
+    }
+
+    #[test]
+    fn numpad_equal_not_ported() {
+        // kp_equal has no enigo 0.5 equivalent and is intentionally absent.
+        // Locks in the current behavior so future contributors don't silently
+        // add a no-op mapping.
+        assert!(parse("kp_equal").is_err());
+    }
+
+    #[test]
+    fn audio_stop_platform_specific() {
+        // On Linux/Windows audio_stop maps to MediaStop; on macOS it's
+        // Key::Other(0) because enigo lacks MediaStop on that platform.
+        let result = parse("audio_stop").unwrap();
+        assert_eq!(result.len(), 1);
+        #[cfg(any(target_os = "windows", all(unix, not(target_os = "macos"))))]
+        assert_eq!(result[0], Key::MediaStop);
+        #[cfg(target_os = "macos")]
+        assert_eq!(result[0], Key::Other(0));
+    }
+
+    #[test]
+    fn empty_string_errors() {
+        assert!(parse("").is_err());
+        assert!(parse("   ").is_err());
     }
 }
