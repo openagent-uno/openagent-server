@@ -11,7 +11,7 @@ pub const MAC_ACCESSIBILITY_HINT: &str =
 #[cfg(target_os = "macos")]
 fn is_accessibility_error(e: &anyhow::Error) -> bool {
     let s = format!("{e:#}").to_lowercase();
-    s.contains("accessibility") || s.contains("not trusted") || s.contains("axiserror")
+    s.contains("accessibility") || s.contains("not trusted") || s.contains("axiserror") || s.contains("permission")
 }
 
 use crate::keys;
@@ -22,14 +22,22 @@ pub struct InputController {
 
 impl InputController {
     pub fn new() -> Result<Self> {
-        let enigo = Enigo::new(&Settings::default()).map_err(|e| {
-            let err: anyhow::Error = e.into();
-            #[cfg(target_os = "macos")]
-            if is_accessibility_error(&err) {
-                return anyhow!(MAC_ACCESSIBILITY_HINT);
+        let enigo = match Enigo::new(&Settings::default()) {
+            Ok(e) => e,
+            Err(e) => {
+                #[cfg(target_os = "macos")]
+                if matches!(e, enigo::NewConError::NoPermission) {
+                    return Err(anyhow!(MAC_ACCESSIBILITY_HINT));
+                }
+                // Fallback: string heuristic for any other permission-related error message
+                let err: anyhow::Error = e.into();
+                #[cfg(target_os = "macos")]
+                if is_accessibility_error(&err) {
+                    return Err(anyhow!(MAC_ACCESSIBILITY_HINT));
+                }
+                return Err(err.context("enigo init failed"));
             }
-            err.context("enigo init failed")
-        })?;
+        };
         Ok(Self { enigo })
     }
 
