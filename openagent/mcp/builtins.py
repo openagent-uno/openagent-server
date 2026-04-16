@@ -10,6 +10,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import platform
+
 from openagent._frozen import bundle_dir, is_frozen
 
 logger = logging.getLogger(__name__)
@@ -30,13 +32,74 @@ else:
 # that would expose ``openagent.mcp`` as a top-level ``mcp`` and shadow the
 # third-party MCP SDK, causing a circular import in openagent/mcp/client.py.
 
+
+def _native_binary_target() -> str:
+    """Return the friendly-name subdirectory for the host platform."""
+    system = platform.system()
+    machine = platform.machine().lower()
+    if system == "Darwin":
+        if machine in ("arm64", "aarch64"):
+            return "darwin-arm64"
+        raise RuntimeError(f"Unsupported macOS arch: {machine}")
+    if system == "Linux":
+        if machine in ("x86_64", "amd64"):
+            return "linux-x64"
+        raise RuntimeError(f"Unsupported Linux arch: {machine}")
+    if system == "Windows":
+        if machine in ("amd64", "x86_64"):
+            return "windows-x64"
+        raise RuntimeError(f"Unsupported Windows arch: {machine}")
+    raise RuntimeError(f"Unsupported OS: {system}")
+
+
+def _resolve_native_binary(name: str) -> str:
+    """Resolve a prebuilt native MCP binary for the host. Returns abs path.
+
+    If the prebuilt binary is missing AND a Cargo.toml exists (dev workflow),
+    auto-run ``cargo build --release`` and stage the artifact into bin/<target>/.
+    """
+    target = _native_binary_target()
+    bin_name = "openagent-" + name + (".exe" if platform.system() == "Windows" else "")
+    path = BUILTIN_MCPS_DIR / name / "bin" / target / bin_name
+    if not path.exists():
+        cargo_toml = BUILTIN_MCPS_DIR / name / "Cargo.toml"
+        if cargo_toml.exists() and command_exists("cargo"):
+            logger.info("Native MCP '%s' binary missing — building from source...", name)
+            subprocess.run(
+                ["cargo", "build", "--release"],
+                cwd=BUILTIN_MCPS_DIR / name,
+                check=True,
+            )
+            host_info = subprocess.run(
+                ["rustc", "-vV"], check=True, capture_output=True, text=True
+            ).stdout
+            triple = ""
+            for line in host_info.splitlines():
+                if line.startswith("host:"):
+                    triple = line.split(": ", 1)[1].strip()
+                    break
+            built = BUILTIN_MCPS_DIR / name / "target" / "release" / bin_name
+            if built.exists():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                import shutil as _sh
+                _sh.copy2(built, path)
+                try:
+                    path.chmod(0o755)
+                except Exception:  # noqa: BLE001 — chmod harmless on platforms that refuse
+                    pass
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Native MCP '{name}' binary not found at {path}. "
+                f"Run: bash scripts/build-{name}.sh"
+            )
+    return str(path)
+
+
 BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
     "computer-control": {
         "dir": "computer-control",
-        "command": ["node", "dist/main.js"],
-        "build": ["npm", "run", "build"],
-        "install": ["npm", "install"],
-        "env": {"DISPLAY": ":1"},
+        "native": True,
+        # No DISPLAY env — the Rust binary picks the right backend per OS.
     },
     "shell": {
         "dir": "shell",
@@ -192,6 +255,19 @@ def resolve_builtin_entry(name: str, env: dict[str, str] | None = None) -> dict[
     if not mcp_dir.exists():
         raise FileNotFoundError(f"Built-in MCP '{name}' directory not found at {mcp_dir}")
 
+    is_native = spec.get("native", False)
+    if is_native:
+        binary = _resolve_native_binary(name)
+        merged_env = dict(spec.get("env") or {})
+        if env:
+            merged_env.update(env)
+        return {
+            "name": name,
+            "command": [binary],
+            "env": merged_env if merged_env else None,
+            "_cwd": str(mcp_dir),
+        }
+
     is_python = spec.get("python", False)
     if is_python:
         reqs = mcp_dir / "requirements.txt"
@@ -248,7 +324,8 @@ def resolve_default_entry(entry: dict[str, Any], db_path: str | None = None) -> 
     if "builtin" in entry:
         spec = BUILTIN_MCP_SPECS.get(entry["builtin"])
         is_python = spec.get("python", False) if spec else False
-        if not is_python and not command_exists("node"):
+        is_native = spec.get("native", False) if spec else False
+        if not is_python and not is_native and not command_exists("node"):
             logger.warning("Skipping default MCP '%s': Node.js not found", name)
             return None
         if entry["builtin"] == "chrome-devtools" and not _node_meets_minimum(22, 12, 0):
