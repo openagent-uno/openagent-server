@@ -102,7 +102,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - name: Install Linux build deps (X11 + Wayland + PipeWire for xcap/enigo)
+      - name: Install Linux build deps (X11 + Wayland + PipeWire + Mesa for xcap/enigo)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
@@ -110,6 +110,7 @@ jobs:
             libxdo-dev libx11-dev libxtst-dev libxi-dev \
             libwayland-dev libxkbcommon-dev \
             libpipewire-0.3-dev libdbus-1-dev \
+            libegl1-mesa-dev libgl1-mesa-dev \
             pkg-config
       - name: Build release binary
         working-directory: openagent/mcp/servers/computer-control
