@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 from openagent.gateway import protocol as P
 from openagent.gateway.commands import command_help_text
 from openagent.gateway.sessions import SessionManager
-from openagent.gateway.api import vault, config, health, logs, control, usage, providers, models
+from openagent.gateway.api import vault, config, health, logs, control, usage, providers, models, scheduled_tasks
 
 if TYPE_CHECKING:
     from openagent.core.agent import Agent
@@ -71,6 +71,11 @@ class Gateway:
         self._runner = None
         self._port_file = None
         self._model_cache: dict[str, object] = {}  # model_spec → BaseModel instance
+
+        # Bound by AgentServer after Scheduler.start(); None when the scheduler
+        # is disabled in config. Handlers in api/scheduled_tasks.py check this
+        # and return 503 when it's absent.
+        self._scheduler = None
 
         # Hot-reload state. Fingerprint = (mtime_ns, first 8 bytes of sha256).
         # Recomputed on each message in _process_message.
@@ -160,6 +165,11 @@ class Gateway:
             ("GET", "/api/config", config.handle_get),
             ("PUT", "/api/config", config.handle_put),
             ("PATCH", "/api/config/{section}", config.handle_patch),
+            ("GET", "/api/scheduled-tasks", scheduled_tasks.handle_list),
+            ("POST", "/api/scheduled-tasks", scheduled_tasks.handle_create),
+            ("GET", "/api/scheduled-tasks/{id}", scheduled_tasks.handle_get),
+            ("PATCH", "/api/scheduled-tasks/{id}", scheduled_tasks.handle_update),
+            ("DELETE", "/api/scheduled-tasks/{id}", scheduled_tasks.handle_delete),
             ("GET", "/api/logs", logs.handle_get),
             ("DELETE", "/api/logs", logs.handle_delete),
             ("GET", "/api/usage", usage.handle_get),

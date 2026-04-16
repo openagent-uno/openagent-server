@@ -369,8 +369,24 @@ class AgentServer:
         from openagent.core.scheduler import Scheduler
         scheduler = Scheduler(self.agent._db, self.agent)
 
-        # User-defined cron tasks
-        for task_cfg in scheduler_cfg.get("tasks", []):
+        # `scheduler.tasks[]` in YAML is deprecated — tasks now live in
+        # SQLite and are managed via /api/scheduled-tasks or the scheduler
+        # MCP. Seed any legacy entries into the DB once (dedup by name) so
+        # existing users don't lose their tasks on upgrade. We intentionally
+        # don't write back a stripped YAML — yaml.dump would clobber
+        # comments, key ordering, and anchors in user-authored files.
+        yaml_tasks = scheduler_cfg.get("tasks", []) or []
+        if yaml_tasks:
+            logger.warning(
+                "scheduler.tasks[] in openagent.yaml is deprecated; tasks are "
+                "now stored in SQLite and managed via the app's Tasks tab or "
+                "the scheduler MCP. Existing YAML tasks have been seeded into "
+                "the DB (if not already present). You can safely remove "
+                "scheduler.tasks from your config."
+            )
+            elog("scheduler.yaml_deprecation", yaml_task_count=len(yaml_tasks))
+
+        for task_cfg in yaml_tasks:
             existing = await self.agent._db.get_tasks()
             if not any(t["name"] == task_cfg["name"] for t in existing):
                 await scheduler.add_task(
@@ -384,6 +400,10 @@ class AgentServer:
 
         await scheduler.start()
         self._scheduler = scheduler
+        # Expose the live scheduler to the gateway so /api/scheduled-tasks
+        # can operate on the same instance that runs the cron loop.
+        if self._gateway is not None:
+            self._gateway._scheduler = scheduler
 
     async def _sync_scheduled_task(
         self, scheduler, *, name: str, enabled: bool, cron_expr: str, prompt: str,
