@@ -78,7 +78,7 @@ class AgnoProvider(BaseModel):
         base_url: str | None = None,
         providers_config: dict | None = None,
         db_path: str | None = None,
-        history_runs: int = 6,
+        history_runs: int = 20,
     ):
         self._providers_config = providers_config or {}
         self.model = normalize_runtime_model_id(model, self._providers_config)
@@ -98,6 +98,10 @@ class AgnoProvider(BaseModel):
         # the classifier uses ``""`` (no system); the main call uses the
         # static framework+user prompt; that's two entries.
         self._agno_agents: dict[str, Any] = {}
+        # Parallel cache for Team-mode runners. One Team per framework
+        # system prompt, built only when ≥2 MCP tool families are connected.
+        # Classifier calls (empty system) never trigger Team construction.
+        self._agno_teams: dict[str, Any] = {}
 
         self._inject_provider_keys()
 
@@ -105,6 +109,7 @@ class AgnoProvider(BaseModel):
         self._db_path = getattr(db, "db_path", self._db_path)
         # Force agent rebuild so the new SqliteDb path takes effect.
         self._agno_agents.clear()
+        self._agno_teams.clear()
 
     def set_mcp_toolkits(self, toolkits: list[Any]) -> None:
         """Receive the pool's pre-connected Agno ``MCPTools`` instances.
@@ -113,8 +118,9 @@ class AgnoProvider(BaseModel):
         once at agent startup, exited at shutdown); we just hold references.
         """
         self._mcp_toolkits = list(toolkits)
-        # Force agent rebuild so the new tool list is picked up.
+        # Force agent/team rebuild so the new tool list is picked up.
         self._agno_agents.clear()
+        self._agno_teams.clear()
 
     async def close_session(self, session_id: str) -> None:
         """Agno persists session history in DB but keeps no per-session subprocess."""
@@ -293,10 +299,151 @@ class AgnoProvider(BaseModel):
             system_message=sys_key or None,
             add_history_to_context=True,
             num_history_runs=self._history_runs,
+            # Agno maintains a rolling summary of older turns in the same
+            # SqliteDb and injects it into context on each call. Combined
+            # with ``num_history_runs=20`` this gives us long-horizon
+            # recall without blowing the token budget on raw transcript.
+            enable_session_summaries=True,
+            add_session_summary_to_context=True,
+            # Agentic memory lets the model persist user-scoped facts
+            # across sessions (e.g. preferences the user restated). Uses
+            # the agent's own model as the default memory manager.
+            enable_agentic_memory=True,
             markdown=False,
         )
         self._agno_agents[sys_key] = agent
         return agent
+
+    def _tool_families(self) -> dict[str, list[Any]]:
+        """Group connected MCP toolkits by their server prefix.
+
+        Each ``MCPTools`` instance wraps exactly one MCP server, so the
+        prefix doubles as a natural "tool family" identifier for Team-mode
+        routing. Uses the same resolution order as ``list_mcp_servers``
+        (``tool_name_prefix`` → ``name`` → ``"default"``). Empty dict when
+        no toolkits are connected.
+        """
+        families: dict[str, list[Any]] = {}
+        for tk in self._mcp_toolkits:
+            family = (
+                getattr(tk, "tool_name_prefix", None)
+                or getattr(tk, "name", None)
+                or "default"
+            )
+            families.setdefault(str(family), []).append(tk)
+        return families
+
+    def _ensure_team(self, system: str):
+        """Lazily construct an Agno Team in route mode for the main agent.
+
+        Returns ``None`` when the team path is not applicable:
+        - empty system prompt (classifier / no-framework-prompt calls)
+        - fewer than 2 connected MCP tool families (nothing to route between)
+        - Team import failure (older Agno or missing extra)
+
+        The team leader carries the framework prompt and the
+        ``list_mcp_servers`` meta-tool so inventory questions still work.
+        Members are thin specialists: each owns one family's toolkit and
+        a short role blurb the router uses to pick between them. Members
+        inherit the framework prompt too so when the leader synthesises
+        their output the persona is preserved.
+        """
+        sys_key = (system or "").strip()
+        if not sys_key:
+            return None
+        cached = self._agno_teams.get(sys_key)
+        if cached is not None:
+            return cached
+
+        families = self._tool_families()
+        if len(families) < 2:
+            return None
+
+        try:
+            from agno.agent import Agent as AgnoAgent
+            from agno.db.sqlite import SqliteDb
+            from agno.team import Team, TeamMode
+        except ImportError as exc:
+            # Older Agno builds without the team module — fall back to
+            # single-agent transparently instead of crashing the session.
+            elog("agno.team.unavailable", model=self.model, error=str(exc))
+            return None
+
+        db_path = Path(self._runtime_db_path())
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        members: list[Any] = []
+        for family, toolkits in families.items():
+            member_role = (
+                f"Specialist for the {family} MCP server. "
+                f"Handles requests best solved with {family} tools. "
+                f"If a request falls outside that area, say so briefly."
+            )
+            member_system = (
+                f"{sys_key}\n\n--- Role ---\nYou are the {family} "
+                f"specialist. Prefer {family} tools; defer to the team "
+                f"leader if the request is outside your area."
+            )
+            member = AgnoAgent(
+                model=self._build_agno_model(),
+                tools=list(toolkits),
+                system_message=member_system,
+                name=f"{family}_specialist",
+                role=member_role,
+                markdown=False,
+            )
+            members.append(member)
+
+        # Leader gets the full toolkit list as a safety net so if gpt-4o-mini
+        # (or any routing-weak model) decides to answer directly instead of
+        # delegating, it still has the tools it needs. In normal route-mode
+        # operation the leader delegates to one specialist and never calls
+        # these itself — so the fallback costs nothing on the happy path.
+        leader_tools: list[Any] = list(self._mcp_toolkits)
+        leader_tools.append(self._build_list_mcps_tool())
+
+        try:
+            team = Team(
+                members=members,
+                mode=TeamMode.route,
+                model=self._build_agno_model(),
+                db=SqliteDb(db_file=str(db_path)),
+                tools=leader_tools,
+                system_message=sys_key,
+                # Surface each member's tool list in the leader's context so
+                # routing decisions see capabilities, not just the member's
+                # short role blurb. Without this, weak routing models tend
+                # to answer directly ("I cannot access files") when the
+                # member name alone doesn't make the match obvious.
+                add_member_tools_to_context=True,
+                add_history_to_context=True,
+                num_history_runs=self._history_runs,
+                enable_session_summaries=True,
+                add_session_summary_to_context=True,
+                enable_agentic_memory=True,
+                markdown=False,
+            )
+        except Exception as exc:
+            # If Team construction fails for any reason (signature drift
+            # between Agno versions, model incompatibility, …), log and
+            # fall back rather than breaking the main generate path.
+            elog(
+                "agno.team.build_failed",
+                model=self.model,
+                error_type=type(exc).__name__,
+                error=str(exc),
+                families=sorted(families.keys()),
+            )
+            return None
+
+        elog(
+            "agno.team.built",
+            model=self.model,
+            families=sorted(families.keys()),
+            member_count=len(members),
+        )
+        self._agno_teams[sys_key] = team
+        return team
 
     def _flatten_messages(self, messages: list[dict[str, Any]]) -> str:
         """Render conversation turns as a single user-side prompt for ``arun``.
@@ -376,13 +523,24 @@ class AgnoProvider(BaseModel):
         """
         prompt = self._flatten_messages(messages)
         sid = session_id or "default"
-        agent = self._ensure_agent(system=system)
+        # Prefer a Team when the caller supplied a system prompt AND we
+        # have ≥2 MCP tool families to route between. Classifier/no-system
+        # calls stay on single Agent so they don't pay the leader-routing
+        # round trip. _ensure_team() returns None whenever the team path
+        # is not applicable, so this collapses to the single-agent path
+        # in minimal deployments.
+        runner = self._ensure_team(system=system or "")
+        runner_kind = "team"
+        if runner is None:
+            runner = self._ensure_agent(system=system)
+            runner_kind = "agent"
         elog(
             "agno.request",
             model=self.model,
             session_id=sid,
             prompt_len=len(prompt),
             mcp_toolkits=len(self._mcp_toolkits),
+            runner=runner_kind,
         )
 
         if on_status:
@@ -392,7 +550,13 @@ class AgnoProvider(BaseModel):
                 pass
 
         try:
-            response = await agent.arun(prompt, session_id=sid)
+            # ``user_id`` is required by ``enable_agentic_memory``; we use a
+            # stable constant so memory accumulates for the single-tenant
+            # OpenAgent deployment. Multi-tenant deployments can wire a
+            # real user_id through BaseModel.generate() in a follow-up.
+            response = await runner.arun(
+                prompt, session_id=sid, user_id="openagent"
+            )
         except Exception as e:
             elog(
                 "agno.error",
