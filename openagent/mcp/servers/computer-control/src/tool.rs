@@ -257,12 +257,12 @@ impl ComputerControlServer {
                 let img_content = Content::image(b64, "image/png");
                 let meta = Content::text(
                     serde_json::to_string(&serde_json::json!({
-                        "display_width_px": cap.reported_width,
-                        "display_height_px": cap.reported_height,
+                        "image_width": cap.reported_width,
+                        "image_height": cap.reported_height,
                     }))
                     .context("serialize display meta")?,
                 );
-                Ok(CallToolResult::success(vec![img_content, meta]))
+                Ok(CallToolResult::success(vec![meta, img_content]))
             }
         }
     }
