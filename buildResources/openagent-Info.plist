@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Info.plist for openagent.app — the outer server application on macOS.
+
+  Why the server now ships as an .app bundle instead of a bare CLI binary:
+
+  macOS TCC (Accessibility, Screen Recording, Automation, etc.) keys each
+  permission grant to the process's *responsible* identity. For a bare CLI
+  binary without a bundle, TCC uses a path-based entry (``client_type=1``)
+  that is pinned to the binary's cdhash — which changes on every openagent
+  release because the Python bytecode and version string change. The
+  effect observed on lyra-agent running v0.6.10 was:
+
+    tccd: Failed to match existing code requirement for subject
+      /Users/development/.local/bin/openagent and service
+      kTCCServiceAccessibility
+      identifier "com.openagent.server" and anchor apple generic and
+      [...] leaf[subject.OU] = B4KWCQFY8V
+
+  The stored DR was correct, but the cdhash pin invalidated the entry.
+  Worse, because a stale entry existed, TCC refused to re-prompt, and the
+  request was denied silently with authReason=5 — the user never saw a
+  dialog and Privacy & Security → Accessibility showed no toggle to
+  toggle.
+
+  Wrapping openagent in an .app bundle with this Info.plist moves TCC to
+  a bundle-based entry (``client_type=0``) keyed by ``CFBundleIdentifier``.
+  The identifier is stable across releases (locked by ``codesign
+  --identifier`` + matching Info.plist), so a grant granted once persists
+  across every future update that keeps the same Team ID and bundle id.
+
+  LSBackgroundOnly keeps openagent invisible to the user — no Dock icon,
+  no menu bar — since it's a headless agent runtime that the user
+  interacts with through Telegram / Discord / WebSocket clients, not via
+  a GUI. The .app is strictly a TCC packaging concern.
+
+  The computer-control MCP sidecar lives at
+  ``Contents/MacOS/openagent-computer-control`` inside the same bundle —
+  TCC attributes its requests to the parent .app via the responsible
+  process chain, so it no longer needs its own .app wrapper.
+-->
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.openagent.server</string>
+    <key>CFBundleExecutable</key>
+    <string>openagent</string>
+    <key>CFBundleName</key>
+    <string>OpenAgent</string>
+    <key>CFBundleDisplayName</key>
+    <string>OpenAgent</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleSignature</key>
+    <string>????</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>LSBackgroundOnly</key>
+    <true/>
+    <key>LSMinimumSystemVersion</key>
+    <string>10.15</string>
+    <key>NSAccessibilityUsageDescription</key>
+    <string>OpenAgent needs Accessibility to simulate keyboard input and mouse clicks when the agent automates GUI applications on your behalf.</string>
+    <key>NSScreenCaptureDescription</key>
+    <string>OpenAgent needs Screen Recording to capture screenshots so the agent can see what's on your screen when you ask it to.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>OpenAgent may send Apple Events to control other applications when you ask it to automate them.</string>
+</dict>
+</plist>

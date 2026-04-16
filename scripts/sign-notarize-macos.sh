@@ -70,13 +70,23 @@ PKG_INSTALL_PATH="${3:-}"
 EXTRA_SIDECAR="${4:-}"
 
 if [ -z "$BINARY" ]; then
-    echo "usage: $0 <binary> [pkg-identifier pkg-install-path [extra-sidecar-binary]]" >&2
+    echo "usage: $0 <binary-or-app-bundle> [pkg-identifier pkg-install-path [extra-sidecar-binary]]" >&2
     exit 2
 fi
-if [ ! -f "$BINARY" ]; then
-    echo "not a file: $BINARY" >&2
+
+# Accept either a bare Mach-O file OR a macOS ``.app`` bundle. The outer
+# ``openagent`` server now ships as ``dist/openagent.app`` (see
+# ``openagent.spec``'s BUNDLE step) so TCC can key grants by bundle id
+# instead of cdhash. The CLI (``openagent-cli``) still ships as a bare
+# binary — TCC isn't involved there.
+IS_APP_BUNDLE=false
+if [ -d "$BINARY" ] && [[ "$BINARY" == *.app ]]; then
+    IS_APP_BUNDLE=true
+elif [ ! -f "$BINARY" ]; then
+    echo "not a file or .app bundle: $BINARY" >&2
     exit 2
 fi
+
 if [ -n "$EXTRA_SIDECAR" ] && [ ! -f "$EXTRA_SIDECAR" ]; then
     echo "sidecar binary not a file: $EXTRA_SIDECAR" >&2
     exit 2
@@ -204,18 +214,14 @@ if [ "$HAVE_INSTALLER_CERT" = true ]; then
     fi
 fi
 
-# ── Sign the binary ───────────────────────────────────────────────────
+# ── Sign the binary (or .app bundle) ──────────────────────────────────
 
 # macOS TCC (Accessibility, Screen Recording, etc.) keys each permission
 # grant to the binary's CODE-SIGN IDENTIFIER. Without an explicit
 # ``--identifier`` flag, codesign defaults to the binary's filename —
 # e.g. ``Identifier=openagent``. That's a valid signature but it's NOT
 # a valid bundle identifier, and TCC refuses to record a persistent
-# entry for non-reverse-DNS identifiers: the permission dialog fires
-# correctly, the user clicks "Open System Settings", but no toggle
-# ever appears in the Accessibility pane because TCC silently dropped
-# the attempted row insertion. Observed on v0.6.7 — the user got the
-# prompt, got redirected to Settings, saw no openagent entry at all.
+# entry for non-reverse-DNS identifiers.
 #
 # ``$PKG_IDENTIFIER`` (2nd arg) is already a valid reverse-DNS string
 # (e.g. ``com.openagent.server``) that the caller passes to pkgbuild;
@@ -226,21 +232,50 @@ fi
 if [ -n "$PKG_IDENTIFIER" ]; then
     SIGN_IDENTIFIER="$PKG_IDENTIFIER"
 else
-    SIGN_IDENTIFIER="com.openagent.$(basename "$BINARY" | tr -d '[:space:]')"
+    SIGN_IDENTIFIER="com.openagent.$(basename "$BINARY" | tr -d '[:space:]' | sed 's/\.app$//')"
 fi
+
+# For an .app bundle, drop the signed Rust sidecar inside
+# ``Contents/MacOS/`` BEFORE we sign the outer bundle so ``codesign
+# --deep`` seals everything together. TCC will attribute child-process
+# requests to the outer .app's identity (it's the "responsible process"
+# in TCC terms) — we don't need a separate .app wrapper for the sidecar
+# anymore, and the outer bundle's bundle-id-keyed TCC entry survives
+# every future release as long as CFBundleIdentifier stays stable.
+if [ "$IS_APP_BUNDLE" = true ] && [ -n "$EXTRA_SIDECAR" ]; then
+    SIDECAR_DEST="$BINARY/Contents/MacOS/$(basename "$EXTRA_SIDECAR")"
+    echo "→ Copying sidecar into app bundle: $SIDECAR_DEST"
+    cp "$EXTRA_SIDECAR" "$SIDECAR_DEST"
+    chmod +x "$SIDECAR_DEST"
+fi
+
 echo "→ Signing $BINARY with identifier $SIGN_IDENTIFIER"
-codesign --force \
-    --sign "$APP_IDENTITY" \
-    --identifier "$SIGN_IDENTIFIER" \
-    --options runtime \
-    --timestamp \
-    --entitlements buildResources/entitlements.mac.plist \
-    "$BINARY"
+if [ "$IS_APP_BUNDLE" = true ]; then
+    # --deep signs every nested Mach-O in the bundle with the parent
+    # signature, which is what we want: the outer openagent binary
+    # plus the sidecar Rust binary in Contents/MacOS/ both get sealed
+    # under the same Developer ID + identifier.
+    codesign --force --deep \
+        --sign "$APP_IDENTITY" \
+        --identifier "$SIGN_IDENTIFIER" \
+        --options runtime \
+        --timestamp \
+        --entitlements buildResources/entitlements.mac.plist \
+        "$BINARY"
+else
+    codesign --force \
+        --sign "$APP_IDENTITY" \
+        --identifier "$SIGN_IDENTIFIER" \
+        --options runtime \
+        --timestamp \
+        --entitlements buildResources/entitlements.mac.plist \
+        "$BINARY"
+fi
 codesign --verify --strict --verbose=2 "$BINARY"
-codesign -dvv "$BINARY" 2>&1 | grep -E '^(Identifier|TeamIdentifier)=' || true
+codesign -dvv "$BINARY" 2>&1 | grep -E '^(Identifier|TeamIdentifier|Format)=' || true
 echo "✓ Binary signed"
 
-# ── Notarize the bare binary (ticket goes into Apple's online DB) ────
+# ── Notarize + (for .app bundles) staple ──────────────────────────────
 
 if [ -z "${APPLE_ID:-}" ] || [ -z "${APPLE_APP_SPECIFIC_PASSWORD:-}" ] || [ -z "${APPLE_TEAM_ID:-}" ]; then
     echo "⚠️  APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD / APPLE_TEAM_ID not set"
@@ -250,7 +285,7 @@ if [ -z "${APPLE_ID:-}" ] || [ -z "${APPLE_APP_SPECIFIC_PASSWORD:-}" ] || [ -z "
 fi
 
 BINARY_ZIP="${RUNNER_TEMP:-/tmp}/$(basename "$BINARY")-notarize.zip"
-echo "→ Notarizing bare binary (ticket recorded online — bare binaries can't be stapled)"
+echo "→ Notarizing $(basename "$BINARY")"
 rm -f "$BINARY_ZIP"
 ditto -c -k --keepParent "$BINARY" "$BINARY_ZIP"
 xcrun notarytool submit "$BINARY_ZIP" \
@@ -258,7 +293,19 @@ xcrun notarytool submit "$BINARY_ZIP" \
     --password "$APPLE_APP_SPECIFIC_PASSWORD" \
     --team-id "$APPLE_TEAM_ID" \
     --wait
-echo "✓ Bare binary notarized"
+
+# .app bundles can have the notarization ticket *stapled* so Gatekeeper
+# validates offline on first run. Bare Mach-O binaries can't be stapled
+# (stapler only supports .app / .pkg / .dmg), so they rely on Apple's
+# online notarization DB lookup instead.
+if [ "$IS_APP_BUNDLE" = true ]; then
+    echo "→ Stapling notarization ticket to $BINARY"
+    xcrun stapler staple "$BINARY"
+    xcrun stapler validate "$BINARY"
+    echo "✓ App bundle notarized + stapled"
+else
+    echo "✓ Bare binary notarized"
+fi
 
 # ── Build signed + notarized + stapled .pkg ───────────────────────────
 
@@ -275,68 +322,33 @@ fi
 PKG_ROOT="${RUNNER_TEMP:-/tmp}/openagent-pkg-root-$(uuidgen)"
 rm -rf "$PKG_ROOT"
 mkdir -p "$PKG_ROOT$PKG_INSTALL_PATH"
-cp "$BINARY" "$PKG_ROOT$PKG_INSTALL_PATH/$(basename "$BINARY")"
-chmod +x "$PKG_ROOT$PKG_INSTALL_PATH/$(basename "$BINARY")"
 
-# Sidecar binary (optional, already-signed). Wrapped in a minimal
-# ``.app`` bundle so macOS TCC treats it as a full app — the bare CLI
-# form silently fails every permission prompt and never registers in
-# Privacy & Security → Accessibility.
-#
-# Bundle layout:
-#   <basename>.app/
-#   ├── Contents/
-#   │   ├── Info.plist           — CFBundleIdentifier=com.openagent.computer-control,
-#   │   │                          NSAccessibilityUsageDescription, etc.
-#   │   └── MacOS/
-#   │       └── <basename>       — the signed Rust binary (moved in,
-#   │                              keeping its Developer-ID signature
-#   │                              with the stable com.openagent.computer-control
-#   │                              identifier set upstream)
-#
-# We re-sign the entire bundle with ``--deep`` after assembly so
-# codesign recalculates the signature over the new Contents/ tree.
-# The inner binary keeps the same identifier because we pass it
-# explicitly; the outer bundle gets the same identifier so
-# ``codesign --verify --strict`` passes with no identifier mismatch.
-if [ -n "$EXTRA_SIDECAR" ]; then
-    SIDECAR_NAME=$(basename "$EXTRA_SIDECAR")
-    APP_NAME="${SIDECAR_NAME}.app"
-    APP_STAGE="${RUNNER_TEMP:-/tmp}/$APP_NAME-stage-$(uuidgen)"
-    rm -rf "$APP_STAGE"
-    mkdir -p "$APP_STAGE/$APP_NAME/Contents/MacOS"
+if [ "$IS_APP_BUNDLE" = true ]; then
+    # Copy the entire .app bundle (with the sidecar already nested under
+    # Contents/MacOS/ and the whole tree signed + stapled above) to the
+    # install location. For openagent that's /Applications/openagent.app.
+    echo "→ Adding $(basename "$BINARY") to pkg payload at $PKG_INSTALL_PATH"
+    cp -R "$BINARY" "$PKG_ROOT$PKG_INSTALL_PATH/$(basename "$BINARY")"
 
-    # Info.plist — the key that unlocks TCC for a bare binary.
-    INFO_PLIST="buildResources/${SIDECAR_NAME}-Info.plist"
-    if [ ! -f "$INFO_PLIST" ]; then
-        echo "ERROR: Info.plist template missing: $INFO_PLIST" >&2
-        exit 1
+    # CLI convenience: a symlink at /usr/local/bin/<exe-name> pointing
+    # into the .app. Users keep typing ``openagent serve ./my-agent`` in
+    # a terminal and it resolves through the .app; TCC still attributes
+    # to com.openagent.server because the executed Mach-O lives inside
+    # the bundle's Contents/MacOS.
+    APP_EXE=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" \
+        "$BINARY/Contents/Info.plist" 2>/dev/null || echo "")
+    if [ -n "$APP_EXE" ]; then
+        mkdir -p "$PKG_ROOT/usr/local/bin"
+        SYMLINK_TARGET="$PKG_INSTALL_PATH/$(basename "$BINARY")/Contents/MacOS/$APP_EXE"
+        echo "→ Adding CLI symlink /usr/local/bin/$APP_EXE → $SYMLINK_TARGET"
+        ln -s "$SYMLINK_TARGET" "$PKG_ROOT/usr/local/bin/$APP_EXE"
     fi
-    cp "$INFO_PLIST" "$APP_STAGE/$APP_NAME/Contents/Info.plist"
-
-    # Move the signed Rust binary into Contents/MacOS. The upstream
-    # computer-control-binary CI job signed it as
-    # ``com.openagent.computer-control`` — preserve that.
-    cp "$EXTRA_SIDECAR" "$APP_STAGE/$APP_NAME/Contents/MacOS/$SIDECAR_NAME"
-    chmod +x "$APP_STAGE/$APP_NAME/Contents/MacOS/$SIDECAR_NAME"
-
-    # Re-sign the whole bundle, deep, with the same stable identifier.
-    echo "→ Wrapping sidecar in .app bundle + re-signing"
-    codesign --force --deep \
-        --sign "$APP_IDENTITY" \
-        --identifier "com.openagent.${SIDECAR_NAME#openagent-}" \
-        --options runtime \
-        --timestamp \
-        --entitlements buildResources/entitlements.mac.plist \
-        "$APP_STAGE/$APP_NAME"
-    codesign --verify --strict --verbose=2 "$APP_STAGE/$APP_NAME"
-    codesign -dvv "$APP_STAGE/$APP_NAME/Contents/MacOS/$SIDECAR_NAME" 2>&1 \
-        | grep -E '^(Identifier|TeamIdentifier|Authority)=' || true
-
-    # Ship the whole .app bundle in the pkg payload (next to the
-    # primary openagent binary).
-    echo "→ Adding $APP_NAME to pkg payload at $PKG_INSTALL_PATH"
-    cp -R "$APP_STAGE/$APP_NAME" "$PKG_ROOT$PKG_INSTALL_PATH/$APP_NAME"
+else
+    # Legacy bare-binary flow (still used by openagent-cli). Copy the
+    # primary binary to the install path — no sidecar wrapping, no
+    # symlinks.
+    cp "$BINARY" "$PKG_ROOT$PKG_INSTALL_PATH/$(basename "$BINARY")"
+    chmod +x "$PKG_ROOT$PKG_INSTALL_PATH/$(basename "$BINARY")"
 fi
 
 UNSIGNED_PKG="${RUNNER_TEMP:-/tmp}/$(basename "$PKG_OUTPUT" .pkg)-unsigned.pkg"

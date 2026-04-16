@@ -218,7 +218,7 @@ jobs:
           dst="dist/openagent-computer-control${{ matrix.cc_ext }}"
           cp "$src" "$dst"
           chmod +x "$dst" || true
-      - name: Sign + notarize macOS binary (+ build stapled .pkg with sidecar)
+      - name: Sign + notarize macOS .app bundle (+ build stapled .pkg)
         if: runner.os == 'macOS'
         env:
           CSC_LINK: ${{ secrets.CSC_LINK }}
@@ -229,19 +229,24 @@ jobs:
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         shell: bash
-        # Produces a signed + notarized bare openagent binary AND a
-        # signed + notarized + stapled .pkg installer that contains
-        # BOTH openagent and openagent-computer-control at
-        # /usr/local/bin. The Rust sidecar was signed in its own
-        # upstream job with a stable ``com.openagent.computer-control``
-        # identifier; we preserve that signature verbatim so macOS TCC
-        # (Accessibility, Screen Recording) keeps the user's grant
-        # across updates.
+        # Produces a signed + notarized + stapled openagent.app bundle
+        # AND a signed + notarized + stapled .pkg installer that drops
+        # openagent.app into /Applications and a CLI convenience symlink
+        # at /usr/local/bin/openagent pointing into the bundle.
+        #
+        # The Rust computer-control sidecar gets copied into
+        # openagent.app/Contents/MacOS/ BEFORE the deep sign runs, so
+        # the whole bundle (outer PyInstaller binary + nested Rust
+        # binary) is sealed together under com.openagent.server. macOS
+        # TCC treats the bundle as a single app for permission grants,
+        # keyed by CFBundleIdentifier rather than cdhash — so
+        # Accessibility and Screen Recording grants persist across
+        # every future openagent release.
         run: |
           bash scripts/sign-notarize-macos.sh \
-            dist/openagent \
+            dist/openagent.app \
             com.openagent.server \
-            /usr/local/bin \
+            /Applications \
             dist/openagent-computer-control
       - name: Package + checksum
         shell: bash

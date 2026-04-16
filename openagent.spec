@@ -160,3 +160,32 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
 )
+
+# ── macOS: wrap the onefile EXE in a proper ``.app`` bundle ──────────
+#
+# TCC (Accessibility, Screen Recording, etc.) keys its persistent grants
+# to the responsible process's identity. For bare CLI binaries TCC falls
+# back to a path-based entry keyed by cdhash, which invalidates on every
+# release. Wrapping openagent in an .app bundle with a stable
+# ``CFBundleIdentifier`` promotes it to a bundle-based entry so grants
+# persist across updates. See buildResources/openagent-Info.plist for
+# the full explanation.
+#
+# The bundle layout is:
+#   dist/openagent.app/
+#   ├── Contents/
+#   │   ├── Info.plist       — copy of buildResources/openagent-Info.plist
+#   │   └── MacOS/
+#   │       └── openagent    — the PyInstaller onefile
+#
+# The sign-notarize-macos.sh script copies the signed Rust sidecar
+# into the same ``Contents/MacOS/`` alongside ``openagent`` after this
+# spec runs, so the final pkg payload has both binaries in one bundle.
+if sys.platform == "darwin":
+    app = BUNDLE(
+        exe,
+        name="openagent.app",
+        icon=None,
+        bundle_identifier="com.openagent.server",
+        info_plist="buildResources/openagent-Info.plist",
+    )
