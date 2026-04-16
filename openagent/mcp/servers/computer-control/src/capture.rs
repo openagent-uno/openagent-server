@@ -42,13 +42,32 @@ pub fn capture_primary_display() -> Result<CaptureResult> {
     Ok(image)
 }
 
-fn try_xcap() -> Result<CaptureResult> {
+/// Pick the primary monitor if one is flagged, otherwise the first.
+///
+/// Headless Linux setups (Xvfb, Xtigervnc, VNC-in-a-container) regularly
+/// return monitors with `is_primary() == false` for every output. Before
+/// this helper, both capture and coordinate scaling would hard-fail with
+/// "no primary monitor found" on every Linux agent VPS we shipped to.
+/// Falling back to the first monitor is correct for single-display setups
+/// (which VPSs always are) and still prefers a real primary flag when the
+/// display server sets one (Xorg-on-a-real-machine).
+pub fn primary_or_first_monitor() -> Result<xcap::Monitor> {
     let monitors = xcap::Monitor::all().context("xcap::Monitor::all failed")?;
-    let primary = monitors
-        .into_iter()
-        .find(|m| m.is_primary().unwrap_or(false))
-        .ok_or_else(|| anyhow!("no primary monitor found"))?;
+    if monitors.is_empty() {
+        return Err(anyhow!("no monitors detected"));
+    }
+    if let Some(m) = monitors.iter().find(|m| m.is_primary().unwrap_or(false)) {
+        return Ok(m.clone());
+    }
+    tracing::warn!(
+        "no primary monitor flagged (common on Xvfb/VNC/headless X); falling back to first of {} monitors",
+        monitors.len(),
+    );
+    Ok(monitors.into_iter().next().expect("non-empty checked above"))
+}
 
+fn try_xcap() -> Result<CaptureResult> {
+    let primary = primary_or_first_monitor()?;
     let rgba: RgbaImage = primary.capture_image().context("xcap capture_image failed")?;
     let logical_w = rgba.width();
     let logical_h = rgba.height();

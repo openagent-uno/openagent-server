@@ -268,11 +268,7 @@ impl ComputerControlServer {
     }
 
     fn logical_display_size(&self) -> Result<(u32, u32)> {
-        let primary = xcap::Monitor::all()
-            .context("xcap::Monitor::all")?
-            .into_iter()
-            .find(|m| m.is_primary().unwrap_or(false))
-            .ok_or_else(|| anyhow!("no primary monitor"))?;
+        let primary = crate::capture::primary_or_first_monitor()?;
         Ok((primary.width()?, primary.height()?))
     }
 }
