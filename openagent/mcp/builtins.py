@@ -280,10 +280,17 @@ def resolve_builtin_entry(name: str, env: dict[str, str] | None = None) -> dict[
 
     spec = BUILTIN_MCP_SPECS[name]
     mcp_dir = BUILTIN_MCPS_DIR / spec["dir"]
-    if not mcp_dir.exists():
+    is_native = spec.get("native", False)
+
+    # Native-binary MCPs don't need a bundled directory — they ship as a
+    # sidecar next to ``openagent`` (see ``_resolve_native_binary``). The
+    # source tree is excluded from the PyInstaller bundle on purpose so
+    # the binary's Developer-ID signature on macOS stays intact. Node /
+    # Python MCPs still need their dist/ + node_modules/ / requirements,
+    # so keep the directory check for those.
+    if not is_native and not mcp_dir.exists():
         raise FileNotFoundError(f"Built-in MCP '{name}' directory not found at {mcp_dir}")
 
-    is_native = spec.get("native", False)
     if is_native:
         binary = _resolve_native_binary(name)
         merged_env = dict(spec.get("env") or {})
@@ -293,7 +300,11 @@ def resolve_builtin_entry(name: str, env: dict[str, str] | None = None) -> dict[
             "name": name,
             "command": [binary],
             "env": merged_env if merged_env else None,
-            "_cwd": str(mcp_dir),
+            # cwd = directory containing the binary. For a sidecar this is
+            # ``$PREFIX``; for a dev-install bundled path this is the
+            # per-target ``bin/`` folder. Either is a real directory the
+            # subprocess module can chdir into.
+            "_cwd": str(Path(binary).parent),
         }
 
     is_python = spec.get("python", False)
