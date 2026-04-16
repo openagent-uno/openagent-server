@@ -2,6 +2,8 @@ use anyhow::Result;
 use rmcp::{ServerHandler, ServiceExt, transport::stdio};
 use tracing_subscriber::{EnvFilter, fmt};
 
+mod scaling;
+
 #[derive(Clone, Default)]
 struct ComputerControlServer;
 
