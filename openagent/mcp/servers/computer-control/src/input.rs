@@ -6,12 +6,45 @@ use enigo::{Axis, Button, Coordinate, Direction, Enigo, Keyboard, Mouse, Setting
 
 #[cfg(target_os = "macos")]
 pub const MAC_ACCESSIBILITY_HINT: &str =
-    "macOS Accessibility permission required. Open System Settings → Privacy & Security → Accessibility and enable 'openagent', then restart the app.";
+    "macOS Accessibility permission required. A system prompt was requested — open System Settings → Privacy & Security → Accessibility, enable 'openagent-computer-control' (or add it via '+' at /usr/local/bin/openagent-computer-control or ~/.local/bin/openagent-computer-control), then retry.";
 
 #[cfg(target_os = "macos")]
 fn is_accessibility_error(e: &anyhow::Error) -> bool {
     let s = format!("{e:#}").to_lowercase();
     s.contains("accessibility") || s.contains("not trusted") || s.contains("axiserror") || s.contains("permission")
+}
+
+/// Ask macOS TCC for Accessibility permission, triggering the system
+/// prompt if the permission hasn't been recorded yet.
+///
+/// enigo's ``Enigo::new()`` on macOS calls the **non-prompting**
+/// ``AXIsProcessTrusted()`` API, so when the permission is missing it
+/// silently returns ``NoPermission`` and no prompt ever fires — the
+/// binary never lands in System Settings → Privacy & Security →
+/// Accessibility, and the user has no way to grant it through the UI.
+///
+/// This helper calls ``AXIsProcessTrustedWithOptions`` with
+/// ``kAXTrustedCheckOptionPrompt = true``, which:
+///   - returns the current trust state (same as the non-prompting form), AND
+///   - asynchronously shows the "openagent-computer-control wants to
+///     control your computer" dialog the first time it's invoked by a
+///     given code signature, AND
+///   - registers the binary in the Accessibility list so the toggle
+///     appears even if the user dismisses the prompt without clicking
+///     "Open System Settings".
+///
+/// The registered TCC identity is whatever the binary is signed as —
+/// ``com.openagent.computer-control`` with Team B4KWCQFY8V, per the
+/// CI signing step. That identity is stable across releases (enforced
+/// by ``codesign --identifier``), so a grant granted once persists.
+#[cfg(target_os = "macos")]
+fn request_accessibility() -> bool {
+    macos_accessibility_client::accessibility::application_is_trusted_with_prompt()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn request_accessibility() -> bool {
+    true
 }
 
 use crate::keys;
@@ -22,6 +55,18 @@ pub struct InputController {
 
 impl InputController {
     pub fn new() -> Result<Self> {
+        // Trigger the TCC prompt FIRST on macOS. If permission is
+        // missing, this both surfaces a user-visible dialog and
+        // registers the binary in System Settings; the caller then
+        // sees a clean MAC_ACCESSIBILITY_HINT error without enigo
+        // ever being touched.
+        #[cfg(target_os = "macos")]
+        {
+            if !request_accessibility() {
+                return Err(anyhow!(MAC_ACCESSIBILITY_HINT));
+            }
+        }
+
         let enigo = match Enigo::new(&Settings::default()) {
             Ok(e) => e,
             Err(e) => {

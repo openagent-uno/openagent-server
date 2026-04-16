@@ -206,13 +206,38 @@ fi
 
 # ── Sign the binary ───────────────────────────────────────────────────
 
+# macOS TCC (Accessibility, Screen Recording, etc.) keys each permission
+# grant to the binary's CODE-SIGN IDENTIFIER. Without an explicit
+# ``--identifier`` flag, codesign defaults to the binary's filename —
+# e.g. ``Identifier=openagent``. That's a valid signature but it's NOT
+# a valid bundle identifier, and TCC refuses to record a persistent
+# entry for non-reverse-DNS identifiers: the permission dialog fires
+# correctly, the user clicks "Open System Settings", but no toggle
+# ever appears in the Accessibility pane because TCC silently dropped
+# the attempted row insertion. Observed on v0.6.7 — the user got the
+# prompt, got redirected to Settings, saw no openagent entry at all.
+#
+# ``$PKG_IDENTIFIER`` (2nd arg) is already a valid reverse-DNS string
+# (e.g. ``com.openagent.server``) that the caller passes to pkgbuild;
+# we reuse it here so the binary's codesign identifier stays
+# consistent with the installer package. When the caller didn't ask
+# for a .pkg (pkg-identifier not set), fall back to prefixing the
+# binary name with ``com.openagent.``.
+if [ -n "$PKG_IDENTIFIER" ]; then
+    SIGN_IDENTIFIER="$PKG_IDENTIFIER"
+else
+    SIGN_IDENTIFIER="com.openagent.$(basename "$BINARY" | tr -d '[:space:]')"
+fi
+echo "→ Signing $BINARY with identifier $SIGN_IDENTIFIER"
 codesign --force \
     --sign "$APP_IDENTITY" \
+    --identifier "$SIGN_IDENTIFIER" \
     --options runtime \
     --timestamp \
     --entitlements buildResources/entitlements.mac.plist \
     "$BINARY"
 codesign --verify --strict --verbose=2 "$BINARY"
+codesign -dvv "$BINARY" 2>&1 | grep -E '^(Identifier|TeamIdentifier)=' || true
 echo "✓ Binary signed"
 
 # ── Notarize the bare binary (ticket goes into Apple's online DB) ────
