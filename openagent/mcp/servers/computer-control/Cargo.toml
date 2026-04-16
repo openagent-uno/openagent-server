@@ -22,6 +22,7 @@ enigo = "0.5"
 xcap = "0.7"
 image = { version = "0.25", default-features = false, features = ["png"] }
 fast_image_resize = "5"
+base64 = "0.22"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # screencapture fallback is shelled out — no extra crate
