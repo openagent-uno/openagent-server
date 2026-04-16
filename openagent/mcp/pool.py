@@ -62,6 +62,17 @@ _MESSAGING_TOKEN_ENV_VARS = (
 # only kicks in when a tool is genuinely stuck past its own limit.
 _MCP_TIMEOUT_SECONDS = 1800
 
+# Per-MCP *handshake* timeout, distinct from the per-call timeout above.
+# This bounds how long a single MCP's ``__aenter__`` can block before the
+# pool moves on. Without it, a dead stdio binary (e.g. a symlink in
+# ``~/.local/share/uv/`` that no longer points anywhere after a disk
+# resize) can pin the whole agent on startup: the subprocess spawn hangs
+# inside anyio, the pool never completes, systemd can't tell anything is
+# wrong, and telegram becomes unresponsive. 30s is generous for healthy
+# handshakes (npx/uv cold-starts usually finish in <5s) and short enough
+# that a single broken server is a recoverable blip, not a total outage.
+_MCP_CONNECT_TIMEOUT = 30
+
 
 def _safe_prefix(name: str) -> str:
     """Coerce a server name into a valid Python identifier prefix.
@@ -236,10 +247,18 @@ class MCPPool:
 
     def __init__(self, specs: list[_ServerSpec]):
         self.specs: list[_ServerSpec] = specs
-        # Lazily populated on connect_all.
+        # Lazily populated on connect_all. Each toolkit gets its *own*
+        # ``AsyncExitStack`` (parallel arrays, ``_agno_toolkits[i]`` is
+        # owned by ``_toolkit_stacks[i]``) so one broken MCP's anyio
+        # cancel-scope violation during startup rolls back in isolation
+        # without corrupting the cleanup state of siblings. This is the
+        # v0.5.29 change — the old shared-stack design coupled every
+        # MCP's cleanup to every other MCP's startup, which is exactly
+        # how one dead symlink (``workspace-mcp`` on mixout-agent)
+        # hung the entire agent.
         self._agno_toolkits: list[Any] = []
+        self._toolkit_stacks: list[AsyncExitStack] = []
         self._tool_counts: dict[str, int] = {name: 0 for name in (s.name for s in specs)}
-        self._stack: AsyncExitStack | None = None
         self._connected = False
         self._lock = asyncio.Lock()
 
@@ -258,57 +277,141 @@ class MCPPool:
     # ── Lifecycle ────────────────────────────────────────────────────────
 
     async def connect_all(self) -> None:
-        """Connect every toolkit. Safe to call multiple times — re-entry is a no-op."""
+        """Connect every toolkit. Safe to call multiple times — re-entry is a no-op.
+
+        Per-MCP failures are isolated: if ``bad-mcp`` can't handshake, it's
+        logged as dormant and the rest still come online. This is a
+        *deliberate* weakening of the old all-or-nothing semantics — in
+        production, one crashed MCP must not take the whole agent down
+        with it. See the v0.5.29 tests in
+        ``scripts/tests/test_mcp_pool_resilience.py`` for the failure
+        modes this guards against.
+        """
         async with self._lock:
             if self._connected:
                 return
-            self._stack = AsyncExitStack()
-            try:
-                for spec in self.specs:
-                    toolkit = await self._build_and_enter_toolkit(spec)
-                    if toolkit is not None:
-                        self._agno_toolkits.append(toolkit)
-                        # Agno MCPTools.functions is the dict of registered tools
-                        # (populated during MCPTools.initialize()).
-                        count = len(getattr(toolkit, "functions", {}) or {})
-                        self._tool_counts[spec.name] = count
-                        elog("mcp.connect", name=spec.name, tools=count)
-                        if count == 0:
-                            logger.warning(
-                                "MCP '%s' connected but registered 0 tools — likely "
-                                "missing credentials or env vars. The server stays in "
-                                "the pool and tools will appear once configured.",
-                                spec.name,
-                            )
-                            elog("mcp.dormant", name=spec.name)
-            except BaseException:
-                # If anything blows up mid-connect, unwind everything we entered.
-                if self._stack is not None:
-                    await self._stack.aclose()
-                self._stack = None
-                self._agno_toolkits.clear()
-                raise
+            for spec in self.specs:
+                toolkit = await self._build_and_enter_toolkit(spec)
+                if toolkit is not None:
+                    self._agno_toolkits.append(toolkit)
+                    # Agno MCPTools.functions is the dict of registered tools
+                    # (populated during MCPTools.initialize()).
+                    count = len(getattr(toolkit, "functions", {}) or {})
+                    self._tool_counts[spec.name] = count
+                    elog("mcp.connect", name=spec.name, tools=count)
+                    if count == 0:
+                        logger.warning(
+                            "MCP '%s' connected but registered 0 tools — likely "
+                            "missing credentials or env vars. The server stays in "
+                            "the pool and tools will appear once configured.",
+                            spec.name,
+                        )
+                        elog("mcp.dormant", name=spec.name)
             self._connected = True
 
     async def close_all(self) -> None:
+        """Close every connected toolkit. Per-toolkit stacks are closed
+        independently so one failing teardown doesn't skip the rest.
+
+        Each toolkit was entered inside its own ``AsyncExitStack`` (see
+        ``_safe_enter``), which means ``stack.aclose()`` runs the
+        toolkit's own ``__aexit__`` — the path Agno + anyio expect for
+        proper cancel-scope teardown. We still wrap each close in an
+        outer ``except BaseException`` so a single broken subprocess
+        can't pin the shutdown.
+        """
         async with self._lock:
             if not self._connected:
                 return
-            stack = self._stack
-            self._stack = None
+            stacks = list(self._toolkit_stacks)
+            self._toolkit_stacks.clear()
             self._agno_toolkits.clear()
             self._connected = False
-        if stack is not None:
+        # Close in reverse registration order so toolkits that share
+        # resources tear down the way AsyncExitStack would have.
+        for stack in reversed(stacks):
             try:
                 await stack.aclose()
-            except Exception as e:
+            except BaseException as e:  # noqa: BLE001 — best-effort cleanup
                 logger.debug("Best-effort MCP pool close: %s", e)
+
+    async def _safe_enter(self, toolkit: Any, spec: _ServerSpec) -> Any | None:
+        """Enter one toolkit's own ``AsyncExitStack`` with a handshake
+        timeout and BaseException isolation. Returns the toolkit on
+        success, or ``None`` after rolling back the per-toolkit stack on
+        timeout/failure.
+
+        Three distinct failure modes are handled:
+
+        1. ``asyncio.TimeoutError`` — handshake exceeded
+           ``_MCP_CONNECT_TIMEOUT``. Roll back the per-toolkit stack so
+           any half-initialised subprocess is cleaned up, then return
+           ``None``.
+        2. ``asyncio.CancelledError`` / ``BaseExceptionGroup`` from
+           inside Agno's init — the mixout post-disk-resize regression.
+           Same rollback, swallowed *unless* the outer task was
+           externally cancelled (shutdown must propagate).
+        3. Regular ``Exception`` — logged + rolled back.
+
+        ``asyncio.timeout`` (not ``asyncio.wait_for``) is used because
+        ``wait_for`` would wrap the coroutine in a sub-task. The anyio
+        cancel scope opened inside ``MCPTools.__aenter__`` would then
+        belong to that sub-task, and when we later ``aclose()`` the
+        stack from the outer task, anyio refuses to exit a scope that
+        isn't the current task's current scope — that broken state
+        bleeds into unrelated awaits later in the same event loop
+        (regression observed: ``aiosqlite.connect`` in the cron test
+        immediately cancelling).
+        """
+        task = asyncio.current_task()
+        cancelling = (
+            getattr(task, "cancelling", None) if task is not None else None
+        )
+        cancel_before = cancelling() if callable(cancelling) else 0
+
+        stack = AsyncExitStack()
+        await stack.__aenter__()
+
+        async def _rollback() -> None:
+            try:
+                await stack.aclose()
+            except BaseException:  # noqa: BLE001 — best-effort cleanup
+                pass
+
+        try:
+            async with asyncio.timeout(_MCP_CONNECT_TIMEOUT):
+                await stack.enter_async_context(toolkit)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "MCP '%s' handshake timed out after %ss — marking dormant",
+                spec.name, _MCP_CONNECT_TIMEOUT,
+            )
+            elog("mcp.timeout", name=spec.name)
+            await _rollback()
+            return None
+        except BaseException as e:
+            await _rollback()
+            # If the outer task itself was externally cancelled (its
+            # ``cancelling()`` counter rose during our await), re-raise
+            # so shutdown propagates. Otherwise treat this as a per-MCP
+            # failure (anyio cancel-scope, synthetic CancelledError,
+            # etc.) and swallow — that's the mixout regression we're
+            # fixing.
+            if callable(cancelling) and cancelling() > cancel_before:
+                raise
+            logger.warning("MCP '%s' failed to connect: %s", spec.name, e)
+            elog("mcp.error", name=spec.name, error=str(e))
+            return None
+
+        # Success — hand the stack to the pool so close_all can unwind it.
+        self._toolkit_stacks.append(stack)
+        return toolkit
 
     async def _build_and_enter_toolkit(self, spec: _ServerSpec) -> Any | None:
         """Construct an Agno ``MCPTools`` for one spec, enter it, return it.
 
-        Returns ``None`` and logs a warning on failure (matching the old
-        registry's behaviour: one bad MCP shouldn't kill the agent).
+        Returns ``None`` on any failure and logs a warning — one bad MCP
+        shouldn't kill the agent.
         """
         try:
             from agno.tools.mcp import MCPTools
@@ -342,14 +445,12 @@ class MCPPool:
             else:
                 logger.warning("MCP spec '%s' has neither command nor url — skipping", spec.name)
                 return None
-
-            assert self._stack is not None
-            await self._stack.enter_async_context(toolkit)
-            return toolkit
         except Exception as e:
-            logger.warning("MCP '%s' failed to connect: %s", spec.name, e)
+            logger.warning("MCP '%s' failed to construct: %s", spec.name, e)
             elog("mcp.error", name=spec.name, error=str(e))
             return None
+
+        return await self._safe_enter(toolkit, spec)
 
     # ── Provider-facing accessors ───────────────────────────────────────
 

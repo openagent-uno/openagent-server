@@ -82,6 +82,8 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_claude_cli_text_recovery",
     # 9. Gateway /stop, /clear, /new command semantics
     "test_gateway_commands",
+    # 10. MCPPool resilience — one bad MCP mustn't sink the whole pool
+    "test_mcp_pool_resilience",
 )
 
 
