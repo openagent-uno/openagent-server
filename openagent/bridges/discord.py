@@ -208,7 +208,10 @@ class DiscordBridge(BaseBridge):
             await interaction.response.send_message("Unauthorized.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
-        result = await self.send_command(cmd)
+        # Scope /stop, /clear, /new, /reset to THIS user's session so a
+        # command from user A doesn't wipe user B's conversation on the
+        # same bot.
+        result = await self.send_command(cmd, session_id=f"dc:{uid}")
         await interaction.followup.send(result, ephemeral=True)
 
     async def stop(self) -> None:

@@ -4,7 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openagent-framework"
+<<<<<<< HEAD
 version = "0.6.0"
+=======
+version = "0.5.28"
+>>>>>>> origin/main
 description = "Simplified LLM agent framework with MCP, memory, and multi-channel support"
 readme = "README.md"
 requires-python = ">=3.11"

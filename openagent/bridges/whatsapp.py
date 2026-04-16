@@ -107,7 +107,10 @@ class WhatsAppBridge(BaseBridge):
                 if cmd == "start":
                     await self._send_text(chat_id, bridge_welcome_text())
                 else:
-                    result = await self.send_command(cmd)
+                    # Scope scope-sensitive commands to this user's
+                    # session so one WhatsApp contact's /clear doesn't
+                    # wipe another's conversation on the same bot.
+                    result = await self.send_command(cmd, session_id=f"wa:{user_id}")
                     await self._send_text(chat_id, result)
                 return
         elif msg_type in ("audioMessage", "voiceMessage"):

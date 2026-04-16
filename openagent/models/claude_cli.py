@@ -323,6 +323,17 @@ class ClaudeCLI(BaseModel):
                 logger.debug("forget_session db delete %s: %s", session_id, e)
         elog("model.session_forget", session_id=session_id)
 
+    def known_session_ids(self) -> list[str]:
+        """Return every session_id this provider has resume state for.
+
+        Includes both live subprocess bindings (``_clients``) and the
+        persistence-hydrated map (``_sdk_sessions``). Used by the gateway's
+        ``/clear`` code path so it can wipe conversations whose bridge
+        session id (e.g. ``tg:<user_id>``) never made it back into
+        SessionManager after a restart.
+        """
+        return sorted(set(self._clients) | set(self._sdk_sessions))
+
     async def shutdown(self) -> None:
         async with self._lock:
             clients = dict(self._clients)

@@ -7,8 +7,18 @@ Client → Server::
 
     {"type": "auth",    "token": "...", "client_id": "..."}
     {"type": "message", "text": "...", "session_id": "..."}
-    {"type": "command", "name": "<gateway command>"}
+    {"type": "command", "name": "<gateway command>", "session_id": "..."}
     {"type": "ping"}
+
+``session_id`` on a ``command`` is optional but strongly recommended for any
+client that multiplexes multiple independent conversations onto a single
+``client_id`` — telegram/discord/whatsapp bridges (many users on one bot)
+AND the desktop app (multiple chat tabs per user). When present, the
+scope-sensitive commands ``stop``, ``clear``, ``new``, ``reset`` act only
+on that conversation; other users/tabs on the same ``client_id`` are left
+untouched. When omitted, those commands fall back to the legacy
+client-wide behaviour — useful for single-user direct ws clients and
+administrative shutdowns.
 
 Server → Client::
 
