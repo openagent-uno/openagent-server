@@ -84,6 +84,8 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_gateway_commands",
     # 10. MCPPool resilience — one bad MCP mustn't sink the whole pool
     "test_mcp_pool_resilience",
+    # 11. /api/files endpoint — agent-side attachment delivery to remote clients
+    "test_files_endpoint",
 )
 
 

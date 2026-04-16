@@ -152,6 +152,7 @@ class Gateway:
         """Register the gateway WebSocket endpoint and REST API routes."""
         app.router.add_get("/ws", self._handle_ws)
         app.router.add_post("/api/upload", self._handle_upload)
+        app.router.add_get("/api/files", self._handle_files)
         app.router.add_get("/api/agent-info", self._handle_agent_info)
 
         routes = (
@@ -308,6 +309,65 @@ class Gateway:
 
         elog("upload.saved", filename=filename, path=path, transcribed=bool(result.get("transcription")))
         return web.json_response(result)
+
+    # ── File serving (agent → client) ──
+
+    async def _handle_files(self, request):
+        """GET /api/files?path=<abs>&token=<gateway-token>
+
+        Serve a local file off the agent server's filesystem so remote
+        clients (desktop app, CLI) can fetch attachments the agent
+        emitted via ``[IMAGE:/path]`` / ``[FILE:/path]`` / ``[VOICE:/path]``
+        / ``[VIDEO:/path]`` markers in a response.
+
+        The agent runs with broad filesystem access and already returns
+        the absolute path to the client in the WS ``response`` message's
+        ``attachments`` array. For local installs the client can read
+        the path directly; for remote installs (app on your laptop,
+        agent on a VPS) this endpoint ferries the bytes over HTTP.
+
+        **Authentication**: requires ``token`` query param matching the
+        gateway token (same token clients use for WS auth). Without a
+        configured token, reads are unauthenticated — this matches the
+        existing ``/api/*`` endpoints which also rely on the gateway
+        binding to localhost for single-user deploys.
+
+        **Path safety**: we use ``os.path.realpath`` before checking
+        ``isfile`` so symlinks resolve, and we reject paths that don't
+        resolve to an actual file. Since the gateway token is required,
+        we don't further restrict to specific directories — the agent
+        has full FS access anyway, so any allow-listing would be
+        theater against a caller who already holds the token.
+        """
+        from aiohttp import web
+        import os
+
+        if self.token:
+            token = request.query.get("token") or (
+                request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+                if request.headers.get("Authorization", "").startswith("Bearer ")
+                else ""
+            )
+            if token != self.token:
+                return web.Response(status=401, text="Unauthorized")
+
+        path = request.query.get("path", "")
+        if not path:
+            return web.Response(status=400, text="path required")
+
+        real = os.path.realpath(path)
+        if not os.path.isfile(real):
+            return web.Response(status=404, text="not found")
+
+        # Let aiohttp pick the Content-Type from the extension and stream
+        # the file from disk instead of buffering the whole thing in RAM.
+        # Expose a sensible Content-Disposition so browsers download with
+        # the original filename rather than a random hash.
+        filename = os.path.basename(real)
+        return web.FileResponse(
+            real,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
 
     # ── WebSocket ──
 
