@@ -46,6 +46,9 @@ mod tests {
 
     #[test]
     fn long_edge_scales_down() {
+        // Note: the plan's original case used 3840x2160, but pixel-count binds there
+        // (pixel scale ≈ 0.381 < long-edge scale ≈ 0.408). 2000x400 has 800k pixels
+        // well under MAX_PIXELS, so only the long-edge constraint fires here.
         // 2000x400: long edge 2000 > 1568, but total pixels 800_000 < MAX_PIXELS,
         // so only the long-edge constraint fires → scale = 1568 / 2000.
         let s = size_to_api_scale(2000, 400);
@@ -63,14 +66,12 @@ mod tests {
     }
 
     #[test]
-    fn api_to_logical_roundtrip_within_1px() {
+    fn api_to_logical_applies_inverse_scale() {
         // Claude sends a coord in downsampled space; we scale up to logical.
-        // For a 3840x2560 display, 1568px API image → scale ≈ 2.449.
-        // Coord (100, 100) in API space → (245, 245) in logical.
+        // For a 3840x2560 display, pixel-count constraint binds (≈ 0.35023), inverse ≈ 2.8553.
+        // (100 * 2.8553).round() = 286.
         let (lx, ly) = api_to_logical(100, 100, 3840, 2560);
-        let scale = api_to_logical_scale(3840, 2560);
-        assert_eq!(lx, (100.0 * scale).round() as i32);
-        assert_eq!(ly, (100.0 * scale).round() as i32);
+        assert_eq!((lx, ly), (286, 286));
     }
 
     #[test]
