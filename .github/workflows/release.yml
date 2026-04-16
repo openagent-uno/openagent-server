@@ -78,18 +78,104 @@ jobs:
             app/desktop/release/*.yml
             app/desktop/release/*.yaml
 
-  # ── openagent server standalone executable (macOS, Linux, Windows) ──
-  executable:
+  # ── Rust computer-control binary per platform ──
+  computer-control-binary:
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: macos-latest
+            target: aarch64-apple-darwin
+            out_dir: darwin-arm64
+            ext: ''
           - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            out_dir: linux-x64
+            ext: ''
           - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            out_dir: windows-x64
+            ext: '.exe'
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install Linux X11 build deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxdo-dev libx11-dev libxtst-dev libxi-dev pkg-config
+      - name: Build release binary
+        working-directory: openagent/mcp/servers/computer-control
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Sign Rust binary (macOS only — required for stable TCC identity)
+        if: runner.os == 'macOS'
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${CSC_LINK:-}" ]; then
+            echo "CSC_LINK not set — leaving binary unsigned (TCC grant will not persist across updates)"
+            exit 0
+          fi
+          KEYCHAIN=$RUNNER_TEMP/cc-sign.keychain
+          KEYCHAIN_PASSWORD=$(openssl rand -hex 16)
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          P12=$RUNNER_TEMP/cc-sign.p12
+          echo "$CSC_LINK" | base64 --decode > "$P12"
+          security import "$P12" -k "$KEYCHAIN" -P "$CSC_KEY_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN" | awk -F'"' '/Developer ID Application/ {print $2; exit}')
+          if [ -z "$IDENTITY" ]; then
+            echo "No Developer ID Application identity found in CSC_LINK"; exit 1
+          fi
+          BIN=openagent/mcp/servers/computer-control/target/${{ matrix.target }}/release/openagent-computer-control
+          codesign --force \
+            --sign "$IDENTITY" \
+            --identifier com.openagent.computer-control \
+            --options runtime \
+            --timestamp \
+            --entitlements buildResources/entitlements.mac.plist \
+            "$BIN"
+          codesign --verify --strict --verbose=2 "$BIN"
+          codesign -dvv "$BIN" 2>&1 | grep -E '^(Identifier|TeamIdentifier)=' || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: computer-control-${{ matrix.out_dir }}
+          path: openagent/mcp/servers/computer-control/target/${{ matrix.target }}/release/openagent-computer-control${{ matrix.ext }}
+
+  # ── openagent server standalone executable (macOS, Linux, Windows) ──
+  executable:
+    needs: computer-control-binary
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            cc_target: darwin-arm64
+            cc_ext: ''
+          - os: ubuntu-latest
+            cc_target: linux-x64
+            cc_ext: ''
+          - os: windows-latest
+            cc_target: windows-x64
+            cc_ext: '.exe'
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download computer-control binary
+        uses: actions/download-artifact@v4
+        with:
+          name: computer-control-${{ matrix.cc_target }}
+          path: openagent/mcp/servers/computer-control/bin/${{ matrix.cc_target }}/
+      - name: Make binary executable
+        if: runner.os != 'Windows'
+        run: chmod +x openagent/mcp/servers/computer-control/bin/${{ matrix.cc_target }}/openagent-computer-control
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -101,7 +187,7 @@ jobs:
       - name: Build Node MCPs
         shell: bash
         run: |
-          for mcp_dir in openagent/mcp/servers/computer-control openagent/mcp/servers/shell openagent/mcp/servers/web-search openagent/mcp/servers/editor openagent/mcp/servers/chrome-devtools openagent/mcp/servers/messaging; do
+          for mcp_dir in openagent/mcp/servers/shell openagent/mcp/servers/web-search openagent/mcp/servers/editor openagent/mcp/servers/chrome-devtools openagent/mcp/servers/messaging; do
             if [ -d "$mcp_dir" ]; then
               echo "Building $mcp_dir..."
               (cd "$mcp_dir" && npm install --silent && npm run build --silent 2>/dev/null || true)
