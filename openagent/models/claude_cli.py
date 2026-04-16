@@ -34,16 +34,14 @@ logger = logging.getLogger(__name__)
 # We only set it if the user hasn't overridden it in the environment.
 os.environ.setdefault("CLAUDE_CODE_STREAM_CLOSE_TIMEOUT", "300000")  # 5 min
 
-# Idle timeout: abort if the SDK produces no message for this long. The old
-# code wrapped the whole receive loop in a single 300 s timeout, which killed
-# legitimate long-running tool calls (an Electron DMG build runs 5–10 min
-# entirely between `tool_use` and `tool_result` with no intermediate SDK
-# messages, so the loop was silent the whole time). Resetting the timeout per
-# message lets big tool calls finish while still catching genuinely stuck
-# subprocesses.
-DEFAULT_IDLE_TIMEOUT = 900  # 15 min without any SDK message → something is wrong
-# Absolute ceiling per query. Retries kick in after this.
-DEFAULT_HARD_TIMEOUT = 1800  # 30 min
+# Idle timeout: abort if the SDK produces no message for this long. Reset per
+# message so a legitimately long single tool call (Electron build, gradle
+# assembleRelease, npm install on a cold cache) can finish as long as the
+# subprocess is actually making progress.
+DEFAULT_IDLE_TIMEOUT = 1800  # 30 min without any SDK message → something is wrong
+# Absolute ceiling per query. The bridge layer gives up at 65 min (see
+# openagent.bridges.base.BRIDGE_RESPONSE_TIMEOUT), so keep headroom under that.
+DEFAULT_HARD_TIMEOUT = 3600  # 60 min
 
 # Close idle clients after 24h — was 10 min, which caused user-visible
 # "lost memory" bugs on Telegram/Discord bridges where the next message after
@@ -348,144 +346,108 @@ class ClaudeCLI(BaseModel):
             elog("model.stale_drain", count=count)
         return count
 
+    async def _emit_tool_status(
+        self, block: Any, on_status: Callable[[str], Awaitable[None]]
+    ) -> None:
+        """Forward a ``ToolUseBlock`` to the bridge's ``on_status`` callback."""
+        tool = getattr(block, "name", None)
+        if not (tool and hasattr(block, "input")):
+            return
+        params = getattr(block, "input", {})
+        try:
+            await on_status(_json.dumps({
+                "tool": tool,
+                "params": params if isinstance(params, dict) else {},
+                "status": "running",
+            }))
+        except Exception:
+            pass
+
+    def _capture_result(
+        self, message: Any, session_id: str
+    ) -> tuple[str, dict[str, Any]]:
+        """Pull text + usage from a ``ResultMessage`` and persist the SDK session id."""
+        result_text = getattr(message, "result", None) or ""
+        sdk_sid = getattr(message, "session_id", None)
+        if sdk_sid:
+            self._sdk_sessions[session_id] = sdk_sid
+            self._persist_sdk_session(session_id, sdk_sid)
+            elog("model.session_stored", session_id=session_id, sdk_session_id=sdk_sid)
+        usage_meta = {
+            "total_cost_usd": getattr(message, "total_cost_usd", None),
+            "usage": getattr(message, "usage", None),
+            "model_usage": getattr(message, "model_usage", None),
+            "duration_ms": getattr(message, "duration_ms", None),
+            "duration_api_ms": getattr(message, "duration_api_ms", None),
+            "num_turns": getattr(message, "num_turns", None),
+        }
+        return result_text, usage_meta
+
     async def _run_once(
         self, client: Any, prompt: str, session_id: str, on_status: Any = None
     ) -> tuple[str, dict[str, Any]]:
-        """Run a single query; return ``(text, usage_meta)``.
+        """Send ``prompt``, consume the SDK stream, return ``(text, usage_meta)``.
 
-        ``usage_meta`` is the parsed cost/token data extracted from
-        ``ResultMessage``. Empty dict if the SDK didn't emit usage info.
+        Shape of the receive loop:
+
+        - Per-message ``idle_timeout`` — a single silent gap longer than this
+          means the subprocess is stuck.
+        - Overall ``hard_timeout`` — last-resort ceiling. The bridge layer
+          tolerates up to 65 min (BRIDGE_RESPONSE_TIMEOUT), so defaults stay
+          comfortably under that.
+        - Text gets captured two ways: ``ResultMessage.result`` when the CLI
+          populates it, or accumulated ``TextBlock.text`` chunks as a fallback
+          when the final result field arrives empty (observed in production
+          with 1000+ output tokens of real text otherwise thrown away).
         """
         from claude_agent_sdk import AssistantMessage, ResultMessage
 
-        # Drain any residual messages from a prior query to prevent
-        # responding to the wrong message (the "penultimate message" bug).
-        await self._drain_stale(client)
-
         t0 = time.monotonic()
         await client.query(prompt, session_id=session_id)
-        result_text = ""
-        # Accumulate TextBlock content from streamed AssistantMessages as a
-        # fallback for when ResultMessage.result arrives empty. Production
-        # traces on lyra-agent showed ``model.empty_result`` events with
-        # 1300+ output_tokens, meaning the CLI generated substantial text
-        # but didn't echo it in the final ``result`` field. Before this fix
-        # the caller just saw "(Done — no final message was returned.)".
         streamed_text_parts: list[str] = []
+        result_text = ""
         usage_meta: dict[str, Any] = {}
-        try:
-            # Per-message idle timeout + absolute ceiling. A wrap-around loop
-            # timeout would kill long tool calls (Electron builds etc.) that
-            # legitimately spend many minutes between `tool_use` and
-            # `tool_result` with no SDK messages in between.
-            iterator = client.receive_response().__aiter__()
-            while True:
-                if time.monotonic() - t0 > self._hard_timeout:
-                    raise TimeoutError(
-                        f"query exceeded {self._hard_timeout}s hard limit"
-                    )
-                try:
-                    async with asyncio.timeout(self._idle_timeout):
-                        message = await iterator.__anext__()
-                except StopAsyncIteration:
-                    break
-                if isinstance(message, AssistantMessage):
-                    for block in (message.content or []):
-                        # Capture text from TextBlocks for the empty-result
-                        # fallback below. The SDK's ``TextBlock.text`` is a
-                        # ``str``; guard against unexpected non-string
-                        # payloads so we don't concatenate "None" or repr().
-                        block_text = getattr(block, "text", None)
-                        if isinstance(block_text, str) and block_text:
-                            streamed_text_parts.append(block_text)
-                        # Emit status for tool calls so bridges can surface
-                        # "running: <tool>" indicators.
-                        tool = getattr(block, "name", None)
-                        if tool and hasattr(block, "input") and on_status:
-                            try:
-                                params = getattr(block, "input", {})
-                                await on_status(_json.dumps({
-                                    "tool": tool,
-                                    "params": params if isinstance(params, dict) else {},
-                                    "status": "running",
-                                }))
-                            except Exception:
-                                pass
-                if isinstance(message, ResultMessage):
-                    result_text = message.result or ""
-                    # Capture SDK session ID for future resume
-                    sdk_sid = getattr(message, "session_id", None)
-                    if sdk_sid:
-                        self._sdk_sessions[session_id] = sdk_sid
-                        self._persist_sdk_session(session_id, sdk_sid)
-                        elog("model.session_stored", session_id=session_id, sdk_session_id=sdk_sid)
-                    # Capture cost + token usage. ``total_cost_usd`` is the
-                    # SDK-provided dollar figure (preferred); ``usage`` is the
-                    # raw token dict; ``model_usage`` is per-model breakdown
-                    # when the SDK invoked multiple models internally.
-                    usage_meta = {
-                        "total_cost_usd": getattr(message, "total_cost_usd", None),
-                        "usage": getattr(message, "usage", None),
-                        "model_usage": getattr(message, "model_usage", None),
-                        "duration_ms": getattr(message, "duration_ms", None),
-                        "duration_api_ms": getattr(message, "duration_api_ms", None),
-                        "num_turns": getattr(message, "num_turns", None),
-                    }
-                    break  # Never read past the response boundary
-        except TimeoutError:
-            raise
+        iterator = client.receive_response().__aiter__()
 
-        # Defense-in-depth: if a substantial response arrived in under 1s,
-        # it's almost certainly stale data from the SDK buffer, not a real
-        # LLM response. Raise so the retry logic in generate() drops the
-        # client and retries with a fresh subprocess.
-        elapsed = time.monotonic() - t0
-        if elapsed < 1.0 and len(result_text) > 10:
-            logger.warning(
-                "Stale response detected (%.0fms, %d chars) — will retry with fresh client",
-                elapsed * 1000, len(result_text),
-            )
-            elog("model.stale_response", session_id=session_id, elapsed_ms=int(elapsed * 1000))
-            raise RuntimeError("Stale response detected")
+        while True:
+            if time.monotonic() - t0 > self._hard_timeout:
+                raise TimeoutError(f"query exceeded {self._hard_timeout}s hard limit")
+            try:
+                async with asyncio.timeout(self._idle_timeout):
+                    message = await iterator.__anext__()
+            except StopAsyncIteration:
+                break
 
-        # Some Claude turns finish with an empty ``ResultMessage.result``
-        # despite the CLI having streamed substantial text in earlier
-        # ``AssistantMessage`` blocks. Recover it from what we captured
-        # during the stream before falling through to the placeholder.
+            if isinstance(message, AssistantMessage):
+                for block in (message.content or []):
+                    block_text = getattr(block, "text", None)
+                    if isinstance(block_text, str) and block_text:
+                        streamed_text_parts.append(block_text)
+                    if on_status is not None:
+                        await self._emit_tool_status(block, on_status)
+
+            if isinstance(message, ResultMessage):
+                result_text, usage_meta = self._capture_result(message, session_id)
+                break  # Never read past the response boundary.
+
         if not result_text and streamed_text_parts:
             result_text = "".join(streamed_text_parts)
-            num_turns = usage_meta.get("num_turns")
-            out_tokens = (usage_meta.get("usage") or {}).get("output_tokens")
-            logger.info(
-                "ResultMessage.result empty — recovered %d chars from streamed "
-                "AssistantMessage TextBlocks (turns=%s, output_tokens=%s) for session %s",
-                len(result_text), num_turns, out_tokens, session_id,
-            )
             elog(
                 "model.result_recovered_from_stream",
                 session_id=session_id,
-                num_turns=num_turns,
-                output_tokens=out_tokens,
+                num_turns=usage_meta.get("num_turns"),
+                output_tokens=(usage_meta.get("usage") or {}).get("output_tokens"),
                 recovered_chars=len(result_text),
             )
 
-        # Some Claude turns finish with tool calls and zero text anywhere
-        # (rare SDK edge case, or a turn that ran only tool calls and
-        # nothing else). The bridge would otherwise forward zero bytes to
-        # the user. Log it structured so we can spot frequency, and
-        # substitute a non-empty placeholder so the caller sees *something*.
         if not result_text:
-            num_turns = usage_meta.get("num_turns")
-            out_tokens = (usage_meta.get("usage") or {}).get("output_tokens")
-            logger.warning(
-                "Claude produced no final text (turns=%s, output_tokens=%s) for session %s",
-                num_turns, out_tokens, session_id,
-            )
+            # Rare: tool-only turn with no text anywhere. Avoid forwarding
+            # zero bytes — callers and bridges assume a non-empty string.
             elog(
                 "model.empty_result",
                 session_id=session_id,
-                num_turns=num_turns,
-                output_tokens=out_tokens,
+                num_turns=usage_meta.get("num_turns"),
+                output_tokens=(usage_meta.get("usage") or {}).get("output_tokens"),
             )
             result_text = "(Done — no final message was returned.)"
 
@@ -511,66 +473,66 @@ class ClaudeCLI(BaseModel):
                 prompt_parts.append(f"[Previous assistant response] {content}")
         prompt = "\n\n".join(prompt_parts)
 
-        for attempt in range(2):
+        # Retry semantics:
+        #   - TimeoutError: do NOT retry. A hung subprocess won't recover by
+        #     spawning a fresh one that immediately re-enters the same long
+        #     tool call; the second attempt just burns another hard_timeout.
+        #     Return a friendly timeout message so the bridge surface is fast.
+        #   - Other exceptions (transient network, SDK decode errors): one
+        #     retry with a fresh client, then give up.
+        MAX_RETRIES_ON_ERROR = 1
+        attempt = 0
+        while True:
             try:
                 client = await self._get_client(sid, system)
                 result, usage_meta = await self._run_once(client, prompt, sid, on_status)
-                input_tokens, output_tokens, cost = await self._record_usage(sid, usage_meta)
+                input_tokens, output_tokens, _ = await self._record_usage(sid, usage_meta)
                 return ModelResponse(
                     content=result,
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     model=self._model_id_for_billing(),
                 )
-            except Exception as e:
-                is_timeout = isinstance(e, TimeoutError)
-                if is_timeout:
-                    event = "model.timeout_retry" if attempt == 0 else "model.timeout"
-                    elog(
-                        event,
-                        session_id=sid,
-                        attempt=attempt + 1,
-                        idle_timeout=self._idle_timeout,
-                        hard_timeout=self._hard_timeout,
-                    )
-                    log_fn = logger.warning if attempt == 0 else logger.error
-                    log_fn(
-                        "Session %s timed out on attempt %d (idle=%ds, hard=%ds)",
-                        sid[-8:],
-                        attempt + 1,
-                        self._idle_timeout,
-                        self._hard_timeout,
-                    )
-                else:
-                    logger.error(
-                        "Session %s error (attempt %d): %s",
-                        sid[-8:],
-                        attempt + 1,
-                        e,
-                    )
-                # Drop the broken client — next attempt creates a fresh one
-                # with resume, recovering history from disk.
-                # Never clear _sdk_sessions: the session is persisted on disk
-                # by the SDK regardless of why this attempt failed.
+            except TimeoutError as e:
+                elog(
+                    "model.timeout",
+                    session_id=sid,
+                    attempt=attempt + 1,
+                    idle_timeout=self._idle_timeout,
+                    hard_timeout=self._hard_timeout,
+                )
+                logger.error(
+                    "Session %s timed out (idle=%ds, hard=%ds): %s",
+                    sid[-8:], self._idle_timeout, self._hard_timeout, e,
+                )
                 await self._drop_client(sid)
-                if attempt == 0:
-                    continue
-                stop_reason = "timeout" if is_timeout else "error"
-                elog("model.generate_error", session_id=sid, attempt=attempt + 1, error=str(e), stop_reason=stop_reason)
                 return ModelResponse(
                     content="I'm sorry, that request took too long to process. "
-                    "Please try again with a simpler request."
-                    if is_timeout
-                    else f"Error: {e}",
-                    stop_reason=stop_reason,
+                    "Please try again with a simpler request.",
+                    stop_reason="timeout",
                     model=self._model_id_for_billing(),
                 )
-        elog("model.generate_error", session_id=sid, attempt=2, error="max retries exceeded", stop_reason="error")
-        return ModelResponse(
-            content="Error: max retries exceeded",
-            stop_reason="error",
-            model=self._model_id_for_billing(),
-        )
+            except Exception as e:
+                logger.error(
+                    "Session %s error (attempt %d): %s",
+                    sid[-8:], attempt + 1, e,
+                )
+                await self._drop_client(sid)
+                if attempt < MAX_RETRIES_ON_ERROR:
+                    attempt += 1
+                    continue
+                elog(
+                    "model.generate_error",
+                    session_id=sid,
+                    attempt=attempt + 1,
+                    error=str(e),
+                    stop_reason="error",
+                )
+                return ModelResponse(
+                    content=f"Error: {e}",
+                    stop_reason="error",
+                    model=self._model_id_for_billing(),
+                )
 
     def _model_id_for_billing(self) -> str:
         """Stable identifier used as the ``model`` column in ``usage_log``.

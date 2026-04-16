@@ -155,3 +155,78 @@ async def t_none_text_ignored(ctx: TestContext) -> None:
     ]
     text, _ = await _run_once_with(messages)
     assert text == "(Done — no final message was returned.)", f"got {text!r}"
+
+
+# ── generate() retry semantics ────────────────────────────────────────
+
+
+class _RecordingCLI:
+    """Wraps ClaudeCLI.generate with a pluggable ``_run_once`` for retry tests."""
+
+    def __init__(self, outcomes):
+        _install_fake_sdk_types()
+        from openagent.models.claude_cli import ClaudeCLI
+
+        self.cli = ClaudeCLI(model=None, providers_config={"anthropic": {"models": ["claude-cli"]}})
+        self.cli._drain_stale = lambda _c: asyncio.sleep(0)  # type: ignore[assignment]
+        self.cli._get_client = self._fake_get_client  # type: ignore[assignment]
+        self.cli._drop_client = self._fake_drop_client  # type: ignore[assignment]
+        self.cli._record_usage = self._fake_record_usage  # type: ignore[assignment]
+        self._outcomes = list(outcomes)
+        self._calls = 0
+        self.dropped = 0
+
+        async def run_once(*_a, **_kw):
+            self._calls += 1
+            outcome = self._outcomes.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+        self.cli._run_once = run_once  # type: ignore[assignment]
+
+    async def _fake_get_client(self, *_a, **_kw):
+        return object()
+
+    async def _fake_drop_client(self, *_a, **_kw):
+        self.dropped += 1
+
+    async def _fake_record_usage(self, *_a, **_kw):
+        return 0, 0, 0.0
+
+    @property
+    def attempts(self) -> int:
+        return self._calls
+
+
+@test("claude_cli_text_recovery", "generate does NOT retry on TimeoutError")
+async def t_no_retry_on_timeout(ctx: TestContext) -> None:
+    harness = _RecordingCLI([TimeoutError("idle timeout")])
+    resp = await harness.cli.generate(
+        [{"role": "user", "content": "ciao"}], session_id="t1"
+    )
+    assert harness.attempts == 1, f"expected 1 call, got {harness.attempts}"
+    assert harness.dropped == 1, f"expected client dropped once, got {harness.dropped}"
+    assert "took too long" in resp.content.lower() or "timeout" in resp.content.lower(), resp.content
+
+
+@test("claude_cli_text_recovery", "generate retries once on non-timeout Exception")
+async def t_retry_on_generic_error(ctx: TestContext) -> None:
+    harness = _RecordingCLI([RuntimeError("transient network blip"), ("recovered", {})])
+    resp = await harness.cli.generate(
+        [{"role": "user", "content": "ciao"}], session_id="t2"
+    )
+    assert harness.attempts == 2, f"expected 2 calls, got {harness.attempts}"
+    assert resp.content == "recovered", resp.content
+
+
+@test("claude_cli_text_recovery", "non-timeout error exhausts retries and reports error")
+async def t_retry_exhausted_on_error(ctx: TestContext) -> None:
+    harness = _RecordingCLI(
+        [RuntimeError("first fail"), RuntimeError("second fail")]
+    )
+    resp = await harness.cli.generate(
+        [{"role": "user", "content": "ciao"}], session_id="t3"
+    )
+    assert harness.attempts == 2, f"expected 2 calls, got {harness.attempts}"
+    assert resp.content.startswith("Error:"), resp.content
