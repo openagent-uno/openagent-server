@@ -743,3 +743,21 @@ async def t_handlers_session_ctxvar(ctx: TestContext) -> None:
     rec = handlers.get_hub().get(started["shell_id"])
     assert rec is not None
     assert rec.session_id == "sess-CTX", f"unexpected session_id: {rec.session_id}"
+
+
+@test("shell", "config.shell_settings returns defaults when unset")
+async def t_config_defaults(ctx: TestContext) -> None:
+    from openagent.core.config import shell_settings
+
+    s = shell_settings({})
+    assert s.wake_wait_window_seconds == 60.0
+    assert s.autoloop_cap == 25
+
+
+@test("shell", "config.shell_settings honours overrides")
+async def t_config_override(ctx: TestContext) -> None:
+    from openagent.core.config import shell_settings
+
+    s = shell_settings({"shell": {"wake_wait_window_seconds": 0, "autoloop_cap": 5}})
+    assert s.wake_wait_window_seconds == 0.0
+    assert s.autoloop_cap == 5

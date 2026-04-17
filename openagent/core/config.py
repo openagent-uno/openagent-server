@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -61,3 +62,30 @@ def load_config(path: str | Path | None = None) -> dict:
     with open(config_path) as f:
         raw = yaml.safe_load(f) or {}
     return _resolve_env_vars(raw)
+
+
+@dataclass(frozen=True)
+class ShellSettings:
+    """Runtime knobs for the in-process shell MCP.
+
+    wake_wait_window_seconds:
+        How long ``agent._run_inner`` sits after the model's final turn
+        waiting for a background shell to complete (so short builds get
+        auto-continuation). 0 disables; the default is 60.
+
+    autoloop_cap:
+        Maximum number of auto-continuation iterations per
+        ``agent.run()`` call, protecting against a runaway shell →
+        reminder → model → shell chain. Default 25.
+    """
+    wake_wait_window_seconds: float = 60.0
+    autoloop_cap: int = 25
+
+
+def shell_settings(config: dict) -> ShellSettings:
+    """Parse ShellSettings out of the top-level ``openagent.yaml`` dict."""
+    raw = (config or {}).get("shell") or {}
+    return ShellSettings(
+        wake_wait_window_seconds=float(raw.get("wake_wait_window_seconds", 60.0)),
+        autoloop_cap=int(raw.get("autoloop_cap", 25)),
+    )
