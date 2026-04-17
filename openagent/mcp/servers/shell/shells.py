@@ -286,3 +286,38 @@ class BackgroundShell:
             os.killpg(pgid, signal_module.SIGKILL)
         except ProcessLookupError:
             return
+
+    # ── Foreground helper ───────────────────────────────────────────
+
+    async def run_with_timeout(
+        self, *, timeout_seconds: float, stdin_data: str | None = None,
+    ) -> "ForegroundResult":
+        await self.start()
+        timed_out = False
+        try:
+            if stdin_data:
+                await self.write_stdin(stdin_data, press_enter=False)
+                # Close stdin so commands that read-until-EOF can exit.
+                if self._proc is not None and self._proc.stdin is not None:
+                    self._proc.stdin.close()
+            assert self._proc is not None
+            try:
+                await asyncio.wait_for(self._proc.wait(), timeout=timeout_seconds)
+            except asyncio.TimeoutError:
+                timed_out = True
+                await self.kill(signal_name="TERM", grace_seconds=DEFAULT_KILL_GRACE)
+        finally:
+            await self.finalise()
+        stdout, stderr = self.read(since_stdout=0, since_stderr=0)
+        started = self._started_at or 0.0
+        completed = self._completed_at or started
+        return ForegroundResult(
+            exit_code=self._exit_code,
+            signal=self._signal,
+            stdout=stdout,
+            stderr=stderr,
+            duration_ms=int((completed - started) * 1000),
+            timed_out=timed_out,
+            stdout_dropped=self._stdout_dropped,
+            stderr_dropped=self._stderr_dropped,
+        )

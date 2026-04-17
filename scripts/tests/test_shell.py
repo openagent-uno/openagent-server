@@ -368,3 +368,28 @@ async def t_bg_kill_escalate(ctx: TestContext) -> None:
     await bg.finalise()
     assert not bg.is_running
     assert bg.signal in ("KILL", "9"), f"expected KILL, got {bg.signal}"
+
+
+@test("shell", "BackgroundShell.run_with_timeout: fast command returns normally")
+async def t_bg_run_with_timeout_ok(ctx: TestContext) -> None:
+    from openagent.mcp.servers.shell.shells import BackgroundShell
+
+    bg = BackgroundShell(shell_id="sh_ok", command="echo abc", cwd=None, env=None)
+    result = await bg.run_with_timeout(timeout_seconds=2.0)
+    assert result.timed_out is False
+    assert result.exit_code == 0
+    assert "abc" in result.stdout
+
+
+@test("shell", "BackgroundShell.run_with_timeout: slow command is killed")
+async def t_bg_run_with_timeout_kill(ctx: TestContext) -> None:
+    import time
+    from openagent.mcp.servers.shell.shells import BackgroundShell
+
+    bg = BackgroundShell(shell_id="sh_slow", command="sleep 30", cwd=None, env=None)
+    t0 = time.time()
+    result = await bg.run_with_timeout(timeout_seconds=0.3)
+    elapsed = time.time() - t0
+    assert result.timed_out is True
+    assert elapsed < 5.0, f"kill took too long: {elapsed}"
+    assert result.signal in ("TERM", "KILL", "15", "9")
