@@ -6,10 +6,28 @@ we wrap them once per provider with the native decorator here.
 """
 from __future__ import annotations
 
+import contextvars
 import json
 from typing import Any
 
 from openagent.mcp.servers.shell import handlers
+
+_session_context: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "openagent_shell_session_id", default=None,
+)
+
+
+def set_session_context(session_id: str | None):
+    """Install ``session_id`` into the contextvar and return the token."""
+    return _session_context.set(session_id)
+
+
+def reset_session_context(token) -> None:
+    _session_context.reset(token)
+
+
+def current_session_id() -> str | None:
+    return _session_context.get()
 
 
 def _json_dump(value: Any) -> str:

@@ -722,3 +722,24 @@ async def t_pool_in_process_import_failure(ctx: TestContext) -> None:
         assert pool.claude_sdk_servers() == {}
     finally:
         await pool.close_all()
+
+
+@test("shell", "handlers: shell_exec picks up session_id from contextvar when arg is None")
+async def t_handlers_session_ctxvar(ctx: TestContext) -> None:
+    from openagent.mcp.servers.shell import handlers, adapters
+
+    _reset_shell_hub()
+    token = adapters.set_session_context("sess-CTX")
+    try:
+        started = await handlers.shell_exec(
+            command="echo ctxvar",
+            cwd=None, env=None, timeout=None,
+            run_in_background=True, stdin=None, description=None,
+            session_id=None,  # omit → fall back to contextvar
+        )
+    finally:
+        adapters.reset_session_context(token)
+    await handlers.get_hub().wait("sess-CTX", timeout=3.0)
+    rec = handlers.get_hub().get(started["shell_id"])
+    assert rec is not None
+    assert rec.session_id == "sess-CTX", f"unexpected session_id: {rec.session_id}"

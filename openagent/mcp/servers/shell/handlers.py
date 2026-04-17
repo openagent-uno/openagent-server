@@ -75,6 +75,10 @@ async def shell_exec(
     """
     if not command or not command.strip():
         raise ValueError("command must be a non-empty string")
+    if session_id is None:
+        # Fall back to the contextvar set by the provider adapter.
+        from openagent.mcp.servers.shell.adapters import current_session_id
+        session_id = current_session_id()
     timeout_s = _clamp_timeout(timeout)
     shell_id = _new_shell_id()
     bg = BackgroundShell(
@@ -257,6 +261,9 @@ async def shell_kill(
 # ── shell_list ──────────────────────────────────────────────────────
 
 async def shell_list(session_id: str | None = None) -> list[dict[str, Any]]:
+    if session_id is None:
+        from openagent.mcp.servers.shell.adapters import current_session_id
+        session_id = current_session_id()
     hub = get_hub()
     records = hub.list_for_session(session_id)
     now = time.time()
