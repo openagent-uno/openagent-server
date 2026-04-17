@@ -131,9 +131,7 @@ async def _watch_background(bg: BackgroundShell, session_id: str | None) -> None
     hub.mark_completed(
         bg.shell_id, exit_code=bg.exit_code, signal=bg.signal,
     )
-    kind = "completed"
-    if bg.signal in ("TERM", "KILL", "INT", "9", "15", "2"):
-        kind = "killed"
+    kind = "completed" if bg.exit_code is not None else "killed"
     event = ShellEvent(
         shell_id=bg.shell_id,
         kind=kind,
