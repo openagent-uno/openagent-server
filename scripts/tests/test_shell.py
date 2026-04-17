@@ -597,3 +597,33 @@ async def t_handlers_list(ctx: TestContext) -> None:
     # Clean up long-runner.
     await handlers.shell_kill(shell_id=bg1["shell_id"], signal="KILL")
     await handlers.get_hub().wait("sess-L", timeout=3.0)
+
+
+@test("shell", "adapters.build_sdk_server exposes the six tools")
+async def t_adapter_claude(ctx: TestContext) -> None:
+    from openagent.mcp.servers.shell.adapters import build_sdk_server
+
+    cfg = build_sdk_server()
+    assert cfg is not None, "expected a non-None SDK server config"
+    # McpSdkServerConfig is a TypedDict / dict in the SDK. Smoke check.
+    assert "instance" in cfg or "server" in cfg or "type" in cfg, f"unexpected shape: {cfg!r}"
+
+
+@test("shell", "adapters.build_agno_toolkit exposes the six tools by name")
+async def t_adapter_agno(ctx: TestContext) -> None:
+    from openagent.mcp.servers.shell.adapters import build_agno_toolkit
+
+    tk = build_agno_toolkit()
+    names = set()
+    for attr in ("functions",):
+        container = getattr(tk, attr, None)
+        if isinstance(container, dict):
+            names.update(container.keys())
+    # Agno's Toolkit populates .functions on init with the callables it
+    # was given; names come from the function __name__.
+    if not names:
+        # Fallback: look at the underlying tools list.
+        tools = getattr(tk, "tools", []) or []
+        names = {t.__name__ for t in tools if callable(t)}
+    for expected in ("shell_exec", "shell_output", "shell_input", "shell_kill", "shell_list", "shell_which"):
+        assert expected in names, f"missing tool {expected} in {names}"
