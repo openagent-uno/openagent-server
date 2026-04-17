@@ -524,3 +524,76 @@ async def t_handlers_output_filter(ctx: TestContext) -> None:
     )
     lines = [l for l in out["stdout_delta"].splitlines() if l]
     assert lines == ["line-beta", "line-gamma"], f"got: {lines}"
+
+
+@test("shell", "handlers.shell_input writes to a running shell's stdin")
+async def t_handlers_input(ctx: TestContext) -> None:
+    import asyncio
+    from openagent.mcp.servers.shell import handlers
+
+    _reset_shell_hub()
+    started = await handlers.shell_exec(
+        command="cat",
+        cwd=None, env=None, timeout=None,
+        run_in_background=True, stdin=None, description=None,
+        session_id="sess-I",
+    )
+    sid = started["shell_id"]
+    written = await handlers.shell_input(shell_id=sid, text="hey", press_enter=True)
+    assert written["bytes_written"] == len("hey\n")
+    # Brief pause so cat has time to echo the input before we kill it.
+    await asyncio.sleep(0.1)
+    # Kill to let the watcher fire so the hub state is clean.
+    await handlers.shell_kill(shell_id=sid, signal="KILL")
+    await handlers.get_hub().wait("sess-I", timeout=3.0)
+    out = await handlers.shell_output(shell_id=sid, filter=None, since_last=True)
+    assert "hey" in out["stdout_delta"]
+
+
+@test("shell", "handlers.shell_kill terminates a running shell")
+async def t_handlers_kill(ctx: TestContext) -> None:
+    from openagent.mcp.servers.shell import handlers
+
+    _reset_shell_hub()
+    started = await handlers.shell_exec(
+        command="sleep 30",
+        cwd=None, env=None, timeout=None,
+        run_in_background=True, stdin=None, description=None,
+        session_id="sess-K",
+    )
+    sid = started["shell_id"]
+    res = await handlers.shell_kill(shell_id=sid, signal="TERM")
+    assert res["killed"] is True
+    await handlers.get_hub().wait("sess-K", timeout=3.0)
+    rec = handlers.get_hub().get(sid)
+    assert rec is not None and rec.is_completed
+
+
+@test("shell", "handlers.shell_list returns running and recently-completed shells")
+async def t_handlers_list(ctx: TestContext) -> None:
+    from openagent.mcp.servers.shell import handlers
+
+    _reset_shell_hub()
+    bg1 = await handlers.shell_exec(
+        command="sleep 5", cwd=None, env=None, timeout=None,
+        run_in_background=True, stdin=None, description="long",
+        session_id="sess-L",
+    )
+    bg2 = await handlers.shell_exec(
+        command="echo fast", cwd=None, env=None, timeout=None,
+        run_in_background=True, stdin=None, description="short",
+        session_id="sess-L",
+    )
+    await handlers.get_hub().wait("sess-L", timeout=3.0)  # fast one completes
+
+    listing = await handlers.shell_list(session_id="sess-L")
+    assert isinstance(listing, list)
+    ids = {entry["shell_id"] for entry in listing}
+    assert bg1["shell_id"] in ids and bg2["shell_id"] in ids
+    states = {entry["shell_id"]: entry["state"] for entry in listing}
+    assert states[bg2["shell_id"]] == "completed"
+    assert states[bg1["shell_id"]] == "running"
+
+    # Clean up long-runner.
+    await handlers.shell_kill(shell_id=bg1["shell_id"], signal="KILL")
+    await handlers.get_hub().wait("sess-L", timeout=3.0)

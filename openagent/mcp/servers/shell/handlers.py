@@ -212,3 +212,84 @@ async def shell_which(command: str) -> dict[str, Any]:
     if path is None:
         return {"available": False}
     return {"available": True, "path": path}
+
+
+# ── shell_input ─────────────────────────────────────────────────────
+
+async def shell_input(
+    shell_id: str,
+    *,
+    text: str,
+    press_enter: bool = True,
+) -> dict[str, Any]:
+    rec = get_hub().get(shell_id)
+    if rec is None:
+        raise ValueError(f"unknown shell_id: {shell_id}")
+    if rec.shell is None:
+        raise RuntimeError(f"shell {shell_id} has no spawned process")
+    n = await rec.shell.write_stdin(text, press_enter=press_enter)
+    return {"bytes_written": n}
+
+
+# ── shell_kill ──────────────────────────────────────────────────────
+
+async def shell_kill(
+    shell_id: str,
+    *,
+    signal: str = "TERM",
+) -> dict[str, Any]:
+    rec = get_hub().get(shell_id)
+    if rec is None:
+        raise ValueError(f"unknown shell_id: {shell_id}")
+    if rec.shell is None:
+        raise RuntimeError(f"shell {shell_id} has no spawned process")
+    sig_name = signal.upper()
+    if sig_name not in ("TERM", "INT", "KILL"):
+        raise ValueError(f"unsupported signal: {signal}")
+    await rec.shell.kill(signal_name=sig_name)  # type: ignore[arg-type]
+    return {
+        "killed": True,
+        "exit_code": rec.shell.exit_code,
+        "signal": rec.shell.signal,
+    }
+
+
+# ── shell_list ──────────────────────────────────────────────────────
+
+async def shell_list(session_id: str | None = None) -> list[dict[str, Any]]:
+    hub = get_hub()
+    records = hub.list_for_session(session_id)
+    now = time.time()
+    out: list[dict[str, Any]] = []
+    for rec in records:
+        bg = rec.shell
+        if bg is None:
+            state = "completed" if rec.is_completed else "running"
+            started_at = rec.created_at
+            runtime_ms = int((now - started_at) * 1000)
+            stdout_bytes = 0
+            stderr_bytes = 0
+        else:
+            if bg.is_running:
+                state = "running"
+            elif bg.signal is not None:
+                state = "killed"
+            else:
+                state = "completed"
+            started_at = bg.started_at or rec.created_at
+            completed = bg.completed_at or now
+            runtime_ms = int((completed - started_at) * 1000)
+            stdout_bytes = bg.stdout_bytes_total
+            stderr_bytes = bg.stderr_bytes_total
+        out.append({
+            "shell_id": rec.shell_id,
+            "command": rec.command,
+            "state": state,
+            "started_at": started_at,
+            "runtime_ms": runtime_ms,
+            "stdout_bytes": stdout_bytes,
+            "stderr_bytes": stderr_bytes,
+            "exit_code": rec.exit_code,
+            "session_id": rec.session_id,
+        })
+    return out
