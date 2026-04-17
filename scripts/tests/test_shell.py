@@ -4,6 +4,12 @@ from __future__ import annotations
 from ._framework import TestContext, test
 
 
+def _reset_shell_hub() -> None:
+    """Isolate hub state between tests so they don't see leaked shells."""
+    from openagent.mcp.servers.shell import handlers
+    handlers._reset_hub_for_tests()
+
+
 @test("shell", "ShellEvent is a frozen dataclass with expected fields")
 async def t_shell_event_shape(ctx: TestContext) -> None:
     from openagent.mcp.servers.shell.events import ShellEvent
@@ -393,3 +399,54 @@ async def t_bg_run_with_timeout_kill(ctx: TestContext) -> None:
     assert result.timed_out is True
     assert elapsed < 5.0, f"kill took too long: {elapsed}"
     assert result.signal in ("TERM", "KILL", "15", "9")
+
+
+@test("shell", "handlers.shell_exec: foreground success")
+async def t_handlers_exec_fg_ok(ctx: TestContext) -> None:
+    _reset_shell_hub()
+    from openagent.mcp.servers.shell import handlers
+
+    out = await handlers.shell_exec(
+        command="echo one-two-three",
+        cwd=None, env=None, timeout=5000,
+        run_in_background=False, stdin=None, description=None,
+        session_id=None,
+    )
+    assert out["exit_code"] == 0
+    assert "one-two-three" in out["stdout"]
+    assert out["stderr"] == ""
+    assert out["timed_out"] is False
+
+
+@test("shell", "handlers.shell_exec: foreground timeout sets timed_out=True")
+async def t_handlers_exec_fg_timeout(ctx: TestContext) -> None:
+    _reset_shell_hub()
+    from openagent.mcp.servers.shell import handlers
+
+    out = await handlers.shell_exec(
+        command="sleep 10",
+        cwd=None, env=None, timeout=200,
+        run_in_background=False, stdin=None, description=None,
+        session_id=None,
+    )
+    assert out["timed_out"] is True
+    assert out["signal"] in ("TERM", "KILL", "15", "9")
+
+
+@test("shell", "handlers.shell_which: existing command returns path")
+async def t_handlers_which_ok(ctx: TestContext) -> None:
+    _reset_shell_hub()
+    from openagent.mcp.servers.shell import handlers
+
+    out = await handlers.shell_which(command="sh")
+    assert out["available"] is True
+    assert out["path"].endswith("/sh") or out["path"].endswith("sh.exe")
+
+
+@test("shell", "handlers.shell_which: missing command returns available=false")
+async def t_handlers_which_missing(ctx: TestContext) -> None:
+    _reset_shell_hub()
+    from openagent.mcp.servers.shell import handlers
+
+    out = await handlers.shell_which(command="definitely_not_a_real_binary_xyz_123")
+    assert out["available"] is False

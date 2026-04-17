@@ -1,0 +1,160 @@
+"""Pure-Python handlers for the six shell tools.
+
+Provider-agnostic: Claude SDK adapter and Agno adapter both wrap these
+functions with their own decorators. All state lives on the ShellHub
+singleton plus per-BackgroundShell buffers. No subprocess shenanigans
+here beyond asyncio.create_subprocess_exec (in BackgroundShell).
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import secrets
+import shutil
+import time
+from typing import Any
+
+from openagent.mcp.servers.shell.events import ShellEvent
+from openagent.mcp.servers.shell.hub import ShellHub
+from openagent.mcp.servers.shell.shells import BackgroundShell
+
+logger = logging.getLogger(__name__)
+
+# Defaults — match the spec § Tool surface and the v0.6 TS MCP.
+DEFAULT_TIMEOUT_MS = 120_000
+MAX_TIMEOUT_MS = 1_800_000  # 30 min
+
+
+_hub_singleton: ShellHub | None = None
+
+
+def get_hub() -> ShellHub:
+    """Return the process-wide ShellHub singleton, creating on demand."""
+    global _hub_singleton
+    if _hub_singleton is None:
+        _hub_singleton = ShellHub()
+    return _hub_singleton
+
+
+def _reset_hub_for_tests() -> None:
+    """Test-only helper: replace the singleton with a fresh instance."""
+    global _hub_singleton
+    _hub_singleton = ShellHub()
+
+
+def _new_shell_id() -> str:
+    return f"sh_{secrets.token_hex(3)}"
+
+
+def _clamp_timeout(ms: int | None) -> float:
+    if ms is None:
+        ms = DEFAULT_TIMEOUT_MS
+    ms = max(1, min(ms, MAX_TIMEOUT_MS))
+    return ms / 1000.0
+
+
+# ── shell_exec ──────────────────────────────────────────────────────
+
+async def shell_exec(
+    command: str,
+    *,
+    cwd: str | None = None,
+    env: dict[str, str] | None = None,
+    timeout: int | None = None,
+    run_in_background: bool = False,
+    stdin: str | None = None,
+    description: str | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """Foreground or background shell command.
+
+    Returns a dict. Foreground: exit_code / stdout / stderr /
+    duration_ms / timed_out / signal / truncated_stdout /
+    truncated_stderr. Background: shell_id / started_at.
+    """
+    if not command or not command.strip():
+        raise ValueError("command must be a non-empty string")
+    timeout_s = _clamp_timeout(timeout)
+    shell_id = _new_shell_id()
+    bg = BackgroundShell(
+        shell_id=shell_id,
+        command=command,
+        cwd=cwd,
+        env=env,
+    )
+    hub = get_hub()
+
+    if run_in_background:
+        await bg.start()
+        rec = hub.register(
+            shell_id=shell_id,
+            session_id=session_id,
+            command=command,
+            shell=bg,
+        )
+        if stdin:
+            await bg.write_stdin(stdin, press_enter=False)
+        # Schedule a watcher task to detect completion and post event.
+        asyncio.create_task(_watch_background(bg, session_id))
+        return {
+            "shell_id": shell_id,
+            "started_at": rec.created_at,
+            "description": description,
+        }
+
+    # Foreground path — no hub registration.
+    result = await bg.run_with_timeout(
+        timeout_seconds=timeout_s, stdin_data=stdin
+    )
+    return {
+        "exit_code": result.exit_code,
+        "signal": result.signal,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "duration_ms": result.duration_ms,
+        "timed_out": result.timed_out,
+        "truncated_stdout": result.stdout_dropped > 0,
+        "truncated_stderr": result.stderr_dropped > 0,
+    }
+
+
+async def _watch_background(bg: BackgroundShell, session_id: str | None) -> None:
+    """Wait for ``bg`` to exit and post a terminal event to the hub."""
+    try:
+        assert bg._proc is not None
+        await bg._proc.wait()
+    except Exception as e:  # noqa: BLE001
+        logger.debug("_watch_background %s failed: %s", bg.shell_id, e)
+        return
+    await bg.finalise()
+    hub = get_hub()
+    hub.mark_completed(
+        bg.shell_id, exit_code=bg.exit_code, signal=bg.signal,
+    )
+    kind = "completed"
+    if bg.signal in ("TERM", "KILL", "INT", "9", "15", "2"):
+        kind = "killed"
+    event = ShellEvent(
+        shell_id=bg.shell_id,
+        kind=kind,
+        exit_code=bg.exit_code,
+        signal=bg.signal,
+        bytes_stdout=bg.stdout_bytes_total,
+        bytes_stderr=bg.stderr_bytes_total,
+        at=time.time(),
+    )
+    hub.post_event(session_id, event)
+
+
+# ── shell_which ─────────────────────────────────────────────────────
+
+async def shell_which(command: str) -> dict[str, Any]:
+    if not command or "/" in command or "\\" in command:
+        # shutil.which handles "/" / "\\" differently across platforms;
+        # reject anything that looks like a path so the model gets an
+        # unambiguous error.
+        raise ValueError("command must be a bare program name (no path separator)")
+    path = shutil.which(command)
+    if path is None:
+        return {"available": False}
+    return {"available": True, "path": path}
