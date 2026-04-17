@@ -275,3 +275,56 @@ async def t_bg_read_cursor(ctx: TestContext) -> None:
     assert s1 == "ABC"
     s2, _ = bg.read(since_stdout=len(s1.encode()), since_stderr=0)
     assert s2 == "", f"expected empty after full read, got: {s2!r}"
+
+
+@test("shell", "BackgroundShell: write_stdin feeds a line to a running cat")
+async def t_bg_stdin_cat(ctx: TestContext) -> None:
+    import asyncio
+    from openagent.mcp.servers.shell.shells import BackgroundShell
+
+    bg = BackgroundShell(
+        shell_id="sh_cat",
+        command="cat",
+        cwd=None,
+        env=None,
+    )
+    await bg.start()
+    try:
+        n = await bg.write_stdin("hello\nworld\n", press_enter=False)
+        assert n == len("hello\nworld\n")
+        # Close stdin so cat exits.
+        assert bg._proc is not None
+        bg._proc.stdin.close()  # type: ignore[union-attr]
+        await bg._proc.wait()
+        await bg.finalise()
+    finally:
+        if bg.is_running:
+            await bg.kill(signal_name="KILL", grace_seconds=0)  # defensive
+    stdout, _ = bg.read(since_stdout=0, since_stderr=0)
+    assert "hello" in stdout and "world" in stdout
+
+
+@test("shell", "BackgroundShell: write_stdin with press_enter appends a newline")
+async def t_bg_stdin_press_enter(ctx: TestContext) -> None:
+    import asyncio
+    from openagent.mcp.servers.shell.shells import BackgroundShell
+
+    bg = BackgroundShell(
+        shell_id="sh_cat2",
+        command="cat",
+        cwd=None,
+        env=None,
+    )
+    await bg.start()
+    try:
+        n = await bg.write_stdin("ping", press_enter=True)
+        assert n == len("ping\n")
+        assert bg._proc is not None
+        bg._proc.stdin.close()  # type: ignore[union-attr]
+        await bg._proc.wait()
+        await bg.finalise()
+    finally:
+        if bg.is_running:
+            await bg.kill(signal_name="KILL", grace_seconds=0)
+    stdout, _ = bg.read(since_stdout=0, since_stderr=0)
+    assert stdout.rstrip("\n") == "ping"

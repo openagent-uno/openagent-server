@@ -236,9 +236,16 @@ class BackgroundShell:
             self._exit_code = rc
         self._completed_at = time.time()
 
-    # Placeholder — next task implements these.
     async def write_stdin(self, text: str, *, press_enter: bool = True) -> int:
-        raise NotImplementedError
+        if self._proc is None or self._proc.stdin is None:
+            raise RuntimeError(f"shell {self.shell_id} has no stdin (not started?)")
+        if self._proc.returncode is not None:
+            raise RuntimeError(f"shell {self.shell_id} has exited")
+        payload = text + "\n" if press_enter and not text.endswith("\n") else text
+        data = payload.encode("utf-8")
+        self._proc.stdin.write(data)
+        await self._proc.stdin.drain()
+        return len(data)
 
     async def kill(self, *, signal_name: SignalName = "TERM", grace_seconds: float = DEFAULT_KILL_GRACE) -> None:
         raise NotImplementedError
