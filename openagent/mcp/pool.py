@@ -29,6 +29,7 @@ is configured but has no tools — set TELEGRAM_BOT_TOKEN to enable").
 from __future__ import annotations
 
 import asyncio
+import importlib
 import logging
 import os
 import shutil
@@ -332,10 +333,14 @@ class MCPPool:
             for spec in self.specs:
                 if not spec.in_process:
                     continue
-                import importlib
-                mod = importlib.import_module(spec.adapter_module)  # type: ignore[arg-type]
-                sdk_factory = getattr(mod, spec.sdk_server_factory, None)
-                agno_factory = getattr(mod, spec.agno_toolkit_factory, None)
+                try:
+                    mod = importlib.import_module(spec.adapter_module)  # type: ignore[arg-type]
+                    sdk_factory = getattr(mod, spec.sdk_server_factory, None)
+                    agno_factory = getattr(mod, spec.agno_toolkit_factory, None)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("in-process MCP '%s' import error: %s", spec.name, e)
+                    elog("mcp.error", name=spec.name, error=str(e))
+                    continue
                 if sdk_factory is None or agno_factory is None:
                     logger.warning(
                         "in-process MCP '%s' missing factories (%s / %s) — skipping",

@@ -700,3 +700,25 @@ async def t_pool_in_process_claude(ctx: TestContext) -> None:
         assert isinstance(cfg, dict) and cfg, f"expected non-empty dict, got {cfg!r}"
     finally:
         await pool.close_all()
+
+
+@test("shell", "MCPPool: bad adapter_module is isolated (pool stays healthy)")
+async def t_pool_in_process_import_failure(ctx: TestContext) -> None:
+    from openagent.mcp.pool import MCPPool, _ServerSpec
+
+    # Construct a pool directly with a single broken in-process spec.
+    broken = _ServerSpec(
+        name="broken_shell",
+        in_process=True,
+        adapter_module="openagent.mcp.servers.does_not_exist",
+        sdk_server_factory="build_sdk_server",
+        agno_toolkit_factory="build_agno_toolkit",
+    )
+    pool = MCPPool(specs=[broken])
+    # connect_all must NOT raise — the broken spec is simply skipped.
+    await pool.connect_all()
+    try:
+        assert pool.agno_toolkits == []
+        assert pool.claude_sdk_servers() == {}
+    finally:
+        await pool.close_all()
