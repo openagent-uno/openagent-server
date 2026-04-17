@@ -90,6 +90,9 @@ class _ServerSpec:
 
     ``command`` is a fully resolved argv list; ``url`` is set for HTTP/SSE
     servers; ``env`` and ``cwd`` are forwarded to the subprocess.
+    ``in_process`` is True for servers whose tools run in the same Python
+    process (no subprocess) — the pool loads the adapter module and calls
+    the named factory functions directly.
     """
     name: str
     command: list[str] | None = None
@@ -99,6 +102,10 @@ class _ServerSpec:
     cwd: str | None = None
     headers: dict[str, str] | None = None
     oauth: bool = False
+    in_process: bool = False
+    adapter_module: str | None = None
+    sdk_server_factory: str = "build_sdk_server"
+    agno_toolkit_factory: str = "build_agno_toolkit"
 
     @property
     def is_stdio(self) -> bool:
@@ -233,6 +240,10 @@ def _spec_from_kwargs(kwargs: dict[str, Any]) -> _ServerSpec:
         cwd=kwargs.get("_cwd"),
         headers=kwargs.get("headers"),
         oauth=bool(kwargs.get("oauth")),
+        in_process=bool(kwargs.get("in_process", False)),
+        adapter_module=kwargs.get("adapter_module"),
+        sdk_server_factory=kwargs.get("sdk_server_factory", "build_sdk_server"),
+        agno_toolkit_factory=kwargs.get("agno_toolkit_factory", "build_agno_toolkit"),
     )
 
 
@@ -261,6 +272,11 @@ class MCPPool:
         self._tool_counts: dict[str, int] = {name: 0 for name in (s.name for s in specs)}
         self._connected = False
         self._lock = asyncio.Lock()
+        # In-process MCP state — populated by connect_all for specs with
+        # in_process=True. These are kept separate from subprocess toolkits
+        # so close_all can handle them independently (no AsyncExitStack needed).
+        self._in_process_sdk_servers: dict[str, Any] = {}
+        self._in_process_agno_toolkits: list[Any] = []
 
     @classmethod
     def from_config(
@@ -290,7 +306,10 @@ class MCPPool:
         async with self._lock:
             if self._connected:
                 return
+            # 1. Subprocess-based MCPs (stdio / HTTP).
             for spec in self.specs:
+                if spec.in_process:
+                    continue
                 toolkit = await self._build_and_enter_toolkit(spec)
                 if toolkit is not None:
                     self._agno_toolkits.append(toolkit)
@@ -307,6 +326,35 @@ class MCPPool:
                             spec.name,
                         )
                         elog("mcp.dormant", name=spec.name)
+
+            # 2. In-process MCPs — loaded by importing the adapter module and
+            #    calling the named factory functions. No subprocess is spawned.
+            for spec in self.specs:
+                if not spec.in_process:
+                    continue
+                import importlib
+                mod = importlib.import_module(spec.adapter_module)  # type: ignore[arg-type]
+                sdk_factory = getattr(mod, spec.sdk_server_factory, None)
+                agno_factory = getattr(mod, spec.agno_toolkit_factory, None)
+                if sdk_factory is None or agno_factory is None:
+                    logger.warning(
+                        "in-process MCP '%s' missing factories (%s / %s) — skipping",
+                        spec.name, spec.sdk_server_factory, spec.agno_toolkit_factory,
+                    )
+                    continue
+                try:
+                    sdk_cfg = sdk_factory()
+                    agno_tk = agno_factory()
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("in-process MCP '%s' factory error: %s", spec.name, e)
+                    elog("mcp.error", name=spec.name, error=str(e))
+                    continue
+                self._in_process_sdk_servers[spec.name] = sdk_cfg
+                self._in_process_agno_toolkits.append(agno_tk)
+                count = 6  # six shell tools
+                self._tool_counts[spec.name] = count
+                elog("mcp.connect", name=spec.name, tools=count, kind="in_process")
+
             self._connected = True
 
     async def close_all(self) -> None:
@@ -326,6 +374,8 @@ class MCPPool:
             stacks = list(self._toolkit_stacks)
             self._toolkit_stacks.clear()
             self._agno_toolkits.clear()
+            self._in_process_sdk_servers.clear()
+            self._in_process_agno_toolkits.clear()
             self._connected = False
         # Close in reverse registration order so toolkits that share
         # resources tear down the way AsyncExitStack would have.
@@ -456,11 +506,21 @@ class MCPPool:
 
     @property
     def agno_toolkits(self) -> list[Any]:
-        """Connected Agno ``MCPTools`` instances. Pass directly to ``Agent(tools=...)``."""
-        return list(self._agno_toolkits)
+        """Connected Agno ``MCPTools`` instances plus in-process Toolkits.
+
+        Pass directly to ``Agent(tools=...)``; both subprocess MCPTools and
+        in-process Toolkit objects satisfy the same Agno interface.
+        """
+        return list(self._agno_toolkits) + list(self._in_process_agno_toolkits)
 
     def claude_sdk_servers(self) -> dict[str, dict[str, Any]]:
-        return {spec.name: spec.claude_sdk_entry() for spec in self.specs}
+        base = {
+            spec.name: spec.claude_sdk_entry()
+            for spec in self.specs
+            if not spec.in_process
+        }
+        base.update(self._in_process_sdk_servers)
+        return base
 
     # ── Introspection (used by Agent for system prompt + health endpoints) ─
 

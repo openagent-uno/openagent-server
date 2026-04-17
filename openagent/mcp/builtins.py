@@ -153,10 +153,10 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
         # No DISPLAY env — the Rust binary picks the right backend per OS.
     },
     "shell": {
-        "dir": "shell",
-        "command": ["node", "dist/index.js"],
-        "build": ["npm", "run", "build"],
-        "install": ["npm", "install"],
+        "in_process": True,
+        "adapter_module": "openagent.mcp.servers.shell.adapters",
+        "sdk_server_factory": "build_sdk_server",
+        "agno_toolkit_factory": "build_agno_toolkit",
     },
     "web-search": {
         "dir": "web-search",
@@ -302,6 +302,18 @@ def resolve_builtin_entry(name: str, env: dict[str, str] | None = None) -> dict[
         raise ValueError(f"Unknown built-in MCP: {name}. Available: {available}")
 
     spec = BUILTIN_MCP_SPECS[name]
+
+    # In-process specs don't need a directory, a subprocess, or Node — return
+    # early with a lightweight descriptor that MCPPool knows how to consume.
+    if spec.get("in_process"):
+        return {
+            "name": name,
+            "in_process": True,
+            "adapter_module": spec["adapter_module"],
+            "sdk_server_factory": spec.get("sdk_server_factory", "build_sdk_server"),
+            "agno_toolkit_factory": spec.get("agno_toolkit_factory", "build_agno_toolkit"),
+        }
+
     mcp_dir = BUILTIN_MCPS_DIR / spec["dir"]
     is_native = spec.get("native", False)
 
@@ -387,7 +399,8 @@ def resolve_default_entry(entry: dict[str, Any], db_path: str | None = None) -> 
         spec = BUILTIN_MCP_SPECS.get(entry["builtin"])
         is_python = spec.get("python", False) if spec else False
         is_native = spec.get("native", False) if spec else False
-        if not is_python and not is_native and not command_exists("node"):
+        is_in_process = spec.get("in_process", False) if spec else False
+        if not is_python and not is_native and not is_in_process and not command_exists("node"):
             logger.warning("Skipping default MCP '%s': Node.js not found", name)
             return None
         if entry["builtin"] == "chrome-devtools" and not _node_meets_minimum(22, 12, 0):

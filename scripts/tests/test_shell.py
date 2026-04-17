@@ -659,3 +659,44 @@ async def t_adapter_claude_schema(ctx: TestContext) -> None:
         f"run_in_background type: {props.get('run_in_background')}"
     assert props.get("timeout", {}).get("type") == "integer", \
         f"timeout type: {props.get('timeout')}"
+
+
+@test("shell", "MCPPool: in-process shell toolkit appears in agno_toolkits")
+async def t_pool_in_process_agno(ctx: TestContext) -> None:
+    from openagent.mcp.pool import MCPPool
+
+    pool = MCPPool.from_config(
+        mcp_config=[{"builtin": "shell"}],
+        include_defaults=False,
+        disable=None,
+        db_path=str(ctx.db_path),
+    )
+    await pool.connect_all()
+    try:
+        kits = pool.agno_toolkits
+        assert len(kits) == 1, f"expected 1 toolkit, got {len(kits)}: {kits}"
+        kit = kits[0]
+        assert getattr(kit, "name", None) == "shell"
+    finally:
+        await pool.close_all()
+
+
+@test("shell", "MCPPool: in-process shell appears in claude_sdk_servers")
+async def t_pool_in_process_claude(ctx: TestContext) -> None:
+    from openagent.mcp.pool import MCPPool
+
+    pool = MCPPool.from_config(
+        mcp_config=[{"builtin": "shell"}],
+        include_defaults=False,
+        disable=None,
+        db_path=str(ctx.db_path),
+    )
+    await pool.connect_all()
+    try:
+        servers = pool.claude_sdk_servers()
+        assert "shell" in servers
+        cfg = servers["shell"]
+        # McpSdkServerConfig is a dict with SDK-specific keys.
+        assert isinstance(cfg, dict) and cfg, f"expected non-empty dict, got {cfg!r}"
+    finally:
+        await pool.close_all()
