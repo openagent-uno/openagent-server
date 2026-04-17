@@ -926,3 +926,43 @@ async def t_agent_autoloop_cap(ctx: TestContext) -> None:
     )
     assert model.turns == 3, f"turns: {model.turns}"
     assert "turn 3" in result
+
+
+@test("shell", "agent.forget_session purges hub entries for that session")
+async def t_agent_forget_purges_hub(ctx: TestContext) -> None:
+    from openagent.core.agent import Agent
+    from openagent.models.base import BaseModel, ModelResponse
+    from openagent.mcp.servers.shell import handlers
+
+    _reset_shell_hub()
+    handlers.get_hub().register(shell_id="sh_x", session_id="S-FOR", command="echo")
+    handlers.get_hub().mark_completed("sh_x", exit_code=0, signal=None)
+
+    class NoopModel(BaseModel):
+        history_mode = "provider"
+        async def generate(self, *a, **kw): return ModelResponse(content="")
+
+    agent = Agent(name="test", model=NoopModel())
+    agent._initialized = True
+    await agent.forget_session("S-FOR")
+    assert handlers.get_hub().list_for_session("S-FOR") == []
+
+
+@test("shell", "agent.shutdown clears the hub")
+async def t_agent_shutdown_clears_hub(ctx: TestContext) -> None:
+    from openagent.core.agent import Agent
+    from openagent.models.base import BaseModel, ModelResponse
+    from openagent.mcp.servers.shell import handlers
+
+    _reset_shell_hub()
+    handlers.get_hub().register(shell_id="sh_y", session_id="S-SH", command="echo")
+    handlers.get_hub().mark_completed("sh_y", exit_code=0, signal=None)
+
+    class NoopModel(BaseModel):
+        history_mode = "provider"
+        async def generate(self, *a, **kw): return ModelResponse(content="")
+
+    agent = Agent(name="test", model=NoopModel())
+    agent._initialized = True
+    await agent.shutdown()
+    assert handlers.get_hub().get("sh_y") is None

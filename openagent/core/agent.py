@@ -228,6 +228,11 @@ class Agent:
         if not callable(close_session):
             return
         await close_session(session_id)
+        try:
+            from openagent.mcp.servers.shell.handlers import get_hub
+            await get_hub().purge_session(session_id)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("shell hub purge for %s failed: %s", session_id, e)
 
     def known_model_session_ids(
         self, *, model_override: BaseModel | None = None
@@ -272,12 +277,17 @@ class Agent:
         forget_session = getattr(model, "forget_session", None)
         if callable(forget_session):
             await forget_session(session_id)
-            return
-        # Fallback: release live resources even if provider lacks explicit
-        # forget support — best-effort; SDK-side resume state may linger.
-        close_session = getattr(model, "close_session", None)
-        if callable(close_session):
-            await close_session(session_id)
+        else:
+            # Fallback: release live resources even if provider lacks explicit
+            # forget support — best-effort; SDK-side resume state may linger.
+            close_session = getattr(model, "close_session", None)
+            if callable(close_session):
+                await close_session(session_id)
+        try:
+            from openagent.mcp.servers.shell.handlers import get_hub
+            await get_hub().purge_session(session_id)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("shell hub purge for %s failed: %s", session_id, e)
 
     async def initialize(self) -> None:
         """Connect MCP servers and initialize memory DB."""
@@ -310,7 +320,14 @@ class Agent:
                 if not callable(cleanup_idle):
                     continue
                 try:
-                    await cleanup_idle()
+                    released_ids = await cleanup_idle()
+                    if released_ids:
+                        try:
+                            from openagent.mcp.servers.shell.handlers import get_hub
+                            for sid in released_ids:
+                                await get_hub().purge_session(sid)
+                        except Exception as e:  # noqa: BLE001
+                            logger.debug("shell hub purge on idle cleanup failed: %s", e)
                 except Exception as e:
                     logger.debug("Idle cleanup error: %s", e)
 
@@ -334,6 +351,11 @@ class Agent:
                 except Exception as e:  # noqa: BLE001
                     logger.warning("Model shutdown error: %s", e)
         await self._mcp.close_all()
+        try:
+            from openagent.mcp.servers.shell.handlers import get_hub
+            await get_hub().shutdown()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("shell hub shutdown failed: %s", e)
         if self._db:
             await self._db.close()
         self._initialized = False
