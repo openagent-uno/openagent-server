@@ -328,3 +328,43 @@ async def t_bg_stdin_press_enter(ctx: TestContext) -> None:
             await bg.kill(signal_name="KILL", grace_seconds=0)
     stdout, _ = bg.read(since_stdout=0, since_stderr=0)
     assert stdout.rstrip("\n") == "ping"
+
+
+@test("shell", "BackgroundShell: kill TERM stops a sleep")
+async def t_bg_kill_term(ctx: TestContext) -> None:
+    import asyncio
+    from openagent.mcp.servers.shell.shells import BackgroundShell
+
+    bg = BackgroundShell(
+        shell_id="sh_sleep",
+        command="sleep 30",
+        cwd=None,
+        env=None,
+    )
+    await bg.start()
+    await asyncio.sleep(0.1)  # let it actually start
+    await bg.kill(signal_name="TERM", grace_seconds=2.0)
+    await bg.finalise()
+    assert not bg.is_running
+    # POSIX SIGTERM — signal captured, exit_code is None.
+    assert bg.signal in ("TERM", "15"), f"unexpected signal: {bg.signal}"
+
+
+@test("shell", "BackgroundShell: kill escalates to KILL if TERM ignored")
+async def t_bg_kill_escalate(ctx: TestContext) -> None:
+    import asyncio
+    from openagent.mcp.servers.shell.shells import BackgroundShell
+
+    # Trap TERM so only KILL works.
+    bg = BackgroundShell(
+        shell_id="sh_trap",
+        command="trap '' TERM; sleep 30",
+        cwd=None,
+        env=None,
+    )
+    await bg.start()
+    await asyncio.sleep(0.2)  # make sure trap is installed
+    await bg.kill(signal_name="TERM", grace_seconds=0.5)
+    await bg.finalise()
+    assert not bg.is_running
+    assert bg.signal in ("KILL", "9"), f"expected KILL, got {bg.signal}"

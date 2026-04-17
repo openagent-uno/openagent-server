@@ -247,5 +247,42 @@ class BackgroundShell:
         await self._proc.stdin.drain()
         return len(data)
 
-    async def kill(self, *, signal_name: SignalName = "TERM", grace_seconds: float = DEFAULT_KILL_GRACE) -> None:
-        raise NotImplementedError
+    async def kill(
+        self,
+        *,
+        signal_name: SignalName = "TERM",
+        grace_seconds: float = DEFAULT_KILL_GRACE,
+    ) -> None:
+        """Kill the subprocess with ``signal_name``; if it's still alive
+        after ``grace_seconds``, escalate to SIGKILL. No-op if already
+        exited.
+
+        Uses ``os.killpg`` since the subprocess was started with
+        ``start_new_session=True`` — child processes of the shell get
+        the signal too (important for ``npm run build`` style commands
+        that spawn their own children).
+        """
+        if self._proc is None or self._proc.returncode is not None:
+            return
+        pgid = os.getpgid(self._proc.pid)
+        sig_map = {
+            "TERM": signal_module.SIGTERM,
+            "INT": signal_module.SIGINT,
+            "KILL": signal_module.SIGKILL,
+        }
+        first = sig_map.get(signal_name, signal_module.SIGTERM)
+        try:
+            os.killpg(pgid, first)
+        except ProcessLookupError:
+            return
+        if first == signal_module.SIGKILL or grace_seconds <= 0:
+            return
+        try:
+            await asyncio.wait_for(self._proc.wait(), timeout=grace_seconds)
+            return
+        except asyncio.TimeoutError:
+            pass
+        try:
+            os.killpg(pgid, signal_module.SIGKILL)
+        except ProcessLookupError:
+            return
