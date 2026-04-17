@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import shutil
 from pathlib import Path
 
@@ -13,6 +12,7 @@ from rich.panel import Panel
 
 from openagent.core import paths
 from openagent.core.config import load_config
+from openagent.core.logging import setup_logging
 from openagent.core.server import AgentServer
 
 console = Console()
@@ -88,10 +88,7 @@ def main(ctx, config: str, agent_dir: str | None, verbose: bool):
     """OpenAgent runtime CLI."""
     ctx.ensure_object(dict)
 
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.WARNING,
-        format="%(name)s: %(message)s",
-    )
+    setup_logging(verbose=verbose)
 
     _setup_agent_dir(agent_dir)
     _startup_cleanup()

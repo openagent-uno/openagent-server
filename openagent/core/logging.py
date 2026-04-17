@@ -1,110 +1,133 @@
-"""Unified structured event logger for OpenAgent.
+"""Unified logging for OpenAgent.
 
-Every significant event in OpenAgent (session lifecycle, tool execution,
-MCP connections, bridge status, errors, restarts …) is logged as a single
-JSON-lines entry to ``<log_dir>/events.jsonl``.
+One system, two outputs:
 
-Usage::
+* **Console / stdout** — free-form messages from any module via the stdlib
+  ``logger = logging.getLogger(__name__)`` pattern.  Captured by systemd/launchd.
+* **events.jsonl** — structured events via :func:`elog`, appended as one JSON
+  object per line to ``<log_dir>/events.jsonl``.
 
-    from openagent.core.logging import elog
+Everything is plain stdlib ``logging``.  :func:`elog` is just a convenience
+wrapper that attaches structured data to a record on the ``openagent.events``
+logger; a JSON formatter on that logger's file handler turns the record into
+one line of JSONL.
 
-    elog("tool.start", tool="bash", params={"command": "ls"})
-    elog("session.create", session_id="abc-123", client_id="app-1")
-
-The convenience function :func:`elog` is the **only** call site most
-modules need.  It writes one JSON object per line and also emits
-the event to Python's standard ``logging`` at INFO level so that
-systemd/launchd stdout capture still works.
+Call :func:`setup_logging` once at process start (the CLI does this).
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import time
 from pathlib import Path
 from typing import Any
 
 from openagent.core.paths import log_dir
 
-_std_logger = logging.getLogger("openagent.events")
+EVENT_LOGGER_NAME = "openagent.events"
 
-# ---------------------------------------------------------------------------
-# EventLogger singleton
-# ---------------------------------------------------------------------------
-
-
-class EventLogger:
-    """Append-only JSONL logger stored at ``<log_dir>/events.jsonl``."""
-
-    _instance: EventLogger | None = None
-
-    @classmethod
-    def get(cls) -> EventLogger:
-        if cls._instance is None:
-            cls._instance = cls()
-        return cls._instance
-
-    def __init__(self) -> None:
-        self._path: Path = log_dir() / "events.jsonl"
-        self._file = open(self._path, "a", encoding="utf-8")  # noqa: SIM115
-
-    # -- write --
-
-    def log(self, event: str, **data: Any) -> None:
-        """Append one structured event entry."""
-        entry: dict[str, Any] = {"ts": time.time(), "event": event, **data}
-        line = json.dumps(entry, default=str)
-        self._file.write(line + "\n")
-        self._file.flush()
-        # Mirror to standard logging (truncated) for console/systemd.
-        _std_logger.info("[%s] %s", event, json.dumps(data, default=str)[:200])
-
-    # -- read --
-
-    def read_tail(
-        self,
-        lines: int = 100,
-        event_filter: str | None = None,
-    ) -> list[dict[str, Any]]:
-        """Return the last *lines* entries, optionally filtered by event prefix."""
-        try:
-            all_lines = self._path.read_text(encoding="utf-8").splitlines()
-        except FileNotFoundError:
-            return []
-        result: list[dict[str, Any]] = []
-        for raw in reversed(all_lines):
-            if not raw.strip():
-                continue
-            try:
-                entry = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            if event_filter and not entry.get("event", "").startswith(event_filter):
-                continue
-            result.append(entry)
-            if len(result) >= lines:
-                break
-        result.reverse()
-        return result
-
-    # -- maintenance --
-
-    def clear(self) -> None:
-        """Truncate the log file (called by dream mode daily)."""
-        self._file.close()
-        self._path.write_text("", encoding="utf-8")
-        self._file = open(self._path, "a", encoding="utf-8")  # noqa: SIM115
-
-    def close(self) -> None:
-        self._file.close()
+# Marker attribute used to recognise our own handlers so we never attach
+# duplicates when setup_logging / _ensure_events_handler run twice.
+_OWNED = "_openagent_owned"
 
 
-# ---------------------------------------------------------------------------
-# Module-level convenience
-# ---------------------------------------------------------------------------
+# ── Public API ───────────────────────────────────────────────────────────────
 
 
 def elog(event: str, **data: Any) -> None:
-    """Log a structured event.  Shorthand for ``EventLogger.get().log(…)``."""
-    EventLogger.get().log(event, **data)
+    """Log a structured event to ``events.jsonl`` (and mirror to stdout)."""
+    _ensure_events_handler()
+    logging.getLogger(EVENT_LOGGER_NAME).info(event, extra={"event_data": data})
+
+
+def setup_logging(verbose: bool = False) -> None:
+    """Configure stdlib logging for the whole process.
+
+    Attaches exactly one console handler to the root logger, and ensures the
+    ``openagent.events`` logger has its JSONL file handler.  Safe to call
+    repeatedly — duplicate handlers are skipped.
+    """
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG if verbose else logging.WARNING)
+
+    if not _has_owned_handler(root):
+        console = logging.StreamHandler()
+        console.setFormatter(logging.Formatter("%(name)s: %(message)s"))
+        setattr(console, _OWNED, True)
+        root.addHandler(console)
+
+    _ensure_events_handler()
+
+
+def read_tail(
+    lines: int = 100,
+    event_filter: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return the last *lines* entries from ``events.jsonl``.
+
+    Optionally keep only entries whose event name starts with *event_filter*.
+    """
+    try:
+        raw_lines = _events_path().read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return []
+
+    result: list[dict[str, Any]] = []
+    for raw in reversed(raw_lines):
+        if not raw.strip():
+            continue
+        try:
+            entry = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if event_filter and not entry.get("event", "").startswith(event_filter):
+            continue
+        result.append(entry)
+        if len(result) >= lines:
+            break
+    result.reverse()
+    return result
+
+
+def clear() -> None:
+    """Truncate ``events.jsonl``.  The next :func:`elog` call reopens the file."""
+    events = logging.getLogger(EVENT_LOGGER_NAME)
+    for handler in list(events.handlers):
+        if getattr(handler, _OWNED, False):
+            handler.close()
+            events.removeHandler(handler)
+    _events_path().write_text("", encoding="utf-8")
+
+
+# ── Internals ────────────────────────────────────────────────────────────────
+
+
+def _events_path() -> Path:
+    return log_dir() / "events.jsonl"
+
+
+def _has_owned_handler(logger: logging.Logger) -> bool:
+    return any(getattr(h, _OWNED, False) for h in logger.handlers)
+
+
+def _ensure_events_handler() -> None:
+    events = logging.getLogger(EVENT_LOGGER_NAME)
+    events.setLevel(logging.INFO)  # capture events even without --verbose
+    if _has_owned_handler(events):
+        return
+    handler = logging.FileHandler(_events_path(), encoding="utf-8")
+    handler.setFormatter(_JsonlFormatter())
+    setattr(handler, _OWNED, True)
+    events.addHandler(handler)
+
+
+class _JsonlFormatter(logging.Formatter):
+    """Format an event record as ``{"ts", "event", **event_data}`` JSON."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        entry: dict[str, Any] = {
+            "ts": record.created,
+            "event": record.getMessage(),
+            **getattr(record, "event_data", {}),
+        }
+        return json.dumps(entry, default=str)

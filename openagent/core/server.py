@@ -18,7 +18,7 @@ import signal
 from openagent.core.agent import Agent
 from openagent.memory.db import MemoryDB
 from openagent.models.runtime import create_model_from_config, wire_model_runtime
-from openagent.core.logging import elog
+from openagent.core.logging import clear as clear_event_log, elog
 
 logger = logging.getLogger(__name__)
 
@@ -460,8 +460,7 @@ class AgentServer:
                     await _orig(task)
                     elog("dream.done")
                     # Clear the event log daily
-                    from openagent.core.logging import EventLogger
-                    EventLogger.get().clear()
+                    clear_event_log()
                     elog("dream.log_cleared")
                 else:
                     await _orig(task)
