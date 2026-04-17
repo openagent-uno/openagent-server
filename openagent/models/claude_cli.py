@@ -265,6 +265,24 @@ class ClaudeCLI(BaseModel):
         on the same session are already serialized one level up, and we
         want the slow ``await client.connect()`` to run outside the
         registry lock so other sessions stay responsive.
+
+        Self-heals stale ``--resume`` state: the Claude CLI prints
+        ``No conversation found with session ID`` and exits 1 when the
+        stored SDK session UUID no longer exists (pruned by claude's own
+        housekeeping, or cleared by the user re-logging in). The SDK
+        surfaces this as a ``ProcessError`` with a generic message —
+        ``stderr`` is hardcoded to ``"Check stderr output for details"``
+        so we can't introspect the real error text. The observed
+        symptom is a hard crash loop: every message retries with the
+        same poisoned resume id and every retry fails the same way.
+
+        Our recovery: when ``connect()`` fails *and* we carry a stored
+        resume id, assume it might be stale, drop it (in memory + DB),
+        and retry once with no ``--resume``. If the root cause is
+        something else (bad API key, CLI missing, etc.) the fresh
+        attempt fails the same way and we bubble up with a cleaner
+        error — no worse than the single-shot behaviour we had before,
+        and in the stale-resume case the session self-heals.
         """
         if session.client is not None:
             session.last_active = time.time()
@@ -285,23 +303,62 @@ class ClaudeCLI(BaseModel):
             pool_size=len(self._sessions),
             resume=bool(session.sdk_session_id),
         )
-        client = ClaudeSDKClient(
-            options=self._build_options(
-                system=system, sdk_session_id=session.sdk_session_id
+
+        async def _connect_once(resume_id: str | None) -> Any:
+            new_client = ClaudeSDKClient(
+                options=self._build_options(system=system, sdk_session_id=resume_id)
             )
-        )
+            await new_client.connect()
+            return new_client
+
+        resume_sid = session.sdk_session_id
         try:
-            await client.connect()
+            client = await _connect_once(resume_sid)
         except Exception as e:
-            logger.exception(
-                "ClaudeSDKClient.connect() failed for %s", session.session_id
-            )
-            elog(
-                "model.connect_error",
-                session_id=session.session_id,
-                error=str(e),
-            )
-            raise
+            if resume_sid:
+                logger.warning(
+                    "ClaudeSDKClient.connect() failed for %s with resume=%s; "
+                    "clearing the stored resume id and retrying fresh (%s)",
+                    session.session_id, resume_sid[:8], e,
+                )
+                elog(
+                    "model.stale_resume_recovery",
+                    session_id=session.session_id,
+                    stale_sdk_session_id=resume_sid,
+                    error=str(e),
+                )
+                session.sdk_session_id = None
+                if self._db is not None:
+                    try:
+                        await self._db.delete_sdk_session(session.session_id)
+                    except Exception as db_e:  # noqa: BLE001 — best effort
+                        logger.debug(
+                            "stale delete_sdk_session %s: %s",
+                            session.session_id, db_e,
+                        )
+                try:
+                    client = await _connect_once(None)
+                except Exception as e2:
+                    logger.exception(
+                        "ClaudeSDKClient.connect() failed for %s (fresh retry)",
+                        session.session_id,
+                    )
+                    elog(
+                        "model.connect_error",
+                        session_id=session.session_id,
+                        error=str(e2),
+                    )
+                    raise
+            else:
+                logger.exception(
+                    "ClaudeSDKClient.connect() failed for %s", session.session_id
+                )
+                elog(
+                    "model.connect_error",
+                    session_id=session.session_id,
+                    error=str(e),
+                )
+                raise
         session.client = client
         session.last_active = time.time()
         return client

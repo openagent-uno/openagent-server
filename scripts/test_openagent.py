@@ -95,6 +95,8 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_claude_cli",
     # 8. Unit tests for claude_cli text-recovery regression
     "test_claude_cli_text_recovery",
+    # Stale-resume self-heal — same monkey-patching pattern.
+    "test_claude_cli_stale_resume",
     # ClaudeCLIRegistry dispatch — runs right after text-recovery since it
     # shares the claude_cli module's monkey-patching patterns.
     "test_claude_cli_registry",
