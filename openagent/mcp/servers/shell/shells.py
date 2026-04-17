@@ -53,12 +53,17 @@ class ForegroundResult:
 class BackgroundShell:
     """One spawned subprocess, tracked by its ``shell_id``.
 
-    Buffers are simple ``bytearray`` with a cap; once full, oldest bytes
-    are dropped and a truncation marker is inserted at the drop boundary
-    (see ``_append``). Cursors are raw byte offsets into the *original*
-    output stream (not the buffer), so ``read(since=N)`` is stable even
-    after truncation — old bytes past the cursor are simply gone and
-    are skipped.
+    Buffers are simple ``bytearray`` with a 1 MB cap per stream; once
+    full, oldest bytes are dropped and ``_stdout_dropped`` /
+    ``_stderr_dropped`` counters track how many. Callers see
+    truncation via the ``stdout_dropped`` / ``stderr_dropped``
+    properties (and the ``truncated_stdout`` / ``truncated_stderr``
+    flags Task 10's ``shell_output`` surfaces).
+
+    Cursors are raw byte offsets into the *original* output stream
+    (not the buffer), so ``read(since=N)`` is stable even after
+    truncation — bytes past the drop boundary are simply gone and
+    are skipped by ``_slice``.
     """
 
     def __init__(
@@ -212,18 +217,18 @@ class BackgroundShell:
             try:
                 await self._stdout_task
             except Exception as e:  # noqa: BLE001
-                logger.debug("stdout drain error for %s: %s", self.shell_id, e)
+                logger.warning("stdout drain error for %s: %s", self.shell_id, e)
         if self._stderr_task:
             try:
                 await self._stderr_task
             except Exception as e:  # noqa: BLE001
-                logger.debug("stderr drain error for %s: %s", self.shell_id, e)
+                logger.warning("stderr drain error for %s: %s", self.shell_id, e)
         # Signal naming: negative returncodes = killed by signal on
         # POSIX. Translate back to a name.
         if rc is not None and rc < 0:
             sig = -rc
             try:
-                self._signal = signal_module.Signals(sig).name.replace("SIG", "")
+                self._signal = signal_module.Signals(sig).name.removeprefix("SIG")
             except ValueError:
                 self._signal = str(sig)
             self._exit_code = None
