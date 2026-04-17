@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 from typing import TYPE_CHECKING
 
 import time
@@ -19,7 +18,6 @@ if TYPE_CHECKING:
 
 from openagent.core.logging import elog
 
-logger = logging.getLogger(__name__)
 
 CHECK_INTERVAL = 30  # seconds between checking for due tasks
 
@@ -46,7 +44,7 @@ class Scheduler:
         await self.db.connect()
         await self._recalculate_next_runs()
         self._task = asyncio.create_task(self._loop())
-        logger.info("Scheduler started")
+        elog("scheduler.start")
 
     async def stop(self) -> None:
         """Stop the scheduler."""
@@ -57,7 +55,7 @@ class Scheduler:
             except asyncio.CancelledError:
                 pass
             self._task = None
-        logger.info("Scheduler stopped")
+        elog("scheduler.stop")
 
     async def _recalculate_next_runs(self) -> None:
         """On startup, recalculate next_run for all enabled tasks."""
@@ -71,7 +69,7 @@ class Scheduler:
                     continue
                 await self.db.update_task(task["id"], next_run=self._next_run(task["cron_expression"], now))
             except ValueError as e:
-                logger.error(f"Invalid cron for task '{task['name']}': {e}")
+                elog("scheduler.invalid_cron", level="warning", task=task["name"], error=str(e))
 
     async def _loop(self) -> None:
         """Main loop: check for due tasks every CHECK_INTERVAL seconds."""
@@ -79,7 +77,7 @@ class Scheduler:
             try:
                 await self._check_and_run()
             except Exception as e:
-                logger.error(f"Scheduler error: {e}")
+                elog("scheduler.loop_error", level="warning", error=str(e))
             await asyncio.sleep(CHECK_INTERVAL)
 
     async def run_task(self, task: dict) -> None:
@@ -95,16 +93,14 @@ class Scheduler:
                 user_id="scheduler",
                 session_id=session_id,
             )
-            logger.info(f"Task '{task_name}' completed: {response[:100]}...")
-            elog("task.done", name=task_name)
+            elog("task.done", name=task_name, preview=str(response)[:100])
         except Exception as e:
-            logger.error(f"Task '{task_name}' failed: {e}")
-            elog("task.error", name=task_name, error=str(e))
+            elog("task.error", level="warning", name=task_name, error=str(e))
         finally:
             try:
                 await self.agent.release_session(session_id)
             except Exception as e:
-                logger.debug("Task '%s' session release failed: %s", task_name, e)
+                elog("scheduler.release_failed", task=task_name, error=str(e))
 
     async def _check_and_run(self) -> None:
         """Check for due tasks and execute them."""
@@ -112,7 +108,7 @@ class Scheduler:
         due_tasks = await self.db.get_due_tasks(now)
 
         for task in due_tasks:
-            logger.info(f"Running scheduled task: {task['name']}")
+            elog("scheduler.run_due", name=task["name"])
             await self.run_task(task)
 
             # Update last_run and compute next_run
@@ -131,7 +127,8 @@ class Scheduler:
                         next_run=self._next_run(task["cron_expression"], now),
                     )
             except ValueError as e:
-                logger.error(f"Failed to update next_run for '{task['name']}': {e}")
+                elog("scheduler.next_run_update_failed", level="warning",
+                     task=task["name"], error=str(e))
 
     # ── Task management helpers ──
 

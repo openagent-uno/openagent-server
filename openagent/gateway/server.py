@@ -112,8 +112,8 @@ class Gateway:
                 except web.HTTPException as ex:
                     resp = ex
                 except Exception as exc:
-                    logger.exception("REST error: %s", exc)
-                    elog("gateway.rest_error", path=request.path, method=request.method, error=str(exc))
+                    elog("gateway.rest_error", level="error", exc_info=True,
+                         path=request.path, method=request.method, error=str(exc))
                     resp = web.Response(status=500, text=str(exc))
             resp.headers["Access-Control-Allow-Origin"] = "*"
             resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
@@ -130,8 +130,7 @@ class Gateway:
 
         site = web.TCPSite(runner, self.host, self.port)
         await site.start()
-        logger.info("Gateway listening on ws://%s:%d/ws", self.host, self.port)
-        elog("gateway.start", host=self.host, port=self.port)
+        elog("gateway.start", level="warning", host=self.host, port=self.port)
 
         # Write .port file for agent discovery
         self._write_port_file()
@@ -324,8 +323,7 @@ class Gateway:
                     result["transcription"] = text
                     elog("upload.transcribed", filename=filename, chars=len(text))
             except Exception as e:
-                logger.warning("Voice transcription failed: %s", e)
-                elog("upload.transcribe_error", filename=filename, error=str(e))
+                elog("upload.transcribe_error", level="warning", filename=filename, error=str(e))
 
         elog("upload.saved", filename=filename, path=path, transcribed=bool(result.get("transcription")))
         return web.json_response(result)
@@ -479,8 +477,7 @@ class Gateway:
                             await self._safe_ws_send_json(ws, {"type": P.QUEUED, "position": pos})
 
         except Exception as e:
-            logger.error("WS error for %s: %s", client_id, e)
-            elog("gateway.ws_error", client_id=client_id, error=str(e))
+            elog("gateway.ws_error", level="warning", client_id=client_id, error=str(e))
         finally:
             if client_id and client_id in self.clients:
                 del self.clients[client_id]
@@ -590,8 +587,7 @@ class Gateway:
         try:
             await self.agent.forget_session(session_id)
         except Exception as e:
-            logger.debug("forget_session(%s) failed: %s", session_id, e)
-            elog("session.forget_one", session_id=session_id, forgotten=0)
+            elog("session.forget_one", session_id=session_id, forgotten=0, error=str(e))
             return 0
         elog("session.forget_one", session_id=session_id, forgotten=1)
         return 1
@@ -664,8 +660,7 @@ class Gateway:
                 from openagent.core.config import load_config
                 new_config = load_config(self.config_path)
             except Exception as e:
-                logger.warning("Config reload: YAML parse failed, skipping: %s", e)
-                elog("gateway.config_reload_parse_error", error=str(e))
+                elog("gateway.config_reload_parse_error", level="warning", error=str(e))
                 return
 
             try:
@@ -673,8 +668,7 @@ class Gateway:
                 new_model = create_model_from_config(new_config)
                 wire_model_runtime(new_model, db=self.agent._db, mcp_pool=self.agent._mcp)
             except Exception as e:
-                logger.warning("Config reload: model build failed, skipping: %s", e)
-                elog("gateway.config_reload_build_error", error=str(e))
+                elog("gateway.config_reload_build_error", level="warning", error=str(e))
                 return
 
             old_model, drain_event = self.agent.swap_model(new_model)
@@ -728,8 +722,8 @@ class Gateway:
             elog("channel.model_override", client_id=client_id, channel=channel, spec=model_spec)
             return self._get_or_create_model(model_spec, raw.get("providers", {}))
         except Exception as e:
-            logger.debug("Channel model resolution failed: %s", e)
-            elog("channel.model_override_error", client_id=client_id, channel=channel, error=str(e))
+            elog("channel.model_override_error", level="warning",
+                 client_id=client_id, channel=channel, error=str(e))
             return None
 
     def _get_or_create_model(self, spec: str, providers_config: dict = None):
@@ -853,9 +847,9 @@ class Gateway:
         except asyncio.CancelledError:
             raise  # already handled above or a separate cancel scope
         except Exception as e:
-            logger.error("Process error for %s: %s: %r", client_id, type(e).__name__, e)
             elog(
                 "message.error",
+                level="warning",
                 client_id=client_id,
                 session_id=session_id,
                 error_type=type(e).__name__,

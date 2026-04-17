@@ -292,11 +292,6 @@ class ClaudeCLI(BaseModel):
 
         from claude_agent_sdk import ClaudeSDKClient
 
-        logger.info(
-            "Creating session %s (%d total)",
-            session.session_id[-12:],
-            len(self._sessions),
-        )
         elog(
             "model.session_create",
             session_id=session.session_id,
@@ -316,13 +311,9 @@ class ClaudeCLI(BaseModel):
             client = await _connect_once(resume_sid)
         except Exception as e:
             if resume_sid:
-                logger.warning(
-                    "ClaudeSDKClient.connect() failed for %s with resume=%s; "
-                    "clearing the stored resume id and retrying fresh (%s)",
-                    session.session_id, resume_sid[:8], e,
-                )
                 elog(
                     "model.stale_resume_recovery",
+                    level="warning",
                     session_id=session.session_id,
                     stale_sdk_session_id=resume_sid,
                     error=str(e),
@@ -339,22 +330,20 @@ class ClaudeCLI(BaseModel):
                 try:
                     client = await _connect_once(None)
                 except Exception as e2:
-                    logger.exception(
-                        "ClaudeSDKClient.connect() failed for %s (fresh retry)",
-                        session.session_id,
-                    )
                     elog(
                         "model.connect_error",
+                        level="error",
+                        exc_info=True,
                         session_id=session.session_id,
                         error=str(e2),
+                        phase="fresh_retry",
                     )
                     raise
             else:
-                logger.exception(
-                    "ClaudeSDKClient.connect() failed for %s", session.session_id
-                )
                 elog(
                     "model.connect_error",
+                    level="error",
+                    exc_info=True,
                     session_id=session.session_id,
                     error=str(e),
                 )
@@ -435,7 +424,6 @@ class ClaudeCLI(BaseModel):
             async with session.lock:
                 if session.client is None:
                     continue
-                logger.info("Closing idle session %s", session.session_id[-12:])
                 elog("model.session_idle_close", session_id=session.session_id)
                 await self._disconnect(session)
 
@@ -670,17 +658,14 @@ class ClaudeCLI(BaseModel):
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.error(
-                    "Session %s error (attempt %d): %s",
-                    sid[-8:],
-                    attempt + 1,
-                    e,
-                )
                 await self._drop_client(sid)
                 if attempt < MAX_RETRIES_ON_ERROR:
+                    elog("model.generate_retry", level="warning",
+                         session_id=sid, attempt=attempt + 1, error=str(e))
                     continue
                 elog(
                     "model.generate_error",
+                    level="warning",
                     session_id=sid,
                     attempt=attempt + 1,
                     error=str(e),
@@ -809,9 +794,9 @@ class ClaudeCLI(BaseModel):
                 cost_source=cost_source,
             )
         except Exception as e:
-            logger.warning("Failed to record claude-cli usage: %s", e)
             elog(
                 "claude_cli.cost_record_error",
+                level="warning",
                 session_id=session_id,
                 model=billing_model,
                 error=str(e),

@@ -30,14 +30,12 @@ cached in-process with a 10-minute TTL.
 from __future__ import annotations
 
 import hashlib
-import logging
 import time
 from typing import Any
 
 from openagent.core.logging import elog
 from openagent.models.catalog import _load_default_pricing
 
-logger = logging.getLogger(__name__)
 
 # Per-provider discovery endpoint config. Every OpenAI-compatible
 # provider shares the same shape. Each tuple is ``(base_url, path)``.
@@ -309,7 +307,7 @@ async def list_provider_models_cached(provider: str) -> list[dict[str, Any]]:
     except (FileNotFoundError, PermissionError, OSError):
         providers_cfg = {}
     except Exception as e:  # noqa: BLE001 — yaml errors, bad env refs, etc.
-        logger.warning("load_config failed in discovery: %s", e)
+        elog("discovery.load_config_error", level="warning", error=str(e))
         providers_cfg = {}
     cfg = providers_cfg.get(provider, {}) or {}
     return await list_provider_models(

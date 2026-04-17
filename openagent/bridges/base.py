@@ -86,8 +86,7 @@ class BaseBridge:
             except Exception as e:
                 if self._should_stop:
                     break
-                logger.error("%s bridge crashed: %s, retrying in %ds...", self.name, e, BRIDGE_RETRY_SECONDS)
-                elog("bridge.error", name=self.name, error=str(e))
+                elog("bridge.error", level="warning", name=self.name, error=str(e), retry_in=BRIDGE_RETRY_SECONDS)
                 await asyncio.sleep(BRIDGE_RETRY_SECONDS)
 
     async def stop(self) -> None:

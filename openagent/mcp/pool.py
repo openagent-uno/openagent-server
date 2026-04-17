@@ -288,12 +288,7 @@ async def _specs_from_db(db: Any, db_path: str | None) -> list[_ServerSpec]:
                     oauth=bool(row.get("oauth")),
                 ))
         except Exception as exc:  # noqa: BLE001 — one bad row must not pin the pool
-            logger.warning(
-                "MCP row %r failed to resolve: %s — skipping (re-enable "
-                "via the manager MCP once fixed)",
-                name, exc,
-            )
-            elog("mcp.db_row_error", name=name, kind=kind, error=str(exc))
+            elog("mcp.db_row_error", level="warning", name=name, kind=kind, error=str(exc))
 
     for spec in specs:
         _normalise_spec(spec)
@@ -477,13 +472,7 @@ class MCPPool:
                     self._tool_counts[spec.name] = count
                     elog("mcp.connect", name=spec.name, tools=count)
                     if count == 0:
-                        logger.warning(
-                            "MCP '%s' connected but registered 0 tools — likely "
-                            "missing credentials or env vars. The server stays in "
-                            "the pool and tools will appear once configured.",
-                            spec.name,
-                        )
-                        elog("mcp.dormant", name=spec.name)
+                        elog("mcp.dormant", level="warning", name=spec.name)
 
             # 2. In-process MCPs — loaded by importing the adapter module and
             #    calling the named factory functions. No subprocess is spawned.
@@ -495,8 +484,7 @@ class MCPPool:
                     sdk_factory = getattr(mod, spec.sdk_server_factory, None)
                     agno_factory = getattr(mod, spec.agno_toolkit_factory, None)
                 except Exception as e:  # noqa: BLE001
-                    logger.warning("in-process MCP '%s' import error: %s", spec.name, e)
-                    elog("mcp.error", name=spec.name, error=str(e))
+                    elog("mcp.error", level="warning", name=spec.name, error=str(e), phase="import")
                     continue
                 if sdk_factory is None or agno_factory is None:
                     logger.warning(
@@ -508,8 +496,7 @@ class MCPPool:
                     sdk_cfg = sdk_factory()
                     agno_tk = agno_factory()
                 except Exception as e:  # noqa: BLE001
-                    logger.warning("in-process MCP '%s' factory error: %s", spec.name, e)
-                    elog("mcp.error", name=spec.name, error=str(e))
+                    elog("mcp.error", level="warning", name=spec.name, error=str(e), phase="factory")
                     continue
                 self._in_process_sdk_servers[spec.name] = sdk_cfg
                 self._in_process_agno_toolkits.append(agno_tk)
@@ -594,11 +581,7 @@ class MCPPool:
             async with asyncio.timeout(_MCP_CONNECT_TIMEOUT):
                 await stack.enter_async_context(toolkit)
         except asyncio.TimeoutError:
-            logger.warning(
-                "MCP '%s' handshake timed out after %ss — marking dormant",
-                spec.name, _MCP_CONNECT_TIMEOUT,
-            )
-            elog("mcp.timeout", name=spec.name)
+            elog("mcp.timeout", level="warning", name=spec.name, seconds=_MCP_CONNECT_TIMEOUT)
             await _rollback()
             return None
         except BaseException as e:
@@ -611,8 +594,7 @@ class MCPPool:
             # fixing.
             if callable(cancelling) and cancelling() > cancel_before:
                 raise
-            logger.warning("MCP '%s' failed to connect: %s", spec.name, e)
-            elog("mcp.error", name=spec.name, error=str(e))
+            elog("mcp.error", level="warning", name=spec.name, error=str(e), phase="connect")
             return None
 
         # Success — hand the stack to the pool so close_all can unwind it.
@@ -658,8 +640,7 @@ class MCPPool:
                 logger.warning("MCP spec '%s' has neither command nor url — skipping", spec.name)
                 return None
         except Exception as e:
-            logger.warning("MCP '%s' failed to construct: %s", spec.name, e)
-            elog("mcp.error", name=spec.name, error=str(e))
+            elog("mcp.error", level="warning", name=spec.name, error=str(e), phase="construct")
             return None
 
         return await self._safe_enter(toolkit, spec)

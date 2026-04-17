@@ -17,27 +17,48 @@ from typing import Any
 from openagent.core.paths import log_dir
 
 EVENT_LOGGER = "openagent.events"
+_LEVELS = {
+    "debug": logging.DEBUG,
+    "info": logging.INFO,
+    "warning": logging.WARNING,
+    "error": logging.ERROR,
+}
 _configured = False
 
 
-def elog(event: str, **data: Any) -> None:
-    """Append a structured event to ``events.jsonl`` (and mirror to stdout)."""
+def elog(event: str, level: str = "info", exc_info: bool = False, **data: Any) -> None:
+    """Append a structured event to ``events.jsonl`` (and mirror to stdout).
+
+    *level* controls stdout severity (``info``/``warning``/``error``); at
+    default verbosity only ``warning``+ shows on the console.  Pass
+    ``exc_info=True`` inside an ``except`` block to also capture a traceback
+    (into events.jsonl, and on stdout).
+    """
     if not _configured:
         setup_logging()
-    logging.getLogger(EVENT_LOGGER).info(event, extra={"event_data": data})
+    logging.getLogger(EVENT_LOGGER).log(
+        _LEVELS[level], event, exc_info=exc_info, extra={"event_data": data}
+    )
 
 
 def setup_logging(verbose: bool = False) -> None:
     """Configure stdlib logging: stdout for text, events.jsonl for events."""
     global _configured
+    stdout_level = logging.DEBUG if verbose else logging.WARNING
     if _configured:
-        logging.getLogger().setLevel(logging.DEBUG if verbose else logging.WARNING)
+        for h in logging.getLogger().handlers:
+            if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler):
+                h.setLevel(stdout_level)
         return
 
+    # Root accepts everything; the console handler is what gates stdout
+    # verbosity.  A logger-level gate wouldn't work because records
+    # propagated up from child loggers bypass the parent's level check.
     console = logging.StreamHandler()
+    console.setLevel(stdout_level)
     console.setFormatter(logging.Formatter("%(name)s: %(message)s"))
     root = logging.getLogger()
-    root.setLevel(logging.DEBUG if verbose else logging.WARNING)
+    root.setLevel(logging.DEBUG)
     root.addHandler(console)
 
     events_file = logging.FileHandler(log_dir() / "events.jsonl", encoding="utf-8")
@@ -85,8 +106,11 @@ def clear() -> None:
 
 class _JsonlFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
-        return json.dumps(
-            {"ts": record.created, "event": record.getMessage(),
-             **getattr(record, "event_data", {})},
-            default=str,
-        )
+        entry: dict[str, Any] = {
+            "ts": record.created,
+            "event": record.getMessage(),
+            **getattr(record, "event_data", {}),
+        }
+        if record.exc_info:
+            entry["traceback"] = self.formatException(record.exc_info)
+        return json.dumps(entry, default=str)

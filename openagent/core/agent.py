@@ -332,8 +332,7 @@ class Agent:
                     model_cfg=self.config.get("model", {}) or {},
                 )
             except Exception as exc:  # noqa: BLE001 — bootstrap must not block startup
-                logger.warning("yaml→DB bootstrap failed: %s", exc)
-                elog("bootstrap.error", error=str(exc))
+                elog("bootstrap.error", level="warning", error=str(exc))
 
             try:
                 db_path = getattr(self._db, "db_path", None)
@@ -341,8 +340,7 @@ class Agent:
                 self._mcp = new_pool
                 self._mcps_last_updated = await self._db.mcps_max_updated()
             except Exception as exc:  # noqa: BLE001 — leave the existing pool untouched
-                logger.warning("MCPPool.from_db failed, using caller pool: %s", exc)
-                elog("pool.from_db_error", error=str(exc))
+                elog("pool.from_db_error", level="warning", error=str(exc))
 
         await self._mcp.connect_all()
 
@@ -385,8 +383,7 @@ class Agent:
                     wire_model_runtime(model, db=self._db, mcp_pool=self._mcp)
                 reloaded = True
             except Exception as exc:  # noqa: BLE001
-                logger.warning("MCP pool reload failed: %s", exc)
-                elog("mcps.reload_error", error=str(exc))
+                elog("mcps.reload_error", level="warning", error=str(exc))
 
         if models_updated > getattr(self, "_models_last_updated", 0.0):
             self._models_last_updated = models_updated
@@ -512,19 +509,13 @@ class Agent:
             logger.info("Agent.run() cancelled for session %s", session_id)
             raise
         except BaseException as e:
-            # Log the exception TYPE and repr so we can tell a KeyError from a
-            # ConnectionResetError from a RuntimeError. The old ``f"{e}"``
-            # format swallowed the type and printed empty strings for
-            # exceptions whose ``__str__`` is "" (CancelledError, SystemExit…),
-            # which is why these have been appearing as "fatal error: " in
-            # the logs.
-            logger.error(
-                "Agent.run() fatal error: %s: %r",
-                type(e).__name__, e,
-                exc_info=True,
-            )
+            # Include error_type so we can tell a KeyError from a
+            # ConnectionResetError from a RuntimeError. The old format
+            # swallowed the type for exceptions whose ``__str__`` is "".
             elog(
                 "agent.run.error",
+                level="error",
+                exc_info=True,
                 agent=self.name,
                 user_id=user_id,
                 session_id=session_id,

@@ -8,14 +8,12 @@ FIFO queue per client. Session metadata is RAM-only and lost on restart.
 from __future__ import annotations
 
 import asyncio
-import logging
 import uuid
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
 from openagent.core.logging import elog
 
-logger = logging.getLogger(__name__)
 
 Handler = Callable[[], Awaitable[None]]
 
@@ -138,8 +136,7 @@ class SessionManager:
         or -1 if the queue is full and the message was rejected."""
         st = self._state(client_id)
         if st.pending.qsize() >= MAX_QUEUE_SIZE:
-            logger.warning("Queue full for %s (%d), rejecting message", client_id, MAX_QUEUE_SIZE)
-            elog("queue.full", client_id=client_id, max=MAX_QUEUE_SIZE)
+            elog("queue.full", level="warning", client_id=client_id, max=MAX_QUEUE_SIZE)
             return -1
         running = 1 if self.is_busy(client_id) else 0
         position = st.pending.qsize() + running
@@ -175,11 +172,10 @@ class SessionManager:
             try:
                 await task
             except asyncio.CancelledError:
-                logger.info("Task cancelled for %s", client_id)
                 elog("queue.cancel", client_id=client_id, session_id=item.session_id)
             except Exception as e:
-                logger.error("Handler error for %s: %s", client_id, e)
-                elog("queue.error", client_id=client_id, session_id=item.session_id, error=str(e))
+                elog("queue.error", level="warning",
+                     client_id=client_id, session_id=item.session_id, error=str(e))
             finally:
                 st.current_task = None
                 st.current_session_id = None

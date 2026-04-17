@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable
 
@@ -17,7 +16,6 @@ from openagent.models.catalog import (
 )
 from openagent.models.runtime import create_model_from_spec, wire_model_runtime
 
-logger = logging.getLogger(__name__)
 
 CLASSIFIER_PROMPT = """\
 Classify this task as simple, medium, or hard.
@@ -104,13 +102,8 @@ class SmartRouter(BaseModel):
                     continue
                 normalised[tier] = runtime_id
             if stripped:
-                elog("router.routing_stripped", stripped=stripped)
-                logger.warning(
-                    "SmartRouter: stripped claude-cli model(s) from routing %s — "
-                    "claude-cli is a standalone provider and cannot be mixed with "
-                    "Agno-routed models in the same session.",
-                    stripped,
-                )
+                # claude-cli is standalone and can't be mixed with Agno-routed models.
+                elog("router.routing_stripped", level="warning", stripped=stripped)
             self._routing = normalised or self._build_auto_routing()
         else:
             self._routing = self._build_auto_routing()
@@ -134,9 +127,8 @@ class SmartRouter(BaseModel):
             models_with_price.append((entry.runtime_id, price))
 
         if not models_with_price:
-            logger.warning("SmartRouter: no API-backed models found in providers config, using defaults")
             routing = dict(DEFAULT_AUTO_ROUTING)
-            elog("router.auto_routing_default", routing=routing)
+            elog("router.auto_routing_default", level="warning", routing=routing)
             return routing
 
         models_with_price.sort(key=lambda item: item[1])
@@ -251,7 +243,6 @@ class SmartRouter(BaseModel):
                     )
                     return tier
         except Exception as e:
-            logger.debug("Classification failed, defaulting to medium: %s", e)
             elog(
                 "router.classify_error",
                 session_id=session_id,

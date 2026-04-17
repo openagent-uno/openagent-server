@@ -577,15 +577,13 @@ class AgnoProvider(BaseModel):
         if raw_content:
             content = raw_content
         else:
-            logger.warning(
-                "Agno returned empty content (model=%s, session=%s, response=%r)",
-                self.model, sid, response,
-            )
             elog(
                 "agno.empty_result",
+                level="warning",
                 model=self.model,
                 session_id=sid,
                 response_type=type(response).__name__,
+                response=repr(response)[:200],
             )
             content = "(Done — no final message was returned.)"
         metrics_obj = getattr(response, "metrics", None)
