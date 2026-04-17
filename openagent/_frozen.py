@@ -21,6 +21,48 @@ def is_frozen() -> bool:
     return getattr(sys, "frozen", False)
 
 
+def patch_ssl_for_frozen() -> None:
+    """Point Python's SSL at certifi's CA bundle inside the PyInstaller
+    extraction tree.
+
+    Without this, any library that uses Python's default
+    ``ssl.create_default_context()`` (aiohttp → discord.py,
+    urllib3, etc.) fails inside the onefile bundle with::
+
+        ssl.SSLCertVerificationError: [SSL: CERTIFICATE_VERIFY_FAILED]
+        certificate verify failed: unable to get local issuer certificate
+
+    because OpenSSL's compiled-in CA path doesn't exist inside
+    ``$TMPDIR/_MEI_xxxxx``. Setting ``SSL_CERT_FILE`` at process
+    start — before any bridge or MCP opens an HTTPS connection — makes
+    every downstream consumer inherit the right CA bundle.
+
+    ``python-telegram-bot`` isn't affected because it uses ``httpx``
+    which imports certifi internally. ``aiohttp`` (used by discord.py)
+    does NOT — it relies on the system CA store, which is missing
+    inside PyInstaller.
+
+    Libraries like ``litellm`` (OpenAI SDK, Anthropic SDK) also benefit:
+    they use ``httpx`` too, but having ``SSL_CERT_FILE`` set is a
+    belt-and-braces safety net for any future transitive dep that uses
+    plain ``urllib3`` or ``aiohttp``.
+
+    No-op when certifi isn't bundled (pip-installed dev setups use the
+    system CA store, which works fine).
+    """
+    if not is_frozen():
+        return
+    if os.environ.get("SSL_CERT_FILE"):
+        return  # caller already set it — don't override
+    try:
+        import certifi
+        ca = certifi.where()
+        if os.path.isfile(ca):
+            os.environ["SSL_CERT_FILE"] = ca
+    except ImportError:
+        pass
+
+
 def bundle_dir() -> Path:
     """Return the directory containing bundled data files.
 

@@ -29,7 +29,13 @@ def _setup_agent_dir(agent_dir: str | None) -> None:
 
 def _startup_cleanup() -> None:
     """Run frozen-binary cleanup tasks on startup."""
-    from openagent._frozen import executable_path, is_frozen
+    from openagent._frozen import executable_path, is_frozen, patch_ssl_for_frozen
+
+    # Must happen BEFORE any bridge or MCP opens an HTTPS connection.
+    # Without this, discord.py (via aiohttp) fails inside the PyInstaller
+    # onefile bundle because the compiled-in OpenSSL CA path doesn't
+    # exist in the _MEI extraction tree.
+    patch_ssl_for_frozen()
 
     if not is_frozen():
         return
