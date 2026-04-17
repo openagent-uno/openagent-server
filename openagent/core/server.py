@@ -127,6 +127,7 @@ def _build_agent(config: dict) -> Agent:
         system_prompt=config.get("system_prompt", "You are a helpful assistant."),
         mcp_pool=mcp_pool,
         memory=db,
+        config=config,  # pass through so Agent can read shell_settings
     )
 
 

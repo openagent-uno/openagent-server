@@ -427,13 +427,27 @@ class Agent:
         session_id: str | None = None,
         model_override: BaseModel | None = None,
     ) -> str:
-        """Inner run logic, wrapped by run() for crash protection.
+        """Run a single agent turn, continuing the session automatically when
+        background shells complete during or shortly after it.
 
-        Providers handle the tool-use loop internally (Agno via its Agent,
-        Claude SDK via its native MCP support), so this method is now a
-        single ``model.generate`` call. The provider returns the final
-        post-tool-loop content; we just package the prompt and unpack the
-        response.
+        Providers handle the internal tool-loop (Agno via its Agent, Claude
+        SDK via its native MCP support), so each call to ``model.generate``
+        returns post-tool-loop content. This method adds a wrapper loop
+        above ``generate`` that:
+
+        1. After each turn, drains the shell hub for terminal events
+           (shell_exec+run_in_background=True) for ``session_id``.
+        2. If any terminal event landed, formats it as a ``<system-reminder>``
+           and re-enters ``generate`` on the same session — same subprocess
+           (Claude), same Agno history — so the model sees the completion
+           mid-conversation.
+        3. If no events landed but shells are still running, awaits
+           ``hub.wait`` up to ``shell.wake_wait_window_seconds`` before
+           giving up and returning to the caller.
+        4. Caps at ``shell.autoloop_cap`` iterations to prevent runaway
+           chains, logged via ``agent.run.autoloop_cap_hit``.
+
+        Returns the final ``ModelResponse.content`` after the loop settles.
         """
         await _status("Loading context...")
 
