@@ -761,3 +761,86 @@ async def t_config_override(ctx: TestContext) -> None:
     s = shell_settings({"shell": {"wake_wait_window_seconds": 0, "autoloop_cap": 5}})
     assert s.wake_wait_window_seconds == 0.0
     assert s.autoloop_cap == 5
+
+
+@test("shell", "agent._run_inner: continues session when bg shell completes")
+async def t_agent_autoloop_continues(ctx: TestContext) -> None:
+    import asyncio
+    from openagent.core.agent import Agent
+    from openagent.models.base import BaseModel, ModelResponse
+    from openagent.mcp.servers.shell import handlers, adapters
+    from openagent.mcp.servers.shell.events import ShellEvent
+
+    _reset_shell_hub()
+
+    class FakeModel(BaseModel):
+        history_mode = "provider"
+
+        def __init__(self):
+            self.turns: list[str] = []
+
+        async def generate(
+            self, messages, system=None, tools=None, on_status=None, session_id=None,
+        ) -> ModelResponse:
+            content = messages[-1]["content"]
+            self.turns.append(content)
+            # Turn 1 — start a background shell then finish.
+            if len(self.turns) == 1:
+                # Simulate the tool-loop having kicked off a bg shell:
+                token = adapters.set_session_context(session_id)
+                try:
+                    await handlers.shell_exec(
+                        command="echo shell-done",
+                        cwd=None, env=None, timeout=None,
+                        run_in_background=True, stdin=None, description=None,
+                        session_id=None,
+                    )
+                finally:
+                    adapters.reset_session_context(token)
+                return ModelResponse(content="Started build, will wait.")
+            # Turn 2 — the reminder came in; produce final text.
+            return ModelResponse(content=f"Saw reminder: {content[:40]}...")
+
+    model = FakeModel()
+    agent = Agent(name="test", model=model)
+    # Skip heavy initialize path; shell MCP doesn't need any MCP pool.
+    agent._initialized = True
+
+    async def _noop_status(*_a, **_k): pass
+
+    result = await agent._run_inner(
+        message="please run the build",
+        attachments=None,
+        _status=_noop_status,
+        session_id="S-AUTO",
+    )
+    # Two turns must have run (the loop re-entered).
+    assert len(model.turns) == 2, f"turns: {model.turns!r}"
+    assert "Saw reminder" in result
+    assert "shell-done" in model.turns[1] or "sh_" in model.turns[1]
+
+
+@test("shell", "agent._run_inner: stops when no bg shells and no events")
+async def t_agent_autoloop_stops(ctx: TestContext) -> None:
+    from openagent.core.agent import Agent
+    from openagent.models.base import BaseModel, ModelResponse
+
+    _reset_shell_hub()
+
+    class NoShellModel(BaseModel):
+        history_mode = "provider"
+        async def generate(self, messages, system=None, tools=None, on_status=None, session_id=None):
+            return ModelResponse(content="just text")
+
+    agent = Agent(name="test", model=NoShellModel())
+    agent._initialized = True
+
+    async def _noop_status(*_a, **_k): pass
+
+    result = await agent._run_inner(
+        message="hi",
+        attachments=None,
+        _status=_noop_status,
+        session_id="S-NONE",
+    )
+    assert result == "just text"
