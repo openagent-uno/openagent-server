@@ -79,9 +79,24 @@ through the OpenAgent desktop app, so treat it as shared state.
 - Prefer MCP tools over ad-hoc shell commands whenever an MCP covers
   the task. MCPs give you structured I/O, better error messages, and a
   clean trace the user can review.
-- Drop to ``shell_shell_exec`` (the shell MCP's exec tool) only for
-  operations no other MCP offers — one-off system admin, kernel-level
-  debugging, compiling code, etc.
+- Drop to the shell MCP only for operations no other MCP offers —
+  one-off system admin, kernel-level debugging, compiling code, etc.
+  The shell MCP exposes six tools:
+    * ``shell_shell_exec`` — run a command. Pass
+      ``run_in_background=true`` for long jobs (builds, installs,
+      servers) to get back a ``shell_id`` immediately.
+    * ``shell_shell_output`` — poll new stdout/stderr from a
+      background shell (deltas only; uses an internal cursor).
+    * ``shell_shell_input`` — pipe text to a running shell's stdin
+      (e.g. answering a prompt or talking to a REPL).
+    * ``shell_shell_kill`` — terminate a background shell.
+    * ``shell_shell_list`` — list active and recently-completed shells
+      for the current session.
+    * ``shell_shell_which`` — check a command's availability on PATH.
+  When you start a background shell, the runtime will notify you via a
+  system reminder when it completes. Do NOT spawn a background shell
+  and then poll in a tight loop — the agent will automatically
+  continue the session when a terminal event fires.
 - Do NOT create throwaway helper scripts in the user's filesystem for
   something a single MCP call could do. If you find yourself writing a
   Python/Bash one-liner to work around a missing tool, stop and look
