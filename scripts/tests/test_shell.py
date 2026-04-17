@@ -627,3 +627,35 @@ async def t_adapter_agno(ctx: TestContext) -> None:
         names = {t.__name__ for t in tools if callable(t)}
     for expected in ("shell_exec", "shell_output", "shell_input", "shell_kill", "shell_list", "shell_which"):
         assert expected in names, f"missing tool {expected} in {names}"
+
+
+@test("shell", "adapters.build_sdk_server: shell_exec schema has command required, run_in_background boolean")
+async def t_adapter_claude_schema(ctx: TestContext) -> None:
+    import mcp.types as mcp_types
+    from openagent.mcp.servers.shell.adapters import build_sdk_server
+
+    cfg = build_sdk_server()
+    server = cfg.get("instance")
+    assert server is not None, f"expected instance in cfg, got keys: {list(cfg.keys())}"
+
+    # The MCP server (mcp.server.lowlevel.server.Server) populates _tool_cache
+    # lazily on the first list_tools call. Trigger it now.
+    list_tools_handler = server.request_handlers.get(mcp_types.ListToolsRequest)
+    assert list_tools_handler is not None, "no ListToolsRequest handler found"
+    await list_tools_handler(mcp_types.ListToolsRequest(method="tools/list"))
+
+    tool_cache: dict = getattr(server, "_tool_cache", {})
+    exec_tool = tool_cache.get("shell_exec")
+    assert exec_tool is not None, (
+        f"couldn't locate shell_exec in _tool_cache; available: {list(tool_cache.keys())}"
+    )
+
+    # mcp.types.Tool uses inputSchema (camelCase).
+    schema = getattr(exec_tool, "inputSchema", None)
+    assert isinstance(schema, dict), f"schema shape: {schema!r}"
+    assert schema.get("required") == ["command"], f"required: {schema.get('required')}"
+    props = schema.get("properties", {})
+    assert props.get("run_in_background", {}).get("type") == "boolean", \
+        f"run_in_background type: {props.get('run_in_background')}"
+    assert props.get("timeout", {}).get("type") == "integer", \
+        f"timeout type: {props.get('timeout')}"

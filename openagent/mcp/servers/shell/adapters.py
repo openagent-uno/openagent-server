@@ -6,12 +6,14 @@ we wrap them once per provider with the native decorator here.
 """
 from __future__ import annotations
 
-import logging
+import json
 from typing import Any
 
 from openagent.mcp.servers.shell import handlers
 
-logger = logging.getLogger(__name__)
+
+def _json_dump(value: Any) -> str:
+    return json.dumps(value, indent=2, default=str)
 
 
 # ── Claude Agent SDK ────────────────────────────────────────────────
@@ -25,13 +27,17 @@ def build_sdk_server() -> Any:
         "Execute a shell command. Returns foreground output, or if "
         "run_in_background=true returns a shell_id.",
         {
-            "command": str,
-            "cwd": (str, None),
-            "env": (dict, None),
-            "timeout": (int, None),
-            "run_in_background": (bool, None),
-            "stdin": (str, None),
-            "description": (str, None),
+            "type": "object",
+            "properties": {
+                "command": {"type": "string"},
+                "cwd": {"type": "string"},
+                "env": {"type": "object", "additionalProperties": {"type": "string"}},
+                "timeout": {"type": "integer"},
+                "run_in_background": {"type": "boolean"},
+                "stdin": {"type": "string"},
+                "description": {"type": "string"},
+            },
+            "required": ["command"],
         },
     )
     async def _shell_exec(args: dict) -> dict:
@@ -49,7 +55,15 @@ def build_sdk_server() -> Any:
     @sdk_tool(
         "shell_output",
         "Read new output from a background shell since the last call.",
-        {"shell_id": str, "filter": (str, None), "since_last": (bool, None)},
+        {
+            "type": "object",
+            "properties": {
+                "shell_id": {"type": "string"},
+                "filter": {"type": "string"},
+                "since_last": {"type": "boolean"},
+            },
+            "required": ["shell_id"],
+        },
     )
     async def _shell_output(args: dict) -> dict:
         return {"content": [{"type": "text", "text": _json_dump(await handlers.shell_output(
@@ -61,7 +75,15 @@ def build_sdk_server() -> Any:
     @sdk_tool(
         "shell_input",
         "Write text to a running background shell's stdin.",
-        {"shell_id": str, "text": str, "press_enter": (bool, None)},
+        {
+            "type": "object",
+            "properties": {
+                "shell_id": {"type": "string"},
+                "text": {"type": "string"},
+                "press_enter": {"type": "boolean"},
+            },
+            "required": ["shell_id", "text"],
+        },
     )
     async def _shell_input(args: dict) -> dict:
         return {"content": [{"type": "text", "text": _json_dump(await handlers.shell_input(
@@ -73,7 +95,14 @@ def build_sdk_server() -> Any:
     @sdk_tool(
         "shell_kill",
         "Kill a background shell by id (TERM, INT, or KILL).",
-        {"shell_id": str, "signal": (str, None)},
+        {
+            "type": "object",
+            "properties": {
+                "shell_id": {"type": "string"},
+                "signal": {"type": "string", "enum": ["TERM", "INT", "KILL"]},
+            },
+            "required": ["shell_id"],
+        },
     )
     async def _shell_kill(args: dict) -> dict:
         return {"content": [{"type": "text", "text": _json_dump(await handlers.shell_kill(
@@ -84,7 +113,13 @@ def build_sdk_server() -> Any:
     @sdk_tool(
         "shell_list",
         "List active and recently-completed background shells.",
-        {"session_id": (str, None)},
+        {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+            },
+            "required": [],
+        },
     )
     async def _shell_list(args: dict) -> dict:
         return {"content": [{"type": "text", "text": _json_dump(await handlers.shell_list(
@@ -94,7 +129,13 @@ def build_sdk_server() -> Any:
     @sdk_tool(
         "shell_which",
         "Check whether a command is available on PATH.",
-        {"command": str},
+        {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string"},
+            },
+            "required": ["command"],
+        },
     )
     async def _shell_which(args: dict) -> dict:
         return {"content": [{"type": "text", "text": _json_dump(await handlers.shell_which(
@@ -105,11 +146,6 @@ def build_sdk_server() -> Any:
         "shell",
         tools=[_shell_exec, _shell_output, _shell_input, _shell_kill, _shell_list, _shell_which],
     )
-
-
-def _json_dump(value: Any) -> str:
-    import json
-    return json.dumps(value, indent=2, default=str)
 
 
 # ── Agno ────────────────────────────────────────────────────────────
