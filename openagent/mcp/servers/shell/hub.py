@@ -43,7 +43,11 @@ class ShellRecord:
 
 
 class ShellHub:
-    """Singleton (per agent process) for background-shell bookkeeping."""
+    """Singleton (per agent process) for background-shell bookkeeping.
+
+    Not thread-safe. Every method must be called from the single agent
+    event loop. See module docstring.
+    """
 
     def __init__(self) -> None:
         self._shells: dict[str, ShellRecord] = {}
@@ -76,6 +80,8 @@ class ShellHub:
         return self._shells.get(shell_id)
 
     def list_for_session(self, session_id: str | None) -> list[ShellRecord]:
+        """Return records for ``session_id``. ``None`` means every record,
+        regardless of session."""
         if session_id is None:
             return list(self._shells.values())
         ids = self._by_session.get(session_id, set())
@@ -100,6 +106,52 @@ class ShellHub:
         rec.completed_at = time.time()
         rec.exit_code = exit_code
         rec.signal = signal
+
+    # ── Event queue ─────────────────────────────────────────────────
+
+    def post_event(self, session_id: str | None, event: ShellEvent) -> None:
+        """Push a terminal event into ``session_id``'s queue and wake any
+        waiter. No-op when ``session_id`` is None — we only do active
+        wake-up for shells that have a session."""
+        if session_id is None:
+            return
+        q = self._queues.setdefault(session_id, deque(maxlen=_MAX_QUEUED_EVENTS))
+        q.append(event)
+        ev = self._events.setdefault(session_id, asyncio.Event())
+        ev.set()
+
+    def drain(self, session_id: str | None) -> list[ShellEvent]:
+        """Return every queued event for ``session_id`` and clear the queue."""
+        if session_id is None:
+            return []
+        q = self._queues.get(session_id)
+        if not q:
+            return []
+        out = list(q)
+        q.clear()
+        ev = self._events.get(session_id)
+        if ev is not None:
+            ev.clear()
+        return out
+
+    async def wait(self, session_id: str | None, timeout: float) -> list[ShellEvent]:
+        """Await up to ``timeout`` seconds for any event on ``session_id``.
+
+        Returns the drained events (possibly empty on timeout). Safe to
+        call when no shells are registered — returns [] immediately
+        after the timeout.
+        """
+        if session_id is None or timeout <= 0:
+            return self.drain(session_id)
+        # Fast path — already something queued.
+        if self._queues.get(session_id):
+            return self.drain(session_id)
+        ev = self._events.setdefault(session_id, asyncio.Event())
+        try:
+            await asyncio.wait_for(ev.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return []
+        return self.drain(session_id)
 
     # ── Purge ───────────────────────────────────────────────────────
 

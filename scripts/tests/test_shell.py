@@ -88,3 +88,74 @@ async def t_hub_purge_session(ctx: TestContext) -> None:
     assert hub.get("sh_1") is None
     assert hub.get("sh_2") is None
     assert hub.get("sh_3") is not None
+
+
+@test("shell", "ShellHub: post_event + drain returns events in FIFO order")
+async def t_hub_post_drain(ctx: TestContext) -> None:
+    from openagent.mcp.servers.shell.hub import ShellHub
+    from openagent.mcp.servers.shell.events import ShellEvent
+
+    hub = ShellHub()
+    e1 = ShellEvent("sh_1", "completed", 0, None, 10, 0, 1.0)
+    e2 = ShellEvent("sh_2", "killed", None, "TERM", 3, 5, 2.0)
+    hub.post_event("s1", e1)
+    hub.post_event("s1", e2)
+    drained = hub.drain("s1")
+    assert [e.shell_id for e in drained] == ["sh_1", "sh_2"]
+    # Queue is empty after drain.
+    assert hub.drain("s1") == []
+
+
+@test("shell", "ShellHub: drain on unknown session returns []")
+async def t_hub_drain_unknown(ctx: TestContext) -> None:
+    from openagent.mcp.servers.shell.hub import ShellHub
+
+    hub = ShellHub()
+    assert hub.drain("nope") == []
+
+
+@test("shell", "ShellHub: wait resolves when an event is posted")
+async def t_hub_wait_wakes_up(ctx: TestContext) -> None:
+    import asyncio
+    from openagent.mcp.servers.shell.hub import ShellHub
+    from openagent.mcp.servers.shell.events import ShellEvent
+
+    hub = ShellHub()
+    e = ShellEvent("sh_9", "completed", 0, None, 1, 0, 9.0)
+
+    async def delayed_post() -> None:
+        await asyncio.sleep(0.05)
+        hub.post_event("s1", e)
+
+    task = asyncio.create_task(delayed_post())
+    try:
+        events = await hub.wait("s1", timeout=1.0)
+    finally:
+        await task
+    assert len(events) == 1
+    assert events[0].shell_id == "sh_9"
+
+
+@test("shell", "ShellHub: wait returns [] on timeout")
+async def t_hub_wait_timeout(ctx: TestContext) -> None:
+    from openagent.mcp.servers.shell.hub import ShellHub
+
+    hub = ShellHub()
+    events = await hub.wait("s1", timeout=0.05)
+    assert events == []
+
+
+@test("shell", "ShellHub: queue cap drops oldest and keeps newest")
+async def t_hub_queue_cap(ctx: TestContext) -> None:
+    from openagent.mcp.servers.shell.hub import ShellHub
+    from openagent.mcp.servers.shell.events import ShellEvent
+
+    hub = ShellHub()
+    # Post more than the cap (200) — confirm the newest 200 survive.
+    for i in range(250):
+        hub.post_event("s1", ShellEvent(f"sh_{i}", "completed", 0, None, 1, 0, float(i)))
+    drained = hub.drain("s1")
+    assert len(drained) == 200
+    # The oldest 50 (sh_0 … sh_49) were dropped.
+    assert drained[0].shell_id == "sh_50"
+    assert drained[-1].shell_id == "sh_249"
