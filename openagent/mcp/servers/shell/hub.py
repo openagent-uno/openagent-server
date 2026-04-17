@@ -36,6 +36,9 @@ class ShellRecord:
     # The BackgroundShell is attached after spawn (None while tests use
     # register() directly without spawning a real subprocess).
     shell: "BackgroundShell | None" = None
+    # Per-caller cursor used by shell_output(since_last=True).
+    last_read_stdout: int = 0
+    last_read_stderr: int = 0
 
     @property
     def is_completed(self) -> bool:

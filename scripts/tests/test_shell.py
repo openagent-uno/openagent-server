@@ -450,3 +450,77 @@ async def t_handlers_which_missing(ctx: TestContext) -> None:
 
     out = await handlers.shell_which(command="definitely_not_a_real_binary_xyz_123")
     assert out["available"] is False
+
+
+@test("shell", "handlers.shell_exec background returns shell_id and posts terminal event")
+async def t_handlers_exec_bg_event(ctx: TestContext) -> None:
+    import asyncio
+    from openagent.mcp.servers.shell import handlers
+
+    _reset_shell_hub()
+    started = await handlers.shell_exec(
+        command="echo background-done",
+        cwd=None, env=None, timeout=None,
+        run_in_background=True, stdin=None, description=None,
+        session_id="sess-A",
+    )
+    assert "shell_id" in started
+    sid_shell = started["shell_id"]
+
+    # Wait for the watcher to post the event.
+    events = await handlers.get_hub().wait("sess-A", timeout=3.0)
+    assert len(events) == 1
+    ev = events[0]
+    assert ev.shell_id == sid_shell
+    assert ev.kind == "completed"
+    assert ev.exit_code == 0
+
+
+@test("shell", "handlers.shell_output: returns delta and marks not running")
+async def t_handlers_output_delta(ctx: TestContext) -> None:
+    import asyncio
+    from openagent.mcp.servers.shell import handlers
+
+    _reset_shell_hub()
+    started = await handlers.shell_exec(
+        command="printf 'abc'",
+        cwd=None, env=None, timeout=None,
+        run_in_background=True, stdin=None, description=None,
+        session_id="sess-B",
+    )
+    sid_shell = started["shell_id"]
+    # Wait until the watcher posts the terminal event, so we know
+    # output has been fully drained.
+    await handlers.get_hub().wait("sess-B", timeout=3.0)
+    out = await handlers.shell_output(
+        shell_id=sid_shell, filter=None, since_last=True,
+    )
+    assert out["still_running"] is False
+    assert out["stdout_delta"] == "abc"
+    assert out["stderr_delta"] == ""
+    assert out["exit_code"] == 0
+    # Second call with since_last=True returns empty delta (cursors advanced).
+    out2 = await handlers.shell_output(
+        shell_id=sid_shell, filter=None, since_last=True,
+    )
+    assert out2["stdout_delta"] == ""
+
+
+@test("shell", "handlers.shell_output: filter matches per-line regex")
+async def t_handlers_output_filter(ctx: TestContext) -> None:
+    from openagent.mcp.servers.shell import handlers
+
+    _reset_shell_hub()
+    started = await handlers.shell_exec(
+        command="printf 'line-alpha\\nline-beta\\nline-gamma\\n'",
+        cwd=None, env=None, timeout=None,
+        run_in_background=True, stdin=None, description=None,
+        session_id="sess-F",
+    )
+    sid_shell = started["shell_id"]
+    await handlers.get_hub().wait("sess-F", timeout=3.0)
+    out = await handlers.shell_output(
+        shell_id=sid_shell, filter=r"beta|gamma", since_last=True,
+    )
+    lines = [l for l in out["stdout_delta"].splitlines() if l]
+    assert lines == ["line-beta", "line-gamma"], f"got: {lines}"

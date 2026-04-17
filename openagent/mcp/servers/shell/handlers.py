@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re as _re
 import secrets
 import shutil
 import time
@@ -142,6 +143,61 @@ async def _watch_background(bg: BackgroundShell, session_id: str | None) -> None
         at=time.time(),
     )
     hub.post_event(session_id, event)
+
+
+# ── shell_output ────────────────────────────────────────────────────
+
+async def shell_output(
+    shell_id: str,
+    *,
+    filter: str | None = None,
+    since_last: bool = True,
+) -> dict[str, Any]:
+    hub = get_hub()
+    rec = hub.get(shell_id)
+    if rec is None:
+        raise ValueError(f"unknown shell_id: {shell_id}")
+    bg = rec.shell
+    if bg is None:
+        # Race: registered without a shell (tests). Fall through as empty.
+        return {
+            "stdout_delta": "",
+            "stderr_delta": "",
+            "still_running": False,
+            "exit_code": rec.exit_code,
+            "signal": rec.signal,
+            "stdout_bytes_total": 0,
+            "stderr_bytes_total": 0,
+            "truncated_stdout": False,
+            "truncated_stderr": False,
+        }
+    since_stdout = rec.last_read_stdout if since_last else 0
+    since_stderr = rec.last_read_stderr if since_last else 0
+    stdout_delta, stderr_delta = bg.read(
+        since_stdout=since_stdout, since_stderr=since_stderr,
+    )
+    if filter:
+        pattern = _re.compile(filter)
+        stdout_delta = "\n".join(
+            l for l in stdout_delta.splitlines() if pattern.search(l)
+        )
+        stderr_delta = "\n".join(
+            l for l in stderr_delta.splitlines() if pattern.search(l)
+        )
+    if since_last:
+        rec.last_read_stdout = bg.stdout_bytes_total
+        rec.last_read_stderr = bg.stderr_bytes_total
+    return {
+        "stdout_delta": stdout_delta,
+        "stderr_delta": stderr_delta,
+        "still_running": bg.is_running,
+        "exit_code": bg.exit_code,
+        "signal": bg.signal,
+        "stdout_bytes_total": bg.stdout_bytes_total,
+        "stderr_bytes_total": bg.stderr_bytes_total,
+        "truncated_stdout": bg.stdout_dropped > 0,
+        "truncated_stderr": bg.stderr_dropped > 0,
+    }
 
 
 # ── shell_which ─────────────────────────────────────────────────────
