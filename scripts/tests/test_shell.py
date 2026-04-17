@@ -196,3 +196,82 @@ async def t_hub_shutdown(ctx: TestContext) -> None:
     assert hub.list_for_session(None) == []
     assert hub.drain("s1") == []
     assert hub.drain("s2") == []
+
+
+async def _run_bg_to_completion(bg, *, max_wait: float = 2.5) -> None:
+    """Helper: busy-wait for ``bg`` to exit, then finalise. 50 x 50ms polls."""
+    import asyncio
+    for _ in range(int(max_wait / 0.05)):
+        if not bg.is_running:
+            break
+        await asyncio.sleep(0.05)
+    await bg.finalise()
+
+
+@test("shell", "BackgroundShell: spawn echo and capture stdout + exit_code")
+async def t_bg_spawn_echo(ctx: TestContext) -> None:
+    from openagent.mcp.servers.shell.shells import BackgroundShell
+
+    bg = BackgroundShell(
+        shell_id="sh_echo",
+        command="echo hello-from-shell",
+        cwd=None,
+        env=None,
+    )
+    await bg.start()
+    await _run_bg_to_completion(bg)
+    assert not bg.is_running, "echo should have completed within 2.5s"
+    stdout, _ = bg.read(since_stdout=0, since_stderr=0)
+    assert "hello-from-shell" in stdout
+    assert bg.exit_code == 0
+
+
+@test("shell", "BackgroundShell: non-zero exit is captured")
+async def t_bg_nonzero_exit(ctx: TestContext) -> None:
+    from openagent.mcp.servers.shell.shells import BackgroundShell
+
+    bg = BackgroundShell(
+        shell_id="sh_exit",
+        command="exit 7",
+        cwd=None,
+        env=None,
+    )
+    await bg.start()
+    await _run_bg_to_completion(bg)
+    assert not bg.is_running
+    assert bg.exit_code == 7
+
+
+@test("shell", "BackgroundShell: stderr is captured separately")
+async def t_bg_stderr(ctx: TestContext) -> None:
+    from openagent.mcp.servers.shell.shells import BackgroundShell
+
+    bg = BackgroundShell(
+        shell_id="sh_err",
+        command="echo to-err 1>&2",
+        cwd=None,
+        env=None,
+    )
+    await bg.start()
+    await _run_bg_to_completion(bg)
+    stdout, stderr = bg.read(since_stdout=0, since_stderr=0)
+    assert stdout == "", f"expected no stdout, got: {stdout!r}"
+    assert "to-err" in stderr
+
+
+@test("shell", "BackgroundShell: read cursors advance (since_last semantics)")
+async def t_bg_read_cursor(ctx: TestContext) -> None:
+    from openagent.mcp.servers.shell.shells import BackgroundShell
+
+    bg = BackgroundShell(
+        shell_id="sh_cursor",
+        command="printf 'ABC'",
+        cwd=None,
+        env=None,
+    )
+    await bg.start()
+    await _run_bg_to_completion(bg)
+    s1, _ = bg.read(since_stdout=0, since_stderr=0)
+    assert s1 == "ABC"
+    s2, _ = bg.read(since_stdout=len(s1.encode()), since_stderr=0)
+    assert s2 == "", f"expected empty after full read, got: {s2!r}"
