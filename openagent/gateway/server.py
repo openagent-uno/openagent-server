@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 from openagent.gateway import protocol as P
 from openagent.gateway.commands import command_help_text
 from openagent.gateway.sessions import SessionManager
-from openagent.gateway.api import vault, config, health, logs, control, usage, providers, models, scheduled_tasks
+from openagent.gateway.api import vault, config, health, logs, control, usage, providers, models, scheduled_tasks, mcps
 
 if TYPE_CHECKING:
     from openagent.core.agent import Agent
@@ -187,6 +187,26 @@ class Gateway:
             ("PUT", "/api/models/{name}", models.handle_update),
             ("DELETE", "/api/models/{name}", models.handle_delete),
             ("POST", "/api/models/{name}/test", models.handle_test),
+            # DB-backed model catalog (the models table). Ordered before the
+            # legacy yaml-providers CRUD above so that a request to a literal
+            # ``/api/models/db`` path matches here instead of being captured
+            # by the ``{name}`` catch-all.
+            ("GET", "/api/models/available", models.handle_available_models),
+            ("GET", "/api/models/db", models.handle_list_db),
+            ("POST", "/api/models/db", models.handle_create_db),
+            ("GET", "/api/models/db/{runtime_id:.+}", models.handle_get_db),
+            ("PUT", "/api/models/db/{runtime_id:.+}", models.handle_update_db),
+            ("DELETE", "/api/models/db/{runtime_id:.+}", models.handle_delete_db),
+            ("POST", "/api/models/db/{runtime_id:.+}/enable", models.handle_enable_db),
+            ("POST", "/api/models/db/{runtime_id:.+}/disable", models.handle_disable_db),
+            # DB-backed MCP registry.
+            ("GET", "/api/mcps", mcps.handle_list),
+            ("POST", "/api/mcps", mcps.handle_create),
+            ("GET", "/api/mcps/{name}", mcps.handle_get),
+            ("PUT", "/api/mcps/{name}", mcps.handle_update),
+            ("DELETE", "/api/mcps/{name}", mcps.handle_delete),
+            ("POST", "/api/mcps/{name}/enable", mcps.handle_enable),
+            ("POST", "/api/mcps/{name}/disable", mcps.handle_disable),
             ("POST", "/api/update", control.handle_update),
             ("POST", "/api/restart", control.handle_restart),
         )
@@ -736,6 +756,26 @@ class Gateway:
         try:
             elog("message.received", client_id=client_id, session_id=session_id, length=len(text))
             await self._maybe_reload_agent_model()
+
+            # Hot-reload MCPs/models if the registry tables changed, and
+            # get the enabled-model count for the rejection gate — one
+            # round-trip to the DB. ``-1`` means no DB is wired.
+            try:
+                _, enabled_count = await self.agent.refresh_registries()
+            except Exception as e:  # noqa: BLE001 — inner method already guards
+                elog("hot_reload.error", error=str(e))
+                enabled_count = -1
+            if enabled_count == 0:
+                await self._safe_ws_send_json(ws, {
+                    "type": P.ERROR,
+                    "text": (
+                        "No models are enabled. Add one via /models or ask "
+                        "the agent to add an openai/anthropic/google model."
+                    ),
+                    "session_id": session_id,
+                })
+                elog("session.rejected_no_models", session_id=session_id)
+                return
 
             async def on_status(status: str) -> None:
                 try:

@@ -1,0 +1,173 @@
+"""CRUD /api/mcps — manage the MCP server registry stored in SQLite.
+
+The list used to live in ``openagent.yaml`` under ``mcp:`` / ``mcp_disable:``
+which required a process restart after every change. These endpoints drive
+the same ``mcps`` table the mcp-manager MCP writes to, and every change
+is picked up by the gateway's hot-reload loop on the next message.
+
+GET    /api/mcps                → list all rows
+GET    /api/mcps/{name}         → fetch one
+POST   /api/mcps                → add a custom or builtin entry
+PUT    /api/mcps/{name}         → partial update
+DELETE /api/mcps/{name}         → remove permanently
+POST   /api/mcps/{name}/enable  → flip enabled=1
+POST   /api/mcps/{name}/disable → flip enabled=0
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from aiohttp import web
+
+
+def _db(request):
+    """Return the ``MemoryDB`` instance held by the running Agent.
+
+    Lives on ``request.app["gateway"].agent._memory`` (private attr used
+    elsewhere in the codebase — see ``_process_message``). Raising a
+    loud error here beats a quiet ``None`` fallback when the gateway is
+    misconfigured: handlers explicitly 500 when the DB is absent.
+    """
+    return request.app["gateway"].agent.memory_db
+
+
+async def handle_list(request):
+    from aiohttp import web
+
+    db = _db(request)
+    if db is None:
+        return web.json_response({"error": "memory DB not available"}, status=500)
+    rows = await db.list_mcps()
+    return web.json_response({"mcps": rows})
+
+
+async def handle_get(request):
+    from aiohttp import web
+
+    db = _db(request)
+    name = request.match_info["name"]
+    row = await db.get_mcp(name)
+    if row is None:
+        return web.json_response({"error": f"MCP {name!r} not found"}, status=404)
+    return web.json_response({"mcp": row})
+
+
+async def handle_create(request):
+    from aiohttp import web
+
+    db = _db(request)
+    body = await request.json() if request.can_read_body else {}
+    name = str(body.get("name") or "").strip()
+    if not name:
+        return web.json_response({"error": "name is required"}, status=400)
+    builtin_name = body.get("builtin_name") or body.get("builtin")
+    if builtin_name:
+        # Validate against BUILTIN_MCP_SPECS so the user gets a clear 400
+        # instead of a runtime pool-load failure on the next message.
+        from openagent.mcp.builtins import BUILTIN_MCP_SPECS
+        if builtin_name not in BUILTIN_MCP_SPECS:
+            available = ", ".join(sorted(BUILTIN_MCP_SPECS.keys()))
+            return web.json_response(
+                {"error": f"unknown builtin {builtin_name!r}. Available: {available}"},
+                status=400,
+            )
+        await db.upsert_mcp(
+            name,
+            kind="builtin",
+            builtin_name=str(builtin_name),
+            env=dict(body.get("env") or {}),
+            enabled=bool(body.get("enabled", True)),
+            source="api",
+        )
+    else:
+        command = body.get("command") or None
+        url = body.get("url") or None
+        if not command and not url:
+            return web.json_response(
+                {"error": "either command (argv list) or url is required"},
+                status=400,
+            )
+        await db.upsert_mcp(
+            name,
+            kind="custom",
+            command=list(command) if command else None,
+            args=list(body.get("args") or []),
+            url=url,
+            env=dict(body.get("env") or {}),
+            headers=dict(body.get("headers") or {}),
+            oauth=bool(body.get("oauth", False)),
+            enabled=bool(body.get("enabled", True)),
+            source="api",
+        )
+    return web.json_response({"ok": True, "mcp": await db.get_mcp(name)}, status=201)
+
+
+async def handle_update(request):
+    from aiohttp import web
+
+    db = _db(request)
+    name = request.match_info["name"]
+    existing = await db.get_mcp(name)
+    if existing is None:
+        return web.json_response({"error": f"MCP {name!r} not found"}, status=404)
+    body = await request.json() if request.can_read_body else {}
+
+    # Merge: body overrides existing field-by-field. Missing keys leave the
+    # old values in place so callers can PATCH-style hit the endpoint.
+    await db.upsert_mcp(
+        name,
+        kind=body.get("kind", existing["kind"]),
+        builtin_name=body.get("builtin_name", existing.get("builtin_name")),
+        command=body.get("command", existing.get("command")),
+        args=body.get("args", existing.get("args")),
+        url=body.get("url", existing.get("url")),
+        env=body.get("env", existing.get("env")),
+        headers=body.get("headers", existing.get("headers")),
+        oauth=bool(body.get("oauth", existing.get("oauth", False))),
+        enabled=bool(body.get("enabled", existing.get("enabled", True))),
+        source=body.get("source", existing.get("source", "api")),
+    )
+    return web.json_response({"ok": True, "mcp": await db.get_mcp(name)})
+
+
+async def handle_delete(request):
+    from aiohttp import web
+
+    db = _db(request)
+    name = request.match_info["name"]
+    if name == "mcp-manager":
+        return web.json_response(
+            {"error": "Refusing to delete mcp-manager — disable instead if you want to turn it off."},
+            status=400,
+        )
+    existing = await db.get_mcp(name)
+    if existing is None:
+        return web.json_response({"error": f"MCP {name!r} not found"}, status=404)
+    await db.delete_mcp(name)
+    return web.json_response({"ok": True})
+
+
+async def handle_enable(request):
+    from aiohttp import web
+
+    db = _db(request)
+    name = request.match_info["name"]
+    existing = await db.get_mcp(name)
+    if existing is None:
+        return web.json_response({"error": f"MCP {name!r} not found"}, status=404)
+    await db.set_mcp_enabled(name, True)
+    return web.json_response({"ok": True, "mcp": await db.get_mcp(name)})
+
+
+async def handle_disable(request):
+    from aiohttp import web
+
+    db = _db(request)
+    name = request.match_info["name"]
+    existing = await db.get_mcp(name)
+    if existing is None:
+        return web.json_response({"error": f"MCP {name!r} not found"}, status=404)
+    await db.set_mcp_enabled(name, False)
+    return web.json_response({"ok": True, "mcp": await db.get_mcp(name)})

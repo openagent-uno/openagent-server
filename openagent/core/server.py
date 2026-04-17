@@ -16,7 +16,6 @@ import logging
 import os
 import signal
 from openagent.core.agent import Agent
-from openagent.mcp.pool import MCPPool
 from openagent.memory.db import MemoryDB
 from openagent.models.runtime import create_model_from_config, wire_model_runtime
 from openagent.core.logging import elog
@@ -99,35 +98,25 @@ def _build_agent(config: dict) -> Agent:
         if wa.get("green_api_token"):
             os.environ["GREEN_API_TOKEN"] = wa["green_api_token"]
 
-    mcp_config = config.get("mcp", [])
-    include_defaults = config.get("mcp_defaults", True)
-    mcp_disable = config.get("mcp_disable", [])
-
     memory_cfg = config.get("memory", {})
     db_path = memory_cfg.get("db_path", str(default_db_path()))
     db = MemoryDB(db_path)
 
-    # Pool resolves and (later, on agent.initialize) connects every MCP server.
-    # Built once per process, shared across all providers (AgnoProvider tiers
-    # via SmartRouter, ClaudeCLI). Channel tokens were exported to os.environ
-    # above; the pool's spec resolution copies them into per-server env dicts.
-    mcp_pool = MCPPool.from_config(
-        mcp_config=mcp_config,
-        include_defaults=include_defaults,
-        disable=mcp_disable,
-        db_path=db_path,
-    )
-
-    # Wire the shared DB and MCP pool into the model.
-    wire_model_runtime(model, db=db, mcp_pool=mcp_pool)
+    # MCP pool is built *inside* ``Agent.initialize`` from the DB after the
+    # yaml → DB bootstrap runs, so first-boot users transparently migrate
+    # their yaml ``mcp:`` list and subsequent edits go through the
+    # mcp-manager MCP instead of requiring a restart. The Agent starts
+    # with an empty pool; ``wire_model_runtime`` re-runs in ``initialize``
+    # once the pool is online so providers see the full toolkit list.
+    wire_model_runtime(model, db=db)
 
     return Agent(
         name=config.get("name", "openagent"),
         model=model,
         system_prompt=config.get("system_prompt", "You are a helpful assistant."),
-        mcp_pool=mcp_pool,
+        mcp_pool=None,
         memory=db,
-        config=config,  # pass through so Agent can read shell_settings
+        config=config,  # Agent.initialize uses mcp / providers / memory sections
     )
 
 

@@ -54,8 +54,20 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_catalog",
     "test_channels",
     "test_formatting",
+    # New DB-backed registry tests: pure CRUD against ctx.db_path, no pool.
+    "test_db_mcps",
+    "test_db_models",
+    "test_bootstrap_import",
+    # Dynamic provider catalog: bundled fallback only (no live HTTP).
+    "test_models_discovery",
+    # ClaudeCLI buffer fix — computer-control screenshot regression guard.
+    "test_buffer_size",
     # 2. MCP pool — sets ctx.extras["pool"] for everything below
     "test_pool",
+    # MCPPool.from_db + reload — runs right after test_pool so it inherits
+    # the "pool machinery imports cleanly" guarantee but uses its own
+    # throwaway DB to avoid touching the shared pool fixture.
+    "test_pool_reload",
     # 3. Provider-level live tests (need pool)
     "test_agno",
     "test_router",
@@ -69,6 +81,8 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_usage",
     "test_models",
     "test_rest",
+    # DB-backed REST endpoints (/api/mcps, /api/models/db) — needs gateway.
+    "test_mcps_rest",
     "test_voice",
     "test_files",
     # 6. Misc standalone
@@ -81,6 +95,9 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_claude_cli",
     # 8. Unit tests for claude_cli text-recovery regression
     "test_claude_cli_text_recovery",
+    # ClaudeCLIRegistry dispatch — runs right after text-recovery since it
+    # shares the claude_cli module's monkey-patching patterns.
+    "test_claude_cli_registry",
     # 9. Gateway /stop, /clear, /new command semantics
     "test_gateway_commands",
     # 10. MCPPool resilience — one bad MCP mustn't sink the whole pool

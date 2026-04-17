@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from typing import Any
@@ -14,6 +15,8 @@ from openagent.memory.schedule import (
     parse_one_shot_expression,
 )
 
+
+VALID_MCP_KINDS = ("builtin", "custom", "default")
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS scheduled_tasks (
@@ -56,6 +59,66 @@ CREATE TABLE IF NOT EXISTS sdk_sessions (
     updated_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_sdk_sessions_updated ON sdk_sessions(updated_at);
+
+-- Configured MCP servers. Replaces the yaml ``mcp:`` list so the agent
+-- itself (via the mcp-manager MCP) can add/remove/toggle servers at
+-- runtime without a process restart. A one-shot import from yaml seeds
+-- the table on first boot; subsequent yaml edits are ignored.
+--
+-- ``kind`` discriminates three sources:
+--   - ``default``: one of DEFAULT_MCPS, resolved via resolve_default_entry
+--   - ``builtin``: user opted-in to one of BUILTIN_MCP_SPECS
+--   - ``custom``:  raw command/url entry (pre-resolved)
+-- JSON columns are stored as TEXT to keep the schema portable; callers
+-- wrap with json.dumps/loads at the Python layer.
+CREATE TABLE IF NOT EXISTS mcps (
+    name TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('builtin','custom','default')),
+    builtin_name TEXT,
+    command TEXT,
+    args_json TEXT NOT NULL DEFAULT '[]',
+    url TEXT,
+    env_json TEXT NOT NULL DEFAULT '{}',
+    headers_json TEXT NOT NULL DEFAULT '{}',
+    oauth INTEGER NOT NULL DEFAULT 0,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    source TEXT NOT NULL DEFAULT 'user',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mcps_enabled ON mcps(enabled);
+CREATE INDEX IF NOT EXISTS idx_mcps_updated ON mcps(updated_at);
+
+-- Configured LLM models. Replaces per-provider ``models:`` lists in yaml
+-- so the agent (via the model-manager MCP) can add/remove/toggle models
+-- at runtime. ``runtime_id`` is the canonical id (provider:model_id, or
+-- claude-cli/model_id) used everywhere in code; see
+-- openagent.models.catalog.build_runtime_model_id.
+CREATE TABLE IF NOT EXISTS models (
+    runtime_id TEXT PRIMARY KEY,
+    provider TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    display_name TEXT,
+    input_cost_per_million REAL,
+    output_cost_per_million REAL,
+    tier_hint TEXT,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_models_provider ON models(provider);
+CREATE INDEX IF NOT EXISTS idx_models_enabled ON models(enabled);
+CREATE INDEX IF NOT EXISTS idx_models_updated ON models(updated_at);
+
+-- Generic string-valued state flags. Used for one-shot bootstrap
+-- markers (``mcps_imported``, ``models_imported``) so yaml → DB import
+-- runs exactly once per DB file.
+CREATE TABLE IF NOT EXISTS config_state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
 """
 
 
@@ -69,8 +132,19 @@ class MemoryDB:
     async def connect(self) -> None:
         if self._conn is not None:
             return
-        self._conn = await aiosqlite.connect(self.db_path)
+        # ``timeout`` is the SQLite-level wait when another connection holds a
+        # write lock. WAL mode lets readers proceed without blocking writers,
+        # but ``executescript(SCHEMA_SQL)`` below needs a write lock to
+        # re-run CREATE TABLE IF NOT EXISTS DDL — and when the same process
+        # already has a MemoryDB connection open (gateway agent + scheduler
+        # MCP subprocess + a fresh per-test MemoryDB all pointing at the same
+        # file), two DDL calls can race. Raise the timeout so the second
+        # connect waits a few seconds instead of deadlocking the event loop.
+        self._conn = await aiosqlite.connect(self.db_path, timeout=10.0)
         self._conn.row_factory = aiosqlite.Row
+        # ``busy_timeout`` gives the same guarantee at every subsequent
+        # statement on this connection — not just the initial open.
+        await self._conn.execute("PRAGMA busy_timeout = 10000")
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.executescript(SCHEMA_SQL)
         await self._conn.commit()
@@ -263,6 +337,281 @@ class MemoryDB:
         await conn.execute(
             "DELETE FROM sdk_sessions WHERE session_id = ?",
             (session_id,),
+        )
+        await conn.commit()
+
+    # ── MCP Registry ──
+
+    @staticmethod
+    def _row_to_mcp(row: aiosqlite.Row) -> dict:
+        """Deserialise JSON columns so callers see plain Python values.
+
+        ``command``/``args``/``env``/``headers`` are stored as TEXT-wrapped
+        JSON. Upstream (MCPPool.from_db, mcp-manager MCP) expects real
+        lists/dicts, so we wrap every read instead of forcing each caller
+        to remember.
+        """
+        d = dict(row)
+        for col, default in (("args_json", "[]"), ("env_json", "{}"), ("headers_json", "{}")):
+            raw = d.pop(col, default) or default
+            key = col[:-5]  # strip "_json"
+            try:
+                d[key] = json.loads(raw)
+            except (TypeError, ValueError):
+                d[key] = [] if default == "[]" else {}
+        # command is also JSON-wrapped (argv list); None when only url is set.
+        raw_cmd = d.get("command")
+        if raw_cmd:
+            try:
+                d["command"] = json.loads(raw_cmd)
+            except (TypeError, ValueError):
+                d["command"] = None
+        d["enabled"] = bool(d.get("enabled"))
+        d["oauth"] = bool(d.get("oauth"))
+        return d
+
+    async def list_mcps(self, enabled_only: bool = False) -> list[dict]:
+        conn = await self._ensure_connected()
+        if enabled_only:
+            cursor = await conn.execute(
+                "SELECT * FROM mcps WHERE enabled = 1 ORDER BY name ASC"
+            )
+        else:
+            cursor = await conn.execute("SELECT * FROM mcps ORDER BY name ASC")
+        rows = await cursor.fetchall()
+        return [self._row_to_mcp(r) for r in rows]
+
+    async def get_mcp(self, name: str) -> dict | None:
+        conn = await self._ensure_connected()
+        cursor = await conn.execute("SELECT * FROM mcps WHERE name = ?", (name,))
+        row = await cursor.fetchone()
+        return self._row_to_mcp(row) if row else None
+
+    async def upsert_mcp(
+        self,
+        name: str,
+        *,
+        kind: str,
+        builtin_name: str | None = None,
+        command: list[str] | None = None,
+        args: list[str] | None = None,
+        url: str | None = None,
+        env: dict | None = None,
+        headers: dict | None = None,
+        oauth: bool = False,
+        enabled: bool = True,
+        source: str = "user",
+    ) -> None:
+        if kind not in VALID_MCP_KINDS:
+            raise ValueError(f"invalid kind: {kind!r}")
+        if not name:
+            raise ValueError("name is required")
+        conn = await self._ensure_connected()
+        now = time.time()
+        cmd_text: str | None
+        if command:
+            # Store the argv as a single shell-safe string. We keep it as TEXT
+            # (not JSON) because the runtime treats command[0] specially
+            # (absolute-path resolution in MCPPool._normalise_spec); shell-join
+            # would re-parse at the wrong boundary. Use a JSON array instead.
+            cmd_text = json.dumps(list(command))
+        else:
+            cmd_text = None
+        await conn.execute(
+            "INSERT INTO mcps (name, kind, builtin_name, command, args_json, url, "
+            "env_json, headers_json, oauth, enabled, source, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET "
+            "kind = excluded.kind, builtin_name = excluded.builtin_name, "
+            "command = excluded.command, args_json = excluded.args_json, "
+            "url = excluded.url, env_json = excluded.env_json, "
+            "headers_json = excluded.headers_json, oauth = excluded.oauth, "
+            "enabled = excluded.enabled, source = excluded.source, "
+            "updated_at = excluded.updated_at",
+            (
+                name,
+                kind,
+                builtin_name,
+                cmd_text,
+                json.dumps(list(args or [])),
+                url,
+                json.dumps(dict(env or {})),
+                json.dumps(dict(headers or {})),
+                1 if oauth else 0,
+                1 if enabled else 0,
+                source,
+                now,
+                now,
+            ),
+        )
+        await conn.commit()
+
+    async def set_mcp_enabled(self, name: str, enabled: bool) -> None:
+        conn = await self._ensure_connected()
+        await conn.execute(
+            "UPDATE mcps SET enabled = ?, updated_at = ? WHERE name = ?",
+            (1 if enabled else 0, time.time(), name),
+        )
+        await conn.commit()
+
+    async def delete_mcp(self, name: str) -> None:
+        conn = await self._ensure_connected()
+        await conn.execute("DELETE FROM mcps WHERE name = ?", (name,))
+        await conn.commit()
+
+    async def mcps_max_updated(self) -> float:
+        """Return the most recent ``updated_at`` across mcps rows.
+
+        Gateway polls this per message and triggers ``MCPPool.reload()`` when
+        it increases. 0.0 when the table is empty — first boot will see
+        a bump to the bootstrap write and reload once, which is fine.
+        """
+        conn = await self._ensure_connected()
+        cursor = await conn.execute("SELECT MAX(updated_at) FROM mcps")
+        row = await cursor.fetchone()
+        return float(row[0] or 0.0) if row else 0.0
+
+    # ── Model Registry ──
+
+    @staticmethod
+    def _row_to_model(row: aiosqlite.Row) -> dict:
+        d = dict(row)
+        raw = d.pop("metadata_json", "{}") or "{}"
+        try:
+            d["metadata"] = json.loads(raw)
+        except (TypeError, ValueError):
+            d["metadata"] = {}
+        d["enabled"] = bool(d.get("enabled"))
+        return d
+
+    async def list_models(
+        self, provider: str | None = None, enabled_only: bool = False
+    ) -> list[dict]:
+        conn = await self._ensure_connected()
+        clauses = []
+        params: list[Any] = []
+        if provider:
+            clauses.append("provider = ?")
+            params.append(provider)
+        if enabled_only:
+            clauses.append("enabled = 1")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        cursor = await conn.execute(
+            f"SELECT * FROM models {where} ORDER BY provider ASC, model_id ASC",
+            params,
+        )
+        rows = await cursor.fetchall()
+        return [self._row_to_model(r) for r in rows]
+
+    async def get_model(self, runtime_id: str) -> dict | None:
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            "SELECT * FROM models WHERE runtime_id = ?", (runtime_id,)
+        )
+        row = await cursor.fetchone()
+        return self._row_to_model(row) if row else None
+
+    async def upsert_model(
+        self,
+        runtime_id: str,
+        *,
+        provider: str,
+        model_id: str,
+        display_name: str | None = None,
+        input_cost: float | None = None,
+        output_cost: float | None = None,
+        tier_hint: str | None = None,
+        enabled: bool = True,
+        metadata: dict | None = None,
+    ) -> None:
+        if not runtime_id or not provider or not model_id:
+            raise ValueError("runtime_id, provider and model_id are required")
+        conn = await self._ensure_connected()
+        now = time.time()
+        await conn.execute(
+            "INSERT INTO models (runtime_id, provider, model_id, display_name, "
+            "input_cost_per_million, output_cost_per_million, tier_hint, enabled, "
+            "metadata_json, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(runtime_id) DO UPDATE SET "
+            "provider = excluded.provider, model_id = excluded.model_id, "
+            "display_name = excluded.display_name, "
+            "input_cost_per_million = excluded.input_cost_per_million, "
+            "output_cost_per_million = excluded.output_cost_per_million, "
+            "tier_hint = excluded.tier_hint, enabled = excluded.enabled, "
+            "metadata_json = excluded.metadata_json, "
+            "updated_at = excluded.updated_at",
+            (
+                runtime_id,
+                provider,
+                model_id,
+                display_name,
+                input_cost,
+                output_cost,
+                tier_hint,
+                1 if enabled else 0,
+                json.dumps(dict(metadata or {})),
+                now,
+                now,
+            ),
+        )
+        await conn.commit()
+
+    async def set_model_enabled(self, runtime_id: str, enabled: bool) -> None:
+        conn = await self._ensure_connected()
+        await conn.execute(
+            "UPDATE models SET enabled = ?, updated_at = ? WHERE runtime_id = ?",
+            (1 if enabled else 0, time.time(), runtime_id),
+        )
+        await conn.commit()
+
+    async def delete_model(self, runtime_id: str) -> None:
+        conn = await self._ensure_connected()
+        await conn.execute("DELETE FROM models WHERE runtime_id = ?", (runtime_id,))
+        await conn.commit()
+
+    async def models_max_updated(self) -> float:
+        conn = await self._ensure_connected()
+        cursor = await conn.execute("SELECT MAX(updated_at) FROM models")
+        row = await cursor.fetchone()
+        return float(row[0] or 0.0) if row else 0.0
+
+    async def registry_status(self) -> tuple[float, float, int]:
+        """One-shot probe used by the gateway's per-message hot-reload loop.
+
+        Returns ``(mcps_max_updated, models_max_updated, enabled_models_count)``
+        in a single round-trip so the dispatcher doesn't pay three SELECTs
+        per incoming message.
+        """
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            "SELECT "
+            "  COALESCE((SELECT MAX(updated_at) FROM mcps), 0), "
+            "  COALESCE((SELECT MAX(updated_at) FROM models), 0), "
+            "  COALESCE((SELECT COUNT(*) FROM models WHERE enabled = 1), 0)"
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return 0.0, 0.0, 0
+        return float(row[0] or 0.0), float(row[1] or 0.0), int(row[2] or 0)
+
+    # ── Generic state flags ──
+
+    async def get_state(self, key: str) -> str | None:
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            "SELECT value FROM config_state WHERE key = ?", (key,)
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+    async def set_state(self, key: str, value: str) -> None:
+        conn = await self._ensure_connected()
+        await conn.execute(
+            "INSERT INTO config_state (key, value, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+            "updated_at = excluded.updated_at",
+            (key, value, time.time()),
         )
         await conn.commit()
 

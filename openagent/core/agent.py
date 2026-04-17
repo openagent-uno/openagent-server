@@ -114,6 +114,13 @@ class Agent:
         self._inflight_counts: dict[int, int] = {}
         self._drain_events: dict[int, asyncio.Event] = {}
 
+    @property
+    def memory_db(self) -> MemoryDB | None:
+        """Expose the runtime DB. Public accessor for REST handlers
+        and manager MCPs so they don't poke at ``_db`` directly.
+        """
+        return self._db
+
     @staticmethod
     def _response_meta_key(session_id: str | None) -> str:
         return session_id or "__default__"
@@ -290,12 +297,53 @@ class Agent:
             logger.debug("shell hub purge for %s failed: %s", session_id, e)
 
     async def initialize(self) -> None:
-        """Connect MCP servers and initialize memory DB."""
+        """Connect MCP servers and initialize memory DB.
+
+        On first boot we also run the yaml → DB bootstrap so existing
+        users migrate transparently. After bootstrap the MCP pool is
+        rebuilt from the ``mcps`` table via ``MCPPool.from_db`` so the
+        runtime can hot-reload entries without a process restart
+        (see ``reload_mcps_if_changed``).
+        """
         if self._initialized:
             return
         elog("agent.initialize.start", agent=self.name, model_class=type(self.model).__name__)
         if self._db:
             await self._db.connect()
+
+        # One-shot yaml → DB bootstrap + swap to the DB-backed pool.
+        # Skipped when there is no DB (pure in-memory tests); in that case
+        # we fall back to whatever pool the caller passed in.
+        if self._db is not None and self.config is not None:
+            try:
+                from openagent.memory.bootstrap import (
+                    import_yaml_mcps_once,
+                    import_yaml_models_once,
+                )
+                mcp_config = self.config.get("mcp", []) or []
+                include_defaults = bool(self.config.get("mcp_defaults", True))
+                mcp_disable = list(self.config.get("mcp_disable", []) or [])
+                await import_yaml_mcps_once(
+                    self._db, mcp_config, include_defaults, mcp_disable,
+                )
+                await import_yaml_models_once(
+                    self._db,
+                    self.config.get("providers", {}) or {},
+                    model_cfg=self.config.get("model", {}) or {},
+                )
+            except Exception as exc:  # noqa: BLE001 — bootstrap must not block startup
+                logger.warning("yaml→DB bootstrap failed: %s", exc)
+                elog("bootstrap.error", error=str(exc))
+
+            try:
+                db_path = getattr(self._db, "db_path", None)
+                new_pool = await MCPPool.from_db(self._db, db_path=db_path)
+                self._mcp = new_pool
+                self._mcps_last_updated = await self._db.mcps_max_updated()
+            except Exception as exc:  # noqa: BLE001 — leave the existing pool untouched
+                logger.warning("MCPPool.from_db failed, using caller pool: %s", exc)
+                elog("pool.from_db_error", error=str(exc))
+
         await self._mcp.connect_all()
 
         self._prepare_model_runtime(self.model)
@@ -310,6 +358,50 @@ class Agent:
             tools=self._mcp.total_tool_count,
             has_db=bool(self._db),
         )
+
+    async def refresh_registries(self) -> tuple[bool, int]:
+        """Combined hot-reload probe for the gateway's dispatcher.
+
+        One SQLite round-trip (``registry_status``) returns the max
+        timestamps for both the mcps and models tables plus the enabled
+        model count. We then reload whatever is stale and return the
+        count so the caller can short-circuit when zero models are
+        enabled. Returns ``(reloaded_anything, enabled_models)``.
+        """
+        if self._db is None:
+            return False, -1
+        try:
+            mcps_updated, models_updated, enabled_count = await self._db.registry_status()
+        except Exception as exc:  # noqa: BLE001 — never gate a message on this probe
+            logger.debug("registry_status probe failed: %s", exc)
+            return False, -1
+
+        reloaded = False
+        if mcps_updated > getattr(self, "_mcps_last_updated", 0.0):
+            self._mcps_last_updated = mcps_updated
+            try:
+                await self._mcp.reload()
+                for model in list(self._runtime_models):
+                    wire_model_runtime(model, db=self._db, mcp_pool=self._mcp)
+                reloaded = True
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("MCP pool reload failed: %s", exc)
+                elog("mcps.reload_error", error=str(exc))
+
+        if models_updated > getattr(self, "_models_last_updated", 0.0):
+            self._models_last_updated = models_updated
+            providers_config = (self.config or {}).get("providers", {})
+            for model in list(self._runtime_models):
+                rebuild = getattr(model, "rebuild_routing", None)
+                if callable(rebuild):
+                    try:
+                        rebuild(providers_config)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("rebuild_routing failed: %s", exc)
+            elog("models.reload")
+            reloaded = True
+
+        return reloaded, enabled_count
 
     async def _run_idle_cleanup(self) -> None:
         """Periodically release idle provider resources."""

@@ -37,7 +37,11 @@ from typing import Any, Awaitable, Callable
 
 from openagent.core.logging import elog
 from openagent.models.base import BaseModel, ModelResponse
-from openagent.models.catalog import claude_cli_model_spec, compute_cost
+from openagent.models.catalog import (
+    claude_cli_model_spec,
+    compute_cost,
+    model_id_from_runtime,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -221,6 +225,18 @@ class ClaudeCLI(BaseModel):
             opts["system_prompt"] = system
         if sdk_session_id:
             opts["resume"] = sdk_session_id
+        # Raise the SDK stdio buffer above the 1 MiB default. Computer-control
+        # screenshots (PNG base64) regularly exceed that cap on retina
+        # displays, which the SDK surfaces as
+        # "Failed to decode JSON: JSON message exceeded maximum buffer size".
+        # 16 MiB covers the worst-case image we downsample to. Ops can
+        # override via OPENAGENT_CLAUDE_SDK_BUFFER_MIB without a redeploy.
+        try:
+            buf_mib = int(os.environ.get("OPENAGENT_CLAUDE_SDK_BUFFER_MIB", "16"))
+        except (TypeError, ValueError):
+            buf_mib = 16
+        if buf_mib > 0:
+            opts["max_buffer_size"] = buf_mib * 1024 * 1024
         return ClaudeAgentOptions(**opts)
 
     async def _hydrate_from_db(self, session: _Session) -> None:
@@ -744,3 +760,175 @@ class ClaudeCLI(BaseModel):
                 error=str(e),
             )
         return input_tokens, output_tokens, cost
+
+
+class ClaudeCLIRegistry(BaseModel):
+    """Per-session model dispatcher for claude-cli.
+
+    OpenAgent's single-process ``ClaudeCLI`` instance binds a model id at
+    construction time: changing ``self.model`` later would not retroactively
+    reconfigure the ``ClaudeSDKClient`` already spawned for a running
+    session (the SDK captures the model in ``options`` when
+    ``connect()`` runs). To let different sessions route to different
+    Claude models without losing their ``--resume`` state, we keep one
+    ``ClaudeCLI`` per model and forward calls by session.
+
+    Lifecycle methods (``set_db``, ``set_mcp_servers``, ``cleanup_idle``,
+    ``shutdown``, ``close_session``, ``forget_session``) fan out to every
+    live instance so downstream wiring (``wire_model_runtime``) works
+    unchanged.
+
+    ``generate`` picks the instance for a session based on:
+
+      1. An explicit ``model_override`` string on the call (``claude-cli/<id>``
+         or bare ``<id>``) — highest priority.
+      2. A session-level pin set via ``pin_session`` (e.g. from the
+         model-manager MCP).
+      3. The registry's default model (``default_model`` constructor arg).
+
+    When the registry has no default and no pin for a session, the first
+    configured claude-cli model in the DB wins — or the call fails with
+    a structured error if none exist.
+    """
+
+    history_mode = "provider"
+
+    def __init__(
+        self,
+        default_model: str | None = None,
+        allowed_tools: list[str] | None = None,
+        permission_mode: str = "bypass",
+        mcp_servers: dict[str, dict] | None = None,
+        providers_config: dict | None = None,
+        idle_ttl_seconds: int | None = None,
+        idle_timeout_seconds: int | None = None,  # noqa: ARG002 — legacy kwarg
+        hard_timeout_seconds: int | None = None,  # noqa: ARG002 — legacy kwarg
+    ):
+        self._default_model = (default_model or "").strip() or None
+        self._allowed_tools = allowed_tools or []
+        self._permission_mode = permission_mode
+        self._mcp_servers: dict[str, dict] = mcp_servers or {}
+        self._providers_config = providers_config or {}
+        self._idle_ttl_seconds = idle_ttl_seconds
+        self._db: Any = None
+        self._instances: dict[str, ClaudeCLI] = {}
+        self._session_model: dict[str, str] = {}
+
+    @property
+    def model(self) -> str | None:
+        return self._default_model
+
+    # ── lifecycle fan-out ─────────────────────────────────────────────
+
+    async def _fanout_async(self, method_name: str, *args: Any) -> None:
+        for inst in list(self._instances.values()):
+            try:
+                await getattr(inst, method_name)(*args)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("registry.%s: %s", method_name, e)
+
+    def _fanout_sync(self, method_name: str, *args: Any) -> None:
+        for inst in self._instances.values():
+            getattr(inst, method_name)(*args)
+
+    def set_db(self, db: Any) -> None:
+        self._db = db
+        self._fanout_sync("set_db", db)
+
+    def set_mcp_servers(self, servers: dict[str, dict]) -> None:
+        self._mcp_servers = servers
+        self._fanout_sync("set_mcp_servers", servers)
+
+    async def cleanup_idle(self) -> Any:
+        await self._fanout_async("cleanup_idle")
+
+    async def shutdown(self) -> None:
+        await self._fanout_async("shutdown")
+        self._instances.clear()
+
+    async def close_session(self, session_id: str) -> None:
+        await self._fanout_async("close_session", session_id)
+        self._session_model.pop(session_id, None)
+
+    async def forget_session(self, session_id: str) -> None:
+        await self._fanout_async("forget_session", session_id)
+        self._session_model.pop(session_id, None)
+
+    def known_session_ids(self) -> list[str]:
+        seen: set[str] = set()
+        for inst in self._instances.values():
+            seen.update(inst.known_session_ids())
+        seen.update(self._session_model.keys())
+        return sorted(seen)
+
+    # ── per-session routing ───────────────────────────────────────────
+
+    def pin_session(self, session_id: str, model_id: str | None) -> None:
+        """Pin (or unpin, when ``model_id`` is None/empty) a session's model."""
+        if model_id and model_id.strip():
+            self._session_model[session_id] = model_id_from_runtime(model_id.strip())
+        else:
+            self._session_model.pop(session_id, None)
+
+    def set_default_model(self, model_id: str | None) -> None:
+        """Change the fallback model used when a session has no pin."""
+        self._default_model = (
+            model_id_from_runtime(model_id.strip()) if (model_id and model_id.strip()) else None
+        )
+
+    def _resolve_model(self, session_id: str, model_override: str | None) -> str | None:
+        """Pick the claude-cli model id for a given turn."""
+        if model_override and model_override.strip():
+            return model_id_from_runtime(model_override.strip())
+        pinned = self._session_model.get(session_id)
+        if pinned:
+            return pinned
+        return self._default_model
+
+    def _get_or_create(self, model_id: str | None) -> ClaudeCLI:
+        key = model_id or ""
+        inst = self._instances.get(key)
+        if inst is not None:
+            return inst
+        inst = ClaudeCLI(
+            model=model_id,
+            allowed_tools=self._allowed_tools,
+            permission_mode=self._permission_mode,
+            mcp_servers=self._mcp_servers,
+            providers_config=self._providers_config,
+            idle_ttl_seconds=self._idle_ttl_seconds,
+        )
+        if self._db is not None:
+            inst.set_db(self._db)
+        self._instances[key] = inst
+        elog("claude_cli_registry.instance_created", model=model_id or "<default>")
+        return inst
+
+    # ── turn ──────────────────────────────────────────────────────────
+
+    async def generate(
+        self,
+        messages: list[dict[str, Any]],
+        system: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        on_status: Callable[[str], Awaitable[None]] | None = None,
+        session_id: str | None = None,
+        model_override: str | None = None,
+    ) -> ModelResponse:
+        sid = session_id or "default"
+        model_id = self._resolve_model(sid, model_override)
+        # Pin the session to this model on first use so follow-up turns hit
+        # the same subprocess (and therefore reuse ``--resume`` state).
+        if model_id and sid not in self._session_model:
+            self._session_model[sid] = model_id
+        inst = self._get_or_create(model_id)
+        return await inst.generate(
+            messages=messages,
+            system=system,
+            tools=tools,
+            on_status=on_status,
+            session_id=sid,
+        )
+
+
+

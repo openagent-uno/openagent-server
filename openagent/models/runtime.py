@@ -123,13 +123,16 @@ def create_model_from_spec(
             claude_permission_mode=permission_mode,
         )
     elif is_claude_cli_model(spec):
-        from openagent.models.claude_cli import ClaudeCLI
+        from openagent.models.claude_cli import ClaudeCLIRegistry
 
         bare = model_id_from_runtime(spec)
-        # ClaudeCLI receives mcp_servers via wire_model_runtime below from the
-        # pool; constructor mcp_servers stays None to avoid double-wiring.
-        model = ClaudeCLI(
-            model=bare if bare and bare != spec else None,
+        default_model = bare if bare and bare != spec else None
+        # The registry hosts one ClaudeCLI per model id so multiple
+        # claude-cli entries in the ``models`` table can coexist and
+        # sessions get routed to the right one. It behaves identically
+        # to a single ClaudeCLI when only one model is configured.
+        model = ClaudeCLIRegistry(
+            default_model=default_model,
             permission_mode=permission_mode,
             providers_config=providers_config,
             idle_timeout_seconds=claude_idle_timeout_seconds,

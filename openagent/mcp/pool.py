@@ -230,6 +230,76 @@ def _resolve_specs(
     return specs
 
 
+async def _specs_from_db(db: Any, db_path: str | None) -> list[_ServerSpec]:
+    """Translate ``mcps`` table rows into resolved specs.
+
+    Each row keeps the same kwargs shape that ``DEFAULT_MCPS`` entries or
+    raw user ``mcp:`` entries use; we then run it through
+    ``resolve_default_entry`` / ``resolve_builtin_entry`` so absolute path
+    resolution, Python-entrypoint substitution for frozen builds, and the
+    scheduler-DB env injection all reuse the existing code path instead
+    of being duplicated.
+    """
+    rows = await db.list_mcps(enabled_only=True)
+    specs: list[_ServerSpec] = []
+    for row in rows:
+        kind = row.get("kind")
+        name = row.get("name") or ""
+        try:
+            if kind == "default":
+                # Reconstruct the minimal dict shape ``resolve_default_entry``
+                # expects. ``source='yaml-default'`` rows use the builtin
+                # indirection when ``builtin_name`` is set; others are raw
+                # command/args (e.g. vault, filesystem).
+                if row.get("builtin_name"):
+                    entry = {"builtin": row["builtin_name"], "env": row.get("env") or None}
+                else:
+                    entry = {
+                        "name": name,
+                        "command": row.get("command"),
+                        "args": row.get("args") or [],
+                        "url": row.get("url"),
+                        "env": row.get("env") or None,
+                    }
+                kwargs = resolve_default_entry(entry, db_path=db_path)
+                if kwargs:
+                    specs.append(_spec_from_kwargs(kwargs))
+            elif kind == "builtin":
+                extra_env = dict(row.get("env") or {})
+                if row.get("builtin_name") in ("scheduler", "mcp-manager", "model-manager"):
+                    # Mirror the db-path injection that resolve_default_entry
+                    # does for the scheduler so runtime-created builtin rows
+                    # still see the DB.
+                    if db_path and "OPENAGENT_DB_PATH" not in extra_env:
+                        extra_env["OPENAGENT_DB_PATH"] = os.path.abspath(db_path)
+                kwargs = resolve_builtin_entry(
+                    row["builtin_name"],
+                    env=extra_env or None,
+                )
+                specs.append(_spec_from_kwargs(kwargs))
+            else:  # custom
+                specs.append(_ServerSpec(
+                    name=name,
+                    command=row.get("command"),
+                    args=list(row.get("args") or []),
+                    url=row.get("url"),
+                    env=row.get("env") or None,
+                    headers=row.get("headers") or None,
+                    oauth=bool(row.get("oauth")),
+                ))
+        except Exception as exc:  # noqa: BLE001 — one bad row must not pin the pool
+            logger.warning(
+                "MCP row %r failed to resolve: %s — skipping (re-enable "
+                "via the manager MCP once fixed)",
+                name, exc,
+            )
+            elog("mcp.db_row_error", name=name, kind=kind, error=str(exc))
+
+    for spec in specs:
+        _normalise_spec(spec)
+    return specs
+
+
 def _spec_from_kwargs(kwargs: dict[str, Any]) -> _ServerSpec:
     """Convert ``resolve_*_entry``'s loose dict into a typed ``_ServerSpec``."""
     return _ServerSpec(
@@ -278,6 +348,10 @@ class MCPPool:
         # so close_all can handle them independently (no AsyncExitStack needed).
         self._in_process_sdk_servers: dict[str, Any] = {}
         self._in_process_agno_toolkits: list[Any] = []
+        # DB reference for ``reload()``. Set by ``from_db``; ``None`` for
+        # ``from_config`` callers (tests) — reload is a no-op in that mode.
+        self._db: Any = None
+        self._db_path: str | None = None
 
     @classmethod
     def from_config(
@@ -290,6 +364,89 @@ class MCPPool:
         """Build a pool from the same shape ``MCPRegistry.from_config`` accepted."""
         specs = _resolve_specs(mcp_config, include_defaults, disable, db_path)
         return cls(specs)
+
+    @classmethod
+    async def from_db(
+        cls,
+        db: Any,
+        *,
+        db_path: str | None = None,
+    ) -> "MCPPool":
+        """Build a pool from the ``mcps`` table in the DB.
+
+        Only ``enabled = 1`` rows are loaded — a disabled row stays in the
+        table so the UI can re-enable it without losing its configuration.
+        Each row is translated back into the loose-dict shape that the
+        existing ``resolve_*_entry`` helpers emit, then flows through the
+        same ``_resolve_specs``-style normalization that ``from_config``
+        uses (absolute-path resolution, messaging-token injection).
+        """
+        specs = await _specs_from_db(db, db_path)
+        pool = cls(specs)
+        pool._db = db
+        pool._db_path = db_path
+        return pool
+
+    async def rebuild_specs(self) -> list[_ServerSpec]:
+        """Re-query the DB and return a fresh spec list.
+
+        Called by ``reload()``. Returns the current ``specs`` unchanged
+        when no DB was wired (``from_config`` path) so tests that manually
+        construct a pool don't silently get an empty list on reload.
+        """
+        if self._db is None:
+            return list(self.specs)
+        return await _specs_from_db(self._db, self._db_path)
+
+    async def reload(self) -> None:
+        """Rebuild the pool in-place without a process restart.
+
+        Order: build new specs → swap lists → connect new → close old.
+        We swap the backing lists in place (``self._agno_toolkits[:] = ...``)
+        so Agno providers that already captured ``pool.agno_toolkits`` by
+        reference see the new tools on their next turn. Old stacks are
+        torn down AFTER the new pool is live, so there is no window where
+        a concurrent turn sees zero tools.
+
+        No-op when the pool was built via ``from_config`` (no DB).
+        """
+        if self._db is None:
+            logger.debug("MCPPool.reload(): no DB wired, skipping")
+            return
+        new_specs = await self.rebuild_specs()
+
+        async with self._lock:
+            old_stacks = list(self._toolkit_stacks)
+            old_agno = list(self._agno_toolkits)
+            old_in_proc_agno = list(self._in_process_agno_toolkits)
+            # Clear in-place so existing references (pool.agno_toolkits returned
+            # by value is list[Any] built on each call, so that's fine; but
+            # provider code may also have stashed ``pool``, and after reload
+            # calls pool.agno_toolkits again it must see the new list.)
+            self._toolkit_stacks.clear()
+            self._agno_toolkits.clear()
+            self._in_process_agno_toolkits.clear()
+            self._in_process_sdk_servers.clear()
+            self.specs = new_specs
+            self._tool_counts = {s.name: 0 for s in new_specs}
+            self._connected = False
+
+        # connect_all has its own lock; new subprocesses come up first.
+        await self.connect_all()
+
+        # Tear down the old stacks. Best-effort — a broken shutdown on the
+        # old set must not prevent new tools from being used. Close in
+        # reverse order to mirror close_all's contract.
+        for stack in reversed(old_stacks):
+            try:
+                await stack.aclose()
+            except BaseException as e:  # noqa: BLE001 — best-effort cleanup
+                logger.debug("reload: best-effort close of old toolkit: %s", e)
+        elog(
+            "mcp.pool.reload",
+            new_servers=len(new_specs),
+            old_toolkits=len(old_agno) + len(old_in_proc_agno),
+        )
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 

@@ -21,6 +21,13 @@ async def t_gateway_health(ctx: TestContext) -> None:
 
     pool = ctx.extras["pool"]
     model = create_model_from_config(ctx.config)
+    # Historically the gateway test didn't wire a MemoryDB — downstream
+    # tests that need one create their own. Keeping that pattern avoids
+    # an aiosqlite thread-interaction issue that surfaces when a live
+    # gateway connection coexists with later per-test connections on the
+    # same file. DB-backed REST endpoints skip gracefully in this mode;
+    # the DB-level unit tests (test_db_mcps, test_db_models) cover that
+    # layer end-to-end.
     agent = Agent(name="test", model=model, system_prompt="test", mcp_pool=pool)
     await agent.initialize()
     port = free_port()

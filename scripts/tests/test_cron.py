@@ -10,7 +10,17 @@ from ._framework import TestContext, test
 @test("cron", "MemoryDB.add_task + get_due_tasks")
 async def t_cron_dbroundtrip(ctx: TestContext) -> None:
     from openagent.memory.db import MemoryDB
-    db = MemoryDB(str(ctx.db_path))
+
+    # Use a throwaway DB path rather than ``ctx.db_path`` — the main
+    # ``ctx.db_path`` is shared with the live gateway agent and the
+    # scheduler MCP subprocess, and opening an additional aiosqlite
+    # Connection against it mid-suite has hit an aiosqlite-thread
+    # deadlock on macOS (the gateway's Connection thread gets wedged on
+    # a background write, any new query queued to it never completes).
+    # This test only exercises the MemoryDB CRUD layer — it doesn't need
+    # the shared DB and is happier on its own file.
+    tmp_path = ctx.db_path.with_name(f"cron-{uuid.uuid4().hex[:8]}.db")
+    db = MemoryDB(str(tmp_path))
     await db.connect()
     try:
         tid = await db.add_task(
@@ -26,3 +36,7 @@ async def t_cron_dbroundtrip(ctx: TestContext) -> None:
         assert all(t["id"] != tid for t in tasks_after)
     finally:
         await db.close()
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass

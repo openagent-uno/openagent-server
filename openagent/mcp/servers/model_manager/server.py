@@ -1,0 +1,314 @@
+"""Model-manager MCP server.
+
+Exposes the ``models`` table over MCP so the agent can inspect and edit
+its own LLM catalog at runtime. Writes land directly in SQLite; the
+gateway polls ``MAX(updated_at)`` per message and rebuilds the
+SmartRouter routing dict — so additions take effect on the next turn
+without a process restart.
+
+Transport: stdio. Storage: the shared OpenAgent SQLite DB via
+``OPENAGENT_DB_PATH`` (set by MCPPool at launch).
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import time
+from typing import Any
+
+import aiosqlite
+from mcp.server.fastmcp import FastMCP
+from openagent.memory.db import MemoryDB
+from openagent.mcp.servers._common import SharedConnection, ensure_row_exists, run_stdio
+
+logger = logging.getLogger(__name__)
+
+_shared = SharedConnection("model-manager")
+
+
+async def _get_conn() -> aiosqlite.Connection:
+    return await _shared.get()
+
+
+_row_to_dict = MemoryDB._row_to_model
+
+
+mcp = FastMCP("model-manager")
+
+
+@mcp.tool()
+async def list_models(
+    provider: str | None = None,
+    enabled_only: bool = False,
+) -> list[dict[str, Any]]:
+    """List every LLM model currently registered in the DB.
+
+    Pass ``provider`` to filter (``openai``, ``anthropic``, ``google``,
+    ``claude-cli``, etc.). Each row has ``runtime_id`` (canonical id
+    used by SmartRouter), ``provider``, ``model_id`` (bare id),
+    ``display_name``, ``input_cost_per_million``, ``output_cost_per_million``,
+    ``tier_hint`` (optional simple/medium/hard for routing), ``enabled``.
+    """
+    conn = await _get_conn()
+    clauses: list[str] = []
+    params: list[Any] = []
+    if provider:
+        clauses.append("provider = ?")
+        params.append(provider)
+    if enabled_only:
+        clauses.append("enabled = 1")
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    cursor = await conn.execute(
+        f"SELECT * FROM models {where} ORDER BY provider ASC, model_id ASC",
+        params,
+    )
+    rows = await cursor.fetchall()
+    return [_row_to_dict(r) for r in rows]
+
+
+@mcp.tool()
+async def get_model(runtime_id: str) -> dict[str, Any]:
+    """Fetch one model row by its canonical runtime id."""
+    conn = await _get_conn()
+    cursor = await conn.execute(
+        "SELECT * FROM models WHERE runtime_id = ?", (runtime_id,)
+    )
+    row = await cursor.fetchone()
+    if not row:
+        raise ValueError(f"No model with runtime_id={runtime_id!r}")
+    return _row_to_dict(row)
+
+
+@mcp.tool()
+async def list_providers() -> list[str]:
+    """List providers supported by OpenAgent.
+
+    Includes all API-backed providers OpenAgent knows how to drive via
+    Agno, plus the ``claude-cli`` pseudo-provider. Whether each is
+    *usable* depends on whether the user has configured an API key
+    (for API providers) or installed the claude binary.
+    """
+    # Local import keeps the subprocess startup lean.
+    from openagent.models.catalog import SUPPORTED_PROVIDERS, CLAUDE_CLI_PROVIDER
+
+    return sorted(list(SUPPORTED_PROVIDERS) + [CLAUDE_CLI_PROVIDER])
+
+
+@mcp.tool()
+async def add_model(
+    provider: str,
+    model_id: str,
+    display_name: str | None = None,
+    input_cost_per_million: float | None = None,
+    output_cost_per_million: float | None = None,
+    tier_hint: str | None = None,
+    enabled: bool = True,
+) -> dict[str, Any]:
+    """Register a new LLM model in the catalog.
+
+    ``model_id`` is the bare provider-side id (e.g. ``gpt-4o-mini``,
+    ``claude-sonnet-4-6``). The canonical ``runtime_id`` is computed by
+    ``catalog.build_runtime_model_id`` (``openai:gpt-4o-mini``,
+    ``claude-cli/claude-sonnet-4-6``, …).
+
+    ``tier_hint`` is optional — one of ``simple``, ``medium``, ``hard``.
+    SmartRouter's auto-routing groups models by price when no tier is
+    hinted; pass one here to force placement.
+    """
+    from openagent.models.catalog import build_runtime_model_id
+
+    if not provider or not provider.strip():
+        raise ValueError("provider is required")
+    if not model_id or not model_id.strip():
+        raise ValueError("model_id is required")
+    runtime_id = build_runtime_model_id(provider.strip(), model_id.strip())
+    if not runtime_id:
+        raise ValueError(
+            f"could not build runtime_id from provider={provider!r} model_id={model_id!r}"
+        )
+    conn = await _get_conn()
+    now = time.time()
+    await conn.execute(
+        "INSERT INTO models (runtime_id, provider, model_id, display_name, "
+        "input_cost_per_million, output_cost_per_million, tier_hint, enabled, "
+        "metadata_json, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?) "
+        "ON CONFLICT(runtime_id) DO UPDATE SET "
+        "provider = excluded.provider, model_id = excluded.model_id, "
+        "display_name = excluded.display_name, "
+        "input_cost_per_million = excluded.input_cost_per_million, "
+        "output_cost_per_million = excluded.output_cost_per_million, "
+        "tier_hint = excluded.tier_hint, enabled = excluded.enabled, "
+        "updated_at = excluded.updated_at",
+        (
+            runtime_id,
+            provider.strip(),
+            model_id.strip(),
+            display_name,
+            input_cost_per_million,
+            output_cost_per_million,
+            tier_hint,
+            1 if enabled else 0,
+            now,
+            now,
+        ),
+    )
+    await conn.commit()
+    return await get_model(runtime_id)
+
+
+@mcp.tool()
+async def update_model(
+    runtime_id: str,
+    display_name: str | None = None,
+    input_cost_per_million: float | None = None,
+    output_cost_per_million: float | None = None,
+    tier_hint: str | None = None,
+    enabled: bool | None = None,
+) -> dict[str, Any]:
+    """Partially update a model row (only fields you pass are changed)."""
+    conn = await _get_conn()
+    cursor = await conn.execute(
+        "SELECT 1 FROM models WHERE runtime_id = ?", (runtime_id,)
+    )
+    if not await cursor.fetchone():
+        raise ValueError(f"No model with runtime_id={runtime_id!r}")
+
+    updates: dict[str, Any] = {}
+    if display_name is not None:
+        updates["display_name"] = display_name
+    if input_cost_per_million is not None:
+        updates["input_cost_per_million"] = float(input_cost_per_million)
+    if output_cost_per_million is not None:
+        updates["output_cost_per_million"] = float(output_cost_per_million)
+    if tier_hint is not None:
+        updates["tier_hint"] = tier_hint or None
+    if enabled is not None:
+        updates["enabled"] = 1 if enabled else 0
+    if not updates:
+        raise ValueError("No fields to update")
+    updates["updated_at"] = time.time()
+    set_clause = ", ".join(f"{k} = ?" for k in updates)
+    values = list(updates.values()) + [runtime_id]
+    await conn.execute(
+        f"UPDATE models SET {set_clause} WHERE runtime_id = ?", values
+    )
+    await conn.commit()
+    return await get_model(runtime_id)
+
+
+@mcp.tool()
+async def enable_model(runtime_id: str) -> dict[str, Any]:
+    """Enable one model (takes effect on next message)."""
+    conn = await _get_conn()
+    await ensure_row_exists(conn, "models", "runtime_id", runtime_id)
+    await conn.execute(
+        "UPDATE models SET enabled = 1, updated_at = ? WHERE runtime_id = ?",
+        (time.time(), runtime_id),
+    )
+    await conn.commit()
+    return await get_model(runtime_id)
+
+
+@mcp.tool()
+async def disable_model(runtime_id: str) -> dict[str, Any]:
+    """Disable one model (row preserved for re-enable)."""
+    conn = await _get_conn()
+    await ensure_row_exists(conn, "models", "runtime_id", runtime_id)
+    await conn.execute(
+        "UPDATE models SET enabled = 0, updated_at = ? WHERE runtime_id = ?",
+        (time.time(), runtime_id),
+    )
+    await conn.commit()
+    return await get_model(runtime_id)
+
+
+@mcp.tool()
+async def remove_model(runtime_id: str) -> dict[str, Any]:
+    """Remove a model permanently.
+
+    Refuses if this would leave zero enabled models — the agent would
+    start rejecting every incoming message. Use ``disable_model``
+    instead if you want to keep the row around.
+    """
+    conn = await _get_conn()
+    await ensure_row_exists(conn, "models", "runtime_id", runtime_id)
+    cursor = await conn.execute(
+        "SELECT COUNT(*) FROM models WHERE enabled = 1 AND runtime_id <> ?",
+        (runtime_id,),
+    )
+    row = await cursor.fetchone()
+    # COUNT(*) always returns one row with an integer value.
+    remaining = int(row[0])
+    if remaining == 0:
+        raise ValueError(
+            "Refusing to remove the last enabled model — the agent would "
+            "reject every incoming message. Add another model first."
+        )
+    await conn.execute("DELETE FROM models WHERE runtime_id = ?", (runtime_id,))
+    await conn.commit()
+    return {"removed": True, "runtime_id": runtime_id}
+
+
+@mcp.tool()
+async def list_available_models(provider: str) -> list[dict[str, Any]]:
+    """List models available from a provider (based on its API key).
+
+    Uses ``openagent.models.discovery`` — queries the provider's
+    ``/v1/models`` endpoint when the user has a key configured, falls
+    back to a bundled catalog otherwise. Returns ``{id, display_name}``
+    entries. Read-only: use ``add_model`` to actually register one.
+    """
+    from openagent.models.discovery import list_provider_models_cached
+
+    return await list_provider_models_cached(provider)
+
+
+@mcp.tool()
+async def test_model(runtime_id: str) -> dict[str, Any]:
+    """Send a 1-token probe through a model to confirm the key works.
+
+    Reuses ``openagent.models.runtime.run_provider_smoke_test``. Does NOT
+    write to the DB; use this before ``enable_model`` to confirm a key
+    is valid.
+    """
+    from openagent.models.runtime import run_provider_smoke_test
+    from openagent.models.catalog import split_runtime_id
+
+    provider, _ = split_runtime_id(runtime_id)
+    # Providers config is owned by yaml; load it fresh on each call so
+    # key rotations are picked up without a restart.
+    providers_config = _load_providers_from_yaml()
+    _, resp = await run_provider_smoke_test(
+        provider,
+        providers_config,
+        model_id=runtime_id,
+        session_id="model-manager-probe",
+    )
+    return {"ok": True, "runtime_id": runtime_id, "response": resp.content}
+
+
+def _load_providers_from_yaml() -> dict:
+    """Read the providers section of the live openagent.yaml (env-resolved).
+
+    Returns ``{}`` when the config file is missing or unreadable — those
+    are expected in test harnesses and first-boot scenarios. Anything
+    else (unexpected exception) is logged so real config errors surface.
+    """
+    from openagent.core.config import load_config
+    try:
+        return load_config(os.environ.get("OPENAGENT_CONFIG_PATH")).get("providers", {}) or {}
+    except (FileNotFoundError, PermissionError, OSError):
+        return {}
+    except Exception as e:  # noqa: BLE001 — upstream YAML errors, etc.
+        logger.warning("load_config failed in model-manager: %s", e)
+        return {}
+
+
+def main() -> None:
+    run_stdio(mcp, loglevel_env="OPENAGENT_MODEL_MANAGER_LOGLEVEL")
+
+
+if __name__ == "__main__":
+    main()
