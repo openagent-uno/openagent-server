@@ -844,3 +844,43 @@ async def t_agent_autoloop_stops(ctx: TestContext) -> None:
         session_id="S-NONE",
     )
     assert result == "just text"
+
+
+@test("shell", "agent._run_inner: passive reminder on next turn")
+async def t_agent_passive_reminder(ctx: TestContext) -> None:
+    from openagent.core.agent import Agent
+    from openagent.models.base import BaseModel, ModelResponse
+    from openagent.mcp.servers.shell import handlers
+    from openagent.mcp.servers.shell.events import ShellEvent
+    import time
+
+    _reset_shell_hub()
+    # Pre-seed the hub with a completed event for session S-P.
+    handlers.get_hub().register(shell_id="sh_old", session_id="S-P", command="echo x")
+    handlers.get_hub().mark_completed("sh_old", exit_code=0, signal=None)
+    handlers.get_hub().post_event("S-P", ShellEvent(
+        shell_id="sh_old", kind="completed", exit_code=0, signal=None,
+        bytes_stdout=1, bytes_stderr=0, at=time.time(),
+    ))
+
+    class EchoModel(BaseModel):
+        history_mode = "provider"
+        last_input: str = ""
+        async def generate(self, messages, system=None, tools=None, on_status=None, session_id=None):
+            EchoModel.last_input = messages[-1]["content"]
+            return ModelResponse(content="ok")
+
+    async def _noop_status(*_a, **_k): pass
+
+    agent = Agent(name="test", model=EchoModel())
+    agent._initialized = True
+    result = await agent._run_inner(
+        message="anything new?",
+        attachments=None,
+        _status=_noop_status,
+        session_id="S-P",
+    )
+    assert result == "ok"
+    assert "<system-reminder>" in EchoModel.last_input
+    assert "sh_old" in EchoModel.last_input
+    assert "anything new?" in EchoModel.last_input

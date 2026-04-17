@@ -491,6 +491,12 @@ class Agent:
         current_input = message
         last_response = None
         iter_count = 0
+
+        pending = hub.drain(session_id)
+        if pending:
+            pre = _format_shell_reminder(pending)
+            current_input = f"{pre}\n\n{current_input}"
+
         try:
             while True:
                 iter_count += 1
