@@ -884,3 +884,45 @@ async def t_agent_passive_reminder(ctx: TestContext) -> None:
     assert "<system-reminder>" in EchoModel.last_input
     assert "sh_old" in EchoModel.last_input
     assert "anything new?" in EchoModel.last_input
+
+
+@test("shell", "agent._run_inner: autoloop_cap stops runaway chains")
+async def t_agent_autoloop_cap(ctx: TestContext) -> None:
+    from openagent.core.agent import Agent
+    from openagent.models.base import BaseModel, ModelResponse
+    from openagent.mcp.servers.shell import handlers, adapters
+
+    _reset_shell_hub()
+
+    class AlwaysStartsShellModel(BaseModel):
+        history_mode = "provider"
+
+        def __init__(self): self.turns = 0
+
+        async def generate(self, messages, system=None, tools=None, on_status=None, session_id=None):
+            self.turns += 1
+            token = adapters.set_session_context(session_id)
+            try:
+                await handlers.shell_exec(
+                    command="echo runaway",
+                    cwd=None, env=None, timeout=None,
+                    run_in_background=True, stdin=None, description=None,
+                    session_id=None,
+                )
+            finally:
+                adapters.reset_session_context(token)
+            return ModelResponse(content=f"turn {self.turns}")
+
+    async def _noop_status(*_a, **_k): pass
+
+    model = AlwaysStartsShellModel()
+    agent = Agent(name="test", model=model, config={"shell": {"autoloop_cap": 3}})
+    agent._initialized = True
+    result = await agent._run_inner(
+        message="go",
+        attachments=None,
+        _status=_noop_status,
+        session_id="S-CAP",
+    )
+    assert model.turns == 3, f"turns: {model.turns}"
+    assert "turn 3" in result
