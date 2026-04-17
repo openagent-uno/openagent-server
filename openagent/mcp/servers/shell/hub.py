@@ -112,7 +112,11 @@ class ShellHub:
     def post_event(self, session_id: str | None, event: ShellEvent) -> None:
         """Push a terminal event into ``session_id``'s queue and wake any
         waiter. No-op when ``session_id`` is None — we only do active
-        wake-up for shells that have a session."""
+        wake-up for shells that have a session.
+
+        The queue is bounded to ``_MAX_QUEUED_EVENTS`` (200); when full, the
+        **oldest** event is silently dropped. See module docstring.
+        """
         if session_id is None:
             return
         q = self._queues.setdefault(session_id, deque(maxlen=_MAX_QUEUED_EVENTS))
@@ -131,7 +135,8 @@ class ShellHub:
         q.clear()
         ev = self._events.get(session_id)
         if ev is not None:
-            ev.clear()
+            ev.clear()  # Order matters: clear queue first, then Event — keeps
+                        # queue and signal in lockstep if contract ever changes.
         return out
 
     async def wait(self, session_id: str | None, timeout: float) -> list[ShellEvent]:
@@ -139,7 +144,8 @@ class ShellHub:
 
         Returns the drained events (possibly empty on timeout). Safe to
         call when no shells are registered — returns [] immediately
-        after the timeout.
+        after the timeout. ``timeout <= 0`` short-circuits to an immediate
+        drain (non-blocking poll).
         """
         if session_id is None or timeout <= 0:
             return self.drain(session_id)
@@ -177,3 +183,47 @@ class ShellHub:
         self._events.pop(session_id, None)
         self._queues.pop(session_id, None)
         return killed
+
+    # ── GC / shutdown ───────────────────────────────────────────────
+
+    def gc(self, ttl_seconds: float = 600.0) -> list[str]:
+        """Drop completed shells older than ``ttl_seconds``.
+
+        Live shells are never touched. Returns the shell_ids removed
+        (for debug logging). Called by the agent's idle cleanup loop.
+        """
+        now = time.time()
+        victims: list[str] = []
+        for sid, rec in list(self._shells.items()):
+            if not rec.is_completed:
+                continue
+            if rec.completed_at is None:
+                continue
+            if (now - rec.completed_at) < ttl_seconds:
+                continue
+            victims.append(sid)
+            del self._shells[sid]
+            if rec.session_id and rec.session_id in self._by_session:
+                self._by_session[rec.session_id].discard(sid)
+                if not self._by_session[rec.session_id]:
+                    del self._by_session[rec.session_id]
+        return victims
+
+    async def shutdown(self) -> None:
+        """Purge every session and clear all queues / events.
+
+        Called from ``Agent.shutdown`` so the process can exit without
+        leaking background subprocesses.
+        """
+        for session_id in list(self._by_session.keys()):
+            await self.purge_session(session_id)
+        # Drop shells that were never associated with a session.
+        for sid, rec in list(self._shells.items()):
+            if rec.shell is not None and not rec.is_completed:
+                try:
+                    await rec.shell.kill(signal_name="KILL", grace_seconds=0)
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("shutdown kill failed for %s: %s", sid, e)
+            del self._shells[sid]
+        self._events.clear()
+        self._queues.clear()

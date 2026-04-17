@@ -159,3 +159,40 @@ async def t_hub_queue_cap(ctx: TestContext) -> None:
     # The oldest 50 (sh_0 … sh_49) were dropped.
     assert drained[0].shell_id == "sh_50"
     assert drained[-1].shell_id == "sh_249"
+
+
+@test("shell", "ShellHub: gc removes completed shells older than TTL")
+async def t_hub_gc(ctx: TestContext) -> None:
+    import time
+    from openagent.mcp.servers.shell.hub import ShellHub
+
+    hub = ShellHub()
+    hub.register(shell_id="sh_old", session_id="s1", command="a")
+    hub.register(shell_id="sh_new", session_id="s1", command="b")
+    hub.register(shell_id="sh_live", session_id="s1", command="c")
+
+    # Old completed 15 min ago; new completed 1 s ago; live still running.
+    hub.mark_completed("sh_old", exit_code=0, signal=None)
+    hub.mark_completed("sh_new", exit_code=0, signal=None)
+    hub._shells["sh_old"].completed_at = time.time() - 15 * 60
+
+    removed = hub.gc(ttl_seconds=10 * 60)
+    assert removed == ["sh_old"], f"unexpected gc: {removed}"
+    assert hub.get("sh_old") is None
+    assert hub.get("sh_new") is not None
+    assert hub.get("sh_live") is not None
+
+
+@test("shell", "ShellHub: shutdown purges every session and clears state")
+async def t_hub_shutdown(ctx: TestContext) -> None:
+    from openagent.mcp.servers.shell.hub import ShellHub
+
+    hub = ShellHub()
+    hub.register(shell_id="sh_1", session_id="s1", command="a")
+    hub.register(shell_id="sh_2", session_id="s2", command="b")
+    await hub.shutdown()
+    assert hub.get("sh_1") is None
+    assert hub.get("sh_2") is None
+    assert hub.list_for_session(None) == []
+    assert hub.drain("s1") == []
+    assert hub.drain("s2") == []
