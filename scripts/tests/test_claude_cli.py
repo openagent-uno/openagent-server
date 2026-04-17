@@ -73,7 +73,6 @@ async def t_claude_minimal(ctx: TestContext) -> None:
         if own_pool:
             await pool.close_all()
 
-
 @test("claude_cli", "live MCP tool invocation through ClaudeCLI provider")
 async def t_claude_provider_mcp_call(ctx: TestContext) -> None:
     if not _find_claude_binary():
@@ -113,3 +112,36 @@ async def t_claude_provider_mcp_call(ctx: TestContext) -> None:
             pass
         if own_pool:
             await pool.close_all()
+
+
+@test("claude-cli", "shell MCP round-trip: start bg shell, receive reminder, read output")
+async def t_claude_shell_bg_roundtrip(ctx: TestContext) -> None:
+    from openagent.core.agent import Agent
+    from openagent.models.claude_cli import ClaudeCLI
+    from openagent.mcp.servers.shell.handlers import get_hub
+
+    pool = ctx.extras.get("pool")
+    if pool is None:
+        from scripts.tests._framework import TestSkip
+        raise TestSkip("pool fixture not set up")
+
+    model = ClaudeCLI()
+    model.set_mcp_servers(pool.claude_sdk_servers())
+    agent = Agent(name="shell-e2e", model=model)
+    agent._initialized = True
+
+    async def _noop_status(*_a, **_k): pass
+
+    prompt = (
+        "Use shell_exec with run_in_background=true to run "
+        "'sleep 1 && echo hello-e2e'. Wait for the system reminder, "
+        "call shell_output to read the result, and reply with "
+        "exactly the text you read."
+    )
+    result = await agent._run_inner(
+        message=prompt,
+        attachments=None,
+        _status=_noop_status,
+        session_id="claude-shell-e2e",
+    )
+    assert "hello-e2e" in result, f"unexpected result: {result!r}"
