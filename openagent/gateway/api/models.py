@@ -330,15 +330,10 @@ async def handle_delete_db(request: web.Request) -> web.Response:
     existing = await db.get_model(runtime_id)
     if existing is None:
         return _web.json_response({"error": f"model {runtime_id!r} not found"}, status=404)
-    # Guardrail: refuse to delete the last enabled row so the rejection
-    # gate doesn't start refusing every message. Callers can disable it
-    # first if they really want to remove the last one.
-    others = await db.list_models(enabled_only=True)
-    if existing.get("enabled") and len([m for m in others if m["runtime_id"] != runtime_id]) == 0:
-        return _web.json_response(
-            {"error": "Refusing to delete the last enabled model; add another first."},
-            status=400,
-        )
+    # Deleting the last enabled row is allowed — the rejection gate in
+    # gateway/server.py will then surface a clear "No models are enabled"
+    # error on the next message, which is what the user wants when they
+    # intentionally empty the catalog.
     await db.delete_model(runtime_id)
     return _web.json_response({"ok": True})
 

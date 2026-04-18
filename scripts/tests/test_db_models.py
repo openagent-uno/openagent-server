@@ -56,6 +56,38 @@ async def t_models_enable(ctx: TestContext) -> None:
         await db.close()
 
 
+@test("db_models", "registry_status.enabled_count drops to 0 after deleting last model")
+async def t_registry_status_empty(ctx: TestContext) -> None:
+    """The gate relies on ``registry_status`` returning zero once the
+    catalog is empty. Verifies we can delete every row and that the
+    probe reports 0 — so `_process_message` surfaces the clear
+    "No models are enabled" error instead of silently routing to a
+    stale claude-cli row.
+    """
+    from openagent.memory.db import MemoryDB
+
+    db = MemoryDB(str(ctx.db_path))
+    await db.connect()
+    try:
+        await db.upsert_model("openai:gpt-gate-a", provider="openai", model_id="gpt-gate-a")
+        await db.upsert_model(
+            "claude-cli:anthropic:sonnet-gate",
+            provider="anthropic", model_id="sonnet-gate", framework="claude-cli",
+        )
+        _, _, count = await db.registry_status()
+        assert count >= 2, count
+
+        await db.delete_model("openai:gpt-gate-a")
+        _, _, count = await db.registry_status()
+        assert count >= 1, count
+
+        await db.delete_model("claude-cli:anthropic:sonnet-gate")
+        _, _, count = await db.registry_status()
+        assert count == 0, f"registry_status still reports {count} after full delete"
+    finally:
+        await db.close()
+
+
 @test("db_models", "config_state get/set roundtrip (bootstrap marker)")
 async def t_state_roundtrip(ctx: TestContext) -> None:
     from openagent.memory.db import MemoryDB

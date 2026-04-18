@@ -141,9 +141,10 @@ async def t_create_db_model(ctx: TestContext) -> None:
         async with sess.delete(
             f"http://127.0.0.1:{port}/api/models/db/{runtime_id}"
         ) as resp:
-            # Delete may fail if this would leave zero enabled models — handle
-            # both outcomes so the test works in isolation and in full runs.
-            assert resp.status in (200, 400), await resp.text()
+            # Since v0.10.3 the guardrail that refused "last enabled model"
+            # is gone — the rejection gate in _process_message surfaces the
+            # zero-model state explicitly, so DELETE always succeeds.
+            assert resp.status == 200, await resp.text()
 
 
 @test("mcps_rest", "GET /api/models/available?provider=openai returns fallback when no key")
