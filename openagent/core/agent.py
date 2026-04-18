@@ -320,6 +320,7 @@ class Agent:
                     ensure_builtin_mcps,
                     import_yaml_mcps_once,
                     import_yaml_models_once,
+                    import_yaml_providers_once,
                 )
                 mcp_config = self.config.get("mcp", []) or []
                 include_defaults = bool(self.config.get("mcp_defaults", True))
@@ -332,6 +333,16 @@ class Agent:
                 # builtins + safety net against manual DB tampering).
                 # Existing rows — including disabled ones — are untouched.
                 await ensure_builtin_mcps(self._db)
+                # v0.11.0: provider keys are DB-backed. Import the yaml
+                # ``providers:`` section once, then hydrate the in-memory
+                # config dict from the DB so SmartRouter / AgnoProvider
+                # see the materialised view. The one-shot flag makes this
+                # safe to re-run on every boot.
+                await import_yaml_providers_once(
+                    self._db, self.config.get("providers", {}) or {},
+                )
+                await self._hydrate_providers_from_db()
+                self._providers_last_updated = await self._db.providers_max_updated()
                 await import_yaml_models_once(
                     self._db,
                     self.config.get("providers", {}) or {},
@@ -384,15 +395,21 @@ class Agent:
         """Combined hot-reload probe for the gateway's dispatcher.
 
         One SQLite round-trip (``registry_status``) returns the max
-        timestamps for both the mcps and models tables plus the enabled
-        model count. We then reload whatever is stale and return the
-        count so the caller can short-circuit when zero models are
-        enabled. Returns ``(reloaded_anything, enabled_models)``.
+        timestamps for the mcps / models / providers tables plus the
+        enabled model count. We then reload whatever is stale and
+        return the count so the caller can short-circuit when zero
+        models are enabled. Returns ``(reloaded_anything, enabled_models)``.
+
+        Provider edits (``api_key``, ``base_url``) invalidate the cached
+        ``providers_config`` dict that SmartRouter hands to AgnoProvider
+        — without this hook, adding a key would require a restart.
         """
         if self._db is None:
             return False, -1
         try:
-            mcps_updated, models_updated, enabled_count = await self._db.registry_status()
+            mcps_updated, models_updated, enabled_count, providers_updated = (
+                await self._db.registry_status()
+            )
         except Exception as exc:  # noqa: BLE001 — never gate a message on this probe
             logger.debug("registry_status probe failed: %s", exc)
             return False, -1
@@ -408,8 +425,21 @@ class Agent:
             except Exception as exc:  # noqa: BLE001
                 elog("mcps.reload_error", level="warning", error=str(exc))
 
-        if models_updated > getattr(self, "_models_last_updated", 0.0):
-            self._models_last_updated = models_updated
+        providers_changed = providers_updated > getattr(self, "_providers_last_updated", 0.0)
+        if providers_changed:
+            self._providers_last_updated = providers_updated
+            try:
+                await self._hydrate_providers_from_db()
+                elog("providers.reload")
+                reloaded = True
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("providers hydrate failed: %s", exc)
+
+        # Models or providers changed → rebuild router. Providers affect
+        # routing because AgnoProvider's api_key lookup goes through
+        # ``providers_config``.
+        if models_updated > getattr(self, "_models_last_updated", 0.0) or providers_changed:
+            self._models_last_updated = max(models_updated, self._models_last_updated or 0.0)
             providers_config = (self.config or {}).get("providers", {})
             for model in list(self._runtime_models):
                 rebuild = getattr(model, "rebuild_routing", None)
@@ -422,6 +452,32 @@ class Agent:
             reloaded = True
 
         return reloaded, enabled_count
+
+    async def _hydrate_providers_from_db(self) -> None:
+        """Pull provider rows from DB into ``self.config['providers']``.
+
+        After v0.11.0 the DB is the source of truth for provider keys;
+        yaml ``providers:`` is only read once at first boot (via
+        ``import_yaml_providers_once``). SmartRouter / AgnoProvider still
+        consume the old dict shape, so we keep the materialised view in
+        ``self.config`` and refresh it whenever ``providers_max_updated``
+        bumps.
+        """
+        if self._db is None or self.config is None:
+            return
+        rows = await self._db.list_providers(enabled_only=True)
+        materialised: dict[str, dict[str, Any]] = {}
+        for r in rows:
+            entry: dict[str, Any] = {}
+            if r.get("api_key"):
+                entry["api_key"] = r["api_key"]
+            if r.get("base_url"):
+                entry["base_url"] = r["base_url"]
+            # Merge any extra metadata (e.g. legacy ``disabled_models``)
+            for k, v in (r.get("metadata") or {}).items():
+                entry.setdefault(k, v)
+            materialised[r["name"]] = entry
+        self.config["providers"] = materialised
 
     async def _run_idle_cleanup(self) -> None:
         """Periodically release idle provider resources."""

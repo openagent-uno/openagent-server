@@ -9,6 +9,48 @@ from __future__ import annotations
 from ._framework import TestContext, test
 
 
+@test("bootstrap", "import_yaml_providers_once seeds DB then short-circuits")
+async def t_providers_bootstrap_idempotent(ctx: TestContext) -> None:
+    """v0.11.0: provider keys are DB-backed. yaml ``providers:`` is
+    imported once at first boot, then ignored. The ``providers_imported``
+    ``config_state`` flag guards the idempotency."""
+    import uuid
+    from openagent.memory.db import MemoryDB
+    from openagent.memory.bootstrap import import_yaml_providers_once
+
+    tmp_db = ctx.db_path.with_name(f"bootstrap-providers-{uuid.uuid4().hex[:8]}.db")
+    try:
+        db = MemoryDB(str(tmp_db))
+        await db.connect()
+
+        yaml_providers = {
+            "openai": {"api_key": "sk-yaml-test", "base_url": None},
+            "zai": {"api_key": "zai-yaml-key", "base_url": "https://api.z.ai/api/paas/v4"},
+        }
+        first = await import_yaml_providers_once(db, yaml_providers)
+        assert first is True, "first import must write"
+
+        rows = {r["name"]: r for r in await db.list_providers()}
+        assert rows["openai"]["api_key"] == "sk-yaml-test"
+        assert rows["zai"]["base_url"] == "https://api.z.ai/api/paas/v4"
+
+        # Re-running is a no-op even with a different dict — the flag
+        # protects against yaml edits post-first-boot.
+        second = await import_yaml_providers_once(
+            db, {"openai": {"api_key": "THIS_SHOULD_NOT_OVERWRITE"}},
+        )
+        assert second is False
+        again = await db.get_provider("openai")
+        assert again["api_key"] == "sk-yaml-test"
+
+        await db.close()
+    finally:
+        try:
+            tmp_db.unlink()
+        except FileNotFoundError:
+            pass
+
+
 @test("bootstrap", "import_yaml_mcps_once writes rows then short-circuits")
 async def t_mcps_bootstrap_idempotent(ctx: TestContext) -> None:
     import uuid

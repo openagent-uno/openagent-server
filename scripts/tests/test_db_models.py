@@ -102,15 +102,15 @@ async def t_registry_status_empty(ctx: TestContext) -> None:
             "claude-cli:anthropic:sonnet-gate",
             provider="anthropic", model_id="sonnet-gate", framework="claude-cli",
         )
-        _, _, count = await db.registry_status()
+        _, _, count, _ = await db.registry_status()
         assert count >= 2, count
 
         await db.delete_model("openai:gpt-gate-a")
-        _, _, count = await db.registry_status()
+        _, _, count, _ = await db.registry_status()
         assert count >= 1, count
 
         await db.delete_model("claude-cli:anthropic:sonnet-gate")
-        _, _, count = await db.registry_status()
+        _, _, count, _ = await db.registry_status()
         assert count == 0, f"registry_status still reports {count} after full delete"
     finally:
         await db.close()

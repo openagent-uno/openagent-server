@@ -1,12 +1,21 @@
-"""CRUD /api/models — manage LLM providers (API keys) and active model.
+"""/api/models — DB-backed model catalog (v0.11.0).
 
-GET    /api/models              → list providers (masked keys) + active model
-POST   /api/models              → add a provider
-GET    /api/models/active       → get active model config
-PUT    /api/models/active       → set active model config
-PUT    /api/models/{name}       → update a provider
-DELETE /api/models/{name}       → remove a provider
-POST   /api/models/{name}/test  → test provider connectivity
+Pre-v0.11 this module held yaml-based provider CRUD at ``/api/models``.
+Provider management moved to :mod:`openagent.gateway.api.providers`; the
+endpoints here now exclusively drive the ``models`` SQLite table.
+
+GET    /api/models              → list model rows
+POST   /api/models              → add a model row
+GET    /api/models/{runtime_id} → fetch one
+PUT    /api/models/{runtime_id} → update one
+DELETE /api/models/{runtime_id} → delete one
+POST   /api/models/{runtime_id}/enable|disable
+
+GET    /api/models/catalog      → iter_configured_models view w/ pricing
+GET    /api/models/active       → active model yaml section
+PUT    /api/models/active       → set active model yaml section
+GET    /api/models/available    → discovery-driven per-provider catalog
+GET    /api/models/providers    → supported provider list
 """
 
 from __future__ import annotations
@@ -17,59 +26,7 @@ if TYPE_CHECKING:
 
 from openagent.gateway.api._common import gateway_db as _db
 from openagent.gateway.api.config import _read_raw, _read_resolved, _write_raw
-from openagent.gateway.api.providers import _mask_key, mask_providers
-
-
-async def handle_list(request: web.Request) -> web.Response:
-    """List all configured providers + the active model."""
-    from aiohttp import web as _web
-
-    raw = _read_raw(request)
-    providers = raw.get("providers", {})
-    active = raw.get("model", {})
-
-    # Mask the active model's api_key too
-    active_masked = dict(active)
-    if "api_key" in active_masked:
-        k = active_masked.pop("api_key")
-        if isinstance(k, str) and k.startswith("${"):
-            active_masked["api_key_display"] = k
-        else:
-            active_masked["api_key_display"] = _mask_key(k)
-
-    return _web.json_response({
-        "models": mask_providers(providers),
-        "active": active_masked,
-    })
-
-
-async def handle_create(request: web.Request) -> web.Response:
-    """Add a new provider entry."""
-    from aiohttp import web as _web
-
-    body = await request.json()
-    name = body.get("name", "").strip()
-    if not name:
-        return _web.json_response({"error": "name is required"}, status=400)
-
-    raw = _read_raw(request)
-    if "providers" not in raw:
-        raw["providers"] = {}
-
-    entry: dict = {}
-    if body.get("api_key"):
-        entry["api_key"] = body["api_key"]
-    if body.get("base_url"):
-        entry["base_url"] = body["base_url"]
-    if "models" in body:
-        entry["models"] = body["models"]
-    if body.get("disabled_models"):
-        entry["disabled_models"] = body["disabled_models"]
-
-    raw["providers"][name] = entry
-    _write_raw(request, raw)
-
-    return _web.json_response({"ok": True, "name": name})
+from openagent.gateway.api.providers import _mask_key
 
 
 async def handle_get_active(request: web.Request) -> web.Response:
@@ -89,7 +46,7 @@ async def handle_get_active(request: web.Request) -> web.Response:
 
 
 async def handle_set_active(request: web.Request) -> web.Response:
-    """Replace the active model config."""
+    """Replace the active model config (yaml ``model:`` section)."""
     from aiohttp import web as _web
     from openagent.core.logging import elog
 
@@ -99,79 +56,7 @@ async def handle_set_active(request: web.Request) -> web.Response:
     _write_raw(request, raw)
     elog("config.update", section="model")
 
-    # The `model:` section is hot-reloaded on the next message.
     return _web.json_response({"ok": True, "restart_required": False})
-
-
-async def handle_update(request: web.Request) -> web.Response:
-    """Update a provider entry."""
-    from aiohttp import web as _web
-
-    name = request.match_info["name"]
-    body = await request.json()
-
-    raw = _read_raw(request)
-    providers = raw.get("providers", {})
-    if name not in providers:
-        return _web.json_response({"error": f"Provider '{name}' not found"}, status=404)
-
-    entry = providers[name]
-    if "api_key" in body:
-        entry["api_key"] = body["api_key"]
-    if "base_url" in body:
-        if body["base_url"]:
-            entry["base_url"] = body["base_url"]
-        else:
-            entry.pop("base_url", None)
-    if "disabled_models" in body:
-        if body["disabled_models"]:
-            entry["disabled_models"] = body["disabled_models"]
-        else:
-            entry.pop("disabled_models", None)
-    if "models" in body:
-        if body["models"]:
-            entry["models"] = body["models"]
-        else:
-            entry.pop("models", None)
-
-    raw["providers"][name] = entry
-    _write_raw(request, raw)
-
-    return _web.json_response({"ok": True})
-
-
-async def handle_delete(request: web.Request) -> web.Response:
-    """Remove a provider entry and cascade-delete its ``models`` rows.
-
-    Provider keys live in yaml, models live in SQLite — without the
-    cascade, removing a provider orphans every (provider, framework, model)
-    triple that referenced it. Those rows would keep showing in the UI
-    catalog and the router would still try to dispatch them, failing at
-    send-time with a confusing "missing API key" error.
-    """
-    from aiohttp import web as _web
-
-    name = request.match_info["name"]
-    raw = _read_raw(request)
-    providers = raw.get("providers", {})
-
-    if name not in providers:
-        return _web.json_response({"error": f"Provider '{name}' not found"}, status=404)
-
-    del providers[name]
-    raw["providers"] = providers
-    _write_raw(request, raw)
-
-    purged = 0
-    db = _db(request)
-    if db is not None:
-        try:
-            purged = await db.delete_models_by_provider(name)
-        except Exception as exc:  # noqa: BLE001 — yaml write already succeeded
-            from openagent.core.logging import elog
-            elog("provider.delete_cascade_error", level="warning", provider=name, error=str(exc))
-
-    return _web.json_response({"ok": True, "models_purged": purged})
 
 
 async def handle_available_providers(request: web.Request) -> web.Response:
@@ -206,28 +91,6 @@ async def handle_catalog(request: web.Request) -> web.Response:
         )
     results.sort(key=lambda item: (item["provider"], item["input_cost_per_million"], item["model_id"]))
     return _web.json_response({"models": results})
-
-
-async def handle_test(request: web.Request) -> web.Response:
-    """Test a configured provider by sending a simple prompt via the runtime."""
-    from aiohttp import web as _web
-    from openagent.models.runtime import run_provider_smoke_test
-
-    name = request.match_info["name"]
-    body = await request.json() if request.can_read_body else {}
-
-    providers = _read_resolved(request).get("providers", {})
-
-    try:
-        runtime_model, resp = await run_provider_smoke_test(
-            name,
-            providers,
-            model_id=body.get("model_id"),
-            session_id="provider-test",
-        )
-        return _web.json_response({"ok": True, "model": runtime_model, "response": resp.content})
-    except Exception as e:
-        return _web.json_response({"ok": False, "error": str(e)}, status=400)
 
 
 # ──────────────────────────────────────────────────────────────────────

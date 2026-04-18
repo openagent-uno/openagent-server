@@ -57,6 +57,7 @@ _TEST_MODULES: tuple[str, ...] = (
     # New DB-backed registry tests: pure CRUD against ctx.db_path, no pool.
     "test_db_mcps",
     "test_db_models",
+    "test_db_providers",
     "test_db_session_bindings",
     "test_bootstrap_import",
     "test_smart_router_hybrid",

@@ -122,13 +122,30 @@ CREATE INDEX IF NOT EXISTS idx_models_enabled ON models(enabled);
 CREATE INDEX IF NOT EXISTS idx_models_updated ON models(updated_at);
 
 -- Generic string-valued state flags. Used for one-shot bootstrap
--- markers (``mcps_imported``, ``models_imported``) so yaml → DB import
--- runs exactly once per DB file.
+-- markers (``mcps_imported``, ``models_imported``, ``providers_imported``)
+-- so yaml → DB import runs exactly once per DB file.
 CREATE TABLE IF NOT EXISTS config_state (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
     updated_at REAL NOT NULL
 );
+
+-- LLM provider credentials. Retires the yaml ``providers:`` section
+-- (since v0.11.0); yaml is imported once via ``import_yaml_providers_once``
+-- then ignored. One row per vendor (openai, anthropic, google, zai, …).
+-- API keys are stored plaintext — same security model as the old
+-- yaml — the DB file is owned by the user with 0600 perms.
+CREATE TABLE IF NOT EXISTS providers (
+    name TEXT PRIMARY KEY,
+    api_key TEXT,
+    base_url TEXT,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_providers_enabled ON providers(enabled);
+CREATE INDEX IF NOT EXISTS idx_providers_updated ON providers(updated_at);
 
 -- Per-session runtime binding. SmartRouter dispatches fresh sessions
 -- to either the Agno stack ("agno") or the Claude CLI
@@ -692,24 +709,116 @@ class MemoryDB:
         row = await cursor.fetchone()
         return float(row[0] or 0.0) if row else 0.0
 
-    async def registry_status(self) -> tuple[float, float, int]:
+    # ── Providers (API keys) ──
+
+    @staticmethod
+    def _row_to_provider(row: aiosqlite.Row) -> dict[str, Any]:
+        metadata = row["metadata_json"] or "{}"
+        try:
+            meta_parsed = json.loads(metadata) if isinstance(metadata, str) else {}
+        except ValueError:
+            meta_parsed = {}
+        return {
+            "name": row["name"],
+            "api_key": row["api_key"],
+            "base_url": row["base_url"],
+            "enabled": bool(row["enabled"]),
+            "metadata": meta_parsed,
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    async def list_providers(self, enabled_only: bool = False) -> list[dict[str, Any]]:
+        conn = await self._ensure_connected()
+        sql = "SELECT * FROM providers"
+        params: tuple = ()
+        if enabled_only:
+            sql += " WHERE enabled = 1"
+        sql += " ORDER BY name"
+        cursor = await conn.execute(sql, params)
+        rows = await cursor.fetchall()
+        return [self._row_to_provider(r) for r in rows]
+
+    async def get_provider(self, name: str) -> dict[str, Any] | None:
+        conn = await self._ensure_connected()
+        cursor = await conn.execute("SELECT * FROM providers WHERE name = ?", (name,))
+        row = await cursor.fetchone()
+        return self._row_to_provider(row) if row else None
+
+    async def upsert_provider(
+        self,
+        name: str,
+        *,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        enabled: bool = True,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        conn = await self._ensure_connected()
+        now = time.time()
+        await conn.execute(
+            """
+            INSERT INTO providers (name, api_key, base_url, enabled, metadata_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET
+                api_key = excluded.api_key,
+                base_url = excluded.base_url,
+                enabled = excluded.enabled,
+                metadata_json = excluded.metadata_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                name, api_key, base_url, 1 if enabled else 0,
+                json.dumps(metadata or {}), now, now,
+            ),
+        )
+        await conn.commit()
+
+    async def set_provider_enabled(self, name: str, enabled: bool) -> None:
+        conn = await self._ensure_connected()
+        await conn.execute(
+            "UPDATE providers SET enabled = ?, updated_at = ? WHERE name = ?",
+            (1 if enabled else 0, time.time(), name),
+        )
+        await conn.commit()
+
+    async def delete_provider(self, name: str) -> None:
+        """Delete a provider row. Does NOT cascade to models — callers
+        that want cascade should call ``delete_models_by_provider(name)``
+        explicitly. Keeping the two steps separate so tests and tools
+        can exercise one without the other."""
+        conn = await self._ensure_connected()
+        await conn.execute("DELETE FROM providers WHERE name = ?", (name,))
+        await conn.commit()
+
+    async def providers_max_updated(self) -> float:
+        conn = await self._ensure_connected()
+        cursor = await conn.execute("SELECT MAX(updated_at) FROM providers")
+        row = await cursor.fetchone()
+        return float(row[0] or 0.0) if row else 0.0
+
+    async def registry_status(self) -> tuple[float, float, int, float]:
         """One-shot probe used by the gateway's per-message hot-reload loop.
 
-        Returns ``(mcps_max_updated, models_max_updated, enabled_models_count)``
-        in a single round-trip so the dispatcher doesn't pay three SELECTs
-        per incoming message.
+        Returns ``(mcps_max_updated, models_max_updated, enabled_models_count,
+        providers_max_updated)`` in a single round-trip so the dispatcher
+        doesn't pay four SELECTs per incoming message.
         """
         conn = await self._ensure_connected()
         cursor = await conn.execute(
             "SELECT "
             "  COALESCE((SELECT MAX(updated_at) FROM mcps), 0), "
             "  COALESCE((SELECT MAX(updated_at) FROM models), 0), "
-            "  COALESCE((SELECT COUNT(*) FROM models WHERE enabled = 1), 0)"
+            "  COALESCE((SELECT COUNT(*) FROM models WHERE enabled = 1), 0), "
+            "  COALESCE((SELECT MAX(updated_at) FROM providers), 0)"
         )
         row = await cursor.fetchone()
         if not row:
-            return 0.0, 0.0, 0
-        return float(row[0] or 0.0), float(row[1] or 0.0), int(row[2] or 0)
+            return 0.0, 0.0, 0, 0.0
+        return (
+            float(row[0] or 0.0), float(row[1] or 0.0),
+            int(row[2] or 0), float(row[3] or 0.0),
+        )
 
     # ── Session Runtime Bindings ──
 

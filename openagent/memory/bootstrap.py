@@ -173,6 +173,59 @@ async def ensure_builtin_mcps(db: MemoryDB) -> int:
     return added
 
 
+async def import_yaml_providers_once(
+    db: MemoryDB, providers_config: dict | None,
+) -> bool:
+    """Seed the ``providers`` table from the yaml ``providers:`` section.
+
+    Returns True iff rows were written. No-op after the first successful
+    run (gated on ``config_state.providers_imported``). Re-runs refresh
+    the rows via ``upsert_provider`` if someone manually cleared the
+    flag; re-runs with the flag set log a one-line warning when the yaml
+    still has ``providers:`` entries (so users know those edits aren't
+    doing anything) and short-circuit.
+
+    ``api_key`` env var substitution (``${OPENAI_API_KEY}``) is already
+    resolved by ``_resolve_env_vars`` before this function sees the dict,
+    so the DB stores the concrete key. Users who later remove the env var
+    keep working because the DB has the snapshot.
+    """
+    if await db.get_state("providers_imported") == "1":
+        if providers_config:
+            logger.info(
+                "providers already imported; yaml providers: section is now "
+                "read-only. Edit providers via /models UI or model-manager MCP."
+            )
+        return False
+
+    if not providers_config:
+        await db.set_state("providers_imported", "1")
+        return False
+
+    written = 0
+    for name, cfg in providers_config.items():
+        if not isinstance(cfg, dict):
+            continue
+        api_key = cfg.get("api_key") or None
+        base_url = cfg.get("base_url") or None
+        # Preserve any non-standard keys (e.g. ``disabled_models``) in
+        # metadata so downstream consumers that read the materialised
+        # dict from ``Agent._hydrate_providers_from_db`` still see them.
+        metadata = {
+            k: v for k, v in cfg.items()
+            if k not in {"api_key", "base_url", "models"}
+        }
+        await db.upsert_provider(
+            name, api_key=api_key, base_url=base_url,
+            enabled=True, metadata=metadata or None,
+        )
+        written += 1
+
+    await db.set_state("providers_imported", "1")
+    logger.info("bootstrap: imported %d provider(s) from yaml into DB", written)
+    return True
+
+
 async def import_yaml_models_once(
     db: MemoryDB,
     providers_config: dict | None,

@@ -111,28 +111,29 @@ async def list_supported_frameworks() -> list[str]:
 
 @mcp.tool()
 async def list_providers() -> list[dict[str, Any]]:
-    """What providers are currently configured in the yaml.
+    """What providers are currently configured.
 
-    Returns one entry per configured provider with ``name``, ``has_api_key``,
-    ``base_url``, and ``configured_model_count`` (rows in the ``models``
-    table). Keys are not surfaced in cleartext — only the presence flag.
+    Reads the ``providers`` SQLite table. Returns one entry per row with
+    ``name``, ``has_api_key``, ``base_url``, and ``configured_model_count``
+    (rows in the ``models`` table). Keys are never surfaced in cleartext
+    — only the presence flag.
     """
-    providers_cfg = _load_providers_from_yaml()
     conn = await _get_conn()
+    rows = await (await conn.execute(
+        "SELECT name, api_key, base_url FROM providers WHERE enabled = 1 ORDER BY name"
+    )).fetchall()
 
     out: list[dict[str, Any]] = []
-    for name, cfg in providers_cfg.items():
-        cfg = cfg or {}
+    for name, api_key, base_url in rows:
         cursor = await conn.execute(
             "SELECT COUNT(*) FROM models WHERE provider = ?", (name,),
         )
-        row = await cursor.fetchone()
-        count = int(row[0]) if row else 0
+        cnt_row = await cursor.fetchone()
         out.append({
             "name": name,
-            "has_api_key": bool(cfg.get("api_key")),
-            "base_url": cfg.get("base_url") or None,
-            "configured_model_count": count,
+            "has_api_key": bool(api_key),
+            "base_url": base_url or None,
+            "configured_model_count": int(cnt_row[0]) if cnt_row else 0,
         })
     return out
 
@@ -143,36 +144,38 @@ async def add_provider(
     api_key: str,
     base_url: str | None = None,
 ) -> dict[str, Any]:
-    """Register a new LLM provider + credentials.
+    """Register a new LLM provider + credentials in the DB.
 
-    Writes ``providers.<name>`` to ``openagent.yaml`` with
-    ``api_key`` (and optional ``base_url``). Keys are the yaml's
-    source-of-truth — not stored in the DB. Once the provider is
-    configured, use ``list_available_models(provider=<name>)`` to see
-    what the provider exposes with that key, then ``add_model`` to
-    register specific runtime ids.
+    Since v0.11.0 provider keys live in the SQLite ``providers`` table,
+    not the yaml. Writes are hot-reloaded on the next message via
+    ``Agent.refresh_registries``. Once the provider is configured, use
+    ``list_available_models(provider=<name>)`` to see what the provider
+    exposes with that key, then ``add_model`` to register specific
+    runtime ids.
     """
     if not name or not name.strip():
         raise ValueError("name is required")
     if not api_key or not api_key.strip():
         raise ValueError("api_key is required")
-    raw = _read_yaml()
-    providers = dict(raw.get("providers") or {})
-    entry: dict[str, Any] = dict(providers.get(name, {}) or {})
-    entry["api_key"] = api_key.strip()
-    if base_url is not None:
-        if base_url.strip():
-            entry["base_url"] = base_url.strip()
-        else:
-            entry.pop("base_url", None)
-    providers[name] = entry
-    raw["providers"] = providers
-    _write_yaml(raw)
-    # Return a sanitized entry (no cleartext key).
+    now = time.time()
+    conn = await _get_conn()
+    await conn.execute(
+        """
+        INSERT INTO providers (name, api_key, base_url, enabled, metadata_json, created_at, updated_at)
+        VALUES (?, ?, ?, 1, '{}', ?, ?)
+        ON CONFLICT(name) DO UPDATE SET
+            api_key = excluded.api_key,
+            base_url = COALESCE(excluded.base_url, providers.base_url),
+            enabled = 1,
+            updated_at = excluded.updated_at
+        """,
+        (name.strip(), api_key.strip(), (base_url or "").strip() or None, now, now),
+    )
+    await conn.commit()
     return {
-        "name": name,
+        "name": name.strip(),
         "has_api_key": True,
-        "base_url": entry.get("base_url") or None,
+        "base_url": (base_url or "").strip() or None,
     }
 
 
@@ -182,63 +185,55 @@ async def update_provider(
     api_key: str | None = None,
     base_url: str | None = None,
 ) -> dict[str, Any]:
-    """Patch ``providers.<name>`` in the yaml.
+    """Patch a provider row.
 
     Only the fields you pass are changed. Pass ``base_url=''`` to clear
     an existing base_url.
     """
-    raw = _read_yaml()
-    providers = dict(raw.get("providers") or {})
-    if name not in providers:
+    conn = await _get_conn()
+    cursor = await conn.execute(
+        "SELECT api_key, base_url FROM providers WHERE name = ?", (name,),
+    )
+    row = await cursor.fetchone()
+    if row is None:
         raise ValueError(f"Provider {name!r} is not configured")
-    entry = dict(providers[name] or {})
+    new_key = row[0]
+    new_base = row[1]
     if api_key is not None:
         if not api_key.strip():
             raise ValueError("api_key cannot be empty")
-        entry["api_key"] = api_key.strip()
+        new_key = api_key.strip()
     if base_url is not None:
-        if base_url.strip():
-            entry["base_url"] = base_url.strip()
-        else:
-            entry.pop("base_url", None)
-    providers[name] = entry
-    raw["providers"] = providers
-    _write_yaml(raw)
+        new_base = base_url.strip() or None
+    await conn.execute(
+        "UPDATE providers SET api_key = ?, base_url = ?, updated_at = ? WHERE name = ?",
+        (new_key, new_base, time.time(), name),
+    )
+    await conn.commit()
     return {
         "name": name,
-        "has_api_key": bool(entry.get("api_key")),
-        "base_url": entry.get("base_url") or None,
+        "has_api_key": bool(new_key),
+        "base_url": new_base,
     }
 
 
 @mcp.tool()
 async def remove_provider(name: str) -> dict[str, Any]:
-    """Remove a provider from the yaml AND purge its models from the DB.
+    """Remove a provider AND cascade-purge its models from the DB.
 
-    Provider keys live in yaml, models live in SQLite — without the
-    cascade, removing a provider orphans every model row that referenced
-    it. Those would keep showing in the catalog and the router would
-    try to dispatch them, failing with a confusing "missing API key" at
-    send time. Cleanup happens in a single tool call.
+    Without the cascade, removing a provider would orphan every model
+    row that referenced it — those would keep showing in the catalog
+    and the router would try to dispatch them, failing with a confusing
+    "missing API key" at send time. Cleanup happens in a single tool call.
     """
-    raw = _read_yaml()
-    providers = dict(raw.get("providers") or {})
-    if name not in providers:
+    conn = await _get_conn()
+    cursor = await conn.execute("SELECT 1 FROM providers WHERE name = ?", (name,))
+    if await cursor.fetchone() is None:
         raise ValueError(f"Provider {name!r} is not configured")
-    providers.pop(name)
-    raw["providers"] = providers
-    _write_yaml(raw)
-
-    models_purged = 0
-    try:
-        conn = await _get_conn()
-        cursor = await conn.execute("DELETE FROM models WHERE provider = ?", (name,))
-        await conn.commit()
-        models_purged = cursor.rowcount or 0
-    except Exception:
-        # yaml write succeeded; DB cascade failure is survivable — the
-        # next provider read will flag the orphans as unreachable.
-        pass
+    purge = await conn.execute("DELETE FROM models WHERE provider = ?", (name,))
+    models_purged = purge.rowcount or 0
+    await conn.execute("DELETE FROM providers WHERE name = ?", (name,))
+    await conn.commit()
     return {"removed": True, "name": name, "models_purged": models_purged}
 
 
@@ -543,9 +538,10 @@ async def test_model(runtime_id: str) -> dict[str, Any]:
     from openagent.models.catalog import split_runtime_id
 
     provider, _ = split_runtime_id(runtime_id)
-    # Providers config is owned by yaml; load it fresh on each call so
-    # key rotations are picked up without a restart.
-    providers_config = _load_providers_from_yaml()
+    # Pull provider keys from the DB fresh on each call so key rotations
+    # are picked up without a restart. Materialised into the dict shape
+    # AgnoProvider expects.
+    providers_config = await _load_providers_from_db()
     _, resp = await run_provider_smoke_test(
         provider,
         providers_config,
@@ -555,65 +551,21 @@ async def test_model(runtime_id: str) -> dict[str, Any]:
     return {"ok": True, "runtime_id": runtime_id, "response": resp.content}
 
 
-def _load_providers_from_yaml() -> dict:
-    """Read the providers section of the live openagent.yaml (env-resolved).
-
-    Returns ``{}`` when the config file is missing or unreadable — those
-    are expected in test harnesses and first-boot scenarios. Anything
-    else (unexpected exception) is logged so real config errors surface.
-    """
-    from openagent.core.config import load_config
-    try:
-        return load_config(os.environ.get("OPENAGENT_CONFIG_PATH")).get("providers", {}) or {}
-    except (FileNotFoundError, PermissionError, OSError):
-        return {}
-    except Exception as e:  # noqa: BLE001 — upstream YAML errors, etc.
-        logger.warning("load_config failed in model-manager: %s", e)
-        return {}
-
-
-def _yaml_path() -> str:
-    """Resolve the yaml path we're allowed to edit.
-
-    Precedence matches ``openagent.core.config.load_config``: env var
-    ``OPENAGENT_CONFIG_PATH`` wins, then CWD's ``openagent.yaml``, then
-    the platform-standard path. Writing to a missing path just creates
-    the file under its parent directory.
-    """
-    explicit = os.environ.get("OPENAGENT_CONFIG_PATH")
-    if explicit:
-        return os.path.expanduser(explicit)
-    cwd = os.path.abspath("openagent.yaml")
-    if os.path.exists(cwd):
-        return cwd
-    from openagent.core.paths import default_config_path
-    return str(default_config_path())
-
-
-def _read_yaml() -> dict[str, Any]:
-    """Read the yaml WITHOUT env-var resolution.
-
-    We want to write back later; resolving ``${VAR}`` now would
-    substitute the value and destroy the reference. The live
-    ``load_config`` path is still the right one for READERS, but this
-    helper is for read-modify-write cycles on the on-disk file.
-    """
-    import yaml
-
-    path = _yaml_path()
-    if not os.path.isfile(path):
-        return {}
-    with open(path) as f:
-        return yaml.safe_load(f) or {}
-
-
-def _write_yaml(data: dict[str, Any]) -> None:
-    import yaml
-
-    path = _yaml_path()
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w") as f:
-        yaml.dump(data, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+async def _load_providers_from_db() -> dict:
+    """Materialise the ``providers`` table into AgnoProvider's dict shape."""
+    conn = await _get_conn()
+    rows = await (await conn.execute(
+        "SELECT name, api_key, base_url FROM providers WHERE enabled = 1"
+    )).fetchall()
+    out: dict[str, dict[str, Any]] = {}
+    for name, api_key, base_url in rows:
+        entry: dict[str, Any] = {}
+        if api_key:
+            entry["api_key"] = api_key
+        if base_url:
+            entry["base_url"] = base_url
+        out[name] = entry
+    return out
 
 
 def main() -> None:

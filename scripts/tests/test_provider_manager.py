@@ -1,4 +1,9 @@
-"""model-manager: provider CRUD tools mutate the yaml, model rows stay in DB."""
+"""model-manager: provider CRUD tools write to the providers table.
+
+Pre-v0.11 these tools wrote yaml; since v0.11.0 they write the
+``providers`` SQLite table. yaml is imported once at bootstrap and
+never touched again.
+"""
 from __future__ import annotations
 
 import os
@@ -7,28 +12,21 @@ import uuid
 from ._framework import TestContext, test
 
 
-@test("provider_manager", "add_provider writes api_key to yaml")
+@test("provider_manager", "add_provider writes api_key to DB (v0.11)")
 async def t_add_provider(ctx: TestContext) -> None:
-    import yaml
     import openagent.mcp.servers.model_manager.server as mgr
     from openagent.memory.db import MemoryDB
 
     tmp_dir = ctx.db_path.parent / f"pmgr-{uuid.uuid4().hex[:8]}"
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    cfg_path = tmp_dir / "openagent.yaml"
     db_path = tmp_dir / "test.db"
 
-    # Seed a minimal yaml so load_config has something to return.
-    cfg_path.write_text(yaml.safe_dump({"name": "test", "providers": {}}))
-
-    prev_cfg = os.environ.get("OPENAGENT_CONFIG_PATH")
     prev_db = os.environ.get("OPENAGENT_DB_PATH")
-    os.environ["OPENAGENT_CONFIG_PATH"] = str(cfg_path)
     os.environ["OPENAGENT_DB_PATH"] = str(db_path)
     mgr._shared._conn = None  # type: ignore[attr-defined]
 
     try:
-        # Need a DB for the list_providers model-count query.
+        # Seed schema so the providers table exists.
         db = MemoryDB(str(db_path))
         await db.connect()
         await db.close()
@@ -38,46 +36,43 @@ async def t_add_provider(ctx: TestContext) -> None:
         assert result["name"] == "zai"
         assert result["has_api_key"] is True
         assert result["base_url"] == "https://api.z.ai/api/paas/v4"
-        # Verify yaml on disk was updated.
-        raw = yaml.safe_load(cfg_path.read_text())
-        assert raw["providers"]["zai"]["api_key"] == "zai-test-key"
 
-        # list_providers now sees it.
+        # Verify the row landed in the DB (cleartext api_key; same
+        # security model as the yaml we replaced).
+        db = MemoryDB(str(db_path))
+        await db.connect()
+        try:
+            row = await db.get_provider("zai")
+            assert row is not None
+            assert row["api_key"] == "zai-test-key"
+            assert row["base_url"] == "https://api.z.ai/api/paas/v4"
+        finally:
+            await db.close()
+
         listed = await mgr.list_providers()
         zai = next((p for p in listed if p["name"] == "zai"), None)
         assert zai is not None
         assert zai["has_api_key"] is True
 
-        # remove_provider pulls it back out.
+        # remove_provider deletes the DB row.
         await mgr.remove_provider("zai")
-        raw = yaml.safe_load(cfg_path.read_text())
-        assert "zai" not in (raw.get("providers") or {})
+        db = MemoryDB(str(db_path))
+        await db.connect()
+        try:
+            assert await db.get_provider("zai") is None
+        finally:
+            await db.close()
     finally:
         mgr._shared._conn = None  # type: ignore[attr-defined]
-        if prev_cfg is None:
-            os.environ.pop("OPENAGENT_CONFIG_PATH", None)
-        else:
-            os.environ["OPENAGENT_CONFIG_PATH"] = prev_cfg
         if prev_db is None:
             os.environ.pop("OPENAGENT_DB_PATH", None)
         else:
             os.environ["OPENAGENT_DB_PATH"] = prev_db
-        try:
-            cfg_path.unlink()
-        except FileNotFoundError:
-            pass
-        try:
-            db_path.unlink()
-        except FileNotFoundError:
-            pass
-        try:
-            (tmp_dir / "openagent.db-shm").unlink()
-        except FileNotFoundError:
-            pass
-        try:
-            (tmp_dir / "openagent.db-wal").unlink()
-        except FileNotFoundError:
-            pass
+        for name in ("test.db", "test.db-shm", "test.db-wal"):
+            try:
+                (tmp_dir / name).unlink()
+            except FileNotFoundError:
+                pass
         try:
             tmp_dir.rmdir()
         except OSError:

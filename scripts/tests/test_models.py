@@ -10,17 +10,24 @@ import json
 from ._framework import TestContext, TestSkip, test
 
 
-@test("models", "GET /api/models returns provider list")
+@test("models", "GET /api/models returns a list of DB model rows")
 async def t_models_list(ctx: TestContext) -> None:
+    """v0.11.0: ``/api/models`` is DB-backed (the ``models`` table). The
+    gateway fixture runs without a wired DB, so we accept either the
+    happy path ``{"models": [...]}`` or a 500 "memory DB not available"
+    which just means this particular fixture can't exercise it."""
     port = ctx.extras.get("gateway_port")
     if not port:
         raise TestSkip("gateway not running")
     import aiohttp
     async with aiohttp.ClientSession() as http:
         async with http.get(f"http://127.0.0.1:{port}/api/models") as r:
+            if r.status == 500:
+                raise TestSkip("gateway fixture has no MemoryDB wired")
             assert r.status == 200
             body = await r.json()
-            assert isinstance(body, (list, dict)), body
+            assert isinstance(body, dict) and "models" in body, body
+            assert isinstance(body["models"], list), body
 
 
 @test("models", "GET /api/models/catalog returns catalog with pricing")

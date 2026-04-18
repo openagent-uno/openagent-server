@@ -174,22 +174,30 @@ class Gateway:
             ("GET", "/api/usage", usage.handle_get),
             ("GET", "/api/usage/daily", usage.handle_daily),
             ("GET", "/api/usage/pricing", usage.handle_pricing),
+            # DB-backed provider CRUD. Legacy yaml-provider endpoints were
+            # retired in v0.11.0 — bootstrap imports the yaml section once,
+            # then DB is canonical. POST /api/providers/test is kept as a
+            # path alias for clients that can't easily switch URLs.
             ("GET", "/api/providers", providers.handle_list),
+            ("POST", "/api/providers", providers.handle_create),
             ("POST", "/api/providers/test", providers.handle_test),
+            ("GET", "/api/providers/{name}", providers.handle_get),
+            ("PUT", "/api/providers/{name}", providers.handle_update),
+            ("DELETE", "/api/providers/{name}", providers.handle_delete),
+            ("POST", "/api/providers/{name}/enable", providers.handle_enable),
+            ("POST", "/api/providers/{name}/disable", providers.handle_disable),
+            ("POST", "/api/providers/{name}/test", providers.handle_test),
+            # Models. /api/models is now the DB-backed catalog directly
+            # (v0.11.0 retired the yaml provider-CRUD that previously
+            # lived here). /api/models/db/* kept as an alias so existing
+            # clients don't break mid-upgrade.
             ("GET", "/api/models/catalog", models.handle_catalog),
             ("GET", "/api/models/providers", models.handle_available_providers),
-            ("GET", "/api/models", models.handle_list),
-            ("POST", "/api/models", models.handle_create),
             ("GET", "/api/models/active", models.handle_get_active),
             ("PUT", "/api/models/active", models.handle_set_active),
-            ("PUT", "/api/models/{name}", models.handle_update),
-            ("DELETE", "/api/models/{name}", models.handle_delete),
-            ("POST", "/api/models/{name}/test", models.handle_test),
-            # DB-backed model catalog (the models table). Ordered before the
-            # legacy yaml-providers CRUD above so that a request to a literal
-            # ``/api/models/db`` path matches here instead of being captured
-            # by the ``{name}`` catch-all.
             ("GET", "/api/models/available", models.handle_available_models),
+            ("GET", "/api/models", models.handle_list_db),
+            ("POST", "/api/models", models.handle_create_db),
             ("GET", "/api/models/db", models.handle_list_db),
             ("POST", "/api/models/db", models.handle_create_db),
             ("GET", "/api/models/db/{runtime_id:.+}", models.handle_get_db),
@@ -197,6 +205,11 @@ class Gateway:
             ("DELETE", "/api/models/db/{runtime_id:.+}", models.handle_delete_db),
             ("POST", "/api/models/db/{runtime_id:.+}/enable", models.handle_enable_db),
             ("POST", "/api/models/db/{runtime_id:.+}/disable", models.handle_disable_db),
+            ("GET", "/api/models/{runtime_id:.+}", models.handle_get_db),
+            ("PUT", "/api/models/{runtime_id:.+}", models.handle_update_db),
+            ("DELETE", "/api/models/{runtime_id:.+}", models.handle_delete_db),
+            ("POST", "/api/models/{runtime_id:.+}/enable", models.handle_enable_db),
+            ("POST", "/api/models/{runtime_id:.+}/disable", models.handle_disable_db),
             # DB-backed MCP registry.
             ("GET", "/api/mcps", mcps.handle_list),
             ("POST", "/api/mcps", mcps.handle_create),
