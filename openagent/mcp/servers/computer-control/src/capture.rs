@@ -9,7 +9,7 @@ use fast_image_resize::{Resizer, images::Image as FirImage};
 use image::{ImageEncoder, RgbaImage, codecs::png::PngEncoder};
 use std::io::Cursor;
 
-use crate::scaling::size_to_api_scale;
+use crate::scaling::{LogicalRegion, size_to_api_scale};
 
 pub struct CaptureResult {
     /// PNG-encoded, already downsampled to fit Claude's API limits.
@@ -22,15 +22,22 @@ pub struct CaptureResult {
     pub logical_height: u32,
 }
 
-pub fn capture_primary_display() -> Result<CaptureResult> {
-    let image = try_xcap()
+/// Capture the primary display and optionally crop to `region` (in logical
+/// screen pixels) before downsampling. The PNG is downsampled to fit API limits.
+///
+/// `reported_*` dimensions reflect the post-downsample output size.
+/// `logical_*` dimensions reflect the full display size (not the cropped
+/// region) — callers need the full logical extents to map cursor / click
+/// coordinates back to API space via [`crate::scaling::api_to_logical`].
+pub fn capture_primary_display_region(region: Option<LogicalRegion>) -> Result<CaptureResult> {
+    let image = try_xcap(region)
         .or_else(|e| {
             tracing::warn!("xcap capture failed: {e}, trying fallback");
             #[cfg(target_os = "macos")]
             if is_permission_error(&e) {
                 return Err(anyhow!(MAC_SCREEN_RECORDING_HINT));
             }
-            try_fallback()
+            try_fallback(region)
         })
         .map_err(|e| {
             #[cfg(target_os = "macos")]
@@ -40,6 +47,57 @@ pub fn capture_primary_display() -> Result<CaptureResult> {
             e
         })?;
     Ok(image)
+}
+
+/// Capture the primary display into a raw RGBA image, cropped to `region` if
+/// given. Used by the recording pipeline (which needs raw frames, not PNGs).
+///
+/// Returns the image together with the full logical display dimensions, so
+/// the caller can translate subsequent ROIs / coordinates relative to the
+/// same baseline.
+pub fn capture_primary_frame_rgba(
+    region: Option<LogicalRegion>,
+) -> Result<(RgbaImage, u32, u32)> {
+    let primary = primary_or_first_monitor()?;
+    let rgba: RgbaImage = match primary.capture_image() {
+        Ok(img) => img,
+        Err(e) => {
+            #[cfg(target_os = "macos")]
+            {
+                let err = anyhow!(e.to_string());
+                if is_permission_error(&err) {
+                    return Err(anyhow!(MAC_SCREEN_RECORDING_HINT));
+                }
+                return Err(err.context("xcap capture_image failed"));
+            }
+            #[cfg(not(target_os = "macos"))]
+            return Err(anyhow!(e).context("xcap capture_image failed"));
+        }
+    };
+    let logical_w = rgba.width();
+    let logical_h = rgba.height();
+    let cropped = match region {
+        None => rgba,
+        Some(r) => crop_rgba(&rgba, r)?,
+    };
+    Ok((cropped, logical_w, logical_h))
+}
+
+/// Crop an RGBA image to the given region. Returns an error if the region
+/// extends beyond the source image bounds.
+fn crop_rgba(src: &RgbaImage, r: LogicalRegion) -> Result<RgbaImage> {
+    if r.x + r.w > src.width() || r.y + r.h > src.height() {
+        return Err(anyhow!(
+            "region [{},{},{},{}] exceeds image bounds {}x{}",
+            r.x,
+            r.y,
+            r.w,
+            r.h,
+            src.width(),
+            src.height(),
+        ));
+    }
+    Ok(image::imageops::crop_imm(src, r.x, r.y, r.w, r.h).to_image())
 }
 
 /// Pick the primary monitor if one is flagged, otherwise the first.
@@ -66,12 +124,16 @@ pub fn primary_or_first_monitor() -> Result<xcap::Monitor> {
     Ok(monitors.into_iter().next().expect("non-empty checked above"))
 }
 
-fn try_xcap() -> Result<CaptureResult> {
+fn try_xcap(region: Option<LogicalRegion>) -> Result<CaptureResult> {
     let primary = primary_or_first_monitor()?;
     let rgba: RgbaImage = primary.capture_image().context("xcap capture_image failed")?;
     let logical_w = rgba.width();
     let logical_h = rgba.height();
-    let (png_bytes, w, h) = downsample_and_encode(rgba)?;
+    let cropped = match region {
+        None => rgba,
+        Some(r) => crop_rgba(&rgba, r)?,
+    };
+    let (png_bytes, w, h) = downsample_and_encode(cropped)?;
     Ok(CaptureResult {
         png_bytes,
         reported_width: w,
@@ -82,7 +144,7 @@ fn try_xcap() -> Result<CaptureResult> {
 }
 
 #[cfg(target_os = "macos")]
-fn try_fallback() -> Result<CaptureResult> {
+fn try_fallback(region: Option<LogicalRegion>) -> Result<CaptureResult> {
     use std::process::Command;
     let tmp = std::env::temp_dir().join(format!(
         "openagent-computer-control-{}.png",
@@ -104,7 +166,11 @@ fn try_fallback() -> Result<CaptureResult> {
     let img = image::load_from_memory(&bytes)?.to_rgba8();
     let logical_w = img.width();
     let logical_h = img.height();
-    let (png_bytes, w, h) = downsample_and_encode(img)?;
+    let cropped = match region {
+        None => img,
+        Some(r) => crop_rgba(&img, r)?,
+    };
+    let (png_bytes, w, h) = downsample_and_encode(cropped)?;
     Ok(CaptureResult {
         png_bytes,
         reported_width: w,
@@ -115,7 +181,7 @@ fn try_fallback() -> Result<CaptureResult> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn try_fallback() -> Result<CaptureResult> {
+fn try_fallback(_region: Option<LogicalRegion>) -> Result<CaptureResult> {
     Err(anyhow!("no fallback available on this platform"))
 }
 
@@ -231,7 +297,7 @@ mod tests {
     #[test]
     #[ignore] // run with `cargo test capture_real -- --ignored --nocapture`
     fn capture_real_display() {
-        let r = capture_primary_display().unwrap();
+        let r = capture_primary_display_region(None).unwrap();
         std::fs::write("/tmp/smoke.png", &r.png_bytes).unwrap();
         println!("logical: {}x{}", r.logical_width, r.logical_height);
         println!("reported: {}x{}", r.reported_width, r.reported_height);

@@ -1,6 +1,7 @@
 mod capture;
 mod input;
 mod keys;
+mod record;
 mod scaling;
 mod tool;
 

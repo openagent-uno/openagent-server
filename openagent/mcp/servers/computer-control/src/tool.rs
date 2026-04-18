@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::{capture, input, scaling};
+use crate::{capture, input, record, scaling};
 
 /// All actions supported by the `computer` tool.
 /// Names are snake_case to match the MCP protocol surface (= TS enum values).
@@ -45,6 +45,11 @@ pub enum Action {
     GetScreenshot,
     /// Get the current (x, y) pixel coordinate of the cursor on the screen.
     GetCursorPosition,
+    /// Start recording the screen to an `.mp4` file. See `ComputerArgs`
+    /// for supported parameters (path, fps, region, max_duration_seconds).
+    StartScreenRecording,
+    /// Stop the active screen recording and return the output file path.
+    StopScreenRecording,
 }
 
 /// Input parameters for the `computer` tool.
@@ -69,6 +74,26 @@ pub struct ComputerArgs {
     /// Text to type or key command to execute.
     #[serde(default)]
     pub text: Option<String>,
+    /// Optional region-of-interest `[x, y, width, height]` in API image space.
+    /// Supported by `get_screenshot` and `start_screen_recording` — the
+    /// captured image / video is cropped to this rectangle before downsampling.
+    /// Useful for focusing the model on a specific panel, a video player,
+    /// a toast, or isolating an animating element for frame-by-frame review.
+    #[serde(default)]
+    pub region: Option<[i32; 4]>,
+    /// Frames per second for `start_screen_recording`. 1–60, default 30.
+    #[serde(default)]
+    pub fps: Option<u32>,
+    /// Optional output path for `start_screen_recording`. If omitted, the
+    /// server writes to a timestamped `.mp4` in the OS temp directory and
+    /// returns the full path in the start response.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Optional auto-stop duration (in seconds) for `start_screen_recording`.
+    /// When set, the recording stops on its own after this many seconds even
+    /// if `stop_screen_recording` hasn't been called yet.
+    #[serde(default)]
+    pub max_duration_seconds: Option<u32>,
 }
 
 // NOTE: The tool description is inlined directly in the #[tool(description = "...")] attribute
@@ -85,6 +110,10 @@ pub struct ComputerControlServer {
     tool_router: ToolRouter<Self>,
     /// Lazily initialized; `None` until the first action that needs input control.
     input: Arc<Mutex<Option<input::InputController>>>,
+    /// The active recording, if any. Only one recording may run at a time —
+    /// we hold the `RecordingSession` here so `stop_screen_recording` can
+    /// reclaim it. `None` means no recording is active.
+    recording: Arc<Mutex<Option<record::RecordingSession>>>,
 }
 
 #[tool_router(router = tool_router)]
@@ -94,11 +123,12 @@ impl ComputerControlServer {
         Self {
             tool_router: Self::tool_router(),
             input: Arc::new(Mutex::new(None)),
+            recording: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// The single computer tool — dispatches all 11 actions.
-    #[tool(description = "Use a mouse and keyboard to interact with a computer, and take screenshots.\n* This is an interface to a desktop GUI. You do not have access to a terminal or applications menu. You must click on desktop icons to start applications.\n* Always prefer using keyboard shortcuts rather than clicking, where possible.\n* If you see boxes with two letters in them, typing these letters will click that element. Use this instead of other shortcuts or clicking, where possible.\n* Some applications may take time to start or process actions, so you may need to wait and take successive screenshots to see the results of your actions. E.g. if you click on Firefox and a window doesn't open, try taking another screenshot.\n* Whenever you intend to move the cursor to click on an element like an icon, you should consult a screenshot to determine the coordinates of the element before moving the cursor.\n* If you tried clicking on a program or link but it failed to load, even after waiting, try adjusting your cursor position so that the tip of the cursor visually falls on the element that you want to click.\n* Make sure to click any buttons, links, icons, etc with the cursor tip in the center of the element. Don't click boxes on their edges unless asked.\n\nUsing the crosshair:\n* Screenshots show a red crosshair at the current cursor position.\n* After clicking, check where the crosshair appears vs your target. If it missed, adjust coordinates proportionally to the distance - start with large adjustments and refine. Avoid small incremental changes when the crosshair is far from the target (distances are often further than you expect).\n* Consider display dimensions when estimating positions. E.g. if it's 90% to the bottom of the screen, the coordinates should reflect this.")]
+    /// The single computer tool — dispatches all actions, including screen recording.
+    #[tool(description = "Use a mouse and keyboard to interact with a computer, take screenshots, and record the screen.\n* This is an interface to a desktop GUI. You do not have access to a terminal or applications menu. You must click on desktop icons to start applications.\n* Always prefer using keyboard shortcuts rather than clicking, where possible.\n* If you see boxes with two letters in them, typing these letters will click that element. Use this instead of other shortcuts or clicking, where possible.\n* Some applications may take time to start or process actions, so you may need to wait and take successive screenshots to see the results of your actions. E.g. if you click on Firefox and a window doesn't open, try taking another screenshot.\n* Whenever you intend to move the cursor to click on an element like an icon, you should consult a screenshot to determine the coordinates of the element before moving the cursor.\n* If you tried clicking on a program or link but it failed to load, even after waiting, try adjusting your cursor position so that the tip of the cursor visually falls on the element that you want to click.\n* Make sure to click any buttons, links, icons, etc with the cursor tip in the center of the element. Don't click boxes on their edges unless asked.\n\nUsing the crosshair:\n* Screenshots show a red crosshair at the current cursor position.\n* After clicking, check where the crosshair appears vs your target. If it missed, adjust coordinates proportionally to the distance - start with large adjustments and refine. Avoid small incremental changes when the crosshair is far from the target (distances are often further than you expect).\n* Consider display dimensions when estimating positions. E.g. if it's 90% to the bottom of the screen, the coordinates should reflect this.\n\nRegion-of-interest (ROI):\n* `get_screenshot` and `start_screen_recording` accept an optional `region: [x, y, width, height]` in API image space. When set, the captured image/video is cropped to that rectangle before being downsampled, letting you focus the model on one pane or an animating element without capturing the whole screen.\n\nScreen recording:\n* `start_screen_recording` begins capturing the primary display to an `.mp4` file and returns immediately with the output path. Optional params: `fps` (1-60, default 30), `region` (ROI), `path` (defaults to a timestamped file in the OS temp dir), `max_duration_seconds` (auto-stop after N seconds).\n* `stop_screen_recording` stops the active recording and returns the final file path, frame count, and duration. Only one recording can be active at a time; starting a second before stopping the first returns an error.\n* Use recording to review animations, transitions, video playback, or any behavior that a single screenshot can't capture. Prefer a small `region` when possible — it keeps file size down and focuses the recording on the element under test.")]
     pub async fn computer(&self, params: Parameters<ComputerArgs>) -> CallToolResult {
         let args = params.0;
         match self.dispatch(args).await {
@@ -124,6 +154,17 @@ impl ServerHandler for ComputerControlServer {
 
 impl ComputerControlServer {
     async fn dispatch(&self, args: ComputerArgs) -> Result<CallToolResult> {
+        // Recording actions don't touch the input controller (no mouse /
+        // keyboard involvement), so dispatch them before we grab the input
+        // lock — this keeps recording responsive even if Accessibility
+        // permission is missing and prevents a recording from holding up
+        // other tool calls.
+        match args.action {
+            Action::StartScreenRecording => return self.dispatch_start_recording(args).await,
+            Action::StopScreenRecording => return self.dispatch_stop_recording().await,
+            _ => {}
+        }
+
         // Scale coordinate from API space to logical screen space, if given.
         let logical_coord: Option<(i32, i32)> = match args.coordinate {
             None => None,
@@ -225,20 +266,67 @@ impl ComputerControlServer {
                 let (cx_logical, cy_logical) = input_guard2.as_mut().unwrap().cursor_position()?;
                 drop(input_guard2);
 
-                let cap = capture::capture_primary_display()?;
+                // Resolve optional ROI to logical coords. We need the full
+                // display size first so scaling::api_region_to_logical can
+                // convert from API image space.
+                let (disp_w, disp_h) = self.logical_display_size()?;
+                let logical_region = match args.region {
+                    None => None,
+                    Some(r) => Some(
+                        scaling::api_region_to_logical(r, disp_w, disp_h)
+                            .map_err(|e| anyhow!(e))?,
+                    ),
+                };
 
-                // Convert logical cursor coords to API image space.
-                let scale_logical_to_api =
-                    1.0 / scaling::api_to_logical_scale(cap.logical_width, cap.logical_height);
-                let cx = (cx_logical as f64 * scale_logical_to_api).round() as i32;
-                let cy = (cy_logical as f64 * scale_logical_to_api).round() as i32;
+                let cap = capture::capture_primary_display_region(logical_region)?;
+
+                // Compute crosshair position in the (possibly cropped)
+                // output image. When an ROI was requested, we shift the
+                // cursor by the region origin and scale by the crop's
+                // downsample factor; if the cursor is outside the crop we
+                // simply skip drawing the crosshair rather than painting a
+                // misleading mark at the image edge.
+                let (cx, cy, draw_crosshair) = match logical_region {
+                    None => {
+                        let scale_logical_to_api = 1.0
+                            / scaling::api_to_logical_scale(
+                                cap.logical_width,
+                                cap.logical_height,
+                            );
+                        (
+                            (cx_logical as f64 * scale_logical_to_api).round() as i32,
+                            (cy_logical as f64 * scale_logical_to_api).round() as i32,
+                            true,
+                        )
+                    }
+                    Some(r) => {
+                        let inside = (cx_logical as u32) >= r.x
+                            && (cx_logical as u32) < r.x + r.w
+                            && (cy_logical as u32) >= r.y
+                            && (cy_logical as u32) < r.y + r.h;
+                        if !inside {
+                            (0, 0, false)
+                        } else {
+                            // Scale from cropped-logical to cropped-output.
+                            let sx = cap.reported_width as f64 / r.w as f64;
+                            let sy = cap.reported_height as f64 / r.h as f64;
+                            (
+                                ((cx_logical as u32 - r.x) as f64 * sx).round() as i32,
+                                ((cy_logical as u32 - r.y) as f64 * sy).round() as i32,
+                                true,
+                            )
+                        }
+                    }
+                };
 
                 // Draw crosshair onto the captured (already downsampled) image.
                 let mut img =
                     image::load_from_memory(&cap.png_bytes)
                         .context("load captured PNG")?
                         .to_rgba8();
-                capture::draw_crosshair(&mut img, cx, cy);
+                if draw_crosshair {
+                    capture::draw_crosshair(&mut img, cx, cy);
+                }
 
                 // Re-encode to PNG.
                 let mut png_buf =
@@ -264,7 +352,76 @@ impl ComputerControlServer {
                 );
                 Ok(CallToolResult::success(vec![meta, img_content]))
             }
+            // Recording actions are routed before this match (they don't
+            // need the input controller). These arms are unreachable in
+            // practice but satisfy the exhaustiveness check.
+            Action::StartScreenRecording | Action::StopScreenRecording => {
+                unreachable!("recording actions are dispatched before input controller init");
+            }
         }
+    }
+
+    /// Resolve the recording output path: use the caller-provided path if any,
+    /// else a timestamped `.mp4` under the OS temp directory.
+    fn resolve_recording_path(arg: Option<String>) -> Result<std::path::PathBuf> {
+        match arg {
+            Some(p) => Ok(std::path::PathBuf::from(p)),
+            None => {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                Ok(std::env::temp_dir()
+                    .join(format!("openagent-recording-{nanos}.mp4")))
+            }
+        }
+    }
+
+    async fn dispatch_start_recording(&self, args: ComputerArgs) -> Result<CallToolResult> {
+        let mut slot = self.recording.lock().await;
+        if slot.is_some() {
+            return Err(anyhow!(
+                "a screen recording is already active; call stop_screen_recording first"
+            ));
+        }
+        let fps = args.fps.unwrap_or(30);
+        let path = Self::resolve_recording_path(args.path)?;
+        let region = match args.region {
+            None => None,
+            Some(r) => {
+                let (lw, lh) = self.logical_display_size()?;
+                Some(scaling::api_region_to_logical(r, lw, lh).map_err(|e| anyhow!(e))?)
+            }
+        };
+        let max_duration = args
+            .max_duration_seconds
+            .map(|s| std::time::Duration::from_secs(s as u64));
+        let session = record::start_recording(path.clone(), fps, region, max_duration)?;
+        let width = session.width;
+        let height = session.height;
+        *slot = Some(session);
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string(&serde_json::json!({
+                "ok": true,
+                "path": path.to_string_lossy(),
+                "fps": fps,
+                "width": width,
+                "height": height,
+            }))
+            .context("serialize start_recording response")?,
+        )]))
+    }
+
+    async fn dispatch_stop_recording(&self) -> Result<CallToolResult> {
+        let session = {
+            let mut slot = self.recording.lock().await;
+            slot.take()
+                .ok_or_else(|| anyhow!("no active screen recording to stop"))?
+        };
+        let outcome = session.stop().await?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string(&outcome).context("serialize recording outcome")?,
+        )]))
     }
 
     fn logical_display_size(&self) -> Result<(u32, u32)> {
