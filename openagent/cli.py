@@ -202,11 +202,25 @@ def migrate_cmd(dest: str):
 @main.command("_mcp-server", hidden=True)
 @click.argument("name")
 def mcp_server_cmd(name: str):
-    """Run a bundled Python MCP server (internal use by the frozen executable)."""
+    """Run a bundled Python MCP server (internal use by the frozen executable).
+
+    The frozen PyInstaller binary rewrites ``python -m openagent.mcp.servers.X.server``
+    to ``openagent _mcp-server X`` because the bundled interpreter can't
+    run ``-m`` against a lazy-imported module. Any new Python MCP that
+    ships in-tree needs an entry below, otherwise it dies at startup
+    with "Unknown MCP server" and the pool marks it dormant.
+    """
     if name == "scheduler":
         from openagent.mcp.servers.scheduler.server import main as scheduler_main
-
         scheduler_main()
+        return
+    if name == "mcp-manager":
+        from openagent.mcp.servers.mcp_manager.server import main as mcp_manager_main
+        mcp_manager_main()
+        return
+    if name == "model-manager":
+        from openagent.mcp.servers.model_manager.server import main as model_manager_main
+        model_manager_main()
         return
 
     click.echo(f"Unknown MCP server: {name}", err=True)

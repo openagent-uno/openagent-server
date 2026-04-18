@@ -37,6 +37,36 @@ async def t_mcps_bootstrap_idempotent(ctx: TestContext) -> None:
             pass
 
 
+@test("bootstrap", "sibling model.provider resolves bare model_id")
+async def t_model_id_uses_sibling_provider(ctx: TestContext) -> None:
+    """Regression: a yaml with provider=claude-cli + bare model_id=<id>
+    used to fail resolution because the bootstrap ignored the sibling
+    provider and tried to guess from the pricing table. Observed on
+    mixout-agent: ``cannot resolve bare model ref 'claude-sonnet-4-6'``.
+    """
+    import uuid
+    from openagent.memory.db import MemoryDB
+    from openagent.memory.bootstrap import import_yaml_models_once
+
+    tmp_db = ctx.db_path.with_name(f"bootstrap-sibling-{uuid.uuid4().hex[:8]}.db")
+    try:
+        db = MemoryDB(str(tmp_db))
+        await db.connect()
+        await import_yaml_models_once(
+            db,
+            providers_config={},  # no providers.X.models — fallback path
+            model_cfg={"provider": "claude-cli", "model_id": "claude-sonnet-4-6"},
+        )
+        runtime_ids = {r["runtime_id"] for r in await db.list_models()}
+        assert "claude-cli/claude-sonnet-4-6" in runtime_ids, runtime_ids
+        await db.close()
+    finally:
+        try:
+            tmp_db.unlink()
+        except FileNotFoundError:
+            pass
+
+
 @test("bootstrap", "import_yaml_models_once pulls routing-only refs")
 async def t_models_bootstrap_routing(ctx: TestContext) -> None:
     import uuid

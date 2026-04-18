@@ -245,11 +245,33 @@ async def import_yaml_models_once(
 
 
 def _extract_model_refs(model_cfg: dict) -> list[str]:
-    """Collect every model id mentioned in the ``model:`` yaml section."""
+    """Collect every model id mentioned in the ``model:`` yaml section.
+
+    The top-level ``model_id`` is combined with its sibling ``provider``
+    (``model.provider``) so a yaml like
+
+        model:
+          provider: claude-cli
+          model_id: claude-sonnet-4-6
+
+    emits ``claude-cli/claude-sonnet-4-6`` instead of the bare
+    ``claude-sonnet-4-6`` — otherwise the caller's pricing-based
+    provider-guess runs and logs "cannot resolve bare model ref".
+    Tier refs under ``routing`` stay provider-agnostic; if they're
+    bare, the caller's guess logic still applies.
+    """
     refs: list[str] = []
+
     direct = str(model_cfg.get("model_id") or "").strip()
     if direct:
-        refs.append(direct)
+        provider_hint = str(model_cfg.get("provider") or "").strip()
+        if provider_hint and ":" not in direct and "/" not in direct:
+            # Claude CLI uses "/" as the separator; everyone else uses ":".
+            sep = "/" if provider_hint == "claude-cli" else ":"
+            refs.append(f"{provider_hint}{sep}{direct}")
+        else:
+            refs.append(direct)
+
     classifier = str(model_cfg.get("classifier_model") or "").strip()
     if classifier:
         refs.append(classifier)
