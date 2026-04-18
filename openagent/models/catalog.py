@@ -91,11 +91,6 @@ FRAMEWORK_AGNO = "agno"
 FRAMEWORK_CLAUDE_CLI = "claude-cli"
 SUPPORTED_FRAMEWORKS = (FRAMEWORK_AGNO, FRAMEWORK_CLAUDE_CLI)
 
-# Back-compat alias. ``claude-cli`` was treated as a "provider" pre-v0.10;
-# existing callers expecting the constant still work, but new code should
-# use ``FRAMEWORK_CLAUDE_CLI`` explicitly.
-CLAUDE_CLI_PROVIDER = FRAMEWORK_CLAUDE_CLI
-
 
 @dataclass(frozen=True)
 class CatalogModel:
@@ -195,7 +190,7 @@ def normalize_runtime_model_id(model_ref: str, providers_config: dict | None = N
         return raw
     if "/" in raw:
         prefix, rest = raw.split("/", 1)
-        if prefix == CLAUDE_CLI_PROVIDER:
+        if prefix == FRAMEWORK_CLAUDE_CLI:
             return raw
         if prefix in SUPPORTED_PROVIDERS or prefix in (providers_config or {}):
             return f"{prefix}:{rest}"
@@ -383,7 +378,7 @@ def get_model_pricing(model_ref: str, providers_config: dict | None = None) -> d
     pricing = defaults.get(runtime_id) or defaults.get(bare_id)
     # claude-cli is a transport for Anthropic models — fall back to anthropic
     # pricing when no claude-cli-specific entry exists (claude-cli:<X> → anthropic:<X>).
-    if pricing is None and is_claude_cli_model(runtime_id) and bare_id and bare_id != CLAUDE_CLI_PROVIDER:
+    if pricing is None and is_claude_cli_model(runtime_id) and bare_id and bare_id != FRAMEWORK_CLAUDE_CLI:
         pricing = defaults.get(f"anthropic:{bare_id}")
         if pricing:
             _log_pricing(

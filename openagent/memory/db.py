@@ -764,17 +764,32 @@ class MemoryDB:
         await conn.commit()
 
     async def pin_session_model(self, session_id: str, runtime_id: str) -> None:
-        """Pin ``session_id`` to a specific model runtime_id.
+        """Pin ``session_id`` to a specific model ``runtime_id``.
 
-        Upserts a ``session_bindings`` row with provider inferred from
-        the runtime_id (claude-cli for ``claude-cli/...``, agno
-        otherwise). Subsequent SmartRouter turns on this session bypass
-        the classifier and dispatch to ``runtime_id`` directly.
+        Framework lock: if the session has already been served by one
+        framework (rows in ``sdk_sessions`` for claude-cli, or in
+        ``session_bindings`` for agno), we refuse to pin it to a model
+        from the OTHER framework. Conversation state would split
+        across two stores and turns would lose context. Callers should
+        ``/clear`` or spawn a fresh session_id if they actually want to
+        switch frameworks.
         """
         if not session_id or not runtime_id:
             raise ValueError("session_id and runtime_id are required")
-        provider = "claude-cli" if runtime_id.startswith("claude-cli") else "agno"
-        await self.set_session_binding(session_id, provider, runtime_id=runtime_id)
+        target_framework = (
+            "claude-cli" if runtime_id.startswith("claude-cli") else "agno"
+        )
+        existing = await self.get_session_binding(session_id)
+        if existing and existing != target_framework:
+            raise ValueError(
+                f"session {session_id!r} is bound to framework={existing!r} "
+                f"and cannot be pinned to a {target_framework!r} model — "
+                "conversation history lives in the current framework's "
+                "store. Use /clear (or a fresh session_id) first."
+            )
+        await self.set_session_binding(
+            session_id, target_framework, runtime_id=runtime_id,
+        )
 
     async def unpin_session_model(self, session_id: str) -> None:
         """Clear the per-session model pin, leaving the side-binding intact.

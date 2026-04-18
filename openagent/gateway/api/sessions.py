@@ -61,7 +61,11 @@ async def handle_pin(request):
             {"error": f"model {runtime_id!r} is disabled — enable it before pinning"},
             status=400,
         )
-    await db.pin_session_model(session_id, runtime_id)
+    try:
+        await db.pin_session_model(session_id, runtime_id)
+    except ValueError as e:
+        # Cross-framework pin attempt (surfaces a human-readable message).
+        return web.json_response({"error": str(e)}, status=409)
     return web.json_response({
         "session_id": session_id,
         "runtime_id": runtime_id,

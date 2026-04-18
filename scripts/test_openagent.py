@@ -60,6 +60,7 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_db_session_bindings",
     "test_bootstrap_import",
     "test_smart_router_hybrid",
+    "test_behavior_contract",
     "test_mcp_manager_guards",
     "test_provider_manager",
     # Dynamic provider catalog: bundled fallback only (no live HTTP).
