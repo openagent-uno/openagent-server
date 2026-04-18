@@ -1,7 +1,7 @@
-"""MemoryDB — Providers table CRUD (v0.11.0).
+"""MemoryDB — Providers table CRUD.
 
-Covers the ``providers`` table that replaces the yaml ``providers:``
-section as the source of truth for LLM credentials.
+Covers the ``providers`` table — the source of truth for LLM
+credentials.
 """
 from __future__ import annotations
 
@@ -102,8 +102,8 @@ async def t_providers_no_cascade(ctx: TestContext) -> None:
 
 @test("db_providers", "registry_status exposes providers_max_updated")
 async def t_providers_registry_status(ctx: TestContext) -> None:
-    """The gateway's hot-reload probe returns a 4-tuple since v0.11.0;
-    the last field must bump whenever providers change."""
+    """The gateway's hot-reload probe returns a 4-tuple; the last field
+    must bump whenever providers change."""
     from openagent.memory.db import MemoryDB
 
     db = MemoryDB(str(ctx.db_path))

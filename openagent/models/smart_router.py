@@ -108,9 +108,9 @@ class SmartRouter(BaseModel):
         self._last_pick_by_session: dict[str, str] = {}
 
         # ``routing`` is retained as a soft starting point: if the user
-        # supplied explicit per-tier model_ids in yaml, use the union of
-        # those values as the seed catalog when the DB is empty (early
-        # boot, or pure-yaml deployments). Once the DB carries enabled
+        # supplied explicit per-tier model_ids in the yaml ``model:``
+        # section, use the union of those values as the seed catalog
+        # when the DB is empty (early boot). Once the DB carries enabled
         # rows, ``iter_configured_models`` is the source of truth.
         self._explicit_routing = (
             {k: normalize_runtime_model_id(v, self._providers_config) for k, v in (routing or {}).items() if v}

@@ -103,11 +103,11 @@ async def t_usage_daily(ctx: TestContext) -> None:
 # ── /api/providers ───────────────────────────────────────────────────
 
 
-@test("providers", "GET /api/providers lists DB-backed providers (v0.11)")
+@test("providers", "GET /api/providers lists DB-backed providers")
 async def t_providers_list(ctx: TestContext) -> None:
-    """Providers moved from yaml to the ``providers`` SQLite table in
-    v0.11.0. The gateway fixture runs without a wired DB, so the list
-    comes back empty — we just verify the shape, not the contents."""
+    """Providers live in the ``providers`` SQLite table. The gateway
+    fixture runs without a wired DB, so the list comes back empty — we
+    just verify the shape, not the contents."""
     port = ctx.extras.get("gateway_port")
     if not port:
         raise TestSkip("gateway not running")

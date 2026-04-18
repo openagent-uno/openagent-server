@@ -60,10 +60,10 @@ CREATE TABLE IF NOT EXISTS sdk_sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_sdk_sessions_updated ON sdk_sessions(updated_at);
 
--- Configured MCP servers. Replaces the yaml ``mcp:`` list so the agent
--- itself (via the mcp-manager MCP) can add/remove/toggle servers at
--- runtime without a process restart. A one-shot import from yaml seeds
--- the table on first boot; subsequent yaml edits are ignored.
+-- Configured MCP servers. The agent itself (via the mcp-manager MCP)
+-- can add/remove/toggle servers at runtime without a process restart.
+-- A one-shot import from yaml seeds the table on first boot;
+-- subsequent yaml edits are ignored.
 --
 -- ``kind`` discriminates three sources:
 --   - ``default``: one of DEFAULT_MCPS, resolved via resolve_default_entry
@@ -89,9 +89,9 @@ CREATE TABLE IF NOT EXISTS mcps (
 CREATE INDEX IF NOT EXISTS idx_mcps_enabled ON mcps(enabled);
 CREATE INDEX IF NOT EXISTS idx_mcps_updated ON mcps(updated_at);
 
--- Configured LLM models. Replaces per-provider ``models:`` lists in yaml
--- so the agent (via the model-manager MCP) can add/remove/toggle models
--- at runtime. ``runtime_id`` is the canonical id (provider:model_id, or
+-- Configured LLM models. The model catalog lives here so the agent
+-- (via the model-manager MCP) can add/remove/toggle models at runtime.
+-- ``runtime_id`` is the canonical id (provider:model_id, or
 -- claude-cli/model_id) used everywhere in code; see
 -- openagent.models.catalog.build_runtime_model_id.
 -- OpenAgent vocabulary (since v0.10.0):
@@ -121,19 +121,17 @@ CREATE INDEX IF NOT EXISTS idx_models_enabled ON models(enabled);
 CREATE INDEX IF NOT EXISTS idx_models_updated ON models(updated_at);
 
 -- Generic string-valued state flags. Used for one-shot bootstrap
--- markers (``mcps_imported``, ``models_imported``, ``providers_imported``)
--- so yaml → DB import runs exactly once per DB file.
+-- markers (``mcps_imported``) so the yaml → DB MCP import runs
+-- exactly once per DB file.
 CREATE TABLE IF NOT EXISTS config_state (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
     updated_at REAL NOT NULL
 );
 
--- LLM provider credentials. Retires the yaml ``providers:`` section
--- (since v0.11.0); yaml is imported once via ``import_yaml_providers_once``
--- then ignored. One row per vendor (openai, anthropic, google, zai, …).
--- API keys are stored plaintext — same security model as the old
--- yaml — the DB file is owned by the user with 0600 perms.
+-- LLM provider credentials. One row per vendor (openai, anthropic,
+-- google, zai, …). API keys are stored plaintext; the DB file is
+-- owned by the user with 0600 perms.
 CREATE TABLE IF NOT EXISTS providers (
     name TEXT PRIMARY KEY,
     api_key TEXT,

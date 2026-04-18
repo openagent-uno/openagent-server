@@ -1,54 +1,12 @@
-"""Yaml → DB bootstrap — idempotency + model reference discovery.
+"""Yaml → DB bootstrap — idempotency for MCP imports.
 
-The bootstrap copies yaml ``mcp:`` entries and per-provider ``models:``
-into the DB on first boot so existing configs migrate transparently.
-Re-running is a no-op guarded by ``config_state`` flags.
+The bootstrap copies yaml ``mcp:`` entries into the DB on first boot
+so existing configs migrate transparently. Re-running is a no-op
+guarded by a ``config_state`` flag.
 """
 from __future__ import annotations
 
 from ._framework import TestContext, test
-
-
-@test("bootstrap", "import_yaml_providers_once seeds DB then short-circuits")
-async def t_providers_bootstrap_idempotent(ctx: TestContext) -> None:
-    """v0.11.0: provider keys are DB-backed. yaml ``providers:`` is
-    imported once at first boot, then ignored. The ``providers_imported``
-    ``config_state`` flag guards the idempotency."""
-    import uuid
-    from openagent.memory.db import MemoryDB
-    from openagent.memory.bootstrap import import_yaml_providers_once
-
-    tmp_db = ctx.db_path.with_name(f"bootstrap-providers-{uuid.uuid4().hex[:8]}.db")
-    try:
-        db = MemoryDB(str(tmp_db))
-        await db.connect()
-
-        yaml_providers = {
-            "openai": {"api_key": "sk-yaml-test", "base_url": None},
-            "zai": {"api_key": "zai-yaml-key", "base_url": "https://api.z.ai/api/paas/v4"},
-        }
-        first = await import_yaml_providers_once(db, yaml_providers)
-        assert first is True, "first import must write"
-
-        rows = {r["name"]: r for r in await db.list_providers()}
-        assert rows["openai"]["api_key"] == "sk-yaml-test"
-        assert rows["zai"]["base_url"] == "https://api.z.ai/api/paas/v4"
-
-        # Re-running is a no-op even with a different dict — the flag
-        # protects against yaml edits post-first-boot.
-        second = await import_yaml_providers_once(
-            db, {"openai": {"api_key": "THIS_SHOULD_NOT_OVERWRITE"}},
-        )
-        assert second is False
-        again = await db.get_provider("openai")
-        assert again["api_key"] == "sk-yaml-test"
-
-        await db.close()
-    finally:
-        try:
-            tmp_db.unlink()
-        except FileNotFoundError:
-            pass
 
 
 @test("bootstrap", "import_yaml_mcps_once writes rows then short-circuits")
@@ -71,72 +29,6 @@ async def t_mcps_bootstrap_idempotent(ctx: TestContext) -> None:
         second = await import_yaml_mcps_once(db, mcp_config, include_defaults=False, disable=[])
         assert second is False, "second import must short-circuit"
 
-        await db.close()
-    finally:
-        try:
-            tmp_db.unlink()
-        except FileNotFoundError:
-            pass
-
-
-@test("bootstrap", "sibling model.provider resolves bare model_id")
-async def t_model_id_uses_sibling_provider(ctx: TestContext) -> None:
-    """Regression: a yaml with provider=claude-cli + bare model_id=<id>
-    used to fail resolution because the bootstrap ignored the sibling
-    provider and tried to guess from the pricing table. Observed on
-    mixout-agent: ``cannot resolve bare model ref 'claude-sonnet-4-6'``.
-    """
-    import uuid
-    from openagent.memory.db import MemoryDB
-    from openagent.memory.bootstrap import import_yaml_models_once
-
-    tmp_db = ctx.db_path.with_name(f"bootstrap-sibling-{uuid.uuid4().hex[:8]}.db")
-    try:
-        db = MemoryDB(str(tmp_db))
-        await db.connect()
-        await import_yaml_models_once(
-            db,
-            providers_config={},  # no providers.X.models — fallback path
-            model_cfg={"provider": "claude-cli", "model_id": "claude-sonnet-4-6"},
-        )
-        runtime_ids = {r["runtime_id"] for r in await db.list_models()}
-        # Canonical v0.10 form: ``claude-cli:<provider>:<model>``.
-        assert "claude-cli:anthropic:claude-sonnet-4-6" in runtime_ids, runtime_ids
-        await db.close()
-    finally:
-        try:
-            tmp_db.unlink()
-        except FileNotFoundError:
-            pass
-
-
-@test("bootstrap", "import_yaml_models_once pulls routing-only refs")
-async def t_models_bootstrap_routing(ctx: TestContext) -> None:
-    import uuid
-    from openagent.memory.db import MemoryDB
-    from openagent.memory.bootstrap import import_yaml_models_once
-
-    tmp_db = ctx.db_path.with_name(f"bootstrap-models-{uuid.uuid4().hex[:8]}.db")
-    try:
-        db = MemoryDB(str(tmp_db))
-        await db.connect()
-
-        # No providers.X.models — the rejection gate would trip without
-        # bootstrap's model_cfg fallback. This test is the regression
-        # guard.
-        providers = {"openai": {"api_key": "sk-test"}}
-        model_cfg = {
-            "provider": "smart",
-            "routing": {"simple": "gpt-4o-mini", "medium": "gpt-4.1-mini", "hard": "gpt-4.1"},
-            "classifier_model": "gpt-4o-mini",
-        }
-        wrote = await import_yaml_models_once(db, providers, model_cfg=model_cfg)
-        assert wrote is True
-
-        rows = await db.list_models(enabled_only=True)
-        runtime_ids = {r["runtime_id"] for r in rows}
-        assert "openai:gpt-4o-mini" in runtime_ids, runtime_ids
-        assert "openai:gpt-4.1" in runtime_ids
         await db.close()
     finally:
         try:

@@ -1,32 +1,29 @@
-"""One-shot import of yaml-configured MCPs and models into the DB.
+"""One-shot import of yaml-configured MCPs into the DB.
 
-Before this module, the MCP server list and per-provider model list lived
-in ``openagent.yaml`` and were read on every boot. Moving them to the DB
-lets the agent itself edit them at runtime (via mcp-manager / model-manager
-MCPs) and hot-reload without a restart. To preserve existing user configs
-without a manual migration, on first boot we copy the yaml entries into
-the DB and set a ``config_state`` flag so we never run the import twice
-against the same database.
+The MCP server list used to live in ``openagent.yaml`` and was read on
+every boot. Moving it to the DB lets the agent itself edit it at
+runtime (via the mcp-manager MCP) and hot-reload without a restart. To
+preserve existing user configs without a manual migration, on first
+boot we copy the yaml entries into the DB and set a ``config_state``
+flag so we never run the import twice against the same database.
 
 Idempotency rests on two layers:
 
-  1. The ``mcps_imported`` / ``models_imported`` flag in ``config_state``
-     short-circuits the whole function after the first successful run.
+  1. The ``mcps_imported`` flag in ``config_state`` short-circuits the
+     whole function after the first successful run.
   2. Every row-write uses ``upsert_*``'s ``ON CONFLICT DO UPDATE`` — so
      even if the flag is missing (someone deleted the row manually) the
      re-import just refreshes the existing rows instead of duplicating.
 
-Subsequent yaml edits to ``mcp:`` / ``providers.X.models:`` are NOT
-reflected in the DB — we log a one-line warning the first time we detect
-the flag is set but the yaml still has entries. Users who want to change
-MCPs/models after first boot go through the manager MCPs or the REST
-endpoints.
+Subsequent yaml edits to ``mcp:`` are NOT reflected in the DB — we log
+a one-line warning the first time we detect the flag is set but the
+yaml still has entries. Users who want to change MCPs after first boot
+go through the manager MCPs or the REST endpoints.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from openagent.memory.db import MemoryDB
 
@@ -171,262 +168,3 @@ async def ensure_builtin_mcps(db: MemoryDB) -> int:
     if added:
         logger.info("bootstrap: auto-seeded %d missing builtin MCP row(s)", added)
     return added
-
-
-async def import_yaml_providers_once(
-    db: MemoryDB, providers_config: dict | None,
-) -> bool:
-    """Seed the ``providers`` table from the yaml ``providers:`` section.
-
-    Returns True iff rows were written. No-op after the first successful
-    run (gated on ``config_state.providers_imported``). Re-runs refresh
-    the rows via ``upsert_provider`` if someone manually cleared the
-    flag; re-runs with the flag set log a one-line warning when the yaml
-    still has ``providers:`` entries (so users know those edits aren't
-    doing anything) and short-circuit.
-
-    ``api_key`` env var substitution (``${OPENAI_API_KEY}``) is already
-    resolved by ``_resolve_env_vars`` before this function sees the dict,
-    so the DB stores the concrete key. Users who later remove the env var
-    keep working because the DB has the snapshot.
-    """
-    if await db.get_state("providers_imported") == "1":
-        if providers_config:
-            logger.info(
-                "providers already imported; yaml providers: section is now "
-                "read-only. Edit providers via /models UI or model-manager MCP."
-            )
-        return False
-
-    if not providers_config:
-        await db.set_state("providers_imported", "1")
-        return False
-
-    written = 0
-    for name, cfg in providers_config.items():
-        if not isinstance(cfg, dict):
-            continue
-        api_key = cfg.get("api_key") or None
-        base_url = cfg.get("base_url") or None
-        # Preserve any non-standard keys (e.g. ``disabled_models``) in
-        # metadata so downstream consumers that read the materialised
-        # dict from ``Agent._hydrate_providers_from_db`` still see them.
-        metadata = {
-            k: v for k, v in cfg.items()
-            if k not in {"api_key", "base_url", "models"}
-        }
-        await db.upsert_provider(
-            name, api_key=api_key, base_url=base_url,
-            enabled=True, metadata=metadata or None,
-        )
-        written += 1
-
-    await db.set_state("providers_imported", "1")
-    logger.info("bootstrap: imported %d provider(s) from yaml into DB", written)
-    return True
-
-
-async def import_yaml_models_once(
-    db: MemoryDB,
-    providers_config: dict | None,
-    model_cfg: dict | None = None,
-) -> bool:
-    """Seed the ``models`` table from the yaml ``providers:`` + ``model:`` sections.
-
-    For each provider entry, every item in ``models:`` becomes a row. The
-    ``runtime_id`` is computed via ``catalog.build_runtime_model_id`` so it
-    matches the shape used everywhere else in the code (``openai:gpt-4o-mini``,
-    ``claude-cli/claude-sonnet-4-6``, etc.).
-
-    We ALSO register any model referenced by the ``model:`` section itself —
-    ``model_id``, ``classifier_model``, and every ``routing.*`` entry — so
-    deployments that don't bother listing models per provider (common for
-    SmartRouter configs that only declare tier routing) still end up with
-    enabled rows. Without this, the "no models enabled" rejection gate
-    would fire on boot for those users.
-
-    Disabled models (in ``providers.X.disabled_models``) are written with
-    ``enabled=0`` so the UI can flip them back without losing the entry.
-    """
-    if await db.get_state("models_imported") == "1":
-        return False
-
-    from openagent.models.catalog import (
-        FRAMEWORK_AGNO,
-        FRAMEWORK_CLAUDE_CLI,
-        build_runtime_model_id,
-        normalize_runtime_model_id,
-        split_runtime_id,
-        is_claude_cli_model,
-    )
-
-    providers_config = providers_config or {}
-    written = 0
-    for provider_name, cfg in providers_config.items():
-        cfg = cfg or {}
-        disabled_ids = {
-            str(item).strip() for item in (cfg.get("disabled_models") or [])
-        }
-        # Legacy yaml quirk: pre-v0.10 configs declare claude-cli models
-        # under ``providers.claude-cli.models``. In the v0.10 vocabulary
-        # claude-cli is a *framework*, not a provider — the underlying
-        # provider is anthropic. Rewrite so the DB row matches the new
-        # shape.
-        if str(provider_name) == FRAMEWORK_CLAUDE_CLI:
-            row_provider = "anthropic"
-            row_framework = FRAMEWORK_CLAUDE_CLI
-        else:
-            row_provider = str(provider_name)
-            row_framework = FRAMEWORK_AGNO
-        for entry in cfg.get("models") or []:
-            model_id = _entry_model_id(entry)
-            if not model_id:
-                continue
-            runtime_id = build_runtime_model_id(row_provider, model_id, row_framework)
-            if not runtime_id:
-                continue
-            meta = _entry_metadata(entry)
-            await db.upsert_model(
-                runtime_id,
-                provider=row_provider,
-                framework=row_framework,
-                model_id=model_id,
-                display_name=meta.get("display_name") or meta.get("name"),
-                tier_hint=meta.get("tier_hint"),
-                notes=meta.get("notes"),
-                enabled=model_id not in disabled_ids,
-                metadata=meta or None,
-            )
-            written += 1
-
-    # Implicit models referenced by model.routing / model_id / classifier_model
-    # that aren't listed under providers.X.models. Without this the rejection
-    # gate would trip on SmartRouter-only configs.
-    bare_refs = [
-        ref for ref in _extract_model_refs(model_cfg or {})
-        if ref and ":" not in ref and "/" not in ref
-    ]
-    # Resolve bare refs (e.g. "gpt-4o-mini") by scanning OpenRouter's
-    # public catalog for a configured-provider match. Cached in-process
-    # after the first hit, so this is free for subsequent calls.
-    or_index: dict[str, str] = {}
-    if bare_refs:
-        try:
-            from openagent.models.discovery import (
-                _fetch_openrouter_catalog, _OPENROUTER_VENDOR_MAP,
-            )
-            entries = await _fetch_openrouter_catalog()
-            configured = set((providers_config or {}).keys())
-            for entry in entries:
-                if not isinstance(entry, dict):
-                    continue
-                raw = str(entry.get("id") or "")
-                if "/" not in raw:
-                    continue
-                vendor, bare = raw.split("/", 1)
-                our_name = _OPENROUTER_VENDOR_MAP.get(vendor)
-                if our_name and our_name in configured and bare not in or_index:
-                    or_index[bare] = our_name
-        except Exception as exc:  # noqa: BLE001 — offline or flaky network
-            logger.warning("bootstrap: OpenRouter catalog unreachable (%s); bare model refs will be skipped", exc)
-
-    for ref in _extract_model_refs(model_cfg or {}):
-        runtime_id = normalize_runtime_model_id(ref, providers_config)
-        if not runtime_id:
-            continue
-        if ":" not in runtime_id and "/" not in runtime_id:
-            guess = or_index.get(runtime_id)
-            if guess is None:
-                logger.warning(
-                    "bootstrap: skipping bare model ref %r — not found in "
-                    "OpenRouter catalog for any configured provider. "
-                    "Prefix with ``provider:`` in yaml or add via /models.",
-                    runtime_id,
-                )
-                continue
-            runtime_id = f"{guess}:{runtime_id}"
-        # v0.10 vocabulary: provider is the vendor, framework is agno
-        # or claude-cli. Claude-cli runtime ids point at anthropic
-        # models regardless of what the legacy yaml suggested.
-        if is_claude_cli_model(runtime_id):
-            provider_name = "anthropic"
-            framework = FRAMEWORK_CLAUDE_CLI
-        else:
-            provider_name, _ = split_runtime_id(runtime_id)
-            framework = FRAMEWORK_AGNO
-        if not provider_name:
-            continue
-        _, bare_model_id = split_runtime_id(runtime_id)
-        if await db.get_model(runtime_id):
-            continue  # already written above
-        await db.upsert_model(
-            runtime_id,
-            provider=provider_name,
-            framework=framework,
-            model_id=bare_model_id,
-            enabled=True,
-            metadata={"source": "model_cfg"},
-        )
-        written += 1
-
-    await db.set_state("models_imported", "1")
-    logger.info("bootstrap: imported %d model rows from yaml", written)
-    return True
-
-
-def _extract_model_refs(model_cfg: dict) -> list[str]:
-    """Collect every model id mentioned in the ``model:`` yaml section.
-
-    The top-level ``model_id`` is combined with its sibling ``provider``
-    (``model.provider``) so a yaml like
-
-        model:
-          provider: claude-cli
-          model_id: claude-sonnet-4-6
-
-    emits ``claude-cli/claude-sonnet-4-6`` instead of the bare
-    ``claude-sonnet-4-6`` — otherwise the caller's pricing-based
-    provider-guess runs and logs "cannot resolve bare model ref".
-    Tier refs under ``routing`` stay provider-agnostic; if they're
-    bare, the caller's guess logic still applies.
-    """
-    refs: list[str] = []
-
-    direct = str(model_cfg.get("model_id") or "").strip()
-    if direct:
-        provider_hint = str(model_cfg.get("provider") or "").strip()
-        if provider_hint and ":" not in direct and "/" not in direct:
-            # Legacy yaml quirk: provider=claude-cli in v0.9.x meant
-            # "framework=claude-cli" in v0.10 vocabulary. The Python
-            # claude_cli_model_spec() helper emits the canonical form
-            # (``claude-cli:anthropic:<id>``); for real providers we
-            # just glue with ``:``.
-            if provider_hint == "claude-cli":
-                refs.append(f"claude-cli:anthropic:{direct}")
-            else:
-                refs.append(f"{provider_hint}:{direct}")
-        else:
-            refs.append(direct)
-
-    classifier = str(model_cfg.get("classifier_model") or "").strip()
-    if classifier:
-        refs.append(classifier)
-    for tier_ref in (model_cfg.get("routing") or {}).values():
-        if isinstance(tier_ref, str) and tier_ref.strip():
-            refs.append(tier_ref.strip())
-    return refs
-
-
-def _entry_model_id(entry: Any) -> str:
-    """Same coercion rules as openagent.models.catalog._entry_model_id."""
-    if isinstance(entry, dict):
-        for key in ("id", "model_id", "model"):
-            value = entry.get(key)
-            if value:
-                return str(value).strip()
-        return ""
-    return str(entry or "").strip()
-
-
-def _entry_metadata(entry: Any) -> dict:
-    return dict(entry) if isinstance(entry, dict) else {}

@@ -246,20 +246,20 @@ def iter_configured_models(
     include_disabled: bool = False,
     history_mode: str | None = None,
 ) -> list[CatalogModel]:
-    """Flatten yaml ``providers.X.models`` into CatalogModel records.
+    """Flatten ``providers_config[provider].models`` into CatalogModel records.
 
-    Legacy quirk: if yaml still declares ``providers.claude-cli.models``
-    (pre-v0.10), we treat those rows as framework=claude-cli models on
-    the ``anthropic`` provider — that's the only thing claude-cli can
-    actually dispatch.
+    The materialised providers dict comes from
+    ``Agent._hydrate_providers_from_db`` — it puts the claude-cli rows
+    under bucket name ``claude-cli`` (framework-as-provider-name) for
+    backward compat with anything still expecting that shape.
     """
     results: list[CatalogModel] = []
     seen: set[str] = set()
 
     for provider_name, cfg in (providers_config or {}).items():
         disabled = {str(item).strip() for item in cfg.get("disabled_models", [])}
-        # Legacy yaml: ``providers.claude-cli.models`` declares claude-cli
-        # models in a v0.9-vocabulary config. Map onto the new shape.
+        # claude-cli bucket → framework=claude-cli on the anthropic
+        # provider (that's the only thing claude-cli dispatches).
         if provider_name == FRAMEWORK_CLAUDE_CLI:
             row_provider = "anthropic"
             row_framework = FRAMEWORK_CLAUDE_CLI

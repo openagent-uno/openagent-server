@@ -1,8 +1,7 @@
-"""/api/providers — LLM provider credentials, DB-backed (v0.11.0).
+"""/api/providers — LLM provider credentials, DB-backed.
 
-Pre-v0.11 this section was yaml-backed. The DB is now the source of
-truth; yaml is imported once via ``import_yaml_providers_once`` and
-thereafter ignored. Provider edits hot-reload on the next message via
+The ``providers`` SQLite table is the source of truth for LLM provider
+credentials. Provider edits hot-reload on the next message via
 ``Agent.refresh_registries`` → ``_hydrate_providers_from_db``.
 
 Endpoints:

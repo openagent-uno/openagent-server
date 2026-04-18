@@ -1,8 +1,7 @@
-"""/api/models — DB-backed model catalog (v0.11.0).
+"""/api/models — DB-backed model catalog.
 
-Pre-v0.11 this module held yaml-based provider CRUD at ``/api/models``.
-Provider management moved to :mod:`openagent.gateway.api.providers`; the
-endpoints here now exclusively drive the ``models`` SQLite table.
+Provider management lives in :mod:`openagent.gateway.api.providers`;
+the endpoints here exclusively drive the ``models`` SQLite table.
 
 GET    /api/models              → list model rows
 POST   /api/models              → add a model row

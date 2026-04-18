@@ -102,9 +102,9 @@ async def t_bound_side_locked(ctx: TestContext) -> None:
         await db.connect()
         providers = {
             "openai": {"api_key": "sk-x", "models": ["gpt-4o-mini"]},
-            # Legacy yaml shape: provider=claude-cli. Bootstrap/catalog
-            # translate this to framework=claude-cli, provider=anthropic
-            # internally.
+            # Hydrated-providers shape: the "claude-cli" bucket holds
+            # framework=claude-cli rows that live under the anthropic
+            # provider in the DB.
             "claude-cli": {"models": ["claude-sonnet-4-6"]},
         }
         router = _make_router(providers, {

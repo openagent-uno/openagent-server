@@ -1,8 +1,7 @@
 """model-manager: provider CRUD tools write to the providers table.
 
-Pre-v0.11 these tools wrote yaml; since v0.11.0 they write the
-``providers`` SQLite table. yaml is imported once at bootstrap and
-never touched again.
+The provider-manager tools write directly to the ``providers`` SQLite
+table.
 """
 from __future__ import annotations
 
@@ -12,7 +11,7 @@ import uuid
 from ._framework import TestContext, test
 
 
-@test("provider_manager", "add_provider writes api_key to DB (v0.11)")
+@test("provider_manager", "add_provider writes api_key to DB")
 async def t_add_provider(ctx: TestContext) -> None:
     import openagent.mcp.servers.model_manager.server as mgr
     from openagent.memory.db import MemoryDB
@@ -37,8 +36,8 @@ async def t_add_provider(ctx: TestContext) -> None:
         assert result["has_api_key"] is True
         assert result["base_url"] == "https://api.z.ai/api/paas/v4"
 
-        # Verify the row landed in the DB (cleartext api_key; same
-        # security model as the yaml we replaced).
+        # Verify the row landed in the DB (cleartext api_key; the DB
+        # file is 0600 and owned by the running user).
         db = MemoryDB(str(db_path))
         await db.connect()
         try:

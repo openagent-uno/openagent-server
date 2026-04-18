@@ -299,11 +299,13 @@ class Agent:
     async def initialize(self) -> None:
         """Connect MCP servers and initialize memory DB.
 
-        On first boot we also run the yaml → DB bootstrap so existing
-        users migrate transparently. After bootstrap the MCP pool is
-        rebuilt from the ``mcps`` table via ``MCPPool.from_db`` so the
-        runtime can hot-reload entries without a process restart
-        (see ``reload_mcps_if_changed``).
+        On first boot we also run the yaml → DB bootstrap for MCPs so
+        existing users migrate transparently. After bootstrap the MCP
+        pool is rebuilt from the ``mcps`` table via ``MCPPool.from_db``
+        so the runtime can hot-reload entries without a process restart
+        (see ``reload_mcps_if_changed``). Providers and models are
+        DB-native — they are always loaded from the ``providers`` /
+        ``models`` tables via ``_hydrate_providers_from_db``.
         """
         if self._initialized:
             return
@@ -311,16 +313,14 @@ class Agent:
         if self._db:
             await self._db.connect()
 
-        # One-shot yaml → DB bootstrap + swap to the DB-backed pool.
-        # Skipped when there is no DB (pure in-memory tests); in that case
-        # we fall back to whatever pool the caller passed in.
+        # Hydrate providers/models from the DB and swap to the DB-backed
+        # MCP pool. Skipped when there is no DB (pure in-memory tests);
+        # in that case we fall back to whatever pool the caller passed in.
         if self._db is not None and self.config is not None:
             try:
                 from openagent.memory.bootstrap import (
                     ensure_builtin_mcps,
                     import_yaml_mcps_once,
-                    import_yaml_models_once,
-                    import_yaml_providers_once,
                 )
                 mcp_config = self.config.get("mcp", []) or []
                 include_defaults = bool(self.config.get("mcp_defaults", True))
@@ -333,21 +333,11 @@ class Agent:
                 # builtins + safety net against manual DB tampering).
                 # Existing rows — including disabled ones — are untouched.
                 await ensure_builtin_mcps(self._db)
-                # v0.11.0: provider keys are DB-backed. Import the yaml
-                # ``providers:`` section once, then hydrate the in-memory
-                # config dict from the DB so SmartRouter / AgnoProvider
-                # see the materialised view. The one-shot flag makes this
-                # safe to re-run on every boot.
-                await import_yaml_providers_once(
-                    self._db, self.config.get("providers", {}) or {},
-                )
+                # Provider keys and the model catalog are DB-backed. Pull
+                # the rows into ``self.config['providers']`` so SmartRouter
+                # / AgnoProvider see the materialised view.
                 await self._hydrate_providers_from_db()
                 self._providers_last_updated = await self._db.providers_max_updated()
-                await import_yaml_models_once(
-                    self._db,
-                    self.config.get("providers", {}) or {},
-                    model_cfg=self.config.get("model", {}) or {},
-                )
             except Exception as exc:  # noqa: BLE001 — bootstrap must not block startup
                 elog("bootstrap.error", level="warning", error=str(exc))
 
@@ -465,11 +455,10 @@ class Agent:
     async def _hydrate_providers_from_db(self) -> None:
         """Pull provider + model rows from DB into ``self.config['providers']``.
 
-        After v0.11.0 the DB is the source of truth for provider keys
-        and the model catalog; yaml ``providers:`` is only read once at
-        first boot. SmartRouter / AgnoProvider still consume the legacy
-        dict shape (``providers_config[X]['models']``), so we materialise
-        DB rows into that shape and refresh whenever ``providers_max_updated``
+        The DB is the source of truth for provider keys and the model
+        catalog. SmartRouter / AgnoProvider consume the dict shape
+        (``providers_config[X]['models']``), so we materialise DB rows
+        into that shape and refresh whenever ``providers_max_updated``
         or ``models_max_updated`` bumps.
 
         ``models`` is populated as a list of ``{id, display_name,

@@ -12,10 +12,10 @@ from ._framework import TestContext, TestSkip, test
 
 @test("models", "GET /api/models returns a list of DB model rows")
 async def t_models_list(ctx: TestContext) -> None:
-    """v0.11.0: ``/api/models`` is DB-backed (the ``models`` table). The
-    gateway fixture runs without a wired DB, so we accept either the
-    happy path ``{"models": [...]}`` or a 500 "memory DB not available"
-    which just means this particular fixture can't exercise it."""
+    """``/api/models`` is DB-backed (the ``models`` table). The gateway
+    fixture runs without a wired DB, so we accept either the happy path
+    ``{"models": [...]}`` or a 500 "memory DB not available" which just
+    means this particular fixture can't exercise it."""
     port = ctx.extras.get("gateway_port")
     if not port:
         raise TestSkip("gateway not running")

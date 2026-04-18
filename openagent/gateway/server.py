@@ -174,10 +174,9 @@ class Gateway:
             ("GET", "/api/usage", usage.handle_get),
             ("GET", "/api/usage/daily", usage.handle_daily),
             ("GET", "/api/usage/pricing", usage.handle_pricing),
-            # DB-backed provider CRUD. Legacy yaml-provider endpoints were
-            # retired in v0.11.0 — bootstrap imports the yaml section once,
-            # then DB is canonical. POST /api/providers/test is kept as a
-            # path alias for clients that can't easily switch URLs.
+            # DB-backed provider CRUD. The ``providers`` SQLite table is
+            # canonical. POST /api/providers/test is kept as a path alias
+            # for clients that can't easily switch URLs.
             ("GET", "/api/providers", providers.handle_list),
             ("POST", "/api/providers", providers.handle_create),
             ("POST", "/api/providers/test", providers.handle_test),
@@ -187,10 +186,8 @@ class Gateway:
             ("POST", "/api/providers/{name}/enable", providers.handle_enable),
             ("POST", "/api/providers/{name}/disable", providers.handle_disable),
             ("POST", "/api/providers/{name}/test", providers.handle_test),
-            # Models. /api/models is now the DB-backed catalog directly
-            # (v0.11.0 retired the yaml provider-CRUD that previously
-            # lived here). /api/models/db/* kept as an alias so existing
-            # clients don't break mid-upgrade.
+            # Models. /api/models is the DB-backed catalog. /api/models/db/*
+            # is kept as an alias for existing clients.
             ("GET", "/api/models/catalog", models.handle_catalog),
             ("GET", "/api/models/providers", models.handle_available_providers),
             ("GET", "/api/models/active", models.handle_get_active),

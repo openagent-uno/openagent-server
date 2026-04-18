@@ -149,9 +149,9 @@ async def add_provider(
 ) -> dict[str, Any]:
     """Register a new LLM provider + credentials in the DB.
 
-    Since v0.11.0 provider keys live in the SQLite ``providers`` table,
-    not the yaml. Writes are hot-reloaded on the next message via
-    ``Agent.refresh_registries``. Once the provider is configured, use
+    Provider keys live in the SQLite ``providers`` table. Writes are
+    hot-reloaded on the next message via ``Agent.refresh_registries``.
+    Once the provider is configured, use
     ``list_available_models(provider=<name>)`` to see what the provider
     exposes with that key, then ``add_model`` to register specific
     runtime ids.
