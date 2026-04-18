@@ -130,7 +130,7 @@ class Gateway:
 
         site = web.TCPSite(runner, self.host, self.port)
         await site.start()
-        elog("gateway.start", level="warning", host=self.host, port=self.port)
+        elog("gateway.start", host=self.host, port=self.port)
 
         # Write .port file for agent discovery
         self._write_port_file()
@@ -477,7 +477,7 @@ class Gateway:
                             await self._safe_ws_send_json(ws, {"type": P.QUEUED, "position": pos})
 
         except Exception as e:
-            elog("gateway.ws_error", level="warning", client_id=client_id, error=str(e))
+            elog("gateway.ws_error", level="error", client_id=client_id, error=str(e))
         finally:
             if client_id and client_id in self.clients:
                 del self.clients[client_id]
@@ -722,7 +722,8 @@ class Gateway:
             elog("channel.model_override", client_id=client_id, channel=channel, spec=model_spec)
             return self._get_or_create_model(model_spec, raw.get("providers", {}))
         except Exception as e:
-            elog("channel.model_override_error", level="warning",
+            # Debug-level: channel override is a fallback, failing is non-fatal.
+            elog("channel.model_override_error", level="debug",
                  client_id=client_id, channel=channel, error=str(e))
             return None
 
@@ -849,7 +850,7 @@ class Gateway:
         except Exception as e:
             elog(
                 "message.error",
-                level="warning",
+                level="error",
                 client_id=client_id,
                 session_id=session_id,
                 error_type=type(e).__name__,

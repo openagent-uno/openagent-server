@@ -69,7 +69,7 @@ class Scheduler:
                     continue
                 await self.db.update_task(task["id"], next_run=self._next_run(task["cron_expression"], now))
             except ValueError as e:
-                elog("scheduler.invalid_cron", level="warning", task=task["name"], error=str(e))
+                elog("scheduler.invalid_cron", level="error", task=task["name"], error=str(e))
 
     async def _loop(self) -> None:
         """Main loop: check for due tasks every CHECK_INTERVAL seconds."""
@@ -77,7 +77,7 @@ class Scheduler:
             try:
                 await self._check_and_run()
             except Exception as e:
-                elog("scheduler.loop_error", level="warning", error=str(e))
+                elog("scheduler.loop_error", level="error", error=str(e))
             await asyncio.sleep(CHECK_INTERVAL)
 
     async def run_task(self, task: dict) -> None:
@@ -95,7 +95,7 @@ class Scheduler:
             )
             elog("task.done", name=task_name, preview=str(response)[:100])
         except Exception as e:
-            elog("task.error", level="warning", name=task_name, error=str(e))
+            elog("task.error", level="error", name=task_name, error=str(e))
         finally:
             try:
                 await self.agent.release_session(session_id)
@@ -127,7 +127,7 @@ class Scheduler:
                         next_run=self._next_run(task["cron_expression"], now),
                     )
             except ValueError as e:
-                elog("scheduler.next_run_update_failed", level="warning",
+                elog("scheduler.next_run_update_failed", level="error",
                      task=task["name"], error=str(e))
 
     # ── Task management helpers ──

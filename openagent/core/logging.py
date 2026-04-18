@@ -56,7 +56,7 @@ def setup_logging(verbose: bool = False) -> None:
     # propagated up from child loggers bypass the parent's level check.
     console = logging.StreamHandler()
     console.setLevel(stdout_level)
-    console.setFormatter(logging.Formatter("%(name)s: %(message)s"))
+    console.setFormatter(_ConsoleFormatter())
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
     root.addHandler(console)
@@ -64,7 +64,7 @@ def setup_logging(verbose: bool = False) -> None:
     events_file = logging.FileHandler(log_dir() / "events.jsonl", encoding="utf-8")
     events_file.setFormatter(_JsonlFormatter())
     events = logging.getLogger(EVENT_LOGGER)
-    events.setLevel(logging.INFO)  # capture events even without --verbose
+    events.setLevel(logging.DEBUG)  # events.jsonl captures every level
     events.addHandler(events_file)
 
     _configured = True
@@ -114,3 +114,25 @@ class _JsonlFormatter(logging.Formatter):
         if record.exc_info:
             entry["traceback"] = self.formatException(record.exc_info)
         return json.dumps(entry, default=str)
+
+
+class _ConsoleFormatter(logging.Formatter):
+    """Human-readable stdout format.
+
+    For ``openagent.events`` records (from :func:`elog`), inlines the
+    structured fields so operators tailing stdout see the same detail
+    the old ``logger.error("msg: %s", err)`` calls used to print — not
+    just the event name.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        if record.name == EVENT_LOGGER:
+            data = getattr(record, "event_data", {}) or {}
+            fields = " ".join(f"{k}={v!r}" for k, v in data.items())
+            base = f"{record.getMessage()}" + (f" {fields}" if fields else "")
+            msg = f"{record.name}: {base}"
+        else:
+            msg = f"{record.name}: {record.getMessage()}"
+        if record.exc_info:
+            msg += "\n" + self.formatException(record.exc_info)
+        return msg

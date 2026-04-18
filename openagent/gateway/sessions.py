@@ -174,7 +174,7 @@ class SessionManager:
             except asyncio.CancelledError:
                 elog("queue.cancel", client_id=client_id, session_id=item.session_id)
             except Exception as e:
-                elog("queue.error", level="warning",
+                elog("queue.error", level="error",
                      client_id=client_id, session_id=item.session_id, error=str(e))
             finally:
                 st.current_task = None

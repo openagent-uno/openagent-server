@@ -665,7 +665,7 @@ class ClaudeCLI(BaseModel):
                     continue
                 elog(
                     "model.generate_error",
-                    level="warning",
+                    level="error",
                     session_id=sid,
                     attempt=attempt + 1,
                     error=str(e),
