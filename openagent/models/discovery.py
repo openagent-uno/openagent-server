@@ -4,27 +4,24 @@ Given a user's configured API keys, return the list of models that
 provider actually exposes. The returned model ids are the bare
 provider-side values (``gpt-4o-mini``, ``claude-sonnet-4-6``, …) — the
 caller wraps them with ``catalog.build_runtime_model_id`` to produce
-the canonical ``openai:gpt-4o-mini`` / ``claude-cli/<id>`` forms used
-in the ``models`` table.
+the canonical ``openai:gpt-4o-mini`` form used in the ``models`` table.
 
 Source chain (highest priority first):
 
   1. **Provider's own /v1/models** with the user's API key. Accurate
      and authoritative for that account. Anthropic, OpenAI, Groq,
-     Mistral, xAI, DeepSeek, Cerebras, ZAI, OpenRouter all speak the
-     same pattern; Google uses a query-param scheme.
+     Mistral, xAI, DeepSeek, Cerebras, ZAI, OpenRouter all speak
+     OpenAI-compatible envelopes; Google uses a query-param scheme.
   2. **OpenRouter's unauthenticated catalog** at
-     ``https://openrouter.ai/api/v1/models``. Returns every model
-     every major provider supports (prefixed like ``openai/gpt-4o``,
-     ``anthropic/claude-sonnet-4.5``). Extracting a provider's list is
-     a prefix filter. Free, no key needed, updated continuously.
-  3. **Bundled fallback** derived from ``default_pricing.json`` — the
-     same table that drives cost reporting. Used when offline / the
-     live fetches error. Display names = bare ids.
+     ``https://openrouter.ai/api/v1/models``. Every major vendor's
+     model prefixed ``<vendor>/<id>``. Free, no key needed, updated
+     continuously. Also carries pricing so a cache hit on this tier
+     primes ``catalog._openrouter_pricing_lookup`` for cost reporting.
 
-Errors are absorbed — the gateway UX is "show what you can" — and
-logged via ``elog`` so operators can diagnose key problems. Each tier
-cached in-process with a 10-minute TTL.
+No bundled offline fallback: OpenRouter is reachable from any network
+that can reach the provider APIs, and stale offline data causes more
+confusion than a clean empty list. Errors are absorbed and logged via
+``elog``; cached in-process with a 10-minute TTL.
 """
 
 from __future__ import annotations
@@ -34,7 +31,6 @@ import time
 from typing import Any
 
 from openagent.core.logging import elog
-from openagent.models.catalog import _load_default_pricing
 
 
 # Per-provider discovery endpoint config. Every OpenAI-compatible
@@ -83,16 +79,33 @@ def _cache_key(provider: str, api_key: str) -> tuple[str, str]:
 
 
 def _parse_openai_style(payload: Any) -> list[dict[str, Any]]:
-    if not isinstance(payload, dict):
+    """Extract ``[{id, display_name}]`` from any reasonable envelope.
+
+    Accepts:
+      * ``{"data": [{"id": "..."}]}``           — OpenAI canonical
+      * ``{"models": [{"id": "..."}]}``         — z.ai, some self-hosts
+      * ``[{"id": "..."}]``                     — bare list (OpenRouter legacy)
+      * ``{"data": [{"model": "..."}]}``        — a few compatibility layers
+
+    Robust envelope handling matters because OpenAI-compatible ≠ OpenAI-
+    identical: z.ai returns ``models``, some providers return a bare
+    array. Returning ``[]`` on an unknown shape means the UI silently
+    surfaces nothing, which we debugged by hand once already.
+    """
+    if isinstance(payload, list):
+        entries = payload
+    elif isinstance(payload, dict):
+        entries = payload.get("data") or payload.get("models") or []
+    else:
         return []
     out: list[dict[str, Any]] = []
-    for entry in payload.get("data") or []:
+    for entry in entries:
         if not isinstance(entry, dict):
             continue
-        mid = str(entry.get("id") or "").strip()
+        mid = str(entry.get("id") or entry.get("model") or entry.get("name") or "").strip()
         if not mid:
             continue
-        out.append({"id": mid, "display_name": str(entry.get("name") or mid)})
+        out.append({"id": mid, "display_name": str(entry.get("name") or entry.get("display_name") or mid)})
     return out
 
 
@@ -206,7 +219,7 @@ def _openrouter_filter_for(
             continue
         pricing = entry.get("pricing") or {}
         # OpenRouter reports $/token; convert to $/million for parity with
-        # default_pricing.json.
+        # the ``<runtime_id>:<pricing>`` format everything else uses.
         try:
             input_cost = float(pricing.get("prompt") or 0.0) * 1_000_000
             output_cost = float(pricing.get("completion") or 0.0) * 1_000_000
@@ -221,40 +234,6 @@ def _openrouter_filter_for(
     return out
 
 
-def _bundled_fallback(provider: str) -> list[dict[str, Any]]:
-    """Last-resort list derived from ``default_pricing.json`` keys.
-
-    We already ship a pricing table with ``<provider>:<model>`` keys;
-    reusing it avoids maintaining a second bundled file. Display name
-    is the bare id since the pricing JSON has no human-readable names.
-
-    Legacy tolerance: callers passing ``claude-cli`` as the provider
-    (pre-v0.10 pseudo-provider) get the Anthropic model list with
-    pricing zeroed out — claude-cli billing goes through the user's
-    Pro/Max subscription, never per-token.
-    """
-    pricing = _load_default_pricing()
-    claude_cli_mode = provider == "claude-cli"
-    effective = "anthropic" if claude_cli_mode else provider
-    out: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    prefix = f"{effective}:"
-    for key, info in pricing.items():
-        if not key.startswith(prefix):
-            continue
-        bare = key[len(prefix):]
-        if bare in seen:
-            continue
-        seen.add(bare)
-        out.append({
-            "id": bare,
-            "display_name": bare,
-            "input_cost_per_million": None if claude_cli_mode else (info.get("input_cost_per_million") or None),
-            "output_cost_per_million": None if claude_cli_mode else (info.get("output_cost_per_million") or None),
-        })
-    return out
-
-
 async def list_provider_models(
     provider: str,
     api_key: str | None = None,
@@ -263,7 +242,7 @@ async def list_provider_models(
     """Return ``[{id, display_name, input_cost_per_million, output_cost_per_million}]``.
 
     Always returns a list — never raises. Source priority: configured
-    key → OpenRouter → bundled pricing table.
+    key → OpenRouter cross-vendor catalog → empty list.
     """
     provider = provider.lower().strip()
     if not provider:
@@ -288,21 +267,15 @@ async def list_provider_models(
         except Exception as e:  # noqa: BLE001 — fall through to OpenRouter
             elog("discovery.live_error", provider=provider, error=str(e))
 
-    # OpenRouter is our dynamic cross-provider catalog. It covers most
-    # vendors we care about and carries pricing too, so it beats the
-    # static fallback.
+    # OpenRouter cross-vendor catalog — free, unauthenticated, live.
     try:
         entries = await _fetch_openrouter_catalog()
         or_models = _openrouter_filter_for(provider, entries)
-        if or_models:
-            elog("discovery.openrouter", provider=provider, count=len(or_models))
-            return or_models
-    except Exception as e:  # noqa: BLE001 — network errors; fall back
+        elog("discovery.openrouter", provider=provider, count=len(or_models))
+        return or_models
+    except Exception as e:  # noqa: BLE001 — network/DNS/etc.
         elog("discovery.openrouter_error", provider=provider, error=str(e))
-
-    fallback = _bundled_fallback(provider)
-    elog("discovery.bundled", provider=provider, count=len(fallback))
-    return fallback
+        return []
 
 
 async def list_provider_models_cached(provider: str) -> list[dict[str, Any]]:

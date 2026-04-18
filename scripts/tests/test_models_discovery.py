@@ -1,32 +1,14 @@
-"""Dynamic LLM catalog discovery — parsers, OpenRouter mapping, fallback.
+"""Dynamic LLM catalog discovery — parsers + OpenRouter mapping.
 
 Live HTTP calls are intentionally NOT exercised here; they'd be flaky
-without network. We test the parser shapes and the bundled fallback
-derived from default_pricing.json (no separate known_models file
-anymore — that JSON was de-duplicated against the catalog).
+without network. We test the parser shapes and the OpenRouter prefix
+filter. Since v0.10.5 there is no bundled offline fallback — if a
+provider isn't reachable and OpenRouter doesn't know it, the picker
+returns an empty list rather than stale hardcoded data.
 """
 from __future__ import annotations
 
 from ._framework import TestContext, test
-
-
-@test("models_discovery", "bundled fallback lists openai + anthropic")
-async def t_bundled_fallback(ctx: TestContext) -> None:
-    from openagent.models.discovery import _bundled_fallback
-
-    openai_models = _bundled_fallback("openai")
-    ids = {m["id"] for m in openai_models}
-    assert "gpt-4o-mini" in ids, ids
-
-    anthropic_models = _bundled_fallback("anthropic")
-    assert any(m["id"].startswith("claude-sonnet-") for m in anthropic_models)
-
-
-@test("models_discovery", "unknown provider returns []")
-async def t_unknown_provider(ctx: TestContext) -> None:
-    from openagent.models.discovery import _bundled_fallback
-
-    assert _bundled_fallback("not-a-real-provider") == []
 
 
 @test("models_discovery", "openai-style parser handles /v1/models envelope")
@@ -41,6 +23,25 @@ async def t_openai_parser_shape(ctx: TestContext) -> None:
     parsed = _parse_openai_style(payload)
     ids = [m["id"] for m in parsed]
     assert ids == ["gpt-4o-mini", "gpt-4.1"]
+
+
+@test("models_discovery", "openai-style parser tolerates alternate envelopes")
+async def t_openai_parser_envelopes(ctx: TestContext) -> None:
+    """z.ai and some self-hosts use ``models[]`` or bare arrays instead
+    of OpenAI's canonical ``data[]``. Parser must handle all three."""
+    from openagent.models.discovery import _parse_openai_style
+
+    # z.ai / self-hosted shape
+    ids = [m["id"] for m in _parse_openai_style({"models": [{"id": "glm-5.1"}]})]
+    assert ids == ["glm-5.1"]
+
+    # bare list shape
+    ids = [m["id"] for m in _parse_openai_style([{"id": "solo"}, {"id": "another"}])]
+    assert ids == ["solo", "another"]
+
+    # malformed input → empty
+    assert _parse_openai_style(None) == []
+    assert _parse_openai_style("not a dict") == []
 
 
 @test("models_discovery", "google parser strips models/ prefix")

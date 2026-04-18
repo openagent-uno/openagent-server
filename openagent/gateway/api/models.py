@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from aiohttp import web
 
+from openagent.gateway.api._common import gateway_db as _db
 from openagent.gateway.api.config import _read_raw, _read_resolved, _write_raw
 from openagent.gateway.api.providers import _mask_key, mask_providers
 
@@ -140,7 +141,14 @@ async def handle_update(request: web.Request) -> web.Response:
 
 
 async def handle_delete(request: web.Request) -> web.Response:
-    """Remove a provider entry."""
+    """Remove a provider entry and cascade-delete its ``models`` rows.
+
+    Provider keys live in yaml, models live in SQLite — without the
+    cascade, removing a provider orphans every (provider, framework, model)
+    triple that referenced it. Those rows would keep showing in the UI
+    catalog and the router would still try to dispatch them, failing at
+    send-time with a confusing "missing API key" error.
+    """
     from aiohttp import web as _web
 
     name = request.match_info["name"]
@@ -154,7 +162,16 @@ async def handle_delete(request: web.Request) -> web.Response:
     raw["providers"] = providers
     _write_raw(request, raw)
 
-    return _web.json_response({"ok": True})
+    purged = 0
+    db = _db(request)
+    if db is not None:
+        try:
+            purged = await db.delete_models_by_provider(name)
+        except Exception as exc:  # noqa: BLE001 — yaml write already succeeded
+            from openagent.core.logging import elog
+            elog("provider.delete_cascade_error", level="warning", provider=name, error=str(exc))
+
+    return _web.json_response({"ok": True, "models_purged": purged})
 
 
 async def handle_available_providers(request: web.Request) -> web.Response:
@@ -218,9 +235,6 @@ async def handle_test(request: web.Request) -> web.Response:
 # model-manager MCP writes to; the gateway's hot-reload loop picks up
 # changes on the next message.
 # ──────────────────────────────────────────────────────────────────────
-
-
-from openagent.gateway.api._common import gateway_db as _db  # noqa: E402
 
 
 async def handle_list_db(request: web.Request) -> web.Response:

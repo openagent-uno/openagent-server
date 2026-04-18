@@ -250,25 +250,45 @@ async def import_yaml_models_once(
     # Implicit models referenced by model.routing / model_id / classifier_model
     # that aren't listed under providers.X.models. Without this the rejection
     # gate would trip on SmartRouter-only configs.
-    from openagent.models.catalog import _load_default_pricing
-    pricing_keys = set(_load_default_pricing().keys())
+    bare_refs = [
+        ref for ref in _extract_model_refs(model_cfg or {})
+        if ref and ":" not in ref and "/" not in ref
+    ]
+    # Resolve bare refs (e.g. "gpt-4o-mini") by scanning OpenRouter's
+    # public catalog for a configured-provider match. Cached in-process
+    # after the first hit, so this is free for subsequent calls.
+    or_index: dict[str, str] = {}
+    if bare_refs:
+        try:
+            from openagent.models.discovery import (
+                _fetch_openrouter_catalog, _OPENROUTER_VENDOR_MAP,
+            )
+            entries = await _fetch_openrouter_catalog()
+            configured = set((providers_config or {}).keys())
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                raw = str(entry.get("id") or "")
+                if "/" not in raw:
+                    continue
+                vendor, bare = raw.split("/", 1)
+                our_name = _OPENROUTER_VENDOR_MAP.get(vendor)
+                if our_name and our_name in configured and bare not in or_index:
+                    or_index[bare] = our_name
+        except Exception as exc:  # noqa: BLE001 — offline or flaky network
+            logger.warning("bootstrap: OpenRouter catalog unreachable (%s); bare model refs will be skipped", exc)
 
     for ref in _extract_model_refs(model_cfg or {}):
         runtime_id = normalize_runtime_model_id(ref, providers_config)
         if not runtime_id:
             continue
         if ":" not in runtime_id and "/" not in runtime_id:
-            # Bare id — scan the pricing table for a matching provider prefix.
-            guess = None
-            for key in pricing_keys:
-                if ":" in key and key.split(":", 1)[1] == runtime_id:
-                    guess = key.split(":", 1)[0]
-                    break
+            guess = or_index.get(runtime_id)
             if guess is None:
                 logger.warning(
-                    "bootstrap: cannot resolve bare model ref %r to a provider — "
-                    "skipping (add it to providers.X.models or prefix with "
-                    "provider:)",
+                    "bootstrap: skipping bare model ref %r — not found in "
+                    "OpenRouter catalog for any configured provider. "
+                    "Prefix with ``provider:`` in yaml or add via /models.",
                     runtime_id,
                 )
                 continue

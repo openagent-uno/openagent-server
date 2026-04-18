@@ -17,19 +17,25 @@ async def t_catalog_split(ctx: TestContext) -> None:
     assert model_id_from_runtime("openai:gpt-4o-mini") == "gpt-4o-mini"
 
 
-@test("catalog", "default pricing fallback works for bare model entries")
-async def t_pricing_fallback(ctx: TestContext) -> None:
+@test("catalog", "pricing returns zero + 'missing' when no source has the model")
+async def t_pricing_missing(ctx: TestContext) -> None:
+    """With no bundled table and a cold OpenRouter cache, an unknown
+    model resolves to zero cost logged as 'missing' — not a crash."""
+    import time
+    from openagent.models import discovery
     from openagent.models.catalog import get_model_pricing, compute_cost
-    user_cfg = {"openai": {"models": ["gpt-4o-mini", "gpt-4.1"]}}
-    p = get_model_pricing("gpt-4o-mini", user_cfg)
-    assert p["input_cost_per_million"] == 0.15, f"unexpected: {p}"
-    assert p["output_cost_per_million"] == 0.60
-    cost = compute_cost("openai:gpt-4.1", 1000, 500, user_cfg)
-    expected = (2.00 * 1000 + 8.00 * 500) / 1_000_000
-    assert abs(cost - expected) < 1e-12
+
+    prev = discovery._OPENROUTER_CACHE
+    try:
+        discovery._OPENROUTER_CACHE = (time.time(), [])  # empty catalog
+        p = get_model_pricing("openai:gpt-unknown-model")
+        assert p == {"input_cost_per_million": 0.0, "output_cost_per_million": 0.0}
+        assert compute_cost("openai:gpt-unknown-model", 10_000, 5_000) == 0.0
+    finally:
+        discovery._OPENROUTER_CACHE = prev
 
 
-@test("catalog", "user pricing overrides defaults")
+@test("catalog", "user pricing overrides OpenRouter")
 async def t_pricing_override(ctx: TestContext) -> None:
     from openagent.models.catalog import get_model_pricing
     cfg = {"openai": {"models": [

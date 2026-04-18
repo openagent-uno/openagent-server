@@ -56,6 +56,34 @@ async def t_models_enable(ctx: TestContext) -> None:
         await db.close()
 
 
+@test("db_models", "delete_models_by_provider purges every row for that provider")
+async def t_cascade_delete(ctx: TestContext) -> None:
+    """When a provider is removed, every row in the ``models`` table
+    owned by it gets cascade-deleted. Without this, the catalog fills
+    with orphan rows that fail at dispatch with "missing API key".
+    """
+    from openagent.memory.db import MemoryDB
+
+    db = MemoryDB(str(ctx.db_path))
+    await db.connect()
+    try:
+        await db.upsert_model("zai:glm-5", provider="zai", model_id="glm-5")
+        await db.upsert_model("zai:glm-4.5", provider="zai", model_id="glm-4.5")
+        await db.upsert_model("openai:gpt-4o-mini", provider="openai", model_id="gpt-4o-mini")
+
+        purged = await db.delete_models_by_provider("zai")
+        assert purged == 2, purged
+        remaining = await db.list_models()
+        providers = {r["provider"] for r in remaining}
+        assert providers == {"openai"}, providers
+
+        # Idempotent: a second call on a now-empty provider returns 0.
+        assert await db.delete_models_by_provider("zai") == 0
+        await db.delete_model("openai:gpt-4o-mini")
+    finally:
+        await db.close()
+
+
 @test("db_models", "registry_status.enabled_count drops to 0 after deleting last model")
 async def t_registry_status_empty(ctx: TestContext) -> None:
     """The gate relies on ``registry_status`` returning zero once the

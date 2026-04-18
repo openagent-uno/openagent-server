@@ -13,15 +13,11 @@ truth for:
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 from openagent.core.logging import elog
 
-_DEFAULT_PRICING_PATH = Path(__file__).with_name("default_pricing.json")
-_DEFAULT_PRICING_CACHE: dict[str, dict[str, float]] | None = None
 # Dedup `catalog.pricing_resolved` events so each (runtime_id, source) pair only
 # logs once per process. Without this every call to compute_cost emits a row;
 # at 3+ lookups per chat turn that drowns the event log.
@@ -30,28 +26,6 @@ _LOGGED_PRICING: set[tuple[str, str]] = set()
 # Provider-specific defaults. Keep here so they have a single home alongside
 # the rest of the provider/model catalog.
 DEFAULT_ZAI_BASE_URL = "https://api.z.ai/api/paas/v4"
-
-
-def _load_default_pricing() -> dict[str, dict[str, float]]:
-    """Load the bundled default pricing table, cached for the process lifetime."""
-    global _DEFAULT_PRICING_CACHE
-    if _DEFAULT_PRICING_CACHE is not None:
-        return _DEFAULT_PRICING_CACHE
-    try:
-        raw = json.loads(_DEFAULT_PRICING_PATH.read_text())
-    except (OSError, ValueError):
-        _DEFAULT_PRICING_CACHE = {}
-        return _DEFAULT_PRICING_CACHE
-    cleaned: dict[str, dict[str, float]] = {}
-    for key, value in raw.items():
-        if key.startswith("_") or not isinstance(value, dict):
-            continue
-        cleaned[key] = {
-            "input_cost_per_million": float(value.get("input_cost_per_million", 0.0) or 0.0),
-            "output_cost_per_million": float(value.get("output_cost_per_million", 0.0) or 0.0),
-        }
-    _DEFAULT_PRICING_CACHE = cleaned
-    return cleaned
 
 # OpenAgent vocabulary (since v0.10.0):
 #   - **provider**  : the model's vendor / owner (anthropic, openai, google, …).
@@ -354,16 +328,14 @@ def get_model_pricing(model_ref: str, providers_config: dict | None = None) -> d
       1. claude-cli models → zero (billed via Claude Pro/Max subscription,
          not per token)
       2. User-provided pricing in ``providers_config`` (per-model metadata)
-      3. Online catalog (OpenRouter) — see ``openrouter_pricing_lookup``
-      4. Bundled offline defaults in ``models/default_pricing.json``
-      5. Zero pricing (logged as a warning)
+      3. Online catalog (OpenRouter) — see ``_openrouter_pricing_lookup``
+      4. Zero pricing (logged as "missing")
 
     Always returns a dict; never raises. Emits ``catalog.pricing_resolved`` event
     on every call with the lookup ``source`` so cost issues can be diagnosed
     from the event log.
     """
     runtime_id = normalize_runtime_model_id(model_ref, providers_config)
-    bare_id = model_id_from_runtime(runtime_id)
 
     # 1. claude-cli is the local subprocess wrapping the user's Claude
     # Pro/Max subscription — no per-token billing, ever. Short-circuit
@@ -373,6 +345,8 @@ def get_model_pricing(model_ref: str, providers_config: dict | None = None) -> d
         _log_pricing(model_ref, runtime_id, "claude_cli_subscription", 0.0, 0.0)
         return {"input_cost_per_million": 0.0, "output_cost_per_million": 0.0}
 
+    bare_id = model_id_from_runtime(runtime_id)
+
     # 2. Per-model metadata in user config wins.
     for entry in iter_configured_models(providers_config, include_disabled=True):
         if runtime_id in {entry.runtime_id, entry.model_id} or bare_id in {entry.runtime_id, entry.model_id}:
@@ -381,7 +355,6 @@ def get_model_pricing(model_ref: str, providers_config: dict | None = None) -> d
             if input_cost > 0 or output_cost > 0:
                 _log_pricing(model_ref, runtime_id, "config", input_cost, output_cost)
                 return {"input_cost_per_million": input_cost, "output_cost_per_million": output_cost}
-            # Config entry exists but has no pricing → fall through to defaults.
             break
 
     # 3. Online catalog (OpenRouter). Resolved from a process-wide cache
@@ -394,17 +367,7 @@ def get_model_pricing(model_ref: str, providers_config: dict | None = None) -> d
         )
         return online
 
-    # 4. Bundled default pricing table (offline backstop).
-    defaults = _load_default_pricing()
-    pricing = defaults.get(runtime_id) or defaults.get(bare_id)
-    if pricing:
-        _log_pricing(
-            model_ref, runtime_id, "default",
-            pricing["input_cost_per_million"], pricing["output_cost_per_million"],
-        )
-        return dict(pricing)
-
-    # 5. Nothing — log a warning so the user can fix their config.
+    # 4. Nothing — log a warning so the user can fix their config.
     _log_pricing(model_ref, runtime_id, "missing", 0.0, 0.0)
     return {"input_cost_per_million": 0.0, "output_cost_per_million": 0.0}
 

@@ -673,6 +673,19 @@ class MemoryDB:
         await conn.execute("DELETE FROM models WHERE runtime_id = ?", (runtime_id,))
         await conn.commit()
 
+    async def delete_models_by_provider(self, provider: str) -> int:
+        """Purge every model row owned by ``provider``. Returns the row count.
+
+        Called on provider removal so the models table doesn't accumulate
+        orphan entries that can no longer be dispatched (missing API key).
+        """
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            "DELETE FROM models WHERE provider = ?", (provider,),
+        )
+        await conn.commit()
+        return cursor.rowcount or 0
+
     async def models_max_updated(self) -> float:
         conn = await self._ensure_connected()
         cursor = await conn.execute("SELECT MAX(updated_at) FROM models")

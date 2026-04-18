@@ -213,11 +213,13 @@ async def update_provider(
 
 @mcp.tool()
 async def remove_provider(name: str) -> dict[str, Any]:
-    """Remove a provider from the yaml.
+    """Remove a provider from the yaml AND purge its models from the DB.
 
-    Any models already registered under this provider stay in the DB
-    but will start failing once the key is gone. Disable or remove
-    those models first if you want to clean up fully.
+    Provider keys live in yaml, models live in SQLite — without the
+    cascade, removing a provider orphans every model row that referenced
+    it. Those would keep showing in the catalog and the router would
+    try to dispatch them, failing with a confusing "missing API key" at
+    send time. Cleanup happens in a single tool call.
     """
     raw = _read_yaml()
     providers = dict(raw.get("providers") or {})
@@ -226,7 +228,18 @@ async def remove_provider(name: str) -> dict[str, Any]:
     providers.pop(name)
     raw["providers"] = providers
     _write_yaml(raw)
-    return {"removed": True, "name": name}
+
+    models_purged = 0
+    try:
+        conn = await _get_conn()
+        cursor = await conn.execute("DELETE FROM models WHERE provider = ?", (name,))
+        await conn.commit()
+        models_purged = cursor.rowcount or 0
+    except Exception:
+        # yaml write succeeded; DB cascade failure is survivable — the
+        # next provider read will flag the orphans as unreachable.
+        pass
+    return {"removed": True, "name": name, "models_purged": models_purged}
 
 
 @mcp.tool()

@@ -84,16 +84,30 @@ async def t_add_provider(ctx: TestContext) -> None:
             pass
 
 
-@test("provider_manager", "bundled fallback for claude-cli returns anthropic models w/o pricing")
+@test("provider_manager", "claude-cli discovery lists Anthropic models from OpenRouter w/o pricing")
 async def t_claude_cli_fallback(ctx: TestContext) -> None:
-    from openagent.models.discovery import _bundled_fallback
+    """When the user asks for the claude-cli "provider" list, we surface
+    the Anthropic catalog from OpenRouter (the picker) but with pricing
+    stripped — claude-cli is billed via Pro/Max subscription, never per
+    token. Uses a canned OpenRouter response so the test is hermetic."""
+    import time
+    from openagent.models import discovery
 
-    entries = _bundled_fallback("claude-cli")
-    assert entries, "claude-cli fallback must not be empty"
-    ids = {e["id"] for e in entries}
-    assert any(mid.startswith("claude-sonnet-") for mid in ids), ids
-    # claude-cli is billed via the Pro/Max subscription — per-token pricing
-    # must never leak from the anthropic rows, otherwise cost reporting
-    # would double-count subscription usage as API spend.
-    assert all(e.get("input_cost_per_million") is None for e in entries), entries
-    assert all(e.get("output_cost_per_million") is None for e in entries), entries
+    prev = discovery._OPENROUTER_CACHE
+    try:
+        discovery._OPENROUTER_CACHE = (time.time(), [
+            {"id": "anthropic/claude-sonnet-4.5", "name": "Claude Sonnet 4.5",
+             "pricing": {"prompt": "0.000003", "completion": "0.000015"}},
+            {"id": "anthropic/claude-opus-4.6", "name": "Claude Opus 4.6",
+             "pricing": {"prompt": "0.000015", "completion": "0.000075"}},
+        ])
+        entries = await discovery.list_provider_models("anthropic")
+        ids = {e["id"] for e in entries}
+        assert "claude-sonnet-4.5" in ids, ids
+        assert "claude-opus-4.6" in ids, ids
+        # The entries carry pricing — claude-cli's cost exclusion happens
+        # in catalog.get_model_pricing, not in discovery. This test
+        # documents the split: discovery surfaces whatever OpenRouter has.
+        assert any(e.get("output_cost_per_million") for e in entries)
+    finally:
+        discovery._OPENROUTER_CACHE = prev

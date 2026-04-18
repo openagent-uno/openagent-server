@@ -44,11 +44,26 @@ async def t_budget_record(ctx: TestContext) -> None:
 
 @test("budget", "BudgetTracker.compute_cost matches catalog")
 async def t_budget_compute_cost(ctx: TestContext) -> None:
+    """compute_cost reads pricing from the OpenRouter cache — prime it
+    with a known shape so the test doesn't depend on the live fetch."""
+    import time
+    from openagent.models import discovery
     from openagent.models.budget import BudgetTracker
-    # Known price: gpt-4o-mini = $0.15 / $0.60 per million
-    cost = BudgetTracker.compute_cost("openai:gpt-4o-mini", 1_000_000, 1_000_000,
-                                       {"openai": {"models": ["gpt-4o-mini"]}})
-    assert abs(cost - 0.75) < 1e-9, f"unexpected cost: {cost}"
+
+    prev = discovery._OPENROUTER_CACHE
+    try:
+        discovery._OPENROUTER_CACHE = (time.time(), [
+            {"id": "openai/gpt-4o-mini", "name": "GPT-4o mini",
+             "pricing": {"prompt": "0.00000015", "completion": "0.00000060"}},
+        ])
+        # $0.15 / $0.60 per million → 1M in, 1M out = $0.75
+        cost = BudgetTracker.compute_cost(
+            "openai:gpt-4o-mini", 1_000_000, 1_000_000,
+            {"openai": {"models": ["gpt-4o-mini"]}},
+        )
+        assert abs(cost - 0.75) < 1e-9, f"unexpected cost: {cost}"
+    finally:
+        discovery._OPENROUTER_CACHE = prev
 
 
 @test("budget", "SmartRouter routes to fallback when budget is exhausted")
