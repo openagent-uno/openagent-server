@@ -70,7 +70,6 @@ class Gateway:
         self.clients: dict[str, object] = {}  # client_id → WebSocketResponse
         self._runner = None
         self._port_file = None
-        self._model_cache: dict[str, object] = {}  # model_spec → BaseModel instance
 
         # Bound by AgentServer after Scheduler.start(); None when the scheduler
         # is disabled in config. Handlers in api/scheduled_tasks.py check this
@@ -672,10 +671,6 @@ class Gateway:
                 return
 
             old_model, drain_event = self.agent.swap_model(new_model)
-
-            # Invalidate per-channel override cache — specs may resolve
-            # to different provider configs after the reload.
-            self._model_cache.clear()
             self._config_fingerprint = current
 
             elog(
@@ -702,50 +697,6 @@ class Gateway:
         finally:
             self.agent._unregister_runtime_model(model)
             elog("gateway.config_reload_drained", model_class=type(model).__name__)
-
-    def _resolve_channel_model(self, client_id: str):
-        """Resolve per-channel model override from config."""
-        channel = client_id.split(":", 1)[1] if client_id.startswith("bridge:") else "websocket"
-        logger.debug("Resolving model for channel=%s (client_id=%s)", channel, client_id)
-
-        # Read channels config from YAML
-        if not self.config_path:
-            return None
-        try:
-            from openagent.gateway.api.config import _load_resolved_config
-
-            raw = _load_resolved_config(Path(self.config_path))
-            channels_cfg = raw.get("channels", {})
-            model_spec = channels_cfg.get(channel, {}).get("model")
-            if not model_spec:
-                return None
-            elog("channel.model_override", client_id=client_id, channel=channel, spec=model_spec)
-            return self._get_or_create_model(model_spec, raw.get("providers", {}))
-        except Exception as e:
-            # Debug-level: channel override is a fallback, failing is non-fatal.
-            elog("channel.model_override_error", level="debug",
-                 client_id=client_id, channel=channel, error=str(e))
-            return None
-
-    def _get_or_create_model(self, spec: str, providers_config: dict = None):
-        """Get or create a cached model instance for a spec string."""
-        if spec in self._model_cache:
-            elog("model.override_cache_hit", spec=spec)
-            return self._model_cache[spec]
-
-        from openagent.models.runtime import create_model_from_spec
-
-        model = create_model_from_spec(
-            spec,
-            providers_config=providers_config or {},
-            db=self.agent._db,
-            mcp_registry=self.agent._mcp,
-            mcp_servers=getattr(self.agent._mcp, "_servers", None),
-        )
-
-        self._model_cache[spec] = model
-        elog("model.override_create", spec=spec, kind=type(model).__name__)
-        return model
 
     async def _process_message(self, ws, client_id: str, text: str, session_id: str) -> None:
         try:
@@ -781,8 +732,13 @@ class Gateway:
                 except Exception:
                     pass
 
-            channel_model = self._resolve_channel_model(client_id)
-            active_model = channel_model or self.agent.model
+            active_model = self.agent.model
+            # SmartRouter handles per-session binding internally via the
+            # ``session_bindings`` / ``sdk_sessions`` tables — it reports
+            # ``history_mode = None`` so the SessionManager pre-bind
+            # check bails. Providers that set a concrete history_mode
+            # (a legacy direct-ClaudeCLIRegistry active model in tests,
+            # for example) still get the old SessionManager enforcement.
             history_mode = getattr(active_model, "history_mode", None)
             try:
                 self.sessions.bind_history_mode(client_id, session_id, history_mode)
@@ -801,7 +757,6 @@ class Gateway:
                 client_id=client_id,
                 session_id=session_id,
                 model_class=type(active_model).__name__,
-                model_override=bool(channel_model),
             )
             try:
                 response = await self.agent.run(
@@ -809,7 +764,6 @@ class Gateway:
                     user_id=client_id,
                     session_id=session_id,
                     on_status=on_status,
-                    model_override=channel_model,
                 )
             except asyncio.CancelledError:
                 # Server is shutting down (restart for config update, launchd

@@ -317,6 +317,7 @@ class Agent:
         if self._db is not None and self.config is not None:
             try:
                 from openagent.memory.bootstrap import (
+                    ensure_builtin_mcps,
                     import_yaml_mcps_once,
                     import_yaml_models_once,
                 )
@@ -326,6 +327,11 @@ class Agent:
                 await import_yaml_mcps_once(
                     self._db, mcp_config, include_defaults, mcp_disable,
                 )
+                # Every boot: re-seed any BUILTIN_MCP_SPECS entry that
+                # doesn't have a row yet (forward-compat for future
+                # builtins + safety net against manual DB tampering).
+                # Existing rows — including disabled ones — are untouched.
+                await ensure_builtin_mcps(self._db)
                 await import_yaml_models_once(
                     self._db,
                     self.config.get("providers", {}) or {},

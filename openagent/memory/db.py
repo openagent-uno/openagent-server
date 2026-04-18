@@ -119,6 +119,23 @@ CREATE TABLE IF NOT EXISTS config_state (
     value TEXT NOT NULL,
     updated_at REAL NOT NULL
 );
+
+-- Per-session runtime binding. SmartRouter dispatches fresh sessions
+-- to either the Agno stack ("agno") or the Claude CLI
+-- registry ("claude-cli") based on the classifier; once a session has
+-- been served by one side its conversation state lives there
+-- (Agno's SqliteDb for agno, Claude's own session store for claude-cli)
+-- so the router must respect that lock on subsequent turns.
+--
+-- Claude-cli bindings are also persisted in ``sdk_sessions`` because
+-- that table carries the SDK-native UUID needed for ``--resume``. This
+-- table only needs to cover the agno case (no resume id to persist),
+-- plus it serves as a fast single-table lookup for SmartRouter.
+CREATE TABLE IF NOT EXISTS session_bindings (
+    session_id TEXT PRIMARY KEY,
+    provider TEXT NOT NULL,
+    bound_at REAL NOT NULL
+);
 """
 
 
@@ -594,6 +611,55 @@ class MemoryDB:
         if not row:
             return 0.0, 0.0, 0
         return float(row[0] or 0.0), float(row[1] or 0.0), int(row[2] or 0)
+
+    # ── Session Runtime Bindings ──
+
+    async def get_session_binding(self, session_id: str) -> str | None:
+        """Return ``"agno"`` / ``"claude-cli"`` or ``None`` if unbound.
+
+        Checks ``sdk_sessions`` first (source of truth for claude-cli
+        resume state) and falls back to ``session_bindings`` for agno.
+        """
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            "SELECT provider FROM sdk_sessions WHERE session_id = ?",
+            (session_id,),
+        )
+        row = await cursor.fetchone()
+        if row and row[0]:
+            return str(row[0])
+        cursor = await conn.execute(
+            "SELECT provider FROM session_bindings WHERE session_id = ?",
+            (session_id,),
+        )
+        row = await cursor.fetchone()
+        return str(row[0]) if row and row[0] else None
+
+    async def set_session_binding(self, session_id: str, provider: str) -> None:
+        """Record that ``session_id`` is served by ``provider``.
+
+        Used by SmartRouter after a first successful dispatch so
+        subsequent turns are forced to the same side. Claude-cli
+        bindings land in ``sdk_sessions`` instead (via
+        ``set_sdk_session``) — this table only tracks agno.
+        """
+        conn = await self._ensure_connected()
+        await conn.execute(
+            "INSERT INTO session_bindings (session_id, provider, bound_at) "
+            "VALUES (?, ?, ?) "
+            "ON CONFLICT(session_id) DO UPDATE SET "
+            "provider = excluded.provider, bound_at = excluded.bound_at",
+            (session_id, provider, time.time()),
+        )
+        await conn.commit()
+
+    async def delete_session_binding(self, session_id: str) -> None:
+        conn = await self._ensure_connected()
+        await conn.execute(
+            "DELETE FROM session_bindings WHERE session_id = ?",
+            (session_id,),
+        )
+        await conn.commit()
 
     # ── Generic state flags ──
 

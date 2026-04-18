@@ -154,38 +154,49 @@ def create_model_from_spec(
 
 
 def create_model_from_config(config: dict) -> BaseModel:
-    """Instantiate the active model from the resolved OpenAgent config."""
+    """Instantiate the active model from the resolved OpenAgent config.
+
+    Always returns a SmartRouter — SmartRouter is the single top-level
+    runtime and dispatches each session to either Agno or the Claude CLI
+    registry internally (see ``openagent.models.smart_router``).
+
+    Legacy ``model.provider`` values (``claude-cli``, ``anthropic``,
+    ``agno``, etc.) are honored as a *routing hint*: the specified
+    ``model_id`` is slotted into the routing tiers so existing yaml
+    configs keep working. The ``models`` DB table is still the source
+    of truth — SmartRouter rebuilds its routing from it on every
+    hot-reload tick.
+    """
     model_cfg = config.get("model", {})
     providers_config = config.get("providers", {})
     permission_mode = model_cfg.get("permission_mode", "bypass")
     api_key = model_cfg.get("api_key")
     provider = _canonical_provider_name(model_cfg.get("provider"))
-    idle_timeout = model_cfg.get("idle_timeout_seconds")
-    hard_timeout = model_cfg.get("hard_timeout_seconds")
-    idle_ttl = model_cfg.get("idle_ttl_seconds")
 
-    if provider == "smart":
-        return create_model_from_spec(
-            "smart",
-            providers_config=providers_config,
-            api_key=api_key,
-            monthly_budget=float(model_cfg.get("monthly_budget", 0)),
-            routing=model_cfg.get("routing") or None,
-            classifier_model=model_cfg.get("classifier_model"),
-            claude_permission_mode=permission_mode,
-        )
+    routing = dict(model_cfg.get("routing") or {})
 
-    spec, base_url = _runtime_spec_from_config(model_cfg, providers_config)
+    # Legacy compat: a yaml like ``model: { provider: claude-cli,
+    # model_id: claude-sonnet-4-6 }`` becomes a SmartRouter whose every
+    # tier points at the single claude-cli model. Users who want the
+    # real auto-routing just drop ``model.provider`` or set it to
+    # ``smart``.
+    if provider not in ("smart", "agno") and not routing:
+        try:
+            legacy_spec, _ = _runtime_spec_from_config(model_cfg, providers_config)
+        except ValueError:
+            legacy_spec = ""
+        if legacy_spec:
+            for tier in ("simple", "medium", "hard", "fallback"):
+                routing.setdefault(tier, legacy_spec)
 
     return create_model_from_spec(
-        spec,
+        "smart",
         providers_config=providers_config,
         api_key=api_key,
-        base_url=base_url,
+        monthly_budget=float(model_cfg.get("monthly_budget", 0)),
+        routing=routing or None,
+        classifier_model=model_cfg.get("classifier_model"),
         claude_permission_mode=permission_mode,
-        claude_idle_timeout_seconds=idle_timeout,
-        claude_hard_timeout_seconds=hard_timeout,
-        claude_idle_ttl_seconds=idle_ttl,
     )
 
 

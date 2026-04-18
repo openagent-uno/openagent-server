@@ -57,7 +57,10 @@ _TEST_MODULES: tuple[str, ...] = (
     # New DB-backed registry tests: pure CRUD against ctx.db_path, no pool.
     "test_db_mcps",
     "test_db_models",
+    "test_db_session_bindings",
     "test_bootstrap_import",
+    "test_smart_router_hybrid",
+    "test_mcp_manager_guards",
     # Dynamic provider catalog: bundled fallback only (no live HTTP).
     "test_models_discovery",
     # ClaudeCLI buffer fix — computer-control screenshot regression guard.

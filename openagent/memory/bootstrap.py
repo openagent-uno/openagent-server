@@ -135,6 +135,43 @@ async def import_yaml_mcps_once(
     return True
 
 
+async def ensure_builtin_mcps(db: MemoryDB) -> int:
+    """Make sure every ``BUILTIN_MCP_SPECS`` entry has a row.
+
+    Unlike ``import_yaml_mcps_once``, this runs every boot (it is NOT
+    guarded by ``config_state``). Purposes:
+
+      1. **Forward compat**: when a new builtin lands in a future
+         release, existing installs pick it up on the next boot without
+         needing a yaml edit or manual DB touch.
+      2. **Safety net**: if someone manually deletes a builtin row
+         (bypassing the API guards), it's reinstated here with
+         ``enabled=1``. Users who want a builtin off keep the row and
+         flip ``enabled=0`` — that's preserved; we only *add* missing
+         rows, we never touch existing ones.
+
+    Returns the number of rows added this boot (zero is the steady
+    state).
+    """
+    from openagent.mcp.builtins import BUILTIN_MCP_SPECS
+
+    added = 0
+    for builtin_name in BUILTIN_MCP_SPECS:
+        if await db.get_mcp(builtin_name) is not None:
+            continue
+        await db.upsert_mcp(
+            builtin_name,
+            kind="default",
+            builtin_name=builtin_name,
+            enabled=True,
+            source="ensure-builtin",
+        )
+        added += 1
+    if added:
+        logger.info("bootstrap: auto-seeded %d missing builtin MCP row(s)", added)
+    return added
+
+
 async def import_yaml_models_once(
     db: MemoryDB,
     providers_config: dict | None,

@@ -120,49 +120,11 @@ async def add_custom_mcp(
     return await get_mcp(name)
 
 
-@mcp.tool()
-async def add_builtin_mcp(
-    builtin_name: str,
-    env: dict[str, str] | None = None,
-    enabled: bool = True,
-) -> dict[str, Any]:
-    """Enable one of OpenAgent's built-in MCP servers.
-
-    ``builtin_name`` must be one of the keys in ``BUILTIN_MCP_SPECS``
-    (vault, filesystem, editor, web-search, shell, computer-control,
-    chrome-devtools, messaging, scheduler, mcp-manager, model-manager).
-    The row is stored under the same ``name`` as ``builtin_name``.
-    """
-    # Local import: BUILTIN_MCP_SPECS lives in openagent.mcp.builtins which
-    # pulls in optional deps. Importing inside the tool body keeps server
-    # startup lean and avoids circular-import pitfalls.
-    from openagent.mcp.builtins import BUILTIN_MCP_SPECS
-
-    if builtin_name not in BUILTIN_MCP_SPECS:
-        available = ", ".join(sorted(BUILTIN_MCP_SPECS.keys()))
-        raise ValueError(f"Unknown builtin {builtin_name!r}. Available: {available}")
-
-    conn = await _get_conn()
-    now = time.time()
-    await conn.execute(
-        "INSERT INTO mcps (name, kind, builtin_name, env_json, enabled, "
-        "source, created_at, updated_at) "
-        "VALUES (?, 'builtin', ?, ?, ?, 'mcp-manager', ?, ?) "
-        "ON CONFLICT(name) DO UPDATE SET "
-        "kind = 'builtin', builtin_name = excluded.builtin_name, "
-        "env_json = excluded.env_json, enabled = excluded.enabled, "
-        "updated_at = excluded.updated_at",
-        (
-            builtin_name,
-            builtin_name,
-            json.dumps(dict(env or {})),
-            1 if enabled else 0,
-            now,
-            now,
-        ),
-    )
-    await conn.commit()
-    return await get_mcp(builtin_name)
+# ``add_builtin_mcp`` was deliberately removed: every builtin defined in
+# ``BUILTIN_MCP_SPECS`` is auto-seeded at agent boot (see
+# ``openagent.memory.bootstrap.ensure_builtin_mcps``), so there's never a
+# case where adding one at runtime makes sense. Use ``enable_mcp`` /
+# ``disable_mcp`` / ``update_mcp`` to toggle state or override env.
 
 
 @mcp.tool()
@@ -239,19 +201,28 @@ async def disable_mcp(name: str) -> dict[str, Any]:
 
 @mcp.tool()
 async def remove_mcp(name: str) -> dict[str, Any]:
-    """Remove an MCP server permanently.
+    """Remove a CUSTOM MCP server permanently.
 
-    Prefer ``disable_mcp`` if you might want it back later. This tool
-    cannot remove ``mcp-manager`` itself — that would leave the agent
-    with no way to add anything back.
+    Built-in MCPs (``kind='default'`` or ``kind='builtin'``) cannot be
+    removed — only disabled via ``disable_mcp``. The definitions live
+    in ``openagent.mcp.builtins.BUILTIN_MCP_SPECS`` so removing a row
+    would just orphan the code and force a manual re-add. Use
+    ``disable_mcp`` if you want to turn a builtin off.
     """
-    if name == "mcp-manager":
-        raise ValueError(
-            "Refusing to remove mcp-manager — disable_mcp instead "
-            "if you really want to turn it off."
-        )
     conn = await _get_conn()
-    await _touch_name(conn, name)
+    cursor = await conn.execute(
+        "SELECT kind FROM mcps WHERE name = ?", (name,)
+    )
+    row = await cursor.fetchone()
+    if row is None:
+        raise ValueError(f"No MCP server named {name!r}")
+    kind = row["kind"]
+    if kind != "custom":
+        raise ValueError(
+            f"Refusing to remove builtin MCP {name!r} (kind={kind!r}). "
+            "Use disable_mcp to turn it off — builtins are defined in "
+            "code and can only be toggled, not deleted."
+        )
     await conn.execute("DELETE FROM mcps WHERE name = ?", (name,))
     await conn.commit()
     return {"removed": True, "name": name}

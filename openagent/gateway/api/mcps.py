@@ -64,22 +64,20 @@ async def handle_create(request):
         return web.json_response({"error": "name is required"}, status=400)
     builtin_name = body.get("builtin_name") or body.get("builtin")
     if builtin_name:
-        # Validate against BUILTIN_MCP_SPECS so the user gets a clear 400
-        # instead of a runtime pool-load failure on the next message.
-        from openagent.mcp.builtins import BUILTIN_MCP_SPECS
-        if builtin_name not in BUILTIN_MCP_SPECS:
-            available = ", ".join(sorted(BUILTIN_MCP_SPECS.keys()))
-            return web.json_response(
-                {"error": f"unknown builtin {builtin_name!r}. Available: {available}"},
-                status=400,
-            )
-        await db.upsert_mcp(
-            name,
-            kind="builtin",
-            builtin_name=str(builtin_name),
-            env=dict(body.get("env") or {}),
-            enabled=bool(body.get("enabled", True)),
-            source="api",
+        # Builtins are defined in code and auto-seeded at boot; adding one
+        # at runtime never produces new behaviour, only a duplicate row.
+        # Callers should enable/disable the existing row instead.
+        return web.json_response(
+            {
+                "error": (
+                    "Builtin MCPs cannot be added at runtime — they are "
+                    "defined in openagent.mcp.builtins.BUILTIN_MCP_SPECS "
+                    "and auto-seeded on boot. Use POST "
+                    f"/api/mcps/{builtin_name}/enable to turn the existing "
+                    "row on, or PUT /api/mcps/{name} to change its env."
+                ),
+            },
+            status=400,
         )
     else:
         command = body.get("command") or None
@@ -137,14 +135,23 @@ async def handle_delete(request):
 
     db = _db(request)
     name = request.match_info["name"]
-    if name == "mcp-manager":
-        return web.json_response(
-            {"error": "Refusing to delete mcp-manager — disable instead if you want to turn it off."},
-            status=400,
-        )
     existing = await db.get_mcp(name)
     if existing is None:
         return web.json_response({"error": f"MCP {name!r} not found"}, status=404)
+    # Builtins are defined in code and can't be meaningfully "deleted";
+    # their row is the control surface for env / enabled state. Force
+    # disable-only for everything that isn't a user-added custom entry.
+    if existing.get("kind") != "custom":
+        return web.json_response(
+            {
+                "error": (
+                    f"Refusing to delete builtin MCP {name!r} "
+                    f"(kind={existing.get('kind')!r}). Disable it instead — "
+                    "builtins can be toggled but not removed."
+                ),
+            },
+            status=400,
+        )
     await db.delete_mcp(name)
     return web.json_response({"ok": True})
 

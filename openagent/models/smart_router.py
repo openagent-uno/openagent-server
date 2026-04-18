@@ -1,7 +1,33 @@
-"""Smart model router with OpenAgent-owned pricing and Agno-backed execution."""
+"""Smart model router — the single top-level runtime.
+
+SmartRouter is the ONLY active-model class wired into the Agent. It
+dispatches each session to either the Agno stack ("agno") or the Claude
+CLI registry ("claude-cli") based on:
+
+  1. **Session binding** (``sdk_sessions`` + ``session_bindings`` tables)
+     — once a session has been served by one side its conversation
+     state lives there (Agno's SqliteDb vs Claude's own session store),
+     so the router must keep subsequent turns on the same side.
+  2. **Classifier** — for fresh sessions, a small LLM call (using the
+     cheapest configured model) tags the user turn as simple / medium /
+     hard and we look up the corresponding routing tier.
+  3. **Budget** — when the monthly budget runs low we degrade to the
+     fallback tier instead of the tier the classifier asked for.
+
+Claude-cli and agno sessions are strictly isolated: once bound, a
+session can't cross. If the bound side has no enabled models the router
+fails cleanly ("No <side> model available for this bound session")
+rather than silently falling through to the other side.
+
+``history_mode`` is intentionally ``None`` — the gateway's
+``SessionManager.bind_history_mode`` bails out on falsy modes, so
+SmartRouter handles binding internally rather than surfacing a
+contradictory "platform" declaration that isn't true in practice.
+"""
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable
 
@@ -16,6 +42,7 @@ from openagent.models.catalog import (
 )
 from openagent.models.runtime import create_model_from_spec, wire_model_runtime
 
+logger = logging.getLogger(__name__)
 
 CLASSIFIER_PROMPT = """\
 Classify this task as simple, medium, or hard.
@@ -26,8 +53,6 @@ Reply with ONLY one word: simple, medium, or hard."""
 
 TIERS = ("simple", "medium", "hard")
 
-# Fallback routing used when no platform-managed models are configured. Kept as
-# a constant so the next "GPT-X is out, swap defaults" change is one edit.
 DEFAULT_AUTO_ROUTING: dict[str, str] = {
     "simple": "openai:gpt-4o-mini",
     "medium": "openai:gpt-4.1-mini",
@@ -52,6 +77,11 @@ HARD_HINTS = (
     "modello più potente",
 )
 
+# Canonical names used in DB ``session_bindings.provider`` and
+# ``sdk_sessions.provider``. Exported for tests.
+SIDE_AGNO = "agno"
+SIDE_CLAUDE_CLI = "claude-cli"
+
 
 @dataclass(frozen=True)
 class RoutingDecision:
@@ -60,12 +90,16 @@ class RoutingDecision:
     reason: str
     primary_model: str
     candidates: list[str]
+    bound_side: str | None = None
 
 
 class SmartRouter(BaseModel):
-    """Cost-aware router for platform-managed API-backed model sessions."""
+    """Hybrid dispatcher covering both Agno and Claude CLI runtimes."""
 
-    history_mode = "platform"
+    # Intentionally None: the gateway's SessionManager.bind_history_mode
+    # bails when history_mode is falsy, so we opt out of the pre-bind
+    # check and handle binding ourselves (see ``_session_side``).
+    history_mode = None
 
     def __init__(
         self,
@@ -79,37 +113,31 @@ class SmartRouter(BaseModel):
         self._providers_config = providers_config or {}
         self._api_key = api_key
         self._monthly_budget = monthly_budget
-        self._budget: BudgetTracker | None = None
-        self._db = None
-        self._providers: dict[str, BaseModel] = {}
-        # Single shared MCPPool — wired to every tier provider as it's lazily
-        # created so all tiers reuse the same MCP server processes.
-        self._mcp_pool: Any = None
         self._claude_permission_mode = claude_permission_mode
-        self._last_tier_by_session: dict[str, str] = {}
 
-        if routing:
-            normalised: dict[str, str] = {}
-            stripped: list[tuple[str, str]] = []
-            for tier, model_id in routing.items():
-                runtime_id = normalize_runtime_model_id(model_id, self._providers_config)
-                if is_claude_cli_model(runtime_id):
-                    # claude-cli is a standalone provider; sessions stay on it for
-                    # their lifetime. SmartRouter is contractually platform-mode
-                    # (``history_mode = "platform"``), so we strip claude-cli from
-                    # any routing tier rather than silently violating the contract.
-                    stripped.append((tier, runtime_id))
-                    continue
-                normalised[tier] = runtime_id
-            if stripped:
-                # claude-cli is standalone and can't be mixed with Agno-routed models.
-                elog("router.routing_stripped", level="warning", stripped=stripped)
-            self._routing = normalised or self._build_auto_routing()
-        else:
-            self._routing = self._build_auto_routing()
+        self._budget: BudgetTracker | None = None
+        self._db: Any = None
+        self._mcp_pool: Any = None
+
+        # Agno tier providers — keyed by runtime_id. Lazily created.
+        self._agno_providers: dict[str, BaseModel] = {}
+        # Single ClaudeCLIRegistry serving every claude-cli runtime_id,
+        # lazily created on first claude-cli dispatch so pure-Agno
+        # deployments don't pay for the import.
+        self._claude_registry: BaseModel | None = None
+
+        self._last_tier_by_session: dict[str, str] = {}
+        # In-process mirror of session_bindings / sdk_sessions so the
+        # routing decision doesn't re-hit the DB on every turn. Written
+        # after first successful dispatch and kept in sync with the
+        # ``close_session`` / ``forget_session`` wipes.
+        self._session_side: dict[str, str] = {}
+
+        self._explicit_routing = dict(routing) if routing else None
+        self._routing = self._normalise_routing(routing) if routing else self._build_auto_routing()
 
         self._classifier_model = normalize_runtime_model_id(
-            classifier_model or self._routing.get("simple", DEFAULT_CLASSIFIER_MODEL),
+            classifier_model or self._routing.get("simple") or DEFAULT_CLASSIFIER_MODEL,
             self._providers_config,
         )
         elog(
@@ -119,13 +147,27 @@ class SmartRouter(BaseModel):
             monthly_budget=self._monthly_budget,
         )
 
-    def _build_auto_routing(self) -> dict[str, str]:
-        """Build routing from configured platform-managed models and their costs."""
-        models_with_price: list[tuple[str, float]] = []
-        for entry in iter_configured_models(self._providers_config, history_mode="platform"):
-            price = float(entry.output_cost_per_million or 0.0)
-            models_with_price.append((entry.runtime_id, price))
+    # ── routing table ────────────────────────────────────────────────
 
+    def _normalise_routing(self, routing: dict[str, str]) -> dict[str, str]:
+        normalised: dict[str, str] = {}
+        for tier, model_id in routing.items():
+            runtime_id = normalize_runtime_model_id(model_id, self._providers_config)
+            if runtime_id:
+                normalised[tier] = runtime_id
+        return normalised or self._build_auto_routing()
+
+    def _build_auto_routing(self) -> dict[str, str]:
+        """Build routing from every configured model (agno + claude-cli).
+
+        Sorted by output cost so "simple" maps to cheapest, "hard" to
+        most expensive. Ties are broken by insertion order (which for
+        DB-sourced entries is provider/model_id).
+        """
+        entries = list(iter_configured_models(self._providers_config))
+        models_with_price: list[tuple[str, float]] = [
+            (e.runtime_id, float(e.output_cost_per_million or 0.0)) for e in entries
+        ]
         if not models_with_price:
             routing = dict(DEFAULT_AUTO_ROUTING)
             elog("router.auto_routing_default", level="warning", routing=routing)
@@ -142,60 +184,141 @@ class SmartRouter(BaseModel):
         elog("router.auto_routing", routing=routing, candidates=n)
         return routing
 
-    def set_db(self, db) -> None:
+    def rebuild_routing(self, providers_config: dict | None = None) -> None:
+        """Called by the hot-reload loop when the ``models`` DB table changes."""
+        if providers_config is not None:
+            self._providers_config = providers_config or {}
+        self._routing = (
+            self._normalise_routing(self._explicit_routing)
+            if self._explicit_routing
+            else self._build_auto_routing()
+        )
+        self._classifier_model = normalize_runtime_model_id(
+            self._classifier_model or self._routing.get("simple") or DEFAULT_CLASSIFIER_MODEL,
+            self._providers_config,
+        )
+        elog("router.rebuilt", routing=self._routing)
+
+    # ── runtime wiring ───────────────────────────────────────────────
+
+    def set_db(self, db: Any) -> None:
         self._db = db
         self._budget = BudgetTracker(db, self._monthly_budget)
-        for model in self._providers.values():
+        for model in self._agno_providers.values():
             wire_model_runtime(model, db=db)
+        if self._claude_registry is not None:
+            wire_model_runtime(self._claude_registry, db=db)
 
     def set_mcp_pool(self, pool: Any) -> None:
-        """Receive the process-wide MCPPool. Re-wires already-created tier providers."""
         self._mcp_pool = pool
-        for model in self._providers.values():
+        for model in self._agno_providers.values():
             wire_model_runtime(model, mcp_pool=pool)
+        if self._claude_registry is not None:
+            wire_model_runtime(self._claude_registry, mcp_pool=pool)
 
     async def cleanup_idle(self) -> None:
-        for model in self._providers.values():
-            cleanup_idle = getattr(model, "cleanup_idle", None)
-            if callable(cleanup_idle):
-                await cleanup_idle()
+        for model in self._agno_providers.values():
+            fn = getattr(model, "cleanup_idle", None)
+            if callable(fn):
+                await fn()
+        if self._claude_registry is not None:
+            fn = getattr(self._claude_registry, "cleanup_idle", None)
+            if callable(fn):
+                await fn()
 
     async def shutdown(self) -> None:
-        for model in self._providers.values():
-            shutdown = getattr(model, "shutdown", None)
-            if callable(shutdown):
-                await shutdown()
+        for model in self._agno_providers.values():
+            fn = getattr(model, "shutdown", None)
+            if callable(fn):
+                await fn()
+        if self._claude_registry is not None:
+            fn = getattr(self._claude_registry, "shutdown", None)
+            if callable(fn):
+                await fn()
 
     async def close_session(self, session_id: str) -> None:
         if not session_id:
             return
         self._last_tier_by_session.pop(session_id, None)
-        for model in self._providers.values():
-            close_session = getattr(model, "close_session", None)
-            if callable(close_session):
-                await close_session(session_id)
+        self._session_side.pop(session_id, None)
+        # Wipe the agno-side binding too; claude-cli's own close_session
+        # below keeps its sdk_sessions entry alive so `/clear` can
+        # distinguish "release subprocess" from "forget conversation".
+        if self._db is not None:
+            try:
+                await self._db.delete_session_binding(session_id)
+            except Exception as e:  # noqa: BLE001 — best effort
+                logger.debug("delete_session_binding %s: %s", session_id, e)
+        for model in self._agno_providers.values():
+            fn = getattr(model, "close_session", None)
+            if callable(fn):
+                await fn(session_id)
+        if self._claude_registry is not None:
+            fn = getattr(self._claude_registry, "close_session", None)
+            if callable(fn):
+                await fn(session_id)
 
-    def _get_provider(self, model: str) -> BaseModel:
-        if is_claude_cli_model(model):
-            # Defence-in-depth: claude-cli is a standalone provider with its own
-            # history_mode ("provider") and its own usage_log writer. The routing
-            # input is already filtered (see __init__ stripping), so reaching
-            # here implies a programming bug — fail loudly rather than violate
-            # the SmartRouter ↔ ClaudeCLI isolation invariant.
-            raise RuntimeError(
-                f"SmartRouter cannot dispatch to claude-cli model '{model}'. "
-                "Switch the agent's model.provider to 'claude-cli' instead."
-            )
-        if model not in self._providers:
-            self._providers[model] = create_model_from_spec(
-                model,
+    # ── dispatch plumbing ───────────────────────────────────────────
+
+    def _get_agno_provider(self, runtime_id: str) -> BaseModel:
+        if runtime_id not in self._agno_providers:
+            self._agno_providers[runtime_id] = create_model_from_spec(
+                runtime_id,
                 providers_config=self._providers_config,
                 api_key=self._api_key,
                 claude_permission_mode=self._claude_permission_mode,
                 db=self._db,
                 mcp_pool=self._mcp_pool,
             )
-        return self._providers[model]
+        return self._agno_providers[runtime_id]
+
+    def _get_claude_registry(self) -> BaseModel:
+        if self._claude_registry is None:
+            from openagent.models.claude_cli import ClaudeCLIRegistry
+
+            self._claude_registry = ClaudeCLIRegistry(
+                default_model=None,
+                permission_mode=self._claude_permission_mode,
+                providers_config=self._providers_config,
+            )
+            if self._db is not None:
+                wire_model_runtime(self._claude_registry, db=self._db)
+            if self._mcp_pool is not None:
+                wire_model_runtime(self._claude_registry, mcp_pool=self._mcp_pool)
+        return self._claude_registry
+
+    @staticmethod
+    def _side_for_model(runtime_id: str) -> str:
+        return SIDE_CLAUDE_CLI if is_claude_cli_model(runtime_id) else SIDE_AGNO
+
+    async def _hydrate_bound_side(self, session_id: str) -> str | None:
+        """Populate the in-memory side cache from the DB once per session."""
+        if session_id in self._session_side:
+            return self._session_side[session_id]
+        if self._db is None:
+            return None
+        try:
+            side = await self._db.get_session_binding(session_id)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("get_session_binding %s: %s", session_id, e)
+            return None
+        if side:
+            self._session_side[session_id] = side
+        return side
+
+    async def _persist_bound_side(self, session_id: str, side: str) -> None:
+        self._session_side[session_id] = side
+        # Claude-cli bindings also land in ``sdk_sessions`` via the
+        # registry's own write path (ClaudeCLI._persist_sdk_session);
+        # the session_bindings row is useful but redundant, so skip it.
+        if side == SIDE_CLAUDE_CLI or self._db is None:
+            return
+        try:
+            await self._db.set_session_binding(session_id, side)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("set_session_binding %s: %s", session_id, e)
+
+    # ── classifier + routing ─────────────────────────────────────────
 
     async def _classify(self, messages: list[dict[str, Any]], session_id: str | None = None) -> str:
         user_msg = ""
@@ -203,7 +326,6 @@ class SmartRouter(BaseModel):
             if msg["role"] == "user":
                 user_msg = str(msg.get("content", ""))[:500]
                 break
-
         if not user_msg:
             elog("router.classify_default", session_id=session_id, tier="medium", reason="empty_user_message")
             return "medium"
@@ -214,19 +336,22 @@ class SmartRouter(BaseModel):
             return "hard"
 
         try:
-            elog(
-                "router.classify_start",
-                session_id=session_id,
-                classifier_model=self._classifier_model,
-                prompt_len=len(user_msg),
-            )
-            provider = self._get_provider(self._classifier_model)
             classifier_session_id = f"{session_id}:classifier" if session_id else "router-classifier"
             classifier_input = (
                 f"{CLASSIFIER_PROMPT}\n\n"
                 f"Task to classify:\n{user_msg}\n\n"
                 "Answer:"
             )
+            elog(
+                "router.classify_start",
+                session_id=session_id,
+                classifier_model=self._classifier_model,
+                prompt_len=len(user_msg),
+            )
+            # The classifier always runs against an Agno model — it's a
+            # cheap throwaway probe and claude-cli can't serve a
+            # sub-session without polluting the parent's history.
+            provider = self._get_agno_provider(self._classifier_model)
             resp = await provider.generate(
                 messages=[{"role": "user", "content": classifier_input}],
                 session_id=classifier_session_id,
@@ -234,21 +359,10 @@ class SmartRouter(BaseModel):
             text = resp.content.strip().lower()
             for tier in TIERS:
                 if tier in text:
-                    elog(
-                        "router.classify_result",
-                        session_id=session_id,
-                        classifier_model=self._classifier_model,
-                        tier=tier,
-                        raw=text[:80],
-                    )
+                    elog("router.classify_result", session_id=session_id, tier=tier, raw=text[:80])
                     return tier
         except Exception as e:
-            elog(
-                "router.classify_error",
-                session_id=session_id,
-                classifier_model=self._classifier_model,
-                error=str(e),
-            )
+            elog("router.classify_error", session_id=session_id, error=str(e))
 
         elog("router.classify_default", session_id=session_id, tier="medium", reason="unrecognized_classifier_output")
         return "medium"
@@ -256,33 +370,41 @@ class SmartRouter(BaseModel):
     def _pick_model(self, tier: str, budget_ratio: float) -> tuple[str, str, str]:
         effective_tier = tier
         reason = "tier"
-
         if budget_ratio <= 0:
-            effective_tier = "fallback"
-            reason = "budget_exhausted"
+            effective_tier, reason = "fallback", "budget_exhausted"
             return self._routing.get("fallback", self._routing.get("simple", "")), effective_tier, reason
         if budget_ratio < 0.05:
-            effective_tier = "fallback"
-            reason = "budget_critical"
+            effective_tier, reason = "fallback", "budget_critical"
             return self._routing.get("fallback", self._routing.get("simple", "")), effective_tier, reason
         if budget_ratio < 0.20:
-            effective_tier = "simple"
-            reason = "budget_degraded"
-
+            effective_tier, reason = "simple", "budget_degraded"
         return self._routing.get(effective_tier, self._routing.get("medium", "")), effective_tier, reason
 
-    def _configured_models(self, history_mode: str | None = None) -> list[str]:
-        return [
-            entry.runtime_id
-            for entry in iter_configured_models(self._providers_config, history_mode=history_mode)
-        ]
+    def _configured_models_for_side(self, side: str | None) -> list[str]:
+        result: list[str] = []
+        for entry in iter_configured_models(self._providers_config):
+            if side and self._side_for_model(entry.runtime_id) != side:
+                continue
+            result.append(entry.runtime_id)
+        return result
 
-    def _candidate_models(self, requested_tier: str, effective_tier: str, primary_model: str) -> list[str]:
+    def _candidate_models(
+        self,
+        requested_tier: str,
+        effective_tier: str,
+        primary_model: str,
+        bound_side: str | None,
+    ) -> list[str]:
+        """Build the fallback chain, restricted to ``bound_side`` if set."""
+        want_side = bound_side or self._side_for_model(primary_model)
         candidates: list[str] = []
 
         def add(model_id: str | None) -> None:
-            if model_id and model_id not in candidates:
-                candidates.append(model_id)
+            if not model_id or model_id in candidates:
+                return
+            if self._side_for_model(model_id) != want_side:
+                return
+            candidates.append(model_id)
 
         add(primary_model)
         add(self._routing.get("fallback"))
@@ -290,12 +412,9 @@ class SmartRouter(BaseModel):
         add(self._routing.get("medium"))
         add(self._routing.get("simple"))
         add(self._routing.get("hard"))
-
-        primary_mode = model_history_mode(primary_model, self._providers_config)
-        for model_id in self._configured_models(history_mode=primary_mode):
+        for model_id in self._configured_models_for_side(want_side):
             add(model_id)
-
-        return [model_id for model_id in candidates if model_history_mode(model_id, self._providers_config) == primary_mode]
+        return candidates
 
     async def _budget_ratio(self, session_id: str | None = None) -> float:
         ratio = 1.0
@@ -305,21 +424,20 @@ class SmartRouter(BaseModel):
         return ratio
 
     def _remember_tier(self, session_id: str | None, tier: str) -> None:
-        if session_id:
-            self._last_tier_by_session[session_id] = tier
-        else:
-            self._last_tier_by_session["__default__"] = tier
+        key = session_id or "__default__"
+        self._last_tier_by_session[key] = tier
 
     def _recall_tier(self, session_id: str | None) -> str:
-        if session_id:
-            return self._last_tier_by_session.get(session_id, "medium")
-        return self._last_tier_by_session.get("__default__", "medium")
+        key = session_id or "__default__"
+        return self._last_tier_by_session.get(key, "medium")
 
-    def _is_retryable_response(self, response: ModelResponse) -> bool:
+    @staticmethod
+    def _is_retryable_response(response: ModelResponse) -> bool:
         stop_reason = (response.stop_reason or "").strip().lower()
         return stop_reason in {"error", "timeout", "rate_limit", "provider_error", "service_unavailable"}
 
-    def _is_tool_continuation(self, messages: list[dict[str, Any]]) -> bool:
+    @staticmethod
+    def _is_tool_continuation(messages: list[dict[str, Any]]) -> bool:
         return bool(messages and messages[-1].get("role") == "tool")
 
     async def _resolve_requested_tier(self, messages: list[dict[str, Any]], session_id: str | None) -> str:
@@ -327,7 +445,6 @@ class SmartRouter(BaseModel):
             tier = self._recall_tier(session_id)
             elog("router.continuation", session_id=session_id, tier=tier)
             return tier
-
         tier = await self._classify(messages, session_id=session_id)
         self._remember_tier(session_id, tier)
         return tier
@@ -338,15 +455,63 @@ class SmartRouter(BaseModel):
         session_id: str | None,
         budget_ratio: float,
     ) -> RoutingDecision:
+        bound_side = (
+            await self._hydrate_bound_side(session_id) if session_id else None
+        )
+
         requested_tier = await self._resolve_requested_tier(messages, session_id)
         primary_model, effective_tier, reason = self._pick_model(requested_tier, budget_ratio)
-        candidates = self._candidate_models(requested_tier, effective_tier, primary_model)
+
+        # If the session is already bound and the classifier's pick lives
+        # on the wrong side, substitute the first configured model on
+        # the bound side. Failing that, leave ``primary_model`` as-is
+        # and let the candidate filter raise downstream.
+        if bound_side and primary_model and self._side_for_model(primary_model) != bound_side:
+            for alt in self._configured_models_for_side(bound_side):
+                primary_model = alt
+                reason = f"bound_to_{bound_side}"
+                break
+            else:
+                primary_model = ""
+
+        candidates = self._candidate_models(requested_tier, effective_tier, primary_model, bound_side)
         return RoutingDecision(
             requested_tier=requested_tier,
             effective_tier=effective_tier,
             reason=reason,
             primary_model=primary_model,
             candidates=candidates,
+            bound_side=bound_side,
+        )
+
+    # ── provider dispatch ────────────────────────────────────────────
+
+    async def _dispatch(
+        self,
+        runtime_id: str,
+        messages: list[dict[str, Any]],
+        system: str | None,
+        tools: list[dict[str, Any]] | None,
+        on_status: Callable[[str], Awaitable[None]] | None,
+        session_id: str | None,
+    ) -> ModelResponse:
+        if is_claude_cli_model(runtime_id):
+            registry = self._get_claude_registry()
+            return await registry.generate(
+                messages,
+                system=system,
+                tools=tools,
+                on_status=on_status,
+                session_id=session_id,
+                model_override=runtime_id,
+            )
+        provider = self._get_agno_provider(runtime_id)
+        return await provider.generate(
+            messages,
+            system=system,
+            tools=tools,
+            on_status=on_status,
+            session_id=session_id,
         )
 
     async def generate(
@@ -367,9 +532,21 @@ class SmartRouter(BaseModel):
             )
 
         decision = await self._routing_decision(messages, session_id, budget_ratio)
-        if not decision.primary_model:
-            elog("router.error", session_id=session_id, tier=decision.requested_tier, routing=self._routing)
-            return ModelResponse(content="No model configured for this task tier.", stop_reason="error")
+        if not decision.primary_model or not decision.candidates:
+            # Bound-side has no enabled model, or routing is empty.
+            msg = (
+                f"No {decision.bound_side} model available for this session."
+                if decision.bound_side
+                else "No model configured for this task tier."
+            )
+            elog(
+                "router.error",
+                session_id=session_id,
+                tier=decision.requested_tier,
+                routing=self._routing,
+                bound_side=decision.bound_side,
+            )
+            return ModelResponse(content=msg, stop_reason="error")
 
         elog(
             "router.route",
@@ -378,15 +555,15 @@ class SmartRouter(BaseModel):
             effective_tier=decision.effective_tier,
             reason=decision.reason,
             model=decision.primary_model,
+            bound_side=decision.bound_side,
             budget_ratio=round(budget_ratio, 3),
         )
         elog("router.candidates", session_id=session_id, models=decision.candidates)
 
-        resp = None
+        resp: ModelResponse | None = None
         active_model_id = decision.primary_model
         last_error: Exception | None = None
         for attempt, candidate_model in enumerate(decision.candidates, start=1):
-            provider = self._get_provider(candidate_model)
             if attempt > 1:
                 elog(
                     "router.retry",
@@ -396,12 +573,8 @@ class SmartRouter(BaseModel):
                     previous_error=str(last_error) if last_error else None,
                 )
             try:
-                resp = await provider.generate(
-                    messages,
-                    system=system,
-                    tools=tools,
-                    on_status=on_status,
-                    session_id=session_id,
+                resp = await self._dispatch(
+                    candidate_model, messages, system, tools, on_status, session_id,
                 )
                 if self._is_retryable_response(resp):
                     raise RuntimeError(resp.content or resp.stop_reason or "provider returned an error response")
@@ -421,6 +594,12 @@ class SmartRouter(BaseModel):
         if resp is None:
             assert last_error is not None
             raise last_error
+
+        # Persist the binding once we've served at least one turn. The
+        # claude-cli path auto-writes to ``sdk_sessions`` via the
+        # registry, so we only need to write the agno row here.
+        if session_id:
+            await self._persist_bound_side(session_id, self._side_for_model(active_model_id))
 
         if self._budget:
             cost = BudgetTracker.compute_cost(
@@ -446,19 +625,9 @@ class SmartRouter(BaseModel):
                     cost_usd=cost,
                 )
             except Exception as e:
-                elog(
-                    "router.cost_record_error",
-                    session_id=session_id,
-                    model=active_model_id,
-                    error=str(e),
-                )
+                elog("router.cost_record_error", session_id=session_id, model=active_model_id, error=str(e))
         else:
-            elog(
-                "router.cost_skipped",
-                session_id=session_id,
-                model=active_model_id,
-                reason="no_budget_tracker",
-            )
+            elog("router.cost_skipped", session_id=session_id, model=active_model_id, reason="no_budget_tracker")
 
         resp.model = active_model_id
         return resp
@@ -469,7 +638,19 @@ class SmartRouter(BaseModel):
         system: str | None = None,
         tools: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[str]:
-        model_id = self._routing.get("medium", self._routing.get("simple", ""))
-        provider = self._get_provider(model_id)
+        """Streaming path — agno-only (claude-cli isn't streamable here).
+
+        Used by the REST smoke-test endpoint; the interactive turn
+        surface always goes through ``generate`` which handles both
+        sides.
+        """
+        model_id = self._routing.get("medium") or self._routing.get("simple") or ""
+        if is_claude_cli_model(model_id):
+            # Fall back to whichever agno model the router knows about.
+            for candidate in self._routing.values():
+                if not is_claude_cli_model(candidate):
+                    model_id = candidate
+                    break
+        provider = self._get_agno_provider(model_id)
         async for chunk in provider.stream(messages, system=system, tools=tools):
             yield chunk

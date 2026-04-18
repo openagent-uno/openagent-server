@@ -36,6 +36,57 @@ async def t_list_mcps(ctx: TestContext) -> None:
     assert isinstance(data["mcps"], list)
 
 
+@test("mcps_rest", "DELETE refuses builtin (kind != 'custom'), allows disable")
+async def t_delete_builtin_refused(ctx: TestContext) -> None:
+    from openagent.memory.db import MemoryDB
+    import uuid as _uuid
+
+    tmp = ctx.db_path.with_name(f"mcps-builtin-{_uuid.uuid4().hex[:8]}.db")
+    try:
+        db = MemoryDB(str(tmp))
+        await db.connect()
+        # Simulate a default row written by the bootstrap.
+        await db.upsert_mcp(
+            "shell",
+            kind="default",
+            builtin_name="shell",
+            enabled=True,
+            source="yaml-default",
+        )
+        # Direct DB delete IS possible (belt and braces); the guard lives
+        # one level up in the REST + MCP manager surfaces. Test the REST
+        # path here since it's the one users hit.
+        from openagent.gateway.api import mcps as mcps_rest
+
+        class _FakeRequest:
+            match_info = {"name": "shell"}
+            class _FakeApp:
+                def __init__(self, agent_db):
+                    self._gw = type("GW", (), {"agent": type("A", (), {"memory_db": agent_db})()})()
+                def __getitem__(self, key):
+                    return self._gw if key == "gateway" else None
+            def __init__(self, agent_db):
+                self.app = self._FakeApp(agent_db)
+
+        fake = _FakeRequest(db)
+        resp = await mcps_rest.handle_delete(fake)
+        assert resp.status == 400, resp.status
+        # aiohttp.web.Response.text is a property (str), not a coroutine.
+        body = resp.text or ""
+        assert "builtin" in body.lower() or "refusing" in body.lower(), body
+        # Row still present
+        assert await db.get_mcp("shell") is not None
+        # Disable should still work
+        await db.set_mcp_enabled("shell", False)
+        assert (await db.get_mcp("shell"))["enabled"] is False
+        await db.close()
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
 @test("mcps_rest", "POST /api/mcps creates, DELETE removes")
 async def t_create_delete_mcp(ctx: TestContext) -> None:
     port = ctx.extras.get("gateway_port")

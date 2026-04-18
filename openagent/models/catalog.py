@@ -119,7 +119,10 @@ def build_runtime_model_id(provider_name: str, model_id: str) -> str:
         if prefix == CLAUDE_CLI_PROVIDER:
             return raw
         return f"{prefix}:{rest}"
-    return f"{provider_name}:{raw}"
+    # claude-cli uses a ``/`` separator so ``is_claude_cli_model`` can
+    # recognise the result; everyone else uses ``:``.
+    sep = "/" if provider_name == CLAUDE_CLI_PROVIDER else ":"
+    return f"{provider_name}{sep}{raw}"
 
 
 def normalize_runtime_model_id(model_ref: str, providers_config: dict | None = None) -> str:
