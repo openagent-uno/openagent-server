@@ -155,9 +155,10 @@ async def ensure_builtin_mcps(db: MemoryDB) -> int:
     """
     from openagent.mcp.builtins import BUILTIN_MCP_SPECS
 
+    existing = {row["name"] for row in await db.list_mcps()}
     added = 0
     for builtin_name in BUILTIN_MCP_SPECS:
-        if await db.get_mcp(builtin_name) is not None:
+        if builtin_name in existing:
             continue
         await db.upsert_mcp(
             builtin_name,

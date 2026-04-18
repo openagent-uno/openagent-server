@@ -35,6 +35,7 @@ from openagent.core.logging import elog
 from openagent.models.base import BaseModel, ModelResponse
 from openagent.models.budget import BudgetTracker
 from openagent.models.catalog import (
+    framework_of,
     is_claude_cli_model,
     iter_configured_models,
     model_history_mode,
@@ -287,10 +288,6 @@ class SmartRouter(BaseModel):
                 wire_model_runtime(self._claude_registry, mcp_pool=self._mcp_pool)
         return self._claude_registry
 
-    @staticmethod
-    def _framework_for_model(runtime_id: str) -> str:
-        return FRAMEWORK_CLAUDE_CLI if is_claude_cli_model(runtime_id) else FRAMEWORK_AGNO
-
     async def _hydrate_bound_framework(self, session_id: str) -> str | None:
         """Populate the in-memory side cache from the DB once per session."""
         if session_id in self._session_framework:
@@ -383,7 +380,7 @@ class SmartRouter(BaseModel):
     def _configured_models_for_framework(self, side: str | None) -> list[str]:
         result: list[str] = []
         for entry in iter_configured_models(self._providers_config):
-            if side and self._framework_for_model(entry.runtime_id) != side:
+            if side and framework_of(entry.runtime_id) != side:
                 continue
             result.append(entry.runtime_id)
         return result
@@ -396,13 +393,13 @@ class SmartRouter(BaseModel):
         bound_framework: str | None,
     ) -> list[str]:
         """Build the fallback chain, restricted to ``bound_framework`` if set."""
-        want_side = bound_framework or self._framework_for_model(primary_model)
+        want_side = bound_framework or framework_of(primary_model)
         candidates: list[str] = []
 
         def add(model_id: str | None) -> None:
             if not model_id or model_id in candidates:
                 return
-            if self._framework_for_model(model_id) != want_side:
+            if framework_of(model_id) != want_side:
                 return
             candidates.append(model_id)
 
@@ -466,7 +463,7 @@ class SmartRouter(BaseModel):
                 logger.debug("get_session_pin failed for %s: %s", session_id, e)
                 pinned_id = None
             if pinned_id:
-                side = self._framework_for_model(pinned_id)
+                side = framework_of(pinned_id)
                 return RoutingDecision(
                     requested_tier="pinned",
                     effective_tier="pinned",
@@ -487,7 +484,7 @@ class SmartRouter(BaseModel):
         # on the wrong side, substitute the first configured model on
         # the bound side. Failing that, leave ``primary_model`` as-is
         # and let the candidate filter raise downstream.
-        if bound_framework and primary_model and self._framework_for_model(primary_model) != bound_framework:
+        if bound_framework and primary_model and framework_of(primary_model) != bound_framework:
             for alt in self._configured_models_for_framework(bound_framework):
                 primary_model = alt
                 reason = f"bound_to_{bound_framework}"
@@ -620,7 +617,7 @@ class SmartRouter(BaseModel):
         # claude-cli path auto-writes to ``sdk_sessions`` via the
         # registry, so we only need to write the agno row here.
         if session_id:
-            await self._persist_bound_framework(session_id, self._framework_for_model(active_model_id))
+            await self._persist_bound_framework(session_id, framework_of(active_model_id))
 
         if self._budget:
             cost = BudgetTracker.compute_cost(

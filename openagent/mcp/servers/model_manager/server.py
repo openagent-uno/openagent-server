@@ -415,41 +415,35 @@ async def pin_session(session_id: str, runtime_id: str) -> dict[str, Any]:
     Subsequent turns on this session skip the SmartRouter classifier
     and dispatch straight to ``runtime_id``. Use this when the user
     asks "force/always use model X for me" — e.g.
-    ``pin_session(session_id, "claude-cli/claude-opus-4-6")``.
+    ``pin_session(session_id, "claude-cli:anthropic:claude-opus-4-6")``.
 
     The agent can find its current ``session_id`` in the
     ``<session-id>...</session-id>`` tag of the framework system
     prompt.
 
-    Use ``unpin_session`` to release the pin.
+    Raises if the pinned model belongs to a different framework than
+    the session's existing binding (pinning a claude-cli session to an
+    agno model would split conversation history across two stores).
+    Use ``unpin_session`` to release.
     """
-    if not session_id or not session_id.strip():
+    session_id = (session_id or "").strip()
+    runtime_id = (runtime_id or "").strip()
+    if not session_id:
         raise ValueError("session_id is required")
-    if not runtime_id or not runtime_id.strip():
+    if not runtime_id:
         raise ValueError("runtime_id is required")
-    # Validate the model exists and is enabled before pinning, else
-    # the session would start failing every turn with "no model
-    # available".
     conn = await _get_conn()
+    # Enabled-model precheck: pin to a missing or disabled model would
+    # start failing every turn with "no model available".
     cursor = await conn.execute(
         "SELECT enabled FROM models WHERE runtime_id = ?", (runtime_id,),
     )
     row = await cursor.fetchone()
     if row is None:
-        raise ValueError(
-            f"Model {runtime_id!r} is not registered. Use add_model first."
-        )
+        raise ValueError(f"Model {runtime_id!r} is not registered. Use add_model first.")
     if not row[0]:
-        raise ValueError(
-            f"Model {runtime_id!r} is disabled. Enable it before pinning."
-        )
-    from openagent.memory.db import MemoryDB
-    db = MemoryDB(_db_path_for_helper())
-    await db.connect()
-    try:
-        await db.pin_session_model(session_id.strip(), runtime_id.strip())
-    finally:
-        await db.close()
+        raise ValueError(f"Model {runtime_id!r} is disabled. Enable it before pinning.")
+    await _pin_on_shared_conn(conn, session_id, runtime_id)
     return {"session_id": session_id, "runtime_id": runtime_id, "pinned": True}
 
 
@@ -458,30 +452,56 @@ async def unpin_session(session_id: str) -> dict[str, Any]:
     """Clear the per-session model pin on ``session_id``.
 
     The session returns to normal SmartRouter routing (classifier →
-    tier → model) on the next turn, while keeping its side binding
-    (agno or claude-cli) intact.
+    tier → model) on the next turn, while keeping its framework
+    binding (agno or claude-cli) intact.
     """
-    if not session_id or not session_id.strip():
+    session_id = (session_id or "").strip()
+    if not session_id:
         raise ValueError("session_id is required")
-    from openagent.memory.db import MemoryDB
-    db = MemoryDB(_db_path_for_helper())
-    await db.connect()
-    try:
-        await db.unpin_session_model(session_id.strip())
-    finally:
-        await db.close()
+    conn = await _get_conn()
+    await conn.execute(
+        "UPDATE session_bindings SET runtime_id = NULL, bound_at = ? WHERE session_id = ?",
+        (time.time(), session_id),
+    )
+    await conn.commit()
     return {"session_id": session_id, "pinned": False}
 
 
-def _db_path_for_helper() -> str:
-    """Resolve the DB path for one-shot MemoryDB instances inside tools.
-
-    The shared aiosqlite connection is fine for raw SELECT/INSERT but
-    some helpers (``pin_session_model``, ``unpin_session_model``) live
-    on ``MemoryDB`` and expect a full connection lifecycle. We open
-    against the same path the shared connection uses.
+async def _pin_on_shared_conn(conn, session_id: str, runtime_id: str) -> None:
+    """Mirror of ``MemoryDB.pin_session_model`` against the subprocess's
+    shared aiosqlite connection, so the tool doesn't pay the cost of
+    opening a second connection + re-running schema migrations every
+    pin. Kept in sync with the MemoryDB method's framework-lock logic.
     """
-    return os.environ.get("OPENAGENT_DB_PATH") or "openagent.db"
+    target_framework = "claude-cli" if runtime_id.startswith("claude-cli") else "agno"
+    # Look up the existing framework binding — sdk_sessions (source of
+    # truth for claude-cli) then session_bindings (agno).
+    cursor = await conn.execute(
+        "SELECT provider FROM sdk_sessions WHERE session_id = ?", (session_id,),
+    )
+    row = await cursor.fetchone()
+    existing = row[0] if row and row[0] else None
+    if not existing:
+        cursor = await conn.execute(
+            "SELECT provider FROM session_bindings WHERE session_id = ?", (session_id,),
+        )
+        row = await cursor.fetchone()
+        existing = row[0] if row and row[0] else None
+    if existing and existing != target_framework:
+        raise ValueError(
+            f"session {session_id!r} is bound to framework={existing!r} and "
+            f"cannot be pinned to a {target_framework!r} model — conversation "
+            "history lives in the current framework's store. Use /clear first."
+        )
+    await conn.execute(
+        "INSERT INTO session_bindings (session_id, provider, bound_at, runtime_id) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(session_id) DO UPDATE SET "
+        "provider = excluded.provider, bound_at = excluded.bound_at, "
+        "runtime_id = excluded.runtime_id",
+        (session_id, target_framework, time.time(), runtime_id),
+    )
+    await conn.commit()
 
 
 @mcp.tool()

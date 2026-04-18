@@ -220,8 +220,7 @@ async def handle_test(request: web.Request) -> web.Response:
 # ──────────────────────────────────────────────────────────────────────
 
 
-def _db(request):
-    return request.app["gateway"].agent.memory_db
+from openagent.gateway.api._common import gateway_db as _db  # noqa: E402
 
 
 async def handle_list_db(request: web.Request) -> web.Response:

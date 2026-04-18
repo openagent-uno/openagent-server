@@ -19,8 +19,7 @@ if TYPE_CHECKING:
     from aiohttp import web
 
 
-def _db(request):
-    return request.app["gateway"].agent.memory_db
+from openagent.gateway.api._common import gateway_db as _db  # noqa: E402
 
 
 async def handle_get(request):

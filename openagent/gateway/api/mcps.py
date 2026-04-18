@@ -22,15 +22,7 @@ if TYPE_CHECKING:
     from aiohttp import web
 
 
-def _db(request):
-    """Return the ``MemoryDB`` instance held by the running Agent.
-
-    Lives on ``request.app["gateway"].agent._memory`` (private attr used
-    elsewhere in the codebase — see ``_process_message``). Raising a
-    loud error here beats a quiet ``None`` fallback when the gateway is
-    misconfigured: handlers explicitly 500 when the DB is absent.
-    """
-    return request.app["gateway"].agent.memory_db
+from openagent.gateway.api._common import gateway_db as _db  # noqa: E402
 
 
 async def handle_list(request):
