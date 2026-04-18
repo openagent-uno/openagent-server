@@ -35,6 +35,57 @@ pub fn api_to_logical(x: i32, y: i32, logical_w: u32, logical_h: u32) -> (i32, i
     ((x as f64 * s).round() as i32, (y as f64 * s).round() as i32)
 }
 
+/// A cropping rectangle in logical screen pixels. Used for both screenshot
+/// and screen-recording ROI. Produced by [`api_region_to_logical`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogicalRegion {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+}
+
+/// Convert an `(x, y, w, h)` ROI from API image coords to logical screen coords,
+/// clamping to `[0, logical_w) x [0, logical_h)`. Returns `Err` if the region
+/// has zero area after clamping or if any dimension is negative.
+///
+/// ROI is expressed in API image space (the same space Claude sees and clicks in)
+/// to match the existing `coordinate` convention in [`super::tool::ComputerArgs`].
+pub fn api_region_to_logical(
+    region: [i32; 4],
+    logical_w: u32,
+    logical_h: u32,
+) -> Result<LogicalRegion, String> {
+    let [ax, ay, aw, ah] = region;
+    if aw <= 0 || ah <= 0 {
+        return Err(format!(
+            "region width and height must be positive, got [{ax},{ay},{aw},{ah}]"
+        ));
+    }
+    let s = api_to_logical_scale(logical_w, logical_h);
+    let lx = (ax as f64 * s).round() as i32;
+    let ly = (ay as f64 * s).round() as i32;
+    let lw = (aw as f64 * s).round() as i32;
+    let lh = (ah as f64 * s).round() as i32;
+
+    let x0 = lx.max(0) as u32;
+    let y0 = ly.max(0) as u32;
+    let x1 = (lx + lw).min(logical_w as i32).max(0) as u32;
+    let y1 = (ly + lh).min(logical_h as i32).max(0) as u32;
+
+    if x1 <= x0 || y1 <= y0 {
+        return Err(format!(
+            "region [{ax},{ay},{aw},{ah}] falls outside display bounds {logical_w}x{logical_h}"
+        ));
+    }
+    Ok(LogicalRegion {
+        x: x0,
+        y: y0,
+        w: x1 - x0,
+        h: y1 - y0,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,6 +123,35 @@ mod tests {
         // (100 * 2.8553).round() = 286.
         let (lx, ly) = api_to_logical(100, 100, 3840, 2560);
         assert_eq!((lx, ly), (286, 286));
+    }
+
+    #[test]
+    fn api_region_to_logical_clamps_and_scales() {
+        // 3840x2560 display → api_to_logical scale ≈ 2.8553 (pixel-count constraint).
+        // ROI [100, 100, 200, 200] in API space → logical [286, 286, 571, 571].
+        let r = api_region_to_logical([100, 100, 200, 200], 3840, 2560).unwrap();
+        assert_eq!((r.x, r.y), (286, 286));
+        assert_eq!((r.w, r.h), (571, 571));
+    }
+
+    #[test]
+    fn api_region_to_logical_rejects_out_of_bounds() {
+        assert!(api_region_to_logical([100_000, 100_000, 10, 10], 1920, 1080).is_err());
+        assert!(api_region_to_logical([-10, -10, 5, 5], 1920, 1080).is_err());
+        assert!(api_region_to_logical([0, 0, 0, 10], 1920, 1080).is_err());
+        assert!(api_region_to_logical([0, 0, 10, -5], 1920, 1080).is_err());
+    }
+
+    #[test]
+    fn api_region_to_logical_clamps_partial_overlap() {
+        // On a display small enough that API == logical (no downsample), a
+        // region running past the right edge is clamped to the display width
+        // rather than being rejected outright. Picks 800x600 so size_to_api_scale
+        // is exactly 1.0 and coordinate arithmetic is trivial to verify.
+        let r = api_region_to_logical([700, 400, 200, 100], 800, 600).unwrap();
+        assert_eq!(r.x, 700);
+        assert_eq!(r.x + r.w, 800);
+        assert_eq!(r.y + r.h, 500);
     }
 
     #[test]

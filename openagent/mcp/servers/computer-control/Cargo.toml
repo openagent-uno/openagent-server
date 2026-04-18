@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 rmcp = { version = "1.4", features = ["server", "transport-io"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "signal", "time", "sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
@@ -23,6 +23,15 @@ xcap = "0.7"
 image = { version = "0.25", default-features = false, features = ["png"] }
 fast_image_resize = "5"
 base64 = "0.22"
+# Screen recording pipeline:
+#   openh264  — pure-Rust H.264 encoder (Cisco binding; downloads prebuilt blob
+#               at build time to sidestep patent licensing, same approach Firefox uses)
+#   mp4       — pure-Rust MP4 muxer for standard .mp4 output playable in
+#               QuickTime / Chrome / VLC without extra codecs.
+#   bytes     — required by mp4 crate for sample payloads.
+openh264 = "0.9"
+mp4 = "0.14"
+bytes = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # macos-accessibility-client: triggers the TCC Accessibility prompt
