@@ -227,11 +227,18 @@ def _bundled_fallback(provider: str) -> list[dict[str, Any]]:
     We already ship a pricing table with ``<provider>:<model>`` keys;
     reusing it avoids maintaining a second bundled file. Display name
     is the bare id since the pricing JSON has no human-readable names.
+
+    Special case ``claude-cli``: the pricing table only has a single
+    ``"claude-cli"`` entry (not ``claude-cli:<model>`` rows), so a
+    naive prefix filter returns nothing. Because claude-cli dispatches
+    arbitrary Anthropic model ids through the ``claude`` binary, we
+    mirror the ``anthropic:*`` pricing rows as the catalog.
     """
     pricing = _load_default_pricing()
+    effective = "anthropic" if provider == "claude-cli" else provider
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
-    prefix = f"{provider}:"
+    prefix = f"{effective}:"
     for key, info in pricing.items():
         if not key.startswith(prefix):
             continue

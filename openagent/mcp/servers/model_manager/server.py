@@ -81,18 +81,137 @@ async def get_model(runtime_id: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-async def list_providers() -> list[str]:
-    """List providers supported by OpenAgent.
+async def list_supported_providers() -> list[str]:
+    """Every provider OpenAgent knows how to drive (code-level enum).
 
-    Includes all API-backed providers OpenAgent knows how to drive via
-    Agno, plus the ``claude-cli`` pseudo-provider. Whether each is
-    *usable* depends on whether the user has configured an API key
-    (for API providers) or installed the claude binary.
+    Listing something here does NOT mean the install can use it — the
+    user still needs to register an API key via ``add_provider``
+    (except for ``claude-cli``, which uses the installed ``claude``
+    binary instead).
     """
-    # Local import keeps the subprocess startup lean.
     from openagent.models.catalog import SUPPORTED_PROVIDERS, CLAUDE_CLI_PROVIDER
 
     return sorted(list(SUPPORTED_PROVIDERS) + [CLAUDE_CLI_PROVIDER])
+
+
+@mcp.tool()
+async def list_providers() -> list[dict[str, Any]]:
+    """What providers are currently configured in the yaml.
+
+    Returns one entry per configured provider with ``name``, ``has_api_key``,
+    ``base_url``, and ``configured_model_count`` (rows in the ``models``
+    table). Keys are not surfaced in cleartext — only the presence flag.
+    """
+    providers_cfg = _load_providers_from_yaml()
+    conn = await _get_conn()
+
+    out: list[dict[str, Any]] = []
+    for name, cfg in providers_cfg.items():
+        cfg = cfg or {}
+        cursor = await conn.execute(
+            "SELECT COUNT(*) FROM models WHERE provider = ?", (name,),
+        )
+        row = await cursor.fetchone()
+        count = int(row[0]) if row else 0
+        out.append({
+            "name": name,
+            "has_api_key": bool(cfg.get("api_key")),
+            "base_url": cfg.get("base_url") or None,
+            "configured_model_count": count,
+        })
+    return out
+
+
+@mcp.tool()
+async def add_provider(
+    name: str,
+    api_key: str,
+    base_url: str | None = None,
+) -> dict[str, Any]:
+    """Register a new LLM provider + credentials.
+
+    Writes ``providers.<name>`` to ``openagent.yaml`` with
+    ``api_key`` (and optional ``base_url``). Keys are the yaml's
+    source-of-truth — not stored in the DB. Once the provider is
+    configured, use ``list_available_models(provider=<name>)`` to see
+    what the provider exposes with that key, then ``add_model`` to
+    register specific runtime ids.
+    """
+    if not name or not name.strip():
+        raise ValueError("name is required")
+    if not api_key or not api_key.strip():
+        raise ValueError("api_key is required")
+    raw = _read_yaml()
+    providers = dict(raw.get("providers") or {})
+    entry: dict[str, Any] = dict(providers.get(name, {}) or {})
+    entry["api_key"] = api_key.strip()
+    if base_url is not None:
+        if base_url.strip():
+            entry["base_url"] = base_url.strip()
+        else:
+            entry.pop("base_url", None)
+    providers[name] = entry
+    raw["providers"] = providers
+    _write_yaml(raw)
+    # Return a sanitized entry (no cleartext key).
+    return {
+        "name": name,
+        "has_api_key": True,
+        "base_url": entry.get("base_url") or None,
+    }
+
+
+@mcp.tool()
+async def update_provider(
+    name: str,
+    api_key: str | None = None,
+    base_url: str | None = None,
+) -> dict[str, Any]:
+    """Patch ``providers.<name>`` in the yaml.
+
+    Only the fields you pass are changed. Pass ``base_url=''`` to clear
+    an existing base_url.
+    """
+    raw = _read_yaml()
+    providers = dict(raw.get("providers") or {})
+    if name not in providers:
+        raise ValueError(f"Provider {name!r} is not configured")
+    entry = dict(providers[name] or {})
+    if api_key is not None:
+        if not api_key.strip():
+            raise ValueError("api_key cannot be empty")
+        entry["api_key"] = api_key.strip()
+    if base_url is not None:
+        if base_url.strip():
+            entry["base_url"] = base_url.strip()
+        else:
+            entry.pop("base_url", None)
+    providers[name] = entry
+    raw["providers"] = providers
+    _write_yaml(raw)
+    return {
+        "name": name,
+        "has_api_key": bool(entry.get("api_key")),
+        "base_url": entry.get("base_url") or None,
+    }
+
+
+@mcp.tool()
+async def remove_provider(name: str) -> dict[str, Any]:
+    """Remove a provider from the yaml.
+
+    Any models already registered under this provider stay in the DB
+    but will start failing once the key is gone. Disable or remove
+    those models first if you want to clean up fully.
+    """
+    raw = _read_yaml()
+    providers = dict(raw.get("providers") or {})
+    if name not in providers:
+        raise ValueError(f"Provider {name!r} is not configured")
+    providers.pop(name)
+    raw["providers"] = providers
+    _write_yaml(raw)
+    return {"removed": True, "name": name}
 
 
 @mcp.tool()
@@ -304,6 +423,50 @@ def _load_providers_from_yaml() -> dict:
     except Exception as e:  # noqa: BLE001 — upstream YAML errors, etc.
         logger.warning("load_config failed in model-manager: %s", e)
         return {}
+
+
+def _yaml_path() -> str:
+    """Resolve the yaml path we're allowed to edit.
+
+    Precedence matches ``openagent.core.config.load_config``: env var
+    ``OPENAGENT_CONFIG_PATH`` wins, then CWD's ``openagent.yaml``, then
+    the platform-standard path. Writing to a missing path just creates
+    the file under its parent directory.
+    """
+    explicit = os.environ.get("OPENAGENT_CONFIG_PATH")
+    if explicit:
+        return os.path.expanduser(explicit)
+    cwd = os.path.abspath("openagent.yaml")
+    if os.path.exists(cwd):
+        return cwd
+    from openagent.core.paths import default_config_path
+    return str(default_config_path())
+
+
+def _read_yaml() -> dict[str, Any]:
+    """Read the yaml WITHOUT env-var resolution.
+
+    We want to write back later; resolving ``${VAR}`` now would
+    substitute the value and destroy the reference. The live
+    ``load_config`` path is still the right one for READERS, but this
+    helper is for read-modify-write cycles on the on-disk file.
+    """
+    import yaml
+
+    path = _yaml_path()
+    if not os.path.isfile(path):
+        return {}
+    with open(path) as f:
+        return yaml.safe_load(f) or {}
+
+
+def _write_yaml(data: dict[str, Any]) -> None:
+    import yaml
+
+    path = _yaml_path()
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w") as f:
+        yaml.dump(data, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
 
 
 def main() -> None:
