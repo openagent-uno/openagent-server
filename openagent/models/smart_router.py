@@ -79,8 +79,8 @@ HARD_HINTS = (
 
 # Canonical names used in DB ``session_bindings.provider`` and
 # ``sdk_sessions.provider``. Exported for tests.
-SIDE_AGNO = "agno"
-SIDE_CLAUDE_CLI = "claude-cli"
+FRAMEWORK_AGNO = "agno"
+FRAMEWORK_CLAUDE_CLI = "claude-cli"
 
 
 @dataclass(frozen=True)
@@ -90,7 +90,7 @@ class RoutingDecision:
     reason: str
     primary_model: str
     candidates: list[str]
-    bound_side: str | None = None
+    bound_framework: str | None = None
 
 
 class SmartRouter(BaseModel):
@@ -131,7 +131,7 @@ class SmartRouter(BaseModel):
         # routing decision doesn't re-hit the DB on every turn. Written
         # after first successful dispatch and kept in sync with the
         # ``close_session`` / ``forget_session`` wipes.
-        self._session_side: dict[str, str] = {}
+        self._session_framework: dict[str, str] = {}
 
         self._explicit_routing = dict(routing) if routing else None
         self._routing = self._normalise_routing(routing) if routing else self._build_auto_routing()
@@ -240,7 +240,7 @@ class SmartRouter(BaseModel):
         if not session_id:
             return
         self._last_tier_by_session.pop(session_id, None)
-        self._session_side.pop(session_id, None)
+        self._session_framework.pop(session_id, None)
         # Wipe the agno-side binding too; claude-cli's own close_session
         # below keeps its sdk_sessions entry alive so `/clear` can
         # distinguish "release subprocess" from "forget conversation".
@@ -288,13 +288,13 @@ class SmartRouter(BaseModel):
         return self._claude_registry
 
     @staticmethod
-    def _side_for_model(runtime_id: str) -> str:
-        return SIDE_CLAUDE_CLI if is_claude_cli_model(runtime_id) else SIDE_AGNO
+    def _framework_for_model(runtime_id: str) -> str:
+        return FRAMEWORK_CLAUDE_CLI if is_claude_cli_model(runtime_id) else FRAMEWORK_AGNO
 
-    async def _hydrate_bound_side(self, session_id: str) -> str | None:
+    async def _hydrate_bound_framework(self, session_id: str) -> str | None:
         """Populate the in-memory side cache from the DB once per session."""
-        if session_id in self._session_side:
-            return self._session_side[session_id]
+        if session_id in self._session_framework:
+            return self._session_framework[session_id]
         if self._db is None:
             return None
         try:
@@ -303,18 +303,18 @@ class SmartRouter(BaseModel):
             logger.debug("get_session_binding %s: %s", session_id, e)
             return None
         if side:
-            self._session_side[session_id] = side
+            self._session_framework[session_id] = side
         return side
 
-    async def _persist_bound_side(self, session_id: str, side: str) -> None:
-        self._session_side[session_id] = side
+    async def _persist_bound_framework(self, session_id: str, framework: str) -> None:
+        self._session_framework[session_id] = framework
         # Claude-cli bindings also land in ``sdk_sessions`` via the
         # registry's own write path (ClaudeCLI._persist_sdk_session);
         # the session_bindings row is useful but redundant, so skip it.
-        if side == SIDE_CLAUDE_CLI or self._db is None:
+        if framework == FRAMEWORK_CLAUDE_CLI or self._db is None:
             return
         try:
-            await self._db.set_session_binding(session_id, side)
+            await self._db.set_session_binding(session_id, framework)
         except Exception as e:  # noqa: BLE001
             logger.debug("set_session_binding %s: %s", session_id, e)
 
@@ -380,10 +380,10 @@ class SmartRouter(BaseModel):
             effective_tier, reason = "simple", "budget_degraded"
         return self._routing.get(effective_tier, self._routing.get("medium", "")), effective_tier, reason
 
-    def _configured_models_for_side(self, side: str | None) -> list[str]:
+    def _configured_models_for_framework(self, side: str | None) -> list[str]:
         result: list[str] = []
         for entry in iter_configured_models(self._providers_config):
-            if side and self._side_for_model(entry.runtime_id) != side:
+            if side and self._framework_for_model(entry.runtime_id) != side:
                 continue
             result.append(entry.runtime_id)
         return result
@@ -393,16 +393,16 @@ class SmartRouter(BaseModel):
         requested_tier: str,
         effective_tier: str,
         primary_model: str,
-        bound_side: str | None,
+        bound_framework: str | None,
     ) -> list[str]:
-        """Build the fallback chain, restricted to ``bound_side`` if set."""
-        want_side = bound_side or self._side_for_model(primary_model)
+        """Build the fallback chain, restricted to ``bound_framework`` if set."""
+        want_side = bound_framework or self._framework_for_model(primary_model)
         candidates: list[str] = []
 
         def add(model_id: str | None) -> None:
             if not model_id or model_id in candidates:
                 return
-            if self._side_for_model(model_id) != want_side:
+            if self._framework_for_model(model_id) != want_side:
                 return
             candidates.append(model_id)
 
@@ -412,7 +412,7 @@ class SmartRouter(BaseModel):
         add(self._routing.get("medium"))
         add(self._routing.get("simple"))
         add(self._routing.get("hard"))
-        for model_id in self._configured_models_for_side(want_side):
+        for model_id in self._configured_models_for_framework(want_side):
             add(model_id)
         return candidates
 
@@ -455,8 +455,29 @@ class SmartRouter(BaseModel):
         session_id: str | None,
         budget_ratio: float,
     ) -> RoutingDecision:
-        bound_side = (
-            await self._hydrate_bound_side(session_id) if session_id else None
+        # Per-session pin wins over everything: if the user (or the
+        # agent itself via ``model-manager.pin_session``) has chosen a
+        # specific model for this session, skip the classifier + routing
+        # tiers + budget tier-drop entirely and dispatch directly.
+        if session_id and self._db is not None:
+            try:
+                pinned_id = await self._db.get_session_pin(session_id)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("get_session_pin failed for %s: %s", session_id, e)
+                pinned_id = None
+            if pinned_id:
+                side = self._framework_for_model(pinned_id)
+                return RoutingDecision(
+                    requested_tier="pinned",
+                    effective_tier="pinned",
+                    reason="session_pin",
+                    primary_model=pinned_id,
+                    candidates=[pinned_id],
+                    bound_framework=side,
+                )
+
+        bound_framework = (
+            await self._hydrate_bound_framework(session_id) if session_id else None
         )
 
         requested_tier = await self._resolve_requested_tier(messages, session_id)
@@ -466,22 +487,22 @@ class SmartRouter(BaseModel):
         # on the wrong side, substitute the first configured model on
         # the bound side. Failing that, leave ``primary_model`` as-is
         # and let the candidate filter raise downstream.
-        if bound_side and primary_model and self._side_for_model(primary_model) != bound_side:
-            for alt in self._configured_models_for_side(bound_side):
+        if bound_framework and primary_model and self._framework_for_model(primary_model) != bound_framework:
+            for alt in self._configured_models_for_framework(bound_framework):
                 primary_model = alt
-                reason = f"bound_to_{bound_side}"
+                reason = f"bound_to_{bound_framework}"
                 break
             else:
                 primary_model = ""
 
-        candidates = self._candidate_models(requested_tier, effective_tier, primary_model, bound_side)
+        candidates = self._candidate_models(requested_tier, effective_tier, primary_model, bound_framework)
         return RoutingDecision(
             requested_tier=requested_tier,
             effective_tier=effective_tier,
             reason=reason,
             primary_model=primary_model,
             candidates=candidates,
-            bound_side=bound_side,
+            bound_framework=bound_framework,
         )
 
     # ── provider dispatch ────────────────────────────────────────────
@@ -535,8 +556,8 @@ class SmartRouter(BaseModel):
         if not decision.primary_model or not decision.candidates:
             # Bound-side has no enabled model, or routing is empty.
             msg = (
-                f"No {decision.bound_side} model available for this session."
-                if decision.bound_side
+                f"No {decision.bound_framework} model available for this session."
+                if decision.bound_framework
                 else "No model configured for this task tier."
             )
             elog(
@@ -544,7 +565,7 @@ class SmartRouter(BaseModel):
                 session_id=session_id,
                 tier=decision.requested_tier,
                 routing=self._routing,
-                bound_side=decision.bound_side,
+                bound_framework=decision.bound_framework,
             )
             return ModelResponse(content=msg, stop_reason="error")
 
@@ -555,7 +576,7 @@ class SmartRouter(BaseModel):
             effective_tier=decision.effective_tier,
             reason=decision.reason,
             model=decision.primary_model,
-            bound_side=decision.bound_side,
+            bound_framework=decision.bound_framework,
             budget_ratio=round(budget_ratio, 3),
         )
         elog("router.candidates", session_id=session_id, models=decision.candidates)
@@ -599,7 +620,7 @@ class SmartRouter(BaseModel):
         # claude-cli path auto-writes to ``sdk_sessions`` via the
         # registry, so we only need to write the agno row here.
         if session_id:
-            await self._persist_bound_side(session_id, self._side_for_model(active_model_id))
+            await self._persist_bound_framework(session_id, self._framework_for_model(active_model_id))
 
         if self._budget:
             cost = BudgetTracker.compute_cost(

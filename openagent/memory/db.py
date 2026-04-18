@@ -94,9 +94,19 @@ CREATE INDEX IF NOT EXISTS idx_mcps_updated ON mcps(updated_at);
 -- at runtime. ``runtime_id`` is the canonical id (provider:model_id, or
 -- claude-cli/model_id) used everywhere in code; see
 -- openagent.models.catalog.build_runtime_model_id.
+-- OpenAgent vocabulary (since v0.10.0):
+--   provider  = vendor/owner (anthropic, openai, google, z.ai, local…)
+--   framework = runtime dispatching the model (agno | claude-cli)
+--   model_id  = bare vendor id (gpt-4o-mini, claude-sonnet-4-6…)
+-- The same (provider, model_id) can run under different frameworks —
+-- notably anthropic models, which run under Agno (direct API) OR under
+-- the local Claude CLI binary (Pro/Max subscription). ``runtime_id``
+-- encodes all three: ``<provider>:<model>`` for framework=agno, and
+-- ``claude-cli:<provider>:<model>`` for framework=claude-cli.
 CREATE TABLE IF NOT EXISTS models (
     runtime_id TEXT PRIMARY KEY,
     provider TEXT NOT NULL,
+    framework TEXT NOT NULL DEFAULT 'agno',
     model_id TEXT NOT NULL,
     display_name TEXT,
     input_cost_per_million REAL,
@@ -134,9 +144,24 @@ CREATE TABLE IF NOT EXISTS config_state (
 CREATE TABLE IF NOT EXISTS session_bindings (
     session_id TEXT PRIMARY KEY,
     provider TEXT NOT NULL,
-    bound_at REAL NOT NULL
+    bound_at REAL NOT NULL,
+    -- Optional per-session *specific* model override. When set,
+    -- SmartRouter skips the classifier and dispatches this session
+    -- straight to ``runtime_id`` regardless of the picked tier.
+    -- NULL means "use the routing table normally for this side".
+    runtime_id TEXT
 );
 """
+
+# Column-add migrations for tables that exist pre-v0.9.2 / pre-v0.10.
+# SQLite's ``CREATE TABLE IF NOT EXISTS`` can't evolve a schema; these
+# ``ALTER TABLE`` statements run at every connect and swallow the
+# "column already exists" OperationalError on subsequent boots. Safe to
+# append more entries as the schema grows.
+_SCHEMA_MIGRATIONS = (
+    "ALTER TABLE session_bindings ADD COLUMN runtime_id TEXT",
+    "ALTER TABLE models ADD COLUMN framework TEXT NOT NULL DEFAULT 'agno'",
+)
 
 
 class MemoryDB:
@@ -164,7 +189,59 @@ class MemoryDB:
         await self._conn.execute("PRAGMA busy_timeout = 10000")
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.executescript(SCHEMA_SQL)
+        # Run column-add migrations for tables that can't be fully
+        # re-specified via ``CREATE TABLE IF NOT EXISTS``. Each statement
+        # is idempotent-by-try/except: SQLite raises OperationalError
+        # when the column already exists, and we swallow that.
+        for stmt in _SCHEMA_MIGRATIONS:
+            try:
+                await self._conn.execute(stmt)
+            except aiosqlite.OperationalError:
+                pass
         await self._conn.commit()
+        # v0.10 data fix-up: pre-v0.10 rows used ``provider='claude-cli'``
+        # as a pseudo-provider. In the new vocabulary claude-cli is a
+        # *framework* and the underlying provider is ``anthropic``.
+        # Translate those rows once so the catalog + SmartRouter see
+        # consistent values. Idempotent: subsequent boots find nothing
+        # to rewrite because ``framework`` is already set.
+        await self._migrate_models_provider_to_framework()
+
+    async def _migrate_models_provider_to_framework(self) -> None:
+        """One-shot rewrite of legacy claude-cli rows in the ``models`` table.
+
+        Before v0.10, claude-cli was stored as ``provider='claude-cli'``
+        with ``runtime_id='claude-cli/<model>'``. The new shape is
+        ``provider='anthropic'``, ``framework='claude-cli'``, and
+        ``runtime_id='claude-cli:anthropic:<model>'``. Runs quietly —
+        no-op on fresh databases and on already-migrated ones.
+        """
+        assert self._conn is not None
+        try:
+            cursor = await self._conn.execute(
+                "SELECT runtime_id, model_id FROM models WHERE provider = 'claude-cli'"
+            )
+            rows = await cursor.fetchall()
+        except aiosqlite.OperationalError:
+            return
+        for row in rows:
+            old_rid = row[0]
+            model_id = row[1]
+            new_rid = f"claude-cli:anthropic:{model_id}"
+            try:
+                await self._conn.execute(
+                    "UPDATE models SET provider = 'anthropic', framework = 'claude-cli', "
+                    "runtime_id = ? WHERE runtime_id = ?",
+                    (new_rid, old_rid),
+                )
+            except aiosqlite.IntegrityError:
+                # New rid already exists (user re-added under new shape).
+                # Drop the legacy row to keep the table consistent.
+                await self._conn.execute(
+                    "DELETE FROM models WHERE runtime_id = ?", (old_rid,)
+                )
+        if rows:
+            await self._conn.commit()
 
     async def close(self) -> None:
         if self._conn:
@@ -499,6 +576,11 @@ class MemoryDB:
         except (TypeError, ValueError):
             d["metadata"] = {}
         d["enabled"] = bool(d.get("enabled"))
+        # Pre-v0.10 rows may not have the ``framework`` column populated
+        # until the migration runs (edge case: a row returned by another
+        # aiosqlite connection in the middle of the startup race). Fall
+        # back so downstream code doesn't need to special-case the key.
+        d.setdefault("framework", "agno")
         return d
 
     async def list_models(
@@ -534,6 +616,7 @@ class MemoryDB:
         *,
         provider: str,
         model_id: str,
+        framework: str = "agno",
         display_name: str | None = None,
         input_cost: float | None = None,
         output_cost: float | None = None,
@@ -543,16 +626,18 @@ class MemoryDB:
     ) -> None:
         if not runtime_id or not provider or not model_id:
             raise ValueError("runtime_id, provider and model_id are required")
+        if framework not in ("agno", "claude-cli"):
+            raise ValueError(f"invalid framework: {framework!r}")
         conn = await self._ensure_connected()
         now = time.time()
         await conn.execute(
-            "INSERT INTO models (runtime_id, provider, model_id, display_name, "
+            "INSERT INTO models (runtime_id, provider, framework, model_id, display_name, "
             "input_cost_per_million, output_cost_per_million, tier_hint, enabled, "
             "metadata_json, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(runtime_id) DO UPDATE SET "
-            "provider = excluded.provider, model_id = excluded.model_id, "
-            "display_name = excluded.display_name, "
+            "provider = excluded.provider, framework = excluded.framework, "
+            "model_id = excluded.model_id, display_name = excluded.display_name, "
             "input_cost_per_million = excluded.input_cost_per_million, "
             "output_cost_per_million = excluded.output_cost_per_million, "
             "tier_hint = excluded.tier_hint, enabled = excluded.enabled, "
@@ -561,6 +646,7 @@ class MemoryDB:
             (
                 runtime_id,
                 provider,
+                framework,
                 model_id,
                 display_name,
                 input_cost,
@@ -635,21 +721,75 @@ class MemoryDB:
         row = await cursor.fetchone()
         return str(row[0]) if row and row[0] else None
 
-    async def set_session_binding(self, session_id: str, provider: str) -> None:
+    async def get_session_pin(self, session_id: str) -> str | None:
+        """Return the pinned ``runtime_id`` for ``session_id``, or ``None``.
+
+        When non-null, SmartRouter dispatches this session straight to
+        ``runtime_id`` without consulting the classifier or the routing
+        tiers. Pinned sessions ignore budget degradation too — an
+        explicit user choice wins.
+        """
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            "SELECT runtime_id FROM session_bindings WHERE session_id = ?",
+            (session_id,),
+        )
+        row = await cursor.fetchone()
+        return str(row[0]) if row and row[0] else None
+
+    async def set_session_binding(
+        self,
+        session_id: str,
+        provider: str,
+        runtime_id: str | None = None,
+    ) -> None:
         """Record that ``session_id`` is served by ``provider``.
 
+        Optional ``runtime_id`` pins the session to a specific model.
         Used by SmartRouter after a first successful dispatch so
         subsequent turns are forced to the same side. Claude-cli
-        bindings land in ``sdk_sessions`` instead (via
-        ``set_sdk_session``) — this table only tracks agno.
+        *side* bindings land in ``sdk_sessions`` instead (via
+        ``set_sdk_session``); this table tracks agno side + per-session
+        explicit model pins for both sides.
         """
         conn = await self._ensure_connected()
         await conn.execute(
-            "INSERT INTO session_bindings (session_id, provider, bound_at) "
-            "VALUES (?, ?, ?) "
+            "INSERT INTO session_bindings (session_id, provider, bound_at, runtime_id) "
+            "VALUES (?, ?, ?, ?) "
             "ON CONFLICT(session_id) DO UPDATE SET "
-            "provider = excluded.provider, bound_at = excluded.bound_at",
-            (session_id, provider, time.time()),
+            "provider = excluded.provider, bound_at = excluded.bound_at, "
+            "runtime_id = excluded.runtime_id",
+            (session_id, provider, time.time(), runtime_id),
+        )
+        await conn.commit()
+
+    async def pin_session_model(self, session_id: str, runtime_id: str) -> None:
+        """Pin ``session_id`` to a specific model runtime_id.
+
+        Upserts a ``session_bindings`` row with provider inferred from
+        the runtime_id (claude-cli for ``claude-cli/...``, agno
+        otherwise). Subsequent SmartRouter turns on this session bypass
+        the classifier and dispatch to ``runtime_id`` directly.
+        """
+        if not session_id or not runtime_id:
+            raise ValueError("session_id and runtime_id are required")
+        provider = "claude-cli" if runtime_id.startswith("claude-cli") else "agno"
+        await self.set_session_binding(session_id, provider, runtime_id=runtime_id)
+
+    async def unpin_session_model(self, session_id: str) -> None:
+        """Clear the per-session model pin, leaving the side-binding intact.
+
+        The ``runtime_id`` column is set to NULL; SmartRouter resumes
+        using the classifier/routing tiers for this session on the next
+        turn. The ``provider`` side-binding is *not* touched — a
+        session pinned to claude-cli stays on claude-cli even after
+        unpinning the specific model.
+        """
+        conn = await self._ensure_connected()
+        await conn.execute(
+            "UPDATE session_bindings SET runtime_id = NULL, bound_at = ? "
+            "WHERE session_id = ?",
+            (time.time(), session_id),
         )
         await conn.commit()
 

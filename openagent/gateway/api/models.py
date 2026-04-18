@@ -250,17 +250,33 @@ async def handle_get_db(request: web.Request) -> web.Response:
 
 async def handle_create_db(request: web.Request) -> web.Response:
     from aiohttp import web as _web
-    from openagent.models.catalog import build_runtime_model_id
+    from openagent.models.catalog import (
+        FRAMEWORK_AGNO, FRAMEWORK_CLAUDE_CLI, SUPPORTED_FRAMEWORKS,
+        build_runtime_model_id,
+    )
 
     db = _db(request)
     body = await request.json() if request.can_read_body else {}
     provider = str(body.get("provider") or "").strip()
     model_id = str(body.get("model_id") or "").strip()
+    framework = str(body.get("framework") or FRAMEWORK_AGNO).strip()
     if not provider or not model_id:
         return _web.json_response(
             {"error": "provider and model_id are required"}, status=400
         )
-    runtime_id = build_runtime_model_id(provider, model_id)
+    # Legacy shorthand: caller passed provider="claude-cli" (pre-v0.10
+    # vocabulary, when it was a pseudo-provider). Rewrite to the new
+    # shape so there's exactly one way to represent claude-cli rows in
+    # the DB.
+    if provider == FRAMEWORK_CLAUDE_CLI:
+        provider = "anthropic"
+        framework = FRAMEWORK_CLAUDE_CLI
+    if framework not in SUPPORTED_FRAMEWORKS:
+        return _web.json_response(
+            {"error": f"invalid framework {framework!r}; expected {SUPPORTED_FRAMEWORKS}"},
+            status=400,
+        )
+    runtime_id = build_runtime_model_id(provider, model_id, framework)
     if not runtime_id:
         return _web.json_response(
             {"error": f"could not build runtime_id from provider={provider!r} model_id={model_id!r}"},
@@ -269,6 +285,7 @@ async def handle_create_db(request: web.Request) -> web.Response:
     await db.upsert_model(
         runtime_id,
         provider=provider,
+        framework=framework,
         model_id=model_id,
         display_name=body.get("display_name"),
         input_cost=body.get("input_cost_per_million"),
@@ -294,6 +311,7 @@ async def handle_update_db(request: web.Request) -> web.Response:
     await db.upsert_model(
         runtime_id,
         provider=body.get("provider", existing["provider"]),
+        framework=body.get("framework", existing.get("framework", "agno")),
         model_id=body.get("model_id", existing["model_id"]),
         display_name=body.get("display_name", existing.get("display_name")),
         input_cost=body.get("input_cost_per_million", existing.get("input_cost_per_million")),

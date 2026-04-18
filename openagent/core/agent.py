@@ -563,8 +563,10 @@ class Agent:
         await _status("Loading context...")
 
         # Combine OpenAgent's framework-level guidelines with the user's
-        # project-specific system prompt from openagent.yaml.
-        system = self._combined_system_prompt()
+        # project-specific system prompt from openagent.yaml. Passing
+        # ``session_id`` appends a ``<session-id>`` tag so the LLM can
+        # call tools that operate on its own session (e.g. pin_session).
+        system = self._combined_system_prompt(session_id=session_id)
 
         # Include local paths for attachments so the tool layer can inspect them.
         if attachments:
@@ -664,16 +666,28 @@ class Agent:
         )
         return (last_response.content if last_response else "") or "(Done — no final message was returned.)"
 
-    def _combined_system_prompt(self) -> str:
-        """Concatenate the framework prompt with the user's project-specific one."""
+    def _combined_system_prompt(self, session_id: str | None = None) -> str:
+        """Concatenate the framework prompt with the user's project-specific one.
+
+        When ``session_id`` is provided we append a ``<session-id>`` tag
+        so the LLM can learn its own id and pass it to tools that
+        operate on "this session" — e.g.
+        ``model-manager.pin_session(session_id=..., runtime_id=...)``.
+        The tag is stripped of whitespace and comes last so project
+        prompts read cleanly above it.
+        """
         user = (self.system_prompt or "").strip()
         if not user:
-            return FRAMEWORK_SYSTEM_PROMPT
-        return (
-            FRAMEWORK_SYSTEM_PROMPT
-            + "\n\n── User-specific identity and project context ──\n\n"
-            + user
-        )
+            combined = FRAMEWORK_SYSTEM_PROMPT
+        else:
+            combined = (
+                FRAMEWORK_SYSTEM_PROMPT
+                + "\n\n── User-specific identity and project context ──\n\n"
+                + user
+            )
+        if session_id:
+            combined += f"\n\n<session-id>{session_id}</session-id>"
+        return combined
 
     async def stream_run(
         self,
@@ -687,7 +701,7 @@ class Agent:
 
         await self.initialize()
 
-        system = self._combined_system_prompt()
+        system = self._combined_system_prompt(session_id=session_id)
         messages: list[dict[str, Any]] = [{"role": "user", "content": message}]
 
         async for chunk in self.model.stream(messages, system=system):

@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 from openagent.gateway import protocol as P
 from openagent.gateway.commands import command_help_text
 from openagent.gateway.sessions import SessionManager
-from openagent.gateway.api import vault, config, health, logs, control, usage, providers, models, scheduled_tasks, mcps
+from openagent.gateway.api import vault, config, health, logs, control, usage, providers, models, scheduled_tasks, mcps, sessions as sessions_api
 
 if TYPE_CHECKING:
     from openagent.core.agent import Agent
@@ -205,6 +205,10 @@ class Gateway:
             ("DELETE", "/api/mcps/{name}", mcps.handle_delete),
             ("POST", "/api/mcps/{name}/enable", mcps.handle_enable),
             ("POST", "/api/mcps/{name}/disable", mcps.handle_disable),
+            # Per-session model pin.
+            ("GET", "/api/sessions/{session_id}/model", sessions_api.handle_get),
+            ("PUT", "/api/sessions/{session_id}/model", sessions_api.handle_pin),
+            ("DELETE", "/api/sessions/{session_id}/model", sessions_api.handle_unpin),
             ("POST", "/api/update", control.handle_update),
             ("POST", "/api/restart", control.handle_restart),
         )

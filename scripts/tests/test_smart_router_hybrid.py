@@ -95,12 +95,15 @@ async def t_bound_side_locked(ctx: TestContext) -> None:
         await db.connect()
         providers = {
             "openai": {"api_key": "sk-x", "models": ["gpt-4o-mini"]},
+            # Legacy yaml shape: provider=claude-cli. Bootstrap/catalog
+            # translate this to framework=claude-cli, provider=anthropic
+            # internally.
             "claude-cli": {"models": ["claude-sonnet-4-6"]},
         }
         router = _make_router(providers, {
             "simple": "openai:gpt-4o-mini",
             "medium": "openai:gpt-4o-mini",
-            "hard": "claude-cli/claude-sonnet-4-6",
+            "hard": "claude-cli:anthropic:claude-sonnet-4-6",
             "fallback": "openai:gpt-4o-mini",
         })
         router.set_db(db)
@@ -140,7 +143,7 @@ async def t_bound_to_claude_cli(ctx: TestContext) -> None:
         router = _make_router(providers, {
             "simple": "openai:gpt-4o-mini",
             "medium": "openai:gpt-4o-mini",
-            "hard": "claude-cli/claude-sonnet-4-6",
+            "hard": "claude-cli:anthropic:claude-sonnet-4-6",
             "fallback": "openai:gpt-4o-mini",
         })
         router.set_db(db)
@@ -154,8 +157,8 @@ async def t_bound_to_claude_cli(ctx: TestContext) -> None:
             [{"role": "user", "content": "hi"}],
             session_id="cli-sess",
         )
-        assert resp.model.startswith("claude-cli/"), f"should stay on claude-cli, got {resp.model}"
-        assert seen and seen[0].startswith("claude-cli/"), seen
+        assert resp.model.startswith("claude-cli:"), f"should stay on claude-cli, got {resp.model}"
+        assert seen and seen[0].startswith("claude-cli:"), seen
         await db.close()
     finally:
         try:

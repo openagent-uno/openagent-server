@@ -53,6 +53,26 @@ def _load_default_pricing() -> dict[str, dict[str, float]]:
     _DEFAULT_PRICING_CACHE = cleaned
     return cleaned
 
+# OpenAgent vocabulary (since v0.10.0):
+#   - **provider**  : the model's vendor / owner (anthropic, openai, google, …).
+#   - **framework** : the runtime OpenAgent dispatches through — ``agno``
+#                     (direct Agno SDK against the provider's API) or
+#                     ``claude-cli`` (the local ``claude`` binary wrapping
+#                     Anthropic models).
+#   - **model**     : the bare model id (``gpt-4o-mini``, ``claude-sonnet-4-6``).
+#
+# ``runtime_id`` encodes all three. Layout:
+#   - ``agno``        framework (the default): ``<provider>:<model>``
+#                                              (backward-compat with v0.9.x).
+#   - ``claude-cli``  framework             : ``claude-cli:<provider>:<model>``
+#                                              where provider is always
+#                                              ``anthropic`` in practice.
+#
+# Rationale: most provider+model pairs only run under agno, so keeping the
+# two-part form for them keeps existing usage_log rows and user references
+# valid. Only claude-cli entries gain the three-part form, which is the
+# minimum needed to distinguish "anthropic via Agno API" from "anthropic
+# via Claude CLI subscription".
 SUPPORTED_PROVIDERS = [
     "anthropic",
     "openai",
@@ -64,9 +84,17 @@ SUPPORTED_PROVIDERS = [
     "deepseek",
     "cerebras",
     "zai",
+    "local",
 ]
 
-CLAUDE_CLI_PROVIDER = "claude-cli"
+FRAMEWORK_AGNO = "agno"
+FRAMEWORK_CLAUDE_CLI = "claude-cli"
+SUPPORTED_FRAMEWORKS = (FRAMEWORK_AGNO, FRAMEWORK_CLAUDE_CLI)
+
+# Back-compat alias. ``claude-cli`` was treated as a "provider" pre-v0.10;
+# existing callers expecting the constant still work, but new code should
+# use ``FRAMEWORK_CLAUDE_CLI`` explicitly.
+CLAUDE_CLI_PROVIDER = FRAMEWORK_CLAUDE_CLI
 
 
 @dataclass(frozen=True)
@@ -75,6 +103,7 @@ class CatalogModel:
     model_id: str
     runtime_id: str
     history_mode: str
+    framework: str = FRAMEWORK_AGNO
     disabled: bool = False
     input_cost_per_million: float | None = None
     output_cost_per_million: float | None = None
@@ -106,23 +135,54 @@ def _entry_metadata(entry: Any) -> dict[str, Any]:
     return {}
 
 
-def build_runtime_model_id(provider_name: str, model_id: str) -> str:
+def build_runtime_model_id(
+    provider_name: str,
+    model_id: str,
+    framework: str = FRAMEWORK_AGNO,
+) -> str:
+    """Canonical runtime_id for a (framework, provider, model) triple.
+
+    Agno entries produce ``<provider>:<model>`` (preserved from v0.9.x).
+    Claude-CLI entries produce ``claude-cli:<provider>:<model>`` — and
+    if the caller passed ``provider=claude-cli`` (pre-v0.10 vocabulary)
+    we treat it as legacy shorthand for ``provider=anthropic,
+    framework=claude-cli``.
+    """
     raw = str(model_id or "").strip()
     if not raw:
         return raw
-    if is_claude_cli_model(raw):
-        return raw
+
+    # Legacy input: user-written ``claude-cli/<model>`` or ``claude-cli:<...>``.
+    if raw.startswith("claude-cli/"):
+        _, rest = raw.split("/", 1)
+        # If the tail already has a provider prefix, keep it; else assume anthropic.
+        if ":" in rest:
+            prov, model = rest.split(":", 1)
+            return f"{FRAMEWORK_CLAUDE_CLI}:{prov}:{model}"
+        return f"{FRAMEWORK_CLAUDE_CLI}:anthropic:{rest}"
+    if raw.startswith(f"{FRAMEWORK_CLAUDE_CLI}:"):
+        tail = raw[len(FRAMEWORK_CLAUDE_CLI) + 1:]
+        # claude-cli:anthropic:model already canonical.
+        if tail.count(":") >= 1:
+            return raw
+        # claude-cli:model → assume anthropic.
+        return f"{FRAMEWORK_CLAUDE_CLI}:anthropic:{tail}"
+    if framework == FRAMEWORK_CLAUDE_CLI:
+        effective_provider = provider_name or "anthropic"
+        if effective_provider == FRAMEWORK_CLAUDE_CLI:
+            effective_provider = "anthropic"
+        return f"{FRAMEWORK_CLAUDE_CLI}:{effective_provider}:{raw}"
+
+    # Agno framework — legacy 2-part form.
+    if provider_name == FRAMEWORK_CLAUDE_CLI:
+        # Caller passed the deprecated pseudo-provider. Treat as framework hint.
+        return f"{FRAMEWORK_CLAUDE_CLI}:anthropic:{raw}"
     if ":" in raw:
         return raw
     if "/" in raw:
         prefix, rest = raw.split("/", 1)
-        if prefix == CLAUDE_CLI_PROVIDER:
-            return raw
         return f"{prefix}:{rest}"
-    # claude-cli uses a ``/`` separator so ``is_claude_cli_model`` can
-    # recognise the result; everyone else uses ``:``.
-    sep = "/" if provider_name == CLAUDE_CLI_PROVIDER else ":"
-    return f"{provider_name}{sep}{raw}"
+    return f"{provider_name}:{raw}"
 
 
 def normalize_runtime_model_id(model_ref: str, providers_config: dict | None = None) -> str:
@@ -148,23 +208,56 @@ def normalize_runtime_model_id(model_ref: str, providers_config: dict | None = N
 
 
 def is_claude_cli_model(model_ref: str | None) -> bool:
+    """True when ``model_ref`` is dispatched via the claude-cli framework.
+
+    Matches both the v0.10 canonical form (``claude-cli:<provider>:<model>``)
+    AND the legacy pre-v0.10 forms (``claude-cli``, ``claude-cli/<model>``).
+    """
     raw = str(model_ref or "").strip()
-    return raw == CLAUDE_CLI_PROVIDER or raw.startswith(f"{CLAUDE_CLI_PROVIDER}/")
+    return (
+        raw == FRAMEWORK_CLAUDE_CLI
+        or raw.startswith(f"{FRAMEWORK_CLAUDE_CLI}:")
+        or raw.startswith(f"{FRAMEWORK_CLAUDE_CLI}/")
+    )
+
+
+def framework_of(model_ref: str | None) -> str:
+    """``"claude-cli"`` when the ref belongs to that framework, else ``"agno"``."""
+    return FRAMEWORK_CLAUDE_CLI if is_claude_cli_model(model_ref) else FRAMEWORK_AGNO
 
 
 def claude_cli_model_spec(model_id: str | None = None) -> str:
+    """Build the canonical claude-cli runtime_id from a bare model id.
+
+    Legacy callers (pre-v0.10) received ``claude-cli/<id>``; the new
+    canonical form is ``claude-cli:anthropic:<id>``. Both are accepted
+    downstream by ``is_claude_cli_model`` / ``split_runtime_id``; this
+    helper emits the new form.
+    """
     raw = str(model_id or "").strip()
-    return f"{CLAUDE_CLI_PROVIDER}/{raw}" if raw else CLAUDE_CLI_PROVIDER
+    if not raw:
+        return FRAMEWORK_CLAUDE_CLI
+    return f"{FRAMEWORK_CLAUDE_CLI}:anthropic:{raw}"
 
 
 def split_runtime_id(runtime_id: str) -> tuple[str, str]:
-    """Split a runtime model id into ``(provider, model_id)``.
+    """Split a runtime id into ``(provider, model_id)`` for billing / display.
 
-    Most providers use ``:`` as the separator (``openai:gpt-4o-mini``).
-    ``claude-cli`` uses ``/`` (``claude-cli/claude-sonnet-4-6``). When neither
-    separator is present, the input is returned twice so callers can treat it
-    as both provider and model id.
+    v0.10 forms:
+      - ``<provider>:<model>``                  → (provider, model)
+      - ``claude-cli:<provider>:<model>``       → (provider, model)
+    Legacy forms still accepted:
+      - ``claude-cli/<model>``                  → ("claude-cli", model)
+      - ``claude-cli``                          → ("claude-cli", "claude-cli")
+      - bare ``<id>``                           → (id, id)
     """
+    if runtime_id.startswith(f"{FRAMEWORK_CLAUDE_CLI}:"):
+        tail = runtime_id[len(FRAMEWORK_CLAUDE_CLI) + 1:]
+        if ":" in tail:
+            provider, model_id = tail.split(":", 1)
+            return provider, model_id
+        # claude-cli:<model> — legacy, assume anthropic.
+        return "anthropic", tail
     if ":" in runtime_id:
         provider, model_id = runtime_id.split(":", 1)
         return provider, model_id
@@ -192,11 +285,27 @@ def iter_configured_models(
     include_disabled: bool = False,
     history_mode: str | None = None,
 ) -> list[CatalogModel]:
+    """Flatten yaml ``providers.X.models`` into CatalogModel records.
+
+    Legacy quirk: if yaml still declares ``providers.claude-cli.models``
+    (pre-v0.10), we treat those rows as framework=claude-cli models on
+    the ``anthropic`` provider — that's the only thing claude-cli can
+    actually dispatch.
+    """
     results: list[CatalogModel] = []
     seen: set[str] = set()
 
     for provider_name, cfg in (providers_config or {}).items():
         disabled = {str(item).strip() for item in cfg.get("disabled_models", [])}
+        # Legacy yaml: ``providers.claude-cli.models`` declares claude-cli
+        # models in a v0.9-vocabulary config. Map onto the new shape.
+        if provider_name == FRAMEWORK_CLAUDE_CLI:
+            row_provider = "anthropic"
+            row_framework = FRAMEWORK_CLAUDE_CLI
+        else:
+            row_provider = provider_name
+            row_framework = FRAMEWORK_AGNO
+
         for entry in cfg.get("models", []):
             model_id = _entry_model_id(entry)
             if not model_id:
@@ -205,7 +314,7 @@ def iter_configured_models(
             if is_disabled and not include_disabled:
                 continue
 
-            runtime_id = build_runtime_model_id(provider_name, model_id)
+            runtime_id = build_runtime_model_id(row_provider, model_id, row_framework)
             mode = model_history_mode(runtime_id, providers_config)
             if history_mode and mode != history_mode:
                 continue
@@ -216,10 +325,11 @@ def iter_configured_models(
             metadata = _entry_metadata(entry)
             results.append(
                 CatalogModel(
-                    provider=provider_name,
+                    provider=row_provider,
                     model_id=model_id,
                     runtime_id=runtime_id,
                     history_mode=mode,
+                    framework=row_framework,
                     disabled=is_disabled,
                     input_cost_per_million=_coerce_cost(metadata.get("input_cost_per_million")),
                     output_cost_per_million=_coerce_cost(metadata.get("output_cost_per_million")),

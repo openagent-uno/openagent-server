@@ -58,7 +58,8 @@ async def t_model_id_uses_sibling_provider(ctx: TestContext) -> None:
             model_cfg={"provider": "claude-cli", "model_id": "claude-sonnet-4-6"},
         )
         runtime_ids = {r["runtime_id"] for r in await db.list_models()}
-        assert "claude-cli/claude-sonnet-4-6" in runtime_ids, runtime_ids
+        # Canonical v0.10 form: ``claude-cli:<provider>:<model>``.
+        assert "claude-cli:anthropic:claude-sonnet-4-6" in runtime_ids, runtime_ids
         await db.close()
     finally:
         try:

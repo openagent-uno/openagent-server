@@ -198,6 +198,8 @@ async def import_yaml_models_once(
         return False
 
     from openagent.models.catalog import (
+        FRAMEWORK_AGNO,
+        FRAMEWORK_CLAUDE_CLI,
         build_runtime_model_id,
         normalize_runtime_model_id,
         split_runtime_id,
@@ -211,17 +213,29 @@ async def import_yaml_models_once(
         disabled_ids = {
             str(item).strip() for item in (cfg.get("disabled_models") or [])
         }
+        # Legacy yaml quirk: pre-v0.10 configs declare claude-cli models
+        # under ``providers.claude-cli.models``. In the v0.10 vocabulary
+        # claude-cli is a *framework*, not a provider — the underlying
+        # provider is anthropic. Rewrite so the DB row matches the new
+        # shape.
+        if str(provider_name) == FRAMEWORK_CLAUDE_CLI:
+            row_provider = "anthropic"
+            row_framework = FRAMEWORK_CLAUDE_CLI
+        else:
+            row_provider = str(provider_name)
+            row_framework = FRAMEWORK_AGNO
         for entry in cfg.get("models") or []:
             model_id = _entry_model_id(entry)
             if not model_id:
                 continue
-            runtime_id = build_runtime_model_id(str(provider_name), model_id)
+            runtime_id = build_runtime_model_id(row_provider, model_id, row_framework)
             if not runtime_id:
                 continue
             meta = _entry_metadata(entry)
             await db.upsert_model(
                 runtime_id,
-                provider=str(provider_name),
+                provider=row_provider,
+                framework=row_framework,
                 model_id=model_id,
                 display_name=meta.get("display_name") or meta.get("name"),
                 input_cost=_coerce_cost(meta.get("input_cost_per_million")),
@@ -258,10 +272,15 @@ async def import_yaml_models_once(
                 )
                 continue
             runtime_id = f"{guess}:{runtime_id}"
+        # v0.10 vocabulary: provider is the vendor, framework is agno
+        # or claude-cli. Claude-cli runtime ids point at anthropic
+        # models regardless of what the legacy yaml suggested.
         if is_claude_cli_model(runtime_id):
-            provider_name = "claude-cli"
+            provider_name = "anthropic"
+            framework = FRAMEWORK_CLAUDE_CLI
         else:
             provider_name, _ = split_runtime_id(runtime_id)
+            framework = FRAMEWORK_AGNO
         if not provider_name:
             continue
         _, bare_model_id = split_runtime_id(runtime_id)
@@ -270,6 +289,7 @@ async def import_yaml_models_once(
         await db.upsert_model(
             runtime_id,
             provider=provider_name,
+            framework=framework,
             model_id=bare_model_id,
             enabled=True,
             metadata={"source": "model_cfg"},
@@ -303,9 +323,15 @@ def _extract_model_refs(model_cfg: dict) -> list[str]:
     if direct:
         provider_hint = str(model_cfg.get("provider") or "").strip()
         if provider_hint and ":" not in direct and "/" not in direct:
-            # Claude CLI uses "/" as the separator; everyone else uses ":".
-            sep = "/" if provider_hint == "claude-cli" else ":"
-            refs.append(f"{provider_hint}{sep}{direct}")
+            # Legacy yaml quirk: provider=claude-cli in v0.9.x meant
+            # "framework=claude-cli" in v0.10 vocabulary. The Python
+            # claude_cli_model_spec() helper emits the canonical form
+            # (``claude-cli:anthropic:<id>``); for real providers we
+            # just glue with ``:``.
+            if provider_hint == "claude-cli":
+                refs.append(f"claude-cli:anthropic:{direct}")
+            else:
+                refs.append(f"{provider_hint}:{direct}")
         else:
             refs.append(direct)
 

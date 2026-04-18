@@ -82,16 +82,31 @@ async def get_model(runtime_id: str) -> dict[str, Any]:
 
 @mcp.tool()
 async def list_supported_providers() -> list[str]:
-    """Every provider OpenAgent knows how to drive (code-level enum).
+    """Every vendor OpenAgent knows how to drive (anthropic, openai, …).
 
     Listing something here does NOT mean the install can use it — the
-    user still needs to register an API key via ``add_provider``
-    (except for ``claude-cli``, which uses the installed ``claude``
-    binary instead).
+    user still needs to register an API key via ``add_provider``.
+    ``claude-cli`` is NOT a provider — it's a framework (runtime) that
+    dispatches Anthropic models through the local ``claude`` binary
+    instead of the API. See ``list_supported_frameworks``.
     """
-    from openagent.models.catalog import SUPPORTED_PROVIDERS, CLAUDE_CLI_PROVIDER
+    from openagent.models.catalog import SUPPORTED_PROVIDERS
 
-    return sorted(list(SUPPORTED_PROVIDERS) + [CLAUDE_CLI_PROVIDER])
+    return sorted(SUPPORTED_PROVIDERS)
+
+
+@mcp.tool()
+async def list_supported_frameworks() -> list[str]:
+    """Every runtime OpenAgent can dispatch through.
+
+    - ``agno``: direct provider API call via the Agno SDK. Works for
+      every supported provider.
+    - ``claude-cli``: the local ``claude`` binary (Claude Pro/Max
+      subscription). Only dispatches Anthropic models.
+    """
+    from openagent.models.catalog import SUPPORTED_FRAMEWORKS
+
+    return list(SUPPORTED_FRAMEWORKS)
 
 
 @mcp.tool()
@@ -218,30 +233,52 @@ async def remove_provider(name: str) -> dict[str, Any]:
 async def add_model(
     provider: str,
     model_id: str,
+    framework: str = "agno",
     display_name: str | None = None,
     input_cost_per_million: float | None = None,
     output_cost_per_million: float | None = None,
     tier_hint: str | None = None,
     enabled: bool = True,
 ) -> dict[str, Any]:
-    """Register a new LLM model in the catalog.
+    """Register a new LLM model.
 
-    ``model_id`` is the bare provider-side id (e.g. ``gpt-4o-mini``,
-    ``claude-sonnet-4-6``). The canonical ``runtime_id`` is computed by
-    ``catalog.build_runtime_model_id`` (``openai:gpt-4o-mini``,
-    ``claude-cli/claude-sonnet-4-6``, …).
+    - ``provider`` is the vendor: ``anthropic``, ``openai``, ``google``,
+      ``zai``, ``groq``, ``local``, …
+    - ``framework`` is the runtime that dispatches the model: ``agno``
+      (direct API call via the Agno SDK — default, works for every
+      provider) or ``claude-cli`` (the local ``claude`` binary, which
+      only wraps Anthropic models and uses the user's Pro/Max
+      subscription instead of API keys).
+    - ``model_id`` is the bare vendor id (``gpt-4o-mini``,
+      ``claude-sonnet-4-6``, ``glm-5``, …).
 
-    ``tier_hint`` is optional — one of ``simple``, ``medium``, ``hard``.
-    SmartRouter's auto-routing groups models by price when no tier is
-    hinted; pass one here to force placement.
+    The canonical ``runtime_id`` comes out as ``<provider>:<model>`` for
+    agno rows and ``claude-cli:<provider>:<model>`` for claude-cli rows.
+    Use ``tier_hint=simple|medium|hard`` to force placement in the
+    SmartRouter routing table; otherwise auto-routing sorts by cost.
     """
-    from openagent.models.catalog import build_runtime_model_id
+    from openagent.models.catalog import (
+        FRAMEWORK_AGNO,
+        FRAMEWORK_CLAUDE_CLI,
+        SUPPORTED_FRAMEWORKS,
+        build_runtime_model_id,
+    )
 
     if not provider or not provider.strip():
         raise ValueError("provider is required")
     if not model_id or not model_id.strip():
         raise ValueError("model_id is required")
-    runtime_id = build_runtime_model_id(provider.strip(), model_id.strip())
+    framework = (framework or FRAMEWORK_AGNO).strip()
+    if framework not in SUPPORTED_FRAMEWORKS:
+        raise ValueError(
+            f"invalid framework {framework!r}; expected one of {SUPPORTED_FRAMEWORKS}"
+        )
+    # Legacy shorthand: caller passed provider="claude-cli". Rewrite to
+    # the modern vocabulary (framework=claude-cli, provider=anthropic).
+    if provider.strip() == FRAMEWORK_CLAUDE_CLI:
+        provider = "anthropic"
+        framework = FRAMEWORK_CLAUDE_CLI
+    runtime_id = build_runtime_model_id(provider.strip(), model_id.strip(), framework)
     if not runtime_id:
         raise ValueError(
             f"could not build runtime_id from provider={provider!r} model_id={model_id!r}"
@@ -249,13 +286,13 @@ async def add_model(
     conn = await _get_conn()
     now = time.time()
     await conn.execute(
-        "INSERT INTO models (runtime_id, provider, model_id, display_name, "
+        "INSERT INTO models (runtime_id, provider, framework, model_id, display_name, "
         "input_cost_per_million, output_cost_per_million, tier_hint, enabled, "
         "metadata_json, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?) "
         "ON CONFLICT(runtime_id) DO UPDATE SET "
-        "provider = excluded.provider, model_id = excluded.model_id, "
-        "display_name = excluded.display_name, "
+        "provider = excluded.provider, framework = excluded.framework, "
+        "model_id = excluded.model_id, display_name = excluded.display_name, "
         "input_cost_per_million = excluded.input_cost_per_million, "
         "output_cost_per_million = excluded.output_cost_per_million, "
         "tier_hint = excluded.tier_hint, enabled = excluded.enabled, "
@@ -263,6 +300,7 @@ async def add_model(
         (
             runtime_id,
             provider.strip(),
+            framework,
             model_id.strip(),
             display_name,
             input_cost_per_million,
@@ -368,6 +406,82 @@ async def remove_model(runtime_id: str) -> dict[str, Any]:
     await conn.execute("DELETE FROM models WHERE runtime_id = ?", (runtime_id,))
     await conn.commit()
     return {"removed": True, "runtime_id": runtime_id}
+
+
+@mcp.tool()
+async def pin_session(session_id: str, runtime_id: str) -> dict[str, Any]:
+    """Pin ``session_id`` to a specific model ``runtime_id`` forever.
+
+    Subsequent turns on this session skip the SmartRouter classifier
+    and dispatch straight to ``runtime_id``. Use this when the user
+    asks "force/always use model X for me" — e.g.
+    ``pin_session(session_id, "claude-cli/claude-opus-4-6")``.
+
+    The agent can find its current ``session_id`` in the
+    ``<session-id>...</session-id>`` tag of the framework system
+    prompt.
+
+    Use ``unpin_session`` to release the pin.
+    """
+    if not session_id or not session_id.strip():
+        raise ValueError("session_id is required")
+    if not runtime_id or not runtime_id.strip():
+        raise ValueError("runtime_id is required")
+    # Validate the model exists and is enabled before pinning, else
+    # the session would start failing every turn with "no model
+    # available".
+    conn = await _get_conn()
+    cursor = await conn.execute(
+        "SELECT enabled FROM models WHERE runtime_id = ?", (runtime_id,),
+    )
+    row = await cursor.fetchone()
+    if row is None:
+        raise ValueError(
+            f"Model {runtime_id!r} is not registered. Use add_model first."
+        )
+    if not row[0]:
+        raise ValueError(
+            f"Model {runtime_id!r} is disabled. Enable it before pinning."
+        )
+    from openagent.memory.db import MemoryDB
+    db = MemoryDB(_db_path_for_helper())
+    await db.connect()
+    try:
+        await db.pin_session_model(session_id.strip(), runtime_id.strip())
+    finally:
+        await db.close()
+    return {"session_id": session_id, "runtime_id": runtime_id, "pinned": True}
+
+
+@mcp.tool()
+async def unpin_session(session_id: str) -> dict[str, Any]:
+    """Clear the per-session model pin on ``session_id``.
+
+    The session returns to normal SmartRouter routing (classifier →
+    tier → model) on the next turn, while keeping its side binding
+    (agno or claude-cli) intact.
+    """
+    if not session_id or not session_id.strip():
+        raise ValueError("session_id is required")
+    from openagent.memory.db import MemoryDB
+    db = MemoryDB(_db_path_for_helper())
+    await db.connect()
+    try:
+        await db.unpin_session_model(session_id.strip())
+    finally:
+        await db.close()
+    return {"session_id": session_id, "pinned": False}
+
+
+def _db_path_for_helper() -> str:
+    """Resolve the DB path for one-shot MemoryDB instances inside tools.
+
+    The shared aiosqlite connection is fine for raw SELECT/INSERT but
+    some helpers (``pin_session_model``, ``unpin_session_model``) live
+    on ``MemoryDB`` and expect a full connection lifecycle. We open
+    against the same path the shared connection uses.
+    """
+    return os.environ.get("OPENAGENT_DB_PATH") or "openagent.db"
 
 
 @mcp.tool()
