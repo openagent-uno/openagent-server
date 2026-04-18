@@ -60,8 +60,9 @@ async def t_router_classifies(ctx: TestContext) -> None:
             session_id=sid,
             budget_ratio=1.0,
         )
-        assert decision.requested_tier in ("simple", "medium", "hard"), decision
-        # In our test config every tier maps to gpt-4o-mini
+        # Classifier-direct routing always reports "classifier" (or
+        # "pinned"); the legacy tier vocabulary is gone.
+        assert decision.requested_tier in ("classifier", "pinned"), decision
         assert "openai" in decision.primary_model
     finally:
         await db.close()

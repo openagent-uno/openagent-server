@@ -47,8 +47,11 @@ async def list_models(
     Pass ``provider`` to filter (``openai``, ``anthropic``, ``google``,
     ``claude-cli``, etc.). Each row has ``runtime_id`` (canonical id
     used by SmartRouter), ``provider``, ``model_id`` (bare id),
-    ``display_name``, ``input_cost_per_million``, ``output_cost_per_million``,
-    ``tier_hint`` (optional simple/medium/hard for routing), ``enabled``.
+    ``display_name``, ``tier_hint`` (soft hint to the classifier:
+    fast / balanced / deep), ``notes`` (free-text strengths for the
+    classifier — e.g. "vision", "200k context", "best for code"),
+    ``enabled``. Pricing is resolved live from OpenRouter and is NOT
+    in this row — see ``get_model_pricing`` if you need it.
     """
     conn = await _get_conn()
     clauses: list[str] = []
@@ -243,9 +246,8 @@ async def add_model(
     model_id: str,
     framework: str = "agno",
     display_name: str | None = None,
-    input_cost_per_million: float | None = None,
-    output_cost_per_million: float | None = None,
     tier_hint: str | None = None,
+    notes: str | None = None,
     enabled: bool = True,
 ) -> dict[str, Any]:
     """Register a new LLM model.
@@ -259,11 +261,18 @@ async def add_model(
       subscription instead of API keys).
     - ``model_id`` is the bare vendor id (``gpt-4o-mini``,
       ``claude-sonnet-4-6``, ``glm-5``, …).
+    - ``tier_hint`` (optional, one of ``fast``/``balanced``/``deep``)
+      is a soft hint to the classifier — NOT a routing key. The
+      classifier reads it as advice and overrides freely.
+    - ``notes`` (optional free-text) describes strengths for the
+      classifier: ``vision``, ``200k context``, ``best for code``,
+      ``cheapest``, etc. Injected into the classifier prompt verbatim.
+
+    Pricing is resolved live from OpenRouter on every billing event,
+    so there is no cost field to set here.
 
     The canonical ``runtime_id`` comes out as ``<provider>:<model>`` for
     agno rows and ``claude-cli:<provider>:<model>`` for claude-cli rows.
-    Use ``tier_hint=simple|medium|hard`` to force placement in the
-    SmartRouter routing table; otherwise auto-routing sorts by cost.
     """
     from openagent.models.catalog import (
         FRAMEWORK_AGNO,
@@ -295,25 +304,21 @@ async def add_model(
     now = time.time()
     await conn.execute(
         "INSERT INTO models (runtime_id, provider, framework, model_id, display_name, "
-        "input_cost_per_million, output_cost_per_million, tier_hint, enabled, "
-        "metadata_json, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?) "
+        "tier_hint, notes, enabled, metadata_json, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?) "
         "ON CONFLICT(runtime_id) DO UPDATE SET "
         "provider = excluded.provider, framework = excluded.framework, "
         "model_id = excluded.model_id, display_name = excluded.display_name, "
-        "input_cost_per_million = excluded.input_cost_per_million, "
-        "output_cost_per_million = excluded.output_cost_per_million, "
-        "tier_hint = excluded.tier_hint, enabled = excluded.enabled, "
-        "updated_at = excluded.updated_at",
+        "tier_hint = excluded.tier_hint, notes = excluded.notes, "
+        "enabled = excluded.enabled, updated_at = excluded.updated_at",
         (
             runtime_id,
             provider.strip(),
             framework,
             model_id.strip(),
             display_name,
-            input_cost_per_million,
-            output_cost_per_million,
             tier_hint,
+            notes,
             1 if enabled else 0,
             now,
             now,
@@ -327,12 +332,15 @@ async def add_model(
 async def update_model(
     runtime_id: str,
     display_name: str | None = None,
-    input_cost_per_million: float | None = None,
-    output_cost_per_million: float | None = None,
     tier_hint: str | None = None,
+    notes: str | None = None,
     enabled: bool | None = None,
 ) -> dict[str, Any]:
-    """Partially update a model row (only fields you pass are changed)."""
+    """Partially update a model row (only fields you pass are changed).
+
+    See ``add_model`` for the meaning of ``tier_hint`` and ``notes``.
+    Pricing isn't editable — it's resolved live on every billing event.
+    """
     conn = await _get_conn()
     cursor = await conn.execute(
         "SELECT 1 FROM models WHERE runtime_id = ?", (runtime_id,)
@@ -343,12 +351,10 @@ async def update_model(
     updates: dict[str, Any] = {}
     if display_name is not None:
         updates["display_name"] = display_name
-    if input_cost_per_million is not None:
-        updates["input_cost_per_million"] = float(input_cost_per_million)
-    if output_cost_per_million is not None:
-        updates["output_cost_per_million"] = float(output_cost_per_million)
     if tier_hint is not None:
         updates["tier_hint"] = tier_hint or None
+    if notes is not None:
+        updates["notes"] = notes or None
     if enabled is not None:
         updates["enabled"] = 1 if enabled else 0
     if not updates:

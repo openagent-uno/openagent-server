@@ -8,11 +8,11 @@ CLI registry ("claude-cli") based on:
      — once a session has been served by one side its conversation
      state lives there (Agno's SqliteDb vs Claude's own session store),
      so the router must keep subsequent turns on the same side.
-  2. **Classifier** — for fresh sessions, a small LLM call (using the
-     cheapest configured model) tags the user turn as simple / medium /
-     hard and we look up the corresponding routing tier.
-  3. **Budget** — when the monthly budget runs low we degrade to the
-     fallback tier instead of the tier the classifier asked for.
+  2. **Classifier** — for fresh sessions, a small LLM call sees the
+     framework-scoped enabled-model catalog (with ``tier_hint`` /
+     ``notes`` per row) and returns the concrete ``runtime_id`` to use
+     for THIS turn. No tiers, no cost-sort buckets — the LLM weighs
+     vision/tools/speed/cost in one shot from natural-language input.
 
 Claude-cli and agno sessions are strictly isolated: once bound, a
 session can't cross. If the bound side has no enabled models the router
@@ -27,6 +27,7 @@ contradictory "platform" declaration that isn't true in practice.
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable
@@ -35,48 +36,17 @@ from openagent.core.logging import elog
 from openagent.models.base import BaseModel, ModelResponse
 from openagent.models.budget import BudgetTracker
 from openagent.models.catalog import (
+    CatalogModel,
     framework_of,
     is_claude_cli_model,
     iter_configured_models,
-    model_history_mode,
     normalize_runtime_model_id,
 )
 from openagent.models.runtime import create_model_from_spec, wire_model_runtime
 
 logger = logging.getLogger(__name__)
 
-CLASSIFIER_PROMPT = """\
-Classify this task as simple, medium, or hard.
-- simple: greetings, short factual questions, text formatting, status checks, translations
-- medium: code review, document summarization, multi-step reasoning, data analysis
-- hard: complex architecture design, multi-file code generation, debugging across systems, research synthesis
-Reply with ONLY one word: simple, medium, or hard."""
-
-TIERS = ("simple", "medium", "hard")
-
-DEFAULT_AUTO_ROUTING: dict[str, str] = {
-    "simple": "openai:gpt-4o-mini",
-    "medium": "openai:gpt-4.1-mini",
-    "hard": "openai:gpt-4.1",
-    "fallback": "openai:gpt-4o-mini",
-}
 DEFAULT_CLASSIFIER_MODEL = "openai:gpt-4o-mini"
-
-HARD_HINTS = (
-    "powerful model",
-    "strong model",
-    "stronger model",
-    "best model",
-    "top model",
-    "most capable model",
-    "use a powerful model",
-    "use the best model",
-    "use the strongest model",
-    "modello potente",
-    "modello forte",
-    "modello migliore",
-    "modello più potente",
-)
 
 # Canonical names used in DB ``session_bindings.provider`` and
 # ``sdk_sessions.provider``. Exported for tests.
@@ -86,7 +56,7 @@ FRAMEWORK_CLAUDE_CLI = "claude-cli"
 
 @dataclass(frozen=True)
 class RoutingDecision:
-    requested_tier: str
+    requested_tier: str  # legacy — kept for tests; populated as "classifier" or "pinned"
     effective_tier: str
     reason: str
     primary_model: str
@@ -127,78 +97,51 @@ class SmartRouter(BaseModel):
         # deployments don't pay for the import.
         self._claude_registry: BaseModel | None = None
 
-        self._last_tier_by_session: dict[str, str] = {}
         # In-process mirror of session_bindings / sdk_sessions so the
         # routing decision doesn't re-hit the DB on every turn. Written
         # after first successful dispatch and kept in sync with the
         # ``close_session`` / ``forget_session`` wipes.
         self._session_framework: dict[str, str] = {}
+        # Per-session memoisation of the last classifier pick. Reused on
+        # tool-continuation turns so consecutive tool roundtrips don't
+        # rebill the classifier and risk a mid-task model swap.
+        self._last_pick_by_session: dict[str, str] = {}
 
-        self._explicit_routing = dict(routing) if routing else None
-        self._routing = self._normalise_routing(routing) if routing else self._build_auto_routing()
+        # ``routing`` is retained as a soft starting point: if the user
+        # supplied explicit per-tier model_ids in yaml, use the union of
+        # those values as the seed catalog when the DB is empty (early
+        # boot, or pure-yaml deployments). Once the DB carries enabled
+        # rows, ``iter_configured_models`` is the source of truth.
+        self._explicit_routing = (
+            {k: normalize_runtime_model_id(v, self._providers_config) for k, v in (routing or {}).items() if v}
+            or None
+        )
 
         self._classifier_model = normalize_runtime_model_id(
-            classifier_model or self._routing.get("simple") or DEFAULT_CLASSIFIER_MODEL,
+            classifier_model or DEFAULT_CLASSIFIER_MODEL,
             self._providers_config,
         )
         elog(
             "router.config",
-            routing=self._routing,
             classifier_model=self._classifier_model,
             monthly_budget=self._monthly_budget,
+            explicit_routing=self._explicit_routing,
         )
-
-    # ── routing table ────────────────────────────────────────────────
-
-    def _normalise_routing(self, routing: dict[str, str]) -> dict[str, str]:
-        normalised: dict[str, str] = {}
-        for tier, model_id in routing.items():
-            runtime_id = normalize_runtime_model_id(model_id, self._providers_config)
-            if runtime_id:
-                normalised[tier] = runtime_id
-        return normalised or self._build_auto_routing()
-
-    def _build_auto_routing(self) -> dict[str, str]:
-        """Build routing from every configured model (agno + claude-cli).
-
-        Sorted by output cost so "simple" maps to cheapest, "hard" to
-        most expensive. Ties are broken by insertion order (which for
-        DB-sourced entries is provider/model_id).
-        """
-        entries = list(iter_configured_models(self._providers_config))
-        models_with_price: list[tuple[str, float]] = [
-            (e.runtime_id, float(e.output_cost_per_million or 0.0)) for e in entries
-        ]
-        if not models_with_price:
-            routing = dict(DEFAULT_AUTO_ROUTING)
-            elog("router.auto_routing_default", level="warning", routing=routing)
-            return routing
-
-        models_with_price.sort(key=lambda item: item[1])
-        n = len(models_with_price)
-        routing = {
-            "simple": models_with_price[0][0],
-            "medium": models_with_price[n // 2][0],
-            "hard": models_with_price[-1][0],
-            "fallback": models_with_price[0][0],
-        }
-        elog("router.auto_routing", routing=routing, candidates=n)
-        return routing
 
     def rebuild_routing(self, providers_config: dict | None = None) -> None:
-        """Called by the hot-reload loop when the ``models`` DB table changes."""
+        """Called by the hot-reload loop when the ``models`` DB table changes.
+
+        With classifier-direct routing the catalog is read fresh on every
+        turn from ``providers_config``, so the only state to refresh here
+        is ``self._providers_config`` and the classifier model id.
+        """
         if providers_config is not None:
             self._providers_config = providers_config or {}
-        self._routing = (
-            self._normalise_routing(self._explicit_routing)
-            if self._explicit_routing
-            else self._build_auto_routing()
-        )
         self._classifier_model = normalize_runtime_model_id(
-            self._classifier_model or self._routing.get("simple") or DEFAULT_CLASSIFIER_MODEL,
+            self._classifier_model or DEFAULT_CLASSIFIER_MODEL,
             self._providers_config,
         )
-        elog("router.rebuilt", routing=self._routing)
+        elog("router.rebuilt", classifier_model=self._classifier_model)
 
     # ── runtime wiring ───────────────────────────────────────────────
 
@@ -240,7 +183,7 @@ class SmartRouter(BaseModel):
     async def close_session(self, session_id: str) -> None:
         if not session_id:
             return
-        self._last_tier_by_session.pop(session_id, None)
+        self._last_pick_by_session.pop(session_id, None)
         self._session_framework.pop(session_id, None)
         # Wipe the agno-side binding too; claude-cli's own close_session
         # below keeps its sdk_sessions entry alive so `/clear` can
@@ -317,100 +260,213 @@ class SmartRouter(BaseModel):
 
     # ── classifier + routing ─────────────────────────────────────────
 
-    async def _classify(self, messages: list[dict[str, Any]], session_id: str | None = None) -> str:
+    def _enabled_catalog(self, framework: str | None = None) -> list[CatalogModel]:
+        """Return the live enabled-model catalog, optionally framework-scoped.
+
+        Reads ``self._providers_config`` fresh — the gateway's hot-reload
+        loop replaces the dict whenever the DB ``models`` table updates,
+        so each turn sees the current enabled set without router-side
+        caching.
+        """
+        out: list[CatalogModel] = []
+        for entry in iter_configured_models(self._providers_config):
+            if entry.disabled:
+                continue
+            if framework and framework_of(entry.runtime_id) != framework:
+                continue
+            out.append(entry)
+        return out
+
+    async def _classify(
+        self,
+        messages: list[dict[str, Any]],
+        session_id: str | None,
+        catalog: list[CatalogModel],
+    ) -> str | None:
+        """Ask the classifier LLM to pick one ``runtime_id`` from ``catalog``.
+
+        Returns the chosen ``runtime_id`` (validated against ``catalog``)
+        or ``None`` on any failure — caller fills in the framework-bound
+        fallback. Catalog is injected into the prompt as a JSON list
+        of ``{runtime_id, provider, display_name, tier_hint, notes}``.
+        """
         user_msg = ""
         for msg in reversed(messages):
             if msg["role"] == "user":
-                user_msg = str(msg.get("content", ""))[:500]
+                user_msg = str(msg.get("content", ""))[:1000]
                 break
-        if not user_msg:
-            elog("router.classify_default", session_id=session_id, tier="medium", reason="empty_user_message")
-            return "medium"
+        if not user_msg or not catalog:
+            return None
 
-        lowered = user_msg.lower()
-        if any(hint in lowered for hint in HARD_HINTS):
-            elog("router.classify_hint", session_id=session_id, tier="hard", reason="explicit_capability_request")
-            return "hard"
+        rendered_catalog = json.dumps(
+            [
+                {
+                    "runtime_id": e.runtime_id,
+                    "provider": e.provider,
+                    "display_name": e.display_name or e.model_id,
+                    "tier_hint": e.tier_hint,
+                    "notes": e.notes,
+                }
+                for e in catalog
+            ],
+            ensure_ascii=False,
+        )
 
+        prompt = (
+            "You are the model router for an LLM agent. Pick the single best "
+            "model for the user's next turn from the catalog below.\n\n"
+            "Catalog (JSON list of available models):\n"
+            f"{rendered_catalog}\n\n"
+            "Selection guidance:\n"
+            "- If the user explicitly asks for a model (in any language: "
+            "'use opus', 'switch to gpt-5', 'usa il modello potente', "
+            "'quello veloce', 'sonnnet' typo), match it to the closest "
+            "runtime_id in the catalog.\n"
+            "- Otherwise infer difficulty, modality (vision, long context, "
+            "tool use), and cost-sensitivity from the turn and pick the "
+            "best fit. tier_hint and notes are advisory only — override "
+            "them when the turn calls for it.\n"
+            "- For trivial turns (greetings, short factual questions, "
+            "simple translations) prefer a fast/cheap model.\n"
+            "- For multi-step refactors, debugging across files, or "
+            "complex reasoning prefer a deep-reasoning model.\n"
+            "- For image inputs prefer a vision-capable model "
+            "(consult notes).\n\n"
+            "Return ONLY a single JSON object on one line, no prose, no "
+            "markdown fences:\n"
+            '{"model": "<runtime_id>", "reason": "<short string>"}\n\n'
+            f"User turn:\n{user_msg}"
+        )
+
+        classifier_session_id = (
+            f"{session_id}:classifier" if session_id else "router-classifier"
+        )
+        elog(
+            "router.classify_start",
+            session_id=session_id,
+            classifier_model=self._classifier_model,
+            catalog_size=len(catalog),
+            prompt_len=len(user_msg),
+        )
         try:
-            classifier_session_id = f"{session_id}:classifier" if session_id else "router-classifier"
-            classifier_input = (
-                f"{CLASSIFIER_PROMPT}\n\n"
-                f"Task to classify:\n{user_msg}\n\n"
-                "Answer:"
-            )
-            elog(
-                "router.classify_start",
-                session_id=session_id,
-                classifier_model=self._classifier_model,
-                prompt_len=len(user_msg),
-            )
-            # The classifier always runs against an Agno model — it's a
-            # cheap throwaway probe and claude-cli can't serve a
-            # sub-session without polluting the parent's history.
             provider = self._get_agno_provider(self._classifier_model)
             resp = await provider.generate(
-                messages=[{"role": "user", "content": classifier_input}],
+                messages=[{"role": "user", "content": prompt}],
                 session_id=classifier_session_id,
             )
-            text = resp.content.strip().lower()
-            for tier in TIERS:
-                if tier in text:
-                    elog("router.classify_result", session_id=session_id, tier=tier, raw=text[:80])
-                    return tier
         except Exception as e:
             elog("router.classify_error", session_id=session_id, error=str(e))
+            return None
 
-        elog("router.classify_default", session_id=session_id, tier="medium", reason="unrecognized_classifier_output")
-        return "medium"
+        text = (resp.content or "").strip()
+        chosen = self._extract_runtime_id_from_response(text)
+        if chosen:
+            elog(
+                "router.classify_result",
+                session_id=session_id,
+                chosen=chosen,
+                raw=text[:200],
+            )
+        else:
+            elog(
+                "router.classify_unparseable",
+                session_id=session_id,
+                raw=text[:200],
+            )
+        return chosen
 
-    def _pick_model(self, tier: str, budget_ratio: float) -> tuple[str, str, str]:
-        effective_tier = tier
-        reason = "tier"
-        if budget_ratio <= 0:
-            effective_tier, reason = "fallback", "budget_exhausted"
-            return self._routing.get("fallback", self._routing.get("simple", "")), effective_tier, reason
-        if budget_ratio < 0.05:
-            effective_tier, reason = "fallback", "budget_critical"
-            return self._routing.get("fallback", self._routing.get("simple", "")), effective_tier, reason
-        if budget_ratio < 0.20:
-            effective_tier, reason = "simple", "budget_degraded"
-        return self._routing.get(effective_tier, self._routing.get("medium", "")), effective_tier, reason
+    @staticmethod
+    def _extract_runtime_id_from_response(text: str) -> str | None:
+        """Pull ``model`` out of the classifier's JSON response.
 
-    def _configured_models_for_framework(self, side: str | None) -> list[str]:
-        result: list[str] = []
-        for entry in iter_configured_models(self._providers_config):
-            if side and framework_of(entry.runtime_id) != side:
+        Tolerates common LLM dressing: leading prose, ```json fences,
+        trailing comments. Returns ``None`` when no plausible JSON
+        object is found — caller falls back to the bound-framework
+        default.
+        """
+        if not text:
+            return None
+        # Strip ```json fences if present.
+        stripped = text.strip()
+        if stripped.startswith("```"):
+            # Drop the opening fence (``` or ```json) and trailing fence.
+            stripped = stripped.split("\n", 1)[-1]
+            if stripped.endswith("```"):
+                stripped = stripped[: -3]
+        # Find the first '{' and last '}' to isolate the JSON object.
+        start = stripped.find("{")
+        end = stripped.rfind("}")
+        if start == -1 or end == -1 or end < start:
+            return None
+        candidate = stripped[start: end + 1]
+        try:
+            parsed = json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        model = parsed.get("model")
+        if not isinstance(model, str) or not model.strip():
+            return None
+        return model.strip()
+
+    def _resolve_classifier_pick(
+        self,
+        returned_runtime_id: str | None,
+        catalog: list[CatalogModel],
+        bound_framework: str | None,
+    ) -> tuple[str, str]:
+        """Validate the classifier's pick against the enabled catalog.
+
+        Returns ``(runtime_id, reason)``. Falls back to the first enabled
+        model on the bound framework (or, when no binding, on either
+        framework) when the classifier returns an id we don't know.
+        """
+        valid = {entry.runtime_id for entry in catalog}
+        if returned_runtime_id and returned_runtime_id in valid:
+            if bound_framework and framework_of(returned_runtime_id) != bound_framework:
+                # Pick lives on the wrong side — ignore and fall through.
+                elog(
+                    "router.fallback",
+                    returned=returned_runtime_id,
+                    reason="wrong_framework",
+                    bound_framework=bound_framework,
+                )
+            else:
+                return returned_runtime_id, "classifier"
+        if returned_runtime_id:
+            elog(
+                "router.fallback",
+                returned=returned_runtime_id,
+                reason="not_in_catalog",
+            )
+        # Fallback: first enabled model on the bound framework.
+        for entry in catalog:
+            if bound_framework and framework_of(entry.runtime_id) != bound_framework:
                 continue
-            result.append(entry.runtime_id)
-        return result
+            return entry.runtime_id, "fallback_first_enabled"
+        return "", "no_enabled_model"
 
     def _candidate_models(
         self,
-        requested_tier: str,
-        effective_tier: str,
         primary_model: str,
+        catalog: list[CatalogModel],
         bound_framework: str | None,
     ) -> list[str]:
-        """Build the fallback chain, restricted to ``bound_framework`` if set."""
-        want_side = bound_framework or framework_of(primary_model)
+        """Build the retry chain, restricted to ``bound_framework`` if set."""
+        want_side = bound_framework or framework_of(primary_model) if primary_model else bound_framework
         candidates: list[str] = []
 
         def add(model_id: str | None) -> None:
             if not model_id or model_id in candidates:
                 return
-            if framework_of(model_id) != want_side:
+            if want_side and framework_of(model_id) != want_side:
                 return
             candidates.append(model_id)
 
         add(primary_model)
-        add(self._routing.get("fallback"))
-        add(self._routing.get(requested_tier))
-        add(self._routing.get("medium"))
-        add(self._routing.get("simple"))
-        add(self._routing.get("hard"))
-        for model_id in self._configured_models_for_framework(want_side):
-            add(model_id)
+        for entry in catalog:
+            add(entry.runtime_id)
         return candidates
 
     async def _budget_ratio(self, session_id: str | None = None) -> float:
@@ -420,13 +476,13 @@ class SmartRouter(BaseModel):
             elog("router.budget", session_id=session_id, budget_ratio=round(ratio, 3))
         return ratio
 
-    def _remember_tier(self, session_id: str | None, tier: str) -> None:
+    def _remember_pick(self, session_id: str | None, runtime_id: str) -> None:
         key = session_id or "__default__"
-        self._last_tier_by_session[key] = tier
+        self._last_pick_by_session[key] = runtime_id
 
-    def _recall_tier(self, session_id: str | None) -> str:
+    def _recall_pick(self, session_id: str | None) -> str | None:
         key = session_id or "__default__"
-        return self._last_tier_by_session.get(key, "medium")
+        return self._last_pick_by_session.get(key)
 
     @staticmethod
     def _is_retryable_response(response: ModelResponse) -> bool:
@@ -437,25 +493,16 @@ class SmartRouter(BaseModel):
     def _is_tool_continuation(messages: list[dict[str, Any]]) -> bool:
         return bool(messages and messages[-1].get("role") == "tool")
 
-    async def _resolve_requested_tier(self, messages: list[dict[str, Any]], session_id: str | None) -> str:
-        if self._is_tool_continuation(messages):
-            tier = self._recall_tier(session_id)
-            elog("router.continuation", session_id=session_id, tier=tier)
-            return tier
-        tier = await self._classify(messages, session_id=session_id)
-        self._remember_tier(session_id, tier)
-        return tier
-
     async def _routing_decision(
         self,
         messages: list[dict[str, Any]],
         session_id: str | None,
-        budget_ratio: float,
+        budget_ratio: float,  # noqa: ARG002 — accepted for backward compat with tests
     ) -> RoutingDecision:
         # Per-session pin wins over everything: if the user (or the
         # agent itself via ``model-manager.pin_session``) has chosen a
-        # specific model for this session, skip the classifier + routing
-        # tiers + budget tier-drop entirely and dispatch directly.
+        # specific model for this session, skip the classifier and
+        # dispatch directly.
         if session_id and self._db is not None:
             try:
                 pinned_id = await self._db.get_session_pin(session_id)
@@ -477,25 +524,34 @@ class SmartRouter(BaseModel):
             await self._hydrate_bound_framework(session_id) if session_id else None
         )
 
-        requested_tier = await self._resolve_requested_tier(messages, session_id)
-        primary_model, effective_tier, reason = self._pick_model(requested_tier, budget_ratio)
+        catalog = self._enabled_catalog(framework=bound_framework)
 
-        # If the session is already bound and the classifier's pick lives
-        # on the wrong side, substitute the first configured model on
-        # the bound side. Failing that, leave ``primary_model`` as-is
-        # and let the candidate filter raise downstream.
-        if bound_framework and primary_model and framework_of(primary_model) != bound_framework:
-            for alt in self._configured_models_for_framework(bound_framework):
-                primary_model = alt
-                reason = f"bound_to_{bound_framework}"
-                break
-            else:
-                primary_model = ""
+        # Tool continuations reuse the prior model — running the
+        # classifier again risks a mid-task model swap and double-bills.
+        if self._is_tool_continuation(messages):
+            recalled = self._recall_pick(session_id)
+            if recalled and any(e.runtime_id == recalled for e in catalog):
+                candidates = self._candidate_models(recalled, catalog, bound_framework)
+                elog("router.continuation", session_id=session_id, model=recalled)
+                return RoutingDecision(
+                    requested_tier="classifier",
+                    effective_tier="classifier",
+                    reason="tool_continuation",
+                    primary_model=recalled,
+                    candidates=candidates,
+                    bound_framework=bound_framework,
+                )
 
-        candidates = self._candidate_models(requested_tier, effective_tier, primary_model, bound_framework)
+        returned_id = await self._classify(messages, session_id, catalog)
+        primary_model, reason = self._resolve_classifier_pick(
+            returned_id, catalog, bound_framework,
+        )
+        if primary_model:
+            self._remember_pick(session_id, primary_model)
+        candidates = self._candidate_models(primary_model, catalog, bound_framework)
         return RoutingDecision(
-            requested_tier=requested_tier,
-            effective_tier=effective_tier,
+            requested_tier="classifier",
+            effective_tier="classifier",
             reason=reason,
             primary_model=primary_model,
             candidates=candidates,
@@ -551,17 +607,16 @@ class SmartRouter(BaseModel):
 
         decision = await self._routing_decision(messages, session_id, budget_ratio)
         if not decision.primary_model or not decision.candidates:
-            # Bound-side has no enabled model, or routing is empty.
+            # Bound-side has no enabled model, or catalog is empty.
             msg = (
                 f"No {decision.bound_framework} model available for this session."
                 if decision.bound_framework
-                else "No model configured for this task tier."
+                else "No model is currently enabled."
             )
             elog(
                 "router.error",
                 session_id=session_id,
-                tier=decision.requested_tier,
-                routing=self._routing,
+                reason=decision.reason,
                 bound_framework=decision.bound_framework,
             )
             return ModelResponse(content=msg, stop_reason="error")
@@ -569,8 +624,6 @@ class SmartRouter(BaseModel):
         elog(
             "router.route",
             session_id=session_id,
-            requested_tier=decision.requested_tier,
-            effective_tier=decision.effective_tier,
             reason=decision.reason,
             model=decision.primary_model,
             bound_framework=decision.bound_framework,
@@ -624,7 +677,6 @@ class SmartRouter(BaseModel):
                 active_model_id,
                 resp.input_tokens,
                 resp.output_tokens,
-                providers_config=self._providers_config,
             )
             try:
                 await self._budget.record(
@@ -660,15 +712,15 @@ class SmartRouter(BaseModel):
 
         Used by the REST smoke-test endpoint; the interactive turn
         surface always goes through ``generate`` which handles both
-        sides.
+        sides. Picks the first enabled agno model from the catalog,
+        falling back to the classifier model id.
         """
-        model_id = self._routing.get("medium") or self._routing.get("simple") or ""
-        if is_claude_cli_model(model_id):
-            # Fall back to whichever agno model the router knows about.
-            for candidate in self._routing.values():
-                if not is_claude_cli_model(candidate):
-                    model_id = candidate
-                    break
+        model_id = ""
+        for entry in self._enabled_catalog(framework=FRAMEWORK_AGNO):
+            model_id = entry.runtime_id
+            break
+        if not model_id:
+            model_id = self._classifier_model
         provider = self._get_agno_provider(model_id)
         async for chunk in provider.stream(messages, system=system, tools=tools):
             yield chunk

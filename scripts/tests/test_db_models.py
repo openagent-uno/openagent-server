@@ -19,16 +19,15 @@ async def t_models_roundtrip(ctx: TestContext) -> None:
             provider="openai",
             model_id="gpt-test",
             display_name="GPT Test",
-            input_cost=1.0,
-            output_cost=2.0,
-            tier_hint="simple",
+            tier_hint="fast",
+            notes="cheap, vision",
         )
         row = await db.get_model("openai:gpt-test")
         assert row is not None
         assert row["provider"] == "openai"
         assert row["model_id"] == "gpt-test"
-        assert row["input_cost_per_million"] == 1.0
-        assert row["tier_hint"] == "simple"
+        assert row["tier_hint"] == "fast"
+        assert row["notes"] == "cheap, vision"
         listed = await db.list_models(provider="openai", enabled_only=True)
         assert any(r["runtime_id"] == "openai:gpt-test" for r in listed)
         await db.delete_model("openai:gpt-test")

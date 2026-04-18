@@ -69,9 +69,9 @@ async def handle_available_providers(request: web.Request) -> web.Response:
 
 
 async def handle_catalog(request: web.Request) -> web.Response:
-    """GET /api/models/catalog?provider=openai — configured models with pricing."""
+    """GET /api/models/catalog?provider=openai — configured models with live pricing."""
     from aiohttp import web as _web
-    from openagent.models.catalog import iter_configured_models
+    from openagent.models.catalog import get_model_pricing, iter_configured_models
 
     provider_filter = request.query.get("provider", "")
     providers_cfg = _read_resolved(request).get("providers", {})
@@ -79,14 +79,17 @@ async def handle_catalog(request: web.Request) -> web.Response:
     for entry in iter_configured_models(providers_cfg):
         if provider_filter and entry.provider != provider_filter:
             continue
+        pricing = get_model_pricing(entry.runtime_id)
         results.append(
             {
                 "provider": entry.provider,
                 "model_id": entry.model_id,
                 "runtime_id": entry.runtime_id,
                 "history_mode": entry.history_mode,
-                "input_cost_per_million": round(float(entry.input_cost_per_million or 0.0), 4),
-                "output_cost_per_million": round(float(entry.output_cost_per_million or 0.0), 4),
+                "tier_hint": entry.tier_hint,
+                "notes": entry.notes,
+                "input_cost_per_million": round(float(pricing["input_cost_per_million"] or 0.0), 4),
+                "output_cost_per_million": round(float(pricing["output_cost_per_million"] or 0.0), 4),
             }
         )
     results.sort(key=lambda item: (item["provider"], item["input_cost_per_million"], item["model_id"]))
@@ -101,8 +104,9 @@ async def handle_catalog(request: web.Request) -> web.Response:
 
 
 async def handle_list_db(request: web.Request) -> web.Response:
-    """GET /api/models/db — list every configured model row."""
+    """GET /api/models/db — list every configured model row with live pricing."""
     from aiohttp import web as _web
+    from openagent.models.catalog import get_model_pricing
 
     db = _db(request)
     if db is None:
@@ -110,17 +114,25 @@ async def handle_list_db(request: web.Request) -> web.Response:
     provider = request.query.get("provider") or None
     enabled_only = request.query.get("enabled_only", "").lower() in ("1", "true", "yes")
     rows = await db.list_models(provider=provider, enabled_only=enabled_only)
+    for row in rows:
+        pricing = get_model_pricing(row["runtime_id"])
+        row["input_cost_per_million"] = round(float(pricing["input_cost_per_million"] or 0.0), 4)
+        row["output_cost_per_million"] = round(float(pricing["output_cost_per_million"] or 0.0), 4)
     return _web.json_response({"models": rows})
 
 
 async def handle_get_db(request: web.Request) -> web.Response:
     from aiohttp import web as _web
+    from openagent.models.catalog import get_model_pricing
 
     db = _db(request)
     runtime_id = request.match_info["runtime_id"]
     row = await db.get_model(runtime_id)
     if row is None:
         return _web.json_response({"error": f"model {runtime_id!r} not found"}, status=404)
+    pricing = get_model_pricing(row["runtime_id"])
+    row["input_cost_per_million"] = round(float(pricing["input_cost_per_million"] or 0.0), 4)
+    row["output_cost_per_million"] = round(float(pricing["output_cost_per_million"] or 0.0), 4)
     return _web.json_response({"model": row})
 
 
@@ -164,9 +176,8 @@ async def handle_create_db(request: web.Request) -> web.Response:
         framework=framework,
         model_id=model_id,
         display_name=body.get("display_name"),
-        input_cost=body.get("input_cost_per_million"),
-        output_cost=body.get("output_cost_per_million"),
         tier_hint=body.get("tier_hint"),
+        notes=body.get("notes"),
         enabled=bool(body.get("enabled", True)),
         metadata=body.get("metadata") or None,
     )
@@ -190,9 +201,8 @@ async def handle_update_db(request: web.Request) -> web.Response:
         framework=body.get("framework", existing.get("framework", "agno")),
         model_id=body.get("model_id", existing["model_id"]),
         display_name=body.get("display_name", existing.get("display_name")),
-        input_cost=body.get("input_cost_per_million", existing.get("input_cost_per_million")),
-        output_cost=body.get("output_cost_per_million", existing.get("output_cost_per_million")),
         tier_hint=body.get("tier_hint", existing.get("tier_hint")),
+        notes=body.get("notes", existing.get("notes")),
         enabled=bool(body.get("enabled", existing.get("enabled", True))),
         metadata=body.get("metadata", existing.get("metadata") or None),
     )

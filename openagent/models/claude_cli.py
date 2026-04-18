@@ -219,8 +219,16 @@ class ClaudeCLI(BaseModel):
             # ``~/.claude.json`` / ``settings.json`` and same-named (or
             # even uniquely-named) entries can lose to external config.
             opts.setdefault("extra_args", {})["strict-mcp-config"] = None
-        if self.model:
-            opts["model"] = self.model
+        # The Claude Agent SDK silently falls back to a hardcoded Sonnet
+        # default when ``model`` is missing. SmartRouter MUST pin a
+        # concrete runtime_id, so an empty value here means routing is
+        # broken — fail loudly instead of misrouting under the radar.
+        if not self.model:
+            raise ValueError(
+                "ClaudeCLI._build_options called with empty model; the "
+                "router must pin a concrete runtime_id before dispatch."
+            )
+        opts["model"] = self.model
         if system:
             opts["system_prompt"] = system
         if sdk_session_id:
@@ -740,7 +748,6 @@ class ClaudeCLI(BaseModel):
                 model_ref=billing_model,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
-                providers_config=self._providers_config,
             )
             cost_source = "catalog"
 
@@ -928,7 +935,13 @@ class ClaudeCLIRegistry(BaseModel):
         return self._default_model
 
     def _get_or_create(self, model_id: str | None) -> ClaudeCLI:
-        key = model_id or ""
+        if not model_id:
+            raise ValueError(
+                "ClaudeCLIRegistry._get_or_create called with empty "
+                "model_id; the router must always pin a concrete "
+                "runtime_id before dispatching to claude-cli."
+            )
+        key = model_id
         inst = self._instances.get(key)
         if inst is not None:
             return inst

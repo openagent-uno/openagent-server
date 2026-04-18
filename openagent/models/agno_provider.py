@@ -652,7 +652,6 @@ class AgnoProvider(BaseModel):
             model_ref=self.model,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
-            providers_config=self._providers_config,
         )
 
         if input_tokens == 0 and output_tokens == 0:

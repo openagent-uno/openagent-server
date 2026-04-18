@@ -109,9 +109,8 @@ CREATE TABLE IF NOT EXISTS models (
     framework TEXT NOT NULL DEFAULT 'agno',
     model_id TEXT NOT NULL,
     display_name TEXT,
-    input_cost_per_million REAL,
-    output_cost_per_million REAL,
     tier_hint TEXT,
+    notes TEXT,
     enabled INTEGER NOT NULL DEFAULT 1,
     metadata_json TEXT NOT NULL DEFAULT '{}',
     created_at REAL NOT NULL,
@@ -178,6 +177,14 @@ CREATE TABLE IF NOT EXISTS session_bindings (
 _SCHEMA_MIGRATIONS = (
     "ALTER TABLE session_bindings ADD COLUMN runtime_id TEXT",
     "ALTER TABLE models ADD COLUMN framework TEXT NOT NULL DEFAULT 'agno'",
+    "ALTER TABLE models ADD COLUMN notes TEXT",
+    # Drop legacy cost columns. Pricing is resolved live via
+    # ``catalog.get_model_pricing`` (claude-cli → 0; agno → OpenRouter
+    # cache); the static columns went stale every time a vendor changed
+    # tariffs. Requires SQLite ≥ 3.35 — older builds raise OperationalError
+    # which is swallowed below, leaving the dead columns in place harmlessly.
+    "ALTER TABLE models DROP COLUMN input_cost_per_million",
+    "ALTER TABLE models DROP COLUMN output_cost_per_million",
 )
 
 
@@ -635,9 +642,8 @@ class MemoryDB:
         model_id: str,
         framework: str = "agno",
         display_name: str | None = None,
-        input_cost: float | None = None,
-        output_cost: float | None = None,
         tier_hint: str | None = None,
+        notes: str | None = None,
         enabled: bool = True,
         metadata: dict | None = None,
     ) -> None:
@@ -649,16 +655,13 @@ class MemoryDB:
         now = time.time()
         await conn.execute(
             "INSERT INTO models (runtime_id, provider, framework, model_id, display_name, "
-            "input_cost_per_million, output_cost_per_million, tier_hint, enabled, "
-            "metadata_json, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "tier_hint, notes, enabled, metadata_json, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(runtime_id) DO UPDATE SET "
             "provider = excluded.provider, framework = excluded.framework, "
             "model_id = excluded.model_id, display_name = excluded.display_name, "
-            "input_cost_per_million = excluded.input_cost_per_million, "
-            "output_cost_per_million = excluded.output_cost_per_million, "
-            "tier_hint = excluded.tier_hint, enabled = excluded.enabled, "
-            "metadata_json = excluded.metadata_json, "
+            "tier_hint = excluded.tier_hint, notes = excluded.notes, "
+            "enabled = excluded.enabled, metadata_json = excluded.metadata_json, "
             "updated_at = excluded.updated_at",
             (
                 runtime_id,
@@ -666,9 +669,8 @@ class MemoryDB:
                 framework,
                 model_id,
                 display_name,
-                input_cost,
-                output_cost,
                 tier_hint,
+                notes,
                 1 if enabled else 0,
                 json.dumps(dict(metadata or {})),
                 now,

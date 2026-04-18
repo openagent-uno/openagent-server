@@ -35,14 +35,30 @@ async def t_pricing_missing(ctx: TestContext) -> None:
         discovery._OPENROUTER_CACHE = prev
 
 
-@test("catalog", "user pricing overrides OpenRouter")
-async def t_pricing_override(ctx: TestContext) -> None:
+@test("catalog", "live OpenRouter pricing wins over any stale config metadata")
+async def t_pricing_live(ctx: TestContext) -> None:
+    """User config metadata is no longer consulted for pricing. The
+    OpenRouter cache is the only source for non-claude-cli models."""
+    import time
+    from openagent.models import discovery
     from openagent.models.catalog import get_model_pricing
-    cfg = {"openai": {"models": [
-        {"id": "gpt-4o-mini", "input_cost_per_million": 99.0, "output_cost_per_million": 88.0}
-    ]}}
-    p = get_model_pricing("gpt-4o-mini", cfg)
-    assert p["input_cost_per_million"] == 99.0
+
+    prev = discovery._OPENROUTER_CACHE
+    try:
+        discovery._OPENROUTER_CACHE = (time.time(), [
+            {"id": "openai/gpt-4o-mini",
+             "pricing": {"prompt": "0.000001", "completion": "0.000002"}},
+        ])
+        # Even if the user config still carries the old static cost
+        # columns, the live cache value is what compute_cost uses.
+        cfg = {"openai": {"models": [
+            {"id": "gpt-4o-mini", "input_cost_per_million": 99.0, "output_cost_per_million": 88.0}
+        ]}}
+        p = get_model_pricing("openai:gpt-4o-mini", cfg)
+        assert p["input_cost_per_million"] == 1.0, p
+        assert p["output_cost_per_million"] == 2.0, p
+    finally:
+        discovery._OPENROUTER_CACHE = prev
 
 
 @test("catalog", "claude-cli models have zero pricing (subscription billing)")
@@ -59,12 +75,10 @@ async def t_claude_cli_zero_pricing(ctx: TestContext) -> None:
         assert p["input_cost_per_million"] == 0.0, f"{ref} leaked pricing: {p}"
         assert p["output_cost_per_million"] == 0.0, f"{ref} leaked pricing: {p}"
 
-    # Even with a config entry that sets anthropic pricing, claude-cli
-    # must not inherit — it's a different framework with different billing.
-    cfg = {"anthropic": {"models": [
-        {"id": "claude-sonnet-4-6", "input_cost_per_million": 3.0, "output_cost_per_million": 15.0}
-    ]}}
-    assert compute_cost("claude-cli:anthropic:claude-sonnet-4-6", 10_000, 5_000, cfg) == 0.0
+    # claude-cli short-circuits even when the corresponding agno model
+    # has live pricing in OpenRouter — different framework, different
+    # billing surface.
+    assert compute_cost("claude-cli:anthropic:claude-sonnet-4-6", 10_000, 5_000) == 0.0
 
 
 @test("catalog", "OpenRouter cache primes pricing lookup")

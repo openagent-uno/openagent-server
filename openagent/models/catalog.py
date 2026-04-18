@@ -74,18 +74,10 @@ class CatalogModel:
     history_mode: str
     framework: str = FRAMEWORK_AGNO
     disabled: bool = False
-    input_cost_per_million: float | None = None
-    output_cost_per_million: float | None = None
+    display_name: str | None = None
+    tier_hint: str | None = None
+    notes: str | None = None
     metadata: dict[str, Any] | None = None
-
-
-def _coerce_cost(value: Any) -> float | None:
-    if value is None or value == "":
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
 
 
 def _entry_model_id(entry: Any) -> str:
@@ -292,6 +284,9 @@ def iter_configured_models(
             seen.add(runtime_id)
 
             metadata = _entry_metadata(entry)
+            tier_hint = metadata.get("tier_hint")
+            notes = metadata.get("notes")
+            display_name = metadata.get("display_name") or metadata.get("name")
             results.append(
                 CatalogModel(
                     provider=row_provider,
@@ -300,8 +295,9 @@ def iter_configured_models(
                     history_mode=mode,
                     framework=row_framework,
                     disabled=is_disabled,
-                    input_cost_per_million=_coerce_cost(metadata.get("input_cost_per_million")),
-                    output_cost_per_million=_coerce_cost(metadata.get("output_cost_per_million")),
+                    display_name=str(display_name) if display_name else None,
+                    tier_hint=str(tier_hint) if tier_hint else None,
+                    notes=str(notes) if notes else None,
                     metadata=metadata or None,
                 )
             )
@@ -324,16 +320,17 @@ def get_default_model_for_provider(provider_name: str, providers_config: dict | 
 def get_model_pricing(model_ref: str, providers_config: dict | None = None) -> dict[str, float]:
     """Return ``{input_cost_per_million, output_cost_per_million}`` for a model.
 
-    Lookup order:
-      1. claude-cli models → zero (billed via Claude Pro/Max subscription,
-         not per token)
-      2. User-provided pricing in ``providers_config`` (per-model metadata)
-      3. Online catalog (OpenRouter) — see ``_openrouter_pricing_lookup``
-      4. Zero pricing (logged as "missing")
+    Lookup order (live, never stale):
+      1. claude-cli models → zero (Claude Pro/Max subscription, not per-token).
+      2. OpenRouter in-process cache — primed lazily on first miss so the
+         next call hits warm cache.
+      3. Zero pricing (logged as "missing") if OpenRouter is unreachable.
 
-    Always returns a dict; never raises. Emits ``catalog.pricing_resolved`` event
-    on every call with the lookup ``source`` so cost issues can be diagnosed
-    from the event log.
+    Always returns a dict; never raises. ``providers_config`` is accepted
+    for backward compat with callers that still pass it but is no longer
+    consulted for pricing — the DB / yaml never carry authoritative cost
+    anymore. Emits ``catalog.pricing_resolved`` so zero-cost events can
+    be alerted on.
     """
     runtime_id = normalize_runtime_model_id(model_ref, providers_config)
 
@@ -345,19 +342,7 @@ def get_model_pricing(model_ref: str, providers_config: dict | None = None) -> d
         _log_pricing(model_ref, runtime_id, "claude_cli_subscription", 0.0, 0.0)
         return {"input_cost_per_million": 0.0, "output_cost_per_million": 0.0}
 
-    bare_id = model_id_from_runtime(runtime_id)
-
-    # 2. Per-model metadata in user config wins.
-    for entry in iter_configured_models(providers_config, include_disabled=True):
-        if runtime_id in {entry.runtime_id, entry.model_id} or bare_id in {entry.runtime_id, entry.model_id}:
-            input_cost = float(entry.input_cost_per_million or 0.0)
-            output_cost = float(entry.output_cost_per_million or 0.0)
-            if input_cost > 0 or output_cost > 0:
-                _log_pricing(model_ref, runtime_id, "config", input_cost, output_cost)
-                return {"input_cost_per_million": input_cost, "output_cost_per_million": output_cost}
-            break
-
-    # 3. Online catalog (OpenRouter). Resolved from a process-wide cache
+    # 2. Online catalog (OpenRouter). Resolved from a process-wide cache
     # populated by discovery.py; never blocks — returns None on cache miss.
     online = _openrouter_pricing_lookup(runtime_id)
     if online is not None:
@@ -367,9 +352,48 @@ def get_model_pricing(model_ref: str, providers_config: dict | None = None) -> d
         )
         return online
 
-    # 4. Nothing — log a warning so the user can fix their config.
+    # 2b. Cache miss — fire-and-forget a prime so the next lookup hits.
+    # Doesn't block the current turn; we still return zero this time.
+    _maybe_prime_openrouter_cache()
+
+    # 3. Nothing — log so ops can alert on persistently-zero entries.
     _log_pricing(model_ref, runtime_id, "missing", 0.0, 0.0)
     return {"input_cost_per_million": 0.0, "output_cost_per_million": 0.0}
+
+
+def _maybe_prime_openrouter_cache() -> None:
+    """Schedule a background fetch of OpenRouter's catalog if cache is cold.
+
+    Pricing lookups are sync, but the fetch is async; we hop into the
+    running loop (when there is one) and fire-and-forget. The first call
+    after process start returns zero; subsequent calls — once the prime
+    lands ~1 s later — get live cost.
+    """
+    try:
+        import asyncio
+
+        from openagent.models import discovery
+    except ImportError:
+        return
+    cache = getattr(discovery, "_OPENROUTER_CACHE", None)
+    import time as _time
+    if cache and _time.time() - cache[0] < discovery._CACHE_TTL_SECONDS:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+    async def _prime() -> None:
+        try:
+            await discovery._fetch_openrouter_catalog()
+        except Exception as e:
+            try:
+                elog("catalog.openrouter_prime_error", level="warning", error=str(e))
+            except Exception:
+                pass
+
+    loop.create_task(_prime())
 
 
 def _openrouter_pricing_lookup(runtime_id: str) -> dict[str, float] | None:
@@ -446,8 +470,8 @@ def _log_pricing(model_ref: str, runtime_id: str, source: str, input_cpm: float,
         pass
 
 
-def compute_cost(model_ref: str, input_tokens: int, output_tokens: int, providers_config: dict | None = None) -> float:
-    pricing = get_model_pricing(model_ref, providers_config)
+def compute_cost(model_ref: str, input_tokens: int, output_tokens: int) -> float:
+    pricing = get_model_pricing(model_ref)
     return (
         (pricing["input_cost_per_million"] * max(0, input_tokens)) / 1_000_000
         + (pricing["output_cost_per_million"] * max(0, output_tokens)) / 1_000_000

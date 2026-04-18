@@ -63,13 +63,12 @@ class BudgetTracker:
         }
 
     @staticmethod
-    def compute_cost(model: str, input_tokens: int, output_tokens: int, providers_config: dict | None = None) -> float:
-        """Compute cost using OpenAgent's configured product catalog."""
+    def compute_cost(model: str, input_tokens: int, output_tokens: int) -> float:
+        """Compute cost using OpenAgent's live pricing catalog."""
         from openagent.models.catalog import compute_cost
 
         return compute_cost(
             model_ref=model,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
-            providers_config=providers_config,
         )

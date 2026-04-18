@@ -33,9 +33,16 @@ def _make_router(providers_config: dict, routing: dict[str, str]):
     return r
 
 
-async def _stub_classifier(router, tier: str) -> None:
-    async def _fake_classify(messages, session_id=None):
-        return tier
+async def _stub_classifier(router, picked_runtime_id: str | None) -> None:
+    """Stub the classifier to return a fixed ``runtime_id`` (or None).
+
+    With classifier-direct routing the classifier returns a concrete
+    runtime_id, not a tier. ``None`` lets the router exercise its
+    "no pick" fallback path (first enabled model on the bound side).
+    """
+
+    async def _fake_classify(messages, session_id, catalog):
+        return picked_runtime_id
 
     router._classify = _fake_classify  # type: ignore[assignment]
 
@@ -67,7 +74,7 @@ async def t_fresh_agno(ctx: TestContext) -> None:
             "fallback": "openai:gpt-4o-mini",
         })
         router.set_db(db)
-        await _stub_classifier(router, "simple")
+        await _stub_classifier(router, "openai:gpt-4o-mini")
         seen: list[str] = []
         await _stub_dispatch(router, seen)
 
@@ -84,7 +91,7 @@ async def t_fresh_agno(ctx: TestContext) -> None:
             pass
 
 
-@test("smart_router_hybrid", "bound-to-agno session stays on agno even if classifier picks hard/claude-cli")
+@test("smart_router_hybrid", "bound-to-agno session stays on agno even if classifier picks claude-cli")
 async def t_bound_side_locked(ctx: TestContext) -> None:
     import uuid as _uuid
     from openagent.memory.db import MemoryDB
@@ -109,7 +116,9 @@ async def t_bound_side_locked(ctx: TestContext) -> None:
         router.set_db(db)
         # Pre-bind the session to agno as if a prior turn landed there.
         await db.set_session_binding("sess-bound", "agno")
-        await _stub_classifier(router, "hard")
+        # Classifier picks a claude-cli model; the bound side filter
+        # should drop it and fall back to the first enabled agno entry.
+        await _stub_classifier(router, "claude-cli:anthropic:claude-sonnet-4-6")
         seen: list[str] = []
         await _stub_dispatch(router, seen)
 
@@ -149,7 +158,7 @@ async def t_bound_to_claude_cli(ctx: TestContext) -> None:
         router.set_db(db)
         # Claude-cli bindings live in sdk_sessions.
         await db.set_sdk_session("cli-sess", "sdk-uuid", provider="claude-cli")
-        await _stub_classifier(router, "simple")
+        await _stub_classifier(router, "claude-cli:anthropic:claude-sonnet-4-6")
         seen: list[str] = []
         await _stub_dispatch(router, seen)
 
@@ -185,9 +194,12 @@ async def t_bound_side_empty(ctx: TestContext) -> None:
         })
         router.set_db(db)
         # Session was bound to claude-cli but we have no claude-cli
-        # models in the routing table.
+        # models configured.
         await db.set_sdk_session("orphan", "sdk-id", provider="claude-cli")
-        await _stub_classifier(router, "simple")
+        # No claude-cli model in the catalog → classifier has nothing
+        # to pick; resolve_classifier_pick returns the empty-string
+        # primary_model and generate surfaces the error.
+        await _stub_classifier(router, None)
 
         resp = await router.generate(
             [{"role": "user", "content": "hi"}],

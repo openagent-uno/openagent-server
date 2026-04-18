@@ -292,9 +292,8 @@ async def import_yaml_models_once(
                 framework=row_framework,
                 model_id=model_id,
                 display_name=meta.get("display_name") or meta.get("name"),
-                input_cost=_coerce_cost(meta.get("input_cost_per_million")),
-                output_cost=_coerce_cost(meta.get("output_cost_per_million")),
                 tier_hint=meta.get("tier_hint"),
+                notes=meta.get("notes"),
                 enabled=model_id not in disabled_ids,
                 metadata=meta or None,
             )
@@ -431,12 +430,3 @@ def _entry_model_id(entry: Any) -> str:
 
 def _entry_metadata(entry: Any) -> dict:
     return dict(entry) if isinstance(entry, dict) else {}
-
-
-def _coerce_cost(value: Any) -> float | None:
-    if value is None or value == "":
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None

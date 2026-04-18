@@ -19,7 +19,11 @@ async def t_default_buffer(ctx: TestContext) -> None:
     except ImportError as e:
         raise TestSkip(f"claude_cli unavailable: {e}")
 
-    cli = ClaudeCLI(model=None, providers_config={"anthropic": {}})
+    # ClaudeCLI._build_options now requires a non-empty model id (the
+    # router must pin one before dispatch — empty falls through to the
+    # SDK's hardcoded Sonnet default which is the bug we're guarding
+    # against). Pass any real id so the buffer-size assertion can run.
+    cli = ClaudeCLI(model="claude-sonnet-4-6", providers_config={"anthropic": {}})
     os.environ.pop("OPENAGENT_CLAUDE_SDK_BUFFER_MIB", None)
     opts = cli._build_options(system=None, sdk_session_id=None)
     val = getattr(opts, "max_buffer_size", None)
@@ -37,7 +41,7 @@ async def t_env_override(ctx: TestContext) -> None:
     prev = os.environ.get("OPENAGENT_CLAUDE_SDK_BUFFER_MIB")
     os.environ["OPENAGENT_CLAUDE_SDK_BUFFER_MIB"] = "4"
     try:
-        cli = ClaudeCLI(model=None, providers_config={"anthropic": {}})
+        cli = ClaudeCLI(model="claude-sonnet-4-6", providers_config={"anthropic": {}})
         opts = cli._build_options(system=None, sdk_session_id=None)
         assert getattr(opts, "max_buffer_size", 0) == 4 * 1024 * 1024
     finally:

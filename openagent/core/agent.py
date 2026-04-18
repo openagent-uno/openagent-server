@@ -437,9 +437,18 @@ class Agent:
 
         # Models or providers changed → rebuild router. Providers affect
         # routing because AgnoProvider's api_key lookup goes through
-        # ``providers_config``.
-        if models_updated > getattr(self, "_models_last_updated", 0.0) or providers_changed:
+        # ``providers_config``; models affect it because the classifier
+        # picks from the materialised models list.
+        models_changed = models_updated > getattr(self, "_models_last_updated", 0.0)
+        if models_changed or providers_changed:
             self._models_last_updated = max(models_updated, self._models_last_updated or 0.0)
+            if models_changed and not providers_changed:
+                # Providers hydrate already ran above; re-run only when
+                # models alone changed so the materialised catalog is fresh.
+                try:
+                    await self._hydrate_providers_from_db()
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("models hydrate failed: %s", exc)
             providers_config = (self.config or {}).get("providers", {})
             for model in list(self._runtime_models):
                 rebuild = getattr(model, "rebuild_routing", None)
@@ -454,14 +463,19 @@ class Agent:
         return reloaded, enabled_count
 
     async def _hydrate_providers_from_db(self) -> None:
-        """Pull provider rows from DB into ``self.config['providers']``.
+        """Pull provider + model rows from DB into ``self.config['providers']``.
 
-        After v0.11.0 the DB is the source of truth for provider keys;
-        yaml ``providers:`` is only read once at first boot (via
-        ``import_yaml_providers_once``). SmartRouter / AgnoProvider still
-        consume the old dict shape, so we keep the materialised view in
-        ``self.config`` and refresh it whenever ``providers_max_updated``
-        bumps.
+        After v0.11.0 the DB is the source of truth for provider keys
+        and the model catalog; yaml ``providers:`` is only read once at
+        first boot. SmartRouter / AgnoProvider still consume the legacy
+        dict shape (``providers_config[X]['models']``), so we materialise
+        DB rows into that shape and refresh whenever ``providers_max_updated``
+        or ``models_max_updated`` bumps.
+
+        ``models`` is populated as a list of ``{id, display_name,
+        tier_hint, notes}`` dicts so ``catalog.iter_configured_models``
+        sees the full enabled catalog — which is what the classifier
+        (since v0.12) consults to pick the runtime_id for each turn.
         """
         if self._db is None or self.config is None:
             return
@@ -473,10 +487,35 @@ class Agent:
                 entry["api_key"] = r["api_key"]
             if r.get("base_url"):
                 entry["base_url"] = r["base_url"]
-            # Merge any extra metadata (e.g. legacy ``disabled_models``)
             for k, v in (r.get("metadata") or {}).items():
                 entry.setdefault(k, v)
+            entry.setdefault("models", [])
             materialised[r["name"]] = entry
+
+        # Inject DB models into the per-provider ``models`` list so the
+        # catalog (and therefore SmartRouter's classifier) sees them.
+        # claude-cli rows live under ``provider=anthropic, framework=claude-cli``;
+        # iter_configured_models also tolerates the legacy
+        # ``providers.claude-cli.models`` shape, so we route them there
+        # for backward compat with anything that still expects it.
+        try:
+            model_rows = await self._db.list_models(enabled_only=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("list_models hydrate failed: %s", exc)
+            model_rows = []
+        for row in model_rows:
+            framework = row.get("framework") or "agno"
+            provider = row.get("provider") or ""
+            bucket_name = (
+                "claude-cli" if framework == "claude-cli" else provider
+            )
+            bucket = materialised.setdefault(bucket_name, {"models": []})
+            bucket.setdefault("models", []).append({
+                "id": row["model_id"],
+                "display_name": row.get("display_name"),
+                "tier_hint": row.get("tier_hint"),
+                "notes": row.get("notes"),
+            })
         self.config["providers"] = materialised
 
     async def _run_idle_cleanup(self) -> None:

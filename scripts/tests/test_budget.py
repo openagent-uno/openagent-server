@@ -59,39 +59,32 @@ async def t_budget_compute_cost(ctx: TestContext) -> None:
         # $0.15 / $0.60 per million → 1M in, 1M out = $0.75
         cost = BudgetTracker.compute_cost(
             "openai:gpt-4o-mini", 1_000_000, 1_000_000,
-            {"openai": {"models": ["gpt-4o-mini"]}},
         )
         assert abs(cost - 0.75) < 1e-9, f"unexpected cost: {cost}"
     finally:
         discovery._OPENROUTER_CACHE = prev
 
 
-@test("budget", "SmartRouter routes to fallback when budget is exhausted")
-async def t_router_budget_fallback(ctx: TestContext) -> None:
+@test("budget", "SmartRouter generate refuses to dispatch when budget is exhausted")
+async def t_router_budget_exhausted(ctx: TestContext) -> None:
+    """With classifier-direct routing the per-tier budget downgrade is
+    gone; the only budget gate left is the hard refusal in
+    ``SmartRouter.generate`` when a positive monthly budget is fully
+    spent. This test confirms that gate still fires."""
     if not have_openai_key(ctx.config):
         raise TestSkip("no OpenAI API key")
     from openagent.memory.db import MemoryDB
     from openagent.models.runtime import create_model_from_config, wire_model_runtime
 
-    # Override config to use DIFFERENT models per tier so we can tell them
-    # apart. All three must be real, reachable IDs so the router doesn't
-    # crash during construction.
     cfg = dict(ctx.config)
     cfg["model"] = dict(ctx.config["model"])
     cfg["model"]["monthly_budget"] = 1.0
-    cfg["model"]["routing"] = {
-        "simple":   "gpt-4o-mini",
-        "medium":   "gpt-4o-mini",
-        "hard":     "gpt-4.1-mini",
-        "fallback": "gpt-4o-mini",
-    }
 
     db = MemoryDB(str(ctx.db_path))
     await db.connect()
     try:
-        # Spend $2 — double the $1 budget.
         await db.record_usage(
-            model="openai:gpt-4.1-mini", input_tokens=1_000_000,
+            model="openai:gpt-4o-mini", input_tokens=1_000_000,
             output_tokens=100_000, cost=2.0,
             session_id=f"over-budget-{uuid.uuid4().hex[:6]}",
         )
@@ -99,19 +92,10 @@ async def t_router_budget_fallback(ctx: TestContext) -> None:
         pool = ctx.extras.get("pool")
         wire_model_runtime(model, db=db, mcp_pool=pool)
 
-        # Force the classifier path to think this is a HARD question, but
-        # _routing_decision should override to the cheaper tier when ratio
-        # is low. We pass a low budget_ratio directly to skip the live
-        # classifier call entirely (deterministic).
-        decision = await model._routing_decision(
+        resp = await model.generate(
             messages=[{"role": "user", "content": "anything"}],
             session_id=f"over-test-{uuid.uuid4().hex[:6]}",
-            budget_ratio=0.0,  # Exhausted
         )
-        # With 0 budget remaining, router should pick simple/fallback, not hard.
-        assert decision.requested_tier in ("simple", "medium", "hard")
-        # The chosen model should NOT be the hard-tier model
-        assert "4.1-mini" not in decision.primary_model, \
-            f"budget exhaustion didn't downgrade from hard tier: {decision.primary_model}"
+        assert resp.stop_reason == "budget_exceeded", resp.stop_reason
     finally:
         await db.close()
