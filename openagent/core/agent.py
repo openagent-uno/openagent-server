@@ -353,6 +353,23 @@ class Agent:
         self._prepare_model_runtime(self.model)
         self._ensure_idle_cleanup_task()
 
+        # Prime OpenRouter's catalog in the background so ``get_model_pricing``
+        # has live rates before the first cost attribution, without blocking
+        # startup on a network call. Errors are swallowed — the catalog has a
+        # bundled offline backstop.
+        async def _prime_openrouter() -> None:
+            try:
+                from openagent.models.discovery import _fetch_openrouter_catalog
+                await _fetch_openrouter_catalog()
+            except Exception as exc:  # noqa: BLE001
+                elog("openrouter.prefetch_error", level="warning", error=str(exc))
+        try:
+            asyncio.get_running_loop().create_task(_prime_openrouter())
+        except RuntimeError:
+            # No running loop (sync entry point) — skip; discovery will
+            # lazily populate on the first /api/models/available call.
+            pass
+
         self._initialized = True
         elog(
             "agent.initialize.done",

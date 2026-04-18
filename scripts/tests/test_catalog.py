@@ -37,3 +37,46 @@ async def t_pricing_override(ctx: TestContext) -> None:
     ]}}
     p = get_model_pricing("gpt-4o-mini", cfg)
     assert p["input_cost_per_million"] == 99.0
+
+
+@test("catalog", "claude-cli models have zero pricing (subscription billing)")
+async def t_claude_cli_zero_pricing(ctx: TestContext) -> None:
+    """claude-cli dispatches via Claude Pro/Max; there is no per-token billing."""
+    from openagent.models.catalog import get_model_pricing, compute_cost
+
+    for ref in [
+        "claude-cli:anthropic:claude-sonnet-4-6",
+        "claude-cli/claude-sonnet-4-6",
+        "claude-cli",
+    ]:
+        p = get_model_pricing(ref)
+        assert p["input_cost_per_million"] == 0.0, f"{ref} leaked pricing: {p}"
+        assert p["output_cost_per_million"] == 0.0, f"{ref} leaked pricing: {p}"
+
+    # Even with a config entry that sets anthropic pricing, claude-cli
+    # must not inherit — it's a different framework with different billing.
+    cfg = {"anthropic": {"models": [
+        {"id": "claude-sonnet-4-6", "input_cost_per_million": 3.0, "output_cost_per_million": 15.0}
+    ]}}
+    assert compute_cost("claude-cli:anthropic:claude-sonnet-4-6", 10_000, 5_000, cfg) == 0.0
+
+
+@test("catalog", "OpenRouter cache primes pricing lookup")
+async def t_openrouter_cache_pricing(ctx: TestContext) -> None:
+    """After discovery fetches OpenRouter's catalog, cost lookups consult it."""
+    import time
+    from openagent.models import discovery
+    from openagent.models.catalog import get_model_pricing
+
+    prev = discovery._OPENROUTER_CACHE
+    try:
+        # Seed the cache with a single OpenRouter-shaped row. 0.000003 $/token
+        # on the wire becomes 3.0 $/M after the *1e6 in catalog's lookup.
+        discovery._OPENROUTER_CACHE = (time.time(), [
+            {"id": "openai/gpt-synthetic", "pricing": {"prompt": "0.000003", "completion": "0.000015"}},
+        ])
+        p = get_model_pricing("openai:gpt-synthetic")
+        assert p["input_cost_per_million"] == 3.0, p
+        assert p["output_cost_per_million"] == 15.0, p
+    finally:
+        discovery._OPENROUTER_CACHE = prev

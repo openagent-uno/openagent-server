@@ -228,14 +228,14 @@ def _bundled_fallback(provider: str) -> list[dict[str, Any]]:
     reusing it avoids maintaining a second bundled file. Display name
     is the bare id since the pricing JSON has no human-readable names.
 
-    Special case ``claude-cli``: the pricing table only has a single
-    ``"claude-cli"`` entry (not ``claude-cli:<model>`` rows), so a
-    naive prefix filter returns nothing. Because claude-cli dispatches
-    arbitrary Anthropic model ids through the ``claude`` binary, we
-    mirror the ``anthropic:*`` pricing rows as the catalog.
+    Legacy tolerance: callers passing ``claude-cli`` as the provider
+    (pre-v0.10 pseudo-provider) get the Anthropic model list with
+    pricing zeroed out — claude-cli billing goes through the user's
+    Pro/Max subscription, never per-token.
     """
     pricing = _load_default_pricing()
-    effective = "anthropic" if provider == "claude-cli" else provider
+    claude_cli_mode = provider == "claude-cli"
+    effective = "anthropic" if claude_cli_mode else provider
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
     prefix = f"{effective}:"
@@ -249,8 +249,8 @@ def _bundled_fallback(provider: str) -> list[dict[str, Any]]:
         out.append({
             "id": bare,
             "display_name": bare,
-            "input_cost_per_million": info.get("input_cost_per_million") or None,
-            "output_cost_per_million": info.get("output_cost_per_million") or None,
+            "input_cost_per_million": None if claude_cli_mode else (info.get("input_cost_per_million") or None),
+            "output_cost_per_million": None if claude_cli_mode else (info.get("output_cost_per_million") or None),
         })
     return out
 

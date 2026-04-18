@@ -84,7 +84,7 @@ async def t_add_provider(ctx: TestContext) -> None:
             pass
 
 
-@test("provider_manager", "bundled fallback for claude-cli returns anthropic models")
+@test("provider_manager", "bundled fallback for claude-cli returns anthropic models w/o pricing")
 async def t_claude_cli_fallback(ctx: TestContext) -> None:
     from openagent.models.discovery import _bundled_fallback
 
@@ -92,5 +92,8 @@ async def t_claude_cli_fallback(ctx: TestContext) -> None:
     assert entries, "claude-cli fallback must not be empty"
     ids = {e["id"] for e in entries}
     assert any(mid.startswith("claude-sonnet-") for mid in ids), ids
-    # Prices should be surfaced (they come from the anthropic: rows).
-    assert any(e.get("output_cost_per_million") for e in entries)
+    # claude-cli is billed via the Pro/Max subscription — per-token pricing
+    # must never leak from the anthropic rows, otherwise cost reporting
+    # would double-count subscription usage as API spend.
+    assert all(e.get("input_cost_per_million") is None for e in entries), entries
+    assert all(e.get("output_cost_per_million") is None for e in entries), entries

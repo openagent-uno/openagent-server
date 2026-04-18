@@ -1,6 +1,6 @@
 {
-  "_comment": "Bundled default pricing for common models. Prices are USD per 1M tokens. User config in openagent.yaml overrides these. Keys use OpenAgent runtime format: 'provider:model_id'. To add a model, use the same shape. Bare model_id keys (without provider prefix) are accepted as a fallback.",
-  "_source": "Public provider pricing pages, last reviewed 2026-04. Prices change; verify against your invoice.",
+  "_comment": "Offline backstop for pricing. Online catalog (OpenRouter /api/v1/models) is the primary source; these rows are only used when the network fetch fails. Prices are USD per 1M tokens, keyed as 'provider:model_id'. claude-cli is deliberately omitted — it dispatches via the Claude Pro/Max subscription and has no per-token billing.",
+  "_source": "Public provider pricing pages, last reviewed 2026-04. Prices change; verify against your invoice or https://openrouter.ai/docs/models.",
 
   "openai:gpt-4o":         {"input_cost_per_million": 2.50,  "output_cost_per_million": 10.00},
   "openai:gpt-4o-mini":    {"input_cost_per_million": 0.15,  "output_cost_per_million": 0.60},
@@ -52,7 +52,6 @@
   "cerebras:llama3.1-8b":    {"input_cost_per_million": 0.10, "output_cost_per_million": 0.10},
 
   "zai:glm-4.5":  {"input_cost_per_million": 0.60, "output_cost_per_million": 2.20},
-  "zai:glm-5":    {"input_cost_per_million": 0.60, "output_cost_per_million": 2.20},
-
-  "claude-cli":  {"input_cost_per_million": 3.00, "output_cost_per_million": 15.00}
+  "zai:glm-5":    {"input_cost_per_million": 0.60, "output_cost_per_million": 2.20}
 }
+

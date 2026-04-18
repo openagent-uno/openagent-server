@@ -351,9 +351,12 @@ def get_model_pricing(model_ref: str, providers_config: dict | None = None) -> d
     """Return ``{input_cost_per_million, output_cost_per_million}`` for a model.
 
     Lookup order:
-      1. User-provided pricing in ``providers_config`` (per-model metadata)
-      2. Bundled defaults in ``models/default_pricing.json``
-      3. Zero pricing (logged as a warning)
+      1. claude-cli models → zero (billed via Claude Pro/Max subscription,
+         not per token)
+      2. User-provided pricing in ``providers_config`` (per-model metadata)
+      3. Online catalog (OpenRouter) — see ``openrouter_pricing_lookup``
+      4. Bundled offline defaults in ``models/default_pricing.json``
+      5. Zero pricing (logged as a warning)
 
     Always returns a dict; never raises. Emits ``catalog.pricing_resolved`` event
     on every call with the lookup ``source`` so cost issues can be diagnosed
@@ -362,7 +365,15 @@ def get_model_pricing(model_ref: str, providers_config: dict | None = None) -> d
     runtime_id = normalize_runtime_model_id(model_ref, providers_config)
     bare_id = model_id_from_runtime(runtime_id)
 
-    # 1. Per-model metadata in user config wins.
+    # 1. claude-cli is the local subprocess wrapping the user's Claude
+    # Pro/Max subscription — no per-token billing, ever. Short-circuit
+    # before any lookup so we don't accidentally attribute Anthropic API
+    # pricing to a claude-cli session.
+    if is_claude_cli_model(runtime_id):
+        _log_pricing(model_ref, runtime_id, "claude_cli_subscription", 0.0, 0.0)
+        return {"input_cost_per_million": 0.0, "output_cost_per_million": 0.0}
+
+    # 2. Per-model metadata in user config wins.
     for entry in iter_configured_models(providers_config, include_disabled=True):
         if runtime_id in {entry.runtime_id, entry.model_id} or bare_id in {entry.runtime_id, entry.model_id}:
             input_cost = float(entry.input_cost_per_million or 0.0)
@@ -373,19 +384,19 @@ def get_model_pricing(model_ref: str, providers_config: dict | None = None) -> d
             # Config entry exists but has no pricing → fall through to defaults.
             break
 
-    # 2. Bundled default pricing table.
+    # 3. Online catalog (OpenRouter). Resolved from a process-wide cache
+    # populated by discovery.py; never blocks — returns None on cache miss.
+    online = _openrouter_pricing_lookup(runtime_id)
+    if online is not None:
+        _log_pricing(
+            model_ref, runtime_id, "openrouter",
+            online["input_cost_per_million"], online["output_cost_per_million"],
+        )
+        return online
+
+    # 4. Bundled default pricing table (offline backstop).
     defaults = _load_default_pricing()
     pricing = defaults.get(runtime_id) or defaults.get(bare_id)
-    # claude-cli is a transport for Anthropic models — fall back to anthropic
-    # pricing when no claude-cli-specific entry exists (claude-cli:<X> → anthropic:<X>).
-    if pricing is None and is_claude_cli_model(runtime_id) and bare_id and bare_id != FRAMEWORK_CLAUDE_CLI:
-        pricing = defaults.get(f"anthropic:{bare_id}")
-        if pricing:
-            _log_pricing(
-                model_ref, runtime_id, "default_via_anthropic",
-                pricing["input_cost_per_million"], pricing["output_cost_per_million"],
-            )
-            return dict(pricing)
     if pricing:
         _log_pricing(
             model_ref, runtime_id, "default",
@@ -393,9 +404,57 @@ def get_model_pricing(model_ref: str, providers_config: dict | None = None) -> d
         )
         return dict(pricing)
 
-    # 3. Nothing — log a warning so the user can fix their config.
+    # 5. Nothing — log a warning so the user can fix their config.
     _log_pricing(model_ref, runtime_id, "missing", 0.0, 0.0)
     return {"input_cost_per_million": 0.0, "output_cost_per_million": 0.0}
+
+
+def _openrouter_pricing_lookup(runtime_id: str) -> dict[str, float] | None:
+    """Look up pricing for ``runtime_id`` in the OpenRouter cache.
+
+    Reads ``discovery._OPENROUTER_CACHE`` without triggering a fetch —
+    this is a hot path and must not block on network. The cache is
+    primed the first time anyone hits ``/api/models/available`` or
+    ``list_provider_models``; subsequent pricing lookups amortize for
+    free. Returns ``None`` when the cache is empty or the model isn't
+    in OpenRouter's catalog.
+    """
+    try:
+        from openagent.models import discovery
+    except ImportError:
+        return None
+    cache = getattr(discovery, "_OPENROUTER_CACHE", None)
+    if not cache or ":" not in runtime_id:
+        return None
+    _ts, entries = cache
+    provider, bare = runtime_id.split(":", 1)
+    # Reverse the _OPENROUTER_VENDOR_MAP: our provider → OpenRouter's vendor prefix.
+    want_prefix = None
+    for vendor, our_name in discovery._OPENROUTER_VENDOR_MAP.items():
+        if our_name == provider:
+            want_prefix = vendor
+            break
+    if not want_prefix:
+        return None
+    target = f"{want_prefix}/{bare}"
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("id") or "") != target:
+            continue
+        pricing = entry.get("pricing") or {}
+        try:
+            input_cost = float(pricing.get("prompt") or 0.0) * 1_000_000
+            output_cost = float(pricing.get("completion") or 0.0) * 1_000_000
+        except (TypeError, ValueError):
+            return None
+        if input_cost <= 0 and output_cost <= 0:
+            return None
+        return {
+            "input_cost_per_million": input_cost,
+            "output_cost_per_million": output_cost,
+        }
+    return None
 
 
 def _log_pricing(model_ref: str, runtime_id: str, source: str, input_cpm: float, output_cpm: float) -> None:
