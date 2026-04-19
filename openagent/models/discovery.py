@@ -278,18 +278,3 @@ async def list_provider_models(
         return []
 
 
-async def list_provider_models_cached(provider: str) -> list[dict[str, Any]]:
-    """Provider discovery that reads the live openagent.yaml for the key."""
-    import os
-    from openagent.core.config import load_config
-    try:
-        providers_cfg = load_config(os.environ.get("OPENAGENT_CONFIG_PATH")).get("providers", {}) or {}
-    except (FileNotFoundError, PermissionError, OSError):
-        providers_cfg = {}
-    except Exception as e:  # noqa: BLE001 — yaml errors, bad env refs, etc.
-        elog("discovery.load_config_error", level="warning", error=str(e))
-        providers_cfg = {}
-    cfg = providers_cfg.get(provider, {}) or {}
-    return await list_provider_models(
-        provider, api_key=cfg.get("api_key") or None, base_url=cfg.get("base_url") or None,
-    )

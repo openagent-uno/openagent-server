@@ -59,7 +59,9 @@ async def handle_pricing(request: web.Request) -> web.Response:
     if not db:
         return _web.json_response({"pricing": {}})
 
-    providers_config = _read_resolved(request).get("providers", {}) if gw.config_path else {}
+    providers_config = (
+        _read_resolved(request).get("providers") or [] if gw.config_path else []
+    )
 
     summary = await db.get_usage_summary()
     pricing = {}

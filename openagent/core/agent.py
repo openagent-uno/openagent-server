@@ -459,7 +459,7 @@ class Agent:
                     await self._hydrate_providers_from_db()
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("models hydrate failed: %s", exc)
-            providers_config = (self.config or {}).get("providers", {})
+            providers_config = (self.config or {}).get("providers") or []
             for model in list(self._runtime_models):
                 rebuild = getattr(model, "rebuild_routing", None)
                 if callable(rebuild):

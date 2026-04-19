@@ -826,22 +826,66 @@ class MemoryDB:
         ``models`` list. Used by :meth:`Agent._hydrate_providers_from_db`
         (``enabled_only=True``) and by the smoke-test endpoints that
         want every row regardless of enabled state.
+
+        Single LEFT JOIN keeps this to one SQLite round-trip. A provider
+        with no models still shows up (important for the UI's "empty
+        provider" state).
         """
-        provider_rows = await self.list_providers(enabled_only=enabled_only)
-        model_rows = await self.list_models(enabled_only=enabled_only)
-        by_id: dict[int, dict[str, Any]] = {
-            int(p["id"]): {**p, "models": []} for p in provider_rows
-        }
-        for m in model_rows:
-            bucket = by_id.get(int(m["provider_id"]))
+        conn = await self._ensure_connected()
+        clauses: list[str] = []
+        if enabled_only:
+            # Model-side filter must go in the JOIN predicate, not WHERE,
+            # or providers with zero enabled models would disappear.
+            join_filter = " AND m.enabled = 1"
+            clauses.append("p.enabled = 1")
+        else:
+            join_filter = ""
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        cursor = await conn.execute(
+            f"""
+            SELECT p.id AS p_id, p.name AS p_name, p.framework AS p_framework,
+                   p.api_key AS p_api_key, p.base_url AS p_base_url,
+                   p.enabled AS p_enabled, p.metadata_json AS p_metadata_json,
+                   p.created_at AS p_created_at, p.updated_at AS p_updated_at,
+                   m.id AS m_id, m.model AS m_model, m.display_name AS m_display_name,
+                   m.tier_hint AS m_tier_hint, m.enabled AS m_enabled
+            FROM providers p
+            LEFT JOIN models m ON p.id = m.provider_id{join_filter}
+            {where}
+            ORDER BY p.name ASC, p.framework ASC, m.model ASC
+            """
+        )
+        rows = await cursor.fetchall()
+        by_id: dict[int, dict[str, Any]] = {}
+        for r in rows:
+            pid = int(r["p_id"])
+            bucket = by_id.get(pid)
             if bucket is None:
-                continue
-            bucket["models"].append({
-                "id": m["id"], "model": m["model"],
-                "display_name": m.get("display_name"),
-                "tier_hint": m.get("tier_hint"),
-                "enabled": m.get("enabled", True),
-            })
+                try:
+                    metadata = json.loads(r["p_metadata_json"] or "{}")
+                except (TypeError, ValueError):
+                    metadata = {}
+                bucket = {
+                    "id": pid,
+                    "name": r["p_name"],
+                    "framework": r["p_framework"],
+                    "api_key": r["p_api_key"],
+                    "base_url": r["p_base_url"],
+                    "enabled": bool(r["p_enabled"]),
+                    "metadata": metadata,
+                    "created_at": r["p_created_at"],
+                    "updated_at": r["p_updated_at"],
+                    "models": [],
+                }
+                by_id[pid] = bucket
+            if r["m_id"] is not None:
+                bucket["models"].append({
+                    "id": int(r["m_id"]),
+                    "model": r["m_model"],
+                    "display_name": r["m_display_name"],
+                    "tier_hint": r["m_tier_hint"],
+                    "enabled": bool(r["m_enabled"]),
+                })
         return list(by_id.values())
 
     async def get_model(self, model_id: int) -> dict | None:
