@@ -88,6 +88,17 @@ class Scheduler:
         session_id = f"scheduler:{task['id']}"
         elog("task.run", name=task_name)
         try:
+            # Pick up any providers/models the REST or MCP layer wrote
+            # since the last tick. The gateway fires refresh_registries on
+            # every user message; the scheduler path bypasses that, so
+            # without this hook a freshly-added model stays invisible to
+            # scheduler turns until the next gateway message tickles the
+            # router. Probe is a single SQLite round-trip; no-op when
+            # nothing changed.
+            try:
+                await self.agent.refresh_registries()
+            except Exception as e:  # noqa: BLE001
+                elog("scheduler.hot_reload_error", level="warning", error=str(e))
             response = await self.agent.run(
                 message=task["prompt"],
                 user_id="scheduler",

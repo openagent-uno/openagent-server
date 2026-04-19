@@ -338,6 +338,24 @@ class Agent:
                 # / AgnoProvider see the materialised view.
                 await self._hydrate_providers_from_db()
                 self._providers_last_updated = await self._db.providers_max_updated()
+                self._models_last_updated = await self._db.models_max_updated()
+                # Hand the freshly-hydrated list to every live runtime
+                # model. SmartRouter captured a reference to the yaml-era
+                # (empty) providers_config at construction; without this
+                # push it would keep that stale reference until the first
+                # hot-reload tick — which only fires on gateway messages,
+                # so scheduler turns that run before any user chat would
+                # see an empty catalog and reject with "no_enabled_model".
+                providers_config = (self.config or {}).get("providers", [])
+                for model in list(self._runtime_models) + [self.model]:
+                    if model is None:
+                        continue
+                    rebuild = getattr(model, "rebuild_routing", None)
+                    if callable(rebuild):
+                        try:
+                            rebuild(providers_config)
+                        except Exception as exc:  # noqa: BLE001
+                            logger.debug("rebuild_routing on boot failed: %s", exc)
             except Exception as exc:  # noqa: BLE001 — bootstrap must not block startup
                 elog("bootstrap.error", level="warning", error=str(exc))
 
