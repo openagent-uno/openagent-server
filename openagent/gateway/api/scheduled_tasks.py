@@ -12,10 +12,10 @@ reads from, so changes take effect within the scheduler's next tick
 by openagent.mcp.servers.scheduler so the app, the CLI, and the agent's
 own scheduler MCP all see identical data.
 
-503 is returned when the scheduler isn't running (scheduler.enabled=false
-in config). In that case there is no live Scheduler instance to
-recompute next_run / reconcile enable-flips against, so the safe thing
-is to reject writes rather than silently let rows drift.
+503 is returned when there is no live Scheduler instance (e.g. when
+the agent was constructed without a DB). In that case there's nothing
+to recompute next_run / reconcile enable-flips against, so the safe
+thing is to reject writes rather than silently let rows drift.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ def _resolve_scheduler(request):
     scheduler = getattr(gw, "_scheduler", None)
     if scheduler is None:
         return None, web.json_response(
-            {"error": "Scheduler is not running (scheduler.enabled is false)"},
+            {"error": "Scheduler is not running"},
             status=503,
         )
     return scheduler, None

@@ -1,9 +1,8 @@
 """CRUD /api/mcps — manage the MCP server registry stored in SQLite.
 
-The list used to live in ``openagent.yaml`` under ``mcp:`` / ``mcp_disable:``
-which required a process restart after every change. These endpoints drive
-the same ``mcps`` table the mcp-manager MCP writes to, and every change
-is picked up by the gateway's hot-reload loop on the next message.
+The ``mcps`` SQLite table is the sole source of truth. These endpoints
+drive the same table the mcp-manager MCP writes to, and every change is
+picked up by the gateway's hot-reload loop on the next message.
 
 GET    /api/mcps                → list all rows
 GET    /api/mcps/{name}         → fetch one

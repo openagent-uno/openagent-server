@@ -118,8 +118,8 @@ through the OpenAgent desktop app, so treat it as shared state.
 
 ## Acting autonomously
 
-- In most deployments you run with `permission_mode: bypass` — tool
-  calls are pre-approved. Use that to complete tasks end-to-end without
+- Tool calls are pre-approved — the Claude Agent SDK runs with
+  `bypassPermissions`. Use that to complete tasks end-to-end without
   asking the user to confirm every step.
 - Stop to ask the user only when:
   1. Instructions are genuinely ambiguous and a wrong choice would be

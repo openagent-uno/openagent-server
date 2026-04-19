@@ -60,30 +60,8 @@ def build_test_config(user_config_path: Path) -> tuple[dict, Path, Path]:
 
     cfg = {
         "name": "openagent-test",
-        "model": {
-            "provider": "smart",
-            "monthly_budget": 100,
-            "classifier_model": "gpt-4o-mini",
-            "routing": {
-                "simple": "gpt-4o-mini",
-                "medium": "gpt-4o-mini",
-                "hard": "gpt-4o-mini",
-                "fallback": "gpt-4o-mini",
-            },
-        },
         "system_prompt": "You are a test assistant.",
         "channels": {"websocket": {"port": free_port()}},
-        # mcp-manager / model-manager spawn two extra python subprocesses each
-        # test run — they're already covered by the dedicated manager-server
-        # tests, so keep them out of the default pool here to keep the suite
-        # fast. The feature tests that exercise them re-enable one ad-hoc.
-        "mcp_disable": [
-            "chrome-devtools",
-            "web-search",
-            "computer-control",
-            "mcp-manager",
-            "model-manager",
-        ],
         # Override the default filesystem MCP to add TMPDIR + /tmp roots.
         "mcp": [
             {
@@ -93,7 +71,6 @@ def build_test_config(user_config_path: Path) -> tuple[dict, Path, Path]:
             },
         ],
         "memory": {"db_path": str(db_path)},
-        "scheduler": {"enabled": False, "tasks": []},
         "providers": user_providers,
     }
     config_path = test_dir / "openagent.yaml"

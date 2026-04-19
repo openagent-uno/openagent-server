@@ -106,15 +106,6 @@ def _install_sdk_log_filters() -> None:
 _install_sdk_log_filters()
 
 
-def _coerce_idle_ttl(value: Any, default: int) -> int:
-    """Clamp ``idle_ttl_seconds`` from config to a positive int."""
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return default
-    return parsed if parsed > 0 else default
-
-
 @dataclass
 class _Session:
     """Everything we track for one conversation."""
@@ -144,16 +135,8 @@ class ClaudeCLI(BaseModel):
         self,
         model: str | None = None,
         allowed_tools: list[str] | None = None,
-        permission_mode: str = "bypass",
         mcp_servers: dict[str, dict] | None = None,
         providers_config: Any = None,
-        idle_ttl_seconds: int | None = None,
-        # Legacy knobs retained for backward compatibility with older yaml
-        # configs. Per-turn timeouts were removed deliberately (long tool
-        # runs must be able to complete) — accepting the kwargs keeps
-        # constructor call sites working without a config migration.
-        idle_timeout_seconds: int | None = None,  # noqa: ARG002
-        hard_timeout_seconds: int | None = None,  # noqa: ARG002
     ):
         # Normalize at the boundary so internal storage is always the bare
         # Anthropic model id the SDK expects. Accepts bare, slash, or colon
@@ -165,10 +148,9 @@ class ClaudeCLI(BaseModel):
         else:
             self.model = model
         self.allowed_tools = allowed_tools or []
-        self.permission_mode = permission_mode
         self.mcp_servers: dict[str, dict] = mcp_servers or {}
         self._providers_config = providers_config if providers_config is not None else []
-        self._idle_ttl = _coerce_idle_ttl(idle_ttl_seconds, DEFAULT_IDLE_TTL)
+        self._idle_ttl = DEFAULT_IDLE_TTL
         self._db: Any = None
         self._sessions: dict[str, _Session] = {}
         self._registry_lock = asyncio.Lock()
@@ -223,11 +205,7 @@ class ClaudeCLI(BaseModel):
     ) -> Any:
         from claude_agent_sdk import ClaudeAgentOptions
 
-        opts: dict[str, Any] = {}
-        if self.permission_mode == "bypass":
-            opts["permission_mode"] = "bypassPermissions"
-        elif self.permission_mode == "auto":
-            opts["permission_mode"] = "acceptEdits"
+        opts: dict[str, Any] = {"permission_mode": "bypassPermissions"}
         if self.mcp_servers:
             opts["mcp_servers"] = self.mcp_servers
             # ``--strict-mcp-config`` forces the claude binary to use ONLY
@@ -979,19 +957,13 @@ class ClaudeCLIRegistry(BaseModel):
         self,
         default_model: str | None = None,
         allowed_tools: list[str] | None = None,
-        permission_mode: str = "bypass",
         mcp_servers: dict[str, dict] | None = None,
         providers_config: Any = None,
-        idle_ttl_seconds: int | None = None,
-        idle_timeout_seconds: int | None = None,  # noqa: ARG002 — legacy kwarg
-        hard_timeout_seconds: int | None = None,  # noqa: ARG002 — legacy kwarg
     ):
         self._default_model = (default_model or "").strip() or None
         self._allowed_tools = allowed_tools or []
-        self._permission_mode = permission_mode
         self._mcp_servers: dict[str, dict] = mcp_servers or {}
         self._providers_config = providers_config if providers_config is not None else []
-        self._idle_ttl_seconds = idle_ttl_seconds
         self._db: Any = None
         self._instances: dict[str, ClaudeCLI] = {}
         self._session_model: dict[str, str] = {}
@@ -1107,10 +1079,8 @@ class ClaudeCLIRegistry(BaseModel):
         inst = ClaudeCLI(
             model=bare,
             allowed_tools=self._allowed_tools,
-            permission_mode=self._permission_mode,
             mcp_servers=self._mcp_servers,
             providers_config=self._providers_config,
-            idle_ttl_seconds=self._idle_ttl_seconds,
         )
         if self._db is not None:
             inst.set_db(self._db)

@@ -12,8 +12,6 @@ DELETE /api/models/{id}           → delete one
 POST   /api/models/{id}/enable|disable
 
 GET    /api/models/catalog        → iter_configured_models view w/ pricing
-GET    /api/models/active         → active model yaml section
-PUT    /api/models/active         → set active model yaml section
 GET    /api/models/available?provider_id=N → discovery-driven per-provider catalog
 GET    /api/models/providers      → supported provider list
 """
@@ -25,38 +23,7 @@ if TYPE_CHECKING:
     from aiohttp import web
 
 from openagent.gateway.api._common import gateway_db as _db
-from openagent.gateway.api.config import _read_raw, _read_resolved, _write_raw
-from openagent.gateway.api.providers import _mask_key
-
-
-async def handle_get_active(request: web.Request) -> web.Response:
-    """Return the active model config (masked key)."""
-    from aiohttp import web as _web
-
-    raw = _read_raw(request)
-    active = dict(raw.get("model", {}))
-    if "api_key" in active:
-        k = active.pop("api_key")
-        if isinstance(k, str) and k.startswith("${"):
-            active["api_key_display"] = k
-        else:
-            active["api_key_display"] = _mask_key(k)
-
-    return _web.json_response({"active": active})
-
-
-async def handle_set_active(request: web.Request) -> web.Response:
-    """Replace the active model config (yaml ``model:`` section)."""
-    from aiohttp import web as _web
-    from openagent.core.logging import elog
-
-    body = await request.json()
-    raw = _read_raw(request)
-    raw["model"] = body
-    _write_raw(request, raw)
-    elog("config.update", section="model")
-
-    return _web.json_response({"ok": True, "restart_required": False})
+from openagent.gateway.api.config import _read_resolved
 
 
 async def handle_available_providers(request: web.Request) -> web.Response:

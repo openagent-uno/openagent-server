@@ -153,9 +153,9 @@ CREATE INDEX IF NOT EXISTS idx_models_provider ON models(provider_id);
 CREATE INDEX IF NOT EXISTS idx_models_enabled ON models(enabled);
 CREATE INDEX IF NOT EXISTS idx_models_updated ON models(updated_at);
 
--- Generic string-valued state flags. Used for one-shot bootstrap
--- markers (``mcps_imported``) so the yaml → DB MCP import runs
--- exactly once per DB file.
+-- Generic string-valued state flags. Intended for process-wide
+-- markers that need to survive restarts (none in active use — the
+-- schema is kept for forward compat).
 CREATE TABLE IF NOT EXISTS config_state (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,

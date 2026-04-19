@@ -58,7 +58,6 @@ async def t_router_classifies(ctx: TestContext) -> None:
         decision = await model._routing_decision(
             messages=[{"role": "user", "content": "hi"}],
             session_id=sid,
-            budget_ratio=1.0,
         )
         # Classifier-direct routing always reports "classifier" (or
         # "pinned"); the legacy tier vocabulary is gone.

@@ -46,7 +46,7 @@ from openagent.models.runtime import create_model_from_spec, wire_model_runtime
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_CLASSIFIER_MODEL = "openai:gpt-4o-mini"
+CLASSIFIER_MODEL = "openai:gpt-4o-mini"
 
 # Canonical names used in DB ``session_bindings.provider`` and
 # ``sdk_sessions.provider``. Exported for tests.
@@ -74,12 +74,7 @@ class SmartRouter(BaseModel):
 
     def __init__(
         self,
-        routing: dict[str, str] | None = None,
-        api_key: str | None = None,
-        monthly_budget: float = 0.0,
-        classifier_model: str | None = None,
         providers_config: Any = None,
-        claude_permission_mode: str = "bypass",
     ):
         # v0.12 providers_config is a flat list of provider entries.
         # Accept both shapes (list or legacy dict) so early-boot / tests
@@ -87,9 +82,6 @@ class SmartRouter(BaseModel):
         if providers_config is None:
             providers_config = []
         self._providers_config = providers_config
-        self._api_key = api_key
-        self._monthly_budget = monthly_budget
-        self._claude_permission_mode = claude_permission_mode
 
         self._budget: BudgetTracker | None = None
         self._db: Any = None
@@ -112,26 +104,10 @@ class SmartRouter(BaseModel):
         # rebill the classifier and risk a mid-task model swap.
         self._last_pick_by_session: dict[str, str] = {}
 
-        # ``routing`` is retained as a soft starting point: if the user
-        # supplied explicit per-tier model_ids in the yaml ``model:``
-        # section, use the union of those values as the seed catalog
-        # when the DB is empty (early boot). Once the DB carries enabled
-        # rows, ``iter_configured_models`` is the source of truth.
-        self._explicit_routing = (
-            {k: normalize_runtime_model_id(v, self._providers_config) for k, v in (routing or {}).items() if v}
-            or None
-        )
-
         self._classifier_model = normalize_runtime_model_id(
-            classifier_model or DEFAULT_CLASSIFIER_MODEL,
-            self._providers_config,
+            CLASSIFIER_MODEL, self._providers_config,
         )
-        elog(
-            "router.config",
-            classifier_model=self._classifier_model,
-            monthly_budget=self._monthly_budget,
-            explicit_routing=self._explicit_routing,
-        )
+        elog("router.config", classifier_model=self._classifier_model)
 
     def rebuild_routing(self, providers_config: Any = None) -> None:
         """Called by the hot-reload loop when the ``models`` DB table changes.
@@ -143,8 +119,7 @@ class SmartRouter(BaseModel):
         if providers_config is not None:
             self._providers_config = providers_config
         self._classifier_model = normalize_runtime_model_id(
-            self._classifier_model or DEFAULT_CLASSIFIER_MODEL,
-            self._providers_config,
+            CLASSIFIER_MODEL, self._providers_config,
         )
         elog("router.rebuilt", classifier_model=self._classifier_model)
 
@@ -152,7 +127,10 @@ class SmartRouter(BaseModel):
 
     def set_db(self, db: Any) -> None:
         self._db = db
-        self._budget = BudgetTracker(db, self._monthly_budget)
+        # BudgetTracker is still wired for per-turn usage logging; the
+        # monthly-budget gate is gone with the yaml knob, so we pass 0
+        # (= unlimited) and rely solely on its ``record`` path.
+        self._budget = BudgetTracker(db, 0.0)
         for model in self._agno_providers.values():
             wire_model_runtime(model, db=db)
         if self._claude_registry is not None:
@@ -214,8 +192,6 @@ class SmartRouter(BaseModel):
             self._agno_providers[runtime_id] = create_model_from_spec(
                 runtime_id,
                 providers_config=self._providers_config,
-                api_key=self._api_key,
-                claude_permission_mode=self._claude_permission_mode,
                 db=self._db,
                 mcp_pool=self._mcp_pool,
             )
@@ -227,7 +203,6 @@ class SmartRouter(BaseModel):
 
             self._claude_registry = ClaudeCLIRegistry(
                 default_model=None,
-                permission_mode=self._claude_permission_mode,
                 providers_config=self._providers_config,
             )
             if self._db is not None:
@@ -474,13 +449,6 @@ class SmartRouter(BaseModel):
             add(entry.runtime_id)
         return candidates
 
-    async def _budget_ratio(self, session_id: str | None = None) -> float:
-        ratio = 1.0
-        if self._budget:
-            ratio = await self._budget.get_budget_ratio()
-            elog("router.budget", session_id=session_id, budget_ratio=round(ratio, 3))
-        return ratio
-
     def _remember_pick(self, session_id: str | None, runtime_id: str) -> None:
         key = session_id or "__default__"
         self._last_pick_by_session[key] = runtime_id
@@ -502,7 +470,6 @@ class SmartRouter(BaseModel):
         self,
         messages: list[dict[str, Any]],
         session_id: str | None,
-        budget_ratio: float,  # noqa: ARG002 — accepted for backward compat with tests
     ) -> RoutingDecision:
         # Per-session pin wins over everything: if the user (or the
         # agent itself via ``model-manager.pin_session``) has chosen a
@@ -601,16 +568,7 @@ class SmartRouter(BaseModel):
         on_status: Callable[[str], Awaitable[None]] | None = None,
         session_id: str | None = None,
     ) -> ModelResponse:
-        budget_ratio = await self._budget_ratio(session_id)
-
-        if budget_ratio <= 0 and self._monthly_budget > 0:
-            elog("router.budget_exceeded", session_id=session_id, monthly_budget=self._monthly_budget)
-            return ModelResponse(
-                content="Monthly budget exhausted. Please increase the budget or wait for the next billing period.",
-                stop_reason="budget_exceeded",
-            )
-
-        decision = await self._routing_decision(messages, session_id, budget_ratio)
+        decision = await self._routing_decision(messages, session_id)
         if not decision.primary_model or not decision.candidates:
             # Bound-side has no enabled model, or catalog is empty.
             msg = (
@@ -632,7 +590,6 @@ class SmartRouter(BaseModel):
             reason=decision.reason,
             model=decision.primary_model,
             bound_framework=decision.bound_framework,
-            budget_ratio=round(budget_ratio, 3),
         )
         elog("router.candidates", session_id=session_id, models=decision.candidates)
 

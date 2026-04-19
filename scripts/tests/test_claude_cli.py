@@ -43,7 +43,8 @@ async def t_claude_minimal(ctx: TestContext) -> None:
     if pool is None:
         pool = MCPPool.from_config(
             mcp_config=ctx.config.get("mcp"), include_defaults=True,
-            disable=ctx.config.get("mcp_disable"), db_path=str(ctx.db_path))
+            disable=["chrome-devtools", "web-search", "computer-control", "mcp-manager", "model-manager"],
+            db_path=str(ctx.db_path))
         await pool.connect_all()
         own_pool = True
 
@@ -87,7 +88,8 @@ async def t_claude_provider_mcp_call(ctx: TestContext) -> None:
     if pool is None:
         pool = MCPPool.from_config(
             mcp_config=ctx.config.get("mcp"), include_defaults=True,
-            disable=ctx.config.get("mcp_disable"), db_path=str(ctx.db_path))
+            disable=["chrome-devtools", "web-search", "computer-control", "mcp-manager", "model-manager"],
+            db_path=str(ctx.db_path))
         await pool.connect_all()
         own_pool = True
 

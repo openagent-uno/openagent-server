@@ -73,12 +73,12 @@ async def handle_patch(request):
     config[section] = patch
     _write_raw(request, config)
     elog("config.update", section=section)
-    # model/providers are hot-reloaded by the Gateway on the next message;
-    # other sections (mcp, scheduler, channels, system_prompt) still need
-    # a restart to take effect.
-    hot_reloadable = section in ("model", "providers")
+    # All yaml sections (channels, system_prompt, memory, dream_mode,
+    # auto_update) require a restart to take effect. Providers, models,
+    # and MCPs are DB-backed and hot-reload on their own path, not
+    # through this endpoint.
     return web.json_response({
         "ok": True,
-        "restart_required": not hot_reloadable,
+        "restart_required": True,
         section: _sanitize(patch),
     })

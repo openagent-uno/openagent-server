@@ -18,7 +18,7 @@ async def t_pool_specs(ctx: TestContext) -> None:
     pool = MCPPool.from_config(
         mcp_config=ctx.config.get("mcp"),
         include_defaults=True,
-        disable=ctx.config.get("mcp_disable"),
+        disable=["chrome-devtools", "web-search", "computer-control", "mcp-manager", "model-manager"],
         db_path=str(ctx.db_path),
     )
     names = [s.name for s in pool.specs]
@@ -36,7 +36,7 @@ async def t_pool_claude_shape(ctx: TestContext) -> None:
     pool = MCPPool.from_config(
         mcp_config=ctx.config.get("mcp"),
         include_defaults=True,
-        disable=ctx.config.get("mcp_disable"),
+        disable=["chrome-devtools", "web-search", "computer-control", "mcp-manager", "model-manager"],
         db_path=str(ctx.db_path),
     )
     sdk = pool.claude_sdk_servers()
@@ -55,7 +55,7 @@ async def t_pool_connect(ctx: TestContext) -> None:
     pool = MCPPool.from_config(
         mcp_config=ctx.config.get("mcp"),
         include_defaults=True,
-        disable=ctx.config.get("mcp_disable"),
+        disable=["chrome-devtools", "web-search", "computer-control", "mcp-manager", "model-manager"],
         db_path=str(ctx.db_path),
     )
     await pool.connect_all()

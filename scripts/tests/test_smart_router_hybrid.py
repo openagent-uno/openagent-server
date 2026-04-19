@@ -21,16 +21,17 @@ class _FakeResp:
         self.model = model
 
 
-def _make_router(providers_config: list, routing: dict[str, str]):
+def _make_router(providers_config: list, routing: dict[str, str] | None = None):
+    """Build a SmartRouter for tests.
+
+    ``routing`` is accepted for call-site compat with the legacy yaml
+    ``model.routing`` tiers, but v0.12 ignores it — the router reads the
+    enabled catalog from ``providers_config`` on every turn.
+    """
     from openagent.models.smart_router import SmartRouter
 
-    r = SmartRouter(
-        routing=routing,
-        providers_config=providers_config,
-        api_key=None,
-        monthly_budget=0.0,
-    )
-    return r
+    del routing
+    return SmartRouter(providers_config=providers_config)
 
 
 async def _stub_classifier(router, picked_runtime_id: str | None) -> None:

@@ -299,13 +299,12 @@ class Agent:
     async def initialize(self) -> None:
         """Connect MCP servers and initialize memory DB.
 
-        On first boot we also run the yaml → DB bootstrap for MCPs so
-        existing users migrate transparently. After bootstrap the MCP
-        pool is rebuilt from the ``mcps`` table via ``MCPPool.from_db``
-        so the runtime can hot-reload entries without a process restart
-        (see ``reload_mcps_if_changed``). Providers and models are
-        DB-native — they are always loaded from the ``providers`` /
-        ``models`` tables via ``_hydrate_providers_from_db``.
+        The ``mcps`` / ``providers`` / ``models`` SQLite tables are the
+        sole sources of truth at runtime. ``ensure_builtin_mcps`` runs
+        every boot to backfill any missing builtin rows (forward compat
+        + safety net); the MCP pool is then (re)built from the DB via
+        ``MCPPool.from_db`` so the runtime can hot-reload entries
+        without a process restart (see ``reload_mcps_if_changed``).
         """
         if self._initialized:
             return
@@ -318,16 +317,7 @@ class Agent:
         # in that case we fall back to whatever pool the caller passed in.
         if self._db is not None and self.config is not None:
             try:
-                from openagent.memory.bootstrap import (
-                    ensure_builtin_mcps,
-                    import_yaml_mcps_once,
-                )
-                mcp_config = self.config.get("mcp", []) or []
-                include_defaults = bool(self.config.get("mcp_defaults", True))
-                mcp_disable = list(self.config.get("mcp_disable", []) or [])
-                await import_yaml_mcps_once(
-                    self._db, mcp_config, include_defaults, mcp_disable,
-                )
+                from openagent.memory.bootstrap import ensure_builtin_mcps
                 # Every boot: re-seed any BUILTIN_MCP_SPECS entry that
                 # doesn't have a row yet (forward-compat for future
                 # builtins + safety net against manual DB tampering).
