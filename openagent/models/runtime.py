@@ -127,10 +127,11 @@ def create_model_from_spec(
 
         bare = model_id_from_runtime(spec)
         default_model = bare if bare and bare != spec else None
-        # The registry hosts one ClaudeCLI per model id so multiple
-        # claude-cli entries in the ``models`` table can coexist and
-        # sessions get routed to the right one. It behaves identically
-        # to a single ClaudeCLI when only one model is configured.
+        # The registry hosts one ClaudeCLI per session; the model the
+        # live subprocess is pinned to can change mid-session via
+        # ClaudeSDKClient.set_model(), so multiple claude-cli entries
+        # in the ``models`` table can coexist without duplicating
+        # subprocesses per model.
         model = ClaudeCLIRegistry(
             default_model=default_model,
             permission_mode=permission_mode,

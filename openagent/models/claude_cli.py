@@ -125,6 +125,14 @@ class _Session:
     last_active: float = 0.0
     hydrated: bool = False  # True once we've consulted the DB for this sid
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Model currently pinned in the live ClaudeSDKClient subprocess. Kept
+    # in sync via ``ClaudeSDKClient.set_model()`` so consecutive turns on
+    # the same session can change models without rebinding --resume.
+    current_sdk_model: str | None = None
+    # Model the SDK reported back for the most recent turn (from the
+    # ``ResultMessage`` event). Used to surface the truly-executed model
+    # in ``ModelResponse.model`` so silent SDK fallbacks become visible.
+    last_actual_model: str | None = None
 
 
 class ClaudeCLI(BaseModel):
@@ -147,7 +155,15 @@ class ClaudeCLI(BaseModel):
         idle_timeout_seconds: int | None = None,  # noqa: ARG002
         hard_timeout_seconds: int | None = None,  # noqa: ARG002
     ):
-        self.model = model
+        # Normalize at the boundary so internal storage is always the bare
+        # Anthropic model id the SDK expects. Accepts bare, slash, or colon
+        # forms (see ``catalog.model_id_from_runtime``). ``model=None`` is
+        # preserved verbatim for back-compat with callers that rely on the
+        # SDK's default model.
+        if model:
+            self.model: str | None = model_id_from_runtime(model) or model
+        else:
+            self.model = model
         self.allowed_tools = allowed_tools or []
         self.permission_mode = permission_mode
         self.mcp_servers: dict[str, dict] = mcp_servers or {}
@@ -220,15 +236,25 @@ class ClaudeCLI(BaseModel):
             # even uniquely-named) entries can lose to external config.
             opts.setdefault("extra_args", {})["strict-mcp-config"] = None
         # The Claude Agent SDK silently falls back to a hardcoded Sonnet
-        # default when ``model`` is missing. SmartRouter MUST pin a
-        # concrete runtime_id, so an empty value here means routing is
-        # broken — fail loudly instead of misrouting under the radar.
+        # default when ``model`` is missing OR when it's a value the SDK
+        # doesn't recognize. SmartRouter passes a namespaced runtime_id
+        # like ``claude-cli:anthropic:<model>``; the SDK only accepts the
+        # bare Anthropic id, so strip the prefix here and fail loudly if
+        # we can't resolve one.
         if not self.model:
             raise ValueError(
                 "ClaudeCLI._build_options called with empty model; the "
                 "router must pin a concrete runtime_id before dispatch."
             )
-        opts["model"] = self.model
+        bare_model = model_id_from_runtime(self.model)
+        if not bare_model:
+            raise ValueError(
+                f"ClaudeCLI._build_options got an unparseable model id "
+                f"{self.model!r}; expected a bare Anthropic model id "
+                f"(e.g. 'claude-opus-4-5-20250929') or the canonical "
+                f"runtime 'claude-cli:anthropic:<model>'."
+            )
+        opts["model"] = bare_model
         if system:
             opts["system_prompt"] = system
         if sdk_session_id:
@@ -358,12 +384,23 @@ class ClaudeCLI(BaseModel):
                 raise
         session.client = client
         session.last_active = time.time()
+        # The subprocess was spawned with ``self.model`` baked into its
+        # options (see ``_build_options``) — record the bare id so
+        # ``generate`` knows what's already loaded and can skip redundant
+        # ``set_model()`` round-trips on same-model turns.
+        session.current_sdk_model = (
+            model_id_from_runtime(self.model) if self.model else None
+        )
         return client
 
     async def _disconnect(self, session: _Session) -> None:
         """Close the subprocess. Keeps ``sdk_session_id`` for resume."""
         client = session.client
         session.client = None
+        # The live subprocess is gone — the next turn must re-pin the
+        # model via either a fresh spawn or ``set_model()`` once the new
+        # client is connected.
+        session.current_sdk_model = None
         if client is not None:
             try:
                 await client.disconnect()
@@ -546,8 +583,8 @@ class ClaudeCLI(BaseModel):
         """Pull text + usage from a ``ResultMessage`` and store the SDK sid."""
         result_text = getattr(message, "result", None) or ""
         sdk_sid = getattr(message, "session_id", None)
+        session = self._sessions.get(session_id)
         if sdk_sid:
-            session = self._sessions.get(session_id)
             if session is not None:
                 session.sdk_session_id = sdk_sid
             self._persist_sdk_session(session_id, sdk_sid)
@@ -556,6 +593,13 @@ class ClaudeCLI(BaseModel):
                 session_id=session_id,
                 sdk_session_id=sdk_sid,
             )
+        # Capture the model the SDK subprocess actually ran so the
+        # response footer reflects reality (not just what the router
+        # asked for). Any silent SDK fallback becomes visible to the
+        # user on the same turn it happens.
+        actual_model = self._extract_actual_model(message)
+        if actual_model and session is not None:
+            session.last_actual_model = actual_model
         usage_meta = {
             "total_cost_usd": getattr(message, "total_cost_usd", None),
             "usage": getattr(message, "usage", None),
@@ -565,6 +609,24 @@ class ClaudeCLI(BaseModel):
             "num_turns": getattr(message, "num_turns", None),
         }
         return result_text, usage_meta
+
+    def _extract_actual_model(self, message: Any) -> str | None:
+        """Pull the model id the SDK subprocess actually used this turn.
+
+        Prefers a direct ``model`` attribute on the ``ResultMessage``
+        (newer SDKs expose it); falls back to the primary key of
+        ``model_usage`` (which the Anthropic SDK always populates).
+        Normalizes to the bare id so callers can feed it straight to
+        ``claude_cli_model_spec``.
+        """
+        raw = getattr(message, "model", None)
+        if not raw:
+            model_usage = getattr(message, "model_usage", None)
+            if isinstance(model_usage, dict) and model_usage:
+                raw = next(iter(model_usage.keys()))
+        if not raw:
+            return None
+        return model_id_from_runtime(str(raw)) or str(raw)
 
     async def _run_once(
         self,
@@ -634,9 +696,21 @@ class ClaudeCLI(BaseModel):
         tools: list[dict[str, Any]] | None = None,
         on_status: Callable[[str], Awaitable[None]] | None = None,
         session_id: str | None = None,
+        model_override: str | None = None,
     ) -> ModelResponse:
         sid = session_id or "default"
         elog("model.generate", session_id=sid)
+
+        # Resolve the target model for this turn: an explicit override
+        # beats the instance default. ``self.model`` is updated BEFORE
+        # ``_ensure_client`` can spawn a subprocess so ``_build_options``
+        # reads the right value on first-use.
+        requested_raw = model_override or self.model
+        if requested_raw:
+            requested_model = model_id_from_runtime(requested_raw) or requested_raw
+            self.model = requested_model
+        else:
+            requested_model = None
 
         prompt_parts: list[str] = []
         for msg in messages:
@@ -650,7 +724,17 @@ class ClaudeCLI(BaseModel):
 
         for attempt in range(MAX_RETRIES_ON_ERROR + 1):
             try:
+                # Clear any stale SDK self-report from a previous turn so
+                # we never surface a value that doesn't belong to THIS
+                # turn — if the SDK fails to report, the fallback to
+                # ``self.model`` (what we asked for) kicks in.
+                existing = self._sessions.get(sid)
+                if existing is not None:
+                    existing.last_actual_model = None
+
                 client = await self._get_client(sid, system)
+                await self._ensure_session_model(sid, client, requested_model)
+
                 result, usage_meta = await self._run_once(
                     client, prompt, sid, on_status
                 )
@@ -661,7 +745,7 @@ class ClaudeCLI(BaseModel):
                     content=result,
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
-                    model=self._model_id_for_billing(),
+                    model=self._model_id_for_response(sid),
                 )
             except asyncio.CancelledError:
                 raise
@@ -682,8 +766,45 @@ class ClaudeCLI(BaseModel):
                 return ModelResponse(
                     content=f"Error: {e}",
                     stop_reason="error",
-                    model=self._model_id_for_billing(),
+                    model=self._model_id_for_response(sid),
                 )
+
+    async def _ensure_session_model(
+        self, session_id: str, client: Any, requested_model: str | None
+    ) -> None:
+        """Ensure the live subprocess is pinned to ``requested_model``.
+
+        Uses ``ClaudeSDKClient.set_model`` (control-protocol message,
+        available since ``claude-agent-sdk>=0.1.50``) so the running
+        subprocess and its conversation context are preserved across
+        a model change — no ``--resume`` rebind, same SDK session UUID.
+
+        Short-circuits when the subprocess is already on the right model
+        (first-use spawns with the desired model via ``_build_options``;
+        same-model follow-ups skip the round-trip entirely).
+        """
+        if not requested_model:
+            return
+        session = self._sessions.get(session_id)
+        if session is None:
+            return
+        if session.current_sdk_model == requested_model:
+            return
+        # Some test harnesses substitute a plain object for the client;
+        # only invoke the real control protocol when it's available.
+        if not hasattr(client, "set_model"):
+            session.current_sdk_model = requested_model
+            return
+        async with session.lock:
+            if session.current_sdk_model == requested_model:
+                return
+            await client.set_model(requested_model)
+            session.current_sdk_model = requested_model
+            elog(
+                "claude_cli.model_switched",
+                session_id=session_id,
+                to_model=requested_model,
+            )
 
     # ── billing ────────────────────────────────────────────────────────
 
@@ -696,6 +817,20 @@ class ClaudeCLI(BaseModel):
         so pricing lookups via ``get_model_pricing`` resolve correctly.
         """
         return claude_cli_model_spec(self.model)
+
+    def _model_id_for_response(self, session_id: str) -> str:
+        """Canonical runtime_id for what the SDK ACTUALLY ran this turn.
+
+        Prefers the SDK's self-reported model (captured from the
+        ``ResultMessage`` into ``_Session.last_actual_model``). Falls
+        back to ``self.model`` — what we asked for — if the SDK gave us
+        nothing. Intended for the ``ModelResponse.model`` field so the
+        bridge footer reflects execution, not intent; billing continues
+        to key off ``_model_id_for_billing`` (intent).
+        """
+        session = self._sessions.get(session_id)
+        actual = (session.last_actual_model if session else None) or self.model
+        return claude_cli_model_spec(actual)
 
     def _extract_usage_tokens(self, usage_meta: dict[str, Any]) -> tuple[int, int]:
         """Pull ``(input_tokens, output_tokens)`` from the SDK ``usage`` dict.
@@ -812,25 +947,23 @@ class ClaudeCLI(BaseModel):
 
 
 class ClaudeCLIRegistry(BaseModel):
-    """Per-session model dispatcher for claude-cli.
+    """Per-session dispatcher for claude-cli.
 
-    OpenAgent's single-process ``ClaudeCLI`` instance binds a model id at
-    construction time: changing ``self.model`` later would not retroactively
-    reconfigure the ``ClaudeSDKClient`` already spawned for a running
-    session (the SDK captures the model in ``options`` when
-    ``connect()`` runs). To let different sessions route to different
-    Claude models without losing their ``--resume`` state, we keep one
-    ``ClaudeCLI`` per model and forward calls by session.
+    Holds one ``ClaudeCLI`` instance (and therefore one live
+    ``ClaudeSDKClient`` subprocess) per ``session_id``. The model the
+    subprocess is pinned to is NOT baked into the key: follow-up turns
+    can change it via ``ClaudeSDKClient.set_model()``, which preserves
+    both the SDK session UUID and the conversation history.
 
     Lifecycle methods (``set_db``, ``set_mcp_servers``, ``cleanup_idle``,
     ``shutdown``, ``close_session``, ``forget_session``) fan out to every
     live instance so downstream wiring (``wire_model_runtime``) works
     unchanged.
 
-    ``generate`` picks the instance for a session based on:
+    ``generate`` picks the target model based on:
 
-      1. An explicit ``model_override`` string on the call (``claude-cli/<id>``
-         or bare ``<id>``) — highest priority.
+      1. An explicit ``model_override`` string on the call (``claude-cli/<id>``,
+         ``claude-cli:anthropic:<id>``, or bare ``<id>``) — highest priority.
       2. A session-level pin set via ``pin_session`` (e.g. from the
          model-manager MCP).
       3. The registry's default model (``default_model`` constructor arg).
@@ -896,11 +1029,27 @@ class ClaudeCLIRegistry(BaseModel):
         self._instances.clear()
 
     async def close_session(self, session_id: str) -> None:
-        await self._fanout_async("close_session", session_id)
+        # Registry keys by session_id now — the only instance that
+        # carries live state for ``session_id`` is ``_instances[session_id]``.
+        inst = self._instances.get(session_id)
+        if inst is not None:
+            try:
+                await inst.close_session(session_id)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("registry.close_session: %s", e)
         self._session_model.pop(session_id, None)
 
     async def forget_session(self, session_id: str) -> None:
-        await self._fanout_async("forget_session", session_id)
+        inst = self._instances.pop(session_id, None)
+        if inst is not None:
+            try:
+                await inst.forget_session(session_id)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("registry.forget_session: %s", e)
+            try:
+                await inst.shutdown()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("registry.forget_session shutdown: %s", e)
         self._session_model.pop(session_id, None)
 
     def known_session_ids(self) -> list[str]:
@@ -934,19 +1083,29 @@ class ClaudeCLIRegistry(BaseModel):
             return pinned
         return self._default_model
 
-    def _get_or_create(self, model_id: str | None) -> ClaudeCLI:
-        if not model_id:
-            raise ValueError(
-                "ClaudeCLIRegistry._get_or_create called with empty "
-                "model_id; the router must always pin a concrete "
-                "runtime_id before dispatching to claude-cli."
-            )
-        key = model_id
-        inst = self._instances.get(key)
+    def _get_or_create(self, session_id: str, model_id: str | None) -> ClaudeCLI:
+        """Return the ``ClaudeCLI`` for ``session_id``, spawning if absent.
+
+        ``model_id`` is the initial model to pin in the subprocess on
+        first spawn. Subsequent turns change models in place via
+        ``ClaudeCLI.generate(model_override=...)`` — the instance's
+        ``self.model`` is updated per turn and the SDK subprocess is
+        re-pinned via ``set_model()``. So this argument only matters the
+        very first time a ``session_id`` is seen.
+        """
+        inst = self._instances.get(session_id)
         if inst is not None:
             return inst
+        if not model_id:
+            raise ValueError(
+                "ClaudeCLIRegistry._get_or_create: first-spawn for "
+                f"session {session_id!r} requires a model_id; the router "
+                "must pin a concrete runtime_id before dispatching to "
+                "claude-cli."
+            )
+        bare = model_id_from_runtime(model_id) or model_id
         inst = ClaudeCLI(
-            model=model_id,
+            model=bare,
             allowed_tools=self._allowed_tools,
             permission_mode=self._permission_mode,
             mcp_servers=self._mcp_servers,
@@ -955,8 +1114,12 @@ class ClaudeCLIRegistry(BaseModel):
         )
         if self._db is not None:
             inst.set_db(self._db)
-        self._instances[key] = inst
-        elog("claude_cli_registry.instance_created", model=model_id or "<default>")
+        self._instances[session_id] = inst
+        elog(
+            "claude_cli_registry.instance_created",
+            session_id=session_id,
+            initial_model=bare,
+        )
         return inst
 
     # ── turn ──────────────────────────────────────────────────────────
@@ -971,18 +1134,15 @@ class ClaudeCLIRegistry(BaseModel):
         model_override: str | None = None,
     ) -> ModelResponse:
         sid = session_id or "default"
-        model_id = self._resolve_model(sid, model_override)
-        # Pin the session to this model on first use so follow-up turns hit
-        # the same subprocess (and therefore reuse ``--resume`` state).
-        if model_id and sid not in self._session_model:
-            self._session_model[sid] = model_id
-        inst = self._get_or_create(model_id)
+        target_model = self._resolve_model(sid, model_override)
+        inst = self._get_or_create(sid, target_model)
         return await inst.generate(
             messages=messages,
             system=system,
             tools=tools,
             on_status=on_status,
             session_id=sid,
+            model_override=target_model,
         )
 
 

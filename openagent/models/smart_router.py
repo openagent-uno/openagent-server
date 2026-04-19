@@ -699,7 +699,11 @@ class SmartRouter(BaseModel):
         else:
             elog("router.cost_skipped", session_id=session_id, model=active_model_id, reason="no_budget_tracker")
 
-        resp.model = active_model_id
+        # Preserve the model the underlying framework actually executed.
+        # SmartRouter's pick is only a fallback for frameworks that don't
+        # self-report (none today, but defensive for future runtimes).
+        if not resp.model:
+            resp.model = active_model_id
         return resp
 
     async def stream(
