@@ -175,19 +175,17 @@ class Gateway:
             ("GET", "/api/usage/daily", usage.handle_daily),
             ("GET", "/api/usage/pricing", usage.handle_pricing),
             # DB-backed provider CRUD. The ``providers`` SQLite table is
-            # canonical. POST /api/providers/test is kept as a path alias
-            # for clients that can't easily switch URLs.
+            # canonical. Rows are keyed on surrogate integer ``id`` so the
+            # same vendor can coexist under both frameworks.
             ("GET", "/api/providers", providers.handle_list),
             ("POST", "/api/providers", providers.handle_create),
-            ("POST", "/api/providers/test", providers.handle_test),
-            ("GET", "/api/providers/{name}", providers.handle_get),
-            ("PUT", "/api/providers/{name}", providers.handle_update),
-            ("DELETE", "/api/providers/{name}", providers.handle_delete),
-            ("POST", "/api/providers/{name}/enable", providers.handle_enable),
-            ("POST", "/api/providers/{name}/disable", providers.handle_disable),
-            ("POST", "/api/providers/{name}/test", providers.handle_test),
-            # Models. /api/models is the DB-backed catalog. /api/models/db/*
-            # is kept as an alias for existing clients.
+            ("GET", r"/api/providers/{id:\d+}", providers.handle_get),
+            ("PUT", r"/api/providers/{id:\d+}", providers.handle_update),
+            ("DELETE", r"/api/providers/{id:\d+}", providers.handle_delete),
+            ("POST", r"/api/providers/{id:\d+}/enable", providers.handle_enable),
+            ("POST", r"/api/providers/{id:\d+}/disable", providers.handle_disable),
+            ("POST", r"/api/providers/{id:\d+}/test", providers.handle_test),
+            # Models. ``/api/models`` is the DB-backed catalog.
             ("GET", "/api/models/catalog", models.handle_catalog),
             ("GET", "/api/models/providers", models.handle_available_providers),
             ("GET", "/api/models/active", models.handle_get_active),
@@ -195,18 +193,11 @@ class Gateway:
             ("GET", "/api/models/available", models.handle_available_models),
             ("GET", "/api/models", models.handle_list_db),
             ("POST", "/api/models", models.handle_create_db),
-            ("GET", "/api/models/db", models.handle_list_db),
-            ("POST", "/api/models/db", models.handle_create_db),
-            ("GET", "/api/models/db/{runtime_id:.+}", models.handle_get_db),
-            ("PUT", "/api/models/db/{runtime_id:.+}", models.handle_update_db),
-            ("DELETE", "/api/models/db/{runtime_id:.+}", models.handle_delete_db),
-            ("POST", "/api/models/db/{runtime_id:.+}/enable", models.handle_enable_db),
-            ("POST", "/api/models/db/{runtime_id:.+}/disable", models.handle_disable_db),
-            ("GET", "/api/models/{runtime_id:.+}", models.handle_get_db),
-            ("PUT", "/api/models/{runtime_id:.+}", models.handle_update_db),
-            ("DELETE", "/api/models/{runtime_id:.+}", models.handle_delete_db),
-            ("POST", "/api/models/{runtime_id:.+}/enable", models.handle_enable_db),
-            ("POST", "/api/models/{runtime_id:.+}/disable", models.handle_disable_db),
+            ("GET", r"/api/models/{id:\d+}", models.handle_get_db),
+            ("PUT", r"/api/models/{id:\d+}", models.handle_update_db),
+            ("DELETE", r"/api/models/{id:\d+}", models.handle_delete_db),
+            ("POST", r"/api/models/{id:\d+}/enable", models.handle_enable_db),
+            ("POST", r"/api/models/{id:\d+}/disable", models.handle_disable_db),
             # DB-backed MCP registry.
             ("GET", "/api/mcps", mcps.handle_list),
             ("POST", "/api/mcps", mcps.handle_create),

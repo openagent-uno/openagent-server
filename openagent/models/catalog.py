@@ -76,16 +76,33 @@ class CatalogModel:
     disabled: bool = False
     display_name: str | None = None
     tier_hint: str | None = None
-    notes: str | None = None
     metadata: dict[str, Any] | None = None
+    # v0.12 fields — the provider's surrogate id and (name, framework)
+    # pair resolved at hydration time so routing doesn't have to re-split
+    # the runtime_id back apart. ``provider_id = 0`` indicates a seed
+    # entry from yaml routing hints (no backing provider row yet).
+    provider_id: int = 0
 
 
 def _entry_model_id(entry: Any) -> str:
+    """Extract the bare vendor model id from a catalog entry.
+
+    Entries come from two shapes:
+    - v0.12 DB rows: ``{"id": 10, "model": "gpt-4o-mini", …}`` —
+      ``id`` is the surrogate DB primary key (int); ``model`` is the id.
+    - Legacy yaml / tests: ``{"id": "gpt-4o-mini"}`` or bare string.
+
+    Prefer ``model`` / ``model_id`` first so DB rows resolve correctly.
+    Only fall back to ``id`` when it's a string (legacy shape).
+    """
     if isinstance(entry, dict):
-        for key in ("id", "model_id", "model"):
+        for key in ("model", "model_id"):
             value = entry.get(key)
             if value:
                 return str(value).strip()
+        raw_id = entry.get("id")
+        if isinstance(raw_id, str) and raw_id.strip():
+            return raw_id.strip()
         return ""
     return str(entry or "").strip()
 
@@ -146,7 +163,7 @@ def build_runtime_model_id(
     return f"{provider_name}:{raw}"
 
 
-def normalize_runtime_model_id(model_ref: str, providers_config: dict | None = None) -> str:
+def normalize_runtime_model_id(model_ref: str, providers_config: Any = None) -> str:
     raw = str(model_ref or "").strip()
     if not raw:
         return raw
@@ -154,18 +171,69 @@ def normalize_runtime_model_id(model_ref: str, providers_config: dict | None = N
         return raw
     if ":" in raw:
         return raw
+    configured_names = _configured_provider_names(providers_config)
     if "/" in raw:
         prefix, rest = raw.split("/", 1)
         if prefix == FRAMEWORK_CLAUDE_CLI:
             return raw
-        if prefix in SUPPORTED_PROVIDERS or prefix in (providers_config or {}):
+        if prefix in SUPPORTED_PROVIDERS or prefix in configured_names:
             return f"{prefix}:{rest}"
         return raw
-    for provider_name, cfg in (providers_config or {}).items():
-        for entry in cfg.get("models", []):
-            if _entry_model_id(entry) == raw:
-                return build_runtime_model_id(provider_name, raw)
+    # Try to resolve a bare model id by scanning configured entries.
+    for entry in _iter_provider_entries(providers_config):
+        provider_name = str(entry.get("name") or "").strip()
+        if not provider_name:
+            continue
+        for raw_model in entry.get("models") or []:
+            if _entry_model_id(raw_model) == raw:
+                return build_runtime_model_id(
+                    provider_name, raw, entry.get("framework") or FRAMEWORK_AGNO,
+                )
     return raw
+
+
+def _iter_provider_entries(providers_config: Any) -> list[dict[str, Any]]:
+    """Yield a list of provider dicts regardless of the config shape.
+
+    Accepts the v0.12 flat list, the pre-v0.12 name-keyed dict (including
+    the special ``claude-cli`` bucket), or ``None``.
+    """
+    if providers_config is None:
+        return []
+    if isinstance(providers_config, list):
+        return [e for e in providers_config if isinstance(e, dict)]
+    if isinstance(providers_config, dict):
+        out: list[dict[str, Any]] = []
+        for name, cfg in providers_config.items():
+            if not isinstance(cfg, dict):
+                continue
+            if name == FRAMEWORK_CLAUDE_CLI:
+                out.append({
+                    "name": "anthropic",
+                    "framework": FRAMEWORK_CLAUDE_CLI,
+                    **cfg,
+                })
+            else:
+                out.append({
+                    "name": name,
+                    "framework": cfg.get("framework") or FRAMEWORK_AGNO,
+                    **cfg,
+                })
+        return out
+    return []
+
+
+def _configured_provider_names(providers_config: Any) -> set[str]:
+    """Return the set of provider names visible in ``providers_config``.
+
+    Works against both the flat-list and the legacy dict shape.
+    """
+    names: set[str] = set()
+    for entry in _iter_provider_entries(providers_config):
+        name = str(entry.get("name") or "").strip()
+        if name:
+            names.add(name)
+    return names
 
 
 def is_claude_cli_model(model_ref: str | None) -> bool:
@@ -233,7 +301,7 @@ def model_id_from_runtime(runtime_id: str) -> str:
     return split_runtime_id(runtime_id)[1]
 
 
-def model_history_mode(model_ref: str, providers_config: dict | None = None) -> str:
+def model_history_mode(model_ref: str, providers_config: Any = None) -> str:
     runtime_id = normalize_runtime_model_id(model_ref, providers_config)
     if is_claude_cli_model(runtime_id):
         return "provider"
@@ -241,79 +309,148 @@ def model_history_mode(model_ref: str, providers_config: dict | None = None) -> 
 
 
 def iter_configured_models(
-    providers_config: dict | None,
+    providers_config: Any,
     *,
     include_disabled: bool = False,
     history_mode: str | None = None,
 ) -> list[CatalogModel]:
-    """Flatten ``providers_config[provider].models`` into CatalogModel records.
+    """Flatten the providers_config into :class:`CatalogModel` records.
 
-    The materialised providers dict comes from
-    ``Agent._hydrate_providers_from_db`` — it puts the claude-cli rows
-    under bucket name ``claude-cli`` (framework-as-provider-name) for
-    backward compat with anything still expecting that shape.
+    v0.12 shape (preferred) — a flat ``list[dict]`` of provider entries:
+
+    .. code-block:: python
+
+        [
+          {"id": 1, "name": "openai", "framework": "agno",
+           "api_key": "sk-…", "base_url": None, "enabled": True,
+           "models": [{"id": 10, "model": "gpt-4o-mini", …}, …]},
+          {"id": 2, "name": "anthropic", "framework": "claude-cli",
+           "api_key": None, "models": [{"id": 7, "model": "claude-opus-4-7"}]},
+        ]
+
+    Legacy shape (accepted for back-compat with yaml seed / old tests) —
+    a ``dict`` keyed by provider name, with a special ``claude-cli``
+    bucket treated as framework=claude-cli/provider=anthropic.
     """
     results: list[CatalogModel] = []
     seen: set[str] = set()
 
-    for provider_name, cfg in (providers_config or {}).items():
-        disabled = {str(item).strip() for item in cfg.get("disabled_models", [])}
-        # claude-cli bucket → framework=claude-cli on the anthropic
-        # provider (that's the only thing claude-cli dispatches).
-        if provider_name == FRAMEWORK_CLAUDE_CLI:
-            row_provider = "anthropic"
-            row_framework = FRAMEWORK_CLAUDE_CLI
-        else:
-            row_provider = provider_name
-            row_framework = FRAMEWORK_AGNO
+    if providers_config is None:
+        return results
 
-        for entry in cfg.get("models", []):
-            model_id = _entry_model_id(entry)
+    normalised: list[dict[str, Any]]
+    if isinstance(providers_config, list):
+        normalised = [dict(entry) for entry in providers_config if isinstance(entry, dict)]
+    elif isinstance(providers_config, dict):
+        normalised = []
+        for provider_name, cfg in providers_config.items():
+            if not isinstance(cfg, dict):
+                continue
+            if provider_name == FRAMEWORK_CLAUDE_CLI:
+                entry_name = "anthropic"
+                entry_framework = FRAMEWORK_CLAUDE_CLI
+            else:
+                entry_name = provider_name
+                entry_framework = cfg.get("framework") or FRAMEWORK_AGNO
+            normalised.append({
+                "id": cfg.get("id") or 0,
+                "name": entry_name,
+                "framework": entry_framework,
+                "api_key": cfg.get("api_key"),
+                "base_url": cfg.get("base_url"),
+                "enabled": cfg.get("enabled", True),
+                "models": list(cfg.get("models") or []),
+                "disabled_models": list(cfg.get("disabled_models") or []),
+            })
+    else:
+        return results
+
+    for entry in normalised:
+        provider_name = str(entry.get("name") or "").strip()
+        provider_framework = entry.get("framework") or FRAMEWORK_AGNO
+        if not provider_name:
+            continue
+        if entry.get("enabled") is False:
+            # A disabled provider's models should never appear in the
+            # routing catalog — the router uses enabled_only hydration in
+            # normal operation, but the dict-shape back-compat path may
+            # feed us stale rows during boot.
+            continue
+        provider_id = int(entry.get("id") or 0)
+        disabled = {
+            str(item).strip()
+            for item in (entry.get("disabled_models") or [])
+        }
+
+        for raw_model in entry.get("models") or []:
+            model_id = _entry_model_id(raw_model)
             if not model_id:
                 continue
-            is_disabled = model_id in disabled
+            model_metadata = _entry_metadata(raw_model)
+            model_enabled = model_metadata.get("enabled", True)
+            is_disabled = (not bool(model_enabled)) or (model_id in disabled)
             if is_disabled and not include_disabled:
                 continue
 
-            runtime_id = build_runtime_model_id(row_provider, model_id, row_framework)
-            mode = model_history_mode(runtime_id, providers_config)
+            runtime_id = build_runtime_model_id(
+                provider_name, model_id, provider_framework,
+            )
+            mode = (
+                "provider"
+                if provider_framework == FRAMEWORK_CLAUDE_CLI
+                else "platform"
+            )
             if history_mode and mode != history_mode:
                 continue
             if runtime_id in seen:
                 continue
             seen.add(runtime_id)
 
-            metadata = _entry_metadata(entry)
-            tier_hint = metadata.get("tier_hint")
-            notes = metadata.get("notes")
-            display_name = metadata.get("display_name") or metadata.get("name")
+            tier_hint = model_metadata.get("tier_hint")
+            display_name = (
+                model_metadata.get("display_name")
+                or model_metadata.get("name")
+            )
             results.append(
                 CatalogModel(
-                    provider=row_provider,
+                    provider=provider_name,
                     model_id=model_id,
                     runtime_id=runtime_id,
                     history_mode=mode,
-                    framework=row_framework,
+                    framework=provider_framework,
                     disabled=is_disabled,
                     display_name=str(display_name) if display_name else None,
                     tier_hint=str(tier_hint) if tier_hint else None,
-                    notes=str(notes) if notes else None,
-                    metadata=metadata or None,
+                    metadata=model_metadata or None,
+                    provider_id=provider_id,
                 )
             )
     return results
 
 
-def supported_providers(configured: dict | None = None) -> list[str]:
+def supported_providers(configured: Any = None) -> list[str]:
     provider_set = set(SUPPORTED_PROVIDERS)
-    provider_set.update((configured or {}).keys())
+    provider_set.update(_configured_provider_names(configured))
     return sorted(provider_set)
 
 
-def get_default_model_for_provider(provider_name: str, providers_config: dict | None = None) -> str | None:
+def get_default_model_for_provider(
+    provider_name: str,
+    providers_config: Any = None,
+    *,
+    framework: str | None = None,
+) -> str | None:
+    """Return the first configured runtime_id for ``provider_name``.
+
+    When a provider is registered under both frameworks (anthropic+agno
+    AND anthropic+claude-cli), pass ``framework=`` to disambiguate.
+    """
     for entry in iter_configured_models(providers_config):
-        if entry.provider == provider_name:
-            return entry.runtime_id
+        if entry.provider != provider_name:
+            continue
+        if framework and entry.framework != framework:
+            continue
+        return entry.runtime_id
     return None
 
 

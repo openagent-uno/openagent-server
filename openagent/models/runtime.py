@@ -7,7 +7,11 @@ from typing import Any
 from openagent.models.base import BaseModel, ModelResponse
 from openagent.models.catalog import (
     DEFAULT_ZAI_BASE_URL,
+    FRAMEWORK_AGNO,
+    FRAMEWORK_CLAUDE_CLI,
+    _iter_provider_entries,
     claude_cli_model_spec,
+    framework_of,
     get_default_model_for_provider,
     is_claude_cli_model,
     model_id_from_runtime,
@@ -23,13 +27,22 @@ LEGACY_PROVIDER_ALIASES = {
 
 
 def _resolved_claude_permission_mode(
-    providers_config: dict | None,
+    providers_config: Any,
     explicit: str | None = None,
 ) -> str:
     if explicit:
         return explicit
-    anthropic_cfg = (providers_config or {}).get("anthropic", {})
-    return anthropic_cfg.get("permission_mode", "bypass")
+    # Find the claude-cli anthropic provider row (if any) and look for a
+    # permission_mode override in its metadata. Falls back to bypass.
+    for entry in _iter_provider_entries(providers_config):
+        if entry.get("name") != "anthropic":
+            continue
+        if entry.get("framework") != FRAMEWORK_CLAUDE_CLI:
+            continue
+        metadata = entry.get("metadata") or {}
+        if isinstance(metadata, dict) and metadata.get("permission_mode"):
+            return str(metadata["permission_mode"])
+    return "bypass"
 
 
 def _canonical_provider_name(provider: str | None) -> str:
@@ -39,7 +52,7 @@ def _canonical_provider_name(provider: str | None) -> str:
 
 def _runtime_spec_from_config(
     model_cfg: dict,
-    providers_config: dict | None,
+    providers_config: Any,
 ) -> tuple[str, str | None]:
     provider = _canonical_provider_name(model_cfg.get("provider"))
     model_id = str(model_cfg.get("model_id") or "").strip()
@@ -94,7 +107,7 @@ def wire_model_runtime(
 def create_model_from_spec(
     spec: str,
     *,
-    providers_config: dict | None = None,
+    providers_config: Any = None,
     api_key: str | None = None,
     base_url: str | None = None,
     monthly_budget: float = 0.0,
@@ -108,7 +121,8 @@ def create_model_from_spec(
     mcp_pool: Any = None,
 ) -> BaseModel:
     """Create a model instance from a compact OpenAgent runtime spec."""
-    providers_config = providers_config or {}
+    if providers_config is None:
+        providers_config = []
     permission_mode = _resolved_claude_permission_mode(providers_config, claude_permission_mode)
 
     if spec == "smart":
@@ -169,7 +183,7 @@ def create_model_from_config(config: dict) -> BaseModel:
     hot-reload tick.
     """
     model_cfg = config.get("model", {})
-    providers_config = config.get("providers", {})
+    providers_config = config.get("providers") or []
     permission_mode = model_cfg.get("permission_mode", "bypass")
     api_key = model_cfg.get("api_key")
     provider = _canonical_provider_name(model_cfg.get("provider"))
@@ -203,22 +217,46 @@ def create_model_from_config(config: dict) -> BaseModel:
 
 async def run_provider_smoke_test(
     provider_name: str,
-    providers_config: dict | None,
+    providers_config: Any,
     *,
     model_id: str | None = None,
+    framework: str | None = None,
     session_id: str = "provider-test",
     prompt: str = "Say 'ok' and nothing else.",
 ) -> tuple[str, ModelResponse]:
-    """Run a minimal prompt through the configured runtime for one provider."""
-    providers_config = providers_config or {}
-    cfg = providers_config.get(provider_name)
-    if not cfg:
+    """Run a minimal prompt through the configured runtime for one provider.
+
+    When the same vendor is registered under both frameworks
+    (anthropic+agno AND anthropic+claude-cli), pass ``framework=`` to
+    disambiguate — otherwise the first matching entry wins.
+    """
+    # Resolve the provider row by (name, framework) pair. Fall back to
+    # the first entry that matches by name when framework is unspecified.
+    cfg: dict[str, Any] | None = None
+    for entry in _iter_provider_entries(providers_config):
+        if str(entry.get("name") or "").strip() != provider_name:
+            continue
+        if framework and entry.get("framework") != framework:
+            continue
+        cfg = dict(entry)
+        break
+    if cfg is None:
         raise ValueError(f"Provider '{provider_name}' not configured")
 
-    runtime_model = model_id or get_default_model_for_provider(provider_name, providers_config)
-    if not runtime_model:
-        raise ValueError(f"No models configured for provider '{provider_name}'")
-    runtime_model = normalize_runtime_model_id(runtime_model, providers_config)
+    # If caller supplied a model_id that already encodes a framework
+    # (e.g. ``claude-cli:anthropic:claude-opus-4-7``), honour it as-is.
+    # Otherwise resolve a default scoped to the provider row's framework.
+    if model_id and framework_of(model_id) == FRAMEWORK_CLAUDE_CLI:
+        runtime_model = model_id
+    else:
+        runtime_model = model_id or get_default_model_for_provider(
+            provider_name,
+            providers_config,
+            framework=cfg.get("framework"),
+        )
+        if not runtime_model:
+            raise ValueError(f"No models configured for provider '{provider_name}'")
+        runtime_model = normalize_runtime_model_id(runtime_model, providers_config)
 
     provider = create_model_from_spec(
         runtime_model,

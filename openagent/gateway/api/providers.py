@@ -1,19 +1,19 @@
-"""/api/providers — LLM provider credentials, DB-backed.
+"""/api/providers — LLM provider rows (v0.12 schema).
 
-The ``providers`` SQLite table is the source of truth for LLM provider
-credentials. Provider edits hot-reload on the next message via
+The ``providers`` SQLite table holds one row per ``(name, framework)``
+pair. Provider edits hot-reload on the next message via
 ``Agent.refresh_registries`` → ``_hydrate_providers_from_db``.
 
 Endpoints:
 
-  GET    /api/providers              — list (masked keys)
-  GET    /api/providers/{name}       — fetch one (masked key)
-  POST   /api/providers              — create/upsert
-  PUT    /api/providers/{name}       — update
-  DELETE /api/providers/{name}       — delete, cascades to models
-  POST   /api/providers/{name}/enable   — flip enabled=1
-  POST   /api/providers/{name}/disable  — flip enabled=0
-  POST   /api/providers/{name}/test  — smoke-test a round-trip
+  GET    /api/providers             — list (masked keys)
+  GET    /api/providers/{id}        — fetch one (masked key)
+  POST   /api/providers             — create/upsert {name, framework, api_key?, base_url?}
+  PUT    /api/providers/{id}        — update
+  DELETE /api/providers/{id}        — delete; FK cascade wipes its models
+  POST   /api/providers/{id}/enable   — flip enabled=1
+  POST   /api/providers/{id}/disable  — flip enabled=0
+  POST   /api/providers/{id}/test   — smoke-test a round-trip
 """
 
 from __future__ import annotations
@@ -32,128 +32,172 @@ def _mask_key(key: str | None) -> str:
     return "****" + key[-4:]
 
 
-def _mask_row(row: dict[str, Any]) -> dict[str, Any]:
-    out = dict(row)
-    key = out.pop("api_key", None)
-    if isinstance(key, str) and key.startswith("${"):
+def _shape_provider(row: dict[str, Any]) -> dict[str, Any]:
+    """Public response shape for a provider row — masked api_key."""
+    out = {
+        "id": row["id"],
+        "name": row["name"],
+        "framework": row["framework"],
+        "base_url": row.get("base_url"),
+        "enabled": bool(row.get("enabled", True)),
+        "metadata": row.get("metadata") or {},
+        "created_at": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
+    }
+    key = row.get("api_key")
+    if key is None:
+        out["api_key_display"] = "—"
+    elif isinstance(key, str) and key.startswith("${"):
         out["api_key_display"] = key
     else:
         out["api_key_display"] = _mask_key(key)
     return out
 
 
-# Retained for backwards-compat with code paths that still pass a
-# providers dict (e.g. cost resolution in usage APIs).
-def mask_provider_entry(cfg: dict) -> dict:
-    entry = dict(cfg)
-    if "api_key" in entry:
-        raw = entry.pop("api_key")
-        if isinstance(raw, str) and raw.startswith("${"):
-            entry["api_key_display"] = raw
-        else:
-            entry["api_key_display"] = _mask_key(raw)
-    return entry
-
-
-def mask_providers(providers: dict) -> dict:
-    return {name: mask_provider_entry(cfg) for name, cfg in providers.items()}
+def _parse_provider_id(request: "web.Request") -> int | None:
+    raw = request.match_info.get("id")
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 async def handle_list(request: web.Request) -> web.Response:
     from aiohttp import web as _web
     db = _db(request)
     if db is None:
-        return _web.json_response({"providers": {}})
+        return _web.json_response({"providers": []})
     rows = await db.list_providers()
     return _web.json_response(
-        {"providers": {r["name"]: _mask_row(r) for r in rows}},
+        {"providers": [_shape_provider(r) for r in rows]},
     )
 
 
 async def handle_get(request: web.Request) -> web.Response:
     from aiohttp import web as _web
     db = _db(request)
-    name = request.match_info["name"]
+    pid = _parse_provider_id(request)
     if db is None:
         return _web.json_response({"error": "DB not available"}, status=500)
-    row = await db.get_provider(name)
+    if pid is None:
+        return _web.json_response({"error": "invalid provider id"}, status=400)
+    row = await db.get_provider(pid)
     if row is None:
-        return _web.json_response({"error": f"Provider {name!r} not found"}, status=404)
-    return _web.json_response({"provider": _mask_row(row)})
+        return _web.json_response({"error": f"Provider id={pid} not found"}, status=404)
+    return _web.json_response({"provider": _shape_provider(row)})
 
 
 async def handle_create(request: web.Request) -> web.Response:
-    """Upsert a provider row. POST body: {name, api_key?, base_url?, enabled?}."""
+    """POST body: {name, framework, api_key?, base_url?, enabled?, metadata?}."""
     from aiohttp import web as _web
     from openagent.core.logging import elog
+    from openagent.memory.db import VALID_FRAMEWORKS
 
     db = _db(request)
     if db is None:
         return _web.json_response({"error": "DB not available"}, status=500)
     body = await request.json() if request.can_read_body else {}
     name = str(body.get("name") or "").strip()
+    framework = str(body.get("framework") or "").strip()
     if not name:
         return _web.json_response({"error": "name is required"}, status=400)
-    await db.upsert_provider(
-        name,
-        api_key=body.get("api_key") or None,
-        base_url=body.get("base_url") or None,
-        enabled=bool(body.get("enabled", True)),
-        metadata=body.get("metadata") or None,
-    )
-    elog("provider.created", name=name)
-    row = await db.get_provider(name)
-    return _web.json_response({"ok": True, "provider": _mask_row(row)}, status=201)
+    if framework not in VALID_FRAMEWORKS:
+        return _web.json_response(
+            {"error": f"framework must be one of {list(VALID_FRAMEWORKS)}"},
+            status=400,
+        )
+    try:
+        pid = await db.upsert_provider(
+            name=name,
+            framework=framework,
+            api_key=(body.get("api_key") or None),
+            base_url=(body.get("base_url") or None),
+            enabled=bool(body.get("enabled", True)),
+            metadata=body.get("metadata") or None,
+        )
+    except ValueError as e:
+        return _web.json_response({"error": str(e)}, status=400)
+    elog("provider.created", provider_id=pid, name=name, framework=framework)
+    row = await db.get_provider(pid)
+    return _web.json_response({"ok": True, "provider": _shape_provider(row)}, status=201)
 
 
 async def handle_update(request: web.Request) -> web.Response:
-    """PUT body merges into the existing row — omitted fields stay."""
+    """PUT body merges into the existing row — omitted fields stay.
+
+    ``framework`` is immutable; attempts to change it return 400.
+    """
     from aiohttp import web as _web
 
     db = _db(request)
-    name = request.match_info["name"]
+    pid = _parse_provider_id(request)
     if db is None:
         return _web.json_response({"error": "DB not available"}, status=500)
-    existing = await db.get_provider(name)
+    if pid is None:
+        return _web.json_response({"error": "invalid provider id"}, status=400)
+    existing = await db.get_provider(pid)
     if existing is None:
-        return _web.json_response({"error": f"Provider {name!r} not found"}, status=404)
+        return _web.json_response({"error": f"Provider id={pid} not found"}, status=404)
     body = await request.json() if request.can_read_body else {}
-    await db.upsert_provider(
-        name,
-        api_key=body.get("api_key", existing.get("api_key")),
-        base_url=body.get("base_url", existing.get("base_url")),
-        enabled=bool(body.get("enabled", existing.get("enabled", True))),
-        metadata=body.get("metadata", existing.get("metadata") or None),
-    )
-    row = await db.get_provider(name)
-    return _web.json_response({"ok": True, "provider": _mask_row(row)})
+    # Framework is immutable — change requires delete + recreate.
+    if "framework" in body and body["framework"] != existing["framework"]:
+        return _web.json_response(
+            {"error": "framework is immutable; delete + recreate the provider instead"},
+            status=400,
+        )
+    try:
+        await db.upsert_provider(
+            name=body.get("name", existing["name"]),
+            framework=existing["framework"],
+            api_key=body.get("api_key", existing.get("api_key")),
+            base_url=body.get("base_url", existing.get("base_url")),
+            enabled=bool(body.get("enabled", existing.get("enabled", True))),
+            metadata=body.get("metadata", existing.get("metadata") or None),
+        )
+    except ValueError as e:
+        return _web.json_response({"error": str(e)}, status=400)
+    row = await db.get_provider(pid)
+    return _web.json_response({"ok": True, "provider": _shape_provider(row)})
 
 
 async def handle_delete(request: web.Request) -> web.Response:
-    """Delete provider row + cascade-delete every model owned by it."""
+    """Delete provider row. FK cascade wipes every model that referenced it."""
     from aiohttp import web as _web
     from openagent.core.logging import elog
 
     db = _db(request)
-    name = request.match_info["name"]
+    pid = _parse_provider_id(request)
     if db is None:
         return _web.json_response({"error": "DB not available"}, status=500)
-    if await db.get_provider(name) is None:
-        return _web.json_response({"error": f"Provider {name!r} not found"}, status=404)
-    purged = await db.delete_models_by_provider(name)
-    await db.delete_provider(name)
-    elog("provider.deleted", name=name, models_purged=purged)
-    return _web.json_response({"ok": True, "models_purged": purged})
+    if pid is None:
+        return _web.json_response({"error": "invalid provider id"}, status=400)
+    existing = await db.get_provider(pid)
+    if existing is None:
+        return _web.json_response({"error": f"Provider id={pid} not found"}, status=404)
+    # Count how many models are about to be cascade-deleted so the caller
+    # can surface the side effect.
+    models = await db.list_models(provider_id=pid)
+    await db.delete_provider(pid)
+    elog(
+        "provider.deleted", provider_id=pid, name=existing["name"],
+        framework=existing["framework"], models_purged=len(models),
+    )
+    return _web.json_response({"ok": True, "models_purged": len(models)})
 
 
 async def _handle_toggle(request: web.Request, enabled: bool) -> web.Response:
     from aiohttp import web as _web
     db = _db(request)
-    name = request.match_info["name"]
-    if db is None or await db.get_provider(name) is None:
-        return _web.json_response({"error": f"Provider {name!r} not found"}, status=404)
-    await db.set_provider_enabled(name, enabled)
-    return _web.json_response({"ok": True, "provider": _mask_row(await db.get_provider(name))})
+    pid = _parse_provider_id(request)
+    if db is None or pid is None:
+        return _web.json_response({"error": "invalid provider id"}, status=400)
+    if await db.get_provider(pid) is None:
+        return _web.json_response({"error": f"Provider id={pid} not found"}, status=404)
+    await db.set_provider_enabled(pid, enabled)
+    row = await db.get_provider(pid)
+    return _web.json_response({"ok": True, "provider": _shape_provider(row)})
 
 
 async def handle_enable(request: web.Request) -> web.Response:
@@ -167,37 +211,47 @@ async def handle_disable(request: web.Request) -> web.Response:
 async def handle_test(request: web.Request) -> web.Response:
     """Round-trip a short prompt through the configured provider.
 
-    Body: ``{"provider": "openai", "model_id": "gpt-4o-mini"?}`` or with
-    ``provider`` in the URL via a ``{name}/test`` route — both supported.
-    Uses the hydrated ``self.config["providers"]`` dict so live key
-    edits are picked up without a message-level refresh.
+    The provider row is looked up by the URL's ``{id}`` — unambiguous
+    when the same vendor is registered under both frameworks. Body is
+    optional ``{model: <runtime_id or bare>}``.
     """
     from aiohttp import web as _web
     from openagent.models.runtime import run_provider_smoke_test
 
     body = await request.json() if request.can_read_body else {}
-    provider_name = request.match_info.get("name") or body.get("provider") or ""
-    if not provider_name:
-        return _web.json_response({"error": "provider name required"}, status=400)
-
-    # Read DB snapshot directly so a freshly-added key is usable
-    # without waiting for the next message's hot-reload tick.
     db = _db(request)
-    providers_materialised: dict[str, dict[str, Any]] = {}
-    if db is not None:
-        for r in await db.list_providers():
-            entry: dict[str, Any] = {}
-            if r.get("api_key"):
-                entry["api_key"] = r["api_key"]
-            if r.get("base_url"):
-                entry["base_url"] = r["base_url"]
-            providers_materialised[r["name"]] = entry
+    pid = _parse_provider_id(request)
+    if db is None or pid is None:
+        return _web.json_response({"error": "invalid provider id"}, status=400)
+    provider_row = await db.get_provider(pid)
+    if provider_row is None:
+        return _web.json_response({"error": f"Provider id={pid} not found"}, status=404)
+
+    # Build a fresh providers_config snapshot from the DB so freshly-added
+    # keys are usable without waiting for the next message's hot-reload.
+    provider_rows = await db.list_providers()
+    model_rows = await db.list_models()
+    by_id: dict[int, dict[str, Any]] = {}
+    for r in provider_rows:
+        by_id[r["id"]] = {
+            **r, "models": [],
+        }
+    for m in model_rows:
+        if m["provider_id"] in by_id:
+            by_id[m["provider_id"]]["models"].append({
+                "id": m["id"], "model": m["model"],
+                "display_name": m.get("display_name"),
+                "tier_hint": m.get("tier_hint"),
+                "enabled": m.get("enabled", True),
+            })
+    providers_config = list(by_id.values())
 
     try:
         runtime_model, resp = await run_provider_smoke_test(
-            provider_name,
-            providers_materialised,
-            model_id=body.get("model_id"),
+            provider_row["name"],
+            providers_config,
+            model_id=body.get("model") or body.get("model_id"),
+            framework=provider_row["framework"],
             session_id="provider-test",
         )
         return _web.json_response({"ok": True, "model": runtime_model, "response": resp.content})

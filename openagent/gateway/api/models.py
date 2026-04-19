@@ -1,24 +1,25 @@
-"""/api/models — DB-backed model catalog.
+"""/api/models — DB-backed model catalog (v0.12 schema).
 
-Provider management lives in :mod:`openagent.gateway.api.providers`;
-the endpoints here exclusively drive the ``models`` SQLite table.
+Models join to their parent provider row via ``models.provider_id``.
+Framework is inherited from the provider; ``runtime_id`` is derived at
+read time (``build_runtime_model_id(provider_name, model, framework)``).
 
-GET    /api/models              → list model rows
-POST   /api/models              → add a model row
-GET    /api/models/{runtime_id} → fetch one
-PUT    /api/models/{runtime_id} → update one
-DELETE /api/models/{runtime_id} → delete one
-POST   /api/models/{runtime_id}/enable|disable
+GET    /api/models                → enriched list with derived runtime_id
+POST   /api/models                → {provider_id, model, display_name?, tier_hint?, enabled?}
+GET    /api/models/{id}           → fetch one (enriched)
+PUT    /api/models/{id}           → update one
+DELETE /api/models/{id}           → delete one
+POST   /api/models/{id}/enable|disable
 
-GET    /api/models/catalog      → iter_configured_models view w/ pricing
-GET    /api/models/active       → active model yaml section
-PUT    /api/models/active       → set active model yaml section
-GET    /api/models/available    → discovery-driven per-provider catalog
-GET    /api/models/providers    → supported provider list
+GET    /api/models/catalog        → iter_configured_models view w/ pricing
+GET    /api/models/active         → active model yaml section
+PUT    /api/models/active         → set active model yaml section
+GET    /api/models/available?provider_id=N → discovery-driven per-provider catalog
+GET    /api/models/providers      → supported provider list
 """
 
 from __future__ import annotations
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from aiohttp import web
@@ -63,7 +64,7 @@ async def handle_available_providers(request: web.Request) -> web.Response:
     from aiohttp import web as _web
     from openagent.models.catalog import supported_providers
 
-    providers_cfg = _read_resolved(request).get("providers", {})
+    providers_cfg = _read_resolved(request).get("providers", [])
     return _web.json_response({"providers": supported_providers(providers_cfg)})
 
 
@@ -73,7 +74,7 @@ async def handle_catalog(request: web.Request) -> web.Response:
     from openagent.models.catalog import get_model_pricing, iter_configured_models
 
     provider_filter = request.query.get("provider", "")
-    providers_cfg = _read_resolved(request).get("providers", {})
+    providers_cfg = _read_resolved(request).get("providers", [])
     results = []
     for entry in iter_configured_models(providers_cfg):
         if provider_filter and entry.provider != provider_filter:
@@ -82,200 +83,286 @@ async def handle_catalog(request: web.Request) -> web.Response:
         results.append(
             {
                 "provider": entry.provider,
-                "model_id": entry.model_id,
+                "framework": entry.framework,
+                "model": entry.model_id,
                 "runtime_id": entry.runtime_id,
                 "history_mode": entry.history_mode,
                 "tier_hint": entry.tier_hint,
-                "notes": entry.notes,
                 "input_cost_per_million": round(float(pricing["input_cost_per_million"] or 0.0), 4),
                 "output_cost_per_million": round(float(pricing["output_cost_per_million"] or 0.0), 4),
             }
         )
-    results.sort(key=lambda item: (item["provider"], item["input_cost_per_million"], item["model_id"]))
+    results.sort(key=lambda item: (item["provider"], item["framework"], item["input_cost_per_million"], item["model"]))
     return _web.json_response({"models": results})
 
 
 # ──────────────────────────────────────────────────────────────────────
-# DB-backed model catalog. These endpoints hit the ``models`` table the
+# DB-backed model CRUD. These endpoints hit the ``models`` table the
 # model-manager MCP writes to; the gateway's hot-reload loop picks up
 # changes on the next message.
 # ──────────────────────────────────────────────────────────────────────
 
 
-async def handle_list_db(request: web.Request) -> web.Response:
-    """GET /api/models/db — list every configured model row with live pricing."""
-    from aiohttp import web as _web
+def _parse_model_id(request: "web.Request") -> int | None:
+    raw = request.match_info.get("id")
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _shape_model(row: dict[str, Any]) -> dict[str, Any]:
+    """Public response shape for an enriched model row."""
     from openagent.models.catalog import get_model_pricing
+
+    pricing = get_model_pricing(row["runtime_id"])
+    return {
+        "id": row["id"],
+        "provider_id": row["provider_id"],
+        "provider_name": row["provider_name"],
+        "framework": row["framework"],
+        "runtime_id": row["runtime_id"],
+        "model": row["model"],
+        "display_name": row.get("display_name"),
+        "tier_hint": row.get("tier_hint"),
+        "enabled": bool(row.get("enabled", True)),
+        "provider_enabled": bool(row.get("provider_enabled", True)),
+        "metadata": row.get("metadata") or {},
+        "created_at": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
+        "input_cost_per_million": round(float(pricing["input_cost_per_million"] or 0.0), 4),
+        "output_cost_per_million": round(float(pricing["output_cost_per_million"] or 0.0), 4),
+    }
+
+
+async def handle_list_db(request: web.Request) -> web.Response:
+    """GET /api/models — list every configured model row with live pricing.
+
+    Query params:
+      - ``provider_id`` (int) — filter to a single provider row
+      - ``framework`` (``agno`` / ``claude-cli``) — filter by framework
+      - ``enabled_only`` (bool) — skip disabled model rows
+    """
+    from aiohttp import web as _web
 
     db = _db(request)
     if db is None:
         return _web.json_response({"error": "memory DB not available"}, status=500)
-    provider = request.query.get("provider") or None
+    framework = request.query.get("framework") or None
+    provider_id_raw = request.query.get("provider_id")
+    provider_id = None
+    if provider_id_raw:
+        try:
+            provider_id = int(provider_id_raw)
+        except ValueError:
+            return _web.json_response({"error": "invalid provider_id"}, status=400)
     enabled_only = request.query.get("enabled_only", "").lower() in ("1", "true", "yes")
-    rows = await db.list_models(provider=provider, enabled_only=enabled_only)
-    for row in rows:
-        pricing = get_model_pricing(row["runtime_id"])
-        row["input_cost_per_million"] = round(float(pricing["input_cost_per_million"] or 0.0), 4)
-        row["output_cost_per_million"] = round(float(pricing["output_cost_per_million"] or 0.0), 4)
-    return _web.json_response({"models": rows})
+
+    if provider_id is not None:
+        provider_row = await db.get_provider(provider_id)
+        if provider_row is None:
+            return _web.json_response({"models": []})
+        rows = await db.list_models_enriched(
+            enabled_only=enabled_only,
+            framework=provider_row["framework"],
+            provider_name=provider_row["name"],
+        )
+    else:
+        rows = await db.list_models_enriched(
+            enabled_only=enabled_only,
+            framework=framework,
+        )
+    return _web.json_response({"models": [_shape_model(r) for r in rows]})
 
 
 async def handle_get_db(request: web.Request) -> web.Response:
     from aiohttp import web as _web
-    from openagent.models.catalog import get_model_pricing
 
     db = _db(request)
-    runtime_id = request.match_info["runtime_id"]
-    row = await db.get_model(runtime_id)
+    mid = _parse_model_id(request)
+    if db is None or mid is None:
+        return _web.json_response({"error": "invalid model id"}, status=400)
+    row = await db.get_model(mid)
     if row is None:
-        return _web.json_response({"error": f"model {runtime_id!r} not found"}, status=404)
-    pricing = get_model_pricing(row["runtime_id"])
-    row["input_cost_per_million"] = round(float(pricing["input_cost_per_million"] or 0.0), 4)
-    row["output_cost_per_million"] = round(float(pricing["output_cost_per_million"] or 0.0), 4)
-    return _web.json_response({"model": row})
+        return _web.json_response({"error": f"model id={mid} not found"}, status=404)
+    enriched = await db.list_models_enriched(enabled_only=False)
+    for entry in enriched:
+        if entry["id"] == mid:
+            return _web.json_response({"model": _shape_model(entry)})
+    return _web.json_response({"error": f"model id={mid} could not be enriched"}, status=500)
 
 
 async def handle_create_db(request: web.Request) -> web.Response:
     from aiohttp import web as _web
-    from openagent.models.catalog import (
-        FRAMEWORK_AGNO, FRAMEWORK_CLAUDE_CLI, SUPPORTED_FRAMEWORKS,
-        build_runtime_model_id,
-    )
 
     db = _db(request)
+    if db is None:
+        return _web.json_response({"error": "memory DB not available"}, status=500)
     body = await request.json() if request.can_read_body else {}
-    provider = str(body.get("provider") or "").strip()
-    model_id = str(body.get("model_id") or "").strip()
-    framework = str(body.get("framework") or FRAMEWORK_AGNO).strip()
-    if not provider or not model_id:
+    provider_id_raw = body.get("provider_id")
+    model = str(body.get("model") or body.get("model_id") or "").strip()
+    if provider_id_raw is None or not model:
         return _web.json_response(
-            {"error": "provider and model_id are required"}, status=400
+            {"error": "provider_id and model are required"}, status=400,
         )
-    # Legacy shorthand: caller passed provider="claude-cli" (pre-v0.10
-    # vocabulary, when it was a pseudo-provider). Rewrite to the new
-    # shape so there's exactly one way to represent claude-cli rows in
-    # the DB.
-    if provider == FRAMEWORK_CLAUDE_CLI:
-        provider = "anthropic"
-        framework = FRAMEWORK_CLAUDE_CLI
-    if framework not in SUPPORTED_FRAMEWORKS:
-        return _web.json_response(
-            {"error": f"invalid framework {framework!r}; expected {SUPPORTED_FRAMEWORKS}"},
-            status=400,
+    try:
+        provider_id = int(provider_id_raw)
+    except (TypeError, ValueError):
+        return _web.json_response({"error": "provider_id must be an integer"}, status=400)
+    try:
+        mid = await db.upsert_model(
+            provider_id=provider_id,
+            model=model,
+            display_name=body.get("display_name"),
+            tier_hint=body.get("tier_hint") or body.get("notes"),
+            enabled=bool(body.get("enabled", True)),
+            metadata=body.get("metadata") or None,
         )
-    runtime_id = build_runtime_model_id(provider, model_id, framework)
-    if not runtime_id:
-        return _web.json_response(
-            {"error": f"could not build runtime_id from provider={provider!r} model_id={model_id!r}"},
-            status=400,
-        )
-    await db.upsert_model(
-        runtime_id,
-        provider=provider,
-        framework=framework,
-        model_id=model_id,
-        display_name=body.get("display_name"),
-        tier_hint=body.get("tier_hint"),
-        notes=body.get("notes"),
-        enabled=bool(body.get("enabled", True)),
-        metadata=body.get("metadata") or None,
-    )
-    return _web.json_response(
-        {"ok": True, "model": await db.get_model(runtime_id)}, status=201
-    )
+    except ValueError as e:
+        return _web.json_response({"error": str(e)}, status=400)
+    enriched = await db.list_models_enriched(enabled_only=False)
+    for entry in enriched:
+        if entry["id"] == mid:
+            return _web.json_response(
+                {"ok": True, "model": _shape_model(entry)}, status=201,
+            )
+    return _web.json_response({"ok": True, "id": mid}, status=201)
 
 
 async def handle_update_db(request: web.Request) -> web.Response:
     from aiohttp import web as _web
 
     db = _db(request)
-    runtime_id = request.match_info["runtime_id"]
-    existing = await db.get_model(runtime_id)
+    mid = _parse_model_id(request)
+    if db is None or mid is None:
+        return _web.json_response({"error": "invalid model id"}, status=400)
+    existing = await db.get_model(mid)
     if existing is None:
-        return _web.json_response({"error": f"model {runtime_id!r} not found"}, status=404)
+        return _web.json_response({"error": f"model id={mid} not found"}, status=404)
     body = await request.json() if request.can_read_body else {}
-    await db.upsert_model(
-        runtime_id,
-        provider=body.get("provider", existing["provider"]),
-        framework=body.get("framework", existing.get("framework", "agno")),
-        model_id=body.get("model_id", existing["model_id"]),
-        display_name=body.get("display_name", existing.get("display_name")),
-        tier_hint=body.get("tier_hint", existing.get("tier_hint")),
-        notes=body.get("notes", existing.get("notes")),
-        enabled=bool(body.get("enabled", existing.get("enabled", True))),
-        metadata=body.get("metadata", existing.get("metadata") or None),
-    )
-    return _web.json_response({"ok": True, "model": await db.get_model(runtime_id)})
+    try:
+        await db.upsert_model(
+            provider_id=existing["provider_id"],
+            model=body.get("model", existing["model"]),
+            display_name=body.get("display_name", existing.get("display_name")),
+            tier_hint=body.get("tier_hint", existing.get("tier_hint")),
+            enabled=bool(body.get("enabled", existing.get("enabled", True))),
+            metadata=body.get("metadata", existing.get("metadata") or None),
+        )
+    except ValueError as e:
+        return _web.json_response({"error": str(e)}, status=400)
+    enriched = await db.list_models_enriched(enabled_only=False)
+    for entry in enriched:
+        if entry["id"] == mid:
+            return _web.json_response({"ok": True, "model": _shape_model(entry)})
+    return _web.json_response({"ok": True, "id": mid})
 
 
 async def handle_delete_db(request: web.Request) -> web.Response:
     from aiohttp import web as _web
 
     db = _db(request)
-    runtime_id = request.match_info["runtime_id"]
-    existing = await db.get_model(runtime_id)
+    mid = _parse_model_id(request)
+    if db is None or mid is None:
+        return _web.json_response({"error": "invalid model id"}, status=400)
+    existing = await db.get_model(mid)
     if existing is None:
-        return _web.json_response({"error": f"model {runtime_id!r} not found"}, status=404)
+        return _web.json_response({"error": f"model id={mid} not found"}, status=404)
     # Deleting the last enabled row is allowed — the rejection gate in
     # gateway/server.py will then surface a clear "No models are enabled"
     # error on the next message, which is what the user wants when they
     # intentionally empty the catalog.
-    await db.delete_model(runtime_id)
+    await db.delete_model(mid)
     return _web.json_response({"ok": True})
 
 
 async def handle_enable_db(request: web.Request) -> web.Response:
-    from aiohttp import web as _web
-
-    db = _db(request)
-    runtime_id = request.match_info["runtime_id"]
-    if await db.get_model(runtime_id) is None:
-        return _web.json_response({"error": f"model {runtime_id!r} not found"}, status=404)
-    await db.set_model_enabled(runtime_id, True)
-    return _web.json_response({"ok": True, "model": await db.get_model(runtime_id)})
+    return await _toggle_model(request, True)
 
 
 async def handle_disable_db(request: web.Request) -> web.Response:
+    return await _toggle_model(request, False)
+
+
+async def _toggle_model(request: web.Request, enabled: bool) -> web.Response:
     from aiohttp import web as _web
 
     db = _db(request)
-    runtime_id = request.match_info["runtime_id"]
-    if await db.get_model(runtime_id) is None:
-        return _web.json_response({"error": f"model {runtime_id!r} not found"}, status=404)
-    await db.set_model_enabled(runtime_id, False)
-    return _web.json_response({"ok": True, "model": await db.get_model(runtime_id)})
+    mid = _parse_model_id(request)
+    if db is None or mid is None:
+        return _web.json_response({"error": "invalid model id"}, status=400)
+    existing = await db.get_model(mid)
+    if existing is None:
+        return _web.json_response({"error": f"model id={mid} not found"}, status=404)
+    await db.set_model_enabled(mid, enabled)
+    enriched = await db.list_models_enriched(enabled_only=False)
+    for entry in enriched:
+        if entry["id"] == mid:
+            return _web.json_response({"ok": True, "model": _shape_model(entry)})
+    return _web.json_response({"ok": True, "id": mid})
 
 
 async def handle_available_models(request: web.Request) -> web.Response:
-    """GET /api/models/available?provider=openai
+    """GET /api/models/available?provider_id=N
 
     Dynamic provider catalog: tries the provider's /v1/models endpoint
     with the configured API key, falls back to the bundled catalog.
-    Fires the live fetch and the DB lookup in parallel — the former can
-    take seconds on a cold OpenRouter cache, the latter is always fast.
+    Claude-cli providers (no api_key) still return their bundled list
+    through discovery's offline path.
     """
     import asyncio
     from aiohttp import web as _web
     from openagent.models.catalog import build_runtime_model_id
     from openagent.models.discovery import list_provider_models
 
-    provider = (request.query.get("provider") or "").strip()
-    if not provider:
-        return _web.json_response({"error": "provider query param is required"}, status=400)
-    providers_cfg = _read_resolved(request).get("providers", {}) or {}
-    cfg = providers_cfg.get(provider, {}) or {}
-
     db = _db(request)
-    db_task = db.list_models(provider=provider) if db is not None else None
-    discovery_task = list_provider_models(
-        provider, api_key=cfg.get("api_key"), base_url=cfg.get("base_url"),
-    )
-    if db_task is not None:
-        models_list, db_rows = await asyncio.gather(discovery_task, db_task)
-        configured = {r["runtime_id"] for r in db_rows}
-        for m in models_list:
-            m["runtime_id"] = build_runtime_model_id(provider, m["id"])
-            m["added"] = m["runtime_id"] in configured
+    if db is None:
+        return _web.json_response({"error": "memory DB not available"}, status=500)
+
+    provider_id_raw = request.query.get("provider_id")
+    provider_name_q = (request.query.get("provider") or "").strip()
+    if provider_id_raw:
+        try:
+            pid = int(provider_id_raw)
+        except ValueError:
+            return _web.json_response({"error": "invalid provider_id"}, status=400)
+        provider_row = await db.get_provider(pid)
+    elif provider_name_q:
+        # Back-compat: ``?provider=openai`` without framework. If the user
+        # has multiple rows under this name, pick the first (stable by id).
+        candidates = [
+            p for p in await db.list_providers() if p["name"] == provider_name_q
+        ]
+        if not candidates:
+            return _web.json_response({"error": f"no provider named {provider_name_q!r}"}, status=404)
+        provider_row = candidates[0]
     else:
-        models_list = await discovery_task
-    return _web.json_response({"provider": provider, "models": models_list})
+        return _web.json_response(
+            {"error": "provider_id (preferred) or provider query param required"},
+            status=400,
+        )
+    if provider_row is None:
+        return _web.json_response({"error": "provider not found"}, status=404)
+
+    discovery_task = list_provider_models(
+        provider_row["name"],
+        api_key=provider_row.get("api_key"),
+        base_url=provider_row.get("base_url"),
+    )
+    db_task = db.list_models(provider_id=provider_row["id"])
+    models_list, db_rows = await asyncio.gather(discovery_task, db_task)
+    configured = {r["model"] for r in db_rows}
+    for m in models_list:
+        m["runtime_id"] = build_runtime_model_id(
+            provider_row["name"], m["id"], provider_row["framework"],
+        )
+        m["added"] = m["id"] in configured
+
+    return _web.json_response({
+        "provider_id": provider_row["id"],
+        "provider": provider_row["name"],
+        "framework": provider_row["framework"],
+        "models": models_list,
+    })

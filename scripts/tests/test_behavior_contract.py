@@ -2,20 +2,24 @@
 
 These tests are the living specification for how OpenAgent's model
 catalog + SmartRouter + session binding are supposed to behave.
-Together they cover the recap the user laid out:
+Together they cover:
 
   1. Models live ONLY in the ``models`` DB table (not in yaml).
-  2. Each model row has a (provider, framework, model_id) triple.
-  3. The same (provider, model_id) can exist under BOTH frameworks
-     when applicable (anthropic via agno + anthropic via claude-cli).
-  4. SmartRouter picks per message via the classifier.
-  5. Framework binding is permanent per session — claude-cli sessions
+  2. Each provider row carries ``(name, framework)`` — same vendor under
+     both frameworks is two separate rows by design (UNIQUE(name, framework)).
+  3. Models carry a ``provider_id`` FK; framework is inherited from the
+     provider row, never stored on the model directly.
+  4. ``runtime_id`` (``openai:gpt-4o-mini``,
+     ``claude-cli:anthropic:claude-opus-4-7``) is derived at read time,
+     not stored in any table.
+  5. SmartRouter picks per message via the classifier.
+  6. Framework binding is permanent per session — claude-cli sessions
      only see claude-cli models; agno sessions only see agno models.
-  6. If no enabled model satisfies the session's framework, the turn
+  7. If no enabled model satisfies the session's framework, the turn
      is rejected with a clear error (never crossed into the other
      framework).
-  7. Cross-framework pin is refused (conversation would split).
-  8. The ``model-manager`` MCP + REST + CLI can add / remove / edit
+  8. Cross-framework pin is refused (conversation would split).
+  9. The ``model-manager`` MCP + REST + CLI can add / remove / edit
      providers, frameworks, and models at runtime.
 
 Kept as pure DB + router unit tests — no LLM calls, no subprocesses.
@@ -52,42 +56,88 @@ def _cleanup(path) -> None:
             pass
 
 
-@test("contract", "model row has (provider, framework, model_id) triple")
-async def t_model_triple(ctx: TestContext) -> None:
+@test("contract", "provider row carries (name, framework), models join via provider_id")
+async def t_provider_triple(ctx: TestContext) -> None:
     db, path = await _tmp_db(ctx, "triple")
     try:
-        await db.upsert_model(
-            "openai:gpt-4o-mini",
-            provider="openai",
-            framework="agno",
-            model_id="gpt-4o-mini",
+        pid = await db.upsert_provider(
+            name="openai", framework="agno", api_key="sk-x",
         )
-        row = await db.get_model("openai:gpt-4o-mini")
-        assert row["provider"] == "openai"
-        assert row["framework"] == "agno"
-        assert row["model_id"] == "gpt-4o-mini"
+        mid = await db.upsert_model(provider_id=pid, model="gpt-4o-mini")
+        row = await db.get_model(mid)
+        assert row["provider_id"] == pid
+        assert row["model"] == "gpt-4o-mini"
+        enriched = (await db.list_models_enriched())[0]
+        assert enriched["provider_name"] == "openai"
+        assert enriched["framework"] == "agno"
+        assert enriched["runtime_id"] == "openai:gpt-4o-mini"
     finally:
         await db.close()
         _cleanup(path)
 
 
-@test("contract", "same (provider, model) under two frameworks are distinct rows")
+@test("contract", "same vendor under two frameworks are distinct provider rows")
 async def t_dual_framework_rows(ctx: TestContext) -> None:
     db, path = await _tmp_db(ctx, "dual")
     try:
-        await db.upsert_model(
+        agno_pid = await db.upsert_provider(
+            name="anthropic", framework="agno", api_key="sk-ant",
+        )
+        cli_pid = await db.upsert_provider(
+            name="anthropic", framework="claude-cli",
+        )
+        assert agno_pid != cli_pid
+        await db.upsert_model(provider_id=agno_pid, model="claude-sonnet-4-6")
+        await db.upsert_model(provider_id=cli_pid, model="claude-sonnet-4-6")
+        # Both rows live side by side: same (provider_name, model), different
+        # framework. The composite runtime_id distinguishes them.
+        enriched = await db.list_models_enriched()
+        rids = sorted(r["runtime_id"] for r in enriched)
+        assert rids == [
             "anthropic:claude-sonnet-4-6",
-            provider="anthropic", framework="agno",
-            model_id="claude-sonnet-4-6",
-        )
-        await db.upsert_model(
             "claude-cli:anthropic:claude-sonnet-4-6",
-            provider="anthropic", framework="claude-cli",
-            model_id="claude-sonnet-4-6",
+        ], rids
+    finally:
+        await db.close()
+        _cleanup(path)
+
+
+@test("contract", "claude-cli provider forbids api_key (sentinel class of bug fixed at schema)")
+async def t_claude_cli_provider_rejects_api_key(ctx: TestContext) -> None:
+    """v0.11.5 added a code-level filter for the ``api_key='claude-cli'``
+    sentinel. v0.12 removes the whole class of bug by rejecting any
+    non-empty api_key on a claude-cli provider row at the DB boundary."""
+    db, path = await _tmp_db(ctx, "cli-nokey")
+    try:
+        raised = False
+        try:
+            await db.upsert_provider(
+                name="anthropic", framework="claude-cli", api_key="x",
+            )
+        except ValueError as e:
+            raised = True
+            assert "api_key" in str(e).lower()
+        assert raised, "claude-cli provider must reject api_key"
+    finally:
+        await db.close()
+        _cleanup(path)
+
+
+@test("contract", "FK cascade: deleting a provider wipes its models")
+async def t_fk_cascade_deletes_models(ctx: TestContext) -> None:
+    db, path = await _tmp_db(ctx, "cascade")
+    try:
+        pid = await db.upsert_provider(
+            name="openai", framework="agno", api_key="sk-x",
         )
-        rows = await db.list_models(provider="anthropic")
-        frameworks = sorted(r["framework"] for r in rows)
-        assert frameworks == ["agno", "claude-cli"], frameworks
+        await db.upsert_model(provider_id=pid, model="gpt-4o-mini")
+        await db.upsert_model(provider_id=pid, model="gpt-4o")
+        await db.upsert_model(provider_id=pid, model="o1-mini")
+        assert len(await db.list_models(provider_id=pid)) == 3
+
+        await db.delete_provider(pid)
+        # FK cascade fires; no models remain.
+        assert len(await db.list_models()) == 0
     finally:
         await db.close()
         _cleanup(path)
@@ -100,10 +150,10 @@ async def t_cross_framework_pin_refused(ctx: TestContext) -> None:
         # Session bound to claude-cli (via sdk_sessions, the normal
         # path the ClaudeCLI provider writes to).
         await db.set_sdk_session("sess-cli", "sdk-uuid", provider="claude-cli")
-        await db.upsert_model(
-            "openai:gpt-4o-mini",
-            provider="openai", framework="agno", model_id="gpt-4o-mini",
+        pid = await db.upsert_provider(
+            name="openai", framework="agno", api_key="sk-x",
         )
+        await db.upsert_model(provider_id=pid, model="gpt-4o-mini")
         raised = False
         try:
             await db.pin_session_model("sess-cli", "openai:gpt-4o-mini")
@@ -121,10 +171,10 @@ async def t_reverse_cross_framework_pin_refused(ctx: TestContext) -> None:
     db, path = await _tmp_db(ctx, "rev-pin")
     try:
         await db.set_session_binding("sess-agno", "agno")
-        await db.upsert_model(
-            "claude-cli:anthropic:claude-opus-4-6",
-            provider="anthropic", framework="claude-cli", model_id="claude-opus-4-6",
+        cli_pid = await db.upsert_provider(
+            name="anthropic", framework="claude-cli",
         )
+        await db.upsert_model(provider_id=cli_pid, model="claude-opus-4-6")
         raised = False
         try:
             await db.pin_session_model(
@@ -143,10 +193,10 @@ async def t_same_framework_pin_ok(ctx: TestContext) -> None:
     db, path = await _tmp_db(ctx, "ok-pin")
     try:
         await db.set_session_binding("sess-agno", "agno")
-        await db.upsert_model(
-            "openai:gpt-4o-mini",
-            provider="openai", framework="agno", model_id="gpt-4o-mini",
+        pid = await db.upsert_provider(
+            name="openai", framework="agno", api_key="sk-x",
         )
+        await db.upsert_model(provider_id=pid, model="gpt-4o-mini")
         await db.pin_session_model("sess-agno", "openai:gpt-4o-mini")
         assert await db.get_session_pin("sess-agno") == "openai:gpt-4o-mini"
     finally:
@@ -158,11 +208,10 @@ async def t_same_framework_pin_ok(ctx: TestContext) -> None:
 async def t_pin_fresh_session_seeds_binding(ctx: TestContext) -> None:
     db, path = await _tmp_db(ctx, "fresh-pin")
     try:
-        await db.upsert_model(
-            "claude-cli:anthropic:claude-sonnet-4-6",
-            provider="anthropic", framework="claude-cli",
-            model_id="claude-sonnet-4-6",
+        cli_pid = await db.upsert_provider(
+            name="anthropic", framework="claude-cli",
         )
+        await db.upsert_model(provider_id=cli_pid, model="claude-sonnet-4-6")
         assert await db.get_session_binding("fresh") is None
         await db.pin_session_model(
             "fresh", "claude-cli:anthropic:claude-sonnet-4-6",
@@ -183,24 +232,24 @@ async def t_router_honors_pin(ctx: TestContext) -> None:
 
     db, path = await _tmp_db(ctx, "pin-dispatch")
     try:
-        # Routing declares openai; pin says something else — pin wins.
-        providers = {"openai": {"api_key": "sk-x", "models": ["gpt-4o-mini"]}}
+        pid = await db.upsert_provider(
+            name="openai", framework="agno", api_key="sk-x",
+        )
+        await db.upsert_model(provider_id=pid, model="gpt-4o-mini")
+        await db.upsert_model(provider_id=pid, model="gpt-4.1")
+        await db.pin_session_model("sess-x", "openai:gpt-4.1")
+
+        providers = await db.list_providers(enabled_only=True)
+        by_id: dict[int, dict] = {p["id"]: {**p, "models": []} for p in providers}
+        for m in await db.list_models(enabled_only=True):
+            by_id[m["provider_id"]]["models"].append(m)
+        providers_config = list(by_id.values())
+
         router = SmartRouter(
-            routing={
-                "simple": "openai:gpt-4o-mini",
-                "medium": "openai:gpt-4o-mini",
-                "hard": "openai:gpt-4o-mini",
-                "fallback": "openai:gpt-4o-mini",
-            },
-            providers_config=providers,
+            routing={},
+            providers_config=providers_config,
         )
         router.set_db(db)
-
-        await db.upsert_model(
-            "openai:gpt-4.1",
-            provider="openai", framework="agno", model_id="gpt-4.1",
-        )
-        await db.pin_session_model("sess-x", "openai:gpt-4.1")
 
         seen: list[str] = []
 
@@ -230,22 +279,28 @@ async def t_bound_framework_no_models_rejects(ctx: TestContext) -> None:
 
     db, path = await _tmp_db(ctx, "no-cli-models")
     try:
-        providers = {"openai": {"api_key": "sk-x", "models": ["gpt-4o-mini"]}}
+        # Only an agno provider+model exists.
+        pid = await db.upsert_provider(
+            name="openai", framework="agno", api_key="sk-x",
+        )
+        await db.upsert_model(provider_id=pid, model="gpt-4o-mini")
+
+        providers = await db.list_providers(enabled_only=True)
+        by_id = {p["id"]: {**p, "models": []} for p in providers}
+        for m in await db.list_models(enabled_only=True):
+            by_id[m["provider_id"]]["models"].append(m)
+        providers_config = list(by_id.values())
+
         router = SmartRouter(
-            routing={
-                "simple": "openai:gpt-4o-mini",
-                "medium": "openai:gpt-4o-mini",
-                "hard": "openai:gpt-4o-mini",
-                "fallback": "openai:gpt-4o-mini",
-            },
-            providers_config=providers,
+            routing={},
+            providers_config=providers_config,
         )
         router.set_db(db)
         # Session pre-bound to claude-cli, no claude-cli models registered.
         await db.set_sdk_session("orphan", "stale-uuid", provider="claude-cli")
 
         async def _fake_classify(*_a, **_kw):
-            return "simple"
+            return None
 
         router._classify = _fake_classify  # type: ignore[assignment]
 
@@ -263,11 +318,10 @@ async def t_bound_framework_no_models_rejects(ctx: TestContext) -> None:
 async def t_unpin_preserves_framework(ctx: TestContext) -> None:
     db, path = await _tmp_db(ctx, "unpin")
     try:
-        await db.upsert_model(
-            "claude-cli:anthropic:claude-sonnet-4-6",
-            provider="anthropic", framework="claude-cli",
-            model_id="claude-sonnet-4-6",
+        cli_pid = await db.upsert_provider(
+            name="anthropic", framework="claude-cli",
         )
+        await db.upsert_model(provider_id=cli_pid, model="claude-sonnet-4-6")
         await db.pin_session_model(
             "sess-unpin", "claude-cli:anthropic:claude-sonnet-4-6",
         )

@@ -1,4 +1,4 @@
-"""SmartRouter hybrid dispatch — agno + claude-cli under one router.
+"""SmartRouter hybrid dispatch — agno + claude-cli under one router (v0.12 schema).
 
 Tests here monkey-patch the classifier + dispatch layer so no real LLM
 or claude binary is needed. We focus on the routing decision, the
@@ -21,7 +21,7 @@ class _FakeResp:
         self.model = model
 
 
-def _make_router(providers_config: dict, routing: dict[str, str]):
+def _make_router(providers_config: list, routing: dict[str, str]):
     from openagent.models.smart_router import SmartRouter
 
     r = SmartRouter(
@@ -57,6 +57,18 @@ async def _stub_dispatch(router, recorded: list[str]):
     router._dispatch = _fake  # type: ignore[assignment]
 
 
+def _providers_both_frameworks() -> list[dict[str, Any]]:
+    """Build a v0.12 flat-list providers_config with agno + claude-cli rows."""
+    return [
+        {"id": 1, "name": "openai", "framework": "agno",
+         "api_key": "sk-x", "base_url": None, "enabled": True,
+         "models": [{"id": 10, "model": "gpt-4o-mini", "enabled": True}]},
+        {"id": 2, "name": "anthropic", "framework": "claude-cli",
+         "api_key": None, "base_url": None, "enabled": True,
+         "models": [{"id": 20, "model": "claude-sonnet-4-6", "enabled": True}]},
+    ]
+
+
 @test("smart_router_hybrid", "fresh session uses classifier pick + records binding")
 async def t_fresh_agno(ctx: TestContext) -> None:
     import uuid as _uuid
@@ -66,7 +78,11 @@ async def t_fresh_agno(ctx: TestContext) -> None:
     try:
         db = MemoryDB(str(tmp))
         await db.connect()
-        providers = {"openai": {"api_key": "sk-x", "models": ["gpt-4o-mini"]}}
+        providers = [
+            {"id": 1, "name": "openai", "framework": "agno",
+             "api_key": "sk-x", "enabled": True,
+             "models": [{"id": 10, "model": "gpt-4o-mini", "enabled": True}]},
+        ]
         router = _make_router(providers, {
             "simple": "openai:gpt-4o-mini",
             "medium": "openai:gpt-4o-mini",
@@ -100,13 +116,7 @@ async def t_bound_side_locked(ctx: TestContext) -> None:
     try:
         db = MemoryDB(str(tmp))
         await db.connect()
-        providers = {
-            "openai": {"api_key": "sk-x", "models": ["gpt-4o-mini"]},
-            # Hydrated-providers shape: the "claude-cli" bucket holds
-            # framework=claude-cli rows that live under the anthropic
-            # provider in the DB.
-            "claude-cli": {"models": ["claude-sonnet-4-6"]},
-        }
+        providers = _providers_both_frameworks()
         router = _make_router(providers, {
             "simple": "openai:gpt-4o-mini",
             "medium": "openai:gpt-4o-mini",
@@ -145,10 +155,7 @@ async def t_bound_to_claude_cli(ctx: TestContext) -> None:
     try:
         db = MemoryDB(str(tmp))
         await db.connect()
-        providers = {
-            "openai": {"api_key": "sk-x", "models": ["gpt-4o-mini"]},
-            "claude-cli": {"models": ["claude-sonnet-4-6"]},
-        }
+        providers = _providers_both_frameworks()
         router = _make_router(providers, {
             "simple": "openai:gpt-4o-mini",
             "medium": "openai:gpt-4o-mini",
@@ -185,7 +192,11 @@ async def t_bound_side_empty(ctx: TestContext) -> None:
     try:
         db = MemoryDB(str(tmp))
         await db.connect()
-        providers = {"openai": {"api_key": "sk-x", "models": ["gpt-4o-mini"]}}
+        providers = [
+            {"id": 1, "name": "openai", "framework": "agno",
+             "api_key": "sk-x", "enabled": True,
+             "models": [{"id": 10, "model": "gpt-4o-mini", "enabled": True}]},
+        ]
         router = _make_router(providers, {
             "simple": "openai:gpt-4o-mini",
             "medium": "openai:gpt-4o-mini",
@@ -213,3 +224,33 @@ async def t_bound_side_empty(ctx: TestContext) -> None:
             tmp.unlink()
         except FileNotFoundError:
             pass
+
+
+@test("smart_router_hybrid", "dual-framework provider isolation — agno key never leaks into claude-cli env")
+async def t_dual_framework_env_isolation(ctx: TestContext) -> None:
+    """Regression guard for the v0.11.5 sentinel bug.
+
+    When the same vendor (anthropic) is registered under both frameworks,
+    AgnoProvider's env-injection must export ONLY the agno row's api_key.
+    The claude-cli row carries api_key=NULL by v0.12 schema, but even if
+    legacy data leaked through, AgnoProvider's per-entry framework filter
+    must drop anything that's not agno.
+    """
+    import os as _os
+    from openagent.models.agno_provider import AgnoProvider
+
+    providers = [
+        {"id": 1, "name": "anthropic", "framework": "agno",
+         "api_key": "sk-ant-real", "enabled": True, "models": []},
+        {"id": 2, "name": "anthropic", "framework": "claude-cli",
+         "api_key": None, "enabled": True, "models": []},
+    ]
+    prev = _os.environ.pop("ANTHROPIC_API_KEY", None)
+    try:
+        AgnoProvider(model="anthropic:claude-sonnet-4-6", providers_config=providers)
+        assert _os.environ.get("ANTHROPIC_API_KEY") == "sk-ant-real"
+    finally:
+        if prev is None:
+            _os.environ.pop("ANTHROPIC_API_KEY", None)
+        else:
+            _os.environ["ANTHROPIC_API_KEY"] = prev

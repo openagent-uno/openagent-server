@@ -78,10 +78,15 @@ class SmartRouter(BaseModel):
         api_key: str | None = None,
         monthly_budget: float = 0.0,
         classifier_model: str | None = None,
-        providers_config: dict | None = None,
+        providers_config: Any = None,
         claude_permission_mode: str = "bypass",
     ):
-        self._providers_config = providers_config or {}
+        # v0.12 providers_config is a flat list of provider entries.
+        # Accept both shapes (list or legacy dict) so early-boot / tests
+        # that still seed with a dict keep working.
+        if providers_config is None:
+            providers_config = []
+        self._providers_config = providers_config
         self._api_key = api_key
         self._monthly_budget = monthly_budget
         self._claude_permission_mode = claude_permission_mode
@@ -128,7 +133,7 @@ class SmartRouter(BaseModel):
             explicit_routing=self._explicit_routing,
         )
 
-    def rebuild_routing(self, providers_config: dict | None = None) -> None:
+    def rebuild_routing(self, providers_config: Any = None) -> None:
         """Called by the hot-reload loop when the ``models`` DB table changes.
 
         With classifier-direct routing the catalog is read fresh on every
@@ -136,7 +141,7 @@ class SmartRouter(BaseModel):
         is ``self._providers_config`` and the classifier model id.
         """
         if providers_config is not None:
-            self._providers_config = providers_config or {}
+            self._providers_config = providers_config
         self._classifier_model = normalize_runtime_model_id(
             self._classifier_model or DEFAULT_CLASSIFIER_MODEL,
             self._providers_config,
@@ -303,9 +308,9 @@ class SmartRouter(BaseModel):
                 {
                     "runtime_id": e.runtime_id,
                     "provider": e.provider,
+                    "framework": e.framework,
                     "display_name": e.display_name or e.model_id,
                     "tier_hint": e.tier_hint,
-                    "notes": e.notes,
                 }
                 for e in catalog
             ],
@@ -324,8 +329,8 @@ class SmartRouter(BaseModel):
             "runtime_id in the catalog.\n"
             "- Otherwise infer difficulty, modality (vision, long context, "
             "tool use), and cost-sensitivity from the turn and pick the "
-            "best fit. tier_hint and notes are advisory only — override "
-            "them when the turn calls for it.\n"
+            "best fit. tier_hint is advisory free-form guidance — "
+            "override it when the turn calls for it.\n"
             "- For trivial turns (greetings, short factual questions, "
             "simple translations) prefer a fast/cheap model.\n"
             "- For multi-step refactors, debugging across files, or "

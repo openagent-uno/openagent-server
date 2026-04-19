@@ -105,9 +105,10 @@ async def t_usage_daily(ctx: TestContext) -> None:
 
 @test("providers", "GET /api/providers lists DB-backed providers")
 async def t_providers_list(ctx: TestContext) -> None:
-    """Providers live in the ``providers`` SQLite table. The gateway
-    fixture runs without a wired DB, so the list comes back empty — we
-    just verify the shape, not the contents."""
+    """Providers live in the ``providers`` SQLite table. Under v0.12
+    the response is a flat list — the same vendor can appear twice
+    (anthropic+agno and anthropic+claude-cli), so a name-keyed dict
+    would collide."""
     port = ctx.extras.get("gateway_port")
     if not port:
         raise TestSkip("gateway not running")
@@ -119,7 +120,7 @@ async def t_providers_list(ctx: TestContext) -> None:
             assert r.status == 200
             body = await r.json()
             assert isinstance(body, dict) and "providers" in body, body
-            assert isinstance(body["providers"], dict), body
+            assert isinstance(body["providers"], list), body
 
 
 # ── /api/providers CRUD (was /api/models CRUD pre-v0.11) ──────────────
@@ -128,7 +129,9 @@ async def t_providers_list(ctx: TestContext) -> None:
 @test("providers", "POST /api/providers adds a provider, DELETE removes it")
 async def t_providers_crud(ctx: TestContext) -> None:
     """Replaces the pre-v0.11 ``POST /api/models`` provider-add path.
-    Provider keys now live in the DB; legacy yaml endpoint is gone."""
+    Provider keys now live in the DB; legacy yaml endpoint is gone.
+    v0.12 body carries a ``framework`` field and the resource is keyed
+    on a surrogate integer ``id`` returned by the create response."""
     port = ctx.extras.get("gateway_port")
     if not port:
         raise TestSkip("gateway not running")
@@ -137,14 +140,17 @@ async def t_providers_crud(ctx: TestContext) -> None:
     async with aiohttp.ClientSession() as http:
         async with http.post(
             f"http://127.0.0.1:{port}/api/providers",
-            json={"name": name, "api_key": "sk-fake"},
+            json={"name": name, "framework": "agno", "api_key": "sk-fake"},
         ) as r:
             if r.status == 500:
                 raise TestSkip("gateway fixture has no MemoryDB wired")
             assert r.status == 201, f"POST returned {r.status}: {await r.text()}"
             body = await r.json()
             assert body.get("ok") is True, body
-        async with http.delete(f"http://127.0.0.1:{port}/api/providers/{name}") as r:
+            provider_id = body["provider"]["id"]
+        async with http.delete(
+            f"http://127.0.0.1:{port}/api/providers/{provider_id}",
+        ) as r:
             assert r.status in (200, 204), f"DELETE returned {r.status}"
 
 

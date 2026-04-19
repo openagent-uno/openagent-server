@@ -117,7 +117,7 @@ async def t_create_delete_mcp(ctx: TestContext) -> None:
             assert resp.status == 200
 
 
-@test("mcps_rest", "POST /api/models/db writes a row")
+@test("mcps_rest", "POST /api/models writes a row (v0.12: provider_id + model)")
 async def t_create_db_model(ctx: TestContext) -> None:
     port = ctx.extras.get("gateway_port")
     if not port:
@@ -125,26 +125,46 @@ async def t_create_db_model(ctx: TestContext) -> None:
     if not _agent_has_db(ctx):
         raise TestSkip("gateway fixture has no MemoryDB wired")
 
-    body = {"provider": "openai", "model_id": "gpt-rest-test", "display_name": "REST Test"}
+    # Create an agno openai provider row first so models can FK to it.
     async with aiohttp.ClientSession() as sess:
-        async with sess.post(f"http://127.0.0.1:{port}/api/models/db", json=body) as resp:
-            assert resp.status == 201, await resp.text()
-            created = (await resp.json())["model"]
-            runtime_id = created["runtime_id"]
-            assert runtime_id == "openai:gpt-rest-test"
-
-        async with sess.get(f"http://127.0.0.1:{port}/api/models/db") as resp:
-            assert resp.status == 200
-            rows = (await resp.json())["models"]
-            assert any(m["runtime_id"] == runtime_id for m in rows)
-
-        async with sess.delete(
-            f"http://127.0.0.1:{port}/api/models/db/{runtime_id}"
+        async with sess.post(
+            f"http://127.0.0.1:{port}/api/providers",
+            json={"name": "openai", "framework": "agno", "api_key": "sk-fake"},
         ) as resp:
-            # Since v0.10.3 the guardrail that refused "last enabled model"
-            # is gone — the rejection gate in _process_message surfaces the
-            # zero-model state explicitly, so DELETE always succeeds.
-            assert resp.status == 200, await resp.text()
+            assert resp.status == 201, await resp.text()
+            provider_id = (await resp.json())["provider"]["id"]
+
+        try:
+            body = {
+                "provider_id": provider_id,
+                "model": "gpt-rest-test",
+                "display_name": "REST Test",
+            }
+            async with sess.post(
+                f"http://127.0.0.1:{port}/api/models", json=body,
+            ) as resp:
+                assert resp.status == 201, await resp.text()
+                created = (await resp.json())["model"]
+                model_id = created["id"]
+                assert created["runtime_id"] == "openai:gpt-rest-test"
+
+            async with sess.get(f"http://127.0.0.1:{port}/api/models") as resp:
+                assert resp.status == 200
+                rows = (await resp.json())["models"]
+                assert any(m["id"] == model_id for m in rows)
+
+            async with sess.delete(
+                f"http://127.0.0.1:{port}/api/models/{model_id}",
+            ) as resp:
+                # Since v0.10.3 the guardrail that refused "last enabled model"
+                # is gone — the rejection gate in _process_message surfaces the
+                # zero-model state explicitly, so DELETE always succeeds.
+                assert resp.status == 200, await resp.text()
+        finally:
+            async with sess.delete(
+                f"http://127.0.0.1:{port}/api/providers/{provider_id}",
+            ) as resp:
+                pass  # FK cascade handles leftover models
 
 
 @test("mcps_rest", "GET /api/models/available?provider=openai returns fallback when no key")
@@ -152,16 +172,35 @@ async def t_available_openai(ctx: TestContext) -> None:
     port = ctx.extras.get("gateway_port")
     if not port:
         raise TestSkip("requires gateway fixture")
+    if not _agent_has_db(ctx):
+        raise TestSkip("gateway fixture has no MemoryDB wired")
 
+    # Provider row must exist — v0.12 discovery resolves either by
+    # provider_id (preferred) or by the legacy ``provider=<name>`` query.
     async with aiohttp.ClientSession() as sess:
-        async with sess.get(
-            f"http://127.0.0.1:{port}/api/models/available?provider=openai"
+        async with sess.post(
+            f"http://127.0.0.1:{port}/api/providers",
+            json={"name": "openai", "framework": "agno", "api_key": "sk-fake"},
         ) as resp:
-            assert resp.status == 200
-            data = await resp.json()
-    assert data["provider"] == "openai"
-    assert isinstance(data["models"], list)
-    # Either live-fetch succeeded (has a key) or bundled fallback kicks in;
-    # either way we expect at least one entry with an ``id`` field.
-    if data["models"]:
-        assert "id" in data["models"][0]
+            provider_id = None
+            if resp.status == 201:
+                provider_id = (await resp.json())["provider"]["id"]
+            elif resp.status != 400:
+                raise TestSkip(f"POST /api/providers returned {resp.status}")
+
+        try:
+            async with sess.get(
+                f"http://127.0.0.1:{port}/api/models/available?provider=openai"
+            ) as resp:
+                assert resp.status == 200
+                data = await resp.json()
+            assert data["provider"] == "openai"
+            assert isinstance(data["models"], list)
+            if data["models"]:
+                assert "id" in data["models"][0]
+        finally:
+            if provider_id is not None:
+                async with sess.delete(
+                    f"http://127.0.0.1:{port}/api/providers/{provider_id}"
+                ) as resp:
+                    pass

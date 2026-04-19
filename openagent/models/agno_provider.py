@@ -32,7 +32,9 @@ from openagent.core.logging import elog
 from openagent.models.base import BaseModel, ModelResponse
 from openagent.models.catalog import (
     DEFAULT_ZAI_BASE_URL,
+    FRAMEWORK_AGNO,
     FRAMEWORK_CLAUDE_CLI,
+    _iter_provider_entries,
     compute_cost,
     model_id_from_runtime,
     normalize_runtime_model_id,
@@ -41,16 +43,17 @@ from openagent.models.catalog import (
 
 logger = logging.getLogger(__name__)
 
-# Providers without a real API key (e.g. anthropic served only through the
-# claude-cli subscription) get this sentinel stored in ``providers.api_key``.
-# Exporting it as ``ANTHROPIC_API_KEY`` poisons the claude subprocess with
-# "Invalid API key · Fix external API key", so every callsite that pushes
-# provider keys into ``os.environ`` must filter these out.
+# v0.11.x shipped with a "sentinel" hack where providers without a real
+# API key (e.g. anthropic served only through the claude-cli subscription)
+# stored the literal string ``"claude-cli"`` in ``providers.api_key``.
+# Exporting it as ``ANTHROPIC_API_KEY`` poisoned the claude subprocess
+# with "Invalid API key · Fix external API key".
+#
+# Under v0.12 the schema rejects api_keys on claude-cli providers at the
+# DB boundary (see ``MemoryDB.upsert_provider``), so this set only
+# remains as a runtime backstop for installs that still have leftover
+# env vars from an older process.
 _SENTINEL_API_KEYS = {FRAMEWORK_CLAUDE_CLI}
-
-
-def _is_real_api_key(key: str | None) -> bool:
-    return bool(key) and key not in _SENTINEL_API_KEYS
 
 
 PROVIDER_ENV_VARS = {
@@ -164,18 +167,24 @@ class AgnoProvider(BaseModel):
             os.environ.pop("GEMINI_API_KEY", None)
 
         provider_name = self._provider_name()
-        if _is_real_api_key(self._api_key):
+        if self._api_key:
             env_var = PROVIDER_ENV_VARS.get(provider_name)
             if env_var and not os.environ.get(env_var):
                 os.environ[env_var] = self._api_key
             if provider_name == "google" and not os.environ.get("GEMINI_API_KEY"):
                 os.environ["GEMINI_API_KEY"] = self._api_key
 
-        for name, cfg in self._providers_config.items():
-            env_var = PROVIDER_ENV_VARS.get(name)
-            key = cfg.get("api_key")
-            if not _is_real_api_key(key):
+        # Only agno-framework provider rows carry api_keys worth exporting.
+        # claude-cli rows have api_key=NULL by schema, but be defensive
+        # against legacy dict-shaped configs that might still be in play.
+        for entry in _iter_provider_entries(self._providers_config):
+            if entry.get("framework", FRAMEWORK_AGNO) != FRAMEWORK_AGNO:
                 continue
+            name = str(entry.get("name") or "").strip()
+            key = entry.get("api_key")
+            if not name or not key:
+                continue
+            env_var = PROVIDER_ENV_VARS.get(name)
             if env_var and not os.environ.get(env_var):
                 os.environ[env_var] = key
             if name == "google" and not os.environ.get("GEMINI_API_KEY"):
@@ -195,8 +204,21 @@ class AgnoProvider(BaseModel):
         return split_runtime_id(self.model)
 
     def _provider_config(self) -> dict[str, Any]:
+        """Return the agno-framework provider entry matching this model's vendor.
+
+        v0.12 stores providers as a flat list where the same vendor can
+        appear twice (agno + claude-cli). AgnoProvider only cares about
+        the agno row — the claude-cli row lives in its own registry.
+        Falls back to the legacy dict-shape for early-boot / tests.
+        """
         provider_name, _ = self._runtime_parts()
-        return self._providers_config.get(provider_name, {})
+        for entry in _iter_provider_entries(self._providers_config):
+            if str(entry.get("name") or "").strip() != provider_name:
+                continue
+            if entry.get("framework", FRAMEWORK_AGNO) != FRAMEWORK_AGNO:
+                continue
+            return dict(entry)
+        return {}
 
     def _provider_setting(self, key: str) -> str | None:
         value = self._provider_config().get(key)

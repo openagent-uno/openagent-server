@@ -11,7 +11,7 @@ import uuid
 from ._framework import TestContext, test
 
 
-@test("provider_manager", "add_provider writes api_key to DB")
+@test("provider_manager", "add_provider writes api_key to DB (v0.12 framework-aware)")
 async def t_add_provider(ctx: TestContext) -> None:
     import openagent.mcp.servers.model_manager.server as mgr
     from openagent.memory.db import MemoryDB
@@ -30,35 +30,58 @@ async def t_add_provider(ctx: TestContext) -> None:
         await db.connect()
         await db.close()
 
-        result = await mgr.add_provider("zai", api_key="zai-test-key",
-                                         base_url="https://api.z.ai/api/paas/v4")
+        result = await mgr.add_provider(
+            "zai",
+            framework="agno",
+            api_key="zai-test-key",
+            base_url="https://api.z.ai/api/paas/v4",
+        )
         assert result["name"] == "zai"
+        assert result["framework"] == "agno"
         assert result["has_api_key"] is True
         assert result["base_url"] == "https://api.z.ai/api/paas/v4"
+        provider_id = result["id"]
 
         # Verify the row landed in the DB (cleartext api_key; the DB
         # file is 0600 and owned by the running user).
         db = MemoryDB(str(db_path))
         await db.connect()
         try:
-            row = await db.get_provider("zai")
+            row = await db.get_provider(provider_id)
             assert row is not None
+            assert row["name"] == "zai"
+            assert row["framework"] == "agno"
             assert row["api_key"] == "zai-test-key"
             assert row["base_url"] == "https://api.z.ai/api/paas/v4"
         finally:
             await db.close()
 
         listed = await mgr.list_providers()
-        zai = next((p for p in listed if p["name"] == "zai"), None)
+        zai = next(
+            (p for p in listed if p["name"] == "zai" and p["framework"] == "agno"),
+            None,
+        )
         assert zai is not None
         assert zai["has_api_key"] is True
 
+        # claude-cli providers reject api_key at the MCP layer (same
+        # contract as the DB layer) — exercises the v0.11 sentinel
+        # regression guard.
+        raised = False
+        try:
+            await mgr.add_provider(
+                "anthropic", framework="claude-cli", api_key="claude-cli",
+            )
+        except ValueError:
+            raised = True
+        assert raised, "claude-cli provider must reject api_key"
+
         # remove_provider deletes the DB row.
-        await mgr.remove_provider("zai")
+        await mgr.remove_provider(provider_id)
         db = MemoryDB(str(db_path))
         await db.connect()
         try:
-            assert await db.get_provider("zai") is None
+            assert await db.get_provider(provider_id) is None
         finally:
             await db.close()
     finally:

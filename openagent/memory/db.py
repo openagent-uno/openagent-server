@@ -1,4 +1,4 @@
-"""SQLite storage for scheduled tasks and usage logs."""
+"""SQLite storage for scheduled tasks, usage logs, providers, and models."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from openagent.memory.schedule import (
 
 
 VALID_MCP_KINDS = ("builtin", "custom", "default")
+VALID_FRAMEWORKS = ("agno", "claude-cli")
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS scheduled_tasks (
@@ -89,34 +90,62 @@ CREATE TABLE IF NOT EXISTS mcps (
 CREATE INDEX IF NOT EXISTS idx_mcps_enabled ON mcps(enabled);
 CREATE INDEX IF NOT EXISTS idx_mcps_updated ON mcps(updated_at);
 
--- Configured LLM models. The model catalog lives here so the agent
--- (via the model-manager MCP) can add/remove/toggle models at runtime.
--- ``runtime_id`` is the canonical id (provider:model_id, or
--- claude-cli/model_id) used everywhere in code; see
--- openagent.models.catalog.build_runtime_model_id.
--- OpenAgent vocabulary (since v0.10.0):
---   provider  = vendor/owner (anthropic, openai, google, z.ai, local…)
---   framework = runtime dispatching the model (agno | claude-cli)
---   model_id  = bare vendor id (gpt-4o-mini, claude-sonnet-4-6…)
--- The same (provider, model_id) can run under different frameworks —
--- notably anthropic models, which run under Agno (direct API) OR under
--- the local Claude CLI binary (Pro/Max subscription). ``runtime_id``
--- encodes all three: ``<provider>:<model>`` for framework=agno, and
--- ``claude-cli:<provider>:<model>`` for framework=claude-cli.
-CREATE TABLE IF NOT EXISTS models (
-    runtime_id TEXT PRIMARY KEY,
-    provider TEXT NOT NULL,
-    framework TEXT NOT NULL DEFAULT 'agno',
-    model_id TEXT NOT NULL,
-    display_name TEXT,
-    tier_hint TEXT,
-    notes TEXT,
+-- LLM providers. One row per (vendor, framework) pair.
+--
+-- OpenAgent vocabulary (v0.12+):
+--   - **provider**  = a concrete credential + dispatch pair. The same vendor
+--                     (``anthropic``) can appear as two rows — one with
+--                     ``framework='agno'`` (direct API, needs ``api_key``) and
+--                     one with ``framework='claude-cli'`` (local ``claude``
+--                     subprocess, ``api_key`` MUST be NULL).
+--   - **framework** = how OpenAgent dispatches calls for this provider row:
+--                     ``agno`` (Agno SDK hits the vendor's REST API) or
+--                     ``claude-cli`` (spawns the user's Pro/Max subscription
+--                     via the local binary).
+--
+-- ``UNIQUE(name, framework)`` lets the UI/API/MCP address a row by its
+-- (vendor, framework) pair; the surrogate ``id`` is what the ``models``
+-- table joins to.
+CREATE TABLE IF NOT EXISTS providers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    framework TEXT NOT NULL CHECK (framework IN ('agno','claude-cli')),
+    api_key TEXT,
+    base_url TEXT,
     enabled INTEGER NOT NULL DEFAULT 1,
     metadata_json TEXT NOT NULL DEFAULT '{}',
     created_at REAL NOT NULL,
-    updated_at REAL NOT NULL
+    updated_at REAL NOT NULL,
+    UNIQUE(name, framework)
 );
-CREATE INDEX IF NOT EXISTS idx_models_provider ON models(provider);
+CREATE INDEX IF NOT EXISTS idx_providers_enabled ON providers(enabled);
+CREATE INDEX IF NOT EXISTS idx_providers_updated ON providers(updated_at);
+CREATE INDEX IF NOT EXISTS idx_providers_name ON providers(name);
+
+-- Configured LLM models. Each row is a bare vendor id plus a FK to the
+-- provider row that owns it. Framework is inherited from the provider —
+-- deleting a provider cascades to wipe its models (ON DELETE CASCADE).
+--
+-- ``model`` is the bare vendor id (e.g. ``gpt-4o-mini``, ``claude-opus-4-7``).
+-- The canonical ``runtime_id`` used in logs / session pins / classifier
+-- responses is DERIVED at read time from the provider row's (name,
+-- framework) pair — no longer stored here.
+--
+-- ``tier_hint`` absorbs the old ``notes`` column: free-form classifier
+-- guidance (``"vision, 200k context, best for code"``, ``"cheap and fast"``).
+CREATE TABLE IF NOT EXISTS models (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider_id INTEGER NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+    model TEXT NOT NULL,
+    display_name TEXT,
+    tier_hint TEXT,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(provider_id, model)
+);
+CREATE INDEX IF NOT EXISTS idx_models_provider ON models(provider_id);
 CREATE INDEX IF NOT EXISTS idx_models_enabled ON models(enabled);
 CREATE INDEX IF NOT EXISTS idx_models_updated ON models(updated_at);
 
@@ -129,65 +158,34 @@ CREATE TABLE IF NOT EXISTS config_state (
     updated_at REAL NOT NULL
 );
 
--- LLM provider credentials. One row per vendor (openai, anthropic,
--- google, zai, …). API keys are stored plaintext; the DB file is
--- owned by the user with 0600 perms.
-CREATE TABLE IF NOT EXISTS providers (
-    name TEXT PRIMARY KEY,
-    api_key TEXT,
-    base_url TEXT,
-    enabled INTEGER NOT NULL DEFAULT 1,
-    metadata_json TEXT NOT NULL DEFAULT '{}',
-    created_at REAL NOT NULL,
-    updated_at REAL NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_providers_enabled ON providers(enabled);
-CREATE INDEX IF NOT EXISTS idx_providers_updated ON providers(updated_at);
-
 -- Per-session runtime binding. SmartRouter dispatches fresh sessions
--- to either the Agno stack ("agno") or the Claude CLI
--- registry ("claude-cli") based on the classifier; once a session has
--- been served by one side its conversation state lives there
--- (Agno's SqliteDb for agno, Claude's own session store for claude-cli)
--- so the router must respect that lock on subsequent turns.
+-- to either the Agno stack (``framework='agno'``) or the Claude CLI
+-- registry (``framework='claude-cli'``) based on the classifier; once a
+-- session has been served by one side its conversation state lives
+-- there so the router must respect that lock on subsequent turns.
 --
--- Claude-cli bindings are also persisted in ``sdk_sessions`` because
+-- ``runtime_id`` is a human-readable label (e.g.
+-- ``claude-cli:anthropic:claude-opus-4-7``) derived from the provider
+-- + model rows at pin time; it's not a FK so a later model delete
+-- leaves a "stale pin" the router gracefully falls back from rather
+-- than throwing an integrity error.
+--
+-- Claude-cli bindings are ALSO persisted in ``sdk_sessions`` because
 -- that table carries the SDK-native UUID needed for ``--resume``. This
--- table only needs to cover the agno case (no resume id to persist),
--- plus it serves as a fast single-table lookup for SmartRouter.
+-- table covers agno sessions + per-session explicit model pins for
+-- both sides, plus it serves as a fast single-table lookup for
+-- SmartRouter.
 CREATE TABLE IF NOT EXISTS session_bindings (
     session_id TEXT PRIMARY KEY,
-    provider TEXT NOT NULL,
-    bound_at REAL NOT NULL,
-    -- Optional per-session *specific* model override. When set,
-    -- SmartRouter skips the classifier and dispatches this session
-    -- straight to ``runtime_id`` regardless of the picked tier.
-    -- NULL means "use the routing table normally for this side".
-    runtime_id TEXT
+    framework TEXT NOT NULL CHECK (framework IN ('agno','claude-cli')),
+    runtime_id TEXT,
+    bound_at REAL NOT NULL
 );
 """
 
-# Column-add migrations for tables that exist pre-v0.9.2 / pre-v0.10.
-# SQLite's ``CREATE TABLE IF NOT EXISTS`` can't evolve a schema; these
-# ``ALTER TABLE`` statements run at every connect and swallow the
-# "column already exists" OperationalError on subsequent boots. Safe to
-# append more entries as the schema grows.
-_SCHEMA_MIGRATIONS = (
-    "ALTER TABLE session_bindings ADD COLUMN runtime_id TEXT",
-    "ALTER TABLE models ADD COLUMN framework TEXT NOT NULL DEFAULT 'agno'",
-    "ALTER TABLE models ADD COLUMN notes TEXT",
-    # Drop legacy cost columns. Pricing is resolved live via
-    # ``catalog.get_model_pricing`` (claude-cli → 0; agno → OpenRouter
-    # cache); the static columns went stale every time a vendor changed
-    # tariffs. Requires SQLite ≥ 3.35 — older builds raise OperationalError
-    # which is swallowed below, leaving the dead columns in place harmlessly.
-    "ALTER TABLE models DROP COLUMN input_cost_per_million",
-    "ALTER TABLE models DROP COLUMN output_cost_per_million",
-)
-
 
 class MemoryDB:
-    """SQLite storage for scheduled tasks."""
+    """SQLite storage for OpenAgent's runtime state."""
 
     def __init__(self, db_path: str = "openagent.db"):
         self.db_path = db_path
@@ -210,60 +208,12 @@ class MemoryDB:
         # statement on this connection — not just the initial open.
         await self._conn.execute("PRAGMA busy_timeout = 10000")
         await self._conn.execute("PRAGMA journal_mode=WAL")
+        # Enable FK constraints per-connection. SQLite's default is OFF,
+        # so without this the ON DELETE CASCADE on models.provider_id is
+        # silently a no-op and deleting a provider orphans its models.
+        await self._conn.execute("PRAGMA foreign_keys = ON")
         await self._conn.executescript(SCHEMA_SQL)
-        # Run column-add migrations for tables that can't be fully
-        # re-specified via ``CREATE TABLE IF NOT EXISTS``. Each statement
-        # is idempotent-by-try/except: SQLite raises OperationalError
-        # when the column already exists, and we swallow that.
-        for stmt in _SCHEMA_MIGRATIONS:
-            try:
-                await self._conn.execute(stmt)
-            except aiosqlite.OperationalError:
-                pass
         await self._conn.commit()
-        # v0.10 data fix-up: pre-v0.10 rows used ``provider='claude-cli'``
-        # as a pseudo-provider. In the new vocabulary claude-cli is a
-        # *framework* and the underlying provider is ``anthropic``.
-        # Translate those rows once so the catalog + SmartRouter see
-        # consistent values. Idempotent: subsequent boots find nothing
-        # to rewrite because ``framework`` is already set.
-        await self._migrate_models_provider_to_framework()
-
-    async def _migrate_models_provider_to_framework(self) -> None:
-        """One-shot rewrite of legacy claude-cli rows in the ``models`` table.
-
-        Before v0.10, claude-cli was stored as ``provider='claude-cli'``
-        with ``runtime_id='claude-cli/<model>'``. The new shape is
-        ``provider='anthropic'``, ``framework='claude-cli'``, and
-        ``runtime_id='claude-cli:anthropic:<model>'``. Runs quietly —
-        no-op on fresh databases and on already-migrated ones.
-        """
-        assert self._conn is not None
-        try:
-            cursor = await self._conn.execute(
-                "SELECT runtime_id, model_id FROM models WHERE provider = 'claude-cli'"
-            )
-            rows = await cursor.fetchall()
-        except aiosqlite.OperationalError:
-            return
-        for row in rows:
-            old_rid = row[0]
-            model_id = row[1]
-            new_rid = f"claude-cli:anthropic:{model_id}"
-            try:
-                await self._conn.execute(
-                    "UPDATE models SET provider = 'anthropic', framework = 'claude-cli', "
-                    "runtime_id = ? WHERE runtime_id = ?",
-                    (new_rid, old_rid),
-                )
-            except aiosqlite.IntegrityError:
-                # New rid already exists (user re-added under new shape).
-                # Drop the legacy row to keep the table consistent.
-                await self._conn.execute(
-                    "DELETE FROM models WHERE runtime_id = ?", (old_rid,)
-                )
-        if rows:
-            await self._conn.commit()
 
     async def close(self) -> None:
         if self._conn:
@@ -587,7 +537,158 @@ class MemoryDB:
         row = await cursor.fetchone()
         return float(row[0] or 0.0) if row else 0.0
 
-    # ── Model Registry ──
+    # ── Providers (v0.12: one row per (name, framework) pair) ──
+
+    @staticmethod
+    def _row_to_provider(row: aiosqlite.Row) -> dict[str, Any]:
+        metadata = row["metadata_json"] or "{}"
+        try:
+            meta_parsed = json.loads(metadata) if isinstance(metadata, str) else {}
+        except ValueError:
+            meta_parsed = {}
+        return {
+            "id": row["id"],
+            "name": row["name"],
+            "framework": row["framework"],
+            "api_key": row["api_key"],
+            "base_url": row["base_url"],
+            "enabled": bool(row["enabled"]),
+            "metadata": meta_parsed,
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    async def list_providers(
+        self,
+        *,
+        enabled_only: bool = False,
+        framework: str | None = None,
+    ) -> list[dict[str, Any]]:
+        conn = await self._ensure_connected()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if enabled_only:
+            clauses.append("enabled = 1")
+        if framework:
+            clauses.append("framework = ?")
+            params.append(framework)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        cursor = await conn.execute(
+            f"SELECT * FROM providers {where} ORDER BY name ASC, framework ASC",
+            params,
+        )
+        rows = await cursor.fetchall()
+        return [self._row_to_provider(r) for r in rows]
+
+    async def get_provider(self, provider_id: int) -> dict[str, Any] | None:
+        """Fetch one provider row by its surrogate id."""
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            "SELECT * FROM providers WHERE id = ?", (int(provider_id),),
+        )
+        row = await cursor.fetchone()
+        return self._row_to_provider(row) if row else None
+
+    async def get_provider_by_name(
+        self, name: str, framework: str,
+    ) -> dict[str, Any] | None:
+        """Fetch the provider row for a (name, framework) pair."""
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            "SELECT * FROM providers WHERE name = ? AND framework = ?",
+            (name, framework),
+        )
+        row = await cursor.fetchone()
+        return self._row_to_provider(row) if row else None
+
+    async def upsert_provider(
+        self,
+        *,
+        name: str,
+        framework: str,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        enabled: bool = True,
+        metadata: dict[str, Any] | None = None,
+    ) -> int:
+        """Upsert a provider row. Returns the provider's surrogate ``id``.
+
+        ``framework='claude-cli'`` providers MUST carry ``api_key=None``
+        (the subscription path authenticates through ``~/.claude/``; any
+        stored value would poison the subprocess). ``framework='agno'``
+        providers can be created with ``api_key=None`` (disabled-until-
+        configured state) but dispatch will fail until a key is set.
+        """
+        if not name or not name.strip():
+            raise ValueError("name is required")
+        if framework not in VALID_FRAMEWORKS:
+            raise ValueError(
+                f"invalid framework {framework!r}; expected one of {VALID_FRAMEWORKS}"
+            )
+        if framework == "claude-cli" and api_key:
+            raise ValueError(
+                "claude-cli providers must not carry an api_key — the "
+                "local `claude` binary authenticates via the Pro/Max "
+                "subscription stored under ~/.claude/."
+            )
+        now = time.time()
+        conn = await self._ensure_connected()
+        await conn.execute(
+            """
+            INSERT INTO providers (name, framework, api_key, base_url, enabled, metadata_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(name, framework) DO UPDATE SET
+                api_key = excluded.api_key,
+                base_url = excluded.base_url,
+                enabled = excluded.enabled,
+                metadata_json = excluded.metadata_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                name.strip(),
+                framework,
+                (api_key or None),
+                (base_url or None),
+                1 if enabled else 0,
+                json.dumps(metadata or {}),
+                now,
+                now,
+            ),
+        )
+        await conn.commit()
+        # Fetch the id (stable across upserts on conflict).
+        cursor = await conn.execute(
+            "SELECT id FROM providers WHERE name = ? AND framework = ?",
+            (name.strip(), framework),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            raise RuntimeError("upsert_provider: row not found after insert")
+        return int(row[0])
+
+    async def set_provider_enabled(self, provider_id: int, enabled: bool) -> None:
+        conn = await self._ensure_connected()
+        await conn.execute(
+            "UPDATE providers SET enabled = ?, updated_at = ? WHERE id = ?",
+            (1 if enabled else 0, time.time(), int(provider_id)),
+        )
+        await conn.commit()
+
+    async def delete_provider(self, provider_id: int) -> None:
+        """Delete a provider row. FK cascade wipes its models."""
+        conn = await self._ensure_connected()
+        await conn.execute(
+            "DELETE FROM providers WHERE id = ?", (int(provider_id),),
+        )
+        await conn.commit()
+
+    async def providers_max_updated(self) -> float:
+        conn = await self._ensure_connected()
+        cursor = await conn.execute("SELECT MAX(updated_at) FROM providers")
+        row = await cursor.fetchone()
+        return float(row[0] or 0.0) if row else 0.0
+
+    # ── Models (v0.12: provider_id FK, no runtime_id column) ──
 
     @staticmethod
     def _row_to_model(row: aiosqlite.Row) -> dict:
@@ -598,77 +699,204 @@ class MemoryDB:
         except (TypeError, ValueError):
             d["metadata"] = {}
         d["enabled"] = bool(d.get("enabled"))
-        # Pre-v0.10 rows may not have the ``framework`` column populated
-        # until the migration runs (edge case: a row returned by another
-        # aiosqlite connection in the middle of the startup race). Fall
-        # back so downstream code doesn't need to special-case the key.
-        d.setdefault("framework", "agno")
         return d
 
     async def list_models(
-        self, provider: str | None = None, enabled_only: bool = False
+        self,
+        *,
+        provider_id: int | None = None,
+        enabled_only: bool = False,
     ) -> list[dict]:
         conn = await self._ensure_connected()
-        clauses = []
+        clauses: list[str] = []
         params: list[Any] = []
-        if provider:
-            clauses.append("provider = ?")
-            params.append(provider)
+        if provider_id is not None:
+            clauses.append("provider_id = ?")
+            params.append(int(provider_id))
         if enabled_only:
             clauses.append("enabled = 1")
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         cursor = await conn.execute(
-            f"SELECT * FROM models {where} ORDER BY provider ASC, model_id ASC",
+            f"SELECT * FROM models {where} ORDER BY provider_id ASC, model ASC",
             params,
         )
         rows = await cursor.fetchall()
         return [self._row_to_model(r) for r in rows]
 
-    async def get_model(self, runtime_id: str) -> dict | None:
+    async def list_models_enriched(
+        self,
+        *,
+        enabled_only: bool = False,
+        framework: str | None = None,
+        provider_name: str | None = None,
+    ) -> list[dict]:
+        """Return each model joined with its provider row.
+
+        Each row carries ``{id, provider_id, model, display_name, tier_hint,
+        enabled, metadata, created_at, updated_at, provider_name, framework,
+        api_key, base_url, provider_enabled, runtime_id}`` — ``runtime_id``
+        is derived on the fly via :func:`openagent.models.catalog.build_runtime_model_id`.
+        This is the shape consumed by ``iter_configured_models`` and the REST
+        ``/api/models`` list endpoint.
+        """
+        from openagent.models.catalog import build_runtime_model_id
+
+        conn = await self._ensure_connected()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if enabled_only:
+            clauses.append("m.enabled = 1")
+            clauses.append("p.enabled = 1")
+        if framework:
+            clauses.append("p.framework = ?")
+            params.append(framework)
+        if provider_name:
+            clauses.append("p.name = ?")
+            params.append(provider_name)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        cursor = await conn.execute(
+            f"""
+            SELECT m.id AS id, m.provider_id AS provider_id, m.model AS model,
+                   m.display_name AS display_name, m.tier_hint AS tier_hint,
+                   m.enabled AS enabled, m.metadata_json AS metadata_json,
+                   m.created_at AS created_at, m.updated_at AS updated_at,
+                   p.name AS provider_name, p.framework AS framework,
+                   p.api_key AS api_key, p.base_url AS base_url,
+                   p.enabled AS provider_enabled
+            FROM models m
+            JOIN providers p ON p.id = m.provider_id
+            {where}
+            ORDER BY p.name ASC, p.framework ASC, m.model ASC
+            """,
+            params,
+        )
+        rows = await cursor.fetchall()
+        out: list[dict] = []
+        for r in rows:
+            d = dict(r)
+            meta_raw = d.pop("metadata_json", "{}") or "{}"
+            try:
+                d["metadata"] = json.loads(meta_raw)
+            except (TypeError, ValueError):
+                d["metadata"] = {}
+            d["enabled"] = bool(d["enabled"])
+            d["provider_enabled"] = bool(d["provider_enabled"])
+            d["runtime_id"] = build_runtime_model_id(
+                d["provider_name"], d["model"], d["framework"],
+            )
+            out.append(d)
+        return out
+
+    async def get_model(self, model_id: int) -> dict | None:
+        """Fetch one model row by its surrogate id."""
         conn = await self._ensure_connected()
         cursor = await conn.execute(
-            "SELECT * FROM models WHERE runtime_id = ?", (runtime_id,)
+            "SELECT * FROM models WHERE id = ?", (int(model_id),),
         )
         row = await cursor.fetchone()
         return self._row_to_model(row) if row else None
 
+    async def get_model_by_ref(
+        self, provider_id: int, model: str,
+    ) -> dict | None:
+        """Fetch a model row by its (provider_id, bare model) pair."""
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            "SELECT * FROM models WHERE provider_id = ? AND model = ?",
+            (int(provider_id), model),
+        )
+        row = await cursor.fetchone()
+        return self._row_to_model(row) if row else None
+
+    async def get_model_by_runtime_id(self, runtime_id: str) -> dict | None:
+        """Fetch an enriched model row via a human-readable ``runtime_id``.
+
+        Used by session-pin + REST/MCP paths where the caller still speaks
+        the composite string (``openai:gpt-4o-mini``,
+        ``claude-cli:anthropic:claude-opus-4-7``). Returns the same shape
+        as :meth:`list_models_enriched`, or ``None`` when no matching
+        (provider_name, framework, model) row exists.
+        """
+        from openagent.models.catalog import framework_of, split_runtime_id
+
+        if not runtime_id:
+            return None
+        framework = framework_of(runtime_id)
+        provider_name, model = split_runtime_id(runtime_id)
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            """
+            SELECT m.id AS id, m.provider_id AS provider_id, m.model AS model,
+                   m.display_name AS display_name, m.tier_hint AS tier_hint,
+                   m.enabled AS enabled, m.metadata_json AS metadata_json,
+                   m.created_at AS created_at, m.updated_at AS updated_at,
+                   p.name AS provider_name, p.framework AS framework,
+                   p.api_key AS api_key, p.base_url AS base_url,
+                   p.enabled AS provider_enabled
+            FROM models m
+            JOIN providers p ON p.id = m.provider_id
+            WHERE p.name = ? AND p.framework = ? AND m.model = ?
+            """,
+            (provider_name, framework, model),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        meta_raw = d.pop("metadata_json", "{}") or "{}"
+        try:
+            d["metadata"] = json.loads(meta_raw)
+        except (TypeError, ValueError):
+            d["metadata"] = {}
+        d["enabled"] = bool(d["enabled"])
+        d["provider_enabled"] = bool(d["provider_enabled"])
+        d["runtime_id"] = runtime_id
+        return d
+
     async def upsert_model(
         self,
-        runtime_id: str,
         *,
-        provider: str,
-        model_id: str,
-        framework: str = "agno",
+        provider_id: int,
+        model: str,
         display_name: str | None = None,
         tier_hint: str | None = None,
-        notes: str | None = None,
         enabled: bool = True,
         metadata: dict | None = None,
-    ) -> None:
-        if not runtime_id or not provider or not model_id:
-            raise ValueError("runtime_id, provider and model_id are required")
-        if framework not in ("agno", "claude-cli"):
-            raise ValueError(f"invalid framework: {framework!r}")
+    ) -> int:
+        """Insert or update a model row. Returns the model's surrogate id."""
+        if not provider_id:
+            raise ValueError("provider_id is required")
+        if not model or not str(model).strip():
+            raise ValueError("model is required")
         conn = await self._ensure_connected()
+        # FK integrity: make sure the parent provider exists before we
+        # try the insert so callers get a clear error instead of the
+        # generic "FOREIGN KEY constraint failed".
+        prov_row = await (
+            await conn.execute(
+                "SELECT 1 FROM providers WHERE id = ?", (int(provider_id),),
+            )
+        ).fetchone()
+        if prov_row is None:
+            raise ValueError(f"Provider id={provider_id!r} does not exist")
         now = time.time()
         await conn.execute(
-            "INSERT INTO models (runtime_id, provider, framework, model_id, display_name, "
-            "tier_hint, notes, enabled, metadata_json, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(runtime_id) DO UPDATE SET "
-            "provider = excluded.provider, framework = excluded.framework, "
-            "model_id = excluded.model_id, display_name = excluded.display_name, "
-            "tier_hint = excluded.tier_hint, notes = excluded.notes, "
-            "enabled = excluded.enabled, metadata_json = excluded.metadata_json, "
-            "updated_at = excluded.updated_at",
+            """
+            INSERT INTO models (provider_id, model, display_name, tier_hint,
+                                enabled, metadata_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(provider_id, model) DO UPDATE SET
+                display_name = excluded.display_name,
+                tier_hint = excluded.tier_hint,
+                enabled = excluded.enabled,
+                metadata_json = excluded.metadata_json,
+                updated_at = excluded.updated_at
+            """,
             (
-                runtime_id,
-                provider,
-                framework,
-                model_id,
+                int(provider_id),
+                str(model).strip(),
                 display_name,
                 tier_hint,
-                notes,
                 1 if enabled else 0,
                 json.dumps(dict(metadata or {})),
                 now,
@@ -676,124 +904,31 @@ class MemoryDB:
             ),
         )
         await conn.commit()
+        cursor = await conn.execute(
+            "SELECT id FROM models WHERE provider_id = ? AND model = ?",
+            (int(provider_id), str(model).strip()),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            raise RuntimeError("upsert_model: row not found after insert")
+        return int(row[0])
 
-    async def set_model_enabled(self, runtime_id: str, enabled: bool) -> None:
+    async def set_model_enabled(self, model_id: int, enabled: bool) -> None:
         conn = await self._ensure_connected()
         await conn.execute(
-            "UPDATE models SET enabled = ?, updated_at = ? WHERE runtime_id = ?",
-            (1 if enabled else 0, time.time(), runtime_id),
+            "UPDATE models SET enabled = ?, updated_at = ? WHERE id = ?",
+            (1 if enabled else 0, time.time(), int(model_id)),
         )
         await conn.commit()
 
-    async def delete_model(self, runtime_id: str) -> None:
+    async def delete_model(self, model_id: int) -> None:
         conn = await self._ensure_connected()
-        await conn.execute("DELETE FROM models WHERE runtime_id = ?", (runtime_id,))
+        await conn.execute("DELETE FROM models WHERE id = ?", (int(model_id),))
         await conn.commit()
-
-    async def delete_models_by_provider(self, provider: str) -> int:
-        """Purge every model row owned by ``provider``. Returns the row count.
-
-        Called on provider removal so the models table doesn't accumulate
-        orphan entries that can no longer be dispatched (missing API key).
-        """
-        conn = await self._ensure_connected()
-        cursor = await conn.execute(
-            "DELETE FROM models WHERE provider = ?", (provider,),
-        )
-        await conn.commit()
-        return cursor.rowcount or 0
 
     async def models_max_updated(self) -> float:
         conn = await self._ensure_connected()
         cursor = await conn.execute("SELECT MAX(updated_at) FROM models")
-        row = await cursor.fetchone()
-        return float(row[0] or 0.0) if row else 0.0
-
-    # ── Providers (API keys) ──
-
-    @staticmethod
-    def _row_to_provider(row: aiosqlite.Row) -> dict[str, Any]:
-        metadata = row["metadata_json"] or "{}"
-        try:
-            meta_parsed = json.loads(metadata) if isinstance(metadata, str) else {}
-        except ValueError:
-            meta_parsed = {}
-        return {
-            "name": row["name"],
-            "api_key": row["api_key"],
-            "base_url": row["base_url"],
-            "enabled": bool(row["enabled"]),
-            "metadata": meta_parsed,
-            "created_at": row["created_at"],
-            "updated_at": row["updated_at"],
-        }
-
-    async def list_providers(self, enabled_only: bool = False) -> list[dict[str, Any]]:
-        conn = await self._ensure_connected()
-        sql = "SELECT * FROM providers"
-        params: tuple = ()
-        if enabled_only:
-            sql += " WHERE enabled = 1"
-        sql += " ORDER BY name"
-        cursor = await conn.execute(sql, params)
-        rows = await cursor.fetchall()
-        return [self._row_to_provider(r) for r in rows]
-
-    async def get_provider(self, name: str) -> dict[str, Any] | None:
-        conn = await self._ensure_connected()
-        cursor = await conn.execute("SELECT * FROM providers WHERE name = ?", (name,))
-        row = await cursor.fetchone()
-        return self._row_to_provider(row) if row else None
-
-    async def upsert_provider(
-        self,
-        name: str,
-        *,
-        api_key: str | None = None,
-        base_url: str | None = None,
-        enabled: bool = True,
-        metadata: dict[str, Any] | None = None,
-    ) -> None:
-        conn = await self._ensure_connected()
-        now = time.time()
-        await conn.execute(
-            """
-            INSERT INTO providers (name, api_key, base_url, enabled, metadata_json, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(name) DO UPDATE SET
-                api_key = excluded.api_key,
-                base_url = excluded.base_url,
-                enabled = excluded.enabled,
-                metadata_json = excluded.metadata_json,
-                updated_at = excluded.updated_at
-            """,
-            (
-                name, api_key, base_url, 1 if enabled else 0,
-                json.dumps(metadata or {}), now, now,
-            ),
-        )
-        await conn.commit()
-
-    async def set_provider_enabled(self, name: str, enabled: bool) -> None:
-        conn = await self._ensure_connected()
-        await conn.execute(
-            "UPDATE providers SET enabled = ?, updated_at = ? WHERE name = ?",
-            (1 if enabled else 0, time.time(), name),
-        )
-        await conn.commit()
-
-    async def delete_provider(self, name: str) -> None:
-        """Delete a provider row. Does NOT cascade to models — callers
-        that want cascade should call ``delete_models_by_provider(name)``
-        explicitly. Keeping the two steps separate so tests and tools
-        can exercise one without the other."""
-        conn = await self._ensure_connected()
-        await conn.execute("DELETE FROM providers WHERE name = ?", (name,))
-        await conn.commit()
-
-    async def providers_max_updated(self) -> float:
-        conn = await self._ensure_connected()
-        cursor = await conn.execute("SELECT MAX(updated_at) FROM providers")
         row = await cursor.fetchone()
         return float(row[0] or 0.0) if row else 0.0
 
@@ -803,13 +938,21 @@ class MemoryDB:
         Returns ``(mcps_max_updated, models_max_updated, enabled_models_count,
         providers_max_updated)`` in a single round-trip so the dispatcher
         doesn't pay four SELECTs per incoming message.
+
+        ``enabled_models_count`` requires BOTH the model row AND its
+        parent provider to be enabled — a model under a disabled
+        provider can't dispatch anyway.
         """
         conn = await self._ensure_connected()
         cursor = await conn.execute(
             "SELECT "
             "  COALESCE((SELECT MAX(updated_at) FROM mcps), 0), "
             "  COALESCE((SELECT MAX(updated_at) FROM models), 0), "
-            "  COALESCE((SELECT COUNT(*) FROM models WHERE enabled = 1), 0), "
+            "  COALESCE(("
+            "    SELECT COUNT(*) FROM models m "
+            "    JOIN providers p ON p.id = m.provider_id "
+            "    WHERE m.enabled = 1 AND p.enabled = 1"
+            "  ), 0), "
             "  COALESCE((SELECT MAX(updated_at) FROM providers), 0)"
         )
         row = await cursor.fetchone()
@@ -837,7 +980,7 @@ class MemoryDB:
         if row and row[0]:
             return str(row[0])
         cursor = await conn.execute(
-            "SELECT provider FROM session_bindings WHERE session_id = ?",
+            "SELECT framework FROM session_bindings WHERE session_id = ?",
             (session_id,),
         )
         row = await cursor.fetchone()
@@ -862,10 +1005,10 @@ class MemoryDB:
     async def set_session_binding(
         self,
         session_id: str,
-        provider: str,
+        framework: str,
         runtime_id: str | None = None,
     ) -> None:
-        """Record that ``session_id`` is served by ``provider``.
+        """Record that ``session_id`` is served by ``framework`` (agno / claude-cli).
 
         Optional ``runtime_id`` pins the session to a specific model.
         Used by SmartRouter after a first successful dispatch so
@@ -874,14 +1017,18 @@ class MemoryDB:
         ``set_sdk_session``); this table tracks agno side + per-session
         explicit model pins for both sides.
         """
+        if framework not in VALID_FRAMEWORKS:
+            raise ValueError(
+                f"invalid framework {framework!r}; expected one of {VALID_FRAMEWORKS}"
+            )
         conn = await self._ensure_connected()
         await conn.execute(
-            "INSERT INTO session_bindings (session_id, provider, bound_at, runtime_id) "
+            "INSERT INTO session_bindings (session_id, framework, bound_at, runtime_id) "
             "VALUES (?, ?, ?, ?) "
             "ON CONFLICT(session_id) DO UPDATE SET "
-            "provider = excluded.provider, bound_at = excluded.bound_at, "
+            "framework = excluded.framework, bound_at = excluded.bound_at, "
             "runtime_id = excluded.runtime_id",
-            (session_id, provider, time.time(), runtime_id),
+            (session_id, framework, time.time(), runtime_id),
         )
         await conn.commit()
 
@@ -896,11 +1043,15 @@ class MemoryDB:
         ``/clear`` or spawn a fresh session_id if they actually want to
         switch frameworks.
         """
+        from openagent.models.catalog import framework_of
+
         if not session_id or not runtime_id:
             raise ValueError("session_id and runtime_id are required")
-        target_framework = (
-            "claude-cli" if runtime_id.startswith("claude-cli") else "agno"
-        )
+        target_framework = framework_of(runtime_id)
+        if target_framework not in VALID_FRAMEWORKS:
+            raise ValueError(
+                f"runtime_id {runtime_id!r} resolved to an unknown framework {target_framework!r}"
+            )
         existing = await self.get_session_binding(session_id)
         if existing and existing != target_framework:
             raise ValueError(
@@ -918,7 +1069,7 @@ class MemoryDB:
 
         The ``runtime_id`` column is set to NULL; SmartRouter resumes
         using the classifier/routing tiers for this session on the next
-        turn. The ``provider`` side-binding is *not* touched — a
+        turn. The ``framework`` side-binding is *not* touched — a
         session pinned to claude-cli stays on claude-cli even after
         unpinning the specific model.
         """

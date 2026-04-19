@@ -146,7 +146,7 @@ class ClaudeCLI(BaseModel):
         allowed_tools: list[str] | None = None,
         permission_mode: str = "bypass",
         mcp_servers: dict[str, dict] | None = None,
-        providers_config: dict | None = None,
+        providers_config: Any = None,
         idle_ttl_seconds: int | None = None,
         # Legacy knobs retained for backward compatibility with older yaml
         # configs. Per-turn timeouts were removed deliberately (long tool
@@ -167,7 +167,7 @@ class ClaudeCLI(BaseModel):
         self.allowed_tools = allowed_tools or []
         self.permission_mode = permission_mode
         self.mcp_servers: dict[str, dict] = mcp_servers or {}
-        self._providers_config = providers_config or {}
+        self._providers_config = providers_config if providers_config is not None else []
         self._idle_ttl = _coerce_idle_ttl(idle_ttl_seconds, DEFAULT_IDLE_TTL)
         self._db: Any = None
         self._sessions: dict[str, _Session] = {}
@@ -981,7 +981,7 @@ class ClaudeCLIRegistry(BaseModel):
         allowed_tools: list[str] | None = None,
         permission_mode: str = "bypass",
         mcp_servers: dict[str, dict] | None = None,
-        providers_config: dict | None = None,
+        providers_config: Any = None,
         idle_ttl_seconds: int | None = None,
         idle_timeout_seconds: int | None = None,  # noqa: ARG002 — legacy kwarg
         hard_timeout_seconds: int | None = None,  # noqa: ARG002 — legacy kwarg
@@ -990,7 +990,7 @@ class ClaudeCLIRegistry(BaseModel):
         self._allowed_tools = allowed_tools or []
         self._permission_mode = permission_mode
         self._mcp_servers: dict[str, dict] = mcp_servers or {}
-        self._providers_config = providers_config or {}
+        self._providers_config = providers_config if providers_config is not None else []
         self._idle_ttl_seconds = idle_ttl_seconds
         self._db: Any = None
         self._instances: dict[str, ClaudeCLI] = {}

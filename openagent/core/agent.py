@@ -457,57 +457,53 @@ class Agent:
     async def _hydrate_providers_from_db(self) -> None:
         """Pull provider + model rows from DB into ``self.config['providers']``.
 
-        The DB is the source of truth for provider keys and the model
-        catalog. SmartRouter / AgnoProvider consume the dict shape
-        (``providers_config[X]['models']``), so we materialise DB rows
-        into that shape and refresh whenever ``providers_max_updated``
-        or ``models_max_updated`` bumps.
-
-        ``models`` is populated as a list of ``{id, display_name,
-        tier_hint, notes}`` dicts so ``catalog.iter_configured_models``
-        sees the full enabled catalog — which is what the classifier
-        (since v0.12) consults to pick the runtime_id for each turn.
+        The DB is the source of truth for provider keys AND the model
+        catalog. SmartRouter / AgnoProvider consume the v0.12 flat-list
+        shape — each entry already carries its ``framework`` and its
+        nested ``models`` list, so the same vendor can appear twice
+        (anthropic+agno AND anthropic+claude-cli) without a key
+        collision.
         """
         if self._db is None or self.config is None:
             return
-        rows = await self._db.list_providers(enabled_only=True)
-        materialised: dict[str, dict[str, Any]] = {}
-        for r in rows:
-            entry: dict[str, Any] = {}
-            if r.get("api_key"):
-                entry["api_key"] = r["api_key"]
-            if r.get("base_url"):
-                entry["base_url"] = r["base_url"]
-            for k, v in (r.get("metadata") or {}).items():
-                entry.setdefault(k, v)
-            entry.setdefault("models", [])
-            materialised[r["name"]] = entry
+        provider_rows = await self._db.list_providers(enabled_only=True)
+        by_id: dict[int, dict[str, Any]] = {}
+        order: list[int] = []
+        for r in provider_rows:
+            pid = int(r["id"])
+            by_id[pid] = {
+                "id": pid,
+                "name": r["name"],
+                "framework": r["framework"],
+                "api_key": r.get("api_key"),
+                "base_url": r.get("base_url"),
+                "enabled": r.get("enabled", True),
+                "metadata": r.get("metadata") or {},
+                "models": [],
+            }
+            order.append(pid)
 
-        # Inject DB models into the per-provider ``models`` list so the
-        # catalog (and therefore SmartRouter's classifier) sees them.
-        # claude-cli rows live under ``provider=anthropic, framework=claude-cli``;
-        # iter_configured_models also tolerates the legacy
-        # ``providers.claude-cli.models`` shape, so we route them there
-        # for backward compat with anything that still expects it.
         try:
             model_rows = await self._db.list_models(enabled_only=True)
         except Exception as exc:  # noqa: BLE001
             logger.debug("list_models hydrate failed: %s", exc)
             model_rows = []
         for row in model_rows:
-            framework = row.get("framework") or "agno"
-            provider = row.get("provider") or ""
-            bucket_name = (
-                "claude-cli" if framework == "claude-cli" else provider
-            )
-            bucket = materialised.setdefault(bucket_name, {"models": []})
-            bucket.setdefault("models", []).append({
-                "id": row["model_id"],
+            pid = int(row["provider_id"])
+            bucket = by_id.get(pid)
+            if bucket is None:
+                # Orphan model (provider disabled or deleted mid-read) —
+                # skip rather than synthesise a fake provider row.
+                continue
+            bucket["models"].append({
+                "id": int(row["id"]),
+                "model": row["model"],
                 "display_name": row.get("display_name"),
                 "tier_hint": row.get("tier_hint"),
-                "notes": row.get("notes"),
+                "enabled": row.get("enabled", True),
             })
-        self.config["providers"] = materialised
+
+        self.config["providers"] = [by_id[pid] for pid in order]
 
     async def _run_idle_cleanup(self) -> None:
         """Periodically release idle provider resources."""
