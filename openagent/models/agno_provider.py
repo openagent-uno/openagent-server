@@ -32,6 +32,7 @@ from openagent.core.logging import elog
 from openagent.models.base import BaseModel, ModelResponse
 from openagent.models.catalog import (
     DEFAULT_ZAI_BASE_URL,
+    FRAMEWORK_CLAUDE_CLI,
     compute_cost,
     model_id_from_runtime,
     normalize_runtime_model_id,
@@ -39,6 +40,19 @@ from openagent.models.catalog import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Providers without a real API key (e.g. anthropic served only through the
+# claude-cli subscription) get this sentinel stored in ``providers.api_key``.
+# Exporting it as ``ANTHROPIC_API_KEY`` poisons the claude subprocess with
+# "Invalid API key · Fix external API key", so every callsite that pushes
+# provider keys into ``os.environ`` must filter these out.
+_SENTINEL_API_KEYS = {FRAMEWORK_CLAUDE_CLI}
+
+
+def _is_real_api_key(key: str | None) -> bool:
+    return bool(key) and key not in _SENTINEL_API_KEYS
+
+
 PROVIDER_ENV_VARS = {
     "anthropic": "ANTHROPIC_API_KEY",
     "openai": "OPENAI_API_KEY",
@@ -137,8 +151,20 @@ class AgnoProvider(BaseModel):
         # them. Two ``AgnoProvider`` instances with different keys for the same
         # provider will race; in practice OpenAgent uses one key per provider so
         # it's fine. Keys already in the env are not overwritten.
+
+        # Self-heal: older builds exported the ``"claude-cli"`` sentinel as a
+        # real env var (e.g. ``ANTHROPIC_API_KEY=claude-cli``), which the
+        # claude subprocess inherits and then rejects with "Invalid API key ·
+        # Fix external API key". Scrub any such leftover so the subscription
+        # auth path works again after an upgrade.
+        for env_var in PROVIDER_ENV_VARS.values():
+            if os.environ.get(env_var) in _SENTINEL_API_KEYS:
+                os.environ.pop(env_var, None)
+        if os.environ.get("GEMINI_API_KEY") in _SENTINEL_API_KEYS:
+            os.environ.pop("GEMINI_API_KEY", None)
+
         provider_name = self._provider_name()
-        if self._api_key:
+        if _is_real_api_key(self._api_key):
             env_var = PROVIDER_ENV_VARS.get(provider_name)
             if env_var and not os.environ.get(env_var):
                 os.environ[env_var] = self._api_key
@@ -148,9 +174,11 @@ class AgnoProvider(BaseModel):
         for name, cfg in self._providers_config.items():
             env_var = PROVIDER_ENV_VARS.get(name)
             key = cfg.get("api_key")
-            if env_var and key and not os.environ.get(env_var):
+            if not _is_real_api_key(key):
+                continue
+            if env_var and not os.environ.get(env_var):
                 os.environ[env_var] = key
-            if name == "google" and key and not os.environ.get("GEMINI_API_KEY"):
+            if name == "google" and not os.environ.get("GEMINI_API_KEY"):
                 os.environ["GEMINI_API_KEY"] = key
 
         if self._base_url and provider_name == "openai" and not os.environ.get("OPENAI_BASE_URL"):
