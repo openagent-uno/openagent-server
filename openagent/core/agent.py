@@ -431,7 +431,9 @@ class Agent:
         # picks from the materialised models list.
         models_changed = models_updated > getattr(self, "_models_last_updated", 0.0)
         if models_changed or providers_changed:
-            self._models_last_updated = max(models_updated, self._models_last_updated or 0.0)
+            self._models_last_updated = max(
+                models_updated, getattr(self, "_models_last_updated", 0.0) or 0.0
+            )
             if models_changed and not providers_changed:
                 # Providers hydrate already ran above; re-run only when
                 # models alone changed so the materialised catalog is fresh.
