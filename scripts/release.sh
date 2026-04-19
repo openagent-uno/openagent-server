@@ -41,7 +41,7 @@ echo
 # ── 1. openagent-framework ──
 echo "📦 openagent-framework → $NEW"
 sed -i.bak "s/version = \"$CURRENT\"/version = \"$NEW\"/" "$ROOT/pyproject.toml"
-sed -i.bak "s/__version__ = \"$CURRENT\"/__version__ = \"$NEW\"/" "$ROOT/openagent/__init__.py"
+sed -i.bak "s/__version__ = \".*\"/__version__ = \"$NEW\"/" "$ROOT/openagent/__init__.py"
 rm -f "$ROOT/pyproject.toml.bak" "$ROOT/openagent/__init__.py.bak"
 
 # ── 2. openagent-cli ──
