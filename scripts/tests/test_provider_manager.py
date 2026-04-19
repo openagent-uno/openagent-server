@@ -22,7 +22,11 @@ async def t_add_provider(ctx: TestContext) -> None:
 
     prev_db = os.environ.get("OPENAGENT_DB_PATH")
     os.environ["OPENAGENT_DB_PATH"] = str(db_path)
-    mgr._shared._conn = None  # type: ignore[attr-defined]
+    # Reset the per-process MemoryDB singleton so the test picks up the
+    # temp path above rather than a stale connection from a prior test.
+    if mgr._db is not None:
+        await mgr._db.close()
+        mgr._db = None
 
     try:
         # Seed schema so the providers table exists.
@@ -85,7 +89,9 @@ async def t_add_provider(ctx: TestContext) -> None:
         finally:
             await db.close()
     finally:
-        mgr._shared._conn = None  # type: ignore[attr-defined]
+        if mgr._db is not None:
+            await mgr._db.close()
+            mgr._db = None
         if prev_db is None:
             os.environ.pop("OPENAGENT_DB_PATH", None)
         else:

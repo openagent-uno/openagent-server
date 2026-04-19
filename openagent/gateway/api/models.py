@@ -152,7 +152,7 @@ async def handle_list_db(request: web.Request) -> web.Response:
         return _web.json_response({"error": "memory DB not available"}, status=500)
     framework = request.query.get("framework") or None
     provider_id_raw = request.query.get("provider_id")
-    provider_id = None
+    provider_id: int | None = None
     if provider_id_raw:
         try:
             provider_id = int(provider_id_raw)
@@ -160,20 +160,11 @@ async def handle_list_db(request: web.Request) -> web.Response:
             return _web.json_response({"error": "invalid provider_id"}, status=400)
     enabled_only = request.query.get("enabled_only", "").lower() in ("1", "true", "yes")
 
-    if provider_id is not None:
-        provider_row = await db.get_provider(provider_id)
-        if provider_row is None:
-            return _web.json_response({"models": []})
-        rows = await db.list_models_enriched(
-            enabled_only=enabled_only,
-            framework=provider_row["framework"],
-            provider_name=provider_row["name"],
-        )
-    else:
-        rows = await db.list_models_enriched(
-            enabled_only=enabled_only,
-            framework=framework,
-        )
+    rows = await db.list_models_enriched(
+        enabled_only=enabled_only,
+        framework=framework,
+        provider_id=provider_id,
+    )
     return _web.json_response({"models": [_shape_model(r) for r in rows]})
 
 
@@ -184,14 +175,10 @@ async def handle_get_db(request: web.Request) -> web.Response:
     mid = _parse_model_id(request)
     if db is None or mid is None:
         return _web.json_response({"error": "invalid model id"}, status=400)
-    row = await db.get_model(mid)
+    row = await db.get_model_enriched(mid)
     if row is None:
         return _web.json_response({"error": f"model id={mid} not found"}, status=404)
-    enriched = await db.list_models_enriched(enabled_only=False)
-    for entry in enriched:
-        if entry["id"] == mid:
-            return _web.json_response({"model": _shape_model(entry)})
-    return _web.json_response({"error": f"model id={mid} could not be enriched"}, status=500)
+    return _web.json_response({"model": _shape_model(row)})
 
 
 async def handle_create_db(request: web.Request) -> web.Response:
@@ -222,13 +209,11 @@ async def handle_create_db(request: web.Request) -> web.Response:
         )
     except ValueError as e:
         return _web.json_response({"error": str(e)}, status=400)
-    enriched = await db.list_models_enriched(enabled_only=False)
-    for entry in enriched:
-        if entry["id"] == mid:
-            return _web.json_response(
-                {"ok": True, "model": _shape_model(entry)}, status=201,
-            )
-    return _web.json_response({"ok": True, "id": mid}, status=201)
+    enriched = await db.get_model_enriched(mid)
+    return _web.json_response(
+        {"ok": True, "model": _shape_model(enriched) if enriched else {"id": mid}},
+        status=201,
+    )
 
 
 async def handle_update_db(request: web.Request) -> web.Response:
@@ -253,11 +238,10 @@ async def handle_update_db(request: web.Request) -> web.Response:
         )
     except ValueError as e:
         return _web.json_response({"error": str(e)}, status=400)
-    enriched = await db.list_models_enriched(enabled_only=False)
-    for entry in enriched:
-        if entry["id"] == mid:
-            return _web.json_response({"ok": True, "model": _shape_model(entry)})
-    return _web.json_response({"ok": True, "id": mid})
+    enriched = await db.get_model_enriched(mid)
+    return _web.json_response(
+        {"ok": True, "model": _shape_model(enriched) if enriched else {"id": mid}},
+    )
 
 
 async def handle_delete_db(request: web.Request) -> web.Response:
@@ -293,15 +277,13 @@ async def _toggle_model(request: web.Request, enabled: bool) -> web.Response:
     mid = _parse_model_id(request)
     if db is None or mid is None:
         return _web.json_response({"error": "invalid model id"}, status=400)
-    existing = await db.get_model(mid)
-    if existing is None:
+    if await db.get_model(mid) is None:
         return _web.json_response({"error": f"model id={mid} not found"}, status=404)
     await db.set_model_enabled(mid, enabled)
-    enriched = await db.list_models_enriched(enabled_only=False)
-    for entry in enriched:
-        if entry["id"] == mid:
-            return _web.json_response({"ok": True, "model": _shape_model(entry)})
-    return _web.json_response({"ok": True, "id": mid})
+    enriched = await db.get_model_enriched(mid)
+    return _web.json_response(
+        {"ok": True, "model": _shape_model(enriched) if enriched else {"id": mid}},
+    )
 
 
 async def handle_available_models(request: web.Request) -> web.Response:

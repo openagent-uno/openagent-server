@@ -480,48 +480,18 @@ class Agent:
         shape — each entry already carries its ``framework`` and its
         nested ``models`` list, so the same vendor can appear twice
         (anthropic+agno AND anthropic+claude-cli) without a key
-        collision.
+        collision. Delegates the SQL materialisation to MemoryDB so
+        smoke-test endpoints can reuse the same shape.
         """
         if self._db is None or self.config is None:
             return
-        provider_rows = await self._db.list_providers(enabled_only=True)
-        by_id: dict[int, dict[str, Any]] = {}
-        order: list[int] = []
-        for r in provider_rows:
-            pid = int(r["id"])
-            by_id[pid] = {
-                "id": pid,
-                "name": r["name"],
-                "framework": r["framework"],
-                "api_key": r.get("api_key"),
-                "base_url": r.get("base_url"),
-                "enabled": r.get("enabled", True),
-                "metadata": r.get("metadata") or {},
-                "models": [],
-            }
-            order.append(pid)
-
         try:
-            model_rows = await self._db.list_models(enabled_only=True)
+            self.config["providers"] = await self._db.materialise_providers_config(
+                enabled_only=True,
+            )
         except Exception as exc:  # noqa: BLE001
-            logger.debug("list_models hydrate failed: %s", exc)
-            model_rows = []
-        for row in model_rows:
-            pid = int(row["provider_id"])
-            bucket = by_id.get(pid)
-            if bucket is None:
-                # Orphan model (provider disabled or deleted mid-read) —
-                # skip rather than synthesise a fake provider row.
-                continue
-            bucket["models"].append({
-                "id": int(row["id"]),
-                "model": row["model"],
-                "display_name": row.get("display_name"),
-                "tier_hint": row.get("tier_hint"),
-                "enabled": row.get("enabled", True),
-            })
-
-        self.config["providers"] = [by_id[pid] for pid in order]
+            logger.debug("providers hydrate failed: %s", exc)
+            self.config["providers"] = []
 
     async def _run_idle_cleanup(self) -> None:
         """Periodically release idle provider resources."""

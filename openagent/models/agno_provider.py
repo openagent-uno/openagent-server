@@ -33,7 +33,6 @@ from openagent.models.base import BaseModel, ModelResponse
 from openagent.models.catalog import (
     DEFAULT_ZAI_BASE_URL,
     FRAMEWORK_AGNO,
-    FRAMEWORK_CLAUDE_CLI,
     _iter_provider_entries,
     compute_cost,
     model_id_from_runtime,
@@ -42,19 +41,6 @@ from openagent.models.catalog import (
 )
 
 logger = logging.getLogger(__name__)
-
-# v0.11.x shipped with a "sentinel" hack where providers without a real
-# API key (e.g. anthropic served only through the claude-cli subscription)
-# stored the literal string ``"claude-cli"`` in ``providers.api_key``.
-# Exporting it as ``ANTHROPIC_API_KEY`` poisoned the claude subprocess
-# with "Invalid API key · Fix external API key".
-#
-# Under v0.12 the schema rejects api_keys on claude-cli providers at the
-# DB boundary (see ``MemoryDB.upsert_provider``), so this set only
-# remains as a runtime backstop for installs that still have leftover
-# env vars from an older process.
-_SENTINEL_API_KEYS = {FRAMEWORK_CLAUDE_CLI}
-
 
 PROVIDER_ENV_VARS = {
     "anthropic": "ANTHROPIC_API_KEY",
@@ -154,18 +140,6 @@ class AgnoProvider(BaseModel):
         # them. Two ``AgnoProvider`` instances with different keys for the same
         # provider will race; in practice OpenAgent uses one key per provider so
         # it's fine. Keys already in the env are not overwritten.
-
-        # Self-heal: older builds exported the ``"claude-cli"`` sentinel as a
-        # real env var (e.g. ``ANTHROPIC_API_KEY=claude-cli``), which the
-        # claude subprocess inherits and then rejects with "Invalid API key ·
-        # Fix external API key". Scrub any such leftover so the subscription
-        # auth path works again after an upgrade.
-        for env_var in PROVIDER_ENV_VARS.values():
-            if os.environ.get(env_var) in _SENTINEL_API_KEYS:
-                os.environ.pop(env_var, None)
-        if os.environ.get("GEMINI_API_KEY") in _SENTINEL_API_KEYS:
-            os.environ.pop("GEMINI_API_KEY", None)
-
         provider_name = self._provider_name()
         if self._api_key:
             env_var = PROVIDER_ENV_VARS.get(provider_name)

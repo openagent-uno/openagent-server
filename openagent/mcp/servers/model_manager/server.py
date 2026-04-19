@@ -25,27 +25,46 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 from typing import Any
 
-import aiosqlite
 from mcp.server.fastmcp import FastMCP
 from openagent.memory.db import MemoryDB, VALID_FRAMEWORKS
-from openagent.mcp.servers._common import SharedConnection, run_stdio
+from openagent.mcp.servers._common import run_stdio
 
 logger = logging.getLogger(__name__)
 
-_shared = SharedConnection("model-manager")
+# Per-process singleton. MemoryDB holds a single aiosqlite connection
+# (with ``PRAGMA foreign_keys = ON`` set on connect) that we share across
+# every tool call; reopening on each call would re-run ``SCHEMA_SQL`` and
+# turn a chatty agent into a DDL-parsing fest.
+_db: MemoryDB | None = None
 
 
-async def _get_conn() -> aiosqlite.Connection:
-    return await _shared.get()
+async def _get_db() -> MemoryDB:
+    global _db
+    if _db is None:
+        _db = MemoryDB(os.environ.get("OPENAGENT_DB_PATH", "openagent.db"))
+        await _db.connect()
+    return _db
 
 
 mcp = FastMCP("model-manager")
 
 
 # ── Providers ─────────────────────────────────────────────────────────────
+
+
+def _provider_summary(row: dict[str, Any], count: int = 0) -> dict[str, Any]:
+    """Shape a ``providers`` row for the MCP response — masked api_key."""
+    return {
+        "id": int(row["id"]),
+        "name": row["name"],
+        "framework": row["framework"],
+        "has_api_key": bool(row.get("api_key")),
+        "base_url": row.get("base_url") or None,
+        "enabled": bool(row.get("enabled", True)),
+        "configured_model_count": int(count),
+    }
 
 
 @mcp.tool()
@@ -57,27 +76,16 @@ async def list_providers() -> list[dict[str, Any]]:
     ``configured_model_count``. API keys are never surfaced in
     cleartext — only the presence flag.
     """
-    conn = await _get_conn()
-    rows = await (await conn.execute(
-        "SELECT id, name, framework, api_key, base_url, enabled "
-        "FROM providers ORDER BY name ASC, framework ASC"
-    )).fetchall()
-
-    out: list[dict[str, Any]] = []
-    for pid, name, framework, api_key, base_url, enabled in rows:
-        cnt_row = await (await conn.execute(
-            "SELECT COUNT(*) FROM models WHERE provider_id = ?", (pid,),
-        )).fetchone()
-        out.append({
-            "id": int(pid),
-            "name": name,
-            "framework": framework,
-            "has_api_key": bool(api_key),
-            "base_url": base_url or None,
-            "enabled": bool(enabled),
-            "configured_model_count": int(cnt_row[0]) if cnt_row else 0,
-        })
-    return out
+    db = await _get_db()
+    rows = await db.list_providers()
+    # Count models per provider in a single GROUP BY so this tool stays
+    # O(1) queries regardless of how many provider rows exist.
+    conn = await db._ensure_connected()
+    cursor = await conn.execute(
+        "SELECT provider_id, COUNT(*) FROM models GROUP BY provider_id"
+    )
+    counts = {int(pid): int(n) for pid, n in await cursor.fetchall()}
+    return [_provider_summary(r, counts.get(r["id"], 0)) for r in rows]
 
 
 @mcp.tool()
@@ -100,54 +108,22 @@ async def add_provider(
     see what the vendor exposes under that key, then ``add_model`` to
     register specific model ids.
     """
-    if not name or not name.strip():
-        raise ValueError("name is required")
-    if framework not in VALID_FRAMEWORKS:
-        raise ValueError(
-            f"invalid framework {framework!r}; expected one of {list(VALID_FRAMEWORKS)}"
-        )
-    if framework == "claude-cli" and api_key:
-        raise ValueError(
-            "claude-cli providers must not carry an api_key — "
-            "the local `claude` binary uses your Pro/Max subscription."
-        )
+    # ``MemoryDB.upsert_provider`` enforces framework + claude-cli key
+    # rules at the schema boundary; we just layer the agno-requires-key
+    # rule here since the DB allows NULL api_key for future "configured
+    # but disabled" agno rows.
     if framework == "agno" and not (api_key or "").strip():
         raise ValueError("agno providers require an api_key")
-
-    now = time.time()
-    conn = await _get_conn()
-    await conn.execute(
-        """
-        INSERT INTO providers (name, framework, api_key, base_url, enabled, metadata_json, created_at, updated_at)
-        VALUES (?, ?, ?, ?, 1, '{}', ?, ?)
-        ON CONFLICT(name, framework) DO UPDATE SET
-            api_key = excluded.api_key,
-            base_url = COALESCE(excluded.base_url, providers.base_url),
-            enabled = 1,
-            updated_at = excluded.updated_at
-        """,
-        (
-            name.strip(),
-            framework,
-            (api_key or "").strip() or None,
-            (base_url or "").strip() or None,
-            now,
-            now,
-        ),
+    db = await _get_db()
+    pid = await db.upsert_provider(
+        name=(name or "").strip(),
+        framework=framework,
+        api_key=(api_key or "").strip() or None,
+        base_url=(base_url or "").strip() or None,
     )
-    await conn.commit()
-    row = await (await conn.execute(
-        "SELECT id FROM providers WHERE name = ? AND framework = ?",
-        (name.strip(), framework),
-    )).fetchone()
-    pid = int(row[0])
-    return {
-        "id": pid,
-        "name": name.strip(),
-        "framework": framework,
-        "has_api_key": bool((api_key or "").strip()),
-        "base_url": (base_url or "").strip() or None,
-    }
+    row = await db.get_provider(pid)
+    assert row is not None
+    return _provider_summary(row)
 
 
 @mcp.tool()
@@ -162,35 +138,29 @@ async def update_provider(
     an existing base_url. ``framework`` is immutable — delete+recreate
     to change it.
     """
-    conn = await _get_conn()
-    cursor = await conn.execute(
-        "SELECT name, framework, api_key, base_url FROM providers WHERE id = ?",
-        (int(provider_id),),
-    )
-    row = await cursor.fetchone()
+    db = await _get_db()
+    row = await db.get_provider(int(provider_id))
     if row is None:
         raise ValueError(f"Provider id={provider_id} not found")
-    name, framework, current_key, current_base = row
-    new_key = current_key
-    new_base = current_base
+    new_key = row["api_key"]
+    new_base = row["base_url"]
     if api_key is not None:
-        if framework == "claude-cli" and api_key.strip():
-            raise ValueError("claude-cli providers must not carry an api_key")
         new_key = api_key.strip() or None
     if base_url is not None:
         new_base = base_url.strip() or None
-    await conn.execute(
-        "UPDATE providers SET api_key = ?, base_url = ?, updated_at = ? WHERE id = ?",
-        (new_key, new_base, time.time(), int(provider_id)),
+    # Roundtrip through ``upsert_provider`` so the claude-cli api_key
+    # rejection stays a single-source rule (see MemoryDB.upsert_provider).
+    await db.upsert_provider(
+        name=row["name"],
+        framework=row["framework"],
+        api_key=new_key,
+        base_url=new_base,
+        enabled=row["enabled"],
+        metadata=row.get("metadata"),
     )
-    await conn.commit()
-    return {
-        "id": int(provider_id),
-        "name": name,
-        "framework": framework,
-        "has_api_key": bool(new_key),
-        "base_url": new_base,
-    }
+    row = await db.get_provider(int(provider_id))
+    assert row is not None
+    return _provider_summary(row)
 
 
 @mcp.tool()
@@ -201,27 +171,19 @@ async def remove_provider(provider_id: int) -> dict[str, Any]:
     model cleanup — no separate call needed. Returns the number of
     models that were wiped so the caller can surface it.
     """
-    conn = await _get_conn()
-    cursor = await conn.execute(
-        "SELECT name, framework FROM providers WHERE id = ?", (int(provider_id),),
-    )
-    row = await cursor.fetchone()
+    db = await _get_db()
+    row = await db.get_provider(int(provider_id))
     if row is None:
         raise ValueError(f"Provider id={provider_id} not found")
-    name, framework = row
-    cursor = await conn.execute(
-        "SELECT COUNT(*) FROM models WHERE provider_id = ?", (int(provider_id),),
-    )
-    cnt_row = await cursor.fetchone()
-    purged = int(cnt_row[0]) if cnt_row else 0
-    await conn.execute("DELETE FROM providers WHERE id = ?", (int(provider_id),))
-    await conn.commit()
+    # Count BEFORE delete — FK cascade wipes the rows in the same txn.
+    models = await db.list_models(provider_id=int(provider_id))
+    await db.delete_provider(int(provider_id))
     return {
         "removed": True,
         "id": int(provider_id),
-        "name": name,
-        "framework": framework,
-        "models_purged": purged,
+        "name": row["name"],
+        "framework": row["framework"],
+        "models_purged": len(models),
     }
 
 
@@ -262,46 +224,27 @@ async def list_models(
     vendor id), ``display_name``, ``tier_hint`` (free-form classifier
     guidance), ``enabled``, and a derived ``runtime_id``.
     """
-    db = MemoryDB(os.environ.get("OPENAGENT_DB_PATH", "openagent.db"))
-    await db.connect()
-    try:
-        provider_name = None
-        if provider_id is not None:
-            prow = await db.get_provider(int(provider_id))
-            if prow is None:
-                raise ValueError(f"Provider id={provider_id} not found")
-            # list_models_enriched filters on (name, framework) — derive
-            # from the provider row to keep the join unambiguous.
-            provider_name = prow["name"]
-            framework = prow["framework"]
-        rows = await db.list_models_enriched(
-            enabled_only=enabled_only,
-            framework=framework,
-            provider_name=provider_name,
-        )
-        return [_model_row(r) for r in rows]
-    finally:
-        await db.close()
+    db = await _get_db()
+    rows = await db.list_models_enriched(
+        enabled_only=enabled_only,
+        framework=framework,
+        provider_id=int(provider_id) if provider_id is not None else None,
+    )
+    return [_model_row(r) for r in rows]
+
+
+async def _require_enriched(model_id: int) -> dict[str, Any]:
+    db = await _get_db()
+    row = await db.get_model_enriched(int(model_id))
+    if row is None:
+        raise ValueError(f"Model id={model_id} not found")
+    return _model_row(row)
 
 
 @mcp.tool()
 async def get_model(model_id: int) -> dict[str, Any]:
     """Fetch one model row by its surrogate id."""
-    db = MemoryDB(os.environ.get("OPENAGENT_DB_PATH", "openagent.db"))
-    await db.connect()
-    try:
-        base = await db.get_model(int(model_id))
-        if base is None:
-            raise ValueError(f"Model id={model_id} not found")
-        # Re-fetch via the enriched view so the caller gets provider +
-        # framework + runtime_id in one dict.
-        enriched = await db.list_models_enriched(enabled_only=False)
-        for r in enriched:
-            if r["id"] == int(model_id):
-                return _model_row(r)
-        raise RuntimeError(f"Model id={model_id} could not be enriched")
-    finally:
-        await db.close()
+    return await _require_enriched(model_id)
 
 
 @mcp.tool()
@@ -354,19 +297,15 @@ async def add_model(
     Pricing is resolved live from OpenRouter on every billing event,
     so there is no cost field to set here. Returns the enriched row.
     """
-    db = MemoryDB(os.environ.get("OPENAGENT_DB_PATH", "openagent.db"))
-    await db.connect()
-    try:
-        mid = await db.upsert_model(
-            provider_id=int(provider_id),
-            model=model.strip(),
-            display_name=display_name,
-            tier_hint=tier_hint,
-            enabled=enabled,
-        )
-        return await get_model(mid)
-    finally:
-        await db.close()
+    db = await _get_db()
+    mid = await db.upsert_model(
+        provider_id=int(provider_id),
+        model=model.strip(),
+        display_name=display_name,
+        tier_hint=tier_hint,
+        enabled=enabled,
+    )
+    return await _require_enriched(mid)
 
 
 @mcp.tool()
@@ -380,51 +319,39 @@ async def update_model(
 
     Pricing isn't editable — it's resolved live on every billing event.
     """
-    db = MemoryDB(os.environ.get("OPENAGENT_DB_PATH", "openagent.db"))
-    await db.connect()
-    try:
-        existing = await db.get_model(int(model_id))
-        if existing is None:
-            raise ValueError(f"Model id={model_id} not found")
-        await db.upsert_model(
-            provider_id=existing["provider_id"],
-            model=existing["model"],
-            display_name=display_name if display_name is not None else existing.get("display_name"),
-            tier_hint=tier_hint if tier_hint is not None else existing.get("tier_hint"),
-            enabled=enabled if enabled is not None else bool(existing.get("enabled", True)),
-            metadata=existing.get("metadata") or None,
-        )
-        return await get_model(int(model_id))
-    finally:
-        await db.close()
+    db = await _get_db()
+    existing = await db.get_model(int(model_id))
+    if existing is None:
+        raise ValueError(f"Model id={model_id} not found")
+    await db.upsert_model(
+        provider_id=existing["provider_id"],
+        model=existing["model"],
+        display_name=display_name if display_name is not None else existing.get("display_name"),
+        tier_hint=tier_hint if tier_hint is not None else existing.get("tier_hint"),
+        enabled=enabled if enabled is not None else bool(existing.get("enabled", True)),
+        metadata=existing.get("metadata") or None,
+    )
+    return await _require_enriched(int(model_id))
 
 
 @mcp.tool()
 async def enable_model(model_id: int) -> dict[str, Any]:
     """Enable one model (takes effect on next message)."""
-    db = MemoryDB(os.environ.get("OPENAGENT_DB_PATH", "openagent.db"))
-    await db.connect()
-    try:
-        if await db.get_model(int(model_id)) is None:
-            raise ValueError(f"Model id={model_id} not found")
-        await db.set_model_enabled(int(model_id), True)
-        return await get_model(int(model_id))
-    finally:
-        await db.close()
+    db = await _get_db()
+    if await db.get_model(int(model_id)) is None:
+        raise ValueError(f"Model id={model_id} not found")
+    await db.set_model_enabled(int(model_id), True)
+    return await _require_enriched(int(model_id))
 
 
 @mcp.tool()
 async def disable_model(model_id: int) -> dict[str, Any]:
     """Disable one model (row preserved for re-enable)."""
-    db = MemoryDB(os.environ.get("OPENAGENT_DB_PATH", "openagent.db"))
-    await db.connect()
-    try:
-        if await db.get_model(int(model_id)) is None:
-            raise ValueError(f"Model id={model_id} not found")
-        await db.set_model_enabled(int(model_id), False)
-        return await get_model(int(model_id))
-    finally:
-        await db.close()
+    db = await _get_db()
+    if await db.get_model(int(model_id)) is None:
+        raise ValueError(f"Model id={model_id} not found")
+    await db.set_model_enabled(int(model_id), False)
+    return await _require_enriched(int(model_id))
 
 
 @mcp.tool()
@@ -435,31 +362,27 @@ async def remove_model(model_id: int) -> dict[str, Any]:
     start rejecting every incoming message. Use ``disable_model``
     instead if you want to keep the row around.
     """
-    db = MemoryDB(os.environ.get("OPENAGENT_DB_PATH", "openagent.db"))
-    await db.connect()
-    try:
-        existing = await db.get_model(int(model_id))
-        if existing is None:
-            raise ValueError(f"Model id={model_id} not found")
-        # Count remaining enabled (model AND its provider enabled).
-        conn = await db._ensure_connected()
-        cursor = await conn.execute(
-            "SELECT COUNT(*) FROM models m "
-            "JOIN providers p ON p.id = m.provider_id "
-            "WHERE m.enabled = 1 AND p.enabled = 1 AND m.id <> ?",
-            (int(model_id),),
+    db = await _get_db()
+    existing = await db.get_model(int(model_id))
+    if existing is None:
+        raise ValueError(f"Model id={model_id} not found")
+    # Count remaining enabled (model AND its provider enabled).
+    conn = await db._ensure_connected()
+    cursor = await conn.execute(
+        "SELECT COUNT(*) FROM models m "
+        "JOIN providers p ON p.id = m.provider_id "
+        "WHERE m.enabled = 1 AND p.enabled = 1 AND m.id <> ?",
+        (int(model_id),),
+    )
+    row = await cursor.fetchone()
+    remaining = int(row[0]) if row else 0
+    if remaining == 0 and existing.get("enabled"):
+        raise ValueError(
+            "Refusing to remove the last enabled model — the agent would "
+            "reject every incoming message. Add another model first."
         )
-        row = await cursor.fetchone()
-        remaining = int(row[0]) if row else 0
-        if remaining == 0 and existing.get("enabled"):
-            raise ValueError(
-                "Refusing to remove the last enabled model — the agent would "
-                "reject every incoming message. Add another model first."
-            )
-        await db.delete_model(int(model_id))
-        return {"removed": True, "id": int(model_id)}
-    finally:
-        await db.close()
+    await db.delete_model(int(model_id))
+    return {"removed": True, "id": int(model_id)}
 
 
 # ── Session pins ──────────────────────────────────────────────────────────
@@ -486,20 +409,16 @@ async def pin_session(session_id: str, runtime_id: str) -> dict[str, Any]:
         raise ValueError("session_id is required")
     if not runtime_id:
         raise ValueError("runtime_id is required")
-    db = MemoryDB(os.environ.get("OPENAGENT_DB_PATH", "openagent.db"))
-    await db.connect()
-    try:
-        # Enabled-model precheck: pin to a missing or disabled model
-        # would start failing every turn with "no model available".
-        row = await db.get_model_by_runtime_id(runtime_id)
-        if row is None:
-            raise ValueError(f"Model {runtime_id!r} is not registered. Use add_model first.")
-        if not row.get("enabled") or not row.get("provider_enabled"):
-            raise ValueError(f"Model {runtime_id!r} is disabled. Enable it before pinning.")
-        await db.pin_session_model(session_id, runtime_id)
-        return {"session_id": session_id, "runtime_id": runtime_id, "pinned": True}
-    finally:
-        await db.close()
+    db = await _get_db()
+    # Enabled-model precheck: pin to a missing or disabled model
+    # would start failing every turn with "no model available".
+    row = await db.get_model_by_runtime_id(runtime_id)
+    if row is None:
+        raise ValueError(f"Model {runtime_id!r} is not registered. Use add_model first.")
+    if not row.get("enabled") or not row.get("provider_enabled"):
+        raise ValueError(f"Model {runtime_id!r} is disabled. Enable it before pinning.")
+    await db.pin_session_model(session_id, runtime_id)
+    return {"session_id": session_id, "runtime_id": runtime_id, "pinned": True}
 
 
 @mcp.tool()
@@ -513,13 +432,9 @@ async def unpin_session(session_id: str) -> dict[str, Any]:
     session_id = (session_id or "").strip()
     if not session_id:
         raise ValueError("session_id is required")
-    db = MemoryDB(os.environ.get("OPENAGENT_DB_PATH", "openagent.db"))
-    await db.connect()
-    try:
-        await db.unpin_session_model(session_id)
-        return {"session_id": session_id, "pinned": False}
-    finally:
-        await db.close()
+    db = await _get_db()
+    await db.unpin_session_model(session_id)
+    return {"session_id": session_id, "pinned": False}
 
 
 # ── Discovery + smoke test ────────────────────────────────────────────────
@@ -536,19 +451,15 @@ async def list_available_models(provider_id: int) -> list[dict[str, Any]]:
     """
     from openagent.models.discovery import list_provider_models
 
-    db = MemoryDB(os.environ.get("OPENAGENT_DB_PATH", "openagent.db"))
-    await db.connect()
-    try:
-        provider_row = await db.get_provider(int(provider_id))
-        if provider_row is None:
-            raise ValueError(f"Provider id={provider_id} not found")
-        return await list_provider_models(
-            provider_row["name"],
-            api_key=provider_row.get("api_key"),
-            base_url=provider_row.get("base_url"),
-        )
-    finally:
-        await db.close()
+    db = await _get_db()
+    provider_row = await db.get_provider(int(provider_id))
+    if provider_row is None:
+        raise ValueError(f"Provider id={provider_id} not found")
+    return await list_provider_models(
+        provider_row["name"],
+        api_key=provider_row.get("api_key"),
+        base_url=provider_row.get("base_url"),
+    )
 
 
 @mcp.tool()
@@ -561,38 +472,18 @@ async def test_model(runtime_id: str) -> dict[str, Any]:
     """
     from openagent.models.runtime import run_provider_smoke_test
 
-    db = MemoryDB(os.environ.get("OPENAGENT_DB_PATH", "openagent.db"))
-    await db.connect()
-    try:
-        model_row = await db.get_model_by_runtime_id(runtime_id)
-        if model_row is None:
-            raise ValueError(f"Model {runtime_id!r} is not registered")
-        # Materialise the full providers_config so AgnoProvider sees
-        # sibling entries (classifier model, etc.) too.
-        provider_rows = await db.list_providers()
-        model_rows = await db.list_models()
-        by_id: dict[int, dict[str, Any]] = {}
-        for p in provider_rows:
-            by_id[p["id"]] = {**p, "models": []}
-        for m in model_rows:
-            if m["provider_id"] in by_id:
-                by_id[m["provider_id"]]["models"].append({
-                    "id": m["id"], "model": m["model"],
-                    "display_name": m.get("display_name"),
-                    "tier_hint": m.get("tier_hint"),
-                    "enabled": m.get("enabled", True),
-                })
-        providers_config = list(by_id.values())
-        _, resp = await run_provider_smoke_test(
-            model_row["provider_name"],
-            providers_config,
-            model_id=runtime_id,
-            framework=model_row["framework"],
-            session_id="model-manager-probe",
-        )
-        return {"ok": True, "runtime_id": runtime_id, "response": resp.content}
-    finally:
-        await db.close()
+    db = await _get_db()
+    model_row = await db.get_model_by_runtime_id(runtime_id)
+    if model_row is None:
+        raise ValueError(f"Model {runtime_id!r} is not registered")
+    _, resp = await run_provider_smoke_test(
+        model_row["provider_name"],
+        await db.materialise_providers_config(),
+        model_id=runtime_id,
+        framework=model_row["framework"],
+        session_id="model-manager-probe",
+    )
+    return {"ok": True, "runtime_id": runtime_id, "response": resp.content}
 
 
 def main() -> None:

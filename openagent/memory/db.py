@@ -14,10 +14,14 @@ from openagent.memory.schedule import (
     is_one_shot_expression,
     parse_one_shot_expression,
 )
+from openagent.models.catalog import SUPPORTED_FRAMEWORKS
 
 
 VALID_MCP_KINDS = ("builtin", "custom", "default")
-VALID_FRAMEWORKS = ("agno", "claude-cli")
+# Alias kept for the ``from openagent.memory.db import VALID_FRAMEWORKS``
+# import sites already in the tree; both names point at the canonical
+# tuple defined in :mod:`openagent.models.catalog`.
+VALID_FRAMEWORKS = SUPPORTED_FRAMEWORKS
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS scheduled_tasks (
@@ -723,12 +727,46 @@ class MemoryDB:
         rows = await cursor.fetchall()
         return [self._row_to_model(r) for r in rows]
 
+    # Common projection for the model-joined-with-provider view. Kept
+    # as a constant so :meth:`list_models_enriched`,
+    # :meth:`get_model_enriched`, and :meth:`get_model_by_runtime_id`
+    # return identical dict shapes.
+    _ENRICHED_MODEL_SELECT = """
+        SELECT m.id AS id, m.provider_id AS provider_id, m.model AS model,
+               m.display_name AS display_name, m.tier_hint AS tier_hint,
+               m.enabled AS enabled, m.metadata_json AS metadata_json,
+               m.created_at AS created_at, m.updated_at AS updated_at,
+               p.name AS provider_name, p.framework AS framework,
+               p.api_key AS api_key, p.base_url AS base_url,
+               p.enabled AS provider_enabled
+        FROM models m
+        JOIN providers p ON p.id = m.provider_id
+    """
+
+    @staticmethod
+    def _shape_enriched(row: aiosqlite.Row) -> dict:
+        from openagent.models.catalog import build_runtime_model_id
+
+        d = dict(row)
+        meta_raw = d.pop("metadata_json", "{}") or "{}"
+        try:
+            d["metadata"] = json.loads(meta_raw)
+        except (TypeError, ValueError):
+            d["metadata"] = {}
+        d["enabled"] = bool(d["enabled"])
+        d["provider_enabled"] = bool(d["provider_enabled"])
+        d["runtime_id"] = build_runtime_model_id(
+            d["provider_name"], d["model"], d["framework"],
+        )
+        return d
+
     async def list_models_enriched(
         self,
         *,
         enabled_only: bool = False,
         framework: str | None = None,
         provider_name: str | None = None,
+        provider_id: int | None = None,
     ) -> list[dict]:
         """Return each model joined with its provider row.
 
@@ -739,8 +777,6 @@ class MemoryDB:
         This is the shape consumed by ``iter_configured_models`` and the REST
         ``/api/models`` list endpoint.
         """
-        from openagent.models.catalog import build_runtime_model_id
-
         conn = await self._ensure_connected()
         clauses: list[str] = []
         params: list[Any] = []
@@ -753,39 +789,60 @@ class MemoryDB:
         if provider_name:
             clauses.append("p.name = ?")
             params.append(provider_name)
+        if provider_id is not None:
+            clauses.append("m.provider_id = ?")
+            params.append(int(provider_id))
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         cursor = await conn.execute(
-            f"""
-            SELECT m.id AS id, m.provider_id AS provider_id, m.model AS model,
-                   m.display_name AS display_name, m.tier_hint AS tier_hint,
-                   m.enabled AS enabled, m.metadata_json AS metadata_json,
-                   m.created_at AS created_at, m.updated_at AS updated_at,
-                   p.name AS provider_name, p.framework AS framework,
-                   p.api_key AS api_key, p.base_url AS base_url,
-                   p.enabled AS provider_enabled
-            FROM models m
-            JOIN providers p ON p.id = m.provider_id
-            {where}
-            ORDER BY p.name ASC, p.framework ASC, m.model ASC
-            """,
+            f"{self._ENRICHED_MODEL_SELECT} {where} "
+            "ORDER BY p.name ASC, p.framework ASC, m.model ASC",
             params,
         )
         rows = await cursor.fetchall()
-        out: list[dict] = []
-        for r in rows:
-            d = dict(r)
-            meta_raw = d.pop("metadata_json", "{}") or "{}"
-            try:
-                d["metadata"] = json.loads(meta_raw)
-            except (TypeError, ValueError):
-                d["metadata"] = {}
-            d["enabled"] = bool(d["enabled"])
-            d["provider_enabled"] = bool(d["provider_enabled"])
-            d["runtime_id"] = build_runtime_model_id(
-                d["provider_name"], d["model"], d["framework"],
-            )
-            out.append(d)
-        return out
+        return [self._shape_enriched(r) for r in rows]
+
+    async def get_model_enriched(self, model_id: int) -> dict | None:
+        """Fetch a single enriched model row by its surrogate id.
+
+        Same shape as :meth:`list_models_enriched` entries. Used by the
+        REST read / create / update / toggle handlers to avoid
+        scanning the full catalog for one row.
+        """
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            f"{self._ENRICHED_MODEL_SELECT} WHERE m.id = ?",
+            (int(model_id),),
+        )
+        row = await cursor.fetchone()
+        return self._shape_enriched(row) if row else None
+
+    async def materialise_providers_config(
+        self, *, enabled_only: bool = False,
+    ) -> list[dict]:
+        """Build the AgnoProvider-consumable providers_config from the DB.
+
+        Produces the flat list shape SmartRouter / AgnoProvider consume:
+        one entry per (name, framework) pair, each carrying its nested
+        ``models`` list. Used by :meth:`Agent._hydrate_providers_from_db`
+        (``enabled_only=True``) and by the smoke-test endpoints that
+        want every row regardless of enabled state.
+        """
+        provider_rows = await self.list_providers(enabled_only=enabled_only)
+        model_rows = await self.list_models(enabled_only=enabled_only)
+        by_id: dict[int, dict[str, Any]] = {
+            int(p["id"]): {**p, "models": []} for p in provider_rows
+        }
+        for m in model_rows:
+            bucket = by_id.get(int(m["provider_id"]))
+            if bucket is None:
+                continue
+            bucket["models"].append({
+                "id": m["id"], "model": m["model"],
+                "display_name": m.get("display_name"),
+                "tier_hint": m.get("tier_hint"),
+                "enabled": m.get("enabled", True),
+            })
+        return list(by_id.values())
 
     async def get_model(self, model_id: int) -> dict | None:
         """Fetch one model row by its surrogate id."""
@@ -825,33 +882,12 @@ class MemoryDB:
         provider_name, model = split_runtime_id(runtime_id)
         conn = await self._ensure_connected()
         cursor = await conn.execute(
-            """
-            SELECT m.id AS id, m.provider_id AS provider_id, m.model AS model,
-                   m.display_name AS display_name, m.tier_hint AS tier_hint,
-                   m.enabled AS enabled, m.metadata_json AS metadata_json,
-                   m.created_at AS created_at, m.updated_at AS updated_at,
-                   p.name AS provider_name, p.framework AS framework,
-                   p.api_key AS api_key, p.base_url AS base_url,
-                   p.enabled AS provider_enabled
-            FROM models m
-            JOIN providers p ON p.id = m.provider_id
-            WHERE p.name = ? AND p.framework = ? AND m.model = ?
-            """,
+            f"{self._ENRICHED_MODEL_SELECT} "
+            "WHERE p.name = ? AND p.framework = ? AND m.model = ?",
             (provider_name, framework, model),
         )
         row = await cursor.fetchone()
-        if not row:
-            return None
-        d = dict(row)
-        meta_raw = d.pop("metadata_json", "{}") or "{}"
-        try:
-            d["metadata"] = json.loads(meta_raw)
-        except (TypeError, ValueError):
-            d["metadata"] = {}
-        d["enabled"] = bool(d["enabled"])
-        d["provider_enabled"] = bool(d["provider_enabled"])
-        d["runtime_id"] = runtime_id
-        return d
+        return self._shape_enriched(row) if row else None
 
     async def upsert_model(
         self,

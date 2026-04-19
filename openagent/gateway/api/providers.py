@@ -229,22 +229,7 @@ async def handle_test(request: web.Request) -> web.Response:
 
     # Build a fresh providers_config snapshot from the DB so freshly-added
     # keys are usable without waiting for the next message's hot-reload.
-    provider_rows = await db.list_providers()
-    model_rows = await db.list_models()
-    by_id: dict[int, dict[str, Any]] = {}
-    for r in provider_rows:
-        by_id[r["id"]] = {
-            **r, "models": [],
-        }
-    for m in model_rows:
-        if m["provider_id"] in by_id:
-            by_id[m["provider_id"]]["models"].append({
-                "id": m["id"], "model": m["model"],
-                "display_name": m.get("display_name"),
-                "tier_hint": m.get("tier_hint"),
-                "enabled": m.get("enabled", True),
-            })
-    providers_config = list(by_id.values())
+    providers_config = await db.materialise_providers_config()
 
     try:
         runtime_model, resp = await run_provider_smoke_test(
