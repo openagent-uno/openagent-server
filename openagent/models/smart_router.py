@@ -89,6 +89,14 @@ class SmartRouter(BaseModel):
 
         # Agno tier providers — keyed by runtime_id. Lazily created.
         self._agno_providers: dict[str, BaseModel] = {}
+        # Dedicated classifier provider — separate from the dispatch
+        # providers because the classifier must NOT attach MCP tools.
+        # A production deployment with 20+ MCP servers easily crosses
+        # the OpenAI 128-tool cap, which makes every classify call
+        # fail with "Invalid 'tools': array too long" and forces the
+        # router into fallback_first_enabled for every turn (= always
+        # the most-expensive model). Lazily created on first classify.
+        self._classifier_provider: BaseModel | None = None
         # Single ClaudeCLIRegistry serving every claude-cli runtime_id,
         # lazily created on first claude-cli dispatch so pure-Agno
         # deployments don't pay for the import.
@@ -121,6 +129,9 @@ class SmartRouter(BaseModel):
         self._classifier_model = normalize_runtime_model_id(
             CLASSIFIER_MODEL, self._providers_config,
         )
+        # Drop the cached classifier provider so the next classify
+        # picks up freshly-rotated API keys. Recreated lazily.
+        self._classifier_provider = None
         elog("router.rebuilt", classifier_model=self._classifier_model)
 
     # ── runtime wiring ───────────────────────────────────────────────
@@ -133,6 +144,8 @@ class SmartRouter(BaseModel):
         self._budget = BudgetTracker(db, 0.0)
         for model in self._agno_providers.values():
             wire_model_runtime(model, db=db)
+        if self._classifier_provider is not None:
+            wire_model_runtime(self._classifier_provider, db=db)
         if self._claude_registry is not None:
             wire_model_runtime(self._claude_registry, db=db)
 
@@ -148,6 +161,10 @@ class SmartRouter(BaseModel):
             fn = getattr(model, "cleanup_idle", None)
             if callable(fn):
                 await fn()
+        if self._classifier_provider is not None:
+            fn = getattr(self._classifier_provider, "cleanup_idle", None)
+            if callable(fn):
+                await fn()
         if self._claude_registry is not None:
             fn = getattr(self._claude_registry, "cleanup_idle", None)
             if callable(fn):
@@ -156,6 +173,10 @@ class SmartRouter(BaseModel):
     async def shutdown(self) -> None:
         for model in self._agno_providers.values():
             fn = getattr(model, "shutdown", None)
+            if callable(fn):
+                await fn()
+        if self._classifier_provider is not None:
+            fn = getattr(self._classifier_provider, "shutdown", None)
             if callable(fn):
                 await fn()
         if self._claude_registry is not None:
@@ -196,6 +217,28 @@ class SmartRouter(BaseModel):
                 mcp_pool=self._mcp_pool,
             )
         return self._agno_providers[runtime_id]
+
+    def _get_classifier_provider(self) -> BaseModel:
+        """Return a tools-free AgnoProvider for routing classification.
+
+        The classifier only needs a small JSON pick from the model —
+        no MCP tools, no memory, no web search. Attaching the full
+        toolkit blows past OpenAI's 128-tool cap when the deployment
+        has many MCP servers registered (observed at 20 toolkits /
+        302 tools in production), which makes every classify call
+        fail with a generic 400 and forces the router into
+        ``fallback_first_enabled`` for every turn. Keeping the
+        classifier on a dedicated provider with ``mcp_pool=None``
+        side-steps the limit entirely.
+        """
+        if self._classifier_provider is None:
+            self._classifier_provider = create_model_from_spec(
+                self._classifier_model,
+                providers_config=self._providers_config,
+                db=self._db,
+                mcp_pool=None,  # intentional — see docstring.
+            )
+        return self._classifier_provider
 
     def _get_claude_registry(self) -> BaseModel:
         if self._claude_registry is None:
@@ -329,7 +372,7 @@ class SmartRouter(BaseModel):
             prompt_len=len(user_msg),
         )
         try:
-            provider = self._get_agno_provider(self._classifier_model)
+            provider = self._get_classifier_provider()
             resp = await provider.generate(
                 messages=[{"role": "user", "content": prompt}],
                 session_id=classifier_session_id,
