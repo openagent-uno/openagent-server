@@ -26,6 +26,19 @@ logger = logging.getLogger(__name__)
 TELEGRAM_MSG_LIMIT = 4096
 VOICE_FALLBACK = "[Voice message not transcribed. Ask the user to type it.]"
 
+# Hard shutdown deadlines for the python-telegram-bot library calls. These
+# exist because ``updater.stop()`` internally POSTs to Telegram's
+# ``getUpdates`` via httpx; on a flaky network or during a launchd-initiated
+# shutdown the request can hang. We refuse to let library cleanup block the
+# entire process restart loop — if it takes more than a few seconds we log
+# and move on so the agent can come back up cleanly.
+_TG_UPDATER_STOP_TIMEOUT = 3.0
+_TG_APP_STOP_TIMEOUT = 3.0
+_TG_APP_SHUTDOWN_TIMEOUT = 3.0
+# Very short timeout for the manual offset-advance POST — it's a one-shot
+# confirmation; if Telegram is slow we'd rather skip than block shutdown.
+_TG_OFFSET_FLUSH_TIMEOUT = 2.0
+
 
 class TelegramBridge(BaseBridge):
     name = "telegram"
@@ -36,6 +49,14 @@ class TelegramBridge(BaseBridge):
         self.token = token
         self.allowed_users = set(allowed_users) if allowed_users else None
         self._app = None
+        # Highest update_id we've seen from Telegram. Used during shutdown
+        # to directly ACK the offset so a queued ``/restart`` cannot
+        # replay on next boot (which is what caused the lyra-agent
+        # mac-mini crash loop: shutdown hung inside
+        # ``updater.stop()`` → ``_get_updates_cleanup``, so the offset
+        # never advanced; launchd restarted us, and the same ``/restart``
+        # Update came right back from ``getUpdates``).
+        self._last_update_id: int = 0
 
     def _is_authorized(self, uid: str) -> bool:
         return self.allowed_users is None or uid in self.allowed_users
@@ -95,24 +116,133 @@ class TelegramBridge(BaseBridge):
         while not self._should_stop:
             await asyncio.sleep(1)
 
+    def _track_update_id(self, update) -> None:
+        """Record the highest update_id we've processed so we can ACK it on stop."""
+        try:
+            uid = getattr(update, "update_id", None)
+            if isinstance(uid, int) and uid > self._last_update_id:
+                self._last_update_id = uid
+        except Exception:
+            pass
+
+    async def flush_updates_offset(self) -> None:
+        """ACK pending Telegram updates so they don't replay after restart.
+
+        The python-telegram-bot ``Updater.stop()`` path is supposed to call
+        ``_get_updates_cleanup`` to confirm our current offset, but during
+        an in-flight shutdown (launchd stop, /restart from a queued Update)
+        that POST can block or be cancelled — leaving the server-side offset
+        unchanged. On next boot ``getUpdates`` re-delivers the same Update
+        and we crash-loop.
+
+        We defend against that by doing the ACK directly via a raw httpx
+        POST with a short timeout BEFORE the library's own cleanup runs,
+        and ignore all errors — best-effort is correct here. If this
+        succeeds the Telegram server advances the offset and the queued
+        command cannot fire again; if it fails, we're no worse off than
+        before the fix.
+        """
+        next_offset = (self._last_update_id or 0) + 1
+        url = f"https://api.telegram.org/bot{self.token}/getUpdates"
+        try:
+            import httpx
+        except ImportError:
+            logger.debug("httpx not available — skipping Telegram offset flush")
+            return
+        try:
+            async with httpx.AsyncClient(timeout=_TG_OFFSET_FLUSH_TIMEOUT) as client:
+                await client.post(
+                    url,
+                    json={"offset": next_offset, "timeout": 0, "limit": 1},
+                )
+            elog("bridge.telegram.offset_flush", offset=next_offset)
+        except asyncio.CancelledError:
+            # Never let cancellation from the flush derail the surrounding
+            # shutdown — swallow and let the caller keep tearing down.
+            elog(
+                "bridge.telegram.offset_flush_cancelled",
+                level="warning",
+                offset=next_offset,
+            )
+        except Exception as e:  # noqa: BLE001 — best-effort
+            elog(
+                "bridge.telegram.offset_flush_error",
+                level="warning",
+                offset=next_offset,
+                error=str(e),
+            )
+
     async def stop(self) -> None:
         self._should_stop = True
-        if self._app:
-            try:
-                await self._app.updater.stop()
-                await self._app.stop()
-                await self._app.shutdown()
-            finally:
-                self._app = None
-        await super().stop()
+        app = self._app
+        # ACK pending updates FIRST so that a queued /restart or /stop can't
+        # survive a library-side hang. Idempotent — if flush_updates_offset
+        # was already called by the gateway restart path, this is a no-op
+        # (at worst a second short POST).
+        try:
+            await self.flush_updates_offset()
+        except asyncio.CancelledError:
+            pass  # handled inside flush_updates_offset
+        except Exception:
+            pass
+        if app is not None:
+            # Library-side cleanup. Each of updater.stop / app.stop /
+            # app.shutdown can internally POST to Telegram, and each has
+            # been observed to hang during an outer cancellation (see the
+            # events.jsonl trace from lyra-agent: cancel scope cancelled
+            # from Gateway._handle_ws.handler while _get_updates_cleanup
+            # was mid-POST). Bound each with a short timeout and swallow
+            # CancelledError at this boundary — callers above us must be
+            # able to finish the rest of shutdown regardless of what
+            # python-telegram-bot decides to do.
+            self._app = None
+            for label, coro_factory, deadline in (
+                ("updater.stop", lambda: app.updater.stop(), _TG_UPDATER_STOP_TIMEOUT),
+                ("app.stop",     lambda: app.stop(),         _TG_APP_STOP_TIMEOUT),
+                ("app.shutdown", lambda: app.shutdown(),     _TG_APP_SHUTDOWN_TIMEOUT),
+            ):
+                try:
+                    await asyncio.wait_for(coro_factory(), timeout=deadline)
+                except asyncio.TimeoutError:
+                    elog(
+                        "bridge.telegram.stop_timeout",
+                        level="warning",
+                        phase=label,
+                        timeout=deadline,
+                    )
+                except asyncio.CancelledError:
+                    # Do not propagate — a CancelledError from httpx/httpcore
+                    # during library cleanup must not bleed out into the
+                    # gateway shutdown path and derail MCP teardown, etc.
+                    elog(
+                        "bridge.telegram.stop_cancelled",
+                        level="warning",
+                        phase=label,
+                    )
+                except Exception as e:  # noqa: BLE001 — best-effort
+                    elog(
+                        "bridge.telegram.stop_error",
+                        level="warning",
+                        phase=label,
+                        error=str(e),
+                    )
+        try:
+            await super().stop()
+        except asyncio.CancelledError:
+            # Same reason — bridge-level cancellation must not escape.
+            elog("bridge.telegram.super_stop_cancelled", level="warning")
+        except Exception as e:  # noqa: BLE001
+            elog("bridge.telegram.super_stop_error", level="warning", error=str(e))
 
     # ── Handlers ──
 
     async def _on_start(self, update, context):
+        self._track_update_id(update)
         name = update.message.from_user.first_name or "there"
         await update.message.reply_text(bridge_welcome_text(name))
 
     async def _on_command(self, update, context, cmd):
+        self._track_update_id(update)
         if not update.message:
             return
         user_id = str(update.message.from_user.id)
@@ -125,6 +255,7 @@ class TelegramBridge(BaseBridge):
         await self._reply_rich(update.message, result)
 
     async def _on_stop_cb(self, update, context):
+        self._track_update_id(update)
         q = update.callback_query
         if not q or not q.data.startswith("stop:"):
             return
@@ -135,6 +266,7 @@ class TelegramBridge(BaseBridge):
         await q.answer(result, show_alert=False)
 
     async def _on_message(self, update, context):
+        self._track_update_id(update)
         msg = update.message
         if not msg:
             return
