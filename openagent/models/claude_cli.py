@@ -674,6 +674,20 @@ class ClaudeCLI(BaseModel):
                     k: dict(v) if isinstance(v, dict) else v
                     for k, v in current_usage.items()
                 }
+        # Expose the diff-resolved verdict so operators can spot silent
+        # fallbacks (requested ≠ resolved) in the log stream without
+        # having to cross-reference ``claude_cli.sdk_reported_model``.
+        elog(
+            "claude_cli.turn_model",
+            session_id=session_id,
+            requested_model=self.model,
+            resolved_model=actual_model,
+            resolved_source=(
+                "result_message.model"
+                if getattr(message, "model", None)
+                else ("model_usage_delta" if actual_model else "fallback_to_requested")
+            ),
+        )
         usage_meta = {
             "total_cost_usd": getattr(message, "total_cost_usd", None),
             "usage": getattr(message, "usage", None),
@@ -738,9 +752,25 @@ class ClaudeCLI(BaseModel):
         streamed_text_parts: list[str] = []
         result_text = ""
         usage_meta: dict[str, Any] = {}
+        # Capture the SDK's own per-turn model claim exactly once. The
+        # Claude Agent SDK sets ``AssistantMessage.model`` for every
+        # AssistantMessage in a turn, so the first one is enough — this
+        # is the most trustworthy signal the SDK exposes for "what model
+        # actually ran this turn" (``ResultMessage.model`` is unset in
+        # 0.1.x, ``model_usage`` is cumulative across the session).
+        sdk_reported_model: str | None = None
 
         async for message in client.receive_response():
             if isinstance(message, AssistantMessage):
+                if sdk_reported_model is None:
+                    sdk_reported_model = getattr(message, "model", None)
+                    if sdk_reported_model:
+                        elog(
+                            "claude_cli.sdk_reported_model",
+                            session_id=session_id,
+                            requested_model=self.model,
+                            sdk_model=sdk_reported_model,
+                        )
                 for block in message.content or []:
                     block_text = getattr(block, "text", None)
                     if isinstance(block_text, str) and block_text:
