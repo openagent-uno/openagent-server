@@ -634,7 +634,19 @@ class SmartRouter(BaseModel):
         if session_id:
             await self._persist_bound_framework(session_id, framework_of(active_model_id))
 
-        if self._budget:
+        # Usage-log writes are metered-traffic only. Claude CLI runs
+        # against the user's Pro/Max subscription, so recording zero-
+        # cost rows there would pollute cost analytics and cost-per-
+        # token summaries. ClaudeCLI emits ``claude_cli.usage_received``
+        # for debugging visibility instead — see ``ClaudeCLI._record_usage``.
+        if is_claude_cli_model(active_model_id):
+            elog(
+                "router.cost_skipped",
+                session_id=session_id,
+                model=active_model_id,
+                reason="subscription_billed",
+            )
+        elif self._budget:
             cost = BudgetTracker.compute_cost(
                 active_model_id,
                 resp.input_tokens,

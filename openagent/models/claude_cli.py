@@ -40,7 +40,6 @@ from openagent.core.logging import elog
 from openagent.models.base import BaseModel, ModelResponse
 from openagent.models.catalog import (
     claude_cli_model_spec,
-    compute_cost,
     model_id_from_runtime,
 )
 
@@ -881,15 +880,24 @@ class ClaudeCLI(BaseModel):
     async def _record_usage(
         self, session_id: str, usage_meta: dict[str, Any]
     ) -> tuple[int, int, float]:
-        """Record one ``usage_log`` row; return ``(in, out, cost)``.
+        """Emit a ``claude_cli.usage_received`` event; NEVER write to ``usage_log``.
 
-        Prefers ``total_cost_usd`` from the SDK (Anthropic-computed,
-        cache-aware). Falls back to catalog pricing otherwise. Always
-        emits a structured event so log tailing can confirm the recording.
+        Claude CLI runs against the user's Pro/Max subscription, not a
+        metered API, so there is no per-turn dollar cost to attribute.
+        ``ResultMessage.total_cost_usd`` is the SDK's theoretical
+        API-equivalent price AND it's cumulative across the session, so
+        recording it per-turn would both misattribute free traffic as
+        paid AND over-count by ~n² across n turns. We keep the event
+        log (useful for debugging cache/token behaviour) but the
+        ``usage_log`` table is reserved for Agno (metered) traffic
+        only — see ``SmartRouter.generate`` for the agno-side write.
+
+        Returned tuple is retained for the upstream ``generate()`` caller,
+        which uses it to populate ``ModelResponse``. Cost is always 0.0.
         """
         if not usage_meta:
             elog(
-                "claude_cli.cost_skipped",
+                "claude_cli.usage_skipped",
                 session_id=session_id,
                 model=self._model_id_for_billing(),
                 reason="no_usage_meta",
@@ -897,80 +905,18 @@ class ClaudeCLI(BaseModel):
             return 0, 0, 0.0
 
         input_tokens, output_tokens = self._extract_usage_tokens(usage_meta)
-        sdk_cost = usage_meta.get("total_cost_usd")
-        sdk_cost = float(sdk_cost) if isinstance(sdk_cost, (int, float)) else None
-
-        billing_model = self._model_id_for_billing()
-
-        if sdk_cost is not None:
-            cost = sdk_cost
-            cost_source = "sdk_total_cost_usd"
-        else:
-            cost = compute_cost(
-                model_ref=billing_model,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-            )
-            cost_source = "catalog"
-
         elog(
             "claude_cli.usage_received",
             session_id=session_id,
-            model=billing_model,
+            model=self._model_id_for_billing(),
             input_tokens=input_tokens,
             output_tokens=output_tokens,
-            cost_usd=cost,
-            cost_source=cost_source,
             duration_ms=usage_meta.get("duration_ms"),
             duration_api_ms=usage_meta.get("duration_api_ms"),
             num_turns=usage_meta.get("num_turns"),
+            billing="subscription",
         )
-
-        if self._db is None:
-            elog(
-                "claude_cli.cost_skipped",
-                session_id=session_id,
-                model=billing_model,
-                reason="no_db_wired",
-                cost_usd=cost,
-            )
-            return input_tokens, output_tokens, cost
-
-        if input_tokens == 0 and output_tokens == 0 and cost == 0:
-            elog(
-                "claude_cli.cost_skipped",
-                session_id=session_id,
-                model=billing_model,
-                reason="zero_usage",
-            )
-            return 0, 0, 0.0
-
-        try:
-            await self._db.record_usage(
-                model=billing_model,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                cost=cost,
-                session_id=session_id,
-            )
-            elog(
-                "claude_cli.cost_recorded",
-                session_id=session_id,
-                model=billing_model,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                cost_usd=cost,
-                cost_source=cost_source,
-            )
-        except Exception as e:
-            elog(
-                "claude_cli.cost_record_error",
-                level="warning",
-                session_id=session_id,
-                model=billing_model,
-                error=str(e),
-            )
-        return input_tokens, output_tokens, cost
+        return input_tokens, output_tokens, 0.0
 
 
 class ClaudeCLIRegistry(BaseModel):
