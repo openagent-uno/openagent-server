@@ -28,6 +28,8 @@ dependencies = [
     # the OS trust store isn't visible inside the bundle (updater.py uses
     # certifi.where() to hand urlopen a working cafile).
     "certifi",
+    # workflow block templating ({{expr}} resolution via SandboxedEnvironment)
+    "jinja2>=3.1.0",
 ]
 
 [project.optional-dependencies]

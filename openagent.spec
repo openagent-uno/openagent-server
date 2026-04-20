@@ -57,6 +57,8 @@ hiddenimports = [
     *collect_submodules("anyio"),
     # httpx (used by litellm)
     *collect_submodules("httpx"),
+    # jinja2 (openagent.workflow.templating — SandboxedEnvironment for {{expr}})
+    *collect_submodules("jinja2"),
     # openagent submodules
     *collect_submodules("openagent"),
 ]
