@@ -66,55 +66,6 @@ os.environ.setdefault("CLAUDE_CODE_STREAM_CLOSE_TIMEOUT", "300000")  # 5 min
 _MODEL_DOTTED_VERSION_RE = re.compile(r"([A-Za-z])-(\d+)\.(\d+)")
 
 
-def _usage_total_tokens(entry: Any) -> int:
-    """Flatten one ``model_usage[model]`` entry into a single int.
-
-    Counts every ``*_tokens`` field (input, output, cache_creation,
-    cache_read, …) so a turn that was 100% cache-read still shows as
-    activity on its model. Non-dict / malformed entries count as zero.
-    """
-    if not isinstance(entry, dict):
-        return 0
-    total = 0
-    for key, value in entry.items():
-        if not key.endswith("_tokens"):
-            continue
-        try:
-            total += int(value or 0)
-        except (TypeError, ValueError):
-            continue
-    return total
-
-
-def _pick_turn_model_from_usage_delta(
-    current: dict[str, Any], previous: dict[str, Any]
-) -> str | None:
-    """Return the model whose token counters grew most since ``previous``.
-
-    The Claude Agent SDK's ``ResultMessage.model_usage`` is cumulative
-    across the whole session (see SDK 0.1.x), so diffing it against the
-    previous turn's snapshot is the only way to identify which model
-    actually ran *this* turn. Ties are broken by picking the key that's
-    newest in ``current`` (insertion order = first-use order).
-    """
-    best_model: str | None = None
-    best_delta = 0
-    for model, entry in current.items():
-        delta = _usage_total_tokens(entry) - _usage_total_tokens(previous.get(model))
-        if delta > best_delta:
-            best_model = model
-            best_delta = delta
-    if best_model is not None:
-        return best_model
-    # No growth detected. This happens when the SDK emits model_usage
-    # unchanged (rare — tool-only turns with cached inputs). Fall back
-    # to whichever model is newest in the session (last dict key by
-    # insertion order), which is the most recently *first-used* model.
-    for model in reversed(list(current.keys())):
-        return model
-    return None
-
-
 def _sanitize_claude_model_id(model_id: str) -> str:
     """Normalise an Anthropic model id for the Claude Agent SDK.
 
@@ -195,17 +146,13 @@ class _Session:
     # in sync via ``ClaudeSDKClient.set_model()`` so consecutive turns on
     # the same session can change models without rebinding --resume.
     current_sdk_model: str | None = None
-    # Model the SDK reported back for the most recent turn (from the
-    # ``ResultMessage`` event). Used to surface the truly-executed model
-    # in ``ModelResponse.model`` so silent SDK fallbacks become visible.
+    # Model the SDK actually ran for the most recent turn, captured
+    # from the first ``AssistantMessage.model`` seen in the stream.
+    # That's the only authoritative per-turn signal the SDK exposes —
+    # ``ResultMessage.model`` is unpopulated in 0.1.x, and
+    # ``ResultMessage.model_usage`` carries the right keys but None
+    # values so diffing it is useless.
     last_actual_model: str | None = None
-    # Snapshot of ``ResultMessage.model_usage`` from the previous turn,
-    # kept so we can diff it after each turn and identify the model that
-    # actually ran *this* turn. The SDK's ``model_usage`` is cumulative
-    # across the session and ``ResultMessage.model`` is unpopulated in
-    # claude-agent-sdk 0.1.x (verified on 0.1.58), so the diff is the
-    # only reliable per-turn signal the SDK provides.
-    prev_model_usage: dict[str, Any] = field(default_factory=dict)
 
 
 class ClaudeCLI(BaseModel):
@@ -655,37 +602,19 @@ class ClaudeCLI(BaseModel):
                 session_id=session_id,
                 sdk_session_id=sdk_sid,
             )
-        # Capture the model the SDK subprocess actually ran so the
-        # response footer reflects reality (not just what the router
-        # asked for). Any silent SDK fallback becomes visible to the
-        # user on the same turn it happens.
-        prev_usage = session.prev_model_usage if session is not None else {}
-        actual_model = self._extract_actual_model(message, prev_usage)
-        if session is not None:
-            if actual_model:
-                session.last_actual_model = actual_model
-            # Snapshot model_usage AFTER extracting so the next turn's
-            # diff has a stable baseline. Use a shallow copy because the
-            # SDK returns a fresh dict per turn but we want to insulate
-            # ourselves from any in-place mutation.
-            current_usage = getattr(message, "model_usage", None)
-            if isinstance(current_usage, dict):
-                session.prev_model_usage = {
-                    k: dict(v) if isinstance(v, dict) else v
-                    for k, v in current_usage.items()
-                }
-        # Expose the diff-resolved verdict so operators can spot silent
-        # fallbacks (requested ≠ resolved) in the log stream without
-        # having to cross-reference ``claude_cli.sdk_reported_model``.
+        # The authoritative per-turn model is set during the stream
+        # (``_run_once`` captures the first ``AssistantMessage.model``
+        # into ``session.last_actual_model``). Log the resolved verdict
+        # alongside the requested model so operators can grep for
+        # requested ≠ resolved drift = silent SDK fallback.
+        resolved = session.last_actual_model if session is not None else None
         elog(
             "claude_cli.turn_model",
             session_id=session_id,
             requested_model=self.model,
-            resolved_model=actual_model,
+            resolved_model=resolved,
             resolved_source=(
-                "result_message.model"
-                if getattr(message, "model", None)
-                else ("model_usage_delta" if actual_model else "fallback_to_requested")
+                "assistant_message.model" if resolved else "fallback_to_requested"
             ),
         )
         usage_meta = {
@@ -697,35 +626,6 @@ class ClaudeCLI(BaseModel):
             "num_turns": getattr(message, "num_turns", None),
         }
         return result_text, usage_meta
-
-    def _extract_actual_model(
-        self, message: Any, prev_model_usage: dict[str, Any]
-    ) -> str | None:
-        """Pull the model id the SDK subprocess actually ran this turn.
-
-        Priority:
-          1. ``ResultMessage.model`` — populated by future SDKs.
-          2. ``model_usage`` diff vs ``prev_model_usage`` — the only
-             reliable per-turn signal in claude-agent-sdk 0.1.x, where
-             ``ResultMessage.model`` is unset and ``model_usage`` is
-             cumulative across the session. The model whose token
-             counters grew most (or was newly inserted) ran this turn.
-          3. ``None`` — caller falls back to ``self.model`` (what the
-             router asked for).
-
-        Normalises to the bare id so callers can feed it straight to
-        ``claude_cli_model_spec``.
-        """
-        raw = getattr(message, "model", None)
-        if not raw:
-            current_usage = getattr(message, "model_usage", None)
-            if isinstance(current_usage, dict) and current_usage:
-                raw = _pick_turn_model_from_usage_delta(
-                    current_usage, prev_model_usage,
-                )
-        if not raw:
-            return None
-        return model_id_from_runtime(str(raw)) or str(raw)
 
     async def _run_once(
         self,
@@ -752,24 +652,31 @@ class ClaudeCLI(BaseModel):
         streamed_text_parts: list[str] = []
         result_text = ""
         usage_meta: dict[str, Any] = {}
-        # Capture the SDK's own per-turn model claim exactly once. The
-        # Claude Agent SDK sets ``AssistantMessage.model`` for every
-        # AssistantMessage in a turn, so the first one is enough — this
-        # is the most trustworthy signal the SDK exposes for "what model
-        # actually ran this turn" (``ResultMessage.model`` is unset in
-        # 0.1.x, ``model_usage`` is cumulative across the session).
-        sdk_reported_model: str | None = None
+        # The first ``AssistantMessage.model`` seen in the stream is
+        # the SDK's own claim for which model ran this turn. That's
+        # the only authoritative per-turn signal the SDK exposes —
+        # ``ResultMessage.model`` is unset in 0.1.x, and
+        # ``ResultMessage.model_usage`` has the right keys but None
+        # values, so token-delta diffing does not work. We stash it
+        # on the ``_Session`` right away so ``_capture_result`` and
+        # ``_model_id_for_response`` both see the same value.
+        session = self._sessions.get(session_id)
+        sdk_reported_logged = False
 
         async for message in client.receive_response():
             if isinstance(message, AssistantMessage):
-                if sdk_reported_model is None:
-                    sdk_reported_model = getattr(message, "model", None)
-                    if sdk_reported_model:
-                        elog(
-                            "claude_cli.sdk_reported_model",
-                            session_id=session_id,
-                            requested_model=self.model,
-                            sdk_model=sdk_reported_model,
+                sdk_model = getattr(message, "model", None)
+                if sdk_model and not sdk_reported_logged:
+                    elog(
+                        "claude_cli.sdk_reported_model",
+                        session_id=session_id,
+                        requested_model=self.model,
+                        sdk_model=sdk_model,
+                    )
+                    sdk_reported_logged = True
+                    if session is not None:
+                        session.last_actual_model = (
+                            model_id_from_runtime(str(sdk_model)) or str(sdk_model)
                         )
                 for block in message.content or []:
                     block_text = getattr(block, "text", None)
