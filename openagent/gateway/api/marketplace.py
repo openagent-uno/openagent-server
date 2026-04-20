@@ -592,7 +592,7 @@ async def handle_install(request):
         headers=kwargs["headers"],
         oauth=False,
         enabled=True,
-        source=f"marketplace:registry.modelcontextprotocol.io@{resolved_version}",
+        source=f"marketplace:registry.modelcontextprotocol.io/{name}@{resolved_version}",
     )
     elog(
         "marketplace.install",
