@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 from openagent.gateway import protocol as P
 from openagent.gateway.commands import command_help_text
 from openagent.gateway.sessions import SessionManager
-from openagent.gateway.api import vault, config, health, logs, control, usage, providers, models, scheduled_tasks, mcps, sessions as sessions_api
+from openagent.gateway.api import vault, config, health, logs, control, usage, providers, models, scheduled_tasks, mcps, marketplace, sessions as sessions_api
 
 if TYPE_CHECKING:
     from openagent.core.agent import Agent
@@ -192,6 +192,10 @@ class Gateway:
             ("DELETE", "/api/mcps/{name}", mcps.handle_delete),
             ("POST", "/api/mcps/{name}/enable", mcps.handle_enable),
             ("POST", "/api/mcps/{name}/disable", mcps.handle_disable),
+            # MCP marketplace — proxy + installer for the official registry.
+            ("GET", "/api/marketplace/search", marketplace.handle_search),
+            ("GET", "/api/marketplace/servers", marketplace.handle_server_detail),
+            ("POST", "/api/marketplace/install", marketplace.handle_install),
             # Per-session model pin.
             ("GET", "/api/sessions/{session_id}/model", sessions_api.handle_get),
             ("PUT", "/api/sessions/{session_id}/model", sessions_api.handle_pin),

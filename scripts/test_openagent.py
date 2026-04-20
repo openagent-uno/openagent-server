@@ -66,6 +66,9 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_provider_manager",
     # Dynamic provider catalog: bundled fallback only (no live HTTP).
     "test_models_discovery",
+    # MCP marketplace — pure schema-mapping unit tests, plus one REST
+    # shape check that skips when no gateway fixture is wired.
+    "test_marketplace",
     # ClaudeCLI buffer fix — computer-control screenshot regression guard.
     "test_buffer_size",
     # 2. MCP pool — sets ctx.extras["pool"] for everything below
