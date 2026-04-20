@@ -87,10 +87,10 @@ def _global_default_paths() -> tuple[Path, Path, Path]:
 def main(ctx, config: str, agent_dir: str | None, verbose: bool):
     """OpenAgent runtime CLI."""
     ctx.ensure_object(dict)
-
-    setup_logging(verbose=verbose)
+    ctx.obj["verbose"] = verbose
 
     _setup_agent_dir(agent_dir)
+    setup_logging(verbose=verbose)
     _startup_cleanup()
 
     if agent_dir is not None and config == "openagent.yaml":
@@ -116,6 +116,7 @@ def serve(ctx, agent_dir: str | None, channel: tuple[str, ...]):
     """Start the OpenAgent server for an agent directory."""
     if agent_dir is not None and paths.get_agent_dir() is None:
         _setup_agent_dir(agent_dir)
+        setup_logging(verbose=ctx.obj.get("verbose", False))
         _reload_context_config(ctx, str(paths.default_config_path()))
 
     config = dict(ctx.obj["config"])

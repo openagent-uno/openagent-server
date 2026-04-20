@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 from typing import Any
 
 from openagent.core.paths import log_dir
@@ -24,6 +25,7 @@ _LEVELS = {
     "error": logging.ERROR,
 }
 _configured = False
+_event_file_path: Path | None = None
 
 
 def elog(event: str, level: str = "info", exc_info: bool = False, **data: Any) -> None:
@@ -42,13 +44,22 @@ def elog(event: str, level: str = "info", exc_info: bool = False, **data: Any) -
 
 
 def setup_logging(verbose: bool = False) -> None:
-    """Configure stdlib logging: stdout for text, events.jsonl for events."""
-    global _configured
+    """Configure stdlib logging: stdout for text, events.jsonl for events.
+
+    Safe to call repeatedly. If the resolved :func:`log_dir` changes between
+    calls (e.g. the agent directory is set after initial bootstrap), the file
+    handler is reopened at the new location so logs follow the agent.
+    """
+    global _configured, _event_file_path
     stdout_level = logging.DEBUG if verbose else logging.WARNING
+    target = log_dir() / "events.jsonl"
+
     if _configured:
         for h in logging.getLogger().handlers:
             if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler):
                 h.setLevel(stdout_level)
+        if _event_file_path != target:
+            _reopen_event_file(target)
         return
 
     # Root accepts everything; the console handler is what gates stdout
@@ -61,13 +72,25 @@ def setup_logging(verbose: bool = False) -> None:
     root.setLevel(logging.DEBUG)
     root.addHandler(console)
 
-    events_file = logging.FileHandler(log_dir() / "events.jsonl", encoding="utf-8")
-    events_file.setFormatter(_JsonlFormatter())
     events = logging.getLogger(EVENT_LOGGER)
     events.setLevel(logging.DEBUG)  # events.jsonl captures every level
-    events.addHandler(events_file)
+    _reopen_event_file(target)
 
     _configured = True
+
+
+def _reopen_event_file(target: Path) -> None:
+    """Swap the FileHandler on the event logger to write to *target*."""
+    global _event_file_path
+    events = logging.getLogger(EVENT_LOGGER)
+    for h in list(events.handlers):
+        if isinstance(h, logging.FileHandler):
+            h.close()
+            events.removeHandler(h)
+    handler = logging.FileHandler(target, encoding="utf-8")
+    handler.setFormatter(_JsonlFormatter())
+    events.addHandler(handler)
+    _event_file_path = target
 
 
 def read_tail(lines: int = 100, event_filter: str | None = None) -> list[dict[str, Any]]:
@@ -93,15 +116,9 @@ def read_tail(lines: int = 100, event_filter: str | None = None) -> list[dict[st
 
 def clear() -> None:
     """Truncate ``events.jsonl`` and re-open the file handler."""
-    events = logging.getLogger(EVENT_LOGGER)
-    for h in list(events.handlers):
-        h.close()
-        events.removeHandler(h)
     path = log_dir() / "events.jsonl"
     path.write_text("", encoding="utf-8")
-    new_handler = logging.FileHandler(path, encoding="utf-8")
-    new_handler.setFormatter(_JsonlFormatter())
-    events.addHandler(new_handler)
+    _reopen_event_file(path)
 
 
 class _JsonlFormatter(logging.Formatter):
