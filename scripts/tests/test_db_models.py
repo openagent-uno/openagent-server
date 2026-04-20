@@ -181,6 +181,116 @@ async def t_reject_orphan(ctx: TestContext) -> None:
         await db.close()
 
 
+@test("db_models", "is_classifier flag persists and surfaces via materialise")
+async def t_is_classifier_roundtrip(ctx: TestContext) -> None:
+    from openagent.memory.db import MemoryDB
+
+    db = MemoryDB(str(ctx.db_path))
+    await db.connect()
+    try:
+        pid = await db.upsert_provider(
+            name="openai", framework="agno", api_key="sk-test",
+        )
+        mid1 = await db.upsert_model(provider_id=pid, model="gpt-cls-a")
+        mid2 = await db.upsert_model(provider_id=pid, model="gpt-cls-b")
+
+        row = await db.get_model(mid1)
+        assert row["is_classifier"] is False
+
+        # Flag mid2 — materialise should reflect it on that row only.
+        await db.set_model_is_classifier(mid2, True)
+        cfg = await db.materialise_providers_config(enabled_only=True)
+        flagged = {
+            m["model"]: m["is_classifier"]
+            for entry in cfg for m in entry["models"]
+        }
+        assert flagged["gpt-cls-a"] is False
+        assert flagged["gpt-cls-b"] is True
+
+        # Flipping to mid1 must clear mid2 in the same transaction.
+        await db.set_model_is_classifier(mid1, True)
+        cfg = await db.materialise_providers_config(enabled_only=True)
+        flagged = {
+            m["model"]: m["is_classifier"]
+            for entry in cfg for m in entry["models"]
+        }
+        assert flagged["gpt-cls-a"] is True
+        assert flagged["gpt-cls-b"] is False
+
+        # Clearing the flag is narrow — doesn't touch other rows.
+        await db.set_model_is_classifier(mid1, False)
+        row1 = await db.get_model(mid1)
+        assert row1["is_classifier"] is False
+
+        await db.delete_provider(pid)
+    finally:
+        await db.close()
+
+
+@test("db_models", "legacy DB (no is_classifier column) auto-migrates on connect")
+async def t_is_classifier_legacy_migration(ctx: TestContext) -> None:
+    """Simulate a pre-flag DB and confirm ``connect()`` ALTERs it in.
+
+    The VPS scenario: an existing openagent.db predates the
+    ``is_classifier`` column. Opening it via MemoryDB must add the
+    column with default=0 so queries that reference it don't error
+    with ``no such column: is_classifier``.
+    """
+    import sqlite3
+    import tempfile
+    from pathlib import Path
+    from openagent.memory.db import MemoryDB
+
+    tmp = tempfile.mkdtemp()
+    path = Path(tmp) / "legacy.db"
+    # Recreate the pre-flag schema by hand. NOT the full SCHEMA_SQL —
+    # just enough to reproduce "models table exists without the column".
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE providers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL, framework TEXT NOT NULL,
+            api_key TEXT, base_url TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at REAL NOT NULL, updated_at REAL NOT NULL,
+            UNIQUE(name, framework)
+        );
+        CREATE TABLE models (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider_id INTEGER NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+            model TEXT NOT NULL, display_name TEXT, tier_hint TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at REAL NOT NULL, updated_at REAL NOT NULL,
+            UNIQUE(provider_id, model)
+        );
+        INSERT INTO providers (name, framework, enabled, created_at, updated_at)
+            VALUES ('anthropic', 'claude-cli', 1, 1.0, 1.0);
+        INSERT INTO models (provider_id, model, enabled, created_at, updated_at)
+            VALUES (1, 'claude-sonnet-4-6', 1, 1.0, 1.0);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    db = MemoryDB(str(path))
+    await db.connect()
+    try:
+        rows = await db.list_models_enriched()
+        assert len(rows) == 1
+        assert rows[0]["is_classifier"] is False
+        # Second connect: idempotent (no duplicate ALTER).
+        await db.close()
+        db2 = MemoryDB(str(path))
+        await db2.connect()
+        await db2.close()
+    finally:
+        if db._conn is not None:
+            await db.close()
+
+
 @test("db_models", "config_state get/set roundtrip (bootstrap marker)")
 async def t_state_roundtrip(ctx: TestContext) -> None:
     from openagent.memory.db import MemoryDB

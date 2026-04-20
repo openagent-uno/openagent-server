@@ -40,18 +40,39 @@ from openagent.models.catalog import (
     framework_of,
     is_claude_cli_model,
     iter_configured_models,
-    normalize_runtime_model_id,
 )
 from openagent.models.runtime import create_model_from_spec, wire_model_runtime
 
 logger = logging.getLogger(__name__)
 
-CLASSIFIER_MODEL = "openai:gpt-4o-mini"
-
 # Canonical names used in DB ``session_bindings.provider`` and
 # ``sdk_sessions.provider``. Exported for tests.
 FRAMEWORK_AGNO = "agno"
 FRAMEWORK_CLAUDE_CLI = "claude-cli"
+
+
+def _resolve_classifier_model(providers_config: Any) -> str:
+    """Pick the classifier ``runtime_id`` from the live catalog.
+
+    Resolution order:
+      1. First enabled model whose ``is_classifier`` flag is True in the
+         ``models`` table — the operator-picked classifier.
+      2. First enabled model overall — sensible default so a fresh
+         install still classifies without requiring DB edits.
+      3. Empty string — signals "no model available", which the router
+         surfaces as the standard "No model is currently enabled" error.
+
+    ``iter_configured_models`` already yields a deterministic order
+    (``p.name, p.framework, m.model`` via ``materialise_providers_config``)
+    so repeated resolutions pick the same fallback when no flag is set.
+    """
+    catalog = [e for e in iter_configured_models(providers_config) if not e.disabled]
+    if not catalog:
+        return ""
+    for entry in catalog:
+        if entry.is_classifier:
+            return entry.runtime_id
+    return catalog[0].runtime_id
 
 
 @dataclass(frozen=True)
@@ -112,9 +133,7 @@ class SmartRouter(BaseModel):
         # rebill the classifier and risk a mid-task model swap.
         self._last_pick_by_session: dict[str, str] = {}
 
-        self._classifier_model = normalize_runtime_model_id(
-            CLASSIFIER_MODEL, self._providers_config,
-        )
+        self._classifier_model = _resolve_classifier_model(self._providers_config)
         elog("router.config", classifier_model=self._classifier_model)
 
     def rebuild_routing(self, providers_config: Any = None) -> None:
@@ -126,12 +145,14 @@ class SmartRouter(BaseModel):
         """
         if providers_config is not None:
             self._providers_config = providers_config
-        self._classifier_model = normalize_runtime_model_id(
-            CLASSIFIER_MODEL, self._providers_config,
-        )
-        # Drop the cached classifier provider so the next classify
-        # picks up freshly-rotated API keys. Recreated lazily.
-        self._classifier_provider = None
+        new_classifier = _resolve_classifier_model(self._providers_config)
+        # Drop the cached classifier provider whenever the resolved id
+        # changes (flag flipped, rotated keys, or provider swap) so the
+        # next classify picks up the fresh config. Also drop when the
+        # id is identical — safe and keeps keys rotation picking up.
+        if new_classifier != self._classifier_model or self._classifier_provider is None:
+            self._classifier_provider = None
+        self._classifier_model = new_classifier
         elog("router.rebuilt", classifier_model=self._classifier_model)
 
     # ── runtime wiring ───────────────────────────────────────────────
@@ -319,6 +340,14 @@ class SmartRouter(BaseModel):
                 user_msg = str(msg.get("content", ""))[:1000]
                 break
         if not user_msg or not catalog:
+            return None
+        # No classifier resolved (empty catalog at boot, or every row
+        # disabled after hot-reload). Skip the LLM call and let the
+        # caller fall back to the first-enabled model — avoids spawning
+        # a provider for a missing id and keeps the "no model" error
+        # surfacing from ``_routing_decision``.
+        if not self._classifier_model:
+            elog("router.classify_skipped", session_id=session_id, reason="no_classifier_model")
             return None
 
         rendered_catalog = json.dumps(
@@ -557,6 +586,23 @@ class SmartRouter(BaseModel):
                     bound_framework=bound_framework,
                 )
 
+        # Single-model catalog: classifying which of one model to pick
+        # is tautological. Skip the extra round-trip — especially important
+        # when the resolved classifier would be a claude-cli subprocess,
+        # which adds multi-second latency per fresh session.
+        if len(catalog) == 1:
+            only = catalog[0].runtime_id
+            self._remember_pick(session_id, only)
+            elog("router.single_model", session_id=session_id, model=only)
+            return RoutingDecision(
+                requested_tier="classifier",
+                effective_tier="classifier",
+                reason="single_enabled_model",
+                primary_model=only,
+                candidates=[only],
+                bound_framework=bound_framework,
+            )
+
         returned_id = await self._classify(messages, session_id, catalog)
         primary_model, reason = self._resolve_classifier_pick(
             returned_id, catalog, bound_framework,
@@ -733,15 +779,20 @@ class SmartRouter(BaseModel):
 
         Used by the REST smoke-test endpoint; the interactive turn
         surface always goes through ``generate`` which handles both
-        sides. Picks the first enabled agno model from the catalog,
-        falling back to the classifier model id.
+        sides. Picks the first enabled agno model from the catalog;
+        raises if no agno model is enabled since ``stream`` can't route
+        to claude-cli.
         """
         model_id = ""
         for entry in self._enabled_catalog(framework=FRAMEWORK_AGNO):
             model_id = entry.runtime_id
             break
-        if not model_id:
+        # Fallback to the classifier only when it's an agno id — a
+        # claude-cli classifier isn't streamable through this path.
+        if not model_id and self._classifier_model and not is_claude_cli_model(self._classifier_model):
             model_id = self._classifier_model
+        if not model_id:
+            raise RuntimeError("No agno model is enabled — streaming path unavailable")
         provider = self._get_agno_provider(model_id)
         async for chunk in provider.stream(messages, system=system, tools=tools):
             yield chunk

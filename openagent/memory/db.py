@@ -144,6 +144,7 @@ CREATE TABLE IF NOT EXISTS models (
     display_name TEXT,
     tier_hint TEXT,
     enabled INTEGER NOT NULL DEFAULT 1,
+    is_classifier INTEGER NOT NULL DEFAULT 0,
     metadata_json TEXT NOT NULL DEFAULT '{}',
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
@@ -152,6 +153,9 @@ CREATE TABLE IF NOT EXISTS models (
 CREATE INDEX IF NOT EXISTS idx_models_provider ON models(provider_id);
 CREATE INDEX IF NOT EXISTS idx_models_enabled ON models(enabled);
 CREATE INDEX IF NOT EXISTS idx_models_updated ON models(updated_at);
+-- idx_models_is_classifier is created in _apply_legacy_alters, after
+-- the column is guaranteed to exist on legacy DBs (SCHEMA_SQL's
+-- CREATE TABLE IF NOT EXISTS can't add columns to an existing table).
 
 -- Generic string-valued state flags. Intended for process-wide
 -- markers that need to survive restarts (none in active use — the
@@ -217,7 +221,30 @@ class MemoryDB:
         # silently a no-op and deleting a provider orphans its models.
         await self._conn.execute("PRAGMA foreign_keys = ON")
         await self._conn.executescript(SCHEMA_SQL)
+        await self._apply_legacy_alters()
         await self._conn.commit()
+
+    async def _apply_legacy_alters(self) -> None:
+        """Idempotent ALTERs for columns added after the schema was first shipped.
+
+        ``CREATE TABLE IF NOT EXISTS`` won't add columns to an existing
+        table, so each new column needs a PRAGMA-guarded ALTER here.
+        Indexes on post-ship columns also live here — creating them in
+        ``SCHEMA_SQL`` would fail on a legacy DB where the column
+        doesn't exist yet (the CREATE INDEX runs before the ALTER).
+        """
+        assert self._conn is not None
+        cursor = await self._conn.execute("PRAGMA table_info(models)")
+        cols = {row[1] for row in await cursor.fetchall()}
+        if "is_classifier" not in cols:
+            await self._conn.execute(
+                "ALTER TABLE models ADD COLUMN is_classifier "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_models_is_classifier "
+            "ON models(is_classifier)"
+        )
 
     async def close(self) -> None:
         if self._conn:
@@ -703,6 +730,7 @@ class MemoryDB:
         except (TypeError, ValueError):
             d["metadata"] = {}
         d["enabled"] = bool(d.get("enabled"))
+        d["is_classifier"] = bool(d.get("is_classifier"))
         return d
 
     async def list_models(
@@ -734,7 +762,8 @@ class MemoryDB:
     _ENRICHED_MODEL_SELECT = """
         SELECT m.id AS id, m.provider_id AS provider_id, m.model AS model,
                m.display_name AS display_name, m.tier_hint AS tier_hint,
-               m.enabled AS enabled, m.metadata_json AS metadata_json,
+               m.enabled AS enabled, m.is_classifier AS is_classifier,
+               m.metadata_json AS metadata_json,
                m.created_at AS created_at, m.updated_at AS updated_at,
                p.name AS provider_name, p.framework AS framework,
                p.api_key AS api_key, p.base_url AS base_url,
@@ -754,6 +783,7 @@ class MemoryDB:
         except (TypeError, ValueError):
             d["metadata"] = {}
         d["enabled"] = bool(d["enabled"])
+        d["is_classifier"] = bool(d.get("is_classifier"))
         d["provider_enabled"] = bool(d["provider_enabled"])
         d["runtime_id"] = build_runtime_model_id(
             d["provider_name"], d["model"], d["framework"],
@@ -848,7 +878,8 @@ class MemoryDB:
                    p.enabled AS p_enabled, p.metadata_json AS p_metadata_json,
                    p.created_at AS p_created_at, p.updated_at AS p_updated_at,
                    m.id AS m_id, m.model AS m_model, m.display_name AS m_display_name,
-                   m.tier_hint AS m_tier_hint, m.enabled AS m_enabled
+                   m.tier_hint AS m_tier_hint, m.enabled AS m_enabled,
+                   m.is_classifier AS m_is_classifier
             FROM providers p
             LEFT JOIN models m ON p.id = m.provider_id{join_filter}
             {where}
@@ -885,6 +916,7 @@ class MemoryDB:
                     "display_name": r["m_display_name"],
                     "tier_hint": r["m_tier_hint"],
                     "enabled": bool(r["m_enabled"]),
+                    "is_classifier": bool(r["m_is_classifier"]),
                 })
         return list(by_id.values())
 
@@ -941,6 +973,7 @@ class MemoryDB:
         display_name: str | None = None,
         tier_hint: str | None = None,
         enabled: bool = True,
+        is_classifier: bool = False,
         metadata: dict | None = None,
     ) -> int:
         """Insert or update a model row. Returns the model's surrogate id."""
@@ -963,12 +996,14 @@ class MemoryDB:
         await conn.execute(
             """
             INSERT INTO models (provider_id, model, display_name, tier_hint,
-                                enabled, metadata_json, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                enabled, is_classifier, metadata_json,
+                                created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(provider_id, model) DO UPDATE SET
                 display_name = excluded.display_name,
                 tier_hint = excluded.tier_hint,
                 enabled = excluded.enabled,
+                is_classifier = excluded.is_classifier,
                 metadata_json = excluded.metadata_json,
                 updated_at = excluded.updated_at
             """,
@@ -978,6 +1013,7 @@ class MemoryDB:
                 display_name,
                 tier_hint,
                 1 if enabled else 0,
+                1 if is_classifier else 0,
                 json.dumps(dict(metadata or {})),
                 now,
                 now,
@@ -999,6 +1035,34 @@ class MemoryDB:
             "UPDATE models SET enabled = ?, updated_at = ? WHERE id = ?",
             (1 if enabled else 0, time.time(), int(model_id)),
         )
+        await conn.commit()
+
+    async def set_model_is_classifier(self, model_id: int, flag: bool) -> None:
+        """Mark ``model_id`` as the SmartRouter classifier (or clear the flag).
+
+        Setting the flag on one row clears it on every other row in the
+        same transaction — the router picks the first flagged row it
+        sees, so keeping at most one flagged row is how callers express
+        "this model, and only this model, is the classifier". Clearing
+        is a narrow update that never touches other rows.
+        """
+        conn = await self._ensure_connected()
+        now = time.time()
+        if flag:
+            await conn.execute(
+                "UPDATE models SET is_classifier = 0, updated_at = ? "
+                "WHERE is_classifier = 1 AND id <> ?",
+                (now, int(model_id)),
+            )
+            await conn.execute(
+                "UPDATE models SET is_classifier = 1, updated_at = ? WHERE id = ?",
+                (now, int(model_id)),
+            )
+        else:
+            await conn.execute(
+                "UPDATE models SET is_classifier = 0, updated_at = ? WHERE id = ?",
+                (now, int(model_id)),
+            )
         await conn.commit()
 
     async def delete_model(self, model_id: int) -> None:

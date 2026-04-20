@@ -255,3 +255,190 @@ async def t_dual_framework_env_isolation(ctx: TestContext) -> None:
             _os.environ.pop("ANTHROPIC_API_KEY", None)
         else:
             _os.environ["ANTHROPIC_API_KEY"] = prev
+
+
+@test("smart_router_hybrid", "classifier resolves from is_classifier flag, else first enabled")
+async def t_classifier_resolution(ctx: TestContext) -> None:
+    """SmartRouter picks its classifier from the live catalog.
+
+    Prior releases hardcoded ``openai:gpt-4o-mini`` as the classifier,
+    which broke any deployment that didn't have an OpenAI key configured
+    (e.g. claude-cli-only installs). The DB-driven resolver must:
+
+      1. prefer the row flagged ``is_classifier=True``,
+      2. fall back to the first enabled row when no flag is set,
+      3. return empty string (signalling "no classifier available") when
+         the catalog has zero enabled rows — caller skips classify and
+         surfaces the standard "No model is currently enabled" error.
+    """
+    from openagent.models.smart_router import _resolve_classifier_model
+
+    # 1. flagged wins over everything
+    cfg = [{
+        "id": 1, "name": "openai", "framework": "agno", "enabled": True,
+        "models": [
+            {"id": 1, "model": "gpt-4o-mini", "enabled": True, "is_classifier": False},
+            {"id": 2, "model": "gpt-5", "enabled": True, "is_classifier": True},
+        ],
+    }]
+    assert _resolve_classifier_model(cfg) == "openai:gpt-5"
+
+    # 2. no flag → first enabled (deterministic order from materialise)
+    cfg = [{
+        "id": 1, "name": "openai", "framework": "agno", "enabled": True,
+        "models": [
+            {"id": 1, "model": "gpt-4o-mini", "enabled": True, "is_classifier": False},
+            {"id": 2, "model": "gpt-5", "enabled": True, "is_classifier": False},
+        ],
+    }]
+    assert _resolve_classifier_model(cfg) == "openai:gpt-4o-mini"
+
+    # 3. claude-cli-only install (the lyra-agent scenario) —
+    # classifier resolves to the claude-cli model, NOT the dead
+    # openai:gpt-4o-mini hardcode.
+    cfg = [{
+        "id": 1, "name": "anthropic", "framework": "claude-cli", "enabled": True,
+        "models": [
+            {"id": 1, "model": "claude-sonnet-4-6", "enabled": True, "is_classifier": False},
+        ],
+    }]
+    assert _resolve_classifier_model(cfg) == "claude-cli:anthropic:claude-sonnet-4-6"
+
+    # 4. every model disabled → empty classifier → router skips
+    # classify and lets the caller surface "No model is currently
+    # enabled" (see _classify's no_classifier_model skip path).
+    cfg = [{
+        "id": 1, "name": "openai", "framework": "agno", "enabled": True,
+        "models": [
+            {"id": 1, "model": "gpt-4o-mini", "enabled": False, "is_classifier": True},
+        ],
+    }]
+    assert _resolve_classifier_model(cfg) == ""
+
+    # 5. empty providers_config → empty classifier
+    assert _resolve_classifier_model([]) == ""
+
+
+@test("smart_router_hybrid", "single-model catalog short-circuits the classifier call")
+async def t_single_model_skips_classify(ctx: TestContext) -> None:
+    """Classifying-of-one is tautological.
+
+    The lyra-agent scenario: only ``claude-cli:anthropic:claude-sonnet-4-6``
+    is enabled, so ``_resolve_classifier_model`` returns that same id —
+    meaning we'd spawn a claude subprocess just to ask the model "which
+    model?". Skip the classify call when the catalog has exactly one
+    entry; the decision is forced.
+
+    Asserts: ``_classify`` is NOT called, and the routing decision still
+    dispatches the only enabled runtime_id with reason
+    ``single_enabled_model``.
+    """
+    providers = [{
+        "id": 1, "name": "anthropic", "framework": "claude-cli",
+        "api_key": None, "enabled": True,
+        "models": [{"id": 1, "model": "claude-sonnet-4-6", "enabled": True}],
+    }]
+    router = _make_router(providers)
+
+    classify_calls: list[Any] = []
+
+    async def _spy_classify(messages, session_id, catalog):
+        classify_calls.append((messages, session_id, catalog))
+        return "claude-cli:anthropic:claude-sonnet-4-6"
+
+    router._classify = _spy_classify  # type: ignore[assignment]
+    seen: list[str] = []
+    await _stub_dispatch(router, seen)
+
+    resp = await router.generate(
+        [{"role": "user", "content": "hi"}],
+        session_id="tg:single",
+    )
+    assert resp.model == "claude-cli:anthropic:claude-sonnet-4-6"
+    assert seen == ["claude-cli:anthropic:claude-sonnet-4-6"]
+    assert classify_calls == [], (
+        f"_classify must not run when the catalog has one entry, got {len(classify_calls)} calls"
+    )
+
+
+@test("smart_router_hybrid", "classifier provider is created with no MCP toolkits attached")
+async def t_classifier_no_mcp_injection(ctx: TestContext) -> None:
+    """Regression guard for the 302-tools-vs-128-cap bug.
+
+    Before the patch, the classifier shared the dispatch provider's MCP
+    pool, which in production deployments (~20 toolkits / 300+ tools)
+    overflowed OpenAI's 128-tool limit and every classify call failed
+    with ``Invalid 'tools': array too long``. The fix: build the
+    classifier with ``mcp_pool=None`` and exclude it from
+    ``SmartRouter.set_mcp_pool``'s fan-out loop.
+
+    This test wires a fake pool with a toolkit, flushes the pool into
+    the router, triggers classifier creation, and asserts the
+    classifier's ``_mcp_toolkits`` stayed empty while the dispatch
+    providers picked up the toolkit.
+    """
+    from openagent.models.smart_router import SmartRouter
+
+    class _FakePool:
+        agno_toolkits = ["fake-toolkit-a", "fake-toolkit-b"]
+
+        def claude_sdk_servers(self):
+            return {}
+
+    providers = [{
+        "id": 1, "name": "openai", "framework": "agno",
+        "api_key": "sk-x", "enabled": True,
+        "models": [{"id": 1, "model": "gpt-4o-mini", "enabled": True}],
+    }]
+    router = SmartRouter(providers_config=providers)
+    router.set_mcp_pool(_FakePool())
+
+    # Build the classifier lazily — mimics what the first classify call
+    # does. If this inadvertently pulled from the pool, the toolkit list
+    # below would be non-empty.
+    classifier = router._get_classifier_provider()
+    assert getattr(classifier, "_mcp_toolkits", None) == [], (
+        f"classifier must have NO MCP toolkits, got {classifier._mcp_toolkits!r}"
+    )
+
+    # A dispatch provider built the same way MUST pick up the pool —
+    # otherwise we've over-corrected and broken real turns.
+    dispatch = router._get_agno_provider("openai:gpt-4o-mini")
+    assert dispatch._mcp_toolkits == ["fake-toolkit-a", "fake-toolkit-b"], (
+        "dispatch provider should still receive the MCP pool"
+    )
+
+
+@test("smart_router_hybrid", "rebuild_routing picks up flag flip without restart")
+async def t_rebuild_routing_hot_reload(ctx: TestContext) -> None:
+    """Hot-reload of the classifier when the ``is_classifier`` flag
+    flips on another row. The gateway's per-message refresh calls
+    ``rebuild_routing``; the router must pick up the new classifier
+    id AND drop any cached provider instance bound to the old id.
+    """
+    from openagent.models.smart_router import SmartRouter
+
+    providers = [{
+        "id": 1, "name": "openai", "framework": "agno",
+        "api_key": "sk-x", "enabled": True,
+        "models": [
+            {"id": 1, "model": "gpt-4o-mini", "enabled": True, "is_classifier": True},
+            {"id": 2, "model": "gpt-5", "enabled": True, "is_classifier": False},
+        ],
+    }]
+    router = SmartRouter(providers_config=providers)
+    assert router._classifier_model == "openai:gpt-4o-mini"
+
+    # Simulate a cached classifier provider so rebuild_routing has
+    # something to invalidate.
+    sentinel = object()
+    router._classifier_provider = sentinel  # type: ignore[assignment]
+
+    # Flip the flag — the re-materialised config now points to gpt-5.
+    providers[0]["models"][0]["is_classifier"] = False
+    providers[0]["models"][1]["is_classifier"] = True
+    router.rebuild_routing(providers)
+    assert router._classifier_model == "openai:gpt-5"
+    assert router._classifier_provider is None, (
+        "cached classifier provider must be dropped when the resolved id changes"
+    )

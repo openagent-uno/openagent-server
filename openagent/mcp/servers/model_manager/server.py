@@ -206,6 +206,7 @@ def _model_row(d: dict[str, Any]) -> dict[str, Any]:
         "display_name": d.get("display_name"),
         "tier_hint": d.get("tier_hint"),
         "enabled": bool(d.get("enabled", True)),
+        "is_classifier": bool(d.get("is_classifier", False)),
         "runtime_id": runtime_id,
     }
 
@@ -281,6 +282,7 @@ async def add_model(
     display_name: str | None = None,
     tier_hint: str | None = None,
     enabled: bool = True,
+    is_classifier: bool = False,
 ) -> dict[str, Any]:
     """Register a new LLM model row under a provider.
 
@@ -293,6 +295,9 @@ async def add_model(
       classifier describing the model's strengths: ``"vision"``,
       ``"200k context"``, ``"best for code"``, ``"fast + cheap"``, etc.
       The classifier treats it as advice and overrides freely.
+    - ``is_classifier`` (optional) marks this row as the SmartRouter
+      classifier. Only one row can hold the flag; setting it here
+      clears the flag on any other row atomically.
 
     Pricing is resolved live from OpenRouter on every billing event,
     so there is no cost field to set here. Returns the enriched row.
@@ -304,7 +309,10 @@ async def add_model(
         display_name=display_name,
         tier_hint=tier_hint,
         enabled=enabled,
+        is_classifier=bool(is_classifier),
     )
+    if is_classifier:
+        await db.set_model_is_classifier(mid, True)
     return await _require_enriched(mid)
 
 
@@ -314,8 +322,13 @@ async def update_model(
     display_name: str | None = None,
     tier_hint: str | None = None,
     enabled: bool | None = None,
+    is_classifier: bool | None = None,
 ) -> dict[str, Any]:
     """Partially update a model row (only fields you pass are changed).
+
+    Pass ``is_classifier=True`` to make this the SmartRouter classifier
+    (clears the flag on every other row); ``False`` clears just this
+    row; omit to leave the current flag intact.
 
     Pricing isn't editable — it's resolved live on every billing event.
     """
@@ -329,8 +342,27 @@ async def update_model(
         display_name=display_name if display_name is not None else existing.get("display_name"),
         tier_hint=tier_hint if tier_hint is not None else existing.get("tier_hint"),
         enabled=enabled if enabled is not None else bool(existing.get("enabled", True)),
+        is_classifier=bool(existing.get("is_classifier", False)),
         metadata=existing.get("metadata") or None,
     )
+    if is_classifier is not None:
+        await db.set_model_is_classifier(int(model_id), bool(is_classifier))
+    return await _require_enriched(int(model_id))
+
+
+@mcp.tool()
+async def set_classifier_model(model_id: int) -> dict[str, Any]:
+    """Mark one model as THE SmartRouter classifier.
+
+    Clears the flag on every other row atomically, so the router
+    resolves this row for turn-1 classification on every fresh session.
+    The flag is honoured on the next message (hot-reload loop picks up
+    ``models.updated_at``).
+    """
+    db = await _get_db()
+    if await db.get_model(int(model_id)) is None:
+        raise ValueError(f"Model id={model_id} not found")
+    await db.set_model_is_classifier(int(model_id), True)
     return await _require_enriched(int(model_id))
 
 

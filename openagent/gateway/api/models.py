@@ -100,6 +100,7 @@ def _shape_model(row: dict[str, Any]) -> dict[str, Any]:
         "display_name": row.get("display_name"),
         "tier_hint": row.get("tier_hint"),
         "enabled": bool(row.get("enabled", True)),
+        "is_classifier": bool(row.get("is_classifier", False)),
         "provider_enabled": bool(row.get("provider_enabled", True)),
         "metadata": row.get("metadata") or {},
         "created_at": row.get("created_at"),
@@ -177,10 +178,16 @@ async def handle_create_db(request: web.Request) -> web.Response:
             display_name=body.get("display_name"),
             tier_hint=body.get("tier_hint") or body.get("notes"),
             enabled=bool(body.get("enabled", True)),
+            is_classifier=bool(body.get("is_classifier", False)),
             metadata=body.get("metadata") or None,
         )
     except ValueError as e:
         return _web.json_response({"error": str(e)}, status=400)
+    # When the caller sets is_classifier=True via create, make it the
+    # sole classifier — matches the set_model_is_classifier semantics
+    # exposed on update so both code paths behave the same.
+    if bool(body.get("is_classifier", False)):
+        await db.set_model_is_classifier(mid, True)
     enriched = await db.get_model_enriched(mid)
     return _web.json_response(
         {"ok": True, "model": _shape_model(enriched) if enriched else {"id": mid}},
@@ -199,6 +206,12 @@ async def handle_update_db(request: web.Request) -> web.Response:
     if existing is None:
         return _web.json_response({"error": f"model id={mid} not found"}, status=404)
     body = await request.json() if request.can_read_body else {}
+    # is_classifier follows the "set one, clear the rest" transactional
+    # path via set_model_is_classifier rather than being baked into
+    # upsert_model — keeps the caller's intent ("this is the new
+    # classifier") explicit and avoids a race with a concurrent update
+    # on another row.
+    desired_classifier = body.get("is_classifier")
     try:
         await db.upsert_model(
             provider_id=existing["provider_id"],
@@ -206,10 +219,13 @@ async def handle_update_db(request: web.Request) -> web.Response:
             display_name=body.get("display_name", existing.get("display_name")),
             tier_hint=body.get("tier_hint", existing.get("tier_hint")),
             enabled=bool(body.get("enabled", existing.get("enabled", True))),
+            is_classifier=bool(existing.get("is_classifier", False)),
             metadata=body.get("metadata", existing.get("metadata") or None),
         )
     except ValueError as e:
         return _web.json_response({"error": str(e)}, status=400)
+    if desired_classifier is not None:
+        await db.set_model_is_classifier(mid, bool(desired_classifier))
     enriched = await db.get_model_enriched(mid)
     return _web.json_response(
         {"ok": True, "model": _shape_model(enriched) if enriched else {"id": mid}},

@@ -82,6 +82,11 @@ class CatalogModel:
     # the runtime_id back apart. ``provider_id = 0`` indicates a seed
     # entry from yaml routing hints (no backing provider row yet).
     provider_id: int = 0
+    # When True, SmartRouter uses this row as its classifier model.
+    # At most one row should carry the flag; the router picks the first
+    # flagged entry from the catalog on turn 1 of a fresh session, and
+    # falls back to the first enabled entry when no row is flagged.
+    is_classifier: bool = False
 
 
 def _entry_model_id(entry: Any) -> str:
@@ -411,6 +416,7 @@ def iter_configured_models(
                 model_metadata.get("display_name")
                 or model_metadata.get("name")
             )
+            is_classifier = bool(model_metadata.get("is_classifier", False))
             results.append(
                 CatalogModel(
                     provider=provider_name,
@@ -423,6 +429,7 @@ def iter_configured_models(
                     tier_hint=str(tier_hint) if tier_hint else None,
                     metadata=model_metadata or None,
                     provider_id=provider_id,
+                    is_classifier=is_classifier,
                 )
             )
     return results
