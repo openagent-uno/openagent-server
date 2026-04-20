@@ -74,6 +74,12 @@ _MCP_TIMEOUT_SECONDS = 1800
 # that a single broken server is a recoverable blip, not a total outage.
 _MCP_CONNECT_TIMEOUT = 30
 
+# Per-MCP *shutdown* timeout — bounds how long we wait for one toolkit's
+# supervisor task to exit after we signal it. Matches the handshake
+# timeout philosophy: most stdio MCPs drain in milliseconds, but a stuck
+# subprocess that ignores SIGTERM could otherwise pin the whole shutdown.
+_MCP_CLOSE_TIMEOUT = 5
+
 
 def _safe_prefix(name: str) -> str:
     """Coerce a server name into a valid Python identifier prefix.
@@ -313,6 +319,30 @@ def _spec_from_kwargs(kwargs: dict[str, Any]) -> _ServerSpec:
     )
 
 
+@dataclass
+class _ToolkitSupervisor:
+    """Handle to the per-toolkit supervisor task.
+
+    Each supervised task holds ``async with stack: enter_async_context(toolkit);
+    await stop_event.wait()`` for the toolkit's entire lifetime. That means
+    ``__aenter__`` AND ``__aexit__`` both run on ``task`` — never on a
+    different task.
+
+    Why this matters: the MCP stdio client (``mcp/client/stdio/__init__.py``)
+    uses an anyio cancel scope. anyio enforces that a cancel scope opened in
+    task A can only be exited by task A; otherwise it raises ``RuntimeError:
+    Attempted to exit cancel scope in a different task than it was entered
+    in``. Before this refactor, ``__aenter__`` ran on the ``connect_all``
+    caller task but ``stack.aclose()`` in ``close_all`` ran on whatever task
+    called stop — usually a different task — which tripped that invariant
+    during every shutdown and also during reload.
+    """
+
+    name: str
+    task: asyncio.Task
+    stop_event: asyncio.Event
+
+
 class MCPPool:
     """Owns the lifecycle of MCP toolkits for the current process.
 
@@ -325,16 +355,20 @@ class MCPPool:
     def __init__(self, specs: list[_ServerSpec]):
         self.specs: list[_ServerSpec] = specs
         # Lazily populated on connect_all. Each toolkit gets its *own*
-        # ``AsyncExitStack`` (parallel arrays, ``_agno_toolkits[i]`` is
-        # owned by ``_toolkit_stacks[i]``) so one broken MCP's anyio
-        # cancel-scope violation during startup rolls back in isolation
-        # without corrupting the cleanup state of siblings. This is the
-        # v0.5.29 change — the old shared-stack design coupled every
-        # MCP's cleanup to every other MCP's startup, which is exactly
-        # how one dead symlink (``workspace-mcp`` on mixout-agent)
-        # hung the entire agent.
+        # supervisor task (parallel arrays, ``_agno_toolkits[i]`` is owned
+        # by ``_toolkit_supervisors[i]``). The supervisor holds the
+        # toolkit's ``AsyncExitStack`` for the toolkit's entire lifetime,
+        # which guarantees ``__aenter__`` and ``__aexit__`` run on the
+        # SAME task — the only way to satisfy the anyio cancel-scope
+        # invariant that the MCP stdio client relies on. The previous
+        # per-toolkit ``AsyncExitStack`` design stored the stack itself
+        # and called ``aclose()`` from ``close_all``'s caller task, which
+        # was fine most of the time but blew up with "Attempted to exit
+        # cancel scope in a different task than it was entered in" every
+        # time shutdown happened on a different task than connect (every
+        # /restart, essentially).
         self._agno_toolkits: list[Any] = []
-        self._toolkit_stacks: list[AsyncExitStack] = []
+        self._toolkit_supervisors: list[_ToolkitSupervisor] = []
         self._tool_counts: dict[str, int] = {name: 0 for name in (s.name for s in specs)}
         self._connected = False
         self._lock = asyncio.Lock()
@@ -399,7 +433,7 @@ class MCPPool:
         Order: build new specs → swap lists → connect new → close old.
         We swap the backing lists in place (``self._agno_toolkits[:] = ...``)
         so Agno providers that already captured ``pool.agno_toolkits`` by
-        reference see the new tools on their next turn. Old stacks are
+        reference see the new tools on their next turn. Old supervisors are
         torn down AFTER the new pool is live, so there is no window where
         a concurrent turn sees zero tools.
 
@@ -411,14 +445,14 @@ class MCPPool:
         new_specs = await self.rebuild_specs()
 
         async with self._lock:
-            old_stacks = list(self._toolkit_stacks)
+            old_supervisors = list(self._toolkit_supervisors)
             old_agno = list(self._agno_toolkits)
             old_in_proc_agno = list(self._in_process_agno_toolkits)
             # Clear in-place so existing references (pool.agno_toolkits returned
             # by value is list[Any] built on each call, so that's fine; but
             # provider code may also have stashed ``pool``, and after reload
             # calls pool.agno_toolkits again it must see the new list.)
-            self._toolkit_stacks.clear()
+            self._toolkit_supervisors.clear()
             self._agno_toolkits.clear()
             self._in_process_agno_toolkits.clear()
             self._in_process_sdk_servers.clear()
@@ -429,14 +463,11 @@ class MCPPool:
         # connect_all has its own lock; new subprocesses come up first.
         await self.connect_all()
 
-        # Tear down the old stacks. Best-effort — a broken shutdown on the
-        # old set must not prevent new tools from being used. Close in
+        # Tear down the old supervisors. Best-effort — a broken shutdown on
+        # the old set must not prevent new tools from being used. Close in
         # reverse order to mirror close_all's contract.
-        for stack in reversed(old_stacks):
-            try:
-                await stack.aclose()
-            except BaseException as e:  # noqa: BLE001 — best-effort cleanup
-                logger.debug("reload: best-effort close of old toolkit: %s", e)
+        for sup in reversed(old_supervisors):
+            await self._shutdown_supervisor(sup)
         elog(
             "mcp.pool.reload",
             new_servers=len(new_specs),
@@ -507,98 +538,204 @@ class MCPPool:
             self._connected = True
 
     async def close_all(self) -> None:
-        """Close every connected toolkit. Per-toolkit stacks are closed
+        """Close every connected toolkit. Per-toolkit supervisors are closed
         independently so one failing teardown doesn't skip the rest.
 
-        Each toolkit was entered inside its own ``AsyncExitStack`` (see
-        ``_safe_enter``), which means ``stack.aclose()`` runs the
-        toolkit's own ``__aexit__`` — the path Agno + anyio expect for
-        proper cancel-scope teardown. We still wrap each close in an
-        outer ``except BaseException`` so a single broken subprocess
-        can't pin the shutdown.
+        Each toolkit is owned by a supervisor task that ran
+        ``async with stack: await stack.enter_async_context(toolkit); await
+        stop_event.wait()`` from the start. We signal its ``stop_event`` and
+        await the task — the ``AsyncExitStack.__aexit__`` runs inside the
+        supervisor, which is the same task that called ``__aenter__``. That
+        satisfies the anyio cancel-scope invariant that the MCP stdio
+        client relies on (see the v0.6.x fix commit message).
         """
         async with self._lock:
             if not self._connected:
                 return
-            stacks = list(self._toolkit_stacks)
-            self._toolkit_stacks.clear()
+            supervisors = list(self._toolkit_supervisors)
+            self._toolkit_supervisors.clear()
             self._agno_toolkits.clear()
             self._in_process_sdk_servers.clear()
             self._in_process_agno_toolkits.clear()
             self._connected = False
         # Close in reverse registration order so toolkits that share
         # resources tear down the way AsyncExitStack would have.
-        for stack in reversed(stacks):
+        for sup in reversed(supervisors):
+            await self._shutdown_supervisor(sup)
+
+    async def _shutdown_supervisor(self, sup: _ToolkitSupervisor) -> None:
+        """Tell one supervisor to exit its ``async with`` block and wait.
+
+        Bounded by ``_MCP_CLOSE_TIMEOUT`` — a stuck subprocess that ignores
+        SIGTERM cannot pin the overall shutdown. On timeout we cancel the
+        task and swallow any BaseException that follows (anyio cleanup on a
+        cancelled task can still raise during shutdown).
+        """
+        sup.stop_event.set()
+        try:
+            await asyncio.wait_for(sup.task, timeout=_MCP_CLOSE_TIMEOUT)
+        except asyncio.TimeoutError:
+            elog(
+                "mcp.close_timeout",
+                level="warning",
+                name=sup.name,
+                seconds=_MCP_CLOSE_TIMEOUT,
+            )
+            sup.task.cancel()
             try:
-                await stack.aclose()
-            except BaseException as e:  # noqa: BLE001 — best-effort cleanup
-                logger.debug("Best-effort MCP pool close: %s", e)
+                await sup.task
+            except BaseException:  # noqa: BLE001 — best-effort cleanup
+                pass
+        except BaseException as e:  # noqa: BLE001 — best-effort cleanup
+            logger.debug("Best-effort MCP supervisor close (%s): %s", sup.name, e)
 
     async def _safe_enter(self, toolkit: Any, spec: _ServerSpec) -> Any | None:
-        """Enter one toolkit's own ``AsyncExitStack`` with a handshake
-        timeout and BaseException isolation. Returns the toolkit on
-        success, or ``None`` after rolling back the per-toolkit stack on
-        timeout/failure.
+        """Spawn a supervisor task that owns this toolkit end-to-end, then
+        wait up to ``_MCP_CONNECT_TIMEOUT`` for it to finish the handshake.
+
+        Success path: supervisor enters ``stack`` and ``stack.enter_async_context(
+        toolkit)``, sets ``ready_event``, and blocks on ``stop_event`` until
+        shutdown. We register the supervisor in ``_toolkit_supervisors`` and
+        return the toolkit.
+
+        Failure path: exception / timeout inside the handshake exits the
+        supervisor with ``ready_event`` still carrying the error info. We
+        log, await the supervisor to let the stack unwind cleanly, and
+        return ``None``.
 
         Three distinct failure modes are handled:
 
         1. ``asyncio.TimeoutError`` — handshake exceeded
-           ``_MCP_CONNECT_TIMEOUT``. Roll back the per-toolkit stack so
-           any half-initialised subprocess is cleaned up, then return
-           ``None``.
+           ``_MCP_CONNECT_TIMEOUT``. Signal the supervisor to stop, await
+           it, return ``None``.
         2. ``asyncio.CancelledError`` / ``BaseExceptionGroup`` from
            inside Agno's init — the mixout post-disk-resize regression.
-           Same rollback, swallowed *unless* the outer task was
-           externally cancelled (shutdown must propagate).
-        3. Regular ``Exception`` — logged + rolled back.
+           Caught inside the supervisor and reported via ``ready_event``.
+        3. Regular ``Exception`` — logged + return ``None``.
 
-        ``asyncio.timeout`` (not ``asyncio.wait_for``) is used because
-        ``wait_for`` would wrap the coroutine in a sub-task. The anyio
-        cancel scope opened inside ``MCPTools.__aenter__`` would then
-        belong to that sub-task, and when we later ``aclose()`` the
-        stack from the outer task, anyio refuses to exit a scope that
-        isn't the current task's current scope — that broken state
-        bleeds into unrelated awaits later in the same event loop
-        (regression observed: ``aiosqlite.connect`` in the cron test
-        immediately cancelling).
+        Why the supervisor task at all: the MCP stdio client in
+        ``mcp/client/stdio/__init__.py`` opens an anyio cancel scope in
+        ``__aenter__`` and closes it in ``__aexit__``. anyio enforces that
+        both ends happen on the same task; otherwise it raises "Attempted
+        to exit cancel scope in a different task than it was entered in".
+        Before this refactor, ``__aenter__`` ran on the ``connect_all``
+        caller task but ``__aexit__`` ran on the shutdown caller task,
+        which reliably tripped that invariant every restart (see
+        events.jsonl from lyra-agent 2026-04-20).
         """
-        task = asyncio.current_task()
+        task_out = asyncio.current_task()
         cancelling = (
-            getattr(task, "cancelling", None) if task is not None else None
+            getattr(task_out, "cancelling", None) if task_out is not None else None
         )
         cancel_before = cancelling() if callable(cancelling) else 0
 
-        stack = AsyncExitStack()
-        await stack.__aenter__()
+        ready_event = asyncio.Event()
+        stop_event = asyncio.Event()
+        # Holds the exception raised during handshake, if any.
+        handshake_error: dict[str, BaseException | None] = {"err": None}
 
-        async def _rollback() -> None:
+        async def _supervisor() -> None:
+            # Open the stack INSIDE this task so __aenter__ and __aexit__
+            # are both on the same task — anyio's cancel-scope invariant.
             try:
-                await stack.aclose()
+                async with AsyncExitStack() as stack:
+                    try:
+                        async with asyncio.timeout(_MCP_CONNECT_TIMEOUT):
+                            await stack.enter_async_context(toolkit)
+                    except BaseException as e:
+                        handshake_error["err"] = e
+                        ready_event.set()
+                        # Exiting the AsyncExitStack here runs any partial
+                        # __aexit__ on the same task — correct.
+                        return
+                    # Handshake succeeded. Signal the pool and hold the
+                    # stack open until shutdown asks us to close.
+                    ready_event.set()
+                    try:
+                        await stop_event.wait()
+                    except asyncio.CancelledError:
+                        # close_all upgrades to cancel when the graceful
+                        # wait_for times out. Let the stack unwind on this
+                        # same task — do NOT re-raise until after __aexit__.
+                        pass
             except BaseException:  # noqa: BLE001 — best-effort cleanup
+                # Any cleanup exception is logged by the caller; keep the
+                # task complete so close_all's await returns.
                 pass
 
+        sup_task = asyncio.create_task(
+            _supervisor(), name=f"mcp-supervisor:{spec.name}"
+        )
+
+        async def _wait_handshake() -> None:
+            await ready_event.wait()
+
         try:
-            async with asyncio.timeout(_MCP_CONNECT_TIMEOUT):
-                await stack.enter_async_context(toolkit)
+            # +1 grace second so ``asyncio.timeout`` inside the supervisor
+            # fires FIRST and records the error, rather than this outer
+            # wait_for tripping on the same boundary and synthesising a
+            # TimeoutError of its own.
+            await asyncio.wait_for(
+                _wait_handshake(), timeout=_MCP_CONNECT_TIMEOUT + 1
+            )
         except asyncio.TimeoutError:
+            # Supervisor didn't report ready within our outer bound — stop
+            # it, drain it, and report as a timeout. This path is defensive:
+            # the inner ``asyncio.timeout(_MCP_CONNECT_TIMEOUT)`` should
+            # already have fired and set ready_event with an error.
             elog("mcp.timeout", level="warning", name=spec.name, seconds=_MCP_CONNECT_TIMEOUT)
-            await _rollback()
+            stop_event.set()
+            try:
+                await asyncio.wait_for(sup_task, timeout=_MCP_CLOSE_TIMEOUT)
+            except asyncio.TimeoutError:
+                sup_task.cancel()
+                try:
+                    await sup_task
+                except BaseException:  # noqa: BLE001
+                    pass
             return None
         except BaseException as e:
-            await _rollback()
-            # If the outer task itself was externally cancelled (its
-            # ``cancelling()`` counter rose during our await), re-raise
-            # so shutdown propagates. Otherwise treat this as a per-MCP
-            # failure (anyio cancel-scope, synthetic CancelledError,
-            # etc.) and swallow — that's the mixout regression we're
-            # fixing.
+            # The outer task itself was cancelled while we were waiting.
+            # Tell the supervisor to exit, then re-raise so shutdown
+            # propagates like it used to.
+            stop_event.set()
+            try:
+                await asyncio.wait_for(sup_task, timeout=_MCP_CLOSE_TIMEOUT)
+            except BaseException:  # noqa: BLE001
+                sup_task.cancel()
+                try:
+                    await sup_task
+                except BaseException:
+                    pass
             if callable(cancelling) and cancelling() > cancel_before:
                 raise
             elog("mcp.error", level="warning", name=spec.name, error=str(e), phase="connect")
             return None
 
-        # Success — hand the stack to the pool so close_all can unwind it.
-        self._toolkit_stacks.append(stack)
+        err = handshake_error["err"]
+        if err is not None:
+            # Handshake failed inside the supervisor. The supervisor has
+            # already returned (its async-with block exited on the same
+            # task it entered); we just need to await the task to
+            # completion and surface the error.
+            try:
+                await sup_task
+            except BaseException:  # noqa: BLE001
+                pass
+            if isinstance(err, asyncio.TimeoutError):
+                elog("mcp.timeout", level="warning", name=spec.name, seconds=_MCP_CONNECT_TIMEOUT)
+            else:
+                # If the outer task was externally cancelled (not us —
+                # something above us asked for shutdown), propagate.
+                if callable(cancelling) and cancelling() > cancel_before:
+                    raise err
+                elog("mcp.error", level="warning", name=spec.name, error=str(err), phase="connect")
+            return None
+
+        # Success — register the supervisor so close_all can unwind it.
+        self._toolkit_supervisors.append(
+            _ToolkitSupervisor(name=spec.name, task=sup_task, stop_event=stop_event)
+        )
         return toolkit
 
     async def _build_and_enter_toolkit(self, spec: _ServerSpec) -> Any | None:
