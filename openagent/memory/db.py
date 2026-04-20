@@ -189,6 +189,67 @@ CREATE TABLE IF NOT EXISTS session_bindings (
     runtime_id TEXT,
     bound_at REAL NOT NULL
 );
+
+-- Workflow graphs (n8n-style multi-block pipelines). The whole node/
+-- edge graph lives inside ``graph_json`` so the AI can round-trip it
+-- via a single tool call and React Flow can consume the same shape on
+-- the UI. ``trigger_kind`` + ``cron_expression`` + ``next_run_at`` let
+-- the existing Scheduler loop pick up scheduled workflows from the
+-- same tick it already uses for ``scheduled_tasks``.
+CREATE TABLE IF NOT EXISTS workflow_tasks (
+    id              TEXT PRIMARY KEY,
+    name            TEXT NOT NULL UNIQUE,
+    description     TEXT,
+    graph_json      TEXT NOT NULL DEFAULT '{"version":1,"nodes":[],"edges":[],"variables":{}}',
+    trigger_kind    TEXT NOT NULL DEFAULT 'manual'
+                    CHECK (trigger_kind IN ('manual','schedule','ai','hybrid')),
+    cron_expression TEXT,
+    enabled         INTEGER NOT NULL DEFAULT 1,
+    last_run_at     REAL,
+    next_run_at     REAL,
+    created_at      REAL NOT NULL,
+    updated_at      REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_wf_enabled  ON workflow_tasks(enabled);
+CREATE INDEX IF NOT EXISTS idx_wf_next_run ON workflow_tasks(next_run_at);
+CREATE INDEX IF NOT EXISTS idx_wf_trigger  ON workflow_tasks(trigger_kind);
+
+-- Per-execution history + append-only trace. ``trace_json`` is a
+-- JSON array of per-block entries:
+--   [{node_id, type, started_at, finished_at, status, input, output, error}]
+-- Reads: RunHistoryDrawer in the UI, ``get_workflow_run`` MCP tool.
+CREATE TABLE IF NOT EXISTS workflow_runs (
+    id              TEXT PRIMARY KEY,
+    workflow_id     TEXT NOT NULL REFERENCES workflow_tasks(id) ON DELETE CASCADE,
+    trigger         TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    started_at      REAL NOT NULL,
+    finished_at     REAL,
+    inputs_json     TEXT NOT NULL DEFAULT '{}',
+    outputs_json    TEXT NOT NULL DEFAULT '{}',
+    error           TEXT,
+    trace_json      TEXT NOT NULL DEFAULT '[]'
+);
+CREATE INDEX IF NOT EXISTS idx_wfruns_workflow ON workflow_runs(workflow_id);
+CREATE INDEX IF NOT EXISTS idx_wfruns_started  ON workflow_runs(started_at);
+CREATE INDEX IF NOT EXISTS idx_wfruns_status   ON workflow_runs(status);
+
+-- Cross-process execution queue. The ``workflow-manager`` MCP
+-- subprocess cannot touch the live Agent, so ``run_workflow`` drops a
+-- row here; the main-process ``Scheduler._check_and_run`` claims it
+-- atomically (``claimed_at`` flipped from NULL to now) and drives the
+-- ``WorkflowExecutor``. Mirrors the mcp-manager / scheduler pattern:
+-- DB-backed hand-off, no in-process IPC.
+CREATE TABLE IF NOT EXISTS workflow_run_requests (
+    id            TEXT PRIMARY KEY,
+    workflow_id   TEXT NOT NULL,
+    inputs_json   TEXT NOT NULL DEFAULT '{}',
+    trigger       TEXT NOT NULL,
+    claimed_at    REAL,
+    run_id        TEXT,
+    created_at    REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_wfreq_unclaimed ON workflow_run_requests(claimed_at);
 """
 
 
@@ -311,6 +372,451 @@ class MemoryDB:
         )
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
+
+    # ── Workflow Tasks ──
+
+    @staticmethod
+    def _row_to_workflow(row: aiosqlite.Row) -> dict:
+        """Hydrate a workflow row. ``graph_json`` is parsed into a
+        ``{"version", "nodes", "edges", "variables"}`` dict; ``enabled``
+        becomes a real bool.
+        """
+        d = dict(row)
+        raw = d.pop("graph_json", None) or '{"version":1,"nodes":[],"edges":[],"variables":{}}'
+        try:
+            d["graph"] = json.loads(raw)
+        except (TypeError, ValueError):
+            d["graph"] = {"version": 1, "nodes": [], "edges": [], "variables": {}}
+        d["enabled"] = bool(d.get("enabled"))
+        return d
+
+    async def list_workflows(
+        self,
+        *,
+        enabled_only: bool = False,
+        trigger_kind: str | None = None,
+    ) -> list[dict]:
+        conn = await self._ensure_connected()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if enabled_only:
+            clauses.append("enabled = 1")
+        if trigger_kind is not None:
+            clauses.append("trigger_kind = ?")
+            params.append(trigger_kind)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        cursor = await conn.execute(
+            f"SELECT * FROM workflow_tasks {where} ORDER BY updated_at DESC",
+            params,
+        )
+        rows = await cursor.fetchall()
+        return [self._row_to_workflow(r) for r in rows]
+
+    async def get_workflow(self, id_or_name: str) -> dict | None:
+        """Look up a workflow by full id, 8-char id prefix, or unique name."""
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            "SELECT * FROM workflow_tasks WHERE id = ? OR name = ?",
+            (id_or_name, id_or_name),
+        )
+        row = await cursor.fetchone()
+        if row is None and len(id_or_name) >= 4:
+            cursor = await conn.execute(
+                "SELECT * FROM workflow_tasks WHERE id LIKE ? LIMIT 2",
+                (f"{id_or_name}%",),
+            )
+            matches = await cursor.fetchall()
+            if len(matches) == 1:
+                row = matches[0]
+        return self._row_to_workflow(row) if row else None
+
+    async def add_workflow(
+        self,
+        *,
+        name: str,
+        description: str | None = None,
+        graph: dict | None = None,
+        trigger_kind: str = "manual",
+        cron_expression: str | None = None,
+        next_run_at: float | None = None,
+        enabled: bool = True,
+    ) -> str:
+        if not name or not name.strip():
+            raise ValueError("name is required")
+        if trigger_kind not in ("manual", "schedule", "ai", "hybrid"):
+            raise ValueError(
+                f"invalid trigger_kind {trigger_kind!r}; expected "
+                "'manual' | 'schedule' | 'ai' | 'hybrid'"
+            )
+        graph_payload = graph or {"version": 1, "nodes": [], "edges": [], "variables": {}}
+        conn = await self._ensure_connected()
+        workflow_id = str(uuid.uuid4())
+        now = time.time()
+        await conn.execute(
+            "INSERT INTO workflow_tasks "
+            "(id, name, description, graph_json, trigger_kind, cron_expression, "
+            " enabled, next_run_at, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                workflow_id,
+                name.strip(),
+                description,
+                json.dumps(graph_payload),
+                trigger_kind,
+                cron_expression,
+                1 if enabled else 0,
+                next_run_at,
+                now,
+                now,
+            ),
+        )
+        await conn.commit()
+        return workflow_id
+
+    async def update_workflow(self, workflow_id: str, **kwargs: Any) -> None:
+        """Partial update. ``graph`` (dict) is serialized to ``graph_json``
+        on the way in."""
+        allowed_direct = {
+            "name",
+            "description",
+            "trigger_kind",
+            "cron_expression",
+            "enabled",
+            "last_run_at",
+            "next_run_at",
+        }
+        updates: dict[str, Any] = {}
+        for k, v in kwargs.items():
+            if k == "graph" and v is not None:
+                updates["graph_json"] = json.dumps(v)
+            elif k in allowed_direct:
+                updates[k] = (1 if v else 0) if k == "enabled" and isinstance(v, bool) else v
+        if not updates:
+            return
+        if "trigger_kind" in updates and updates["trigger_kind"] not in (
+            "manual", "schedule", "ai", "hybrid",
+        ):
+            raise ValueError(f"invalid trigger_kind {updates['trigger_kind']!r}")
+        updates["updated_at"] = time.time()
+        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        conn = await self._ensure_connected()
+        await conn.execute(
+            f"UPDATE workflow_tasks SET {set_clause} WHERE id = ?",
+            list(updates.values()) + [workflow_id],
+        )
+        await conn.commit()
+
+    async def delete_workflow(self, workflow_id: str) -> None:
+        conn = await self._ensure_connected()
+        await conn.execute("DELETE FROM workflow_tasks WHERE id = ?", (workflow_id,))
+        await conn.commit()
+
+    async def get_due_workflow_tasks(self, now: float) -> list[dict]:
+        """Enabled workflows with a schedule trigger whose next_run_at is <= now."""
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            "SELECT * FROM workflow_tasks "
+            "WHERE enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ? "
+            "AND trigger_kind IN ('schedule','hybrid') "
+            "ORDER BY next_run_at ASC",
+            (now,),
+        )
+        rows = await cursor.fetchall()
+        return [self._row_to_workflow(r) for r in rows]
+
+    async def list_scheduled_workflows(self) -> list[dict]:
+        """All workflows with a cron schedule, enabled or not. Used by
+        ``Scheduler._recalculate_next_runs`` at boot."""
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            "SELECT * FROM workflow_tasks "
+            "WHERE cron_expression IS NOT NULL "
+            "AND trigger_kind IN ('schedule','hybrid')"
+        )
+        rows = await cursor.fetchall()
+        return [self._row_to_workflow(r) for r in rows]
+
+    # ── Workflow Runs (execution history) ──
+
+    @staticmethod
+    def _row_to_workflow_run(row: aiosqlite.Row) -> dict:
+        d = dict(row)
+        for col in ("inputs_json", "outputs_json", "trace_json"):
+            raw = d.pop(col, None) or ("[]" if col == "trace_json" else "{}")
+            key = col[:-5]
+            try:
+                d[key] = json.loads(raw)
+            except (TypeError, ValueError):
+                d[key] = [] if key == "trace" else {}
+        return d
+
+    async def add_workflow_run(
+        self,
+        *,
+        workflow_id: str,
+        trigger: str,
+        inputs: dict | None = None,
+        run_id: str | None = None,
+    ) -> str:
+        conn = await self._ensure_connected()
+        rid = run_id or str(uuid.uuid4())
+        await conn.execute(
+            "INSERT INTO workflow_runs "
+            "(id, workflow_id, trigger, status, started_at, inputs_json) "
+            "VALUES (?, ?, ?, 'running', ?, ?)",
+            (rid, workflow_id, trigger, time.time(), json.dumps(inputs or {})),
+        )
+        await conn.commit()
+        return rid
+
+    async def update_workflow_run(self, run_id: str, **kwargs: Any) -> None:
+        """Partial update. ``outputs`` / ``trace`` (Python objects) are
+        serialized to their ``_json`` columns."""
+        allowed_direct = {"status", "finished_at", "error"}
+        updates: dict[str, Any] = {}
+        for k, v in kwargs.items():
+            if k == "outputs" and v is not None:
+                updates["outputs_json"] = json.dumps(v)
+            elif k == "trace" and v is not None:
+                updates["trace_json"] = json.dumps(v)
+            elif k in allowed_direct:
+                updates[k] = v
+        if not updates:
+            return
+        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        conn = await self._ensure_connected()
+        await conn.execute(
+            f"UPDATE workflow_runs SET {set_clause} WHERE id = ?",
+            list(updates.values()) + [run_id],
+        )
+        await conn.commit()
+
+    async def get_workflow_run(self, run_id: str) -> dict | None:
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            "SELECT * FROM workflow_runs WHERE id = ?", (run_id,),
+        )
+        row = await cursor.fetchone()
+        return self._row_to_workflow_run(row) if row else None
+
+    async def list_workflow_runs(
+        self,
+        workflow_id: str,
+        *,
+        limit: int = 20,
+        status: str | None = None,
+    ) -> list[dict]:
+        conn = await self._ensure_connected()
+        clauses = ["workflow_id = ?"]
+        params: list[Any] = [workflow_id]
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        params.append(int(limit))
+        cursor = await conn.execute(
+            f"SELECT * FROM workflow_runs WHERE {' AND '.join(clauses)} "
+            "ORDER BY started_at DESC LIMIT ?",
+            params,
+        )
+        rows = await cursor.fetchall()
+        return [self._row_to_workflow_run(r) for r in rows]
+
+    async def prune_workflow_runs(
+        self,
+        workflow_id: str,
+        *,
+        keep_last: int = 50,
+    ) -> int:
+        """Delete all runs older than the most recent ``keep_last`` for a
+        given workflow. Returns the number of rows removed."""
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            "DELETE FROM workflow_runs WHERE id IN ("
+            "  SELECT id FROM workflow_runs WHERE workflow_id = ? "
+            "  ORDER BY started_at DESC LIMIT -1 OFFSET ?"
+            ")",
+            (workflow_id, int(keep_last)),
+        )
+        await conn.commit()
+        return cursor.rowcount or 0
+
+    async def workflow_run_stats(
+        self,
+        workflow_id: str,
+        *,
+        sparkline_count: int = 10,
+    ) -> dict[str, Any]:
+        """Aggregate run statistics for a workflow.
+
+        Powers the workflow editor's RunHistoryDrawer header + the
+        list-screen row badges. Returns:
+          - total_runs, success_count, failed_count, cancelled_count
+          - running_count (for the "something is currently in flight" pill)
+          - success_rate (float 0–1, 0 when no runs yet)
+          - avg_duration_s (mean of finished_at - started_at for
+            success+failed runs; None when no completed runs exist)
+          - last: [{id, status, started_at, finished_at, duration_s}]
+            newest-first, capped at ``sparkline_count``
+        """
+        conn = await self._ensure_connected()
+        agg_cursor = await conn.execute(
+            """
+            SELECT status, COUNT(*) AS n,
+                   AVG(
+                     CASE
+                       WHEN finished_at IS NOT NULL THEN finished_at - started_at
+                       ELSE NULL
+                     END
+                   ) AS avg_dur
+            FROM workflow_runs
+            WHERE workflow_id = ?
+            GROUP BY status
+            """,
+            (workflow_id,),
+        )
+        agg_rows = await agg_cursor.fetchall()
+        stats = {
+            "total_runs": 0,
+            "success_count": 0,
+            "failed_count": 0,
+            "cancelled_count": 0,
+            "running_count": 0,
+            "success_rate": 0.0,
+            "avg_duration_s": None,
+        }
+        weighted_sum = 0.0
+        weighted_n = 0
+        for row in agg_rows:
+            r = dict(row)
+            n = int(r.get("n") or 0)
+            stats["total_runs"] += n
+            key = f"{r['status']}_count"
+            if key in stats:
+                stats[key] = n
+            avg = r.get("avg_dur")
+            if avg is not None and r["status"] in ("success", "failed"):
+                weighted_sum += float(avg) * n
+                weighted_n += n
+        terminal = stats["success_count"] + stats["failed_count"]
+        if terminal:
+            stats["success_rate"] = stats["success_count"] / terminal
+        if weighted_n:
+            stats["avg_duration_s"] = weighted_sum / weighted_n
+
+        last_cursor = await conn.execute(
+            """
+            SELECT id, status, started_at, finished_at
+            FROM workflow_runs
+            WHERE workflow_id = ?
+            ORDER BY started_at DESC
+            LIMIT ?
+            """,
+            (workflow_id, int(sparkline_count)),
+        )
+        last_rows = await last_cursor.fetchall()
+        last = []
+        for row in last_rows:
+            r = dict(row)
+            duration = (
+                r["finished_at"] - r["started_at"]
+                if r.get("finished_at") and r.get("started_at") is not None
+                else None
+            )
+            r["duration_s"] = duration
+            last.append(r)
+        stats["last"] = last
+        return stats
+
+    # ── Workflow run request queue (MCP ↔ main-process hand-off) ──
+
+    async def enqueue_workflow_run_request(
+        self,
+        *,
+        workflow_id: str,
+        trigger: str,
+        inputs: dict | None = None,
+    ) -> str:
+        conn = await self._ensure_connected()
+        req_id = str(uuid.uuid4())
+        await conn.execute(
+            "INSERT INTO workflow_run_requests "
+            "(id, workflow_id, inputs_json, trigger, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (req_id, workflow_id, json.dumps(inputs or {}), trigger, time.time()),
+        )
+        await conn.commit()
+        return req_id
+
+    async def claim_pending_workflow_requests(self, *, limit: int = 5) -> list[dict]:
+        """Atomically claim up to ``limit`` unclaimed requests. Each
+        returned row has ``claimed_at`` set so concurrent scheduler
+        ticks (or stray retries) won't run the same request twice."""
+        conn = await self._ensure_connected()
+        now = time.time()
+        # Select unclaimed ids first, then UPDATE in the same transaction
+        # (SQLite doesn't support ``UPDATE ... RETURNING`` on all versions
+        # we target). Wrap both statements so a concurrent claimer can't
+        # race past the SELECT.
+        await conn.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = await conn.execute(
+                "SELECT * FROM workflow_run_requests "
+                "WHERE claimed_at IS NULL "
+                "ORDER BY created_at ASC LIMIT ?",
+                (int(limit),),
+            )
+            rows = await cursor.fetchall()
+            if not rows:
+                await conn.execute("COMMIT")
+                return []
+            ids = [row["id"] for row in rows]
+            placeholders = ",".join("?" for _ in ids)
+            await conn.execute(
+                f"UPDATE workflow_run_requests SET claimed_at = ? "
+                f"WHERE id IN ({placeholders})",
+                [now, *ids],
+            )
+            await conn.execute("COMMIT")
+        except Exception:
+            await conn.execute("ROLLBACK")
+            raise
+        claimed = []
+        for row in rows:
+            d = dict(row)
+            raw = d.pop("inputs_json", "{}") or "{}"
+            try:
+                d["inputs"] = json.loads(raw)
+            except (TypeError, ValueError):
+                d["inputs"] = {}
+            d["claimed_at"] = now
+            claimed.append(d)
+        return claimed
+
+    async def set_workflow_request_run_id(self, request_id: str, run_id: str) -> None:
+        """Link a claimed request back to the ``workflow_runs`` row it
+        spawned so the MCP tool's ``wait=True`` poller can find the run."""
+        conn = await self._ensure_connected()
+        await conn.execute(
+            "UPDATE workflow_run_requests SET run_id = ? WHERE id = ?",
+            (run_id, request_id),
+        )
+        await conn.commit()
+
+    async def get_workflow_run_request(self, request_id: str) -> dict | None:
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            "SELECT * FROM workflow_run_requests WHERE id = ?", (request_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        d = dict(row)
+        raw = d.pop("inputs_json", "{}") or "{}"
+        try:
+            d["inputs"] = json.loads(raw)
+        except (TypeError, ValueError):
+            d["inputs"] = {}
+        return d
 
     # ── Usage Tracking ──
 

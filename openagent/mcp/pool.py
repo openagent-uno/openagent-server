@@ -369,6 +369,11 @@ class MCPPool:
         # /restart, essentially).
         self._agno_toolkits: list[Any] = []
         self._toolkit_supervisors: list[_ToolkitSupervisor] = []
+        # Name-indexed view of every connected toolkit (subprocess + in-process).
+        # Lets callers resolve ``toolkit_by_name("shell")`` without walking the
+        # parallel arrays — used by the workflow executor to dispatch
+        # ``mcp-tool`` blocks to the right toolkit.
+        self._toolkit_by_name: dict[str, Any] = {}
         self._tool_counts: dict[str, int] = {name: 0 for name in (s.name for s in specs)}
         self._connected = False
         self._lock = asyncio.Lock()
@@ -456,6 +461,7 @@ class MCPPool:
             self._agno_toolkits.clear()
             self._in_process_agno_toolkits.clear()
             self._in_process_sdk_servers.clear()
+            self._toolkit_by_name.clear()
             self.specs = new_specs
             self._tool_counts = {s.name: 0 for s in new_specs}
             self._connected = False
@@ -497,6 +503,7 @@ class MCPPool:
                 toolkit = await self._build_and_enter_toolkit(spec)
                 if toolkit is not None:
                     self._agno_toolkits.append(toolkit)
+                    self._toolkit_by_name[spec.name] = toolkit
                     # Agno MCPTools.functions is the dict of registered tools
                     # (populated during MCPTools.initialize()).
                     count = len(getattr(toolkit, "functions", {}) or {})
@@ -531,6 +538,7 @@ class MCPPool:
                     continue
                 self._in_process_sdk_servers[spec.name] = sdk_cfg
                 self._in_process_agno_toolkits.append(agno_tk)
+                self._toolkit_by_name[spec.name] = agno_tk
                 count = 6  # six shell tools
                 self._tool_counts[spec.name] = count
                 elog("mcp.connect", name=spec.name, tools=count, kind="in_process")
@@ -557,6 +565,7 @@ class MCPPool:
             self._agno_toolkits.clear()
             self._in_process_sdk_servers.clear()
             self._in_process_agno_toolkits.clear()
+            self._toolkit_by_name.clear()
             self._connected = False
         # Close in reverse registration order so toolkits that share
         # resources tear down the way AsyncExitStack would have.
@@ -792,6 +801,38 @@ class MCPPool:
         in-process Toolkit objects satisfy the same Agno interface.
         """
         return list(self._agno_toolkits) + list(self._in_process_agno_toolkits)
+
+    def toolkit_by_name(self, mcp_name: str) -> Any | None:
+        """Resolve a connected toolkit by MCP name, or ``None`` when
+        the MCP isn't loaded. Covers both subprocess and in-process
+        toolkits — used by the workflow executor to dispatch
+        ``mcp-tool`` blocks.
+        """
+        return self._toolkit_by_name.get(mcp_name)
+
+    def list_mcp_tools(self) -> list[dict[str, Any]]:
+        """Shape-for-UI list of every loaded MCP and the tool names it
+        exposes. Returns ``[{mcp_name, tools: [{name, description,
+        parameters_schema}]}]`` — consumed by the workflow editor's
+        tool picker and the ``GET /api/mcp-tools`` endpoint.
+        """
+        out: list[dict[str, Any]] = []
+        for name, toolkit in self._toolkit_by_name.items():
+            tools_meta: list[dict[str, Any]] = []
+            functions = getattr(toolkit, "functions", {}) or {}
+            for tool_name, fn in functions.items():
+                # Agno's MCPTools wraps the remote tool; it exposes
+                # ``description`` and ``parameters`` on the function
+                # object after ``initialize()``. Fall back to empty
+                # strings/dicts rather than the inspect machinery so
+                # we don't stringify opaque pydantic models.
+                tools_meta.append({
+                    "name": tool_name,
+                    "description": getattr(fn, "description", "") or "",
+                    "parameters_schema": getattr(fn, "parameters", None) or {},
+                })
+            out.append({"mcp_name": name, "tools": tools_meta})
+        return out
 
     def claude_sdk_servers(self) -> dict[str, dict[str, Any]]:
         base = {

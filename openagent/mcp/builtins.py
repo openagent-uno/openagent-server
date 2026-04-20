@@ -197,6 +197,11 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
         "command": ["python", "-m", "openagent.mcp.servers.model_manager.server"],
         "python": True,
     },
+    "workflow-manager": {
+        "dir": "workflow_manager",
+        "command": ["python", "-m", "openagent.mcp.servers.workflow_manager.server"],
+        "python": True,
+    },
 }
 
 DEFAULT_MCPS: list[dict[str, Any]] = [
@@ -211,6 +216,7 @@ DEFAULT_MCPS: list[dict[str, Any]] = [
     {"builtin": "scheduler", "_default": True},
     {"builtin": "mcp-manager", "_default": True},
     {"builtin": "model-manager", "_default": True},
+    {"builtin": "workflow-manager", "_default": True},
 ]
 
 
@@ -426,12 +432,15 @@ def resolve_default_entry(entry: dict[str, Any], db_path: str | None = None) -> 
             return None
 
         extra_env: dict[str, str] = dict(entry.get("env") or {})
-        # The scheduler, mcp-manager, and model-manager all speak to the
-        # shared OpenAgent SQLite DB. Inject OPENAGENT_DB_PATH so they
-        # land on the same file as the main process (otherwise they'd
-        # fall back to ``./openagent.db`` in each subprocess CWD and
-        # every write would go to a different file).
-        if entry["builtin"] in ("scheduler", "mcp-manager", "model-manager"):
+        # The scheduler, mcp-manager, model-manager and workflow-manager
+        # all speak to the shared OpenAgent SQLite DB. Inject
+        # OPENAGENT_DB_PATH so they land on the same file as the main
+        # process (otherwise they'd fall back to ``./openagent.db`` in
+        # each subprocess CWD and every write would go to a different
+        # file).
+        if entry["builtin"] in (
+            "scheduler", "mcp-manager", "model-manager", "workflow-manager",
+        ):
             if db_path:
                 extra_env["OPENAGENT_DB_PATH"] = os.path.abspath(db_path)
             else:

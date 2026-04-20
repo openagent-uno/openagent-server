@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 from openagent.gateway import protocol as P
 from openagent.gateway.commands import command_help_text
 from openagent.gateway.sessions import SessionManager
-from openagent.gateway.api import vault, config, health, logs, control, usage, providers, models, scheduled_tasks, mcps, marketplace, sessions as sessions_api
+from openagent.gateway.api import vault, config, health, logs, control, usage, providers, models, scheduled_tasks, workflow_tasks, mcps, marketplace, sessions as sessions_api
 
 if TYPE_CHECKING:
     from openagent.core.agent import Agent
@@ -163,6 +163,21 @@ class Gateway:
             ("GET", "/api/scheduled-tasks/{id}", scheduled_tasks.handle_get),
             ("PATCH", "/api/scheduled-tasks/{id}", scheduled_tasks.handle_update),
             ("DELETE", "/api/scheduled-tasks/{id}", scheduled_tasks.handle_delete),
+            # Workflow engine (n8n-style multi-block pipelines). Same
+            # scheduler 503 invariant as scheduled-tasks — handlers
+            # return 503 when no Scheduler is attached.
+            ("GET", "/api/workflows", workflow_tasks.handle_list),
+            ("POST", "/api/workflows", workflow_tasks.handle_create),
+            ("GET", "/api/workflows/{id}", workflow_tasks.handle_get),
+            ("PATCH", "/api/workflows/{id}", workflow_tasks.handle_update),
+            ("DELETE", "/api/workflows/{id}", workflow_tasks.handle_delete),
+            ("POST", "/api/workflows/{id}/run", workflow_tasks.handle_run),
+            ("GET", "/api/workflows/{id}/runs", workflow_tasks.handle_runs_list),
+            ("GET", "/api/workflows/{id}/stats", workflow_tasks.handle_stats),
+            ("GET", "/api/workflow-runs/{run_id}", workflow_tasks.handle_run_get),
+            ("GET", "/api/workflow-block-types", workflow_tasks.handle_block_types),
+            ("GET", "/api/mcp-tools", workflow_tasks.handle_mcp_tools),
+            ("GET", "/api/cron/describe", workflow_tasks.handle_cron_describe),
             ("GET", "/api/logs", logs.handle_get),
             ("DELETE", "/api/logs", logs.handle_delete),
             ("GET", "/api/usage", usage.handle_get),

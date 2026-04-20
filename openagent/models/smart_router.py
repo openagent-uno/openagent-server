@@ -233,6 +233,38 @@ class SmartRouter(BaseModel):
 
     # ── dispatch plumbing ───────────────────────────────────────────
 
+    def build_override_model(self, runtime_id: str) -> BaseModel:
+        """Construct (or reuse) a BaseModel bound to a specific runtime_id.
+
+        The workflow engine's ``ai-prompt`` block uses this to honour a
+        user's ``model_override`` setting on the block without going
+        through the classifier. Same factory paths the router itself
+        uses for dispatch, so the returned model is wired against the
+        same providers_config, DB, and MCP pool — no divergence.
+
+        Raises ``ValueError`` when ``runtime_id`` doesn't match any
+        enabled catalog entry, so the executor can fail fast with a
+        clear message instead of crashing mid-block.
+        """
+        if not runtime_id:
+            raise ValueError("runtime_id is required")
+        # Only accept ids that correspond to an enabled model — otherwise
+        # a stale graph_json value could resurrect a deleted model and
+        # surprise the caller.
+        known = {m.runtime_id for m in self._enabled_catalog()}
+        if runtime_id not in known:
+            raise ValueError(
+                f"runtime_id {runtime_id!r} is not an enabled model. "
+                f"Known ids: {sorted(known)}"
+            )
+        if is_claude_cli_model(runtime_id):
+            # Claude-cli dispatches through a registry, not a per-model
+            # provider — returning the shared registry is correct here;
+            # the ``model_override=runtime_id`` pass-through in
+            # ``_dispatch`` is what actually routes to the right model.
+            return self._get_claude_registry()
+        return self._get_agno_provider(runtime_id)
+
     def _get_agno_provider(self, runtime_id: str) -> BaseModel:
         if runtime_id not in self._agno_providers:
             self._agno_providers[runtime_id] = create_model_from_spec(
