@@ -662,6 +662,12 @@ class MemoryDB:
                 "local `claude` binary authenticates via the Pro/Max "
                 "subscription stored under ~/.claude/."
             )
+        if framework == "claude-cli" and name.strip().lower() != "anthropic":
+            raise ValueError(
+                "claude-cli framework is only supported for the "
+                "'anthropic' provider — the local `claude` binary "
+                "dispatches Anthropic models via the Pro/Max subscription."
+            )
         now = time.time()
         conn = await self._ensure_connected()
         await conn.execute(
