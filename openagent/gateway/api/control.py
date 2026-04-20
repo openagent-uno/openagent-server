@@ -6,14 +6,58 @@ POST /api/restart → restart OpenAgent processes
 
 from __future__ import annotations
 
+import asyncio
+
 from openagent.core.logging import elog
 
 
+def _schedule_bridge_offset_flush(gateway) -> None:
+    """Proactively ACK pending platform updates *before* the restart fires.
+
+    Without this, the exact Update that triggered /restart can stay in
+    Telegram's delivery queue: library shutdown inside
+    ``Updater.stop()`` runs ``_get_updates_cleanup`` which is itself a
+    ``getUpdates`` POST, and that POST can block or be cancelled as the
+    event loop winds down. When launchd restarts us, ``getUpdates`` on
+    the next boot still advertises the same Update and the command
+    re-fires → crash loop (observed on lyra-agent 2026-04-20).
+
+    We schedule the flush as a background task on the current loop so
+    the restart path isn't blocked by network I/O. The bridge's
+    ``flush_updates_offset`` swallows its own errors/cancellation.
+    """
+    bridges = getattr(gateway, "_bridges", None) or []
+    for bridge in bridges:
+        flush = getattr(bridge, "flush_updates_offset", None)
+        if flush is None:
+            continue
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop (unit test context). Nothing to do.
+            return
+        try:
+            loop.create_task(flush(), name=f"bridge:{bridge.name}:flush-updates")
+        except Exception as e:  # noqa: BLE001 — best-effort
+            elog(
+                "bridge.flush_schedule_error",
+                level="warning",
+                bridge=getattr(bridge, "name", "?"),
+                error=str(e),
+            )
+
+
 def request_restart(gateway, *, source: str) -> None:
-    """Set the restart exit code and ask the server loop to stop."""
+    """Set the restart exit code and ask the server loop to stop.
+
+    Before signalling stop we kick off a best-effort bridge offset flush
+    so any command that came in via a platform (Telegram today) gets
+    ACKed on the platform side, preventing replay after restart.
+    """
     from openagent.core.server import RESTART_EXIT_CODE
 
     elog("server.restart", source=source)
+    _schedule_bridge_offset_flush(gateway)
     gateway.agent._restart_exit_code = RESTART_EXIT_CODE
     if getattr(gateway, "_stop_event", None):
         gateway._stop_event.set()

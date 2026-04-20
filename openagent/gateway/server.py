@@ -73,6 +73,12 @@ class Gateway:
         # check this and return 503 when it's absent.
         self._scheduler = None
 
+        # Bound by AgentServer.start() once bridges are instantiated. Used by
+        # control.request_restart so /restart can proactively ACK pending
+        # Telegram updates before the restart fires (so a queued /restart
+        # can't replay on the next boot and produce a crash loop).
+        self._bridges: list = []
+
     @staticmethod
     async def _safe_ws_send_json(ws, payload: dict) -> bool:
         """Best-effort websocket send that tolerates closing transports."""
