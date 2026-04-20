@@ -181,8 +181,16 @@ async def t_reject_orphan(ctx: TestContext) -> None:
         await db.close()
 
 
-@test("db_models", "is_classifier flag persists and surfaces via materialise")
+@test("db_models", "is_classifier flag is narrow per-row — multiple rows may carry it")
 async def t_is_classifier_roundtrip(ctx: TestContext) -> None:
+    """Multi-classifier semantics.
+
+    ``set_model_is_classifier`` is a narrow UPDATE on a single row; it
+    does NOT clear the flag on other rows. Multiple rows can be flagged
+    simultaneously, forming a "classifier pool". The SmartRouter
+    resolver then picks the first flagged entry in deterministic
+    catalog order (see test_smart_router_hybrid).
+    """
     from openagent.memory.db import MemoryDB
 
     db = MemoryDB(str(ctx.db_path))
@@ -197,30 +205,32 @@ async def t_is_classifier_roundtrip(ctx: TestContext) -> None:
         row = await db.get_model(mid1)
         assert row["is_classifier"] is False
 
-        # Flag mid2 — materialise should reflect it on that row only.
+        # Flag mid2 — only mid2 changes.
         await db.set_model_is_classifier(mid2, True)
         cfg = await db.materialise_providers_config(enabled_only=True)
         flagged = {
             m["model"]: m["is_classifier"]
             for entry in cfg for m in entry["models"]
         }
-        assert flagged["gpt-cls-a"] is False
-        assert flagged["gpt-cls-b"] is True
+        assert flagged == {"gpt-cls-a": False, "gpt-cls-b": True}
 
-        # Flipping to mid1 must clear mid2 in the same transaction.
+        # Flag mid1 too — BOTH rows stay flagged (multi-classifier pool).
         await db.set_model_is_classifier(mid1, True)
         cfg = await db.materialise_providers_config(enabled_only=True)
         flagged = {
             m["model"]: m["is_classifier"]
             for entry in cfg for m in entry["models"]
         }
-        assert flagged["gpt-cls-a"] is True
-        assert flagged["gpt-cls-b"] is False
+        assert flagged == {"gpt-cls-a": True, "gpt-cls-b": True}
 
-        # Clearing the flag is narrow — doesn't touch other rows.
+        # Clearing mid1 leaves mid2 flagged — narrow update.
         await db.set_model_is_classifier(mid1, False)
-        row1 = await db.get_model(mid1)
-        assert row1["is_classifier"] is False
+        cfg = await db.materialise_providers_config(enabled_only=True)
+        flagged = {
+            m["model"]: m["is_classifier"]
+            for entry in cfg for m in entry["models"]
+        }
+        assert flagged == {"gpt-cls-a": False, "gpt-cls-b": True}
 
         await db.delete_provider(pid)
     finally:

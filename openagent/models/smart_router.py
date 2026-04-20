@@ -56,7 +56,10 @@ def _resolve_classifier_model(providers_config: Any) -> str:
 
     Resolution order:
       1. First enabled model whose ``is_classifier`` flag is True in the
-         ``models`` table — the operator-picked classifier.
+         ``models`` table — operator-flagged classifier. Multiple rows
+         may carry the flag (the "classifier pool"); this helper picks
+         the first one it sees, which gives deterministic and stable
+         routing from the caller's perspective.
       2. First enabled model overall — sensible default so a fresh
          install still classifies without requiring DB edits.
       3. Empty string — signals "no model available", which the router
@@ -64,7 +67,8 @@ def _resolve_classifier_model(providers_config: Any) -> str:
 
     ``iter_configured_models`` already yields a deterministic order
     (``p.name, p.framework, m.model`` via ``materialise_providers_config``)
-    so repeated resolutions pick the same fallback when no flag is set.
+    so repeated resolutions pick the same entry from the pool when no
+    external state changes.
     """
     catalog = [e for e in iter_configured_models(providers_config) if not e.disabled]
     if not catalog:

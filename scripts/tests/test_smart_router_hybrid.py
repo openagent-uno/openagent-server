@@ -318,6 +318,19 @@ async def t_classifier_resolution(ctx: TestContext) -> None:
     # 5. empty providers_config → empty classifier
     assert _resolve_classifier_model([]) == ""
 
+    # 6. multiple rows flagged → resolver picks the first in catalog
+    # order (p.name, p.framework, m.model). Multiple-classifier
+    # semantics: the flag opts a row into the pool, it doesn't claim
+    # exclusive ownership.
+    cfg = [{
+        "id": 1, "name": "openai", "framework": "agno", "enabled": True,
+        "models": [
+            {"id": 1, "model": "gpt-4o-mini", "enabled": True, "is_classifier": True},
+            {"id": 2, "model": "gpt-5", "enabled": True, "is_classifier": True},
+        ],
+    }]
+    assert _resolve_classifier_model(cfg) == "openai:gpt-4o-mini"
+
 
 @test("smart_router_hybrid", "single-model catalog short-circuits the classifier call")
 async def t_single_model_skips_classify(ctx: TestContext) -> None:

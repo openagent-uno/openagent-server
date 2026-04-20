@@ -295,9 +295,10 @@ async def add_model(
       classifier describing the model's strengths: ``"vision"``,
       ``"200k context"``, ``"best for code"``, ``"fast + cheap"``, etc.
       The classifier treats it as advice and overrides freely.
-    - ``is_classifier`` (optional) marks this row as the SmartRouter
-      classifier. Only one row can hold the flag; setting it here
-      clears the flag on any other row atomically.
+    - ``is_classifier`` (optional) marks this row as an eligible
+      SmartRouter classifier. Multiple rows can carry the flag; the
+      router picks the first flagged row it sees each turn, so the
+      flag effectively opts a model into the "classifier pool".
 
     Pricing is resolved live from OpenRouter on every billing event,
     so there is no cost field to set here. Returns the enriched row.
@@ -311,8 +312,6 @@ async def add_model(
         enabled=enabled,
         is_classifier=bool(is_classifier),
     )
-    if is_classifier:
-        await db.set_model_is_classifier(mid, True)
     return await _require_enriched(mid)
 
 
@@ -326,9 +325,12 @@ async def update_model(
 ) -> dict[str, Any]:
     """Partially update a model row (only fields you pass are changed).
 
-    Pass ``is_classifier=True`` to make this the SmartRouter classifier
-    (clears the flag on every other row); ``False`` clears just this
-    row; omit to leave the current flag intact.
+    Pass ``is_classifier=True`` to opt this row into the SmartRouter
+    classifier pool, ``False`` to remove it; omit to leave the flag
+    intact. Multiple rows may carry the flag — the router picks the
+    first flagged row per turn, so the pool acts as "eligible
+    classifiers" ordered by the catalog's deterministic order
+    (provider name, framework, model).
 
     Pricing isn't editable — it's resolved live on every billing event.
     """
@@ -342,20 +344,26 @@ async def update_model(
         display_name=display_name if display_name is not None else existing.get("display_name"),
         tier_hint=tier_hint if tier_hint is not None else existing.get("tier_hint"),
         enabled=enabled if enabled is not None else bool(existing.get("enabled", True)),
-        is_classifier=bool(existing.get("is_classifier", False)),
+        is_classifier=(
+            bool(is_classifier)
+            if is_classifier is not None
+            else bool(existing.get("is_classifier", False))
+        ),
         metadata=existing.get("metadata") or None,
     )
-    if is_classifier is not None:
-        await db.set_model_is_classifier(int(model_id), bool(is_classifier))
     return await _require_enriched(int(model_id))
 
 
 @mcp.tool()
 async def set_classifier_model(model_id: int) -> dict[str, Any]:
-    """Mark one model as THE SmartRouter classifier.
+    """Opt one model into the SmartRouter classifier pool.
 
-    Clears the flag on every other row atomically, so the router
-    resolves this row for turn-1 classification on every fresh session.
+    Idempotent narrow UPDATE — this row's ``is_classifier`` flag flips
+    to 1, other rows are untouched. Multiple rows can carry the flag
+    at once; the router picks the first flagged row in catalog order
+    each turn. To remove a row from the pool, call
+    ``update_model(model_id, is_classifier=False)``.
+
     The flag is honoured on the next message (hot-reload loop picks up
     ``models.updated_at``).
     """

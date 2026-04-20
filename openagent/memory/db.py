@@ -1038,31 +1038,20 @@ class MemoryDB:
         await conn.commit()
 
     async def set_model_is_classifier(self, model_id: int, flag: bool) -> None:
-        """Mark ``model_id`` as the SmartRouter classifier (or clear the flag).
+        """Toggle the classifier flag on ``model_id``.
 
-        Setting the flag on one row clears it on every other row in the
-        same transaction — the router picks the first flagged row it
-        sees, so keeping at most one flagged row is how callers express
-        "this model, and only this model, is the classifier". Clearing
-        is a narrow update that never touches other rows.
+        Multiple rows are allowed to carry the flag simultaneously —
+        this is a narrow UPDATE that only touches ``model_id``. The
+        SmartRouter resolver picks the first flagged row it sees
+        (deterministic catalog order), so having several flagged rows
+        is effectively a pool of "eligible classifiers" where the
+        first one wins each turn.
         """
         conn = await self._ensure_connected()
-        now = time.time()
-        if flag:
-            await conn.execute(
-                "UPDATE models SET is_classifier = 0, updated_at = ? "
-                "WHERE is_classifier = 1 AND id <> ?",
-                (now, int(model_id)),
-            )
-            await conn.execute(
-                "UPDATE models SET is_classifier = 1, updated_at = ? WHERE id = ?",
-                (now, int(model_id)),
-            )
-        else:
-            await conn.execute(
-                "UPDATE models SET is_classifier = 0, updated_at = ? WHERE id = ?",
-                (now, int(model_id)),
-            )
+        await conn.execute(
+            "UPDATE models SET is_classifier = ?, updated_at = ? WHERE id = ?",
+            (1 if flag else 0, time.time(), int(model_id)),
+        )
         await conn.commit()
 
     async def delete_model(self, model_id: int) -> None:
