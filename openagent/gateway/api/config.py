@@ -57,10 +57,21 @@ async def handle_get(request):
     return web.json_response(_sanitize(_read_raw(request)))
 
 
+#: Sections owned by the SQLite DB. They must never be written to the
+#: yaml — creating them there is a silent no-op at runtime and confuses
+#: users who expect edits to take effect.
+DB_OWNED_SECTIONS = frozenset({"providers", "models", "mcp", "mcps", "scheduled", "scheduled_tasks"})
+
+
+def _strip_db_owned(data: dict) -> dict:
+    """Drop any DB-owned keys from a yaml payload before persisting."""
+    return {k: v for k, v in data.items() if k not in DB_OWNED_SECTIONS}
+
+
 async def handle_put(request):
     from aiohttp import web
     data = await request.json()
-    _write_raw(request, data)
+    _write_raw(request, _strip_db_owned(data))
     elog("config.update", section="full")
     return web.json_response({"ok": True, "restart_required": True})
 
@@ -68,15 +79,22 @@ async def handle_put(request):
 async def handle_patch(request):
     from aiohttp import web
     section = request.match_info["section"]
+    if section in DB_OWNED_SECTIONS:
+        return web.json_response(
+            {
+                "error": (
+                    f"section {section!r} is managed by the SQLite database; "
+                    "use the corresponding /api/* endpoint instead of the "
+                    "yaml config."
+                )
+            },
+            status=400,
+        )
     patch = await request.json()
     config = _read_raw(request)
     config[section] = patch
     _write_raw(request, config)
     elog("config.update", section=section)
-    # All yaml sections (channels, system_prompt, memory, dream_mode,
-    # auto_update) require a restart to take effect. Providers, models,
-    # and MCPs are DB-backed and hot-reload on their own path, not
-    # through this endpoint.
     return web.json_response({
         "ok": True,
         "restart_required": True,

@@ -98,11 +98,13 @@ def create_model_from_config(config: dict) -> BaseModel:
     runtime and dispatches each session to either Agno or the Claude CLI
     registry internally (see ``openagent.models.smart_router``). The
     ``providers`` / ``models`` SQLite tables are the sole source of
-    truth for the catalog; SmartRouter rebuilds its routing from them
-    on every hot-reload tick.
+    truth for the catalog; SmartRouter starts empty and gets its routing
+    populated by ``Agent.initialize`` (and every hot-reload tick) via
+    ``rebuild_routing``. The yaml is never consulted for provider or
+    model state.
     """
-    providers_config = config.get("providers") or []
-    return create_model_from_spec("smart", providers_config=providers_config)
+    del config  # catalog comes from the DB, not yaml
+    return create_model_from_spec("smart", providers_config=[])
 
 
 async def run_provider_smoke_test(

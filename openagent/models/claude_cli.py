@@ -31,6 +31,7 @@ import asyncio
 import json as _json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
@@ -53,6 +54,31 @@ logger = logging.getLogger(__name__)
 # import time means every spawn uses the larger value. We only set it if
 # the user hasn't overridden it in the environment.
 os.environ.setdefault("CLAUDE_CODE_STREAM_CLOSE_TIMEOUT", "300000")  # 5 min
+
+# Rewrite ``<word>-<int>.<int>`` → ``<word>-<int>-<int>`` in model ids.
+# OpenRouter lists Anthropic models with a dotted version separator
+# (``claude-sonnet-4.6``) but the Claude CLI only accepts dashes
+# (``claude-sonnet-4-6``). Anything OpenRouter-imported into the
+# ``models`` table therefore has to be rewritten before it reaches the
+# SDK. The regex is anchored to ``<word>-<digits>.<digits>`` so it only
+# touches version separators, never model suffixes that legitimately
+# contain dots (none exist today, but the anchor keeps us safe).
+_MODEL_DOTTED_VERSION_RE = re.compile(r"([A-Za-z])-(\d+)\.(\d+)")
+
+
+def _sanitize_claude_model_id(model_id: str) -> str:
+    """Normalise an Anthropic model id for the Claude Agent SDK.
+
+    The CLI rejects dotted versions verbatim (``There's an issue with
+    the selected model (claude-sonnet-4.6)``); swapping each
+    ``<word>-N.M`` to ``<word>-N-M`` yields the canonical Anthropic id
+    the subprocess accepts. Non-Anthropic or already-dashed ids pass
+    through unchanged.
+    """
+    if not model_id:
+        return model_id
+    return _MODEL_DOTTED_VERSION_RE.sub(r"\1-\2-\3", model_id)
+
 
 # Close idle clients after 24h. Was 10 min, which caused user-visible
 # "lost memory" bugs on bridges where the next message after idle-close
@@ -232,7 +258,7 @@ class ClaudeCLI(BaseModel):
                 f"(e.g. 'claude-opus-4-5-20250929') or the canonical "
                 f"runtime 'claude-cli:anthropic:<model>'."
             )
-        opts["model"] = bare_model
+        opts["model"] = _sanitize_claude_model_id(bare_model)
         if system:
             opts["system_prompt"] = system
         if sdk_session_id:
@@ -363,11 +389,13 @@ class ClaudeCLI(BaseModel):
         session.client = client
         session.last_active = time.time()
         # The subprocess was spawned with ``self.model`` baked into its
-        # options (see ``_build_options``) — record the bare id so
-        # ``generate`` knows what's already loaded and can skip redundant
-        # ``set_model()`` round-trips on same-model turns.
+        # options (see ``_build_options``) — record the sanitized bare id
+        # so ``generate`` knows what's actually loaded and can skip
+        # redundant ``set_model()`` round-trips on same-model turns.
         session.current_sdk_model = (
-            model_id_from_runtime(self.model) if self.model else None
+            _sanitize_claude_model_id(model_id_from_runtime(self.model))
+            if self.model
+            else None
         )
         return client
 
@@ -763,25 +791,30 @@ class ClaudeCLI(BaseModel):
         """
         if not requested_model:
             return
+        # Normalise before comparing AND before handing to the SDK so a
+        # dotted OpenRouter id doesn't trip a spurious set_model call
+        # (dashed vs dotted would compare unequal forever) and so the
+        # subprocess receives the canonical Anthropic form.
+        sanitized = _sanitize_claude_model_id(requested_model)
         session = self._sessions.get(session_id)
         if session is None:
             return
-        if session.current_sdk_model == requested_model:
+        if session.current_sdk_model == sanitized:
             return
         # Some test harnesses substitute a plain object for the client;
         # only invoke the real control protocol when it's available.
         if not hasattr(client, "set_model"):
-            session.current_sdk_model = requested_model
+            session.current_sdk_model = sanitized
             return
         async with session.lock:
-            if session.current_sdk_model == requested_model:
+            if session.current_sdk_model == sanitized:
                 return
-            await client.set_model(requested_model)
-            session.current_sdk_model = requested_model
+            await client.set_model(sanitized)
+            session.current_sdk_model = sanitized
             elog(
                 "claude_cli.model_switched",
                 session_id=session_id,
-                to_model=requested_model,
+                to_model=sanitized,
             )
 
     # ── billing ────────────────────────────────────────────────────────

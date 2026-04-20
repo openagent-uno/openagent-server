@@ -50,12 +50,12 @@ def get_agent_dir() -> Path | None:
 _DEFAULT_YAML = textwrap.dedent("""\
     # OpenAgent agent configuration
     # See https://github.com/geroale/OpenAgent for full reference.
+    #
+    # Providers, models, MCPs, and scheduled tasks are managed exclusively
+    # through the SQLite database (configure them via the desktop app or
+    # the /api/* REST endpoints). This file only holds server-level knobs.
 
     name: agent
-
-    model:
-      provider: claude-cli
-      model_id: claude-sonnet-4-6
 
     channels:
       websocket:

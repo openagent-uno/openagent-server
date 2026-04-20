@@ -102,13 +102,10 @@ def _build_agent(config: dict) -> Agent:
     db_path = memory_cfg.get("db_path", str(default_db_path()))
     db = MemoryDB(db_path)
 
-    # MCP pool is built *inside* ``Agent.initialize`` from the DB after the
-    # yaml → DB MCP bootstrap runs, so first-boot users transparently
-    # migrate their yaml ``mcp:`` list and subsequent edits go through
-    # the mcp-manager MCP instead of requiring a restart. The Agent
-    # starts with an empty pool; ``wire_model_runtime`` re-runs in
-    # ``initialize``
-    # once the pool is online so providers see the full toolkit list.
+    # MCP pool is built *inside* ``Agent.initialize`` from the ``mcps``
+    # DB table — the yaml never carried MCP state. The Agent starts with
+    # an empty pool; ``wire_model_runtime`` re-runs in ``initialize`` once
+    # the pool is online so providers see the full toolkit list.
     wire_model_runtime(model, db=db)
 
     return Agent(
@@ -117,7 +114,7 @@ def _build_agent(config: dict) -> Agent:
         system_prompt=config.get("system_prompt", "You are a helpful assistant."),
         mcp_pool=None,
         memory=db,
-        config=config,  # Agent.initialize uses mcp / providers / memory sections
+        config=config,  # channels / memory / name only — providers/models/mcps live in the DB
     )
 
 

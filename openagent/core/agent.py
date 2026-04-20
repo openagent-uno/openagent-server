@@ -64,12 +64,11 @@ class Agent:
     platform-managed chat sessions, and usage tracking.
 
     Usage:
-        pool = MCPPool.from_config(mcp_config=cfg.get("mcp"), ...)
         agent = Agent(
             name="assistant",
             model=AgnoProvider(model="anthropic:claude-sonnet-4-20250514"),
             system_prompt="You are a helpful assistant.",
-            mcp_pool=pool,
+            mcp_pool=None,  # ``initialize`` rebuilds from the ``mcps`` DB table
             memory=MemoryDB("agent.db"),
         )
         async with agent:
@@ -107,6 +106,12 @@ class Agent:
         self._idle_cleanup_task: asyncio.Task | None = None
         self._runtime_models: list[BaseModel] = []
         self._last_response_meta: dict[str, dict[str, Any]] = {}
+
+        # Materialised provider+model catalog from the SQLite ``providers`` /
+        # ``models`` tables. Populated by ``_hydrate_providers_from_db`` at
+        # boot and on every hot-reload tick; the yaml config is never
+        # consulted for this state.
+        self._providers_config: list[dict[str, Any]] = []
 
         # Per-model in-flight counters + drain events. Keyed by id(model).
         # Used by swap_model() to hold old models alive until their last
@@ -315,7 +320,7 @@ class Agent:
         # Hydrate providers/models from the DB and swap to the DB-backed
         # MCP pool. Skipped when there is no DB (pure in-memory tests);
         # in that case we fall back to whatever pool the caller passed in.
-        if self._db is not None and self.config is not None:
+        if self._db is not None:
             try:
                 from openagent.memory.bootstrap import ensure_builtin_mcps
                 # Every boot: re-seed any BUILTIN_MCP_SPECS entry that
@@ -324,19 +329,19 @@ class Agent:
                 # Existing rows — including disabled ones — are untouched.
                 await ensure_builtin_mcps(self._db)
                 # Provider keys and the model catalog are DB-backed. Pull
-                # the rows into ``self.config['providers']`` so SmartRouter
+                # the rows into ``self._providers_config`` so SmartRouter
                 # / AgnoProvider see the materialised view.
                 await self._hydrate_providers_from_db()
                 self._providers_last_updated = await self._db.providers_max_updated()
                 self._models_last_updated = await self._db.models_max_updated()
                 # Hand the freshly-hydrated list to every live runtime
-                # model. SmartRouter captured a reference to the yaml-era
-                # (empty) providers_config at construction; without this
-                # push it would keep that stale reference until the first
-                # hot-reload tick — which only fires on gateway messages,
-                # so scheduler turns that run before any user chat would
-                # see an empty catalog and reject with "no_enabled_model".
-                providers_config = (self.config or {}).get("providers", [])
+                # model. SmartRouter was constructed with an empty
+                # providers_config; without this push it would keep that
+                # empty reference until the first hot-reload tick — which
+                # only fires on gateway messages, so scheduler turns that
+                # run before any user chat would see an empty catalog and
+                # reject with "no_enabled_model".
+                providers_config = self._providers_config
                 for model in list(self._runtime_models) + [self.model]:
                     if model is None:
                         continue
@@ -449,7 +454,7 @@ class Agent:
                     await self._hydrate_providers_from_db()
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("models hydrate failed: %s", exc)
-            providers_config = (self.config or {}).get("providers") or []
+            providers_config = self._providers_config
             for model in list(self._runtime_models):
                 rebuild = getattr(model, "rebuild_routing", None)
                 if callable(rebuild):
@@ -463,7 +468,7 @@ class Agent:
         return reloaded, enabled_count
 
     async def _hydrate_providers_from_db(self) -> None:
-        """Pull provider + model rows from DB into ``self.config['providers']``.
+        """Pull provider + model rows from the DB into ``self._providers_config``.
 
         The DB is the source of truth for provider keys AND the model
         catalog. SmartRouter / AgnoProvider consume the v0.12 flat-list
@@ -473,15 +478,15 @@ class Agent:
         collision. Delegates the SQL materialisation to MemoryDB so
         smoke-test endpoints can reuse the same shape.
         """
-        if self._db is None or self.config is None:
+        if self._db is None:
             return
         try:
-            self.config["providers"] = await self._db.materialise_providers_config(
+            self._providers_config = await self._db.materialise_providers_config(
                 enabled_only=True,
             )
         except Exception as exc:  # noqa: BLE001
             logger.debug("providers hydrate failed: %s", exc)
-            self.config["providers"] = []
+            self._providers_config = []
 
     async def _run_idle_cleanup(self) -> None:
         """Periodically release idle provider resources."""

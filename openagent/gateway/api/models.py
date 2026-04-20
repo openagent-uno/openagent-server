@@ -23,7 +23,6 @@ if TYPE_CHECKING:
     from aiohttp import web
 
 from openagent.gateway.api._common import gateway_db as _db
-from openagent.gateway.api.config import _read_resolved
 
 
 async def handle_available_providers(request: web.Request) -> web.Response:
@@ -31,7 +30,10 @@ async def handle_available_providers(request: web.Request) -> web.Response:
     from aiohttp import web as _web
     from openagent.models.catalog import supported_providers
 
-    providers_cfg = _read_resolved(request).get("providers", [])
+    db = _db(request)
+    providers_cfg = (
+        await db.materialise_providers_config(enabled_only=False) if db else []
+    )
     return _web.json_response({"providers": supported_providers(providers_cfg)})
 
 
@@ -41,7 +43,10 @@ async def handle_catalog(request: web.Request) -> web.Response:
     from openagent.models.catalog import get_model_pricing, iter_configured_models
 
     provider_filter = request.query.get("provider", "")
-    providers_cfg = _read_resolved(request).get("providers", [])
+    db = _db(request)
+    providers_cfg = (
+        await db.materialise_providers_config(enabled_only=False) if db else []
+    )
     results = []
     for entry in iter_configured_models(providers_cfg):
         if provider_filter and entry.provider != provider_filter:

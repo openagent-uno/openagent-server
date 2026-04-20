@@ -6,9 +6,6 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from aiohttp import web
 
-from openagent.gateway.api.config import _read_resolved
-
-
 async def _usage_summary_for_agent(agent) -> dict:
     model = agent.model
 
@@ -59,13 +56,12 @@ async def handle_pricing(request: web.Request) -> web.Response:
     if not db:
         return _web.json_response({"pricing": {}})
 
-    providers_config = (
-        _read_resolved(request).get("providers") or [] if gw.config_path else []
-    )
-
+    # get_model_pricing no longer consults providers_config (it resolves
+    # via OpenRouter / the claude-cli subscription short-circuit), so we
+    # don't need to materialise the DB catalog just to hand it in.
     summary = await db.get_usage_summary()
-    pricing = {}
-    for model_id in summary.get("by_model", {}).keys():
-        pricing[model_id] = get_model_pricing(model_id, providers_config)
-
+    pricing = {
+        model_id: get_model_pricing(model_id)
+        for model_id in summary.get("by_model", {}).keys()
+    }
     return _web.json_response({"pricing": pricing})
