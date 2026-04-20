@@ -30,6 +30,11 @@ dependencies = [
     "certifi",
     # workflow block templating ({{expr}} resolution via SandboxedEnvironment)
     "jinja2>=3.1.0",
+    # Directly imported by openagent code — currently arrives as a transitive
+    # of anthropic/openai, but declare explicitly so swapping those SDKs
+    # doesn't silently drop it from the PyInstaller build env.
+    "httpx>=0.24",
+    "packaging>=21.0",
 ]
 
 [project.optional-dependencies]
