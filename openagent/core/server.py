@@ -433,8 +433,7 @@ class AgentServer:
                     elog("dream.start")
                     await _orig(task)
                     elog("dream.done")
-                    # Clear the event log daily
-                    clear_event_log()
+                    clear_event_log(older_than_days=6)
                     elog("dream.log_cleared")
                 else:
                     await _orig(task)

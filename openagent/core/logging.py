@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -114,10 +115,39 @@ def read_tail(lines: int = 100, event_filter: str | None = None) -> list[dict[st
     return out
 
 
-def clear() -> None:
-    """Truncate ``events.jsonl`` and re-open the file handler."""
+def clear(older_than_days: float | None = None) -> None:
+    """Truncate ``events.jsonl`` and re-open the file handler.
+
+    With no argument, wipes the whole file. If *older_than_days* is given,
+    only entries whose ``ts`` is older than that many days are dropped;
+    newer (and malformed / ts-less) entries are preserved.
+    """
     path = log_dir() / "events.jsonl"
-    path.write_text("", encoding="utf-8")
+    if older_than_days is None:
+        path.write_text("", encoding="utf-8")
+        _reopen_event_file(path)
+        return
+
+    cutoff = time.time() - older_than_days * 86400
+    try:
+        raw = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        _reopen_event_file(path)
+        return
+
+    kept: list[str] = []
+    for line in raw:
+        try:
+            entry = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            # Preserve unparseable lines rather than silently dropping them.
+            kept.append(line)
+            continue
+        ts = entry.get("ts")
+        if not isinstance(ts, (int, float)) or ts >= cutoff:
+            kept.append(line)
+
+    path.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
     _reopen_event_file(path)
 
 
