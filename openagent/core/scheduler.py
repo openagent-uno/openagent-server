@@ -154,10 +154,18 @@ class Scheduler:
         except Exception as e:
             elog("task.error", level="error", name=task_name, error=str(e))
         finally:
+            # Scheduled firings are fire-and-forget — each tick must run in
+            # a fresh session with no memory of prior firings. ``forget_session``
+            # wipes the provider-native resume id, so the next firing spawns
+            # a new Claude CLI subprocess without ``--resume``. Using
+            # ``release_session`` here caused the bug in issue #5: compaction
+            # of a resumed transcript would produce a summary like "all done,
+            # nothing outstanding", and the next firing would silently exit
+            # without ever re-running the task prompt.
             try:
-                await self.agent.release_session(session_id)
+                await self.agent.forget_session(session_id)
             except Exception as e:
-                elog("scheduler.release_failed", task=task_name, error=str(e))
+                elog("scheduler.forget_failed", task=task_name, error=str(e))
 
     async def _check_and_run(self) -> None:
         """Check for due tasks and execute them."""

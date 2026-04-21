@@ -96,6 +96,8 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_files",
     # 6. Misc standalone
     "test_cron",
+    # Issue #5 regression — scheduler must start each firing in a fresh session.
+    "test_scheduler_fresh_session",
     "test_dream",
     "test_updater",
     "test_bridges",
