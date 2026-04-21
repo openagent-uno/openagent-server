@@ -24,6 +24,15 @@ import sys
 from pathlib import Path
 from PyInstaller.utils.hooks import collect_submodules
 
+# ── Build-environment guard ──
+# Fail loudly if a runtime-critical dependency isn't importable in the build
+# environment. ``collect_submodules()`` silently returns ``[]`` when the
+# package is missing, which in the past produced a shipped binary that
+# crashed at first ``serve`` invocation with ``ModuleNotFoundError: jinja2``.
+# Importing here turns that silent failure into a loud build-time error.
+import jinja2  # noqa: F401 — openagent.workflow.templating
+import markupsafe  # noqa: F401 — jinja2's required runtime dep
+
 block_cipher = None
 
 # ── Hidden imports ──
@@ -57,8 +66,36 @@ hiddenimports = [
     *collect_submodules("anyio"),
     # httpx (used by litellm)
     *collect_submodules("httpx"),
-    # jinja2 (openagent.workflow.templating — SandboxedEnvironment for {{expr}})
+    # jinja2 (openagent.workflow.templating — SandboxedEnvironment for {{expr}}).
+    # Explicit names are belt-and-suspenders next to ``collect_submodules``:
+    # if the build env is ever missing jinja2 despite the top-of-file guard
+    # (e.g. a future build script that bypasses ``pip install -e .[all]``),
+    # at least these attempted imports make the failure mode obvious instead
+    # of producing a binary that crashes only on the first ``serve`` call.
+    "jinja2",
+    "jinja2.environment",
+    "jinja2.sandbox",
+    "jinja2.ext",
+    "jinja2.nodes",
+    "jinja2.compiler",
+    "jinja2.runtime",
+    "jinja2.utils",
+    "jinja2.filters",
+    "jinja2.tests",
+    "jinja2.loaders",
+    "jinja2.defaults",
+    "jinja2.lexer",
+    "jinja2.parser",
+    "jinja2.visitor",
+    "jinja2.exceptions",
+    "jinja2.bccache",
+    "jinja2.idtracking",
+    "jinja2.meta",
+    "jinja2.optimizer",
+    "jinja2.async_utils",
+    "markupsafe",
     *collect_submodules("jinja2"),
+    *collect_submodules("markupsafe"),
     # openagent submodules
     *collect_submodules("openagent"),
 ]
