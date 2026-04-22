@@ -32,6 +32,7 @@ from PyInstaller.utils.hooks import collect_submodules
 # Importing here turns that silent failure into a loud build-time error.
 import jinja2  # noqa: F401 — openagent.workflow.templating
 import markupsafe  # noqa: F401 — jinja2's required runtime dep
+import groq  # noqa: F401 — agno.models.groq (optional provider SDK, must ship in bundle)
 
 block_cipher = None
 
@@ -98,6 +99,11 @@ hiddenimports = [
     *collect_submodules("markupsafe"),
     # openagent submodules
     *collect_submodules("openagent"),
+    # agno: loaded dynamically via importlib.import_module in agno_provider._load_agno_model_class;
+    # PyInstaller can't trace dynamic imports so we collect all submodules explicitly.
+    *collect_submodules("agno"),
+    # groq Python SDK: imported at module level by agno.models.groq.groq — must be bundled.
+    *collect_submodules("groq"),
 ]
 
 # ── Data files ──

@@ -35,6 +35,10 @@ dependencies = [
     # doesn't silently drop it from the PyInstaller build env.
     "httpx>=0.24",
     "packaging>=21.0",
+    # Groq SDK: imported at module level by agno.models.groq when a groq-based
+    # provider is selected.  Declaring it here ensures it is installed in the
+    # build environment so PyInstaller bundles it (collect_submodules("groq")).
+    "groq>=0.4.0",
 ]
 
 [project.optional-dependencies]

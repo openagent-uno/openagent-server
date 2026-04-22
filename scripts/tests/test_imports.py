@@ -35,6 +35,27 @@ async def t_imports(ctx: TestContext) -> None:
     assert openagent.__version__
 
 
+@test("imports", "groq SDK in deps + agno collected in spec (bundle completeness)")
+async def t_bundle_agno_groq(ctx: TestContext) -> None:
+    """Verify that the PyInstaller spec collects agno submodules and that the
+    groq Python SDK is a declared project dependency.  Both are required so
+    ``agno.models.groq`` is importable from the frozen binary; the original
+    bug was a per-session ImportError on lyra-virgil whenever a groq model
+    was selected."""
+    import re
+
+    spec_path = REPO_ROOT / "openagent.spec"
+    spec_text = spec_path.read_text()
+    assert re.search(r'collect_submodules\("agno"\)', spec_text), \
+        "openagent.spec must have collect_submodules(\"agno\") in hiddenimports"
+    assert re.search(r'collect_submodules\("groq"\)', spec_text), \
+        "openagent.spec must have collect_submodules(\"groq\") in hiddenimports"
+
+    toml_text = (REPO_ROOT / "pyproject.toml").read_text()
+    assert re.search(r'"groq[><=!]', toml_text) or re.search(r'"groq"', toml_text), \
+        "pyproject.toml must list groq as a dependency"
+
+
 @test("imports", "no stale legacy refs (MCPRegistry / MCPTools / tool_factory)")
 async def t_no_stale_refs(ctx: TestContext) -> None:
     import re
