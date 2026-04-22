@@ -88,7 +88,9 @@ async def t_stale_resume_self_heal(ctx: TestContext) -> None:
     _install_fake_sdk_client(restore)
     _FakeClient.fail_on_resume = True
     try:
-        cli = ClaudeCLI(model=None, providers_config={"anthropic": {}})
+        # ``_build_options`` now rejects empty model — pass a concrete id
+        # since the fake SDK client doesn't care about the value.
+        cli = ClaudeCLI(model="claude-sonnet-4-6", providers_config={"anthropic": {}})
         db = _FakeDB({"tg:123": "pruned-sdk-uuid"})
         cli.set_db(db)
         session = _Session(session_id="tg:123")
@@ -123,7 +125,7 @@ async def t_no_resume_connect_failure_raises(ctx: TestContext) -> None:
 
     _FakeClient.connect = _always_fail  # type: ignore[assignment]
     try:
-        cli = ClaudeCLI(model=None, providers_config={"anthropic": {}})
+        cli = ClaudeCLI(model="claude-sonnet-4-6", providers_config={"anthropic": {}})
         db = _FakeDB({})  # no stored resume id
         cli.set_db(db)
         session = _Session(session_id="tg:456")
@@ -158,7 +160,7 @@ async def t_fresh_retry_also_fails(ctx: TestContext) -> None:
     original_connect = _FakeClient.connect
     _FakeClient.connect = _always_fail  # type: ignore[assignment]
     try:
-        cli = ClaudeCLI(model=None, providers_config={"anthropic": {}})
+        cli = ClaudeCLI(model="claude-sonnet-4-6", providers_config={"anthropic": {}})
         db = _FakeDB({"tg:789": "stale-id"})
         cli.set_db(db)
         session = _Session(session_id="tg:789")

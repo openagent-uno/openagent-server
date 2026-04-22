@@ -245,10 +245,7 @@ async def t_router_honors_pin(ctx: TestContext) -> None:
             by_id[m["provider_id"]]["models"].append(m)
         providers_config = list(by_id.values())
 
-        router = SmartRouter(
-            routing={},
-            providers_config=providers_config,
-        )
+        router = SmartRouter(providers_config=providers_config)
         router.set_db(db)
 
         seen: list[str] = []
@@ -291,10 +288,7 @@ async def t_bound_framework_no_models_rejects(ctx: TestContext) -> None:
             by_id[m["provider_id"]]["models"].append(m)
         providers_config = list(by_id.values())
 
-        router = SmartRouter(
-            routing={},
-            providers_config=providers_config,
-        )
+        router = SmartRouter(providers_config=providers_config)
         router.set_db(db)
         # Session pre-bound to claude-cli, no claude-cli models registered.
         await db.set_sdk_session("orphan", "stale-uuid", provider="claude-cli")

@@ -127,7 +127,10 @@ async def t_claude_shell_bg_roundtrip(ctx: TestContext) -> None:
         from scripts.tests._framework import TestSkip
         raise TestSkip("pool fixture not set up")
 
-    model = ClaudeCLI()
+    # ``_build_options`` now rejects empty model (SmartRouter is expected
+    # to pin a runtime_id before dispatch in prod); pin one here so the
+    # bare-ClaudeCLI path in this e2e still reaches the SDK.
+    model = ClaudeCLI(model="claude-sonnet-4-6")
     model.set_mcp_servers(pool.claude_sdk_servers())
     agent = Agent(name="shell-e2e", model=model)
     agent._initialized = True
