@@ -51,6 +51,7 @@ _TEST_MODULES: tuple[str, ...] = (
     # 1. Lightweight / pure-unit (no fixtures needed)
     "test_imports",
     "test_setup",
+    "test_serve_singleton",
     "test_catalog",
     "test_channels",
     "test_formatting",

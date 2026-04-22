@@ -13,6 +13,7 @@ from rich.panel import Panel
 from openagent.core import paths
 from openagent.core.config import load_config
 from openagent.core.logging import setup_logging
+from openagent.core.serve_singleton import kill_stale_serve_processes
 from openagent.core.server import AgentServer
 
 console = Console()
@@ -118,6 +119,10 @@ def serve(ctx, agent_dir: str | None, channel: tuple[str, ...]):
         _setup_agent_dir(agent_dir)
         setup_logging(verbose=ctx.obj.get("verbose", False))
         _reload_context_config(ctx, str(paths.default_config_path()))
+
+    active_dir = paths.get_agent_dir()
+    if active_dir is not None:
+        kill_stale_serve_processes(active_dir)
 
     config = dict(ctx.obj["config"])
     config["_config_path"] = str(Path(ctx.obj["config_path"]).resolve())
