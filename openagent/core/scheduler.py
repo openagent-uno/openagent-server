@@ -91,30 +91,33 @@ class Scheduler:
             except ValueError as e:
                 elog("scheduler.invalid_cron", level="error", task=task["name"], error=str(e))
 
-        # Workflows with a schedule trigger — same missed-run handling.
+        # Per-block schedules in ``workflow_schedules``. Each row is a
+        # trigger-schedule block; recalculate its next_run on boot so
+        # schedules that elapsed while we were down fire once on next
+        # tick rather than stampede once each missed window.
         try:
-            workflows = await self.db.list_scheduled_workflows()
-        except Exception as e:  # noqa: BLE001 — missing helper or DB blip
-            elog("scheduler.workflow_recalc_skipped", level="warning", error=str(e))
-            workflows = []
-        for wf in workflows:
-            cron = wf.get("cron_expression")
+            schedules = await self.db.list_schedules(enabled_only=True)
+        except Exception as e:  # noqa: BLE001
+            elog("scheduler.schedules_recalc_skipped", level="warning", error=str(e))
+            schedules = []
+        for sched in schedules:
+            cron = sched.get("cron_expression")
             if not cron:
                 continue
             try:
                 if is_one_shot_expression(cron):
-                    if wf.get("last_run_at"):
-                        await self.db.update_workflow(
-                            wf["id"], enabled=False, next_run_at=None,
+                    if sched.get("last_run_at"):
+                        await self.db.update_schedule(
+                            sched["id"], enabled=False,
                         )
                     continue
-                await self.db.update_workflow(
-                    wf["id"], next_run_at=self._next_run(cron, now),
+                await self.db.update_schedule(
+                    sched["id"], next_run_at=self._next_run(cron, now),
                 )
             except ValueError as e:
                 elog(
                     "scheduler.invalid_cron", level="error",
-                    workflow=wf.get("name"), error=str(e),
+                    schedule=sched.get("id"), error=str(e),
                 )
 
     async def _loop(self) -> None:
@@ -195,32 +198,57 @@ class Scheduler:
                 elog("scheduler.next_run_update_failed", level="error",
                      task=task["name"], error=str(e))
 
-        # Scheduled workflows (Phase 2).
+        # Per-block schedules. Each due row fires its own
+        # trigger-schedule node as the entry point; a workflow with
+        # multiple schedule blocks gets multiple independent firings.
         try:
-            due_workflows = await self.db.get_due_workflow_tasks(now)
+            due_schedules = await self.db.get_due_schedules(now)
         except Exception as e:  # noqa: BLE001
-            elog("scheduler.workflow_fetch_failed", level="warning", error=str(e))
-            due_workflows = []
-        for wf in due_workflows:
-            elog("scheduler.workflow_due", name=wf.get("name"), id=wf.get("id"))
-            await self._run_workflow(wf, trigger="schedule")
+            elog("scheduler.schedules_fetch_failed", level="warning", error=str(e))
+            due_schedules = []
+        for sched in due_schedules:
+            wf = await self.db.get_workflow(sched["workflow_id"])
+            if wf is None:
+                # FK cascade should prevent this, but guard anyway.
+                await self.db.delete_schedule(sched["id"])
+                continue
+            elog(
+                "scheduler.schedule_due",
+                workflow=wf.get("name"),
+                node_id=sched.get("node_id"),
+                schedule_id=sched.get("id"),
+            )
+            await self._run_workflow(
+                wf,
+                trigger="schedule",
+                entry_node_id=sched["node_id"],
+            )
+            # Advance the schedule row for its next tick.
             try:
-                cron = wf.get("cron_expression")
-                if cron and is_one_shot_expression(cron):
-                    await self.db.update_workflow(
-                        wf["id"], last_run_at=now, next_run_at=None,
-                        enabled=False,
+                cron = sched.get("cron_expression") or ""
+                if is_one_shot_expression(cron):
+                    await self.db.update_schedule(
+                        sched["id"], last_run_at=now, enabled=False,
                     )
-                elif cron:
-                    await self.db.update_workflow(
-                        wf["id"], last_run_at=now,
+                else:
+                    await self.db.update_schedule(
+                        sched["id"],
+                        last_run_at=now,
                         next_run_at=self._next_run(cron, now),
                     )
             except ValueError as e:
                 elog(
-                    "scheduler.workflow_next_run_failed", level="error",
-                    workflow=wf.get("name"), error=str(e),
+                    "scheduler.schedule_next_run_failed", level="error",
+                    schedule=sched.get("id"), error=str(e),
                 )
+            # Workflow-level last_run_at surfaces "some schedule fired"
+            # to the list UI even when the workflow has many schedules.
+            try:
+                await self.db.update_workflow(
+                    sched["workflow_id"], last_run_at=now,
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
         # AI-enqueued + manually-enqueued workflow runs (Phase 2).
         try:
@@ -264,11 +292,17 @@ class Scheduler:
         trigger: str,
         inputs: dict | None = None,
         request_id: str | None = None,
+        entry_node_id: str | None = None,
     ) -> None:
         """Execute a workflow. Mirrors ``run_task``: catches exceptions,
         refreshes registries, and — when this run came from a request
         row — links the request to the new ``run_id`` so the MCP's
-        ``run_workflow`` poller can find it without a race."""
+        ``run_workflow`` poller can find it without a race.
+
+        ``entry_node_id`` restricts the walk's entry set to a specific
+        node, used by the scheduler when a workflow has multiple
+        ``trigger-schedule`` blocks and only one of them fired this tick.
+        """
         import uuid
 
         wf_name = wf.get("name")
@@ -276,6 +310,7 @@ class Scheduler:
         elog(
             "workflow.run", name=wf_name, run_id=run_id,
             trigger=trigger, request_id=request_id,
+            entry_node_id=entry_node_id,
         )
         if request_id is not None:
             # Link the request row first so a polling MCP tool can move
@@ -297,6 +332,7 @@ class Scheduler:
             executor = self._get_workflow_executor()
             final = await executor.run(
                 wf, trigger=trigger, inputs=inputs, run_id=run_id,
+                entry_node_id=entry_node_id,
             )
             elog(
                 "workflow.done",

@@ -1,27 +1,22 @@
-"""Keep a workflow's row-level ``cron_expression`` in sync with the
-``trigger-schedule`` block inside its graph.
+"""Keep the ``workflow_schedules`` table in sync with each workflow's
+graph. Called on every workflow write — the graph is the single source
+of truth, the table is its scheduler-friendly index.
 
-The scheduler loop polls the ``workflow_tasks.cron_expression`` +
-``next_run_at`` columns — that's what makes a workflow fire on a
-schedule. The user (or the AI) edits the schedule visually via a
-``trigger-schedule`` block's ``config.cron_expression``. Without a
-sync step, the two drift: you'd change the block's cron and nothing
-would happen because the scheduler reads the row column.
+Each ``trigger-schedule`` block in a graph becomes a row keyed by
+``(workflow_id, node_id)``. Removing a block removes its row; editing
+a block's cron updates the row (and re-computes ``next_run_at`` only
+when the cron actually changed, so the scheduler doesn't "miss" a
+scheduled tick just because someone renamed the block).
 
-This module exports one pure helper that computes the row updates a
-caller should apply after any graph mutation. Call it from the
-gateway's REST handlers and from every workflow-manager MCP tool that
-touches the graph.
-
-Direction: graph → row. Row-level cron can also be set directly
-(e.g. the list-screen create form when the graph is empty); in that
-case the caller passes ``explicit_cron`` and the helper honours it.
-When both are present, ``explicit_cron`` wins.
+A workflow can carry any number of ``trigger-schedule`` blocks. The
+row-level scheduler has no opinion on the workflow itself — workflows
+no longer carry ``trigger_kind``, ``cron_expression``, or
+``next_run_at`` columns. All schedule state is per-block.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Iterable
 
 from openagent.memory.schedule import (
     next_run_for_expression,
@@ -29,75 +24,93 @@ from openagent.memory.schedule import (
 )
 
 
-# Public sentinel distinguishing "caller didn't pass cron" from
-# "caller passed None (clear the schedule)". Callers that want to say
-# "leave the row cron alone" pass ``NOT_PROVIDED``; callers that want
-# to clear it pass ``None``. Any other value is validated as cron.
-NOT_PROVIDED = object()
+def iter_trigger_schedule_blocks(
+    graph: dict[str, Any] | None,
+) -> Iterable[dict[str, Any]]:
+    """Yield each ``trigger-schedule`` node from ``graph.nodes``.
 
-
-def pick_trigger_schedule_cron(graph: dict[str, Any]) -> str | None:
-    """Return the cron_expression of the first ``trigger-schedule``
-    block in the graph, or ``None`` if there isn't one. v1 uses the
-    first block by iteration order; workflows needing multiple
-    distinct schedules should be split into separate workflows.
+    Yields nothing for empty or malformed graphs. Consumers should
+    check ``node["config"]["cron_expression"]`` — blocks with empty
+    cron are intentionally left unsynced so the user can add a block
+    in the editor, save, and fill the cron later.
     """
-    for node in graph.get("nodes", []) or []:
-        if node.get("type") != "trigger-schedule":
-            continue
+    if not graph:
+        return
+    for node in graph.get("nodes") or []:
+        if node.get("type") == "trigger-schedule":
+            yield node
+
+
+async def sync_workflow_schedules(
+    db: Any,
+    workflow_id: str,
+    graph: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Reconcile ``workflow_schedules`` rows against the graph.
+
+    Creates a row for each ``trigger-schedule`` block with a non-empty
+    cron; updates existing rows (preserving ``next_run_at`` when the
+    cron didn't change); deletes rows for blocks that no longer exist.
+
+    Returns a small summary dict ``{created, updated, removed,
+    invalid}`` — mostly useful for tests; production callers can
+    ignore it.
+    """
+    summary = {"created": 0, "updated": 0, "removed": 0, "invalid": 0}
+    keep_node_ids: list[str] = []
+    existing = await db.list_schedules(workflow_id=workflow_id)
+    by_node = {row["node_id"]: row for row in existing}
+
+    for node in iter_trigger_schedule_blocks(graph):
+        node_id = node.get("id")
         cfg = node.get("config") or {}
         cron = cfg.get("cron_expression")
-        if cron:
-            return str(cron)
-    return None
+        if not node_id or not cron:
+            # Block exists but has no cron yet — don't create a row.
+            # Any previous row keyed to this node_id will be pruned
+            # by ``delete_schedules_not_in`` below (node_id missing
+            # from ``keep_node_ids``).
+            continue
+        try:
+            validate_schedule_expression(cron)
+        except ValueError:
+            summary["invalid"] += 1
+            continue
+        keep_node_ids.append(node_id)
+        try:
+            nxt = next_run_for_expression(cron)
+        except ValueError:
+            summary["invalid"] += 1
+            continue
+        if node_id in by_node and by_node[node_id]["cron_expression"] == cron:
+            summary["updated"] += 1
+        else:
+            summary["created"] += 1 if node_id not in by_node else 0
+            summary["updated"] += 1 if node_id in by_node else 0
+        await db.upsert_schedule(
+            workflow_id=workflow_id,
+            node_id=node_id,
+            cron_expression=cron,
+            next_run_at=nxt,
+        )
+
+    removed = await db.delete_schedules_not_in(workflow_id, keep_node_ids)
+    summary["removed"] = removed
+    return summary
 
 
-def derive_schedule_updates(
-    graph: dict[str, Any] | None,
-    *,
-    explicit_cron: Any = NOT_PROVIDED,
-    explicit_trigger_kind: str | None = None,
-    current_trigger_kind: str | None = None,
-) -> dict[str, Any]:
-    """Compute row patches ``{cron_expression, next_run_at,
-    trigger_kind}`` needed after a graph mutation.
+def trigger_types_from_graph(graph: dict[str, Any] | None) -> list[str]:
+    """Derive the set of trigger types present in a workflow's graph.
 
-    Precedence:
-      1. ``explicit_cron`` if the caller passed one (row-level edit).
-         ``None`` clears. Anything else is validated + used.
-      2. Otherwise the first ``trigger-schedule`` block in the graph.
-      3. Otherwise no change (returns ``{}``).
-
-    Auto-promote: when a cron becomes active and ``trigger_kind`` is
-    ``None`` or ``'manual'``, bump it to ``'schedule'`` so the
-    scheduler loop starts polling. When the caller explicitly passes
-    ``'hybrid'`` / ``'ai'`` we leave that alone — they're signaling
-    multiple entry points.
+    Returns a sorted list so ``list_workflows`` responses are stable.
+    Callers (UI / AI) use this to render the "How is this triggered?"
+    badge without needing a dedicated ``trigger_kind`` column.
     """
-    graph = graph or {}
-    graph_cron = pick_trigger_schedule_cron(graph)
-
-    if explicit_cron is not NOT_PROVIDED:
-        cron_to_use = explicit_cron
-    elif graph_cron is not None:
-        cron_to_use = graph_cron
-    else:
-        return {}
-
-    updates: dict[str, Any] = {}
-    tk = (
-        explicit_trigger_kind
-        if explicit_trigger_kind is not None
-        else current_trigger_kind
-    )
-
-    if cron_to_use:
-        validate_schedule_expression(cron_to_use)
-        updates["cron_expression"] = str(cron_to_use)
-        updates["next_run_at"] = next_run_for_expression(str(cron_to_use))
-        if tk in (None, "manual"):
-            updates["trigger_kind"] = "schedule"
-    else:
-        updates["cron_expression"] = None
-        updates["next_run_at"] = None
-    return updates
+    if not graph:
+        return []
+    seen: set[str] = set()
+    for node in graph.get("nodes") or []:
+        ntype = node.get("type")
+        if isinstance(ntype, str) and ntype.startswith("trigger-"):
+            seen.add(ntype)
+    return sorted(seen)

@@ -35,8 +35,8 @@ from openagent.workflow import (
 )
 from openagent.workflow.blocks import get_block_spec
 from openagent.workflow.schedule_sync import (
-    NOT_PROVIDED as _MISSING,
-    derive_schedule_updates,
+    iter_trigger_schedule_blocks,
+    trigger_types_from_graph,
 )
 from openagent.memory.db import SCHEMA_SQL
 from openagent.memory.schedule import (
@@ -76,7 +76,10 @@ async def _get_conn() -> aiosqlite.Connection:
 # ── row hydration ────────────────────────────────────────────────────
 
 
-def _decorate_workflow(row: aiosqlite.Row) -> dict[str, Any]:
+def _decorate_workflow_row(row: aiosqlite.Row) -> dict[str, Any]:
+    """Shape a workflow row without loading its schedules yet.
+    ``_decorate_workflow_full`` wraps this + a schedules lookup for
+    callers that want the fully-decorated response shape."""
     d = dict(row)
     raw = d.pop("graph_json", None) or '{"version":1,"nodes":[],"edges":[],"variables":{}}'
     try:
@@ -84,9 +87,38 @@ def _decorate_workflow(row: aiosqlite.Row) -> dict[str, Any]:
     except (TypeError, ValueError):
         d["graph"] = {"version": 1, "nodes": [], "edges": [], "variables": {}}
     d["enabled"] = bool(d.get("enabled"))
-    for key in ("last_run_at", "next_run_at", "created_at", "updated_at"):
+    # Drop deprecated v0.12.10 row-level fields; schedules now live
+    # in workflow_schedules.
+    for deprecated in ("trigger_kind", "cron_expression", "next_run_at"):
+        d.pop(deprecated, None)
+    for key in ("last_run_at", "created_at", "updated_at"):
         epoch = d.get(key)
         d[f"{key}_iso"] = epoch_to_iso(epoch) if epoch else None
+    d["trigger_types"] = trigger_types_from_graph(d.get("graph"))
+    return d
+
+
+async def _decorate_workflow(
+    conn: aiosqlite.Connection, row: aiosqlite.Row,
+) -> dict[str, Any]:
+    """Full workflow decoration including the ``schedules`` array
+    pulled from ``workflow_schedules``."""
+    d = _decorate_workflow_row(row)
+    cursor = await conn.execute(
+        "SELECT * FROM workflow_schedules WHERE workflow_id = ? "
+        "ORDER BY next_run_at ASC",
+        (d["id"],),
+    )
+    rows = await cursor.fetchall()
+    schedules = []
+    for s in rows:
+        sd = dict(s)
+        sd["enabled"] = bool(sd.get("enabled"))
+        for key in ("next_run_at", "last_run_at", "created_at", "updated_at"):
+            epoch = sd.get(key)
+            sd[f"{key}_iso"] = epoch_to_iso(epoch) if epoch else None
+        schedules.append(sd)
+    d["schedules"] = schedules
     return d
 
 
@@ -181,50 +213,97 @@ async def _load_graph(conn: aiosqlite.Connection, workflow_id: str) -> dict:
     return json.loads(row[0])
 
 
+async def _sync_workflow_schedules(
+    conn: aiosqlite.Connection, workflow_id: str, graph: dict,
+) -> None:
+    """Reconcile ``workflow_schedules`` rows against the graph's
+    ``trigger-schedule`` blocks. Same logic as
+    ``openagent.workflow.schedule_sync.sync_workflow_schedules`` but
+    runs against the MCP subprocess's raw ``aiosqlite.Connection``
+    without pulling MemoryDB into this process.
+    """
+    keep_node_ids: list[str] = []
+    now = time.time()
+    for node in iter_trigger_schedule_blocks(graph):
+        node_id = node.get("id")
+        cfg = node.get("config") or {}
+        cron = cfg.get("cron_expression")
+        if not node_id or not cron:
+            continue
+        try:
+            validate_schedule_expression(cron)
+            nxt = next_run_for_expression(cron)
+        except ValueError:
+            continue
+        keep_node_ids.append(node_id)
+        cursor = await conn.execute(
+            "SELECT id, cron_expression FROM workflow_schedules "
+            "WHERE workflow_id = ? AND node_id = ?",
+            (workflow_id, node_id),
+        )
+        existing = await cursor.fetchone()
+        if existing is not None:
+            keep_next = existing["cron_expression"] == cron
+            if keep_next:
+                await conn.execute(
+                    "UPDATE workflow_schedules SET cron_expression = ?, "
+                    "updated_at = ? WHERE id = ?",
+                    (cron, now, existing["id"]),
+                )
+            else:
+                await conn.execute(
+                    "UPDATE workflow_schedules SET cron_expression = ?, "
+                    "next_run_at = ?, updated_at = ? WHERE id = ?",
+                    (cron, nxt, now, existing["id"]),
+                )
+        else:
+            await conn.execute(
+                "INSERT INTO workflow_schedules "
+                "(id, workflow_id, node_id, cron_expression, next_run_at, "
+                " enabled, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
+                (
+                    str(uuid.uuid4()),
+                    workflow_id,
+                    node_id,
+                    cron,
+                    nxt,
+                    now,
+                    now,
+                ),
+            )
+    # Prune schedules for removed / renamed blocks.
+    if keep_node_ids:
+        placeholders = ",".join("?" for _ in keep_node_ids)
+        await conn.execute(
+            f"DELETE FROM workflow_schedules WHERE workflow_id = ? "
+            f"AND node_id NOT IN ({placeholders})",
+            [workflow_id, *keep_node_ids],
+        )
+    else:
+        await conn.execute(
+            "DELETE FROM workflow_schedules WHERE workflow_id = ?",
+            (workflow_id,),
+        )
+
+
 async def _save_graph(
     conn: aiosqlite.Connection, workflow_id: str, graph: dict,
 ) -> None:
-    """Persist graph_json + reconcile row-level schedule columns.
+    """Persist graph_json + reconcile ``workflow_schedules`` rows.
 
-    After any incremental graph edit (``add_block`` / ``update_block``
-    / ``remove_block`` / ``connect_blocks``), re-derive the row's
-    cron_expression + next_run_at from the (possibly absent)
-    trigger-schedule block. When the graph mutates, the graph is the
-    source of truth — removing the last trigger-schedule block clears
-    the row cron so the scheduler stops firing.
+    After any graph write (``add_block`` / ``update_block`` /
+    ``remove_block`` / ``connect_blocks``) the graph is the source of
+    truth: adding a trigger-schedule block creates a matching schedule
+    row, editing its cron updates the row, removing it prunes the row.
     """
     validate_graph(graph)
-    cursor = await conn.execute(
-        "SELECT trigger_kind FROM workflow_tasks WHERE id = ?",
-        (workflow_id,),
-    )
-    row = await cursor.fetchone()
-    current_kind = row["trigger_kind"] if row else None
-
-    # Pass explicit_cron=<graph cron or None> so derive_schedule_updates
-    # always returns a patch (clearing when the block is gone, setting
-    # when present). Default ``NOT_PROVIDED`` would early-return {} on
-    # an empty graph, leaving stale row cron behind.
-    from openagent.workflow.schedule_sync import pick_trigger_schedule_cron
-
-    schedule_patch = derive_schedule_updates(
-        graph,
-        explicit_cron=pick_trigger_schedule_cron(graph),
-        current_trigger_kind=current_kind,
-    )
-
     now = time.time()
-    set_clauses = ["graph_json = ?", "updated_at = ?"]
-    values: list[Any] = [json.dumps(graph), now]
-    for key in ("cron_expression", "next_run_at", "trigger_kind"):
-        if key in schedule_patch:
-            set_clauses.append(f"{key} = ?")
-            values.append(schedule_patch[key])
-    values.append(workflow_id)
     await conn.execute(
-        f"UPDATE workflow_tasks SET {', '.join(set_clauses)} WHERE id = ?",
-        values,
+        "UPDATE workflow_tasks SET graph_json = ?, updated_at = ? WHERE id = ?",
+        (json.dumps(graph), now, workflow_id),
     )
+    await _sync_workflow_schedules(conn, workflow_id, graph)
     await conn.commit()
 
 
@@ -236,39 +315,46 @@ mcp = FastMCP("workflow-manager")
 @mcp.tool()
 async def list_workflows(
     enabled_only: bool = False,
-    trigger_kind: str | None = None,
+    has_trigger_type: str | None = None,
 ) -> list[dict[str, Any]]:
-    """List workflows. Optionally filter by ``enabled_only`` or
-    ``trigger_kind`` ('manual', 'schedule', 'ai', 'hybrid'). Returns a
-    list of workflow rows with the full graph included.
+    """List workflows with their graphs and schedule rows.
+
+    - ``enabled_only`` filters to workflows whose ``enabled`` flag is set.
+    - ``has_trigger_type`` filters to workflows whose graph contains at
+      least one block of that type (e.g. ``'trigger-schedule'``,
+      ``'trigger-ai'``, ``'trigger-manual'``). Computed in Python from
+      the returned graphs since triggers live inside the graph.
+
+    Workflows no longer carry a row-level ``trigger_kind`` — any
+    workflow can be triggered manually, by the AI, or on a schedule at
+    any time. The trigger nodes inside the graph are the whole story.
     """
     conn = await _get_conn()
-    clauses: list[str] = []
-    params: list[Any] = []
-    if enabled_only:
-        clauses.append("enabled = 1")
-    if trigger_kind:
-        clauses.append("trigger_kind = ?")
-        params.append(trigger_kind)
-    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    where = "WHERE enabled = 1" if enabled_only else ""
     cursor = await conn.execute(
-        f"SELECT * FROM workflow_tasks {where} ORDER BY updated_at DESC",
-        params,
+        f"SELECT * FROM workflow_tasks {where} ORDER BY updated_at DESC"
     )
     rows = await cursor.fetchall()
-    return [_decorate_workflow(r) for r in rows]
+    decorated = [await _decorate_workflow(conn, r) for r in rows]
+    if has_trigger_type:
+        decorated = [w for w in decorated if has_trigger_type in w["trigger_types"]]
+    return decorated
 
 
 @mcp.tool()
 async def get_workflow(id_or_name: str) -> dict[str, Any]:
-    """Return a single workflow: ``{id, name, description, trigger_kind,
-    cron_expression, enabled, graph: {nodes, edges, variables},
-    last_run_at, next_run_at, ...}``. Accepts full id, 8-char id prefix,
-    or unique name.
+    """Return a single workflow: ``{id, name, description, enabled,
+    graph: {nodes, edges, variables}, schedules: [...], trigger_types:
+    [...], last_run_at, ...}``. Accepts full id, 8-char id prefix, or
+    unique name.
+
+    ``schedules`` is one row per ``trigger-schedule`` block inside the
+    graph, carrying its ``cron_expression`` + ``next_run_at`` +
+    ``last_run_at`` — read this, not a row-level cron column.
     """
     conn = await _get_conn()
     row = await _resolve_workflow(conn, id_or_name)
-    return _decorate_workflow(row)
+    return await _decorate_workflow(conn, row)
 
 
 @mcp.tool()
@@ -278,25 +364,21 @@ async def create_workflow(
     nodes: list[dict] | None = None,
     edges: list[dict] | None = None,
     variables: dict | None = None,
-    trigger_kind: str = "manual",
-    cron_expression: str | None = None,
 ) -> dict[str, Any]:
     """Create a new workflow.
 
     - ``name`` must be unique across workflows (case-sensitive).
-    - ``trigger_kind`` is one of 'manual' | 'schedule' | 'ai' | 'hybrid'.
-    - When ``cron_expression`` is provided, it is validated before insert
-      and ``next_run_at`` is computed so the scheduler picks it up on the
-      next tick.
     - ``nodes``/``edges``/``variables`` default to an empty graph you
-      can populate with ``add_block`` + ``connect_blocks``.
+      can populate with ``add_block`` + ``connect_blocks``. Use
+      ``trigger-manual`` / ``trigger-schedule`` / ``trigger-ai``
+      blocks inside the graph to control *how* it fires — the workflow
+      row itself has no ``trigger_kind``.
+    - ``trigger-schedule`` blocks with a ``cron_expression`` in their
+      ``config`` automatically appear in ``workflow_schedules`` and
+      are fired by the main-process scheduler.
     """
     if not name or not name.strip():
         raise ValueError("name is required")
-    if trigger_kind not in ("manual", "schedule", "ai", "hybrid"):
-        raise ValueError(
-            f"invalid trigger_kind {trigger_kind!r} (expected manual | schedule | ai | hybrid)"
-        )
     graph = {
         "version": 1,
         "nodes": nodes or [],
@@ -308,39 +390,24 @@ async def create_workflow(
     except ValidationError as e:
         raise ValueError(f"graph validation failed: {e}") from e
 
-    # Reconcile row-level schedule with any trigger-schedule block
-    # inside the graph. ``cron_expression`` in the call args wins when
-    # set; otherwise the block's cron is used.
-    schedule_patch = derive_schedule_updates(
-        graph,
-        explicit_cron=cron_expression if cron_expression is not None else _MISSING,
-        explicit_trigger_kind=trigger_kind,
-    )
-    cron_expression = schedule_patch.get("cron_expression", cron_expression)
-    next_run_at = schedule_patch.get("next_run_at")
-    trigger_kind = schedule_patch.get("trigger_kind", trigger_kind)
-
     conn = await _get_conn()
     workflow_id = str(uuid.uuid4())
     now = time.time()
     try:
         await conn.execute(
             "INSERT INTO workflow_tasks "
-            "(id, name, description, graph_json, trigger_kind, cron_expression, "
-            " enabled, next_run_at, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
+            "(id, name, description, graph_json, enabled, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, 1, ?, ?)",
             (
                 workflow_id,
                 name.strip(),
                 description or None,
                 json.dumps(graph),
-                trigger_kind,
-                cron_expression,
-                next_run_at,
                 now,
                 now,
             ),
         )
+        await _sync_workflow_schedules(conn, workflow_id, graph)
         await conn.commit()
     except aiosqlite.IntegrityError as e:
         if "UNIQUE" in str(e):
@@ -357,8 +424,6 @@ async def update_workflow(
     nodes: list[dict] | None = None,
     edges: list[dict] | None = None,
     variables: dict | None = None,
-    trigger_kind: str | None = None,
-    cron_expression: str | None = None,
     enabled: bool | None = None,
 ) -> dict[str, Any]:
     """Patch-style update. Only fields you pass are changed.
@@ -367,8 +432,11 @@ async def update_workflow(
     for incremental edits use ``add_block`` / ``update_block`` /
     ``remove_block`` / ``connect_blocks`` / ``disconnect_blocks``.
 
-    Changing ``cron_expression`` re-validates it and recomputes
-    ``next_run_at`` so the scheduler picks up the new cadence.
+    Scheduling lives inside the graph: add / edit / remove a
+    ``trigger-schedule`` block's ``config.cron_expression`` to control
+    when the workflow fires. Per-block schedules are kept in
+    ``workflow_schedules`` via ``_sync_workflow_schedules`` on every
+    write.
     """
     conn = await _get_conn()
     row = await _resolve_workflow(conn, id_or_name)
@@ -382,10 +450,6 @@ async def update_workflow(
         updates["name"] = name.strip()
     if description is not None:
         updates["description"] = description or None
-    if trigger_kind is not None:
-        if trigger_kind not in ("manual", "schedule", "ai", "hybrid"):
-            raise ValueError(f"invalid trigger_kind {trigger_kind!r}")
-        updates["trigger_kind"] = trigger_kind
     if enabled is not None:
         updates["enabled"] = 1 if enabled else 0
 
@@ -405,30 +469,8 @@ async def update_workflow(
             raise ValueError(f"graph validation failed: {e}") from e
         updates["graph_json"] = json.dumps(new_graph)
 
-    # Reconcile schedule column against (new or current) graph.
-    #
-    # ``cron_expression=None`` here is MCP-ambiguous (tool default vs
-    # caller-passed ``None``). Treat the ``""`` sentinel as "clear the
-    # schedule", any truthy string as "use this cron", and None as
-    # "leave alone — derive from graph instead". This matches n8n's
-    # behaviour where editing a trigger block in the graph is enough.
-    if cron_expression == "":
-        explicit = None
-    elif cron_expression is not None:
-        explicit = cron_expression
-    else:
-        explicit = _MISSING
-    graph_for_sync = new_graph if new_graph is not None else current_graph
-    schedule_patch = derive_schedule_updates(
-        graph_for_sync,
-        explicit_cron=explicit,
-        explicit_trigger_kind=updates.get("trigger_kind"),
-        current_trigger_kind=row["trigger_kind"],
-    )
-    updates.update(schedule_patch)
-
     if not updates:
-        return _decorate_workflow(row)
+        return await _decorate_workflow(conn, row)
 
     updates["updated_at"] = time.time()
     set_clause = ", ".join(f"{k} = ?" for k in updates)
@@ -437,6 +479,11 @@ async def update_workflow(
             f"UPDATE workflow_tasks SET {set_clause} WHERE id = ?",
             list(updates.values()) + [workflow_id],
         )
+        # When the graph changed, sync per-block schedule rows before
+        # committing so reads in the same transaction see consistent
+        # state.
+        if new_graph is not None:
+            await _sync_workflow_schedules(conn, workflow_id, new_graph)
         await conn.commit()
     except aiosqlite.IntegrityError as e:
         if "UNIQUE" in str(e):

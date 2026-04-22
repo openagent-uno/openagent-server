@@ -193,26 +193,53 @@ CREATE TABLE IF NOT EXISTS session_bindings (
 -- Workflow graphs (n8n-style multi-block pipelines). The whole node/
 -- edge graph lives inside ``graph_json`` so the AI can round-trip it
 -- via a single tool call and React Flow can consume the same shape on
--- the UI. ``trigger_kind`` + ``cron_expression`` + ``next_run_at`` let
--- the existing Scheduler loop pick up scheduled workflows from the
--- same tick it already uses for ``scheduled_tasks``.
+-- the UI. A workflow has no opinion on how it's triggered — any
+-- workflow can be fired manually, by the AI, or on a schedule at any
+-- time. The scheduling state (cron + next_run_at) is keyed per
+-- trigger-schedule *node* in ``workflow_schedules`` below, so a single
+-- workflow can carry multiple independent schedules.
+--
+-- Legacy columns ``trigger_kind`` / ``cron_expression`` / ``next_run_at``
+-- shipped in v0.12.10; they are kept on the table for existing DBs
+-- (SQLite can't cleanly drop NOT NULL columns pre-3.35) but are no
+-- longer read or written by any new code. See ``_apply_legacy_alters``
+-- for the migration that backfills ``workflow_schedules`` from the
+-- first release's row-level cron.
 CREATE TABLE IF NOT EXISTS workflow_tasks (
     id              TEXT PRIMARY KEY,
     name            TEXT NOT NULL UNIQUE,
     description     TEXT,
     graph_json      TEXT NOT NULL DEFAULT '{"version":1,"nodes":[],"edges":[],"variables":{}}',
-    trigger_kind    TEXT NOT NULL DEFAULT 'manual'
-                    CHECK (trigger_kind IN ('manual','schedule','ai','hybrid')),
-    cron_expression TEXT,
+    trigger_kind    TEXT NOT NULL DEFAULT 'manual',  -- DEPRECATED, ignored
+    cron_expression TEXT,                             -- DEPRECATED, ignored
     enabled         INTEGER NOT NULL DEFAULT 1,
     last_run_at     REAL,
-    next_run_at     REAL,
+    next_run_at     REAL,                              -- DEPRECATED, ignored
     created_at      REAL NOT NULL,
     updated_at      REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_wf_enabled  ON workflow_tasks(enabled);
-CREATE INDEX IF NOT EXISTS idx_wf_next_run ON workflow_tasks(next_run_at);
-CREATE INDEX IF NOT EXISTS idx_wf_trigger  ON workflow_tasks(trigger_kind);
+
+-- One row per ``trigger-schedule`` block in any workflow's graph. The
+-- scheduler polls ``WHERE enabled=1 AND next_run_at <= ?`` with the
+-- ``next_run_at`` index so the scan stays O(scheduled) regardless of
+-- how many workflows exist. Rows are kept in sync with the graph by
+-- ``sync_workflow_schedules`` on every workflow write.
+CREATE TABLE IF NOT EXISTS workflow_schedules (
+    id              TEXT PRIMARY KEY,
+    workflow_id     TEXT NOT NULL REFERENCES workflow_tasks(id) ON DELETE CASCADE,
+    node_id         TEXT NOT NULL,
+    cron_expression TEXT NOT NULL,
+    next_run_at     REAL NOT NULL,
+    last_run_at     REAL,
+    enabled         INTEGER NOT NULL DEFAULT 1,
+    created_at      REAL NOT NULL,
+    updated_at      REAL NOT NULL,
+    UNIQUE(workflow_id, node_id)
+);
+CREATE INDEX IF NOT EXISTS idx_wfsched_next_run ON workflow_schedules(next_run_at);
+CREATE INDEX IF NOT EXISTS idx_wfsched_enabled  ON workflow_schedules(enabled);
+CREATE INDEX IF NOT EXISTS idx_wfsched_workflow ON workflow_schedules(workflow_id);
 
 -- Per-execution history + append-only trace. ``trace_json`` is a
 -- JSON array of per-block entries:
@@ -307,6 +334,122 @@ class MemoryDB:
             "ON models(is_classifier)"
         )
 
+        # v0.12.10 → v0.12.11: per-block scheduling.
+        # Rows in ``workflow_tasks.cron_expression`` were the single
+        # row-level schedule. The new model carries schedules per
+        # ``trigger-schedule`` block in ``workflow_schedules``. For each
+        # legacy workflow with a row-level cron, ensure its graph has a
+        # matching trigger-schedule block (inject one if missing) and
+        # seed the ``workflow_schedules`` row — then clear the legacy
+        # column so subsequent boots don't re-migrate.
+        await self._migrate_workflow_schedules_from_legacy_columns()
+
+    async def _migrate_workflow_schedules_from_legacy_columns(self) -> None:
+        """One-time backfill from v0.12.10's row-level ``cron_expression``
+        column into the per-block ``workflow_schedules`` table.
+        Idempotent — runs every boot but only does work on rows that
+        still carry a legacy cron.
+        """
+        assert self._conn is not None
+        # Probe for the legacy column — absent on fresh installs that
+        # started on v0.12.11+, present on upgrades.
+        cursor = await self._conn.execute("PRAGMA table_info(workflow_tasks)")
+        cols = {row[1] for row in await cursor.fetchall()}
+        if "cron_expression" not in cols:
+            return
+
+        cursor = await self._conn.execute(
+            "SELECT id, graph_json, cron_expression FROM workflow_tasks "
+            "WHERE cron_expression IS NOT NULL AND cron_expression != ''"
+        )
+        rows = await cursor.fetchall()
+        if not rows:
+            return
+
+        now = time.time()
+        # Defer the cron parse to avoid pulling croniter into every boot;
+        # only import on actual migration work.
+        from openagent.memory.schedule import (
+            next_run_for_expression,
+            validate_schedule_expression,
+        )
+
+        for row in rows:
+            wf_id = row[0]
+            graph_json = row[1] or '{"version":1,"nodes":[],"edges":[],"variables":{}}'
+            legacy_cron = row[2]
+            try:
+                graph = json.loads(graph_json)
+            except (TypeError, ValueError):
+                continue
+
+            nodes = graph.setdefault("nodes", [])
+            edges = graph.setdefault("edges", [])
+
+            # Does the graph already carry a trigger-schedule block?
+            sched_node = next(
+                (n for n in nodes if n.get("type") == "trigger-schedule"),
+                None,
+            )
+            if sched_node is None:
+                # Inject one so the legacy cron survives the migration.
+                used_ids = {n.get("id") for n in nodes}
+                i = len(nodes) + 1
+                new_id = f"n{i}"
+                while new_id in used_ids:
+                    i += 1
+                    new_id = f"n{i}"
+                sched_node = {
+                    "id": new_id,
+                    "type": "trigger-schedule",
+                    "label": "Scheduled",
+                    "position": {"x": 120.0, "y": 120.0},
+                    "config": {"cron_expression": legacy_cron},
+                }
+                nodes.insert(0, sched_node)
+                await self._conn.execute(
+                    "UPDATE workflow_tasks SET graph_json = ?, updated_at = ? WHERE id = ?",
+                    (json.dumps(graph), now, wf_id),
+                )
+            else:
+                cfg = sched_node.setdefault("config", {})
+                if not cfg.get("cron_expression"):
+                    cfg["cron_expression"] = legacy_cron
+                    await self._conn.execute(
+                        "UPDATE workflow_tasks SET graph_json = ?, updated_at = ? WHERE id = ?",
+                        (json.dumps(graph), now, wf_id),
+                    )
+
+            # Create a workflow_schedules row if one doesn't exist yet.
+            try:
+                validate_schedule_expression(sched_node["config"]["cron_expression"])
+                nxt = next_run_for_expression(sched_node["config"]["cron_expression"])
+            except ValueError:
+                continue  # drop invalid legacy crons silently
+
+            await self._conn.execute(
+                "INSERT OR IGNORE INTO workflow_schedules "
+                "(id, workflow_id, node_id, cron_expression, next_run_at, "
+                " enabled, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
+                (
+                    str(uuid.uuid4()),
+                    wf_id,
+                    sched_node["id"],
+                    sched_node["config"]["cron_expression"],
+                    nxt,
+                    now,
+                    now,
+                ),
+            )
+            # Clear the legacy column so the next boot is a no-op.
+            await self._conn.execute(
+                "UPDATE workflow_tasks SET cron_expression = NULL WHERE id = ?",
+                (wf_id,),
+            )
+
+        await self._conn.commit()
+
     async def close(self) -> None:
         if self._conn:
             await self._conn.close()
@@ -379,7 +522,10 @@ class MemoryDB:
     def _row_to_workflow(row: aiosqlite.Row) -> dict:
         """Hydrate a workflow row. ``graph_json`` is parsed into a
         ``{"version", "nodes", "edges", "variables"}`` dict; ``enabled``
-        becomes a real bool.
+        becomes a real bool. Legacy ``trigger_kind`` / ``cron_expression`` /
+        ``next_run_at`` columns (v0.12.10) are stripped — callers read
+        schedule state from ``workflow_schedules`` via
+        ``list_schedules(workflow_id=...)``.
         """
         d = dict(row)
         raw = d.pop("graph_json", None) or '{"version":1,"nodes":[],"edges":[],"variables":{}}'
@@ -388,26 +534,23 @@ class MemoryDB:
         except (TypeError, ValueError):
             d["graph"] = {"version": 1, "nodes": [], "edges": [], "variables": {}}
         d["enabled"] = bool(d.get("enabled"))
+        # Drop deprecated row-level fields — they're still stored on the
+        # table for backwards-compatibility but callers should not read
+        # them. ``_migrate_workflow_schedules_from_legacy_columns``
+        # clears them on first boot after the upgrade.
+        for deprecated in ("trigger_kind", "cron_expression", "next_run_at"):
+            d.pop(deprecated, None)
         return d
 
     async def list_workflows(
         self,
         *,
         enabled_only: bool = False,
-        trigger_kind: str | None = None,
     ) -> list[dict]:
         conn = await self._ensure_connected()
-        clauses: list[str] = []
-        params: list[Any] = []
-        if enabled_only:
-            clauses.append("enabled = 1")
-        if trigger_kind is not None:
-            clauses.append("trigger_kind = ?")
-            params.append(trigger_kind)
-        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        where = "WHERE enabled = 1" if enabled_only else ""
         cursor = await conn.execute(
-            f"SELECT * FROM workflow_tasks {where} ORDER BY updated_at DESC",
-            params,
+            f"SELECT * FROM workflow_tasks {where} ORDER BY updated_at DESC"
         )
         rows = await cursor.fetchall()
         return [self._row_to_workflow(r) for r in rows]
@@ -436,36 +579,24 @@ class MemoryDB:
         name: str,
         description: str | None = None,
         graph: dict | None = None,
-        trigger_kind: str = "manual",
-        cron_expression: str | None = None,
-        next_run_at: float | None = None,
         enabled: bool = True,
     ) -> str:
         if not name or not name.strip():
             raise ValueError("name is required")
-        if trigger_kind not in ("manual", "schedule", "ai", "hybrid"):
-            raise ValueError(
-                f"invalid trigger_kind {trigger_kind!r}; expected "
-                "'manual' | 'schedule' | 'ai' | 'hybrid'"
-            )
         graph_payload = graph or {"version": 1, "nodes": [], "edges": [], "variables": {}}
         conn = await self._ensure_connected()
         workflow_id = str(uuid.uuid4())
         now = time.time()
         await conn.execute(
             "INSERT INTO workflow_tasks "
-            "(id, name, description, graph_json, trigger_kind, cron_expression, "
-            " enabled, next_run_at, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "(id, name, description, graph_json, enabled, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 workflow_id,
                 name.strip(),
                 description,
                 json.dumps(graph_payload),
-                trigger_kind,
-                cron_expression,
                 1 if enabled else 0,
-                next_run_at,
                 now,
                 now,
             ),
@@ -475,16 +606,11 @@ class MemoryDB:
 
     async def update_workflow(self, workflow_id: str, **kwargs: Any) -> None:
         """Partial update. ``graph`` (dict) is serialized to ``graph_json``
-        on the way in."""
-        allowed_direct = {
-            "name",
-            "description",
-            "trigger_kind",
-            "cron_expression",
-            "enabled",
-            "last_run_at",
-            "next_run_at",
-        }
+        on the way in. Schedule state is kept in sync via
+        ``workflow_schedules`` — callers should invoke
+        ``sync_workflow_schedules`` after any graph write.
+        """
+        allowed_direct = {"name", "description", "enabled", "last_run_at"}
         updates: dict[str, Any] = {}
         for k, v in kwargs.items():
             if k == "graph" and v is not None:
@@ -493,10 +619,6 @@ class MemoryDB:
                 updates[k] = (1 if v else 0) if k == "enabled" and isinstance(v, bool) else v
         if not updates:
             return
-        if "trigger_kind" in updates and updates["trigger_kind"] not in (
-            "manual", "schedule", "ai", "hybrid",
-        ):
-            raise ValueError(f"invalid trigger_kind {updates['trigger_kind']!r}")
         updates["updated_at"] = time.time()
         set_clause = ", ".join(f"{k} = ?" for k in updates)
         conn = await self._ensure_connected()
@@ -511,30 +633,157 @@ class MemoryDB:
         await conn.execute("DELETE FROM workflow_tasks WHERE id = ?", (workflow_id,))
         await conn.commit()
 
-    async def get_due_workflow_tasks(self, now: float) -> list[dict]:
-        """Enabled workflows with a schedule trigger whose next_run_at is <= now."""
+    # ── Workflow Schedules (per trigger-schedule block) ──
+
+    @staticmethod
+    def _row_to_schedule(row: aiosqlite.Row) -> dict:
+        d = dict(row)
+        d["enabled"] = bool(d.get("enabled"))
+        return d
+
+    async def list_schedules(
+        self,
+        *,
+        workflow_id: str | None = None,
+        enabled_only: bool = False,
+    ) -> list[dict]:
+        conn = await self._ensure_connected()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if workflow_id is not None:
+            clauses.append("workflow_id = ?")
+            params.append(workflow_id)
+        if enabled_only:
+            clauses.append("enabled = 1")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        cursor = await conn.execute(
+            f"SELECT * FROM workflow_schedules {where} "
+            "ORDER BY next_run_at ASC",
+            params,
+        )
+        rows = await cursor.fetchall()
+        return [self._row_to_schedule(r) for r in rows]
+
+    async def get_due_schedules(self, now: float) -> list[dict]:
+        """Schedules whose next_run_at is <= now. The scheduler loop
+        consumes this on every tick to drive per-block triggering."""
         conn = await self._ensure_connected()
         cursor = await conn.execute(
-            "SELECT * FROM workflow_tasks "
-            "WHERE enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ? "
-            "AND trigger_kind IN ('schedule','hybrid') "
-            "ORDER BY next_run_at ASC",
+            "SELECT s.* FROM workflow_schedules s "
+            "JOIN workflow_tasks w ON w.id = s.workflow_id "
+            "WHERE s.enabled = 1 AND w.enabled = 1 AND s.next_run_at <= ? "
+            "ORDER BY s.next_run_at ASC",
             (now,),
         )
         rows = await cursor.fetchall()
-        return [self._row_to_workflow(r) for r in rows]
+        return [self._row_to_schedule(r) for r in rows]
 
-    async def list_scheduled_workflows(self) -> list[dict]:
-        """All workflows with a cron schedule, enabled or not. Used by
-        ``Scheduler._recalculate_next_runs`` at boot."""
+    async def upsert_schedule(
+        self,
+        *,
+        workflow_id: str,
+        node_id: str,
+        cron_expression: str,
+        next_run_at: float,
+        enabled: bool = True,
+    ) -> str:
+        """Insert or update the schedule row for a given
+        (workflow_id, node_id). Returns the row id."""
         conn = await self._ensure_connected()
+        now = time.time()
         cursor = await conn.execute(
-            "SELECT * FROM workflow_tasks "
-            "WHERE cron_expression IS NOT NULL "
-            "AND trigger_kind IN ('schedule','hybrid')"
+            "SELECT id, cron_expression, next_run_at FROM workflow_schedules "
+            "WHERE workflow_id = ? AND node_id = ?",
+            (workflow_id, node_id),
         )
-        rows = await cursor.fetchall()
-        return [self._row_to_workflow(r) for r in rows]
+        existing = await cursor.fetchone()
+        if existing is not None:
+            # Preserve next_run_at when only metadata changed and cron
+            # is identical — avoids rolling the scheduler forward on
+            # every graph save.
+            keep_next = existing["cron_expression"] == cron_expression
+            await conn.execute(
+                "UPDATE workflow_schedules SET cron_expression = ?, "
+                "next_run_at = ?, enabled = ?, updated_at = ? "
+                "WHERE id = ?",
+                (
+                    cron_expression,
+                    existing["next_run_at"] if keep_next else next_run_at,
+                    1 if enabled else 0,
+                    now,
+                    existing["id"],
+                ),
+            )
+            await conn.commit()
+            return existing["id"]
+        sid = str(uuid.uuid4())
+        await conn.execute(
+            "INSERT INTO workflow_schedules "
+            "(id, workflow_id, node_id, cron_expression, next_run_at, "
+            " enabled, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                sid,
+                workflow_id,
+                node_id,
+                cron_expression,
+                next_run_at,
+                1 if enabled else 0,
+                now,
+                now,
+            ),
+        )
+        await conn.commit()
+        return sid
+
+    async def update_schedule(self, schedule_id: str, **kwargs: Any) -> None:
+        allowed = {"cron_expression", "next_run_at", "last_run_at", "enabled"}
+        updates: dict[str, Any] = {}
+        for k, v in kwargs.items():
+            if k not in allowed:
+                continue
+            updates[k] = (1 if v else 0) if k == "enabled" and isinstance(v, bool) else v
+        if not updates:
+            return
+        updates["updated_at"] = time.time()
+        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        conn = await self._ensure_connected()
+        await conn.execute(
+            f"UPDATE workflow_schedules SET {set_clause} WHERE id = ?",
+            list(updates.values()) + [schedule_id],
+        )
+        await conn.commit()
+
+    async def delete_schedule(self, schedule_id: str) -> None:
+        conn = await self._ensure_connected()
+        await conn.execute(
+            "DELETE FROM workflow_schedules WHERE id = ?", (schedule_id,),
+        )
+        await conn.commit()
+
+    async def delete_schedules_not_in(
+        self,
+        workflow_id: str,
+        keep_node_ids: list[str],
+    ) -> int:
+        """Prune schedules whose block no longer exists in the graph.
+        Returns the number of rows removed. Called by
+        ``sync_workflow_schedules`` after processing graph blocks."""
+        conn = await self._ensure_connected()
+        if not keep_node_ids:
+            cursor = await conn.execute(
+                "DELETE FROM workflow_schedules WHERE workflow_id = ?",
+                (workflow_id,),
+            )
+        else:
+            placeholders = ",".join("?" for _ in keep_node_ids)
+            cursor = await conn.execute(
+                f"DELETE FROM workflow_schedules WHERE workflow_id = ? "
+                f"AND node_id NOT IN ({placeholders})",
+                [workflow_id, *keep_node_ids],
+            )
+        await conn.commit()
+        return cursor.rowcount or 0
 
     # ── Workflow Runs (execution history) ──
 

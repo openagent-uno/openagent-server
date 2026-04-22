@@ -125,7 +125,17 @@ class WorkflowExecutor:
         inputs: dict[str, Any] | None = None,
         on_status: StatusCallback | None = None,
         run_id: str | None = None,
+        entry_node_id: str | None = None,
     ) -> dict[str, Any]:
+        """Execute one workflow run.
+
+        ``entry_node_id`` — when supplied, restricts the walk's entry
+        set to the single named node (and any other orphans are
+        ignored). Used by the scheduler to fire a specific
+        ``trigger-schedule`` block in a workflow that carries several
+        of them. When ``None`` (manual / api / ai-triggered runs),
+        every node with in-degree 0 enters the walk.
+        """
         graph = workflow.get("graph") or {}
         validate_graph(graph)
 
@@ -154,7 +164,7 @@ class WorkflowExecutor:
                     pass
 
             try:
-                await self._walk(graph, ctx, on_status)
+                await self._walk(graph, ctx, on_status, entry_node_id=entry_node_id)
             except WorkflowExecutionError as exc:
                 await self._finalize_run(
                     ctx, status="failed", error=str(exc),
@@ -189,6 +199,8 @@ class WorkflowExecutor:
         graph: dict,
         ctx: _RunCtx,
         on_status: StatusCallback | None,
+        *,
+        entry_node_id: str | None = None,
     ) -> None:
         """Batch-parallel walker with per-edge routing.
 
@@ -203,6 +215,12 @@ class WorkflowExecutor:
         skipped+cascaded), ``parallel`` (all branches satisfied, run
         concurrently on the next tick), ``merge`` (waits for upstream,
         handles partial-skip), and plain linear flow.
+
+        ``entry_node_id`` optionally restricts the walk's entry set to
+        a single node so the scheduler can fire a specific
+        ``trigger-schedule`` block in a multi-trigger workflow. Other
+        entry candidates become ``dead`` (their subgraphs don't run
+        for this tick).
         """
         nodes_by_id = {n["id"]: n for n in graph.get("nodes", [])}
         edges = list(graph.get("edges", []))
@@ -222,7 +240,39 @@ class WorkflowExecutor:
         completed: set[str] = set()
         dead: set[str] = set()
 
-        ready: list[str] = [nid for nid, deg in in_degree.items() if deg == 0]
+        default_entries = [nid for nid, deg in in_degree.items() if deg == 0]
+        if entry_node_id is not None:
+            if entry_node_id not in nodes_by_id:
+                raise WorkflowExecutionError(
+                    f"entry_node_id {entry_node_id!r} is not in the graph"
+                )
+            if entry_node_id not in default_entries:
+                raise WorkflowExecutionError(
+                    f"entry_node_id {entry_node_id!r} is not a valid entry "
+                    "(has incoming edges)"
+                )
+            ready: list[str] = [entry_node_id]
+            # Other entry candidates are siblings that won't fire for
+            # this tick — mark them dead so their reachable subgraphs
+            # cascade-skip (via the normal ``dead`` propagation below)
+            # instead of re-entering the ready queue.
+            for nid in default_entries:
+                if nid == entry_node_id:
+                    continue
+                dead.add(nid)
+                ctx.trace.append({
+                    "node_id": nid,
+                    "type": nodes_by_id[nid].get("type"),
+                    "status": "skipped",
+                    "started_at": None,
+                    "finished_at": None,
+                    "input": None,
+                    "output": None,
+                    "error": None,
+                })
+                ctx.nodes[nid] = {"output": None, "status": "skipped"}
+        else:
+            ready = list(default_entries)
 
         async def _resolve_edge(src: str, edge: dict, satisfied: bool) -> None:
             """Mark ``edge`` as satisfied or skipped; promote target to
@@ -254,6 +304,15 @@ class WorkflowExecutor:
                 # Cascade — every outgoing edge is skipped.
                 for e2 in outgoing.get(tgt, []):
                     await _resolve_edge(tgt, e2, satisfied=False)
+
+        # When ``entry_node_id`` dropped siblings into ``dead`` above,
+        # their outgoing edges haven't been accounted for yet. Cascade
+        # now so downstream nodes fed solely by those siblings flip
+        # to skipped before the main loop starts.
+        if entry_node_id is not None:
+            for skipped_nid in list(dead):
+                for e2 in outgoing.get(skipped_nid, []):
+                    await _resolve_edge(skipped_nid, e2, satisfied=False)
 
         while ready:
             # Snapshot the ready set; clear so we can re-populate as

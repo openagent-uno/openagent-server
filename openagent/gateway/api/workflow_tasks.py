@@ -36,8 +36,8 @@ from openagent.memory.schedule import (
 )
 from openagent.workflow.blocks import iter_block_specs
 from openagent.workflow.schedule_sync import (
-    NOT_PROVIDED as _MISSING,
-    derive_schedule_updates,
+    sync_workflow_schedules,
+    trigger_types_from_graph,
 )
 from openagent.workflow.validate import ValidationError, validate_graph
 
@@ -56,8 +56,23 @@ def _resolve_scheduler(request):
     return scheduler, None
 
 
-def _decorate_workflow(row: dict) -> dict:
-    """Shape a DB row for JSON: parse graph_json, add ISO timestamps."""
+def _decorate_schedule(row: dict) -> dict:
+    """Shape a workflow_schedules row for JSON."""
+    out = dict(row)
+    out["enabled"] = bool(out.get("enabled"))
+    for key in ("next_run_at", "last_run_at", "created_at", "updated_at"):
+        epoch = out.get(key)
+        out[f"{key}_iso"] = epoch_to_iso(epoch) if epoch else None
+    return out
+
+
+async def _decorate_workflow(db, row: dict) -> dict:
+    """Shape a DB row for JSON: parse graph_json, add ISO timestamps,
+    fold in the per-block ``schedules[]`` array + derived
+    ``trigger_types[]``. Drops legacy row-level columns
+    (``trigger_kind`` / ``cron_expression`` / ``next_run_at``) from
+    the response — schedule state lives in ``workflow_schedules``.
+    """
     out = dict(row)
     if "graph" not in out:
         raw = out.pop("graph_json", None) or '{"version":1,"nodes":[],"edges":[],"variables":{}}'
@@ -65,10 +80,15 @@ def _decorate_workflow(row: dict) -> dict:
             out["graph"] = json.loads(raw)
         except (TypeError, ValueError):
             out["graph"] = {"version": 1, "nodes": [], "edges": [], "variables": {}}
-    for key in ("last_run_at", "next_run_at", "created_at", "updated_at"):
+    for deprecated in ("trigger_kind", "cron_expression", "next_run_at"):
+        out.pop(deprecated, None)
+    for key in ("last_run_at", "created_at", "updated_at"):
         epoch = out.get(key)
         out[f"{key}_iso"] = epoch_to_iso(epoch) if epoch else None
     out["enabled"] = bool(out.get("enabled"))
+    out["trigger_types"] = trigger_types_from_graph(out.get("graph"))
+    schedules = await db.list_schedules(workflow_id=out["id"])
+    out["schedules"] = [_decorate_schedule(s) for s in schedules]
     return out
 
 
@@ -97,11 +117,12 @@ async def handle_list(request):
         return err
 
     enabled_only = request.query.get("enabled_only", "").lower() in ("1", "true", "yes")
-    trigger_kind = request.query.get("trigger_kind") or None
-    rows = await scheduler.db.list_workflows(
-        enabled_only=enabled_only, trigger_kind=trigger_kind,
-    )
-    return web.json_response({"workflows": [_decorate_workflow(r) for r in rows]})
+    has_trigger = request.query.get("has_trigger_type") or None
+    rows = await scheduler.db.list_workflows(enabled_only=enabled_only)
+    decorated = [await _decorate_workflow(scheduler.db, r) for r in rows]
+    if has_trigger:
+        decorated = [w for w in decorated if has_trigger in w["trigger_types"]]
+    return web.json_response({"workflows": decorated})
 
 
 async def handle_get(request):
@@ -117,7 +138,7 @@ async def handle_get(request):
             {"error": f"Workflow {request.match_info['id']!r} not found"},
             status=404,
         )
-    return web.json_response(_decorate_workflow(row))
+    return web.json_response(await _decorate_workflow(scheduler.db, row))
 
 
 async def handle_create(request):
@@ -136,13 +157,6 @@ async def handle_create(request):
     if not name:
         return web.json_response({"error": "name is required"}, status=400)
 
-    trigger_kind = body.get("trigger_kind") or "manual"
-    if trigger_kind not in ("manual", "schedule", "ai", "hybrid"):
-        return web.json_response(
-            {"error": f"invalid trigger_kind {trigger_kind!r}"},
-            status=400,
-        )
-
     graph = {
         "version": 1,
         "nodes": body.get("nodes") or [],
@@ -154,31 +168,11 @@ async def handle_create(request):
     except ValidationError as exc:
         return web.json_response({"error": f"graph validation failed: {exc}"}, status=400)
 
-    # Reconcile graph's trigger-schedule block with the row-level
-    # cron. Explicit cron in the request body (e.g. from the list
-    # screen's quick-create form) wins; otherwise we derive from
-    # any trigger-schedule block inside the graph.
-    body_cron = body.get("cron_expression")
-    try:
-        schedule_patch = derive_schedule_updates(
-            graph,
-            explicit_cron=body_cron if "cron_expression" in body else _MISSING,
-            explicit_trigger_kind=trigger_kind,
-        )
-    except ValueError as exc:
-        return web.json_response({"error": str(exc)}, status=400)
-    cron_expression = schedule_patch.get("cron_expression")
-    next_run_at = schedule_patch.get("next_run_at")
-    trigger_kind = schedule_patch.get("trigger_kind", trigger_kind)
-
     try:
         workflow_id = await scheduler.db.add_workflow(
             name=name,
             description=body.get("description") or None,
             graph=graph,
-            trigger_kind=trigger_kind,
-            cron_expression=cron_expression,
-            next_run_at=next_run_at,
             enabled=bool(body.get("enabled", True)),
         )
     except Exception as exc:  # integrity error on duplicate name, etc.
@@ -189,9 +183,18 @@ async def handle_create(request):
             )
         return web.json_response({"error": str(exc)}, status=400)
 
+    # Sync the workflow_schedules rows from any trigger-schedule
+    # blocks in the new graph.
+    try:
+        await sync_workflow_schedules(scheduler.db, workflow_id, graph)
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+
     row = await scheduler.db.get_workflow(workflow_id)
-    elog("workflow.create", id=workflow_id, name=name, trigger_kind=trigger_kind)
-    return web.json_response(_decorate_workflow(row), status=201)
+    elog("workflow.create", id=workflow_id, name=name)
+    return web.json_response(
+        await _decorate_workflow(scheduler.db, row), status=201,
+    )
 
 
 async def handle_update(request):
@@ -224,18 +227,10 @@ async def handle_update(request):
     if "description" in body:
         updates["description"] = body["description"] or None
 
-    if "trigger_kind" in body:
-        tk = body["trigger_kind"]
-        if tk not in ("manual", "schedule", "ai", "hybrid"):
-            return web.json_response(
-                {"error": f"invalid trigger_kind {tk!r}"},
-                status=400,
-            )
-        updates["trigger_kind"] = tk
-
     if "enabled" in body:
         updates["enabled"] = bool(body["enabled"])
 
+    new_graph: dict | None = None
     if any(k in body for k in ("nodes", "edges", "variables")):
         current = existing["graph"]
         new_graph = {
@@ -256,23 +251,6 @@ async def handle_update(request):
             )
         updates["graph"] = new_graph
 
-    # Reconcile schedule column with graph's trigger-schedule block,
-    # honouring any explicit cron_expression in the body.
-    graph_for_sync = updates.get("graph") or existing.get("graph") or {}
-    try:
-        schedule_patch = derive_schedule_updates(
-            graph_for_sync,
-            explicit_cron=(
-                body["cron_expression"] if "cron_expression" in body else _MISSING
-            ),
-            explicit_trigger_kind=updates.get("trigger_kind"),
-            current_trigger_kind=existing.get("trigger_kind"),
-        )
-    except ValueError as exc:
-        return web.json_response({"error": str(exc)}, status=400)
-    # schedule_patch may override trigger_kind (auto-promote to schedule).
-    updates.update(schedule_patch)
-
     if not updates:
         return web.json_response(
             {"error": "No fields to update."}, status=400,
@@ -288,13 +266,20 @@ async def handle_update(request):
             )
         return web.json_response({"error": str(exc)}, status=400)
 
+    # Sync the schedule rows against the graph if it changed.
+    if new_graph is not None:
+        try:
+            await sync_workflow_schedules(scheduler.db, existing["id"], new_graph)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+
     row = await scheduler.db.get_workflow(existing["id"])
     elog(
         "workflow.update",
         id=existing["id"],
         fields=list(updates.keys()),
     )
-    return web.json_response(_decorate_workflow(row))
+    return web.json_response(await _decorate_workflow(scheduler.db, row))
 
 
 async def handle_delete(request):
