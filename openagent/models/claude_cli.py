@@ -645,9 +645,10 @@ class ClaudeCLI(BaseModel):
         observation: turns with 1000+ output tokens of real text whose
         ``ResultMessage.result`` came back empty).
         """
-        from claude_agent_sdk import AssistantMessage, ResultMessage
+        from claude_agent_sdk import AssistantMessage, ResultMessage, UserMessage
 
         await client.query(prompt, session_id=session_id)
+        elog("claude_cli.stream_start", session_id=session_id)
         streamed_text_parts: list[str] = []
         result_text = ""
         usage_meta: dict[str, Any] = {}
@@ -681,9 +682,28 @@ class ClaudeCLI(BaseModel):
                     block_text = getattr(block, "text", None)
                     if isinstance(block_text, str) and block_text:
                         streamed_text_parts.append(block_text)
+                    tool_name = getattr(block, "name", None)
+                    if tool_name and hasattr(block, "input"):
+                        elog(
+                            "claude_cli.tool_use_request",
+                            session_id=session_id,
+                            tool=tool_name,
+                            tool_use_id=getattr(block, "id", None),
+                        )
                     if on_status is not None:
                         await self._emit_tool_status(block, on_status)
+            elif isinstance(message, UserMessage):
+                for block in getattr(message, "content", None) or []:
+                    tool_use_id = getattr(block, "tool_use_id", None)
+                    if tool_use_id:
+                        elog(
+                            "claude_cli.tool_use_result",
+                            session_id=session_id,
+                            tool_use_id=tool_use_id,
+                            is_error=getattr(block, "is_error", None),
+                        )
             elif isinstance(message, ResultMessage):
+                elog("claude_cli.stream_end", session_id=session_id)
                 result_text, usage_meta = self._capture_result(message, session_id)
                 break  # Never read past the response boundary.
 

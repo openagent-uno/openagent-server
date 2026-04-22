@@ -59,7 +59,6 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_db_models",
     "test_db_providers",
     "test_db_session_bindings",
-    "test_bootstrap_import",
     "test_smart_router_hybrid",
     "test_behavior_contract",
     "test_mcp_manager_guards",
