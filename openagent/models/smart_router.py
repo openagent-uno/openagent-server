@@ -231,6 +231,50 @@ class SmartRouter(BaseModel):
             if callable(fn):
                 await fn(session_id)
 
+    async def forget_session(self, session_id: str) -> None:
+        # Without this override BaseModel's default calls close_session, which
+        # drops the subprocess but keeps claude-cli's sdk_sessions resume id —
+        # the next turn then --resume'd the prior transcript and /clear looked
+        # like a no-op to the user.
+        if not session_id:
+            return
+        self._last_pick_by_session.pop(session_id, None)
+        self._session_framework.pop(session_id, None)
+        if self._db is not None:
+            try:
+                await self._db.delete_session_binding(session_id)
+            except Exception as e:  # noqa: BLE001 — best effort
+                logger.debug("delete_session_binding %s: %s", session_id, e)
+        for model in self._agno_providers.values():
+            fn = getattr(model, "forget_session", None)
+            if callable(fn):
+                await fn(session_id)
+        if self._claude_registry is not None:
+            fn = getattr(self._claude_registry, "forget_session", None)
+            if callable(fn):
+                await fn(session_id)
+
+    def known_session_ids(self) -> list[str]:
+        # Aggregated across underlying models so the gateway's post-restart
+        # fallback (known_model_session_ids filtered by bridge prefix) can
+        # still reach sessions rehydrated from sqlite.
+        seen: set[str] = set()
+        for model in self._agno_providers.values():
+            fn = getattr(model, "known_session_ids", None)
+            if callable(fn):
+                try:
+                    seen.update(fn())
+                except Exception as e:  # noqa: BLE001 — best effort
+                    logger.debug("known_session_ids agno: %s", e)
+        if self._claude_registry is not None:
+            fn = getattr(self._claude_registry, "known_session_ids", None)
+            if callable(fn):
+                try:
+                    seen.update(fn())
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("known_session_ids claude: %s", e)
+        return sorted(seen)
+
     # ── dispatch plumbing ───────────────────────────────────────────
 
     def build_override_model(self, runtime_id: str) -> BaseModel:

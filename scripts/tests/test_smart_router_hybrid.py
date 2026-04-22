@@ -455,3 +455,95 @@ async def t_rebuild_routing_hot_reload(ctx: TestContext) -> None:
     assert router._classifier_provider is None, (
         "cached classifier provider must be dropped when the resolved id changes"
     )
+
+
+class _RecordingUnderlying:
+    """Stand-in for an underlying model/registry that records lifecycle calls.
+
+    Mirrors the BaseModel surface SmartRouter fans out to. ``known_ids``
+    simulates sdk_sessions rehydrated from sqlite after a restart.
+    """
+
+    def __init__(self, known_ids: list[str] | None = None) -> None:
+        self.closed: list[str] = []
+        self.forgotten: list[str] = []
+        self._known: list[str] = list(known_ids or [])
+
+    async def close_session(self, session_id: str) -> None:
+        self.closed.append(session_id)
+
+    async def forget_session(self, session_id: str) -> None:
+        self.forgotten.append(session_id)
+        if session_id in self._known:
+            self._known.remove(session_id)
+
+    def known_session_ids(self) -> list[str]:
+        return list(self._known)
+
+
+@test(
+    "smart_router_hybrid",
+    "forget_session fans out to underlying forget_session, not close_session",
+)
+async def t_forget_session_fans_out_to_forget(ctx: TestContext) -> None:
+    """Regression for the ``/clean`` telegram bug (v0.12.16).
+
+    SmartRouter only implemented ``close_session`` — so ``forget_session``
+    fell through to ``BaseModel``'s default (which calls ``close_session``).
+    That released the claude-cli subprocess but left the ``sdk_sessions``
+    resume id intact, and the next turn ``--resume``'d the prior
+    transcript. The user saw ``/clean`` echo "forgot 1 prior
+    conversation" yet the LLM still remembered.
+
+    The fix is an explicit ``SmartRouter.forget_session`` that fans out
+    to the underlying models' own ``forget_session`` (not
+    ``close_session``) so resume state is actually erased.
+    """
+    from openagent.models.smart_router import SmartRouter
+
+    providers = _providers_both_frameworks()
+    router = SmartRouter(providers_config=providers)
+
+    agno_fake = _RecordingUnderlying()
+    claude_fake = _RecordingUnderlying()
+    router._agno_providers["openai:gpt-4o-mini"] = agno_fake  # type: ignore[assignment]
+    router._claude_registry = claude_fake  # type: ignore[assignment]
+
+    await router.forget_session("tg:155490357")
+
+    assert agno_fake.forgotten == ["tg:155490357"], agno_fake.forgotten
+    assert claude_fake.forgotten == ["tg:155490357"], claude_fake.forgotten
+    # The regression: close_session must NOT be the one called, or
+    # claude-cli would keep its sdk_sessions row and --resume the
+    # prior transcript on the next turn.
+    assert agno_fake.closed == [], agno_fake.closed
+    assert claude_fake.closed == [], claude_fake.closed
+
+
+@test(
+    "smart_router_hybrid",
+    "known_session_ids aggregates from underlying models (post-restart fallback)",
+)
+async def t_known_session_ids_aggregates(ctx: TestContext) -> None:
+    """Gateway ``/clear`` without a session_id filters the model's
+    ``known_session_ids`` by bridge prefix to reach sessions rehydrated
+    from sqlite. SmartRouter with no override returned ``[]`` (BaseModel
+    default), so post-restart /clear from telegram silently forgot
+    nothing.
+    """
+    from openagent.models.smart_router import SmartRouter
+
+    providers = _providers_both_frameworks()
+    router = SmartRouter(providers_config=providers)
+
+    router._agno_providers["openai:gpt-4o-mini"] = _RecordingUnderlying(  # type: ignore[assignment]
+        known_ids=["tg:aaa", "discord:42"]
+    )
+    router._claude_registry = _RecordingUnderlying(  # type: ignore[assignment]
+        known_ids=["tg:bbb", "tg:ccc"]
+    )
+
+    ids = router.known_session_ids()
+    assert sorted(ids) == ["discord:42", "tg:aaa", "tg:bbb", "tg:ccc"], ids
+
+
