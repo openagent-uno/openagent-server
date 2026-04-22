@@ -217,3 +217,130 @@ async def t_telegram_concurrent_updates(ctx: TestContext) -> None:
         if step[0] == "concurrent_updates":
             assert step[1] == (True,), f"expected concurrent_updates(True), got {step}"
             break
+
+
+# ── Telegram duplicate-update detection ────────────────────────────────
+#
+# Background: Telegram re-delivers an Update when our offset ACK is lost
+# (network timeout during ``getUpdates``, two bot processes racing the
+# same token, SIGKILL'd shutdown before ``flush_updates_offset``). Before
+# the ``_is_fresh_update`` guard the bridge processed the replay: the user
+# saw their prior message answered again, usually "super fast" because
+# the model's prompt cache was warm. The tests below pin:
+#
+#   * fresh update_ids pass through exactly once,
+#   * a duplicate update_id is rejected and ``_on_message`` never reaches
+#     ``send_message`` (nothing leaks into ``_pending``),
+#   * the bounded-set eviction lets an id eventually be accepted again
+#     after it has rotated out of the window,
+#   * ``_last_update_id`` still advances so ``flush_updates_offset``
+#     points at the right offset on shutdown.
+
+class _FakeTgMessage:
+    """Minimal stand-in for ``telegram.Message`` — just enough surface
+    for ``_on_message``'s early branches (auth, text extraction).
+    Never actually hits Telegram."""
+
+    def __init__(self, text: str, uid: str = "1") -> None:
+        self.text = text
+        self.caption = None
+        self.photo = None
+        self.voice = None
+        self.audio = None
+        self.document = None
+        self.video = None
+        self.from_user = type("U", (), {"id": uid, "first_name": "t"})()
+        self.replies: list[str] = []
+
+    async def reply_text(self, text, reply_markup=None):
+        self.replies.append(text)
+        return type("M", (), {"edit_text": lambda *_a, **_k: None,
+                              "delete": lambda *_a, **_k: None})()
+
+
+class _FakeTgUpdate:
+    def __init__(self, update_id: int, text: str = "hello") -> None:
+        self.update_id = update_id
+        self.message = _FakeTgMessage(text)
+
+
+def _fresh_telegram_bridge():
+    from openagent.bridges.telegram import TelegramBridge
+
+    bridge = TelegramBridge(token="fake", allowed_users=None)
+    # We never start the WS gateway loop — just probe ``_is_fresh_update``
+    # and ``_on_message`` in isolation. Attach stubs for what the handler
+    # touches after the freshness check.
+    bridge._pending = {}
+    bridge._status_callbacks = {}
+    bridge._session_locks = {}
+    return bridge
+
+
+@test("bridges", "telegram bridge rejects duplicate update_id (replay defense)")
+async def t_telegram_duplicate_update_rejected(ctx: TestContext) -> None:
+    bridge = _fresh_telegram_bridge()
+
+    sent: list[tuple[str, str]] = []
+
+    async def _fake_send_message(text, session_id, on_status=None):
+        sent.append((text, session_id))
+        return {"text": "ok"}
+
+    bridge.send_message = _fake_send_message  # type: ignore[assignment]
+
+    u1 = _FakeTgUpdate(update_id=1001, text="hello")
+    assert bridge._is_fresh_update(u1), "first sight must be fresh"
+
+    # Replay the SAME update_id. This is the exact scenario that caused
+    # mixout to reply with a cached-looking copy of the previous turn.
+    u1_replay = _FakeTgUpdate(update_id=1001, text="hello")
+    assert not bridge._is_fresh_update(u1_replay), "replay must be rejected"
+
+    # A fresh id is still accepted.
+    u2 = _FakeTgUpdate(update_id=1002, text="different text")
+    assert bridge._is_fresh_update(u2), "different update_id must pass"
+
+    # End-to-end: _on_message must NOT call send_message for the replay.
+    # (First call is gated by _is_fresh_update; we only need to prove the
+    # replay is dropped.)
+    await bridge._on_message(_FakeTgUpdate(update_id=2000, text="once"), None)
+    await bridge._on_message(_FakeTgUpdate(update_id=2000, text="once"), None)
+    assert len(sent) == 1, f"send_message called for replay: {sent}"
+
+
+@test("bridges", "telegram bridge advances _last_update_id even on replay")
+async def t_telegram_last_update_id_still_tracks(ctx: TestContext) -> None:
+    # ``flush_updates_offset`` reads ``_last_update_id`` to ACK the offset
+    # on shutdown. Dedup must not break that — otherwise a replay-heavy
+    # window could leave the offset stuck BELOW the latest real message.
+    bridge = _fresh_telegram_bridge()
+
+    bridge._is_fresh_update(_FakeTgUpdate(update_id=500))
+    bridge._is_fresh_update(_FakeTgUpdate(update_id=500))  # replay
+    assert bridge._last_update_id == 500
+
+    bridge._is_fresh_update(_FakeTgUpdate(update_id=501))
+    assert bridge._last_update_id == 501
+
+
+@test("bridges", "telegram duplicate-id set is bounded (eviction lets old ids through)")
+async def t_telegram_seen_set_bounded(ctx: TestContext) -> None:
+    # We don't want an unbounded memory leak in long-running bots, and
+    # after enough fresh updates have passed, a very old id is indistinct
+    # from a never-seen one anyway.
+    from openagent.bridges.telegram import _SEEN_UPDATE_IDS_MAX
+
+    bridge = _fresh_telegram_bridge()
+    first_id = 10
+    assert bridge._is_fresh_update(_FakeTgUpdate(update_id=first_id))
+
+    # Fill the window completely with distinct ids; ``first_id`` evicts.
+    for i in range(1, _SEEN_UPDATE_IDS_MAX + 1):
+        assert bridge._is_fresh_update(_FakeTgUpdate(update_id=first_id + i))
+
+    # first_id should now be out of the set and accepted again. This is
+    # intentional: Telegram's own offset logic won't replay something
+    # that far back under normal ops, so allowing it avoids permanent
+    # memory growth without weakening the near-term dedup.
+    assert bridge._is_fresh_update(_FakeTgUpdate(update_id=first_id))

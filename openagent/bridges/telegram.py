@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import tempfile
+from collections import deque
 from pathlib import Path
 
 from openagent.bridges.base import BaseBridge, format_tool_status
@@ -39,6 +40,16 @@ _TG_APP_SHUTDOWN_TIMEOUT = 3.0
 # confirmation; if Telegram is slow we'd rather skip than block shutdown.
 _TG_OFFSET_FLUSH_TIMEOUT = 2.0
 
+# How many recent update_ids to remember for duplicate detection. Telegram
+# can re-deliver an Update when our offset ACK was lost (network timeout
+# during ``getUpdates``, two bot processes racing on the same token, a
+# shutdown that SIGKILLed before ``flush_updates_offset`` landed). Without
+# dedup the replay reaches ``_on_message`` and the user sees their prior
+# message answered again — often "super fast" because the model's prompt
+# cache is still warm. 256 is large enough to span any realistic burst
+# and small enough that the deque is a no-op on memory.
+_SEEN_UPDATE_IDS_MAX = 256
+
 
 class TelegramBridge(BaseBridge):
     name = "telegram"
@@ -57,6 +68,11 @@ class TelegramBridge(BaseBridge):
         # never advanced; launchd restarted us, and the same ``/restart``
         # Update came right back from ``getUpdates``).
         self._last_update_id: int = 0
+        # Bounded set of recently-seen update_ids used by ``_is_fresh_update``
+        # to reject Telegram redeliveries. The deque enforces the size cap
+        # while the set gives O(1) membership; they're kept in lockstep.
+        self._seen_update_ids: set[int] = set()
+        self._seen_update_ids_order: deque[int] = deque(maxlen=_SEEN_UPDATE_IDS_MAX)
 
     def _is_authorized(self, uid: str) -> bool:
         return self.allowed_users is None or uid in self.allowed_users
@@ -124,6 +140,41 @@ class TelegramBridge(BaseBridge):
                 self._last_update_id = uid
         except Exception:
             pass
+
+    def _is_fresh_update(self, update) -> bool:
+        """Return True on first sight of ``update.update_id``, False on replay.
+
+        Telegram can re-deliver an Update when our offset ACK was lost
+        (see the ``_SEEN_UPDATE_IDS_MAX`` comment). Without this guard the
+        bridge happily processes the duplicate: the user sees their prior
+        message answered a second time, usually faster than a real turn
+        because the model's prompt cache is warm.
+
+        ``_track_update_id`` still runs so ``flush_updates_offset`` knows
+        the highest id even if a duplicate is rejected.
+        """
+        self._track_update_id(update)
+        try:
+            uid = getattr(update, "update_id", None)
+        except Exception:
+            return True  # unknown id — can't dedup, let it through
+        if not isinstance(uid, int):
+            return True
+        if uid in self._seen_update_ids:
+            elog(
+                "bridge.telegram.duplicate_update_skipped",
+                level="warning",
+                update_id=uid,
+            )
+            return False
+        # Bounded set: when the deque evicts an old id, drop it from the
+        # lookup set too so the two stay in sync.
+        if len(self._seen_update_ids_order) == self._seen_update_ids_order.maxlen:
+            evicted = self._seen_update_ids_order[0]
+            self._seen_update_ids.discard(evicted)
+        self._seen_update_ids_order.append(uid)
+        self._seen_update_ids.add(uid)
+        return True
 
     async def flush_updates_offset(self) -> None:
         """ACK pending Telegram updates so they don't replay after restart.
@@ -237,12 +288,14 @@ class TelegramBridge(BaseBridge):
     # ── Handlers ──
 
     async def _on_start(self, update, context):
-        self._track_update_id(update)
+        if not self._is_fresh_update(update):
+            return
         name = update.message.from_user.first_name or "there"
         await update.message.reply_text(bridge_welcome_text(name))
 
     async def _on_command(self, update, context, cmd):
-        self._track_update_id(update)
+        if not self._is_fresh_update(update):
+            return
         if not update.message:
             return
         user_id = str(update.message.from_user.id)
@@ -255,7 +308,8 @@ class TelegramBridge(BaseBridge):
         await self._reply_rich(update.message, result)
 
     async def _on_stop_cb(self, update, context):
-        self._track_update_id(update)
+        if not self._is_fresh_update(update):
+            return
         q = update.callback_query
         if not q or not q.data.startswith("stop:"):
             return
@@ -266,7 +320,8 @@ class TelegramBridge(BaseBridge):
         await q.answer(result, show_alert=False)
 
     async def _on_message(self, update, context):
-        self._track_update_id(update)
+        if not self._is_fresh_update(update):
+            return
         msg = update.message
         if not msg:
             return
