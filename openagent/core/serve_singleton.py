@@ -79,14 +79,21 @@ def _pid_alive(pid: int) -> bool:
 
 
 def find_stale_serve_pids(agent_dir: Path, *, self_pid: int | None = None) -> list[int]:
-    """PIDs (other than ``self_pid``) serving ``agent_dir``."""
+    """PIDs (other than ``self_pid`` and the parent PID) serving ``agent_dir``.
+
+    The parent PID is excluded because PyInstaller's onefile bootloader on
+    Linux forks a Python child whose os.getpid() differs from the parent
+    bootloader PID. Without this exclusion the singleton would SIGTERM its
+    own parent on every startup, causing an immediate crash loop.
+    """
     me = self_pid if self_pid is not None else os.getpid()
+    parent = os.getppid()
     abs_dir = str(agent_dir)
     name = agent_dir.name
     return [
         pid
         for pid, cmd in _scan_ps()
-        if pid != me and _matches_serve(cmd, abs_dir, name)
+        if pid != me and pid != parent and _matches_serve(cmd, abs_dir, name)
     ]
 
 

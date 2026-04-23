@@ -57,6 +57,33 @@ async def t_find_stale_filters(ctx: TestContext) -> None:
     assert set(found) == {1111, 2222, 6666}, f"unexpected matches: {found}"
 
 
+@test("serve_singleton", "parent pid (PyInstaller bootloader) excluded from stale set")
+async def t_parent_pid_excluded(ctx: TestContext) -> None:
+    """Regression: PyInstaller onefile forks a Python child whose os.getpid()
+    differs from the parent bootloader PID. Without excluding os.getppid() the
+    singleton kills its own parent on every startup.
+    """
+    agent_dir = Path("/tmp/openagent-singleton-test-agent")
+    parent_pid = os.getppid()
+
+    fake_scan = [
+        (parent_pid, f"/home/u/.local/bin/openagent serve {agent_dir}"),
+        (1111, f"/home/u/.local/bin/openagent serve {agent_dir}"),
+    ]
+
+    orig_scan = serve_singleton._scan_ps
+    serve_singleton._scan_ps = lambda: fake_scan
+    try:
+        found = serve_singleton.find_stale_serve_pids(agent_dir)
+    finally:
+        serve_singleton._scan_ps = orig_scan
+
+    assert parent_pid not in found, (
+        f"parent pid {parent_pid} included in stale set — would kill PyInstaller bootloader"
+    )
+    assert 1111 in found, f"unrelated stale pid missing from result: {found}"
+
+
 @test("serve_singleton", "basename-only match (shell passed '.')")
 async def t_basename_match(ctx: TestContext) -> None:
     agent_dir = Path("/home/user/my-uniquely-named-agent-xyz")
