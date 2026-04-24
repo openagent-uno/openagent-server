@@ -129,6 +129,102 @@ class AgnoProvider(BaseModel):
         """Agno persists session history in DB but keeps no per-session subprocess."""
         return None
 
+    async def forget_session(self, session_id: str) -> None:
+        """Erase Agno's stored history for ``session_id`` so the next
+        call on that session id starts empty.
+
+        Without this, ``add_history_to_context=True`` (see
+        :meth:`_ensure_agent`) reloads the full prior transcript AND
+        any rolling session summary on the next generate() — so the
+        gateway's ``/clear`` and the scheduler's per-fire forget both
+        silently break for agno-backed models.
+
+        Strategy: call Agno's native ``SqliteDb.delete_session`` (which
+        drops the ``agno_sessions`` row carrying both the transcript
+        and the summary). Fall back to raw SQL if the API ever changes.
+        The ``_agno_agents`` / ``_agno_teams`` caches don't need to
+        be invalidated — the live ``Agent`` re-reads history from the
+        DB on every ``arun()``, so deletion takes effect immediately.
+        Agentic memory rows (``agno_memories``) are user-scoped by
+        design; wiping them per-session would contradict the product
+        model (user-level preferences should survive /clear).
+        """
+        if not session_id:
+            return
+        try:
+            from agno.db.sqlite import SqliteDb
+        except ImportError:
+            return
+
+        db_path = self._runtime_db_path()
+        try:
+            db = SqliteDb(db_file=db_path)
+        except Exception as e:
+            logger.debug("agno forget_session: SqliteDb init failed: %s", e)
+            await self._agno_fallback_sql_forget(db_path, session_id)
+            elog("agno.session_forget", session_id=session_id, db=db_path)
+            return
+
+        delete_fn = getattr(db, "delete_session", None)
+        deleted_via_api = False
+        if callable(delete_fn):
+            try:
+                result = delete_fn(session_id=session_id)
+                if inspect.isawaitable(result):
+                    await result
+                deleted_via_api = True
+            except Exception as e:
+                logger.debug(
+                    "agno delete_session failed for %s: %s", session_id, e,
+                )
+        if not deleted_via_api:
+            await self._agno_fallback_sql_forget(db_path, session_id)
+        elog("agno.session_forget", session_id=session_id, db=db_path)
+
+    async def _agno_fallback_sql_forget(
+        self, db_path: str, session_id: str
+    ) -> None:
+        """Raw-SQL delete for when Agno's ``SqliteDb.delete_session``
+        is unavailable or errors out.
+
+        Agno 2.x keeps session history and summary in ``agno_sessions``;
+        earlier/alternate schemas may call it ``sessions``. Drop the
+        row in whichever of those tables exists — a missing table is
+        a no-op, not an error. Read-only when no relevant table is
+        present (brand-new DB before Agno has created its schema).
+        """
+        import sqlite3
+        candidate_tables = ("agno_sessions", "sessions")
+        try:
+            conn = sqlite3.connect(db_path)
+        except Exception as e:
+            logger.debug("agno fallback sql: connect %s failed: %s", db_path, e)
+            return
+        try:
+            cur = conn.cursor()
+            present = {
+                row[0]
+                for row in cur.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            for table in candidate_tables:
+                if table not in present:
+                    continue
+                try:
+                    cur.execute(
+                        f"DELETE FROM {table} WHERE session_id = ?",
+                        (session_id,),
+                    )
+                except sqlite3.OperationalError as e:
+                    logger.debug(
+                        "agno fallback delete from %s for %s failed: %s",
+                        table, session_id, e,
+                    )
+            conn.commit()
+        finally:
+            conn.close()
+
     def _provider_name(self) -> str:
         return split_runtime_id(self.model)[0]
 

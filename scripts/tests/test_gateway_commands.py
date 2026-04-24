@@ -152,9 +152,9 @@ async def t_stop_preserves_context(ctx: TestContext) -> None:
         await asyncio.sleep(10)
 
     task = asyncio.create_task(_dummy())
-    h.sessions._state(client).current_task = task
-    h.sessions._state(client).current_session_id = sid
-    await h.sessions._state(client).pending.put(object())
+    ss = h.sessions._session_state(client, sid)
+    ss.current_task = task
+    await ss.pending.put(object())
 
     text = await h.run_command(client, "stop")
 
@@ -188,29 +188,30 @@ async def t_stop_scoped_preserves_others(ctx: TestContext) -> None:
         await asyncio.sleep(10)
 
     running = asyncio.create_task(_long())
-    # Simulate B's task being the one currently running.
-    h.sessions._state(client).current_task = running
-    h.sessions._state(client).current_session_id = b
-    # A has one message queued.
-    await h.sessions._state(client).pending.put(_QueuedItem(handler=lambda: None, session_id=a))
-    # B has one message queued.
-    await h.sessions._state(client).pending.put(_QueuedItem(handler=lambda: None, session_id=b))
+    # B's task is currently running — now lives on B's own _SessionState.
+    ss_b = h.sessions._session_state(client, b)
+    ss_b.current_task = running
+    ss_a = h.sessions._session_state(client, a)
+    # A has one message queued on A's queue.
+    await ss_a.pending.put(_QueuedItem(handler=lambda: None, session_id=a))
+    # B has one message queued on B's queue.
+    await ss_b.pending.put(_QueuedItem(handler=lambda: None, session_id=b))
 
     text = await h.run_command(client, "stop", session_id=a)
 
     # A's stop must NOT cancel B's running task.
     assert not running.done(), "A's /stop cancelled B's running task"
-    # A's queued message got dropped.
-    # B's queued message still in the queue.
-    pending = h.sessions._state(client).pending
-    remaining = []
+    # A's queued message got dropped; A's queue is now empty.
+    assert ss_a.pending.qsize() == 0, ss_a.pending.qsize()
+    # B's queued message still sits on B's queue.
+    b_remaining = []
     while True:
         try:
-            remaining.append(pending.get_nowait())
+            b_remaining.append(ss_b.pending.get_nowait())
         except asyncio.QueueEmpty:
             break
-    assert len(remaining) == 1, remaining
-    assert remaining[0].session_id == b, remaining[0].session_id
+    assert len(b_remaining) == 1, b_remaining
+    assert b_remaining[0].session_id == b, b_remaining[0].session_id
     # The response text should reflect "nothing running" for A since the
     # current task isn't theirs, but A's queued msg WAS cleared.
     assert "cleared 1" in text, text

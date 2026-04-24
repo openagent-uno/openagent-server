@@ -79,6 +79,12 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_pool_reload",
     # 3. Provider-level live tests (need pool)
     "test_agno",
+    # AgnoProvider.forget_session must wipe stored history so the
+    # scheduler's per-fire forget and the gateway's /clear actually
+    # reach Agno's SqliteDb-backed session store. Runs here (not in
+    # provider live tests) because it uses a synthetic DB and doesn't
+    # need the pool fixture.
+    "test_agno_forget_clears_history",
     "test_router",
     "test_mcp",
     "test_budget",
@@ -98,6 +104,9 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_cron",
     # Issue #5 regression — scheduler must start each firing in a fresh session.
     "test_scheduler_fresh_session",
+    # Workflow ai-prompt must forget/release at the right moment (same
+    # bug class as scheduler issue #5 but for workflows).
+    "test_workflow_forgets_session",
     "test_dream",
     "test_updater",
     "test_bridges",
@@ -108,11 +117,19 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_claude_cli_text_recovery",
     # Stale-resume self-heal — same monkey-patching pattern.
     "test_claude_cli_stale_resume",
+    # forget_session must drain pending sdk_session writes so a
+    # background persist can't resurrect the deleted resume id.
+    "test_claude_cli_forget_drains_writes",
     # ClaudeCLIRegistry dispatch — runs right after text-recovery since it
     # shares the claude_cli module's monkey-patching patterns.
     "test_claude_cli_registry",
     # 9. Gateway /stop, /clear, /new command semantics
     "test_gateway_commands",
+    # SessionManager must run sessions in parallel on one client
+    # (each session has its own worker queue). Prior design funneled
+    # every message from a client through one queue, serialising chat
+    # tabs unnecessarily.
+    "test_sessions_parallel_execution",
     # 10. MCPPool resilience — one bad MCP mustn't sink the whole pool
     "test_mcp_pool_resilience",
     # 11. /api/files endpoint — agent-side attachment delivery to remote clients

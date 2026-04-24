@@ -183,7 +183,10 @@ class ClaudeCLI(BaseModel):
         self._sessions: dict[str, _Session] = {}
         self._registry_lock = asyncio.Lock()
         # Retained so Python's GC doesn't discard a pending write task.
-        self._pending_writes: set[asyncio.Task] = set()
+        # Keyed per-session so ``forget_session`` can drain just the
+        # writes that affect its own row without blocking on unrelated
+        # users' pending writes (important on multi-tenant bridges).
+        self._pending_writes: dict[str, set[asyncio.Task]] = {}
 
     # ── wiring ─────────────────────────────────────────────────────────
 
@@ -452,6 +455,24 @@ class ClaudeCLI(BaseModel):
             async with session.lock:
                 await self._disconnect(session)
                 session.sdk_session_id = None
+        # Drain this session's pending sdk_sessions writes BEFORE the
+        # delete lands. ``_persist_sdk_session`` schedules writes on a
+        # background task so turns don't block on disk; without this
+        # drain the write can land AFTER ``delete_sdk_session`` and
+        # silently resurrect the resume id, making /clear (and the
+        # scheduler's per-fire forget) useless. Mirrors ``shutdown()``.
+        pending = self._pending_writes.pop(session_id, None)
+        if pending:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*pending, return_exceptions=True),
+                    timeout=SHUTDOWN_WRITE_GRACE,
+                )
+            except asyncio.TimeoutError:
+                logger.debug(
+                    "forget_session: %d sdk_session writes for %s did not finish in %.1fs",
+                    len(pending), session_id, SHUTDOWN_WRITE_GRACE,
+                )
         if self._db is not None:
             try:
                 await self._db.delete_sdk_session(session_id)
@@ -491,7 +512,7 @@ class ClaudeCLI(BaseModel):
 
         # Give in-flight ``sdk_sessions`` writes a chance to land so a
         # restart-right-after-turn doesn't lose the mapping.
-        pending = list(self._pending_writes)
+        pending = [t for bucket in self._pending_writes.values() for t in bucket]
         if pending:
             try:
                 await asyncio.wait_for(
@@ -504,6 +525,7 @@ class ClaudeCLI(BaseModel):
                     len(pending),
                     SHUTDOWN_WRITE_GRACE,
                 )
+        self._pending_writes.clear()
 
     def known_session_ids(self) -> list[str]:
         """Every ``session_id`` we have live state or resume state for.
@@ -525,8 +547,10 @@ class ClaudeCLI(BaseModel):
 
         The turn must not block on disk, but we don't want to lose the
         write either — the task handle is parked in ``_pending_writes``
-        so it doesn't get collected by the GC, and ``shutdown()`` drains
-        the set before returning.
+        keyed by ``session_id`` so ``shutdown()`` drains everything and
+        ``forget_session()`` drains just this session's pending writes
+        (preventing a background write from resurrecting a deleted
+        resume id).
         """
         if self._db is None:
             return
@@ -544,8 +568,18 @@ class ClaudeCLI(BaseModel):
                 logger.debug("Persist sdk_session failed: %s", e)
 
         task = loop.create_task(_write())
-        self._pending_writes.add(task)
-        task.add_done_callback(self._pending_writes.discard)
+        bucket = self._pending_writes.setdefault(session_id, set())
+        bucket.add(task)
+
+        def _discard(t: asyncio.Task, sid: str = session_id) -> None:
+            b = self._pending_writes.get(sid)
+            if b is None:
+                return
+            b.discard(t)
+            if not b:
+                self._pending_writes.pop(sid, None)
+
+        task.add_done_callback(_discard)
 
     # ── turn loop ──────────────────────────────────────────────────────
 

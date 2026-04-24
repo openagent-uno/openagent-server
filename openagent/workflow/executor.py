@@ -480,6 +480,26 @@ class WorkflowExecutor:
         await self.db.update_workflow_run(ctx.run_id, **kwargs)
         await self.db.update_workflow(ctx.workflow_id, last_run_at=now)
 
+        # Wipe any shared-policy ai-prompt session carried across this run.
+        # ephemeral nodes already forgot their own sessions at node-end;
+        # shared nodes only released (subprocess dropped, resume id kept)
+        # so consecutive nodes could chain thought. Now that the run is
+        # over, drop the resume id too so sdk_sessions doesn't grow
+        # unboundedly and a future run can't inherit transcript. No-op
+        # when the workflow had no shared nodes (the session never existed).
+        shared_sid = f"workflow:{ctx.workflow_id}:{ctx.run_id}"
+        forget = getattr(self.agent, "forget_session", None)
+        if callable(forget):
+            maybe = forget(shared_sid)
+            if inspect.isawaitable(maybe):
+                try:
+                    await maybe
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "workflow shared forget_session failed for %s",
+                        shared_sid,
+                    )
+
     def _collect_outputs(self, graph: dict, ctx: _RunCtx) -> dict[str, Any]:
         nodes = {n["id"]: n for n in graph.get("nodes", [])}
         edges = graph.get("edges", [])
@@ -627,14 +647,24 @@ async def _h_ai_prompt(
             model_override=override,
         )
     finally:
-        release = getattr(exe.agent, "release_session", None)
-        if callable(release):
-            maybe = release(session_id)
+        # ephemeral: each node owns a unique session_id never reused in
+        # this run — so forget now to wipe provider-native resume state
+        # (claude-cli's sdk_sessions row, agno's history rows). Otherwise
+        # a re-run of the same workflow could inherit transcript through
+        # persisted resume ids (same bug class as scheduler issue #5).
+        # shared: every ai-prompt node in the run shares one session_id
+        # so successive nodes chain thought via claude-cli's --resume;
+        # we only release the subprocess here. _finalize_run calls
+        # forget_session on the shared sid once the run is done.
+        method_name = "forget_session" if policy != "shared" else "release_session"
+        fn = getattr(exe.agent, method_name, None)
+        if callable(fn):
+            maybe = fn(session_id)
             if inspect.isawaitable(maybe):
                 try:
                     await maybe
                 except Exception:  # noqa: BLE001
-                    logger.debug("release_session failed for %s", session_id)
+                    logger.debug("%s failed for %s", method_name, session_id)
     return {"text": text}
 
 
