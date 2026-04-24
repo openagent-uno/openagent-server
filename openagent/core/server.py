@@ -27,6 +27,7 @@ RESTART_EXIT_CODE = 75
 
 DREAM_MODE_TASK_NAME = "dream-mode"
 AUTO_UPDATE_TASK_NAME = "auto-update"
+MANAGER_REVIEW_TASK_NAME = "manager-review"
 
 DREAM_MODE_PROMPT = """\
 You are running in Dream Mode — a nightly maintenance routine.
@@ -72,6 +73,43 @@ Perform these tasks and write a concise audit log at the end.
 Be thorough but non-destructive. When in doubt, skip rather than
 delete, and always use mcpvault tools instead of raw filesystem access
 for anything under the memory vault.
+"""
+
+MANAGER_REVIEW_PROMPT = """\
+You are running a weekly Manager Review. Look at your own work as a
+project manager would look at their team's work and act on what you
+find. Do this silently and efficiently.
+
+1. **Review the memory vault**:
+   - Search for notes tagged ``pending-automation`` or ``followup``.
+     For each: is the pattern still active? If yes, propose or
+     schedule the automation now via ``scheduler`` or
+     ``workflow-manager``. If no, archive the note.
+   - List notes from the last 7 days. Identify duplicates, stubs
+     (<20 words with no links), or notes that contradict a newer
+     note. Merge, cross-link, or delete.
+   - Scan recent session transcripts / event log for "I'll
+     remember", "next time", "we decided" that never landed as a
+     note. Create the missing notes.
+
+2. **Review scheduled tasks and workflows**:
+   - List all via ``scheduler_list_scheduled_tasks``. Has each fired
+     as expected? Is the prompt still accurate? Should any retire?
+   - Same question for workflows via the ``workflow-manager`` MCP.
+
+3. **Detect recurring work you haven't yet automated**:
+   - Review the last 7 days of activity. Any task run 3+ times with
+     minor variation? Create a scheduled task or workflow for it.
+
+4. **Log the review**: Write a concise receipt under
+   ``manager-reviews/review-YYYY-MM-DD.md`` with frontmatter
+   ``type: manager-review`` summarising what you changed, what you
+   noticed but didn't change (and why), and what the user should
+   decide next.
+
+Be non-destructive by default — when in doubt about deleting or
+disabling, leave it and log the uncertainty. Use the ``vault`` MCP
+for all vault access — never shell out.
 """
 
 
@@ -360,6 +398,7 @@ class AgentServer:
         scheduler = Scheduler(self.agent._db, self.agent)
 
         await self._sync_dream_mode(scheduler)
+        await self._sync_manager_review(scheduler)
         await self._sync_auto_update(scheduler)
 
         await scheduler.start()
@@ -439,6 +478,37 @@ class AgentServer:
                     await _orig(task)
 
             self._wrap_scheduler_run_task(scheduler, _dream_run)
+
+    async def _sync_manager_review(self, scheduler) -> None:
+        """Weekly self-review: agent audits its own work as a project manager.
+
+        Complements Dream Mode (nightly hygiene) with a forward-looking
+        pass: what should I schedule, what did I miss, what decisions
+        are pending? Ships enabled by default as a deliberate signal
+        that proactive self-review is core to OpenAgent.
+        """
+        review_cfg = self.config.get("manager_review", {})
+        enabled = review_cfg.get("enabled", True)
+        cron_expr = review_cfg.get("cron", "0 9 * * MON")
+
+        await self._sync_scheduled_task(
+            scheduler,
+            name=MANAGER_REVIEW_TASK_NAME,
+            enabled=enabled,
+            cron_expr=cron_expr,
+            prompt=MANAGER_REVIEW_PROMPT,
+        )
+
+        if enabled:
+            async def _manager_review_run(task, _orig):
+                if task["name"] == MANAGER_REVIEW_TASK_NAME:
+                    elog("manager_review.start")
+                    await _orig(task)
+                    elog("manager_review.done")
+                else:
+                    await _orig(task)
+
+            self._wrap_scheduler_run_task(scheduler, _manager_review_run)
 
     async def _sync_auto_update(self, scheduler) -> None:
         update_cfg = self.config.get("auto_update", {})
