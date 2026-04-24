@@ -77,3 +77,26 @@ async def t_filesystem_list(ctx: TestContext) -> None:
     res = await fn.entrypoint(path="/tmp")
     out = res.content if hasattr(res, "content") else str(res)
     assert len(out) > 0, "list_directory returned empty"
+
+
+@test("mcp", "every Python builtin has a _mcp-server CLI dispatcher branch")
+async def t_cli_dispatcher_covers_python_builtins(ctx: TestContext) -> None:
+    """Frozen PyInstaller binaries rewrite ``python -m …server`` to
+    ``openagent _mcp-server <name>``. If the dispatcher in cli.py misses
+    a name, the subprocess dies with "Unknown MCP server" and the pool
+    marks the MCP dormant — exactly how workflow-manager shipped broken
+    on the VPS for three days. This check keeps the two lists in sync.
+    """
+    import inspect
+    from openagent import cli
+    from openagent.mcp.builtins import BUILTIN_MCP_SPECS
+
+    src = inspect.getsource(cli.mcp_server_cmd.callback)
+    missing = [
+        name for name, spec in BUILTIN_MCP_SPECS.items()
+        if spec.get("python") and f'"{name}"' not in src and f"'{name}'" not in src
+    ]
+    assert not missing, (
+        f"cli._mcp-server has no dispatcher branch for Python builtin(s): {missing}. "
+        f"Add an `if name == \"X\":` import+call in openagent/cli.py:mcp_server_cmd."
+    )

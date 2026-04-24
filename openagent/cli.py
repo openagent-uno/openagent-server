@@ -228,6 +228,10 @@ def mcp_server_cmd(name: str):
         from openagent.mcp.servers.model_manager.server import main as model_manager_main
         model_manager_main()
         return
+    if name == "workflow-manager":
+        from openagent.mcp.servers.workflow_manager.server import main as workflow_manager_main
+        workflow_manager_main()
+        return
 
     click.echo(f"Unknown MCP server: {name}", err=True)
     raise SystemExit(1)
