@@ -279,10 +279,25 @@ def download_update(url: str, checksum_url: str | None = None) -> Path:
     raise RuntimeError("Could not locate executable in downloaded archive")
 
 
+def _find_app_bundle(path: Path) -> "Path | None":
+    """Walk up from path to find the enclosing .app bundle directory, if any."""
+    p = path.parent
+    while p != p.parent:
+        if p.suffix == ".app" and p.is_dir():
+            return p
+        p = p.parent
+    return None
+
+
 def apply_update(new_exe: Path) -> None:
     """Replace the running executable with the new onefile binary.
 
-    - macOS/Linux: rename current → .old, move new into place, chmod +x
+    - macOS inside .app bundle: rename the whole bundle from its parent
+      directory (which the service user owns) to .app.old, then copy the
+      new bundle in place. Renaming the inner binary directly fails when
+      the Contents/MacOS/ directory is root-owned (e.g. after a pkg install),
+      but the user-owned Applications/ parent always allows the bundle rename.
+    - macOS/Linux bare binary: rename current → .old, move new into place, chmod +x
     - Windows: save as ``<name>.pending.exe`` next to the current binary;
       the startup hook (see ``_frozen.swap_pending_if_any``) promotes it on
       the next launch since a running .exe can't be overwritten on Windows.
@@ -298,17 +313,38 @@ def apply_update(new_exe: Path) -> None:
             pending.unlink()
         shutil.copy2(str(new_exe), str(pending))
         logger.info("Update staged at %s (will apply on next restart)", pending)
-    else:
-        # Rename the running binary to .old — the OS keeps the file open for
-        # the live process, and the new file is installed in its place so
-        # the next launch picks up the upgrade.
-        old = current_exe.with_suffix(current_exe.suffix + ".old")
-        if old.exists():
-            old.unlink()
-        current_exe.rename(old)
-        shutil.copy2(str(new_exe), str(current_exe))
-        current_exe.chmod(0o755)
-        logger.info("Update applied. Old version at %s", old)
+        return
+
+    if system == "Darwin":
+        current_bundle = _find_app_bundle(current_exe)
+        if current_bundle is not None:
+            new_bundle = _find_app_bundle(new_exe)
+            if new_bundle is None:
+                raise RuntimeError(
+                    "Current executable is inside an .app bundle but the "
+                    "downloaded archive did not contain an .app bundle. "
+                    f"(new_exe={new_exe})"
+                )
+            parent_dir = current_bundle.parent
+            old = parent_dir / (current_bundle.stem + ".app.old")
+            if old.exists():
+                shutil.rmtree(str(old))
+            current_bundle.rename(old)
+            shutil.copytree(str(new_bundle), str(current_bundle))
+            logger.info("Update applied (bundle swap). Old version at %s", old)
+            return
+
+    # Bare binary (Linux, or macOS without .app bundle).
+    # Rename the running binary to .old — the OS keeps the file open for
+    # the live process, and the new file is installed in its place so
+    # the next launch picks up the upgrade.
+    old = current_exe.with_suffix(current_exe.suffix + ".old")
+    if old.exists():
+        old.unlink()
+    current_exe.rename(old)
+    shutil.copy2(str(new_exe), str(current_exe))
+    current_exe.chmod(0o755)
+    logger.info("Update applied. Old version at %s", old)
 
 
 def perform_self_update_sync() -> tuple[str, str]:

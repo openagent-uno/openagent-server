@@ -82,6 +82,51 @@ async def t_updater_prefers_server_asset(ctx: TestContext) -> None:
     assert info.checksum_url and info.checksum_url.endswith("/openagent.tgz.sha256"), info
 
 
+@test("updater", "apply_update uses bundle swap when executable is inside .app bundle")
+async def t_apply_update_bundle_swap(ctx: TestContext) -> None:
+    import shutil
+    import stat
+    import tempfile
+    from pathlib import Path
+    from unittest.mock import patch
+    import platform
+    import openagent.updater as updater
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+
+        # Build a fake current .app bundle with a non-writable Contents/MacOS/
+        # directory, simulating a pkg-installed bundle owned by root.
+        cur_bundle = tmp / "Apps" / "openagent.app"
+        cur_macos = cur_bundle / "Contents" / "MacOS"
+        cur_macos.mkdir(parents=True)
+        cur_bin = cur_macos / "openagent"
+        cur_bin.write_bytes(b"old binary")
+        cur_bin.chmod(0o755)
+        # Make Contents/MacOS non-writable so renaming the inner binary fails.
+        cur_macos.chmod(stat.S_IRUSR | stat.S_IXUSR)
+
+        # Build the "new" .app bundle extracted from a downloaded pkg.
+        new_bundle = tmp / "extracted" / "openagent.app"
+        new_macos = new_bundle / "Contents" / "MacOS"
+        new_macos.mkdir(parents=True)
+        new_bin = new_macos / "openagent"
+        new_bin.write_bytes(b"new binary")
+        new_bin.chmod(0o755)
+
+        with patch("openagent._frozen.executable_path", return_value=cur_bin), \
+             patch("platform.system", return_value="Darwin"):
+            updater.apply_update(new_bin)
+
+        # Restore so tempfile cleanup works.
+        cur_macos.chmod(0o755)
+
+        old_bundle = tmp / "Apps" / "openagent.app.old"
+        assert old_bundle.exists(), "old bundle not found"
+        assert (cur_bundle / "Contents" / "MacOS" / "openagent").read_bytes() == b"new binary"
+        assert (old_bundle / "Contents" / "MacOS" / "openagent").read_bytes() == b"old binary"
+
+
 @test("updater", "download_update rejects archives without server binary")
 async def t_updater_rejects_cli_only_archive(ctx: TestContext) -> None:
     import openagent.updater as updater
