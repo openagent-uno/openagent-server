@@ -19,9 +19,26 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { basename } from 'node:path';
 import { z } from 'zod';
+
+import { loadPhoneConfig, isDestinationAllowed } from './phone-config.js';
+import { placeCall, sendSms, sendMms, hangupCall } from './twilio.js';
+import {
+	createCallSession,
+	getCallSession,
+	setTwilioSid,
+	requestHangup,
+	snapshot,
+	isFinalStatus,
+	waitForChange,
+	dailyUsedSeconds,
+	setStatus,
+	setError,
+} from './call-session.js';
+import { ensurePhoneServer, twimlUrlFor, statusUrlFor } from './phone-server.js';
 
 // ── Shared helpers ────────────────────────────────────────────────────
 
@@ -76,18 +93,39 @@ const server = new McpServer({
 const TG_TOKEN_PRESENT = !!process.env.TELEGRAM_BOT_TOKEN;
 const DC_TOKEN_PRESENT = !!process.env.DISCORD_BOT_TOKEN;
 const WA_CREDS_PRESENT = !!process.env.GREEN_API_ID && !!process.env.GREEN_API_TOKEN;
+const PHONE_CONFIG = loadPhoneConfig();
 
 server.registerTool(
 	'status',
 	{
 		title: 'Messaging MCP status',
 		description:
-			'Return which messaging platforms (Telegram, Discord, WhatsApp) are currently ' +
-			'enabled in this MCP server, and how to enable the disabled ones via the ' +
-			'OpenAgent config.',
+			'Return which messaging platforms (Telegram, Discord, WhatsApp, Phone/SMS) ' +
+			'are currently enabled in this MCP server, and how to enable the disabled ' +
+			'ones via the OpenAgent config.',
 		inputSchema: z.object({}).strict(),
 	},
 	async () => {
+		const phoneTools = ['sms_send', 'sms_send_file', 'phone_call_place', 'phone_call_status', 'phone_call_hangup'];
+		const phoneBlock: Record<string, unknown> = PHONE_CONFIG
+			? {
+					enabled: true,
+					tools: phoneTools,
+					from_number: PHONE_CONFIG.twilioFromNumber,
+					public_url: PHONE_CONFIG.publicUrl || '(not set — voice calls disabled, SMS still works)',
+					allow_prefixes: PHONE_CONFIG.allowPrefixes,
+					max_call_duration_seconds: PHONE_CONFIG.maxDurationSeconds,
+					daily_seconds_used: dailyUsedSeconds(),
+					daily_seconds_cap: PHONE_CONFIG.maxDailySeconds,
+					realtime_model: PHONE_CONFIG.realtimeModel,
+				}
+			: {
+					enabled: false,
+					how_to_enable:
+						'Add `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER`, ' +
+						'and `OPENAI_API_KEY` to the messaging MCP env in openagent.yaml ' +
+						'(and `OPENAGENT_PHONE_PUBLIC_URL` for voice calls). See docs/guide/phone-mcp.md.',
+				};
 		const status = {
 			telegram: TG_TOKEN_PRESENT
 				? { enabled: true, tools: ['telegram_send_message', 'telegram_send_file'] }
@@ -114,6 +152,7 @@ server.registerTool(
 							'`channels.whatsapp.green_api_token` to openagent.yaml ' +
 							'(and restart the agent).',
 				  },
+			phone: phoneBlock,
 		};
 		return { content: [{ type: 'text', text: JSON.stringify(status, null, 2) }] };
 	},
@@ -373,6 +412,244 @@ if (WA_ID && WA_TOKEN) {
 	);
 
 	console.error('WhatsApp messaging tools registered');
+}
+
+// ── Twilio (Voice + SMS) ──
+//
+// Conditional on the four required env vars (TWILIO_ACCOUNT_SID,
+// TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER, OPENAI_API_KEY). The
+// OPENAI_API_KEY is needed because the live phone-call brain runs
+// on the OpenAI Realtime API (g711_ulaw end-to-end with Twilio Media
+// Streams). SMS works without OPENAI_API_KEY in principle but we keep
+// the gate uniform — if you've configured Twilio you almost certainly
+// want voice too. The voice webhook server also requires
+// OPENAGENT_PHONE_PUBLIC_URL (an ngrok/cloudflared tunnel); SMS does
+// not need that, so phone_call_place fails loudly while sms_send works.
+
+if (PHONE_CONFIG) {
+	const cfg = PHONE_CONFIG;
+
+	server.registerTool(
+		'sms_send',
+		{
+			title: 'Send SMS',
+			description:
+				'Send a plain-text SMS via Twilio Programmable Messaging. The from-number ' +
+				'is the configured TWILIO_FROM_NUMBER. Returns the Twilio message SID and ' +
+				'submission status.',
+			inputSchema: z.object({
+				to: z.string().describe('Destination phone number in E.164 format, e.g. +393331234567'),
+				text: z.string().describe('Message text. SMS segments at 160 chars (ASCII) or 70 chars (UCS-2); long messages auto-split.'),
+			}).strict(),
+		},
+		async (args) => {
+			const { to, text } = args as { to: string; text: string };
+			if (cfg.allowPrefixes.length > 0 && !isDestinationAllowed(to, cfg.allowPrefixes)) {
+				throw new Error(
+					`Destination ${to} is not in OPENAGENT_PHONE_ALLOW_PREFIXES (${cfg.allowPrefixes.join(', ')}). ` +
+					`Add the prefix to the messaging MCP env or remove the allowlist to permit it.`,
+				);
+			}
+			const result = await sendSms(cfg, { to, text });
+			return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+		},
+	);
+
+	server.registerTool(
+		'sms_send_file',
+		{
+			title: 'Send MMS (file via SMS)',
+			description:
+				'Send a file (image / audio / video / pdf / vcard) as MMS via Twilio. ' +
+				'Twilio fetches the media from a public URL — local paths are not ' +
+				'supported (Twilio constraint). For private files, host them temporarily ' +
+				'(e.g. a signed S3 URL) and pass that URL.',
+			inputSchema: z.object({
+				to: z.string().describe('Destination phone number in E.164 format'),
+				url: z.string().describe('Public URL of the file Twilio should fetch and forward'),
+				text: z.string().optional().describe('Optional accompanying text body'),
+			}).strict(),
+		},
+		async (args) => {
+			const { to, url, text } = args as { to: string; url: string; text?: string };
+			if (cfg.allowPrefixes.length > 0 && !isDestinationAllowed(to, cfg.allowPrefixes)) {
+				throw new Error(
+					`Destination ${to} is not in OPENAGENT_PHONE_ALLOW_PREFIXES (${cfg.allowPrefixes.join(', ')}).`,
+				);
+			}
+			const result = await sendMms(cfg, { to, mediaUrl: url, text });
+			return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+		},
+	);
+
+	server.registerTool(
+		'phone_call_place',
+		{
+			title: 'Place AI-driven phone call',
+			description:
+				'Place an outbound phone call where an embedded AI conducts the live ' +
+				'conversation end-to-end (Google-Duplex-style). Provide a ``mission`` ' +
+				'(free text — what the call is for) and optionally success criteria, ' +
+				'caller identity, language. Returns immediately with a ``call_id``; ' +
+				'use ``phone_call_status`` to follow progress and retrieve the final ' +
+				'transcript / notes / outcome. The AI is required to disclose itself ' +
+				'as an AI assistant on connect.\n\n' +
+				'Per-call max duration is clamped down (never up) to the server-wide ' +
+				'OPENAGENT_PHONE_MAX_DURATION_SECONDS cap.',
+			inputSchema: z.object({
+				to: z.string().describe('Destination phone number in E.164 format, e.g. +393331234567'),
+				mission: z.string().describe('What the call is for, in free text. Example: "Call this restaurant and book a table for 4 at 7pm tomorrow under the name Alessandro."'),
+				caller_identity: z.string().optional().describe('Name to disclose on the user\'s behalf (e.g. "Alessandro Gerelli"). If omitted, the AI says "the user".'),
+				language: z.string().optional().describe('Language for the call, e.g. "en-US", "it-IT". Default en-US.'),
+				success_criteria: z.string().optional().describe('Optional: what counts as success. The AI uses this to decide outcome=success vs partial vs failure.'),
+				max_duration_seconds: z.number().int().positive().optional().describe('Per-call cap in seconds. Clamped to the server max.'),
+			}).strict(),
+		},
+		async (args) => {
+			const a = args as {
+				to: string;
+				mission: string;
+				caller_identity?: string;
+				language?: string;
+				success_criteria?: string;
+				max_duration_seconds?: number;
+			};
+			if (!cfg.publicUrl) {
+				throw new Error(
+					'OPENAGENT_PHONE_PUBLIC_URL is not set. Voice calls require a public ' +
+					'tunnel (ngrok / cloudflared) so Twilio can reach the local webhook ' +
+					'server. SMS still works without this.',
+				);
+			}
+			if (!isDestinationAllowed(a.to, cfg.allowPrefixes)) {
+				throw new Error(
+					`Destination ${a.to} is not in OPENAGENT_PHONE_ALLOW_PREFIXES ` +
+					`(${cfg.allowPrefixes.join(', ') || '<empty — allowlist denies all by default>'}). ` +
+					`Add the country/area-code prefix to the messaging MCP env to permit it.`,
+				);
+			}
+			if (dailyUsedSeconds() >= cfg.maxDailySeconds) {
+				throw new Error(
+					`Per-day call-duration cap reached (${cfg.maxDailySeconds}s used today). ` +
+					`Raise OPENAGENT_PHONE_MAX_DAILY_SECONDS or wait until tomorrow.`,
+				);
+			}
+
+			const requestedMax = a.max_duration_seconds ?? cfg.maxDurationSeconds;
+			const max = Math.min(requestedMax, cfg.maxDurationSeconds);
+
+			const callId = randomUUID();
+			const session = createCallSession({
+				id: callId,
+				to: a.to,
+				from: cfg.twilioFromNumber,
+				mission: a.mission,
+				caller_identity: a.caller_identity ?? null,
+				language: a.language ?? 'en-US',
+				success_criteria: a.success_criteria ?? null,
+				max_duration_seconds: max,
+			});
+
+			await ensurePhoneServer(cfg);
+
+			try {
+				const { sid } = await placeCall(cfg, {
+					to: a.to,
+					twimlUrl: twimlUrlFor(cfg, callId),
+					statusCallbackUrl: statusUrlFor(cfg, callId),
+				});
+				setTwilioSid(callId, sid);
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				setError(callId, `twilio placeCall failed: ${msg}`);
+				setStatus(callId, 'failed');
+				throw new Error(`Failed to place call via Twilio: ${msg}`);
+			}
+
+			return {
+				content: [{
+					type: 'text',
+					text: JSON.stringify({
+						call_id: callId,
+						status: session.status,
+						twilio_sid: session.twilio_sid,
+						hint: 'Poll phone_call_status(call_id, wait=true) for live updates and the final transcript.',
+					}, null, 2),
+				}],
+			};
+		},
+	);
+
+	server.registerTool(
+		'phone_call_status',
+		{
+			title: 'Get phone-call status',
+			description:
+				'Return the current state, partial transcript, notes, summary, and ' +
+				'outcome of a phone call placed via ``phone_call_place``. With ' +
+				'``wait=true``, blocks for up to ~30 seconds waiting for the next ' +
+				'state change — this is the friendly way to follow a call: the ' +
+				'first wait returns when the call is answered, the next when notes ' +
+				'are added or the call ends. ``outcome`` and ``summary`` are only ' +
+				'populated once the call is in a final state.',
+			inputSchema: z.object({
+				call_id: z.string().describe('The call_id returned by phone_call_place'),
+				wait: z.boolean().optional().describe('If true, long-poll for up to ~30s waiting for a state change. Default false (returns immediately with current state).'),
+			}).strict(),
+		},
+		async (args) => {
+			const { call_id, wait } = args as { call_id: string; wait?: boolean };
+			const session = getCallSession(call_id);
+			if (!session) {
+				throw new Error(`Unknown call_id: ${call_id}`);
+			}
+			if (wait && !isFinalStatus(session.status)) {
+				await waitForChange(call_id, 30_000);
+			}
+			const fresh = getCallSession(call_id)!;
+			return { content: [{ type: 'text', text: JSON.stringify(snapshot(fresh), null, 2) }] };
+		},
+	);
+
+	server.registerTool(
+		'phone_call_hangup',
+		{
+			title: 'Force-hang-up phone call',
+			description:
+				'Immediately end an in-flight phone call. Useful when the agent ' +
+				'decides the mission is impossible or the call has gone wrong. ' +
+				'Returns the final session snapshot. No-op if the call is already ' +
+				'in a final state.',
+			inputSchema: z.object({
+				call_id: z.string().describe('The call_id returned by phone_call_place'),
+			}).strict(),
+		},
+		async (args) => {
+			const { call_id } = args as { call_id: string };
+			const session = getCallSession(call_id);
+			if (!session) {
+				throw new Error(`Unknown call_id: ${call_id}`);
+			}
+			if (isFinalStatus(session.status)) {
+				return { content: [{ type: 'text', text: JSON.stringify(snapshot(session), null, 2) }] };
+			}
+			requestHangup(call_id);
+			// Best-effort REST hangup as belt-and-suspenders — the bridge poll
+			// will hangup too, but the REST call ensures Twilio drops the line
+			// even if the bridge has lost its WS.
+			if (session.twilio_sid) {
+				try { await hangupCall(cfg, session.twilio_sid); } catch (err) {
+					console.error('[phone] hangup REST failed', err);
+				}
+			}
+			// Wait briefly for the bridge to finalise the session.
+			await waitForChange(call_id, 3_000);
+			const fresh = getCallSession(call_id)!;
+			return { content: [{ type: 'text', text: JSON.stringify(snapshot(fresh), null, 2) }] };
+		},
+	);
+
+	console.error('Twilio (SMS + Voice) messaging tools registered');
 }
 
 // Start
