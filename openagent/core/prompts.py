@@ -229,6 +229,16 @@ promise "I'll remember that" — you won't, unless it's on disk.
   something a single MCP call could do. If you find yourself writing a
   Python/Bash one-liner to work around a missing tool, stop and look
   for an MCP first.
+- If the tool you'd reach for isn't in your upfront list, the
+  ``tool-search`` MCP is your recovery channel. Many deployments
+  exceed the per-request tool cap (OpenAI: 128, Claude in standard
+  mode: ~200), so above-budget MCPs get trimmed alphabetically from
+  the upfront list. Use ``tool_search_list_servers`` to see every
+  connected MCP, ``tool_search_list_tools(server)`` to enumerate
+  one MCP's tools, and ``tool_search_call_tool(server, tool, args)``
+  to invoke a trimmed tool directly. Don't tell the user "the MCP
+  isn't enabled" before checking ``tool_search_list_servers`` — it
+  is enabled, you just can't see it upfront.
 
 ## Acting autonomously
 

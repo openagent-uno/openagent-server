@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import inspect
 import logging
 import os
 import shutil
@@ -530,16 +531,36 @@ class MCPPool:
                         spec.name, spec.sdk_server_factory, spec.agno_toolkit_factory,
                     )
                     continue
+                # Inject ``pool=self`` only for factories that accept it.
+                # Existing in-process adapters (e.g. shell) take no kwargs;
+                # tool-search needs the pool to navigate other MCPs. We
+                # detect this via signature so neither side has to know
+                # about the other.
+                def _factory_kwargs(factory: Any) -> dict[str, Any]:
+                    try:
+                        params = inspect.signature(factory).parameters
+                    except (TypeError, ValueError):
+                        return {}
+                    return {"pool": self} if "pool" in params else {}
+
                 try:
-                    sdk_cfg = sdk_factory()
-                    agno_tk = agno_factory()
+                    sdk_cfg = sdk_factory(**_factory_kwargs(sdk_factory))
+                    agno_tk = agno_factory(**_factory_kwargs(agno_factory))
                 except Exception as e:  # noqa: BLE001
                     elog("mcp.error", level="warning", name=spec.name, error=str(e), phase="factory")
                     continue
                 self._in_process_sdk_servers[spec.name] = sdk_cfg
                 self._in_process_agno_toolkits.append(agno_tk)
                 self._toolkit_by_name[spec.name] = agno_tk
-                count = 6  # six shell tools
+                # Count both sync and async tool dicts — Toolkits with
+                # async-only callables register them in ``async_functions``
+                # and leave ``functions`` empty, so the prior hardcoded
+                # ``count = 6`` (a leftover from when shell was the only
+                # in-process MCP) under-counted in general.
+                count = (
+                    len(getattr(agno_tk, "functions", {}) or {})
+                    + len(getattr(agno_tk, "async_functions", {}) or {})
+                )
                 self._tool_counts[spec.name] = count
                 elog("mcp.connect", name=spec.name, tools=count, kind="in_process")
 
@@ -841,6 +862,94 @@ class MCPPool:
             if not spec.in_process
         }
         base.update(self._in_process_sdk_servers)
+        return base
+
+    # ── Tool-budget filtering ───────────────────────────────────────────
+    #
+    # LLM providers cap how many tools they accept per request (OpenAI:
+    # 128; Claude Code in standard mode: ~200). When the pool exposes
+    # more tools than the cap, the provider silently drops the
+    # alphabetically-late ones — workflow-manager was the canary that
+    # surfaced this bug. The two methods below return a trimmed view
+    # that fits the budget; the trimmed-out MCPs stay reachable via
+    # the ``tool-search`` in-process MCP, which the wire layer keeps
+    # in the kept set unconditionally. The two paths share a single
+    # alphabetic-fill heuristic so Agno and Claude SDK behave the
+    # same way for the same budget — a deliberate symmetry the user
+    # asked for ("non un sistema specifico per claude sdk").
+
+    def _toolkit_tool_count(self, toolkit: Any) -> int:
+        """Tool count for a toolkit, summing sync + async function dicts."""
+        return (
+            len(getattr(toolkit, "functions", {}) or {})
+            + len(getattr(toolkit, "async_functions", {}) or {})
+        )
+
+    def _toolkit_name(self, toolkit: Any) -> str:
+        """Reverse-lookup a toolkit's MCP name in ``_toolkit_by_name``."""
+        for name, tk in self._toolkit_by_name.items():
+            if tk is toolkit:
+                return name
+        return ""
+
+    def agno_toolkits_under_budget(self, budget: int) -> list[Any]:
+        """Subset of ``agno_toolkits`` whose combined tool count fits ``budget``.
+
+        In-process toolkits (including ``tool-search``) are always
+        included — they're cheap and ``tool-search`` is the recovery
+        channel for trimmed MCPs. Subprocess toolkits are added in
+        alphabetical name order; the next one is dropped when adding it
+        would push the total over ``budget``. Dropped MCPs remain
+        invocable via ``tool-search.call_tool``.
+
+        Pass ``budget < 0`` to skip trimming entirely (legacy callers /
+        tests).
+        """
+        if budget < 0:
+            return self.agno_toolkits
+
+        in_process = list(self._in_process_agno_toolkits)
+        used = sum(self._toolkit_tool_count(tk) for tk in in_process)
+        remaining = max(0, budget - used)
+
+        subprocess_pairs = sorted(
+            ((self._toolkit_name(tk), tk) for tk in self._agno_toolkits),
+            key=lambda p: p[0],
+        )
+        kept: list[Any] = []
+        for _, tk in subprocess_pairs:
+            n = self._toolkit_tool_count(tk)
+            if n <= remaining:
+                kept.append(tk)
+                remaining -= n
+        return kept + in_process
+
+    def claude_sdk_servers_under_budget(self, budget: int) -> dict[str, dict[str, Any]]:
+        """Same idea as ``agno_toolkits_under_budget`` for Claude SDK config.
+
+        In-process SDK servers are always included; subprocess specs are
+        added alphabetically until the budget would be exceeded. Tool
+        counts are read from the pool's ``_tool_counts`` (populated by
+        ``connect_all``), so a fresh pool that hasn't connected yet
+        budgets every subprocess at zero — which means ``budget < 0``
+        is the right call before ``connect_all`` returns.
+        """
+        if budget < 0:
+            return self.claude_sdk_servers()
+
+        base: dict[str, dict[str, Any]] = dict(self._in_process_sdk_servers)
+        used = sum(self._tool_counts.get(name, 0) for name in base)
+        remaining = max(0, budget - used)
+
+        subprocess_specs = sorted(
+            (s for s in self.specs if not s.in_process),
+            key=lambda s: s.name,
+        )
+        for spec in subprocess_specs:
+            n = self._tool_counts.get(spec.name, 0)
+            if n <= remaining:
+                base[spec.name] = spec.claude_sdk_entry()
+                remaining -= n
         return base
 
     # ── Introspection (used by Agent for system prompt + health endpoints) ─

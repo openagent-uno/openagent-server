@@ -158,6 +158,12 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
         "sdk_server_factory": "build_sdk_server",
         "agno_toolkit_factory": "build_agno_toolkit",
     },
+    "tool-search": {
+        "in_process": True,
+        "adapter_module": "openagent.mcp.servers.tool_search.adapters",
+        "sdk_server_factory": "build_sdk_server",
+        "agno_toolkit_factory": "build_agno_toolkit",
+    },
     "web-search": {
         "dir": "web-search",
         "command": ["node", "dist/index.js"],
@@ -210,6 +216,7 @@ DEFAULT_MCPS: list[dict[str, Any]] = [
     {"builtin": "editor", "_default": True},
     {"builtin": "web-search", "_default": True},
     {"builtin": "shell", "_default": True},
+    {"builtin": "tool-search", "_default": True},
     {"builtin": "computer-control", "_default": True},
     {"builtin": "chrome-devtools", "_default": True},
     {"builtin": "messaging", "_default": True},

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from openagent.models.base import BaseModel, ModelResponse
@@ -16,6 +17,36 @@ from openagent.models.catalog import (
 )
 
 
+# ── Tool-budget knobs ───────────────────────────────────────────────
+#
+# LLM providers cap how many tools they accept per request:
+#   • OpenAI (Agno path on most accounts): 128
+#   • Claude Code in standard mode:        ~200
+# Above the cap, alphabetically-late MCPs get silently dropped — the
+# bug that hid ``workflow-manager`` from production sessions until
+# this layer existed. We trim the upfront tool list to the cap and let
+# the in-process ``tool-search`` MCP recover the rest on demand.
+#
+# Defaults are conservative on purpose: the failure mode of
+# overshooting (silent tool truncation, or a hard 400 from OpenAI) is
+# worse than the cost of a single tool-search round-trip. Operators
+# can raise the budget via env when they know their provider tolerates
+# more (e.g. Claude SDK with ``ENABLE_TOOL_SEARCH=auto:0`` does its
+# own deferred-tool dance and effectively has no upfront cap).
+_DEFAULT_AGNO_TOOL_BUDGET = 128
+_DEFAULT_CLAUDE_TOOL_BUDGET = 200
+
+
+def _budget_from_env(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return default
+
+
 def wire_model_runtime(
     model: BaseModel,
     *,
@@ -28,20 +59,36 @@ def wire_model_runtime(
     lifecycle for the process. AgnoProvider gets pre-connected Agno
     ``MCPTools`` instances; ClaudeCLI gets the raw stdio config dict
     that the Claude Agent SDK accepts as its ``mcp_servers`` parameter.
+
+    Budget-aware filtering: when ``mcp_pool.total_tool_count`` exceeds
+    the configured budget, the call below trims subprocess MCPs in
+    alphabetical order until the count fits. The in-process
+    ``tool-search`` MCP is always kept and exposes ``call_tool`` so
+    the model can still reach trimmed MCPs on demand. Both providers
+    use the same trimming rule — a single mechanism, not a Claude-only
+    or Agno-only path.
     """
     if db is not None:
         set_db = getattr(model, "set_db", None)
         if callable(set_db):
             set_db(db)
     if mcp_pool is not None:
+        agno_budget = _budget_from_env(
+            "OPENAGENT_AGNO_TOOL_BUDGET", _DEFAULT_AGNO_TOOL_BUDGET,
+        )
+        claude_budget = _budget_from_env(
+            "OPENAGENT_CLAUDE_TOOL_BUDGET", _DEFAULT_CLAUDE_TOOL_BUDGET,
+        )
         # AgnoProvider / SmartRouter: pre-connected Agno MCPTools instances.
         set_mcp_toolkits = getattr(model, "set_mcp_toolkits", None)
         if callable(set_mcp_toolkits):
-            set_mcp_toolkits(mcp_pool.agno_toolkits)
+            set_mcp_toolkits(mcp_pool.agno_toolkits_under_budget(agno_budget))
         # ClaudeCLI: raw stdio config for the Claude Agent SDK.
         set_mcp_servers = getattr(model, "set_mcp_servers", None)
         if callable(set_mcp_servers):
-            set_mcp_servers(mcp_pool.claude_sdk_servers())
+            set_mcp_servers(
+                mcp_pool.claude_sdk_servers_under_budget(claude_budget)
+            )
         # SmartRouter holds the pool itself so it can re-wire newly created
         # tier providers as they're lazily instantiated.
         set_mcp_pool = getattr(model, "set_mcp_pool", None)
