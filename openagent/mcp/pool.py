@@ -840,8 +840,18 @@ class MCPPool:
         out: list[dict[str, Any]] = []
         for name, toolkit in self._toolkit_by_name.items():
             tools_meta: list[dict[str, Any]] = []
-            functions = getattr(toolkit, "functions", {}) or {}
-            for tool_name, fn in functions.items():
+            # Subprocess MCPs (Agno's MCPTools) populate ``functions``;
+            # in-process Toolkits with async-only callables (tool-search,
+            # potentially future ones) populate ``async_functions``
+            # instead. Merge both so the UI sees every exposed tool —
+            # the agent already does the merge via Toolkit's
+            # ``get_async_functions()`` so this brings introspection in
+            # line with what the model actually sees.
+            merged = {
+                **(getattr(toolkit, "functions", {}) or {}),
+                **(getattr(toolkit, "async_functions", {}) or {}),
+            }
+            for tool_name, fn in merged.items():
                 # Agno's MCPTools wraps the remote tool; it exposes
                 # ``description`` and ``parameters`` on the function
                 # object after ``initialize()``. Fall back to empty
