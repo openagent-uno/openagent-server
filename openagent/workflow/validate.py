@@ -12,10 +12,13 @@ cheap LLM edit most often makes:
 - missing required config fields
 - config fields of the wrong shape (enum, scalar type)
 - multiple trigger nodes when ``trigger_kind`` says only one
+- ``mcp-tool`` blocks pointing at MCPs/tools that aren't loaded (only
+  when an ``mcp_inventory`` is supplied — see ``validate_graph``)
 """
 
 from __future__ import annotations
 
+import difflib
 from typing import Any
 
 from openagent.workflow.blocks import BLOCK_CATALOG, BlockSpec
@@ -66,6 +69,74 @@ def _check_config(node_id: str, spec: BlockSpec, config: dict[str, Any]) -> None
                 )
 
 
+def _check_mcp_tool(
+    node_id: str,
+    config: dict[str, Any],
+    inventory: dict[str, dict[str, Any]],
+) -> None:
+    """Validate (and lightly repair) an ``mcp-tool`` block's mcp_name +
+    tool_name against the live ``inventory`` snapshot.
+
+    ``inventory`` shape: ``{mcp_name: {tool_name: parameters_schema_or_{}}}``.
+
+    Auto-repair: when ``tool_name`` doesn't exist on the MCP but
+    ``f"{mcp_name}_{tool_name}"`` does, the block's config is rewritten
+    in place. Agno prefixes remote tool names with the MCP name; LLM-
+    authored workflows routinely emit the bare upstream name (e.g.
+    ``telegram_send_message`` instead of ``messaging_telegram_send_message``).
+    Auto-repair eliminates that whole failure class without forcing the
+    LLM to re-author.
+    """
+    mcp_name = config.get("mcp_name")
+    tool_name = config.get("tool_name")
+    if not isinstance(mcp_name, str) or not isinstance(tool_name, str):
+        return  # required-field check elsewhere catches this
+
+    tools = inventory.get(mcp_name)
+    if tools is None:
+        suggestions = difflib.get_close_matches(mcp_name, inventory.keys(), n=3)
+        hint = f" Did you mean: {suggestions}?" if suggestions else ""
+        raise ValidationError(
+            f"node {node_id}: MCP {mcp_name!r} is not loaded. "
+            f"Known MCPs: {sorted(inventory)}.{hint}",
+            node_id=node_id,
+            field="mcp_name",
+        )
+
+    if tool_name not in tools:
+        prefixed = f"{mcp_name}_{tool_name}"
+        if prefixed in tools:
+            config["tool_name"] = prefixed
+            tool_name = prefixed
+        else:
+            suggestions = difflib.get_close_matches(tool_name, tools.keys(), n=3)
+            hint = f" Did you mean: {suggestions}?" if suggestions else ""
+            raise ValidationError(
+                f"node {node_id}: MCP {mcp_name!r} has no tool {tool_name!r}. "
+                f"Available: {sorted(tools)}.{hint}",
+                node_id=node_id,
+                field="tool_name",
+            )
+
+    # Best-effort args sanity: only flag plain-missing required keys.
+    # Templated values like ``"{{ctx.inputs.x}}"`` are valid strings
+    # and count as present — we don't try to resolve them here.
+    args = config.get("args") or {}
+    if not isinstance(args, dict):
+        return  # type check elsewhere catches this
+    schema = tools.get(tool_name) or {}
+    required = schema.get("required") if isinstance(schema, dict) else None
+    if isinstance(required, list):
+        missing = [k for k in required if k not in args]
+        if missing:
+            raise ValidationError(
+                f"node {node_id}: tool {mcp_name}.{tool_name} requires "
+                f"args {missing} that are not set",
+                node_id=node_id,
+                field="args",
+            )
+
+
 def _detect_cycle(nodes: list[dict], edges: list[dict]) -> None:
     """Iterative DFS; loop blocks' body-self-edges are exempt."""
     adj: dict[str, list[tuple[str, str]]] = {n["id"]: [] for n in nodes}
@@ -112,9 +183,24 @@ def _detect_cycle(nodes: list[dict], edges: list[dict]) -> None:
             dfs(nid)
 
 
-def validate_graph(graph: dict[str, Any]) -> None:
+def validate_graph(
+    graph: dict[str, Any],
+    *,
+    mcp_inventory: dict[str, dict[str, Any]] | None = None,
+) -> None:
     """Validate a ``graph_json`` payload. Raises ``ValidationError`` on
     the first problem found; returns ``None`` on success.
+
+    When ``mcp_inventory`` is supplied (shape:
+    ``{mcp_name: {tool_name: parameters_schema}}``) ``mcp-tool`` blocks
+    are additionally cross-checked against the loaded MCPs. Tool-name
+    prefix mismatches (LLM emitting ``telegram_send_message`` when the
+    pool exposes ``messaging_telegram_send_message``) are auto-repaired
+    in place. Pass ``None`` (default) on code paths that don't have a
+    pool handy — the rest of the validation still runs.
+
+    Build the inventory with :func:`mcp_inventory_from_pool` from any
+    caller that has an ``MCPPool`` in scope.
     """
     if not isinstance(graph, dict):
         raise ValidationError("graph must be an object")
@@ -152,6 +238,8 @@ def validate_graph(graph: dict[str, Any]) -> None:
                 field="config",
             )
         _check_config(nid, spec, config)
+        if ntype == "mcp-tool" and mcp_inventory is not None:
+            _check_mcp_tool(nid, config, mcp_inventory)
 
     for edge in edges:
         if not isinstance(edge, dict):
@@ -168,3 +256,38 @@ def validate_graph(graph: dict[str, Any]) -> None:
             )
 
     _detect_cycle(nodes, edges)
+
+
+def mcp_inventory_from_pool(pool: Any) -> dict[str, dict[str, Any]] | None:
+    """Snapshot a ``MCPPool`` into the shape ``validate_graph`` expects:
+    ``{mcp_name: {tool_name: parameters_schema}}``.
+
+    Returns ``None`` when the pool can't be introspected (``None``, no
+    ``list_mcp_tools`` method, exception during enumeration). Callers
+    pass this directly to ``validate_graph(graph, mcp_inventory=...)``
+    and ``None`` means "skip MCP-existence checks" — the right
+    behavior at boot, in tests, or anywhere a pool isn't attached yet.
+    A genuine empty pool returns ``{}``, which causes mcp-tool blocks
+    to fail validation (no MCPs are loaded, so referencing one is wrong).
+    """
+    if pool is None:
+        return None
+    list_fn = getattr(pool, "list_mcp_tools", None)
+    if not callable(list_fn):
+        return None
+    try:
+        listing = list_fn()
+    except Exception:
+        return None
+    out: dict[str, dict[str, Any]] = {}
+    for entry in listing or []:
+        name = entry.get("mcp_name")
+        if not isinstance(name, str):
+            continue
+        tools_meta = entry.get("tools") or []
+        out[name] = {
+            t["name"]: t.get("parameters_schema") or {}
+            for t in tools_meta
+            if isinstance(t, dict) and isinstance(t.get("name"), str)
+        }
+    return out

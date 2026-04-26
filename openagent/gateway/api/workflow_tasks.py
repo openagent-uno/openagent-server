@@ -39,7 +39,11 @@ from openagent.workflow.schedule_sync import (
     sync_workflow_schedules,
     trigger_types_from_graph,
 )
-from openagent.workflow.validate import ValidationError, validate_graph
+from openagent.workflow.validate import (
+    ValidationError,
+    mcp_inventory_from_pool,
+    validate_graph,
+)
 
 
 def _resolve_scheduler(request):
@@ -54,6 +58,22 @@ def _resolve_scheduler(request):
             status=503,
         )
     return scheduler, None
+
+
+def _resolve_mcp_inventory(request) -> dict[str, dict[str, Any]] | None:
+    """Return ``{mcp_name: {tool_name: parameters_schema}}`` from the
+    live pool, or ``None`` when no agent/pool is attached. ``None``
+    tells ``validate_graph`` to skip the MCP-existence check —
+    appropriate during boot, in tests, or any path where the pool
+    isn't reachable. A live pool that happens to have zero MCPs
+    returns ``{}`` and any mcp-tool block correctly fails validation.
+    """
+    gw = request.app["gateway"]
+    agent = getattr(gw, "agent", None) or getattr(gw, "_agent", None)
+    if agent is None:
+        return None
+    pool = getattr(agent, "_mcp", None)
+    return mcp_inventory_from_pool(pool)
 
 
 def _decorate_schedule(row: dict) -> dict:
@@ -164,7 +184,7 @@ async def handle_create(request):
         "variables": body.get("variables") or {},
     }
     try:
-        validate_graph(graph)
+        validate_graph(graph, mcp_inventory=_resolve_mcp_inventory(request))
     except ValidationError as exc:
         return web.json_response({"error": f"graph validation failed: {exc}"}, status=400)
 
@@ -244,7 +264,7 @@ async def handle_update(request):
             ),
         }
         try:
-            validate_graph(new_graph)
+            validate_graph(new_graph, mcp_inventory=_resolve_mcp_inventory(request))
         except ValidationError as exc:
             return web.json_response(
                 {"error": f"graph validation failed: {exc}"}, status=400,

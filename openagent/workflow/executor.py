@@ -598,8 +598,23 @@ async def _h_mcp_tool(
             f"mcp-tool: MCP {mcp_name!r} is not loaded. Known MCPs: "
             f"{sorted(pool._toolkit_by_name)}"
         )
-    functions = getattr(toolkit, "functions", {}) or {}
+    # Merge sync + async function dicts: subprocess MCPs populate
+    # ``functions``, in-process Toolkits with async-only callables use
+    # ``async_functions``. ``list_mcp_tools`` does the same merge — keeping
+    # introspection and dispatch in sync.
+    functions = {
+        **(getattr(toolkit, "functions", {}) or {}),
+        **(getattr(toolkit, "async_functions", {}) or {}),
+    }
     fn = functions.get(tool_name)
+    if fn is None:
+        # Agno prefixes remote tools with the MCP name (``messaging_…``).
+        # LLM-authored workflows often emit the bare upstream name; auto-
+        # repair that one specific mismatch instead of failing.
+        prefixed = f"{mcp_name}_{tool_name}"
+        if prefixed in functions:
+            tool_name = prefixed
+            fn = functions[tool_name]
     if fn is None:
         raise RuntimeError(
             f"mcp-tool: MCP {mcp_name!r} has no tool {tool_name!r}. "
