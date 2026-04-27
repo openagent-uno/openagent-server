@@ -111,6 +111,11 @@ _TEST_MODULES: tuple[str, ...] = (
     # the ``TypeError: 'Function' object is not callable`` regression
     # that broke LLM-authored workflows touching subprocess MCPs.
     "test_workflow_mcp_dispatch",
+    # Canonical workflow examples — every example must round-trip
+    # through validate_graph so the "reference manual" we ship to the
+    # LLM (via list_workflow_examples / get_workflow_example) stays
+    # accurate as block schemas evolve.
+    "test_workflow_examples",
     "test_dream",
     "test_updater",
     "test_bridges",

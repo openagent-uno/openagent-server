@@ -34,6 +34,10 @@ from openagent.workflow import (
     validate_graph,
 )
 from openagent.workflow.blocks import get_block_spec
+from openagent.workflow.examples import (
+    get_workflow_example as _get_workflow_example,
+    list_workflow_examples as _list_workflow_examples,
+)
 from openagent.workflow.schedule_sync import (
     iter_trigger_schedule_blocks,
     trigger_types_from_graph,
@@ -376,6 +380,41 @@ async def create_workflow(
     - ``trigger-schedule`` blocks with a ``cron_expression`` in their
       ``config`` automatically appear in ``workflow_schedules`` and
       are fired by the main-process scheduler.
+
+    Schema (the validator enforces this):
+
+        node = {
+          "id":      "<unique str>",          # referenced by edges
+          "type":    "<one of BLOCK_CATALOG>",  # see list_block_types
+          "label":   "<human label>",         # optional UI hint
+          "position": {"x": int, "y": int},   # optional UI hint
+          "config":  {<per-block fields>},    # see describe_block_type
+        }
+        edge = {
+          "id":             "<unique str>",
+          "source":         "<source node id>",
+          "target":         "<target node id>",
+          "sourceHandle":   "out" | "true" | "false" | "branch_<i>" | "body" | "done",
+          "targetHandle":   "in"  | "body",
+        }
+
+    Workflow-authoring playbook:
+
+      1. Call ``list_workflow_examples`` to see canonical patterns.
+         If one matches your intent, ``get_workflow_example(name)``
+         returns a complete copy-pasteable graph — adapt and create.
+      2. Call ``list_block_types`` (or ``describe_block_type(t)``) to
+         confirm config_schema for every block you use.
+      3. Call ``list_available_tools`` BEFORE referencing ``mcp-tool``
+         blocks; tool_name MUST be the prefixed form the pool exposes
+         (e.g. ``messaging_telegram_send_message``, NOT bare
+         ``telegram_send_message``).
+      4. Wire branching/parallel/loop edges with the right
+         ``sourceHandle`` (``true``/``false`` for ``if``,
+         ``branch_<i>`` for ``parallel``, ``body``/``done`` for
+         ``loop``) — the default ``out`` won't fire on those blocks.
+      5. Reference upstream block outputs in templated args via
+         ``{{nodes.<id>.output.<field>}}``.
     """
     if not name or not name.strip():
         raise ValueError("name is required")
@@ -708,6 +747,29 @@ async def list_block_types() -> list[dict[str, Any]]:
     schema. Sibling of ``describe_block_type`` for bulk discovery.
     """
     return iter_block_specs()
+
+
+@mcp.tool()
+async def list_workflow_examples() -> list[dict[str, Any]]:
+    """Lightweight index of canonical workflow examples — name +
+    description + patterns demonstrated. Cheap to scan when picking
+    which example to load in full via ``get_workflow_example``.
+
+    Use this BEFORE calling ``create_workflow`` for any non-trivial
+    graph: pick the example whose ``patterns`` match your intent,
+    then pull its graph and adapt.
+    """
+    return _list_workflow_examples()
+
+
+@mcp.tool()
+async def get_workflow_example(name: str) -> dict[str, Any]:
+    """Return one canonical workflow example by ``name`` — full graph
+    included, ready to adapt and pass to ``create_workflow``. Names
+    come from ``list_workflow_examples``. Each example passes
+    structural validation; pool-level tool existence is still your
+    responsibility (verify via ``list_available_tools``)."""
+    return _get_workflow_example(name)
 
 
 @mcp.tool()

@@ -138,16 +138,28 @@ BLOCK_CATALOG: dict[str, BlockSpec] = {
         description=(
             "Call a tool from any connected MCP (builtin or user-configured). "
             "Arg values support {{...}} templating against ctx.nodes, "
-            "ctx.inputs, and ctx.vars."
+            "ctx.inputs, and ctx.vars (e.g. \"{{nodes.n2.output.text}}\"). "
+            "The tool_name MUST be the prefixed form the pool actually "
+            "exposes (e.g. 'messaging_telegram_send_message', NOT bare "
+            "'telegram_send_message') — call list_available_tools first or "
+            "consult /api/mcp-tools to see the canonical names. The bare "
+            "form is auto-repaired but emitting the prefixed form keeps "
+            "trace_json clean and avoids relying on the repair."
         ),
         config_schema={
             "mcp_name": _field(
                 "string", required=True,
-                description="Name as it appears in /api/mcp-tools (e.g. 'shell', 'web-search').",
+                description=(
+                    "MCP server name as it appears in /api/mcp-tools "
+                    "(e.g. 'shell', 'messaging', 'scheduler')."
+                ),
             ),
             "tool_name": _field(
                 "string", required=True,
-                description="Tool name within that MCP (e.g. 'shell_exec').",
+                description=(
+                    "Prefixed tool name within that MCP, e.g. 'shell_exec', "
+                    "'messaging_telegram_send_message', 'scheduler_create_one_shot_task'."
+                ),
             ),
             "args": _field(
                 "object", default={},
@@ -213,7 +225,10 @@ BLOCK_CATALOG: dict[str, BlockSpec] = {
         description=(
             "Route control via a jinja expression evaluated against ctx. "
             "Edges with sourceHandle='true' run when the expression is "
-            "truthy; 'false' otherwise."
+            "truthy; 'false' otherwise. WIRING: every outgoing edge from "
+            "an `if` MUST set sourceHandle to either 'true' or 'false' "
+            "(default 'out' will never fire). The two branches cascade-"
+            "skip independently — downstream merges can collect both."
         ),
         config_schema={
             "expression": _field(
@@ -233,8 +248,14 @@ BLOCK_CATALOG: dict[str, BlockSpec] = {
         description=(
             "Iterate over a list. items_expr resolves to a sequence; the "
             "body subgraph (sourceHandle='body') runs once per item with "
-            "ctx.vars[iteration_var] set. 'done' fires after the last "
-            "iteration."
+            "ctx.vars[iteration_var] set. 'done' fires once after the "
+            "last iteration. WIRING: connect the loop's 'body' handle "
+            "to the FIRST node of a forward DAG; the loop handler runs "
+            "that subgraph once per item internally — do NOT add a "
+            "back-edge from the body's tail to the loop (the validator "
+            "rejects it). Wire the 'done' handle to whatever should run "
+            "after the loop completes. Reference the current item via "
+            "\"{{vars.<iteration_var>}}\" (default \"{{vars.item}}\")."
         ),
         config_schema={
             "items_expr": _field(
@@ -274,9 +295,12 @@ BLOCK_CATALOG: dict[str, BlockSpec] = {
         type="parallel",
         category="flow",
         description=(
-            "Fan out to N branches that run concurrently. Wire branches to "
-            "sourceHandle='branch_0', 'branch_1', ... Pair with a merge "
-            "block downstream to collect."
+            "Fan out to N branches that run concurrently. WIRING: each "
+            "outgoing edge MUST set sourceHandle to a distinct "
+            "'branch_<i>' (branch_0, branch_1, ...) — the default 'out' "
+            "won't fire. Pair with a merge block downstream that gathers "
+            "every branch's tail; the merge waits for all upstream edges "
+            "before emitting."
         ),
         config_schema={
             "branches": _field(
@@ -316,7 +340,9 @@ BLOCK_CATALOG: dict[str, BlockSpec] = {
         description=(
             "Write a value into ctx.vars so later blocks can reference it "
             "via {{vars.<key>}}. Useful for accumulators in loops and for "
-            "naming derived values."
+            "naming derived values. The expression is evaluated against "
+            "the same ctx as templating, so \"{{n2.output.text}}\" or "
+            "\"{{inputs.user_id}}\" work directly."
         ),
         config_schema={
             "key": _field("string", required=True, description="Variable name."),
