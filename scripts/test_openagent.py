@@ -107,6 +107,10 @@ _TEST_MODULES: tuple[str, ...] = (
     # Workflow ai-prompt must forget/release at the right moment (same
     # bug class as scheduler issue #5 but for workflows).
     "test_workflow_forgets_session",
+    # mcp-tool dispatch + validator callability check — guards against
+    # the ``TypeError: 'Function' object is not callable`` regression
+    # that broke LLM-authored workflows touching subprocess MCPs.
+    "test_workflow_mcp_dispatch",
     "test_dream",
     "test_updater",
     "test_bridges",

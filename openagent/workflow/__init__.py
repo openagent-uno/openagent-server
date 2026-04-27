@@ -13,6 +13,7 @@ from openagent.workflow.blocks import (
 from openagent.workflow.templating import resolve_templates
 from openagent.workflow.validate import (
     ValidationError,
+    mcp_callability_from_pool,
     mcp_inventory_from_pool,
     validate_graph,
 )
@@ -24,6 +25,7 @@ __all__ = [
     "iter_block_specs",
     "resolve_templates",
     "ValidationError",
+    "mcp_callability_from_pool",
     "mcp_inventory_from_pool",
     "validate_graph",
 ]

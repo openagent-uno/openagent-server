@@ -73,6 +73,7 @@ def _check_mcp_tool(
     node_id: str,
     config: dict[str, Any],
     inventory: dict[str, dict[str, Any]],
+    callability: dict[str, dict[str, bool]] | None = None,
 ) -> None:
     """Validate (and lightly repair) an ``mcp-tool`` block's mcp_name +
     tool_name against the live ``inventory`` snapshot.
@@ -86,6 +87,15 @@ def _check_mcp_tool(
     ``telegram_send_message`` instead of ``messaging_telegram_send_message``).
     Auto-repair eliminates that whole failure class without forcing the
     LLM to re-author.
+
+    ``callability`` (optional, shape:
+    ``{mcp_name: {tool_name: bool}}``) is a parallel snapshot built by
+    :func:`mcp_callability_from_pool`. When supplied, the resolved tool
+    must be invocable — either a raw callable in the toolkit, or an
+    Agno ``Function`` descriptor with a non-None ``entrypoint``. A
+    ``False`` here means the executor would fail at run-time with
+    ``TypeError: 'Function' object is not callable``; we surface it as
+    a clear validation error instead.
     """
     mcp_name = config.get("mcp_name")
     tool_name = config.get("tool_name")
@@ -114,6 +124,22 @@ def _check_mcp_tool(
             raise ValidationError(
                 f"node {node_id}: MCP {mcp_name!r} has no tool {tool_name!r}. "
                 f"Available: {sorted(tools)}.{hint}",
+                node_id=node_id,
+                field="tool_name",
+            )
+
+    # Callability: catch the case where the toolkit registered a
+    # non-callable (e.g. an Agno ``Function`` descriptor whose
+    # ``entrypoint`` never got bound). The executor would otherwise
+    # raise ``TypeError: 'Function' object is not callable`` mid-DAG.
+    if callability is not None:
+        per_mcp = callability.get(mcp_name) or {}
+        if per_mcp.get(tool_name) is False:
+            raise ValidationError(
+                f"node {node_id}: tool {mcp_name}.{tool_name} resolved to "
+                f"a non-callable in the live MCP pool — likely a stale "
+                f"subprocess MCP toolkit registration. Reload the MCP "
+                f"and retry.",
                 node_id=node_id,
                 field="tool_name",
             )
@@ -187,6 +213,7 @@ def validate_graph(
     graph: dict[str, Any],
     *,
     mcp_inventory: dict[str, dict[str, Any]] | None = None,
+    mcp_callability: dict[str, dict[str, bool]] | None = None,
 ) -> None:
     """Validate a ``graph_json`` payload. Raises ``ValidationError`` on
     the first problem found; returns ``None`` on success.
@@ -198,6 +225,12 @@ def validate_graph(
     pool exposes ``messaging_telegram_send_message``) are auto-repaired
     in place. Pass ``None`` (default) on code paths that don't have a
     pool handy — the rest of the validation still runs.
+
+    When ``mcp_callability`` is supplied (shape:
+    ``{mcp_name: {tool_name: bool}}``) every ``mcp-tool`` block whose
+    resolved tool maps to ``False`` is rejected with an actionable
+    error. Built by :func:`mcp_callability_from_pool` alongside the
+    inventory snapshot.
 
     Build the inventory with :func:`mcp_inventory_from_pool` from any
     caller that has an ``MCPPool`` in scope.
@@ -239,7 +272,7 @@ def validate_graph(
             )
         _check_config(nid, spec, config)
         if ntype == "mcp-tool" and mcp_inventory is not None:
-            _check_mcp_tool(nid, config, mcp_inventory)
+            _check_mcp_tool(nid, config, mcp_inventory, mcp_callability)
 
     for edge in edges:
         if not isinstance(edge, dict):
@@ -290,4 +323,37 @@ def mcp_inventory_from_pool(pool: Any) -> dict[str, dict[str, Any]] | None:
             for t in tools_meta
             if isinstance(t, dict) and isinstance(t.get("name"), str)
         }
+    return out
+
+
+def mcp_callability_from_pool(pool: Any) -> dict[str, dict[str, bool]] | None:
+    """Snapshot a ``MCPPool`` into ``{mcp_name: {tool_name: bool}}``,
+    where ``True`` means "the executor can dispatch this tool" and
+    ``False`` means "calling it would raise ``TypeError`` mid-DAG".
+
+    A tool is considered callable when the toolkit registers either:
+    a raw Python callable (in-process toolkits like ``tool-search``);
+    or an Agno ``Function`` descriptor whose ``entrypoint`` field is
+    itself callable (the standard subprocess-MCP shape).
+
+    Returns ``None`` when the pool can't be introspected — same
+    convention as :func:`mcp_inventory_from_pool`. Pass alongside the
+    inventory to :func:`validate_graph`.
+    """
+    if pool is None:
+        return None
+    by_name = getattr(pool, "_toolkit_by_name", None)
+    if not isinstance(by_name, dict):
+        return None
+    out: dict[str, dict[str, bool]] = {}
+    for mcp_name, toolkit in by_name.items():
+        merged = {
+            **(getattr(toolkit, "functions", {}) or {}),
+            **(getattr(toolkit, "async_functions", {}) or {}),
+        }
+        per: dict[str, bool] = {}
+        for tool_name, fn in merged.items():
+            entrypoint = getattr(fn, "entrypoint", None)
+            per[tool_name] = bool(callable(entrypoint) or callable(fn))
+        out[mcp_name] = per
     return out

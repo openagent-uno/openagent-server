@@ -48,7 +48,11 @@ from openagent.workflow.templating import (
     evaluate_expression,
     resolve_templates,
 )
-from openagent.workflow.validate import validate_graph
+from openagent.workflow.validate import (
+    mcp_callability_from_pool,
+    mcp_inventory_from_pool,
+    validate_graph,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +141,6 @@ class WorkflowExecutor:
         every node with in-degree 0 enters the walk.
         """
         graph = workflow.get("graph") or {}
-        validate_graph(graph)
 
         workflow_id = workflow["id"]
         lock = self._locks.setdefault(workflow_id, asyncio.Lock())
@@ -164,6 +167,24 @@ class WorkflowExecutor:
                     pass
 
             try:
+                # Run-start re-validation with the live pool. The
+                # workflow-manager MCP subprocess validates without
+                # inventory (it can't see the parent's pool); the
+                # gateway path already validates with inventory at
+                # create/update time. This belt-and-suspenders catch
+                # turns opaque mid-DAG ``TypeError`` / ``RuntimeError``
+                # failures into actionable ``trace_json`` errors,
+                # regardless of which authoring path produced the
+                # workflow. Run inside the try/except so a validation
+                # failure surfaces as a finalized ``failed`` run row,
+                # not an uncaught exception that strands the row in
+                # ``running``.
+                pool = getattr(self.agent, "_mcp", None)
+                validate_graph(
+                    graph,
+                    mcp_inventory=mcp_inventory_from_pool(pool),
+                    mcp_callability=mcp_callability_from_pool(pool),
+                )
                 await self._walk(graph, ctx, on_status, entry_node_id=entry_node_id)
             except WorkflowExecutionError as exc:
                 await self._finalize_run(
@@ -624,7 +645,19 @@ async def _h_mcp_tool(
         raise ValueError(
             f"mcp-tool: 'args' must be an object, got {type(args).__name__}"
         )
-    result = fn(**args)
+    # Agno's ``MCPTools`` registers remote tools as ``Function``
+    # descriptors (Pydantic models with no ``__call__``); the actual
+    # callable lives on ``.entrypoint`` (Agno binds ``tool_name`` via
+    # ``functools.partial`` so a bare ``(**args)`` call works). In-
+    # process toolkits register raw callables. Mirror the established
+    # pattern from ``tool_search/adapters.py:129``.
+    callable_fn = getattr(fn, "entrypoint", None) or fn
+    if not callable(callable_fn):
+        raise RuntimeError(
+            f"mcp-tool: tool {mcp_name!r}.{tool_name!r} resolved to a "
+            f"non-callable {type(fn).__name__}"
+        )
+    result = callable_fn(**args)
     if inspect.isawaitable(result):
         result = await result
     return {"result": _coerce_to_jsonable(result)}

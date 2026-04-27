@@ -41,6 +41,7 @@ from openagent.workflow.schedule_sync import (
 )
 from openagent.workflow.validate import (
     ValidationError,
+    mcp_callability_from_pool,
     mcp_inventory_from_pool,
     validate_graph,
 )
@@ -74,6 +75,19 @@ def _resolve_mcp_inventory(request) -> dict[str, dict[str, Any]] | None:
         return None
     pool = getattr(agent, "_mcp", None)
     return mcp_inventory_from_pool(pool)
+
+
+def _resolve_mcp_callability(request) -> dict[str, dict[str, bool]] | None:
+    """Companion to ``_resolve_mcp_inventory`` returning
+    ``{mcp_name: {tool_name: bool}}`` so ``validate_graph`` can reject
+    tools whose toolkit registered a non-callable (would otherwise
+    raise ``TypeError`` mid-DAG)."""
+    gw = request.app["gateway"]
+    agent = getattr(gw, "agent", None) or getattr(gw, "_agent", None)
+    if agent is None:
+        return None
+    pool = getattr(agent, "_mcp", None)
+    return mcp_callability_from_pool(pool)
 
 
 def _decorate_schedule(row: dict) -> dict:
@@ -184,7 +198,11 @@ async def handle_create(request):
         "variables": body.get("variables") or {},
     }
     try:
-        validate_graph(graph, mcp_inventory=_resolve_mcp_inventory(request))
+        validate_graph(
+            graph,
+            mcp_inventory=_resolve_mcp_inventory(request),
+            mcp_callability=_resolve_mcp_callability(request),
+        )
     except ValidationError as exc:
         return web.json_response({"error": f"graph validation failed: {exc}"}, status=400)
 
@@ -264,7 +282,11 @@ async def handle_update(request):
             ),
         }
         try:
-            validate_graph(new_graph, mcp_inventory=_resolve_mcp_inventory(request))
+            validate_graph(
+                new_graph,
+                mcp_inventory=_resolve_mcp_inventory(request),
+                mcp_callability=_resolve_mcp_callability(request),
+            )
         except ValidationError as exc:
             return web.json_response(
                 {"error": f"graph validation failed: {exc}"}, status=400,
