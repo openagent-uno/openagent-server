@@ -100,9 +100,15 @@ async def handle_write(request):
     vault = _resolve_vault(request)
     note_path = request.match_info["path"]
     full = vault / note_path
+    existed = full.exists()
     full.parent.mkdir(parents=True, exist_ok=True)
     data = await request.json()
     full.write_text(data.get("content", ""))
+    gw = request.app.get("gateway")
+    if gw is not None:
+        await gw.broadcast_resource(
+            "vault", "updated" if existed else "created", note_path,
+        )
     return web.json_response({"ok": True, "path": note_path})
 
 
@@ -113,6 +119,9 @@ async def handle_delete(request):
     full = vault / note_path
     if full.exists():
         full.unlink()
+        gw = request.app.get("gateway")
+        if gw is not None:
+            await gw.broadcast_resource("vault", "deleted", note_path)
         return web.json_response({"ok": True})
     return web.json_response({"error": "Not found"}, status=404)
 

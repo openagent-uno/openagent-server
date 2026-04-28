@@ -24,6 +24,14 @@ if TYPE_CHECKING:
 from openagent.gateway.api._common import gateway_db as _db  # noqa: E402
 
 
+async def _emit(request, action: str, name: str | None = None) -> None:
+    """Best-effort fan-out to subscribed clients. No-ops without a gateway."""
+    gw = request.app.get("gateway")
+    if gw is None:
+        return
+    await gw.broadcast_resource("mcp", action, name)
+
+
 async def handle_list(request):
     from aiohttp import web
 
@@ -90,6 +98,7 @@ async def handle_create(request):
             enabled=bool(body.get("enabled", True)),
             source="api",
         )
+    await _emit(request, "created", name)
     return web.json_response({"ok": True, "mcp": await db.get_mcp(name)}, status=201)
 
 
@@ -118,6 +127,7 @@ async def handle_update(request):
         enabled=bool(body.get("enabled", existing.get("enabled", True))),
         source=body.get("source", existing.get("source", "api")),
     )
+    await _emit(request, "updated", name)
     return web.json_response({"ok": True, "mcp": await db.get_mcp(name)})
 
 
@@ -144,6 +154,7 @@ async def handle_delete(request):
             status=400,
         )
     await db.delete_mcp(name)
+    await _emit(request, "deleted", name)
     return web.json_response({"ok": True})
 
 
@@ -156,6 +167,7 @@ async def handle_enable(request):
     if existing is None:
         return web.json_response({"error": f"MCP {name!r} not found"}, status=404)
     await db.set_mcp_enabled(name, True)
+    await _emit(request, "updated", name)
     return web.json_response({"ok": True, "mcp": await db.get_mcp(name)})
 
 
@@ -168,4 +180,5 @@ async def handle_disable(request):
     if existing is None:
         return web.json_response({"error": f"MCP {name!r} not found"}, status=404)
     await db.set_mcp_enabled(name, False)
+    await _emit(request, "updated", name)
     return web.json_response({"ok": True, "mcp": await db.get_mcp(name)})

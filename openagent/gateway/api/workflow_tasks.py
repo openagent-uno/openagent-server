@@ -230,6 +230,9 @@ async def handle_create(request):
 
     row = await scheduler.db.get_workflow(workflow_id)
     elog("workflow.create", id=workflow_id, name=name)
+    await request.app["gateway"].broadcast_resource(
+        "workflow", "created", workflow_id,
+    )
     return web.json_response(
         await _decorate_workflow(scheduler.db, row), status=201,
     )
@@ -321,6 +324,9 @@ async def handle_update(request):
         id=existing["id"],
         fields=list(updates.keys()),
     )
+    await request.app["gateway"].broadcast_resource(
+        "workflow", "updated", existing["id"],
+    )
     return web.json_response(await _decorate_workflow(scheduler.db, row))
 
 
@@ -340,6 +346,9 @@ async def handle_delete(request):
 
     await scheduler.db.delete_workflow(existing["id"])
     elog("workflow.delete", id=existing["id"], name=existing.get("name", ""))
+    await request.app["gateway"].broadcast_resource(
+        "workflow", "deleted", existing["id"],
+    )
     return web.json_response({"ok": True, "id": existing["id"]})
 
 
@@ -393,6 +402,11 @@ async def handle_run(request):
             {"error": "Scheduler has no workflow runtime attached"},
             status=503,
         )
+    # Notify subscribed clients that a run kicked off; the workflows
+    # screen turns the "Run" button into a spinner on this signal.
+    await request.app["gateway"].broadcast_resource(
+        "workflow", "updated", existing["id"],
+    )
 
     if not wait:
         # We can't report the run_id synchronously without waiting a
@@ -423,6 +437,11 @@ async def handle_run(request):
     runs = await scheduler.db.list_workflow_runs(existing["id"], limit=1)
     if not runs:
         return web.json_response({"error": "run did not produce a row"}, status=500)
+    # Run finished — re-broadcast so the screen flips the spinner off
+    # and the "last run" badge picks up the new status.
+    await request.app["gateway"].broadcast_resource(
+        "workflow", "updated", existing["id"],
+    )
     return web.json_response(_decorate_run(runs[0]))
 
 

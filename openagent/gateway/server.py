@@ -11,7 +11,7 @@ import asyncio
 import json
 import logging
 import socket
-from typing import TYPE_CHECKING
+from typing import Any, Awaitable, Callable, TYPE_CHECKING
 
 from openagent.gateway import protocol as P
 from openagent.gateway.commands import command_help_text
@@ -79,6 +79,15 @@ class Gateway:
         # can't replay on the next boot and produce a crash loop).
         self._bridges: list = []
 
+        # Per-section live-reaction hooks, populated by AgentServer when it
+        # spins up the scheduler. ``config.handle_patch`` calls
+        # ``on_config_change(section, patch)`` after writing the yaml so
+        # toggles (dream_mode, manager_review, auto_update) take effect
+        # without a restart. Keyed by config section name.
+        self._config_change_callbacks: dict[
+            str, Callable[[dict], Awaitable[None]]
+        ] = {}
+
     @staticmethod
     async def _safe_ws_send_json(ws, payload: dict) -> bool:
         """Best-effort websocket send that tolerates closing transports."""
@@ -94,6 +103,75 @@ class Gateway:
             if getattr(ws, "closed", False):
                 return False
             raise
+
+    async def broadcast(self, payload: dict) -> None:
+        """Best-effort fan-out to every authenticated client.
+
+        Resource-change pings travel here so the desktop app's list
+        screens can refetch without polling. Never raises — a single
+        flaky client must not interrupt the producer (a REST handler
+        or the scheduler tick loop).
+        """
+        if not self.clients:
+            return
+        # Snapshot keys: a slow client closing during the loop would
+        # otherwise mutate self.clients underneath us.
+        for client_id, ws in list(self.clients.items()):
+            try:
+                await self._safe_ws_send_json(ws, payload)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("broadcast skipped for %s: %s", client_id, e)
+
+    async def broadcast_resource(
+        self,
+        resource: str,
+        action: str,
+        id: str | None = None,
+    ) -> None:
+        """Emit a ``resource_event`` to all connected clients."""
+        payload: dict[str, Any] = {
+            "type": P.RESOURCE_EVENT,
+            "resource": resource,
+            "action": action,
+        }
+        if id is not None:
+            payload["id"] = id
+        await self.broadcast(payload)
+
+    def broadcast_resource_sync(
+        self,
+        resource: str,
+        action: str,
+        id: str | None = None,
+    ) -> None:
+        """Schedule a resource broadcast from sync context.
+
+        Used by the Scheduler tick (it's running inside an asyncio task
+        already, so ``create_task`` works) and by any other producer
+        that doesn't want to ``await``. Silently no-ops outside an
+        event loop so unit tests that drive a Scheduler without a live
+        gateway aren't forced to mock everything.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self.broadcast_resource(resource, action, id))
+
+    async def on_config_change(self, section: str, patch: dict) -> None:
+        """Notify a registered side-effect that a yaml section changed.
+
+        ``AgentServer`` registers closures here for ``dream_mode``,
+        ``manager_review`` and ``auto_update`` so toggles flow straight
+        into the scheduler without a restart.
+        """
+        cb = self._config_change_callbacks.get(section)
+        if cb is None:
+            return
+        try:
+            await cb(patch)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("config-change callback for %r failed: %s", section, e)
 
     async def start(self) -> None:
         from aiohttp import web
@@ -654,7 +732,40 @@ class Gateway:
                 elog("session.rejected_no_models", session_id=session_id)
                 return
 
+            # MCP-tool-driven writes bypass the gateway (the MCPs are
+            # subprocesses talking straight to SQLite), so we can't fire
+            # fine-grained resource events from those handlers. Instead,
+            # watch the tool-name stream coming through ``on_status`` —
+            # tool names embed the MCP server prefix
+            # (``mcp__scheduler__add_task`` for Claude SDK,
+            # ``scheduler_add_task`` for Agno) — and after the turn
+            # finishes broadcast one ``resource_event`` per MCP namespace
+            # we saw. Substring match is good enough: ``Bash`` / ``Read``
+            # don't contain any of these tokens.
+            seen_resources: set[str] = set()
+            _MCP_PREFIX_TO_RESOURCE = (
+                ("scheduler", "scheduled_task"),
+                ("workflow_manager", "workflow"),
+                ("mcp_manager", "mcp"),
+                ("vault", "vault"),
+            )
+
+            def _track_tool(status: str) -> None:
+                try:
+                    data = json.loads(status)
+                except (ValueError, TypeError):
+                    return
+                if not isinstance(data, dict):
+                    return
+                tool = data.get("tool")
+                if not isinstance(tool, str):
+                    return
+                for needle, resource in _MCP_PREFIX_TO_RESOURCE:
+                    if needle in tool:
+                        seen_resources.add(resource)
+
             async def on_status(status: str) -> None:
+                _track_tool(status)
                 try:
                     await self._safe_ws_send_json(
                         ws,
@@ -730,6 +841,13 @@ class Gateway:
                 "attachments": att_list or None,
                 "model": response_meta.get("model"),
             })
+
+            # Coarse resource hints based on which MCP families were used
+            # this turn. Sent after RESPONSE so the client first sees the
+            # answer, then refreshes any list it's showing. Skipped when
+            # nothing relevant ran — keeps idle chats noise-free.
+            for resource in seen_resources:
+                await self.broadcast_resource(resource, "changed")
         except asyncio.CancelledError:
             raise  # already handled above or a separate cancel scope
         except Exception as e:

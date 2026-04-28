@@ -95,8 +95,22 @@ async def handle_patch(request):
     config[section] = patch
     _write_raw(request, config)
     elog("config.update", section=section)
+
+    # Sections with a registered live-reaction hook (dream_mode,
+    # manager_review, auto_update) take effect immediately — the
+    # AgentServer registered a closure that re-syncs the matching
+    # scheduled-task row to the new state without a process restart.
+    gw = request.app.get("gateway")
+    handled_live = False
+    if gw is not None and section in getattr(gw, "_config_change_callbacks", {}):
+        await gw.on_config_change(section, patch)
+        handled_live = True
+    # Other resource screens may want to refresh derived values.
+    if gw is not None:
+        await gw.broadcast_resource("config", "updated", section)
+
     return web.json_response({
         "ok": True,
-        "restart_required": True,
+        "restart_required": not handled_live,
         section: _sanitize(patch),
     })

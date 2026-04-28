@@ -30,6 +30,16 @@ Server → Client::
     {"type": "queued",         "position": N}
     {"type": "command_result", "text": "..."}
     {"type": "pong"}
+    {"type": "resource_event", "resource": "...", "action": "...", "id": "..."}
+
+A ``resource_event`` tells subscribed clients (the desktop app's MCPs /
+Tasks / Workflows / Memory screens) that a server-side resource list
+changed and they should refetch. ``resource`` is one of ``"mcp"``,
+``"scheduled_task"``, ``"workflow"``, ``"vault"`` or ``"config"``;
+``action`` is one of ``"created"``, ``"updated"``, ``"deleted"``, or
+``"changed"`` (the coarse hint used when we know *something* in that
+namespace moved but not exactly what — e.g. an MCP-tool driven write
+from a chat turn). ``id`` is optional.
 """
 
 # Message type constants
@@ -45,5 +55,6 @@ ERROR = "error"
 QUEUED = "queued"
 PING = "ping"
 PONG = "pong"
+RESOURCE_EVENT = "resource_event"
 
 from openagent.gateway.commands import COMMANDS

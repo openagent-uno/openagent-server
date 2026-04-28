@@ -25,9 +25,11 @@ logger = logging.getLogger(__name__)
 # Exit code that signals the OS service manager to restart the process
 RESTART_EXIT_CODE = 75
 
-DREAM_MODE_TASK_NAME = "dream-mode"
-AUTO_UPDATE_TASK_NAME = "auto-update"
-MANAGER_REVIEW_TASK_NAME = "manager-review"
+from openagent.core.builtin_tasks import (
+    AUTO_UPDATE_TASK_NAME,
+    DREAM_MODE_TASK_NAME,
+    MANAGER_REVIEW_TASK_NAME,
+)
 
 DREAM_MODE_PROMPT = """\
 You are running in Dream Mode — a nightly maintenance routine.
@@ -395,7 +397,11 @@ class AgentServer:
             return
 
         from openagent.core.scheduler import Scheduler
-        scheduler = Scheduler(self.agent._db, self.agent)
+        scheduler = Scheduler(
+            self.agent._db,
+            self.agent,
+            broadcast=self._scheduler_broadcast,
+        )
 
         await self._sync_dream_mode(scheduler)
         await self._sync_manager_review(scheduler)
@@ -407,6 +413,48 @@ class AgentServer:
         # can operate on the same instance that runs the cron loop.
         if self._gateway is not None:
             self._gateway._scheduler = scheduler
+            # Register live-reaction hooks so toggling these sections in
+            # /api/config/{section} re-syncs the underlying scheduled-task
+            # row immediately (no restart).
+            self._register_config_callbacks(scheduler)
+
+    def _scheduler_broadcast(
+        self, resource: str, action: str, id: str | None = None,
+    ) -> None:
+        """Forward scheduler-internal mutations (one-shot disable, run
+        start, schedule advance) to the gateway broadcast bus. Sync
+        because Scheduler holds asyncio loop access already."""
+        gw = self._gateway
+        if gw is None:
+            return
+        gw.broadcast_resource_sync(resource, action, id)
+
+    def _register_config_callbacks(self, scheduler) -> None:
+        """Hook ``/api/config/{section}`` PATCH writes into live scheduler
+        re-sync for our three built-in tasks. Updates ``self.config`` in
+        place so subsequent reads see the new state."""
+        gw = self._gateway
+        if gw is None:
+            return
+
+        async def _dream(patch: dict) -> None:
+            self.config["dream_mode"] = patch or {}
+            await self._sync_dream_mode(scheduler)
+            gw.broadcast_resource_sync("scheduled_task", "updated")
+
+        async def _review(patch: dict) -> None:
+            self.config["manager_review"] = patch or {}
+            await self._sync_manager_review(scheduler)
+            gw.broadcast_resource_sync("scheduled_task", "updated")
+
+        async def _autoupdate(patch: dict) -> None:
+            self.config["auto_update"] = patch or {}
+            await self._sync_auto_update(scheduler)
+            gw.broadcast_resource_sync("scheduled_task", "updated")
+
+        gw._config_change_callbacks["dream_mode"] = _dream
+        gw._config_change_callbacks["manager_review"] = _review
+        gw._config_change_callbacks["auto_update"] = _autoupdate
 
     async def _sync_scheduled_task(
         self, scheduler, *, name: str, enabled: bool, cron_expr: str, prompt: str,

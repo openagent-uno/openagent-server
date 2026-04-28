@@ -20,6 +20,7 @@ thing is to reject writes rather than silently let rows drift.
 
 from __future__ import annotations
 
+from openagent.core.builtin_tasks import BUILTIN_TASK_NAMES
 from openagent.core.logging import elog
 from openagent.memory.schedule import decorate_scheduled_task
 
@@ -38,6 +39,34 @@ def _resolve_scheduler(request):
     return scheduler, None
 
 
+def _is_builtin(row: dict | None) -> bool:
+    return bool(row and row.get("name") in BUILTIN_TASK_NAMES)
+
+
+async def _reject_if_builtin(scheduler, task_id: str):
+    """Return (row, error_response). row is None on error.
+
+    Built-in tasks (``dream-mode``, ``manager-review``, ``auto-update``)
+    are seeded by ``AgentServer`` and managed via ``/api/config/<section>``;
+    the gateway pretends they don't exist for GET-by-id and returns 403
+    for mutations. Centralised so any new handler added later inherits
+    the policy without drift.
+    """
+    from aiohttp import web
+
+    row = await scheduler.db.get_task(task_id)
+    if row is None:
+        return None, web.json_response(
+            {"error": f"Task {task_id!r} not found"}, status=404,
+        )
+    if _is_builtin(row):
+        return None, web.json_response(
+            {"error": "Built-in tasks are managed via /api/config/<section>"},
+            status=403,
+        )
+    return row, None
+
+
 def _serialize(row: dict) -> dict:
     return decorate_scheduled_task(row)
 
@@ -51,6 +80,7 @@ async def handle_list(request):
 
     enabled_only = request.query.get("enabled_only", "").lower() in ("1", "true", "yes")
     rows = await scheduler.db.get_tasks(enabled_only=enabled_only)
+    rows = [r for r in rows if not _is_builtin(r)]
     return web.json_response({"tasks": [_serialize(r) for r in rows]})
 
 
@@ -63,7 +93,9 @@ async def handle_get(request):
 
     task_id = request.match_info["id"]
     row = await scheduler.db.get_task(task_id)
-    if row is None:
+    if row is None or _is_builtin(row):
+        # Treat builtins as 404 on GET-by-id so callers can't enumerate
+        # their existence — same behaviour as a non-existent id.
         return web.json_response({"error": f"Task {task_id!r} not found"}, status=404)
     return web.json_response(_serialize(row))
 
@@ -97,6 +129,12 @@ async def handle_create(request):
     except ValueError as exc:
         return web.json_response({"error": str(exc)}, status=400)
 
+    if name in BUILTIN_TASK_NAMES:
+        return web.json_response(
+            {"error": f"name {name!r} is reserved for a built-in task"},
+            status=400,
+        )
+
     task_id = await scheduler.add_task(name, cron_expression, prompt)
 
     # add_task enables by default; honour an explicit enabled=false.
@@ -105,6 +143,8 @@ async def handle_create(request):
 
     row = await scheduler.db.get_task(task_id)
     elog("scheduled_task.create", id=task_id, name=name)
+    gw = request.app["gateway"]
+    await gw.broadcast_resource("scheduled_task", "created", task_id)
     return web.json_response(_serialize(row), status=201)
 
 
@@ -117,9 +157,9 @@ async def handle_update(request):
         return err
 
     task_id = request.match_info["id"]
-    existing = await scheduler.db.get_task(task_id)
-    if existing is None:
-        return web.json_response({"error": f"Task {task_id!r} not found"}, status=404)
+    existing, reject = await _reject_if_builtin(scheduler, task_id)
+    if reject is not None:
+        return reject
 
     try:
         body = await request.json()
@@ -184,6 +224,8 @@ async def handle_update(request):
         id=task_id,
         fields=list(updates.keys()) + (["enabled"] if enabled_change is not None else []),
     )
+    gw = request.app["gateway"]
+    await gw.broadcast_resource("scheduled_task", "updated", task_id)
     return web.json_response(_serialize(row))
 
 
@@ -195,10 +237,12 @@ async def handle_delete(request):
         return err
 
     task_id = request.match_info["id"]
-    existing = await scheduler.db.get_task(task_id)
-    if existing is None:
-        return web.json_response({"error": f"Task {task_id!r} not found"}, status=404)
+    existing, reject = await _reject_if_builtin(scheduler, task_id)
+    if reject is not None:
+        return reject
 
     await scheduler.remove_task(task_id)
     elog("scheduled_task.delete", id=task_id, name=existing.get("name", ""))
+    gw = request.app["gateway"]
+    await gw.broadcast_resource("scheduled_task", "deleted", task_id)
     return web.json_response({"ok": True, "id": task_id})

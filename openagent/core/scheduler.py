@@ -19,7 +19,7 @@ overhead for users who never adopt workflows.
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING
+from typing import Callable, TYPE_CHECKING
 
 import time
 
@@ -39,6 +39,19 @@ from openagent.core.logging import elog
 CHECK_INTERVAL = 30  # seconds between checking for due tasks
 
 
+# Resource broadcast hook. ``AgentServer`` plugs the Gateway's
+# ``broadcast_resource_sync`` in here so that internal mutations (a
+# one-shot task auto-disabling itself, a workflow run starting from
+# cron) reach the desktop app without going through the REST handlers.
+BroadcastHook = Callable[[str, str, "str | None"], None]
+
+
+def _no_broadcast(resource: str, action: str, id: str | None = None) -> None:
+    """Default hook used when the scheduler runs without a gateway
+    attached (unit tests, headless invocations)."""
+    return None
+
+
 class Scheduler:
     """Background scheduler that runs agent prompts on cron schedules.
 
@@ -46,12 +59,18 @@ class Scheduler:
     On startup, recalculates next_run for all tasks to handle missed runs.
     """
 
-    def __init__(self, db: MemoryDB, agent: Agent):
+    def __init__(
+        self,
+        db: MemoryDB,
+        agent: Agent,
+        broadcast: BroadcastHook | None = None,
+    ):
         self.db = db
         self.agent = agent
         self._task: asyncio.Task | None = None
         # Lazy — created on first workflow tick.
         self._workflow_executor: WorkflowExecutor | None = None
+        self._broadcast: BroadcastHook = broadcast or _no_broadcast
 
     def _next_run(self, cron_expression: str, base: float | None = None) -> float:
         return next_run_for_expression(cron_expression, base)
@@ -194,6 +213,7 @@ class Scheduler:
                         last_run=now,
                         next_run=self._next_run(task["cron_expression"], now),
                     )
+                self._broadcast("scheduled_task", "updated", task["id"])
             except ValueError as e:
                 elog("scheduler.next_run_update_failed", level="error",
                      task=task["name"], error=str(e))
@@ -249,6 +269,7 @@ class Scheduler:
                 )
             except Exception:  # noqa: BLE001
                 pass
+            self._broadcast("workflow", "updated", sched["workflow_id"])
 
         # AI-enqueued + manually-enqueued workflow runs (Phase 2).
         try:
