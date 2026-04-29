@@ -116,9 +116,21 @@ def _check_mcp_tool(
     if tool_name not in tools:
         prefixed = f"{mcp_name}_{tool_name}"
         if prefixed in tools:
+            # Forward repair: bare upstream name → Agno-prefixed name.
             config["tool_name"] = prefixed
             tool_name = prefixed
         else:
+            # Reverse repair: strip a redundant leading mcp_name_ prefix
+            # (e.g. shell_shell_exec → shell_exec). Happens when an LLM
+            # emits mcp_name + "_" + already-prefixed tool_name.
+            mcp_prefix = f"{mcp_name}_"
+            if tool_name.startswith(mcp_prefix):
+                stripped = tool_name[len(mcp_prefix):]
+                if stripped in tools:
+                    config["tool_name"] = stripped
+                    tool_name = stripped
+
+        if tool_name not in tools:
             suggestions = difflib.get_close_matches(tool_name, tools.keys(), n=3)
             hint = f" Did you mean: {suggestions}?" if suggestions else ""
             raise ValidationError(

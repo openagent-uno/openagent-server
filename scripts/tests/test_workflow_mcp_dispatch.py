@@ -376,3 +376,41 @@ async def t_executor_revalidates_at_run_start(ctx: TestContext) -> None:
     assert "messaging" in error, error
     # Crucially NOT the opaque mid-DAG TypeError we used to get.
     assert "'Function' object is not callable" not in error, error
+
+
+@test(
+    "workflow_mcp_dispatch",
+    "validate_graph auto-repairs double-prefixed tool names (shell_shell_exec → shell_exec)",
+)
+async def t_validate_repairs_double_prefix(ctx: TestContext) -> None:
+    """When an LLM emits mcp_name + '_' + already-prefixed tool_name
+    (e.g. tool_name='shell_shell_exec' for MCP 'shell'), the validator
+    must strip the redundant prefix and repair in place rather than
+    raising a ValidationError. Regression for the mixout Git Sync
+    workflow that kept crashing with ValidationError: shell_shell_exec."""
+    from openagent.workflow.validate import validate_graph
+
+    config = {
+        "mcp_name": "shell",
+        "tool_name": "shell_shell_exec",  # double-prefixed — the bug
+        "args": {},
+    }
+    graph = {
+        "version": 1,
+        "nodes": [{"id": "n1", "type": "mcp-tool", "config": config}],
+        "edges": [],
+        "variables": {},
+    }
+    inventory = {
+        "shell": {
+            "shell_exec": {},
+            "shell_input": {},
+            "shell_kill": {},
+        },
+    }
+
+    # Must not raise — double-prefix should be silently repaired.
+    validate_graph(graph, mcp_inventory=inventory)
+
+    # Verify the config was repaired in-place.
+    assert config["tool_name"] == "shell_exec", config["tool_name"]
