@@ -115,6 +115,16 @@ hiddenimports = [
     # _psutil_linux) loaded via getattr/importlib — explicit collect so the
     # platform-correct one ends up in the frozen bundle.
     *collect_submodules("psutil"),
+    # tiktoken_ext is a namespace package whose submodules (e.g. openai_public)
+    # register encodings like cl100k_base via pkgutil.iter_modules at runtime.
+    # collect_data_files alone bundles the JSON data but not the Python plugin
+    # module, so the frozen binary ends up with "Plugins found: []" and any
+    # tiktoken.get_encoding(...) call raises ValueError. litellm's
+    # litellm_core_utils/default_encoding.py invokes get_encoding('cl100k_base')
+    # at import time, which crashes the entire serve startup path
+    # (telegram → channels.voice → litellm).
+    *collect_submodules("tiktoken_ext"),
+    *collect_submodules("tiktoken"),
 ]
 
 # ── Data files ──
