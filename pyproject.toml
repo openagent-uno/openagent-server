@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openagent-framework"
-version = "0.12.32"
+version = "0.12.33"
 description = "Simplified LLM agent framework with MCP, memory, and multi-channel support"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -49,6 +49,16 @@ dependencies = [
     # the bundled installer ships voice-in working out of the box (no
     # cloud STT key required). First call downloads the model (~150 MB).
     "faster-whisper>=1.0.0",
+    # Local TTS fallback (Piper). Same rationale as faster-whisper:
+    # the bundled Python release ships voice-out working out of the
+    # box. First synth call downloads the voice (~25 MB) into
+    # ``~/.cache/openagent/piper/``. ONNX runtime + native phonemize
+    # binary add ~80 MB to the install but mean the user never sees
+    # the "no TTS configured" banner unless they explicitly want a
+    # cloud vendor. Pinned to >=1.3 because that's where the
+    # ``PiperVoice.synthesize_wav`` entry point lands; the older
+    # ``synthesize(text, wav_file)`` signature was removed.
+    "piper-tts>=1.3.0",
     # Cross-platform system telemetry (CPU/RAM/disk/network/processes)
     # surfaced over /api/system + the system_snapshot WS broadcast.
     # Same API on Windows, macOS, Linux — keeps the gateway code
@@ -60,9 +70,10 @@ dependencies = [
 telegram = ["python-telegram-bot>=21.0"]
 discord = ["discord.py>=2.3.0"]
 whatsapp = ["whatsapp-api-client-python>=0.0.46"]
-# Voice transcription (faster-whisper) + ffmpeg are now core deps; the
-# legacy ``voice`` extra is kept as an alias so existing installs keep
-# resolving cleanly.
+# Voice in (faster-whisper) AND voice out (piper-tts) are core deps
+# so the bundled Python release ships voice mode working out of the
+# box. The ``voice`` extra is kept as an empty alias so existing
+# installers that resolve it keep working cleanly.
 voice = []
 websocket = ["aiohttp>=3.9"]
 all = [
