@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 609 546" role="img" aria-label="OpenAgent">
+<title>OpenAgent</title>
+<defs>
+<filter id="oa-glow" x="-15%" y="-15%" width="130%" height="130%"><feGaussianBlur in="SourceAlpha" stdDeviation="3"/><feColorMatrix type="matrix" values="0 0 0 0 0.247  0 0 0 0 0.784  0 0 0 0 1.0  0 0 0 0.55 0"/><feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+<linearGradient id="oa-cyan" x1="0" y1="0" x2="609" y2="546" gradientUnits="userSpaceOnUse"><stop offset="0%" stop-color="#3FC8FF"/><stop offset="100%" stop-color="#7FE0FF"/></linearGradient>
+</defs>
+<g filter="url(#oa-glow)">
+<polygon points="520.0,67.5 582.0,6.5 606.5,15.0 520.0,67.5" fill="#62D5FF"/>
+<polygon points="565.5,0.0 387.0,170.5 386.5,0.0" fill="#5CD3FF"/>
+<polygon points="47.0,82.5 0.5,82.0 47.0,39.5 47.0,82.5" fill="#44CAFF"/>
+<polygon points="158.0,181.5 63.5,181.0 64.0,28.5 104.0,28.5 202.5,136.0 158.0,181.5" fill="#4CCDFF"/>
+<polygon points="370.5,0.0 370.0,181.5 181.0,181.5 351.5,0.0" fill="#57D1FF"/>
+<polygon points="285.0,420.5 75.0,197.5 366.5,198.0 285.0,420.5" fill="#5BD3FF"/>
+<polygon points="370.0,544.5 275.5,493.0 370.0,235.5 370.0,544.5" fill="#69D8FF"/>
+</g></svg>
