@@ -92,6 +92,7 @@ class WhatsAppBridge(BaseBridge):
         msg_data = body.get("messageData", {})
         msg_type = msg_data.get("typeMessage", "")
         text = ""
+        voice_detected = False
 
         files_info = []
 
@@ -119,7 +120,12 @@ class WhatsAppBridge(BaseBridge):
             if url:
                 path = await self._download(url, "voice.ogg")
                 if path:
-                    t = await transcribe_voice(path)
+                    voice_detected = True
+                    # Prefer the gateway's DB-routed STT (LiteLLM); fall
+                    # back to local Whisper when offline.
+                    t = await self.transcribe_via_gateway(path)
+                    if not t:
+                        t = await transcribe_voice(path)
                     text = t if t else VOICE_FALLBACK
         elif msg_type == "imageMessage":
             file_data = msg_data.get("fileMessageData", {})
@@ -177,9 +183,29 @@ class WhatsAppBridge(BaseBridge):
             except Exception:
                 pass
 
-        response = await self.send_message(text, session_id, on_status=on_status)
+        # WhatsApp's HTTP API can't edit messages — every "update"
+        # would be a new chat bubble, which would spam the user. So we
+        # opt into streaming purely to exercise the gateway's DELTA
+        # path (no bridge-side accumulation needed because the trailing
+        # RESPONSE carries the full text), but keep the user-visible
+        # output identical to today: status pings + final message.
+        async def on_delta(_chunk: str) -> None:
+            return
+
+        response = await self.send_message_streaming(
+            text, session_id,
+            on_status=on_status,
+            on_delta=on_delta,
+        )
 
         resp_text = response.get("text", "")
+
+        # Mirror modality: voice-in → voice reply attachment.
+        if voice_detected and resp_text:
+            voice_marker = await self.synthesise_audio_attachment(resp_text)
+            if voice_marker:
+                resp_text = f"{voice_marker}\n{resp_text}"
+
         clean, attachments = parse_response_markers(resp_text)
         clean = self.append_model_feedback(clean, response.get("model"))
 

@@ -63,7 +63,19 @@ SUPPORTED_PROVIDERS = [
 
 FRAMEWORK_AGNO = "agno"
 FRAMEWORK_CLAUDE_CLI = "claude-cli"
-SUPPORTED_FRAMEWORKS = (FRAMEWORK_AGNO, FRAMEWORK_CLAUDE_CLI)
+# Vendor-agnostic adapter for TTS/STT — single dispatch path through
+# ``litellm.aspeech`` / ``litellm.atranscription``. The provider row's
+# ``name`` carries the vendor (``openai``, ``elevenlabs``, ``azure``,
+# ``groq``, …) and ``metadata.model_id`` carries the vendor-specific
+# model id, mirroring how Agno wraps multiple LLM vendors today.
+FRAMEWORK_LITELLM = "litellm"
+# LLM-dispatch frameworks. The classifier/router/text-LLM code paths
+# iterate over these only — TTS/STT providers (kind != 'llm') live in
+# the same ``providers`` table but are addressed by capability-specific
+# code (``channels/tts.py`` and ``channels/voice.py``), not the LLM
+# dispatcher.
+LLM_FRAMEWORKS = (FRAMEWORK_AGNO, FRAMEWORK_CLAUDE_CLI)
+SUPPORTED_FRAMEWORKS = (FRAMEWORK_AGNO, FRAMEWORK_CLAUDE_CLI, FRAMEWORK_LITELLM)
 
 
 @dataclass(frozen=True)

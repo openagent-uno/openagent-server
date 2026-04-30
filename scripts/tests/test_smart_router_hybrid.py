@@ -398,6 +398,13 @@ async def t_classifier_no_mcp_injection(ctx: TestContext) -> None:
         def claude_sdk_servers(self):
             return {}
 
+        def agno_toolkits_under_budget(self, budget: int) -> list:
+            # Mirror the real MCPPool method's signature so dispatch
+            # provider construction (set_mcp_toolkits → this method)
+            # doesn't AttributeError. Budget is ignored — these fakes
+            # cost zero tools.
+            return list(self.agno_toolkits)
+
     providers = [{
         "id": 1, "name": "openai", "framework": "agno",
         "api_key": "sk-x", "enabled": True,

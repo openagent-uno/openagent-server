@@ -34,7 +34,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 from openagent.core.logging import elog
 from openagent.models.base import BaseModel, ModelResponse
@@ -237,6 +237,16 @@ class ClaudeCLI(BaseModel):
         from claude_agent_sdk import ClaudeAgentOptions
 
         opts: dict[str, Any] = {"permission_mode": "bypassPermissions"}
+        # Empty ``setting_sources`` isolates the OpenAgent agent from the
+        # user's personal Claude Code config (``~/.claude/settings.json``,
+        # any project ``.claude/settings.json``, local overrides). Without
+        # this, hooks defined in those files can inject parallel "memory"
+        # systems (e.g. Claude Code's auto-memory pointing at
+        # ``~/.claude/projects/<id>/memory/``) into the system prompt and
+        # the agent ends up writing notes to the wrong location instead of
+        # using the OpenAgent vault. OpenAgent owns the system prompt
+        # end-to-end via ``opts["system_prompt"]`` below.
+        opts["setting_sources"] = []
         if self.mcp_servers:
             opts["mcp_servers"] = self.mcp_servers
             # ``--strict-mcp-config`` forces the claude binary to use ONLY
@@ -666,6 +676,8 @@ class ClaudeCLI(BaseModel):
         prompt: str,
         session_id: str,
         on_status: Any = None,
+        on_delta: Callable[[str], Awaitable[None]] | None = None,
+        tool_names_out: list[str] | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """Send ``prompt`` and consume the SDK stream.
 
@@ -716,6 +728,13 @@ class ClaudeCLI(BaseModel):
                     block_text = getattr(block, "text", None)
                     if isinstance(block_text, str) and block_text:
                         streamed_text_parts.append(block_text)
+                        if on_delta is not None:
+                            try:
+                                await on_delta(block_text)
+                            except Exception:
+                                # Caller's queue closed or similar — drop
+                                # the callback for the rest of this turn.
+                                on_delta = None
                     tool_name = getattr(block, "name", None)
                     if tool_name and hasattr(block, "input"):
                         elog(
@@ -724,6 +743,8 @@ class ClaudeCLI(BaseModel):
                             tool=tool_name,
                             tool_use_id=getattr(block, "id", None),
                         )
+                        if tool_names_out is not None:
+                            tool_names_out.append(str(tool_name))
                     if on_status is not None:
                         await self._emit_tool_status(block, on_status)
             elif isinstance(message, UserMessage):
@@ -810,14 +831,16 @@ class ClaudeCLI(BaseModel):
                 client = await self._get_client(sid, system)
                 await self._ensure_session_model(sid, client, requested_model)
 
+                tool_names_called: list[str] = []
                 result, usage_meta = await self._run_once(
-                    client, prompt, sid, on_status
+                    client, prompt, sid, on_status, tool_names_out=tool_names_called
                 )
                 input_tokens, output_tokens, _ = await self._record_usage(
                     sid, usage_meta
                 )
                 return ModelResponse(
                     content=result,
+                    tool_names_called=tool_names_called,
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     model=self._model_id_for_response(sid),
@@ -843,6 +866,75 @@ class ClaudeCLI(BaseModel):
                     stop_reason="error",
                     model=self._model_id_for_response(sid),
                 )
+
+    async def stream(
+        self,
+        messages: list[dict[str, Any]],
+        system: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> AsyncIterator[str]:
+        """Stream text deltas via the SDK's existing receive-response loop.
+
+        Bridges :meth:`_run_once`'s ``on_delta`` callback into an async
+        generator using a small queue. Tool-only turns and errors are
+        handled the same way as :meth:`generate` — the iterator simply
+        terminates and the orchestrator proceeds with whatever was
+        emitted (likely empty), then the trailing ``RESPONSE`` text path
+        carries the placeholder ``"(Done — no final message was returned.)"``.
+        """
+        sid = "default"
+        prompt_parts: list[str] = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if role == "user":
+                prompt_parts.append(content)
+            elif role == "assistant":
+                prompt_parts.append(f"[Previous assistant response] {content}")
+        prompt = "\n\n".join(prompt_parts)
+
+        queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+        DONE = "__done__"
+
+        async def on_delta(text: str) -> None:
+            await queue.put(("delta", text))
+
+        async def driver() -> None:
+            try:
+                client = await self._get_client(sid, system)
+                await self._ensure_session_model(sid, client, self.model)
+                await self._run_once(client, prompt, sid, on_status=None, on_delta=on_delta)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 — surface to caller
+                await queue.put(("error", e))
+                return
+            await queue.put((DONE, None))
+
+        task = asyncio.create_task(driver())
+        try:
+            while True:
+                kind, payload = await queue.get()
+                if kind == "delta":
+                    if payload:
+                        yield payload
+                elif kind == "error":
+                    elog(
+                        "claude_cli.stream.error",
+                        level="warning",
+                        error_type=type(payload).__name__,
+                        error=str(payload) or repr(payload),
+                    )
+                    return
+                else:  # DONE
+                    return
+        finally:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
 
     async def _ensure_session_model(
         self, session_id: str, client: Any, requested_model: str | None

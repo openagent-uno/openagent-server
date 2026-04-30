@@ -51,6 +51,44 @@ _GOOGLE_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models"
 _OPENROUTER_CATALOG = "https://openrouter.ai/api/v1/models"
 _ANTHROPIC_VERSION = "2023-06-01"
 
+# Bundled catalogs for audio-only vendors that don't expose a public
+# /v1/models endpoint. These models are picked by the same Add Model
+# flow as LLM rows — the catalog seeds the dropdown so the user never
+# types a model id by hand.
+_AUDIO_BUNDLED: dict[str, list[dict[str, Any]]] = {
+    "elevenlabs": [
+        {"id": "eleven_flash_v2_5", "display_name": "ElevenLabs Flash v2.5"},
+        {"id": "eleven_turbo_v2_5", "display_name": "ElevenLabs Turbo v2.5"},
+        {"id": "eleven_multilingual_v2", "display_name": "ElevenLabs Multilingual v2"},
+    ],
+    "deepgram": [
+        {"id": "nova-2", "display_name": "Deepgram Nova 2"},
+    ],
+}
+
+
+def _kind_for_model(provider: str, model_id: str) -> str:
+    """Heuristic: classify a model as ``llm`` / ``tts`` / ``stt`` from id.
+
+    Audio-only vendors get a flat label; otherwise we pattern-match on
+    the model id so OpenAI's /v1/models response gets correctly split
+    into chat (``gpt-*``), TTS (``tts-1``, ``gpt-4o-mini-tts``), and
+    STT (``whisper-1``, ``gpt-4o-transcribe``).
+    """
+    p = provider.lower()
+    m = model_id.lower()
+    if p == "elevenlabs":
+        return "tts"
+    if p == "deepgram":
+        return "stt"
+    # Order matters: ``gpt-4o-mini-tts`` contains ``gpt`` but is TTS,
+    # ``gpt-4o-transcribe`` contains ``gpt`` but is STT.
+    if "tts" in m or m.startswith("eleven_") or m == "playai-tts":
+        return "tts"
+    if "whisper" in m or "transcribe" in m or m.startswith("nova-"):
+        return "stt"
+    return "llm"
+
 # OpenRouter prefixes each model with ``<vendor>/<id>``. Map vendor →
 # our provider key so we can filter OpenRouter's response. ``openai``,
 # ``anthropic``, ``google``, … match 1:1 except for a few edge cases
@@ -248,6 +286,12 @@ async def list_provider_models(
     if not provider:
         return []
 
+    # Audio-only vendors short-circuit to the bundled catalog — they
+    # don't expose a discovery endpoint and the model set is small and
+    # stable enough that hand-curating beats live fetch.
+    if provider in _AUDIO_BUNDLED:
+        return _tagged(provider, [dict(e) for e in _AUDIO_BUNDLED[provider]])
+
     if api_key:
         cached = _CACHE.get(_cache_key(provider, api_key))
         if cached and time.time() - cached[0] < _CACHE_TTL_SECONDS:
@@ -260,9 +304,10 @@ async def list_provider_models(
             else:
                 result = []
             if result:
-                _CACHE[_cache_key(provider, api_key)] = (time.time(), list(result))
-                elog("discovery.live", provider=provider, count=len(result), source="live")
-                return result
+                tagged = _tagged(provider, result)
+                _CACHE[_cache_key(provider, api_key)] = (time.time(), list(tagged))
+                elog("discovery.live", provider=provider, count=len(tagged), source="live")
+                return tagged
             elog("discovery.live_empty", provider=provider)
         except Exception as e:  # noqa: BLE001 — fall through to OpenRouter
             elog("discovery.live_error", provider=provider, error=str(e))
@@ -272,9 +317,16 @@ async def list_provider_models(
         entries = await _fetch_openrouter_catalog()
         or_models = _openrouter_filter_for(provider, entries)
         elog("discovery.openrouter", provider=provider, count=len(or_models))
-        return or_models
+        return _tagged(provider, or_models)
     except Exception as e:  # noqa: BLE001 — network/DNS/etc.
         elog("discovery.openrouter_error", provider=provider, error=str(e))
         return []
+
+
+def _tagged(provider: str, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Annotate each entry with its inferred ``kind`` in place."""
+    for e in entries:
+        e["kind"] = _kind_for_model(provider, str(e.get("id") or ""))
+    return entries
 
 

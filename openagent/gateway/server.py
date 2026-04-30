@@ -16,7 +16,7 @@ from typing import Any, Awaitable, Callable, TYPE_CHECKING
 from openagent.gateway import protocol as P
 from openagent.gateway.commands import command_help_text
 from openagent.gateway.sessions import SessionManager
-from openagent.gateway.api import vault, config, health, logs, control, usage, providers, models, scheduled_tasks, workflow_tasks, mcps, marketplace, sessions as sessions_api
+from openagent.gateway.api import vault, config, health, logs, control, usage, providers, models, scheduled_tasks, workflow_tasks, mcps, marketplace, sessions as sessions_api, system as system_api
 
 if TYPE_CHECKING:
     from openagent.core.agent import Agent
@@ -67,6 +67,13 @@ class Gateway:
         self.clients: dict[str, object] = {}  # client_id → WebSocketResponse
         self._runner = None
         self._port_file = None
+
+        # Cross-platform host-telemetry sampler (psutil). Filled in by
+        # ``start()``; the /api/system handler and the broadcast loop
+        # both read off this single instance so the network-rate
+        # deltas come from one continuous time series.
+        self._system_telemetry: system_api.SystemTelemetry | None = None
+        self._system_broadcast_task: asyncio.Task | None = None
 
         # Bound by AgentServer after Scheduler.start(); None when the agent
         # was constructed without a DB. Handlers in api/scheduled_tasks.py
@@ -207,16 +214,59 @@ class Gateway:
         await site.start()
         elog("gateway.start", host=self.host, port=self.port)
 
+        # Spin up host telemetry. Broadcast loop primes psutil's CPU
+        # baseline on first tick, then emits one ``system_snapshot``
+        # every ``BROADCAST_INTERVAL_S`` seconds — but only when at
+        # least one client is listening, so an idle gateway never
+        # iterates processes for nobody.
+        self._system_telemetry = system_api.SystemTelemetry()
+        self._system_broadcast_task = asyncio.create_task(
+            self._system_broadcast_loop(), name="gateway-system-broadcast"
+        )
+
         # Write .port file for agent discovery
         self._write_port_file()
 
     async def stop(self) -> None:
         await self.sessions.shutdown()
+        if self._system_broadcast_task is not None:
+            self._system_broadcast_task.cancel()
+            try:
+                await self._system_broadcast_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._system_broadcast_task = None
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
         self.clients.clear()
         self._remove_port_file()
+
+    async def _system_broadcast_loop(self) -> None:
+        """Push a ``system_snapshot`` to all clients on a fixed cadence.
+
+        Skips the iter-processes call when ``self.clients`` is empty —
+        an idle gateway shouldn't burn CPU sampling its own host. Errors
+        are logged and swallowed so a transient psutil hiccup (e.g. a
+        process that vanished mid-iteration) doesn't kill the loop.
+        """
+        interval = system_api.BROADCAST_INTERVAL_S
+        telemetry = self._system_telemetry
+        assert telemetry is not None
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                if not self.clients:
+                    continue
+                snap = await telemetry.snapshot()
+                await self.broadcast({
+                    "type": P.SYSTEM_SNAPSHOT,
+                    "snapshot": snap,
+                })
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                logger.debug("system broadcast skipped: %s", e)
 
     def _register_routes(self, app) -> None:
         """Register the gateway WebSocket endpoint and REST API routes."""
@@ -224,6 +274,8 @@ class Gateway:
         app.router.add_post("/api/upload", self._handle_upload)
         app.router.add_get("/api/files", self._handle_files)
         app.router.add_get("/api/agent-info", self._handle_agent_info)
+        app.router.add_post("/api/tts/synthesize", self._handle_tts_synthesize)
+        app.router.add_post("/api/stt/transcribe", self._handle_stt_transcribe)
 
         routes = (
             ("GET", "/api/health", health.handle_health),
@@ -301,6 +353,11 @@ class Gateway:
             ("DELETE", "/api/sessions/{session_id}/model", sessions_api.handle_unpin),
             ("POST", "/api/update", control.handle_update),
             ("POST", "/api/restart", control.handle_restart),
+            # Cross-platform host telemetry (psutil-backed). Live
+            # updates flow over the WS as ``system_snapshot`` events;
+            # this REST handler exists for the initial paint and any
+            # client that doesn't speak the WS feed.
+            ("GET", "/api/system", system_api.handle_get),
         )
         for method, path, handler in routes:
             app.router.add_route(method, path, handler)
@@ -392,17 +449,138 @@ class Gateway:
         from openagent.channels.voice import is_audio_file
 
         if is_audio_file(filename):
+            # Hint downstream that the next chat message originated from
+            # voice — even when transcription failed, so the client can
+            # still flip its WS ``input_was_voice`` flag and the gateway
+            # can give a spoken reply if a TTS provider is configured.
+            result["transcribed_from_voice"] = True
+            # Optional ISO-639-1 hint from the client (?lang=it). Auto-
+            # detect on small Whisper models is unreliable for short
+            # utterances and has misidentified Italian as Cyrillic.
+            lang = (request.query.get("lang") or "").strip().lower() or None
             try:
                 from openagent.channels.voice import transcribe
-                text = await transcribe(path)
+                text = await transcribe(
+                    path,
+                    db=getattr(self.agent, "db", None),
+                    language=lang,
+                )
                 if text:
                     result["transcription"] = text
-                    elog("upload.transcribed", filename=filename, chars=len(text))
+                    elog(
+                        "upload.transcribed",
+                        filename=filename, chars=len(text),
+                        language=lang or "auto",
+                    )
+                else:
+                    elog(
+                        "upload.transcribed_empty",
+                        level="warning",
+                        filename=filename, language=lang or "auto",
+                    )
             except Exception as e:
-                elog("upload.transcribe_error", level="warning", filename=filename, error=str(e))
+                elog(
+                    "upload.transcribe_error",
+                    level="warning",
+                    filename=filename, error=str(e), language=lang or "auto",
+                )
 
         elog("upload.saved", filename=filename, path=path, transcribed=bool(result.get("transcription")))
         return web.json_response(result)
+
+    def _check_bearer_token(self, request) -> bool:
+        """Return True when the request carries a matching gateway token.
+
+        Mirrors the inline check in ``_handle_files``: accepts either a
+        ``?token=`` query param or an ``Authorization: Bearer …`` header.
+        Endpoints that incur cost (TTS / STT) call this so an open
+        local port can't be turned into a free transcription proxy.
+        """
+        if not self.token:
+            return True
+        token = request.query.get("token") or ""
+        if not token:
+            auth = request.headers.get("Authorization", "")
+            if auth.startswith("Bearer "):
+                token = auth[len("Bearer "):].strip()
+        return token == self.token
+
+    async def _handle_stt_transcribe(self, request):
+        """POST /api/stt/transcribe — transcribe an audio upload.
+
+        Accepts multipart form ``file`` and returns ``{text}``. Used by
+        bridges (Telegram, Discord, WhatsApp) so they all share the
+        same DB-configured STT route — no per-bridge Whisper install.
+
+        Resolution order matches :func:`channels.voice.transcribe`:
+        DB-configured LiteLLM row → local faster-whisper → OpenAI
+        Whisper API (env-driven) → ``404`` if every backend fails.
+        """
+        from aiohttp import web
+        from openagent.channels.voice import transcribe, is_audio_file
+        import tempfile
+
+        if not self._check_bearer_token(request):
+            return web.Response(status=401, text="Unauthorized")
+
+        reader = await request.multipart()
+        field = await reader.next()
+        if not field:
+            return web.json_response({"error": "no file"}, status=400)
+        filename = field.filename or "upload"
+        if not is_audio_file(filename):
+            return web.json_response({"error": "not an audio file"}, status=400)
+        tmp = tempfile.mkdtemp(prefix="oa_stt_")
+        path = f"{tmp}/{filename}"
+        with open(path, "wb") as f:
+            while True:
+                chunk = await field.read_chunk()
+                if not chunk:
+                    break
+                f.write(chunk)
+        db = getattr(self.agent, "db", None)
+        lang = (request.query.get("lang") or "").strip().lower() or None
+        try:
+            text = await transcribe(path, db=db, language=lang)
+        except Exception as e:  # noqa: BLE001
+            return web.json_response({"error": str(e)}, status=500)
+        if not text:
+            return web.json_response({"error": "no STT backend produced text"}, status=404)
+        return web.json_response({"text": text})
+
+    async def _handle_tts_synthesize(self, request):
+        """POST /api/tts/synthesize — synthesise text to audio bytes for bridges.
+
+        Body: ``{"text": "..."}`` → audio bytes (MIME varies by vendor,
+        usually ``audio/mpeg``); ``404`` if no TTS provider configured,
+        ``400`` on missing text. Bridges (Telegram, Discord, WhatsApp)
+        call this so the ElevenLabs/OpenAI/Azure key only lives in the
+        SQLite providers table next to the gateway, never in each
+        bridge process.
+        """
+        from aiohttp import web
+        from openagent.channels.tts import resolve_tts_provider, synthesize_full
+
+        if not self._check_bearer_token(request):
+            return web.Response(status=401, text="Unauthorized")
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid JSON body"}, status=400)
+        text = (body.get("text") or "").strip()
+        if not text:
+            return web.json_response({"error": "text is required"}, status=400)
+
+        db = getattr(self.agent, "db", None)
+        cfg = await resolve_tts_provider(db)
+        if cfg is None:
+            return web.json_response({"error": "no TTS provider configured"}, status=404)
+
+        audio = await synthesize_full(text, cfg)
+        if not audio:
+            return web.json_response({"error": "synthesis failed"}, status=502)
+        return web.Response(body=audio, content_type="audio/mpeg")
 
     # ── File serving (agent → client) ──
 
@@ -536,11 +714,33 @@ class Gateway:
                 elif t == P.MESSAGE:
                     text = data.get("text", "").strip()
                     session_id = data.get("session_id", "default")
+                    # The client sets this when the inbound text came
+                    # from voice (mic + ASR). The agent reply will be
+                    # synthesised back to audio if a TTS provider is
+                    # configured. See VoiceTurnOrchestrator.
+                    input_was_voice = bool(data.get("input_was_voice"))
+                    # ISO-639-1 hint from the client — same code Whisper
+                    # used for transcription. The voice pipeline forwards
+                    # it to Piper so a transcribed Italian message gets
+                    # spoken with an Italian voice instead of the default
+                    # American one. ``None`` falls through to the default
+                    # voice (today's behaviour for older clients).
+                    voice_language = data.get("voice_language")
+                    if isinstance(voice_language, str):
+                        voice_language = voice_language.strip().lower() or None
+                    else:
+                        voice_language = None
                     if text:
                         sid = self.sessions.get_or_create_session(client_id, session_id)
 
-                        async def handler(_t=text, _s=sid, _c=client_id, _w=ws):
-                            await self._process_message(_w, _c, _t, _s)
+                        async def handler(
+                            _t=text, _s=sid, _c=client_id, _w=ws,
+                            _v=input_was_voice, _lang=voice_language,
+                        ):
+                            await self._process_message(
+                                _w, _c, _t, _s,
+                                input_was_voice=_v, voice_language=_lang,
+                            )
 
                         pos = await self.sessions.enqueue(client_id, handler, session_id=sid)
                         if pos < 0:
@@ -708,7 +908,16 @@ class Gateway:
         )
         return forgotten
 
-    async def _process_message(self, ws, client_id: str, text: str, session_id: str) -> None:
+    async def _process_message(
+        self,
+        ws,
+        client_id: str,
+        text: str,
+        session_id: str,
+        *,
+        input_was_voice: bool = False,
+        voice_language: str | None = None,
+    ) -> None:
         try:
             elog("message.received", client_id=client_id, session_id=session_id, length=len(text))
 
@@ -799,14 +1008,94 @@ class Gateway:
                 client_id=client_id,
                 session_id=session_id,
                 model_class=type(active_model).__name__,
+                input_was_voice=input_was_voice,
             )
+            # Voice-mode reply: stream LLM → sentence chunker → ElevenLabs
+            # TTS → WS audio frames, then a trailing RESPONSE with the
+            # full text. Mirror-modality semantics (per the voice-chat
+            # plan): only voice-input messages get spoken replies.
+            if input_was_voice:
+                from openagent.gateway.voice_pipeline import VoiceTurnOrchestrator
+                orchestrator = VoiceTurnOrchestrator(
+                    self.agent,
+                    lambda payload: self._safe_ws_send_json(ws, payload),
+                )
+                try:
+                    summary = await orchestrator.run(
+                        text,
+                        client_id=client_id,
+                        session_id=session_id,
+                        on_status=on_status,
+                        language=voice_language,
+                    )
+                    elog(
+                        "message.voice_response",
+                        client_id=client_id,
+                        session_id=session_id,
+                        length=len(summary.get("text") or ""),
+                        audio_chunks=summary.get("audio_chunks") or 0,
+                    )
+                    # Coarse resource hints — same as the text path below.
+                    for resource in seen_resources:
+                        await self.broadcast_resource(resource, "changed")
+                    return
+                except asyncio.CancelledError:
+                    elog(
+                        "message.cancelled",
+                        client_id=client_id, session_id=session_id,
+                        reason="server_shutdown",
+                    )
+                    try:
+                        await self._safe_ws_send_json(ws, {
+                            "type": P.ERROR,
+                            "text": "Server is restarting, please try your message again in a moment.",
+                            "session_id": session_id,
+                        })
+                    except Exception:
+                        pass
+                    raise
+
+            # Text-mode reply: stream LLM deltas to the client as they
+            # arrive (typewriter UX) and finish with a canonical
+            # RESPONSE frame carrying the full text + attachments + meta.
+            # Mirrors the voice path's event loop but emits ``P.DELTA``
+            # in place of audio chunks. Older clients ignore unknown
+            # frame types and still see the trailing RESPONSE — fully
+            # backward-compatible.
+            accumulated: list[str] = []
+            stream_error: BaseException | None = None
             try:
-                response = await self.agent.run(
+                async for event in self.agent.run_stream(
                     message=text,
                     user_id=client_id,
                     session_id=session_id,
                     on_status=on_status,
-                )
+                ):
+                    kind = event.get("kind")
+                    if kind == "delta":
+                        delta = event.get("text") or ""
+                        if not delta:
+                            continue
+                        accumulated.append(delta)
+                        try:
+                            await self._safe_ws_send_json(ws, {
+                                "type": P.DELTA,
+                                "text": delta,
+                                "session_id": session_id,
+                            })
+                        except Exception as e:  # noqa: BLE001 — WS dead mid-turn
+                            logger.debug("delta send failed: %s", e)
+                    elif kind == "done":
+                        # The stream's terminal event. ``run_stream``
+                        # always emits one; if it carries text and we
+                        # somehow accumulated nothing, fall back to it
+                        # (parity with voice_pipeline's safety net).
+                        done_text = event.get("text") or ""
+                        if done_text and not accumulated:
+                            accumulated.append(done_text)
+                        break
+                    # ``iteration_break`` is purely a TTS chunker hint —
+                    # text clients have nothing to do with it.
             except asyncio.CancelledError:
                 # Server is shutting down (restart for config update, launchd
                 # stop, etc.). Send a user-facing message so the client knows
@@ -827,6 +1116,25 @@ class Gateway:
                 except Exception:
                     pass  # WS may already be half-closed
                 raise
+            except Exception as e:  # noqa: BLE001 — surface to client as text + log
+                stream_error = e
+                logger.warning("text stream failed mid-turn: %s", e)
+                elog(
+                    "message.stream_error",
+                    level="warning",
+                    client_id=client_id,
+                    session_id=session_id,
+                    error_type=type(e).__name__,
+                    error=str(e) or repr(e),
+                )
+
+            response = "".join(accumulated)
+            if not response and stream_error is not None:
+                # Mid-stream failure with nothing accumulated: surface
+                # the exception in the RESPONSE rather than as a bare
+                # ERROR frame (older clients route ERROR globally and
+                # might miss the originating session).
+                response = f"Error: {stream_error}"
 
             from openagent.channels.base import parse_response_markers
             clean, attachments = parse_response_markers(response)

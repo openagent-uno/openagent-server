@@ -20,6 +20,7 @@ class ModelResponse:
     """Response from a model generation call."""
     content: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
+    tool_names_called: list[str] = field(default_factory=list)
     input_tokens: int = 0
     output_tokens: int = 0
     stop_reason: str | None = None
@@ -70,6 +71,22 @@ class BaseModel(ABC):
         """Stream response text chunks. Default: falls back to generate()."""
         response = await self.generate(messages, system=system, tools=tools)
         yield response.content
+
+    def effective_model_id(self, session_id: str | None = None) -> str | None:
+        """Return the model id that *actually* produced the last response.
+
+        Used by ``Agent._run_inner_stream`` to populate
+        ``last_response_meta()`` for streaming turns — providers don't
+        return a ``ModelResponse`` from ``stream()``, so the agent has
+        to synthesize one and needs to know which model to credit.
+
+        Default reads ``self.model`` (set by ClaudeCLI and Agno).
+        SmartRouter overrides because it picks per-session and a single
+        instance attribute can't capture which routed model handled the
+        latest turn. ``None`` is acceptable — the chat UI just hides the
+        model badge instead of crashing.
+        """
+        return getattr(self, "model", None)
 
     async def close_session(self, session_id: str) -> None:
         """Release any live runtime resources for one session.

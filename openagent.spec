@@ -33,6 +33,9 @@ from PyInstaller.utils.hooks import collect_submodules
 import jinja2  # noqa: F401 — openagent.workflow.templating
 import markupsafe  # noqa: F401 — jinja2's required runtime dep
 import groq  # noqa: F401 — agno.models.groq (optional provider SDK, must ship in bundle)
+import litellm  # noqa: F401 — TTS / STT dispatch (channels/tts.py, channels/voice.py)
+import faster_whisper  # noqa: F401 — local-first STT fallback
+import psutil  # noqa: F401 — cross-platform host telemetry (api/system.py)
 
 block_cipher = None
 
@@ -104,6 +107,14 @@ hiddenimports = [
     *collect_submodules("agno"),
     # groq Python SDK: imported at module level by agno.models.groq.groq — must be bundled.
     *collect_submodules("groq"),
+    # Voice: faster-whisper (local STT) loaded lazily inside _load_local_model;
+    # ctranslate2 is its native runtime backend.
+    *collect_submodules("faster_whisper"),
+    *collect_submodules("ctranslate2"),
+    # psutil ships per-OS C extension modules (_psutil_osx, _psutil_windows,
+    # _psutil_linux) loaded via getattr/importlib — explicit collect so the
+    # platform-correct one ends up in the frozen bundle.
+    *collect_submodules("psutil"),
 ]
 
 # ── Data files ──

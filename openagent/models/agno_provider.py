@@ -26,7 +26,7 @@ import inspect
 import logging
 import os
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 from openagent.core.logging import elog
 from openagent.models.base import BaseModel, ModelResponse
@@ -41,6 +41,71 @@ from openagent.models.catalog import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class AgnoProviderError(RuntimeError):
+    """Raised when Agno's underlying provider failed (e.g. OpenAI 403,
+    rate-limit, model-not-allowed) but Agno swallowed the exception and
+    returned an empty response. We capture the ERROR log record(s) and
+    re-raise with a user-readable message so the chat UI can show what
+    actually went wrong instead of a silent placeholder."""
+
+
+def _extract_tool_names_from_agno_response(response: Any) -> list[str]:
+    """Best-effort extraction of executed tool names from an Agno RunResponse.
+
+    Agno surfaces executed tools in different shapes across versions:
+    ``response.tools`` (list of ``ToolExecution`` with ``.tool_name``),
+    ``response.tool_executions``, or nested under ``response.run_response``.
+    We probe each candidate and return the first non-empty list of names.
+    Returns ``[]`` on miss — telemetry is best-effort, not load-bearing.
+    """
+    candidates = [
+        getattr(response, "tools", None),
+        getattr(response, "tool_executions", None),
+        getattr(getattr(response, "run_response", None), "tools", None),
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        names: list[str] = []
+        for entry in candidate:
+            name = None
+            if isinstance(entry, dict):
+                name = entry.get("tool_name") or entry.get("name")
+            else:
+                name = getattr(entry, "tool_name", None) or getattr(entry, "name", None)
+            if name:
+                names.append(str(name))
+        if names:
+            return names
+    return []
+
+
+def _summarize_provider_errors(errs: list[str]) -> str:
+    """Pick the most useful line from a list of captured ERROR log
+    messages. Agno emits a small flurry of three lines for one provider
+    failure ("API status error", "Non-retryable model provider error",
+    "Error in Team run") — the second one is the cleanest and shortest,
+    so we prefer that pattern, then fall back to the last record.
+
+    Falls back to joining all of them when nothing matches the known
+    Agno phrasing.
+    """
+    if not errs:
+        return "Provider returned no content"
+    # Prefer the "Non-retryable model provider error: <reason>" line
+    # since that's the cleanest provider-side message.
+    for line in errs:
+        if "Non-retryable model provider error:" in line:
+            return line.split("Non-retryable model provider error:", 1)[1].strip() or line
+    # Otherwise prefer the API status error which carries the HTTP code.
+    for line in errs:
+        if "API status error" in line or "status_code" in line.lower():
+            return line.strip()
+    # Fall back to the last error message.
+    return errs[-1].strip()
+
 
 PROVIDER_ENV_VARS = {
     "anthropic": "ANTHROPIC_API_KEY",
@@ -669,34 +734,72 @@ class AgnoProvider(BaseModel):
             except Exception:
                 pass
 
+        # Capture ERROR-level log records from any logger during the run so
+        # that when Agno swallows a provider failure (e.g. OpenAI 403,
+        # rate-limit, model-not-allowed), we can surface the underlying
+        # message to the user instead of returning the silent empty-result
+        # placeholder. Agno logs the failure with strings like
+        # "API status error from OpenAI API: Error code: 403 - ..." and
+        # "Non-retryable model provider error: ...", but does not re-raise.
+        captured_errors: list[str] = []
+
+        class _ErrorCapture(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                if record.levelno < logging.ERROR:
+                    return
+                try:
+                    msg = record.getMessage()
+                except Exception:
+                    msg = str(record.msg)
+                if msg:
+                    captured_errors.append(msg)
+
+        capture = _ErrorCapture(level=logging.ERROR)
+        root_logger = logging.getLogger()
+        root_logger.addHandler(capture)
         try:
             # ``user_id`` is required by ``enable_agentic_memory``; we use a
             # stable constant so memory accumulates for the single-tenant
             # OpenAgent deployment. Multi-tenant deployments can wire a
             # real user_id through BaseModel.generate() in a follow-up.
-            response = await runner.arun(
-                prompt, session_id=sid, user_id="openagent"
-            )
-        except Exception as e:
-            elog(
-                "agno.error",
-                model=self.model,
-                session_id=sid,
-                error_type=type(e).__name__,
-                error=str(e) or repr(e),
-            )
-            raise
+            try:
+                response = await runner.arun(
+                    prompt, session_id=sid, user_id="openagent"
+                )
+            except Exception as e:
+                elog(
+                    "agno.error",
+                    model=self.model,
+                    session_id=sid,
+                    error_type=type(e).__name__,
+                    error=str(e) or repr(e),
+                )
+                raise
+        finally:
+            root_logger.removeHandler(capture)
 
         # Agno occasionally returns a response whose ``.content`` is None or
-        # empty string (tool-only turn, provider returned an empty choice,
-        # length cap hit mid-text). Surface it as a structured event and
-        # substitute a non-empty placeholder so bridges don't forward zero
-        # bytes to the user. Symmetrical with claude_cli.py's empty-result
-        # handling.
+        # empty string. Two cases to distinguish:
+        #   1. A *legitimate* tool-only turn — no error logs captured. Fall
+        #      back to the placeholder so bridges don't ship zero bytes.
+        #   2. A *swallowed provider failure* — Agno logged ERRORs but did
+        #      not re-raise (this is the OpenAI 403 / rate-limit case the
+        #      user reported). Raise a clean exception with the captured
+        #      message so ``agent.run()`` formats it for the chat UI.
         raw_content = getattr(response, "content", None)
         if raw_content:
             content = raw_content
         else:
+            if captured_errors:
+                detail = _summarize_provider_errors(captured_errors)
+                elog(
+                    "agno.provider_error",
+                    level="error",
+                    model=self.model,
+                    session_id=sid,
+                    detail=detail[:300],
+                )
+                raise AgnoProviderError(detail)
             elog(
                 "agno.empty_result",
                 level="warning",
@@ -740,13 +843,76 @@ class AgnoProvider(BaseModel):
             cost_usd=cost,
             stop_reason=stop_reason or "stop",
         )
+        tool_names_called = _extract_tool_names_from_agno_response(response)
         return ModelResponse(
             content=content,
+            tool_names_called=tool_names_called,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             stop_reason=stop_reason or "stop",
             model=self.model,
         )
+
+    async def stream(
+        self,
+        messages: list[dict[str, Any]],
+        system: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> AsyncIterator[str]:
+        """Stream content deltas via Agno's native ``stream=True`` path.
+
+        Yields raw text strings as they arrive from the LLM. Tool-call
+        events and other meta events are dropped — voice-mode UX only
+        needs the speakable text. On any failure, falls back to
+        :meth:`generate` and yields the full content as one chunk so the
+        caller still gets a reply (just without time-to-first-audio).
+        """
+        prompt = self._flatten_messages(messages)
+        sid = "default"  # streaming path is currently called only by run_stream
+        # which runs without explicit session_id at the model layer.
+        runner = self._ensure_team(system=system or "")
+        if runner is None:
+            runner = self._ensure_agent(system=system)
+        elog("agno.stream.start", model=self.model, prompt_len=len(prompt))
+        try:
+            # Lazy import — Agno event types are only needed on the streaming
+            # path, and we don't want to require them on every import.
+            from agno.run.agent import RunContentEvent
+
+            stream = runner.arun(
+                prompt, session_id=sid, user_id="openagent", stream=True,
+            )
+            try:
+                emitted = 0
+                async for event in stream:
+                    # Only RunContentEvent carries text deltas; other events
+                    # (tool starts, reasoning, run lifecycle) are noise from
+                    # the TTS pipeline's perspective.
+                    if isinstance(event, RunContentEvent):
+                        text = getattr(event, "content", None) or ""
+                        if text:
+                            emitted += len(text)
+                            yield text
+            finally:
+                # Agno's iterator may need explicit closing — best-effort.
+                aclose = getattr(stream, "aclose", None)
+                if aclose is not None:
+                    try:
+                        await aclose()
+                    except Exception:
+                        pass
+            elog("agno.stream.done", model=self.model, chars=emitted)
+        except Exception as e:
+            elog(
+                "agno.stream.fallback",
+                level="warning",
+                model=self.model,
+                error_type=type(e).__name__,
+                error=str(e) or repr(e),
+            )
+            response = await self.generate(messages, system=system, tools=tools)
+            if response.content:
+                yield response.content
 
     def _compute_and_mirror_cost(
         self,

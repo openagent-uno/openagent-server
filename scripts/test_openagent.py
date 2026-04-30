@@ -55,6 +55,20 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_catalog",
     "test_channels",
     "test_formatting",
+    "test_tts_chunker",
+    "test_voice_pipeline",
+    # Local Piper TTS fallback — pure-unit, no fixtures. Paired with
+    # test_voice_pipeline.py which covers the orchestrator-side wiring.
+    "test_tts_local",
+    # DELTA frame plumbing for the unified streaming path (web chat +
+    # bridges). Pure-unit; relies on the BaseBridge dispatch logic.
+    "test_streaming",
+    # Agent.run_stream empty-stream safety net — pure-unit, no fixtures.
+    # Guards the contract that voice mode (and the soon-to-be-streaming
+    # web chat) always gets text even when the streaming provider yields
+    # zero deltas (claude_cli tool-only turns, smart_router → claude_cli
+    # with empty content, agno when no RunContentEvent fires).
+    "test_agent_run_stream",
     # New DB-backed registry tests: pure CRUD against ctx.db_path, no pool.
     "test_db_mcps",
     "test_db_models",

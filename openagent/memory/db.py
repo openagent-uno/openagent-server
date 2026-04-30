@@ -14,7 +14,7 @@ from openagent.memory.schedule import (
     is_one_shot_expression,
     parse_one_shot_expression,
 )
-from openagent.models.catalog import SUPPORTED_FRAMEWORKS
+from openagent.models.catalog import LLM_FRAMEWORKS, SUPPORTED_FRAMEWORKS
 
 
 VALID_MCP_KINDS = ("builtin", "custom", "default")
@@ -110,14 +110,22 @@ CREATE INDEX IF NOT EXISTS idx_mcps_updated ON mcps(updated_at);
 -- ``UNIQUE(name, framework)`` lets the UI/API/MCP address a row by its
 -- (vendor, framework) pair; the surrogate ``id`` is what the ``models``
 -- table joins to.
+-- ``kind`` partitions the registry by capability:
+--   ``llm`` — text generation (existing rows; ``framework`` ∈ {agno,claude-cli}).
+--   ``tts`` — speech synthesis (e.g. ElevenLabs; ``framework='elevenlabs'``).
+--   ``stt`` — speech-to-text (reserved; ASR is currently env-driven via
+--             ``faster-whisper`` / OpenAI Whisper, so no rows yet).
+-- Router/classifier code MUST filter to ``kind='llm'`` before iterating
+-- providers, so a TTS row never gets handed to the LLM dispatch path.
 CREATE TABLE IF NOT EXISTS providers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
-    framework TEXT NOT NULL CHECK (framework IN ('agno','claude-cli')),
+    framework TEXT NOT NULL,
     api_key TEXT,
     base_url TEXT,
     enabled INTEGER NOT NULL DEFAULT 1,
     metadata_json TEXT NOT NULL DEFAULT '{}',
+    kind TEXT NOT NULL DEFAULT 'llm' CHECK (kind IN ('llm','tts','stt')),
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     UNIQUE(name, framework)
@@ -125,6 +133,9 @@ CREATE TABLE IF NOT EXISTS providers (
 CREATE INDEX IF NOT EXISTS idx_providers_enabled ON providers(enabled);
 CREATE INDEX IF NOT EXISTS idx_providers_updated ON providers(updated_at);
 CREATE INDEX IF NOT EXISTS idx_providers_name ON providers(name);
+-- idx_providers_kind is created in _apply_legacy_alters, after the
+-- column is guaranteed to exist on legacy DBs (same rationale as
+-- idx_models_is_classifier below).
 
 -- Configured LLM models. Each row is a bare vendor id plus a FK to the
 -- provider row that owns it. Framework is inherited from the provider —
@@ -137,6 +148,15 @@ CREATE INDEX IF NOT EXISTS idx_providers_name ON providers(name);
 --
 -- ``tier_hint`` absorbs the old ``notes`` column: free-form classifier
 -- guidance (``"vision, 200k context, best for code"``, ``"cheap and fast"``).
+--
+-- ``kind`` partitions the row by capability:
+--   ``llm`` — text generation (the SmartRouter / classifier picks one).
+--   ``tts`` — speech synthesis. ``metadata.voice_id`` carries the voice.
+--   ``stt`` — speech-to-text.
+-- LLM rows route via the provider's framework (``agno`` / ``claude-cli``);
+-- ``tts`` / ``stt`` rows always dispatch through LiteLLM
+-- (``litellm.aspeech`` / ``atranscription``) using the provider's
+-- ``name`` as the LiteLLM vendor prefix (``openai/tts-1``).
 CREATE TABLE IF NOT EXISTS models (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     provider_id INTEGER NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
@@ -146,6 +166,7 @@ CREATE TABLE IF NOT EXISTS models (
     enabled INTEGER NOT NULL DEFAULT 1,
     is_classifier INTEGER NOT NULL DEFAULT 0,
     metadata_json TEXT NOT NULL DEFAULT '{}',
+    kind TEXT NOT NULL DEFAULT 'llm' CHECK (kind IN ('llm','tts','stt')),
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     UNIQUE(provider_id, model)
@@ -343,6 +364,228 @@ class MemoryDB:
         # seed the ``workflow_schedules`` row — then clear the legacy
         # column so subsequent boots don't re-migrate.
         await self._migrate_workflow_schedules_from_legacy_columns()
+
+        # Voice chat: providers gains a ``kind`` column and drops the
+        # framework CHECK that locked it to ('agno','claude-cli'), so
+        # audio providers (LiteLLM-routed TTS/STT) can live in the same
+        # registry.
+        await self._migrate_providers_kind_column()
+        # Idempotent on both fresh installs and post-rebuild — the
+        # column is guaranteed to exist by the line above.
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_providers_kind ON providers(kind)"
+        )
+        # Cleanup: the very first voice-chat preview shipped with
+        # ``framework='elevenlabs'`` for TTS rows. The current code
+        # routes through LiteLLM (``framework='litellm'``), so any
+        # surviving ``elevenlabs`` row would be invisible to the
+        # resolver. Convert them in place — the row's existing
+        # ``api_key`` and ``metadata`` (voice_id, model_id) carry over
+        # 1:1 because the LiteLLM ``elevenlabs/<model>`` shape uses the
+        # same names.
+        await self._migrate_legacy_elevenlabs_to_litellm()
+        # Add ``kind`` to the models table + fold any TTS/STT provider
+        # rows (where ``model_id`` and ``voice_id`` lived in
+        # ``metadata_json``) into proper model rows. The unified design:
+        # one model row per (provider, model_id, kind), no audio config
+        # smuggled into provider metadata.
+        await self._migrate_models_kind_column()
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_models_kind ON models(kind)"
+        )
+
+    async def _migrate_models_kind_column(self) -> None:
+        """Add ``models.kind`` (idempotent) and lift TTS/STT settings out
+        of ``providers.metadata_json`` into model rows.
+        """
+        assert self._conn is not None
+        cursor = await self._conn.execute("PRAGMA table_info(models)")
+        cols = {r[1] for r in await cursor.fetchall()}
+        if "kind" not in cols:
+            await self._conn.execute(
+                "ALTER TABLE models ADD COLUMN kind TEXT NOT NULL "
+                "DEFAULT 'llm' CHECK (kind IN ('llm','tts','stt'))"
+            )
+
+        # For each provider row whose ``providers.kind`` was 'tts'/'stt',
+        # promote the model_id+voice_id stored in metadata_json into a
+        # proper model row, then reset the provider's kind to 'llm' so
+        # the discriminator lives only on the model side.
+        cursor = await self._conn.execute(
+            "SELECT id, name, metadata_json, kind FROM providers "
+            "WHERE kind IN ('tts','stt')"
+        )
+        rows = await cursor.fetchall()
+        if not rows:
+            await self._conn.commit()
+            return
+
+        now = time.time()
+        for row in rows:
+            audio_provider_id, vendor, meta_raw, audio_kind = row
+            try:
+                meta = json.loads(meta_raw or "{}") if isinstance(meta_raw, str) else {}
+            except ValueError:
+                meta = {}
+            model_id = (meta.get("model_id") or "").strip()
+            if not model_id:
+                # Nothing actionable on this row — drop the kind tag and move on.
+                await self._conn.execute(
+                    "UPDATE providers SET kind='llm', updated_at=? WHERE id=?",
+                    (now, audio_provider_id),
+                )
+                continue
+
+            # Prefer attaching the audio model to a sibling LLM
+            # provider for the same vendor (so the user keeps one
+            # api_key per vendor). Fall back to the audio provider's
+            # own row when no sibling exists.
+            cursor2 = await self._conn.execute(
+                "SELECT id FROM providers WHERE name=? AND kind='llm' "
+                "ORDER BY id LIMIT 1",
+                (vendor,),
+            )
+            sibling = await cursor2.fetchone()
+            target_provider_id = sibling[0] if sibling else audio_provider_id
+            model_meta = {k: v for k, v in meta.items() if k != "model_id"}
+            await self._conn.execute(
+                """
+                INSERT OR IGNORE INTO models
+                    (provider_id, model, kind, enabled, metadata_json,
+                     created_at, updated_at)
+                VALUES (?, ?, ?, 1, ?, ?, ?)
+                """,
+                (target_provider_id, model_id, audio_kind,
+                 json.dumps(model_meta), now, now),
+            )
+            # Provider row now exists only to hold the api_key (if it
+            # was the audio-only row) — flip its kind to 'llm' so
+            # nothing in the codebase keeps reading the old discriminator.
+            await self._conn.execute(
+                "UPDATE providers SET kind='llm', metadata_json='{}', "
+                "updated_at=? WHERE id=?",
+                (now, audio_provider_id),
+            )
+        await self._conn.commit()
+
+    async def _migrate_legacy_elevenlabs_to_litellm(self) -> None:
+        """Idempotent UPDATE of pre-LiteLLM TTS rows to the new shape."""
+        assert self._conn is not None
+        cursor = await self._conn.execute(
+            "SELECT COUNT(*) FROM providers WHERE framework='elevenlabs'"
+        )
+        row = await cursor.fetchone()
+        if not row or not row[0]:
+            return
+        # Some rows might collide with an existing (name='elevenlabs',
+        # framework='litellm') under the UNIQUE(name, framework)
+        # constraint. Pick a non-colliding name like 'elevenlabs-legacy'
+        # in that case so we never lose data.
+        await self._conn.execute(
+            """
+            UPDATE providers
+               SET framework='litellm',
+                   name=CASE
+                     WHEN EXISTS (
+                       SELECT 1 FROM providers p2
+                       WHERE p2.framework='litellm' AND p2.name=providers.name
+                     ) THEN providers.name || '-legacy'
+                     ELSE providers.name
+                   END,
+                   updated_at=?
+             WHERE framework='elevenlabs'
+            """,
+            (time.time(),),
+        )
+        await self._conn.commit()
+
+    async def _migrate_providers_kind_column(self) -> None:
+        """Add ``kind`` to ``providers`` and lift the ``framework`` CHECK.
+
+        Idempotent: detects the old CHECK by inspecting ``sqlite_master``
+        and the missing column via ``PRAGMA table_info``. Only does work
+        on legacy DBs; fresh installs already get the new shape from
+        ``SCHEMA_SQL`` and exit early.
+        """
+        assert self._conn is not None
+
+        cursor = await self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='providers'"
+        )
+        row = await cursor.fetchone()
+        if not row or not row[0]:
+            return  # No providers table — fresh install hasn't created it yet
+        table_sql = row[0]
+        # The legacy CHECK literal as it appears in SCHEMA_SQL prior to this
+        # migration. Substring match is fine because SQLite stores the
+        # CREATE TABLE text verbatim.
+        has_old_check = "framework IN ('agno','claude-cli')" in table_sql
+
+        cursor = await self._conn.execute("PRAGMA table_info(providers)")
+        cols = {r[1] for r in await cursor.fetchall()}
+        has_kind = "kind" in cols
+
+        if has_kind and not has_old_check:
+            return  # already migrated
+
+        # Close any pending implicit tx so PRAGMA foreign_keys takes effect.
+        await self._conn.commit()
+        await self._conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            await self._conn.execute(
+                """
+                CREATE TABLE providers_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    framework TEXT NOT NULL,
+                    api_key TEXT,
+                    base_url TEXT,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    kind TEXT NOT NULL DEFAULT 'llm'
+                        CHECK (kind IN ('llm','tts','stt')),
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    UNIQUE(name, framework)
+                )
+                """
+            )
+            if has_kind:
+                await self._conn.execute(
+                    "INSERT INTO providers_new "
+                    "(id, name, framework, api_key, base_url, enabled, "
+                    " metadata_json, kind, created_at, updated_at) "
+                    "SELECT id, name, framework, api_key, base_url, enabled, "
+                    " metadata_json, kind, created_at, updated_at FROM providers"
+                )
+            else:
+                await self._conn.execute(
+                    "INSERT INTO providers_new "
+                    "(id, name, framework, api_key, base_url, enabled, "
+                    " metadata_json, kind, created_at, updated_at) "
+                    "SELECT id, name, framework, api_key, base_url, enabled, "
+                    " metadata_json, 'llm', created_at, updated_at FROM providers"
+                )
+            await self._conn.execute("DROP TABLE providers")
+            await self._conn.execute("ALTER TABLE providers_new RENAME TO providers")
+            await self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_providers_enabled ON providers(enabled)"
+            )
+            await self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_providers_updated ON providers(updated_at)"
+            )
+            await self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_providers_name ON providers(name)"
+            )
+            await self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_providers_kind ON providers(kind)"
+            )
+            await self._conn.commit()
+        except Exception:
+            await self._conn.rollback()
+            raise
+        finally:
+            await self._conn.execute("PRAGMA foreign_keys = ON")
 
     async def _migrate_workflow_schedules_from_legacy_columns(self) -> None:
         """One-time backfill from v0.12.10's row-level ``cron_expression``
@@ -1332,10 +1575,19 @@ class MemoryDB:
             meta_parsed = json.loads(metadata) if isinstance(metadata, str) else {}
         except ValueError:
             meta_parsed = {}
+        # ``kind`` is post-ship: legacy DBs may surface aiosqlite.Row
+        # objects without it during the brief window between schema
+        # script and migration. Default to 'llm' to keep LLM-dispatch
+        # callers safe.
+        try:
+            kind = row["kind"] or "llm"
+        except (KeyError, IndexError):
+            kind = "llm"
         return {
             "id": row["id"],
             "name": row["name"],
             "framework": row["framework"],
+            "kind": kind,
             "api_key": row["api_key"],
             "base_url": row["base_url"],
             "enabled": bool(row["enabled"]),
@@ -1349,6 +1601,7 @@ class MemoryDB:
         *,
         enabled_only: bool = False,
         framework: str | None = None,
+        kind: str | None = None,
     ) -> list[dict[str, Any]]:
         conn = await self._ensure_connected()
         clauses: list[str] = []
@@ -1358,6 +1611,9 @@ class MemoryDB:
         if framework:
             clauses.append("framework = ?")
             params.append(framework)
+        if kind:
+            clauses.append("kind = ?")
+            params.append(kind)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         cursor = await conn.execute(
             f"SELECT * FROM providers {where} ORDER BY name ASC, framework ASC",
@@ -1396,6 +1652,7 @@ class MemoryDB:
         base_url: str | None = None,
         enabled: bool = True,
         metadata: dict[str, Any] | None = None,
+        kind: str = "llm",
     ) -> int:
         """Upsert a provider row. Returns the provider's surrogate ``id``.
 
@@ -1404,12 +1661,24 @@ class MemoryDB:
         stored value would poison the subprocess). ``framework='agno'``
         providers can be created with ``api_key=None`` (disabled-until-
         configured state) but dispatch will fail until a key is set.
+
+        ``kind`` defaults to ``'llm'`` (text generation). Use ``'tts'``
+        for speech synthesis providers (e.g. ElevenLabs) or ``'stt'`` for
+        speech-to-text providers — the LLM dispatcher filters these out
+        via ``list_providers(kind='llm')``.
         """
         if not name or not name.strip():
             raise ValueError("name is required")
-        if framework not in VALID_FRAMEWORKS:
+        if kind not in ("llm", "tts", "stt"):
+            raise ValueError(f"invalid kind {kind!r}; expected llm/tts/stt")
+        # LLM-kind rows are still gated by the historical framework whitelist
+        # (agno / claude-cli). Audio kinds use their own framework values
+        # (e.g. 'elevenlabs') which the schema accepts but the LLM router
+        # never iterates.
+        if kind == "llm" and framework not in LLM_FRAMEWORKS:
             raise ValueError(
-                f"invalid framework {framework!r}; expected one of {VALID_FRAMEWORKS}"
+                f"invalid framework {framework!r} for kind='llm'; "
+                f"expected one of {LLM_FRAMEWORKS}"
             )
         if framework == "claude-cli" and api_key:
             raise ValueError(
@@ -1427,13 +1696,14 @@ class MemoryDB:
         conn = await self._ensure_connected()
         await conn.execute(
             """
-            INSERT INTO providers (name, framework, api_key, base_url, enabled, metadata_json, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO providers (name, framework, api_key, base_url, enabled, metadata_json, kind, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(name, framework) DO UPDATE SET
                 api_key = excluded.api_key,
                 base_url = excluded.base_url,
                 enabled = excluded.enabled,
                 metadata_json = excluded.metadata_json,
+                kind = excluded.kind,
                 updated_at = excluded.updated_at
             """,
             (
@@ -1443,6 +1713,7 @@ class MemoryDB:
                 (base_url or None),
                 1 if enabled else 0,
                 json.dumps(metadata or {}),
+                kind,
                 now,
                 now,
             ),
@@ -1492,6 +1763,12 @@ class MemoryDB:
             d["metadata"] = {}
         d["enabled"] = bool(d.get("enabled"))
         d["is_classifier"] = bool(d.get("is_classifier"))
+        # ``kind`` is post-ship: legacy aiosqlite.Row objects between
+        # the schema script and the migration may surface without it.
+        try:
+            d["kind"] = d.get("kind") or "llm"
+        except (KeyError, IndexError):
+            d["kind"] = "llm"
         return d
 
     async def list_models(
@@ -1499,6 +1776,7 @@ class MemoryDB:
         *,
         provider_id: int | None = None,
         enabled_only: bool = False,
+        kind: str | None = None,
     ) -> list[dict]:
         conn = await self._ensure_connected()
         clauses: list[str] = []
@@ -1508,6 +1786,9 @@ class MemoryDB:
             params.append(int(provider_id))
         if enabled_only:
             clauses.append("enabled = 1")
+        if kind:
+            clauses.append("kind = ?")
+            params.append(kind)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         cursor = await conn.execute(
             f"SELECT * FROM models {where} ORDER BY provider_id ASC, model ASC",
@@ -1515,6 +1796,26 @@ class MemoryDB:
         )
         rows = await cursor.fetchall()
         return [self._row_to_model(r) for r in rows]
+
+    async def latest_audio_model(self, kind: str) -> dict | None:
+        """Return the most-recently-updated enabled model row of ``kind``,
+        joined with its provider for credentials.
+
+        Used by the TTS / STT resolvers — the unified pick rule is
+        "latest-edited enabled wins" (matches the classifier-row
+        convention used elsewhere). Returns ``None`` when no row matches.
+        """
+        if kind not in ("tts", "stt"):
+            raise ValueError(f"latest_audio_model: invalid kind {kind!r}")
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            self._ENRICHED_MODEL_SELECT
+            + " WHERE m.kind = ? AND m.enabled = 1 AND p.enabled = 1"
+            "  ORDER BY m.updated_at DESC LIMIT 1",
+            (kind,),
+        )
+        row = await cursor.fetchone()
+        return self._shape_enriched(row) if row else None
 
     # Common projection for the model-joined-with-provider view. Kept
     # as a constant so :meth:`list_models_enriched`,
@@ -1524,7 +1825,7 @@ class MemoryDB:
         SELECT m.id AS id, m.provider_id AS provider_id, m.model AS model,
                m.display_name AS display_name, m.tier_hint AS tier_hint,
                m.enabled AS enabled, m.is_classifier AS is_classifier,
-               m.metadata_json AS metadata_json,
+               m.metadata_json AS metadata_json, m.kind AS kind,
                m.created_at AS created_at, m.updated_at AS updated_at,
                p.name AS provider_name, p.framework AS framework,
                p.api_key AS api_key, p.base_url AS base_url,
@@ -1546,6 +1847,7 @@ class MemoryDB:
         d["enabled"] = bool(d["enabled"])
         d["is_classifier"] = bool(d.get("is_classifier"))
         d["provider_enabled"] = bool(d["provider_enabled"])
+        d["kind"] = d.get("kind") or "llm"
         d["runtime_id"] = build_runtime_model_id(
             d["provider_name"], d["model"], d["framework"],
         )
@@ -1558,13 +1860,14 @@ class MemoryDB:
         framework: str | None = None,
         provider_name: str | None = None,
         provider_id: int | None = None,
+        kind: str | None = None,
     ) -> list[dict]:
         """Return each model joined with its provider row.
 
         Each row carries ``{id, provider_id, model, display_name, tier_hint,
-        enabled, metadata, created_at, updated_at, provider_name, framework,
-        api_key, base_url, provider_enabled, runtime_id}`` — ``runtime_id``
-        is derived on the fly via :func:`openagent.models.catalog.build_runtime_model_id`.
+        enabled, kind, metadata, created_at, updated_at, provider_name,
+        framework, api_key, base_url, provider_enabled, runtime_id}`` —
+        ``runtime_id`` is derived via :func:`openagent.models.catalog.build_runtime_model_id`.
         This is the shape consumed by ``iter_configured_models`` and the REST
         ``/api/models`` list endpoint.
         """
@@ -1583,6 +1886,9 @@ class MemoryDB:
         if provider_id is not None:
             clauses.append("m.provider_id = ?")
             params.append(int(provider_id))
+        if kind:
+            clauses.append("m.kind = ?")
+            params.append(kind)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         cursor = await conn.execute(
             f"{self._ENRICHED_MODEL_SELECT} {where} "
@@ -1623,15 +1929,19 @@ class MemoryDB:
         provider" state).
         """
         conn = await self._ensure_connected()
-        clauses: list[str] = []
+        # LLM-dispatch hydration must skip TTS/STT model rows (they share
+        # the table but route through LiteLLM, not the LLM frameworks).
+        # The kind discriminator now lives on ``models.kind``; the
+        # ``providers.kind='llm'`` check is kept as a no-op safety net
+        # for any pre-migration legacy row that still carried it.
+        clauses: list[str] = ["p.kind = 'llm'"]
+        join_filter = " AND m.kind = 'llm'"
         if enabled_only:
             # Model-side filter must go in the JOIN predicate, not WHERE,
             # or providers with zero enabled models would disappear.
-            join_filter = " AND m.enabled = 1"
+            join_filter += " AND m.enabled = 1"
             clauses.append("p.enabled = 1")
-        else:
-            join_filter = ""
-        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        where = f"WHERE {' AND '.join(clauses)}"
         cursor = await conn.execute(
             f"""
             SELECT p.id AS p_id, p.name AS p_name, p.framework AS p_framework,
@@ -1736,12 +2046,15 @@ class MemoryDB:
         enabled: bool = True,
         is_classifier: bool = False,
         metadata: dict | None = None,
+        kind: str = "llm",
     ) -> int:
         """Insert or update a model row. Returns the model's surrogate id."""
         if not provider_id:
             raise ValueError("provider_id is required")
         if not model or not str(model).strip():
             raise ValueError("model is required")
+        if kind not in ("llm", "tts", "stt"):
+            raise ValueError(f"invalid kind {kind!r}; expected llm/tts/stt")
         conn = await self._ensure_connected()
         # FK integrity: make sure the parent provider exists before we
         # try the insert so callers get a clear error instead of the
@@ -1757,15 +2070,16 @@ class MemoryDB:
         await conn.execute(
             """
             INSERT INTO models (provider_id, model, display_name, tier_hint,
-                                enabled, is_classifier, metadata_json,
+                                enabled, is_classifier, metadata_json, kind,
                                 created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(provider_id, model) DO UPDATE SET
                 display_name = excluded.display_name,
                 tier_hint = excluded.tier_hint,
                 enabled = excluded.enabled,
                 is_classifier = excluded.is_classifier,
                 metadata_json = excluded.metadata_json,
+                kind = excluded.kind,
                 updated_at = excluded.updated_at
             """,
             (
@@ -1776,6 +2090,7 @@ class MemoryDB:
                 1 if enabled else 0,
                 1 if is_classifier else 0,
                 json.dumps(dict(metadata or {})),
+                kind,
                 now,
                 now,
             ),
@@ -1911,9 +2226,10 @@ class MemoryDB:
         ``set_sdk_session``); this table tracks agno side + per-session
         explicit model pins for both sides.
         """
-        if framework not in VALID_FRAMEWORKS:
+        if framework not in LLM_FRAMEWORKS:
             raise ValueError(
-                f"invalid framework {framework!r}; expected one of {VALID_FRAMEWORKS}"
+                f"invalid framework {framework!r}; session_bindings is for "
+                f"LLM dispatch only — expected one of {LLM_FRAMEWORKS}"
             )
         conn = await self._ensure_connected()
         await conn.execute(
@@ -1942,7 +2258,7 @@ class MemoryDB:
         if not session_id or not runtime_id:
             raise ValueError("session_id and runtime_id are required")
         target_framework = framework_of(runtime_id)
-        if target_framework not in VALID_FRAMEWORKS:
+        if target_framework not in LLM_FRAMEWORKS:
             raise ValueError(
                 f"runtime_id {runtime_id!r} resolved to an unknown framework {target_framework!r}"
             )

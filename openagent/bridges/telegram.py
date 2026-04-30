@@ -6,6 +6,7 @@ import asyncio
 import logging
 import tempfile
 from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from openagent.bridges.base import BaseBridge, format_tool_status
@@ -26,6 +27,14 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_MSG_LIMIT = 4096
 VOICE_FALLBACK = "[Voice message not transcribed. Ask the user to type it.]"
+
+
+@dataclass
+class _Extracted:
+    """Output of :meth:`TelegramBridge._extract_files` for one Telegram message."""
+    text_addition: str = ""
+    files_info: list[str] = field(default_factory=list)
+    voice_detected: bool = False
 
 # Hard shutdown deadlines for the python-telegram-bot library calls. These
 # exist because ``updater.stop()`` internally POSTs to Telegram's
@@ -319,31 +328,33 @@ class TelegramBridge(BaseBridge):
         result = await self.send_command(cmd, session_id=f"tg:{user_id}")
         await self._reply_rich(update.message, result)
 
-    async def _extract_files(self, msg, tmp: str) -> tuple[str, list[str]]:
-        """Download every attachment on a single Telegram ``Message`` to
-        ``tmp`` and return ``(text_addition, files_info)``.
+    async def _extract_files(self, msg, tmp: str) -> _Extracted:
+        """Download every attachment on a single Telegram ``Message`` to ``tmp``.
 
-        ``text_addition`` covers the voice-transcription augmentation
-        (Telegram delivers voice notes as a separate field that we
-        transcribe inline). ``files_info`` lines mirror the format
-        ``build_attachment_context`` expects.
+        Returns an :class:`_Extracted` carrying the voice-transcription
+        text (if any), the per-file ``build_attachment_context`` lines,
+        and a flag set when the user sent a voice note (so the caller
+        can mirror the modality on reply).
         """
-        text_addition = ""
-        files_info: list[str] = []
+        out = _Extracted()
 
         if msg.photo:
             photo = msg.photo[-1]
             f = await photo.get_file()
             path = str(Path(tmp) / f"photo_{photo.file_unique_id}.jpg")
             await f.download_to_drive(path)
-            files_info.append(f"- image: photo.jpg — local path: {path}")
+            out.files_info.append(f"- image: photo.jpg — local path: {path}")
 
         if msg.voice:
+            out.voice_detected = True
             f = await msg.voice.get_file()
             path = str(Path(tmp) / f"voice_{msg.voice.file_unique_id}.ogg")
             await f.download_to_drive(path)
-            transcription = await transcribe_voice(path)
-            text_addition = transcription if transcription else VOICE_FALLBACK
+            # Prefer DB-configured STT (LiteLLM); fall back to local Whisper.
+            transcription = await self.transcribe_via_gateway(path)
+            if not transcription:
+                transcription = await transcribe_voice(path)
+            out.text_addition = transcription or VOICE_FALLBACK
 
         if msg.audio:
             fname = msg.audio.file_name or f"audio_{msg.audio.file_unique_id}"
@@ -351,7 +362,7 @@ class TelegramBridge(BaseBridge):
                 f = await msg.audio.get_file()
                 path = str(Path(tmp) / fname)
                 await f.download_to_drive(path)
-                files_info.append(f"- file: {fname} — local path: {path}")
+                out.files_info.append(f"- file: {fname} — local path: {path}")
 
         if msg.document:
             fname = msg.document.file_name or f"doc_{msg.document.file_unique_id}"
@@ -361,7 +372,7 @@ class TelegramBridge(BaseBridge):
                 f = await msg.document.get_file()
                 path = str(Path(tmp) / fname)
                 await f.download_to_drive(path)
-                files_info.append(f"- file: {fname} — local path: {path}")
+                out.files_info.append(f"- file: {fname} — local path: {path}")
 
         if msg.video:
             fname = msg.video.file_name or f"video_{msg.video.file_unique_id}.mp4"
@@ -369,9 +380,9 @@ class TelegramBridge(BaseBridge):
                 f = await msg.video.get_file()
                 path = str(Path(tmp) / fname)
                 await f.download_to_drive(path)
-                files_info.append(f"- video: {fname} — local path: {path}")
+                out.files_info.append(f"- video: {fname} — local path: {path}")
 
-        return text_addition, files_info
+        return out
 
     async def _on_message(self, update, context):
         if not self._is_fresh_update(update):
@@ -396,17 +407,17 @@ class TelegramBridge(BaseBridge):
         elog("bridge.message", bridge="telegram", user_id=uid)
         text = msg.caption or msg.text or ""
         tmp = tempfile.mkdtemp(prefix="oa_tg_")
-        text_addition, files_info = await self._extract_files(msg, tmp)
-        if text_addition:
-            text = text_addition if not text else f"{text}\n{text_addition}"
+        extracted = await self._extract_files(msg, tmp)
+        if extracted.text_addition:
+            text = f"{text}\n{extracted.text_addition}" if text else extracted.text_addition
 
-        if files_info:
-            text = prepend_context_block(text, build_attachment_context(files_info))
+        if extracted.files_info:
+            text = prepend_context_block(text, build_attachment_context(extracted.files_info))
 
         if not text:
             return
 
-        await self._dispatch_to_agent(msg, uid, text)
+        await self._dispatch_to_agent(msg, uid, text, voice_detected=extracted.voice_detected)
 
     async def _enqueue_media_group(self, uid: str, group_id: str, msg) -> None:
         """Buffer a media-group sibling and (re)arm the flush timer."""
@@ -474,9 +485,10 @@ class TelegramBridge(BaseBridge):
 
         tmp = tempfile.mkdtemp(prefix="oa_tg_")
         all_files: list[str] = []
+        any_voice = False
         for m in messages:
             try:
-                addition, files = await self._extract_files(m, tmp)
+                extracted = await self._extract_files(m, tmp)
             except Exception as e:  # noqa: BLE001
                 elog(
                     "bridge.media_group_extract_error",
@@ -485,9 +497,11 @@ class TelegramBridge(BaseBridge):
                     error=str(e),
                 )
                 continue
-            if addition:
-                text = addition if not text else f"{text}\n{addition}"
-            all_files.extend(files)
+            if extracted.text_addition:
+                text = f"{text}\n{extracted.text_addition}" if text else extracted.text_addition
+            all_files.extend(extracted.files_info)
+            if extracted.voice_detected:
+                any_voice = True
 
         if all_files:
             text = prepend_context_block(text, build_attachment_context(all_files))
@@ -495,11 +509,18 @@ class TelegramBridge(BaseBridge):
         if not text:
             return
 
-        # Use the first sibling as the anchor for the status reply so
-        # the user sees a single in-flight indicator next to the group.
-        await self._dispatch_to_agent(messages[0], uid, text)
+        # Anchor the status reply on the first sibling so the user sees
+        # a single in-flight indicator next to the group.
+        await self._dispatch_to_agent(messages[0], uid, text, voice_detected=any_voice)
 
-    async def _dispatch_to_agent(self, msg, uid: str, text: str) -> None:
+    async def _dispatch_to_agent(
+        self,
+        msg,
+        uid: str,
+        text: str,
+        *,
+        voice_detected: bool = False,
+    ) -> None:
         """Send ``text`` (already attachment-prepended) to the agent on
         behalf of ``uid``, posting a plain status reply against ``msg``.
         Shared by the single-message and media-group paths.
@@ -508,6 +529,13 @@ class TelegramBridge(BaseBridge):
         running turn; the inline-button shortcut was removed because it
         cluttered every reply and the slash command covers the same
         intent without the visual noise.
+
+        ``voice_detected`` mirrors the modality: when the user sent a
+        voice note, we batch-synthesise the agent's reply to OGG/opus and
+        inject a ``[VOICE:/path]`` marker so the existing reply pipeline
+        (:meth:`_send_response`) sends it as ``send_voice``. The Telegram
+        Bot API can't stream voice, hence batch synth here rather than
+        the gateway's streaming path used for the desktop/web client.
         """
         session_id = f"tg:{uid}"
 
@@ -516,15 +544,65 @@ class TelegramBridge(BaseBridge):
         except Exception:
             status_msg = None
 
+        # Telegram caps message edits at ~1/sec per chat — go any faster
+        # and the bot starts dropping edits silently. The throttle lives
+        # in this scope (not the bridge) so each turn gets a fresh
+        # cooldown timer; previous turns' timing is irrelevant.
+        TG_EDIT_THROTTLE_SECS = 1.0
+        accumulated_delta: list[str] = []
+        last_edit_at = [0.0]
+        delta_started = [False]
+
         async def on_status(s):
             if status_msg is None:
+                return
+            # Once deltas start arriving, status frames stop overwriting
+            # the live text — the user is reading the response now and
+            # would only get jitter from "Using X…" flashing in between.
+            if delta_started[0]:
                 return
             try:
                 await status_msg.edit_text(f"⏳ {format_tool_status(s)}")
             except Exception:
                 pass
 
-        response = await self.send_message(text, session_id, on_status=on_status)
+        async def on_delta(chunk: str):
+            """Edit status_msg with the running response text.
+
+            First delta marks the transition from "Thinking…" to live
+            text. Subsequent deltas update the same message, throttled
+            to one edit per second to stay under Telegram's rate limit.
+            The trailing RESPONSE deletes the status message and posts
+            the final clean text so attachments + markdown render
+            properly via :meth:`_send_response`.
+            """
+            if status_msg is None or not chunk:
+                return
+            accumulated_delta.append(chunk)
+            now = asyncio.get_event_loop().time()
+            if delta_started[0] and now - last_edit_at[0] < TG_EDIT_THROTTLE_SECS:
+                return
+            delta_started[0] = True
+            last_edit_at[0] = now
+            preview = "".join(accumulated_delta)
+            # Cap at TELEGRAM_MSG_LIMIT so a long stream doesn't 400
+            # mid-edit; the final RESPONSE handles overflow via
+            # split_preserving_code_blocks.
+            if len(preview) > TELEGRAM_MSG_LIMIT - 4:
+                preview = preview[: TELEGRAM_MSG_LIMIT - 4] + "…"
+            try:
+                await status_msg.edit_text(preview)
+            except Exception:
+                pass
+
+        # Telegram bridge does its own batch synthesis — keep the
+        # gateway on the regular text path so we don't waste a streaming
+        # TTS call whose audio frames we'd drop anyway.
+        response = await self.send_message_streaming(
+            text, session_id,
+            on_status=on_status,
+            on_delta=on_delta,
+        )
 
         if status_msg:
             try:
@@ -532,7 +610,24 @@ class TelegramBridge(BaseBridge):
             except Exception:
                 pass
 
-        await self._send_response(msg, response.get("text", ""), response.get("model"))
+        response_text = response.get("text", "") or ""
+        if voice_detected and response_text:
+            try:
+                voice_marker = await self.synthesise_audio_attachment(response_text)
+                if voice_marker:
+                    response_text = f"{voice_marker}\n{response_text}"
+            except Exception as e:  # noqa: BLE001 — don't drop the text reply on synth failure
+                elog(
+                    "telegram.tts.error",
+                    level="warning",
+                    error_type=type(e).__name__,
+                    error=str(e) or repr(e),
+                )
+
+        await self._send_response(msg, response_text, response.get("model"))
+
+    # The TTS / STT gateway calls live on ``BaseBridge`` so Telegram,
+    # Discord, and WhatsApp share the same DB-routed plumbing.
 
     # ── Sending ──
 
@@ -558,7 +653,13 @@ class TelegramBridge(BaseBridge):
                     if att.type == "image":
                         await msg.reply_photo(photo=f)
                     elif att.type == "voice":
-                        await msg.reply_voice(voice=f)
+                        # Telegram's reply_voice requires OGG/Opus; MP3
+                        # (the LiteLLM default) ships via reply_audio
+                        # instead — renders as a music-player bubble.
+                        if p.suffix.lower() in (".ogg", ".oga", ".opus"):
+                            await msg.reply_voice(voice=f)
+                        else:
+                            await msg.reply_audio(audio=f)
                     elif att.type == "video":
                         await msg.reply_video(video=f)
                     else:

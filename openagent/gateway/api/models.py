@@ -87,26 +87,82 @@ def _parse_model_id(request: "web.Request") -> int | None:
 
 def _shape_model(row: dict[str, Any]) -> dict[str, Any]:
     """Public response shape for an enriched model row."""
+    from openagent.channels.tts import DEFAULT_VOICE_BY_VENDOR
     from openagent.models.catalog import get_model_pricing
 
     pricing = get_model_pricing(row["runtime_id"])
+    kind = row.get("kind") or "llm"
+    display_name = row.get("display_name")
+    # Synthesize a display_name for audio rows that don't carry one — old
+    # migrated rows, or anything added through APIs whose discovery layer
+    # only returned a bare model id. The UI renders rows as
+    # "<model> · <KIND> · <display_name>", so this keeps the column shape
+    # consistent with LLM rows (which usually inherit a vendor-prefixed
+    # display_name from OpenRouter, e.g. "OpenAI: GPT-5.4").
+    if not display_name and kind in ("tts", "stt"):
+        display_name = f"{row['provider_name']}: {row['model']}"
+    # For TTS: surface the *effective* voice_id (configured or per-vendor
+    # default) so the UI mirrors what the runtime actually plays. The
+    # fallback chain matches ``tts.resolve_tts_provider``.
+    metadata = dict(row.get("metadata") or {})
+    if kind == "tts" and not metadata.get("voice_id"):
+        default_voice = DEFAULT_VOICE_BY_VENDOR.get(row["provider_name"])
+        if default_voice:
+            metadata["voice_id"] = default_voice
+            metadata["voice_id_source"] = "default"
     return {
         "id": row["id"],
         "provider_id": row["provider_id"],
         "provider_name": row["provider_name"],
         "framework": row["framework"],
+        "kind": kind,
         "runtime_id": row["runtime_id"],
         "model": row["model"],
-        "display_name": row.get("display_name"),
+        "display_name": display_name,
         "tier_hint": row.get("tier_hint"),
         "enabled": bool(row.get("enabled", True)),
         "is_classifier": bool(row.get("is_classifier", False)),
         "provider_enabled": bool(row.get("provider_enabled", True)),
-        "metadata": row.get("metadata") or {},
+        "metadata": metadata,
         "created_at": row.get("created_at"),
         "updated_at": row.get("updated_at"),
         "input_cost_per_million": round(float(pricing["input_cost_per_million"] or 0.0), 4),
         "output_cost_per_million": round(float(pricing["output_cost_per_million"] or 0.0), 4),
+    }
+
+
+def _synthetic_piper_row() -> dict[str, Any]:
+    """Surface the bundled Piper local TTS as a read-only catalog entry.
+
+    Negative id (``-1``) so the universal client can detect it (
+    ``id < 0`` → can't be edited or deleted via PUT/DELETE — those
+    endpoints reject non-positive ids). The Voice tab uses the
+    presence of any ``kind='tts'`` row to suppress its "no TTS"
+    banner; this entry makes that check naturally pass when Piper is
+    available.
+    """
+    from openagent.channels import tts_local
+
+    voice = tts_local._resolve_voice_name(None)
+    return {
+        "id": -1,
+        "synthetic": True,
+        "provider_id": -1,
+        "provider_name": "(local)",
+        "framework": "local",
+        "kind": "tts",
+        "runtime_id": f"piper:{voice}",
+        "model": "piper",
+        "display_name": f"(local) Piper · {voice}",
+        "tier_hint": "Bundled offline TTS — auto-downloads ~25 MB on first use",
+        "enabled": True,
+        "is_classifier": False,
+        "provider_enabled": True,
+        "metadata": {"local": True, "voice_id": voice, "voice_id_source": "default"},
+        "created_at": None,
+        "updated_at": None,
+        "input_cost_per_million": 0.0,
+        "output_cost_per_million": 0.0,
     }
 
 
@@ -117,8 +173,13 @@ async def handle_list_db(request: web.Request) -> web.Response:
       - ``provider_id`` (int) — filter to a single provider row
       - ``framework`` (``agno`` / ``claude-cli``) — filter by framework
       - ``enabled_only`` (bool) — skip disabled model rows
+
+    When Piper is importable AND no kind='tts' row exists yet, a
+    synthetic local-Piper TTS row is appended so the Voice tab knows
+    there's a working backend even before the user adds a cloud row.
     """
     from aiohttp import web as _web
+    from openagent.channels import tts_local
 
     db = _db(request)
     if db is None:
@@ -138,7 +199,23 @@ async def handle_list_db(request: web.Request) -> web.Response:
         framework=framework,
         provider_id=provider_id,
     )
-    return _web.json_response({"models": [_shape_model(r) for r in rows]})
+    shaped = [_shape_model(r) for r in rows]
+
+    # Append the synthetic Piper row only when no real TTS row exists
+    # AND no provider/framework filter is in play (those filters
+    # implicitly target a specific real provider, where the synthetic
+    # entry would be confusing). Skip when piper isn't installed —
+    # ``resolve_tts_provider`` would fall through to text-only anyway,
+    # so don't lie to the UI about audio availability.
+    if (
+        provider_id is None
+        and framework is None
+        and tts_local.is_available()
+        and not any(m.get("kind") == "tts" for m in shaped)
+    ):
+        shaped.append(_synthetic_piper_row())
+
+    return _web.json_response({"models": shaped})
 
 
 async def handle_get_db(request: web.Request) -> web.Response:
@@ -171,6 +248,9 @@ async def handle_create_db(request: web.Request) -> web.Response:
         provider_id = int(provider_id_raw)
     except (TypeError, ValueError):
         return _web.json_response({"error": "provider_id must be an integer"}, status=400)
+    kind = (body.get("kind") or "llm").strip()
+    if kind not in ("llm", "tts", "stt"):
+        return _web.json_response({"error": "kind must be llm/tts/stt"}, status=400)
     try:
         mid = await db.upsert_model(
             provider_id=provider_id,
@@ -180,6 +260,7 @@ async def handle_create_db(request: web.Request) -> web.Response:
             enabled=bool(body.get("enabled", True)),
             is_classifier=bool(body.get("is_classifier", False)),
             metadata=body.get("metadata") or None,
+            kind=kind,
         )
     except ValueError as e:
         return _web.json_response({"error": str(e)}, status=400)
@@ -220,6 +301,7 @@ async def handle_update_db(request: web.Request) -> web.Response:
                 else bool(existing.get("is_classifier", False))
             ),
             metadata=body.get("metadata", existing.get("metadata") or None),
+            kind=existing.get("kind", "llm"),
         )
     except ValueError as e:
         return _web.json_response({"error": str(e)}, status=400)
@@ -300,7 +382,8 @@ async def handle_available_models(request: web.Request) -> web.Response:
         # Back-compat: ``?provider=openai`` without framework. If the user
         # has multiple rows under this name, pick the first (stable by id).
         candidates = [
-            p for p in await db.list_providers() if p["name"] == provider_name_q
+            p for p in await db.list_providers(kind="llm")
+            if p["name"] == provider_name_q
         ]
         if not candidates:
             return _web.json_response({"error": f"no provider named {provider_name_q!r}"}, status=404)

@@ -18,6 +18,26 @@ from openagent.core.logging import elog
 logger = logging.getLogger(__name__)
 
 
+def _format_run_error(e: BaseException) -> str:
+    """Produce a chat-renderable error string for any agent-run failure.
+
+    Two shapes:
+      - ``AgnoProviderError`` carries an already-clean provider message
+        (e.g. "API status error from OpenAI API: 403 - You are not
+        allowed to sample from this model"). Prefix with a stable
+        marker so bridges and the app can detect it as an error and
+        style it accordingly.
+      - Anything else falls back to ``Error: <ClassName>: <repr>`` so
+        the user sees *something* even on novel exception types.
+    """
+    from openagent.models.agno_provider import AgnoProviderError
+
+    if isinstance(e, AgnoProviderError):
+        return f"⚠️ Model provider error\n\n{e}"
+    msg = str(e) or repr(e)
+    return f"⚠️ {type(e).__name__}: {msg}" if msg else f"⚠️ {type(e).__name__}"
+
+
 def _format_shell_reminder(events) -> str:
     """Format terminal shell events into a <system-reminder> block."""
     lines = ["Background shell status update since your last message:"]
@@ -38,6 +58,61 @@ def _format_shell_reminder(events) -> str:
     )
     body = "\n".join(lines)
     return f"<system-reminder>\n{body}\n</system-reminder>"
+
+
+_VAULT_WRITE_TOOLS = frozenset({
+    "vault_write_note",
+    "vault_patch_note",
+    "vault_update_frontmatter",
+    "vault_delete_note",
+    "vault_move_note",
+    "vault_manage_tags",
+})
+
+_VAULT_READ_TOOLS = frozenset({
+    "vault_read_note",
+    "vault_read_multiple_notes",
+    "vault_search_notes",
+    "vault_list_notes",
+    "vault_get_frontmatter",
+    "vault_list_all_tags",
+    "vault_get_vault_stats",
+    "vault_get_backlinks",
+})
+
+
+def _emit_tool_call_summary(
+    response: Any, *, session_id: str | None, iter_count: int,
+) -> None:
+    """Log per-iteration tool call breakdown to events.jsonl.
+
+    Used to measure how often the agent actually writes to the vault, so
+    prompt tweaks can be evaluated against a numeric baseline. Best-effort:
+    silently no-ops when the provider didn't populate ``tool_names_called``.
+    """
+    tool_names = list(getattr(response, "tool_names_called", None) or [])
+    if not tool_names:
+        return
+    by_server: dict[str, int] = {}
+    vault_writes = 0
+    vault_reads = 0
+    for name in tool_names:
+        server = name.split("_", 1)[0] if "_" in name else name
+        by_server[server] = by_server.get(server, 0) + 1
+        if name in _VAULT_WRITE_TOOLS:
+            vault_writes += 1
+        elif name in _VAULT_READ_TOOLS:
+            vault_reads += 1
+    elog(
+        "agent.turn.tool_calls",
+        session_id=session_id,
+        iter=iter_count,
+        by_server=by_server,
+        vault_writes=vault_writes,
+        vault_reads=vault_reads,
+        total=len(tool_names),
+    )
+
 
 # Status callback type: async def on_status(status: str) -> None
 StatusCallback = Callable[[str], Awaitable[None]]
@@ -377,11 +452,46 @@ class Agent:
                 await _fetch_openrouter_catalog()
             except Exception as exc:  # noqa: BLE001
                 elog("openrouter.prefetch_error", level="warning", error=str(exc))
+
+        # Warm the local Whisper model in the background so the first
+        # voice-tab utterance doesn't pay the 60s+ download/load tax
+        # (small ≈ 464 MB; ~10s cold-load even when cached locally).
+        # By the time the user records anything, the model is in RAM.
+        # Errors swallowed — transcribe() lazy-loads as a fallback.
+        async def _prime_whisper() -> None:
+            try:
+                from openagent.channels.voice import _load_local_model
+                await _load_local_model()
+                elog("whisper.prefetch_done")
+            except Exception as exc:  # noqa: BLE001
+                elog("whisper.prefetch_error", level="warning", error=str(exc))
+
+        # Same idea for Piper: cold-load is ~10s for the ONNX model
+        # plus a one-time ~25 MB voice-file download. Prefetch so the
+        # first reply doesn't sit silent for 12s before audio plays.
+        async def _prime_piper() -> None:
+            try:
+                from openagent.channels import tts_local
+                if not tts_local.is_available():
+                    return
+                # Resolve to the configured default voice and load it.
+                # ``_load_voice`` is the exact path synth uses, so a
+                # successful prefetch guarantees the next synth is warm.
+                voice = tts_local._resolve_voice_name(None)
+                loaded = await tts_local._load_voice(voice)
+                if loaded is not None:
+                    elog("piper.prefetch_done", voice=voice)
+            except Exception as exc:  # noqa: BLE001
+                elog("piper.prefetch_error", level="warning", error=str(exc))
+
         try:
-            asyncio.get_running_loop().create_task(_prime_openrouter())
+            loop = asyncio.get_running_loop()
+            loop.create_task(_prime_openrouter())
+            loop.create_task(_prime_whisper())
+            loop.create_task(_prime_piper())
         except RuntimeError:
-            # No running loop (sync entry point) — skip; discovery will
-            # lazily populate on the first /api/models/available call.
+            # No running loop (sync entry point) — skip; all three
+            # backends lazy-load on first request.
             pass
 
         self._initialized = True
@@ -610,7 +720,7 @@ class Agent:
                 error_type=type(e).__name__,
                 error=str(e) or repr(e),
             )
-            return f"Error: {type(e).__name__}: {e}" if str(e) else f"Error: {type(e).__name__}"
+            return _format_run_error(e)
 
     async def _run_inner(
         self,
@@ -719,6 +829,10 @@ class Agent:
 
                 last_response = response
 
+                _emit_tool_call_summary(
+                    response, session_id=session_id, iter_count=iter_count,
+                )
+
                 events = hub.drain(session_id)
                 if not events:
                     if not hub.has_running(session_id):
@@ -748,8 +862,323 @@ class Agent:
         )
         return (last_response.content if last_response else "") or "(Done — no final message was returned.)"
 
+    async def run_stream(
+        self,
+        message: str,
+        user_id: str = "",
+        session_id: str | None = None,
+        attachments: list[dict] | None = None,
+        on_status: StatusCallback | None = None,
+        model_override: BaseModel | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Streaming sibling of :meth:`run` for voice-mode replies.
+
+        Yields events as plain dicts so the gateway/orchestrator can
+        consume them without import gymnastics:
+
+        - ``{"kind": "delta", "text": "..."}`` — incremental text from
+          the LLM. Feed this to a sentence chunker → TTS pipeline.
+        - ``{"kind": "iteration_break"}`` — emitted between autoloop
+          iterations (a tool finished and the agent re-enters
+          ``model.stream`` with a shell-reminder). The chunker should
+          ``flush()`` here so a sentence split by a tool call isn't
+          re-narrated. (Risk #1 in the voice-chat plan.)
+        - ``{"kind": "done", "text": "<full text>"}`` — final event with
+          the assembled response text (post-marker-strip is up to the
+          caller; we just emit raw text).
+
+        Cancellation propagates exactly like :meth:`run`: a
+        ``CancelledError`` from the model layer is logged and re-raised.
+        """
+        if not self.model:
+            raise RuntimeError("No model configured. Set agent.model before calling run_stream().")
+
+        await self.initialize()
+        self._prepare_model_runtime(model_override)
+        self._ensure_idle_cleanup_task()
+
+        async def _status(msg: str) -> None:
+            if on_status:
+                try:
+                    await on_status(msg)
+                except Exception:
+                    pass
+
+        elog(
+            "agent.run_stream.start",
+            agent=self.name,
+            user_id=user_id,
+            session_id=session_id,
+            model_class=type(model_override or self.model).__name__,
+            attachments=len(attachments or []),
+        )
+
+        try:
+            async for event in self._run_inner_stream(
+                message, attachments, _status,
+                session_id=session_id, model_override=model_override,
+            ):
+                yield event
+        except asyncio.CancelledError:
+            elog(
+                "agent.run_stream.cancelled",
+                agent=self.name,
+                user_id=user_id,
+                session_id=session_id,
+            )
+            raise
+        # ``Exception`` (not ``BaseException``) so we don't catch
+        # ``GeneratorExit`` — that's how Python tells us the consumer
+        # stopped iterating early (the orchestrator's ``break`` after a
+        # ``done`` event triggers ``aclose`` → ``GeneratorExit`` here).
+        # Catching it and yielding from the cleanup path is illegal —
+        # Python raises ``RuntimeError("async generator ignored
+        # GeneratorExit")`` and asyncio leaves the cleanup task
+        # un-retrieved. Letting it propagate is the right thing.
+        except Exception as e:
+            elog(
+                "agent.run_stream.error",
+                level="error",
+                exc_info=True,
+                agent=self.name,
+                user_id=user_id,
+                session_id=session_id,
+                error_type=type(e).__name__,
+                error=str(e) or repr(e),
+            )
+            yield {"kind": "done", "text": _format_run_error(e)}
+
+    async def _run_inner_stream(
+        self,
+        message: str,
+        attachments: list[dict] | None,
+        _status,
+        session_id: str | None = None,
+        model_override: BaseModel | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Streaming variant of :meth:`_run_inner`.
+
+        Mirrors the autoloop logic line-for-line but calls
+        ``active_model.stream(...)`` instead of ``generate(...)``.
+        Providers that don't override ``stream`` fall back to a single
+        post-hoc yield via ``BaseModel.stream`` — voice-chat still works,
+        just without the time-to-first-audio win.
+        """
+        await _status("Loading context...")
+        system = self._combined_system_prompt(session_id=session_id)
+
+        if attachments:
+            files_info: list[str] = []
+            for a in attachments:
+                a_type = a.get("type", "file")
+                a_name = a.get("filename", "")
+                a_path = a.get("path", "")
+                if a_path:
+                    files_info.append(f"- {a_type}: {a_name} — local path: {a_path}")
+                else:
+                    files_info.append(f"- {a_type}: {a_name}")
+            message = prepend_context_block(
+                message,
+                build_attachment_context(
+                    files_info,
+                    read_hint=(
+                        "Use the Read tool (or an MCP tool) with the local path to inspect each file. "
+                        "For images, Read returns the image content for you to see directly."
+                    ),
+                ),
+            )
+
+        from openagent.mcp.servers.shell.handlers import get_hub
+        from openagent.mcp.servers.shell.adapters import set_session_context, reset_session_context
+        from openagent.core.config import shell_settings
+
+        hub = get_hub()
+        settings = shell_settings(getattr(self, "config", None) or {})
+        wake_window = settings.wake_wait_window_seconds
+        cap = settings.autoloop_cap
+
+        active_model = self._acquire_model_slot(model_override or self.model)
+
+        current_input = message
+        accumulated: list[str] = []
+        iter_count = 0
+
+        pending = hub.drain(session_id)
+        if pending:
+            pre = _format_shell_reminder(pending)
+            current_input = f"{pre}\n\n{current_input}"
+
+        # When the streaming autoloop yields zero deltas (claude_cli
+        # tool-only turns, smart_router → claude_cli with empty content,
+        # agno when no RunContentEvent fires), we fall back to a
+        # one-shot generate() so callers always receive text. The real
+        # ModelResponse from that call wins for last_response_meta()
+        # over the synthetic placeholder.
+        fallback_response: ModelResponse | None = None
+        try:
+            while True:
+                iter_count += 1
+                if iter_count > cap:
+                    elog("agent.run_stream.autoloop_cap_hit",
+                         session_id=session_id, cap=cap)
+                    break
+
+                messages: list[dict[str, Any]] = [{"role": "user", "content": current_input}]
+                await _status("Thinking...")
+
+                token = set_session_context(session_id)
+                try:
+                    # Pass session_id and on_status so SmartRouter.stream
+                    # can run the same classifier + binding logic that
+                    # ``generate`` uses. Without these, voice turns would
+                    # route to "first enabled agno model" instead of the
+                    # session's bound side, which 403'd on users whose
+                    # first agno model was an OpenAI model their key
+                    # couldn't access.
+                    stream_kwargs: dict[str, Any] = {"system": system}
+                    try:
+                        # Older provider implementations don't accept
+                        # session_id / on_status — fall back gracefully.
+                        async for delta in active_model.stream(
+                            messages,
+                            session_id=session_id,
+                            on_status=_status,
+                            **stream_kwargs,
+                        ):
+                            if not delta:
+                                continue
+                            accumulated.append(delta)
+                            yield {"kind": "delta", "text": delta}
+                    except TypeError:
+                        async for delta in active_model.stream(
+                            messages, **stream_kwargs,
+                        ):
+                            if not delta:
+                                continue
+                            accumulated.append(delta)
+                            yield {"kind": "delta", "text": delta}
+                finally:
+                    reset_session_context(token)
+
+                events = hub.drain(session_id)
+                if not events:
+                    if not hub.has_running(session_id):
+                        break
+                    if wake_window > 0:
+                        events = await hub.wait(session_id, timeout=wake_window)
+                    if not events:
+                        break
+
+                # Force-flush any in-progress sentence before re-entering the
+                # model — a sentence split by a tool call must not be
+                # re-narrated. Risk #1 from the voice-chat plan.
+                yield {"kind": "iteration_break"}
+
+                elog(
+                    "agent.run_stream.autoloop_iter",
+                    session_id=session_id, iter=iter_count, events=len(events),
+                )
+                current_input = _format_shell_reminder(events)
+
+            # Empty-stream safety net: some providers emit zero deltas
+            # for tool-only turns, empty completions, or non-streamable
+            # backends (claude-cli through smart_router). Without this
+            # fallback voice mode (and the soon-to-be-streaming web
+            # chat) would surface a confusing "(no output)" message
+            # while ``Agent.run()`` worked fine for the same prompt.
+            if not accumulated:
+                elog(
+                    "agent.run_stream.fallback_to_generate",
+                    session_id=session_id,
+                    reason="no_deltas_yielded",
+                )
+                try:
+                    fallback_response = await active_model.generate(
+                        [{"role": "user", "content": message}],
+                        system=system,
+                        tools=None,
+                    )
+                    _emit_tool_call_summary(
+                        fallback_response,
+                        session_id=session_id,
+                        iter_count=iter_count,
+                    )
+                    fallback_text = (fallback_response.content or "").strip()
+                    if fallback_text:
+                        accumulated.append(fallback_text)
+                        # Yield as a final delta so SentenceChunker /
+                        # TTS / streaming clients see it the same way
+                        # they would a normal delta.
+                        yield {"kind": "delta", "text": fallback_text}
+                except Exception as e:  # noqa: BLE001 — surface in log, return empty
+                    fallback_response = None
+                    elog(
+                        "agent.run_stream.generate_fallback_failed",
+                        level="warning",
+                        session_id=session_id,
+                        error_type=type(e).__name__,
+                        error=str(e) or repr(e),
+                    )
+        finally:
+            self._release_model_slot(active_model)
+
+        full_text = "".join(accumulated)
+        # Prefer the real ModelResponse from the generate() fallback so
+        # last_response_meta() has accurate model + usage. Otherwise
+        # synthesize a minimal stand-in from the accumulated text and
+        # the *effective* model id — for SmartRouter this is the
+        # runtime actually picked for the session, not a generic
+        # instance attribute. ``getattr(active_model, "model_name",
+        # None)`` (the previous code) returned ``None`` for every
+        # provider in tree (claude_cli/agno expose ``self.model``;
+        # SmartRouter exposes neither), which silently dropped the
+        # model badge from the chat UI after the streaming migration.
+        # ``effective_model_id`` is the provider-aware accessor.
+        if fallback_response is not None:
+            self._store_response_meta(session_id, fallback_response)
+        else:
+            model_id = active_model.effective_model_id(session_id)
+            synthetic = ModelResponse(content=full_text, model=model_id)
+            self._store_response_meta(session_id, synthetic)
+        elog(
+            "agent.run_stream.done",
+            agent=self.name,
+            session_id=session_id,
+            model_class=type(active_model).__name__,
+            response_len=len(full_text),
+            used_fallback=fallback_response is not None,
+        )
+        yield {"kind": "done", "text": full_text}
+
+    def _resolve_vault_path(self) -> str:
+        """Return the on-disk path the vault MCP is actually using.
+
+        Mirrors the gateway's resolution order
+        ([openagent/gateway/api/vault.py]): a YAML-level
+        ``memory.vault_path`` override wins, otherwise falls back to
+        ``default_vault_path()`` (which already honours ``--agent-dir``
+        via the ``_agent_dir`` global in :mod:`openagent.core.paths`).
+        Returned as a string ready to splice into the framework prompt.
+        """
+        from pathlib import Path
+        from openagent.core.paths import default_vault_path
+
+        cfg_path = (
+            (self.config or {}).get("memory", {}).get("vault_path")
+        )
+        if cfg_path:
+            return str(Path(cfg_path).expanduser().resolve())
+        return str(default_vault_path())
+
     def _combined_system_prompt(self, session_id: str | None = None) -> str:
         """Concatenate the framework prompt with the user's project-specific one.
+
+        Substitutes ``{{OPENAGENT_VAULT_PATH}}`` in the framework prompt
+        with the resolved on-disk path so the agent sees the exact folder
+        it must use as memory (and can compare against any rogue path a
+        wrapper SDK might inject). Per-agent because each agent runs in
+        its own process with its own ``--agent-dir`` (and optional
+        ``memory.vault_path`` YAML override).
 
         When ``session_id`` is provided we append a ``<session-id>`` tag
         so the LLM can learn its own id and pass it to tools that
@@ -758,12 +1187,16 @@ class Agent:
         The tag is stripped of whitespace and comes last so project
         prompts read cleanly above it.
         """
+        framework = FRAMEWORK_SYSTEM_PROMPT.replace(
+            "{{OPENAGENT_VAULT_PATH}}", self._resolve_vault_path()
+        )
+
         user = (self.system_prompt or "").strip()
         if not user:
-            combined = FRAMEWORK_SYSTEM_PROMPT
+            combined = framework
         else:
             combined = (
-                FRAMEWORK_SYSTEM_PROMPT
+                framework
                 + "\n\n── User-specific identity and project context ──\n\n"
                 + user
             )

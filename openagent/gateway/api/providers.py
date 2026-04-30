@@ -38,6 +38,7 @@ def _shape_provider(row: dict[str, Any]) -> dict[str, Any]:
         "id": row["id"],
         "name": row["name"],
         "framework": row["framework"],
+        "kind": row.get("kind", "llm"),
         "base_url": row.get("base_url"),
         "enabled": bool(row.get("enabled", True)),
         "metadata": row.get("metadata") or {},
@@ -90,10 +91,16 @@ async def handle_get(request: web.Request) -> web.Response:
 
 
 async def handle_create(request: web.Request) -> web.Response:
-    """POST body: {name, framework, api_key?, base_url?, enabled?, metadata?}."""
+    """POST body: {name, framework, kind?, api_key?, base_url?, enabled?, metadata?}.
+
+    ``kind`` defaults to ``'llm'``. For audio providers (e.g. ElevenLabs)
+    pass ``kind='tts'`` and any framework string the schema accepts —
+    ``upsert_provider`` enforces the LLM whitelist only when ``kind='llm'``.
+    """
     from aiohttp import web as _web
     from openagent.core.logging import elog
     from openagent.memory.db import VALID_FRAMEWORKS
+    from openagent.models.catalog import LLM_FRAMEWORKS
 
     db = _db(request)
     if db is None:
@@ -101,9 +108,22 @@ async def handle_create(request: web.Request) -> web.Response:
     body = await request.json() if request.can_read_body else {}
     name = str(body.get("name") or "").strip()
     framework = str(body.get("framework") or "").strip()
+    kind = str(body.get("kind") or "llm").strip()
     if not name:
         return _web.json_response({"error": "name is required"}, status=400)
-    if framework not in VALID_FRAMEWORKS:
+    if kind not in ("llm", "tts", "stt"):
+        return _web.json_response(
+            {"error": "kind must be one of llm/tts/stt"},
+            status=400,
+        )
+    # LLM-kind rows are still gated by the historical whitelist; audio
+    # rows can use any framework the schema accepts.
+    if kind == "llm" and framework not in LLM_FRAMEWORKS:
+        return _web.json_response(
+            {"error": f"framework must be one of {list(LLM_FRAMEWORKS)} for kind='llm'"},
+            status=400,
+        )
+    if kind != "llm" and framework not in VALID_FRAMEWORKS:
         return _web.json_response(
             {"error": f"framework must be one of {list(VALID_FRAMEWORKS)}"},
             status=400,
@@ -116,10 +136,11 @@ async def handle_create(request: web.Request) -> web.Response:
             base_url=(body.get("base_url") or None),
             enabled=bool(body.get("enabled", True)),
             metadata=body.get("metadata") or None,
+            kind=kind,
         )
     except ValueError as e:
         return _web.json_response({"error": str(e)}, status=400)
-    elog("provider.created", provider_id=pid, name=name, framework=framework)
+    elog("provider.created", provider_id=pid, name=name, framework=framework, kind=kind)
     row = await db.get_provider(pid)
     return _web.json_response({"ok": True, "provider": _shape_provider(row)}, status=201)
 
@@ -147,6 +168,13 @@ async def handle_update(request: web.Request) -> web.Response:
             {"error": "framework is immutable; delete + recreate the provider instead"},
             status=400,
         )
+    # ``kind`` is also immutable — flipping a TTS row into LLM (or
+    # vice-versa) would make it visible to the wrong dispatcher.
+    if "kind" in body and body["kind"] != existing.get("kind", "llm"):
+        return _web.json_response(
+            {"error": "kind is immutable; delete + recreate the provider instead"},
+            status=400,
+        )
     try:
         await db.upsert_provider(
             name=body.get("name", existing["name"]),
@@ -155,6 +183,7 @@ async def handle_update(request: web.Request) -> web.Response:
             base_url=body.get("base_url", existing.get("base_url")),
             enabled=bool(body.get("enabled", existing.get("enabled", True))),
             metadata=body.get("metadata", existing.get("metadata") or None),
+            kind=existing.get("kind", "llm"),
         )
     except ValueError as e:
         return _web.json_response({"error": str(e)}, status=400)

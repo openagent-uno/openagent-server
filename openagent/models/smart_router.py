@@ -609,6 +609,18 @@ class SmartRouter(BaseModel):
         key = session_id or "__default__"
         return self._last_pick_by_session.get(key)
 
+    def effective_model_id(self, session_id: str | None = None) -> str | None:
+        """Return the runtime_id the router most recently dispatched to.
+
+        Override of :meth:`BaseModel.effective_model_id`. The router has
+        no single ``self.model`` — every turn picks fresh — so the
+        per-session ``_last_pick_by_session`` map is the canonical
+        record of "what generated the last reply". Falls back to
+        ``None`` (the chat UI's model badge just hides) when nothing
+        has been routed yet for this session.
+        """
+        return self._recall_pick(session_id)
+
     @staticmethod
     def _is_retryable_response(response: ModelResponse) -> bool:
         stop_reason = (response.stop_reason or "").strip().lower()
@@ -854,25 +866,74 @@ class SmartRouter(BaseModel):
         messages: list[dict[str, Any]],
         system: str | None = None,
         tools: list[dict[str, Any]] | None = None,
+        session_id: str | None = None,
+        on_status: Callable[[str], Awaitable[None]] | None = None,
     ) -> AsyncIterator[str]:
-        """Streaming path — agno-only (claude-cli isn't streamable here).
+        """Streaming path — uses the SAME routing as ``generate``.
 
-        Used by the REST smoke-test endpoint; the interactive turn
-        surface always goes through ``generate`` which handles both
-        sides. Picks the first enabled agno model from the catalog;
-        raises if no agno model is enabled since ``stream`` can't route
-        to claude-cli.
+        Voice mode (``agent.run_stream`` → ``active_model.stream``) flows
+        through here, so this MUST honour the classifier + session
+        binding instead of blindly picking "the first enabled agno
+        model" (which silently routed every voice turn to whichever
+        agno provider happened to come first in the catalog — almost
+        always not the model the user expected, and a 403/permission
+        landmine when that happened to be a model their key couldn't
+        access).
+
+        Resolution:
+
+          1. Get the same ``RoutingDecision`` as ``generate`` would —
+             session-bound side wins, otherwise classifier picks.
+          2. If the picked model is claude-cli, dispatch through
+             ``_dispatch`` (non-streaming) and yield the full text as
+             a single chunk. Claude CLI isn't token-streamable through
+             this surface; one-shot is the next-best thing and keeps
+             voice mode working with claude-cli sessions.
+          3. If the picked model is an agno model, stream from its
+             provider as before.
         """
-        model_id = ""
-        for entry in self._enabled_catalog(framework=FRAMEWORK_AGNO):
-            model_id = entry.runtime_id
-            break
-        # Fallback to the classifier only when it's an agno id — a
-        # claude-cli classifier isn't streamable through this path.
-        if not model_id and self._classifier_model and not is_claude_cli_model(self._classifier_model):
-            model_id = self._classifier_model
-        if not model_id:
-            raise RuntimeError("No agno model is enabled — streaming path unavailable")
-        provider = self._get_agno_provider(model_id)
+        decision = await self._routing_decision(messages, session_id)
+        if not decision.primary_model:
+            msg = (
+                f"No {decision.bound_framework} model available for this session."
+                if decision.bound_framework
+                else "No model is currently enabled."
+            )
+            elog(
+                "router.stream.error",
+                session_id=session_id,
+                reason=decision.reason,
+                bound_framework=decision.bound_framework,
+            )
+            yield msg
+            return
+
+        elog(
+            "router.stream.route",
+            session_id=session_id,
+            reason=decision.reason,
+            model=decision.primary_model,
+            bound_framework=decision.bound_framework,
+        )
+
+        runtime_id = decision.primary_model
+
+        if is_claude_cli_model(runtime_id):
+            # Claude CLI doesn't expose token-level streaming through
+            # this surface — fall back to ``_dispatch`` (which calls
+            # ``registry.generate``) and emit the whole text as one
+            # chunk. Voice's TTS sentence chunker still re-segments it
+            # into spoken sentences, so the user-perceived behaviour is
+            # the same minus the time-to-first-audio win.
+            resp = await self._dispatch(
+                runtime_id, messages, system, tools, on_status, session_id,
+            )
+            self._remember_pick(session_id, runtime_id)
+            if resp.content:
+                yield resp.content
+            return
+
+        provider = self._get_agno_provider(runtime_id)
+        self._remember_pick(session_id, runtime_id)
         async for chunk in provider.stream(messages, system=system, tools=tools):
             yield chunk

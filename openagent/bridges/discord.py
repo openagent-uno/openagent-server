@@ -136,6 +136,7 @@ class DiscordBridge(BaseBridge):
             # Process attachments
             blocked = []
             files_info = []
+            voice_detected = False
             tmp = tempfile.mkdtemp(prefix="oa_dc_")
             for att in message.attachments:
                 if is_blocked_attachment(att.filename):
@@ -147,7 +148,12 @@ class DiscordBridge(BaseBridge):
                 await att.save(path)
 
                 if is_voice:
-                    t = await transcribe_voice(path)
+                    voice_detected = True
+                    # Prefer the gateway's DB-routed STT; fall back to
+                    # local Whisper when offline / no provider configured.
+                    t = await self.transcribe_via_gateway(path)
+                    if not t:
+                        t = await transcribe_voice(path)
                     if t:
                         content = f"{content}\n{t}" if content else t
                     else:
@@ -168,13 +174,48 @@ class DiscordBridge(BaseBridge):
             session_id = f"dc:{uid}"
             status_msg = await message.channel.send("⏳ Thinking...")
 
+            # Discord allows ~5 message edits per 5 seconds — pick a
+            # ~750 ms throttle so the user gets ~6 progressive updates
+            # over a typical multi-second turn without tripping the
+            # rate limit.
+            DC_EDIT_THROTTLE_SECS = 0.75
+            accumulated_delta: list[str] = []
+            last_edit_at = [0.0]
+            delta_started = [False]
+
             async def on_status(status):
+                if delta_started[0]:
+                    return
                 try:
                     await status_msg.edit(content=f"⏳ {format_tool_status(status)}")
                 except Exception:
                     pass
 
-            response = await self.send_message(content, session_id, on_status=on_status)
+            async def on_delta(chunk: str):
+                if not chunk:
+                    return
+                accumulated_delta.append(chunk)
+                now = asyncio.get_event_loop().time()
+                if delta_started[0] and now - last_edit_at[0] < DC_EDIT_THROTTLE_SECS:
+                    return
+                delta_started[0] = True
+                last_edit_at[0] = now
+                preview = "".join(accumulated_delta)
+                # Cap at Discord's 2000-char message limit so a long
+                # stream doesn't 400 mid-edit; the trailing send loop
+                # handles overflow via split_preserving_code_blocks.
+                if len(preview) > DISCORD_MSG_LIMIT - 4:
+                    preview = preview[: DISCORD_MSG_LIMIT - 4] + "…"
+                try:
+                    await status_msg.edit(content=preview)
+                except Exception:
+                    pass
+
+            response = await self.send_message_streaming(
+                content, session_id,
+                on_status=on_status,
+                on_delta=on_delta,
+            )
 
             try:
                 await status_msg.delete()
@@ -182,6 +223,15 @@ class DiscordBridge(BaseBridge):
                 pass
 
             resp_text = response.get("text", "")
+
+            # Mirror the modality: if the user sent a voice note, try to
+            # synthesise the reply to OGG/Opus and surface it as a
+            # ``[VOICE:/path]`` attachment alongside the text.
+            if voice_detected and resp_text:
+                voice_marker = await self.synthesise_audio_attachment(resp_text)
+                if voice_marker:
+                    resp_text = f"{voice_marker}\n{resp_text}"
+
             clean, attachments = parse_response_markers(resp_text)
             clean = self.append_model_feedback(clean, response.get("model"))
 
