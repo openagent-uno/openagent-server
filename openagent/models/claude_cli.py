@@ -249,16 +249,26 @@ class ClaudeCLI(BaseModel):
         # so the existing ``streamed_text_parts`` accumulator + tool
         # block extraction keep working unchanged.
         opts["include_partial_messages"] = True
-        # Empty ``setting_sources`` isolates the OpenAgent agent from the
-        # user's personal Claude Code config (``~/.claude/settings.json``,
-        # any project ``.claude/settings.json``, local overrides). Without
-        # this, hooks defined in those files can inject parallel "memory"
-        # systems (e.g. Claude Code's auto-memory pointing at
-        # ``~/.claude/projects/<id>/memory/``) into the system prompt and
-        # the agent ends up writing notes to the wrong location instead of
-        # using the OpenAgent vault. OpenAgent owns the system prompt
-        # end-to-end via ``opts["system_prompt"]`` below.
+        # Disable Claude Code's user / project / local settings so the
+        # subprocess can't pull hook scripts, plugins (e.g.
+        # ``claude-md-management``), or MCP entries from
+        # ``~/.claude/settings.json``, ``.claude/settings.json``, or
+        # ``.claude/settings.local.json``. Anything in those files can
+        # inject competing memory systems, register MCPs that shadow
+        # OpenAgent's vault, or override our prompt.
+        #
+        # The dataclass field ``setting_sources=[]`` is by itself a
+        # silent no-op: the SDK transport gates emission on
+        # ``if self._options.setting_sources:`` (see
+        # ``claude_agent_sdk._internal.transport.subprocess_cli``), and
+        # an empty list is falsy, so ``--setting-sources`` is never
+        # emitted to the CLI and the binary loads the defaults. The
+        # only reliable knob is to pass the flag with an empty value
+        # through ``extra_args``, which goes straight onto argv. The
+        # field is kept set for static-typing intent and so a future
+        # SDK fix doesn't double-emit.
         opts["setting_sources"] = []
+        opts.setdefault("extra_args", {})["setting-sources"] = ""
         if self.mcp_servers:
             opts["mcp_servers"] = self.mcp_servers
             # ``--strict-mcp-config`` forces the claude binary to use ONLY

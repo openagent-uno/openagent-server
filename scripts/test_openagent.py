@@ -80,6 +80,8 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_agent_run_stream",
     # New DB-backed registry tests: pure CRUD against ctx.db_path, no pool.
     "test_db_mcps",
+    # Bootstrap MCP-row seeding: regression for the missing-vault bug.
+    "test_bootstrap",
     "test_db_models",
     "test_db_providers",
     "test_db_session_bindings",
