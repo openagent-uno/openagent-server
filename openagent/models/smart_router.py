@@ -884,13 +884,19 @@ class SmartRouter(BaseModel):
 
           1. Get the same ``RoutingDecision`` as ``generate`` would —
              session-bound side wins, otherwise classifier picks.
-          2. If the picked model is claude-cli, dispatch through
-             ``_dispatch`` (non-streaming) and yield the full text as
-             a single chunk. Claude CLI isn't token-streamable through
-             this surface; one-shot is the next-best thing and keeps
-             voice mode working with claude-cli sessions.
-          3. If the picked model is an agno model, stream from its
-             provider as before.
+          2. Whatever provider/registry handles the picked runtime, call
+             its ``stream`` method and forward the deltas. Both
+             :class:`ClaudeCLIRegistry` and :class:`AgnoProvider`
+             implement real token streaming now (the registry override
+             landed alongside this change; ``_dispatch`` to a one-shot
+             ``generate`` was the historical workaround that buffered
+             every claude-cli reply into a single chunk and capped the
+             TTS pipeline's time-to-first-audio at "full reply latency").
+
+        ``on_status`` is forwarded so tool-running statuses surface
+        during streamed turns; ``session_id`` is forwarded so per-session
+        SDK subprocesses (claude-cli) don't all collide on
+        ``"default"``.
         """
         decision = await self._routing_decision(messages, session_id)
         if not decision.primary_model:
@@ -917,23 +923,37 @@ class SmartRouter(BaseModel):
         )
 
         runtime_id = decision.primary_model
+        # Remember the pick BEFORE the stream starts so
+        # ``effective_model_id`` (read by Agent._run_inner_stream's
+        # synthetic ModelResponse) returns the right runtime even when
+        # the stream yields zero deltas — otherwise the chat UI's model
+        # badge would briefly disappear on tool-only turns.
+        self._remember_pick(session_id, runtime_id)
 
         if is_claude_cli_model(runtime_id):
-            # Claude CLI doesn't expose token-level streaming through
-            # this surface — fall back to ``_dispatch`` (which calls
-            # ``registry.generate``) and emit the whole text as one
-            # chunk. Voice's TTS sentence chunker still re-segments it
-            # into spoken sentences, so the user-perceived behaviour is
-            # the same minus the time-to-first-audio win.
-            resp = await self._dispatch(
-                runtime_id, messages, system, tools, on_status, session_id,
-            )
-            self._remember_pick(session_id, runtime_id)
-            if resp.content:
-                yield resp.content
+            registry = self._get_claude_registry()
+            async for chunk in registry.stream(
+                messages,
+                system=system,
+                tools=tools,
+                on_status=on_status,
+                session_id=session_id,
+                model_override=runtime_id,
+            ):
+                yield chunk
             return
 
         provider = self._get_agno_provider(runtime_id)
-        self._remember_pick(session_id, runtime_id)
-        async for chunk in provider.stream(messages, system=system, tools=tools):
+        # Forward session_id so each chat tab keeps its own Agno history
+        # — the previous default of "default" collided every concurrent
+        # stream. ``on_status`` is forwarded for parity with the
+        # claude-cli branch (Agno currently no-ops it but the contract
+        # matches).
+        async for chunk in provider.stream(
+            messages,
+            system=system,
+            tools=tools,
+            on_status=on_status,
+            session_id=session_id,
+        ):
             yield chunk

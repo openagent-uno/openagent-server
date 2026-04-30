@@ -21,6 +21,12 @@ logger = logging.getLogger(__name__)
 # Retry cooldown between bridge crashes.
 BRIDGE_RETRY_SECONDS = 30
 
+# Single shared fallback message when STT can't transcribe an inbound
+# voice note. Forks per bridge had cosmetically-different copy
+# ("Voice message not transcribed.", "Voice not transcribed.", etc.) —
+# unifying here so the user gets the same prompt across channels.
+VOICE_FALLBACK = "[Voice message could not be transcribed. Ask the user to type it.]"
+
 # No per-turn timeout. A runaway or legitimately-long turn is ended by the
 # user sending ``/stop`` (which routes to ``sessions.stop_current`` and cancels
 # the in-flight asyncio task — see openagent/gateway/server.py), or by
@@ -36,23 +42,16 @@ def format_tool_status(raw: str) -> str:
     Structured events look like: ``{"tool":"bash","status":"running",...}``
     Plain strings like ``"Thinking..."`` are returned unchanged.
     """
-    try:
-        data = json.loads(raw)
-        if not isinstance(data, dict) or "tool" not in data:
-            return raw
-    except (json.JSONDecodeError, TypeError):
+    from openagent.channels.base import parse_status_event
+    evt = parse_status_event(raw)
+    if evt is None:
         return raw
-
-    tool = data["tool"]
-    status = data.get("status", "running")
-
-    if status == "running":
-        return f"Using {tool}..."
-    if status == "error":
-        err = data.get("error", "unknown error")
-        return f"✗ {tool} failed: {err}"
-    # done
-    return f"✓ {tool} done"
+    if evt.status == "running":
+        return f"Using {evt.tool}..."
+    if evt.status == "error":
+        return f"✗ {evt.tool} failed: {evt.error or 'unknown error'}"
+    # done / anything else
+    return f"✓ {evt.tool} done"
 
 
 class BaseBridge:
@@ -72,11 +71,12 @@ class BaseBridge:
         self._command_future: asyncio.Future | None = None
         self._command_lock = asyncio.Lock()
         self._status_callbacks: dict[str, Callable] = {}  # session_id → on_status
-        # Per-session DELTA frame callback. Populated by
-        # ``send_message_streaming``; cleared on RESPONSE/ERROR alongside
-        # ``_status_callbacks`` so a slow/disconnected callback can't
-        # leak across sessions.
-        self._delta_callbacks: dict[str, Callable] = {}  # session_id → on_delta
+        # NOTE: there is no ``_delta_callbacks`` field. Bridges run in
+        # answer-response mode — the gateway streams deltas server-side
+        # (the web app consumes them), but bridges only forward the
+        # final ``RESPONSE`` text. If a future bridge wants progressive
+        # editing it can subclass and tap the WS directly; we don't
+        # carry dead infrastructure for a hypothetical caller.
         self._session_locks: dict[str, asyncio.Lock] = {}  # per-session serialization
 
     async def start(self) -> None:
@@ -120,7 +120,6 @@ class BaseBridge:
         orphaned = list(self._pending.items())
         self._pending.clear()
         self._status_callbacks.clear()
-        self._delta_callbacks.clear()
         for sid, future in orphaned:
             if not future.done():
                 future.set_result({"type": "error", "text": reason})
@@ -204,22 +203,17 @@ class BaseBridge:
                             await self._status_callbacks[sid](data.get("text", ""))
                         except Exception:
                             pass
-                    elif t == P.DELTA and sid in self._delta_callbacks:
-                        # Streaming token chunk for the in-flight turn.
-                        # Bridges that opted into streaming via
-                        # ``send_message_streaming`` get progressive
-                        # text; the trailing RESPONSE still resolves
-                        # the pending future with the canonical text.
-                        try:
-                            await self._delta_callbacks[sid](data.get("text", ""))
-                        except Exception:
-                            pass
+                    elif t == P.DELTA:
+                        # Bridges run in answer-response mode — the
+                        # gateway streams server-side but we wait for
+                        # the trailing RESPONSE to post one clean
+                        # message. Nothing to do per-delta here.
+                        pass
                     elif t == P.RESPONSE and sid in self._pending:
                         future = self._pending.pop(sid)
                         if not future.done():
                             future.set_result(data)
                         self._status_callbacks.pop(sid, None)
-                        self._delta_callbacks.pop(sid, None)
                     elif t == P.ERROR:
                         # Errors may or may not have a session_id.  Try to
                         # route to the matching pending future; if no match,
@@ -229,7 +223,6 @@ class BaseBridge:
                             if not future.done():
                                 future.set_result(data)
                             self._status_callbacks.pop(sid, None)
-                            self._delta_callbacks.pop(sid, None)
                     elif t == P.COMMAND_RESULT and self._command_future and not self._command_future.done():
                         self._command_future.set_result(data)
                         self._command_future = None
@@ -244,47 +237,29 @@ class BaseBridge:
         self,
         text: str,
         session_id: str,
-        on_status: Callable[[str], Awaitable[None]] | None = None,
-        *,
-        input_was_voice: bool = False,
-    ) -> dict:
-        """Send a message through the Gateway and wait for the response.
-
-        Thin wrapper around :meth:`send_message_streaming` that doesn't
-        request streaming deltas. Existing bridge code keeps working
-        unchanged — only callers that opt-in via
-        ``send_message_streaming`` get progressive text updates.
-        """
-        return await self.send_message_streaming(
-            text, session_id,
-            on_status=on_status,
-            on_delta=None,
-            input_was_voice=input_was_voice,
-        )
-
-    async def send_message_streaming(
-        self,
-        text: str,
-        session_id: str,
         *,
         on_status: Callable[[str], Awaitable[None]] | None = None,
-        on_delta: Callable[[str], Awaitable[None]] | None = None,
         input_was_voice: bool = False,
     ) -> dict:
-        """Send through the Gateway with optional streaming-delta callback.
+        """Send a message through the Gateway and wait for the canonical RESPONSE.
 
-        Per-session locking keeps only one message in-flight per user so a
-        second concurrent message doesn't clobber ``_pending[session_id]``.
-        The awaited future is resolved when the Gateway replies, cancelled
-        when the user issues ``/stop`` (see ``sessions.stop_current``), or
-        raised on gateway disconnect (``_resolve_orphaned_futures``). No
-        wall-clock timeout — long tool calls are the point.
+        The gateway streams the LLM reply server-side via DELTA frames
+        (the web app consumes them for typewriter UX), but bridges run
+        in answer-response mode — they post the FINAL clean text once
+        the trailing RESPONSE arrives. Per-session locking keeps only
+        one message in-flight per user so a second concurrent message
+        doesn't clobber ``_pending[session_id]``.
 
-        ``on_delta`` is invoked once per ``delta`` WS frame as tokens
-        arrive from the LLM. Bridges typically wrap it in a throttle
-        (Telegram caps message edits at ~1/sec) and call ``edit_text``
-        with the accumulated string. ``None`` (the default) skips
-        streaming entirely and matches today's behaviour exactly.
+        The awaited future is resolved when the Gateway replies,
+        cancelled when the user issues ``/stop`` (see
+        ``sessions.stop_current``), or raised on gateway disconnect
+        (``_resolve_orphaned_futures``). No wall-clock timeout — long
+        tool calls are the point.
+
+        ``on_status`` surfaces structured tool-call hints
+        ("Using bash…") to the channel via whatever the subclass wants
+        to do (Telegram edits the status message; Discord similarly;
+        WhatsApp posts new throttled chat bubbles).
 
         ``input_was_voice`` mirrors the modality: when True, the gateway
         invokes the streaming TTS pipeline so the reply is voice as well
@@ -297,8 +272,6 @@ class BaseBridge:
             self._pending[session_id] = future
             if on_status:
                 self._status_callbacks[session_id] = on_status
-            if on_delta:
-                self._delta_callbacks[session_id] = on_delta
 
             try:
                 payload = {
@@ -312,7 +285,6 @@ class BaseBridge:
             except Exception:
                 self._pending.pop(session_id, None)
                 self._status_callbacks.pop(session_id, None)
-                self._delta_callbacks.pop(session_id, None)
                 raise
 
             try:
@@ -322,7 +294,6 @@ class BaseBridge:
                 # on_response(), but cancellation (e.g. /stop) unwinds here.
                 self._pending.pop(session_id, None)
                 self._status_callbacks.pop(session_id, None)
-                self._delta_callbacks.pop(session_id, None)
 
     # ── Voice helpers (shared by every bridge) ──────────────────────
 
@@ -391,6 +362,19 @@ class BaseBridge:
             logger.debug("%s.stt.http_exc: %s", self.name, e)
             return None
 
+    async def transcribe_with_fallback(self, file_path: str) -> str:
+        """Transcribe ``file_path``: gateway STT first, local Whisper
+        fallback, ``VOICE_FALLBACK`` if both produce nothing.
+
+        Used by every bridge for inbound voice notes — keeps the
+        gateway-vs-local routing logic in one place.
+        """
+        from openagent.channels.voice import transcribe as transcribe_local
+        text = await self.transcribe_via_gateway(file_path)
+        if not text:
+            text = await transcribe_local(file_path)
+        return text or VOICE_FALLBACK
+
     async def synthesise_voice_reply(self, text: str) -> bytes | None:
         """POST text to ``/api/tts/synthesize`` and return the audio bytes."""
         import aiohttp
@@ -427,16 +411,51 @@ class BaseBridge:
         bubble. Acceptable for v1; switch to OGG-Opus output via
         LiteLLM's ``response_format='opus'`` and a tiny pure-Python OGG
         muxer if the voice-note UI matters later.
+
+        ``NamedTemporaryFile(delete=False)`` is used so the bridge can
+        finish uploading the file to the platform before deletion —
+        the platform sender unlinks it via ``parse_response_markers``-
+        driven cleanup once the message lands. (Earlier code used
+        ``mkdtemp`` per call with no cleanup, leaking one directory per
+        voice reply.)
         """
         import tempfile
         audio = await self.synthesise_voice_reply(text)
         if not audio:
             return None
-        tmp = tempfile.mkdtemp(prefix=f"oa_{self.name}_tts_")
-        mp3_path = f"{tmp}/reply.mp3"
-        with open(mp3_path, "wb") as f:
-            f.write(audio)
+        with tempfile.NamedTemporaryFile(
+            prefix=f"oa_{self.name}_tts_", suffix=".mp3", delete=False,
+        ) as fh:
+            fh.write(audio)
+            mp3_path = fh.name
         return f"[VOICE:{mp3_path}]"
+
+    async def maybe_prepend_voice_reply(
+        self, text: str, voice_detected: bool,
+    ) -> str:
+        """Mirror modality: voice-in → voice-out attachment.
+
+        When the inbound message was voice and we have a non-empty text
+        reply, synthesize the reply to MP3 and prepend the
+        ``[VOICE:/path]`` marker. Errors during synthesis are logged
+        and swallowed — the user still gets the text reply. Used by
+        every bridge so the voice-out logic lives in one place.
+        """
+        if not (voice_detected and text):
+            return text
+        try:
+            voice_marker = await self.synthesise_audio_attachment(text)
+        except Exception as e:  # noqa: BLE001 — never drop the text on synth failure
+            elog(
+                f"{self.name}.tts.error",
+                level="warning",
+                error_type=type(e).__name__,
+                error=str(e) or repr(e),
+            )
+            return text
+        if not voice_marker:
+            return text
+        return f"{voice_marker}\n{text}"
 
     async def send_command(self, name: str, session_id: str | None = None) -> str:
         """Send a command and wait for the result.

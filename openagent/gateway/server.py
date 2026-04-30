@@ -717,7 +717,7 @@ class Gateway:
                     # The client sets this when the inbound text came
                     # from voice (mic + ASR). The agent reply will be
                     # synthesised back to audio if a TTS provider is
-                    # configured. See VoiceTurnOrchestrator.
+                    # configured. See TurnRunner.
                     input_was_voice = bool(data.get("input_was_voice"))
                     # ISO-639-1 hint from the client — same code Whisper
                     # used for transcription. The voice pipeline forwards
@@ -725,21 +725,25 @@ class Gateway:
                     # spoken with an Italian voice instead of the default
                     # American one. ``None`` falls through to the default
                     # voice (today's behaviour for older clients).
-                    voice_language = data.get("voice_language")
-                    if isinstance(voice_language, str):
-                        voice_language = voice_language.strip().lower() or None
+                    # Wire format keeps ``voice_language`` for backward
+                    # compat with older universal-app builds; we use
+                    # ``language`` internally to match TurnRunner /
+                    # synthesize_stream / etc.
+                    language = data.get("voice_language")
+                    if isinstance(language, str):
+                        language = language.strip().lower() or None
                     else:
-                        voice_language = None
+                        language = None
                     if text:
                         sid = self.sessions.get_or_create_session(client_id, session_id)
 
                         async def handler(
                             _t=text, _s=sid, _c=client_id, _w=ws,
-                            _v=input_was_voice, _lang=voice_language,
+                            _v=input_was_voice, _lang=language,
                         ):
                             await self._process_message(
                                 _w, _c, _t, _s,
-                                input_was_voice=_v, voice_language=_lang,
+                                input_was_voice=_v, language=_lang,
                             )
 
                         pos = await self.sessions.enqueue(client_id, handler, session_id=sid)
@@ -916,7 +920,7 @@ class Gateway:
         session_id: str,
         *,
         input_was_voice: bool = False,
-        voice_language: str | None = None,
+        language: str | None = None,
     ) -> None:
         try:
             elog("message.received", client_id=client_id, session_id=session_id, length=len(text))
@@ -1010,101 +1014,48 @@ class Gateway:
                 model_class=type(active_model).__name__,
                 input_was_voice=input_was_voice,
             )
-            # Voice-mode reply: stream LLM → sentence chunker → ElevenLabs
-            # TTS → WS audio frames, then a trailing RESPONSE with the
-            # full text. Mirror-modality semantics (per the voice-chat
-            # plan): only voice-input messages get spoken replies.
-            if input_was_voice:
-                from openagent.gateway.voice_pipeline import VoiceTurnOrchestrator
-                orchestrator = VoiceTurnOrchestrator(
-                    self.agent,
-                    lambda payload: self._safe_ws_send_json(ws, payload),
-                )
-                try:
-                    summary = await orchestrator.run(
-                        text,
-                        client_id=client_id,
-                        session_id=session_id,
-                        on_status=on_status,
-                        language=voice_language,
-                    )
-                    elog(
-                        "message.voice_response",
-                        client_id=client_id,
-                        session_id=session_id,
-                        length=len(summary.get("text") or ""),
-                        audio_chunks=summary.get("audio_chunks") or 0,
-                    )
-                    # Coarse resource hints — same as the text path below.
-                    for resource in seen_resources:
-                        await self.broadcast_resource(resource, "changed")
-                    return
-                except asyncio.CancelledError:
-                    elog(
-                        "message.cancelled",
-                        client_id=client_id, session_id=session_id,
-                        reason="server_shutdown",
-                    )
-                    try:
-                        await self._safe_ws_send_json(ws, {
-                            "type": P.ERROR,
-                            "text": "Server is restarting, please try your message again in a moment.",
-                            "session_id": session_id,
-                        })
-                    except Exception:
-                        pass
-                    raise
-
-            # Text-mode reply: stream LLM deltas to the client as they
-            # arrive (typewriter UX) and finish with a canonical
-            # RESPONSE frame carrying the full text + attachments + meta.
-            # Mirrors the voice path's event loop but emits ``P.DELTA``
-            # in place of audio chunks. Older clients ignore unknown
-            # frame types and still see the trailing RESPONSE — fully
-            # backward-compatible.
-            accumulated: list[str] = []
-            stream_error: BaseException | None = None
+            # Both text and voice turns flow through the same runner.
+            # ``speak`` toggles the TTS sidecar; everything else (DELTA
+            # frames for typewriter UX + final RESPONSE with attachments
+            # + model meta) is unconditional. ``language`` is ignored
+            # when ``speak=False``.
+            from openagent.gateway.turn_runner import TurnRunner
+            runner = TurnRunner(
+                self.agent,
+                lambda payload: self._safe_ws_send_json(ws, payload),
+            )
             try:
-                async for event in self.agent.run_stream(
-                    message=text,
-                    user_id=client_id,
-                    session_id=session_id,
-                    on_status=on_status,
-                ):
-                    kind = event.get("kind")
-                    if kind == "delta":
-                        delta = event.get("text") or ""
-                        if not delta:
-                            continue
-                        accumulated.append(delta)
-                        try:
-                            await self._safe_ws_send_json(ws, {
-                                "type": P.DELTA,
-                                "text": delta,
-                                "session_id": session_id,
-                            })
-                        except Exception as e:  # noqa: BLE001 — WS dead mid-turn
-                            logger.debug("delta send failed: %s", e)
-                    elif kind == "done":
-                        # The stream's terminal event. ``run_stream``
-                        # always emits one; if it carries text and we
-                        # somehow accumulated nothing, fall back to it
-                        # (parity with voice_pipeline's safety net).
-                        done_text = event.get("text") or ""
-                        if done_text and not accumulated:
-                            accumulated.append(done_text)
-                        break
-                    # ``iteration_break`` is purely a TTS chunker hint —
-                    # text clients have nothing to do with it.
-            except asyncio.CancelledError:
-                # Server is shutting down (restart for config update, launchd
-                # stop, etc.). Send a user-facing message so the client knows
-                # it wasn't a silent failure, log the cancellation, and
-                # re-raise so the surrounding cancel scope propagates.
-                elog(
-                    "message.cancelled",
+                summary = await runner.run(
+                    text,
                     client_id=client_id,
                     session_id=session_id,
+                    speak=input_was_voice,
+                    on_status=on_status,
+                    language=language,
+                )
+                elog(
+                    "message.response",
+                    client_id=client_id,
+                    session_id=session_id,
+                    length=len(summary.get("text") or ""),
+                    audio_chunks=summary.get("audio_chunks") or 0,
+                    speak=input_was_voice,
+                )
+                # Coarse resource hints based on which MCP families were
+                # used this turn. Sent after RESPONSE so the client first
+                # sees the answer, then refreshes any list it's showing.
+                # Skipped when nothing relevant ran — idle chats stay
+                # noise-free.
+                for resource in seen_resources:
+                    await self.broadcast_resource(resource, "changed")
+            except asyncio.CancelledError:
+                # Server shutdown (restart for config update, launchd
+                # stop, etc.). Tell the client it wasn't a silent
+                # failure, log it, then re-raise so the surrounding
+                # cancel scope propagates.
+                elog(
+                    "message.cancelled",
+                    client_id=client_id, session_id=session_id,
                     reason="server_shutdown",
                 )
                 try:
@@ -1116,46 +1067,6 @@ class Gateway:
                 except Exception:
                     pass  # WS may already be half-closed
                 raise
-            except Exception as e:  # noqa: BLE001 — surface to client as text + log
-                stream_error = e
-                logger.warning("text stream failed mid-turn: %s", e)
-                elog(
-                    "message.stream_error",
-                    level="warning",
-                    client_id=client_id,
-                    session_id=session_id,
-                    error_type=type(e).__name__,
-                    error=str(e) or repr(e),
-                )
-
-            response = "".join(accumulated)
-            if not response and stream_error is not None:
-                # Mid-stream failure with nothing accumulated: surface
-                # the exception in the RESPONSE rather than as a bare
-                # ERROR frame (older clients route ERROR globally and
-                # might miss the originating session).
-                response = f"Error: {stream_error}"
-
-            from openagent.channels.base import parse_response_markers
-            clean, attachments = parse_response_markers(response)
-            att_list = [{"type": a.type, "path": a.path, "filename": a.filename} for a in attachments]
-            response_meta = self.agent.last_response_meta(session_id)
-
-            elog("message.response", client_id=client_id, session_id=session_id, length=len(clean))
-            await self._safe_ws_send_json(ws, {
-                "type": P.RESPONSE,
-                "text": clean,
-                "session_id": session_id,
-                "attachments": att_list or None,
-                "model": response_meta.get("model"),
-            })
-
-            # Coarse resource hints based on which MCP families were used
-            # this turn. Sent after RESPONSE so the client first sees the
-            # answer, then refreshes any list it's showing. Skipped when
-            # nothing relevant ran — keeps idle chats noise-free.
-            for resource in seen_resources:
-                await self.broadcast_resource(resource, "changed")
         except asyncio.CancelledError:
             raise  # already handled above or a separate cancel scope
         except Exception as e:

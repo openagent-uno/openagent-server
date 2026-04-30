@@ -56,10 +56,6 @@ class _FakeBridge:
         self._real = BaseBridge.__new__(BaseBridge)
         self._real._pending = {}
         self._real._status_callbacks = {}
-        # Mirror the new map added when bridges learned to consume DELTA
-        # frames. Without this, ``send_message_streaming``'s cleanup
-        # path raises AttributeError.
-        self._real._delta_callbacks = {}
         self._real._session_locks = {}
         self._real._ws = object()  # non-None bypasses the "not connected" guard
         self._sent: list[dict] = []
@@ -72,16 +68,9 @@ class _FakeBridge:
     def future_for(self, sid: str):
         return self._real._pending[sid]
 
-    async def send(self, text: str, sid: str):
-        return await self._real.send_message(text=text, session_id=sid)
-
-    async def send_streaming(
-        self, text: str, sid: str,
-        *, on_delta=None, on_status=None,
-    ):
-        return await self._real.send_message_streaming(
-            text=text, session_id=sid,
-            on_delta=on_delta, on_status=on_status,
+    async def send(self, text: str, sid: str, *, on_status=None):
+        return await self._real.send_message(
+            text=text, session_id=sid, on_status=on_status,
         )
 
 
@@ -286,7 +275,6 @@ def _fresh_telegram_bridge():
     # touches after the freshness check.
     bridge._pending = {}
     bridge._status_callbacks = {}
-    bridge._delta_callbacks = {}  # required by send_message_streaming cleanup
     bridge._session_locks = {}
     return bridge
 
@@ -301,11 +289,11 @@ async def t_telegram_duplicate_update_rejected(ctx: TestContext) -> None:
         sent.append((text, session_id))
         return {"text": "ok"}
 
-    # Telegram migrated to send_message_streaming (with on_delta for
-    # progressive edits); intercept that. Keep send_message stubbed
-    # too so any legacy code path also routes here.
+    # Telegram (and every other bridge) now uses send_message — the
+    # short-lived ``send_message_streaming`` API was retired when
+    # bridges dropped progressive in-message edits. Intercept the
+    # single canonical entry point.
     bridge.send_message = _fake_send  # type: ignore[assignment]
-    bridge.send_message_streaming = _fake_send  # type: ignore[assignment]
 
     u1 = _FakeTgUpdate(update_id=1001, text="hello")
     assert bridge._is_fresh_update(u1), "first sight must be fresh"

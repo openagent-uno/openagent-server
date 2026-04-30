@@ -237,6 +237,18 @@ class ClaudeCLI(BaseModel):
         from claude_agent_sdk import ClaudeAgentOptions
 
         opts: dict[str, Any] = {"permission_mode": "bypassPermissions"}
+        # Token-level streaming. Without this the SDK only emits one
+        # ``AssistantMessage`` at the END of each block carrying the
+        # entire reply — voice mode gets the whole text in a single
+        # ``on_delta`` call, the SentenceChunker buffers it, and the
+        # user hears nothing until the LLM finishes. With it set we
+        # ALSO get ``StreamEvent`` objects carrying the raw Anthropic
+        # ``content_block_delta`` events, which is what ``_run_once``
+        # uses to fire ``on_delta`` per token. The trailing
+        # ``AssistantMessage`` still arrives as the canonical record
+        # so the existing ``streamed_text_parts`` accumulator + tool
+        # block extraction keep working unchanged.
+        opts["include_partial_messages"] = True
         # Empty ``setting_sources`` isolates the OpenAgent agent from the
         # user's personal Claude Code config (``~/.claude/settings.json``,
         # any project ``.claude/settings.json``, local overrides). Without
@@ -693,6 +705,15 @@ class ClaudeCLI(BaseModel):
         """
         from claude_agent_sdk import AssistantMessage, ResultMessage, UserMessage
 
+        # ``StreamEvent`` only exists in claude-agent-sdk >= 0.1.x with
+        # partial-message support. Import behind a try so older SDKs
+        # still load — without StreamEvent the loop falls back to
+        # block-level on_delta calls (which is what shipped before).
+        try:
+            from claude_agent_sdk import StreamEvent  # type: ignore
+        except ImportError:  # pragma: no cover — old SDK
+            StreamEvent = None  # type: ignore
+
         await client.query(prompt, session_id=session_id)
         elog("claude_cli.stream_start", session_id=session_id)
         streamed_text_parts: list[str] = []
@@ -708,8 +729,37 @@ class ClaudeCLI(BaseModel):
         # ``_model_id_for_response`` both see the same value.
         session = self._sessions.get(session_id)
         sdk_reported_logged = False
+        # Track whether the current AssistantMessage's content blocks
+        # already received per-token deltas via StreamEvent, so the
+        # block-level handler doesn't double-fire on_delta.
+        # ``include_partial_messages=True`` (set in ``_build_options``)
+        # is what makes the SDK emit StreamEvents in the first place.
+        partials_for_current_block = 0
 
         async for message in client.receive_response():
+            # Per-token deltas — fire ``on_delta`` the moment the SDK
+            # forwards a ``content_block_delta`` from the Anthropic
+            # API. Without this the user only sees streaming once the
+            # whole message block is done, which on long replies looks
+            # exactly like no streaming at all.
+            if StreamEvent is not None and isinstance(message, StreamEvent):
+                event = message.event or {}
+                etype = event.get("type")
+                if etype == "content_block_start":
+                    # Reset the partials counter so the AssistantMessage
+                    # handler can re-evaluate its block-level fallback.
+                    partials_for_current_block = 0
+                elif etype == "content_block_delta":
+                    delta = event.get("delta") or {}
+                    if delta.get("type") == "text_delta":
+                        text = delta.get("text") or ""
+                        if text and on_delta is not None:
+                            partials_for_current_block += len(text)
+                            try:
+                                await on_delta(text)
+                            except Exception:
+                                on_delta = None
+                continue
             if isinstance(message, AssistantMessage):
                 sdk_model = getattr(message, "model", None)
                 if sdk_model and not sdk_reported_logged:
@@ -728,7 +778,13 @@ class ClaudeCLI(BaseModel):
                     block_text = getattr(block, "text", None)
                     if isinstance(block_text, str) and block_text:
                         streamed_text_parts.append(block_text)
-                        if on_delta is not None:
+                        # Block-level fallback: only fire on_delta if no
+                        # partial events streamed this block already
+                        # (older SDK / partials disabled / first-use
+                        # before StreamEvent fired). Without the guard
+                        # we'd re-narrate the entire block on top of
+                        # the per-token stream, doubling the audio.
+                        if on_delta is not None and partials_for_current_block == 0:
                             try:
                                 await on_delta(block_text)
                             except Exception:
@@ -872,6 +928,9 @@ class ClaudeCLI(BaseModel):
         messages: list[dict[str, Any]],
         system: str | None = None,
         tools: list[dict[str, Any]] | None = None,
+        on_status: Callable[[str], Awaitable[None]] | None = None,
+        session_id: str | None = None,
+        model_override: str | None = None,
     ) -> AsyncIterator[str]:
         """Stream text deltas via the SDK's existing receive-response loop.
 
@@ -881,8 +940,31 @@ class ClaudeCLI(BaseModel):
         terminates and the orchestrator proceeds with whatever was
         emitted (likely empty), then the trailing ``RESPONSE`` text path
         carries the placeholder ``"(Done — no final message was returned.)"``.
+
+        ``session_id`` is required for any non-trivial use: each session
+        keeps its own SDK subprocess + resume state, and the historical
+        hardcoded ``"default"`` collided every concurrent voice turn.
+
+        ``on_status`` is forwarded to ``_run_once`` so tool-running
+        statuses surface to the WS during a streamed turn (the previous
+        implementation passed ``None``, swallowing every "Using X…"
+        update — visible in voice mode as silence between sentences).
+
+        ``model_override`` lets the caller pin a specific runtime id for
+        this turn, mirroring :meth:`generate` and the registry path so
+        SmartRouter's per-turn routing decision flows through unchanged.
         """
-        sid = "default"
+        sid = session_id or "default"
+
+        # Same model-resolution dance as generate(): an explicit override
+        # beats the instance default, normalise via model_id_from_runtime
+        # so dotted OpenRouter ids reach the SDK in the canonical form,
+        # update self.model BEFORE _ensure_session_model so the
+        # subprocess gets pinned to the right thing on first spawn.
+        requested_raw = model_override or self.model
+        if requested_raw:
+            self.model = model_id_from_runtime(requested_raw) or requested_raw
+
         prompt_parts: list[str] = []
         for msg in messages:
             role = msg.get("role", "user")
@@ -903,7 +985,10 @@ class ClaudeCLI(BaseModel):
             try:
                 client = await self._get_client(sid, system)
                 await self._ensure_session_model(sid, client, self.model)
-                await self._run_once(client, prompt, sid, on_status=None, on_delta=on_delta)
+                await self._run_once(
+                    client, prompt, sid,
+                    on_status=on_status, on_delta=on_delta,
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001 — surface to caller
@@ -1255,6 +1340,38 @@ class ClaudeCLIRegistry(BaseModel):
             session_id=sid,
             model_override=target_model,
         )
+
+    async def stream(
+        self,
+        messages: list[dict[str, Any]],
+        system: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        on_status: Callable[[str], Awaitable[None]] | None = None,
+        session_id: str | None = None,
+        model_override: str | None = None,
+    ) -> AsyncIterator[str]:
+        """Stream text deltas via the per-session :class:`ClaudeCLI`.
+
+        Mirrors :meth:`generate`'s session resolution. Without this
+        override, the default :meth:`BaseModel.stream` would fall back
+        to a one-shot ``generate`` call — exactly the bug that made
+        SmartRouter buffer claude-cli replies into one chunk and broke
+        voice mode's time-to-first-audio. With this in place the
+        streaming surface honours per-session subprocesses, runtime-id
+        overrides, and tool-status forwarding the same way the
+        non-streaming path does.
+        """
+        sid = session_id or "default"
+        target_model = self._resolve_model(sid, model_override)
+        inst = self._get_or_create(sid, target_model)
+        async for delta in inst.stream(
+            messages,
+            system=system,
+            on_status=on_status,
+            session_id=sid,
+            model_override=target_model,
+        ):
+            yield delta
 
 
 

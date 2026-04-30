@@ -1681,7 +1681,7 @@ wheels = [
 
 [[package]]
 name = "openagent-framework"
-version = "0.12.32"
+version = "0.12.34"
 source = { editable = "." }
 dependencies = [
     { name = "agno" },
@@ -1705,6 +1705,7 @@ dependencies = [
     { name = "pyyaml" },
     { name = "rich" },
     { name = "sqlalchemy" },
+    { name = "websockets" },
 ]
 
 [package.optional-dependencies]
@@ -1756,6 +1757,7 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "rich", specifier = ">=13.0.0" },
     { name = "sqlalchemy", specifier = ">=2.0.0" },
+    { name = "websockets", specifier = ">=12.0" },
     { name = "whatsapp-api-client-python", marker = "extra == 'all'", specifier = ">=0.0.46" },
     { name = "whatsapp-api-client-python", marker = "extra == 'whatsapp'", specifier = ">=0.0.46" },
 ]

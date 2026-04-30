@@ -16,14 +16,12 @@ from openagent.channels.base import (
     split_preserving_code_blocks,
 )
 from openagent.channels.formatting import markdown_to_whatsapp
-from openagent.channels.voice import transcribe as transcribe_voice
 from openagent.gateway.commands import BRIDGE_COMMANDS, bridge_welcome_text
 
 from openagent.core.logging import elog
 
 logger = logging.getLogger(__name__)
 
-VOICE_FALLBACK = "[Voice not transcribed. Ask the user to type it.]"
 # WhatsApp message size limit (Green API allows up to 65 536 chars; keep
 # generous headroom for our own framing).
 WHATSAPP_MSG_LIMIT = 4096
@@ -121,12 +119,7 @@ class WhatsAppBridge(BaseBridge):
                 path = await self._download(url, "voice.ogg")
                 if path:
                     voice_detected = True
-                    # Prefer the gateway's DB-routed STT (LiteLLM); fall
-                    # back to local Whisper when offline.
-                    t = await self.transcribe_via_gateway(path)
-                    if not t:
-                        t = await transcribe_voice(path)
-                    text = t if t else VOICE_FALLBACK
+                    text = await self.transcribe_with_fallback(path)
         elif msg_type == "imageMessage":
             file_data = msg_data.get("fileMessageData", {})
             text = file_data.get("caption", "")
@@ -184,27 +177,17 @@ class WhatsAppBridge(BaseBridge):
                 pass
 
         # WhatsApp's HTTP API can't edit messages — every "update"
-        # would be a new chat bubble, which would spam the user. So we
-        # opt into streaming purely to exercise the gateway's DELTA
-        # path (no bridge-side accumulation needed because the trailing
-        # RESPONSE carries the full text), but keep the user-visible
-        # output identical to today: status pings + final message.
-        async def on_delta(_chunk: str) -> None:
-            return
-
-        response = await self.send_message_streaming(
+        # would be a new chat bubble, which would spam the user. So
+        # the bridge-visible UX is "status pings + final response".
+        # The gateway still streams server-side via DELTA frames; we
+        # just don't consume them here.
+        response = await self.send_message(
             text, session_id,
             on_status=on_status,
-            on_delta=on_delta,
         )
 
         resp_text = response.get("text", "")
-
-        # Mirror modality: voice-in → voice reply attachment.
-        if voice_detected and resp_text:
-            voice_marker = await self.synthesise_audio_attachment(resp_text)
-            if voice_marker:
-                resp_text = f"{voice_marker}\n{resp_text}"
+        resp_text = await self.maybe_prepend_voice_reply(resp_text, voice_detected)
 
         clean, attachments = parse_response_markers(resp_text)
         clean = self.append_model_feedback(clean, response.get("model"))

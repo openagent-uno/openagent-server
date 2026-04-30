@@ -858,6 +858,8 @@ class AgnoProvider(BaseModel):
         messages: list[dict[str, Any]],
         system: str | None = None,
         tools: list[dict[str, Any]] | None = None,
+        on_status: Callable[[str], Awaitable[None]] | None = None,
+        session_id: str | None = None,
     ) -> AsyncIterator[str]:
         """Stream content deltas via Agno's native ``stream=True`` path.
 
@@ -866,10 +868,20 @@ class AgnoProvider(BaseModel):
         needs the speakable text. On any failure, falls back to
         :meth:`generate` and yields the full content as one chunk so the
         caller still gets a reply (just without time-to-first-audio).
+
+        ``session_id`` is forwarded into Agno's ``arun(session_id=...)``
+        so each chat tab keeps its own RAM history. The previous
+        hardcoded ``"default"`` collided every concurrent stream — two
+        browser tabs would stomp on each other's history mid-turn.
+
+        ``on_status`` is accepted for parity with
+        :class:`ClaudeCLIRegistry.stream` (so ``Agent._run_inner_stream``
+        can introspect-and-forward without provider-specific branching);
+        Agno doesn't surface tool-running statuses through its content
+        stream so this is currently a no-op.
         """
         prompt = self._flatten_messages(messages)
-        sid = "default"  # streaming path is currently called only by run_stream
-        # which runs without explicit session_id at the model layer.
+        sid = session_id or "default"
         runner = self._ensure_team(system=system or "")
         if runner is None:
             runner = self._ensure_agent(system=system)

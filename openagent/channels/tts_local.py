@@ -262,7 +262,7 @@ async def synthesize(
     by the default American voice.
 
     Returns ``None`` when piper isn't installed, the voice file can't
-    be obtained, or synthesis throws. The caller (voice_pipeline)
+    be obtained, or synthesis throws. The caller (turn_runner)
     treats ``None`` the same as today's "no TTS configured" path.
     """
     if not text or not text.strip():

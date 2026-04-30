@@ -1,6 +1,6 @@
-"""VoiceTurnOrchestrator — RESPONSE contract under all paths.
+"""TurnRunner — RESPONSE contract under all paths.
 
-Every code path through ``VoiceTurnOrchestrator.run`` must emit exactly
+Every code path through ``TurnRunner.run`` must emit exactly
 one ``RESPONSE`` frame so the client clears its "Thinking..." state.
 This module guards that contract against four scenarios:
 
@@ -78,18 +78,18 @@ def _types(frames: list[dict[str, Any]]) -> list[str]:
 # ── Tests: voice pipeline RESPONSE contract ────────────────────────
 
 
-@test("voice_pipeline", "no TTS configured → text-only RESPONSE still sent")
+@test("turn_runner", "no TTS configured → text-only RESPONSE still sent")
 async def t_no_tts_response_still_sent(ctx: TestContext) -> None:
-    from openagent.gateway.voice_pipeline import VoiceTurnOrchestrator
+    from openagent.gateway.turn_runner import TurnRunner
 
     agent = _FakeAgent(["Hello ", "world."])
     send, frames = _capture_send()
 
-    with patch("openagent.gateway.voice_pipeline.resolve_tts_provider",
+    with patch("openagent.gateway.turn_runner.resolve_tts_provider",
                return_value=None):
-        orchestrator = VoiceTurnOrchestrator(agent, send)
+        orchestrator = TurnRunner(agent, send)
         result = await orchestrator.run(
-            "hi", client_id="c1", session_id="sess-A",
+            "hi", client_id="c1", session_id="sess-A", speak=True,
         )
 
     types = _types(frames)
@@ -102,9 +102,9 @@ async def t_no_tts_response_still_sent(ctx: TestContext) -> None:
     assert result["errored"] is False
 
 
-@test("voice_pipeline", "TTS configured + success → audio frames AND RESPONSE")
+@test("turn_runner", "TTS configured + success → audio frames AND RESPONSE")
 async def t_tts_success_full_pipeline(ctx: TestContext) -> None:
-    from openagent.gateway.voice_pipeline import VoiceTurnOrchestrator
+    from openagent.gateway.turn_runner import TurnRunner
 
     agent = _FakeAgent(["First sentence. ", "Second sentence."])
     send, frames = _capture_send()
@@ -117,16 +117,24 @@ async def t_tts_success_full_pipeline(ctx: TestContext) -> None:
         yield b"\xff\xfb\x90\x00fake-mp3-1"
         yield b"\xff\xfb\x90\x00fake-mp3-2"
 
-    with patch("openagent.gateway.voice_pipeline.resolve_tts_provider",
+    with patch("openagent.gateway.turn_runner.resolve_tts_provider",
                return_value=_FakeTTSConfig()), \
-         patch("openagent.gateway.voice_pipeline.synthesize_stream", fake_synth):
-        orchestrator = VoiceTurnOrchestrator(agent, send)
+         patch("openagent.gateway.turn_runner.synthesize_stream", fake_synth):
+        orchestrator = TurnRunner(agent, send)
         result = await orchestrator.run(
-            "hi", client_id="c1", session_id="sess-B",
+            "hi", client_id="c1", session_id="sess-B", speak=True,
         )
 
     types = _types(frames)
-    assert types[0] == "audio_start", f"first frame should be audio_start: {types}"
+    # DELTA frames lead — they're emitted on every agent delta so the
+    # voice tab's chat panel updates token-by-token. ``audio_start``
+    # follows once the chunker has buffered a complete sentence.
+    assert types[0] == "delta", f"first frame should be delta (typewriter): {types}"
+    assert "audio_start" in types, f"audio_start missing: {types}"
+    audio_start_idx = types.index("audio_start")
+    assert all(t == "delta" for t in types[:audio_start_idx]), (
+        f"only deltas should precede audio_start: {types}"
+    )
     assert types.count("audio_chunk") >= 2, f"expected ≥2 audio chunks: {types}"
     assert "audio_end" in types, types
     assert types[-1] == "response", f"last frame should be response: {types}"
@@ -137,19 +145,19 @@ async def t_tts_success_full_pipeline(ctx: TestContext) -> None:
     assert result["audio_chunks"] == len(chunks)
 
 
-@test("voice_pipeline", "agent stream raises mid-turn → RESPONSE still sent (errored=True)")
+@test("turn_runner", "agent stream raises mid-turn → RESPONSE still sent (errored=True)")
 async def t_stream_error_response_still_sent(ctx: TestContext) -> None:
-    from openagent.gateway.voice_pipeline import VoiceTurnOrchestrator
+    from openagent.gateway.turn_runner import TurnRunner
 
     # Yield one delta, then raise on the next iteration.
     agent = _FakeAgent(["Partial answer ", "before crash"], raise_after=1)
     send, frames = _capture_send()
 
-    with patch("openagent.gateway.voice_pipeline.resolve_tts_provider",
+    with patch("openagent.gateway.turn_runner.resolve_tts_provider",
                return_value=None):
-        orchestrator = VoiceTurnOrchestrator(agent, send)
+        orchestrator = TurnRunner(agent, send)
         result = await orchestrator.run(
-            "hi", client_id="c1", session_id="sess-C",
+            "hi", client_id="c1", session_id="sess-C", speak=True,
         )
 
     types = _types(frames)
@@ -161,9 +169,9 @@ async def t_stream_error_response_still_sent(ctx: TestContext) -> None:
     assert result["errored"] is True
 
 
-@test("voice_pipeline", "TTS chunk send fails → RESPONSE still completes")
+@test("turn_runner", "TTS chunk send fails → RESPONSE still completes")
 async def t_tts_chunk_error_doesnt_break_response(ctx: TestContext) -> None:
-    from openagent.gateway.voice_pipeline import VoiceTurnOrchestrator
+    from openagent.gateway.turn_runner import TurnRunner
 
     agent = _FakeAgent(["A sentence."])
     send, frames = _capture_send()
@@ -172,12 +180,12 @@ async def t_tts_chunk_error_doesnt_break_response(ctx: TestContext) -> None:
         yield b"first-ok-chunk"
         raise RuntimeError("synth API down")
 
-    with patch("openagent.gateway.voice_pipeline.resolve_tts_provider",
+    with patch("openagent.gateway.turn_runner.resolve_tts_provider",
                return_value=_FakeTTSConfig()), \
-         patch("openagent.gateway.voice_pipeline.synthesize_stream", failing_synth):
-        orchestrator = VoiceTurnOrchestrator(agent, send)
+         patch("openagent.gateway.turn_runner.synthesize_stream", failing_synth):
+        orchestrator = TurnRunner(agent, send)
         result = await orchestrator.run(
-            "hi", client_id="c1", session_id="sess-D",
+            "hi", client_id="c1", session_id="sess-D", speak=True,
         )
 
     types = _types(frames)
@@ -191,6 +199,70 @@ async def t_tts_chunk_error_doesnt_break_response(ctx: TestContext) -> None:
     # ``errored`` stays False (the orchestrator only flips it on agent
     # stream errors).
     assert result["errored"] is False
+
+
+@test("turn_runner", "voice turn emits DELTA frames for chat-panel typewriter UX")
+async def t_voice_emits_delta_frames(ctx: TestContext) -> None:
+    """The voice tab shares the same chat store as the text tab — when
+    the user speaks, the in-progress assistant bubble at the bottom of
+    the voice screen should fill in token-by-token, not jump to the
+    full text only when the trailing RESPONSE arrives.
+
+    The turn runner must emit one ``DELTA`` frame per agent delta
+    so the web client's chat store (which already routes ``delta``
+    via ``_layout.tsx``) appends each chunk to the streaming bubble.
+    Audio frames are independent — they continue to flow through TTS.
+    """
+    from openagent.gateway.turn_runner import TurnRunner
+
+    agent = _FakeAgent(["First ", "second ", "third."])
+    send, frames = _capture_send()
+
+    async def fake_synth(_sentence: str, _cfg, **_kwargs):
+        yield b"\xff\xfb\x90\x00mp3"
+
+    with patch("openagent.gateway.turn_runner.resolve_tts_provider",
+               return_value=_FakeTTSConfig()), \
+         patch("openagent.gateway.turn_runner.synthesize_stream", fake_synth):
+        orchestrator = TurnRunner(agent, send)
+        await orchestrator.run("hi", client_id="c1", session_id="sess-delta", speak=True)
+
+    deltas = [f for f in frames if f["type"] == "delta"]
+    types = _types(frames)
+    assert len(deltas) == 3, (
+        f"expected one DELTA per agent delta (3), got {len(deltas)}: {types}"
+    )
+    assert [d["text"] for d in deltas] == ["First ", "second ", "third."], deltas
+    for d in deltas:
+        assert d["session_id"] == "sess-delta", d
+    # DELTAs must arrive BEFORE the trailing RESPONSE so the streaming
+    # bubble exists when the canonical text replaces it.
+    response_idx = types.index("response")
+    delta_indices = [i for i, t in enumerate(types) if t == "delta"]
+    assert all(i < response_idx for i in delta_indices), (
+        f"DELTAs must precede RESPONSE: {types}"
+    )
+
+
+@test("turn_runner", "no-TTS voice turn still emits DELTA frames")
+async def t_voice_no_tts_emits_delta(ctx: TestContext) -> None:
+    """When TTS is unconfigured, the voice tab still routes the user's
+    message through ``input_was_voice=true`` so the gateway runs the
+    voice pipeline; the chat panel must still see token-by-token
+    updates. This guards against a regression where the DELTA emission
+    only happened on the TTS-configured branch."""
+    from openagent.gateway.turn_runner import TurnRunner
+
+    agent = _FakeAgent(["hello ", "world"])
+    send, frames = _capture_send()
+
+    with patch("openagent.gateway.turn_runner.resolve_tts_provider",
+               return_value=None):
+        orchestrator = TurnRunner(agent, send)
+        await orchestrator.run("hi", client_id="c1", session_id="sess-noTTS-d", speak=True)
+
+    deltas = [f for f in frames if f["type"] == "delta"]
+    assert [d["text"] for d in deltas] == ["hello ", "world"], deltas
 
 
 # ── Tests: local Piper fallback path ───────────────────────────────
@@ -208,9 +280,9 @@ class _LocalPiperConfig:
         self.response_format = "wav"
 
 
-@test("voice_pipeline", "local Piper config → audio_start emits mime=audio/wav")
+@test("turn_runner", "local Piper config → audio_start emits mime=audio/wav")
 async def t_local_piper_emits_wav_mime(ctx: TestContext) -> None:
-    from openagent.gateway.voice_pipeline import VoiceTurnOrchestrator
+    from openagent.gateway.turn_runner import TurnRunner
 
     agent = _FakeAgent(["Hello from Piper."])
     send, frames = _capture_send()
@@ -220,11 +292,11 @@ async def t_local_piper_emits_wav_mime(ctx: TestContext) -> None:
         # since we only assert the mime/format wiring.
         yield b"RIFF\x00\x00\x00\x00WAVEfmt "
 
-    with patch("openagent.gateway.voice_pipeline.resolve_tts_provider",
+    with patch("openagent.gateway.turn_runner.resolve_tts_provider",
                return_value=_LocalPiperConfig()), \
-         patch("openagent.gateway.voice_pipeline.synthesize_stream", piper_synth):
-        orchestrator = VoiceTurnOrchestrator(agent, send)
-        await orchestrator.run("hi", client_id="c1", session_id="sess-piper")
+         patch("openagent.gateway.turn_runner.synthesize_stream", piper_synth):
+        orchestrator = TurnRunner(agent, send)
+        await orchestrator.run("hi", client_id="c1", session_id="sess-piper", speak=True)
 
     audio_start = next((f for f in frames if f["type"] == "audio_start"), None)
     assert audio_start is not None, f"audio_start missing: {_types(frames)}"
@@ -236,14 +308,14 @@ async def t_local_piper_emits_wav_mime(ctx: TestContext) -> None:
     assert any(f["type"] == "response" for f in frames), _types(frames)
 
 
-@test("voice_pipeline", "language hint forwarded from orchestrator → synthesize_stream")
+@test("turn_runner", "language hint forwarded from orchestrator → synthesize_stream")
 async def t_language_forwarded_to_synth(ctx: TestContext) -> None:
     """Regression for the user complaint where an Italian transcription
     was spoken in an American accent: the orchestrator must thread the
     ``language`` arg into every synth call so Piper can pick a matching
     voice. Without this, Piper synthesised every sentence with the
     default English voice regardless of the source language."""
-    from openagent.gateway.voice_pipeline import VoiceTurnOrchestrator
+    from openagent.gateway.turn_runner import TurnRunner
 
     agent = _FakeAgent(["Ciao mondo."])
     send, _frames = _capture_send()
@@ -253,12 +325,12 @@ async def t_language_forwarded_to_synth(ctx: TestContext) -> None:
         seen_languages.append(language)
         yield b"\xff\xfb\x90\x00mp3"
 
-    with patch("openagent.gateway.voice_pipeline.resolve_tts_provider",
+    with patch("openagent.gateway.turn_runner.resolve_tts_provider",
                return_value=_FakeTTSConfig()), \
-         patch("openagent.gateway.voice_pipeline.synthesize_stream", lang_capturing_synth):
-        orchestrator = VoiceTurnOrchestrator(agent, send)
+         patch("openagent.gateway.turn_runner.synthesize_stream", lang_capturing_synth):
+        orchestrator = TurnRunner(agent, send)
         await orchestrator.run(
-            "ciao", client_id="c1", session_id="sess-lang", language="it",
+            "ciao", client_id="c1", session_id="sess-lang", language="it", speak=True,
         )
 
     # Must have called the synth at least once with language='it'.
@@ -295,7 +367,7 @@ class _MiniChatStore:
         self.voice_session_id = None
 
 
-@test("voice_pipeline", "voice-session helper: subsequent calls return same id")
+@test("turn_runner", "voice-session helper: subsequent calls return same id")
 async def t_voice_session_idempotent(ctx: TestContext) -> None:
     store = _MiniChatStore()
     a = store.get_or_create_voice_session()
@@ -304,7 +376,7 @@ async def t_voice_session_idempotent(ctx: TestContext) -> None:
     assert len(store.sessions) == 1, store.sessions
 
 
-@test("voice_pipeline", "voice-session helper: clear → next call mints fresh")
+@test("turn_runner", "voice-session helper: clear → next call mints fresh")
 async def t_voice_session_reset(ctx: TestContext) -> None:
     store = _MiniChatStore()
     a = store.get_or_create_voice_session()
@@ -314,7 +386,7 @@ async def t_voice_session_reset(ctx: TestContext) -> None:
     assert len(store.sessions) == 2, store.sessions
 
 
-@test("voice_pipeline", "empty done text + no deltas → fallback message in RESPONSE")
+@test("turn_runner", "empty done text + no deltas → fallback message in RESPONSE")
 async def t_empty_done_fallback(ctx: TestContext) -> None:
     """The agent's ``_run_inner_stream`` always yields exactly one
     ``done`` event with ``full_text = "".join(deltas)``. If the model
@@ -322,7 +394,7 @@ async def t_empty_done_fallback(ctx: TestContext) -> None:
     safety net (``if event.get("text") and not accumulated:``) skips
     because ``""`` is falsy. The fallback in the finally block must
     surface a readable hint instead of letting RESPONSE go out empty."""
-    from openagent.gateway.voice_pipeline import VoiceTurnOrchestrator
+    from openagent.gateway.turn_runner import TurnRunner
 
     class _AgentEmptyDone:
         def __init__(self):
@@ -335,10 +407,10 @@ async def t_empty_done_fallback(ctx: TestContext) -> None:
             return {}
 
     send, frames = _capture_send()
-    with patch("openagent.gateway.voice_pipeline.resolve_tts_provider",
+    with patch("openagent.gateway.turn_runner.resolve_tts_provider",
                return_value=None):
-        orch = VoiceTurnOrchestrator(_AgentEmptyDone(), send)
-        result = await orch.run("hi", client_id="c1", session_id="sess-EMP")
+        orch = TurnRunner(_AgentEmptyDone(), send)
+        result = await orch.run("hi", client_id="c1", session_id="sess-EMP", speak=True)
 
     response = next(f for f in frames if f["type"] == "response")
     text = response["text"] or ""
@@ -348,13 +420,13 @@ async def t_empty_done_fallback(ctx: TestContext) -> None:
     assert "No text response" in result["text"], result
 
 
-@test("voice_pipeline", "done-only with text-only (no deltas) populates accumulated")
+@test("turn_runner", "done-only with text-only (no deltas) populates accumulated")
 async def t_done_only_with_text(ctx: TestContext) -> None:
     """Some agents (older Agno versions, claude-cli synchronous mode)
     skip deltas entirely and put the full text in ``done.text``. The
     safety valve at the orchestrator must still pick that up so the
     user sees the response."""
-    from openagent.gateway.voice_pipeline import VoiceTurnOrchestrator
+    from openagent.gateway.turn_runner import TurnRunner
 
     class _AgentDoneOnly:
         def __init__(self):
@@ -367,10 +439,10 @@ async def t_done_only_with_text(ctx: TestContext) -> None:
             return {}
 
     send, frames = _capture_send()
-    with patch("openagent.gateway.voice_pipeline.resolve_tts_provider",
+    with patch("openagent.gateway.turn_runner.resolve_tts_provider",
                return_value=None):
-        orch = VoiceTurnOrchestrator(_AgentDoneOnly(), send)
-        result = await orch.run("hi", client_id="c1", session_id="sess-DON")
+        orch = TurnRunner(_AgentDoneOnly(), send)
+        result = await orch.run("hi", client_id="c1", session_id="sess-DON", speak=True)
 
     response = next(f for f in frames if f["type"] == "response")
     assert response["text"] == "Hello world from done.", response
@@ -378,7 +450,7 @@ async def t_done_only_with_text(ctx: TestContext) -> None:
     assert result["text"] == "Hello world from done."
 
 
-@test("voice_pipeline", "agent generator: GeneratorExit propagates without RuntimeError")
+@test("turn_runner", "agent generator: GeneratorExit propagates without RuntimeError")
 async def t_generatorexit_clean_propagation(ctx: TestContext) -> None:
     """Mirrors the new ``except Exception`` shape in
     :func:`openagent.core.agent.Agent.run_stream`. ``GeneratorExit``
@@ -415,12 +487,12 @@ async def t_generatorexit_clean_propagation(ctx: TestContext) -> None:
     assert received[1]["text"] == "chunk-1"
 
 
-@test("voice_pipeline", "spoken status: 'Using ReadFile...' becomes a TTS sentence")
+@test("turn_runner", "spoken status: 'Using ReadFile...' becomes a TTS sentence")
 async def t_spoken_status_basic(ctx: TestContext) -> None:
     """When the agent fires status events during a tool call, the
     orchestrator must enqueue a short spoken summary so the user hears
     what's happening instead of minutes of silence."""
-    from openagent.gateway.voice_pipeline import VoiceTurnOrchestrator
+    from openagent.gateway.turn_runner import TurnRunner
 
     class _AgentWithStatus:
         def __init__(self):
@@ -447,12 +519,12 @@ async def t_spoken_status_basic(ctx: TestContext) -> None:
         sentences_synthesized.append(sentence)
         yield b"\xff\xfb\x90\x00mp3"
 
-    with patch("openagent.gateway.voice_pipeline.resolve_tts_provider",
+    with patch("openagent.gateway.turn_runner.resolve_tts_provider",
                return_value=_FakeTTSConfig()), \
-         patch("openagent.gateway.voice_pipeline.synthesize_stream", fake_synth):
-        orchestrator = VoiceTurnOrchestrator(agent, send)
+         patch("openagent.gateway.turn_runner.synthesize_stream", fake_synth):
+        orchestrator = TurnRunner(agent, send)
         result = await orchestrator.run(
-            "ciao", client_id="c1", session_id="sess-S",
+            "ciao", client_id="c1", session_id="sess-S", speak=True,
         )
 
     assert "Using ReadFile" in sentences_synthesized, sentences_synthesized
@@ -468,12 +540,12 @@ async def t_spoken_status_basic(ctx: TestContext) -> None:
     assert types.count("audio_chunk") >= 3, types  # 2 status + 1 response
 
 
-@test("voice_pipeline", "spoken status: forwarded to original on_status callback")
+@test("turn_runner", "spoken status: forwarded to original on_status callback")
 async def t_spoken_status_forwarded(ctx: TestContext) -> None:
     """The wrapped on_status must still call through to the original
     callback so the WS status frames continue to populate the chat
     transcript with tool cards."""
-    from openagent.gateway.voice_pipeline import VoiceTurnOrchestrator
+    from openagent.gateway.turn_runner import TurnRunner
 
     forwarded: list[str] = []
 
@@ -493,24 +565,24 @@ async def t_spoken_status_forwarded(ctx: TestContext) -> None:
             return {}
 
     send, _frames = _capture_send()
-    with patch("openagent.gateway.voice_pipeline.resolve_tts_provider",
+    with patch("openagent.gateway.turn_runner.resolve_tts_provider",
                return_value=_FakeTTSConfig()), \
          patch(
-             "openagent.gateway.voice_pipeline.synthesize_stream",
+             "openagent.gateway.turn_runner.synthesize_stream",
              lambda _s, _c, **_k: _empty_async_iter(),
          ):
-        orch = VoiceTurnOrchestrator(_Agent(), send)
+        orch = TurnRunner(_Agent(), send)
         await orch.run("hi", client_id="c1", session_id="sess-F",
-                       on_status=original_on_status)
+                       on_status=original_on_status, speak=True)
 
     assert forwarded == ['Using ReadFile...'], forwarded
 
 
-@test("voice_pipeline", "no TTS configured: status events don't crash + RESPONSE still sent")
+@test("turn_runner", "no TTS configured: status events don't crash + RESPONSE still sent")
 async def t_status_no_tts(ctx: TestContext) -> None:
     """Voice path must stay robust when the user hasn't configured TTS.
     Status callbacks are exercised but no audio frames are produced."""
-    from openagent.gateway.voice_pipeline import VoiceTurnOrchestrator
+    from openagent.gateway.turn_runner import TurnRunner
 
     class _Agent:
         def __init__(self):
@@ -525,10 +597,10 @@ async def t_status_no_tts(ctx: TestContext) -> None:
             return {}
 
     send, frames = _capture_send()
-    with patch("openagent.gateway.voice_pipeline.resolve_tts_provider",
+    with patch("openagent.gateway.turn_runner.resolve_tts_provider",
                return_value=None):
-        orch = VoiceTurnOrchestrator(_Agent(), send)
-        result = await orch.run("hi", client_id="c1", session_id="sess-N")
+        orch = TurnRunner(_Agent(), send)
+        result = await orch.run("hi", client_id="c1", session_id="sess-N", speak=True)
 
     types = _types(frames)
     assert "audio_start" not in types, types
@@ -537,9 +609,9 @@ async def t_status_no_tts(ctx: TestContext) -> None:
     assert result["audio_chunks"] == 0
 
 
-@test("voice_pipeline", "_status_speech_for: dedup + JSON shape + plain text")
+@test("turn_runner", "_status_speech_for: dedup + JSON shape + plain text")
 async def t_status_speech_helper(ctx: TestContext) -> None:
-    from openagent.gateway.voice_pipeline import _status_speech_for
+    from openagent.gateway.turn_runner import _status_speech_for
 
     seen: set[str] = set()
 
@@ -571,7 +643,7 @@ async def _empty_async_iter():
         yield b""
 
 
-@test("voice_pipeline", "transcribe: language hint forwarded to faster-whisper")
+@test("turn_runner", "transcribe: language hint forwarded to faster-whisper")
 async def t_transcribe_language_local(ctx: TestContext) -> None:
     """The ``language=`` kwarg on :func:`transcribe` must reach the
     underlying ``WhisperModel.transcribe`` call. Auto-detect on short
@@ -600,7 +672,7 @@ async def t_transcribe_language_local(ctx: TestContext) -> None:
     assert seen.get("vad_filter") is True, seen
 
 
-@test("voice_pipeline", "transcribe: env OPENAGENT_VOICE_LANG fills missing language")
+@test("turn_runner", "transcribe: env OPENAGENT_VOICE_LANG fills missing language")
 async def t_transcribe_language_env_fallback(ctx: TestContext) -> None:
     import os
     from openagent.channels import voice as voice_mod
@@ -623,7 +695,7 @@ async def t_transcribe_language_env_fallback(ctx: TestContext) -> None:
     assert seen.get("language") == "es", seen
 
 
-@test("voice_pipeline", "transcribe: language=None means auto-detect")
+@test("turn_runner", "transcribe: language=None means auto-detect")
 async def t_transcribe_language_auto(ctx: TestContext) -> None:
     import os
     from openagent.channels import voice as voice_mod
@@ -648,7 +720,7 @@ async def t_transcribe_language_auto(ctx: TestContext) -> None:
     assert seen.get("language") is None, seen
 
 
-@test("voice_pipeline", "voice-session helper: orphaned id mints fresh on next call")
+@test("turn_runner", "voice-session helper: orphaned id mints fresh on next call")
 async def t_voice_session_orphan(ctx: TestContext) -> None:
     """If voice_session_id points to a session that's been removed (e.g.
     user manually deleted it from the Chat tab sidebar), the next

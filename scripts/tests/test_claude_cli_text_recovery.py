@@ -39,6 +39,16 @@ class _FakeAssistantMessage:
 
 
 @dataclass
+class _FakeStreamEvent:
+    """Mirror of ``claude_agent_sdk.StreamEvent`` for tests.
+
+    The real type carries ``uuid`` / ``session_id`` / ``parent_tool_use_id``
+    too; ``_run_once`` only reads ``event``, so the fake omits them.
+    """
+    event: dict[str, Any]
+
+
+@dataclass
 class _FakeResultMessage:
     result: str | None = None
     session_id: str | None = "sdk-sess-1"
@@ -80,11 +90,15 @@ def _install_fake_sdk_types() -> None:
     ``claude_agent_sdk``, so we monkey-patch the module to point at our fakes.
     That avoids pulling in the real types (and their dataclass constructors
     with required fields).
+
+    ``StreamEvent`` is also patched in so the per-token partial-message
+    branch added in the streaming-TTFB round can be exercised.
     """
     import claude_agent_sdk
 
     claude_agent_sdk.AssistantMessage = _FakeAssistantMessage
     claude_agent_sdk.ResultMessage = _FakeResultMessage
+    claude_agent_sdk.StreamEvent = _FakeStreamEvent
 
 
 async def _run_once_with(messages: list[Any], *, session_id: str = "test-sess") -> tuple[str, dict]:
@@ -137,6 +151,102 @@ async def t_placeholder_when_truly_empty(ctx: TestContext) -> None:
     ]
     text, _ = await _run_once_with(messages)
     assert text == "(Done — no final message was returned.)", f"got {text!r}"
+
+
+@test("claude_cli_text_recovery", "StreamEvent text_deltas fire on_delta per token")
+async def t_partial_messages_stream_per_token(ctx: TestContext) -> None:
+    """The whole point of enabling ``include_partial_messages=True``:
+    SDK forwards ``content_block_delta`` events as ``StreamEvent``
+    objects, and ``_run_once`` must forward each ``text_delta`` via
+    ``on_delta`` so the user sees tokens as they're generated. Without
+    this branch the only ``on_delta`` source is the AssistantMessage
+    handler, which fires once per complete block — for a normal reply
+    that's the entire reply at the end, indistinguishable from no
+    streaming at all."""
+    _install_fake_sdk_types()
+    from openagent.models.claude_cli import ClaudeCLI
+
+    messages = [
+        _FakeStreamEvent(event={"type": "content_block_start"}),
+        _FakeStreamEvent(event={
+            "type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": "Hello"},
+        }),
+        _FakeStreamEvent(event={
+            "type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": " from "},
+        }),
+        _FakeStreamEvent(event={
+            "type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": "Claude"},
+        }),
+        # AssistantMessage arrives at the end with the consolidated
+        # block — its on_delta call MUST be skipped because partials
+        # already streamed the same text.
+        _FakeAssistantMessage(content=[_FakeTextBlock(text="Hello from Claude")]),
+        _FakeResultMessage(result="Hello from Claude"),
+    ]
+
+    received: list[str] = []
+
+    async def on_delta(text: str) -> None:
+        received.append(text)
+
+    cli = ClaudeCLI(model=None, providers_config={"anthropic": {"models": ["claude-cli"]}})
+    client = _FakeSDKClient(messages, startup_delay=0.0)
+    await cli._run_once(client, "hi", "test-sess", on_status=None, on_delta=on_delta)
+
+    assert received == ["Hello", " from ", "Claude"], (
+        f"on_delta must fire per-token, not in one chunk. Got {received!r}"
+    )
+
+
+@test("claude_cli_text_recovery", "AssistantMessage falls back to on_delta when no partials seen")
+async def t_block_level_fallback_when_no_partials(ctx: TestContext) -> None:
+    """If the SDK ever emits AssistantMessage without preceding
+    StreamEvents (older SDK, partials disabled, or a block that
+    skipped the partial path for some reason), the block-level
+    on_delta fallback must still fire so the user gets SOME streaming
+    rather than nothing. The guard counter resets per block."""
+    _install_fake_sdk_types()
+    from openagent.models.claude_cli import ClaudeCLI
+
+    messages = [
+        # No StreamEvents, just an AssistantMessage with text.
+        _FakeAssistantMessage(content=[_FakeTextBlock(text="Whole block at once.")]),
+        _FakeResultMessage(result="Whole block at once."),
+    ]
+
+    received: list[str] = []
+
+    async def on_delta(text: str) -> None:
+        received.append(text)
+
+    cli = ClaudeCLI(model=None, providers_config={"anthropic": {"models": ["claude-cli"]}})
+    client = _FakeSDKClient(messages, startup_delay=0.0)
+    await cli._run_once(client, "hi", "test-sess", on_status=None, on_delta=on_delta)
+
+    assert received == ["Whole block at once."], (
+        f"AssistantMessage must fire on_delta when no partials streamed: {received}"
+    )
+
+
+@test("claude_cli_text_recovery", "include_partial_messages is set in _build_options")
+async def t_build_options_enables_partials(ctx: TestContext) -> None:
+    """Sentinel for the ``include_partial_messages=True`` line in
+    _build_options. Removing it would disable token streaming silently
+    — the existing tests above mock the SDK, so they wouldn't catch a
+    real-world regression here."""
+    from openagent.models.claude_cli import ClaudeCLI
+    cli = ClaudeCLI(model="claude-sonnet-4-6")
+    opts = cli._build_options(system="test", sdk_session_id=None)
+    # ClaudeAgentOptions is a dataclass; the field name stays as-is.
+    assert getattr(opts, "include_partial_messages", False) is True, (
+        "include_partial_messages must be True so the SDK emits "
+        "token-level StreamEvents — without it _run_once only sees "
+        "AssistantMessage at the end of each block and the user gets "
+        "no streaming."
+    )
 
 
 @test("claude_cli_text_recovery", "AssistantMessage with only None text blocks is ignored")

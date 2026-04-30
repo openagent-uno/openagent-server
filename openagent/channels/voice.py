@@ -43,16 +43,6 @@ _WHISPER_MODEL: object | None = None
 _WHISPER_LOCK = asyncio.Lock()
 AUDIO_EXTENSIONS = frozenset({".webm", ".ogg", ".mp3", ".wav", ".m4a", ".opus", ".flac"})
 
-# Per-vendor sensible defaults. Used when a kind='stt' provider row
-# omits ``metadata.model_id``. The user can override per-row.
-DEFAULT_STT_MODEL_BY_VENDOR = {
-    "openai": "whisper-1",
-    "groq": "whisper-large-v3",
-    "deepgram": "nova-2",
-    "azure": "whisper-1",
-}
-
-
 def is_audio_file(filename: str | None, content_type: str | None = None) -> bool:
     """Return True when a file should be treated as an audio upload."""
     if content_type and content_type.startswith("audio/"):

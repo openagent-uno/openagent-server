@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, AsyncIterator
 
@@ -42,19 +43,116 @@ logger = logging.getLogger(__name__)
 LOCAL_PIPER_VENDOR = "_local_piper"
 
 
-DEFAULT_MODEL_BY_VENDOR = {
-    "openai": "tts-1",
-    "elevenlabs": "eleven_flash_v2_5",
-    "azure": "tts-1",
-    "groq": "playai-tts",
-    "vertex_ai": "text-to-speech",
-}
 DEFAULT_VOICE_BY_VENDOR = {
     "openai": "alloy",
     "elevenlabs": "21m00Tcm4TlvDq8ikWAM",  # Rachel
 }
 # mp3 decodes natively in browsers + React Native; supported by every vendor.
 DEFAULT_RESPONSE_FORMAT = "mp3"
+
+
+# ── TTS text sanitizer ─────────────────────────────────────────────────
+#
+# Local Piper (and most vendor TTS models) literally pronounces every
+# character it receives — emojis become "smiling face with smiling eyes",
+# markdown asterisks become "asterisk asterisk bold asterisk asterisk",
+# code fences become "backtick backtick backtick", and bare URLs become a
+# tedious letter-by-letter spelling. That makes the spoken reply feel
+# unhinged. ``sanitize_for_tts`` strips anything that wouldn't be spoken
+# in a natural reading of the text:
+#
+#   * markdown formatting (bold, italic, strikethrough, headers, lists,
+#     blockquotes, inline code) — keep the inner text, drop the markers
+#   * links: ``[text](url)`` → ``text``;  ``![alt](url)`` → ``alt``
+#   * bare URLs and HTML tags → dropped entirely
+#   * code fences are already replaced by SentenceChunker with the
+#     "Code shown on screen." placeholder, but we still strip stray
+#     leftover backticks defensively
+#   * emojis and other pictographic symbols — dropped
+#   * pipe-separated table syntax (``| a | b |``) → spaces
+#   * collapsed whitespace
+#
+# Idempotent and safe to call on already-clean text. Pure-Python regex —
+# no external dependency.
+
+_EMOJI_RE = re.compile(
+    "["                              # any of these unicode ranges →
+    "\U0001F300-\U0001F5FF"          # symbols & pictographs
+    "\U0001F600-\U0001F64F"          # emoticons
+    "\U0001F680-\U0001F6FF"          # transport & map
+    "\U0001F700-\U0001F77F"          # alchemical
+    "\U0001F780-\U0001F7FF"          # geometric shapes ext
+    "\U0001F800-\U0001F8FF"          # supplemental arrows-c
+    "\U0001F900-\U0001F9FF"          # supplemental symbols & pictographs
+    "\U0001FA00-\U0001FA6F"          # chess symbols
+    "\U0001FA70-\U0001FAFF"          # symbols & pictographs ext-a
+    "\U00002600-\U000026FF"          # misc symbols (☀ ☁ ★ …)
+    "\U00002700-\U000027BF"          # dingbats (✓ ✗ ❤ …)
+    "\U0001F1E6-\U0001F1FF"          # regional indicators (flags)
+    "\U0000FE0F"                     # variation selector-16
+    "\U0000200D"                     # zero-width joiner (multi-codepoint emoji)
+    "]+",
+    flags=re.UNICODE,
+)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_URL_RE = re.compile(r"https?://\S+|www\.\S+")
+_CODE_BLOCK_RE = re.compile(r"```[\s\S]*?```")
+_INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
+_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\([^)]+\)")
+_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+_HEADER_RE = re.compile(r"^\s{0,3}#{1,6}\s+", flags=re.MULTILINE)
+_BLOCKQUOTE_RE = re.compile(r"^\s*>+\s?", flags=re.MULTILINE)
+_LIST_BULLET_RE = re.compile(r"^\s*(?:[-*+]|\d+\.)\s+", flags=re.MULTILINE)
+_BOLD_RE = re.compile(r"\*\*([^*]+)\*\*|__([^_]+)__")
+_ITALIC_RE = re.compile(r"(?<!\*)\*([^*\n]+)\*(?!\*)|(?<!_)_([^_\n]+)_(?!_)")
+_STRIKE_RE = re.compile(r"~~?([^~\n]+)~~?")
+_TABLE_PIPE_RE = re.compile(r"\s*\|\s*")
+_WHITESPACE_RE = re.compile(r"\s+")
+# Punctuation that TTS engines speak literally when they appear alone or
+# as runs (``— • ★`` etc.). We keep the everyday ones (``. , ! ? ; :``)
+# because they carry prosody.
+_NOISE_PUNCT_RE = re.compile(r"[*_~`#|>•·★☆►▶◆◇■□●○]+")
+
+
+def sanitize_for_tts(text: str, *, preserve_edges: bool = False) -> str:
+    """Strip markdown / emoji / URLs from ``text`` so TTS reads it naturally.
+
+    Idempotent. Empty input returns ``""``. By default the result has
+    single-space-separated tokens with leading/trailing whitespace
+    trimmed.
+
+    Set ``preserve_edges=True`` for per-chunk sanitization on a
+    streaming pipeline (e.g. ElevenLabs WS) where leading/trailing
+    spaces carry the gap between adjacent tokens — without this an
+    input of ``[\"Hello\", \" world\"]`` would collapse to
+    ``\"Helloworld\"`` once the vendor concatenates frames.
+    """
+    if not text:
+        return ""
+    s = text
+    # Remove code blocks first so a stray ``` inside doesn't confuse the
+    # inline-code regex below. The chunker already does this for the
+    # streaming path but bridges' synthesize_full path goes around it.
+    s = _CODE_BLOCK_RE.sub(" ", s)
+    s = _INLINE_CODE_RE.sub(r"\1", s)
+    # Images BEFORE links — same regex shape, image rule is more specific.
+    s = _IMAGE_RE.sub(r"\1", s)
+    s = _LINK_RE.sub(r"\1", s)
+    s = _URL_RE.sub(" ", s)
+    s = _HTML_TAG_RE.sub(" ", s)
+    s = _HEADER_RE.sub("", s)
+    s = _BLOCKQUOTE_RE.sub("", s)
+    s = _LIST_BULLET_RE.sub("", s)
+    s = _BOLD_RE.sub(lambda m: m.group(1) or m.group(2), s)
+    s = _ITALIC_RE.sub(lambda m: m.group(1) or m.group(2), s)
+    s = _STRIKE_RE.sub(r"\1", s)
+    s = _TABLE_PIPE_RE.sub(" ", s)
+    s = _EMOJI_RE.sub("", s)
+    s = _NOISE_PUNCT_RE.sub(" ", s)
+    s = _WHITESPACE_RE.sub(" ", s)
+    if not preserve_edges:
+        s = s.strip()
+    return s
 
 
 @dataclass(frozen=True)
@@ -68,6 +166,13 @@ class TTSConfig:
     response_format: str = DEFAULT_RESPONSE_FORMAT
     speed: float | None = None
     metadata: dict[str, Any] | None = None  # passthrough for vendor-specific knobs
+    # When True the turn_runner opens a token-in/audio-out WebSocket
+    # to the vendor (currently only ElevenLabs implements one) and
+    # streams agent deltas directly into it. Beats the per-sentence
+    # REST path on TTFB by ~2–5 s on long replies. Opt-in per row via
+    # ``metadata.stream_input = true`` so existing rows behave exactly
+    # like before this field landed.
+    stream_input: bool = False
 
     @property
     def litellm_model(self) -> str:
@@ -100,6 +205,11 @@ async def resolve_tts_provider(db: Any) -> TTSConfig | None:
             voice_id = (meta.get("voice_id") or DEFAULT_VOICE_BY_VENDOR.get(vendor) or None)
             if isinstance(voice_id, str):
                 voice_id = voice_id.strip() or None
+            # ``stream_input`` opts the row into the WebSocket
+            # token-in/audio-out path (currently only ElevenLabs has
+            # one; gracefully ignored for other vendors so the row
+            # falls back to LiteLLM's REST aspeech).
+            stream_input = bool(meta.get("stream_input"))
             return TTSConfig(
                 vendor=vendor,
                 model_id=model_id,
@@ -109,6 +219,7 @@ async def resolve_tts_provider(db: Any) -> TTSConfig | None:
                 response_format=meta.get("response_format") or DEFAULT_RESPONSE_FORMAT,
                 speed=_as_float(meta.get("speed")),
                 metadata=dict(meta),
+                stream_input=stream_input,
             )
 
     # No DB-configured cloud TTS — try the bundled local fallback so
@@ -183,8 +294,13 @@ async def synthesize_stream(
 
     On any error the iterator terminates silently; the caller treats
     a short stream as graceful degradation rather than a crash.
+
+    Markdown markers, emojis, code fences, URLs and HTML are stripped
+    via :func:`sanitize_for_tts` before synthesis — Piper (and most
+    cloud vendors) literally pronounce these characters otherwise.
     """
-    if not text or not text.strip():
+    text = sanitize_for_tts(text)
+    if not text:
         return
 
     if cfg.vendor == LOCAL_PIPER_VENDOR:
@@ -252,8 +368,13 @@ async def synthesize_full(
     ``language`` matches :func:`synthesize_stream` — an ISO-639-1
     code that lets Piper pick a language-matched voice. Cloud TTS
     rows ignore it.
+
+    Same :func:`sanitize_for_tts` pre-processing as the streaming
+    path — bridges that synthesise the full reply benefit from the
+    same markdown/emoji stripping.
     """
-    if not text or not text.strip():
+    text = sanitize_for_tts(text)
+    if not text:
         return None
     if cfg.vendor == LOCAL_PIPER_VENDOR:
         voice_arg = cfg.voice_id

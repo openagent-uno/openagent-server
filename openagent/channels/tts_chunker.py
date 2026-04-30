@@ -5,6 +5,18 @@ sentence boundaries. Keeps abbreviations and decimals from being split,
 skips code fences (replaced with a single placeholder per fence), and
 defers chunks below ``MIN_LEN`` so we don't ship 0.4-second clips.
 
+The very first chunk of an iteration uses a relaxed boundary set so the
+user hears something within ~1 s on Piper instead of waiting for the
+first full sentence (which can take 3–5 s for long replies). Concretely:
+
+* terminal punctuation OR clause punctuation (``,``, ``;``, ``:``)
+* ``MIN_FIRST_LEN`` (12) instead of ``MIN_LEN`` (20)
+
+Once the first chunk emits, subsequent chunks revert to the strict
+sentence-only rules so the bulk of the reply preserves natural prosody.
+``iteration_break()`` re-arms the first-chunk mode so each tool-loop
+iteration also gets the TTFB win on its first sentence.
+
 Use::
 
     chunker = SentenceChunker()
@@ -23,17 +35,32 @@ from __future__ import annotations
 
 class SentenceChunker:
     MIN_LEN = 20
+    # Lower bar for the first emitted chunk so Piper can start
+    # synthesising sooner. 12 chars is roughly 2–3 short words —
+    # big enough to be worth a synth call, small enough that a
+    # quick "Sure, let me…" greeting fires immediately.
+    MIN_FIRST_LEN = 12
     PLACEHOLDER = "Code shown on screen."
     ABBREVIATIONS: tuple[str, ...] = (
         "Mr.", "Mrs.", "Ms.", "Dr.", "Sr.", "Jr.", "St.", "Mt.",
         "e.g.", "i.e.", "etc.", "vs.", "Prof.", "Inc.", "Ltd.", "Co.",
     )
+    # Clause boundaries used ONLY for the first-chunk path. Adding
+    # these to the steady-state boundary set butchers prosody (commas
+    # mid-sentence don't carry the same intonation drop a period does),
+    # so we restrict them to the time-to-first-audio optimisation.
+    CLAUSE_PUNCT: tuple[str, ...] = (",", ";", ":")
 
     def __init__(self) -> None:
         self._raw = ""
         self._speakable = ""
         self._in_fence = False
         self._placeholder_pending = False
+        # When False, ``_next_chunk`` accepts CLAUSE_PUNCT boundaries
+        # and uses MIN_FIRST_LEN. Flipped to True after the first
+        # successful emission. Reset by ``iteration_break`` so each
+        # tool-loop turn gets its own TTFB win.
+        self._first_chunk_emitted = False
 
     def feed(self, delta: str) -> list[str]:
         if not delta:
@@ -55,7 +82,12 @@ class SentenceChunker:
         return text or None
 
     def iteration_break(self) -> str | None:
-        return self.flush()
+        # Re-arm the first-chunk early-emission mode so the next
+        # iteration's first sentence also gets the TTFB win, not just
+        # the very first sentence of the entire reply.
+        result = self.flush()
+        self._first_chunk_emitted = False
+        return result
 
     # ── internals ──────────────────────────────────────────────────────
 
@@ -107,14 +139,20 @@ class SentenceChunker:
         text = self._speakable
         if not text:
             return None
+        # First-chunk mode lowers the bar in two ways: clause punct
+        # counts as a boundary AND the min length drops. Both reset
+        # to strict sentence behaviour after the first emission.
+        in_first_mode = not self._first_chunk_emitted
+        min_len = self.MIN_FIRST_LEN if in_first_mode else self.MIN_LEN
         n = len(text)
         i = 0
         while i < n:
             ch = text[i]
             if ch == "\n" and i + 1 < n and text[i + 1] == "\n":
                 chunk = text[:i].strip()
-                if len(chunk) >= self.MIN_LEN:
+                if len(chunk) >= min_len:
                     self._speakable = text[i + 2:].lstrip()
+                    self._first_chunk_emitted = True
                     return chunk
                 i += 2
                 continue
@@ -124,8 +162,20 @@ class SentenceChunker:
                         i += 1
                         continue
                     chunk = text[:i + 1].strip()
-                    if len(chunk) >= self.MIN_LEN:
+                    if len(chunk) >= min_len:
                         self._speakable = text[i + 1:].lstrip()
+                        self._first_chunk_emitted = True
+                        return chunk
+            elif in_first_mode and ch in self.CLAUSE_PUNCT:
+                # Clause-boundary path: only fires until the first
+                # successful emission. Same followed-by-whitespace
+                # rule as terminal punct so we don't split inside a
+                # decimal/URL/etc.
+                if i + 1 < n and text[i + 1] in " \n\t":
+                    chunk = text[:i + 1].strip()
+                    if len(chunk) >= min_len:
+                        self._speakable = text[i + 1:].lstrip()
+                        self._first_chunk_emitted = True
                         return chunk
             i += 1
         return None

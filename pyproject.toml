@@ -59,6 +59,13 @@ dependencies = [
     # ``PiperVoice.synthesize_wav`` entry point lands; the older
     # ``synthesize(text, wav_file)`` signature was removed.
     "piper-tts>=1.3.0",
+    # WebSocket client for ElevenLabs streaming TTS (token-in / audio-out).
+    # Already pulled in transitively by aiohttp / discord.py / openai-sdk
+    # in current installs, but declaring it explicit so the streaming
+    # TTS path doesn't quietly break if the transitive disappears in a
+    # future bump. ``openagent.channels.tts_streaming`` is the only
+    # module that imports it.
+    "websockets>=12.0",
     # Cross-platform system telemetry (CPU/RAM/disk/network/processes)
     # surfaced over /api/system + the system_snapshot WS broadcast.
     # Same API on Windows, macOS, Linux — keeps the gateway code

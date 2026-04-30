@@ -5,9 +5,60 @@ Used by both the Gateway and platform bridges.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
+
+
+@dataclass(frozen=True)
+class ToolStatusEvent:
+    """One parsed tool-status event.
+
+    The agent fires status events in two shapes (the chat store and
+    every bridge / turn runner has historically had to detect both):
+
+      * JSON: ``{"tool": "ReadFile", "status": "running", ...}``
+      * Plain: ``"Using ReadFile..."``
+
+    This dataclass normalizes them into a single shape so callers can
+    branch on ``status`` without re-parsing.
+    """
+    tool: str
+    status: str  # "running" / "done" / "error"
+    error: str | None = None
+
+
+def parse_status_event(raw: str) -> Optional[ToolStatusEvent]:
+    """Parse a status string from ``Agent._status``. Returns ``None``
+    for non-tool statuses (``"Thinking..."``, plain text, empty input).
+
+    Same try-JSON-then-fallback shape every consumer used to inline.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None
+
+    # JSON shape first.
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict) and parsed.get("tool"):
+            return ToolStatusEvent(
+                tool=str(parsed["tool"]),
+                status=str(parsed.get("status") or "running"),
+                error=(str(parsed["error"]) if parsed.get("error") else None),
+            )
+    except (json.JSONDecodeError, ValueError, TypeError):
+        pass
+
+    # Plain "Using X..." text from the legacy code path.
+    if text.startswith("Using "):
+        tool = text[len("Using "):].rstrip(".").strip()
+        if tool:
+            return ToolStatusEvent(tool=tool, status="running")
+
+    return None
 
 
 @dataclass

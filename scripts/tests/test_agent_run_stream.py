@@ -181,6 +181,170 @@ async def t_fallback_meta_uses_real_response(_ctx: TestContext) -> None:
     )
 
 
+class _SignatureFreeModel:
+    """BaseModel-compatible stub whose ``stream`` signature does NOT
+    accept ``session_id`` / ``on_status`` — exercises the
+    signature-introspection path in ``_run_inner_stream``.
+
+    Older provider implementations (and any third-party model wired
+    via ``wire_model_runtime``) might still expose the minimal
+    ``(messages, system, tools)`` signature; the agent must call
+    them without the streaming-specific kwargs and yield deltas
+    normally.
+    """
+
+    history_mode = "caller"
+
+    def __init__(self, deltas: list[str]) -> None:
+        self.model = "legacy/no-kwargs"
+        self.model_name = self.model
+        self._deltas = list(deltas)
+        self.stream_calls = 0
+        self.generate_calls = 0
+        self.received_kwargs: dict[str, Any] = {}
+
+    def effective_model_id(self, session_id: str | None = None) -> str | None:
+        return self.model
+
+    async def stream(
+        self,
+        messages: list[dict[str, Any]],
+        system: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> AsyncIterator[str]:
+        self.stream_calls += 1
+        for d in self._deltas:
+            yield d
+
+    async def generate(
+        self,
+        messages: list[dict[str, Any]],
+        system: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        **_kwargs: Any,
+    ):
+        from openagent.models.base import ModelResponse
+        self.generate_calls += 1
+        return ModelResponse(content="", model=self.model_name)
+
+    async def close_session(self, session_id: str) -> None:
+        return None
+
+
+class _MidStreamTypeErrorModel:
+    """``stream`` accepts the kwargs but raises TypeError MID-iteration
+    (after yielding ``yield_count`` deltas). Mirrors a hypothetical
+    SDK shape change inside ``claude_cli._run_once``: the signature
+    matches but the body explodes once a real message arrives.
+
+    Before Part B's introspection fix, ``Agent._run_inner_stream``
+    wrapped the ``async for`` in ``try/except TypeError`` and silently
+    retried the call WITHOUT ``session_id`` — yielding zero deltas on
+    the retry (different subprocess) and falling back to ``generate()``,
+    which masked the real bug as "one giant delta at the end". Now
+    the TypeError must propagate.
+    """
+
+    history_mode = "caller"
+
+    def __init__(self, *, yield_count: int) -> None:
+        self.model = "fake/typeerror-mid-stream"
+        self.model_name = self.model
+        self._yield_count = yield_count
+        self.stream_calls = 0
+        self.generate_calls = 0
+
+    def effective_model_id(self, session_id: str | None = None) -> str | None:
+        return self.model
+
+    async def stream(
+        self,
+        messages: list[dict[str, Any]],
+        system: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        session_id: str | None = None,
+        on_status: Callable[[str], Awaitable[None]] | None = None,
+    ) -> AsyncIterator[str]:
+        self.stream_calls += 1
+        for i in range(self._yield_count):
+            yield f"chunk-{i}"
+        raise TypeError("simulated mid-iteration TypeError")
+
+    async def generate(
+        self,
+        messages: list[dict[str, Any]],
+        system: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        **_kwargs: Any,
+    ):
+        from openagent.models.base import ModelResponse
+        self.generate_calls += 1
+        return ModelResponse(content="GENERATE FALLBACK SHOULD NOT BE USED", model=self.model_name)
+
+    async def close_session(self, session_id: str) -> None:
+        return None
+
+
+@test("agent_run_stream", "stream signature-introspect drops kwargs the provider doesn't accept")
+async def t_stream_signature_introspect(_ctx: TestContext) -> None:
+    """Older / minimal ``stream`` signatures (no session_id, no on_status)
+    must still get called and yield deltas. Without the introspection
+    path the agent would either pass kwargs the provider rejects or
+    fall back to one-shot generate()."""
+    model = _SignatureFreeModel(deltas=["one ", "two ", "three"])
+    agent = _make_agent(model)
+
+    events = await _drive(agent, "hi", session_id="sess-noargs")
+
+    deltas = [e for e in events if e.get("kind") == "delta"]
+    full_text = "".join(d["text"] for d in deltas)
+
+    assert model.stream_calls == 1, (
+        f"stream() must be invoked exactly once (calls={model.stream_calls})"
+    )
+    assert model.generate_calls == 0, (
+        "no fallback to generate() — stream returned text just fine"
+    )
+    assert full_text == "one two three", f"deltas concatenated wrong: {full_text!r}"
+
+
+@test("agent_run_stream", "mid-iteration TypeError surfaces (no silent retry/fallback)")
+async def t_mid_iteration_typeerror_surfaces(_ctx: TestContext) -> None:
+    """Mid-iteration TypeError USED to be swallowed by the over-broad
+    ``try/except TypeError`` around the ``async for``, which then
+    silently retried without ``session_id`` and fell back to one-shot
+    generate(). The introspection-based call now wraps only the
+    signature check in ``try/except``, so iteration-body TypeErrors
+    propagate to the outer ``except Exception`` in ``_run_inner_stream``
+    — the user gets the deltas yielded BEFORE the error, plus a logged
+    error, instead of one giant fallback delta."""
+    model = _MidStreamTypeErrorModel(yield_count=2)
+    agent = _make_agent(model)
+
+    events = await _drive(agent, "hi", session_id="sess-typeerror")
+
+    # The two deltas that landed before the TypeError must reach the
+    # caller. The fallback to generate() must NOT be invoked (would
+    # mask the real bug). The done event still fires (the outer
+    # exception handler in run_stream resolves with whatever was
+    # accumulated).
+    deltas = [e for e in events if e.get("kind") == "delta"]
+    delta_texts = [d["text"] for d in deltas]
+
+    assert model.stream_calls == 1, (
+        f"stream() must NOT be retried after a mid-iteration error "
+        f"(calls={model.stream_calls})"
+    )
+    assert model.generate_calls == 0, (
+        "TypeErrors raised mid-iteration must NOT trigger the "
+        "generate() fallback — that's the very bug we're guarding against"
+    )
+    # We expect the partial deltas that arrived before the TypeError.
+    assert delta_texts == ["chunk-0", "chunk-1"], (
+        f"partial deltas before TypeError must reach the caller: {delta_texts}"
+    )
+
+
 @test("agent_run_stream", "streaming path stores model meta from effective_model_id")
 async def t_streaming_meta_uses_effective_model_id(_ctx: TestContext) -> None:
     # Regression for the chat UI's missing model badge after the

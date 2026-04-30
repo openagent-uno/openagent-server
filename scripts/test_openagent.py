@@ -56,10 +56,19 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_channels",
     "test_formatting",
     "test_tts_chunker",
-    "test_voice_pipeline",
+    "test_turn_runner",
     # Local Piper TTS fallback — pure-unit, no fixtures. Paired with
-    # test_voice_pipeline.py which covers the orchestrator-side wiring.
+    # test_turn_runner.py which covers the runner-side wiring.
     "test_tts_local",
+    # TTS text sanitizer — markdown / emoji / URL stripping shared by
+    # both synth entry points + the WS-streaming drain. Pure-unit, no
+    # fixtures.
+    "test_tts_sanitize",
+    # ElevenLabs WebSocket streaming TTS — token-in / audio-out path
+    # used by TurnRunner when cfg.stream_input is True.
+    # Spins up a real local websockets server on a free port to
+    # exercise the full BOS / text-frame / EOS protocol.
+    "test_tts_elevenlabs_streaming",
     # DELTA frame plumbing for the unified streaming path (web chat +
     # bridges). Pure-unit; relies on the BaseBridge dispatch logic.
     "test_streaming",
@@ -75,6 +84,12 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_db_providers",
     "test_db_session_bindings",
     "test_smart_router_hybrid",
+    # SmartRouter.stream + ClaudeCLIRegistry.stream — token-streaming
+    # dispatch for both frameworks. Pure-unit (stubs the registries) and
+    # guards the bug where claude-cli replies came back as one giant
+    # chunk through the router (TTFB-killing for voice mode).
+    "test_smart_router_stream",
+    "test_claude_cli_stream",
     "test_behavior_contract",
     "test_mcp_manager_guards",
     "test_provider_manager",

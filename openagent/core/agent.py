@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from typing import Any, AsyncIterator, Callable, Awaitable
 
@@ -1035,28 +1036,35 @@ class Agent:
                     # session's bound side, which 403'd on users whose
                     # first agno model was an OpenAI model their key
                     # couldn't access.
+                    #
+                    # Introspect once instead of try/except TypeError around
+                    # the iteration body — a catch-all TypeError swallows
+                    # errors raised mid-iteration (e.g. an SDK shape change
+                    # inside ``claude_cli._run_once``) and the silent retry
+                    # without ``session_id`` collides on the ``"default"``
+                    # subprocess, which then yields zero deltas → fallback
+                    # at line 1089 fires → caller sees ONE giant delta.
                     stream_kwargs: dict[str, Any] = {"system": system}
                     try:
-                        # Older provider implementations don't accept
-                        # session_id / on_status — fall back gracefully.
-                        async for delta in active_model.stream(
-                            messages,
-                            session_id=session_id,
-                            on_status=_status,
-                            **stream_kwargs,
-                        ):
-                            if not delta:
-                                continue
-                            accumulated.append(delta)
-                            yield {"kind": "delta", "text": delta}
-                    except TypeError:
-                        async for delta in active_model.stream(
-                            messages, **stream_kwargs,
-                        ):
-                            if not delta:
-                                continue
-                            accumulated.append(delta)
-                            yield {"kind": "delta", "text": delta}
+                        sig_params = inspect.signature(
+                            active_model.stream
+                        ).parameters
+                    except (TypeError, ValueError):
+                        # Builtins / C-coded callables don't expose a
+                        # signature. Skip the introspection — call with
+                        # only the always-supported args.
+                        sig_params = {}
+                    if "session_id" in sig_params:
+                        stream_kwargs["session_id"] = session_id
+                    if "on_status" in sig_params:
+                        stream_kwargs["on_status"] = _status
+                    async for delta in active_model.stream(
+                        messages, **stream_kwargs,
+                    ):
+                        if not delta:
+                            continue
+                        accumulated.append(delta)
+                        yield {"kind": "delta", "text": delta}
                 finally:
                     reset_session_context(token)
 
