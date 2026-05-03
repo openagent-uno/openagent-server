@@ -59,7 +59,6 @@ class _FakeBridge:
         self._real.name = "fake"
         self._real._stream_opened = set()
         self._real._stream_pending = {}
-        self._real._status_callbacks = {}
         self._real._ws = object()  # non-None bypasses the "not connected" guard
         self._sent: list[dict] = []
 
@@ -363,6 +362,158 @@ async def t_dispatch_turn_owner_renders(ctx: TestContext) -> None:
     assert chunks == ["merged reply"], chunks
 
 
+@test("bridges", "spam: owner posts the merged reply ANCHORED to the LATEST follower target")
+async def t_dispatch_turn_anchors_to_latest_in_spam(ctx: TestContext) -> None:
+    """🔴 Production regression: when a Telegram user spams 5 messages,
+    the OWNER (handler for message #1) is what eventually posts the
+    merged reply. Before this fix, the owner anchored its
+    ``msg.reply_text(...)`` call to its OWN ``msg`` — which is the
+    FIRST message of the burst. The user saw the bot replying to a
+    stale bubble while later messages sat unanswered. Looks exactly
+    like "the bot is answering the previous message I sent".
+
+    Fix: ``send_message`` stashes each follower's target on the owner's
+    collector; the owner reads ``response['target']`` (the LATEST one
+    seen) and posts against that. This test pins the new contract end
+    to end through ``dispatch_turn``."""
+    import asyncio
+    from openagent.bridges.base import BaseBridge
+    from openagent.stream.events import SessionOpen, TextFinal, now_ms
+    from openagent.stream.wire import event_to_wire
+
+    posted_chunks: list[tuple[object, str]] = []
+
+    class _Stub(BaseBridge):
+        name = "stub"
+        message_limit = 4096
+
+        async def post_status(self, target, text):
+            return None  # don't care about status here
+
+        async def send_text_chunk(self, target, chunk):
+            posted_chunks.append((target, chunk))
+
+        async def send_attachment(self, target, att):
+            pass
+
+    bridge = _Stub.__new__(_Stub)
+    bridge.name = "stub"
+    bridge._stream_opened = set()
+    bridge._stream_pending = {}
+    bridge._ws = object()  # bypass the not-connected guard
+    sent: list[dict] = []
+
+    async def _capture(payload):
+        sent.append(payload)
+
+    bridge._send_gateway_json = _capture  # type: ignore[method-assign]
+
+    async def resolve_owner_with_merged_response():
+        for _ in range(500):
+            col = bridge._stream_pending.get("sid:spam")
+            if col is not None:
+                # All three followers have stashed their target by now;
+                # release the owner with a merged-style reply.
+                col.text = "addresses M1, M2, and M3"
+                col.model = "fake"
+                col.done.set()
+                return
+            await asyncio.sleep(0.001)
+        raise AssertionError("collector never appeared")
+
+    # Three concurrent handlers, three different reply anchors. Mirrors
+    # a Telegram user spamming three messages.
+    a, b, c, _ = await asyncio.gather(
+        bridge.dispatch_turn("target-M1", "sid:spam", "M1"),
+        bridge.dispatch_turn("target-M2", "sid:spam", "M2"),
+        bridge.dispatch_turn("target-M3", "sid:spam", "M3"),
+        resolve_owner_with_merged_response(),
+    )
+
+    # Exactly one chunk posted (the owner's merged reply), anchored to
+    # the LATEST target. The pre-fix bug would post against target-M1.
+    assert len(posted_chunks) == 1, posted_chunks
+    target, chunk = posted_chunks[0]
+    assert target == "target-M3", (
+        f"owner anchored reply to STALE target {target!r} — should be the "
+        f"latest follower target 'target-M3'. This is the spam-anchor bug."
+    )
+    assert "M1" in chunk and "M2" in chunk and "M3" in chunk, chunk
+
+    # All three text_finals reached the gateway so the merge has them.
+    text_finals = sorted(p["text"] for p in sent if p["type"] == "text_final")
+    assert text_finals == ["M1", "M2", "M3"], text_finals
+
+
+@test("bridges", "late follower of a finalised collector starts a fresh turn (no target leak)")
+async def t_dispatch_turn_late_follower_does_not_poison(ctx: TestContext) -> None:
+    """Race window: the gateway has fired ``turn_complete`` (collector's
+    ``done`` is set) but the OWNER hasn't finished its ``finally``
+    cleanup yet. A new message arriving in that window must NOT latch
+    onto the dying collector — otherwise its target overwrites the
+    owner's already-finalised ``latest_target`` and the merged reply
+    gets anchored to a message that belongs to a FUTURE turn.
+
+    Fix: ``send_message`` treats a collector with ``done.is_set()`` as
+    no-owner so the late arrival gets its own collector. We also gate
+    ``latest_target`` updates on ``not done.is_set()`` so even if the
+    check above gets refactored away, the corpse can't be re-targeted.
+    """
+    import asyncio
+    from openagent.bridges.base import BaseBridge
+    from openagent.stream.collector import StreamCollector
+
+    bridge = BaseBridge.__new__(BaseBridge)
+    bridge.name = "fake"
+    bridge._stream_opened = set()
+    bridge._stream_pending = {}
+    bridge._ws = object()
+
+    sent: list[dict] = []
+
+    async def _capture(payload):
+        sent.append(payload)
+
+    bridge._send_gateway_json = _capture  # type: ignore[method-assign]
+
+    # Pre-seed the slot with a collector whose ``done`` is already set,
+    # mimicking a turn that just finished but hasn't cleaned up.
+    finalised = StreamCollector()
+    finalised.latest_target = "stale-original-target"
+    finalised.done.set()
+    bridge._stream_opened.add("sid:race")
+    bridge._stream_pending["sid:race"] = finalised
+
+    # A late arrival should treat the finalised collector as no-owner
+    # and create its OWN collector, NOT overwrite the corpse's target.
+    async def _late_send():
+        return await bridge.send_message(
+            "late text", "sid:race", target="late-target",
+        )
+
+    async def _resolver():
+        # Wait for the new collector to appear, then release it.
+        for _ in range(500):
+            col = bridge._stream_pending.get("sid:race")
+            if col is not None and col is not finalised:
+                col.text = "fresh response"
+                col.done.set()
+                return
+            await asyncio.sleep(0.001)
+        raise AssertionError("late follower never created a fresh collector")
+
+    result, _ = await asyncio.gather(_late_send(), _resolver())
+
+    # The late arrival was an OWNER, not a duplicate.
+    assert result["type"] == "response", result
+    assert result["text"] == "fresh response", result
+    # And critically: the corpse's target is unchanged.
+    assert finalised.latest_target == "stale-original-target", (
+        f"late follower poisoned the finalised collector's target: "
+        f"{finalised.latest_target!r}"
+    )
+
+
 @test("bridges", "every bridge handler funnels through BaseBridge.dispatch_turn")
 async def t_bridges_use_shared_dispatch(ctx: TestContext) -> None:
     """Spam-coalescence, voice-modality mirror, and duplicate-sentinel
@@ -570,7 +721,6 @@ def _fresh_telegram_bridge():
     # touches after the freshness check.
     bridge._stream_opened = set()
     bridge._stream_pending = {}
-    bridge._status_callbacks = {}
     return bridge
 
 

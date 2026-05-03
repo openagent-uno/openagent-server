@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Callable, Awaitable
+from typing import Any, Callable, Awaitable
 
 from openagent.channels.base import (
     parse_response_markers,
@@ -95,7 +95,6 @@ class BaseBridge:
         self._should_stop = False
         self._command_future: asyncio.Future | None = None
         self._command_lock = asyncio.Lock()
-        self._status_callbacks: dict[str, Callable] = {}  # session_id → on_status
         # NOTE: there is no ``_delta_callbacks`` field. Bridges run in
         # answer-response mode — the gateway streams deltas server-side
         # (the web app consumes them), but bridges only forward the
@@ -107,7 +106,9 @@ class BaseBridge:
         # since the gateway tears down server-side sessions on WS drop.
         # ``_stream_pending`` maps session_id → in-flight collector;
         # the listener writes events into it via ``fold_outbound_event``,
-        # ``send_message`` awaits ``collector.done``.
+        # ``send_message`` awaits ``collector.done``. The tool-status
+        # callback lives ON the collector so it dies with the collector
+        # (no stale per-session callback dict to keep in sync).
         self._stream_opened: set[str] = set()
         self._stream_pending: dict[str, StreamCollector] = {}
 
@@ -153,7 +154,6 @@ class BaseBridge:
         # the awaiters.
         orphaned_streams = list(self._stream_pending.items())
         self._stream_pending.clear()
-        self._status_callbacks.clear()
         for sid, collector in orphaned_streams:
             collector.errored = True
             collector.error_text = reason
@@ -250,7 +250,7 @@ class BaseBridge:
         collector = self._stream_pending.get(sid) if sid else None
 
         if t == P.STATUS:
-            cb = self._status_callbacks.get(sid)
+            cb = collector.on_status if collector is not None else None
             if cb is not None:
                 try:
                     await cb(data.get("text", ""))
@@ -285,6 +285,7 @@ class BaseBridge:
         text: str,
         session_id: str,
         *,
+        target: Any = None,
         on_status: Callable[[str], Awaitable[None]] | None = None,
         input_was_voice: bool = False,
         source: str = "user_typed",
@@ -304,6 +305,13 @@ class BaseBridge:
         ``turn_complete`` that's now routed to the third caller's
         collector. Voice notes (``source="stt"``) still bypass server
         coalescence for instant barge-in.
+
+        ``target`` is the platform-specific reply anchor (Telegram
+        ``Message`` etc.). Both owner and followers stash it on the
+        owner's collector so the merged reply gets posted against the
+        LATEST message — without this, the bot visibly replies to the
+        FIRST message in the burst, looking like it's "answering an
+        old message".
         """
         if session_id not in self._stream_opened:
             await self._send_gateway_json(event_to_wire(SessionOpen(
@@ -316,16 +324,27 @@ class BaseBridge:
             self._stream_opened.add(session_id)
 
         # Atomic ownership check — synchronous, no awaits between read
-        # and write so two concurrent tasks can't both win.
+        # and write so two concurrent tasks can't both win. A collector
+        # whose ``done`` is already set is in its post-turn cleanup
+        # window; treat it as no-owner so a fresh message starts a new
+        # turn instead of latching onto a corpse and overwriting the
+        # owner's ``latest_target`` after it's been read.
         existing = self._stream_pending.get(session_id)
-        is_owner = existing is None
+        is_owner = (existing is None) or existing.done.is_set()
         if is_owner:
             collector = StreamCollector()
+            collector.on_status = on_status
             self._stream_pending[session_id] = collector
-            if on_status:
-                self._status_callbacks[session_id] = on_status
         else:
             collector = existing
+
+        # Both owner and followers contribute their target so the owner
+        # posts the merged reply against the most-recent message — see
+        # docstring rationale. Skip once the collector has fired its
+        # ``done`` event so a late follower can't poison the OWNER's
+        # already-finalised target read.
+        if target is not None and not collector.done.is_set():
+            collector.latest_target = target
 
         try:
             await self._send_gateway_json(event_to_wire(TextFinal(
@@ -335,9 +354,8 @@ class BaseBridge:
                 source=source,  # type: ignore[arg-type]
             )))
         except Exception:
-            if is_owner:
+            if is_owner and self._stream_pending.get(session_id) is collector:
                 self._stream_pending.pop(session_id, None)
-                self._status_callbacks.pop(session_id, None)
             raise
 
         if not is_owner:
@@ -350,6 +368,7 @@ class BaseBridge:
                 "text": "",
                 "model": None,
                 "attachments": [],
+                "target": None,
             }
 
         try:
@@ -361,7 +380,6 @@ class BaseBridge:
             # our ``done`` fired).
             if self._stream_pending.get(session_id) is collector:
                 self._stream_pending.pop(session_id, None)
-            self._status_callbacks.pop(session_id, None)
 
     # ── Platform primitives (override per bridge) ──────────────────
     #
@@ -435,6 +453,7 @@ class BaseBridge:
         try:
             response = await self.send_message(
                 text, session_id,
+                target=target,
                 on_status=on_status,
                 # Voice notes bypass the typed-burst coalescence window
                 # for instant barge-in (StreamSession STT-bypass path).
@@ -452,18 +471,25 @@ class BaseBridge:
         if response.get("type") == "duplicate":
             return
 
+        # Anchor the merged reply to the LATEST message the burst saw,
+        # not the FIRST. Without this, a 5-message spam visibly replies
+        # to bubble #1 — looks like the bot is "answering an old
+        # message". send_message stashed each follower's target on the
+        # collector; the owner's reply now reads back the latest.
+        post_target = response.get("target") or target
+
         response_text = response.get("text", "") or ""
         response_text = await self.maybe_prepend_voice_reply(response_text, voice_detected)
 
         clean, attachments = parse_response_markers(response_text)
         for att in attachments:
             try:
-                await self.send_attachment(target, att)
+                await self.send_attachment(post_target, att)
             except Exception as e:  # noqa: BLE001
                 logger.error("%s attachment send error: %s", self.name, e)
 
         clean = self.append_model_feedback(clean, response.get("model"))
-        await self.send_response_text(target, clean)
+        await self.send_response_text(post_target, clean)
 
     async def send_response_text(self, target, text: str) -> None:
         """Split ``text`` at ``message_limit`` and send each chunk.

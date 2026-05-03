@@ -37,7 +37,6 @@ class _FakeBridge:
         self._real.name = "fake"
         self._real._stream_opened = set()
         self._real._stream_pending = {}
-        self._real._status_callbacks = {}
         self._real._ws = object()
         self.sent: list[dict] = []
 
@@ -59,7 +58,7 @@ class _FakeBridge:
             collector = self._real._stream_pending.get(sid) if sid else None
 
             if t == P.STATUS:
-                cb = self._real._status_callbacks.get(sid)
+                cb = collector.on_status if collector is not None else None
                 if cb is not None:
                     await cb(data.get("text", ""))
             elif t == P.DELTA:
@@ -157,7 +156,7 @@ async def t_send_message_ignores_delta(_ctx: TestContext) -> None:
         driver(),
     )
     assert result["text"] == "Hello world!", result
-    # Cleanup — the collector map and status-callback map must be empty
-    # so a later turn against the same id starts fresh.
+    # Cleanup — the collector map must be empty so a later turn against
+    # the same id starts fresh. on_status is bound to the collector so
+    # it dies with it (no separate map to check).
     assert "s-final" not in fb._real._stream_pending, fb._real._stream_pending
-    assert "s-final" not in fb._real._status_callbacks, fb._real._status_callbacks
