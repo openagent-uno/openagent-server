@@ -33,6 +33,7 @@ async def t_wire_round_trip(ctx: TestContext) -> None:
         OutTextDelta, OutTextFinal, OutToolStatus, OutVideoFrame, SessionOpen,
         TextDelta, TextFinal, TurnComplete, VideoFrame,
     )
+    from openagent.stream.events import OutError
     from openagent.stream.wire import event_to_wire, wire_to_event
 
     cases = [
@@ -54,6 +55,7 @@ async def t_wire_round_trip(ctx: TestContext) -> None:
         Interrupt(session_id="s", seq=13, ts_ms=130, reason="user_speech"),
         SessionOpen(session_id="s", seq=14, ts_ms=140, profile="realtime",
                     language="en", client_kind="webapp"),
+        OutError(session_id="s", seq=15, ts_ms=150, text="boom"),
     ]
     for evt in cases:
         wire = event_to_wire(evt)
@@ -79,6 +81,31 @@ async def t_unknown_wire(ctx: TestContext) -> None:
     assert wire_to_event({"type": "auth"}) is None
     assert wire_to_event({"type": "lol_what"}) is None
     assert wire_to_event({}) is None
+
+
+@test("stream", "session_open emits explicit 0 on the wire (encoder side of the 3-state contract)")
+async def t_session_open_emits_explicit_zero(ctx: TestContext) -> None:
+    """The decoder distinguishes None / 0 / positive (see
+    ``t_session_open_coalesce_default``); pin the encoder side too. A
+    future "optimization" that drops 0 from the JSON would silently
+    flip explicit opt-out sessions back to the default coalesce."""
+    from openagent.stream.events import SessionOpen
+    from openagent.stream.wire import event_to_wire
+
+    explicit_zero = event_to_wire(SessionOpen(
+        session_id="s", seq=1, ts_ms=10, coalesce_window_ms=0,
+    ))
+    assert explicit_zero["coalesce_window_ms"] == 0, explicit_zero
+
+    explicit_positive = event_to_wire(SessionOpen(
+        session_id="s", seq=1, ts_ms=10, coalesce_window_ms=750,
+    ))
+    assert explicit_positive["coalesce_window_ms"] == 750, explicit_positive
+
+    server_default = event_to_wire(SessionOpen(
+        session_id="s", seq=1, ts_ms=10, coalesce_window_ms=None,
+    ))
+    assert server_default["coalesce_window_ms"] is None, server_default
 
 
 @test("stream", "session_open without coalesce_window_ms decodes to None (use default)")
@@ -1254,6 +1281,223 @@ async def t_slow_spawn_salvage(ctx: TestContext) -> None:
         f"merged turn must contain BOTH 'hello' and 'time' — that's the "
         f"smoking-gun fix. Got seen_messages={seen_messages}"
     )
+
+
+@test("stream", "Interrupt during cold spawn DROPS the input — no salvage, no merged dispatch")
+async def t_interrupt_during_spawn_no_salvage(ctx: TestContext) -> None:
+    """Counterpart to ``t_slow_spawn_salvage``: a typed-text barge-in
+    SALVAGES the just-dispatched message, but an explicit ``Interrupt``
+    DISCARDS it (no salvage, no merged turn). Pin this asymmetry — a
+    refactor that flipped Interrupt to ``salvage_to_burst=True`` would
+    silently re-feed user content the user was trying to discard."""
+    from openagent.stream.events import Interrupt, TextFinal, now_ms
+
+    spawn_release = asyncio.Event()
+    seen_messages: list[str] = []
+
+    class _SlowSpawnAgent:
+        name = "slow-spawn"
+        db = None
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def run_stream(self, *, message, user_id, session_id,
+                             attachments=None, on_status=None):
+            self.calls += 1
+            if self.calls == 1:
+                await spawn_release.wait()
+            seen_messages.append(message)
+            yield {"kind": "done", "text": ""}
+
+        def last_response_meta(self, sid):
+            return {"model": "slow-spawn"}
+
+    agent = _SlowSpawnAgent()
+    sess = _make_session(agent, coalesce_window_ms=100)
+
+    async def _null(_db):
+        return None
+
+    await sess.start(stt_factory=_null, tts_factory=_null)
+    try:
+        await sess.push_in(TextFinal(
+            session_id="s", seq=1, ts_ms=now_ms(),
+            text="hello", source="user_typed",
+        ))
+        await _wait_for(lambda: agent.calls >= 1, timeout=2.0)
+        # Interrupt during spawn → drop, do NOT salvage.
+        await sess.push_in(Interrupt(
+            session_id="s", seq=2, ts_ms=now_ms(), reason="manual",
+        ))
+        spawn_release.set()
+        # Give the dispatch loop time to handle the Interrupt + any
+        # ghost dispatch attempts; nothing more should land.
+        await asyncio.sleep(0.4)
+    finally:
+        spawn_release.set()
+        await sess.close()
+
+    # The cancelled first call ran (spawn-blocked) but produced no
+    # actual yield. ``seen_messages`` only collects what the agent
+    # AFTER cancellation processes — Interrupt must not let "hello"
+    # come back via a follow-up burst.
+    assert "hello" not in seen_messages, (
+        f"Interrupt must DISCARD the in-flight typed input — saw "
+        f"seen_messages={seen_messages}"
+    )
+    assert sess._pending_burst == [], (
+        f"Interrupt must clear the burst buffer; got {sess._pending_burst}"
+    )
+
+
+@test("stream", "mirror modality: STT input speaks even when speak_enabled=False")
+async def t_mirror_modality_stt_speaks_when_typed_silent(ctx: TestContext) -> None:
+    """``speak_enabled=False`` silences typed-text replies (chat tab
+    default), but voice (``source='stt'``) MUST still speak via the
+    mirror-modality rule — without this the OpenAI-Realtime feel
+    breaks for voice notes sent into chat-tab sessions."""
+    from openagent.channels.tts_base import BaseTTS
+    from openagent.stream.events import (
+        OutAudioChunk, OutTextDelta, TextFinal, TurnComplete, now_ms,
+    )
+
+    class _NoiseTTS(BaseTTS):
+        @property
+        def audio_format(self):
+            return "wav", "audio/wav"
+
+        @property
+        def voice_id(self):
+            return "test-voice"
+
+        async def synthesize_full(self, text, *, language=None):
+            return b"\x00\x01" * 8
+
+        async def synthesize_stream(self, text_chunks, *, language=None):
+            async for _ in text_chunks:
+                pass
+            yield b"VOICE-CHUNK"
+
+    async def _tts_factory(_db):
+        return _NoiseTTS()
+
+    async def _null(_db):
+        return None
+
+    # speak_enabled=False — typed replies stay silent.
+    sess = _make_session(_FakeAgent(["he", "llo"]), coalesce_window_ms=0,
+                         speak_enabled=False)
+    await sess.start(stt_factory=_null, tts_factory=_tts_factory)
+    try:
+        # Typed message: NO audio.
+        await sess.push_in(TextFinal(
+            session_id="s", seq=1, ts_ms=now_ms(),
+            text="typed silently", source="user_typed",
+        ))
+        # Drain until TurnComplete.
+        typed_audio = 0
+        while True:
+            evt = await asyncio.wait_for(sess.outbound.get(), timeout=2.0)
+            if isinstance(evt, OutAudioChunk):
+                typed_audio += 1
+            if isinstance(evt, TurnComplete):
+                break
+        assert typed_audio == 0, (
+            f"speak_enabled=False must silence typed replies; got {typed_audio} audio chunks"
+        )
+
+        # STT message on the SAME session: MUST speak (mirror modality).
+        await sess.push_in(TextFinal(
+            session_id="s", seq=2, ts_ms=now_ms(),
+            text="spoken aloud", source="stt",
+        ))
+        stt_audio = 0
+        while True:
+            evt = await asyncio.wait_for(sess.outbound.get(), timeout=2.0)
+            if isinstance(evt, OutAudioChunk):
+                stt_audio += 1
+            if isinstance(evt, TurnComplete):
+                break
+        assert stt_audio >= 1, (
+            f"STT input MUST speak via mirror modality even with "
+            f"speak_enabled=False; got {stt_audio} audio chunks"
+        )
+    finally:
+        await sess.close()
+
+
+@test("stream", "pre_dispatch_hook rejection publishes OutError + TurnComplete, no runner")
+async def t_pre_dispatch_hook_rejects(ctx: TestContext) -> None:
+    """Gateway uses the hook for budget gating + history-mode binding.
+    Returning a non-None error string must publish a clean error frame
+    and SKIP the runner entirely — without this, budget-blocked turns
+    would still spawn the agent."""
+    from openagent.stream.events import OutError, TextFinal, TurnComplete, now_ms
+
+    agent = _RecordingAgent(block_first=False)
+    sess = _make_session(agent, coalesce_window_ms=0)
+
+    async def _reject(_msg):
+        return "BUDGET_EXCEEDED"
+
+    sess.pre_dispatch_hook = _reject
+
+    async def _null(_db):
+        return None
+
+    await sess.start(stt_factory=_null, tts_factory=_null)
+    try:
+        await sess.push_in(TextFinal(
+            session_id="s", seq=1, ts_ms=now_ms(),
+            text="should not reach agent", source="user_typed",
+        ))
+        # Drain.
+        events = []
+        while True:
+            evt = await asyncio.wait_for(sess.outbound.get(), timeout=2.0)
+            events.append(evt)
+            if isinstance(evt, TurnComplete):
+                break
+    finally:
+        await sess.close()
+
+    assert agent.calls == [], (
+        f"rejected turn must NOT reach the agent; got {agent.calls}"
+    )
+    errors = [e for e in events if isinstance(e, OutError)]
+    assert len(errors) == 1 and errors[0].text == "BUDGET_EXCEEDED", events
+
+
+@test("stream", "pre_dispatch_hook exception is swallowed, dispatch proceeds")
+async def t_pre_dispatch_hook_exception_swallowed(ctx: TestContext) -> None:
+    """A buggy hook must not break the session — log, swallow, and
+    fall through to the normal dispatch path."""
+    from openagent.stream.events import TextFinal, TurnComplete, now_ms
+
+    agent = _RecordingAgent(block_first=False)
+    sess = _make_session(agent, coalesce_window_ms=0)
+
+    async def _crashy(_msg):
+        raise RuntimeError("hook crashed")
+
+    sess.pre_dispatch_hook = _crashy
+
+    async def _null(_db):
+        return None
+
+    await sess.start(stt_factory=_null, tts_factory=_null)
+    try:
+        await sess.push_in(TextFinal(
+            session_id="s", seq=1, ts_ms=now_ms(),
+            text="hi", source="user_typed",
+        ))
+        await _wait_for(lambda: len(agent.calls) >= 1, timeout=1.0)
+    finally:
+        await sess.close()
+
+    # Hook crashed but the agent still saw the message.
+    assert agent.calls and agent.calls[0]["message"] == "hi"
 
 
 @test("stream", "10-message rapid spam coalesces — every message reaches the agent")

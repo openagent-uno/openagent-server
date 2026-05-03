@@ -290,6 +290,78 @@ async def t_send_message_owner_cleanup_idempotent(ctx: TestContext) -> None:
     )
 
 
+@test("bridges", "telegram _dispatch_to_agent skips _send_response on duplicate sentinel")
+async def t_telegram_handler_skips_duplicate(ctx: TestContext) -> None:
+    """Pin the bridge-handler short-circuit on the duplicate sentinel.
+    Without this check, a follower's empty ``response.text`` would
+    reach ``_send_response`` and post an empty reply — or worse, future
+    refactors could silently re-introduce N copies of the merged reply
+    per burst. This test fires the handler with a stub ``send_message``
+    that returns the sentinel and verifies no reply was posted."""
+    from openagent.bridges.telegram import TelegramBridge
+
+    bridge = TelegramBridge.__new__(TelegramBridge)
+    bridge.name = "telegram"
+    posted: list[tuple[str, str | None]] = []
+
+    async def _fake_send_message(text, session_id, **kwargs):
+        return {"type": "duplicate", "text": "", "model": None, "attachments": []}
+
+    async def _fake_send_response(msg, response_text, model=None):
+        posted.append((response_text, model))
+
+    async def _fake_maybe_prepend(text, voice_detected):
+        return text
+
+    bridge.send_message = _fake_send_message  # type: ignore[method-assign]
+    bridge._send_response = _fake_send_response  # type: ignore[method-assign]
+    bridge.maybe_prepend_voice_reply = _fake_maybe_prepend  # type: ignore[method-assign]
+
+    class _FakeStatus:
+        async def edit_text(self, *_a, **_kw): pass
+        async def delete(self): pass
+
+    class _FakeMsg:
+        async def reply_text(self, *_a, **_kw): return _FakeStatus()
+
+    await bridge._dispatch_to_agent(_FakeMsg(), uid="42", text="hello")
+    assert posted == [], f"duplicate sentinel must not post a reply; got {posted}"
+
+
+@test("bridges", "discord on_message handler returns early on duplicate sentinel")
+async def t_discord_handler_skips_duplicate(ctx: TestContext) -> None:
+    """Verify the duplicate-sentinel short-circuit on the Discord side
+    by reading the bridge module's source — the on_message handler is
+    a closure inside ``_run`` so we can't drive it directly without
+    spinning up the real discord client. A source-level grep is the
+    pragmatic alternative."""
+    import inspect
+
+    import openagent.bridges.discord as dc
+
+    src = inspect.getsource(dc.DiscordBridge._run)
+    assert 'if response.get("type") == "duplicate"' in src, (
+        "Discord on_message must short-circuit on duplicate sentinel — "
+        "without this, concurrent message spam would post N copies of "
+        "the merged reply"
+    )
+
+
+@test("bridges", "whatsapp _handle returns early on duplicate sentinel")
+async def t_whatsapp_handler_skips_duplicate(ctx: TestContext) -> None:
+    """Mirrors the Telegram test for the WhatsApp handler."""
+    import inspect
+
+    import openagent.bridges.whatsapp as wa
+
+    src = inspect.getsource(wa.WhatsAppBridge._handle)
+    assert 'if response.get("type") == "duplicate"' in src, (
+        "WhatsApp _handle must short-circuit on duplicate sentinel — "
+        "without this, concurrent message spam would post N copies of "
+        "the merged reply"
+    )
+
+
 @test("bridges", "send_message exposes errors as type=error on the legacy reply")
 async def t_send_message_error(ctx: TestContext) -> None:
     """Stream-side errors set ``collector.errored``; ``to_legacy_reply``
