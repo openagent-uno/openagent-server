@@ -12,6 +12,8 @@ import signal as signal_module
 import time
 from typing import Literal
 
+from openagent.core.logging import elog
+
 logger = logging.getLogger(__name__)
 
 # Per-stream output cap (spec § Buffering and truncation).
@@ -223,6 +225,7 @@ class BackgroundShell:
                 await self._stderr_task
             except Exception as e:  # noqa: BLE001
                 logger.warning("stderr drain error for %s: %s", self.shell_id, e)
+        elog("shell_exec.finalise_done", shell_id=self.shell_id, rc=rc)
         # Signal naming: negative returncodes = killed by signal on
         # POSIX. Translate back to a name.
         if rc is not None and rc < 0:
@@ -305,7 +308,9 @@ class BackgroundShell:
                 await asyncio.wait_for(self._proc.wait(), timeout=timeout_seconds)
             except asyncio.TimeoutError:
                 timed_out = True
+                elog("shell_exec.wait_timeout_fired", shell_id=self.shell_id, timeout_s=timeout_seconds)
                 await self.kill(signal_name="TERM", grace_seconds=DEFAULT_KILL_GRACE)
+                elog("shell_exec.kill_returned", shell_id=self.shell_id)
         finally:
             await self.finalise()
         stdout, stderr = self.read(since_stdout=0, since_stderr=0)

@@ -433,6 +433,50 @@ async def t_handlers_exec_fg_timeout(ctx: TestContext) -> None:
     assert out["signal"] in ("TERM", "KILL", "15", "9")
 
 
+@test("shell", "shell_exec emits diag events on the timeout path")
+async def t_shell_exec_diag_events(ctx: TestContext) -> None:
+    """The shell-stall diag (chore(diag) on 2026-05-03) needs these
+    five events on the timeout path so the next stall is layer-isolatable.
+    Without them, events.jsonl just shows a tool_use_request with no
+    tool_use_result and we're back to guessing at the layer.
+    """
+    import logging as _logging
+
+    _reset_shell_hub()
+    from openagent.core.logging import EVENT_LOGGER
+    from openagent.mcp.servers.shell import handlers
+
+    captured: list[str] = []
+
+    class _Capture(_logging.Handler):
+        def emit(self, record: _logging.LogRecord) -> None:
+            captured.append(record.getMessage())
+
+    handler = _Capture(level=_logging.DEBUG)
+    events_logger = _logging.getLogger(EVENT_LOGGER)
+    events_logger.addHandler(handler)
+    try:
+        out = await handlers.shell_exec(
+            command="sleep 10",
+            cwd=None, env=None, timeout=200,
+            run_in_background=False, stdin=None, description=None,
+            session_id="sess-diag",
+        )
+    finally:
+        events_logger.removeHandler(handler)
+
+    assert out["timed_out"] is True
+    expected = {
+        "shell_exec.handler_enter",
+        "shell_exec.wait_timeout_fired",
+        "shell_exec.kill_returned",
+        "shell_exec.finalise_done",
+        "shell_exec.handler_done",
+    }
+    missing = expected - set(captured)
+    assert not missing, f"diag events missing: {missing}; got {captured}"
+
+
 @test("shell", "handlers.shell_which: existing command returns path")
 async def t_handlers_which_ok(ctx: TestContext) -> None:
     _reset_shell_hub()

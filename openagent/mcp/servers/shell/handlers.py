@@ -15,6 +15,7 @@ import shutil
 import time
 from typing import Any
 
+from openagent.core.logging import elog
 from openagent.mcp.servers.shell.events import ShellEvent
 from openagent.mcp.servers.shell.hub import ShellHub
 from openagent.mcp.servers.shell.shells import BackgroundShell
@@ -108,8 +109,18 @@ async def shell_exec(
         }
 
     # Foreground path — no hub registration.
+    elog("shell_exec.handler_enter", session_id=session_id, shell_id=shell_id, timeout_s=timeout_s)
     result = await bg.run_with_timeout(
         timeout_seconds=timeout_s, stdin_data=stdin
+    )
+    elog(
+        "shell_exec.handler_done",
+        session_id=session_id,
+        shell_id=shell_id,
+        timed_out=result.timed_out,
+        exit_code=result.exit_code,
+        signal=result.signal,
+        duration_ms=result.duration_ms,
     )
     return {
         "exit_code": result.exit_code,
