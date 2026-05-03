@@ -13,6 +13,10 @@ import json
 import logging
 from typing import Callable, Awaitable
 
+from openagent.channels.base import (
+    parse_response_markers,
+    split_preserving_code_blocks,
+)
 from openagent.gateway import protocol as P
 
 from openagent.core.logging import elog
@@ -65,9 +69,21 @@ def format_tool_status(raw: str) -> str:
 
 
 class BaseBridge:
-    """Abstract base for platform bridges."""
+    """Abstract base for platform bridges.
+
+    Concrete bridges plug their platform's polling/event primitives into
+    :meth:`_run` and override the small set of platform helpers below
+    (``post_status``, ``update_status``, ``clear_status``,
+    ``send_text_chunk``, ``send_attachment``); the shared turn
+    orchestration lives in :meth:`dispatch_turn` so a fix to the
+    spam-coalescence + voice-mirror flow lands in every bridge at once.
+    """
 
     name: str = "bridge"
+
+    # Per-platform message size limit used by ``dispatch_turn`` when it
+    # splits the response. Overridden in subclasses.
+    message_limit: int = 4000
 
     def __init__(self, gateway_url: str = "ws://localhost:8765/ws", gateway_token: str | None = None):
         self.gateway_url = gateway_url
@@ -346,6 +362,123 @@ class BaseBridge:
             if self._stream_pending.get(session_id) is collector:
                 self._stream_pending.pop(session_id, None)
             self._status_callbacks.pop(session_id, None)
+
+    # ── Platform primitives (override per bridge) ──────────────────
+    #
+    # ``dispatch_turn`` calls these to translate between the shared
+    # orchestration and the platform's send/edit primitives. Defaults are
+    # no-ops so a bridge that genuinely can't do something (e.g. WhatsApp
+    # has no edit API) doesn't have to think about it — the abstract
+    # methods are ``send_text_chunk`` and ``send_attachment``, which
+    # every bridge MUST override.
+
+    async def post_status(self, target, text: str):
+        """Post the initial "Thinking..." status. Return an opaque
+        handle (anything the bridge wants — message object, chat_id, …)
+        that ``update_status`` / ``clear_status`` will receive back, or
+        ``None`` if the bridge has no status surface."""
+        return None
+
+    async def update_status(self, handle, text: str) -> None:
+        """Update the in-flight status with a new line (e.g. "Using bash…").
+        Default: no-op (bridges with no edit API can override to
+        post a throttled new message instead)."""
+        return None
+
+    async def clear_status(self, handle) -> None:
+        """Remove the status indicator once the turn is done. Default:
+        no-op (WhatsApp can't delete messages, so the throttled status
+        line just stays in the chat)."""
+        return None
+
+    async def send_text_chunk(self, target, chunk: str) -> None:
+        """Send one already-split chunk of response text. Subclasses
+        own platform formatting (HTML render + fallback for Telegram,
+        whatsapp markdown, etc.) inside this method."""
+        raise NotImplementedError
+
+    async def send_attachment(self, target, att) -> None:
+        """Send one ``Attachment`` (image, voice, video, file) to the
+        platform. Subclasses dispatch by ``att.type`` as needed."""
+        raise NotImplementedError
+
+    async def dispatch_turn(
+        self,
+        target,
+        session_id: str,
+        text: str,
+        *,
+        voice_detected: bool = False,
+    ) -> None:
+        """Shared orchestration: post status → send_message → render reply.
+
+        Lives here (not in each bridge) so the spam-coalescence
+        sentinel, voice-modality mirror, attachment splitting, and
+        message-limit chunking all stay in lockstep across Telegram,
+        Discord, and WhatsApp. A subclass usually only needs to fill in
+        the platform primitives above; the orchestration "just works".
+        """
+        try:
+            status_handle = await self.post_status(target, "Thinking...")
+        except Exception as e:  # noqa: BLE001
+            logger.debug("%s: post_status failed: %s", self.name, e)
+            status_handle = None
+
+        async def on_status(raw: str) -> None:
+            if status_handle is None:
+                return
+            try:
+                await self.update_status(status_handle, format_tool_status(raw))
+            except Exception:
+                pass
+
+        try:
+            response = await self.send_message(
+                text, session_id,
+                on_status=on_status,
+                # Voice notes bypass the typed-burst coalescence window
+                # for instant barge-in (StreamSession STT-bypass path).
+                source="stt" if voice_detected else "user_typed",
+            )
+        finally:
+            if status_handle is not None:
+                try:
+                    await self.clear_status(status_handle)
+                except Exception:
+                    pass
+
+        # Concurrent message in the same burst — the owner posts the
+        # merged reply; followers exit so the user sees ONE response.
+        if response.get("type") == "duplicate":
+            return
+
+        response_text = response.get("text", "") or ""
+        response_text = await self.maybe_prepend_voice_reply(response_text, voice_detected)
+
+        clean, attachments = parse_response_markers(response_text)
+        for att in attachments:
+            try:
+                await self.send_attachment(target, att)
+            except Exception as e:  # noqa: BLE001
+                logger.error("%s attachment send error: %s", self.name, e)
+
+        clean = self.append_model_feedback(clean, response.get("model"))
+        await self.send_response_text(target, clean)
+
+    async def send_response_text(self, target, text: str) -> None:
+        """Split ``text`` at ``message_limit`` and send each chunk.
+
+        Shared by ``dispatch_turn`` and command handlers (``/clear``,
+        ``/help``) so a long command result obeys the same chunking +
+        per-platform rendering as a normal reply.
+        """
+        if not text:
+            return
+        for chunk in split_preserving_code_blocks(text, self.message_limit):
+            try:
+                await self.send_text_chunk(target, chunk)
+            except Exception as e:  # noqa: BLE001
+                logger.error("%s text send error: %s", self.name, e)
 
     # ── Voice helpers (shared by every bridge) ──────────────────────
 

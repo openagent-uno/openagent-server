@@ -7,13 +7,11 @@ import logging
 import tempfile
 from pathlib import Path
 
-from openagent.bridges.base import BaseBridge, format_tool_status
+from openagent.bridges.base import BaseBridge
 from openagent.channels.base import (
     build_attachment_context,
     is_blocked_attachment,
-    parse_response_markers,
     prepend_context_block,
-    split_preserving_code_blocks,
 )
 from openagent.channels.formatting import markdown_to_whatsapp
 from openagent.gateway.commands import BRIDGE_COMMANDS, bridge_welcome_text
@@ -35,6 +33,7 @@ class WhatsAppBridge(BaseBridge):
     """WhatsApp (Green API) ↔ Gateway bridge."""
 
     name = "whatsapp"
+    message_limit = WHATSAPP_MSG_LIMIT
 
     def __init__(
         self,
@@ -49,6 +48,11 @@ class WhatsAppBridge(BaseBridge):
         self.api_token = api_token
         self.allowed_users = set(str(u) for u in allowed_users) if allowed_users else None
         self._greenapi = None
+        # Per-chat throttle for status updates: WhatsApp can't edit, so
+        # every progress ping is a brand-new bubble. We dedupe identical
+        # lines and wait ``WA_STATUS_THROTTLE_SECS`` between distinct
+        # updates so the user doesn't see a wall of "Using bash…" pings.
+        self._status_throttle: dict[str, dict] = {}
 
     async def _run(self) -> None:
         try:
@@ -154,66 +158,57 @@ class WhatsAppBridge(BaseBridge):
         if not text:
             return
 
-        session_id = f"wa:{user_id}"
-
-        # Send "thinking" (WA can't edit messages, so we throttle updates
-        # to avoid spam — only post a new status if the message changed
-        # AND at least WA_STATUS_THROTTLE_SECS have passed.)
-        await self._send_text(chat_id, "⏳ Thinking...")
-        last_status = {"text": "", "ts": 0.0}
-
-        async def on_status(raw: str):
-            line = format_tool_status(raw)
-            now = asyncio.get_event_loop().time()
-            if line == last_status["text"]:
-                return
-            if now - last_status["ts"] < WA_STATUS_THROTTLE_SECS:
-                return
-            last_status["text"] = line
-            last_status["ts"] = now
-            try:
-                await self._send_text(chat_id, f"⏳ {line}")
-            except Exception:
-                pass
-
-        # WhatsApp's HTTP API can't edit messages — every "update"
-        # would be a new chat bubble, which would spam the user. So
-        # the bridge-visible UX is "status pings + final response".
-        # The gateway still streams server-side via DELTA frames; we
-        # just don't consume them here.
-        response = await self.send_message(
-            text, session_id,
-            on_status=on_status,
-            # Voice notes bypass the typed-burst coalescence window
-            # for instant barge-in (StreamSession STT-bypass path).
-            source="stt" if voice_detected else "user_typed",
+        await self.dispatch_turn(
+            chat_id, f"wa:{user_id}", text, voice_detected=voice_detected,
         )
 
-        # Concurrent message in the same burst — the owner posts the
-        # merged reply; followers exit so the user sees ONE response.
-        if response.get("type") == "duplicate":
+    # ── Platform primitives (consumed by BaseBridge.dispatch_turn) ──
+    #
+    # WhatsApp's HTTP API can't edit messages — every "update" would be
+    # a new chat bubble. ``post_status`` posts the initial line and
+    # seeds the per-chat throttle so ``update_status`` only re-posts
+    # when the line CHANGES and at least ``WA_STATUS_THROTTLE_SECS``
+    # have passed since the last ping. ``clear_status`` wipes the
+    # throttle slot (the visible "Thinking…" stays in chat — there's
+    # no API to remove it).
+
+    async def post_status(self, chat_id, text: str):
+        await self._send_text(chat_id, f"⏳ {text}")
+        self._status_throttle[chat_id] = {
+            "text": text, "ts": asyncio.get_event_loop().time(),
+        }
+        return chat_id
+
+    async def update_status(self, chat_id, text: str) -> None:
+        last = self._status_throttle.get(chat_id) or {"text": "", "ts": 0.0}
+        now = asyncio.get_event_loop().time()
+        if text == last["text"]:
             return
+        if now - last["ts"] < WA_STATUS_THROTTLE_SECS:
+            return
+        self._status_throttle[chat_id] = {"text": text, "ts": now}
+        try:
+            await self._send_text(chat_id, f"⏳ {text}")
+        except Exception:
+            pass
 
-        resp_text = response.get("text", "")
-        resp_text = await self.maybe_prepend_voice_reply(resp_text, voice_detected)
+    async def clear_status(self, chat_id) -> None:
+        self._status_throttle.pop(chat_id, None)
 
-        clean, attachments = parse_response_markers(resp_text)
-        clean = self.append_model_feedback(clean, response.get("model"))
+    async def send_text_chunk(self, chat_id, chunk: str) -> None:
+        await self._send_text(chat_id, markdown_to_whatsapp(chunk))
 
-        for att in attachments:
-            try:
-                p = Path(att.path)
-                if p.exists():
-                    await asyncio.to_thread(
-                        self._greenapi.sending.sendFileByUpload, chat_id, str(p), att.filename, ""
-                    )
-            except Exception as e:
-                logger.error("WA attachment error: %s", e)
-
-        if clean:
-            wa_text = markdown_to_whatsapp(clean)
-            for chunk in split_preserving_code_blocks(wa_text, WHATSAPP_MSG_LIMIT):
-                await self._send_text(chat_id, chunk)
+    async def send_attachment(self, chat_id, att) -> None:
+        p = Path(att.path)
+        if not p.exists():
+            return
+        try:
+            await asyncio.to_thread(
+                self._greenapi.sending.sendFileByUpload,
+                chat_id, str(p), att.filename, "",
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error("WA attachment error: %s", e)
 
     async def _send_text(self, chat_id: str, text: str) -> None:
         try:

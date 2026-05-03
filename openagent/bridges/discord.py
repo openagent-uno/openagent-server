@@ -11,13 +11,11 @@ import logging
 import tempfile
 from pathlib import Path
 
-from openagent.bridges.base import BaseBridge, format_tool_status
+from openagent.bridges.base import BaseBridge
 from openagent.channels.base import (
     build_attachment_context,
     is_blocked_attachment,
-    parse_response_markers,
     prepend_context_block,
-    split_preserving_code_blocks,
 )
 from openagent.channels.voice import is_audio_file
 from openagent.gateway.commands import BOT_COMMANDS, bridge_welcome_text
@@ -31,6 +29,7 @@ DISCORD_MSG_LIMIT = 2000
 
 class DiscordBridge(BaseBridge):
     name = "discord"
+    message_limit = DISCORD_MSG_LIMIT
 
     def __init__(
         self,
@@ -163,65 +162,48 @@ class DiscordBridge(BaseBridge):
             if not content:
                 return
 
-            session_id = f"dc:{uid}"
-            status_msg = await message.channel.send("⏳ Thinking...")
-
-            # Tool-running statuses ("Using bash…") are still useful in
-            # Discord because they tell the user something is happening
-            # during a long turn. Token-by-token deltas USED to repaint
-            # the status message progressively too, but that re-flowed
-            # text on every edit and code blocks looked broken mid-
-            # stream, so we now wait for the canonical RESPONSE and
-            # post one clean message.
-            async def on_status(status):
-                try:
-                    await status_msg.edit(content=f"⏳ {format_tool_status(status)}")
-                except Exception:
-                    pass
-
-            response = await self.send_message(
-                content, session_id,
-                on_status=on_status,
-                # Voice notes bypass the typed-burst coalescence window
-                # for instant barge-in (StreamSession STT-bypass path).
-                source="stt" if voice_detected else "user_typed",
+            await self.dispatch_turn(
+                message.channel, f"dc:{uid}", content,
+                voice_detected=voice_detected,
             )
 
-            try:
-                await status_msg.delete()
-            except Exception:
-                pass
-
-            # Concurrent message in the same burst — the owner posts the
-            # merged reply; followers exit so the user sees ONE response.
-            if response.get("type") == "duplicate":
-                return
-
-            resp_text = response.get("text", "")
-
-            # Mirror the modality: if the user sent a voice note, try
-            # to synthesise the reply to MP3 and surface it as a
-            # ``[VOICE:/path]`` attachment alongside the text.
-            resp_text = await self.maybe_prepend_voice_reply(resp_text, voice_detected)
-
-            clean, attachments = parse_response_markers(resp_text)
-            clean = self.append_model_feedback(clean, response.get("model"))
-
-            # Send file attachments
-            import discord as _dc
-            for att in attachments:
-                p = Path(att.path)
-                if p.exists():
-                    try:
-                        await message.channel.send(file=_dc.File(str(p), filename=att.filename))
-                    except Exception as e:
-                        logger.error("Discord file send error: %s", e)
-
-            if clean:
-                for chunk in split_preserving_code_blocks(clean, DISCORD_MSG_LIMIT):
-                    await message.channel.send(chunk)
-
         await client.start(self.token)
+
+    # ── Platform primitives (consumed by BaseBridge.dispatch_turn) ──
+
+    async def post_status(self, channel, text: str):
+        try:
+            return await channel.send(f"⏳ {text}")
+        except Exception:
+            return None
+
+    async def update_status(self, status_msg, text: str) -> None:
+        try:
+            await status_msg.edit(content=f"⏳ {text}")
+        except Exception:
+            pass
+
+    async def clear_status(self, status_msg) -> None:
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+
+    async def send_text_chunk(self, channel, chunk: str) -> None:
+        try:
+            await channel.send(chunk)
+        except Exception as e:  # noqa: BLE001
+            logger.error("Discord text send error: %s", e)
+
+    async def send_attachment(self, channel, att) -> None:
+        import discord as _dc
+        p = Path(att.path)
+        if not p.exists():
+            return
+        try:
+            await channel.send(file=_dc.File(str(p), filename=att.filename))
+        except Exception as e:  # noqa: BLE001
+            logger.error("Discord file send error: %s", e)
 
     async def _handle_slash(self, interaction, cmd: str) -> None:
         """Handle a Discord slash command via the Gateway."""

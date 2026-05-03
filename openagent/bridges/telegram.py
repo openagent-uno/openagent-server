@@ -9,14 +9,12 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from openagent.bridges.base import BaseBridge, format_tool_status
+from openagent.bridges.base import BaseBridge
 from openagent.channels.formatting import markdown_to_telegram_html
 from openagent.channels.base import (
     build_attachment_context,
     is_blocked_attachment,
-    parse_response_markers,
     prepend_context_block,
-    split_preserving_code_blocks,
 )
 from openagent.gateway.commands import BOT_COMMANDS, BRIDGE_COMMANDS, bridge_welcome_text
 
@@ -70,6 +68,7 @@ _MEDIA_GROUP_FLUSH_DELAY = 1.0
 
 class TelegramBridge(BaseBridge):
     name = "telegram"
+    message_limit = TELEGRAM_MSG_LIMIT
 
     def __init__(self, token: str, allowed_users: list[str] | None = None,
                  gateway_url: str = "ws://localhost:8765/ws", gateway_token: str | None = None):
@@ -324,7 +323,7 @@ class TelegramBridge(BaseBridge):
         # just the user who issued them. Other users on the same bot keep
         # their own conversations.
         result = await self.send_command(cmd, session_id=f"tg:{user_id}")
-        await self._reply_rich(update.message, result)
+        await self.send_response_text(update.message, result)
 
     async def _extract_files(self, msg, tmp: str) -> _Extracted:
         """Download every attachment on a single Telegram ``Message`` to ``tmp``.
@@ -411,7 +410,9 @@ class TelegramBridge(BaseBridge):
         if not text:
             return
 
-        await self._dispatch_to_agent(msg, uid, text, voice_detected=extracted.voice_detected)
+        await self.dispatch_turn(
+            msg, f"tg:{uid}", text, voice_detected=extracted.voice_detected,
+        )
 
     async def _enqueue_media_group(self, uid: str, group_id: str, msg) -> None:
         """Buffer a media-group sibling and (re)arm the flush timer."""
@@ -505,118 +506,65 @@ class TelegramBridge(BaseBridge):
 
         # Anchor the status reply on the first sibling so the user sees
         # a single in-flight indicator next to the group.
-        await self._dispatch_to_agent(messages[0], uid, text, voice_detected=any_voice)
-
-    async def _dispatch_to_agent(
-        self,
-        msg,
-        uid: str,
-        text: str,
-        *,
-        voice_detected: bool = False,
-    ) -> None:
-        """Send ``text`` (already attachment-prepended) to the agent on
-        behalf of ``uid``, posting a plain status reply against ``msg``.
-        Shared by the single-message and media-group paths.
-
-        The Telegram ``/stop`` command remains the way to interrupt a
-        running turn; the inline-button shortcut was removed because it
-        cluttered every reply and the slash command covers the same
-        intent without the visual noise.
-
-        ``voice_detected`` mirrors the modality: when the user sent a
-        voice note, we batch-synthesise the agent's reply to OGG/opus and
-        inject a ``[VOICE:/path]`` marker so the existing reply pipeline
-        (:meth:`_send_response`) sends it as ``send_voice``. The Telegram
-        Bot API can't stream voice, hence batch synth here rather than
-        the gateway's streaming path used for the desktop/web client.
-        """
-        session_id = f"tg:{uid}"
-
-        try:
-            status_msg = await msg.reply_text("⏳ Thinking...")
-        except Exception:
-            status_msg = None
-
-        # Tool-running statuses ("Using bash…") still surface so the
-        # user knows the agent is doing something during long turns.
-        # Token-by-token deltas USED to repaint this message
-        # progressively, but that re-flowed text on every edit and
-        # markdown rendered inconsistently mid-stream — we now wait
-        # for the canonical RESPONSE and post one clean message via
-        # ``_send_response``.
-        async def on_status(s):
-            if status_msg is None:
-                return
-            try:
-                await status_msg.edit_text(f"⏳ {format_tool_status(s)}")
-            except Exception:
-                pass
-
-        response = await self.send_message(
-            text, session_id,
-            on_status=on_status,
-            # Tag voice-note text as STT so the StreamSession dispatches
-            # it instantly (bypasses the typed-burst coalescence window).
-            # Matches the OpenAI-Realtime feel for voice-call mode.
-            source="stt" if voice_detected else "user_typed",
+        await self.dispatch_turn(
+            messages[0], f"tg:{uid}", text, voice_detected=any_voice,
         )
 
-        if status_msg:
+    # ── Platform primitives (consumed by BaseBridge.dispatch_turn) ──
+    #
+    # The shared orchestration is in ``BaseBridge.dispatch_turn``; here
+    # we only translate between its calls and the python-telegram-bot
+    # ``Message`` surface. Voice-mode mirroring (voice in → voice out)
+    # is also handled by BaseBridge via ``maybe_prepend_voice_reply``,
+    # so this file no longer carries any of that logic.
+
+    async def post_status(self, msg, text: str):
+        try:
+            return await msg.reply_text(f"⏳ {text}")
+        except Exception:
+            return None
+
+    async def update_status(self, status_msg, text: str) -> None:
+        try:
+            await status_msg.edit_text(f"⏳ {text}")
+        except Exception:
+            pass
+
+    async def clear_status(self, status_msg) -> None:
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+
+    async def send_text_chunk(self, msg, chunk: str) -> None:
+        # Render once per chunk so a giant reply doesn't pay the cost
+        # in one go AND so a chunk-local HTML failure can fall back to
+        # plain text without losing the rest of the response.
+        rendered = markdown_to_telegram_html(chunk)
+        try:
+            await msg.reply_text(rendered, parse_mode="HTML", disable_web_page_preview=True)
+        except Exception:
             try:
-                await status_msg.delete()
+                await msg.reply_text(chunk)
             except Exception:
                 pass
 
-        # Concurrent message in the same burst — the first handler owns
-        # the merged reply; followers just exit so the user sees ONE
-        # response addressing the whole spam, not N copies.
-        if response.get("type") == "duplicate":
+    async def send_attachment(self, msg, att) -> None:
+        p = Path(att.path)
+        if not p.exists():
             return
-
-        response_text = response.get("text", "") or ""
-        response_text = await self.maybe_prepend_voice_reply(response_text, voice_detected)
-        await self._send_response(msg, response_text, response.get("model"))
-
-    # The TTS / STT gateway calls live on ``BaseBridge`` so Telegram,
-    # Discord, and WhatsApp share the same DB-routed plumbing.
-
-    # ── Sending ──
-
-    async def _reply_rich(self, msg, text):
-        for chunk in split_preserving_code_blocks(text, TELEGRAM_MSG_LIMIT):
-            rendered = markdown_to_telegram_html(chunk)
-            try:
-                await msg.reply_text(rendered, parse_mode="HTML", disable_web_page_preview=True)
-            except Exception:
-                try:
-                    await msg.reply_text(chunk)
-                except Exception:
-                    pass
-
-    async def _send_response(self, msg, response, model: str | None = None):
-        clean, attachments = parse_response_markers(response)
-        for att in attachments:
-            try:
-                p = Path(att.path)
-                if not p.exists():
-                    continue
-                with open(p, "rb") as f:
-                    if att.type == "image":
-                        await msg.reply_photo(photo=f)
-                    elif att.type == "voice":
-                        # Telegram's reply_voice requires OGG/Opus; MP3
-                        # (the LiteLLM default) ships via reply_audio
-                        # instead — renders as a music-player bubble.
-                        if p.suffix.lower() in (".ogg", ".oga", ".opus"):
-                            await msg.reply_voice(voice=f)
-                        else:
-                            await msg.reply_audio(audio=f)
-                    elif att.type == "video":
-                        await msg.reply_video(video=f)
-                    else:
-                        await msg.reply_document(document=f, filename=att.filename)
-            except Exception as e:
-                logger.error("Attachment send error: %s", e)
-        if clean or model:
-            await self._reply_rich(msg, self.append_model_feedback(clean, model))
+        with open(p, "rb") as f:
+            if att.type == "image":
+                await msg.reply_photo(photo=f)
+            elif att.type == "voice":
+                # Telegram's reply_voice requires OGG/Opus; MP3 (the
+                # LiteLLM default) ships via reply_audio instead —
+                # renders as a music-player bubble.
+                if p.suffix.lower() in (".ogg", ".oga", ".opus"):
+                    await msg.reply_voice(voice=f)
+                else:
+                    await msg.reply_audio(audio=f)
+            elif att.type == "video":
+                await msg.reply_video(video=f)
+            else:
+                await msg.reply_document(document=f, filename=att.filename)
