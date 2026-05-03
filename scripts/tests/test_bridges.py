@@ -59,6 +59,7 @@ class _FakeBridge:
         self._real.name = "fake"
         self._real._stream_opened = set()
         self._real._stream_pending = {}
+        self._real._command_future = None
         self._real._ws = object()  # non-None bypasses the "not connected" guard
         self._sent: list[dict] = []
 
@@ -795,3 +796,554 @@ async def t_telegram_seen_set_bounded(ctx: TestContext) -> None:
     # that far back under normal ops, so allowing it avoids permanent
     # memory growth without weakening the near-term dedup.
     assert bridge._is_fresh_update(_FakeTgUpdate(update_id=first_id))
+
+
+# ── WhatsApp status-throttle tests ────────────────────────────────────
+#
+# WhatsApp can't edit messages — every ``update_status`` call would be a
+# brand-new chat bubble. The bridge dedupes identical lines and enforces
+# a minimum gap between distinct lines. That throttle dict was moved
+# from a per-call closure to a per-instance dict keyed by chat_id; the
+# tests below pin all three invariants so a regression doesn't drown
+# WhatsApp users in "Using bash…" pings.
+
+def _fresh_whatsapp_bridge():
+    from openagent.bridges.whatsapp import WhatsAppBridge
+
+    bridge = WhatsAppBridge.__new__(WhatsAppBridge)
+    bridge.name = "whatsapp"
+    bridge._status_throttle = {}
+    bridge._greenapi = None  # never used — we stub _send_text below
+    sent: list[tuple[str, str]] = []
+
+    async def _fake_send_text(chat_id, text):
+        sent.append((chat_id, text))
+
+    bridge._send_text = _fake_send_text  # type: ignore[method-assign]
+    return bridge, sent
+
+
+@test("bridges", "whatsapp: status throttle dedupes identical consecutive lines")
+async def t_whatsapp_throttle_dedupes_identical(ctx: TestContext) -> None:
+    """An agent can fire the same tool-status string back-to-back
+    (e.g., two ``Using bash...`` pings as it batches sub-commands).
+    The throttle must drop the second one — otherwise WhatsApp users
+    see redundant bubbles."""
+    bridge, sent = _fresh_whatsapp_bridge()
+    chat = "1234@c.us"
+
+    await bridge.post_status(chat, "Thinking...")  # seeds throttle
+    sent.clear()
+
+    await bridge.update_status(chat, "Using bash...")
+    await bridge.update_status(chat, "Using bash...")  # dedupe
+    await bridge.update_status(chat, "Using bash...")  # dedupe
+
+    assert sent == [(chat, "⏳ Using bash...")], (
+        f"identical lines must dedupe; got {sent}"
+    )
+
+
+@test("bridges", "whatsapp: status throttle enforces minimum gap between distinct lines")
+async def t_whatsapp_throttle_enforces_gap(ctx: TestContext) -> None:
+    """Distinct status lines arriving inside ``WA_STATUS_THROTTLE_SECS``
+    are dropped. Without this, a fast tool-loop would fire one bubble
+    per tool call."""
+    import asyncio
+    from openagent.bridges.whatsapp import WA_STATUS_THROTTLE_SECS
+
+    bridge, sent = _fresh_whatsapp_bridge()
+    chat = "1234@c.us"
+    await bridge.post_status(chat, "Thinking...")
+    sent.clear()
+
+    # Same instant: second distinct line is throttled.
+    await bridge.update_status(chat, "Using read_file...")
+    await bridge.update_status(chat, "Using bash...")
+    assert len(sent) == 1, f"throttle must drop the second line; got {sent}"
+
+    # Forge the timestamp BEYOND the throttle window so the next
+    # distinct line gets through (avoids a real 8 s sleep in tests).
+    bridge._status_throttle[chat]["ts"] -= WA_STATUS_THROTTLE_SECS + 1
+    await bridge.update_status(chat, "Using web_search...")
+    assert len(sent) == 2, f"line beyond gap must pass; got {sent}"
+
+
+@test("bridges", "whatsapp: status throttle is per-chat (no cross-chat leak) and cleared on clear_status")
+async def t_whatsapp_throttle_per_chat_isolation(ctx: TestContext) -> None:
+    """Two concurrent WhatsApp users share one bridge instance. Their
+    throttle state must NOT leak — chat A's recent ``Using bash...``
+    cannot suppress chat B's first ``Using bash...``."""
+    bridge, sent = _fresh_whatsapp_bridge()
+    a, b = "alice@c.us", "bob@c.us"
+
+    await bridge.post_status(a, "Thinking...")
+    await bridge.post_status(b, "Thinking...")
+    sent.clear()
+
+    await bridge.update_status(a, "Using bash...")
+    # If state leaked, this would be deduped against alice's entry.
+    await bridge.update_status(b, "Using bash...")
+    targets = sorted(c for c, _ in sent)
+    assert targets == [a, b], (
+        f"per-chat throttle leaked across chats; got {sent}"
+    )
+
+    # clear_status pops the slot so a new burst starts fresh.
+    assert a in bridge._status_throttle
+    await bridge.clear_status(a)
+    assert a not in bridge._status_throttle, (
+        f"clear_status must pop throttle entry; got {bridge._status_throttle}"
+    )
+    # The other chat's slot is untouched.
+    assert b in bridge._status_throttle
+
+
+# ── on_status callback lifecycle ──────────────────────────────────────
+#
+# on_status was moved from a per-session ``_status_callbacks`` dict onto
+# the collector itself. The race fix: a fresh owner replacing the slot
+# must NOT have its callback wiped by the previous owner's ``finally``
+# cleanup. These tests pin the contract end-to-end through the bridge's
+# gateway-frame router.
+
+@test("bridges", "STATUS gateway frame fires the OWNER's on_status (collector-bound)")
+async def t_status_frame_invokes_owner_callback(ctx: TestContext) -> None:
+    """End-to-end: gateway sends a STATUS frame for an in-flight turn;
+    the owner's on_status (now stored ON the collector, not in a side
+    dict) must fire with the frame's text. Pre-fix, removing the
+    ``_status_callbacks`` dict would have silently broken every bridge's
+    Thinking… progress UI."""
+    fb = _FakeBridge()
+    sid = "s-status"
+    received: list[str] = []
+
+    async def on_status(line: str):
+        received.append(line)
+
+    async def feed_status_then_resolve():
+        for _ in range(500):
+            if sid in fb._real._stream_pending:
+                # STATUS frame BEFORE turn_complete.
+                await fb._real._handle_gateway_frame({
+                    "type": "status", "session_id": sid,
+                    "text": '{"tool":"bash","status":"running"}',
+                })
+                col = fb._real._stream_pending[sid]
+                col.text = "ok"
+                col.done.set()
+                return
+            await asyncio.sleep(0.001)
+        raise AssertionError("collector never appeared")
+
+    import asyncio
+    result, _ = await asyncio.gather(
+        fb.send("hi", sid, on_status=on_status),
+        feed_status_then_resolve(),
+    )
+    assert result["text"] == "ok", result
+    assert received, "owner's on_status was never invoked"
+    assert "bash" in received[0], received
+
+
+@test("bridges", "fresh owner's on_status is independent of previous owner's cleanup (race fix)")
+async def t_on_status_no_leak_across_turns(ctx: TestContext) -> None:
+    """🔴 The race the recent refactor fixes: turn N's owner is in its
+    ``finally`` block (about to pop ``_stream_pending``) while turn N+1
+    has already taken over the slot with its own collector + on_status.
+    Pre-fix, the pop also wiped ``_status_callbacks[sid]`` — turn N+1's
+    callback (just registered) silently disappeared. Now on_status
+    lives on the collector itself, so it can't be wiped by anyone but
+    the collector going out of scope.
+
+    We simulate the race by manually replacing the slot WHILE the
+    original owner's collector is finalised, then assert turn N+1's
+    callback survives and STATUS frames for turn N+1 reach it."""
+    import asyncio
+
+    fb = _FakeBridge()
+    sid = "s-leak"
+    received_n1: list[str] = []
+
+    async def on_status_n1(line: str):
+        received_n1.append(line)
+
+    # Hand-craft turn N (just finished, slot still holds finalised C1).
+    from openagent.stream.collector import StreamCollector
+    c1 = StreamCollector()
+    c1.done.set()
+    fb._real._stream_pending[sid] = c1
+
+    # Turn N+1 takes over via send_message. The done.is_set() check
+    # makes this caller the new owner with a fresh collector.
+    async def resolve_n1():
+        for _ in range(500):
+            col = fb._real._stream_pending.get(sid)
+            if col is not None and col is not c1:
+                # Now fire a STATUS frame and confirm N+1 receives it.
+                await fb._real._handle_gateway_frame({
+                    "type": "status", "session_id": sid,
+                    "text": "Using web_search...",
+                })
+                col.text = "n1 reply"
+                col.done.set()
+                return
+            await asyncio.sleep(0.001)
+        raise AssertionError("turn N+1 never registered a fresh collector")
+
+    result, _ = await asyncio.gather(
+        fb.send("turn N+1", sid, on_status=on_status_n1),
+        resolve_n1(),
+    )
+    assert result["text"] == "n1 reply", result
+    assert received_n1, (
+        "turn N+1's on_status was wiped by turn N's cleanup — "
+        "the per-collector on_status binding is broken"
+    )
+    assert received_n1 == ["Using web_search..."], received_n1
+
+
+# ── Voice-modality mirror (voice in → voice out) ──────────────────────
+
+@test("bridges", "dispatch_turn voice-in synthesizes a [VOICE:/path] attachment for the reply")
+async def t_dispatch_turn_voice_mirror_synth(ctx: TestContext) -> None:
+    """When the inbound was a voice note, ``dispatch_turn`` must call
+    ``maybe_prepend_voice_reply`` (which synthesises MP3 via TTS and
+    prepends ``[VOICE:/path]``). The marker then drives
+    ``send_attachment`` for the audio file. This is the entire voice-
+    mode UX on bridges; if it regresses, voice replies become text-only
+    and the user notices instantly."""
+    import asyncio
+    from openagent.bridges.base import BaseBridge
+
+    sent_attachments: list = []
+    sent_chunks: list[tuple[object, str]] = []
+
+    class _Stub(BaseBridge):
+        name = "stub"
+        message_limit = 4096
+
+        async def post_status(self, target, text):
+            return None
+
+        async def send_text_chunk(self, target, chunk):
+            sent_chunks.append((target, chunk))
+
+        async def send_attachment(self, target, att):
+            sent_attachments.append(att)
+
+    bridge = _Stub.__new__(_Stub)
+    bridge.name = "stub"
+
+    async def _fake_send_message(text, session_id, *, target=None, **kwargs):
+        # Pre-fix sanity: verify the source flag ALSO travels through
+        # so STT bypass works server-side.
+        assert kwargs.get("source") == "stt", kwargs
+        return {"type": "response", "text": "spoken reply", "model": None,
+                "attachments": [], "target": target}
+
+    async def _fake_synth(text):
+        return "[VOICE:/tmp/oa_stub_tts_xyz.mp3]"
+
+    bridge.send_message = _fake_send_message  # type: ignore[method-assign]
+    bridge.synthesise_audio_attachment = _fake_synth  # type: ignore[method-assign]
+
+    await bridge.dispatch_turn("target-A", "sid:1", "hello", voice_detected=True)
+
+    # The marker must have been parsed back out and an Attachment
+    # produced for the MP3 path.
+    assert len(sent_attachments) == 1, sent_attachments
+    att = sent_attachments[0]
+    assert att.type == "voice", att
+    assert att.path == "/tmp/oa_stub_tts_xyz.mp3", att
+    # Text chunk also posted (mirrors modality, doesn't replace it).
+    assert sent_chunks == [("target-A", "spoken reply")], sent_chunks
+
+
+@test("bridges", "dispatch_turn voice-in still posts text when synth fails (graceful)")
+async def t_dispatch_turn_voice_synth_failure_posts_text(ctx: TestContext) -> None:
+    """If TTS synthesis raises, the user must STILL see the text
+    reply. ``maybe_prepend_voice_reply`` swallows the error and returns
+    the original text; this test pins that contract end-to-end."""
+    from openagent.bridges.base import BaseBridge
+
+    sent_chunks: list[str] = []
+    sent_attachments: list = []
+
+    class _Stub(BaseBridge):
+        name = "stub"
+        message_limit = 4096
+
+        async def post_status(self, target, text):
+            return None
+
+        async def send_text_chunk(self, target, chunk):
+            sent_chunks.append(chunk)
+
+        async def send_attachment(self, target, att):
+            sent_attachments.append(att)
+
+    bridge = _Stub.__new__(_Stub)
+    bridge.name = "stub"
+
+    async def _fake_send_message(text, session_id, **kwargs):
+        return {"type": "response", "text": "text-only reply", "model": None,
+                "attachments": [], "target": None}
+
+    async def _broken_synth(text):
+        raise RuntimeError("TTS provider is down")
+
+    bridge.send_message = _fake_send_message  # type: ignore[method-assign]
+    bridge.synthesise_audio_attachment = _broken_synth  # type: ignore[method-assign]
+
+    await bridge.dispatch_turn("target", "sid:1", "hello", voice_detected=True)
+    assert sent_chunks == ["text-only reply"], sent_chunks
+    assert sent_attachments == [], (
+        f"no voice attachment when synth failed; got {sent_attachments}"
+    )
+
+
+# ── Telegram send_attachment dispatch ────────────────────────────────
+
+@test("bridges", "telegram send_attachment routes by type: image/voice-ogg/voice-mp3/video/file")
+async def t_telegram_send_attachment_dispatch(ctx: TestContext) -> None:
+    """The voice-mode UX hinges on .ogg/.oga/.opus → reply_voice
+    (native voice-note bubble) vs .mp3 → reply_audio (music-player
+    bubble). One regression here and every voice reply sounds broken."""
+    import tempfile
+    from pathlib import Path
+    from openagent.bridges.telegram import TelegramBridge
+    from openagent.channels.base import Attachment
+
+    bridge = TelegramBridge.__new__(TelegramBridge)
+    bridge.name = "telegram"
+
+    calls: list[tuple[str, str]] = []  # (method, suffix)
+
+    class _FakeMsg:
+        async def reply_photo(self, photo): calls.append(("photo", ""))
+        async def reply_voice(self, voice): calls.append(("voice", ""))
+        async def reply_audio(self, audio): calls.append(("audio", ""))
+        async def reply_video(self, video): calls.append(("video", ""))
+        async def reply_document(self, document, filename):
+            calls.append(("document", filename))
+
+    msg = _FakeMsg()
+    tmp = tempfile.mkdtemp()
+    cases = [
+        ("image", "shot.jpg"),
+        ("voice", "note.ogg"),    # must hit reply_voice
+        ("voice", "note.opus"),   # must hit reply_voice
+        ("voice", "note.mp3"),    # must hit reply_audio (LiteLLM default)
+        ("video", "clip.mp4"),
+        ("file",  "doc.pdf"),
+    ]
+    for kind, fname in cases:
+        path = Path(tmp) / fname
+        path.write_bytes(b"x")  # send_attachment needs the file to exist
+        await bridge.send_attachment(msg, Attachment(
+            type=kind, path=str(path), filename=fname,
+        ))
+
+    methods = [m for m, _ in calls]
+    assert methods == [
+        "photo", "voice", "voice", "audio", "video", "document",
+    ], f"attachment dispatch wrong: {methods}"
+
+    # The doc fallback path passes the filename through.
+    assert calls[-1] == ("document", "doc.pdf"), calls[-1]
+
+
+@test("bridges", "telegram send_attachment skips when file does not exist (no crash)")
+async def t_telegram_send_attachment_missing_file(ctx: TestContext) -> None:
+    """A `[VOICE:/tmp/xxx.mp3]` marker can outlive the file (cleanup
+    race or full disk). The send_attachment path must skip silently
+    instead of raising and breaking the whole reply pipeline."""
+    from openagent.bridges.telegram import TelegramBridge
+    from openagent.channels.base import Attachment
+
+    bridge = TelegramBridge.__new__(TelegramBridge)
+    bridge.name = "telegram"
+    calls: list[str] = []
+
+    class _FakeMsg:
+        async def reply_voice(self, voice): calls.append("voice")
+
+    await bridge.send_attachment(_FakeMsg(), Attachment(
+        type="voice", path="/no/such/path.ogg", filename="missing.ogg",
+    ))
+    assert calls == [], f"missing file should NOT call reply_*; got {calls}"
+
+
+# ── Telegram HTML render fallback ────────────────────────────────────
+
+@test("bridges", "telegram send_text_chunk falls back to plain text when HTML parse fails")
+async def t_telegram_send_text_chunk_html_fallback(ctx: TestContext) -> None:
+    """A malformed HTML render (e.g., unbalanced tag from a weird
+    markdown edge case) returns a 400 from Telegram. The bridge must
+    retry as plain text so the user sees the message instead of a
+    silent drop."""
+    from openagent.bridges.telegram import TelegramBridge
+
+    bridge = TelegramBridge.__new__(TelegramBridge)
+    bridge.name = "telegram"
+    sent: list[tuple[str, dict]] = []
+
+    class _FakeMsg:
+        async def reply_text(self, text, parse_mode=None, disable_web_page_preview=None):
+            sent.append((text, {"parse_mode": parse_mode}))
+            if parse_mode == "HTML":
+                raise RuntimeError("bad-html")
+
+    await bridge.send_text_chunk(_FakeMsg(), "**bold** text")
+    # First attempt: HTML render. Second attempt: plain-text fallback.
+    assert len(sent) == 2, sent
+    assert sent[0][1]["parse_mode"] == "HTML", sent[0]
+    assert sent[1][1]["parse_mode"] is None, sent[1]
+    assert sent[1][0] == "**bold** text", sent[1]
+
+
+# ── dispatch_turn graceful degradation ───────────────────────────────
+
+@test("bridges", "dispatch_turn: post_status raise → on_status no-ops, response still posts")
+async def t_dispatch_turn_post_status_raises(ctx: TestContext) -> None:
+    """A status-bubble post failure (rate-limit, transient API error)
+    must not abort the turn — the response is the load-bearing part."""
+    from openagent.bridges.base import BaseBridge
+
+    sent_chunks: list[str] = []
+
+    class _Stub(BaseBridge):
+        name = "stub"
+        message_limit = 4096
+
+        async def post_status(self, target, text):
+            raise RuntimeError("rate-limited")
+
+        async def send_text_chunk(self, target, chunk):
+            sent_chunks.append(chunk)
+
+        async def send_attachment(self, target, att):
+            pass
+
+    bridge = _Stub.__new__(_Stub)
+    bridge.name = "stub"
+
+    async def _fake_send_message(text, session_id, *, on_status=None, **kwargs):
+        # Trigger on_status to confirm it's safely no-op when no handle.
+        if on_status:
+            await on_status('{"tool":"bash","status":"running"}')
+        return {"type": "response", "text": "ok", "model": None,
+                "attachments": [], "target": None}
+
+    bridge.send_message = _fake_send_message  # type: ignore[method-assign]
+    await bridge.dispatch_turn("target", "sid:1", "hi")
+    assert sent_chunks == ["ok"], sent_chunks
+
+
+@test("bridges", "dispatch_turn: send_attachment raise → text reply still posts")
+async def t_dispatch_turn_attachment_raise(ctx: TestContext) -> None:
+    """If one attachment send fails, the text reply must still land —
+    otherwise a flaky CDN takes the whole conversation down."""
+    from openagent.bridges.base import BaseBridge
+    from openagent.channels.base import Attachment
+
+    sent_chunks: list[str] = []
+
+    class _Stub(BaseBridge):
+        name = "stub"
+        message_limit = 4096
+
+        async def send_text_chunk(self, target, chunk):
+            sent_chunks.append(chunk)
+
+        async def send_attachment(self, target, att):
+            raise RuntimeError("disk full")
+
+    bridge = _Stub.__new__(_Stub)
+    bridge.name = "stub"
+
+    # Inject an attachment marker so dispatch_turn calls send_attachment.
+    async def _fake_send(text, session_id, **kwargs):
+        return {"type": "response",
+                "text": "[FILE:/tmp/oa_x.bin]\nhere is your reply",
+                "model": None, "attachments": [], "target": None}
+
+    bridge.send_message = _fake_send  # type: ignore[method-assign]
+    await bridge.dispatch_turn("target", "sid:1", "hi")
+    # The text body survives even though send_attachment raised.
+    assert sent_chunks == ["here is your reply"], sent_chunks
+
+
+@test("bridges", "dispatch_turn: send_text_chunk raise on first chunk → next chunk still attempted")
+async def t_dispatch_turn_chunk_raise_continues(ctx: TestContext) -> None:
+    """A multi-chunk reply where chunk 1 errors must still try
+    chunk 2. Otherwise a single bad message kills the rest of the
+    response and the user thinks the turn died."""
+    from openagent.bridges.base import BaseBridge
+
+    attempted: list[str] = []
+    succeeded: list[str] = []
+
+    class _Stub(BaseBridge):
+        name = "stub"
+        # Force the splitter into multiple chunks.
+        message_limit = 50
+
+        async def send_text_chunk(self, target, chunk):
+            attempted.append(chunk)
+            if len(attempted) == 1:
+                raise RuntimeError("flaky network")
+            succeeded.append(chunk)
+
+        async def send_attachment(self, target, att):
+            pass
+
+    bridge = _Stub.__new__(_Stub)
+    bridge.name = "stub"
+
+    long_text = "First half of the message.\n\n" + ("x" * 60)
+
+    async def _fake_send(text, session_id, **kwargs):
+        return {"type": "response", "text": long_text, "model": None,
+                "attachments": [], "target": None}
+
+    bridge.send_message = _fake_send  # type: ignore[method-assign]
+    await bridge.dispatch_turn("target", "sid:1", "hi")
+    assert len(attempted) >= 2, (
+        f"second chunk must still be attempted after first raises; "
+        f"got {len(attempted)} attempts"
+    )
+    assert succeeded, "no chunks succeeded — error short-circuited"
+
+
+# ── Gateway WS drop with in-flight collectors ────────────────────────
+
+@test("bridges", "gateway WS drop resolves in-flight collectors with errored=True")
+async def t_gateway_ws_drop_orphan_cleanup(ctx: TestContext) -> None:
+    """A dropped WebSocket (gateway crash, network blip) calls
+    ``_resolve_orphaned_futures``, which must mark every in-flight
+    collector as errored and set ``done`` so the awaiter unblocks
+    instead of hanging forever. Without this, every spam-burst owner
+    would deadlock the bridge handler when the gateway hiccups."""
+    fb = _FakeBridge()
+    sid = "s-drop"
+
+    async def trigger_drop_after_owner_appears():
+        for _ in range(500):
+            if sid in fb._real._stream_pending:
+                fb._real._resolve_orphaned_futures("Gateway connection lost")
+                return
+            await asyncio.sleep(0.001)
+        raise AssertionError("collector never appeared")
+
+    import asyncio
+    result, _ = await asyncio.gather(
+        fb.send("hello", sid),
+        trigger_drop_after_owner_appears(),
+    )
+    assert result["type"] == "error", result
+    assert result["text"] == "Gateway connection lost", result
+    # All cached state cleaned.
+    assert sid not in fb._real._stream_pending
+    assert sid not in fb._real._stream_opened

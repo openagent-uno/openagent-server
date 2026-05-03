@@ -174,9 +174,12 @@ class WhatsAppBridge(BaseBridge):
 
     async def post_status(self, chat_id, text: str):
         await self._send_text(chat_id, f"⏳ {text}")
-        self._status_throttle[chat_id] = {
-            "text": text, "ts": asyncio.get_event_loop().time(),
-        }
+        # Seed text for dedup but ``ts=0`` so the FIRST tool-status
+        # update isn't throttled by the initial "Thinking…" post — the
+        # original closure kept ``ts=0`` for the same reason. Without
+        # this, the user wouldn't see ``Using bash…`` until 8 s after
+        # the bot started thinking.
+        self._status_throttle[chat_id] = {"text": text, "ts": 0.0}
         return chat_id
 
     async def update_status(self, chat_id, text: str) -> None:
