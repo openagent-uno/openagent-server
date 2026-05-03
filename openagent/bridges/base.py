@@ -276,11 +276,18 @@ class BaseBridge:
         """Push ``text`` into the user's stream session and await the reply.
 
         Each ``session_id`` maps to one server-side
-        :class:`StreamSession`. Concurrency is handled server-side: typed
-        messages within ``BRIDGE_COALESCE_WINDOW_MS`` coalesce, voice
-        notes (``source="stt"``) bypass the window for instant barge-in.
-        The awaiter resolves on ``turn_complete`` or terminates with an
-        error dict on WS drop / ``/stop`` cancel.
+        :class:`StreamSession`. Concurrency is handled by ownership: the
+        first concurrent caller for a session creates the collector and
+        awaits the reply (the OWNER); subsequent callers send their
+        ``text_final`` so the gateway folds them into the same merged
+        turn, then return a ``{"type":"duplicate"}`` sentinel so the
+        bridge skips posting a redundant response. Without this, three
+        concurrent messages would each create their own collector,
+        overwriting ``_stream_pending[session_id]`` — the first two
+        ``send_message`` calls would hang forever waiting for a
+        ``turn_complete`` that's now routed to the third caller's
+        collector. Voice notes (``source="stt"``) still bypass server
+        coalescence for instant barge-in.
         """
         if session_id not in self._stream_opened:
             await self._send_gateway_json(event_to_wire(SessionOpen(
@@ -292,10 +299,17 @@ class BaseBridge:
             )))
             self._stream_opened.add(session_id)
 
-        collector = StreamCollector()
-        self._stream_pending[session_id] = collector
-        if on_status:
-            self._status_callbacks[session_id] = on_status
+        # Atomic ownership check — synchronous, no awaits between read
+        # and write so two concurrent tasks can't both win.
+        existing = self._stream_pending.get(session_id)
+        is_owner = existing is None
+        if is_owner:
+            collector = StreamCollector()
+            self._stream_pending[session_id] = collector
+            if on_status:
+                self._status_callbacks[session_id] = on_status
+        else:
+            collector = existing
 
         try:
             await self._send_gateway_json(event_to_wire(TextFinal(
@@ -305,18 +319,32 @@ class BaseBridge:
                 source=source,  # type: ignore[arg-type]
             )))
         except Exception:
-            self._stream_pending.pop(session_id, None)
-            self._status_callbacks.pop(session_id, None)
+            if is_owner:
+                self._stream_pending.pop(session_id, None)
+                self._status_callbacks.pop(session_id, None)
             raise
+
+        if not is_owner:
+            # Follower: text_final has been pushed into the gateway's
+            # coalescence buffer. The owner's collector will receive the
+            # merged response. Return immediately so the bridge skips
+            # posting a duplicate reply.
+            return {
+                "type": "duplicate",
+                "text": "",
+                "model": None,
+                "attachments": [],
+            }
 
         try:
             await collector.done.wait()
             return collector.to_legacy_reply()
         finally:
-            # Defensive cleanup — the normal path also clears these on
-            # turn_complete via the listener, but cancellation (e.g.
-            # /stop) unwinds here.
-            self._stream_pending.pop(session_id, None)
+            # Owner cleanup — but only if the slot still holds OUR
+            # collector (a brand-new turn could have replaced it after
+            # our ``done`` fired).
+            if self._stream_pending.get(session_id) is collector:
+                self._stream_pending.pop(session_id, None)
             self._status_callbacks.pop(session_id, None)
 
     # ── Voice helpers (shared by every bridge) ──────────────────────

@@ -568,6 +568,12 @@ class TelegramBridge(BaseBridge):
             except Exception:
                 pass
 
+        # Concurrent message in the same burst — the first handler owns
+        # the merged reply; followers just exit so the user sees ONE
+        # response addressing the whole spam, not N copies.
+        if response.get("type") == "duplicate":
+            return
+
         response_text = response.get("text", "") or ""
         response_text = await self.maybe_prepend_voice_reply(response_text, voice_detected)
         await self._send_response(msg, response_text, response.get("model"))

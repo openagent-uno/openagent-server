@@ -192,6 +192,11 @@ class DiscordBridge(BaseBridge):
             except Exception:
                 pass
 
+            # Concurrent message in the same burst — the owner posts the
+            # merged reply; followers exit so the user sees ONE response.
+            if response.get("type") == "duplicate":
+                return
+
             resp_text = response.get("text", "")
 
             # Mirror the modality: if the user sent a voice note, try

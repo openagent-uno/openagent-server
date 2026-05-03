@@ -160,6 +160,136 @@ async def t_send_message_cancelled(ctx: TestContext) -> None:
     assert "s-cancel" not in fb._real._stream_pending, "stream collector leaked"
 
 
+@test("bridges", "concurrent send_message for one session: ONE owner awaits, followers return duplicate")
+async def t_send_message_concurrent_spam(ctx: TestContext) -> None:
+    """🔴 Production regression: when a Telegram/Discord/WhatsApp user
+    sends 3 quick messages, each platform's message handler runs
+    concurrently (Telegram via ``concurrent_updates(True)``, Discord
+    via ``client.event``, WhatsApp via concurrent webhook tasks). Each
+    handler called ``send_message`` on the same ``session_id`` and each
+    overwrote ``_stream_pending[sid]`` with its own collector — the
+    first two handlers' ``await collector.done.wait()`` would never
+    fire because their collectors had been replaced and the gateway's
+    merged-turn ``turn_complete`` only resolved the LAST one.
+
+    The fix: ownership-aware ``send_message``. The first concurrent
+    caller owns the collector; subsequent callers send their
+    ``text_final`` (so the gateway folds them into the merged turn)
+    and return ``{"type": "duplicate"}`` so the bridge skips posting
+    a redundant response. This test pins the contract."""
+    import asyncio
+
+    fb = _FakeBridge()
+    sid = "s-spam"
+
+    async def resolve_when_owner_appears():
+        for _ in range(500):
+            col = fb._real._stream_pending.get(sid)
+            if col is not None:
+                col.text = "merged reply addressing all 3"
+                col.model = "fake"
+                col.done.set()
+                return
+            await asyncio.sleep(0.001)
+        raise AssertionError("collector never appeared")
+
+    # Three concurrent sends, exactly mirroring 3 quick bridge handlers.
+    results = await asyncio.gather(
+        fb.send("hello", sid),
+        fb.send("and what time", sid),
+        fb.send("also weather", sid),
+        resolve_when_owner_appears(),
+    )
+    a, b, c, _ = results
+
+    # Exactly ONE owner with the merged reply, TWO followers as duplicates.
+    types = sorted([a["type"], b["type"], c["type"]])
+    assert types == ["duplicate", "duplicate", "response"], (
+        f"expected ONE response + TWO duplicate sentinels, got {types}"
+    )
+    owner_reply = next(r for r in (a, b, c) if r["type"] == "response")
+    assert owner_reply["text"] == "merged reply addressing all 3", owner_reply
+
+    # All three text_final frames must have reached the wire so the
+    # gateway can merge them server-side.
+    text_finals = [p for p in fb._sent if p["type"] == "text_final"]
+    sent_texts = sorted(p["text"] for p in text_finals)
+    assert sent_texts == ["also weather", "and what time", "hello"], (
+        f"all 3 text_finals must reach the gateway; got {sent_texts}"
+    )
+
+    # Owner cleanup pops the slot; followers don't add new ones.
+    assert sid not in fb._real._stream_pending, "owner cleanup left a leak"
+
+
+@test("bridges", "concurrent burst error path: owner sees the error, followers exit cleanly")
+async def t_send_message_concurrent_error(ctx: TestContext) -> None:
+    """When the merged turn errors (gateway sends OutError), the owner
+    receives ``type='error'`` and the followers still get their
+    ``duplicate`` sentinel — they should not block on a never-resolving
+    collector after their owner has died."""
+    import asyncio
+
+    fb = _FakeBridge()
+    sid = "s-spam-err"
+
+    async def fail_when_owner_appears():
+        for _ in range(500):
+            col = fb._real._stream_pending.get(sid)
+            if col is not None:
+                col.errored = True
+                col.error_text = "boom"
+                col.done.set()
+                return
+            await asyncio.sleep(0.001)
+
+    a, b, _ = await asyncio.gather(
+        fb.send("first", sid),
+        fb.send("second", sid),
+        fail_when_owner_appears(),
+    )
+    types = sorted([a["type"], b["type"]])
+    assert types == ["duplicate", "error"], types
+    owner_reply = next(r for r in (a, b) if r["type"] == "error")
+    assert owner_reply["text"] == "boom", owner_reply
+
+
+@test("bridges", "owner cleanup only pops its OWN collector (next-turn race safety)")
+async def t_send_message_owner_cleanup_idempotent(ctx: TestContext) -> None:
+    """If a brand-new turn races in after the owner's ``done`` fires
+    but before its ``finally`` runs, the new turn's collector must
+    survive — the owner's cleanup checks identity, not just key
+    presence."""
+    import asyncio
+
+    fb = _FakeBridge()
+    sid = "s-race"
+
+    async def resolve_owner_then_replace():
+        # Wait for the original owner's collector, set done, then
+        # replace it with a new collector to simulate the next turn
+        # starting before the original owner's finally runs.
+        for _ in range(500):
+            col = fb._real._stream_pending.get(sid)
+            if col is not None:
+                col.text = "owner-reply"
+                col.done.set()
+                # Race: the next turn's collector arrives while
+                # the original owner is still in its `await
+                # collector.done.wait()` -> finally transition.
+                from openagent.stream.collector import StreamCollector
+                fb._real._stream_pending[sid] = StreamCollector()
+                return
+            await asyncio.sleep(0.001)
+
+    await asyncio.gather(fb.send("hi", sid), resolve_owner_then_replace())
+    # The replacement collector must still be present — original owner
+    # only pops if the slot still holds its own collector.
+    assert sid in fb._real._stream_pending, (
+        "owner cleanup wrongly evicted the next turn's collector"
+    )
+
+
 @test("bridges", "send_message exposes errors as type=error on the legacy reply")
 async def t_send_message_error(ctx: TestContext) -> None:
     """Stream-side errors set ``collector.errored``; ``to_legacy_reply``

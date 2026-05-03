@@ -189,6 +189,11 @@ class WhatsAppBridge(BaseBridge):
             source="stt" if voice_detected else "user_typed",
         )
 
+        # Concurrent message in the same burst — the owner posts the
+        # merged reply; followers exit so the user sees ONE response.
+        if response.get("type") == "duplicate":
+            return
+
         resp_text = response.get("text", "")
         resp_text = await self.maybe_prepend_voice_reply(resp_text, voice_detected)
 
