@@ -254,6 +254,46 @@ class SmartRouter(BaseModel):
             if callable(fn):
                 await fn(session_id)
 
+    async def commit_partial_assistant(self, session_id: str, text: str) -> None:
+        """Route to the bound provider for barge-in commit.
+
+        Resolves the session's framework binding (cached from prior turns
+        or the DB), then forwards to either the Claude registry or the
+        relevant Agno provider. Falls back to fan-out across both sides
+        when no binding is recorded yet (first-turn interrupt).
+        """
+        if not session_id or not text:
+            return
+        framework = self._session_framework.get(session_id)
+        if framework is None:
+            framework = await self._hydrate_bound_framework(session_id)
+        if framework == FRAMEWORK_CLAUDE_CLI:
+            if self._claude_registry is not None:
+                await self._claude_registry.commit_partial_assistant(session_id, text)
+            return
+        if framework == FRAMEWORK_AGNO:
+            for model in self._agno_providers.values():
+                fn = getattr(model, "commit_partial_assistant", None)
+                if callable(fn):
+                    try:
+                        await fn(session_id, text)
+                    except Exception as e:  # noqa: BLE001
+                        logger.debug("agno commit_partial_assistant: %s", e)
+            return
+        # No binding yet — best-effort fanout (cheap: missing rows skip silently).
+        if self._claude_registry is not None:
+            try:
+                await self._claude_registry.commit_partial_assistant(session_id, text)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("claude registry commit_partial_assistant: %s", e)
+        for model in self._agno_providers.values():
+            fn = getattr(model, "commit_partial_assistant", None)
+            if callable(fn):
+                try:
+                    await fn(session_id, text)
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("agno commit_partial_assistant fanout: %s", e)
+
     def known_session_ids(self) -> list[str]:
         # Aggregated across underlying models so the gateway's post-restart
         # fallback (known_model_session_ids filtered by bridge prefix) can

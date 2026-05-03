@@ -112,6 +112,19 @@ class BaseModel(ABC):
         """
         await self.close_session(session_id)
 
+    async def commit_partial_assistant(self, session_id: str, text: str) -> None:
+        """Persist a synthesized assistant turn after barge-in.
+
+        Called by ``StreamSession._cancel_active_turn`` when the user
+        interrupts a reply mid-flight. Provider-managed models (Claude
+        SDK) translate this into a control-request interrupt so the
+        SDK's session log records what was emitted up to the cut. Platform-
+        managed models (Agno) inject a synthetic run into their session
+        store so the next turn sees coherent history. Default no-op for
+        caller-managed models (no hidden history state to maintain).
+        """
+        return None
+
     def known_session_ids(self) -> list[str]:
         """Return every session_id the provider currently has resume state for.
 

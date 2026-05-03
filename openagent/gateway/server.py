@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import socket
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, TYPE_CHECKING
 
 from openagent.gateway import protocol as P
@@ -24,6 +25,14 @@ if TYPE_CHECKING:
 from openagent.core.logging import elog
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _StreamHolder:
+    """A live stream session attached to a client WS."""
+
+    session: "StreamSession"
+    channel: "RealtimeChannel"
 
 
 def _find_available_port(preferred: int, host: str = "0.0.0.0") -> int:
@@ -67,6 +76,11 @@ class Gateway:
         self.clients: dict[str, object] = {}  # client_id → WebSocketResponse
         self._runner = None
         self._port_file = None
+
+        # Per (client_id, session_id) StreamSession + RealtimeChannel
+        # pair. Created on demand from inbound stream frames; closed on
+        # ``session_close`` or WS drop.
+        self._stream_sessions: dict[tuple[str, str], _StreamHolder] = {}
 
         # Cross-platform host-telemetry sampler (psutil). Filled in by
         # ``start()``; the /api/system handler and the broadcast loop
@@ -450,9 +464,11 @@ class Gateway:
 
         if is_audio_file(filename):
             # Hint downstream that the next chat message originated from
-            # voice — even when transcription failed, so the client can
-            # still flip its WS ``input_was_voice`` flag and the gateway
-            # can give a spoken reply if a TTS provider is configured.
+            # voice — clients tag the next ``text_final`` with
+            # ``source="stt"`` so the StreamSession applies the mirror-
+            # modality rule (instant barge-in + spoken reply when TTS
+            # is configured) regardless of the session-level speak
+            # toggle.
             result["transcribed_from_voice"] = True
             # Optional ISO-639-1 hint from the client (?lang=it). Auto-
             # detect on small Whisper models is unreliable for short
@@ -710,51 +726,20 @@ class Gateway:
                     )
                     await self._handle_command(ws, client_id, cmd_name, cmd_sid)
 
-                # Message
-                elif t == P.MESSAGE:
-                    text = data.get("text", "").strip()
-                    session_id = data.get("session_id", "default")
-                    # The client sets this when the inbound text came
-                    # from voice (mic + ASR). The agent reply will be
-                    # synthesised back to audio if a TTS provider is
-                    # configured. See TurnRunner.
-                    input_was_voice = bool(data.get("input_was_voice"))
-                    # ISO-639-1 hint from the client — same code Whisper
-                    # used for transcription. The voice pipeline forwards
-                    # it to Piper so a transcribed Italian message gets
-                    # spoken with an Italian voice instead of the default
-                    # American one. ``None`` falls through to the default
-                    # voice (today's behaviour for older clients).
-                    # Wire format keeps ``voice_language`` for backward
-                    # compat with older universal-app builds; we use
-                    # ``language`` internally to match TurnRunner /
-                    # synthesize_stream / etc.
-                    language = data.get("voice_language")
-                    if isinstance(language, str):
-                        language = language.strip().lower() or None
-                    else:
-                        language = None
-                    if text:
-                        sid = self.sessions.get_or_create_session(client_id, session_id)
-
-                        async def handler(
-                            _t=text, _s=sid, _c=client_id, _w=ws,
-                            _v=input_was_voice, _lang=language,
-                        ):
-                            await self._process_message(
-                                _w, _c, _t, _s,
-                                input_was_voice=_v, language=_lang,
-                            )
-
-                        pos = await self.sessions.enqueue(client_id, handler, session_id=sid)
-                        if pos < 0:
-                            await self._safe_ws_send_json(
-                                ws,
-                                {"type": P.ERROR, "text": "Too many messages queued. Please wait.", "session_id": sid},
-                            )
-                        elif pos > 0:
-                            elog("message.queued", client_id=client_id, session_id=sid, position=pos)
-                            await self._safe_ws_send_json(ws, {"type": P.QUEUED, "position": pos})
+                # Stream protocol — typed event frames. Every text/voice/
+                # video/attachment message goes through here now (the
+                # legacy ``MESSAGE`` handler was retired once bridges,
+                # the universal app and the CLI all migrated to
+                # ``session_open`` + ``text_final``). Decoded via
+                # :mod:`openagent.stream.wire` and dispatched to a
+                # per-(client, session) :class:`StreamSession`.
+                elif t in (
+                    P.SESSION_OPEN, P.SESSION_CLOSE,
+                    P.TEXT_DELTA_IN, P.TEXT_FINAL_IN,
+                    P.AUDIO_CHUNK_IN, P.AUDIO_END_IN,
+                    P.VIDEO_FRAME_IN, P.ATTACHMENT_IN, P.INTERRUPT,
+                ):
+                    await self._handle_stream_frame(ws, client_id, data)
 
         except Exception as e:
             elog("gateway.ws_error", level="error", client_id=client_id, error=str(e))
@@ -762,6 +747,10 @@ class Gateway:
             if client_id and client_id in self.clients:
                 del self.clients[client_id]
                 elog("gateway.client_disconnect", client_id=client_id)
+            # Tear down any stream sessions belonging to this client so
+            # the agent's per-session resources (claude-cli subprocesses,
+            # agno session rows) get a clean release.
+            await self._close_stream_sessions_for(client_id)
         return ws
 
     async def _handle_command(
@@ -912,91 +901,140 @@ class Gateway:
         )
         return forgotten
 
-    async def _process_message(
-        self,
-        ws,
-        client_id: str,
-        text: str,
-        session_id: str,
-        *,
-        input_was_voice: bool = False,
-        language: str | None = None,
+    async def _handle_stream_frame(
+        self, ws, client_id: str, frame: dict
     ) -> None:
-        try:
-            elog("message.received", client_id=client_id, session_id=session_id, length=len(text))
+        """Decode a stream-protocol wire frame and dispatch into the
+        matching :class:`StreamSession`.
 
-            # Hot-reload MCPs/models if the registry tables changed, and
-            # get the enabled-model count for the rejection gate — one
-            # round-trip to the DB. ``-1`` means no DB is wired.
+        Sessions are created on demand on the first frame for a given
+        ``(client_id, session_id)`` pair. ``session_close`` (or the
+        client WS dropping) tears them down.
+        """
+        from openagent.stream.session import StreamSession
+        from openagent.stream.channel import RealtimeChannel
+        from openagent.stream.wire import wire_to_event
+        from openagent.stream.events import SessionClose, SessionOpen
+
+        session_id = (frame.get("session_id") or "default").strip() or "default"
+        sid = self.sessions.get_or_create_session(client_id, session_id)
+        key = (client_id, sid)
+        evt = wire_to_event(frame)
+        if evt is None:
+            return
+
+        if isinstance(evt, SessionClose):
+            await self._close_stream_session(key)
+            return
+
+        holder = self._stream_sessions.get(key)
+        if holder is None:
+            language: str | None = None
+            profile = "realtime"
+            # ``None`` lets ``StreamSession`` pick its own default
+            # (currently 500 ms — the OpenAI-Realtime-style merged-burst
+            # UX). The wire decoder hands us ``None`` whenever the client
+            # didn't carry the field, and an explicit ``0`` whenever the
+            # client opted out.
+            coalesce_window_ms: int | None = None
+            speak_enabled = True
+            if isinstance(evt, SessionOpen):
+                language = evt.language
+                profile = evt.profile
+                coalesce_window_ms = evt.coalesce_window_ms
+                speak_enabled = bool(evt.speak)
+            session = StreamSession(
+                self.agent,
+                client_id=client_id,
+                session_id=sid,
+                profile=profile,
+                language=language,
+                coalesce_window_ms=coalesce_window_ms,
+                speak_enabled=speak_enabled,
+            )
+            # Install gateway hooks: pre-dispatch enforces the same
+            # "no enabled models" + "history-mode binding" guards the
+            # legacy MESSAGE handler did per turn; post-turn fires the
+            # same MCP resource broadcasts. Both close over ``self``
+            # and ``client_id`` / ``sid`` so each session gets its own
+            # scoped pair.
+            session.pre_dispatch_hook = self._make_stream_pre_dispatch_hook(
+                client_id, sid,
+            )
+            session.post_turn_hook = self._make_stream_post_turn_hook()
+            await session.start()
+            channel = RealtimeChannel(
+                session,
+                lambda payload, _ws=ws: self._safe_ws_send_json(_ws, payload),
+            )
+            await channel.start()
+            holder = _StreamHolder(session=session, channel=channel)
+            self._stream_sessions[key] = holder
+            elog(
+                "stream.session.attach",
+                client_id=client_id,
+                session_id=sid,
+                profile=profile,
+            )
+
+        if isinstance(evt, SessionOpen):
+            return  # session already created above; SessionOpen is metadata-only
+
+        await holder.session.push_in(evt)
+
+    async def _close_stream_session(self, key: tuple[str, str]) -> None:
+        """Pop and close one stream session. Idempotent + crash-safe."""
+        holder = self._stream_sessions.pop(key, None)
+        if holder is None:
+            return
+        try:
+            await holder.channel.close()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("stream session close failed: %s", e)
+
+    async def _close_stream_sessions_for(self, client_id: str | None) -> None:
+        """Close any stream sessions belonging to a disconnecting client."""
+        if not client_id:
+            return
+        for key in [k for k in self._stream_sessions if k[0] == client_id]:
+            await self._close_stream_session(key)
+
+    def _make_stream_pre_dispatch_hook(self, client_id: str, session_id: str):
+        """Build a per-session pre-dispatch hook for the stream path.
+
+        Mirrors the per-turn checks the legacy MESSAGE handler did:
+        hot-reload registries, refuse the turn if no models are
+        enabled, then bind the session's history mode for SmartRouter.
+        Returns a non-None error string to reject the turn — the
+        StreamSession publishes ``OutError`` + ``TurnComplete`` so the
+        client gets a clean error frame.
+        """
+        async def _pre_dispatch(_msg) -> str | None:
+            # Hot-reload MCPs/models if the registry tables changed,
+            # and get the enabled-model count for the rejection gate —
+            # one round-trip to the DB. ``-1`` means no DB is wired.
             try:
                 _, enabled_count = await self.agent.refresh_registries()
             except Exception as e:  # noqa: BLE001 — inner method already guards
                 elog("hot_reload.error", error=str(e))
                 enabled_count = -1
             if enabled_count == 0:
-                await self._safe_ws_send_json(ws, {
-                    "type": P.ERROR,
-                    "text": (
-                        "No models are enabled. Add one via /models or ask "
-                        "the agent to add an openai/anthropic/google model."
-                    ),
-                    "session_id": session_id,
-                })
                 elog("session.rejected_no_models", session_id=session_id)
-                return
+                return (
+                    "No models are enabled. Add one via /models or ask "
+                    "the agent to add an openai/anthropic/google model."
+                )
 
-            # MCP-tool-driven writes bypass the gateway (the MCPs are
-            # subprocesses talking straight to SQLite), so we can't fire
-            # fine-grained resource events from those handlers. Instead,
-            # watch the tool-name stream coming through ``on_status`` —
-            # tool names embed the MCP server prefix
-            # (``mcp__scheduler__add_task`` for Claude SDK,
-            # ``scheduler_add_task`` for Agno) — and after the turn
-            # finishes broadcast one ``resource_event`` per MCP namespace
-            # we saw. Substring match is good enough: ``Bash`` / ``Read``
-            # don't contain any of these tokens.
-            seen_resources: set[str] = set()
-            _MCP_PREFIX_TO_RESOURCE = (
-                ("scheduler", "scheduled_task"),
-                ("workflow_manager", "workflow"),
-                ("mcp_manager", "mcp"),
-                ("vault", "vault"),
-            )
-
-            def _track_tool(status: str) -> None:
-                try:
-                    data = json.loads(status)
-                except (ValueError, TypeError):
-                    return
-                if not isinstance(data, dict):
-                    return
-                tool = data.get("tool")
-                if not isinstance(tool, str):
-                    return
-                for needle, resource in _MCP_PREFIX_TO_RESOURCE:
-                    if needle in tool:
-                        seen_resources.add(resource)
-
-            async def on_status(status: str) -> None:
-                _track_tool(status)
-                try:
-                    await self._safe_ws_send_json(
-                        ws,
-                        {"type": P.STATUS, "text": status, "session_id": session_id},
-                    )
-                except Exception:
-                    pass
-
+            # SmartRouter handles per-session binding internally; it
+            # reports ``history_mode = None`` so this is a no-op for
+            # the common case. Direct-provider models (legacy/test
+            # paths) get the SessionManager pre-bind enforcement.
             active_model = self.agent.model
-            # SmartRouter handles per-session binding internally via the
-            # ``session_bindings`` / ``sdk_sessions`` tables — it reports
-            # ``history_mode = None`` so the SessionManager pre-bind
-            # check bails. Providers that set a concrete history_mode
-            # (a legacy direct-ClaudeCLIRegistry active model in tests,
-            # for example) still get the old SessionManager enforcement.
             history_mode = getattr(active_model, "history_mode", None)
             try:
-                self.sessions.bind_history_mode(client_id, session_id, history_mode)
+                self.sessions.bind_history_mode(
+                    client_id, session_id, history_mode,
+                )
             except ValueError as e:
                 elog(
                     "session.history_mode_conflict",
@@ -1005,83 +1043,37 @@ class Gateway:
                     history_mode=history_mode,
                     error=str(e),
                 )
-                await self._safe_ws_send_json(ws, {"type": P.ERROR, "text": str(e), "session_id": session_id})
-                return
+                return str(e)
+
             elog(
-                "message.process_start",
+                "stream.turn.pre_dispatch",
                 client_id=client_id,
                 session_id=session_id,
                 model_class=type(active_model).__name__,
-                input_was_voice=input_was_voice,
             )
-            # Both text and voice turns flow through the same runner.
-            # ``speak`` toggles the TTS sidecar; everything else (DELTA
-            # frames for typewriter UX + final RESPONSE with attachments
-            # + model meta) is unconditional. ``language`` is ignored
-            # when ``speak=False``.
-            from openagent.gateway.turn_runner import TurnRunner
-            runner = TurnRunner(
-                self.agent,
-                lambda payload: self._safe_ws_send_json(ws, payload),
+            return None
+
+        return _pre_dispatch
+
+    def _make_stream_post_turn_hook(self):
+        """Build a post-turn hook that fans out MCP resource broadcasts.
+
+        Mirrors the legacy MESSAGE handler's tail: after the turn
+        completes, send one ``resource_event`` per MCP namespace
+        whose tools fired during the turn, so the desktop app's
+        MCPs/Tasks/Workflows screens refresh. ``StreamSession``
+        accumulates the set via ``OutToolStatus`` taps.
+        """
+        async def _post_turn(seen_resources: set[str]) -> None:
+            if not seen_resources:
+                return
+            results = await asyncio.gather(
+                *(self.broadcast_resource(r, "changed") for r in seen_resources),
+                return_exceptions=True,
             )
-            try:
-                summary = await runner.run(
-                    text,
-                    client_id=client_id,
-                    session_id=session_id,
-                    speak=input_was_voice,
-                    on_status=on_status,
-                    language=language,
-                )
-                elog(
-                    "message.response",
-                    client_id=client_id,
-                    session_id=session_id,
-                    length=len(summary.get("text") or ""),
-                    audio_chunks=summary.get("audio_chunks") or 0,
-                    speak=input_was_voice,
-                )
-                # Coarse resource hints based on which MCP families were
-                # used this turn. Sent after RESPONSE so the client first
-                # sees the answer, then refreshes any list it's showing.
-                # Skipped when nothing relevant ran — idle chats stay
-                # noise-free.
-                for resource in seen_resources:
-                    await self.broadcast_resource(resource, "changed")
-            except asyncio.CancelledError:
-                # Server shutdown (restart for config update, launchd
-                # stop, etc.). Tell the client it wasn't a silent
-                # failure, log it, then re-raise so the surrounding
-                # cancel scope propagates.
-                elog(
-                    "message.cancelled",
-                    client_id=client_id, session_id=session_id,
-                    reason="server_shutdown",
-                )
-                try:
-                    await self._safe_ws_send_json(ws, {
-                        "type": P.ERROR,
-                        "text": "Server is restarting, please try your message again in a moment.",
-                        "session_id": session_id,
-                    })
-                except Exception:
-                    pass  # WS may already be half-closed
-                raise
-        except asyncio.CancelledError:
-            raise  # already handled above or a separate cancel scope
-        except Exception as e:
-            elog(
-                "message.error",
-                level="error",
-                client_id=client_id,
-                session_id=session_id,
-                error_type=type(e).__name__,
-                error=str(e) or repr(e),
-            )
-            try:
-                await self._safe_ws_send_json(
-                    ws,
-                    {"type": P.ERROR, "text": str(e) or type(e).__name__, "session_id": session_id},
-                )
-            except Exception:
-                pass  # WS is dead — bridge timeout will handle cleanup
+            for r, outcome in zip(seen_resources, results):
+                if isinstance(outcome, Exception):
+                    logger.debug("broadcast_resource(%s) failed: %s", r, outcome)
+
+        return _post_turn
+

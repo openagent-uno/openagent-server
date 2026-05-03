@@ -335,6 +335,79 @@ class AgnoProvider(BaseModel):
 
         return str(default_db_path())
 
+    async def commit_partial_assistant(self, session_id: str, text: str) -> None:
+        """Append a synthetic assistant run to Agno's session row.
+
+        After barge-in, the in-flight Agno run is cancelled mid-stream and
+        nothing has been committed to ``agno_sessions.runs``. We append a
+        synthetic ``RunOutput`` with ``status=cancelled`` carrying the
+        partial assistant text, so the next turn (which reads the session
+        via ``add_history_to_context=True``) sees ``user → assistant
+        (interrupted) → user`` rather than two adjacent user turns.
+
+        Best-effort: missing session row, schema mismatch, or import
+        errors all degrade silently — barge-in must succeed even when
+        history persistence fails.
+        """
+        if not session_id or not text:
+            return
+        try:
+            from agno.db.sqlite import SqliteDb
+            from agno.db.base import SessionType
+            from agno.session.agent import AgentSession
+            from agno.run.agent import RunOutput
+            from agno.run.base import RunStatus
+            from agno.models.message import Message
+        except ImportError as e:
+            logger.debug("agno commit_partial_assistant: import failed: %s", e)
+            return
+
+        db_path = self._runtime_db_path()
+        try:
+            db = SqliteDb(db_file=db_path)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("agno commit_partial_assistant: SqliteDb init failed: %s", e)
+            return
+
+        try:
+            session = db.get_session(
+                session_id=session_id,
+                session_type=SessionType.AGENT,
+                deserialize=True,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("agno commit_partial_assistant: get_session %s: %s", session_id, e)
+            return
+
+        if not isinstance(session, AgentSession):
+            return
+
+        import time as _time
+        # ``agent_id`` is REQUIRED on the run dict — Agno's
+        # ``AgentSession.from_dict`` filters out any run that lacks both
+        # ``agent_id`` and ``team_id`` when deserialising. Without it,
+        # our synth run round-trips through SqliteDb and silently
+        # disappears on the next read.
+        run = RunOutput(
+            run_id=f"interrupted-{int(_time.time() * 1000)}",
+            agent_id=session.agent_id,
+            session_id=session_id,
+            user_id=session.user_id,
+            content=text,
+            messages=[Message(role="assistant", content=text)],
+            status=RunStatus.cancelled,
+        )
+        try:
+            session.upsert_run(run)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("agno commit_partial_assistant: upsert_run failed: %s", e)
+            return
+        try:
+            db.upsert_session(session, deserialize=False)
+            elog("agno.barge_in_commit", session_id=session_id, chars=len(text))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("agno commit_partial_assistant: upsert_session failed: %s", e)
+
     def _runtime_parts(self) -> tuple[str, str]:
         return split_runtime_id(self.model)
 

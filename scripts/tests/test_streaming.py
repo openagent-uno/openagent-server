@@ -34,9 +34,10 @@ class _FakeBridge:
         from openagent.bridges.base import BaseBridge
 
         self._real = BaseBridge.__new__(BaseBridge)
-        self._real._pending = {}
+        self._real.name = "fake"
+        self._real._stream_opened = set()
+        self._real._stream_pending = {}
         self._real._status_callbacks = {}
-        self._real._session_locks = {}
         self._real._ws = object()
         self.sent: list[dict] = []
 
@@ -47,25 +48,32 @@ class _FakeBridge:
 
     async def feed_listener(self, frames: list[dict]) -> None:
         """Faithful copy of the post-cleanup ``BaseBridge._listen_gateway``
-        dispatch — DELTA is a no-op, RESPONSE resolves the future.
-        Used to drive the bridge end-to-end without a real WebSocket."""
+        dispatch — DELTA is a no-op, RESPONSE latches text onto the
+        collector, TURN_COMPLETE releases the awaiter. Used to drive
+        the bridge end-to-end without a real WebSocket."""
         from openagent.gateway import protocol as P
 
         for data in frames:
             t = data.get("type")
             sid = data.get("session_id")
-            if t == P.STATUS and sid in self._real._status_callbacks:
-                await self._real._status_callbacks[sid](data.get("text", ""))
+            collector = self._real._stream_pending.get(sid) if sid else None
+
+            if t == P.STATUS:
+                cb = self._real._status_callbacks.get(sid)
+                if cb is not None:
+                    await cb(data.get("text", ""))
             elif t == P.DELTA:
                 # Bridges ignore DELTA frames — they wait for the
-                # canonical RESPONSE. This branch must NOT touch any
-                # per-session callback dict (none exists for deltas).
+                # canonical RESPONSE / TURN_COMPLETE. This branch must
+                # NOT touch any per-session callback dict (none exists
+                # for deltas).
                 pass
-            elif t == P.RESPONSE and sid in self._real._pending:
-                fut = self._real._pending.pop(sid)
-                if not fut.done():
-                    fut.set_result(data)
-                self._real._status_callbacks.pop(sid, None)
+            elif t == P.RESPONSE and collector is not None:
+                collector.text = data.get("text", "") or ""
+                collector.model = data.get("model")
+                collector.attachments = list(data.get("attachments") or [])
+            elif t == P.TURN_COMPLETE and collector is not None:
+                collector.done.set()
 
 
 @test("streaming", "P.DELTA constant is exposed by the protocol module")
@@ -77,21 +85,25 @@ async def t_protocol_delta_constant(_ctx: TestContext) -> None:
     assert P.DELTA == "delta", f"DELTA should be 'delta', got {P.DELTA!r}"
 
 
-@test("streaming", "TurnRunner emits DELTA payloads with the canonical shape")
-async def t_gateway_delta_payload_shape(_ctx: TestContext) -> None:
-    """Verifies the WS payload emitted by the unified turn runner has
-    exactly the fields the universal client expects (``type``, ``text``,
-    ``session_id``). Reads the source directly so the test catches
-    drift even when the live WS path can't be exercised without API
-    keys."""
-    from pathlib import Path
-    src = Path(__file__).resolve().parents[2] / "openagent" / "gateway" / "turn_runner.py"
-    body = src.read_text(encoding="utf-8")
-    assert '"type": P.DELTA' in body, "turn_runner.py no longer emits P.DELTA payloads"
-    assert '"text": delta' in body, "turn_runner.py no longer wires delta text into payload"
-    assert '"session_id": session_id' in body, "turn_runner DELTA payload missing session_id"
-    # JSON sanity-check that nothing unparseable lurks at the file level.
-    json.dumps({"type": "delta", "text": "x", "session_id": "y"})  # smoke
+@test("streaming", "stream wire codec maps OutTextDelta to {type=delta, text, session_id}")
+async def t_stream_delta_payload_shape(_ctx: TestContext) -> None:
+    """Verifies the wire shape the universal client + CLI receive for
+    streaming token frames. The legacy ``TurnRunner`` was retired —
+    every text-mode reply now flows through ``StreamSession`` which
+    publishes ``OutTextDelta`` events and the wire codec serializes
+    them to ``{type: "delta", text, session_id}``. The shape MUST
+    stay stable so older clients keep typing-out tokens correctly."""
+    from openagent.stream.events import OutTextDelta
+    from openagent.stream.wire import event_to_wire
+
+    payload = event_to_wire(OutTextDelta(
+        session_id="s1", seq=3, ts_ms=42, text="hello",
+    ))
+    assert payload["type"] == "delta", payload
+    assert payload["text"] == "hello", payload
+    assert payload["session_id"] == "s1", payload
+    # JSON sanity-check that nothing unparseable lurks in the payload.
+    json.dumps(payload)
 
 
 @test("streaming", "BaseBridge exposes a single send_message API")
@@ -119,16 +131,17 @@ async def t_basebridge_no_delta_callbacks_field(_ctx: TestContext) -> None:
     )
 
 
-@test("streaming", "send_message resolves on RESPONSE and ignores DELTA frames")
+@test("streaming", "send_message resolves on TURN_COMPLETE and ignores DELTA frames")
 async def t_send_message_ignores_delta(_ctx: TestContext) -> None:
     """End-to-end: a turn that emits DELTA frames before the trailing
-    RESPONSE must complete cleanly. The DELTAs are silently dropped;
-    only the RESPONSE text reaches the caller."""
+    RESPONSE + TURN_COMPLETE must complete cleanly. The DELTAs are
+    silently dropped; only the canonical RESPONSE text reaches the
+    caller, and TURN_COMPLETE is what releases the awaiter."""
     fb = _FakeBridge()
 
     async def driver() -> None:
         for _ in range(500):
-            if "s-final" in fb._real._pending:
+            if "s-final" in fb._real._stream_pending:
                 break
             await asyncio.sleep(0.001)
         await fb.feed_listener([
@@ -136,6 +149,7 @@ async def t_send_message_ignores_delta(_ctx: TestContext) -> None:
             {"type": "delta", "session_id": "s-final", "text": "world"},
             {"type": "delta", "session_id": "s-final", "text": "!"},
             {"type": "response", "session_id": "s-final", "text": "Hello world!"},
+            {"type": "turn_complete", "session_id": "s-final"},
         ])
 
     result, _ = await asyncio.gather(
@@ -143,7 +157,7 @@ async def t_send_message_ignores_delta(_ctx: TestContext) -> None:
         driver(),
     )
     assert result["text"] == "Hello world!", result
-    # Cleanup — the pending map and status-callback map must be empty
+    # Cleanup — the collector map and status-callback map must be empty
     # so a later turn against the same id starts fresh.
-    assert "s-final" not in fb._real._pending, fb._real._pending
+    assert "s-final" not in fb._real._stream_pending, fb._real._stream_pending
     assert "s-final" not in fb._real._status_callbacks, fb._real._status_callbacks

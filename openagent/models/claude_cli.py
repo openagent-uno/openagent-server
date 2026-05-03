@@ -512,6 +512,35 @@ class ClaudeCLI(BaseModel):
                 logger.debug("forget_session db delete %s: %s", session_id, e)
         elog("model.session_forget", session_id=session_id)
 
+    async def commit_partial_assistant(self, session_id: str, text: str) -> None:
+        """Stop the in-flight SDK turn cleanly via control request.
+
+        The Claude Agent SDK exposes ``ClaudeSDKClient.interrupt()`` which
+        sends a ``{"subtype": "interrupt"}`` control request to the
+        subprocess. The SDK's session log retains whatever was emitted up
+        to the interrupt point — that's exactly what ``--resume`` needs
+        on the next turn, so we don't need to manually inject anything.
+
+        ``text`` is informational only; the SDK manages its own log.
+        Best-effort: a missing session is a no-op, and any SDK-side error
+        is logged but never raised (the user's interrupt should land
+        regardless of provider state).
+        """
+        if not session_id:
+            return
+        async with self._registry_lock:
+            session = self._sessions.get(session_id)
+        if session is None or session.client is None:
+            return
+        interrupt = getattr(session.client, "interrupt", None)
+        if not callable(interrupt):
+            return
+        try:
+            await interrupt()
+            elog("claude_cli.barge_in_interrupt", session_id=session_id)
+        except Exception as e:  # noqa: BLE001 — best-effort
+            logger.debug("claude_cli interrupt failed for %s: %s", session_id, e)
+
     async def cleanup_idle(self) -> None:
         """Close clients idle for more than ``_idle_ttl`` seconds.
 
@@ -1266,6 +1295,18 @@ class ClaudeCLIRegistry(BaseModel):
             seen.update(inst.known_session_ids())
         seen.update(self._session_model.keys())
         return sorted(seen)
+
+    async def commit_partial_assistant(self, session_id: str, text: str) -> None:
+        """Forward to the per-session ``ClaudeCLI`` instance, if any."""
+        if not session_id:
+            return
+        inst = self._instances.get(session_id)
+        if inst is None:
+            return
+        try:
+            await inst.commit_partial_assistant(session_id, text)
+        except Exception as e:  # noqa: BLE001 — best-effort
+            logger.debug("registry.commit_partial_assistant: %s", e)
 
     # ── per-session routing ───────────────────────────────────────────
 

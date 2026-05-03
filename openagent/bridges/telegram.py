@@ -556,6 +556,10 @@ class TelegramBridge(BaseBridge):
         response = await self.send_message(
             text, session_id,
             on_status=on_status,
+            # Tag voice-note text as STT so the StreamSession dispatches
+            # it instantly (bypasses the typed-burst coalescence window).
+            # Matches the OpenAI-Realtime feel for voice-call mode.
+            source="stt" if voice_detected else "user_typed",
         )
 
         if status_msg:

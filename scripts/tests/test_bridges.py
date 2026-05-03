@@ -47,16 +47,18 @@ async def t_bridge_base(ctx: TestContext) -> None:
 
 
 class _FakeBridge:
-    """Subclass stand-in that skips the WS connect. Only used for send_message
-    tests where we control the pending future directly."""
+    """Subclass stand-in that skips the WS connect. Used for the
+    send_message tests — we drive the in-flight ``_StreamCollector``
+    directly to simulate gateway responses."""
 
     def __init__(self) -> None:
         from openagent.bridges.base import BaseBridge
 
         self._real = BaseBridge.__new__(BaseBridge)
-        self._real._pending = {}
+        self._real.name = "fake"
+        self._real._stream_opened = set()
+        self._real._stream_pending = {}
         self._real._status_callbacks = {}
-        self._real._session_locks = {}
         self._real._ws = object()  # non-None bypasses the "not connected" guard
         self._sent: list[dict] = []
 
@@ -65,32 +67,74 @@ class _FakeBridge:
 
         self._real._send_gateway_json = fake_send  # type: ignore[assignment]
 
-    def future_for(self, sid: str):
-        return self._real._pending[sid]
+    def collector_for(self, sid: str):
+        return self._real._stream_pending[sid]
 
-    async def send(self, text: str, sid: str, *, on_status=None):
+    async def send(self, text: str, sid: str, *, on_status=None, source="user_typed"):
         return await self._real.send_message(
-            text=text, session_id=sid, on_status=on_status,
+            text=text, session_id=sid, on_status=on_status, source=source,
         )
 
 
-@test("bridges", "send_message resolves when the gateway future is set")
+@test("bridges", "send_message resolves when turn_complete fires on the collector")
 async def t_send_message_normal(ctx: TestContext) -> None:
+    """The new stream-protocol send_message awaits ``collector.done`` —
+    the listener sets it on the ``turn_complete`` frame. Verify the
+    end-to-end shape: SESSION_OPEN gets sent first, then TEXT_FINAL_IN,
+    then the awaiter resolves with the legacy dict shape."""
     import asyncio
 
     fb = _FakeBridge()
 
     async def resolver():
-        # Wait until send_message registered the pending future, then resolve.
         for _ in range(500):
-            if "s1" in fb._real._pending:
-                fb.future_for("s1").set_result({"type": "response", "text": "pong"})
+            if "s1" in fb._real._stream_pending:
+                col = fb.collector_for("s1")
+                col.text = "pong"
+                col.model = "fake-model"
+                col.done.set()
                 return
             await asyncio.sleep(0.001)
-        raise AssertionError("pending future never appeared")
+        raise AssertionError("collector never appeared")
 
     result, _ = await asyncio.gather(fb.send("ping", "s1"), resolver())
     assert result["text"] == "pong", result
+    assert result["model"] == "fake-model", result
+    # First call must open the stream session, then push the text.
+    assert fb._sent[0]["type"] == "session_open", fb._sent[0]
+    assert fb._sent[0]["profile"] == "batched", fb._sent[0]
+    assert fb._sent[0]["coalesce_window_ms"] == 1500, fb._sent[0]
+    assert fb._sent[1]["type"] == "text_final", fb._sent[1]
+    assert fb._sent[1]["text"] == "ping", fb._sent[1]
+    assert fb._sent[1]["source"] == "user_typed", fb._sent[1]
+
+
+@test("bridges", "send_message reuses an open stream session for repeat calls")
+async def t_send_message_reopen(ctx: TestContext) -> None:
+    """Each ``session_id`` should ``session_open`` exactly once per WS;
+    subsequent messages on the same session push only ``text_final``."""
+    import asyncio
+
+    fb = _FakeBridge()
+
+    async def resolve_each():
+        # Resolve both turns as they come in.
+        sid = "s-reuse"
+        for _ in range(500):
+            if sid in fb._real._stream_pending:
+                col = fb._real._stream_pending[sid]
+                col.text = "ok"
+                col.done.set()
+                return
+            await asyncio.sleep(0.001)
+
+    # First turn — should send session_open + text_final.
+    await asyncio.gather(fb.send("first", "s-reuse"), resolve_each())
+    # Second turn — should send only text_final.
+    await asyncio.gather(fb.send("second", "s-reuse"), resolve_each())
+
+    types = [p["type"] for p in fb._sent]
+    assert types == ["session_open", "text_final", "text_final"], types
 
 
 @test("bridges", "send_message raises CancelledError when /stop cancels the caller")
@@ -99,12 +143,12 @@ async def t_send_message_cancelled(ctx: TestContext) -> None:
 
     fb = _FakeBridge()
     task = asyncio.create_task(fb.send("ping", "s-cancel"))
-    # Give the bridge a moment to register the pending future + send payload.
+    # Give the bridge a moment to register the collector + send payload.
     for _ in range(500):
-        if "s-cancel" in fb._real._pending:
+        if "s-cancel" in fb._real._stream_pending:
             break
         await asyncio.sleep(0.001)
-    assert "s-cancel" in fb._real._pending, "send_message never registered"
+    assert "s-cancel" in fb._real._stream_pending, "send_message never registered"
     task.cancel()
     raised: BaseException | None = None
     try:
@@ -113,7 +157,31 @@ async def t_send_message_cancelled(ctx: TestContext) -> None:
         raised = e
     assert raised is not None, "CancelledError was swallowed"
     # Defensive cleanup should have popped the entry.
-    assert "s-cancel" not in fb._real._pending, "pending future leaked"
+    assert "s-cancel" not in fb._real._stream_pending, "stream collector leaked"
+
+
+@test("bridges", "send_message exposes errors as type=error on the legacy reply")
+async def t_send_message_error(ctx: TestContext) -> None:
+    """Stream-side errors set ``collector.errored``; ``to_legacy_reply``
+    must surface them in the dict shape per-bridge code already checks
+    (``response.get("type") == "error"`` is the legacy convention)."""
+    import asyncio
+
+    fb = _FakeBridge()
+
+    async def fail_it():
+        for _ in range(500):
+            if "s-err" in fb._real._stream_pending:
+                col = fb._real._stream_pending["s-err"]
+                col.errored = True
+                col.error_text = "boom"
+                col.done.set()
+                return
+            await asyncio.sleep(0.001)
+
+    result, _ = await asyncio.gather(fb.send("ping", "s-err"), fail_it())
+    assert result["type"] == "error", result
+    assert result["text"] == "boom", result
 
 
 @test("bridges", "telegram bridge wires ApplicationBuilder().concurrent_updates(True)")
@@ -232,7 +300,7 @@ async def t_telegram_concurrent_updates(ctx: TestContext) -> None:
 #
 #   * fresh update_ids pass through exactly once,
 #   * a duplicate update_id is rejected and ``_on_message`` never reaches
-#     ``send_message`` (nothing leaks into ``_pending``),
+#     ``send_message`` (nothing leaks into ``_stream_pending``),
 #   * the bounded-set eviction lets an id eventually be accepted again
 #     after it has rotated out of the window,
 #   * ``_last_update_id`` still advances so ``flush_updates_offset``
@@ -273,9 +341,9 @@ def _fresh_telegram_bridge():
     # We never start the WS gateway loop — just probe ``_is_fresh_update``
     # and ``_on_message`` in isolation. Attach stubs for what the handler
     # touches after the freshness check.
-    bridge._pending = {}
+    bridge._stream_opened = set()
+    bridge._stream_pending = {}
     bridge._status_callbacks = {}
-    bridge._session_locks = {}
     return bridge
 
 

@@ -56,9 +56,10 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_channels",
     "test_formatting",
     "test_tts_chunker",
-    "test_turn_runner",
-    # Local Piper TTS fallback — pure-unit, no fixtures. Paired with
-    # test_turn_runner.py which covers the runner-side wiring.
+    # Local Piper TTS fallback — pure-unit, no fixtures. The legacy
+    # ``TurnRunner`` it used to be paired with is gone (every text/voice
+    # turn now flows through ``StreamSession`` / ``StreamTurnRunner``);
+    # the runner-side wiring is exercised in test_stream.py.
     "test_tts_local",
     # TTS text sanitizer — markdown / emoji / URL stripping shared by
     # both synth entry points + the WS-streaming drain. Pure-unit, no
@@ -69,9 +70,31 @@ _TEST_MODULES: tuple[str, ...] = (
     # Spins up a real local websockets server on a free port to
     # exercise the full BOS / text-frame / EOS protocol.
     "test_tts_elevenlabs_streaming",
+    # Deepgram WebSocket streaming STT — audio-in / transcript-out
+    # adapter that powers the universal app's voice tab via
+    # StreamSession's STT pump. Local fake-WS server exercises the
+    # full audio → CloseStream → final protocol.
+    "test_stt_deepgram_streaming",
+    # Barge-in commit: StreamSession._cancel_active_turn calls
+    # Agent.commit_partial_assistant with the accumulated deltas BEFORE
+    # cancelling the in-flight turn. Pure-unit; no provider live calls.
+    "test_barge_in_commit",
+    # ClaudeCLI.commit_partial_assistant routes to client.interrupt()
+    # so the SDK's session log records what was emitted up to the
+    # interrupt — keeps --resume coherent post-barge-in.
+    "test_claude_cli_interrupt",
+    # AgnoProvider.commit_partial_assistant injects a synthetic run
+    # into the agno_sessions row so the next turn sees ``user →
+    # assistant (interrupted) → user`` instead of two adjacent user
+    # turns. Round-trips against a throwaway SqliteDb.
+    "test_agno_partial_commit",
     # DELTA frame plumbing for the unified streaming path (web chat +
     # bridges). Pure-unit; relies on the BaseBridge dispatch logic.
     "test_streaming",
+    # Unified streaming I/O protocol — typed events, wire codec,
+    # StreamSession, channel profiles. Pure-unit; uses a fake agent
+    # so no network or DB is required.
+    "test_stream",
     # Agent.run_stream empty-stream safety net — pure-unit, no fixtures.
     # Guards the contract that voice mode (and the soon-to-be-streaming
     # web chat) always gets text even when the streaming provider yields

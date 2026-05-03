@@ -62,6 +62,7 @@ _AUDIO_BUNDLED: dict[str, list[dict[str, Any]]] = {
         {"id": "eleven_multilingual_v2", "display_name": "ElevenLabs Multilingual v2"},
     ],
     "deepgram": [
+        {"id": "nova-3", "display_name": "Deepgram Nova 3"},
         {"id": "nova-2", "display_name": "Deepgram Nova 2"},
     ],
 }

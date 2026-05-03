@@ -157,8 +157,9 @@ async def t_create_db_model(ctx: TestContext) -> None:
                 f"http://127.0.0.1:{port}/api/models/{model_id}",
             ) as resp:
                 # Since v0.10.3 the guardrail that refused "last enabled model"
-                # is gone — the rejection gate in _process_message surfaces the
-                # zero-model state explicitly, so DELETE always succeeds.
+                # is gone — the rejection gate in StreamSession's pre-dispatch
+                # hook surfaces the zero-model state explicitly, so DELETE
+                # always succeeds.
                 assert resp.status == 200, await resp.text()
         finally:
             async with sess.delete(

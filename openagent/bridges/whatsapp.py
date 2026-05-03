@@ -184,6 +184,9 @@ class WhatsAppBridge(BaseBridge):
         response = await self.send_message(
             text, session_id,
             on_status=on_status,
+            # Voice notes bypass the typed-burst coalescence window
+            # for instant barge-in (StreamSession STT-bypass path).
+            source="stt" if voice_detected else "user_typed",
         )
 
         resp_text = response.get("text", "")

@@ -343,6 +343,30 @@ class Agent:
         except Exception:
             return []
 
+    async def commit_partial_assistant(
+        self, session_id: str, text: str
+    ) -> None:
+        """Persist a partial assistant reply after barge-in.
+
+        Called by ``StreamSession._cancel_active_turn`` when the user
+        interrupts a turn mid-flight. Forwards to ``self.model`` so the
+        bound provider (Claude SDK / Agno) can either issue a clean
+        interrupt control-request or inject a synthetic run into its
+        history store. Best-effort: provider failures log and swallow.
+        """
+        if not session_id or not text or self.model is None:
+            return
+        commit = getattr(self.model, "commit_partial_assistant", None)
+        if not callable(commit):
+            return
+        try:
+            await commit(session_id, text)
+        except Exception as e:  # noqa: BLE001 — best-effort
+            logger.debug(
+                "commit_partial_assistant on %s failed: %s",
+                type(self.model).__name__, e,
+            )
+
     async def forget_session(
         self,
         session_id: str | None,
