@@ -66,12 +66,17 @@ async def t_commit_before_cancel(_ctx: TestContext) -> None:
         session_id="s", seq=1, ts_ms=now_ms(),
         text="say hi", source="user_typed",
     ))
-    # Wait until at least one delta has been accumulated.
+    # Wait for ≥2 deltas. Breaking on the first one races the dispatch
+    # loop: ``_cancel_active_turn`` snapshots ``_partial_assistant`` the
+    # instant the Interrupt is processed, and on a fast loop that's
+    # before the agent task gets back from ``await asyncio.sleep(0.01)``
+    # to yield the second delta — leaving ``partial == "hel"`` and the
+    # ``"lo" in text`` assertion below false.
     for _ in range(60):
         await asyncio.sleep(0.05)
-        if sess._partial_assistant:
+        if len(sess._partial_assistant) >= 2:
             break
-    assert sess._partial_assistant, "runner should have buffered deltas"
+    assert len(sess._partial_assistant) >= 2, sess._partial_assistant
 
     # Now interrupt.
     await sess.push_in(Interrupt(
