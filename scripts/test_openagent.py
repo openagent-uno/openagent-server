@@ -170,6 +170,10 @@ _TEST_MODULES: tuple[str, ...] = (
     # LLM (via list_workflow_examples / get_workflow_example) stays
     # accurate as block schemas evolve.
     "test_workflow_examples",
+    # Scheduler must dispatch each due workflow as its own asyncio.Task
+    # so different workflows on the same tick run concurrently. Companion
+    # asserts the per-workflow lock keeps SAME-workflow runs ordered.
+    "test_workflow_parallel_execution",
     "test_dream",
     "test_updater",
     "test_bridges",

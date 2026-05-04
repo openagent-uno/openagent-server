@@ -390,9 +390,12 @@ async def handle_run(request):
     # queue-claimed requests so trace/history come out identical.
     run_id = str(uuid.uuid4())
     try:
-        # Call private helper intentionally — gateway + scheduler share
-        # this module boundary. See Scheduler._run_workflow docstring.
-        scheduler._run_workflow_task = asyncio.create_task(
+        # Spawn through the scheduler's bookkeeping set so concurrent
+        # API calls each get their own task handle (the previous design
+        # stashed the task on ``scheduler._run_workflow_task`` — a single
+        # attribute that overlapping calls trampled, leaving the earlier
+        # handler awaiting whichever task arrived last).
+        run_task = scheduler._spawn_workflow(
             scheduler._run_workflow(
                 existing, trigger="api", inputs=inputs,
             )
@@ -428,7 +431,7 @@ async def handle_run(request):
 
     # wait=True: let the task finish, then fetch the run row.
     try:
-        await asyncio.wait_for(scheduler._run_workflow_task, timeout=timeout_s)
+        await asyncio.wait_for(run_task, timeout=timeout_s)
     except asyncio.TimeoutError:
         return web.json_response(
             {"error": f"workflow did not finish within {timeout_s}s"},

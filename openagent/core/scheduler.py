@@ -71,6 +71,11 @@ class Scheduler:
         # Lazy — created on first workflow tick.
         self._workflow_executor: WorkflowExecutor | None = None
         self._broadcast: BroadcastHook = broadcast or _no_broadcast
+        # In-flight per-tick dispatches. ``_check_and_run`` spawns each
+        # due task / schedule / queue request as its own ``asyncio.Task``
+        # so different workflows actually run concurrently — the previous
+        # design awaited each run inline, serialising the whole tick.
+        self._workflow_tasks: set[asyncio.Task] = set()
 
     def _next_run(self, cron_expression: str, base: float | None = None) -> float:
         return next_run_for_expression(cron_expression, base)
@@ -93,7 +98,26 @@ class Scheduler:
             except asyncio.CancelledError:
                 pass
             self._task = None
+        # Let in-flight runs finish — matches the existing fire-and-forget
+        # semantics of ``run_task``. Cancelling here would strand
+        # ``workflow_runs`` rows in ``running`` and lose ai-prompt
+        # transcripts mid-stream.
+        if self._workflow_tasks:
+            await asyncio.gather(*self._workflow_tasks, return_exceptions=True)
         elog("scheduler.stop")
+
+    def _spawn_workflow(self, coro) -> asyncio.Task:
+        """Dispatch ``coro`` as a tracked background task.
+
+        The set is the only handle the scheduler keeps; ``stop()``
+        drains it on shutdown so no run is silently abandoned. Without
+        the strong reference, ``asyncio`` may garbage-collect a still-
+        running task (see ``asyncio.create_task`` docs).
+        """
+        task = asyncio.create_task(coro)
+        self._workflow_tasks.add(task)
+        task.add_done_callback(self._workflow_tasks.discard)
+        return task
 
     async def _recalculate_next_runs(self) -> None:
         """On startup, recalculate next_run for all enabled tasks AND
@@ -190,15 +214,21 @@ class Scheduler:
                 elog("scheduler.forget_failed", task=task_name, error=str(e))
 
     async def _check_and_run(self) -> None:
-        """Check for due tasks and execute them."""
+        """Check for due tasks and execute them.
+
+        Each due item is dispatched as its own ``asyncio.Task`` via
+        ``_spawn_workflow`` so different workflows actually run in
+        parallel. Bookkeeping (``last_run`` / ``next_run`` advances,
+        broadcasts) happens *before* dispatch — otherwise a long run
+        would still be in-flight when the next 30 s tick fires
+        ``get_due_tasks`` again, and the same row would be re-fired
+        repeatedly.
+        """
         now = time.time()
         due_tasks = await self.db.get_due_tasks(now)
 
         for task in due_tasks:
             elog("scheduler.run_due", name=task["name"])
-            await self.run_task(task)
-
-            # Update last_run and compute next_run
             try:
                 if is_one_shot_expression(task["cron_expression"]):
                     await self.db.update_task(
@@ -217,6 +247,7 @@ class Scheduler:
             except ValueError as e:
                 elog("scheduler.next_run_update_failed", level="error",
                      task=task["name"], error=str(e))
+            self._spawn_workflow(self.run_task(task))
 
         # Per-block schedules. Each due row fires its own
         # trigger-schedule node as the entry point; a workflow with
@@ -238,12 +269,6 @@ class Scheduler:
                 node_id=sched.get("node_id"),
                 schedule_id=sched.get("id"),
             )
-            await self._run_workflow(
-                wf,
-                trigger="schedule",
-                entry_node_id=sched["node_id"],
-            )
-            # Advance the schedule row for its next tick.
             try:
                 cron = sched.get("cron_expression") or ""
                 if is_one_shot_expression(cron):
@@ -270,6 +295,13 @@ class Scheduler:
             except Exception:  # noqa: BLE001
                 pass
             self._broadcast("workflow", "updated", sched["workflow_id"])
+            self._spawn_workflow(
+                self._run_workflow(
+                    wf,
+                    trigger="schedule",
+                    entry_node_id=sched["node_id"],
+                )
+            )
 
         # AI-enqueued + manually-enqueued workflow runs (Phase 2).
         try:
@@ -286,11 +318,13 @@ class Scheduler:
                     request_id=req.get("id"), workflow_id=workflow_id,
                 )
                 continue
-            await self._run_workflow(
-                wf,
-                trigger=req.get("trigger") or "api",
-                inputs=req.get("inputs") or {},
-                request_id=req.get("id"),
+            self._spawn_workflow(
+                self._run_workflow(
+                    wf,
+                    trigger=req.get("trigger") or "api",
+                    inputs=req.get("inputs") or {},
+                    request_id=req.get("id"),
+                )
             )
 
     # ── Workflow helpers (Phase 2) ──
