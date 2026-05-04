@@ -605,7 +605,17 @@ async def _h_mcp_tool(
 ) -> dict[str, Any]:
     mcp_name = cfg.get("mcp_name")
     tool_name = cfg.get("tool_name")
-    args = cfg.get("args") or {}
+    # Accept ``arguments`` as a synonym for ``args``: the MCP JSON-RPC
+    # spec and most LLM-authored workflows use ``arguments`` (matching
+    # ``CallToolRequest.params.arguments``), while the block schema's
+    # canonical key is ``args``. Without this fallback, a workflow that
+    # set ``arguments`` would call the wrapped function with no kwargs
+    # and die with ``missing 1 required positional argument``.
+    args = cfg.get("args")
+    if args is None:
+        args = cfg.get("arguments")
+    if args is None:
+        args = {}
     if not mcp_name or not tool_name:
         raise ValueError(
             "mcp-tool: both 'mcp_name' and 'tool_name' are required"

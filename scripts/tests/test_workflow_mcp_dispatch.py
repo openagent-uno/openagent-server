@@ -414,3 +414,116 @@ async def t_validate_repairs_double_prefix(ctx: TestContext) -> None:
 
     # Verify the config was repaired in-place.
     assert config["tool_name"] == "shell_exec", config["tool_name"]
+
+
+@test(
+    "workflow_mcp_dispatch",
+    "mcp-tool accepts 'arguments' as synonym for 'args'",
+)
+async def t_executor_accepts_arguments_alias(ctx: TestContext) -> None:
+    """LLM-authored workflows commonly emit ``arguments`` (matching the
+    MCP JSON-RPC ``CallToolRequest.params.arguments`` field) instead of
+    the block schema's canonical ``args``. Without the fallback in
+    ``_h_mcp_tool``, ``cfg.get('args')`` returned ``{}``, the wrapped
+    function was called with no kwargs, and the workflow died with
+    ``TypeError: shell_exec() missing 1 required positional argument:
+    'command'``. Regression for the Mixout Daily Release Check workflow
+    (run 9b0eb495-…)."""
+    from openagent.workflow.executor import (
+        WorkflowExecutor, _RunCtx, _h_mcp_tool,
+    )
+
+    Function = _agno_function_factory()
+
+    seen: dict[str, Any] = {}
+
+    async def entrypoint(*, command: str, timeout: int = 60) -> str:
+        seen["command"] = command
+        seen["timeout"] = timeout
+        return "ran"
+
+    fn = Function(name="shell_exec", entrypoint=entrypoint)
+    toolkit = _ToolkitStub(functions={fn.name: fn})
+    pool = _make_pool({"shell": toolkit})
+
+    executor = WorkflowExecutor(agent=_RecordingAgent(pool=pool), db=_StubDB())  # type: ignore[arg-type]
+    run_ctx = _RunCtx(run_id="r", workflow_id="w", inputs={}, vars={})
+
+    result = await _h_mcp_tool(
+        executor,
+        {"id": "n12", "type": "mcp-tool"},
+        {
+            "mcp_name": "shell",
+            "tool_name": "shell_exec",
+            # NOTE: 'arguments', not 'args' — the bug-trigger field.
+            "arguments": {"command": "echo hi", "timeout": 600},
+        },
+        run_ctx,
+    )
+
+    assert result == {"result": "ran"}, result
+    assert seen == {"command": "echo hi", "timeout": 600}, seen
+
+
+@test(
+    "workflow_mcp_dispatch",
+    "validate_graph repairs 'arguments' → 'args' in place",
+)
+async def t_validate_repairs_arguments_alias(ctx: TestContext) -> None:
+    """The validator must rename ``arguments`` → ``args`` so trace_json
+    stays consistent and the missing-required-args check uses the right
+    keys. Mirrors the existing tool_name auto-repair pattern."""
+    from openagent.workflow.validate import validate_graph
+
+    config = {
+        "mcp_name": "shell",
+        "tool_name": "shell_exec",
+        # Uses 'arguments' — should be renamed to 'args' in place.
+        "arguments": {"command": "echo hi"},
+    }
+    graph = {
+        "version": 1,
+        "nodes": [{"id": "n1", "type": "mcp-tool", "config": config}],
+        "edges": [],
+        "variables": {},
+    }
+    inventory = {
+        "shell": {"shell_exec": {"required": ["command"]}},
+    }
+
+    # Must not raise: the repair must run before the missing-required
+    # check, so ``args.command`` is seen as present.
+    validate_graph(graph, mcp_inventory=inventory)
+
+    assert "arguments" not in config, config
+    assert config["args"] == {"command": "echo hi"}, config["args"]
+
+
+@test(
+    "workflow_mcp_dispatch",
+    "validate_graph keeps 'args' when both 'args' and 'arguments' set",
+)
+async def t_validate_args_wins_over_arguments(ctx: TestContext) -> None:
+    """If a workflow has both keys (corrupt or hand-edited), the
+    canonical ``args`` wins and ``arguments`` is left untouched.
+    Repairing in this case would silently change behaviour."""
+    from openagent.workflow.validate import validate_graph
+
+    config = {
+        "mcp_name": "shell",
+        "tool_name": "shell_exec",
+        "args": {"command": "echo args"},
+        "arguments": {"command": "echo arguments"},
+    }
+    graph = {
+        "version": 1,
+        "nodes": [{"id": "n1", "type": "mcp-tool", "config": config}],
+        "edges": [],
+        "variables": {},
+    }
+    inventory = {"shell": {"shell_exec": {"required": ["command"]}}}
+
+    validate_graph(graph, mcp_inventory=inventory)
+
+    assert config["args"] == {"command": "echo args"}, config["args"]
+    assert config["arguments"] == {"command": "echo arguments"}, config["arguments"]

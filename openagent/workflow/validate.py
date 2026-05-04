@@ -282,6 +282,18 @@ def validate_graph(
                 node_id=nid,
                 field="config",
             )
+        # Auto-repair: ``arguments`` → ``args`` for mcp-tool blocks.
+        # The MCP JSON-RPC spec uses ``arguments``; LLM-authored
+        # workflows routinely emit that name. The block schema's
+        # canonical key is ``args``. Repair in place so trace_json,
+        # the missing-required-args check below, and the executor all
+        # see the canonical form. Same spirit as the tool_name repair.
+        if (
+            ntype == "mcp-tool"
+            and "args" not in config
+            and isinstance(config.get("arguments"), dict)
+        ):
+            config["args"] = config.pop("arguments")
         _check_config(nid, spec, config)
         if ntype == "mcp-tool" and mcp_inventory is not None:
             _check_mcp_tool(nid, config, mcp_inventory, mcp_callability)
