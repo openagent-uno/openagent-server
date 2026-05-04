@@ -22,6 +22,12 @@ MAX_STREAM_BYTES = 1_000_000
 # Grace between SIGTERM and SIGKILL during kill.
 DEFAULT_KILL_GRACE = 5.0
 
+# Cap on each individual await inside finalise(): proc.wait() and the
+# two _drain tasks all gate on pipe EOF, and a setsid'd grandchild that
+# inherited stdout/stderr pins those pipes open even after the immediate
+# shell is reaped — without this bound the handler hangs forever.
+FINALISE_TIMEOUT = 5.0
+
 
 SignalName = Literal["TERM", "INT", "KILL"]
 
@@ -209,22 +215,63 @@ class BackgroundShell:
     def stderr_dropped(self) -> int:
         return self._stderr_dropped
 
+    async def _wait_with_timeout(self) -> int | None:
+        """Bounded ``proc.wait()``; force-closes the transport on stall.
+
+        ``asyncio.Process.wait()`` only returns once the subprocess
+        transport fires ``_call_connection_lost``, which itself only
+        fires after the child exits AND every pipe transport closes.
+        A setsid'd grandchild that inherited stdout/stderr pins those
+        pipes open after the immediate shell is reaped, so without a
+        bound here we wait forever. The transport-close fallback
+        slams the pipes shut from our side, which both unblocks the
+        wait and lets the drain tasks see EOF.
+        """
+        assert self._proc is not None
+        try:
+            return await asyncio.wait_for(self._proc.wait(), timeout=FINALISE_TIMEOUT)
+        except asyncio.TimeoutError:
+            elog("shell_exec.wait_stuck", shell_id=self.shell_id)
+            transport = getattr(self._proc, "_transport", None)
+            if transport is not None:
+                try:
+                    transport.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                return await asyncio.wait_for(self._proc.wait(), timeout=FINALISE_TIMEOUT)
+            except asyncio.TimeoutError:
+                return self._proc.returncode
+
+    async def _await_drain(self, task: asyncio.Task | None, name: str) -> None:
+        if task is None:
+            return
+        if task.done():
+            try:
+                task.result()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("%s drain error for %s: %s", name, self.shell_id, e)
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=FINALISE_TIMEOUT)
+        except asyncio.TimeoutError:
+            elog("shell_exec.drain_stuck", shell_id=self.shell_id, stream=name)
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        except Exception as e:  # noqa: BLE001
+            logger.warning("%s drain error for %s: %s", name, self.shell_id, e)
+
     # Triggered by handlers once the process has exited — drains
     # remaining buffered output and finalises exit_code / signal.
     async def finalise(self) -> None:
         if self._proc is None:
             return
-        rc = await self._proc.wait()
-        if self._stdout_task:
-            try:
-                await self._stdout_task
-            except Exception as e:  # noqa: BLE001
-                logger.warning("stdout drain error for %s: %s", self.shell_id, e)
-        if self._stderr_task:
-            try:
-                await self._stderr_task
-            except Exception as e:  # noqa: BLE001
-                logger.warning("stderr drain error for %s: %s", self.shell_id, e)
+        rc = await self._wait_with_timeout()
+        await self._await_drain(self._stdout_task, "stdout")
+        await self._await_drain(self._stderr_task, "stderr")
         elog("shell_exec.finalise_done", shell_id=self.shell_id, rc=rc)
         # Signal naming: negative returncodes = killed by signal on
         # POSIX. Translate back to a name.

@@ -477,6 +477,81 @@ async def t_shell_exec_diag_events(ctx: TestContext) -> None:
     assert not missing, f"diag events missing: {missing}; got {captured}"
 
 
+@test("shell", "BackgroundShell.finalise is bounded when grandchild keeps pipes open")
+async def t_shell_finalise_bounded_with_grandchild_holding_pipes(ctx: TestContext) -> None:
+    """Reproduces the performa scheduler stall (2026-05-04 06:45 UTC):
+    a setsid'd grandchild inherits stdout/stderr from the shell and
+    keeps them open after the immediate shell exits, pinning
+    asyncio.Process.wait() and the _drain tasks. Pre-fix finalise()
+    awaits would never return — diag events showed kill_returned but
+    no finalise_done. The bound + transport-close fallback in
+    _wait_with_timeout / _await_drain must keep the cleanup finite.
+    """
+    import asyncio as _asyncio
+    import time as _time
+
+    from openagent.mcp.servers.shell.shells import (
+        BackgroundShell,
+        FINALISE_TIMEOUT,
+    )
+
+    # The shell forks a child, the child calls setsid() to become its
+    # own session leader (so killpg on the shell's pgid won't reach
+    # it), then sleeps for a while. The child inherits stdout/stderr
+    # from the shell. The parent exits immediately, so the shell's
+    # immediate child reaps cleanly — but the grandchild keeps the
+    # pipes pinned. Done via python3 to stay portable (macOS lacks
+    # setsid(1) by default).
+    import shlex as _shlex
+    # The marker comment ends up in /proc/<pid>/cmdline so we can pkill
+    # this specific grandchild after the test without nuking unrelated
+    # python processes.
+    _marker = "openagent_t_shell_finalise_grandchild"
+    grandchild_py = (
+        f"# {_marker}\n"
+        "import os, sys, time\n"
+        "if os.fork() == 0:\n"
+        "    os.setsid()\n"
+        "    time.sleep(30)\n"
+        "else:\n"
+        "    sys.exit(0)\n"
+    )
+    sh = BackgroundShell(
+        shell_id="t_grandchild",
+        command=f"python3 -c {_shlex.quote(grandchild_py)}",
+        cwd=None,
+        env=None,
+    )
+    started = _time.monotonic()
+    try:
+        result = await _asyncio.wait_for(
+            sh.run_with_timeout(timeout_seconds=2.0),
+            # Generous outer cap: 3 finalise awaits × FINALISE_TIMEOUT,
+            # plus kill grace, plus headroom. Pre-fix this hangs forever.
+            timeout=FINALISE_TIMEOUT * 6 + 10.0,
+        )
+    except _asyncio.TimeoutError:
+        raise AssertionError(
+            "finalise() hung — setsid grandchild kept stdout/stderr "
+            "open and the cleanup awaits were unbounded"
+        )
+    elapsed = _time.monotonic() - started
+    # The 2s run timeout fires (because proc.wait() itself blocks on
+    # pipe EOF — the same root cause), then finalise's bounded
+    # cleanup kicks in: up to 3 × FINALISE_TIMEOUT. Allow generous
+    # headroom but well under the outer wait_for cap.
+    assert elapsed < FINALISE_TIMEOUT * 6 + 5.0, (
+        f"finalise took {elapsed:.1f}s; expected bounded by FINALISE_TIMEOUT cleanup"
+    )
+    # Whatever exit_code/signal we get is fine; the contract under
+    # test is just that we return at all in bounded time.
+    assert result is not None
+    # Cleanup: the grandchild is still sleeping in its own session;
+    # kill it (matched by the marker) so it doesn't outlive the test.
+    import os as _os
+    _os.system(f"pkill -f {_shlex.quote(_marker)} 2>/dev/null || true")
+
+
 @test("shell", "handlers.shell_which: existing command returns path")
 async def t_handlers_which_ok(ctx: TestContext) -> None:
     _reset_shell_hub()
