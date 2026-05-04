@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
@@ -70,18 +71,43 @@ class BatchedReply:
 
 
 class RealtimeChannel:
-    """Pass-through channel for full-duplex transports."""
+    """Pass-through channel for full-duplex transports.
+
+    The send callable returns ``True`` when the frame reached the
+    transport and ``False`` when the transport is closed (the gateway's
+    ``_safe_ws_send_json`` follows that contract). On ``False`` the pump
+    holds the frame and retries — without that, a WS reconnect mid-turn
+    would silently drop ``OutTextFinal`` / ``TurnComplete`` and leave the
+    UI stuck on ``Thinking…``. After ``unrecoverable_after_s`` of failed
+    sends we surrender the frame and fire ``on_unrecoverable`` so the
+    gateway can reap the orphaned session.
+    """
 
     profile = "realtime"
+
+    UNRECOVERABLE_AFTER_S = 60.0
+    RETRY_INTERVAL_S = 0.5
 
     def __init__(
         self,
         session: StreamSession,
-        send_wire: Callable[[dict], Awaitable[None]],
+        send_wire: Callable[[dict], Awaitable[bool]],
+        *,
+        on_unrecoverable: Callable[[], Awaitable[None]] | None = None,
     ):
         self._session = session
         self._send = send_wire
         self._pump_task: asyncio.Task | None = None
+        self._on_unrecoverable = on_unrecoverable
+
+    def rebind(self, send_wire: Callable[[dict], Awaitable[bool]]) -> None:
+        """Swap the send target — used when the WS reconnects.
+
+        Atomic on the asyncio loop: the pump rereads ``self._send`` on
+        every retry, so a rebind during a stuck send completes the
+        delivery on the new transport without losing the frame.
+        """
+        self._send = send_wire
 
     async def start(self) -> None:
         if self._pump_task is None:
@@ -106,10 +132,31 @@ class RealtimeChannel:
                 except TypeError as e:
                     logger.debug("realtime: drop unwireable event: %s", e)
                     continue
-                try:
-                    await self._send(payload)
-                except Exception as e:  # noqa: BLE001
-                    logger.debug("realtime: send failed: %s", e)
+                deadline = time.monotonic() + self.UNRECOVERABLE_AFTER_S
+                while True:
+                    try:
+                        ok = await self._send(payload)
+                    except Exception as e:  # noqa: BLE001
+                        logger.debug("realtime: send raised: %s", e)
+                        ok = False
+                    if ok:
+                        break
+                    if time.monotonic() >= deadline:
+                        logger.warning(
+                            "realtime: dropping frame, no live ws for %.0fs"
+                            " (session=%s)",
+                            self.UNRECOVERABLE_AFTER_S,
+                            self._session.session_id,
+                        )
+                        if self._on_unrecoverable is not None:
+                            try:
+                                await self._on_unrecoverable()
+                            except Exception as e:  # noqa: BLE001
+                                logger.debug(
+                                    "realtime: on_unrecoverable raised: %s", e
+                                )
+                        return
+                    await asyncio.sleep(self.RETRY_INTERVAL_S)
         except asyncio.CancelledError:
             return
 

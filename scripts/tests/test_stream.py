@@ -1596,3 +1596,198 @@ async def t_drain_race_no_double_dispatch(ctx: TestContext) -> None:
     assert after_first.count("C") == 1, msgs
     assert after_first.count("D") == 1, msgs
     assert msgs[0] == "A", msgs
+
+
+# ── RealtimeChannel reconnect / rebind ──────────────────────────────
+
+
+@test("stream", "RealtimeChannel.rebind delivers buffered frames to a fresh ws")
+async def t_realtime_rebind_recovers_stuck_frames(ctx: TestContext) -> None:
+    """Reproduces the 'stuck on Thinking…' bug: the original send target
+    rejects every frame (closed transport, returns False); after
+    ``rebind`` the same frame lands on the new send target. Without the
+    fix the pump dropped the frame on the first False return and the
+    UI's ``isProcessing`` flag never cleared."""
+    from openagent.stream.channel import RealtimeChannel
+    from openagent.stream.events import OutTextFinal, TurnComplete
+    from openagent.stream.session import StreamSession
+
+    agent = _FakeAgent(["hello"])
+    sess = StreamSession(agent, client_id="c", session_id="s")
+
+    async def dead_send(_payload: dict) -> bool:
+        return False
+
+    delivered: list[dict] = []
+
+    async def live_send(payload: dict) -> bool:
+        delivered.append(payload)
+        return True
+
+    # Tighten the retry interval so the test isn't slow.
+    channel = RealtimeChannel(sess, dead_send)
+    channel.RETRY_INTERVAL_S = 0.05  # type: ignore[misc]
+    channel.UNRECOVERABLE_AFTER_S = 5.0  # type: ignore[misc]
+    await channel.start()
+
+    try:
+        # Queue a turn — the runner publishes deltas + OutTextFinal +
+        # TurnComplete onto outbound. The pump tries to send via
+        # dead_send (False on every call) and parks on the retry sleep.
+        await sess.run_one_shot("hi", speak=False)
+        # Give the pump time to attempt at least one send + retry.
+        await asyncio.sleep(0.2)
+        assert delivered == [], "dead send must not deliver anything"
+
+        channel.rebind(live_send)
+        # Wait for the pump to drain the queued frames onto live_send.
+        def _drained() -> bool:
+            kinds = {p.get("type") for p in delivered}
+            return "response" in kinds and "turn_complete" in kinds
+        await _wait_for(_drained, timeout=3.0)
+
+        # OutTextFinal serialises to ``response``; the frontend clears
+        # ``isProcessing`` on it.
+        types = [p["type"] for p in delivered]
+        assert "response" in types, types
+        assert types[-1] == "turn_complete", types
+    finally:
+        await channel.close()
+
+
+@test("stream", "RealtimeChannel fires on_unrecoverable after the deadline")
+async def t_realtime_unrecoverable_callback(ctx: TestContext) -> None:
+    """When no rebind ever lands, the pump surrenders the frame after
+    the deadline and fires ``on_unrecoverable`` so the gateway can reap
+    the orphaned StreamSession instead of leaking the agent resources."""
+    from openagent.stream.channel import RealtimeChannel
+    from openagent.stream.session import StreamSession
+
+    agent = _FakeAgent(["x"])
+    sess = StreamSession(agent, client_id="c", session_id="s")
+
+    async def dead_send(_payload: dict) -> bool:
+        return False
+
+    fired = asyncio.Event()
+
+    async def on_unrecoverable() -> None:
+        fired.set()
+
+    channel = RealtimeChannel(
+        sess, dead_send, on_unrecoverable=on_unrecoverable,
+    )
+    channel.RETRY_INTERVAL_S = 0.05  # type: ignore[misc]
+    channel.UNRECOVERABLE_AFTER_S = 0.3  # type: ignore[misc]
+    await channel.start()
+
+    try:
+        await sess.run_one_shot("hi", speak=False)
+        await asyncio.wait_for(fired.wait(), timeout=2.0)
+    finally:
+        await channel.close()
+
+
+@test("stream", "Gateway._adopt_sessions_to_ws rebinds every channel for the client_id")
+async def t_gateway_adopt_sessions_to_ws(ctx: TestContext) -> None:
+    """End-to-end check of the reconnect adoption path: sessions
+    created with ``ws_old`` should have their channel send-target
+    swapped to ``ws_new`` after ``_adopt_sessions_to_ws`` fires."""
+    from openagent.gateway.server import Gateway, _StreamHolder
+    from openagent.stream.channel import RealtimeChannel
+    from openagent.stream.session import StreamSession
+
+    class _StubAgent:
+        name = "stub"
+        db = None
+
+    gw = Gateway.__new__(Gateway)
+    gw.clients = {}
+    gw._stream_sessions = {}
+    # _safe_ws_send_json is a staticmethod, no need to bind.
+
+    class _FakeWS:
+        def __init__(self, name):
+            self.name = name
+            self.closed = False
+            self.sent: list[dict] = []
+        async def send_json(self, payload):
+            self.sent.append(payload)
+
+    ws_old = _FakeWS("old")
+    ws_new = _FakeWS("new")
+
+    sess_a = StreamSession(_StubAgent(), client_id="alice", session_id="sa")
+    sess_b = StreamSession(_StubAgent(), client_id="alice", session_id="sb")
+    sess_c = StreamSession(_StubAgent(), client_id="bob",   session_id="sc")
+    ch_a = RealtimeChannel(
+        sess_a,
+        lambda p, _ws=ws_old: gw._safe_ws_send_json(_ws, p),
+    )
+    ch_b = RealtimeChannel(
+        sess_b,
+        lambda p, _ws=ws_old: gw._safe_ws_send_json(_ws, p),
+    )
+    ch_c = RealtimeChannel(
+        sess_c,
+        lambda p, _ws=ws_old: gw._safe_ws_send_json(_ws, p),
+    )
+    gw._stream_sessions[("alice", "sa")] = _StreamHolder(session=sess_a, channel=ch_a)
+    gw._stream_sessions[("alice", "sb")] = _StreamHolder(session=sess_b, channel=ch_b)
+    gw._stream_sessions[("bob",   "sc")] = _StreamHolder(session=sess_c, channel=ch_c)
+
+    # Adopt only Alice's sessions onto ws_new.
+    gw._adopt_sessions_to_ws("alice", ws_new)
+
+    # Alice's channels now hit ws_new; Bob's still hit ws_old.
+    await ch_a._send({"type": "ping", "tag": "a"})
+    await ch_b._send({"type": "ping", "tag": "b"})
+    await ch_c._send({"type": "ping", "tag": "c"})
+
+    assert [p["tag"] for p in ws_new.sent] == ["a", "b"], ws_new.sent
+    assert [p["tag"] for p in ws_old.sent] == ["c"], ws_old.sent
+
+
+@test("stream", "RealtimeChannel.rebind preserves frame ordering across the swap")
+async def t_realtime_rebind_preserves_order(ctx: TestContext) -> None:
+    """A rebind during an in-flight pump iteration must not lose or
+    reorder frames. The frame that was stuck on dead_send completes
+    first on live_send, then subsequent frames follow in order."""
+    from openagent.stream.channel import RealtimeChannel
+    from openagent.stream.session import StreamSession
+
+    agent = _FakeAgent(["a", "b", "c"])
+    sess = StreamSession(agent, client_id="c", session_id="s")
+
+    async def dead_send(_payload: dict) -> bool:
+        return False
+
+    delivered: list[dict] = []
+
+    async def live_send(payload: dict) -> bool:
+        delivered.append(payload)
+        return True
+
+    channel = RealtimeChannel(sess, dead_send)
+    channel.RETRY_INTERVAL_S = 0.05  # type: ignore[misc]
+    channel.UNRECOVERABLE_AFTER_S = 5.0  # type: ignore[misc]
+    await channel.start()
+
+    try:
+        await sess.run_one_shot("hi", speak=False)
+        await asyncio.sleep(0.2)
+        channel.rebind(live_send)
+        def _drained() -> bool:
+            return any(p.get("type") == "turn_complete" for p in delivered)
+        await _wait_for(_drained, timeout=3.0)
+
+        types = [p["type"] for p in delivered]
+        # Deltas concat to "abc"; final OutTextFinal carries the same;
+        # TurnComplete is last.
+        assert types[-1] == "turn_complete", types
+        deltas_text = "".join(
+            p.get("text", "") for p in delivered if p.get("type") == "delta"
+        )
+        assert deltas_text == "abc", deltas_text
+    finally:
+        await channel.close()

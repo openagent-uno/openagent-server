@@ -693,7 +693,29 @@ class Gateway:
                         return ws
                     client_id = data.get("client_id") or f"ws-{id(ws)}"
                     authed = True
+                    # Reconnect path: a prior ws under the same
+                    # ``client_id`` (network blip, sleep/wake, refresh)
+                    # leaves its StreamSessions alive with their channel
+                    # send-callable bound to the now-dead ws. Rebind
+                    # them onto this fresh ws so any in-flight turn's
+                    # ``OutTextFinal`` / ``TurnComplete`` reaches the UI
+                    # — without this the client stays stuck on
+                    # "Thinking…" until manual reload.
+                    old_ws = self.clients.get(client_id)
                     self.clients[client_id] = ws
+                    if old_ws is not None and old_ws is not ws:
+                        self._adopt_sessions_to_ws(client_id, ws)
+                        elog(
+                            "gateway.client_reconnect",
+                            client_id=client_id,
+                        )
+                        if not getattr(old_ws, "closed", True):
+                            try:
+                                await old_ws.close()
+                            except Exception as e:  # noqa: BLE001
+                                logger.debug(
+                                    "old ws close failed: %s", e
+                                )
                     import openagent
                     elog("gateway.client_connect", client_id=client_id)
                     await self._safe_ws_send_json(ws, {
@@ -744,13 +766,23 @@ class Gateway:
         except Exception as e:
             elog("gateway.ws_error", level="error", client_id=client_id, error=str(e))
         finally:
-            if client_id and client_id in self.clients:
+            # Identity-aware cleanup: a reconnected ws may have already
+            # taken this client_id's slot via ``_adopt_sessions_to_ws``.
+            # Touching ``clients[client_id]`` or
+            # ``_close_stream_sessions_for`` here would tear down the
+            # *new* connection's live sessions and leave its UI stuck.
+            if client_id and self.clients.get(client_id) is ws:
                 del self.clients[client_id]
                 elog("gateway.client_disconnect", client_id=client_id)
-            # Tear down any stream sessions belonging to this client so
-            # the agent's per-session resources (claude-cli subprocesses,
-            # agno session rows) get a clean release.
-            await self._close_stream_sessions_for(client_id)
+                # Tear down any stream sessions belonging to this client
+                # so the agent's per-session resources (claude-cli
+                # subprocesses, agno session rows) get a clean release.
+                await self._close_stream_sessions_for(client_id)
+            elif client_id:
+                elog(
+                    "gateway.client_replaced",
+                    client_id=client_id,
+                )
         return ws
 
     async def _handle_command(
@@ -966,6 +998,7 @@ class Gateway:
             channel = RealtimeChannel(
                 session,
                 lambda payload, _ws=ws: self._safe_ws_send_json(_ws, payload),
+                on_unrecoverable=self._make_unrecoverable_callback(key),
             )
             await channel.start()
             holder = _StreamHolder(session=session, channel=channel)
@@ -998,6 +1031,39 @@ class Gateway:
             return
         for key in [k for k in self._stream_sessions if k[0] == client_id]:
             await self._close_stream_session(key)
+
+    def _adopt_sessions_to_ws(self, client_id: str, ws) -> None:
+        """Rebind every live channel for ``client_id`` onto ``ws``.
+
+        Called from the AUTH path when a previous ws under the same
+        ``client_id`` is being replaced. The channel pump retries the
+        in-flight frame on every iteration, so a frame stuck on the
+        dead transport completes delivery as soon as we swap the send
+        callable.
+        """
+        for key, holder in self._stream_sessions.items():
+            if key[0] != client_id:
+                continue
+            holder.channel.rebind(
+                lambda payload, _ws=ws: self._safe_ws_send_json(_ws, payload),
+            )
+
+    def _make_unrecoverable_callback(self, key: tuple[str, str]):
+        """Build the ``on_unrecoverable`` callback for a channel.
+
+        Fires when the channel pump has spent
+        :attr:`RealtimeChannel.UNRECOVERABLE_AFTER_S` waiting for any ws
+        to come back. Reaping the session releases the StreamSession's
+        agent resources rather than leaking them.
+        """
+        async def _on_unrecoverable() -> None:
+            elog(
+                "stream.session.unrecoverable",
+                client_id=key[0],
+                session_id=key[1],
+            )
+            await self._close_stream_session(key)
+        return _on_unrecoverable
 
     def _make_stream_pre_dispatch_hook(self, client_id: str, session_id: str):
         """Build a per-session pre-dispatch hook for the stream path.
