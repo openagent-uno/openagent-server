@@ -468,3 +468,84 @@ async def t_try_elog_safe(ctx: TestContext) -> None:
     with patch.object(logmod, "elog", side_effect=boom):
         # Should NOT raise.
         updater._try_elog("update.test", level="warning", foo=1)
+
+
+@test("updater", "run_upgrade short-circuits when a sibling already swapped the binary")
+async def t_run_upgrade_sibling_swap(ctx: TestContext) -> None:
+    """When two services share an on-disk binary (e.g. performa
+    boss / yoanna / friday all run from ~/.local/bin/openagent-stable),
+    the first /api/update swaps the file. A subsequent /api/update on a
+    sibling whose process is still running the OLD binary used to
+    crash with ``zlib.error: Error -3 while decompressing data:
+    incorrect header check`` because PyInstaller's lazy module loader
+    read using stale archive offsets.
+
+    The fix detects the swap by comparing the executable's current
+    mtime to the value captured at process start, and short-circuits
+    run_upgrade without calling perform_self_update_sync — the running
+    process is stale and a restart will pick up the new binary.
+    """
+    import openagent.core.server as server_mod
+
+    sentinel_called = {"perform_self_update_sync": 0}
+
+    def fake_perform_self_update_sync():
+        sentinel_called["perform_self_update_sync"] += 1
+        return ("should-not-be-reached", "should-not-be-reached")
+
+    # Pretend we're a frozen build, the initial mtime was 1000.0, and
+    # the on-disk binary's mtime is now 2000.0 (sibling already swapped).
+    class _FakeStat:
+        st_mtime = 2000.0
+
+    class _FakePath:
+        def stat(self):
+            return _FakeStat()
+
+    with patch.object(server_mod, "_INITIAL_EXECUTABLE_MTIME", 1000.0), \
+         patch.object(server_mod.openagent._frozen, "is_frozen", return_value=True), \
+         patch.object(server_mod.openagent._frozen, "executable_path", return_value=_FakePath()), \
+         patch.object(server_mod, "_read_disk_binary_version", return_value="0.12.99"), \
+         patch("openagent.updater.perform_self_update_sync", side_effect=fake_perform_self_update_sync):
+        old, new = server_mod.run_upgrade()
+
+    # The short-circuit MUST have fired — perform_self_update_sync
+    # untouched, and ``new`` reflects what was on disk.
+    assert sentinel_called["perform_self_update_sync"] == 0, (
+        "perform_self_update_sync must not run when the binary has "
+        "been swapped by a sibling"
+    )
+    assert new == "0.12.99", new
+    assert old != new  # caller's restart_needed branch will fire
+
+
+@test("updater", "run_upgrade takes the normal path when the binary is unchanged")
+async def t_run_upgrade_normal_path(ctx: TestContext) -> None:
+    """Regression guard: the sibling-swap short-circuit must NOT fire
+    when our on-disk binary still matches what we started with."""
+    import openagent.core.server as server_mod
+
+    sentinel_called = {"perform_self_update_sync": 0}
+
+    def fake_perform_self_update_sync():
+        sentinel_called["perform_self_update_sync"] += 1
+        return ("0.12.41", "0.12.41")  # already up-to-date
+
+    class _FakeStat:
+        st_mtime = 1000.0  # SAME as captured initial
+
+    class _FakePath:
+        def stat(self):
+            return _FakeStat()
+
+    with patch.object(server_mod, "_INITIAL_EXECUTABLE_MTIME", 1000.0), \
+         patch.object(server_mod.openagent._frozen, "is_frozen", return_value=True), \
+         patch.object(server_mod.openagent._frozen, "executable_path", return_value=_FakePath()), \
+         patch("openagent.updater.perform_self_update_sync", side_effect=fake_perform_self_update_sync):
+        old, new = server_mod.run_upgrade()
+
+    assert sentinel_called["perform_self_update_sync"] == 1, (
+        "perform_self_update_sync must run on the normal path when "
+        "the binary is unchanged"
+    )
+    assert (old, new) == ("0.12.41", "0.12.41")

@@ -19,11 +19,35 @@ from openagent.core.agent import Agent
 from openagent.memory.db import MemoryDB
 from openagent.models.runtime import create_model_from_config, wire_model_runtime
 from openagent.core.logging import clear as clear_event_log, elog
+# Pre-import the update-flow modules at server boot so the PyInstaller
+# archive entries they live in are loaded into memory before any sibling
+# service that shares the same on-disk binary can swap it. Without this,
+# a /api/update on a sibling (e.g. performa boss/yoanna/friday share
+# ~/.local/bin/openagent-stable) replaces the file we lazy-read from,
+# and the next ``from openagent._frozen import is_frozen`` in run_upgrade
+# raises ``zlib.error: Error -3 while decompressing data: incorrect
+# header check``. Loading these eagerly puts them in sys.modules so
+# subsequent ``from`` statements are dict lookups, not archive reads.
+import openagent._frozen  # noqa: F401 — preload for concurrent-update safety
+import openagent.updater  # noqa: F401 — preload for concurrent-update safety
 
 logger = logging.getLogger(__name__)
 
 # Exit code that signals the OS service manager to restart the process
 RESTART_EXIT_CODE = 75
+
+# Captured at import time (i.e. process start). If this changes by the
+# time ``run_upgrade`` is called, a sibling service that shares our
+# binary has already swapped it; we short-circuit instead of trying to
+# download/apply our own update against a now-stale archive layout.
+try:
+    _INITIAL_EXECUTABLE_MTIME: float | None = (
+        openagent._frozen.executable_path().stat().st_mtime
+        if openagent._frozen.is_frozen()
+        else None
+    )
+except Exception:  # noqa: BLE001 — best-effort, never block startup
+    _INITIAL_EXECUTABLE_MTIME = None
 
 from openagent.core.builtin_tasks import (
     AUTO_UPDATE_TASK_NAME,
@@ -632,6 +656,42 @@ def _run_pip_upgrade() -> tuple[str, str]:
     return old, new
 
 
+def _binary_replaced_by_sibling() -> bool:
+    """Return True if our on-disk executable's mtime differs from what
+    we captured at process start — i.e. a sibling service that shares
+    this binary has already applied its own update. Calling
+    perform_self_update_sync against a swapped archive raises
+    ``zlib.error`` because PyInstaller's lazy module loader reads
+    using offsets from the old archive layout."""
+    if _INITIAL_EXECUTABLE_MTIME is None:
+        return False
+    try:
+        return (
+            openagent._frozen.executable_path().stat().st_mtime
+            != _INITIAL_EXECUTABLE_MTIME
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _read_disk_binary_version() -> str | None:
+    """Ask the on-disk binary for its --version. Used after a sibling
+    swap so we can report the new version without trying to read the
+    PyInstaller archive directly. Returns None on any failure — the
+    caller falls back to a synthetic placeholder."""
+    import subprocess
+    try:
+        path = openagent._frozen.executable_path()
+        out = subprocess.check_output(
+            [str(path), "--version"], timeout=10, stderr=subprocess.DEVNULL
+        )
+        line = out.decode("utf-8", "replace").strip().splitlines()[-1]
+        # ``--version`` prints e.g. "openagent 0.12.42" — last token wins.
+        return line.split()[-1] if line else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def run_upgrade() -> tuple[str, str]:
     """Upgrade OpenAgent and return (old_version, new_version).
 
@@ -640,6 +700,22 @@ def run_upgrade() -> tuple[str, str]:
     """
     from openagent._frozen import is_frozen
     if is_frozen():
+        if _binary_replaced_by_sibling():
+            # A sibling service that shares our on-disk binary already
+            # applied its own update. Our running image is stale; the
+            # restart that follows this return will pick up the new
+            # binary. Skip download/apply so we don't crash trying to
+            # read the freshly-rewritten PyInstaller archive.
+            import openagent
+            current = getattr(openagent, "__version__", "unknown")
+            new = _read_disk_binary_version() or f"{current}+sibling-swap"
+            elog(
+                "update.swap_already_applied",
+                level="warning",
+                current_running=current,
+                new_disk=new,
+            )
+            return current, new
         from openagent.updater import perform_self_update_sync
         return perform_self_update_sync()
     return _run_pip_upgrade()
