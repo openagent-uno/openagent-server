@@ -476,7 +476,16 @@ class Agent:
                 from openagent.models.discovery import _fetch_openrouter_catalog
                 await _fetch_openrouter_catalog()
             except Exception as exc:  # noqa: BLE001
-                elog("openrouter.prefetch_error", level="warning", error=str(exc))
+                # Some shutdown-time exceptions stringify to "" — also
+                # capture the type and full traceback so events.jsonl
+                # has something to triage from.
+                elog(
+                    "openrouter.prefetch_error",
+                    level="warning",
+                    error=str(exc) or type(exc).__name__,
+                    error_type=type(exc).__name__,
+                    exc_info=True,
+                )
 
         # Warm the local Whisper model in the background so the first
         # voice-tab utterance doesn't pay the 60s+ download/load tax
@@ -489,7 +498,13 @@ class Agent:
                 await _load_local_model()
                 elog("whisper.prefetch_done")
             except Exception as exc:  # noqa: BLE001
-                elog("whisper.prefetch_error", level="warning", error=str(exc))
+                elog(
+                    "whisper.prefetch_error",
+                    level="warning",
+                    error=str(exc) or type(exc).__name__,
+                    error_type=type(exc).__name__,
+                    exc_info=True,
+                )
 
         # Same idea for Piper: cold-load is ~10s for the ONNX model
         # plus a one-time ~25 MB voice-file download. Prefetch so the
@@ -507,7 +522,13 @@ class Agent:
                 if loaded is not None:
                     elog("piper.prefetch_done", voice=voice)
             except Exception as exc:  # noqa: BLE001
-                elog("piper.prefetch_error", level="warning", error=str(exc))
+                elog(
+                    "piper.prefetch_error",
+                    level="warning",
+                    error=str(exc) or type(exc).__name__,
+                    error_type=type(exc).__name__,
+                    exc_info=True,
+                )
 
         try:
             loop = asyncio.get_running_loop()
