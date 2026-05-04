@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openagent-framework"
-version = "0.12.41"
+version = "0.12.42"
 description = "Simplified LLM agent framework with MCP, memory, and multi-channel support"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -71,6 +71,27 @@ dependencies = [
     # Same API on Windows, macOS, Linux — keeps the gateway code
     # platform-agnostic.
     "psutil>=5.9.0",
+    # Iroh: peer-to-peer QUIC transport that replaces the legacy
+    # ip:port + token gateway model. Networks are addressed by NodeId,
+    # users authenticate as handle@network. Pin tightly — pre-1.0 and
+    # the FFI surface still shifts between minors.
+    "iroh==0.35.0",
+    # SRP-6a: PAKE backend for the coordinator login flow. Pure-Python.
+    # The coordinator stores a verifier (never the password) and runs
+    # the standard SRP-6a exchange to mint device certs.
+    "srptools>=1.0.1",
+    # Ed25519 sign/verify for device certificates and key management.
+    # Already pulled in transitively by anthropic/openai but declared
+    # explicitly because the network layer imports the Ed25519 APIs
+    # directly — a transitive bump must not silently drop it.
+    "cryptography>=42",
+    # CBOR: device-cert payload encoding. Compact and deterministic
+    # (canonical CBOR), which matters because we sign the encoded bytes.
+    "cbor2>=5.5",
+    # aiohttp powers the gateway's HTTP+WS surface. Was previously an
+    # extra; promote to core since the network layer cannot work
+    # without it.
+    "aiohttp>=3.9",
 ]
 
 [project.optional-dependencies]
