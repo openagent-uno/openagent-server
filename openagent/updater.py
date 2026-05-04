@@ -260,9 +260,10 @@ def download_update(url: str, checksum_url: str | None = None) -> Path:
 
     The body is streamed to disk and hashed incrementally. ``resp.read()``
     used to load the entire archive (200 MB+) into memory before writing
-    a single byte — on the performa-agent VPS (7.8 GiB RAM, 3 OpenAgent
-    services, no swap) the kernel OOM-killed openagent + systemd itself
-    mid-download. Streaming caps peak memory at one chunk.
+    a single byte — on a small multi-tenant VPS (single-digit GiB RAM,
+    several OpenAgent services, no swap) the kernel OOM-killed openagent
+    plus systemd itself mid-download. Streaming caps peak memory at one
+    chunk.
     """
     tmp_dir = Path(tempfile.mkdtemp(prefix="openagent_update_"))
     archive_path = tmp_dir / "update_archive"
@@ -383,11 +384,11 @@ def _find_app_bundle(path: Path) -> "Path | None":
 def _swap_lock_path(target: Path) -> Path:
     """Path to the cross-process lockfile next to the binary or bundle.
 
-    Multi-tenant boxes (e.g. ``openagent.service`` + ``yoanna-agent.service``
-    + ``friday-agent.service`` sharing ``/home/ubuntu/.local/bin/openagent-stable``)
-    can otherwise race in apply_update: A renames current→.old, then B's
-    rename(current→.old) hits FileNotFoundError because A's already moved
-    it. The default 4 AM auto-update cron makes that race very likely.
+    Multi-tenant boxes that run several systemd units sharing a single
+    ``openagent`` (or ``openagent-stable``) binary can otherwise race in
+    apply_update: A renames current→.old, then B's rename(current→.old)
+    hits FileNotFoundError because A has already moved it. The default
+    4 AM auto-update cron makes that race very likely.
     """
     return target.with_name(target.name + ".swap-lock")
 

@@ -78,11 +78,11 @@ class TelegramBridge(BaseBridge):
         self._app = None
         # Highest update_id we've seen from Telegram. Used during shutdown
         # to directly ACK the offset so a queued ``/restart`` cannot
-        # replay on next boot (which is what caused the lyra-agent
-        # mac-mini crash loop: shutdown hung inside
-        # ``updater.stop()`` → ``_get_updates_cleanup``, so the offset
-        # never advanced; launchd restarted us, and the same ``/restart``
-        # Update came right back from ``getUpdates``).
+        # replay on next boot. The original failure mode: shutdown hung
+        # inside ``updater.stop()`` → ``_get_updates_cleanup``, so the
+        # offset never advanced; the service manager restarted us, and
+        # the same ``/restart`` Update came right back from
+        # ``getUpdates`` — crash loop.
         self._last_update_id: int = 0
         # Bounded set of recently-seen update_ids used by ``_is_fresh_update``
         # to reject Telegram redeliveries. The deque enforces the size cap
@@ -237,7 +237,7 @@ class TelegramBridge(BaseBridge):
             # ``httpx.CancelledError`` and a few other shutdown-time
             # exceptions stringify to ``""`` — fall back to the type
             # name so events.jsonl never logs ``error: ""`` (which is
-            # unsearchable and prevented diagnosis on lyra-agent).
+            # unsearchable and prevents postmortem diagnosis).
             elog(
                 "bridge.telegram.offset_flush_error",
                 level="warning",
@@ -261,13 +261,13 @@ class TelegramBridge(BaseBridge):
         if app is not None:
             # Library-side cleanup. Each of updater.stop / app.stop /
             # app.shutdown can internally POST to Telegram, and each has
-            # been observed to hang during an outer cancellation (see the
-            # events.jsonl trace from lyra-agent: cancel scope cancelled
-            # from Gateway._handle_ws.handler while _get_updates_cleanup
-            # was mid-POST). Bound each with a short timeout and swallow
-            # CancelledError at this boundary — callers above us must be
-            # able to finish the rest of shutdown regardless of what
-            # python-telegram-bot decides to do.
+            # been observed to hang during an outer cancellation: the
+            # cancel scope from ``Gateway._handle_ws.handler`` fires
+            # while ``_get_updates_cleanup`` is mid-POST. Bound each
+            # with a short timeout and swallow CancelledError at this
+            # boundary — callers above us must be able to finish the
+            # rest of shutdown regardless of what python-telegram-bot
+            # decides to do.
             self._app = None
             for label, coro_factory, deadline in (
                 ("updater.stop", lambda: app.updater.stop(), _TG_UPDATER_STOP_TIMEOUT),

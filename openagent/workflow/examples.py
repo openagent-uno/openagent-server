@@ -44,8 +44,7 @@ class WorkflowExample:
 
 
 # ── Example 1 ───────────────────────────────────────────────────────
-# The Hello-World shape: cron trigger + one MCP tool call. Mirrors
-# the "Greet Alessandro Every Minute" workflow on mixout-agent.
+# The Hello-World shape: cron trigger + one MCP tool call.
 
 _SCHEDULED_TELEGRAM = WorkflowExample(
     name="scheduled-telegram-ping",

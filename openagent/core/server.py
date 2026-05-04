@@ -284,7 +284,7 @@ class AgentServer:
             # Wire the bridge list onto the gateway so the /restart handler
             # can flush pending Telegram updates BEFORE the restart actually
             # fires — otherwise the queued /restart Update gets re-delivered
-            # on next boot and we crash-loop (lyra-agent 2026-04-20).
+            # on next boot and the agent crash-loops.
             self._gateway._bridges = self._bridges
             await self._gateway.start()
 

@@ -21,9 +21,9 @@ def _schedule_bridge_offset_flush(gateway) -> None:
     Telegram's delivery queue: library shutdown inside
     ``Updater.stop()`` runs ``_get_updates_cleanup`` which is itself a
     ``getUpdates`` POST, and that POST can block or be cancelled as the
-    event loop winds down. When launchd restarts us, ``getUpdates`` on
-    the next boot still advertises the same Update and the command
-    re-fires → crash loop (observed on lyra-agent 2026-04-20).
+    event loop winds down. When the service manager restarts us,
+    ``getUpdates`` on the next boot still advertises the same Update
+    and the command re-fires → crash loop.
 
     We schedule the flush as a background task on the current loop so
     the restart path isn't blocked by network I/O. The bridge's
@@ -79,7 +79,7 @@ def perform_update(gateway) -> dict:
     for scheduling :func:`request_restart` AFTER the HTTP response has
     been flushed; otherwise ``stop_event`` racing the response writer
     leaves the client with "Empty reply from server" while the update
-    actually succeeded (observed on performa-agent 2026-05-04).
+    actually succeeded.
     """
     from openagent.core.server import run_upgrade
 

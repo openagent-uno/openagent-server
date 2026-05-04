@@ -639,8 +639,9 @@ class MCPPool:
            ``_MCP_CONNECT_TIMEOUT``. Signal the supervisor to stop, await
            it, return ``None``.
         2. ``asyncio.CancelledError`` / ``BaseExceptionGroup`` from
-           inside Agno's init — the mixout post-disk-resize regression.
-           Caught inside the supervisor and reported via ``ready_event``.
+           inside Agno's init — observed after a host disk-resize on a
+           production agent. Caught inside the supervisor and reported
+           via ``ready_event``.
         3. Regular ``Exception`` — logged + return ``None``.
 
         Why the supervisor task at all: the MCP stdio client in
@@ -650,8 +651,7 @@ class MCPPool:
         to exit cancel scope in a different task than it was entered in".
         Before this refactor, ``__aenter__`` ran on the ``connect_all``
         caller task but ``__aexit__`` ran on the shutdown caller task,
-        which reliably tripped that invariant every restart (see
-        events.jsonl from lyra-agent 2026-04-20).
+        which reliably tripped that invariant every restart.
         """
         task_out = asyncio.current_task()
         cancelling = (
