@@ -320,8 +320,28 @@ def download_update(url: str, checksum_url: str | None = None) -> Path:
         with zipfile.ZipFile(archive_path) as zf:
             zf.extractall(extract_dir)
     else:
-        with tarfile.open(archive_path) as tf:
-            tf.extractall(extract_dir)
+        # tarfile.open has been seen raising ``zlib.error: Error -3 ...
+        # incorrect header check`` on a downloaded archive whose sha256
+        # matches the published checksum and which extracts cleanly with
+        # system tar. Capture archive size + magic bytes + the full
+        # traceback so the next reproduction has the data to root-cause
+        # whether the failure is in the bundled zlib, a truncated read,
+        # or something else.
+        try:
+            with tarfile.open(archive_path) as tf:
+                tf.extractall(extract_dir)
+        except Exception:
+            try:
+                stat = archive_path.stat()
+                with open(archive_path, "rb") as _f:
+                    head = _f.read(32)
+                logger.exception(
+                    "tarfile.open failed for %s (size=%d, head_hex=%s)",
+                    archive_path, stat.st_size, head.hex(),
+                )
+            except Exception:
+                logger.exception("tarfile.open failed for %s (stat unavailable)", archive_path)
+            raise
 
     # Find the server binary, not any sibling artifact such as openagent-cli.
     # Releases are supposed to contain one executable per archive, but we keep

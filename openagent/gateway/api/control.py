@@ -7,8 +7,11 @@ POST /api/restart → restart OpenAgent processes
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from openagent.core.logging import elog
+
+logger = logging.getLogger(__name__)
 
 
 def _schedule_bridge_offset_flush(gateway) -> None:
@@ -83,7 +86,12 @@ def perform_update(gateway) -> dict:
     try:
         old, new = run_upgrade()
     except Exception as exc:
-        elog("update.error", error=str(exc))
+        # ``elog`` only records str(exc), which can be empty or a single
+        # opaque line (e.g. ``Error -3 while decompressing data: incorrect
+        # header check``). Log the full traceback through the standard
+        # logger so the next reproduction has frame-level context.
+        logger.exception("update flow failed")
+        elog("update.error", error=str(exc) or type(exc).__name__)
         return {"ok": False, "error": str(exc)}
 
     if old == new:
