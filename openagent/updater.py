@@ -12,6 +12,7 @@ manager restarts the process with the new binary.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import logging
 import platform
@@ -26,8 +27,12 @@ from urllib.request import urlopen, Request
 
 logger = logging.getLogger(__name__)
 
-# GitHub repository for release lookups
-GITHUB_REPO = "geroale/OpenAgent"
+# GitHub repository for release lookups. The previous owner ``geroale``
+# still resolves via GitHub's rename redirect, but pinning to the
+# canonical owner removes a silent single point of failure: if the
+# redirect is ever revoked (rename loop, namespace conflict) every
+# deployed agent would silently stop receiving updates.
+GITHUB_REPO = "openagent-uno/OpenAgent"
 GITHUB_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
 
@@ -148,10 +153,27 @@ def _asset_suffix() -> str:
     return f"{os_name}-{arch}.{ext}"
 
 
+def _try_elog(event: str, level: str = "info", **data) -> None:
+    """Best-effort wrapper around :func:`elog` so importing the events
+    sink can never block a self-update flow that runs before logging is
+    fully wired (e.g. during tests, or pre-``setup_logging`` startup).
+    """
+    try:
+        from openagent.core.logging import elog
+        elog(event, level=level, **data)
+    except Exception:
+        pass
+
+
 def check_for_update() -> UpdateInfo | None:
     """Query GitHub Releases for a newer version.
 
     Returns UpdateInfo if a newer version is available, else None.
+
+    Every "no update" path emits a structured event so an operator
+    watching ``events.jsonl`` can tell "really up-to-date" apart from
+    "GitHub unreachable", "tag malformed", or "no asset for this
+    platform". Without those events all four cases looked identical.
     """
     import json
     import openagent
@@ -164,18 +186,39 @@ def check_for_update() -> UpdateInfo | None:
             data = json.loads(resp.read())
     except Exception as e:
         logger.error("Failed to check for updates: %s", e)
+        _try_elog("update.check_failed", level="warning", error=str(e) or type(e).__name__)
+        return None
+
+    # Defence-in-depth: GitHub's ``/releases/latest`` filters prereleases
+    # server-side, but a future migration to ``/releases`` (or someone
+    # marking a release as ``latest=true`` manually) would otherwise
+    # auto-deploy an RC build to every production agent on the next 6 h
+    # check.
+    if data.get("prerelease"):
+        tag = data.get("tag_name", "")
+        logger.info("Skipping prerelease %s", tag)
+        _try_elog("update.skipped_prerelease", tag=tag)
         return None
 
     tag = data.get("tag_name", "")
     new_version = tag.lstrip("v")
 
     # Compare versions
-    from packaging.version import Version
+    from packaging.version import Version, InvalidVersion
     try:
         if Version(new_version) <= Version(current):
             return None
-    except Exception:
-        # If version parsing fails, skip update
+    except InvalidVersion as e:
+        # Without this log path the agent silently stayed on the old
+        # version forever: the caller logs ``update.check updated=false``
+        # which is indistinguishable from a healthy no-op.
+        logger.warning("Could not parse release tag %r: %s", tag, e)
+        _try_elog(
+            "update.tag_parse_failed",
+            level="warning",
+            tag=tag,
+            error=str(e) or type(e).__name__,
+        )
         return None
 
     # Find matching server asset. Releases also ship desktop and CLI artifacts,
@@ -186,7 +229,14 @@ def check_for_update() -> UpdateInfo | None:
     )
 
     if not download_url:
-        logger.warning("No matching release asset for %s", _expected_asset_name(new_version))
+        expected = _expected_asset_name(new_version)
+        logger.warning("No matching release asset for %s", expected)
+        _try_elog(
+            "update.no_asset",
+            level="warning",
+            tag=tag,
+            expected=expected,
+        )
         return None
 
     return UpdateInfo(
@@ -197,6 +247,9 @@ def check_for_update() -> UpdateInfo | None:
     )
 
 
+_DOWNLOAD_CHUNK_SIZE = 64 * 1024
+
+
 def download_update(url: str, checksum_url: str | None = None) -> Path:
     """Download and verify the update archive. Returns the path to the new
     executable file (onefile format — a single binary, not a directory).
@@ -204,34 +257,52 @@ def download_update(url: str, checksum_url: str | None = None) -> Path:
     Since v0.5.2 the release archives contain ONE executable each:
         openagent-<ver>-<platform>-<arch>.tar.gz → openagent (or .exe)
     We pick that one file out of the archive and return its path.
+
+    The body is streamed to disk and hashed incrementally. ``resp.read()``
+    used to load the entire archive (200 MB+) into memory before writing
+    a single byte — on the performa-agent VPS (7.8 GiB RAM, 3 OpenAgent
+    services, no swap) the kernel OOM-killed openagent + systemd itself
+    mid-download. Streaming caps peak memory at one chunk.
     """
     tmp_dir = Path(tempfile.mkdtemp(prefix="openagent_update_"))
     archive_path = tmp_dir / "update_archive"
 
-    logger.info("Downloading update from %s", url)
-    req = Request(url)
-    # Generous timeout because release assets are large and residential
-    # networks/VPNs occasionally cap throughput well below GitHub Releases'
-    # CDN speed, stretching a 100 MB archive past 2 minutes.
     ctx = _ssl_context()
-    with urlopen(req, timeout=600, context=ctx) as resp:
-        archive_path.write_bytes(resp.read())
 
-    # Verify checksum
+    # Fetch the expected checksum FIRST, so we can verify as we stream
+    # rather than reading the file back from disk for a second pass.
+    expected: str | None = None
     if checksum_url:
         try:
             with urlopen(Request(checksum_url), timeout=15, context=ctx) as resp:
                 expected = resp.read().decode().strip().split()[0]
-            actual = hashlib.sha256(archive_path.read_bytes()).hexdigest()
-            if actual != expected:
-                raise RuntimeError(
-                    f"Checksum mismatch: expected {expected}, got {actual}"
-                )
-            logger.info("Checksum verified OK")
-        except RuntimeError:
-            raise
         except Exception as e:
-            logger.warning("Could not verify checksum: %s", e)
+            logger.warning("Could not fetch checksum: %s", e)
+
+    logger.info("Downloading update from %s", url)
+    # Generous timeout because release assets are large and residential
+    # networks/VPNs occasionally cap throughput well below GitHub Releases'
+    # CDN speed, stretching a 100 MB archive past 2 minutes.
+    h = hashlib.sha256()
+    bytes_read = 0
+    with urlopen(Request(url), timeout=600, context=ctx) as resp, \
+         open(archive_path, "wb") as f:
+        while True:
+            chunk = resp.read(_DOWNLOAD_CHUNK_SIZE)
+            if not chunk:
+                break
+            f.write(chunk)
+            h.update(chunk)
+            bytes_read += len(chunk)
+    logger.info("Downloaded %d bytes", bytes_read)
+
+    if expected is not None:
+        actual = h.hexdigest()
+        if actual != expected:
+            raise RuntimeError(
+                f"Checksum mismatch: expected {expected}, got {actual}"
+            )
+        logger.info("Checksum verified OK")
 
     extract_dir = tmp_dir / "extracted"
     extract_dir.mkdir()
@@ -289,6 +360,45 @@ def _find_app_bundle(path: Path) -> "Path | None":
     return None
 
 
+def _swap_lock_path(target: Path) -> Path:
+    """Path to the cross-process lockfile next to the binary or bundle.
+
+    Multi-tenant boxes (e.g. ``openagent.service`` + ``yoanna-agent.service``
+    + ``friday-agent.service`` sharing ``/home/ubuntu/.local/bin/openagent-stable``)
+    can otherwise race in apply_update: A renames current→.old, then B's
+    rename(current→.old) hits FileNotFoundError because A's already moved
+    it. The default 4 AM auto-update cron makes that race very likely.
+    """
+    return target.with_name(target.name + ".swap-lock")
+
+
+@contextlib.contextmanager
+def _swap_lock(target: Path):
+    """Hold an exclusive flock on the swap-lock file for the duration.
+
+    Best-effort: on platforms without ``fcntl`` (Windows) we just no-op,
+    since the Windows path uses a side-by-side ``.pending.exe`` and
+    doesn't need the lock anyway.
+    """
+    lock_path = _swap_lock_path(target)
+    try:
+        import fcntl
+    except ImportError:
+        yield
+        return
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = open(lock_path, "w")
+    try:
+        fcntl.flock(fd.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        fd.close()
+
+
 def apply_update(new_exe: Path) -> None:
     """Replace the running executable with the new onefile binary.
 
@@ -301,6 +411,12 @@ def apply_update(new_exe: Path) -> None:
     - Windows: save as ``<name>.pending.exe`` next to the current binary;
       the startup hook (see ``_frozen.swap_pending_if_any``) promotes it on
       the next launch since a running .exe can't be overwritten on Windows.
+
+    The rename + copy pair is wrapped in a try/except: if the copy fails
+    (disk full, permission error) the previous binary is renamed back so
+    a subsequent launch can still find it. Without this rollback a
+    half-completed swap left the .app bundle missing entirely and any
+    later restart would fail to exec.
     """
     from openagent._frozen import executable_path
 
@@ -327,10 +443,18 @@ def apply_update(new_exe: Path) -> None:
                 )
             parent_dir = current_bundle.parent
             old = parent_dir / (current_bundle.stem + ".app.old")
-            if old.exists():
-                shutil.rmtree(str(old))
-            current_bundle.rename(old)
-            shutil.copytree(str(new_bundle), str(current_bundle))
+            with _swap_lock(current_bundle):
+                if old.exists():
+                    shutil.rmtree(str(old))
+                current_bundle.rename(old)
+                try:
+                    shutil.copytree(str(new_bundle), str(current_bundle))
+                except Exception:
+                    # Roll back so launchd can still find the bundle.
+                    if current_bundle.exists():
+                        shutil.rmtree(str(current_bundle), ignore_errors=True)
+                    old.rename(current_bundle)
+                    raise
             logger.info("Update applied (bundle swap). Old version at %s", old)
             return
 
@@ -339,11 +463,18 @@ def apply_update(new_exe: Path) -> None:
     # the live process, and the new file is installed in its place so
     # the next launch picks up the upgrade.
     old = current_exe.with_suffix(current_exe.suffix + ".old")
-    if old.exists():
-        old.unlink()
-    current_exe.rename(old)
-    shutil.copy2(str(new_exe), str(current_exe))
-    current_exe.chmod(0o755)
+    with _swap_lock(current_exe):
+        if old.exists():
+            old.unlink()
+        current_exe.rename(old)
+        try:
+            shutil.copy2(str(new_exe), str(current_exe))
+            current_exe.chmod(0o755)
+        except Exception:
+            if current_exe.exists():
+                current_exe.unlink()
+            old.rename(current_exe)
+            raise
     logger.info("Update applied. Old version at %s", old)
 
 

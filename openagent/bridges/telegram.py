@@ -234,11 +234,15 @@ class TelegramBridge(BaseBridge):
                 offset=next_offset,
             )
         except Exception as e:  # noqa: BLE001 — best-effort
+            # ``httpx.CancelledError`` and a few other shutdown-time
+            # exceptions stringify to ``""`` — fall back to the type
+            # name so events.jsonl never logs ``error: ""`` (which is
+            # unsearchable and prevented diagnosis on lyra-agent).
             elog(
                 "bridge.telegram.offset_flush_error",
                 level="warning",
                 offset=next_offset,
-                error=str(e),
+                error=str(e) or type(e).__name__,
             )
 
     async def stop(self) -> None:

@@ -581,10 +581,13 @@ class AgentServer:
         if enabled:
             agent = self.agent
             stop_event = self._stop_event
+            gateway = self._gateway
 
             async def _auto_update_run(task, _orig):
                 if task["name"] == AUTO_UPDATE_TASK_NAME:
-                    await _do_auto_update(agent, mode, stop_event=stop_event)
+                    await _do_auto_update(
+                        agent, mode, stop_event=stop_event, gateway=gateway,
+                    )
                 else:
                     await _orig(task)
 
@@ -650,6 +653,7 @@ async def _do_auto_update(
     agent: Agent,
     mode: str,
     stop_event: asyncio.Event | None = None,
+    gateway=None,
 ) -> None:
     """Check for updates and act according to *mode* (auto/notify/manual).
 
@@ -657,11 +661,19 @@ async def _do_auto_update(
     server to shut down gracefully via *stop_event* and stores the
     restart exit code on the agent so the CLI can pick it up **after**
     cleanup has finished.
+
+    Going through :func:`request_restart` (when *gateway* is provided)
+    is what fires the proactive bridge-offset flush — without it, the
+    Telegram update that triggered an /update command can replay after
+    launchd brings the new binary up. We saw the flush still get an
+    ``offset_flush_error`` with empty error, but at least the proactive
+    POST happens before the loop tears down.
     """
     try:
-        old_ver, new_ver = run_upgrade()
+        old_ver, new_ver = await asyncio.to_thread(run_upgrade)
     except Exception as exc:
         logger.error("Auto-update check failed: %s", exc)
+        elog("update.error", level="warning", error=str(exc) or type(exc).__name__)
         return
 
     if old_ver == new_ver:
@@ -675,9 +687,14 @@ async def _do_auto_update(
     if mode == "auto":
         logger.warning("Restarting for update %s -> %s (exit code %d)...",
                         old_ver, new_ver, RESTART_EXIT_CODE)
-        # Store the desired exit code so the CLI can use it after clean
-        # shutdown instead of raising SystemExit here (which would skip
-        # server.stop() and leave bridges/gateway in a dirty state).
+        if gateway is not None:
+            from openagent.gateway.api.control import request_restart
+            request_restart(gateway, source="auto-update")
+            return
+        # Fallback when no gateway is wired (e.g. headless test rigs):
+        # store the exit code and signal the loop directly. The bridge
+        # offset flush won't fire on this path — but it's also a path
+        # that has no bridges to flush.
         agent._restart_exit_code = RESTART_EXIT_CODE
         if stop_event is not None:
             stop_event.set()

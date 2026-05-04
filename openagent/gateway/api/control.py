@@ -64,7 +64,20 @@ def request_restart(gateway, *, source: str) -> None:
 
 
 def perform_update(gateway) -> dict:
-    """Run the package update flow and return a structured result."""
+    """Run the package update flow and return a structured result.
+
+    Note: this function is synchronous and BLOCKS for the duration of
+    the download + apply (potentially minutes for a 200 MB archive).
+    Callers on the event loop must run it via ``asyncio.to_thread`` or
+    the entire gateway becomes unresponsive — observed serialising 5
+    concurrent ``/api/update`` calls at ~310 ms each.
+
+    The restart is NOT triggered here. The async caller is responsible
+    for scheduling :func:`request_restart` AFTER the HTTP response has
+    been flushed; otherwise ``stop_event`` racing the response writer
+    leaves the client with "Empty reply from server" while the update
+    actually succeeded (observed on performa-agent 2026-05-04).
+    """
     from openagent.core.server import run_upgrade
 
     try:
@@ -78,8 +91,7 @@ def perform_update(gateway) -> dict:
         return {"ok": True, "updated": False, "version": old}
 
     elog("update.installed", old=old, new=new)
-    request_restart(gateway, source="update")
-    return {"ok": True, "updated": True, "old": old, "new": new}
+    return {"ok": True, "updated": True, "old": old, "new": new, "restart_needed": True}
 
 
 async def handle_update(request):
@@ -87,12 +99,33 @@ async def handle_update(request):
     from aiohttp import web
 
     gw = request.app["gateway"]
-    result = perform_update(gw)
+    # Run the (blocking) upgrade flow off the event loop. Without this
+    # the gateway is unresponsive for the entire download — concurrent
+    # /api/health, WS frames, and bridge polling all stall.
+    result = await asyncio.to_thread(perform_update, gw)
     if not result["ok"]:
         return web.json_response({"error": result["error"]}, status=500)
-    payload = dict(result)
-    payload.pop("ok", None)
-    return web.json_response(payload)
+
+    payload = {k: v for k, v in result.items() if k not in ("ok", "restart_needed")}
+    response = web.json_response(payload)
+
+    if result.get("restart_needed"):
+        # Schedule the restart on the loop so the response writer flushes
+        # FIRST. ``request_restart`` sets ``stop_event`` which the server
+        # loop picks up immediately; if we triggered it inside the same
+        # tick as the response, the client could see "Empty reply from
+        # server" while the update actually succeeded.
+        async def _delayed_restart():
+            # Short sleep gives aiohttp time to drain the response onto
+            # the socket and for the kernel to push the bytes. 0.5 s is
+            # negligible against the 5-30 s shutdown that follows.
+            await asyncio.sleep(0.5)
+            request_restart(gw, source="update")
+        asyncio.get_running_loop().create_task(
+            _delayed_restart(), name="control:delayed-restart"
+        )
+
+    return response
 
 
 async def handle_restart(request):
