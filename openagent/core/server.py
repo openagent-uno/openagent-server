@@ -185,14 +185,15 @@ def _build_agent(config: dict) -> Agent:
     )
 
 
-def _build_bridges(config: dict, gateway_url: str | None = None) -> list:
-    """Build platform bridges from config.
+def _build_bridges(config: dict, gateway_url: str) -> list:
+    """Build platform bridges from config. Each connects to the Gateway via WS.
 
-    Bridges historically connected to the Gateway via ``ws://localhost:port``
-    with a shared token. With Iroh transport that path is gone — bridges
-    will need their own dialer (LoopbackProxy + device cert minted for a
-    bridge user) which is tracked as a follow-up. For now we surface a
-    clear warning and skip them so the rest of the agent comes up.
+    With the iroh transport the gateway no longer listens on a fixed
+    localhost port; ``gateway_url`` here points at a ``LoopbackProxy``
+    started by ``BridgeSession`` (see ``openagent.network.bridge_session``)
+    that pumps the bridge's WS bytes onto an authed iroh stream targeting
+    our own NodeId. The cert is attached at the iroh layer, so the
+    bridge's legacy ``gateway_token`` field is unused and left empty.
     """
     channels_config = config.get("channels") or {}
     out = []
@@ -201,16 +202,55 @@ def _build_bridges(config: dict, gateway_url: str | None = None) -> list:
         if name == "websocket":
             continue  # legacy, ignored — gateway is now Iroh-bound
 
-        if name in ("telegram", "discord", "whatsapp") and cfg:
-            logger.warning(
-                "%s bridge configured but bridges-over-iroh aren't wired in this build; "
-                "skipping. Add a bridge user via `openagent network invite --role user` "
-                "and run the bridge as a network client once that flow lands.",
-                name,
-            )
-            continue
+        if name == "telegram":
+            from openagent.bridges.telegram import TelegramBridge
+            token = cfg.get("token") or os.environ.get("TELEGRAM_BOT_TOKEN")
+            if not token:
+                logger.warning("Telegram token not configured; skipping")
+                continue
+            out.append(TelegramBridge(
+                token=token,
+                allowed_users=cfg.get("allowed_users"),
+                gateway_url=gateway_url,
+                gateway_token=None,
+            ))
 
-        if name not in ("websocket", "telegram", "discord", "whatsapp"):
+        elif name == "discord":
+            from openagent.bridges.discord import DiscordBridge
+            token = cfg.get("token") or os.environ.get("DISCORD_BOT_TOKEN")
+            if not token:
+                logger.warning("Discord token not configured; skipping")
+                continue
+            allowed = cfg.get("allowed_users")
+            if not allowed:
+                logger.warning("Discord needs allowed_users; skipping")
+                continue
+            out.append(DiscordBridge(
+                token=token,
+                allowed_users=allowed,
+                allowed_guilds=cfg.get("allowed_guilds"),
+                listen_channels=cfg.get("listen_channels"),
+                dm_only=bool(cfg.get("dm_only", False)),
+                gateway_url=gateway_url,
+                gateway_token=None,
+            ))
+
+        elif name == "whatsapp":
+            from openagent.bridges.whatsapp import WhatsAppBridge
+            iid = cfg.get("green_api_id") or os.environ.get("GREEN_API_ID")
+            tok = cfg.get("green_api_token") or os.environ.get("GREEN_API_TOKEN")
+            if not iid or not tok:
+                logger.warning("WhatsApp credentials not configured; skipping")
+                continue
+            out.append(WhatsAppBridge(
+                instance_id=iid,
+                api_token=tok,
+                allowed_users=cfg.get("allowed_users"),
+                gateway_url=gateway_url,
+                gateway_token=None,
+            ))
+
+        else:
             logger.warning(f"Unknown channel: {name}")
 
     return out
@@ -235,6 +275,7 @@ class AgentServer:
 
         self._bridge_tasks: list[asyncio.Task] = []
         self._bridges: list = []
+        self._bridge_session = None  # openagent.network.bridge_session.BridgeSession
         self._scheduler = None
         self._gateway = None
         self._stop_event: asyncio.Event | None = None
@@ -247,8 +288,11 @@ class AgentServer:
         server._gateway_vault_path = memory_cfg.get("vault_path")
         server._gateway_config_path = config.get("_config_path")
         server._network_state = None
-        # Bridges are deferred until bridge-over-iroh lands.
-        server._bridges = _build_bridges(config)
+        server._only_channels = only_channels
+        # Bridges are constructed in ``start`` after the gateway + bridge
+        # session are up — they need ``gateway_url`` to point at the
+        # bridge session's LoopbackProxy, which doesn't exist yet.
+        server._bridges = []
         return server
 
     async def _build_network_state(self):
@@ -316,10 +360,19 @@ class AgentServer:
                 config_path=getattr(self, "_gateway_config_path", None),
             )
             self._gateway._stop_event = self._stop_event
-            self._gateway._bridges = self._bridges
+            self._gateway._bridges = self._bridges  # populated below
             self._gateway._prepare_iroh_site()
             await self._network_state.start()
             await self._gateway.start()
+
+            # 2.5. Bridge session — mints a coordinator-signed cert for
+            #      handle ``__bridge`` and starts a LoopbackProxy that
+            #      pumps localhost HTTP/WS bytes onto an authed iroh
+            #      stream targeting our own NodeId. Gives in-process
+            #      bridges a ``gateway_url`` that's wire-compatible
+            #      with the legacy ``ws://localhost:8765/ws`` they
+            #      were built against.
+            await self._build_bridge_session_and_bridges()
 
         # 3. Scheduler (with dream mode + auto-update hooks)
         await self._start_scheduler()
@@ -329,6 +382,57 @@ class AgentServer:
             self._bridge_tasks.append(asyncio.create_task(
                 bridge.start(), name=f"bridge:{bridge.name}"
             ))
+
+    async def _build_bridge_session_and_bridges(self) -> None:
+        """Provision the in-process bridge session + concrete bridges.
+
+        Failure to bring up the bridge session (member-mode agents,
+        missing coordinator key, iroh self-dial unsupported, etc.)
+        is non-fatal — the agent comes up without bridges and emits a
+        warning. The gateway itself (remote clients over iroh) is
+        unaffected.
+        """
+        from openagent.core.paths import get_agent_dir
+        from openagent.network.bridge_session import (
+            BridgeSession,
+            BridgeSessionUnavailable,
+        )
+
+        channels_config = self.config.get("channels") or {}
+        wants_bridge = any(
+            name in channels_config and channels_config[name]
+            for name in ("telegram", "discord", "whatsapp")
+        )
+        if not wants_bridge:
+            return
+
+        agent_dir = get_agent_dir()
+        if agent_dir is None:
+            logger.warning(
+                "no agent dir set; cannot persist the bridge device key — skipping bridges",
+            )
+            return
+
+        session = BridgeSession()
+        try:
+            await session.start(
+                network_state=self._network_state,
+                gateway_site=getattr(self._gateway, "_site", None),
+                agent_dir=agent_dir,
+            )
+        except BridgeSessionUnavailable as e:
+            logger.warning("bridges unavailable: %s — skipping bridges", e)
+            return
+        except Exception:
+            logger.exception("bridge session failed to start — skipping bridges")
+            return
+
+        self._bridge_session = session
+        self._bridges = _build_bridges(self.config, gateway_url=session.ws_url)
+        # Keep the gateway's reference in sync — it uses ``self._bridges``
+        # for shutdown signaling on gateway.stop().
+        if self._gateway is not None:
+            self._gateway._bridges = self._bridges
 
     async def stop(self, timeout: float = 15) -> None:
         """Stop bridges, gateway, scheduler, agent (in reverse).
@@ -353,6 +457,16 @@ class AgentServer:
             except (asyncio.CancelledError, Exception):
                 pass
         self._bridge_tasks.clear()
+
+        # 1b. Bridge session (LoopbackProxy + dialer + iroh self-conn).
+        #     After all bridges are stopped — they may still be writing
+        #     to the loopback socket during cancellation.
+        if self._bridge_session is not None:
+            try:
+                await asyncio.wait_for(self._bridge_session.stop(), timeout=5)
+            except (asyncio.TimeoutError, Exception) as e:
+                logger.warning("Bridge session stop error: %s", e)
+            self._bridge_session = None
 
         # 2. Gateway
         if self._gateway:

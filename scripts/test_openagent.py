@@ -178,6 +178,7 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_dream",
     "test_updater",
     "test_bridges",
+    "test_bridge_session",
     "test_shell",
     # 7. Optional Claude CLI path (needs --include-claude)
     "test_claude_cli",
