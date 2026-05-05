@@ -1242,37 +1242,52 @@ class MemoryDB:
     async def claim_pending_workflow_requests(self, *, limit: int = 5) -> list[dict]:
         """Atomically claim up to ``limit`` unclaimed requests. Each
         returned row has ``claimed_at`` set so concurrent scheduler
-        ticks (or stray retries) won't run the same request twice."""
+        ticks (or stray retries) won't run the same request twice.
+
+        The atomicity comes from the row-level ``WHERE claimed_at IS NULL``
+        guard inside the UPDATE — a concurrent claimer that picked the
+        same rows from the SELECT loses the race because their UPDATE
+        filters out already-claimed rows. The previous implementation
+        wrapped the SELECT+UPDATE in an explicit ``BEGIN IMMEDIATE`` /
+        ``COMMIT`` pair, which fought with the ``sqlite3`` driver's
+        auto-managed transaction state on the shared aiosqlite
+        connection: when a sibling coroutine's DML had already
+        auto-begun a transaction, the explicit ``BEGIN IMMEDIATE``
+        produced ``cannot start a transaction within a transaction``
+        and the except branch's ``ROLLBACK`` then chained
+        ``cannot rollback - no transaction is active``.
+        """
         conn = await self._ensure_connected()
         now = time.time()
-        # Select unclaimed ids first, then UPDATE in the same transaction
-        # (SQLite doesn't support ``UPDATE ... RETURNING`` on all versions
-        # we target). Wrap both statements so a concurrent claimer can't
-        # race past the SELECT.
-        await conn.execute("BEGIN IMMEDIATE")
-        try:
-            cursor = await conn.execute(
-                "SELECT * FROM workflow_run_requests "
-                "WHERE claimed_at IS NULL "
-                "ORDER BY created_at ASC LIMIT ?",
-                (int(limit),),
-            )
-            rows = await cursor.fetchall()
-            if not rows:
-                await conn.execute("COMMIT")
-                return []
-            ids = [row["id"] for row in rows]
-            placeholders = ",".join("?" for _ in ids)
-            await conn.execute(
-                f"UPDATE workflow_run_requests SET claimed_at = ? "
-                f"WHERE id IN ({placeholders})",
-                [now, *ids],
-            )
-            await conn.execute("COMMIT")
-        except Exception:
-            await conn.execute("ROLLBACK")
-            raise
-        claimed = []
+        cursor = await conn.execute(
+            "SELECT * FROM workflow_run_requests "
+            "WHERE claimed_at IS NULL "
+            "ORDER BY created_at ASC LIMIT ?",
+            (int(limit),),
+        )
+        rows = await cursor.fetchall()
+        if not rows:
+            return []
+        ids = [row["id"] for row in rows]
+        placeholders = ",".join("?" for _ in ids)
+        await conn.execute(
+            f"UPDATE workflow_run_requests SET claimed_at = ? "
+            f"WHERE id IN ({placeholders}) AND claimed_at IS NULL",
+            [now, *ids],
+        )
+        await conn.commit()
+        # Only the rows we won carry our ``now`` marker. Any rows a
+        # concurrent claimer grabbed in between SELECT and UPDATE
+        # filter out via the ``claimed_at IS NULL`` guard above and
+        # don't reappear here.
+        cursor = await conn.execute(
+            f"SELECT * FROM workflow_run_requests "
+            f"WHERE id IN ({placeholders}) AND claimed_at = ? "
+            f"ORDER BY created_at ASC",
+            [*ids, now],
+        )
+        rows = await cursor.fetchall()
+        claimed: list[dict] = []
         for row in rows:
             d = dict(row)
             raw = d.pop("inputs_json", "{}") or "{}"
@@ -1280,7 +1295,6 @@ class MemoryDB:
                 d["inputs"] = json.loads(raw)
             except (TypeError, ValueError):
                 d["inputs"] = {}
-            d["claimed_at"] = now
             claimed.append(d)
         return claimed
 
