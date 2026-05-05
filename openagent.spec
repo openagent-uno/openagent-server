@@ -22,7 +22,7 @@ reuse that cache and start in under a second.
 
 import sys
 from pathlib import Path
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_submodules, collect_dynamic_libs
 
 # ── Build-environment guard ──
 # Fail loudly if a runtime-critical dependency isn't importable in the build
@@ -36,6 +36,7 @@ import groq  # noqa: F401 — agno.models.groq (optional provider SDK, must ship
 import litellm  # noqa: F401 — TTS / STT dispatch (channels/tts.py, channels/voice.py)
 import faster_whisper  # noqa: F401 — local-first STT fallback
 import psutil  # noqa: F401 — cross-platform host telemetry (api/system.py)
+import iroh  # noqa: F401 — P2P transport (openagent.network.iroh_node) — Rust FFI dylib must be bundled
 
 block_cipher = None
 
@@ -125,7 +126,22 @@ hiddenimports = [
     # (telegram → channels.voice → litellm).
     *collect_submodules("tiktoken_ext"),
     *collect_submodules("tiktoken"),
+    # iroh: ships a uniffi-generated FFI module that loads
+    # ``libiroh_ffi.{so,dylib,dll}`` via ctypes at import time. Without
+    # an explicit collect, PyInstaller's static analyzer misses the
+    # dylib and the bundled binary crashes at first ``import iroh`` with
+    # ``OSError: ...libiroh_ffi.so: cannot open shared object file``.
+    "iroh",
+    "iroh.iroh_ffi",
+    *collect_submodules("iroh"),
 ]
+
+# ── Dynamic libs ──
+# iroh's Rust FFI library (libiroh_ffi.{so,dylib,dll}) is loaded via
+# ctypes.CDLL at import time, so PyInstaller's static analyzer doesn't
+# see the dependency. ``collect_dynamic_libs`` finds the platform's
+# .so/.dylib/.dll inside the installed iroh wheel and bundles it.
+binaries = collect_dynamic_libs("iroh")
 
 # ── Data files ──
 # Bundle the entire mcp/servers/ directory (built-in MCP servers).
@@ -176,7 +192,7 @@ datas += collect_data_files("mcp")
 a = Analysis(
     ["openagent/cli.py"],
     pathex=["."],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
