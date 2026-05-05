@@ -21,6 +21,7 @@ it; existing in-process adapters that don't take ``pool`` (e.g.
 """
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 from typing import Any
@@ -56,6 +57,46 @@ def _functions_dict(toolkit: Any) -> dict[str, Any]:
     out = dict(getattr(toolkit, "functions", {}) or {})
     out.update(getattr(toolkit, "async_functions", {}) or {})
     return out
+
+
+# Lazy-recovery timeout for ``call_tool``. Lower than the connect-time
+# recovery budget — by the time the model invokes a trimmed tool we want
+# to fail fast rather than make the user wait. One short attempt is enough
+# to cover the "first call after persona startup, while the busy host has
+# settled" case that's the whole reason this hook exists.
+_LAZY_RECOVERY_TIMEOUT = 6
+
+
+async def _ensure_functions_loaded(toolkit: Any, server: str) -> dict[str, Any]:
+    """Return the toolkit's tool dict, retrying ``initialize()`` once if empty.
+
+    Mirrors ``MCPPool._recover_dormant_toolkit`` but scoped to a single
+    just-in-time attempt: if the upfront connect path swallowed an Agno
+    BaseException and left ``functions == {}``, the model would otherwise
+    see a confusing ``"Available: []"`` error on a healthy MCP. Re-running
+    ``initialize()`` here costs at most one cold-start handshake.
+    """
+    fns = _functions_dict(toolkit)
+    if fns:
+        return fns
+    initialize = getattr(toolkit, "initialize", None)
+    if not callable(initialize):
+        return fns
+    try:
+        toolkit._initialized = False  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        async with asyncio.timeout(_LAZY_RECOVERY_TIMEOUT):
+            result = initialize()
+            if inspect.isawaitable(result):
+                await result
+    except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+        # Caller will surface a "no tool 'X'. Available: []" error which
+        # at least tells the user *which* MCP failed; we don't need to
+        # double-log here.
+        pass
+    return _functions_dict(toolkit)
 
 
 def _list_servers_impl(pool: Any) -> list[dict[str, Any]]:
@@ -112,9 +153,12 @@ async def _call_tool_impl(
             f"MCP {server!r} is not loaded. Known MCPs: "
             f"{sorted(pool._toolkit_by_name)}"
         )
-    fn = _functions_dict(toolkit).get(tool)
+    # Recover from connect-time stealth-fail before reporting "no such tool".
+    # See ``_ensure_functions_loaded`` for the rationale.
+    fns = await _ensure_functions_loaded(toolkit, server)
+    fn = fns.get(tool)
     if fn is None:
-        avail = sorted(_functions_dict(toolkit))
+        avail = sorted(fns)
         raise ValueError(
             f"MCP {server!r} has no tool {tool!r}. Available: {avail}"
         )

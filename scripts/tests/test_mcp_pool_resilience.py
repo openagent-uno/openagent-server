@@ -101,6 +101,52 @@ class _FakeToolkit:
             raise self._aexit_exc
 
 
+class _StealthFailToolkit(_FakeToolkit):
+    """Models the Agno bug: ``__aenter__`` returns OK with an empty tools
+    dict (because the wrapped ``initialize`` swallowed a BaseException),
+    but a follow-up ``initialize()`` call succeeds.
+
+    ``recover_after``: number of failed ``initialize()`` calls before
+    recovery succeeds (0 = first retry wins, ``None`` = never recovers).
+    """
+
+    def __init__(
+        self,
+        name: str = "stealth",
+        *,
+        recover_after: int | None = 0,
+        tool_count: int = 2,
+    ) -> None:
+        super().__init__(name=name, tool_count=tool_count)
+        self._recover_after = recover_after
+        self._initialized = False
+        self.initialize_calls = 0
+
+    async def __aenter__(self) -> "_StealthFailToolkit":
+        # Stealth-fail: enter succeeds, but functions stays empty until
+        # something forces another initialize() (just like real Agno).
+        self.entered = True
+        self.functions = {}
+        return self
+
+    async def initialize(self) -> None:
+        self.initialize_calls += 1
+        # Agno's idempotency guard: skip if already initialized.
+        if self._initialized:
+            return
+        if (
+            self._recover_after is not None
+            and self.initialize_calls > self._recover_after
+        ):
+            self.functions = {
+                f"{self.name}_tool_{i}": object() for i in range(self._tool_count)
+            }
+            self._initialized = True
+            return
+        # Mimic Agno: log the error and silently leave _initialized=False.
+        # No exception propagates to the caller.
+
+
 def _install_pool_fakes(monkey_specs: list[tuple[str, _FakeToolkit]]) -> Any:
     """Install a fake ``_build_and_enter_toolkit`` on ``MCPPool``.
 
@@ -227,6 +273,76 @@ async def t_handshake_hang_times_out(ctx: TestContext) -> None:
     assert good.entered
     assert pool.server_summary()["good"] == 1
     assert pool.server_summary()["hung"] == 0
+    await pool.close_all()
+
+
+@test(
+    "mcp_pool_resilience",
+    "Stealth-failed Agno init recovers via post-enter initialize() retry",
+)
+async def t_stealth_fail_recovers(ctx: TestContext) -> None:
+    """The mixout-2026-05 regression. Agno's ``MCPTools.initialize()`` wraps
+    its real init in ``except (RuntimeError, BaseException): log_error(...)``.
+    When the wrapped init raises a ``BaseExceptionGroup`` from anyio's
+    TaskGroup (typical under host load), Agno swallows it, leaves
+    ``_initialized=False``, and ``__aenter__`` returns OK with zero tools.
+    16/20 MCPs went silently dormant on a busy persona because of this.
+
+    The pool must detect ``count == 0`` post-enter and re-run
+    ``initialize()`` directly. The toolkit's idempotency-guard means we
+    have to reset ``_initialized=False`` between attempts, which the fake
+    here mirrors.
+    """
+    good = _FakeToolkit("good", tool_count=2)
+    # Recovers on the FIRST retry (typical case).
+    flaky = _StealthFailToolkit("flaky", recover_after=0, tool_count=4)
+    pool = _install_pool_fakes([("good", good), ("flaky", flaky)])
+
+    await pool.connect_all()
+
+    summary = pool.server_summary()
+    assert summary == {"good": 2, "flaky": 4}, summary
+    assert flaky.initialize_calls >= 1, "recovery never re-ran initialize()"
+    assert "flaky" not in pool.dormant_servers(), (
+        f"flaky shouldn't be dormant after recovery; dormant={pool.dormant_servers()}"
+    )
+    await pool.close_all()
+
+
+@test(
+    "mcp_pool_resilience",
+    "Permanently-broken stealth-fail eventually dormants out (bounded retries)",
+)
+async def t_stealth_fail_gives_up(ctx: TestContext) -> None:
+    """Pool retries are bounded — a permanently-broken MCP must end up
+    dormant within a couple seconds, not loop forever."""
+    from openagent.mcp import pool as pool_mod
+
+    good = _FakeToolkit("good", tool_count=1)
+    # ``recover_after=None`` means initialize() never restores functions.
+    dead = _StealthFailToolkit("dead", recover_after=None, tool_count=3)
+    pool = _install_pool_fakes([("good", good), ("dead", dead)])
+
+    saved_attempts = pool_mod._DORMANT_RECOVERY_ATTEMPTS
+    saved_backoff = pool_mod._DORMANT_RECOVERY_BACKOFF
+    pool_mod._DORMANT_RECOVERY_ATTEMPTS = 2
+    pool_mod._DORMANT_RECOVERY_BACKOFF = 0.01
+    try:
+        t0 = asyncio.get_event_loop().time()
+        await pool.connect_all()
+        elapsed = asyncio.get_event_loop().time() - t0
+    finally:
+        pool_mod._DORMANT_RECOVERY_ATTEMPTS = saved_attempts
+        pool_mod._DORMANT_RECOVERY_BACKOFF = saved_backoff
+
+    assert elapsed < 3.0, f"recovery loop ran too long: {elapsed:.1f}s"
+    summary = pool.server_summary()
+    assert summary == {"good": 1, "dead": 0}, summary
+    assert "dead" in pool.dormant_servers()
+    # We attempted recovery the bounded number of times.
+    assert dead.initialize_calls == 2, (
+        f"expected 2 recovery attempts, got {dead.initialize_calls}"
+    )
     await pool.close_all()
 
 
