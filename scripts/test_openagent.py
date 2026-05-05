@@ -108,6 +108,7 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_db_models",
     "test_db_providers",
     "test_db_session_bindings",
+    "test_db_workflow_claim",
     "test_smart_router_hybrid",
     # SmartRouter.stream + ClaudeCLIRegistry.stream — token-streaming
     # dispatch for both frameworks. Pure-unit (stubs the registries) and
