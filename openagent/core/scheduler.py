@@ -307,7 +307,18 @@ class Scheduler:
         try:
             requests = await self.db.claim_pending_workflow_requests(limit=5)
         except Exception as e:  # noqa: BLE001
-            elog("scheduler.workflow_claim_failed", level="warning", error=str(e))
+            # 37e99bd dropped explicit BEGIN/ROLLBACK from the claim path,
+            # but both signatures still surface across mixout / performa
+            # boss / friday on v0.12.44 — root cause not yet pinned. Capture
+            # the type and full traceback so the next run can see which
+            # call site inside aiosqlite is raising the auto-begin error.
+            elog(
+                "scheduler.workflow_claim_failed",
+                level="warning",
+                error=str(e) or type(e).__name__,
+                error_type=type(e).__name__,
+                exc_info=True,
+            )
             requests = []
         for req in requests:
             workflow_id = req.get("workflow_id")
