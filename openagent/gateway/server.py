@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import socket
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, TYPE_CHECKING
 
@@ -18,9 +17,13 @@ from openagent.gateway import protocol as P
 from openagent.gateway.commands import command_help_text
 from openagent.gateway.sessions import SessionManager
 from openagent.gateway.api import vault, config, health, logs, control, usage, providers, models, scheduled_tasks, workflow_tasks, mcps, marketplace, sessions as sessions_api, system as system_api
+from openagent.network import peers as peers_api
+from openagent.network.auth.middleware import make_auth_middleware
+from openagent.network.transport.aiohttp_iroh_site import IrohSite
 
 if TYPE_CHECKING:
     from openagent.core.agent import Agent
+    from openagent.network.state import NetworkState
 
 from openagent.core.logging import elog
 
@@ -35,47 +38,31 @@ class _StreamHolder:
     channel: "RealtimeChannel"
 
 
-def _find_available_port(preferred: int, host: str = "0.0.0.0") -> int:
-    """Try the preferred port, then scan +1..+99 for an available one."""
-    for port in range(preferred, preferred + 100):
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                s.bind((host, port))
-                return port
-        except OSError:
-            continue
-    raise RuntimeError(
-        f"No available port found in range {preferred}–{preferred + 99}"
-    )
-
-
 class Gateway:
-    """WebSocket + REST gateway powered by aiohttp."""
+    """aiohttp gateway tunneled over Iroh — handle@network auth, no IPs/ports.
+
+    The legacy ``host:port + token`` constructor is gone. The Gateway now
+    binds to the Iroh endpoint owned by ``NetworkState`` and authenticates
+    every inbound stream via the device-cert middleware.
+    """
 
     def __init__(
         self,
         agent: Agent,
-        host: str = "0.0.0.0",
-        port: int = 8765,
-        token: str | None = None,
+        network_state: NetworkState,
         vault_path: str | None = None,
         config_path: str | None = None,
         stop_event: asyncio.Event | None = None,
     ):
         self.agent = agent
-        self.host = host
-        self.port = _find_available_port(port, host)
-        if self.port != port:
-            logger.info("Port %d busy, using %d instead", port, self.port)
-        self.token = token
+        self._network_state = network_state
         self.vault_path = vault_path
         self.config_path = config_path
         self._stop_event = stop_event
         self.sessions = SessionManager(agent_name=agent.name)
         self.clients: dict[str, object] = {}  # client_id → WebSocketResponse
         self._runner = None
-        self._port_file = None
+        self._site: IrohSite | None = None
 
         # Per (client_id, session_id) StreamSession + RealtimeChannel
         # pair. Created on demand from inbound stream frames; closed on
@@ -194,6 +181,35 @@ class Gateway:
         except Exception as e:  # noqa: BLE001
             logger.warning("config-change callback for %r failed: %s", section, e)
 
+    def _prepare_iroh_site(self) -> None:
+        """Register the gateway ALPN handler on the IrohNode.
+
+        iroh-py 0.35 bakes the protocol handler dict into NodeOptions
+        at node-construction time, so this MUST run before
+        ``IrohNode.start``. The AgentServer calls this between
+        building the NetworkState and starting it. We don't construct
+        the IrohSite here yet — that needs the aiohttp runner — but
+        we DO register the per-ALPN callback that the IrohSite will
+        eventually own. Storing the unbound method works because
+        register_handler captures it as a callable.
+        """
+        # The actual IrohSite is created in ``start`` once the runner
+        # exists; until then we register a thin shim that defers to
+        # ``self._site`` when it lands.
+        async def _gateway_handler(connection):
+            site = self._site
+            if site is None:
+                # Site hasn't been wired yet — drain and drop.
+                try:
+                    connection.close(0, b"gateway not ready")
+                except Exception:
+                    pass
+                return
+            await site._handle_stream(connection)
+
+        from openagent.network.iroh_node import NetworkAlpn as _Alpn
+        self._network_state.iroh_node.register_handler(_Alpn.GATEWAY, _gateway_handler)
+
     async def start(self) -> None:
         from aiohttp import web
         from aiohttp.web import middleware
@@ -216,7 +232,11 @@ class Gateway:
             resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
             return resp
 
-        app = web.Application(middlewares=[cors])
+        # Order matters: cors first (handles OPTIONS preflight without
+        # going through auth), then auth (every other request needs a
+        # valid device cert). Both run for every route added below.
+        auth_middleware = make_auth_middleware(self._network_state.auth_state)
+        app = web.Application(middlewares=[cors, auth_middleware])
         app["gateway"] = self  # accessible in handlers via request.app["gateway"]
         self._register_routes(app)
 
@@ -224,9 +244,21 @@ class Gateway:
         await runner.setup()
         self._runner = runner
 
-        site = web.TCPSite(runner, self.host, self.port)
-        await site.start()
-        elog("gateway.start", host=self.host, port=self.port)
+        # The IrohSite was built in ``__init__`` (it registers the ALPN
+        # handler with the IrohNode, which has to happen *before*
+        # ``IrohNode.start``). Here we just attach it to the runner
+        # and start the lifecycle. The runner-aware bits of BaseSite
+        # need a constructed runner, hence the deferred wiring.
+        self._site = IrohSite(runner, self._network_state.iroh_node)
+        await self._site.start()
+        node_id = await self._network_state.node_id()
+        elog(
+            "gateway.start",
+            transport="iroh",
+            node_id=node_id,
+            network=self._network_state.network_name,
+            role=self._network_state.role,
+        )
 
         # Spin up host telemetry. Broadcast loop primes psutil's CPU
         # baseline on first tick, then emits one ``system_snapshot``
@@ -238,9 +270,6 @@ class Gateway:
             self._system_broadcast_loop(), name="gateway-system-broadcast"
         )
 
-        # Write .port file for agent discovery
-        self._write_port_file()
-
     async def stop(self) -> None:
         await self.sessions.shutdown()
         if self._system_broadcast_task is not None:
@@ -250,11 +279,16 @@ class Gateway:
             except (asyncio.CancelledError, Exception):
                 pass
             self._system_broadcast_task = None
+        if self._site is not None:
+            try:
+                await self._site.stop()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("iroh site stop failed: %s", e)
+            self._site = None
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
         self.clients.clear()
-        self._remove_port_file()
 
     async def _system_broadcast_loop(self) -> None:
         """Push a ``system_snapshot`` to all clients on a fixed cadence.
@@ -372,27 +406,20 @@ class Gateway:
             # this REST handler exists for the initial paint and any
             # client that doesn't speak the WS feed.
             ("GET", "/api/system", system_api.handle_get),
+            # Network membership: peer networks (federation), and
+            # info about this agent's home network. ``network/info``
+            # works on both coordinator and member agents; ``peers``
+            # is per-agent so federation state can differ between
+            # peers in the same home network.
+            ("GET", "/api/network/info", self._handle_network_info),
+            ("GET", "/api/peers", peers_api.handle_list),
+            ("POST", "/api/peers", peers_api.handle_create),
+            ("DELETE", "/api/peers/{network_id}", peers_api.handle_delete),
+            ("GET", "/api/peers/{network_id}/agents", peers_api.handle_list_agents),
         )
         for method, path, handler in routes:
             app.router.add_route(method, path, handler)
         app.router.add_route("OPTIONS", "/{path:.*}", self._handle_options)
-
-    def _write_port_file(self) -> None:
-        """Write a .port file to the agent dir for discovery by CLI/app."""
-        from openagent.core.paths import get_agent_dir
-        agent_dir = get_agent_dir()
-        if agent_dir is not None:
-            port_file = agent_dir / ".port"
-            port_file.write_text(str(self.port))
-            self._port_file = port_file
-
-    def _remove_port_file(self) -> None:
-        """Remove the .port file on shutdown."""
-        if self._port_file and self._port_file.exists():
-            try:
-                self._port_file.unlink()
-            except OSError:
-                pass
 
     def runtime_info(self) -> dict:
         """Return shared gateway/agent metadata exposed by REST endpoints."""
@@ -403,20 +430,36 @@ class Gateway:
         return {
             "agent": self.agent.name,
             "agent_dir": str(agent_dir) if agent_dir else None,
-            "port": self.port,
+            "node_id": self._network_state.identity.public_hex,
+            "network": self._network_state.network_name,
+            "role": self._network_state.role,
             "version": getattr(openagent, "__version__", "?"),
         }
 
     async def _handle_agent_info(self, request):
-        """GET /api/agent-info — agent name, dir, port, version."""
+        """GET /api/agent-info — agent name, network, node_id, version."""
         from aiohttp import web
 
         info = self.runtime_info()
         return web.json_response({
             "name": info["agent"],
             "agent_dir": info["agent_dir"],
-            "port": info["port"],
+            "node_id": info["node_id"],
+            "network": info["network"],
+            "role": info["role"],
             "version": info["version"],
+        })
+
+    async def _handle_network_info(self, request):
+        """GET /api/network/info — describe this agent's network membership."""
+        from aiohttp import web
+
+        ns = self._network_state
+        return web.json_response({
+            "role": ns.role,
+            "network_id": ns.network_id,
+            "network_name": ns.network_name,
+            "node_id": ns.identity.public_hex,
         })
 
     # ── File upload ──
@@ -505,21 +548,15 @@ class Gateway:
         return web.json_response(result)
 
     def _check_bearer_token(self, request) -> bool:
-        """Return True when the request carries a matching gateway token.
+        """Legacy compat — returns True iff the auth middleware approved this request.
 
-        Mirrors the inline check in ``_handle_files``: accepts either a
-        ``?token=`` query param or an ``Authorization: Bearer …`` header.
-        Endpoints that incur cost (TTS / STT) call this so an open
-        local port can't be turned into a free transcription proxy.
+        The ``Gateway.token`` field and inline token check are gone;
+        every authed handler now sees ``request['device_cert']`` set
+        by ``make_auth_middleware``. Some pre-existing handlers still
+        call this helper for clarity; it just confirms the middleware
+        attached an identity.
         """
-        if not self.token:
-            return True
-        token = request.query.get("token") or ""
-        if not token:
-            auth = request.headers.get("Authorization", "")
-            if auth.startswith("Bearer "):
-                token = auth[len("Bearer "):].strip()
-        return token == self.token
+        return request.get("device_cert") is not None
 
     async def _handle_stt_transcribe(self, request):
         """POST /api/stt/transcribe — transcribe an audio upload.
@@ -536,9 +573,7 @@ class Gateway:
         from openagent.channels.voice import transcribe, is_audio_file
         import tempfile
 
-        if not self._check_bearer_token(request):
-            return web.Response(status=401, text="Unauthorized")
-
+        # Auth handled by middleware; cert is on request["device_cert"].
         reader = await request.multipart()
         field = await reader.next()
         if not field:
@@ -577,9 +612,7 @@ class Gateway:
         from aiohttp import web
         from openagent.channels.tts import resolve_tts_provider, synthesize_full
 
-        if not self._check_bearer_token(request):
-            return web.Response(status=401, text="Unauthorized")
-
+        # Auth handled by middleware; cert is on request["device_cert"].
         try:
             body = await request.json()
         except Exception:
@@ -630,14 +663,12 @@ class Gateway:
         from aiohttp import web
         import os
 
-        if self.token:
-            token = request.query.get("token") or (
-                request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-                if request.headers.get("Authorization", "").startswith("Bearer ")
-                else ""
-            )
-            if token != self.token:
-                return web.Response(status=401, text="Unauthorized")
+        # Auth is enforced by ``make_auth_middleware`` for every
+        # ``/api/*`` route — by the time the handler runs the cert is
+        # already verified. Defensive sanity check kept so a misrouted
+        # request without a cert can't bypass FS access.
+        if request.get("device_cert") is None:
+            return web.Response(status=401, text="Unauthorized")
 
         path = request.query.get("path", "")
         if not path:
@@ -666,11 +697,55 @@ class Gateway:
     async def _handle_ws(self, request):
         from aiohttp import web, WSMsgType
 
+        # The auth middleware already verified the device cert before
+        # the WS upgrade ran — by the time we get here, the request
+        # carries a valid identity. The legacy ``token`` AUTH frame is
+        # gone; the first AUTH frame just carries an optional
+        # ``client_kind`` for telemetry.
+        cert = request.get("device_cert")
+        if cert is None:
+            return web.Response(status=401, text="Unauthorized")
+
         ws = web.WebSocketResponse()
         await ws.prepare(request)
 
-        client_id: str | None = None
-        authed = self.token is None
+        # ``client_id`` is bound to the device's pubkey. This means a
+        # reconnect from the same device picks up its existing
+        # StreamSessions; a different device gets a fresh slot. The
+        # client cannot pick its own ID anymore — that was a footgun
+        # the old protocol allowed (one client could clobber another's
+        # sessions by guessing the ID).
+        client_id: str = cert.device_pubkey_hex
+        old_ws = self.clients.get(client_id)
+        self.clients[client_id] = ws
+        if old_ws is not None and old_ws is not ws:
+            self._adopt_sessions_to_ws(client_id, ws)
+            elog("gateway.client_reconnect", client_id=client_id)
+            if not getattr(old_ws, "closed", True):
+                try:
+                    await old_ws.close()
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("old ws close failed: %s", e)
+
+        # Greet the client. Old clients sent an AUTH frame and waited
+        # for AUTH_OK; the new wire skips the AUTH frame but keeps the
+        # AUTH_OK greeting for backward-compat in client code that
+        # waits for it as a "ready" signal.
+        import openagent
+        elog("gateway.client_connect", client_id=client_id, handle=cert.handle)
+        await self._safe_ws_send_json(ws, {
+            "type": P.AUTH_OK,
+            "agent_name": self.agent.name,
+            "version": getattr(openagent, "__version__", "?"),
+            "handle": cert.handle,
+            # Human-readable name (``agent-personal``) so the renderer
+            # can pass it back through as the ``network`` segment of
+            # ``handle@network`` on re-login. ``network_id`` is the
+            # internal UUID; older clients that only kept ``network``
+            # would otherwise stash the UUID and break next sign-in.
+            "network": self._network_state.network_name,
+            "network_id": cert.network_id,
+        })
 
         try:
             async for msg in ws:
@@ -684,53 +759,11 @@ class Gateway:
 
                 t = data.get("type", "")
 
-                # Auth
+                # Legacy AUTH frame: ignored — the middleware already
+                # authenticated us. Tolerate it for old clients that
+                # still send one before their first session_open.
                 if t == P.AUTH:
-                    if self.token and data.get("token") != self.token:
-                        elog("auth.fail", client_id=data.get("client_id"))
-                        await self._safe_ws_send_json(ws, {"type": P.AUTH_ERROR, "reason": "Invalid token"})
-                        await ws.close()
-                        return ws
-                    client_id = data.get("client_id") or f"ws-{id(ws)}"
-                    authed = True
-                    # Reconnect path: a prior ws under the same
-                    # ``client_id`` (network blip, sleep/wake, refresh)
-                    # leaves its StreamSessions alive with their channel
-                    # send-callable bound to the now-dead ws. Rebind
-                    # them onto this fresh ws so any in-flight turn's
-                    # ``OutTextFinal`` / ``TurnComplete`` reaches the UI
-                    # — without this the client stays stuck on
-                    # "Thinking…" until manual reload.
-                    old_ws = self.clients.get(client_id)
-                    self.clients[client_id] = ws
-                    if old_ws is not None and old_ws is not ws:
-                        self._adopt_sessions_to_ws(client_id, ws)
-                        elog(
-                            "gateway.client_reconnect",
-                            client_id=client_id,
-                        )
-                        if not getattr(old_ws, "closed", True):
-                            try:
-                                await old_ws.close()
-                            except Exception as e:  # noqa: BLE001
-                                logger.debug(
-                                    "old ws close failed: %s", e
-                                )
-                    import openagent
-                    elog("gateway.client_connect", client_id=client_id)
-                    await self._safe_ws_send_json(ws, {
-                        "type": P.AUTH_OK,
-                        "agent_name": self.agent.name,
-                        "version": getattr(openagent, "__version__", "?"),
-                    })
                     continue
-
-                if not authed:
-                    await self._safe_ws_send_json(ws, {"type": P.AUTH_ERROR, "reason": "Not authenticated"})
-                    continue
-                if client_id is None:
-                    client_id = f"ws-{id(ws)}"
-                    self.clients[client_id] = ws
 
                 # Ping
                 if t == P.PING:

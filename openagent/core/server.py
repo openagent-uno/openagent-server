@@ -145,8 +145,11 @@ def _build_agent(config: dict) -> Agent:
 
     model = create_model_from_config(config)
 
-    # Export channel tokens as env vars so the messaging MCP can pick them up
-    channels_config = config.get("channels", {})
+    # Export channel tokens as env vars so the messaging MCP can pick them up.
+    # ``or {}`` because yaml.safe_load returns ``None`` for an empty mapping
+    # (e.g. ``channels:`` with no children) — ``dict.get`` won't substitute
+    # the default in that case.
+    channels_config = config.get("channels") or {}
     if "telegram" in channels_config:
         token = channels_config["telegram"].get("token") or os.environ.get("TELEGRAM_BOT_TOKEN")
         if token:
@@ -182,65 +185,32 @@ def _build_agent(config: dict) -> Agent:
     )
 
 
-def _build_bridges(config: dict, gateway_port: int = 8765, gateway_token: str | None = None) -> list:
-    """Build platform bridges from config. Each connects to the Gateway via WS."""
-    channels_config = config.get("channels", {})
-    gw_url = f"ws://localhost:{gateway_port}/ws"
+def _build_bridges(config: dict, gateway_url: str | None = None) -> list:
+    """Build platform bridges from config.
+
+    Bridges historically connected to the Gateway via ``ws://localhost:port``
+    with a shared token. With Iroh transport that path is gone — bridges
+    will need their own dialer (LoopbackProxy + device cert minted for a
+    bridge user) which is tracked as a follow-up. For now we surface a
+    clear warning and skip them so the rest of the agent comes up.
+    """
+    channels_config = config.get("channels") or {}
     out = []
 
     for name, cfg in channels_config.items():
         if name == "websocket":
-            continue  # handled by Gateway directly
+            continue  # legacy, ignored — gateway is now Iroh-bound
 
-        if name == "telegram":
-            from openagent.bridges.telegram import TelegramBridge
-            token = cfg.get("token") or os.environ.get("TELEGRAM_BOT_TOKEN")
-            if not token:
-                logger.warning("Telegram token not configured; skipping")
-                continue
-            out.append(TelegramBridge(
-                token=token,
-                allowed_users=cfg.get("allowed_users"),
-                gateway_url=gw_url,
-                gateway_token=gateway_token,
-            ))
+        if name in ("telegram", "discord", "whatsapp") and cfg:
+            logger.warning(
+                "%s bridge configured but bridges-over-iroh aren't wired in this build; "
+                "skipping. Add a bridge user via `openagent network invite --role user` "
+                "and run the bridge as a network client once that flow lands.",
+                name,
+            )
+            continue
 
-        elif name == "discord":
-            from openagent.bridges.discord import DiscordBridge
-            token = cfg.get("token") or os.environ.get("DISCORD_BOT_TOKEN")
-            if not token:
-                logger.warning("Discord token not configured; skipping")
-                continue
-            allowed = cfg.get("allowed_users")
-            if not allowed:
-                logger.warning("Discord needs allowed_users; skipping")
-                continue
-            out.append(DiscordBridge(
-                token=token,
-                allowed_users=allowed,
-                allowed_guilds=cfg.get("allowed_guilds"),
-                listen_channels=cfg.get("listen_channels"),
-                dm_only=bool(cfg.get("dm_only", False)),
-                gateway_url=gw_url,
-                gateway_token=gateway_token,
-            ))
-
-        elif name == "whatsapp":
-            from openagent.bridges.whatsapp import WhatsAppBridge
-            iid = cfg.get("green_api_id") or os.environ.get("GREEN_API_ID")
-            tok = cfg.get("green_api_token") or os.environ.get("GREEN_API_TOKEN")
-            if not iid or not tok:
-                logger.warning("WhatsApp credentials not configured; skipping")
-                continue
-            out.append(WhatsAppBridge(
-                instance_id=iid,
-                api_token=tok,
-                allowed_users=cfg.get("allowed_users"),
-                gateway_url=gw_url,
-                gateway_token=gateway_token,
-            ))
-
-        else:
+        if name not in ("websocket", "telegram", "discord", "whatsapp"):
             logger.warning(f"Unknown channel: {name}")
 
     return out
@@ -273,24 +243,49 @@ class AgentServer:
     def from_config(cls, config: dict, only_channels: list[str] | None = None) -> AgentServer:
         agent = _build_agent(config)
         server = cls(agent=agent, config=config)
-        # Build Gateway if websocket channel is configured
-        ws_cfg = config.get("channels", {}).get("websocket", {})
-        if ws_cfg or (only_channels and "websocket" in only_channels):
-            from openagent.gateway.server import Gateway
-            memory_cfg = config.get("memory", {}) or {}
-            gw_token = ws_cfg.get("token") or os.environ.get("OPENAGENT_WS_TOKEN")
-            gw_port = int(ws_cfg.get("port", 8765))
-            server._gateway = Gateway(
-                agent=agent,
-                host=ws_cfg.get("host", "0.0.0.0"),
-                port=gw_port,
-                token=gw_token,
-                vault_path=memory_cfg.get("vault_path"),
-                config_path=config.get("_config_path"),
-            )
-            # Build bridges (Telegram, Discord, WhatsApp) — they connect to Gateway
-            server._bridges = _build_bridges(config, gateway_port=gw_port, gateway_token=gw_token)
+        memory_cfg = config.get("memory", {}) or {}
+        server._gateway_vault_path = memory_cfg.get("vault_path")
+        server._gateway_config_path = config.get("_config_path")
+        server._network_state = None
+        # Bridges are deferred until bridge-over-iroh lands.
+        server._bridges = _build_bridges(config)
         return server
+
+    async def _build_network_state(self):
+        """Read the singleton ``network`` row and build a ``NetworkState``.
+
+        Returns ``None`` for standalone agents — the caller skips the
+        gateway and prints a helpful message. Any other failure
+        propagates so a misconfigured network row surfaces loudly
+        rather than silently disabling the public interface.
+        """
+        from openagent.network.state import NetworkState, StandaloneAgentError
+        from openagent.core.paths import get_agent_dir
+
+        agent_dir = get_agent_dir()
+        if agent_dir is None:
+            logger.warning(
+                "no agent dir set; running without a gateway. "
+                "Pass --agent-dir to ``openagent`` to enable network mode.",
+            )
+            return None
+
+        net_cfg = self.config.get("network") or {}
+        identity_path = agent_dir / (net_cfg.get("identity_path") or "identity.key")
+        derp_url = net_cfg.get("derp_url") or None
+        try:
+            return await NetworkState.from_db(
+                db=self.agent._db,
+                identity_path=identity_path,
+                derp_url=derp_url,
+            )
+        except StandaloneAgentError:
+            logger.warning(
+                "this agent has no network configured. Run "
+                "`openagent network init` to create one — or join an "
+                "existing network. The gateway will not be exposed until then.",
+            )
+            return None
 
     # ── Lifecycle ──
 
@@ -302,14 +297,28 @@ class AgentServer:
         # 1. Agent (connects MCPs, opens DB)
         await self.agent.initialize()
 
-        # 2. Gateway (public WS + REST interface)
-        if self._gateway:
+        # 2. Build NetworkState now that the DB is open. iroh-py 0.35
+        #    bakes the ALPN handler dict into NodeOptions at node
+        #    construction time — every handler must be registered
+        #    *before* NetworkState.start binds the iroh endpoint. So
+        #    we (a) build NetworkState (constructor wires the
+        #    coordinator handler if applicable), (b) build Gateway
+        #    eagerly via a pre-start hook so IrohSite registers the
+        #    gateway handler, (c) start NetworkState, (d) finish the
+        #    Gateway lifecycle. Standalone agents skip the gateway.
+        self._network_state = await self._build_network_state()
+        if self._network_state is not None:
+            from openagent.gateway.server import Gateway
+            self._gateway = Gateway(
+                agent=self.agent,
+                network_state=self._network_state,
+                vault_path=getattr(self, "_gateway_vault_path", None),
+                config_path=getattr(self, "_gateway_config_path", None),
+            )
             self._gateway._stop_event = self._stop_event
-            # Wire the bridge list onto the gateway so the /restart handler
-            # can flush pending Telegram updates BEFORE the restart actually
-            # fires — otherwise the queued /restart Update gets re-delivered
-            # on next boot and the agent crash-loops.
             self._gateway._bridges = self._bridges
+            self._gateway._prepare_iroh_site()
+            await self._network_state.start()
             await self._gateway.start()
 
         # 3. Scheduler (with dream mode + auto-update hooks)
@@ -351,6 +360,14 @@ class AgentServer:
                 await asyncio.wait_for(self._gateway.stop(), timeout=10)
             except (asyncio.TimeoutError, Exception) as e:
                 logger.warning("Gateway stop error: %s", e)
+
+        # 2b. NetworkState (Iroh endpoint + coordinator service)
+        if self._network_state is not None:
+            try:
+                await asyncio.wait_for(self._network_state.stop(), timeout=10)
+            except (asyncio.TimeoutError, Exception) as e:
+                logger.warning("NetworkState stop error: %s", e)
+            self._network_state = None
 
         # 3. Scheduler
         if self._scheduler is not None:

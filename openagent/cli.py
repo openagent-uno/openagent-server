@@ -15,6 +15,7 @@ from openagent.core.config import load_config
 from openagent.core.logging import setup_logging
 from openagent.core.serve_singleton import kill_stale_serve_processes
 from openagent.core.server import AgentServer
+from openagent.network.cli_commands import network_group
 
 console = Console()
 
@@ -112,9 +113,18 @@ def init(agent_dir: str):
 @main.command()
 @click.argument("agent_dir", required=False, default=None)
 @click.option("--channel", "-ch", multiple=True, help="Channels to start (telegram, discord, whatsapp)")
+@click.option("--no-auto-init", is_flag=True,
+              help="Don't auto-create a personal network on first run; require explicit `network init`.")
 @click.pass_context
-def serve(ctx, agent_dir: str | None, channel: tuple[str, ...]):
-    """Start the OpenAgent server for an agent directory."""
+def serve(ctx, agent_dir: str | None, channel: tuple[str, ...], no_auto_init: bool):
+    """Start the OpenAgent server for an agent directory.
+
+    On first run this also bootstraps the agent: creates the directory
+    structure if missing, generates the Iroh + coordinator identity keys,
+    writes the singleton ``network`` row in coordinator mode, and mints
+    a one-shot user invite ticket so you can connect right away. No
+    separate ``network init`` step needed.
+    """
     if agent_dir is not None and paths.get_agent_dir() is None:
         _setup_agent_dir(agent_dir)
         setup_logging(verbose=ctx.obj.get("verbose", False))
@@ -127,16 +137,42 @@ def serve(ctx, agent_dir: str | None, channel: tuple[str, ...]):
     config = dict(ctx.obj["config"])
     config["_config_path"] = str(Path(ctx.obj["config_path"]).resolve())
     only = list(channel) if channel else None
-    server = AgentServer.from_config(config, only_channels=only)
 
     async def _serve():
+        from openagent.network.cli_commands import (
+            auto_init_if_standalone,
+            list_active_invite_tickets,
+            mint_first_user_invite,
+        )
+
+        # Pre-flight: auto-bootstrap a personal network if this is the
+        # first run. The user only ever needs ``openagent serve <dir>``.
+        bootstrap_invite: tuple[str, dict] | None = None
+        active_invites: list[dict] = []
+        if active_dir is not None and not no_auto_init:
+            network_row = await auto_init_if_standalone(
+                agent_dir=active_dir, config=config,
+            )
+            if network_row is not None and network_row["role"] == "coordinator":
+                bootstrap_invite = await mint_first_user_invite(
+                    agent_dir=active_dir, config=config, network_row=network_row,
+                )
+                active_invites = await list_active_invite_tickets(
+                    agent_dir=active_dir, config=config, network_row=network_row,
+                )
+
+        server = AgentServer.from_config(config, only_channels=only)
+
         restart_code = 0
         served = False
         try:
             async with server:
                 active: list[str] = []
-                if server._gateway:
-                    active.append(f"gateway:{server._gateway.port}")
+                if server._gateway and server._network_state:
+                    node_id_short = server._network_state.identity.public_hex[:12]
+                    active.append(
+                        f"gateway:iroh@{node_id_short} ({server._network_state.network_name})"
+                    )
                 if server._bridges:
                     active.extend(f"bridge:{bridge.name}" for bridge in server._bridges)
                 if server._scheduler is not None:
@@ -148,6 +184,61 @@ def serve(ctx, agent_dir: str | None, channel: tuple[str, ...]):
 
                 served = True
                 console.print(Panel(f"[bold]Serving[/bold]: {', '.join(active)}", border_style="green"))
+
+                # First-run hint: print the auto-minted invite so the
+                # user can connect without going looking for ``network
+                # invite``. Only fires when the coordinator has zero
+                # users, so it stops nagging once anyone has joined.
+                # No Panel borders so the ticket sits on its own line —
+                # triple-click + copy gives the bare ``oa1…`` string.
+                if bootstrap_invite is not None:
+                    ticket_str, _ = bootstrap_invite
+                    console.print()
+                    console.print("[bold]First-time join[/bold] — no users registered yet. Paste this ticket in the app or CLI:")
+                    console.print()
+                    print(ticket_str)
+                    console.print()
+                    console.print(
+                        "[dim]CLI:[/dim] [cyan]openagent-cli connect <ticket>[/cyan]"
+                    )
+                    console.print(
+                        "[dim]Single-use; mint more with[/dim] "
+                        "[cyan]openagent network invite[/cyan]."
+                    )
+                    console.print()
+
+                # Surface every other unspent invite the operator has
+                # already minted (via ``network invite`` or auto-
+                # bootstrap from a previous run). Skip the bootstrap
+                # ticket we just printed standalone above to avoid
+                # duplicating it.
+                bootstrap_code = (
+                    bootstrap_invite[1]["code"] if bootstrap_invite is not None else None
+                )
+                others = [i for i in active_invites if i["code"] != bootstrap_code]
+                if others:
+                    import time as _time
+                    console.print(f"[bold]Active invites[/bold] ({len(others)}):")
+                    console.print()
+                    for inv in others:
+                        bind = f", for [cyan]{inv['bind_to']}[/cyan]" if inv["bind_to"] else ""
+                        ttl_left = max(0, int(inv["expires_at"] - _time.time()))
+                        days, rem = divmod(ttl_left, 86400)
+                        hours, rem = divmod(rem, 3600)
+                        minutes = rem // 60
+                        if days:
+                            when = f"{days}d{hours}h"
+                        elif hours:
+                            when = f"{hours}h{minutes}m"
+                        else:
+                            when = f"{minutes}m"
+                        console.print(
+                            f"  [dim]role={inv['role']}, uses_left={inv['uses_left']}, "
+                            f"expires_in={when}, by={inv['created_by']}{bind}[/dim]"
+                        )
+                        print(f"  {inv['ticket']}")
+                        console.print()
+
                 await server.wait()
                 console.print("\nShutting down...")
                 restart_code = getattr(server.agent, "_restart_exit_code", 0)
@@ -235,6 +326,9 @@ def mcp_server_cmd(name: str):
 
     click.echo(f"Unknown MCP server: {name}", err=True)
     raise SystemExit(1)
+
+
+main.add_command(network_group)
 
 
 if __name__ == "__main__":

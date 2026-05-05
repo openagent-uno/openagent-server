@@ -298,6 +298,111 @@ CREATE TABLE IF NOT EXISTS workflow_run_requests (
     created_at    REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_wfreq_unclaimed ON workflow_run_requests(claimed_at);
+
+-- ── Network / identity / coordinator ──
+--
+-- This agent's role in the OpenAgent network model. Singleton row.
+-- ``role`` is one of:
+--   ``standalone`` — no network configured yet (boot default).
+--   ``coordinator`` — this agent runs the embedded coordinator service.
+--   ``member``     — this agent is a member of an external network.
+-- ``coordinator_pubkey`` is the Ed25519 verify key (32 raw bytes) used to
+-- verify device-certs presented by inbound clients on this gateway.
+CREATE TABLE IF NOT EXISTS network (
+    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+    role TEXT NOT NULL DEFAULT 'standalone',
+    network_id TEXT,
+    name TEXT,
+    coordinator_node_id TEXT,
+    coordinator_pubkey BLOB,
+    created_at REAL NOT NULL
+);
+
+-- Networks this agent belongs to as a CLIENT (used for agent-to-agent
+-- federation: an agent stores other networks here so it can dial peer
+-- agents through them). Independent of the singleton ``network`` row,
+-- which only describes this agent's own home network.
+CREATE TABLE IF NOT EXISTS peer_networks (
+    network_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    coordinator_node_id TEXT NOT NULL,
+    coordinator_pubkey BLOB NOT NULL,
+    our_handle TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    added_at REAL NOT NULL,
+    last_seen REAL
+);
+CREATE INDEX IF NOT EXISTS idx_peer_networks_status ON peer_networks(status);
+
+-- Cached device certificates (CBOR-encoded, Ed25519-signed by the
+-- coordinator) per (network, handle). Refreshed at 50% TTL by the
+-- session dialer; deleted on logout.
+CREATE TABLE IF NOT EXISTS device_certs (
+    network_id TEXT NOT NULL,
+    handle TEXT NOT NULL,
+    cert BLOB NOT NULL,
+    expires_at REAL NOT NULL,
+    PRIMARY KEY(network_id, handle)
+);
+CREATE INDEX IF NOT EXISTS idx_device_certs_expires ON device_certs(expires_at);
+
+-- ── Coordinator-only tables ──
+-- Populated only when ``network.role='coordinator'``. Other agents
+-- carry these tables empty (cheaper than two schemas).
+
+-- Registered users for this network. ``pake_record`` is the SRP-6a
+-- verifier (or OPAQUE record once we swap the PAKE backend) — opaque
+-- to the coordinator: the password itself never reaches us.
+CREATE TABLE IF NOT EXISTS network_users (
+    handle TEXT PRIMARY KEY,
+    pake_record BLOB NOT NULL,
+    pake_algo TEXT NOT NULL DEFAULT 'srp6a',
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at REAL NOT NULL
+);
+
+-- One row per device a user has paired with this network. The
+-- coordinator signs a fresh device cert for each device that completes
+-- a PAKE login; revocation flips ``status`` to 'revoked' so future
+-- cert refreshes fail and inbound dials carrying the old cert are
+-- rejected (the agent middleware checks this table on every dial).
+CREATE TABLE IF NOT EXISTS network_devices (
+    device_pubkey BLOB PRIMARY KEY,
+    user_handle TEXT NOT NULL,
+    label TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
+    added_at REAL NOT NULL,
+    last_seen REAL,
+    FOREIGN KEY(user_handle) REFERENCES network_users(handle) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_network_devices_user ON network_devices(user_handle);
+
+-- Agents registered in this network. Discovery is coordinator-mediated:
+-- clients call ``list_agents`` and dial ``node_id`` directly afterwards.
+CREATE TABLE IF NOT EXISTS network_agents (
+    handle TEXT PRIMARY KEY,
+    node_id TEXT NOT NULL,
+    label TEXT,
+    owner_handle TEXT NOT NULL,
+    added_at REAL NOT NULL,
+    last_seen REAL
+);
+
+-- One-shot or N-shot invites. ``code`` is a base32 string the user
+-- pastes / scans. ``role`` decides what they get on redemption: ``user``
+-- registers a new account, ``device`` adds a device to an existing
+-- account.
+CREATE TABLE IF NOT EXISTS network_invitations (
+    code TEXT PRIMARY KEY,
+    role TEXT NOT NULL CHECK(role IN ('user','device','agent')),
+    created_by TEXT,
+    bind_to_handle TEXT,
+    uses_left INTEGER NOT NULL DEFAULT 1,
+    expires_at REAL NOT NULL,
+    created_at REAL NOT NULL,
+    used_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_invitations_expires ON network_invitations(expires_at);
 """
 
 

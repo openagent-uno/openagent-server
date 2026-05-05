@@ -57,9 +57,25 @@ _DEFAULT_YAML = textwrap.dedent("""\
 
     name: agent
 
+    network:
+      # Path to this agent's Iroh secret key (relative to the agent dir).
+      # Generated automatically on first run. Keep at 0600 — leaking it
+      # impersonates this agent on the entire network.
+      identity_path: ./identity.key
+
+      coordinator:
+        # Path to the coordinator's signing key. Only used when this
+        # agent has been promoted to network coordinator via
+        # ``openagent network init``.
+        key_path: ./coordinator.key
+
+      # Optional: override Iroh's public DERP relay. Empty = use Iroh's
+      # public network. Self-host one for full data locality.
+      derp_url: ""
+
     channels:
-      websocket:
-        port: 8765
+      # Bridges (telegram, discord, whatsapp) connect as network clients
+      # rather than via host:port. See `openagent network invite --role user`.
 """)
 
 
