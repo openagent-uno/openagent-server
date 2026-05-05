@@ -40,16 +40,36 @@ from openagent.network.transport.inproc import InProcConnection, InProcDialer
 logger = logging.getLogger(__name__)
 
 
-BRIDGE_HANDLE = "__bridge"
-BRIDGE_DEVICE_KEY_FILENAME = ".bridge-device.key"
+BRIDGE_HANDLE_PREFIX = "__bridge"
+BRIDGE_DEVICE_KEY_FILENAME_PREFIX = ".bridge-device"
+
+
+def bridge_handle_for(bridge_name: str) -> str:
+    """Cert handle for a given bridge.
+
+    Each bridge needs its OWN handle so the gateway sees distinct
+    ``client_id`` values (the gateway derives ``client_id`` from the
+    cert's ``device_pubkey``; see ``openagent.gateway.server``). When
+    two bridges share a handle, the second bridge's WS connection
+    triggers ``gateway.client_replaced`` on the first, killing the
+    first bridge's send half — which is what bit friday in v0.12.49
+    when telegram + whatsapp ran together.
+    """
+    return f"{BRIDGE_HANDLE_PREFIX}_{bridge_name}"
+
+
+def bridge_device_key_filename(bridge_name: str) -> str:
+    return f"{BRIDGE_DEVICE_KEY_FILENAME_PREFIX}-{bridge_name}.key"
 
 
 class BridgeSessionUnavailable(Exception):
     """Raised when bridges cannot be wired (member-mode, missing key, …)."""
 
 
-def _load_or_create_bridge_device_key(agent_dir: Path) -> Ed25519PrivateKey:
-    p = agent_dir / BRIDGE_DEVICE_KEY_FILENAME
+def _load_or_create_bridge_device_key(
+    agent_dir: Path, bridge_name: str,
+) -> Ed25519PrivateKey:
+    p = agent_dir / bridge_device_key_filename(bridge_name)
     if p.exists():
         return Ed25519PrivateKey.from_private_bytes(p.read_bytes())
     key = Ed25519PrivateKey.generate()
@@ -69,16 +89,35 @@ def _load_or_create_bridge_device_key(agent_dir: Path) -> Ed25519PrivateKey:
 class BridgeSession:
     """In-process bridge plumbing: cert + InProcConnection + LoopbackProxy.
 
+    One BridgeSession per bridge — they MUST NOT be shared across
+    bridges (telegram + whatsapp on the same agent) because each
+    bridge needs its own gateway client_id. Sharing produced the
+    v0.12.49 friday outage where one bridge's WS was kicked off by
+    the other's via ``gateway.client_replaced``.
+
     Lifecycle: ``await session.start(network_state, gateway_site, agent_dir)`` →
     ``session.ws_url`` → ``await session.stop()``.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, bridge_name: str) -> None:
+        if not bridge_name or not bridge_name.replace("_", "").isalnum():
+            raise ValueError(
+                f"bridge_name must be alphanumeric (got {bridge_name!r})",
+            )
+        self._bridge_name = bridge_name
         self._connection: InProcConnection | None = None
         self._dialer: InProcDialer | None = None
         self._proxy: LoopbackProxy | None = None
         self._site_handler_task: asyncio.Task | None = None
         self._cert_wire: bytes | None = None
+
+    @property
+    def bridge_name(self) -> str:
+        return self._bridge_name
+
+    @property
+    def handle(self) -> str:
+        return bridge_handle_for(self._bridge_name)
 
     @property
     def ws_url(self) -> str:
@@ -122,7 +161,9 @@ class BridgeSession:
                 "gateway, not before",
             )
 
-        device_key = _load_or_create_bridge_device_key(Path(agent_dir))
+        device_key = _load_or_create_bridge_device_key(
+            Path(agent_dir), self._bridge_name,
+        )
         device_pubkey = device_key.public_key().public_bytes(
             encoding=serialization.Encoding.Raw,
             format=serialization.PublicFormat.Raw,
@@ -134,7 +175,7 @@ class BridgeSession:
         # process restart anyway.
         cert_wire = issue_cert(
             coordinator_key=network_state.coordinator_key,
-            handle=BRIDGE_HANDLE,
+            handle=self.handle,
             device_pubkey=device_pubkey,
             network_id=network_state.network_id,
             capabilities=["bridge"],
@@ -145,7 +186,9 @@ class BridgeSession:
         # remote iroh peer. The cert prefix is written by InProcDialer
         # exactly the same way a real SessionDialer would.
         self._cert_wire = cert_wire
-        self._connection = InProcConnection(peer_node_id="inproc:bridge")
+        self._connection = InProcConnection(
+            peer_node_id=f"inproc:bridge:{self._bridge_name}",
+        )
         self._dialer = InProcDialer(
             connection=self._connection,
             cert_wire=cert_wire,
@@ -156,7 +199,7 @@ class BridgeSession:
         # as a remote inbound connection, with a different byte source.
         self._site_handler_task = asyncio.create_task(
             gateway_site._handle_stream(self._connection),
-            name="bridge-inproc-site-handler",
+            name=f"bridge-inproc-site-handler:{self._bridge_name}",
         )
 
         self._proxy = LoopbackProxy(
@@ -165,8 +208,8 @@ class BridgeSession:
         )
         await self._proxy.start()
         logger.info(
-            "bridge session ready: ws=%s handle=%s capability=bridge",
-            self._proxy.ws_url, BRIDGE_HANDLE,
+            "bridge session ready: bridge=%s ws=%s handle=%s capability=bridge",
+            self._bridge_name, self._proxy.ws_url, self.handle,
         )
 
     async def stop(self) -> None:

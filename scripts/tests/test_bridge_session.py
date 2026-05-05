@@ -82,7 +82,7 @@ async def t_bridge_rejects_member(ctx: TestContext) -> None:
     network_state.role = "member"
     network_state.coordinator_key = None
     site = MagicMock()
-    session = BridgeSession()
+    session = BridgeSession(bridge_name="telegram")
     raised = False
     try:
         with tempfile.TemporaryDirectory() as d:
@@ -108,7 +108,7 @@ async def t_bridge_rejects_no_coord_key(ctx: TestContext) -> None:
     network_state.role = "coordinator"
     network_state.coordinator_key = None  # bad
     site = MagicMock()
-    session = BridgeSession()
+    session = BridgeSession(bridge_name="telegram")
     raised = False
     try:
         with tempfile.TemporaryDirectory() as d:
@@ -123,17 +123,7 @@ async def t_bridge_rejects_no_coord_key(ctx: TestContext) -> None:
     assert raised, "expected BridgeSessionUnavailable for missing key"
 
 
-@test("bridge_session", "BridgeSession happy path mints a verifiable cert + working LoopbackProxy")
-async def t_bridge_happy_path(ctx: TestContext) -> None:
-    from openagent.network.bridge_session import (
-        BridgeSession,
-        BRIDGE_HANDLE,
-    )
-    from openagent.network.auth.device_cert import verify_cert
-
-    coord_key = Ed25519PrivateKey.generate()
-    network_id = "test-network-uuid"
-
+def _make_network_state_for_test(coord_key, network_id="test-network-uuid"):
     network_state = MagicMock()
     network_state.role = "coordinator"
     network_state.coordinator_key = coord_key
@@ -145,12 +135,10 @@ async def t_bridge_happy_path(ctx: TestContext) -> None:
             format=serialization.PublicFormat.Raw,
         ),
     )
+    return network_state
 
-    # Stand-in for IrohSite — record streams so we can assert the
-    # bridge actually opened one. The real IrohSite would dispatch
-    # each stream to aiohttp.
-    streams_received: list = []
 
+def _make_fake_site(streams_received):
     async def fake_handle_stream(connection) -> None:
         while True:
             bi = await connection.accept_bi()
@@ -160,7 +148,6 @@ async def t_bridge_happy_path(ctx: TestContext) -> None:
             ln = int.from_bytes(await recv.read(4), "big")
             cert_wire = await recv.read(ln)
             streams_received.append(cert_wire)
-            # Drain any further bytes so the writer doesn't block.
             try:
                 while True:
                     chunk = await recv.read(4096)
@@ -171,8 +158,24 @@ async def t_bridge_happy_path(ctx: TestContext) -> None:
 
     fake_site = MagicMock()
     fake_site._handle_stream = fake_handle_stream
+    return fake_site
 
-    session = BridgeSession()
+
+@test("bridge_session", "BridgeSession happy path mints a verifiable cert + working LoopbackProxy")
+async def t_bridge_happy_path(ctx: TestContext) -> None:
+    from openagent.network.bridge_session import (
+        BridgeSession,
+        bridge_handle_for,
+    )
+    from openagent.network.auth.device_cert import verify_cert
+
+    coord_key = Ed25519PrivateKey.generate()
+    network_id = "test-network-uuid"
+    network_state = _make_network_state_for_test(coord_key, network_id)
+    streams_received: list = []
+    fake_site = _make_fake_site(streams_received)
+
+    session = BridgeSession(bridge_name="telegram")
     with tempfile.TemporaryDirectory() as d:
         await session.start(
             network_state=network_state,
@@ -189,7 +192,10 @@ async def t_bridge_happy_path(ctx: TestContext) -> None:
             coordinator_pubkey=coord_key.public_key(),
             expected_network_id=network_id,
         )
-        assert cert.handle == BRIDGE_HANDLE
+        assert cert.handle == bridge_handle_for("telegram"), (
+            f"cert handle should be __bridge_telegram, got {cert.handle!r}"
+        )
+        assert cert.handle == "__bridge_telegram"
         assert "bridge" in cert.capabilities
 
         # Open a TCP connection to the loopback's HTTP port and write
@@ -201,7 +207,6 @@ async def t_bridge_happy_path(ctx: TestContext) -> None:
         reader, writer = await asyncio.open_connection(host, int(port_s))
         writer.write(b"GET /api/health HTTP/1.1\r\nHost: x\r\n\r\n")
         await writer.drain()
-        # The fake handler doesn't reply, so just give it a moment.
         await asyncio.sleep(0.1)
         writer.close()
         try:
@@ -219,27 +224,125 @@ async def t_bridge_happy_path(ctx: TestContext) -> None:
         await session.stop()
 
 
-@test("bridge_session", "BridgeSession.start twice is idempotent on the device key file")
-async def t_bridge_persists_device_key(ctx: TestContext) -> None:
+@test("bridge_session", "two BridgeSessions in the same agent_dir get distinct keys, certs, ws_urls")
+async def t_bridge_distinct_per_bridge(ctx: TestContext) -> None:
+    """Regression test for v0.12.49 friday outage.
+
+    Pre-fix: telegram + whatsapp on one agent shared a single
+    BridgeSession → single device_pubkey → single client_id on the
+    gateway. The second bridge's WS reconnect kicked the first off
+    via gateway.client_replaced, breaking the first bridge's send
+    half. Post-fix: each bridge has its own BridgeSession with a
+    distinct device key, distinct cert handle, distinct LoopbackProxy
+    bound port — so the gateway sees them as independent clients.
+    """
     from openagent.network.bridge_session import (
         BridgeSession,
-        BRIDGE_DEVICE_KEY_FILENAME,
+        bridge_handle_for,
+        bridge_device_key_filename,
+    )
+    from openagent.network.auth.device_cert import verify_cert
+
+    coord_key = Ed25519PrivateKey.generate()
+    network_state = _make_network_state_for_test(coord_key)
+    streams: list = []
+    site = _make_fake_site(streams)
+
+    with tempfile.TemporaryDirectory() as d:
+        s_tg = BridgeSession(bridge_name="telegram")
+        s_wa = BridgeSession(bridge_name="whatsapp")
+        await s_tg.start(
+            network_state=network_state, gateway_site=site, agent_dir=Path(d),
+        )
+        await s_wa.start(
+            network_state=network_state, gateway_site=site, agent_dir=Path(d),
+        )
+        try:
+            tg_cert = verify_cert(
+                s_tg.cert_wire, coordinator_pubkey=coord_key.public_key(),
+            )
+            wa_cert = verify_cert(
+                s_wa.cert_wire, coordinator_pubkey=coord_key.public_key(),
+            )
+
+            # 1. Distinct cert handles — proves the gateway will see
+            #    them as different client_ids (gateway derives client_id
+            #    from device_pubkey, but the handles differ + the
+            #    pubkeys differ, so client_ids differ).
+            assert tg_cert.handle == "__bridge_telegram", tg_cert.handle
+            assert wa_cert.handle == "__bridge_whatsapp", wa_cert.handle
+            assert tg_cert.handle == bridge_handle_for("telegram")
+            assert wa_cert.handle == bridge_handle_for("whatsapp")
+
+            # 2. Distinct device pubkeys — the actual collision driver
+            #    on the gateway side. Same pubkey across bridges =
+            #    same client_id = client_replaced cascade.
+            assert tg_cert.device_pubkey != wa_cert.device_pubkey, (
+                "device_pubkey must differ per bridge — same pubkey "
+                "would re-introduce the gateway client_id collision"
+            )
+
+            # 3. Distinct LoopbackProxy bound ports — each bridge has
+            #    its own localhost endpoint to send WS to.
+            assert s_tg.ws_url != s_wa.ws_url, (
+                f"ws_urls collided: tg={s_tg.ws_url} wa={s_wa.ws_url}"
+            )
+
+            # 4. Distinct on-disk device key files (so a restart keeps
+            #    each bridge's identity stable independently).
+            tg_key = Path(d) / bridge_device_key_filename("telegram")
+            wa_key = Path(d) / bridge_device_key_filename("whatsapp")
+            assert tg_key.exists() and wa_key.exists()
+            assert tg_key.read_bytes() != wa_key.read_bytes()
+            # Both must be 32 bytes (raw ed25519 secret).
+            assert len(tg_key.read_bytes()) == 32
+            assert len(wa_key.read_bytes()) == 32
+        finally:
+            await s_tg.stop()
+            await s_wa.stop()
+
+
+@test("bridge_session", "BridgeSession persists device key across restarts (per-bridge)")
+async def t_bridge_persists_device_key(ctx: TestContext) -> None:
+    from openagent.network.bridge_session import (
+        bridge_device_key_filename,
         _load_or_create_bridge_device_key,
     )
 
     with tempfile.TemporaryDirectory() as d:
         agent = Path(d)
-        k1 = _load_or_create_bridge_device_key(agent)
-        k2 = _load_or_create_bridge_device_key(agent)
-        b1 = k1.private_bytes(
+        k1_tg = _load_or_create_bridge_device_key(agent, "telegram")
+        k2_tg = _load_or_create_bridge_device_key(agent, "telegram")
+        b1 = k1_tg.private_bytes(
             encoding=serialization.Encoding.Raw,
             format=serialization.PrivateFormat.Raw,
             encryption_algorithm=serialization.NoEncryption(),
         )
-        b2 = k2.private_bytes(
+        b2 = k2_tg.private_bytes(
             encoding=serialization.Encoding.Raw,
             format=serialization.PrivateFormat.Raw,
             encryption_algorithm=serialization.NoEncryption(),
         )
         assert b1 == b2, "device key was not persisted across calls"
-        assert (agent / BRIDGE_DEVICE_KEY_FILENAME).exists()
+        assert (agent / bridge_device_key_filename("telegram")).exists()
+        # A different bridge_name should produce a different key.
+        k_wa = _load_or_create_bridge_device_key(agent, "whatsapp")
+        b_wa = k_wa.private_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PrivateFormat.Raw,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        assert b_wa != b1, "whatsapp key should differ from telegram key"
+        assert (agent / bridge_device_key_filename("whatsapp")).exists()
+
+
+@test("bridge_session", "BridgeSession rejects invalid bridge_name")
+async def t_bridge_rejects_bad_name(ctx: TestContext) -> None:
+    from openagent.network.bridge_session import BridgeSession
+
+    for bad in ("", "has space", "../escape", "name/with/slash"):
+        try:
+            BridgeSession(bridge_name=bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"BridgeSession({bad!r}) should have raised ValueError")
