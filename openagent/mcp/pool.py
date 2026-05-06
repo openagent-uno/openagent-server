@@ -106,8 +106,50 @@ _MCP_CLOSE_TIMEOUT = 5
 # (``if self._initialized: return``), and bounded so a permanently-broken
 # MCP still dormants out within a handful of seconds.
 _DORMANT_RECOVERY_ATTEMPTS = 3
-_DORMANT_RECOVERY_TIMEOUT = 15
+# Bumped from 15s → 30s after v0.12.51 production data showed the bypass
+# bottoming out on TimeoutError for slow Python-builtin MCPs (workflow-
+# manager, scheduler, mcp-manager, model-manager). These spawn the
+# frozen openagent binary recursively, which extracts the ~220 MB
+# PyInstaller archive to /tmp/_MEIxxxxx/ per process; under cold-start
+# clustering the disk + import cost can push session.initialize past
+# 15s. 30s leaves headroom for a worst-case host without making a
+# permanently-broken MCP block startup unreasonably long (3 attempts
+# × 30s = 90s upper bound, still well below systemd's 1-minute
+# Restart= window).
+_DORMANT_RECOVERY_TIMEOUT = 30
 _DORMANT_RECOVERY_BACKOFF = 0.5
+
+# Cold-start stagger between subprocess MCP spawns.
+#
+# Field evidence (friday-agent post-v0.12.51 deploy, 2026-05-05):
+# 12/20 MCPs came up cleanly via the dormant-recovery loop, but 8 — all
+# slow Python builtins or first-spawn npm packages — still hit
+# ``TimeoutError`` in ``session.initialize`` with
+# ``bypassed_agno_swallow=True``. Trace pattern:
+#   anyio/streams/memory.py:receive_nowait → WouldBlock
+#   → CancelledError on memory_stream.receive
+#   → wrapped by asyncio.timeouts.__aexit__ in TimeoutError
+# Translation: the subprocess is still bootstrapping (PyInstaller
+# extract / npm cache miss / Python import graph) when we start
+# polling for its initialize() response. The pipe is empty; we time
+# out; Agno swallows; pool flags dormant.
+#
+# Sleeping a fixed amount between subprocess spawns spreads the
+# disk-I/O and CPU cost over wallclock instead of stacking it inside
+# one cold-start window. Sequential ``for`` loop already serialises
+# at the Agno-pool level, but Claude SDK ALSO spawns its own
+# subprocesses in parallel for its own session, and the OS scheduler
+# happily interleaves both. The stagger introduces a kernel-level
+# breathing room that lets the previous spawn at least finish its
+# PyInstaller extract before the next one starts thrashing the same
+# /tmp filesystem.
+#
+# 250 ms is the sweet spot from the production trace: long enough
+# that workflow-manager finishes its archive extract before we move
+# on (~150 ms observed), short enough that 20 MCPs add only ~5 s to
+# total startup time — negligible against systemd's 30 s post-boot
+# bridge polling delay.
+_STARTUP_STAGGER_SECONDS = 0.25
 
 
 def _install_agno_log_passthrough() -> None:
@@ -576,9 +618,15 @@ class MCPPool:
             if self._connected:
                 return
             # 1. Subprocess-based MCPs (stdio / HTTP).
+            # Stagger spawns to avoid the cold-start clustering that produces
+            # the dormant-recovery TimeoutError — see _STARTUP_STAGGER_SECONDS.
+            first_subprocess = True
             for spec in self.specs:
                 if spec.in_process:
                     continue
+                if not first_subprocess and _STARTUP_STAGGER_SECONDS > 0:
+                    await asyncio.sleep(_STARTUP_STAGGER_SECONDS)
+                first_subprocess = False
                 toolkit = await self._build_and_enter_toolkit(spec)
                 if toolkit is not None:
                     self._agno_toolkits.append(toolkit)

@@ -348,6 +348,80 @@ async def t_stealth_fail_gives_up(ctx: TestContext) -> None:
 
 @test(
     "mcp_pool_resilience",
+    "Subprocess MCPs are spawned with a cold-start stagger",
+)
+async def t_startup_stagger(ctx: TestContext) -> None:
+    """The 2026-05-05 v0.12.51 production trace showed slow Python-builtin
+    MCPs hitting ``TimeoutError`` on ``session.initialize`` because all
+    subprocesses raced to extract the same PyInstaller archive at boot.
+    The pool now waits ``_STARTUP_STAGGER_SECONDS`` between subprocess
+    spawns so the previous bootstrap finishes before the next thrashes
+    /tmp. We verify the spacing rather than the wall-time absolute, so
+    the test stays robust to CI scheduling jitter.
+    """
+    from openagent.mcp import pool as pool_mod
+
+    a = _FakeToolkit("a", tool_count=1)
+    b = _FakeToolkit("b", tool_count=1)
+    c_ = _FakeToolkit("c", tool_count=1)
+    pool = _install_pool_fakes([("a", a), ("b", b), ("c", c_)])
+
+    # Crank the stagger up so timing is unambiguous on slow CI; ratio
+    # against zero-stagger would otherwise vanish into scheduler noise.
+    saved = pool_mod._STARTUP_STAGGER_SECONDS
+    pool_mod._STARTUP_STAGGER_SECONDS = 0.1
+    try:
+        t0 = asyncio.get_event_loop().time()
+        await pool.connect_all()
+        elapsed = asyncio.get_event_loop().time() - t0
+    finally:
+        pool_mod._STARTUP_STAGGER_SECONDS = saved
+
+    # 3 subprocess MCPs → 2 stagger gaps → ≥ 0.2s; allow generous slack.
+    assert elapsed >= 0.18, (
+        f"connect_all finished in {elapsed:.3f}s — stagger not applied"
+    )
+    assert elapsed < 2.0, (
+        f"connect_all took {elapsed:.3f}s — stagger overshoot suggests serialisation regression"
+    )
+    assert pool.server_summary() == {"a": 1, "b": 1, "c": 1}
+    await pool.close_all()
+
+
+@test(
+    "mcp_pool_resilience",
+    "Stagger is skipped between in-process MCPs (no subprocess to space out)",
+)
+async def t_stagger_only_subprocess(ctx: TestContext) -> None:
+    """In-process MCPs don't spawn anything, so staggering them would just
+    pad startup for nothing. The bookkeeping flag must reset correctly so
+    a single subprocess MCP after several in-process ones doesn't get an
+    unexpected delay (and a single subprocess at all costs nothing).
+    """
+    from openagent.mcp import pool as pool_mod
+
+    a = _FakeToolkit("a", tool_count=1)
+    pool = _install_pool_fakes([("a", a)])
+
+    saved = pool_mod._STARTUP_STAGGER_SECONDS
+    pool_mod._STARTUP_STAGGER_SECONDS = 0.5  # would dominate if mis-applied
+    try:
+        t0 = asyncio.get_event_loop().time()
+        await pool.connect_all()
+        elapsed = asyncio.get_event_loop().time() - t0
+    finally:
+        pool_mod._STARTUP_STAGGER_SECONDS = saved
+
+    # One subprocess MCP must NOT pay the stagger — the gap is BETWEEN spawns.
+    assert elapsed < 0.4, (
+        f"single-subprocess connect_all took {elapsed:.3f}s — stagger applied at index 0"
+    )
+    assert a.entered
+    await pool.close_all()
+
+
+@test(
+    "mcp_pool_resilience",
     "connect_all doesn't raise when every MCP fails (empty pool is valid)",
 )
 async def t_all_fail_no_raise(ctx: TestContext) -> None:
