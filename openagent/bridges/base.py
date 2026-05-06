@@ -226,13 +226,36 @@ class BaseBridge:
     async def _listen_gateway(self) -> None:
         """Listen for Gateway responses and dispatch to pending collectors."""
         import aiohttp
+        exit_kind = "normal"
+        last_msg_type: str | None = None
         try:
             async for msg in self._ws:
+                last_msg_type = msg.type.name if hasattr(msg.type, "name") else str(msg.type)
                 if msg.type == aiohttp.WSMsgType.TEXT:
                     await self._handle_gateway_frame(json.loads(msg.data))
                 elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                    exit_kind = last_msg_type or "closed_or_error"
                     break
+        except Exception as e:  # noqa: BLE001
+            # Capturing here (not just relying on the silent ``finally``) so
+            # the next reproduction has the exception type + traceback. The
+            # bridge's ``start()`` retry loop only sees the orphan-future
+            # reason string, which strips the exception type and frame info
+            # — that's how the v0.12.50+ deflate-error class went undiagnosed
+            # for so long: the WS died, futures were orphaned, no one logged
+            # what actually killed the listener.
+            exit_kind = f"exception:{type(e).__name__}"
+            logger.exception(
+                "%s bridge gateway listener died (last_msg_type=%s)",
+                self.name, last_msg_type,
+            )
+            elog(
+                "bridge.listener_died", level="error", name=self.name,
+                error_type=type(e).__name__, error=str(e),
+                last_msg_type=last_msg_type,
+            )
         finally:
+            elog("bridge.listener_exit", name=self.name, exit_kind=exit_kind)
             self._resolve_orphaned_futures("Gateway connection lost")
 
     async def _handle_gateway_frame(self, data: dict) -> None:

@@ -747,10 +747,14 @@ class Gateway:
             "network_id": cert.network_id,
         })
 
+        frames_seen = 0
+        last_msg_type: str | None = None
         try:
             async for msg in ws:
+                last_msg_type = msg.type.name if hasattr(msg.type, "name") else str(msg.type)
                 if msg.type != WSMsgType.TEXT:
                     break
+                frames_seen += 1
                 try:
                     data = json.loads(msg.data)
                 except json.JSONDecodeError:
@@ -797,7 +801,23 @@ class Gateway:
                     await self._handle_stream_frame(ws, client_id, data)
 
         except Exception as e:
-            elog("gateway.ws_error", level="error", client_id=client_id, error=str(e))
+            # Capture exception TYPE + traceback in addition to the bare
+            # ``str(e)``. The deflate-error class fired on the fleet from
+            # v0.12.48 onward (in-process iroh bridge transport) shows up
+            # here as ``Error -3 while decompressing data: incorrect header
+            # check`` — opaque without the type and frame info needed to
+            # pinpoint whether aiohttp's permessage-deflate decoder is
+            # cracking on a truncated frame, a corrupted RSV1 bit, or
+            # something further down the iroh-stream byte pump.
+            logger.exception(
+                "gateway WS handler died: client_id=%s frames_seen=%d last_msg_type=%s",
+                client_id, frames_seen, last_msg_type,
+            )
+            elog(
+                "gateway.ws_error", level="error", client_id=client_id,
+                error=str(e), error_type=type(e).__name__,
+                frames_seen=frames_seen, last_msg_type=last_msg_type,
+            )
         finally:
             # Identity-aware cleanup: a reconnected ws may have already
             # taken this client_id's slot via ``_adopt_sessions_to_ws``.

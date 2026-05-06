@@ -563,6 +563,49 @@ async def t_send_message_error(ctx: TestContext) -> None:
     assert result["text"] == "boom", result
 
 
+@test("bridges", "_listen_gateway emits bridge.listener_died with exception type when the WS iterator raises")
+async def t_listen_gateway_diag_emits_on_crash(ctx: TestContext) -> None:
+    """Regression test for the diag introduced after the v0.12.50+
+    fleet-wide ``gateway.ws_error: Error -3 while decompressing data:
+    incorrect header check`` outage. Before the diag the listener died
+    silently inside the ``finally`` clause and the bridge's ``start()``
+    retry loop only saw the orphan-future reason string — no exception
+    type, no traceback. The patch wraps the iteration in a guarded
+    ``except`` and emits ``bridge.listener_died`` so the next tick has
+    actionable data."""
+    from unittest.mock import patch
+    import openagent.bridges.base as bridge_mod
+
+    fb = _FakeBridge()
+    real = fb._real
+
+    class _BoomWS:
+        def __aiter__(self):
+            return self
+        async def __anext__(self):
+            raise RuntimeError("simulated zlib boom")
+
+    real._ws = _BoomWS()
+    events: list[tuple[str, dict]] = []
+    def capture(event: str, *_a, **kw):
+        events.append((event, kw))
+    # Patch the imported binding inside the bridge module — patching
+    # ``openagent.core.logging.elog`` doesn't help because base.py
+    # already pulled it into its module namespace at import time.
+    with patch.object(bridge_mod, "elog", side_effect=capture):
+        await real._listen_gateway()
+
+    died = [(e, kw) for e, kw in events if e == "bridge.listener_died"]
+    assert died, f"expected bridge.listener_died, got: {[e for e, _ in events]}"
+    _, kw = died[0]
+    assert kw.get("error_type") == "RuntimeError", kw
+    assert kw.get("name") == "fake", kw
+    assert "simulated zlib boom" in kw.get("error", ""), kw
+
+    exit_evt = [(e, kw) for e, kw in events if e == "bridge.listener_exit"]
+    assert exit_evt and exit_evt[0][1].get("exit_kind", "").startswith("exception:RuntimeError"), exit_evt
+
+
 @test("bridges", "telegram bridge wires ApplicationBuilder().concurrent_updates(True)")
 async def t_telegram_concurrent_updates(ctx: TestContext) -> None:
     """Without concurrent_updates(True), python-telegram-bot dispatches
