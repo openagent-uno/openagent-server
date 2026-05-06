@@ -343,6 +343,36 @@ class AgentServer:
             )
             return None
 
+    async def _publish_coordinator_addr_cache(self) -> None:
+        """Snapshot the iroh node's reachable addresses so the
+        ``openagent network invite`` CLI can embed them in tickets.
+
+        Members (non-coordinators) skip this — their tickets are minted
+        by the coordinator they joined, not by themselves. Quiet on
+        failure: the worst case is missing optimisation, not a broken
+        coordinator.
+        """
+        from openagent.core.paths import get_agent_dir
+        from openagent.network.coordinator_addr_cache import write_cache
+
+        if self._network_state is None or self._network_state.role != "coordinator":
+            return
+        agent_dir = get_agent_dir()
+        if agent_dir is None:
+            return
+        try:
+            relay_url, direct = await self._network_state.iroh_node.local_node_addr()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("local_node_addr failed during cache publish: %s", e)
+            return
+        node_id = await self._network_state.node_id()
+        write_cache(
+            agent_dir,
+            node_id=node_id,
+            relay_url=relay_url,
+            direct_addresses=direct,
+        )
+
     # ── Lifecycle ──
 
     async def start(self) -> None:
@@ -375,6 +405,7 @@ class AgentServer:
             self._gateway._bridges = self._bridges  # populated below
             self._gateway._prepare_iroh_site()
             await self._network_state.start()
+            await self._publish_coordinator_addr_cache()
             await self._gateway.start()
 
             # 2.5. Bridge session — mints a coordinator-signed cert for

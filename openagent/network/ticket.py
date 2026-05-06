@@ -25,6 +25,13 @@ Wire format::
         network_id: <network UUID>,
         role: "user" | "device" | "agent",
         bind_to: <handle or empty>,
+        # Optional fields (added in v0.12.54). Embed the coordinator's
+        # iroh relay URL + direct addresses so first-contact dials skip
+        # iroh discovery — a hard requirement on macOS DMG builds where
+        # mDNS is gated behind Local Network access permission and pkarr
+        # DNS doesn't always resolve same-machine coordinators.
+        relay_url?: <coordinator home relay URL or empty/missing>,
+        addresses?: <list of "ip:port" direct UDP addrs or missing>,
     })
 
 Base32 (no padding, lowercase) keeps the string URL-safe + double-clickable
@@ -58,9 +65,18 @@ class InviteTicket:
     network_id: str
     role: str
     bind_to: str = ""
+    # Optional address hints — see module docstring. ``None`` (rather
+    # than empty containers) means "this ticket was minted before the
+    # field existed"; the client falls back to iroh discovery.
+    relay_url: str | None = None
+    addresses: tuple[str, ...] | None = None
 
     def encode(self) -> str:
-        return _encode_payload({
+        # Only emit the optional fields when populated — keeps tickets
+        # minted by older deployments byte-identical to before, and
+        # avoids a wave of "ticket changed!" support tickets after the
+        # rollout.
+        payload: dict = {
             "v": TICKET_VERSION,
             "code": self.code,
             "node_id": self.coordinator_node_id,
@@ -68,12 +84,24 @@ class InviteTicket:
             "network_id": self.network_id,
             "role": self.role,
             "bind_to": self.bind_to,
-        })
+        }
+        if self.relay_url:
+            payload["relay_url"] = self.relay_url
+        if self.addresses:
+            payload["addresses"] = list(self.addresses)
+        return _encode_payload(payload)
 
     @classmethod
     def decode(cls, s: str) -> "InviteTicket":
         obj = _decode_payload(s)
         try:
+            raw_addresses = obj.get("addresses")
+            addresses: tuple[str, ...] | None = None
+            if isinstance(raw_addresses, list):
+                cleaned = tuple(a for a in raw_addresses if isinstance(a, str) and a)
+                addresses = cleaned or None
+            raw_relay = obj.get("relay_url")
+            relay_url = raw_relay if isinstance(raw_relay, str) and raw_relay else None
             return cls(
                 code=str(obj["code"]),
                 coordinator_node_id=str(obj["node_id"]),
@@ -81,6 +109,8 @@ class InviteTicket:
                 network_id=str(obj["network_id"]),
                 role=str(obj.get("role", "user")),
                 bind_to=str(obj.get("bind_to", "")),
+                relay_url=relay_url,
+                addresses=addresses,
             )
         except KeyError as e:
             raise TicketError(f"ticket missing field: {e}") from e

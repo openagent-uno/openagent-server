@@ -178,6 +178,35 @@ class IrohNode:
 
     # ── Identity ─────────────────────────────────────────────────────
 
+    async def local_node_addr(self) -> tuple[str | None, tuple[str, ...]]:
+        """Return ``(relay_url, direct_addresses)`` for this node.
+
+        Used by the coordinator to publish its reachable addresses for
+        clients minting invite tickets — the client embeds them in the
+        ticket so first-contact dials skip iroh discovery (mDNS often
+        gated by macOS Local Network access; pkarr DNS doesn't always
+        resolve same-machine coordinators on time).
+
+        Returns ``(None, ())`` when the node isn't running. Empty list
+        for ``direct_addresses`` is a valid result (the node is bound
+        but hasn't observed any reachable addr yet); caller decides
+        whether to write a partial record or skip.
+        """
+        if self._node is None:
+            return None, ()
+        try:
+            net = self._node.net()
+            addr = await net.node_addr()
+            # iroh-py 0.35: ``relay_url`` and ``direct_addresses`` on
+            # ``NodeAddr`` are *methods*, not properties (the JS sibling
+            # exposes them as fields — easy to miss).
+            relay = addr.relay_url()
+            direct_raw = addr.direct_addresses() or []
+            return (relay if relay else None), tuple(direct_raw)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("local_node_addr failed: %s", e)
+            return None, ()
+
     async def node_id(self) -> str:
         """Return the public NodeId string for this endpoint.
 

@@ -186,6 +186,7 @@ async def mint_first_user_invite(
     valid — otherwise mints a fresh one. Returns ``None`` once any user
     has joined, so the "first-time join" banner stops nagging.
     """
+    from openagent.network.coordinator_addr_cache import read_cache
     from openagent.network.ticket import InviteTicket
 
     db = await _open_db(config)
@@ -214,6 +215,7 @@ async def mint_first_user_invite(
                 uses=1,
             )
         identity = load_or_create_identity(_identity_path(agent_dir))
+        relay_url, addresses = read_cache(agent_dir)
         ticket = InviteTicket(
             code=invite.code,
             coordinator_node_id=_node_id_for(identity),
@@ -221,6 +223,8 @@ async def mint_first_user_invite(
             network_id=network_row["network_id"],
             role="user",
             bind_to="",
+            relay_url=relay_url,
+            addresses=addresses or None,
         )
         return ticket.encode(), {
             "code": invite.code,
@@ -244,6 +248,7 @@ async def list_active_invite_tickets(
     on startup so the operator doesn't have to run ``network invite``
     just to see what's already minted.
     """
+    from openagent.network.coordinator_addr_cache import read_cache
     from openagent.network.ticket import InviteTicket
 
     db = await _open_db(config)
@@ -252,6 +257,8 @@ async def list_active_invite_tickets(
         invites = await store.list_invitations(include_expired=False)
         identity = load_or_create_identity(_identity_path(agent_dir))
         node_id = _node_id_for(identity)
+        relay_url, addresses = read_cache(agent_dir)
+        addresses_or_none = addresses or None
         out: list[dict] = []
         for inv in invites:
             if inv.uses_left <= 0:
@@ -263,6 +270,8 @@ async def list_active_invite_tickets(
                 network_id=network_row["network_id"],
                 role=inv.role,
                 bind_to=inv.bind_to_handle or "",
+                relay_url=relay_url,
+                addresses=addresses_or_none,
             )
             out.append({
                 "ticket": ticket.encode(),
@@ -406,6 +415,7 @@ def cmd_invite(ctx, role: str, bind_to: str | None, ttl: int, uses: int):
 
 
 async def _run_invite(ctx, role: str, bind_to: str | None, ttl: int, uses: int):
+    from openagent.network.coordinator_addr_cache import read_cache
     from openagent.network.ticket import InviteTicket
 
     agent_dir = _agent_dir_or_die()
@@ -426,6 +436,11 @@ async def _run_invite(ctx, role: str, bind_to: str | None, ttl: int, uses: int):
             bind_to_handle=bind_to,
         )
         identity = load_or_create_identity(_identity_path(agent_dir))
+        # Optional address hints — only present when the coordinator
+        # has run at least once on this machine since the addr-cache
+        # feature shipped. Missing/empty = old behaviour (client falls
+        # back to iroh discovery on the dial).
+        relay_url, addresses = read_cache(agent_dir)
         ticket = InviteTicket(
             code=invite.code,
             coordinator_node_id=_node_id_for(identity),
@@ -433,6 +448,8 @@ async def _run_invite(ctx, role: str, bind_to: str | None, ttl: int, uses: int):
             network_id=row["network_id"],
             role=invite.role,
             bind_to=bind_to or "",
+            relay_url=relay_url,
+            addresses=addresses or None,
         )
         ticket_str = ticket.encode()
         console.print()
