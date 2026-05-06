@@ -58,7 +58,7 @@ jobs:
           fi
       - name: Build Electron app
         working-directory: app/desktop
-        run: npx tsc && npx electron-builder ${{ matrix.build_flag }} --publish never
+        run: npx tsc && node ./scripts/bundle-main.js && npx electron-builder ${{ matrix.build_flag }} --publish never
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CSC_LINK: ${{ runner.os == 'macOS' && secrets.CSC_LINK || '' }}
