@@ -529,6 +529,72 @@ async def t_forget_session_fans_out_to_forget(ctx: TestContext) -> None:
 
 @test(
     "smart_router_hybrid",
+    "forget_session clears dormant claude-cli DB binding so /clear can switch frameworks",
+)
+async def t_forget_session_clears_dormant_claude_binding(ctx: TestContext) -> None:
+    """Regression for the Telegram `/clear` framework-switch bug.
+
+    Real-world sequence:
+      1. Session previously ran on claude-cli, so ``sdk_sessions`` holds
+         a row for ``tg:<uid>``.
+      2. Operator disables claude-cli models, leaving only agno enabled.
+      3. User sends `/clear` and expects the next message to start fresh.
+
+    Before the fix, ``SmartRouter.forget_session`` only delegated to a
+    live ``ClaudeCLIRegistry`` instance. With no live registry/instance
+    in memory, the stale ``sdk_sessions`` row survived, the router still
+    saw the session as bound to claude-cli, and the next turn failed
+    with "No claude-cli model available for this session."
+    """
+    import uuid as _uuid
+    from openagent.memory.db import MemoryDB
+
+    tmp = ctx.db_path.with_name(f"sr-clear-switch-{_uuid.uuid4().hex[:8]}.db")
+    try:
+        db = MemoryDB(str(tmp))
+        await db.connect()
+        providers = [
+            {"id": 1, "name": "openai", "framework": "agno",
+             "api_key": "sk-x", "enabled": True,
+             "models": [{"id": 10, "model": "gpt-4o-mini", "enabled": True}]},
+        ]
+        router = _make_router(providers)
+        router.set_db(db)
+        await db.set_sdk_session("tg:switch", "sdk-stale", provider="claude-cli")
+
+        # Post-restart fallback visibility: no live claude registry yet,
+        # but the router must still surface the DB-backed session id.
+        assert "tg:switch" in router.known_session_ids(), router.known_session_ids()
+
+        before = await router.generate(
+            [{"role": "user", "content": "hi"}],
+            session_id="tg:switch",
+        )
+        assert before.stop_reason == "error"
+        assert "No claude-cli model available for this session." in before.content
+
+        seen: list[str] = []
+        await _stub_dispatch(router, seen)
+        await router.forget_session("tg:switch")
+        assert await db.get_session_binding("tg:switch") is None
+        assert await db.get_sdk_session("tg:switch") is None
+
+        after = await router.generate(
+            [{"role": "user", "content": "hi again"}],
+            session_id="tg:switch",
+        )
+        assert after.model == "openai:gpt-4o-mini", after.model
+        assert seen == ["openai:gpt-4o-mini"], seen
+        await db.close()
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+@test(
+    "smart_router_hybrid",
     "known_session_ids aggregates from underlying models (post-restart fallback)",
 )
 async def t_known_session_ids_aggregates(ctx: TestContext) -> None:
@@ -552,5 +618,3 @@ async def t_known_session_ids_aggregates(ctx: TestContext) -> None:
 
     ids = router.known_session_ids()
     assert sorted(ids) == ["discord:42", "tg:aaa", "tg:bbb", "tg:ccc"], ids
-
-

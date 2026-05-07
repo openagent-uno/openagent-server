@@ -841,6 +841,77 @@ async def t_telegram_seen_set_bounded(ctx: TestContext) -> None:
     assert bridge._is_fresh_update(_FakeTgUpdate(update_id=first_id))
 
 
+@test("bridges", "telegram stop force-cancels leaked polling task after updater.stop timeout")
+async def t_telegram_stop_force_cancels_leaked_poller(ctx: TestContext) -> None:
+    import asyncio
+    import openagent.bridges.telegram as tg
+
+    bridge = _fresh_telegram_bridge()
+
+    async def _noop_flush():
+        return None
+
+    bridge.flush_updates_offset = _noop_flush  # type: ignore[assignment]
+
+    poller_cancelled = asyncio.Event()
+
+    async def _poller():
+        try:
+            while True:
+                await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            poller_cancelled.set()
+            raise
+
+    poll_task = asyncio.create_task(_poller(), name="test-telegram-poller")
+
+    class _FakeUpdater:
+        def __init__(self) -> None:
+            self._Updater__polling_task = poll_task
+            self._Updater__polling_task_stop_event = asyncio.Event()
+            self._Updater__polling_cleanup_cb = object()
+            self._running = True
+
+        async def stop(self) -> None:
+            await asyncio.sleep(10)
+
+        async def shutdown(self) -> None:
+            return None
+
+    class _FakeApp:
+        def __init__(self) -> None:
+            self.updater = _FakeUpdater()
+
+        async def stop(self) -> None:
+            return None
+
+        async def shutdown(self) -> None:
+            return None
+
+    app = _FakeApp()
+    bridge._app = app
+
+    old_stop_timeout = tg._TG_UPDATER_STOP_TIMEOUT
+    old_force_timeout = tg._TG_FORCE_POLLING_CANCEL_TIMEOUT
+    tg._TG_UPDATER_STOP_TIMEOUT = 0.01
+    tg._TG_FORCE_POLLING_CANCEL_TIMEOUT = 0.2
+    try:
+        await bridge.stop()
+        await asyncio.wait_for(poller_cancelled.wait(), timeout=0.5)
+        assert app.updater._Updater__polling_task is None
+        assert app.updater._Updater__polling_cleanup_cb is None
+        assert not app.updater._Updater__polling_task_stop_event.is_set()
+    finally:
+        tg._TG_UPDATER_STOP_TIMEOUT = old_stop_timeout
+        tg._TG_FORCE_POLLING_CANCEL_TIMEOUT = old_force_timeout
+        if not poll_task.done():
+            poll_task.cancel()
+            try:
+                await poll_task
+            except asyncio.CancelledError:
+                pass
+
+
 # ── WhatsApp status-throttle tests ────────────────────────────────────
 #
 # WhatsApp can't edit messages — every ``update_status`` call would be a

@@ -245,6 +245,10 @@ class SmartRouter(BaseModel):
                 await self._db.delete_session_binding(session_id)
             except Exception as e:  # noqa: BLE001 — best effort
                 logger.debug("delete_session_binding %s: %s", session_id, e)
+            try:
+                await self._db.delete_sdk_session(session_id)
+            except Exception as e:  # noqa: BLE001 — best effort
+                logger.debug("delete_sdk_session %s: %s", session_id, e)
         for model in self._agno_providers.values():
             fn = getattr(model, "forget_session", None)
             if callable(fn):
@@ -313,6 +317,13 @@ class SmartRouter(BaseModel):
                     seen.update(fn())
                 except Exception as e:  # noqa: BLE001
                     logger.debug("known_session_ids claude: %s", e)
+        if self._db is not None:
+            try:
+                from openagent.models.claude_cli import _known_sdk_session_ids_from_db
+
+                seen.update(_known_sdk_session_ids_from_db(self._db))
+            except Exception as e:  # noqa: BLE001
+                logger.debug("known_session_ids claude db snapshot: %s", e)
         return sorted(seen)
 
     # ── dispatch plumbing ───────────────────────────────────────────

@@ -32,6 +32,7 @@ import json as _json
 import logging
 import os
 import re
+import sqlite3
 import time
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -78,6 +79,38 @@ def _sanitize_claude_model_id(model_id: str) -> str:
     if not model_id:
         return model_id
     return _MODEL_DOTTED_VERSION_RE.sub(r"\1-\2-\3", model_id)
+
+
+def _known_sdk_session_ids_from_db(
+    db: Any,
+    *,
+    provider: str = "claude-cli",
+) -> set[str]:
+    """Best-effort sync snapshot of persisted ``sdk_sessions`` rows.
+
+    ``known_session_ids()`` is intentionally synchronous, but the
+    gateway's post-restart ``/clear`` fallback needs it to surface
+    claude-cli sessions that only exist in SQLite (no live subprocess
+    yet, no in-memory registry entry yet). Reading the DB directly keeps
+    the public contract synchronous while avoiding a startup hydration
+    task.
+    """
+    db_path = getattr(db, "db_path", None)
+    if not db_path:
+        return set()
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=0.2)
+        try:
+            rows = conn.execute(
+                "SELECT session_id FROM sdk_sessions "
+                "WHERE provider = ? OR provider IS NULL",
+                (provider,),
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        return set()
+    return {str(row[0]) for row in rows if row and row[0]}
 
 
 # Close idle clients after 24h. Was 10 min, which caused user-visible
@@ -611,7 +644,9 @@ class ClaudeCLI(BaseModel):
         (``tg:<uid>``, ``disc:<uid>`` …) never made it back into the
         gateway's in-memory SessionManager after a restart.
         """
-        return sorted(self._sessions.keys())
+        seen = set(self._sessions.keys())
+        seen.update(_known_sdk_session_ids_from_db(self._db))
+        return sorted(seen)
 
     # ── persistence (background, but retained) ─────────────────────────
 
@@ -1300,12 +1335,18 @@ class ClaudeCLIRegistry(BaseModel):
             except Exception as e:  # noqa: BLE001
                 logger.debug("registry.forget_session shutdown: %s", e)
         self._session_model.pop(session_id, None)
+        if self._db is not None:
+            try:
+                await self._db.delete_sdk_session(session_id)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("registry.forget_session db delete %s: %s", session_id, e)
 
     def known_session_ids(self) -> list[str]:
         seen: set[str] = set()
         for inst in self._instances.values():
             seen.update(inst.known_session_ids())
         seen.update(self._session_model.keys())
+        seen.update(_known_sdk_session_ids_from_db(self._db))
         return sorted(seen)
 
     async def commit_partial_assistant(self, session_id: str, text: str) -> None:
@@ -1435,6 +1476,5 @@ class ClaudeCLIRegistry(BaseModel):
             model_override=target_model,
         ):
             yield delta
-
 
 

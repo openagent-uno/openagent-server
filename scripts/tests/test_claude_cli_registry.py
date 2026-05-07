@@ -7,6 +7,7 @@ without external dependencies.
 """
 from __future__ import annotations
 
+import uuid
 from typing import Any
 
 from ._framework import TestContext, test
@@ -111,3 +112,51 @@ async def t_fan_out_set_db(ctx: TestContext) -> None:
     registry.set_db(db)
     assert inst_a._db is db
     assert inst_b._db is db
+
+
+@test("claude_cli_registry", "forget_session deletes DB-backed resume rows even without a live instance")
+async def t_registry_forget_without_live_instance_clears_db(ctx: TestContext) -> None:
+    from openagent.memory.db import MemoryDB
+    from openagent.models.claude_cli import ClaudeCLIRegistry
+
+    tmp = ctx.db_path.with_name(f"claude-reg-forget-{uuid.uuid4().hex[:8]}.db")
+    try:
+        db = MemoryDB(str(tmp))
+        await db.connect()
+        await db.set_sdk_session("tg:db-only", "sdk-db-only", provider="claude-cli")
+
+        registry = ClaudeCLIRegistry(default_model="claude-sonnet-4-6")
+        registry.set_db(db)
+
+        await registry.forget_session("tg:db-only")
+
+        assert await db.get_sdk_session("tg:db-only") is None
+        await db.close()
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+@test("claude_cli_registry", "known_session_ids includes DB-backed resume rows")
+async def t_registry_known_session_ids_include_db_rows(ctx: TestContext) -> None:
+    from openagent.memory.db import MemoryDB
+    from openagent.models.claude_cli import ClaudeCLIRegistry
+
+    tmp = ctx.db_path.with_name(f"claude-reg-known-{uuid.uuid4().hex[:8]}.db")
+    try:
+        db = MemoryDB(str(tmp))
+        await db.connect()
+        await db.set_sdk_session("tg:db-known", "sdk-known", provider="claude-cli")
+
+        registry = ClaudeCLIRegistry(default_model="claude-sonnet-4-6")
+        registry.set_db(db)
+
+        assert "tg:db-known" in registry.known_session_ids()
+        await db.close()
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass

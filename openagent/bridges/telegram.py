@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import tempfile
 from collections import deque
@@ -44,6 +45,10 @@ _TG_APP_SHUTDOWN_TIMEOUT = 3.0
 # Very short timeout for the manual offset-advance POST — it's a one-shot
 # confirmation; if Telegram is slow we'd rather skip than block shutdown.
 _TG_OFFSET_FLUSH_TIMEOUT = 2.0
+# Extra grace for the force-cancel fallback. Only used when the library's
+# own ``updater.stop()`` exceeded its deadline and left the polling task
+# running in the background.
+_TG_FORCE_POLLING_CANCEL_TIMEOUT = 1.0
 
 # How many recent update_ids to remember for duplicate detection. Telegram
 # can re-deliver an Update when our offset ACK was lost (network timeout
@@ -245,6 +250,65 @@ class TelegramBridge(BaseBridge):
                 error=str(e) or type(e).__name__,
             )
 
+    async def _force_stop_updater_poller(self, app) -> None:
+        """Best-effort kill switch for a leaked PTB polling task.
+
+        ``python-telegram-bot`` keeps the long-poll loop on a private
+        ``Updater.__polling_task``. If ``updater.stop()`` times out while
+        awaiting that task, the old ``getUpdates`` call can survive into
+        the next bridge boot and Telegram replies with 409 Conflict on
+        every poll. We already flush the offset manually before teardown,
+        so it's safe to skip PTB's cleanup callback here and cancel the
+        task forcefully.
+        """
+        updater = getattr(app, "updater", None)
+        if updater is None:
+            return
+        poll_task = getattr(updater, "_Updater__polling_task", None)
+        stop_event = getattr(updater, "_Updater__polling_task_stop_event", None)
+        cleanup_cb = getattr(updater, "_Updater__polling_cleanup_cb", None)
+
+        if stop_event is not None:
+            with contextlib.suppress(Exception):
+                stop_event.set()
+
+        if isinstance(poll_task, asyncio.Task) and not poll_task.done():
+            poll_task.cancel()
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(poll_task),
+                    timeout=_TG_FORCE_POLLING_CANCEL_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                elog(
+                    "bridge.telegram.force_cancel_timeout",
+                    level="warning",
+                    timeout=_TG_FORCE_POLLING_CANCEL_TIMEOUT,
+                )
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:  # noqa: BLE001
+                elog(
+                    "bridge.telegram.force_cancel_error",
+                    level="warning",
+                    error=str(e) or type(e).__name__,
+                )
+
+        if poll_task is not None:
+            setattr(updater, "_Updater__polling_task", None)
+        if cleanup_cb is not None:
+            setattr(updater, "_Updater__polling_cleanup_cb", None)
+        if stop_event is not None:
+            with contextlib.suppress(Exception):
+                stop_event.clear()
+        with contextlib.suppress(Exception):
+            updater._running = False
+        elog(
+            "bridge.telegram.updater_force_stopped",
+            had_polling_task=bool(poll_task),
+            dropped_cleanup=cleanup_cb is not None,
+        )
+
     async def stop(self) -> None:
         self._should_stop = True
         app = self._app
@@ -283,6 +347,8 @@ class TelegramBridge(BaseBridge):
                         phase=label,
                         timeout=deadline,
                     )
+                    if label == "updater.stop":
+                        await self._force_stop_updater_poller(app)
                 except asyncio.CancelledError:
                     # Do not propagate — a CancelledError from httpx/httpcore
                     # during library cleanup must not bleed out into the
@@ -292,6 +358,8 @@ class TelegramBridge(BaseBridge):
                         level="warning",
                         phase=label,
                     )
+                    if label == "updater.stop":
+                        await self._force_stop_updater_poller(app)
                 except Exception as e:  # noqa: BLE001 — best-effort
                     elog(
                         "bridge.telegram.stop_error",
