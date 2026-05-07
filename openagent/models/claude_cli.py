@@ -33,6 +33,7 @@ import logging
 import os
 import re
 import time
+from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Awaitable, Callable
 
@@ -378,7 +379,18 @@ class ClaudeCLI(BaseModel):
             new_client = ClaudeSDKClient(
                 options=self._build_options(system=system, sdk_session_id=resume_id)
             )
-            await new_client.connect()
+            try:
+                await new_client.connect()
+            except BaseException:
+                # connect() spawns the claude subprocess inside transport.connect();
+                # if the subsequent initialize() handshake fails (e.g. "Control
+                # request timeout"), the subprocess is left orphaned. Each retry
+                # then leaks another process — under load this snowballs into the
+                # crash described in performa boss outage 2026-05-07. Best-effort
+                # disconnect releases the partial state.
+                with suppress(Exception):
+                    await new_client.disconnect()
+                raise
             return new_client
 
         resume_sid = session.sdk_session_id

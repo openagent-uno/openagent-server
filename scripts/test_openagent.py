@@ -186,6 +186,9 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_claude_cli_text_recovery",
     # Stale-resume self-heal — same monkey-patching pattern.
     "test_claude_cli_stale_resume",
+    # Failed connect() must call disconnect() so the partially-spawned
+    # claude subprocess doesn't leak (performa boss outage 2026-05-07).
+    "test_claude_cli_connect_cleanup",
     # forget_session must drain pending sdk_session writes so a
     # background persist can't resurrect the deleted resume id.
     "test_claude_cli_forget_drains_writes",
