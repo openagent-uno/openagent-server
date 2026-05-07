@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -136,36 +137,39 @@ class DiscordBridge(BaseBridge):
             files_info = []
             voice_detected = False
             tmp = tempfile.mkdtemp(prefix="oa_dc_")
-            for att in message.attachments:
-                if is_blocked_attachment(att.filename):
-                    blocked.append(att.filename)
-                    continue
-                ct = att.content_type or ""
-                is_voice = is_audio_file(att.filename, ct)
-                path = str(Path(tmp) / att.filename)
-                await att.save(path)
+            try:
+                for att in message.attachments:
+                    if is_blocked_attachment(att.filename):
+                        blocked.append(att.filename)
+                        continue
+                    ct = att.content_type or ""
+                    is_voice = is_audio_file(att.filename, ct)
+                    path = str(Path(tmp) / att.filename)
+                    await att.save(path)
 
-                if is_voice:
-                    voice_detected = True
-                    t = await self.transcribe_with_fallback(path)
-                    content = f"{content}\n{t}" if content else t
-                elif ct.startswith("image/"):
-                    files_info.append(f"- image: {att.filename} — local path: {path}")
-                else:
-                    files_info.append(f"- file: {att.filename} — local path: {path}")
+                    if is_voice:
+                        voice_detected = True
+                        t = await self.transcribe_with_fallback(path)
+                        content = f"{content}\n{t}" if content else t
+                    elif ct.startswith("image/"):
+                        files_info.append(f"- image: {att.filename} — local path: {path}")
+                    else:
+                        files_info.append(f"- file: {att.filename} — local path: {path}")
 
-            if blocked:
-                await message.channel.send(f"⚠️ Blocked: {', '.join(blocked)}")
-            if files_info:
-                content = prepend_context_block(content, build_attachment_context(files_info))
+                if blocked:
+                    await message.channel.send(f"⚠️ Blocked: {', '.join(blocked)}")
+                if files_info:
+                    content = prepend_context_block(content, build_attachment_context(files_info))
 
-            if not content:
-                return
+                if not content:
+                    return
 
-            await self.dispatch_turn(
-                message.channel, f"dc:{uid}", content,
-                voice_detected=voice_detected,
-            )
+                await self.dispatch_turn(
+                    message.channel, f"dc:{uid}", content,
+                    voice_detected=voice_detected,
+                )
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
 
         await client.start(self.token)
 

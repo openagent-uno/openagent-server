@@ -184,7 +184,7 @@ async def t_bound_to_claude_cli(ctx: TestContext) -> None:
             pass
 
 
-@test("smart_router_hybrid", "bound side with no enabled models returns a clear error")
+@test("smart_router_hybrid", "stale bound side with no enabled models self-heals to the remaining framework")
 async def t_bound_side_empty(ctx: TestContext) -> None:
     import uuid as _uuid
     from openagent.memory.db import MemoryDB
@@ -208,17 +208,22 @@ async def t_bound_side_empty(ctx: TestContext) -> None:
         # Session was bound to claude-cli but we have no claude-cli
         # models configured.
         await db.set_sdk_session("orphan", "sdk-id", provider="claude-cli")
-        # No claude-cli model in the catalog → classifier has nothing
-        # to pick; resolve_classifier_pick returns the empty-string
-        # primary_model and generate surfaces the error.
+        # No claude-cli model in the catalog. The router should forget
+        # the dead claude-cli binding and restart this session unbound
+        # so it can recover onto the remaining agno model.
         await _stub_classifier(router, None)
+        seen: list[str] = []
+        await _stub_dispatch(router, seen)
 
         resp = await router.generate(
             [{"role": "user", "content": "hi"}],
             session_id="orphan",
         )
-        assert resp.stop_reason == "error"
-        assert "claude-cli" in resp.content, resp.content
+        assert resp.stop_reason == "stop"
+        assert resp.model == "openai:gpt-4o-mini", resp.model
+        assert seen == ["openai:gpt-4o-mini"], seen
+        assert await db.get_sdk_session("orphan") is None
+        assert await db.get_session_binding("orphan") == "agno"
         await db.close()
     finally:
         try:
@@ -542,9 +547,8 @@ async def t_forget_session_clears_dormant_claude_binding(ctx: TestContext) -> No
 
     Before the fix, ``SmartRouter.forget_session`` only delegated to a
     live ``ClaudeCLIRegistry`` instance. With no live registry/instance
-    in memory, the stale ``sdk_sessions`` row survived, the router still
-    saw the session as bound to claude-cli, and the next turn failed
-    with "No claude-cli model available for this session."
+    in memory, the stale ``sdk_sessions`` row survived, so `/clear`
+    failed to reset the session onto the remaining agno framework.
     """
     import uuid as _uuid
     from openagent.memory.db import MemoryDB
@@ -565,13 +569,6 @@ async def t_forget_session_clears_dormant_claude_binding(ctx: TestContext) -> No
         # Post-restart fallback visibility: no live claude registry yet,
         # but the router must still surface the DB-backed session id.
         assert "tg:switch" in router.known_session_ids(), router.known_session_ids()
-
-        before = await router.generate(
-            [{"role": "user", "content": "hi"}],
-            session_id="tg:switch",
-        )
-        assert before.stop_reason == "error"
-        assert "No claude-cli model available for this session." in before.content
 
         seen: list[str] = []
         await _stub_dispatch(router, seen)

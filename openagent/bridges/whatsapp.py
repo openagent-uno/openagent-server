@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -95,6 +96,7 @@ class WhatsAppBridge(BaseBridge):
         msg_type = msg_data.get("typeMessage", "")
         text = ""
         voice_detected = False
+        temp_dirs: set[Path] = set()
 
         files_info = []
 
@@ -122,6 +124,7 @@ class WhatsAppBridge(BaseBridge):
             if url:
                 path = await self._download(url, "voice.ogg")
                 if path:
+                    temp_dirs.add(Path(path).parent)
                     voice_detected = True
                     text = await self.transcribe_with_fallback(path)
         elif msg_type == "imageMessage":
@@ -132,6 +135,7 @@ class WhatsAppBridge(BaseBridge):
                 fname = file_data.get("fileName", "image.jpg")
                 path = await self._download(url, fname)
                 if path:
+                    temp_dirs.add(Path(path).parent)
                     files_info.append(f"- image: {fname} — local path: {path}")
         elif msg_type == "documentMessage":
             file_data = msg_data.get("fileMessageData", {})
@@ -141,6 +145,7 @@ class WhatsAppBridge(BaseBridge):
             if url and not is_blocked_attachment(fname):
                 path = await self._download(url, fname)
                 if path:
+                    temp_dirs.add(Path(path).parent)
                     files_info.append(f"- file: {fname} — local path: {path}")
         elif msg_type == "videoMessage":
             file_data = msg_data.get("fileMessageData", {})
@@ -150,17 +155,22 @@ class WhatsAppBridge(BaseBridge):
             if url:
                 path = await self._download(url, fname)
                 if path:
+                    temp_dirs.add(Path(path).parent)
                     files_info.append(f"- video: {fname} — local path: {path}")
 
-        if files_info:
-            text = prepend_context_block(text, build_attachment_context(files_info))
+        try:
+            if files_info:
+                text = prepend_context_block(text, build_attachment_context(files_info))
 
-        if not text:
-            return
+            if not text:
+                return
 
-        await self.dispatch_turn(
-            chat_id, f"wa:{user_id}", text, voice_detected=voice_detected,
-        )
+            await self.dispatch_turn(
+                chat_id, f"wa:{user_id}", text, voice_detected=voice_detected,
+            )
+        finally:
+            for tmp_dir in temp_dirs:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
 
     # ── Platform primitives (consumed by BaseBridge.dispatch_turn) ──
     #

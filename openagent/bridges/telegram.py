@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import shutil
 import tempfile
 from collections import deque
 from dataclasses import dataclass, field
@@ -472,19 +473,22 @@ class TelegramBridge(BaseBridge):
         elog("bridge.message", bridge="telegram", user_id=uid)
         text = msg.caption or msg.text or ""
         tmp = tempfile.mkdtemp(prefix="oa_tg_")
-        extracted = await self._extract_files(msg, tmp)
-        if extracted.text_addition:
-            text = f"{text}\n{extracted.text_addition}" if text else extracted.text_addition
+        try:
+            extracted = await self._extract_files(msg, tmp)
+            if extracted.text_addition:
+                text = f"{text}\n{extracted.text_addition}" if text else extracted.text_addition
 
-        if extracted.files_info:
-            text = prepend_context_block(text, build_attachment_context(extracted.files_info))
+            if extracted.files_info:
+                text = prepend_context_block(text, build_attachment_context(extracted.files_info))
 
-        if not text:
-            return
+            if not text:
+                return
 
-        await self.dispatch_turn(
-            msg, f"tg:{uid}", text, voice_detected=extracted.voice_detected,
-        )
+            await self.dispatch_turn(
+                msg, f"tg:{uid}", text, voice_detected=extracted.voice_detected,
+            )
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
     async def _enqueue_media_group(self, uid: str, group_id: str, msg) -> None:
         """Buffer a media-group sibling and (re)arm the flush timer."""
@@ -551,36 +555,39 @@ class TelegramBridge(BaseBridge):
         text = "\n".join(captions)
 
         tmp = tempfile.mkdtemp(prefix="oa_tg_")
-        all_files: list[str] = []
-        any_voice = False
-        for m in messages:
-            try:
-                extracted = await self._extract_files(m, tmp)
-            except Exception as e:  # noqa: BLE001
-                elog(
-                    "bridge.media_group_extract_error",
-                    level="warning",
-                    bridge="telegram",
-                    error=str(e),
-                )
-                continue
-            if extracted.text_addition:
-                text = f"{text}\n{extracted.text_addition}" if text else extracted.text_addition
-            all_files.extend(extracted.files_info)
-            if extracted.voice_detected:
-                any_voice = True
+        try:
+            all_files: list[str] = []
+            any_voice = False
+            for m in messages:
+                try:
+                    extracted = await self._extract_files(m, tmp)
+                except Exception as e:  # noqa: BLE001
+                    elog(
+                        "bridge.media_group_extract_error",
+                        level="warning",
+                        bridge="telegram",
+                        error=str(e),
+                    )
+                    continue
+                if extracted.text_addition:
+                    text = f"{text}\n{extracted.text_addition}" if text else extracted.text_addition
+                all_files.extend(extracted.files_info)
+                if extracted.voice_detected:
+                    any_voice = True
 
-        if all_files:
-            text = prepend_context_block(text, build_attachment_context(all_files))
+            if all_files:
+                text = prepend_context_block(text, build_attachment_context(all_files))
 
-        if not text:
-            return
+            if not text:
+                return
 
-        # Anchor the status reply on the first sibling so the user sees
-        # a single in-flight indicator next to the group.
-        await self.dispatch_turn(
-            messages[0], f"tg:{uid}", text, voice_detected=any_voice,
-        )
+            # Anchor the status reply on the first sibling so the user sees
+            # a single in-flight indicator next to the group.
+            await self.dispatch_turn(
+                messages[0], f"tg:{uid}", text, voice_detected=any_voice,
+            )
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
     # ── Platform primitives (consumed by BaseBridge.dispatch_turn) ──
     #

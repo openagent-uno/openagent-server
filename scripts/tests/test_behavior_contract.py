@@ -13,11 +13,12 @@ Together they cover:
      ``claude-cli:anthropic:claude-opus-4-7``) is derived at read time,
      not stored in any table.
   5. SmartRouter picks per message via the classifier.
-  6. Framework binding is permanent per session — claude-cli sessions
-     only see claude-cli models; agno sessions only see agno models.
-  7. If no enabled model satisfies the session's framework, the turn
-     is rejected with a clear error (never crossed into the other
-     framework).
+  6. Framework binding is sticky per session while that framework still
+     has enabled models — claude-cli sessions only see claude-cli
+     models; agno sessions only see agno models.
+  7. If a stale binding points at a framework with zero enabled models,
+     the router forgets that dead session state and restarts unbound
+     instead of leaving the session permanently wedged.
   8. Cross-framework pin is refused (conversation would split).
   9. The ``model-manager`` MCP + REST + CLI can add / remove / edit
      providers, frameworks, and models at runtime.
@@ -270,8 +271,8 @@ async def t_router_honors_pin(ctx: TestContext) -> None:
         _cleanup(path)
 
 
-@test("contract", "bound claude-cli session with no enabled claude-cli model rejects")
-async def t_bound_framework_no_models_rejects(ctx: TestContext) -> None:
+@test("contract", "stale claude-cli binding with no enabled claude-cli model self-heals to agno")
+async def t_bound_framework_no_models_self_heals(ctx: TestContext) -> None:
     from openagent.models.smart_router import SmartRouter
 
     db, path = await _tmp_db(ctx, "no-cli-models")
@@ -297,12 +298,22 @@ async def t_bound_framework_no_models_rejects(ctx: TestContext) -> None:
             return None
 
         router._classify = _fake_classify  # type: ignore[assignment]
+        seen: list[str] = []
+
+        async def _fake_dispatch(runtime_id, *_a, **_kw):
+            seen.append(runtime_id)
+            return _FakeResp("ok", runtime_id)
+
+        router._dispatch = _fake_dispatch  # type: ignore[assignment]
 
         resp = await router.generate(
             [{"role": "user", "content": "hi"}], session_id="orphan",
         )
-        assert resp.stop_reason == "error"
-        assert "claude-cli" in resp.content.lower()
+        assert resp.stop_reason == "stop"
+        assert resp.model == "openai:gpt-4o-mini", resp.model
+        assert seen == ["openai:gpt-4o-mini"], seen
+        assert await db.get_sdk_session("orphan") is None
+        assert await db.get_session_binding("orphan") == "agno"
     finally:
         await db.close()
         _cleanup(path)

@@ -701,7 +701,7 @@ class StreamSession:
                 continue
             try:
                 tmp = tempfile.NamedTemporaryFile(
-                    prefix=f"{stream}-snapshot-",
+                    prefix=f"oa_{stream}_snapshot_",
                     suffix=".jpg",
                     delete=False,
                 )

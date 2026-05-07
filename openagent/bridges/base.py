@@ -11,6 +11,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import tempfile
+from pathlib import Path
 from typing import Any, Callable, Awaitable
 
 from openagent.channels.base import (
@@ -510,9 +513,41 @@ class BaseBridge:
                 await self.send_attachment(post_target, att)
             except Exception as e:  # noqa: BLE001
                 logger.error("%s attachment send error: %s", self.name, e)
+            finally:
+                self._cleanup_owned_temp_artifact(att.path)
 
         clean = self.append_model_feedback(clean, response.get("model"))
         await self.send_response_text(post_target, clean)
+
+    @staticmethod
+    def _cleanup_owned_temp_artifact(path: str | None) -> None:
+        """Best-effort unlink of bridge-owned temp files.
+
+        We only remove files we can confidently identify as OpenAgent's
+        own ephemeral artifacts: direct children of the OS temp dir whose
+        basename starts with ``oa_``. This covers voice replies, stream
+        snapshots, uploads, and similar per-turn scratch files while
+        avoiding accidental deletion of arbitrary user files the agent may
+        have intentionally attached by local path.
+        """
+        if not path:
+            return
+        try:
+            temp_root = Path(tempfile.gettempdir()).resolve()
+            candidate = Path(path).resolve()
+        except Exception:
+            return
+        if candidate.parent != temp_root:
+            return
+        if not candidate.name.startswith("oa_"):
+            return
+        try:
+            if candidate.is_file() or candidate.is_symlink():
+                os.unlink(candidate)
+        except FileNotFoundError:
+            return
+        except OSError as e:
+            logger.debug("bridge temp cleanup skipped for %s: %s", candidate, e)
 
     async def send_response_text(self, target, text: str) -> None:
         """Split ``text`` at ``message_limit`` and send each chunk.

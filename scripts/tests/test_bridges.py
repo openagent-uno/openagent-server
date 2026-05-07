@@ -363,6 +363,55 @@ async def t_dispatch_turn_owner_renders(ctx: TestContext) -> None:
     assert chunks == ["merged reply"], chunks
 
 
+@test("bridges", "BaseBridge.dispatch_turn cleans up owned temp attachments after send")
+async def t_dispatch_turn_cleans_owned_temp_attachments(ctx: TestContext) -> None:
+    import tempfile
+    from pathlib import Path
+
+    from openagent.bridges.base import BaseBridge
+
+    sent_paths: list[str] = []
+
+    class _Stub(BaseBridge):
+        name = "stub"
+        message_limit = 4096
+
+        async def send_text_chunk(self, target, chunk):
+            pass
+
+        async def send_attachment(self, target, att):
+            sent_paths.append(att.path)
+            assert Path(att.path).exists(), att.path
+
+    bridge = _Stub.__new__(_Stub)
+    bridge.name = "stub"
+
+    tmp = tempfile.NamedTemporaryFile(
+        prefix="oa_bridge_test_",
+        suffix=".txt",
+        delete=False,
+    )
+    try:
+        tmp.write(b"hello")
+        tmp.close()
+        marker = f"[FILE:{tmp.name}]"
+
+        async def _ok(text, session_id, **kwargs):
+            return {"type": "response", "text": marker, "model": None, "attachments": []}
+
+        bridge.send_message = _ok  # type: ignore[method-assign]
+        await bridge.dispatch_turn("target", "sid:cleanup", "hello")
+        assert sent_paths == [tmp.name], sent_paths
+        assert not Path(tmp.name).exists(), (
+            "bridge-owned temp attachment should be removed after send"
+        )
+    finally:
+        try:
+            Path(tmp.name).unlink()
+        except FileNotFoundError:
+            pass
+
+
 @test("bridges", "spam: owner posts the merged reply ANCHORED to the LATEST follower target")
 async def t_dispatch_turn_anchors_to_latest_in_spam(ctx: TestContext) -> None:
     """🔴 Production regression: when a Telegram user spams 5 messages,

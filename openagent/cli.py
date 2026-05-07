@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
+import tempfile
+import time
 from pathlib import Path
 
 import click
@@ -18,6 +21,7 @@ from openagent.core.server import AgentServer
 from openagent.network.cli_commands import network_group
 
 console = Console()
+_STALE_TEMP_ARTIFACT_MAX_AGE_S = 12 * 60 * 60
 
 
 def _setup_agent_dir(agent_dir: str | None) -> None:
@@ -29,6 +33,38 @@ def _setup_agent_dir(agent_dir: str | None) -> None:
     paths.ensure_agent_dir(path)
 
 
+def _cleanup_stale_openagent_temp_artifacts(max_age_s: int = _STALE_TEMP_ARTIFACT_MAX_AGE_S) -> None:
+    """Best-effort sweep of stale OpenAgent temp artifacts.
+
+    Crashes or hard restarts can strand ``/tmp/oa_*`` directories and files.
+    Left unchecked they accumulate until temp-space pressure starts breaking
+    bridge attachment handling, PyInstaller extraction, and other unrelated
+    startup paths. We only touch direct children of the OS temp dir whose
+    basename starts with ``oa_`` and are older than a generous grace window.
+    """
+    now = time.time()
+    temp_root = Path(tempfile.gettempdir())
+    try:
+        entries = list(temp_root.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            if not entry.name.startswith("oa_"):
+                continue
+            age_s = now - entry.stat().st_mtime
+            if age_s < max_age_s:
+                continue
+            if entry.is_dir():
+                shutil.rmtree(entry, ignore_errors=True)
+            else:
+                os.unlink(entry)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            continue
+
+
 def _startup_cleanup() -> None:
     """Run frozen-binary cleanup tasks on startup."""
     from openagent._frozen import executable_path, is_frozen, patch_ssl_for_frozen
@@ -38,6 +74,7 @@ def _startup_cleanup() -> None:
     # onefile bundle because the compiled-in OpenSSL CA path doesn't
     # exist in the _MEI extraction tree.
     patch_ssl_for_frozen()
+    _cleanup_stale_openagent_temp_artifacts()
 
     if not is_frozen():
         return

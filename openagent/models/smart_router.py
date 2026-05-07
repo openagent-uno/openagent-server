@@ -14,10 +14,11 @@ CLI registry ("claude-cli") based on:
      for THIS turn. No tiers, no cost-sort buckets — the LLM weighs
      vision/tools/speed/cost in one shot from natural-language input.
 
-Claude-cli and agno sessions are strictly isolated: once bound, a
-session can't cross. If the bound side has no enabled models the router
-fails cleanly ("No <side> model available for this bound session")
-rather than silently falling through to the other side.
+Claude-cli and agno sessions are isolated while their bound framework
+remains available: once bound, a session can't cross frameworks unless
+that framework has no enabled models left. In that stale-binding case
+the router forgets the dead session state and restarts unbound so the
+session does not stay permanently wedged.
 
 ``history_mode`` is intentionally ``None`` — the gateway's
 ``SessionManager.bind_history_mode`` bails out on falsy modes, so
@@ -514,7 +515,10 @@ class SmartRouter(BaseModel):
             "- For multi-step refactors, debugging across files, or "
             "complex reasoning prefer a deep-reasoning model.\n"
             "- For image inputs prefer a vision-capable model "
-            "(consult notes).\n\n"
+            "(consult notes).\n"
+            "- For desktop GUI, browser-driving, screenshot analysis, or "
+            "computer-control tasks, avoid text-only models when another "
+            "compatible model is available.\n\n"
             "Return ONLY a single JSON object on one line, no prose, no "
             "markdown fences:\n"
             '{"model": "<runtime_id>", "reason": "<short string>"}\n\n'
@@ -712,6 +716,16 @@ class SmartRouter(BaseModel):
         )
 
         catalog = self._enabled_catalog(framework=bound_framework)
+        if session_id and bound_framework and not catalog:
+            elog(
+                "router.binding_auto_heal",
+                session_id=session_id,
+                bound_framework=bound_framework,
+                reason="no_enabled_model",
+            )
+            await self.forget_session(session_id)
+            bound_framework = None
+            catalog = self._enabled_catalog()
 
         # Tool continuations reuse the prior model — running the
         # classifier again risks a mid-task model swap and double-bills.

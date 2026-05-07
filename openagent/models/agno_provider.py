@@ -41,6 +41,13 @@ from openagent.models.catalog import (
 )
 
 logger = logging.getLogger(__name__)
+_INCOMPATIBLE_TOOL_FAMILIES_BY_PROVIDER: dict[str, frozenset[str]] = {
+    # DeepSeek v4 flash/pro chat completions are text-only on the official
+    # API, so Agno computer-control screenshot artifacts (image parts) fail
+    # with "unknown variant image_url, expected text". Filter that toolkit
+    # out up front instead of letting sessions crash mid-turn.
+    "deepseek": frozenset({"computer_control"}),
+}
 
 
 class AgnoProviderError(RuntimeError):
@@ -411,6 +418,40 @@ class AgnoProvider(BaseModel):
     def _runtime_parts(self) -> tuple[str, str]:
         return split_runtime_id(self.model)
 
+    @staticmethod
+    def _toolkit_family_name(toolkit: Any) -> str:
+        return str(
+            getattr(toolkit, "tool_name_prefix", None)
+            or getattr(toolkit, "name", None)
+            or "default"
+        )
+
+    def _compatible_mcp_toolkits(self) -> tuple[list[Any], list[str]]:
+        provider_name, _model_id = self._runtime_parts()
+        blocked = _INCOMPATIBLE_TOOL_FAMILIES_BY_PROVIDER.get(provider_name, frozenset())
+        if not blocked:
+            return list(self._mcp_toolkits), []
+        allowed: list[Any] = []
+        filtered: set[str] = set()
+        for toolkit in self._mcp_toolkits:
+            family = self._toolkit_family_name(toolkit)
+            if family in blocked:
+                filtered.add(family)
+                continue
+            allowed.append(toolkit)
+        return allowed, sorted(filtered)
+
+    def _rewrite_provider_error_detail(self, detail: str) -> str:
+        provider_name, _model_id = self._runtime_parts()
+        lowered = (detail or "").lower()
+        if provider_name == "deepseek" and "unknown variant image_url" in lowered:
+            return (
+                "DeepSeek's official chat API only accepts text message content, "
+                "so Agno computer-control screenshots are incompatible with this "
+                "model. Use a non-DeepSeek model for computer-control / GUI tasks."
+            )
+        return detail
+
     def _provider_config(self) -> dict[str, Any]:
         """Return the agno-framework provider entry matching this model's vendor.
 
@@ -498,7 +539,7 @@ class AgnoProvider(BaseModel):
         names into the system prompt — server names are computed from the
         live toolkit list at call time, not baked into any string).
         """
-        toolkits = self._mcp_toolkits
+        toolkits, _filtered = self._compatible_mcp_toolkits()
 
         def list_mcp_servers() -> str:
             """List every MCP server wired to this agent and how many tools each provides.
@@ -548,7 +589,15 @@ class AgnoProvider(BaseModel):
 
         db_path = Path(self._runtime_db_path())
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        agent_tools: list[Any] = list(self._mcp_toolkits)
+        compatible_toolkits, filtered_families = self._compatible_mcp_toolkits()
+        if filtered_families:
+            elog(
+                "agno.toolkits_filtered",
+                model=self.model,
+                filtered_families=filtered_families,
+                runner="agent",
+            )
+        agent_tools: list[Any] = list(compatible_toolkits)
         agent_tools.append(self._build_list_mcps_tool())
         agent = AgnoAgent(
             model=self._build_agno_model(),
@@ -581,14 +630,11 @@ class AgnoProvider(BaseModel):
         (``tool_name_prefix`` → ``name`` → ``"default"``). Empty dict when
         no toolkits are connected.
         """
+        compatible_toolkits, _filtered = self._compatible_mcp_toolkits()
         families: dict[str, list[Any]] = {}
-        for tk in self._mcp_toolkits:
-            family = (
-                getattr(tk, "tool_name_prefix", None)
-                or getattr(tk, "name", None)
-                or "default"
-            )
-            families.setdefault(str(family), []).append(tk)
+        for tk in compatible_toolkits:
+            family = self._toolkit_family_name(tk)
+            families.setdefault(family, []).append(tk)
         return families
 
     def _ensure_team(self, system: str):
@@ -613,9 +659,17 @@ class AgnoProvider(BaseModel):
         if cached is not None:
             return cached
 
+        compatible_toolkits, filtered_families = self._compatible_mcp_toolkits()
         families = self._tool_families()
         if len(families) < 2:
             return None
+        if filtered_families:
+            elog(
+                "agno.toolkits_filtered",
+                model=self.model,
+                filtered_families=filtered_families,
+                runner="team",
+            )
 
         try:
             from agno.agent import Agent as AgnoAgent
@@ -657,7 +711,7 @@ class AgnoProvider(BaseModel):
         # delegating, it still has the tools it needs. In normal route-mode
         # operation the leader delegates to one specialist and never calls
         # these itself — so the fallback costs nothing on the happy path.
-        leader_tools: list[Any] = list(self._mcp_toolkits)
+        leader_tools: list[Any] = list(compatible_toolkits)
         leader_tools.append(self._build_list_mcps_tool())
 
         try:
@@ -787,6 +841,7 @@ class AgnoProvider(BaseModel):
         # round trip. _ensure_team() returns None whenever the team path
         # is not applicable, so this collapses to the single-agent path
         # in minimal deployments.
+        compatible_toolkits, filtered_families = self._compatible_mcp_toolkits()
         runner = self._ensure_team(system=system or "")
         runner_kind = "team"
         if runner is None:
@@ -797,7 +852,8 @@ class AgnoProvider(BaseModel):
             model=self.model,
             session_id=sid,
             prompt_len=len(prompt),
-            mcp_toolkits=len(self._mcp_toolkits),
+            mcp_toolkits=len(compatible_toolkits),
+            filtered_families=filtered_families or None,
             runner=runner_kind,
         )
 
@@ -840,13 +896,17 @@ class AgnoProvider(BaseModel):
                     prompt, session_id=sid, user_id="openagent"
                 )
             except Exception as e:
+                raw_error = str(e) or repr(e)
+                rewritten_error = self._rewrite_provider_error_detail(raw_error)
                 elog(
                     "agno.error",
                     model=self.model,
                     session_id=sid,
                     error_type=type(e).__name__,
-                    error=str(e) or repr(e),
+                    error=rewritten_error,
                 )
+                if rewritten_error != raw_error:
+                    raise AgnoProviderError(rewritten_error) from e
                 raise
         finally:
             root_logger.removeHandler(capture)
@@ -864,7 +924,9 @@ class AgnoProvider(BaseModel):
             content = raw_content
         else:
             if captured_errors:
-                detail = _summarize_provider_errors(captured_errors)
+                detail = self._rewrite_provider_error_detail(
+                    _summarize_provider_errors(captured_errors)
+                )
                 elog(
                     "agno.provider_error",
                     level="error",
@@ -955,10 +1017,17 @@ class AgnoProvider(BaseModel):
         """
         prompt = self._flatten_messages(messages)
         sid = session_id or "default"
+        compatible_toolkits, filtered_families = self._compatible_mcp_toolkits()
         runner = self._ensure_team(system=system or "")
         if runner is None:
             runner = self._ensure_agent(system=system)
-        elog("agno.stream.start", model=self.model, prompt_len=len(prompt))
+        elog(
+            "agno.stream.start",
+            model=self.model,
+            prompt_len=len(prompt),
+            mcp_toolkits=len(compatible_toolkits),
+            filtered_families=filtered_families or None,
+        )
         try:
             # Lazy import — Agno event types are only needed on the streaming
             # path, and we don't want to require them on every import.
@@ -995,7 +1064,13 @@ class AgnoProvider(BaseModel):
                 error_type=type(e).__name__,
                 error=str(e) or repr(e),
             )
-            response = await self.generate(messages, system=system, tools=tools)
+            response = await self.generate(
+                messages,
+                system=system,
+                tools=tools,
+                on_status=on_status,
+                session_id=session_id,
+            )
             if response.content:
                 yield response.content
 

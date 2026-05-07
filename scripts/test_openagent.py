@@ -110,6 +110,7 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_db_session_bindings",
     "test_db_workflow_claim",
     "test_smart_router_hybrid",
+    "test_agno_tool_filter",
     # SmartRouter.stream + ClaudeCLIRegistry.stream — token-streaming
     # dispatch for both frameworks. Pure-unit (stubs the registries) and
     # guards the bug where claude-cli replies came back as one giant
