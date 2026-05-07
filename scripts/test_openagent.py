@@ -52,6 +52,7 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_imports",
     "test_setup",
     "test_serve_singleton",
+    "test_cli_cleanup",
     "test_catalog",
     "test_channels",
     "test_formatting",

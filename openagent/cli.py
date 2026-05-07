@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -22,6 +23,7 @@ from openagent.network.cli_commands import network_group
 
 console = Console()
 _STALE_TEMP_ARTIFACT_MAX_AGE_S = 12 * 60 * 60
+_STALE_FROZEN_EXTRACT_MAX_AGE_S = 60 * 60
 
 
 def _setup_agent_dir(agent_dir: str | None) -> None:
@@ -65,6 +67,85 @@ def _cleanup_stale_openagent_temp_artifacts(max_age_s: int = _STALE_TEMP_ARTIFAC
             continue
 
 
+def _active_openagent_frozen_extract_dirs(temp_root: Path) -> set[Path]:
+    """Best-effort set of live OpenAgent ``_MEI`` extract dirs.
+
+    Every frozen OpenAgent subprocess gets its own PyInstaller extract
+    directory under the OS temp root. We must not delete a bundle that's
+    still in use by another live service, so on Linux we scan ``/proc`` for
+    paths into ``.../_MEIxxxx/...`` and treat those bundle roots as active.
+    The current process's own bundle dir is always protected separately.
+    """
+    active: set[Path] = set()
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return active
+    prefix = re.escape(str(temp_root.resolve()) + os.sep)
+    pattern = re.compile(prefix + r"(_MEI[^/\0\s]+)")
+    for pid_dir in proc_root.iterdir():
+        if not pid_dir.name.isdigit():
+            continue
+        for probe_name in ("cmdline", "maps"):
+            try:
+                blob = (pid_dir / probe_name).read_bytes()
+            except OSError:
+                continue
+            text = blob.decode(errors="ignore")
+            for match in pattern.finditer(text):
+                active.add((temp_root / match.group(1)).resolve())
+    return active
+
+
+def _cleanup_stale_openagent_frozen_extract_dirs(
+    max_age_s: int = _STALE_FROZEN_EXTRACT_MAX_AGE_S,
+) -> None:
+    """Sweep stale OpenAgent PyInstaller ``_MEI`` bundles from temp.
+
+    Recursive frozen subprocesses (builtin MCP servers, secondary serves,
+    etc.) each unpack the ~220 MB onefile bundle into ``/tmp/_MEIxxxx``.
+    Crashes and forced restarts can strand those directories indefinitely,
+    and a few bad restart loops are enough to fill a production volume.
+
+    We only remove directories that:
+    1. live directly under the OS temp root,
+    2. look like OpenAgent bundles (contain ``openagent/``),
+    3. are older than a grace window, and
+    4. are not referenced by any currently-live OpenAgent process.
+    """
+    from openagent._frozen import bundle_dir, is_frozen
+
+    if not is_frozen():
+        return
+    now = time.time()
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    try:
+        entries = list(temp_root.iterdir())
+    except OSError:
+        return
+    active_dirs = _active_openagent_frozen_extract_dirs(temp_root)
+    try:
+        active_dirs.add(bundle_dir().resolve())
+    except OSError:
+        pass
+    for entry in entries:
+        try:
+            if not entry.name.startswith("_MEI") or not entry.is_dir():
+                continue
+            if not (entry / "openagent").is_dir():
+                continue
+            resolved = entry.resolve()
+            if resolved in active_dirs:
+                continue
+            age_s = now - entry.stat().st_mtime
+            if age_s < max_age_s:
+                continue
+            shutil.rmtree(entry, ignore_errors=True)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            continue
+
+
 def _startup_cleanup() -> None:
     """Run frozen-binary cleanup tasks on startup."""
     from openagent._frozen import executable_path, is_frozen, patch_ssl_for_frozen
@@ -75,6 +156,7 @@ def _startup_cleanup() -> None:
     # exist in the _MEI extraction tree.
     patch_ssl_for_frozen()
     _cleanup_stale_openagent_temp_artifacts()
+    _cleanup_stale_openagent_frozen_extract_dirs()
 
     if not is_frozen():
         return

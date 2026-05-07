@@ -701,6 +701,20 @@ class SmartRouter(BaseModel):
                 logger.debug("get_session_pin failed for %s: %s", session_id, e)
                 pinned_id = None
             if pinned_id:
+                enabled_ids = {entry.runtime_id for entry in self._enabled_catalog()}
+                if pinned_id not in enabled_ids:
+                    elog(
+                        "router.pin_auto_heal",
+                        session_id=session_id,
+                        pinned_model=pinned_id,
+                        reason="model_not_enabled",
+                    )
+                    try:
+                        await self._db.unpin_session_model(session_id)
+                    except Exception as e:  # noqa: BLE001
+                        logger.debug("unpin_session_model failed for %s: %s", session_id, e)
+                    pinned_id = None
+            if pinned_id:
                 side = framework_of(pinned_id)
                 return RoutingDecision(
                     requested_tier="pinned",

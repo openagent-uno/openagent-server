@@ -232,6 +232,52 @@ async def t_bound_side_empty(ctx: TestContext) -> None:
             pass
 
 
+@test("smart_router_hybrid", "stale pinned model self-heals by unpinning then recovering onto an enabled framework")
+async def t_stale_pinned_model_self_heals(ctx: TestContext) -> None:
+    import uuid as _uuid
+    from openagent.memory.db import MemoryDB
+
+    tmp = ctx.db_path.with_name(f"sr-stale-pin-{_uuid.uuid4().hex[:8]}.db")
+    try:
+        db = MemoryDB(str(tmp))
+        await db.connect()
+        providers = [
+            {"id": 1, "name": "openai", "framework": "agno",
+             "api_key": "sk-x", "enabled": True,
+             "models": [{"id": 10, "model": "gpt-4o-mini", "enabled": True}]},
+        ]
+        router = _make_router(providers, {
+            "simple": "openai:gpt-4o-mini",
+            "medium": "openai:gpt-4o-mini",
+            "hard": "openai:gpt-4o-mini",
+            "fallback": "openai:gpt-4o-mini",
+        })
+        router.set_db(db)
+        await db.pin_session_model(
+            "stale-pin", "claude-cli:anthropic:claude-sonnet-4-6",
+        )
+        await _stub_classifier(router, None)
+        seen: list[str] = []
+        await _stub_dispatch(router, seen)
+
+        resp = await router.generate(
+            [{"role": "user", "content": "hi"}],
+            session_id="stale-pin",
+        )
+        assert resp.stop_reason == "stop"
+        assert resp.model == "openai:gpt-4o-mini", resp.model
+        assert seen == ["openai:gpt-4o-mini"], seen
+        assert await db.get_session_pin("stale-pin") is None
+        assert await db.get_sdk_session("stale-pin") is None
+        assert await db.get_session_binding("stale-pin") == "agno"
+        await db.close()
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
 @test("smart_router_hybrid", "dual-framework provider isolation — agno key never leaks into claude-cli env")
 async def t_dual_framework_env_isolation(ctx: TestContext) -> None:
     """Regression guard for the v0.11.5 sentinel bug.
