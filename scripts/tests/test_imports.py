@@ -7,6 +7,7 @@ modules (both removed during the MCP migration).
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
 
 from ._framework import TestContext, test
 
@@ -70,3 +71,33 @@ async def t_no_stale_refs(ctx: TestContext) -> None:
                 raise AssertionError(f"stale openagent.mcp.client ref in {p}: {stripped}")
             if re.search(r"openagent\.models\.tool_factory\b", stripped):
                 raise AssertionError(f"stale tool_factory ref in {p}: {stripped}")
+
+
+@test("imports", "frozen runtime preloader warms late imports without aborting startup")
+async def t_frozen_runtime_preload(ctx: TestContext) -> None:
+    import openagent.core.agent as agent_mod
+
+    imported: list[str] = []
+
+    def fake_import(name: str, package=None):
+        imported.append(name)
+        if name == "test.module.boom":
+            raise RuntimeError("boom")
+        return object()
+
+    with patch("openagent._frozen.is_frozen", return_value=True), \
+         patch.object(agent_mod, "_FROZEN_RUNTIME_PRELOADS", (
+             "test.module.ok",
+             "test.module.boom",
+             "test.module.tail",
+         )), \
+         patch("importlib.import_module", side_effect=fake_import), \
+         patch.object(agent_mod, "elog") as elog_mock:
+        agent_mod._preload_frozen_runtime_modules()
+
+    assert imported == [
+        "test.module.ok",
+        "test.module.boom",
+        "test.module.tail",
+    ], imported
+    elog_mock.assert_called_once()

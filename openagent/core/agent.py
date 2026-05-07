@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import inspect
 import logging
 from typing import Any, AsyncIterator, Callable, Awaitable
@@ -17,6 +18,12 @@ from openagent.models.runtime import wire_model_runtime
 from openagent.core.logging import elog
 
 logger = logging.getLogger(__name__)
+
+_FROZEN_RUNTIME_PRELOADS = (
+    "openagent.models.discovery",
+    "openagent.channels.voice",
+    "openagent.channels.tts_local",
+)
 
 
 def _format_run_error(e: BaseException) -> str:
@@ -37,6 +44,37 @@ def _format_run_error(e: BaseException) -> str:
         return f"⚠️ Model provider error\n\n{e}"
     msg = str(e) or repr(e)
     return f"⚠️ {type(e).__name__}: {msg}" if msg else f"⚠️ {type(e).__name__}"
+
+
+def _preload_frozen_runtime_modules() -> None:
+    """Eagerly import late-loaded modules in frozen builds.
+
+    PyInstaller onefile processes still lazy-read code from the on-disk
+    executable when a module hasn't been imported yet. Performa runs
+    multiple services from the same shared binary, so replacing that file
+    during a deploy can break a long-lived sibling later when background
+    warmup tasks finally import voice/discovery modules. Preloading the
+    known late imports up front pins them in ``sys.modules`` before any
+    sibling can swap the executable.
+    """
+    try:
+        from openagent._frozen import is_frozen
+    except Exception:  # noqa: BLE001
+        return
+    if not is_frozen():
+        return
+    for module_name in _FROZEN_RUNTIME_PRELOADS:
+        try:
+            importlib.import_module(module_name)
+        except Exception as exc:  # noqa: BLE001
+            elog(
+                "frozen.preload_error",
+                level="warning",
+                module=module_name,
+                error=str(exc) or type(exc).__name__,
+                error_type=type(exc).__name__,
+                exc_info=True,
+            )
 
 
 def _format_shell_reminder(events) -> str:
@@ -462,6 +500,7 @@ class Agent:
             except Exception as exc:  # noqa: BLE001 — leave the existing pool untouched
                 elog("pool.from_db_error", level="warning", error=str(exc))
 
+        _preload_frozen_runtime_modules()
         await self._mcp.connect_all()
 
         self._prepare_model_runtime(self.model)
