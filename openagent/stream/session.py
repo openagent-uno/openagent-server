@@ -53,6 +53,10 @@ logger = logging.getLogger(__name__)
 
 VIDEO_RING_SIZE = 8
 SPEAKER_DRAIN_TIMEOUT = 20.0
+_EMPTY_TURN_FALLBACK_TEXT = (
+    "(No text response — the agent finished without producing any output. "
+    "Please retry, and check the model/provider logs if this keeps happening.)"
+)
 
 
 # Tool-name substring → resource category. Substring (not equality)
@@ -899,11 +903,12 @@ class StreamTurnRunner:
             full_text = "".join(accumulated)
             if not full_text and stream_error is not None:
                 full_text = f"Error: {stream_error}"
-            elif not full_text and speak:
-                full_text = (
-                    "(No text response — the agent finished without producing "
-                    "any output. Check the gateway log for ``turn.agent.event`` "
-                    "lines and your model configuration.)"
+            elif not full_text:
+                full_text = _EMPTY_TURN_FALLBACK_TEXT
+                elog(
+                    "stream.turn.empty_output",
+                    session_id=session_id,
+                    speak=speak,
                 )
 
             from openagent.channels.base import parse_response_markers

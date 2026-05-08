@@ -52,6 +52,7 @@ class _FakeModel:
         self._generate_text = generate_text
         self._generate_raises = generate_raises
         self.generate_calls = 0
+        self.generate_session_ids: list[str | None] = []
         self.stream_calls = 0
 
     def effective_model_id(self, session_id: str | None = None) -> str | None:
@@ -79,6 +80,7 @@ class _FakeModel:
     ):
         from openagent.models.base import ModelResponse
         self.generate_calls += 1
+        self.generate_session_ids.append(session_id)
         if self._generate_raises is not None:
             raise self._generate_raises
         return ModelResponse(content=self._generate_text, model=self.model_name)
@@ -116,6 +118,7 @@ async def t_fallback_when_stream_empty(_ctx: TestContext) -> None:
     assert model.generate_calls == 1, (
         f"generate() was not invoked as a fallback (calls={model.generate_calls})"
     )
+    assert model.generate_session_ids == ["sess-empty"], model.generate_session_ids
     assert len(deltas) == 1, f"expected one delta from fallback, got {deltas}"
     assert deltas[0]["text"] == "Hello from generate", deltas[0]
     assert len(done) == 1 and done[0]["text"] == "Hello from generate", done

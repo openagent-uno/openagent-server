@@ -1185,10 +1185,23 @@ class Agent:
                     reason="no_deltas_yielded",
                 )
                 try:
+                    generate_kwargs: dict[str, Any] = {
+                        "system": system,
+                        "tools": None,
+                    }
+                    try:
+                        gen_params = inspect.signature(
+                            active_model.generate
+                        ).parameters
+                    except (TypeError, ValueError):
+                        gen_params = {}
+                    if "session_id" in gen_params:
+                        generate_kwargs["session_id"] = session_id
+                    if "on_status" in gen_params:
+                        generate_kwargs["on_status"] = _status
                     fallback_response = await active_model.generate(
                         [{"role": "user", "content": message}],
-                        system=system,
-                        tools=None,
+                        **generate_kwargs,
                     )
                     _emit_tool_call_summary(
                         fallback_response,

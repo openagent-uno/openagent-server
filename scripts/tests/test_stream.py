@@ -257,6 +257,25 @@ async def t_run_one_shot(ctx: TestContext) -> None:
     assert isinstance(out[-1], TurnComplete), f"TurnComplete must be last; got {out[-1]!r}"
 
 
+@test("stream", "StreamSession.run_one_shot never ships an empty final response")
+async def t_run_one_shot_empty_reply_gets_fallback(ctx: TestContext) -> None:
+    from openagent.stream.events import OutTextFinal
+    from openagent.stream.session import StreamSession
+
+    sess = StreamSession(_FakeAgent([]), client_id="c", session_id="s")
+    summary = await sess.run_one_shot("hi", speak=False)
+
+    assert "No text response" in summary["text"], summary
+
+    out = []
+    while not sess.outbound.empty():
+        out.append(sess.outbound.get_nowait())
+
+    finals = [e for e in out if isinstance(e, OutTextFinal)]
+    assert finals, out
+    assert "No text response" in finals[-1].text, finals[-1]
+
+
 @test("stream", "BatchedChannel collapses one turn into a finished reply")
 async def t_batched_channel(ctx: TestContext) -> None:
     from openagent.stream.channel import BatchedChannel
