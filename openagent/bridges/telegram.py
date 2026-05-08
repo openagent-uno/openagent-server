@@ -153,7 +153,7 @@ class TelegramBridge(BaseBridge):
             logger.warning("Failed to set bot commands: %s", e)
 
         await self._app.updater.start_polling()
-        while not self._should_stop:
+        while not self._should_stop and not self._gateway_lost.is_set():
             await asyncio.sleep(1)
 
     def _track_update_id(self, update) -> None:
@@ -310,19 +310,19 @@ class TelegramBridge(BaseBridge):
             dropped_cleanup=cleanup_cb is not None,
         )
 
-    async def stop(self) -> None:
-        self._should_stop = True
+    async def _shutdown_app(self, *, flush_offset: bool) -> None:
         app = self._app
-        # ACK pending updates FIRST so that a queued /restart or /stop can't
-        # survive a library-side hang. Idempotent — if flush_updates_offset
-        # was already called by the gateway restart path, this is a no-op
-        # (at worst a second short POST).
-        try:
-            await self.flush_updates_offset()
-        except asyncio.CancelledError:
-            pass  # handled inside flush_updates_offset
-        except Exception:
-            pass
+        if flush_offset:
+            # ACK pending updates FIRST so that a queued /restart or /stop
+            # can't survive a library-side hang. Idempotent — if
+            # flush_updates_offset was already called by the gateway restart
+            # path, this is a no-op (at worst a second short POST).
+            try:
+                await self.flush_updates_offset()
+            except asyncio.CancelledError:
+                pass  # handled inside flush_updates_offset
+            except Exception:
+                pass
         if app is not None:
             # Library-side cleanup. Each of updater.stop / app.stop /
             # app.shutdown can internally POST to Telegram, and each has
@@ -368,6 +368,13 @@ class TelegramBridge(BaseBridge):
                         phase=label,
                         error=str(e),
                     )
+
+    async def _on_gateway_lost(self) -> None:
+        await self._shutdown_app(flush_offset=False)
+
+    async def stop(self) -> None:
+        self._should_stop = True
+        await self._shutdown_app(flush_offset=True)
         try:
             await super().stop()
         except asyncio.CancelledError:

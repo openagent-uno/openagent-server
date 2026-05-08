@@ -64,7 +64,7 @@ class WhatsAppBridge(BaseBridge):
         self._greenapi = GreenAPI.GreenApi(self.instance_id, self.api_token)
         logger.info("WhatsApp bridge started")
 
-        while not self._should_stop:
+        while not self._should_stop and not self._gateway_lost.is_set():
             try:
                 response = await asyncio.to_thread(self._greenapi.receiving.receiveNotification)
                 if not response or not response.data:

@@ -167,6 +167,127 @@ async def t_fallback_generate_raises(_ctx: TestContext) -> None:
     )
 
 
+class _CancellationPoisoningModel(_FakeModel):
+    """Simulate a provider whose stream path swallows CancelledError.
+
+    The async generator returns no deltas, but first it cancels the current
+    task and consumes the resulting ``CancelledError`` without calling
+    ``uncancel()``. Before the fix, the next await in
+    ``Agent._run_inner_stream`` immediately raised CancelledError and the
+    fallback ``generate()`` never ran.
+    """
+
+    async def stream(
+        self,
+        messages: list[dict[str, Any]],
+        system: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        session_id: str | None = None,
+        on_status: Callable[[str], Awaitable[None]] | None = None,
+    ) -> AsyncIterator[str]:
+        import asyncio
+
+        self.stream_calls += 1
+        task = asyncio.current_task()
+        assert task is not None
+        task.cancel()
+        try:
+            await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            pass
+        if False:
+            yield ""
+
+
+class _DeferredCancellationPoisoningModel(_FakeModel):
+    """Simulate a second stray cancel landing during fallback generate().
+
+    Some real providers leave the caller task cancellation-poisoned AND also
+    schedule a later cancel that fires on the next await after the stream loop
+    has already ended. The fallback now runs in a quarantined child task so the
+    reply can still complete through that second stray cancel.
+    """
+
+    async def stream(
+        self,
+        messages: list[dict[str, Any]],
+        system: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        session_id: str | None = None,
+        on_status: Callable[[str], Awaitable[None]] | None = None,
+    ) -> AsyncIterator[str]:
+        import asyncio
+
+        self.stream_calls += 1
+        task = asyncio.current_task()
+        assert task is not None
+        task.cancel()
+        try:
+            await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            pass
+        asyncio.get_running_loop().call_soon(task.cancel)
+        if False:
+            yield ""
+
+    async def generate(
+        self,
+        messages: list[dict[str, Any]],
+        system: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        on_status: Callable[[str], Awaitable[None]] | None = None,
+        session_id: str | None = None,
+    ):
+        import asyncio
+
+        await asyncio.sleep(0)
+        return await super().generate(
+            messages,
+            system=system,
+            tools=tools,
+            on_status=on_status,
+            session_id=session_id,
+        )
+
+
+@test("agent_run_stream", "empty-stream fallback recovers from cancellation-poisoned provider stream")
+async def t_fallback_recovers_poisoned_cancel(_ctx: TestContext) -> None:
+    model = _CancellationPoisoningModel(
+        deltas=[],
+        generate_text="Recovered after poisoned cancel",
+    )
+    agent = _make_agent(model)
+
+    events = await _drive(agent, "hi", session_id="sess-poison")
+
+    deltas = [e for e in events if e.get("kind") == "delta"]
+    done = [e for e in events if e.get("kind") == "done"]
+
+    assert model.stream_calls == 1, model.stream_calls
+    assert model.generate_calls == 1, model.generate_calls
+    assert deltas and deltas[0]["text"] == "Recovered after poisoned cancel", deltas
+    assert done and done[0]["text"] == "Recovered after poisoned cancel", done
+
+
+@test("agent_run_stream", "fallback child task survives a deferred stray cancel")
+async def t_fallback_survives_deferred_cancel(_ctx: TestContext) -> None:
+    model = _DeferredCancellationPoisoningModel(
+        deltas=[],
+        generate_text="Recovered after deferred cancel",
+    )
+    agent = _make_agent(model)
+
+    events = await _drive(agent, "hi", session_id="sess-deferred-poison")
+
+    deltas = [e for e in events if e.get("kind") == "delta"]
+    done = [e for e in events if e.get("kind") == "done"]
+
+    assert model.stream_calls == 1, model.stream_calls
+    assert model.generate_calls == 1, model.generate_calls
+    assert deltas and deltas[0]["text"] == "Recovered after deferred cancel", deltas
+    assert done and done[0]["text"] == "Recovered after deferred cancel", done
+
+
 @test("agent_run_stream", "fallback response populates last_response_meta()")
 async def t_fallback_meta_uses_real_response(_ctx: TestContext) -> None:
     model = _FakeModel(

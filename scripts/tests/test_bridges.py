@@ -47,6 +47,36 @@ async def t_bridge_base(ctx: TestContext) -> None:
     assert format_tool_status('{"tool":"bash","status":"running"}') == "Using bash..."
 
 
+@test("bridges", "BaseBridge treats listener exit as a reconnect signal")
+async def t_bridge_listener_exit_marks_gateway_lost(ctx: TestContext) -> None:
+    import asyncio
+    from openagent.bridges.base import BaseBridge
+
+    class _EmptyWS:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+    class _Stub(BaseBridge):
+        async def _run(self) -> None:
+            return None
+
+        async def _on_gateway_lost(self) -> None:
+            self.hook_called.set()
+
+    bridge = _Stub()
+    bridge.name = "stub"
+    bridge.hook_called = asyncio.Event()
+    bridge._ws = _EmptyWS()
+
+    await bridge._listen_gateway()
+
+    assert bridge._gateway_lost.is_set(), "listener exit must mark gateway lost"
+    await asyncio.wait_for(bridge.hook_called.wait(), timeout=0.1)
+
+
 class _FakeBridge:
     """Subclass stand-in that skips the WS connect. Used for the
     send_message tests — we drive the in-flight ``_StreamCollector``
@@ -56,10 +86,8 @@ class _FakeBridge:
         from openagent.bridges.base import BaseBridge
 
         self._real = BaseBridge.__new__(BaseBridge)
+        BaseBridge.__init__(self._real)
         self._real.name = "fake"
-        self._real._stream_opened = set()
-        self._real._stream_pending = {}
-        self._real._command_future = None
         self._real._ws = object()  # non-None bypasses the "not connected" guard
         self._sent: list[dict] = []
 
@@ -104,6 +132,7 @@ async def t_send_message_normal(ctx: TestContext) -> None:
     # First call must open the stream session, then push the text.
     assert fb._sent[0]["type"] == "session_open", fb._sent[0]
     assert fb._sent[0]["profile"] == "batched", fb._sent[0]
+    assert fb._sent[0]["speak"] is False, fb._sent[0]
     assert fb._sent[0]["coalesce_window_ms"] == 1500, fb._sent[0]
     assert fb._sent[1]["type"] == "text_final", fb._sent[1]
     assert fb._sent[1]["text"] == "ping", fb._sent[1]
@@ -959,6 +988,33 @@ async def t_telegram_stop_force_cancels_leaked_poller(ctx: TestContext) -> None:
                 await poll_task
             except asyncio.CancelledError:
                 pass
+
+
+@test("bridges", "telegram tears down its polling app when the gateway listener dies")
+async def t_telegram_gateway_lost_stops_app(ctx: TestContext) -> None:
+    bridge = _fresh_telegram_bridge()
+    calls: list[str] = []
+
+    class _FakeUpdater:
+        async def stop(self) -> None:
+            calls.append("updater.stop")
+
+    class _FakeApp:
+        def __init__(self) -> None:
+            self.updater = _FakeUpdater()
+
+        async def stop(self) -> None:
+            calls.append("app.stop")
+
+        async def shutdown(self) -> None:
+            calls.append("app.shutdown")
+
+    bridge._app = _FakeApp()
+
+    await bridge._on_gateway_lost()
+
+    assert bridge._app is None, "gateway-loss cleanup must drop the stale PTB app"
+    assert calls == ["updater.stop", "app.stop", "app.shutdown"], calls
 
 
 # ── WhatsApp status-throttle tests ────────────────────────────────────

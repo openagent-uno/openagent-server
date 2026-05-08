@@ -96,6 +96,7 @@ class BaseBridge:
         self._http_session = None  # cached aiohttp.ClientSession for TTS/STT
         self._listener_task: asyncio.Task | None = None
         self._should_stop = False
+        self._gateway_lost = asyncio.Event()
         self._command_future: asyncio.Future | None = None
         self._command_lock = asyncio.Lock()
         # NOTE: there is no ``_delta_callbacks`` field. Bridges run in
@@ -121,8 +122,14 @@ class BaseBridge:
         elog("bridge.start", name=self.name)
         while not self._should_stop:
             try:
+                self._gateway_lost.clear()
                 await self._connect_gateway()
                 await self._run()
+                if self._should_stop:
+                    break
+                if self._gateway_lost.is_set():
+                    elog("bridge.reconnect", name=self.name, reason="gateway_lost")
+                    continue
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -130,6 +137,10 @@ class BaseBridge:
                     break
                 elog("bridge.error", level="error", name=self.name, error=str(e), retry_in=BRIDGE_RETRY_SECONDS)
                 await asyncio.sleep(BRIDGE_RETRY_SECONDS)
+
+    async def _on_gateway_lost(self) -> None:
+        """Platform hook fired when the gateway WS listener exits."""
+        return None
 
     async def stop(self) -> None:
         elog("bridge.stop", name=self.name)
@@ -260,6 +271,12 @@ class BaseBridge:
         finally:
             elog("bridge.listener_exit", name=self.name, exit_kind=exit_kind)
             self._resolve_orphaned_futures("Gateway connection lost")
+            if not self._should_stop:
+                self._gateway_lost.set()
+                try:
+                    await self._on_gateway_lost()
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("%s gateway-loss hook failed: %s", self.name, e)
 
     async def _handle_gateway_frame(self, data: dict) -> None:
         """Route a single decoded WS frame.
@@ -344,6 +361,7 @@ class BaseBridge:
                 session_id=session_id,
                 ts_ms=now_ms(),
                 profile="batched",
+                speak=False,
                 client_kind=self.name,
                 coalesce_window_ms=BRIDGE_COALESCE_WINDOW_MS,
             )))

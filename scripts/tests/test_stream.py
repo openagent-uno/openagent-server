@@ -276,6 +276,39 @@ async def t_run_one_shot_empty_reply_gets_fallback(ctx: TestContext) -> None:
     assert "No text response" in finals[-1].text, finals[-1]
 
 
+@test("stream", "StreamSession.run_one_shot finalizes unexpected cancellation")
+async def t_run_one_shot_unexpected_cancel_gets_terminal_frame(ctx: TestContext) -> None:
+    from openagent.stream.events import OutTextFinal, TurnComplete
+    from openagent.stream.session import StreamSession
+
+    class _CancelledAgent:
+        name = "cancelled"
+        db = None
+
+        async def run_stream(self, *, message, user_id, session_id,
+                             attachments=None, on_status=None):
+            raise asyncio.CancelledError()
+            yield  # pragma: no cover - keeps this an async generator
+
+        def last_response_meta(self, session_id: str) -> dict:
+            return {"model": "cancelled-model"}
+
+    sess = StreamSession(_CancelledAgent(), client_id="c", session_id="s")
+    summary = await sess.run_one_shot("hi", speak=False)
+
+    assert "interrupted before a response" in summary["text"], summary
+
+    out = []
+    while not sess.outbound.empty():
+        out.append(sess.outbound.get_nowait())
+
+    finals = [e for e in out if isinstance(e, OutTextFinal)]
+    completes = [e for e in out if isinstance(e, TurnComplete)]
+    assert finals, out
+    assert "interrupted before a response" in finals[-1].text, finals[-1]
+    assert completes, out
+
+
 @test("stream", "BatchedChannel collapses one turn into a finished reply")
 async def t_batched_channel(ctx: TestContext) -> None:
     from openagent.stream.channel import BatchedChannel

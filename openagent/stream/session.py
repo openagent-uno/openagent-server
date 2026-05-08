@@ -57,6 +57,9 @@ _EMPTY_TURN_FALLBACK_TEXT = (
     "(No text response — the agent finished without producing any output. "
     "Please retry, and check the model/provider logs if this keeps happening.)"
 )
+_CANCELLED_TURN_FALLBACK_TEXT = (
+    "(The turn was interrupted before a response was ready. Please retry.)"
+)
 
 
 # Tool-name substring → resource category. Substring (not equality)
@@ -150,6 +153,13 @@ class StreamSession:
         # cancels after take the partial-commit path.
         self._current_turn_msg: TextFinal | None = None
         self._current_turn_started: bool = False
+        # Reason for the active task cancellation currently being
+        # orchestrated by ``_cancel_active_turn``. ``None`` means any
+        # CancelledError escaping the runner was unexpected (for
+        # example, a provider-side cancel leak) and should be
+        # finalised into a terminal frame instead of leaving the
+        # bridge collector stuck on "Thinking...".
+        self._active_cancel_reason: str | None = None
         self._seq = 0
         self._closed = False
         # Status side-channel for run_one_shot callers.
@@ -283,7 +293,14 @@ class StreamSession:
             evt, (OutTextFinal, TurnComplete)
         ):
             return
-        await self.outbound.put(evt)
+        # ``outbound`` is intentionally unbounded, so queueing the
+        # frame never needs to suspend. Enqueue FIRST, synchronously:
+        # if the current task is cancellation-poisoned by a provider
+        # leak, the bridge/web collector still sees the terminal frame
+        # and can clear "Thinking..." before any follow-up callback
+        # await (status tee, post_turn_hook) has a chance to trip over
+        # the cancellation.
+        self.outbound.put_nowait(evt)
         if isinstance(evt, OutToolStatus):
             if self.post_turn_hook is not None:
                 self._track_tool_prefix(evt.text)
@@ -657,6 +674,7 @@ class StreamSession:
         # honour the suppression while the cancel propagates.
         if suppress_completion:
             self._suppress_runner_completion = True
+        self._active_cancel_reason = reason
         # Cancel BEFORE any provider control-request — otherwise the
         # provider's reader might be parked behind a full receive
         # channel and ``client.interrupt()``'s ack can't land,
@@ -670,6 +688,7 @@ class StreamSession:
             self._current_turn = None
             self._current_turn_msg = None
             self._current_turn_started = False
+            self._active_cancel_reason = None
             if suppress_completion:
                 self._suppress_runner_completion = False
         if salvaged_msg is not None:
@@ -769,6 +788,8 @@ class StreamTurnRunner:
         audio_started = False
         audio_chunks = 0
         stream_error: BaseException | None = None
+        cancelled = False
+        cancel_reason: str | None = None
         spoken_tools: set[str] = set()
 
         text_q: asyncio.Queue[str | None] = asyncio.Queue()
@@ -873,9 +894,20 @@ class StreamTurnRunner:
                 if speaker is not None:
                     await text_q.put(None)
             except asyncio.CancelledError:
+                cancelled = True
+                cancel_reason = getattr(sess, "_active_cancel_reason", None)
+                task = asyncio.current_task()
+                if task is not None and hasattr(task, "uncancel"):
+                    while task.cancelling():
+                        task.uncancel()
                 if speaker is not None:
                     await text_q.put(None)
-                raise
+                elog(
+                    "stream.turn.cancelled",
+                    session_id=session_id,
+                    reason=cancel_reason or "unexpected",
+                    suppress_completion=sess._suppress_runner_completion,
+                )
             except Exception as e:  # noqa: BLE001
                 stream_error = e
                 if speaker is not None:
@@ -903,6 +935,8 @@ class StreamTurnRunner:
             full_text = "".join(accumulated)
             if not full_text and stream_error is not None:
                 full_text = f"Error: {stream_error}"
+            elif not full_text and cancelled and cancel_reason is None:
+                full_text = _CANCELLED_TURN_FALLBACK_TEXT
             elif not full_text:
                 full_text = _EMPTY_TURN_FALLBACK_TEXT
                 elog(
@@ -945,7 +979,9 @@ class StreamTurnRunner:
                 response_chars=len(clean),
                 audio_chunks=audio_chunks,
                 spoken_tools=len(spoken_tools),
-                errored=stream_error is not None,
+                errored=(stream_error is not None) or cancelled,
+                cancelled=cancelled,
+                cancel_reason=cancel_reason,
             )
 
         return {

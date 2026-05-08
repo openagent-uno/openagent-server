@@ -1056,6 +1056,21 @@ class AgnoProvider(BaseModel):
                     except Exception:
                         pass
             elog("agno.stream.done", model=self.model, chars=emitted)
+            if emitted == 0:
+                elog(
+                    "agno.stream.empty_fallback",
+                    model=self.model,
+                    session_id=sid,
+                )
+                response = await self.generate(
+                    messages,
+                    system=system,
+                    tools=tools,
+                    on_status=on_status,
+                    session_id=session_id,
+                )
+                if response.content:
+                    yield response.content
         except Exception as e:
             elog(
                 "agno.stream.fallback",

@@ -1087,6 +1087,7 @@ class Agent:
         current_input = message
         accumulated: list[str] = []
         iter_count = 0
+        stream_finished_cleanly = False
 
         pending = hub.drain(session_id)
         if pending:
@@ -1149,6 +1150,7 @@ class Agent:
                             continue
                         accumulated.append(delta)
                         yield {"kind": "delta", "text": delta}
+                    stream_finished_cleanly = True
                 finally:
                     reset_session_context(token)
 
@@ -1184,6 +1186,28 @@ class Agent:
                     session_id=session_id,
                     reason="no_deltas_yielded",
                 )
+                # Some provider streaming stacks return "normally" after
+                # swallowing an inner CancelledError, leaving the caller task
+                # cancellation-poisoned. The next await then raises
+                # CancelledError immediately and the empty-stream fallback
+                # never gets a chance to recover. Only clear that poisoned
+                # state after the stream loop itself finished cleanly.
+                task = asyncio.current_task()
+                if (
+                    stream_finished_cleanly
+                    and task is not None
+                    and hasattr(task, "uncancel")
+                    and task.cancelling()
+                ):
+                    pending_cancels = task.cancelling()
+                    while task.cancelling():
+                        task.uncancel()
+                    elog(
+                        "agent.run_stream.recovered_cancel",
+                        session_id=session_id,
+                        pending_cancels=pending_cancels,
+                        phase="post_stream_empty_fallback",
+                    )
                 try:
                     generate_kwargs: dict[str, Any] = {
                         "system": system,
@@ -1199,10 +1223,37 @@ class Agent:
                         generate_kwargs["session_id"] = session_id
                     if "on_status" in gen_params:
                         generate_kwargs["on_status"] = _status
-                    fallback_response = await active_model.generate(
-                        [{"role": "user", "content": message}],
-                        **generate_kwargs,
+
+                    fallback_task = asyncio.create_task(
+                        active_model.generate(
+                            [{"role": "user", "content": message}],
+                            **generate_kwargs,
+                        ),
+                        name=f"generate-fallback:{session_id or 'default'}",
                     )
+                    while True:
+                        try:
+                            fallback_response = await asyncio.shield(fallback_task)
+                            break
+                        except asyncio.CancelledError:
+                            if fallback_task.done():
+                                raise
+                            task = asyncio.current_task()
+                            if task is None or not hasattr(task, "uncancel"):
+                                fallback_task.cancel()
+                                raise
+                            pending_cancels = task.cancelling()
+                            if pending_cancels <= 0:
+                                fallback_task.cancel()
+                                raise
+                            while task.cancelling():
+                                task.uncancel()
+                            elog(
+                                "agent.run_stream.recovered_cancel",
+                                session_id=session_id,
+                                pending_cancels=pending_cancels,
+                                phase="await_generate_fallback",
+                            )
                     _emit_tool_call_summary(
                         fallback_response,
                         session_id=session_id,

@@ -173,6 +173,15 @@ class DiscordBridge(BaseBridge):
 
         await client.start(self.token)
 
+    async def _on_gateway_lost(self) -> None:
+        client = self._client
+        if client is None:
+            return
+        try:
+            await client.close()
+        finally:
+            self._client = None
+
     # ── Platform primitives (consumed by BaseBridge.dispatch_turn) ──
 
     async def post_status(self, channel, text: str):
