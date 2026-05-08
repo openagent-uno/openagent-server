@@ -765,11 +765,31 @@ class AgnoProvider(BaseModel):
         real ``system`` role message. Including it here would duplicate it as
         user text, undoing the fix that makes procedural instructions
         authoritative for weak models.
+
+        For text-only providers (DeepSeek), ``image_url`` content parts are
+        stripped so the API never receives a message variant it can't parse.
         """
+        provider_name, _model_id = self._runtime_parts()
+        strip_images = provider_name == "deepseek"
         parts: list[str] = []
         for msg in messages:
             role = msg.get("role", "user")
-            content = str(msg.get("content", "") or "")
+            content = msg.get("content")
+            if isinstance(content, list):
+                texts: list[str] = []
+                for part in content:
+                    if isinstance(part, dict):
+                        if part.get("type") == "text" and part.get("text"):
+                            texts.append(str(part["text"]))
+                        elif strip_images and part.get("type") == "image_url":
+                            texts.append("[image omitted]")
+                        else:
+                            texts.append(str(part))
+                    else:
+                        texts.append(str(part))
+                content = " ".join(texts)
+            else:
+                content = str(content or "")
             if role == "user":
                 parts.append(content)
             elif role == "assistant":

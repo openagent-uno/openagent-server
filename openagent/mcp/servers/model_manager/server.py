@@ -205,6 +205,7 @@ def _model_row(d: dict[str, Any]) -> dict[str, Any]:
         "model": d["model"],
         "display_name": d.get("display_name"),
         "tier_hint": d.get("tier_hint"),
+        "description": d.get("description"),
         "enabled": bool(d.get("enabled", True)),
         "is_classifier": bool(d.get("is_classifier", False)),
         "runtime_id": runtime_id,
@@ -281,6 +282,7 @@ async def add_model(
     model: str,
     display_name: str | None = None,
     tier_hint: str | None = None,
+    description: str | None = None,
     enabled: bool = True,
     is_classifier: bool = False,
 ) -> dict[str, Any]:
@@ -295,6 +297,9 @@ async def add_model(
       classifier describing the model's strengths: ``"vision"``,
       ``"200k context"``, ``"best for code"``, ``"fast + cheap"``, etc.
       The classifier treats it as advice and overrides freely.
+    - ``description`` (optional, free-form) is a human-readable note
+      stored alongside the model row. It surfaces in the UI and catalog
+      but has no effect on dispatch or routing.
     - ``is_classifier`` (optional) marks this row as an eligible
       SmartRouter classifier. Multiple rows can carry the flag; the
       router picks the first flagged row it sees each turn, so the
@@ -309,6 +314,7 @@ async def add_model(
         model=model.strip(),
         display_name=display_name,
         tier_hint=tier_hint,
+        description=description,
         enabled=enabled,
         is_classifier=bool(is_classifier),
     )
@@ -320,6 +326,7 @@ async def update_model(
     model_id: int,
     display_name: str | None = None,
     tier_hint: str | None = None,
+    description: str | None = None,
     enabled: bool | None = None,
     is_classifier: bool | None = None,
 ) -> dict[str, Any]:
@@ -332,6 +339,9 @@ async def update_model(
     classifiers" ordered by the catalog's deterministic order
     (provider name, framework, model).
 
+    ``description`` is a free-form note stored alongside the model; it
+    appears in the UI and catalog but has no effect on routing.
+
     Pricing isn't editable — it's resolved live on every billing event.
     """
     db = await _get_db()
@@ -343,6 +353,7 @@ async def update_model(
         model=existing["model"],
         display_name=display_name if display_name is not None else existing.get("display_name"),
         tier_hint=tier_hint if tier_hint is not None else existing.get("tier_hint"),
+        description=description if description is not None else existing.get("description"),
         enabled=enabled if enabled is not None else bool(existing.get("enabled", True)),
         is_classifier=(
             bool(is_classifier)

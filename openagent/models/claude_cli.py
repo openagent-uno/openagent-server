@@ -338,12 +338,13 @@ class ClaudeCLI(BaseModel):
         # screenshots (PNG base64) regularly exceed that cap on retina
         # displays, which the SDK surfaces as
         # "Failed to decode JSON: JSON message exceeded maximum buffer size".
-        # 16 MiB covers the worst-case image we downsample to. Ops can
-        # override via OPENAGENT_CLAUDE_SDK_BUFFER_MIB without a redeploy.
+        # 32 MiB covers the worst-case image we downsample to (retina
+        # displays with many open windows). Ops can override via
+        # OPENAGENT_CLAUDE_SDK_BUFFER_MIB without a redeploy.
         try:
-            buf_mib = int(os.environ.get("OPENAGENT_CLAUDE_SDK_BUFFER_MIB", "16"))
+            buf_mib = int(os.environ.get("OPENAGENT_CLAUDE_SDK_BUFFER_MIB", "32"))
         except (TypeError, ValueError):
-            buf_mib = 16
+            buf_mib = 32
         if buf_mib > 0:
             opts["max_buffer_size"] = buf_mib * 1024 * 1024
         return ClaudeAgentOptions(**opts)

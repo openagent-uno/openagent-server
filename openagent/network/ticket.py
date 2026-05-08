@@ -133,7 +133,9 @@ def _encode_payload(obj: dict) -> str:
 def _decode_payload(s: str) -> dict:
     if not isinstance(s, str) or not s.startswith(TICKET_PREFIX):
         raise TicketError(f"not an OpenAgent ticket: {s[:8]!r}")
-    body = s[len(TICKET_PREFIX):].upper()
+    body = s[len(TICKET_PREFIX):]
+    body = "".join(c for c in body if c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz234567")
+    body = body.upper()
     # Base32 wants padding to a multiple of 8 chars; we strip it for
     # cosmetics on encode and add it back here for decode.
     body += "=" * (-len(body) % 8)

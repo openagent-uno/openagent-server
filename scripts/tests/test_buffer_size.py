@@ -12,7 +12,7 @@ import os
 from ._framework import TestContext, TestSkip, test
 
 
-@test("buffer_size", "ClaudeCLI._build_options sets max_buffer_size >= 16 MiB")
+@test("buffer_size", "ClaudeCLI._build_options sets max_buffer_size >= 32 MiB")
 async def t_default_buffer(ctx: TestContext) -> None:
     try:
         from openagent.models.claude_cli import ClaudeCLI
@@ -28,7 +28,7 @@ async def t_default_buffer(ctx: TestContext) -> None:
     opts = cli._build_options(system=None, sdk_session_id=None)
     val = getattr(opts, "max_buffer_size", None)
     assert val is not None, "ClaudeAgentOptions.max_buffer_size should be set"
-    assert val >= 16 * 1024 * 1024, f"max_buffer_size too low: {val}"
+    assert val >= 32 * 1024 * 1024, f"max_buffer_size too low: {val}"
 
 
 @test("buffer_size", "OPENAGENT_CLAUDE_SDK_BUFFER_MIB env override honored")

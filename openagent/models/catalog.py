@@ -88,6 +88,7 @@ class CatalogModel:
     disabled: bool = False
     display_name: str | None = None
     tier_hint: str | None = None
+    description: str | None = None
     metadata: dict[str, Any] | None = None
     # v0.12 fields — the provider's surrogate id and (name, framework)
     # pair resolved at hydration time so routing doesn't have to re-split
@@ -424,6 +425,7 @@ def iter_configured_models(
             seen.add(runtime_id)
 
             tier_hint = model_metadata.get("tier_hint")
+            description = model_metadata.get("description")
             display_name = (
                 model_metadata.get("display_name")
                 or model_metadata.get("name")
@@ -439,6 +441,7 @@ def iter_configured_models(
                     disabled=is_disabled,
                     display_name=str(display_name) if display_name else None,
                     tier_hint=str(tier_hint) if tier_hint else None,
+                    description=str(description) if description else None,
                     metadata=model_metadata or None,
                     provider_id=provider_id,
                     is_classifier=is_classifier,

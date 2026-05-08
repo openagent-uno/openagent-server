@@ -163,6 +163,7 @@ CREATE TABLE IF NOT EXISTS models (
     model TEXT NOT NULL,
     display_name TEXT,
     tier_hint TEXT,
+    description TEXT,
     enabled INTEGER NOT NULL DEFAULT 1,
     is_classifier INTEGER NOT NULL DEFAULT 0,
     metadata_json TEXT NOT NULL DEFAULT '{}',
@@ -498,6 +499,7 @@ class MemoryDB:
         await self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_models_kind ON models(kind)"
         )
+        await self._migrate_models_description_column()
 
     async def _migrate_models_kind_column(self) -> None:
         """Add ``models.kind`` (idempotent) and lift TTS/STT settings out
@@ -603,6 +605,17 @@ class MemoryDB:
             (time.time(),),
         )
         await self._conn.commit()
+
+    async def _migrate_models_description_column(self) -> None:
+        """Add ``description`` to ``models`` (idempotent)."""
+        assert self._conn is not None
+        cursor = await self._conn.execute("PRAGMA table_info(models)")
+        cols = {r[1] for r in await cursor.fetchall()}
+        if "description" not in cols:
+            await self._conn.execute(
+                "ALTER TABLE models ADD COLUMN description TEXT"
+            )
+            await self._conn.commit()
 
     async def _migrate_providers_kind_column(self) -> None:
         """Add ``kind`` to ``providers`` and lift the ``framework`` CHECK.
@@ -1943,6 +1956,7 @@ class MemoryDB:
     _ENRICHED_MODEL_SELECT = """
         SELECT m.id AS id, m.provider_id AS provider_id, m.model AS model,
                m.display_name AS display_name, m.tier_hint AS tier_hint,
+               m.description AS description,
                m.enabled AS enabled, m.is_classifier AS is_classifier,
                m.metadata_json AS metadata_json, m.kind AS kind,
                m.created_at AS created_at, m.updated_at AS updated_at,
@@ -2068,7 +2082,8 @@ class MemoryDB:
                    p.enabled AS p_enabled, p.metadata_json AS p_metadata_json,
                    p.created_at AS p_created_at, p.updated_at AS p_updated_at,
                    m.id AS m_id, m.model AS m_model, m.display_name AS m_display_name,
-                   m.tier_hint AS m_tier_hint, m.enabled AS m_enabled,
+                   m.tier_hint AS m_tier_hint, m.description AS m_description,
+                   m.enabled AS m_enabled,
                    m.is_classifier AS m_is_classifier
             FROM providers p
             LEFT JOIN models m ON p.id = m.provider_id{join_filter}
@@ -2105,6 +2120,7 @@ class MemoryDB:
                     "model": r["m_model"],
                     "display_name": r["m_display_name"],
                     "tier_hint": r["m_tier_hint"],
+                    "description": r["m_description"],
                     "enabled": bool(r["m_enabled"]),
                     "is_classifier": bool(r["m_is_classifier"]),
                 })
@@ -2162,6 +2178,7 @@ class MemoryDB:
         model: str,
         display_name: str | None = None,
         tier_hint: str | None = None,
+        description: str | None = None,
         enabled: bool = True,
         is_classifier: bool = False,
         metadata: dict | None = None,
@@ -2189,12 +2206,13 @@ class MemoryDB:
         await conn.execute(
             """
             INSERT INTO models (provider_id, model, display_name, tier_hint,
-                                enabled, is_classifier, metadata_json, kind,
-                                created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                description, enabled, is_classifier, metadata_json,
+                                kind, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(provider_id, model) DO UPDATE SET
                 display_name = excluded.display_name,
                 tier_hint = excluded.tier_hint,
+                description = excluded.description,
                 enabled = excluded.enabled,
                 is_classifier = excluded.is_classifier,
                 metadata_json = excluded.metadata_json,
@@ -2206,6 +2224,7 @@ class MemoryDB:
                 str(model).strip(),
                 display_name,
                 tier_hint,
+                description,
                 1 if enabled else 0,
                 1 if is_classifier else 0,
                 json.dumps(dict(metadata or {})),

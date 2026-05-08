@@ -489,7 +489,7 @@ class SmartRouter(BaseModel):
                     "provider": e.provider,
                     "framework": e.framework,
                     "display_name": e.display_name or e.model_id,
-                    "tier_hint": e.tier_hint,
+                    "description": e.description,
                 }
                 for e in catalog
             ],
@@ -508,14 +508,14 @@ class SmartRouter(BaseModel):
             "runtime_id in the catalog.\n"
             "- Otherwise infer difficulty, modality (vision, long context, "
             "tool use), and cost-sensitivity from the turn and pick the "
-            "best fit. tier_hint is advisory free-form guidance — "
+            "best fit. description is advisory free-form guidance — "
             "override it when the turn calls for it.\n"
             "- For trivial turns (greetings, short factual questions, "
             "simple translations) prefer a fast/cheap model.\n"
             "- For multi-step refactors, debugging across files, or "
             "complex reasoning prefer a deep-reasoning model.\n"
             "- For image inputs prefer a vision-capable model "
-            "(consult notes).\n"
+            "(consult description for capabilities).\n"
             "- For desktop GUI, browser-driving, screenshot analysis, or "
             "computer-control tasks, avoid text-only models when another "
             "compatible model is available.\n\n"
