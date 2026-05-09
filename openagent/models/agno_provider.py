@@ -58,6 +58,52 @@ class AgnoProviderError(RuntimeError):
     actually went wrong instead of a silent placeholder."""
 
 
+def _save_agno_image_to_disk(image: Any) -> tuple[str | None, str | None]:
+    """Persist an Agno ``Image`` to a temp file. Returns ``(path, filename)``.
+
+    Tries ``content`` (bytes) first, then ``filepath``, then ``url``.
+    Returns ``(None, None)`` when no bytes can be resolved synchronously.
+    """
+    import tempfile, os
+
+    mime_type = getattr(image, "mime_type", None) or "image/png"
+    fmt = getattr(image, "format", None)
+    if not fmt:
+        fmt = mime_type.split("/")[-1] if "/" in mime_type else "png"
+    if fmt == "jpeg":
+        fmt = "jpg"
+    filename = getattr(image, "id", None) or f"image.{fmt}"
+    if not filename.endswith(f".{fmt}"):
+        filename = f"{filename}.{fmt}"
+
+    content = getattr(image, "content", None)
+    if content is not None:
+        if isinstance(content, str):
+            content = content.encode("utf-8")
+    elif getattr(image, "filepath", None):
+        fp = str(image.filepath)
+        try:
+            with open(fp, "rb") as f:
+                content = f.read()
+        except Exception:
+            pass
+    elif getattr(image, "url", None):
+        try:
+            import httpx
+            content = httpx.get(str(image.url)).content
+        except Exception:
+            pass
+
+    if not content:
+        return None, None
+
+    tmp = tempfile.mkdtemp(prefix="oa_agno_img_")
+    path = os.path.join(tmp, filename)
+    with open(path, "wb") as f:
+        f.write(content)
+    return os.path.realpath(path), filename
+
+
 def _extract_tool_names_from_agno_response(response: Any) -> list[str]:
     """Best-effort extraction of executed tool names from an Agno RunResponse.
 
@@ -1008,6 +1054,64 @@ class AgnoProvider(BaseModel):
             model=self.model,
         )
 
+    async def _emit_agno_tool_status(
+        self,
+        on_status: Callable[[str], Awaitable[None]],
+        tool_exec: Any | None,
+        status: str,
+        *,
+        error_text: str | None = None,
+    ) -> None:
+        """Forward an Agno ``ToolExecution`` as a JSON status frame.
+
+        Shape matches ``claude_cli._emit_tool_status`` — the contract
+        with ``openagent/stream/session.py`` and the frontend's
+        ``handleServerMessage`` parser.
+        """
+        import json as _json
+
+        tool_name = getattr(tool_exec, "tool_name", None) if tool_exec is not None else None
+        if not tool_name:
+            return
+        params = getattr(tool_exec, "tool_args", None)
+        result = getattr(tool_exec, "result", None) if tool_exec is not None else None
+        payload: dict[str, Any] = {
+            "tool": str(tool_name),
+            "params": params if isinstance(params, dict) else {},
+            "status": status,
+        }
+        if status == "done" and result is not None:
+            payload["result"] = str(result)
+        if status == "error" and error_text:
+            payload["error"] = str(error_text)
+        try:
+            await on_status(_json.dumps(payload))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _save_stream_image(image: Any) -> str | None:
+        """Write an Agno ``Image`` from ``RunContentEvent`` to a temp file.
+
+        Returns a ``[IMAGE:/path]`` marker that ``parse_response_markers``
+        extracts downstream, or ``None`` when the image has no bytes.
+        """
+        path, _filename = _save_agno_image_to_disk(image)
+        if path is None:
+            return None
+        return f"\n[IMAGE:{path}]\n"
+
+    @staticmethod
+    def _save_tool_image(tool_exec: Any | None, image: Any) -> str | None:
+        """Write an Agno ``Image`` produced by a tool call to a temp file.
+
+        Returns a ``[IMAGE:/path]`` marker, or ``None`` when no bytes.
+        """
+        path, _filename = _save_agno_image_to_disk(image)
+        if path is None:
+            return None
+        return f"\n[IMAGE:{path}]\n"
+
     async def stream(
         self,
         messages: list[dict[str, Any]],
@@ -1019,21 +1123,11 @@ class AgnoProvider(BaseModel):
         """Stream content deltas via Agno's native ``stream=True`` path.
 
         Yields raw text strings as they arrive from the LLM. Tool-call
-        events and other meta events are dropped — voice-mode UX only
-        needs the speakable text. On any failure, falls back to
-        :meth:`generate` and yields the full content as one chunk so the
-        caller still gets a reply (just without time-to-first-audio).
-
-        ``session_id`` is forwarded into Agno's ``arun(session_id=...)``
-        so each chat tab keeps its own RAM history. The previous
-        hardcoded ``"default"`` collided every concurrent stream — two
-        browser tabs would stomp on each other's history mid-turn.
-
-        ``on_status`` is accepted for parity with
-        :class:`ClaudeCLIRegistry.stream` (so ``Agent._run_inner_stream``
-        can introspect-and-forward without provider-specific branching);
-        Agno doesn't surface tool-running statuses through its content
-        stream so this is currently a no-op.
+        events are forwarded to ``on_status`` in the same JSON format
+        used by claude-cli, and image/file artifacts from tool results
+        are written to disk and yielded as ``[IMAGE:/path]`` markers.
+        On any failure, falls back to :meth:`generate` and yields the
+        full content as one chunk so the caller still gets a reply.
         """
         prompt = self._flatten_messages(messages)
         sid = session_id or "default"
@@ -1049,9 +1143,12 @@ class AgnoProvider(BaseModel):
             filtered_families=filtered_families or None,
         )
         try:
-            # Lazy import — Agno event types are only needed on the streaming
-            # path, and we don't want to require them on every import.
-            from agno.run.agent import RunContentEvent
+            from agno.run.agent import (
+                RunContentEvent,
+                ToolCallStartedEvent,
+                ToolCallCompletedEvent,
+                ToolCallErrorEvent,
+            )
 
             stream = runner.arun(
                 prompt, session_id=sid, user_id="openagent", stream=True,
@@ -1059,16 +1156,42 @@ class AgnoProvider(BaseModel):
             try:
                 emitted = 0
                 async for event in stream:
-                    # Only RunContentEvent carries text deltas; other events
-                    # (tool starts, reasoning, run lifecycle) are noise from
-                    # the TTS pipeline's perspective.
                     if isinstance(event, RunContentEvent):
                         text = getattr(event, "content", None) or ""
                         if text:
                             emitted += len(text)
                             yield text
+                        image = getattr(event, "image", None)
+                        if image is not None:
+                            marker = self._save_stream_image(image)
+                            if marker:
+                                yield marker
+                    elif isinstance(event, ToolCallStartedEvent):
+                        if on_status is not None:
+                            tool_exec = getattr(event, "tool", None)
+                            await self._emit_agno_tool_status(
+                                on_status, tool_exec, "running",
+                            )
+                    elif isinstance(event, ToolCallCompletedEvent):
+                        tool_exec = getattr(event, "tool", None)
+                        if on_status is not None:
+                            await self._emit_agno_tool_status(
+                                on_status, tool_exec, "done",
+                            )
+                        images = getattr(event, "images", None) or []
+                        for img in images:
+                            marker = self._save_tool_image(tool_exec, img)
+                            if marker:
+                                yield marker
+                    elif isinstance(event, ToolCallErrorEvent):
+                        if on_status is not None:
+                            tool_exec = getattr(event, "tool", None)
+                            error_text = getattr(event, "error", None)
+                            await self._emit_agno_tool_status(
+                                on_status, tool_exec, "error",
+                                error_text=error_text,
+                            )
             finally:
-                # Agno's iterator may need explicit closing — best-effort.
                 aclose = getattr(stream, "aclose", None)
                 if aclose is not None:
                     try:
