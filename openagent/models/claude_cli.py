@@ -86,14 +86,10 @@ def _known_sdk_session_ids_from_db(
     *,
     provider: str = "claude-cli",
 ) -> set[str]:
-    """Best-effort sync snapshot of persisted ``sdk_sessions`` rows.
+    """Best-effort sync snapshot of persisted session rows.
 
-    ``known_session_ids()`` is intentionally synchronous, but the
-    gateway's post-restart ``/clear`` fallback needs it to surface
-    claude-cli sessions that only exist in SQLite (no live subprocess
-    yet, no in-memory registry entry yet). Reading the DB directly keeps
-    the public contract synchronous while avoiding a startup hydration
-    task.
+    Reads ``agno_sessions``, filtering to rows whose ``metadata`` JSON
+    carries a ``provider`` matching *provider*.
     """
     db_path = getattr(db, "db_path", None)
     if not db_path:
@@ -102,8 +98,8 @@ def _known_sdk_session_ids_from_db(
         conn = sqlite3.connect(str(db_path), timeout=0.2)
         try:
             rows = conn.execute(
-                "SELECT session_id FROM sdk_sessions "
-                "WHERE provider = ? OR provider IS NULL",
+                "SELECT session_id FROM agno_sessions "
+                "WHERE json_extract(metadata, '$.provider') = ?",
                 (provider,),
             ).fetchall()
         finally:
@@ -571,6 +567,11 @@ class ClaudeCLI(BaseModel):
         Best-effort: a missing session is a no-op, and any SDK-side error
         is logged but never raised (the user's interrupt should land
         regardless of provider state).
+
+        Additionally writes a cancelled run to ``chat_session_runs`` so
+        the DB mirrors Agno's ``commit_partial_assistant`` behaviour:
+        the session shows ``user → assistant(interrupted) → user``
+        rather than two adjacent user turns.
         """
         if not session_id:
             return
@@ -586,6 +587,14 @@ class ClaudeCLI(BaseModel):
             elog("claude_cli.barge_in_interrupt", session_id=session_id)
         except Exception as e:  # noqa: BLE001 — best-effort
             logger.debug("claude_cli interrupt failed for %s: %s", session_id, e)
+        if self._db is not None and text:
+            try:
+                await self._db.commit_partial_session_run(
+                    session_id, text,
+                    model=self._model_id_for_response(session_id),
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.debug("claude_cli commit_partial db write failed: %s", e)
 
     async def cleanup_idle(self) -> None:
         """Close clients idle for more than ``_idle_ttl`` seconds.
@@ -777,6 +786,7 @@ class ClaudeCLI(BaseModel):
         on_status: Any = None,
         on_delta: Callable[[str], Awaitable[None]] | None = None,
         tool_names_out: list[str] | None = None,
+        tool_calls_out: list[dict] | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """Send ``prompt`` and consume the SDK stream.
 
@@ -888,6 +898,13 @@ class ClaudeCLI(BaseModel):
                         )
                         if tool_names_out is not None:
                             tool_names_out.append(str(tool_name))
+                        if tool_calls_out is not None:
+                            tool_call: dict[str, Any] = {
+                                "name": str(tool_name),
+                                "input": getattr(block, "input", None),
+                                "id": getattr(block, "id", None),
+                            }
+                            tool_calls_out.append(tool_call)
                     if on_status is not None:
                         await self._emit_tool_status(block, on_status)
             elif isinstance(message, UserMessage):
@@ -900,6 +917,12 @@ class ClaudeCLI(BaseModel):
                             tool_use_id=tool_use_id,
                             is_error=getattr(block, "is_error", None),
                         )
+                        if tool_calls_out is not None:
+                            for tc in tool_calls_out:
+                                if tc.get("id") == tool_use_id:
+                                    tc["output"] = getattr(block, "content", None)
+                                    tc["is_error"] = bool(getattr(block, "is_error", None))
+                                    break
             elif isinstance(message, ResultMessage):
                 elog("claude_cli.stream_end", session_id=session_id)
                 result_text, usage_meta = self._capture_result(message, session_id)
@@ -975,11 +998,23 @@ class ClaudeCLI(BaseModel):
                 await self._ensure_session_model(sid, client, requested_model)
 
                 tool_names_called: list[str] = []
+                tool_calls_detail: list[dict] = []
                 result, usage_meta = await self._run_once(
-                    client, prompt, sid, on_status, tool_names_out=tool_names_called
+                    client, prompt, sid, on_status,
+                    tool_names_out=tool_names_called,
+                    tool_calls_out=tool_calls_detail,
                 )
                 input_tokens, output_tokens, _ = await self._record_usage(
                     sid, usage_meta
+                )
+                self._persist_turn(
+                    sid,
+                    prompt=prompt,
+                    assistant_text=result,
+                    tool_calls=tool_calls_detail,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    model=self._model_id_for_response(sid),
                 )
                 return ModelResponse(
                     content=result,
@@ -1235,6 +1270,75 @@ class ClaudeCLI(BaseModel):
             billing="subscription",
         )
         return input_tokens, output_tokens, 0.0
+
+    def _persist_turn(
+        self,
+        session_id: str,
+        *,
+        prompt: str,
+        assistant_text: str,
+        tool_calls: list[dict] | None = None,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        model: str | None = None,
+    ) -> None:
+        """Write one turn's data to ``chat_session_runs``.
+
+        Mirrors what Agno does via ``SqliteDb`` when it persists a
+        session run after ``arun()``. This gives Claude CLI sessions
+        the same queryable turn history (actions, messages, MCP tool
+        calls, token usage) that Agno sessions already have in the
+        database, so session listing/deletion/reporting works across
+        both frameworks.
+        """
+        if self._db is None:
+            return
+        messages: list[dict] = [
+            {"role": "user", "content": prompt},
+        ]
+        if assistant_text:
+            messages.append({"role": "assistant", "content": assistant_text})
+        for tc in (tool_calls or []):
+            messages.append({
+                "role": "tool",
+                "content": str(tc.get("output", "") or ""),
+                "name": tc.get("name", ""),
+            })
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        async def _write() -> None:
+            try:
+                # Upsert session metadata so this session shows up in
+                # the persisted list, carrying the model and framework.
+                await self._db.upsert_session(
+                    session_id, client_id=session_id,
+                    title=prompt[:120],
+                    model=model,
+                    framework="claude-cli",
+                )
+                await self._db.add_session_run(
+                    session_id=session_id,
+                    status="completed",
+                    messages=messages,
+                    tool_calls=tool_calls or [],
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cost=0.0,
+                    model=model,
+                )
+                elog(
+                    "claude_cli.turn_persisted",
+                    session_id=session_id,
+                    messages=len(messages),
+                    tool_calls=len(tool_calls or []),
+                )
+            except Exception as e:
+                logger.debug("claude_cli _persist_turn failed: %s", e)
+
+        loop.create_task(_write())
 
 
 class ClaudeCLIRegistry(BaseModel):

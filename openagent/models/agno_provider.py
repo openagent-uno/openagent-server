@@ -658,10 +658,10 @@ class AgnoProvider(BaseModel):
             # recall without blowing the token budget on raw transcript.
             enable_session_summaries=True,
             add_session_summary_to_context=True,
-            # Agentic memory lets the model persist user-scoped facts
-            # across sessions (e.g. preferences the user restated). Uses
-            # the agent's own model as the default memory manager.
-            enable_agentic_memory=True,
+            # Agentic memory is disabled — OpenAgent uses the vault for
+            # user-scoped persistence. Keeping it off avoids agno_memories
+            # table creation and keeps all state in agno_sessions.
+            enable_agentic_memory=False,
             markdown=False,
         )
         self._agno_agents[sys_key] = agent
@@ -778,7 +778,7 @@ class AgnoProvider(BaseModel):
                 num_history_runs=self._history_runs,
                 enable_session_summaries=True,
                 add_session_summary_to_context=True,
-                enable_agentic_memory=True,
+                enable_agentic_memory=False,
                 markdown=False,
             )
         except Exception as exc:
@@ -1010,6 +1010,12 @@ class AgnoProvider(BaseModel):
                 response=repr(response)[:200],
             )
             content = "(Done — no final message was returned.)"
+
+        if on_status:
+            tools = getattr(response, "tools", None) or []
+            for tool_exec in tools:
+                await self._emit_agno_tool_status(on_status, tool_exec, "done")
+
         metrics_obj = getattr(response, "metrics", None)
         metrics_dict = self._metrics_to_dict(metrics_obj)
 
@@ -1166,13 +1172,15 @@ class AgnoProvider(BaseModel):
                             marker = self._save_stream_image(image)
                             if marker:
                                 yield marker
-                    elif isinstance(event, ToolCallStartedEvent):
+                        continue
+                    et = getattr(event, "event", "")
+                    if et == "ToolCallStarted" or isinstance(event, ToolCallStartedEvent):
                         if on_status is not None:
                             tool_exec = getattr(event, "tool", None)
                             await self._emit_agno_tool_status(
                                 on_status, tool_exec, "running",
                             )
-                    elif isinstance(event, ToolCallCompletedEvent):
+                    elif et == "ToolCallCompleted" or isinstance(event, ToolCallCompletedEvent):
                         tool_exec = getattr(event, "tool", None)
                         if on_status is not None:
                             await self._emit_agno_tool_status(
@@ -1183,7 +1191,7 @@ class AgnoProvider(BaseModel):
                             marker = self._save_tool_image(tool_exec, img)
                             if marker:
                                 yield marker
-                    elif isinstance(event, ToolCallErrorEvent):
+                    elif et == "ToolCallError" or isinstance(event, ToolCallErrorEvent):
                         if on_status is not None:
                             tool_exec = getattr(event, "tool", None)
                             error_text = getattr(event, "error", None)

@@ -51,19 +51,39 @@ CREATE TABLE IF NOT EXISTS usage_log (
 CREATE INDEX IF NOT EXISTS idx_usage_year_month ON usage_log(year_month);
 CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON usage_log(timestamp);
 
--- Mapping from OpenAgent session_id (e.g. "tg:155490357") to the
--- provider-native session_id (e.g. Claude SDK UUID) so the provider can
--- --resume the correct transcript after a process restart. Without this
--- the in-memory mapping is wiped by any restart (OOM kill, auto-update,
--- manual restart) and the user's next message starts a brand-new
--- conversation — which presents as "agent forgot everything".
-CREATE TABLE IF NOT EXISTS sdk_sessions (
-    session_id TEXT PRIMARY KEY,
-    sdk_session_id TEXT NOT NULL,
-    provider TEXT,
-    updated_at REAL NOT NULL
+-- Canonical session table — every chat conversation lives here.
+-- Agno sessions are written natively by ``agno.db.sqlite.SqliteDb``
+-- (which creates this table on first use via its own ORM). Claude
+-- CLI sessions are inserted manually with the same column layout
+-- so session listing, deletion, and reporting work uniformly across
+-- both frameworks.
+--
+-- ``runs`` is a JSON array of RunOutput-shaped objects:
+--   [{"run_id": "...", "messages": [{"role":"user","content":"..."},...],
+--     "status":"completed", "metrics":{...}, ...}]
+--
+-- ``metadata`` is a JSON object for framework-private state:
+--   - Claude CLI stores ``{"sdk_session_id": "...", "provider": "claude-cli"}``
+--     so ``--resume`` survives process restarts.
+--   - Agno stores its own session/agent/team descriptors (managed by SqliteDb).
+CREATE TABLE IF NOT EXISTS agno_sessions (
+    session_id   TEXT PRIMARY KEY,
+    session_type TEXT,
+    agent_id     TEXT,
+    team_id      TEXT,
+    workflow_id  TEXT,
+    user_id      TEXT,
+    session_data TEXT,
+    agent_data   TEXT,
+    team_data    TEXT,
+    workflow_data TEXT,
+    metadata     TEXT,
+    runs         TEXT,
+    summary      TEXT,
+    created_at   INTEGER NOT NULL,
+    updated_at   INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_sdk_sessions_updated ON sdk_sessions(updated_at);
+CREATE INDEX IF NOT EXISTS idx_agno_sessions_updated ON agno_sessions(updated_at);
 
 -- Configured MCP servers. The agent itself (via the mcp-manager MCP)
 -- can add/remove/toggle servers at runtime without a process restart.
@@ -500,6 +520,116 @@ class MemoryDB:
             "CREATE INDEX IF NOT EXISTS idx_models_kind ON models(kind)"
         )
         await self._migrate_models_description_column()
+        await self._migrate_legacy_tables_to_agno_sessions()
+
+    async def _migrate_legacy_tables_to_agno_sessions(self) -> None:
+        """One-time: fold sdk_sessions + chat_sessions + chat_session_runs
+        into the canonical ``agno_sessions`` table, then drop them.
+
+        Idempotent: probes for the old tables first; a fresh install
+        (where agno_sessions is the only session table from the start)
+        skips all work.
+        """
+        assert self._conn is not None
+        cursor = await self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+            "('sdk_sessions','chat_sessions','chat_session_runs')"
+        )
+        legacy_tables = {r[0] for r in await cursor.fetchall()}
+        if not legacy_tables:
+            return
+
+        now = time.time()
+
+        # 1. Upsert sdk_sessions rows into agno_sessions, carrying the
+        #    SDK session id in the metadata JSON column.
+        if "sdk_sessions" in legacy_tables:
+            cursor = await self._conn.execute(
+                "SELECT session_id, sdk_session_id, provider, updated_at "
+                "FROM sdk_sessions"
+            )
+            for row in await cursor.fetchall():
+                sid = row[0]
+                sdk_sid = row[1]
+                provider = row[2] or "claude-cli"
+                ts = row[3] or now
+                meta = json.dumps({
+                    "sdk_session_id": sdk_sid,
+                    "provider": provider,
+                })
+                await self._conn.execute(
+                    "INSERT OR IGNORE INTO agno_sessions "
+                    "(session_id, session_type, user_id, metadata, "
+                    " created_at, updated_at) "
+                    "VALUES (?, 'agent', 'openagent', ?, ?, ?)",
+                    (sid, meta, ts, ts),
+                )
+                # If a row already existed (from agno), merge the SDK metadata.
+                await self._conn.execute(
+                    "UPDATE agno_sessions SET metadata = ? "
+                    "WHERE session_id = ? AND (metadata IS NULL OR metadata = '' "
+                    " OR json_extract(metadata, '$.sdk_session_id') IS NULL)",
+                    (meta, sid),
+                )
+            await self._conn.commit()
+
+        # 2. Upsert chat_sessions rows (metadata like title, model, framework).
+        if "chat_sessions" in legacy_tables:
+            col_list = {"session_id", "client_id", "title", "model",
+                         "framework", "created_at", "updated_at", "last_active_at"}
+            cursor = await self._conn.execute(
+                "SELECT session_id, client_id, title, model, framework, "
+                "created_at, updated_at, last_active_at FROM chat_sessions"
+            )
+            for row in await cursor.fetchall():
+                r = dict(row)
+                sid = r.get("session_id")
+                if not sid:
+                    continue
+                # Merge extra metadata into the JSON column.
+                extra = {k: r[k] for k in ("client_id", "title", "model")
+                         if r.get(k)}
+                if extra:
+                    extra["framework"] = r.get("framework", "")
+                # Read existing metadata, merge.
+                cursor2 = await self._conn.execute(
+                    "SELECT metadata FROM agno_sessions WHERE session_id = ?", (sid,)
+                )
+                existing = await cursor2.fetchone()
+                try:
+                    meta = json.loads(existing[0] or "{}") if existing else {}
+                except (TypeError, ValueError):
+                    meta = {}
+                meta.update(extra)
+                ts = r.get("updated_at") or r.get("created_at") or now
+                await self._conn.execute(
+                    "INSERT OR IGNORE INTO agno_sessions "
+                    "(session_id, session_type, user_id, metadata, "
+                    " created_at, updated_at) "
+                    "VALUES (?, 'agent', 'openagent', ?, ?, ?)",
+                    (sid, json.dumps(meta), r.get("created_at", ts), ts),
+                )
+                if existing:
+                    await self._conn.execute(
+                        "UPDATE agno_sessions SET metadata = ?, updated_at = MAX(updated_at, ?) "
+                        "WHERE session_id = ?",
+                        (json.dumps(meta), ts, sid),
+                    )
+            await self._conn.commit()
+
+        # 3. Drop the legacy tables.
+        for table in ("chat_session_runs", "chat_sessions", "sdk_sessions"):
+            if table in legacy_tables:
+                try:
+                    await self._conn.execute(f"DROP TABLE IF EXISTS {table}")
+                except Exception:
+                    pass
+        # Drop agno_memories — agentic memory is disabled.
+        try:
+            await self._conn.execute("DROP TABLE IF EXISTS agno_memories")
+        except Exception:
+            pass
+        await self._conn.commit()
 
     async def _migrate_models_kind_column(self) -> None:
         """Add ``models.kind`` (idempotent) and lift TTS/STT settings out
@@ -1499,7 +1629,59 @@ class MemoryDB:
             total += r["total_cost"]
         return {"total": round(total, 6), "by_model": by_model}
 
-    # ── SDK Session Mapping ──
+    # ── Session store (agno_sessions) ──
+    #
+    # agno_sessions is the single canonical table for all chat sessions.
+    # Agno writes via ``SqliteDb``; Claude CLI writes manually with the
+    # same column layout. SDK resume state lives in the ``metadata``
+    # JSON column so ``--resume`` survives restarts without a separate
+    # mapping table.
+
+    async def _ensure_agno_session_row(
+        self, session_id: str, *, metadata_updates: dict | None = None
+    ) -> None:
+        """Create the baseline agno_sessions row if it doesn't exist yet.
+        Fills in the minimum columns that both Agno and Claude CLI need.
+        """
+        conn = await self._ensure_connected()
+        now = int(time.time())
+        existing = await (
+            await conn.execute(
+                "SELECT 1 FROM agno_sessions WHERE session_id = ?", (session_id,)
+            )
+        ).fetchone()
+        if existing:
+            if metadata_updates:
+                await conn.execute(
+                    "UPDATE agno_sessions SET metadata = ?, updated_at = ? "
+                    "WHERE session_id = ?",
+                    (json.dumps(metadata_updates), now, session_id),
+                )
+            await conn.commit()
+            return
+        await conn.execute(
+            "INSERT OR IGNORE INTO agno_sessions "
+            "(session_id, session_type, user_id, metadata, created_at, updated_at) "
+            "VALUES (?, 'agent', 'openagent', ?, ?, ?)",
+            (session_id, json.dumps(metadata_updates or {}), now, now),
+        )
+        await conn.commit()
+
+    async def get_sdk_session(self, session_id: str) -> str | None:
+        """Read the SDK session id from agno_sessions.metadata."""
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            "SELECT metadata FROM agno_sessions WHERE session_id = ?",
+            (session_id,),
+        )
+        row = await cursor.fetchone()
+        if not row or not row[0]:
+            return None
+        try:
+            meta = json.loads(row[0])
+        except (TypeError, ValueError):
+            return None
+        return meta.get("sdk_session_id")
 
     async def set_sdk_session(
         self,
@@ -1507,65 +1689,56 @@ class MemoryDB:
         sdk_session_id: str,
         provider: str | None = None,
     ) -> None:
-        """Persist the ``session_id → sdk_session_id`` mapping for resume
-        after restart. Callers typically fire-and-forget so provider latency
-        isn't affected.
-        """
-        conn = await self._ensure_connected()
-        await conn.execute(
-            "INSERT INTO sdk_sessions (session_id, sdk_session_id, provider, updated_at) "
-            "VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(session_id) DO UPDATE SET "
-            "sdk_session_id = excluded.sdk_session_id, "
-            "provider = excluded.provider, "
-            "updated_at = excluded.updated_at",
-            (session_id, sdk_session_id, provider, time.time()),
+        """Store SDK session id in agno_sessions.metadata."""
+        await self._ensure_agno_session_row(
+            session_id,
+            metadata_updates={
+                "sdk_session_id": sdk_session_id,
+                "provider": provider or "claude-cli",
+            },
         )
-        await conn.commit()
 
-    async def get_sdk_session(self, session_id: str) -> str | None:
-        """Look up the provider-native session_id previously stored for ``session_id``."""
+    async def delete_sdk_session(self, session_id: str) -> None:
+        """Clear the SDK session id from metadata. The session row stays."""
         conn = await self._ensure_connected()
         cursor = await conn.execute(
-            "SELECT sdk_session_id FROM sdk_sessions WHERE session_id = ?",
+            "SELECT metadata FROM agno_sessions WHERE session_id = ?",
             (session_id,),
         )
         row = await cursor.fetchone()
-        return row[0] if row else None
-
-    async def get_all_sdk_sessions(self, provider: str | None = None) -> dict[str, str]:
-        """Return ``{session_id: sdk_session_id}`` for all (or one provider's) rows.
-
-        Used on provider startup to hydrate the in-memory cache from disk so
-        the first user message after a restart can resume the right transcript.
-        """
-        conn = await self._ensure_connected()
-        if provider is None:
-            cursor = await conn.execute(
-                "SELECT session_id, sdk_session_id FROM sdk_sessions"
-            )
-        else:
-            cursor = await conn.execute(
-                "SELECT session_id, sdk_session_id FROM sdk_sessions WHERE provider = ?",
-                (provider,),
-            )
-        rows = await cursor.fetchall()
-        return {row[0]: row[1] for row in rows}
-
-    async def delete_sdk_session(self, session_id: str) -> None:
-        """Remove the stored ``session_id → sdk_session_id`` row.
-
-        Called when the user explicitly asks to forget a conversation
-        (``/clear``, ``/new``) so that the next message spawns a fresh
-        subprocess without ``--resume`` instead of picking the old
-        transcript back up.
-        """
-        conn = await self._ensure_connected()
+        if not row:
+            return
+        try:
+            meta = json.loads(row[0] or "{}")
+        except (TypeError, ValueError):
+            meta = {}
+        meta.pop("sdk_session_id", None)
+        meta.pop("provider", None)
         await conn.execute(
-            "DELETE FROM sdk_sessions WHERE session_id = ?",
-            (session_id,),
+            "UPDATE agno_sessions SET metadata = ?, updated_at = ? WHERE session_id = ?",
+            (json.dumps(meta), int(time.time()), session_id),
         )
         await conn.commit()
+
+    async def get_all_sdk_sessions(self, provider: str | None = None) -> dict[str, str]:
+        """Return {session_id: sdk_session_id} for claude-cli sessions."""
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            "SELECT session_id, metadata FROM agno_sessions "
+            "WHERE json_extract(metadata, '$.sdk_session_id') IS NOT NULL"
+        )
+        rows = await cursor.fetchall()
+        result: dict[str, str] = {}
+        for row in rows:
+            try:
+                meta = json.loads(row[1] or "{}")
+            except (TypeError, ValueError):
+                continue
+            sid = meta.get("sdk_session_id")
+            p = meta.get("provider")
+            if sid and (provider is None or p == provider):
+                result[row[0]] = sid
+        return result
 
     # ── MCP Registry ──
 
@@ -2315,17 +2488,24 @@ class MemoryDB:
     async def get_session_binding(self, session_id: str) -> str | None:
         """Return ``"agno"`` / ``"claude-cli"`` or ``None`` if unbound.
 
-        Checks ``sdk_sessions`` first (source of truth for claude-cli
-        resume state) and falls back to ``session_bindings`` for agno.
+        Checks ``agno_sessions.metadata`` for a provider field first
+        (source of truth for claude-cli resume state), then falls back
+        to ``session_bindings`` for agno.
         """
         conn = await self._ensure_connected()
         cursor = await conn.execute(
-            "SELECT provider FROM sdk_sessions WHERE session_id = ?",
+            "SELECT metadata FROM agno_sessions WHERE session_id = ?",
             (session_id,),
         )
         row = await cursor.fetchone()
         if row and row[0]:
-            return str(row[0])
+            try:
+                meta = json.loads(row[0])
+            except (TypeError, ValueError):
+                meta = {}
+            provider = meta.get("provider")
+            if provider:
+                return str(provider)
         cursor = await conn.execute(
             "SELECT framework FROM session_bindings WHERE session_id = ?",
             (session_id,),
@@ -2434,6 +2614,244 @@ class MemoryDB:
         await conn.execute(
             "DELETE FROM session_bindings WHERE session_id = ?",
             (session_id,),
+        )
+        await conn.commit()
+
+    # ── Session list / CRUD (agno_sessions) ──
+
+    @staticmethod
+    def _parse_metadata(raw: str | None) -> dict:
+        try:
+            return json.loads(raw or "{}")
+        except (TypeError, ValueError):
+            return {}
+
+    async def list_all_sessions(
+        self,
+        client_id: str | None = None,
+        *,
+        limit: int = 50,
+    ) -> list[dict]:
+        """Return every session in ``agno_sessions``, ordered by
+        ``updated_at`` descending. Metadata columns (client_id, title,
+        model, framework) are extracted from the ``metadata`` JSON
+        column when present."""
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            "SELECT session_id, metadata, created_at, updated_at "
+            "FROM agno_sessions "
+            "ORDER BY updated_at DESC LIMIT ?",
+            (int(limit),),
+        )
+        results: list[dict] = []
+        for row in await cursor.fetchall():
+            sid = row[0]
+            meta = self._parse_metadata(row[1])
+            results.append({
+                "session_id": sid,
+                "client_id": meta.get("client_id", ""),
+                "title": meta.get("title"),
+                "model": meta.get("model"),
+                "framework": meta.get("framework") or "agno",
+                "created_at": row[2],
+                "last_active_at": row[3],
+            })
+        if client_id:
+            results = [r for r in results if r["client_id"] == client_id]
+        return results
+
+    async def upsert_session(
+        self,
+        session_id: str,
+        *,
+        client_id: str | None = None,
+        title: str | None = None,
+        model: str | None = None,
+        framework: str | None = None,
+    ) -> None:
+        """Create or update the ``agno_sessions`` row, merging the
+        display metadata into the ``metadata`` JSON column."""
+        conn = await self._ensure_connected()
+        now = int(time.time())
+        existing = await (
+            await conn.execute(
+                "SELECT metadata FROM agno_sessions WHERE session_id = ?",
+                (session_id,),
+            )
+        ).fetchone()
+        meta = self._parse_metadata(existing[0] if existing else None)
+        if client_id:
+            meta["client_id"] = client_id
+        if title:
+            meta["title"] = title[:200]
+        if model:
+            meta["model"] = model
+        if framework:
+            meta["framework"] = framework
+        if existing:
+            await conn.execute(
+                "UPDATE agno_sessions SET metadata = ?, updated_at = ? "
+                "WHERE session_id = ?",
+                (json.dumps(meta), now, session_id),
+            )
+        else:
+            await conn.execute(
+                "INSERT OR IGNORE INTO agno_sessions "
+                "(session_id, session_type, user_id, metadata, created_at, updated_at) "
+                "VALUES (?, 'agent', 'openagent', ?, ?, ?)",
+                (session_id, json.dumps(meta), now, now),
+            )
+        await conn.commit()
+
+    async def delete_session(self, session_id: str) -> None:
+        conn = await self._ensure_connected()
+        await conn.execute(
+            "DELETE FROM agno_sessions WHERE session_id = ?",
+            (session_id,),
+        )
+        await conn.commit()
+
+    async def get_session(self, session_id: str) -> dict | None:
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            "SELECT session_id, metadata, created_at, updated_at "
+            "FROM agno_sessions WHERE session_id = ?",
+            (session_id,),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        meta = self._parse_metadata(row[1])
+        return {
+            "session_id": row[0],
+            "client_id": meta.get("client_id", ""),
+            "title": meta.get("title"),
+            "model": meta.get("model"),
+            "framework": meta.get("framework") or "agno",
+            "created_at": row[2],
+            "last_active_at": row[3],
+        }
+
+    # ── Session runs (Claude CLI writes, Agno writes via SqliteDb) ──
+
+    async def add_session_run(
+        self,
+        session_id: str,
+        *,
+        status: str = "completed",
+        messages: list[dict] | None = None,
+        tool_calls: list[dict] | None = None,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cost: float = 0.0,
+        model: str | None = None,
+        run_id: str | None = None,
+    ) -> str:
+        """Append one turn to ``agno_sessions.runs``. The run is stored
+        in Agno's ``RunOutput`` shape so it is queryable alongside runs
+        produced by ``SqliteDb``."""
+        import time as _time
+        conn = await self._ensure_connected()
+        rid = run_id or str(uuid.uuid4())
+        now = int(_time.time())
+        run_obj = {
+            "run_id": rid,
+            "agent_id": "openagent",
+            "session_id": session_id,
+            "user_id": "openagent",
+            "content": "",
+            "messages": messages or [],
+            "status": status,
+            "metrics": {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cost": cost,
+            },
+        }
+        if model:
+            run_obj["model"] = model
+        if status == "completed":
+            for m in (messages or []):
+                if m.get("role") == "assistant":
+                    run_obj["content"] = m.get("content", "")
+                    break
+        # Append tool_call data as extra messages.
+        for tc in (tool_calls or []):
+            run_obj["messages"].append({
+                "role": "tool",
+                "content": str(tc.get("output", "") or ""),
+                "tool_name": tc.get("name", ""),
+                "tool_call_id": tc.get("id", ""),
+            })
+        # Read current runs array, append new run.
+        cursor = await conn.execute(
+            "SELECT runs FROM agno_sessions WHERE session_id = ?",
+            (session_id,),
+        )
+        row = await cursor.fetchone()
+        try:
+            runs = json.loads(row[0] or "[]") if row else []
+        except (TypeError, ValueError):
+            runs = []
+        if not isinstance(runs, list):
+            runs = []
+        runs.append(run_obj)
+        await conn.execute(
+            "INSERT OR IGNORE INTO agno_sessions "
+            "(session_id, session_type, user_id, runs, created_at, updated_at) "
+            "VALUES (?, 'agent', 'openagent', ?, ?, ?)",
+            (session_id, json.dumps(runs), now, now),
+        )
+        await conn.execute(
+            "UPDATE agno_sessions SET runs = ?, updated_at = ? WHERE session_id = ?",
+            (json.dumps(runs), now, session_id),
+        )
+        await conn.commit()
+        return rid
+
+    async def commit_partial_session_run(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        model: str | None = None,
+    ) -> str | None:
+        if not session_id or not text:
+            return None
+        return await self.add_session_run(
+            session_id=session_id,
+            status="cancelled",
+            messages=[{"role": "assistant", "content": text}],
+            model=model,
+        )
+
+    async def list_session_runs(
+        self,
+        session_id: str,
+        *,
+        limit: int = 20,
+    ) -> list[dict]:
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            "SELECT runs FROM agno_sessions WHERE session_id = ?",
+            (session_id,),
+        )
+        row = await cursor.fetchone()
+        if not row or not row[0]:
+            return []
+        try:
+            runs = json.loads(row[0])
+        except (TypeError, ValueError):
+            return []
+        if not isinstance(runs, list):
+            return []
+        return list(reversed(runs[-limit:]))
+
+    async def delete_session_runs(self, session_id: str) -> None:
+        conn = await self._ensure_connected()
+        await conn.execute(
+            "UPDATE agno_sessions SET runs = NULL, updated_at = ? WHERE session_id = ?",
+            (int(time.time()), session_id),
         )
         await conn.commit()
 

@@ -368,18 +368,36 @@ class Agent:
         Used by the gateway's ``/clear`` code path to reach past its own
         in-memory SessionManager (which starts empty after a restart) and
         forget conversations whose bridge session ids were hydrated back
-        into the model from disk.
+        into the model from disk. Also includes sessions persisted in the
+        ``agno_sessions`` table so that Claude CLI sessions without a live
+        SDK session mapping still appear in the list.
         """
+        import sqlite3
+
         model = model_override or self.model
-        if model is None:
-            return []
-        known = getattr(model, "known_session_ids", None)
-        if not callable(known):
-            return []
-        try:
-            return list(known())
-        except Exception:
-            return []
+        sids: set[str] = set()
+        if model is not None:
+            known = getattr(model, "known_session_ids", None)
+            if callable(known):
+                try:
+                    sids.update(known())
+                except Exception:
+                    pass
+        if self._db is not None:
+            db_path = getattr(self._db, "db_path", None)
+            if db_path:
+                try:
+                    conn = sqlite3.connect(str(db_path), timeout=0.2)
+                    try:
+                        rows = conn.execute(
+                            "SELECT session_id FROM agno_sessions"
+                        ).fetchall()
+                        sids.update(str(r[0]) for r in rows if r and r[0])
+                    finally:
+                        conn.close()
+                except Exception:
+                    pass
+        return list(sids)
 
     async def commit_partial_assistant(
         self, session_id: str, text: str

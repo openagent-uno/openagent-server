@@ -238,6 +238,7 @@ class Gateway:
         auth_middleware = make_auth_middleware(self._network_state.auth_state)
         app = web.Application(middlewares=[cors, auth_middleware])
         app["gateway"] = self  # accessible in handlers via request.app["gateway"]
+        self.sessions.set_db(self.agent.memory_db)
         self._register_routes(app)
 
         runner = web.AppRunner(app)
@@ -399,6 +400,11 @@ class Gateway:
             ("GET", "/api/sessions/{session_id}/model", sessions_api.handle_get),
             ("PUT", "/api/sessions/{session_id}/model", sessions_api.handle_pin),
             ("DELETE", "/api/sessions/{session_id}/model", sessions_api.handle_unpin),
+            # Session list, delete, and run history.
+            ("GET", "/api/sessions", sessions_api.handle_list),
+            ("DELETE", "/api/sessions/{session_id}", sessions_api.handle_delete),
+            ("PATCH", "/api/sessions/{session_id}", sessions_api.handle_patch_metadata),
+            ("GET", "/api/sessions/{session_id}/runs", sessions_api.handle_get_runs),
             ("POST", "/api/update", control.handle_update),
             ("POST", "/api/restart", control.handle_restart),
             # Cross-platform host telemetry (psutil-backed). Live

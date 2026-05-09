@@ -11,8 +11,9 @@ and AgnoProvider.
 
 Stop/clear semantics stay session-scoped: ``/stop`` from one tab
 cancels only that tab's in-flight turn; the legacy unscoped form used
-by admin shutdowns still walks every session. Session metadata remains
-RAM-only and is lost on process restart.
+by admin shutdowns still walks every session. Session metadata is
+persisted to the MemoryDB ``chat_sessions`` table when a DB reference
+is wired, so the session list survives process restarts.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 from openagent.core.logging import elog
 
@@ -74,11 +75,29 @@ class _ClientState:
 
 
 class SessionManager:
-    """Manages sessions and per-session message queues per client."""
+    """Manages sessions and per-session message queues per client.
+
+    When a MemoryDB reference is wired via ``set_db()``, session metadata
+    is persisted to the ``chat_sessions`` table so the session list
+    survives process restarts. Without a DB, behaviour is identical to
+    prior releases (RAM-only, lost on restart).
+    """
 
     def __init__(self, agent_name: str = "agent"):
         self.agent_name = agent_name
+        self._db: Any = None
         self._clients: dict[str, _ClientState] = {}
+
+    def set_db(self, db: Any) -> None:
+        self._db = db
+
+    def _fire_and_forget(self, coro) -> None:
+        """Schedule a DB write on the running loop without blocking the caller."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(coro)
 
     def _state(self, client_id: str) -> _ClientState:
         if client_id not in self._clients:
@@ -94,11 +113,30 @@ class SessionManager:
             st.session_states[session_id] = ss
         return ss
 
+    # ── session persistence helpers ──
+
+    def _persist_session(
+        self, session_id: str, client_id: str, title: str | None = None
+    ) -> None:
+        if self._db is None:
+            return
+        self._fire_and_forget(
+            self._db.upsert_session(
+                session_id, client_id=client_id, title=title,
+            )
+        )
+
+    def _remove_session_from_db(self, session_id: str) -> None:
+        if self._db is None:
+            return
+        self._fire_and_forget(self._db.delete_session(session_id))
+
     # ── sessions ──
 
     def create_session(self, client_id: str) -> str:
         sid = f"{self.agent_name}:{client_id}:{uuid.uuid4().hex[:8]}"
         self._state(client_id).sessions[sid] = Session(id=sid, client_id=client_id)
+        self._persist_session(sid, client_id)
         elog("session.create", client_id=client_id, session_id=sid)
         return sid
 
@@ -107,6 +145,7 @@ class SessionManager:
         created = False
         if session_id not in st.sessions:
             st.sessions[session_id] = Session(id=session_id, client_id=client_id)
+            self._persist_session(session_id, client_id)
             created = True
         elog("session.attach", client_id=client_id, session_id=session_id, created=created)
         return session_id
@@ -114,9 +153,7 @@ class SessionManager:
     def reset_session(self, client_id: str, session_id: str) -> str:
         st = self._state(client_id)
         st.sessions.pop(session_id, None)
-        # Also drop the per-session worker state so a reset + create
-        # actually gives a fresh queue. Any pending messages are
-        # discarded (caller is asking for a reset).
+        self._remove_session_from_db(session_id)
         ss = st.session_states.pop(session_id, None)
         if ss is not None and ss.worker_task is not None and not ss.worker_task.done():
             ss.worker_task.cancel()
@@ -143,6 +180,76 @@ class SessionManager:
 
     def list_sessions(self, client_id: str) -> list[str]:
         return list(self._state(client_id).sessions.keys())
+
+    async def list_sessions_persisted(self, client_id: str) -> list[dict]:
+        """Return sessions for ``client_id``, merging RAM + DB.
+
+        RAM entries carry live queue/busy state; DB entries fill in
+        sessions that existed before this process started. Results
+        are deduplicated by session_id.
+        """
+        ram_sids = set(self.list_sessions(client_id))
+        results: dict[str, dict] = {}
+        for sid in ram_sids:
+            results[sid] = {
+                "session_id": sid,
+                "client_id": client_id,
+                "title": None,
+                "model": None,
+                "framework": None,
+                "created_at": None,
+                "last_active_at": None,
+            }
+
+        if self._db is not None:
+            try:
+                db_rows = await self._db.list_all_sessions(client_id, limit=200)
+                for row in db_rows:
+                    sid = row.get("session_id", "")
+                    if sid in results:
+                        # Enrich RAM entry with DB metadata
+                        results[sid].update({k: v for k, v in row.items() if v is not None})
+                    else:
+                        results[sid] = {
+                            "session_id": sid,
+                            "client_id": row.get("client_id", client_id),
+                            "title": row.get("title"),
+                            "model": row.get("model"),
+                            "framework": row.get("framework"),
+                            "created_at": row.get("created_at"),
+                            "last_active_at": row.get("last_active_at"),
+                        }
+            except Exception:
+                pass
+
+        return sorted(
+            results.values(),
+            key=lambda r: r.get("last_active_at") or 0,
+            reverse=True,
+        )
+
+    async def delete_session(self, client_id: str, session_id: str) -> bool:
+        """Delete one session from RAM and DB. Returns True if anything was removed."""
+        deleted = False
+        st = self._clients.get(client_id)
+        if st:
+            st.sessions.pop(session_id, None)
+            ss = st.session_states.pop(session_id, None)
+            if ss is not None:
+                if ss.current_task and not ss.current_task.done():
+                    ss.current_task.cancel()
+                if ss.worker_task and not ss.worker_task.done():
+                    ss.worker_task.cancel()
+                deleted = True
+        if self._db is not None:
+            try:
+                await self._db.delete_session(session_id)
+                deleted = True
+            except Exception:
+                pass
+        if deleted:
+            elog("session.delete", client_id=client_id, session_id=session_id)
+        return deleted
 
     # ── queue ──
 
