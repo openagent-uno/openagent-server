@@ -1014,6 +1014,8 @@ class AgnoProvider(BaseModel):
         if on_status:
             tools = getattr(response, "tools", None) or []
             for tool_exec in tools:
+                await self._emit_agno_tool_status(on_status, tool_exec, "running")
+            for tool_exec in tools:
                 await self._emit_agno_tool_status(on_status, tool_exec, "done")
 
         metrics_obj = getattr(response, "metrics", None)
@@ -1158,6 +1160,7 @@ class AgnoProvider(BaseModel):
 
             stream = runner.arun(
                 prompt, session_id=sid, user_id="openagent", stream=True,
+                stream_events=True,
             )
             try:
                 emitted = 0
