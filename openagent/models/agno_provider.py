@@ -1152,11 +1152,29 @@ class AgnoProvider(BaseModel):
         )
         try:
             from agno.run.agent import (
-                RunContentEvent,
-                ToolCallStartedEvent,
-                ToolCallCompletedEvent,
-                ToolCallErrorEvent,
+                RunContentEvent as AgentRunContentEvent,
+                ToolCallStartedEvent as AgentToolCallStartedEvent,
+                ToolCallCompletedEvent as AgentToolCallCompletedEvent,
+                ToolCallErrorEvent as AgentToolCallErrorEvent,
             )
+            try:
+                from agno.run.team import (
+                    RunContentEvent as TeamRunContentEvent,
+                    ToolCallStartedEvent as TeamToolCallStartedEvent,
+                    ToolCallCompletedEvent as TeamToolCallCompletedEvent,
+                    ToolCallErrorEvent as TeamToolCallErrorEvent,
+                )
+            except ImportError:
+                TeamRunContentEvent = None  # type: ignore
+                TeamToolCallStartedEvent = None  # type: ignore
+                TeamToolCallCompletedEvent = None  # type: ignore
+                TeamToolCallErrorEvent = None  # type: ignore
+                AGNO_TEAM_EVENTS = False
+            else:
+                AGNO_TEAM_EVENTS = True
+            _content_event_types: tuple = (AgentRunContentEvent,)
+            if AGNO_TEAM_EVENTS and TeamRunContentEvent is not None:
+                _content_event_types = (AgentRunContentEvent, TeamRunContentEvent)
 
             stream = runner.arun(
                 prompt, session_id=sid, user_id="openagent", stream=True,
@@ -1165,7 +1183,7 @@ class AgnoProvider(BaseModel):
             try:
                 emitted = 0
                 async for event in stream:
-                    if isinstance(event, RunContentEvent):
+                    if isinstance(event, _content_event_types):
                         text = getattr(event, "content", None) or ""
                         if text:
                             emitted += len(text)
@@ -1177,13 +1195,24 @@ class AgnoProvider(BaseModel):
                                 yield marker
                         continue
                     et = getattr(event, "event", "")
-                    if et == "ToolCallStarted" or isinstance(event, ToolCallStartedEvent):
+                    _tool_started = (AgentToolCallStartedEvent,)
+                    _tool_completed = (AgentToolCallCompletedEvent,)
+                    _tool_error = (AgentToolCallErrorEvent,)
+                    if AGNO_TEAM_EVENTS:
+                        _tool_started = (AgentToolCallStartedEvent, TeamToolCallStartedEvent)
+                        _tool_completed = (AgentToolCallCompletedEvent, TeamToolCallCompletedEvent)
+                        _tool_error = (AgentToolCallErrorEvent, TeamToolCallErrorEvent)
+                    if et in ("ToolCallStarted", "TeamToolCallStarted") or isinstance(
+                        event, _tool_started
+                    ):
                         if on_status is not None:
                             tool_exec = getattr(event, "tool", None)
                             await self._emit_agno_tool_status(
                                 on_status, tool_exec, "running",
                             )
-                    elif et == "ToolCallCompleted" or isinstance(event, ToolCallCompletedEvent):
+                    elif et in ("ToolCallCompleted", "TeamToolCallCompleted") or isinstance(
+                        event, _tool_completed
+                    ):
                         tool_exec = getattr(event, "tool", None)
                         if on_status is not None:
                             await self._emit_agno_tool_status(
@@ -1194,7 +1223,9 @@ class AgnoProvider(BaseModel):
                             marker = self._save_tool_image(tool_exec, img)
                             if marker:
                                 yield marker
-                    elif et == "ToolCallError" or isinstance(event, ToolCallErrorEvent):
+                    elif et in ("ToolCallError", "TeamToolCallError") or isinstance(
+                        event, _tool_error
+                    ):
                         if on_status is not None:
                             tool_exec = getattr(event, "tool", None)
                             error_text = getattr(event, "error", None)

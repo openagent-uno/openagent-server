@@ -115,7 +115,10 @@ async def handle_get_runs(request):
     runs = await db.list_session_runs(session_id, limit=limit)
     messages: list[dict] = []
     msg_idx = 0
-    for run in runs:
+    for run in reversed(runs):
+        run_status = str(run.get("status", "")).lower()
+        if run_status in ("cancelled", "canceled"):
+            continue
         run_tools = run.get("tools") or []
         run_tools_map: dict[str, dict] = {}
         for t in run_tools:
@@ -132,6 +135,10 @@ async def handle_get_runs(request):
             role = m.get("role", "user")
             content = m.get("content", "")
             if role == "system":
+                continue
+            if m.get("from_history"):
+                continue
+            if not content and role == "assistant":
                 continue
             msg_idx += 1
             entry: dict = {
