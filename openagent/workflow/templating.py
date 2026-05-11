@@ -64,6 +64,16 @@ def _build_env() -> _OpenAgentSandbox:
         undefined=StrictUndefined,
     )
     env.filters["json"] = lambda v: json.dumps(v, default=str)
+    # ``fromjson`` is the inverse of ``json``. ``from_json`` is an alias
+    # for users coming from Ansible/n8n conventions. Both decode a JSON
+    # string (or bytes) to its native Python value; non-string inputs
+    # pass through untouched so the filter is safe to apply
+    # unconditionally. The primary use case is ``loop.items_expr`` —
+    # which must resolve to a native list — when the upstream is an
+    # ``ai-prompt`` node returning a JSON array inside ``output.text``.
+    _from_json = lambda v: json.loads(v) if isinstance(v, (str, bytes, bytearray)) else v
+    env.filters["fromjson"] = _from_json
+    env.filters["from_json"] = _from_json
     env.filters["truncate_str"] = lambda v, n=80: (str(v)[: int(n)] + "…") if len(str(v)) > int(n) else str(v)
     env.filters["default_if_none"] = lambda v, d="": d if v is None else v
     return env
