@@ -1,0 +1,20 @@
+# Generated private key (recreated from manifest.json if needed)
+key.pem
+
+# Generated browser launchers
+host/launch-*.sh
+host/launch-*.bat
+
+# Node dependencies
+host/node_modules/
+host/package-lock.json
+
+# Generated native messaging manifests (managed by auto-setup)
+*.json.bak
+
+# Runtime files
+host/.agent-chrome.pid
+host/node_modules/
+host/package-lock.json
+host/native-host-launcher.js
+host/native-host-wrapper.sh

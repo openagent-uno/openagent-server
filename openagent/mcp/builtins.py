@@ -177,9 +177,9 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
         "build": ["npm", "run", "build"],
         "install": ["npm", "install"],
     },
-    "chrome-devtools": {
-        "dir": "chrome-devtools",
-        "command": ["node", "node_modules/chrome-devtools-mcp/build/src/bin/chrome-devtools-mcp.js"],
+    "agent-in-chrome": {
+        "dir": "agent-in-chrome/host",
+        "command": ["node", "./mcp-server.js"],
         "install": ["npm", "install"],
     },
     "messaging": {
@@ -218,7 +218,7 @@ DEFAULT_MCPS: list[dict[str, Any]] = [
     {"builtin": "shell", "_default": True},
     {"builtin": "tool-search", "_default": True},
     {"builtin": "computer-control", "_default": True},
-    {"builtin": "chrome-devtools", "_default": True},
+    {"builtin": "agent-in-chrome", "_default": True},
     {"builtin": "messaging", "_default": True},
     {"builtin": "scheduler", "_default": True},
     {"builtin": "mcp-manager", "_default": True},
@@ -295,29 +295,117 @@ def command_exists(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
 
-def _node_version() -> tuple[int, int, int] | None:
-    if not command_exists("node"):
-        return None
-    try:
-        result = subprocess.run(["node", "--version"], check=True, capture_output=True, text=True)
-    except Exception:
-        return None
-    raw = result.stdout.strip().lstrip("v")
-    parts = raw.split(".")
-    try:
-        major = int(parts[0])
-        minor = int(parts[1]) if len(parts) > 1 else 0
-        patch = int(parts[2]) if len(parts) > 2 else 0
-    except ValueError:
-        return None
-    return major, minor, patch
+def _find_node_binary() -> str | None:
+    """Return absolute path to a working node binary, or None."""
+    candidates = [
+        "/opt/homebrew/bin/node",
+        "/usr/local/bin/node",
+        "/usr/bin/node",
+        "/snap/bin/node",
+    ]
+    if SYSTEM := platform.system() == "Windows":
+        candidates += [
+            os.path.expandvars(r"%ProgramFiles%\nodejs\node.exe"),
+            os.path.expandvars(r"%ProgramFiles(x86)%\nodejs\node.exe"),
+            os.path.expandvars(r"%APPDATA%\npm\node.exe"),
+        ]
+    for p in candidates:
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    # Search nvm
+    nvm_dir = Path.home() / ".nvm" / "versions" / "node"
+    if nvm_dir.is_dir():
+        for v in sorted(nvm_dir.iterdir(), reverse=True):
+            p = v / "bin" / "node"
+            if p.is_file() and os.access(p, os.X_OK):
+                return str(p)
+    # Fall back to whatever is on PATH
+    return shutil.which("node")
 
 
-def _node_meets_minimum(major: int, minor: int, patch: int = 0) -> bool:
-    current = _node_version()
-    if current is None:
-        return False
-    return current >= (major, minor, patch)
+def _run_agent_in_chrome_auto_setup(base_dir: Path) -> None:
+    """Run the idempotent auto-setup for agent-in-chrome.
+
+    Two phases (both safe to run on every startup):
+
+    1. **Native messaging** — installs native messaging host manifests for
+       all detected Chromium browsers (auto-setup.sh / auto-setup.ps1).
+
+    2. **Extension installation** — modifies each browser's Preferences
+       file to permanently install the unpacked extension so the user
+       never has to touch ``chrome://extensions``.  If a browser is
+       running, it is gracefully closed before Preferences are modified
+       and then relaunched (one-time, only when the extension isn't
+       already present).
+    """
+    # --- Phase 1: native messaging manifests ---------------------------
+    if platform.system() == "Windows":
+        script = base_dir / "auto-setup.ps1"
+        if not script.exists():
+            logger.warning("agent-in-chrome: auto-setup.ps1 not found at %s", script)
+        else:
+            try:
+                subprocess.run(
+                    ["powershell", "-ExecutionPolicy", "Bypass", "-File", str(script)],
+                    cwd=str(base_dir),
+                    check=False,
+                    capture_output=True,
+                    timeout=30,
+                )
+            except subprocess.TimeoutExpired:
+                logger.warning("agent-in-chrome: native messaging setup timed out")
+            except Exception as exc:
+                logger.warning("agent-in-chrome: native messaging setup failed: %s", exc)
+    else:
+        script = base_dir / "auto-setup.sh"
+        if not script.exists():
+            logger.warning("agent-in-chrome: auto-setup.sh not found at %s", script)
+        else:
+            if not os.access(script, os.X_OK):
+                script.chmod(0o755)
+            try:
+                subprocess.run(
+                    ["bash", str(script)],
+                    cwd=str(base_dir),
+                    check=False,
+                    capture_output=True,
+                    timeout=30,
+                )
+            except subprocess.TimeoutExpired:
+                logger.warning("agent-in-chrome: native messaging setup timed out")
+            except Exception as exc:
+                logger.warning("agent-in-chrome: native messaging setup failed: %s", exc)
+
+    # --- Phase 2: launch dedicated Chrome with extension pre-loaded ---
+    # Uses --load-extension with an isolated profile so the user's main
+    # browser is untouched.  No file modification — Chrome's own flag
+    # loads the extension.  On subsequent starts this is a no-op when
+    # the dedicated Chrome is already running.
+    launcher = base_dir / "auto-install-extension.py"
+    if not launcher.exists():
+        logger.warning("agent-in-chrome: auto-install-extension.py not found at %s", launcher)
+        return
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(launcher)],
+            cwd=str(base_dir),
+            check=False,
+            capture_output=True,
+            timeout=30,
+        )
+        if proc.stdout:
+            for line in proc.stdout.decode(errors="replace").splitlines():
+                if line.strip():
+                    logger.info("agent-in-chrome: %s", line.strip())
+        if proc.stderr:
+            for line in proc.stderr.decode(errors="replace").splitlines():
+                if line.strip():
+                    logger.warning("agent-in-chrome: %s", line.strip())
+    except subprocess.TimeoutExpired:
+        logger.warning("agent-in-chrome: Chrome launch timed out")
+    except Exception as exc:
+        logger.warning("agent-in-chrome: Chrome launch failed: %s", exc)
 
 
 def resolve_builtin_entry(name: str, env: dict[str, str] | None = None) -> dict[str, Any]:
@@ -387,6 +475,13 @@ def resolve_builtin_entry(name: str, env: dict[str, str] | None = None) -> dict[
             logger.info("Building built-in MCP '%s'...", name)
             subprocess.run(spec["build"], cwd=mcp_dir, check=True, capture_output=True)
 
+        # Auto-setup native messaging for agent-in-chrome (idempotent).
+        # This installs native messaging host manifests for all detected
+        # Chromium browsers and creates launch wrappers so the user doesn't
+        # need to manually load the extension or run install scripts.
+        if name == "agent-in-chrome":
+            _run_agent_in_chrome_auto_setup(mcp_dir.parent)
+
     cmd_list = list(spec["command"])
     if is_python and cmd_list and cmd_list[0] in ("python3", "python"):
         exe_basename = os.path.basename(sys.executable).lower()
@@ -394,6 +489,13 @@ def resolve_builtin_entry(name: str, env: dict[str, str] | None = None) -> dict[
             cmd_list = [sys.executable, "_mcp-server", name]
         else:
             cmd_list[0] = sys.executable
+
+    # Resolve bare "node" / "npx" to absolute paths so subprocesses
+    # launched from a venv (where node may not be on PATH) still work.
+    if cmd_list and cmd_list[0] in ("node", "npx"):
+        found = _find_node_binary()
+        if found:
+            cmd_list[0] = found
 
     full_command: list[str] = []
     for part in cmd_list:
@@ -425,17 +527,8 @@ def resolve_default_entry(entry: dict[str, Any], db_path: str | None = None) -> 
         is_python = spec.get("python", False) if spec else False
         is_native = spec.get("native", False) if spec else False
         is_in_process = spec.get("in_process", False) if spec else False
-        if not is_python and not is_native and not is_in_process and not command_exists("node"):
+        if not is_python and not is_native and not is_in_process and not _find_node_binary():
             logger.warning("Skipping default MCP '%s': Node.js not found", name)
-            return None
-        if entry["builtin"] == "chrome-devtools" and not _node_meets_minimum(22, 12, 0):
-            version = _node_version()
-            rendered = ".".join(map(str, version)) if version else "unknown"
-            logger.warning(
-                "Skipping default MCP '%s': Node 22.12.0+ required (found %s)",
-                name,
-                rendered,
-            )
             return None
 
         extra_env: dict[str, str] = dict(entry.get("env") or {})

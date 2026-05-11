@@ -1,0 +1,42 @@
+{
+  "manifest_version": 3,
+  "name": "OpenAgent in Chrome",
+  "version": "1.0.0",
+  "description": "Browser automation for OpenAgent. No domain blocklist. Any Chromium browser.",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "tabs",
+    "debugger",
+    "activeTab",
+    "scripting",
+    "nativeMessaging",
+    "tabGroups",
+    "windows",
+    "storage",
+    "alarms"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA09sb2fTKD3Wz4OBJYW5YpzXhk81XLSw43NnYy/M7a0TpUKLz3EZOuAnX/Adchm7WfI2GZm7yczo4V9K2g3XFpBaBubSwixA1c4aWdgAPMvEqHM+tOK+JTblNsYGw6WFedPzBjbuUzoZogWUXj+0keHGYahYWmAZlvOVHlA65zNoMO2Y6ltWjDbOpiXtAOO6khOnPQeV08JAUbzuI7CA3VPP2oC2/KIwxG/JFp0h0Bb+jKvuu5/TxdL4bXT1fcuXv7TfuZX042chC1QwoQlUfugX4Q5Qe2LH1+MOXwwRRZOi+4fkeqcVmZXKrQoK48gwoweaG78uK6k8aoAq3TVhZtwIDAQAB"
+}

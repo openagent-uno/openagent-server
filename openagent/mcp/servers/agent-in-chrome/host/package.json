@@ -1,0 +1,11 @@
+{
+  "name": "openagent-agent-in-chrome",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Browser automation extension for OpenAgent — an open-source agent-in-chrome implementation. No domain blocklist. Any Chromium browser.",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.23.0"
+  }
+}
