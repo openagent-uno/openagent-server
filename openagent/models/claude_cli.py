@@ -1099,6 +1099,7 @@ class ClaudeCLI(BaseModel):
 
         queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
         DONE = "__done__"
+        _result: dict[str, Any] = {}
 
         async def on_delta(text: str) -> None:
             await queue.put(("delta", text))
@@ -1107,9 +1108,18 @@ class ClaudeCLI(BaseModel):
             try:
                 client = await self._get_client(sid, system)
                 await self._ensure_session_model(sid, client, self.model)
-                await self._run_once(
+                tool_names: list[str] = []
+                tool_calls: list[dict] = []
+                result_text, usage_meta = await self._run_once(
                     client, prompt, sid,
                     on_status=on_status, on_delta=on_delta,
+                    tool_names_out=tool_names,
+                    tool_calls_out=tool_calls,
+                )
+                _result.update(
+                    result_text=result_text,
+                    usage_meta=usage_meta,
+                    tool_calls=tool_calls,
                 )
             except asyncio.CancelledError:
                 raise
@@ -1142,6 +1152,20 @@ class ClaudeCLI(BaseModel):
                     await task
                 except (asyncio.CancelledError, Exception):
                     pass
+            if _result:
+                input_tokens, output_tokens, _ = await self._record_usage(
+                    sid, _result.get("usage_meta", {})
+                )
+                self._persist_turn(
+                    sid,
+                    prompt=prompt,
+                    assistant_text=_result.get("result_text", "")
+                        or "(Done — no final message was returned.)",
+                    tool_calls=_result.get("tool_calls", []),
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    model=self._model_id_for_response(sid),
+                )
 
     async def _ensure_session_model(
         self, session_id: str, client: Any, requested_model: str | None

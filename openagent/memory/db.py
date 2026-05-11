@@ -1652,10 +1652,19 @@ class MemoryDB:
         ).fetchone()
         if existing:
             if metadata_updates:
+                meta = self._parse_metadata(None)
+                cursor = await conn.execute(
+                    "SELECT metadata FROM agno_sessions WHERE session_id = ?",
+                    (session_id,),
+                )
+                row = await cursor.fetchone()
+                if row:
+                    meta = self._parse_metadata(row[0])
+                meta.update(metadata_updates)
                 await conn.execute(
                     "UPDATE agno_sessions SET metadata = ?, updated_at = ? "
                     "WHERE session_id = ?",
-                    (json.dumps(metadata_updates), now, session_id),
+                    (json.dumps(meta), now, session_id),
                 )
             await conn.commit()
             return
@@ -2775,14 +2784,23 @@ class MemoryDB:
                 if m.get("role") == "assistant":
                     run_obj["content"] = m.get("content", "")
                     break
-        # Append tool_call data as extra messages.
-        for tc in (tool_calls or []):
-            run_obj["messages"].append({
-                "role": "tool",
-                "content": str(tc.get("output", "") or ""),
-                "tool_name": tc.get("name", ""),
-                "tool_call_id": tc.get("id", ""),
-            })
+        # Store structured tool info so the frontend can render
+        # expandable tool-result cards instead of raw JSON text.
+        # The messages list already carries tool results from
+        # ``_persist_turn`` — this ``tools`` array mirrors Agno's
+        # ``RunOutput.tools`` shape.
+        if tool_calls:
+            run_obj["tools"] = []
+            for tc in tool_calls:
+                result = tc.get("output")
+                if result is not None and not isinstance(result, str):
+                    result = json.dumps(result)
+                run_obj["tools"].append({
+                    "tool_name": tc.get("name", ""),
+                    "tool_args": tc.get("input", {}),
+                    "result": result,
+                    "tool_call_error": "tool error" if tc.get("is_error") else None,
+                })
         # Read current runs array, append new run.
         cursor = await conn.execute(
             "SELECT runs FROM agno_sessions WHERE session_id = ?",

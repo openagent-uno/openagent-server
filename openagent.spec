@@ -22,7 +22,12 @@ reuse that cache and start in under a second.
 
 import sys
 from pathlib import Path
-from PyInstaller.utils.hooks import collect_submodules, collect_dynamic_libs
+from PyInstaller.utils.hooks import (
+    collect_data_files,
+    collect_dynamic_libs,
+    collect_submodules,
+    copy_metadata,
+)
 
 # ── Build-environment guard ──
 # Fail loudly if a runtime-critical dependency isn't importable in the build
@@ -37,6 +42,8 @@ import litellm  # noqa: F401 — TTS / STT dispatch (channels/tts.py, channels/v
 import faster_whisper  # noqa: F401 — local-first STT fallback
 import psutil  # noqa: F401 — cross-platform host telemetry (api/system.py)
 import iroh  # noqa: F401 — P2P transport (openagent.network.iroh_node) — Rust FFI dylib must be bundled
+import pydantic  # noqa: F401 — agno calls importlib.metadata.version("pydantic") at runtime
+import email_validator  # noqa: F401 — pydantic.EmailStr validation calls version("email-validator")
 
 block_cipher = None
 
@@ -134,6 +141,17 @@ hiddenimports = [
     "iroh",
     "iroh.iroh_ffi",
     *collect_submodules("iroh"),
+    # pydantic + pydantic-core: transitive deps of agno whose
+    # ``.dist-info`` metadata must be present in the frozen bundle so
+    # that ``importlib.metadata.version("pydantic")`` (called by
+    # agno.tools.function.Function._wrap_callable at runtime) and
+    # ``importlib.metadata.version("email-validator")`` (called by
+    # pydantic.networks.import_email_validator at runtime) succeed.
+    # Without the metadata, the agent raises "No package metadata was
+    # found for pydantic" on the first tool-registration pass.
+    *collect_submodules("pydantic"),
+    *collect_submodules("pydantic_core"),
+    *collect_submodules("email_validator"),
 ]
 
 # ── Dynamic libs ──
@@ -146,8 +164,6 @@ binaries = collect_dynamic_libs("iroh")
 # ── Data files ──
 # Bundle the entire mcp/servers/ directory (built-in MCP servers).
 # Each Node MCP needs its dist/ and node_modules/ directories.
-
-from PyInstaller.utils.hooks import collect_data_files
 
 mcps_dir = Path("openagent/mcp/servers")
 
@@ -186,6 +202,21 @@ datas += collect_data_files("tiktoken_ext")
 datas += collect_data_files("certifi")
 # mcp package data
 datas += collect_data_files("mcp")
+
+# ── Package metadata (``.dist-info``) ──
+# ``importlib.metadata.version()`` reads from ``*.dist-info/METADATA``
+# at runtime.  PyInstaller's static analyser bundles module *code* but
+# does not always include the sidecar ``.dist-info`` directory for
+# transitive (non-top-level) packages.  Without the metadata the
+# following calls fail with ``PackageNotFoundError``:
+#
+#   agno.tools.function         → version("pydantic")
+#   pydantic.networks           → version("email-validator")
+#
+# ``copy_metadata`` explicitly adds the dist-info tree to the bundle.
+datas += copy_metadata("pydantic")
+datas += copy_metadata("pydantic_core")
+datas += copy_metadata("email_validator")
 
 # ── Analysis ──
 
