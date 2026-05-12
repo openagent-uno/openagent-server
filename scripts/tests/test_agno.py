@@ -55,9 +55,11 @@ async def t_agno_meta_tool(ctx: TestContext) -> None:
 
 @test("agno", "compaction flags enabled on constructed agent")
 async def t_agno_compaction_flags(ctx: TestContext) -> None:
-    """Session summaries + agentic memory must be ON by default so the
-    agent gets long-horizon recall without blowing token budget. Bumped
-    history_runs default to 20 in the same change."""
+    """Session summaries must be ON by default so the agent gets
+    long-horizon recall without blowing token budget. Agentic memory is
+    DELIBERATELY OFF (see agno_provider.py): OpenAgent uses the vault
+    for user-scoped persistence and we don't want the ``agno_memories``
+    table created. Bumped ``num_history_runs`` default to 20."""
     from openagent.models.agno_provider import AgnoProvider
     pool = ctx.extras["pool"]
     provider = AgnoProvider(
@@ -72,8 +74,8 @@ async def t_agno_compaction_flags(ctx: TestContext) -> None:
         "enable_session_summaries must be True"
     assert getattr(agent, "add_session_summary_to_context", False), \
         "add_session_summary_to_context must be True"
-    assert getattr(agent, "enable_agentic_memory", False), \
-        "enable_agentic_memory must be True"
+    assert getattr(agent, "enable_agentic_memory", True) is False, \
+        "enable_agentic_memory must be False (vault handles user-scoped state)"
     assert getattr(agent, "num_history_runs", 0) >= 20, \
         f"num_history_runs should be ≥20, got {getattr(agent, 'num_history_runs', None)}"
 
@@ -172,11 +174,12 @@ async def t_agno_team_build(ctx: TestContext) -> None:
     members = getattr(team, "members", [])
     assert len(members) == len(families), \
         f"member count {len(members)} != family count {len(families)}"
-    # Verify compaction flags on the team leader
+    # Verify compaction flags on the team leader — same contract as the
+    # single-agent path: summaries ON, agentic memory OFF (vault path).
     assert getattr(team, "enable_session_summaries", False), \
         "team leader must have session summaries enabled"
-    assert getattr(team, "enable_agentic_memory", False), \
-        "team leader must have agentic memory enabled"
+    assert getattr(team, "enable_agentic_memory", True) is False, \
+        "team leader agentic memory must be OFF (vault handles user-scoped state)"
     # Second call should hit the cache, returning the same object
     assert provider._ensure_team(system="You are a test bot.") is team, \
         "team must be cached by system prompt"

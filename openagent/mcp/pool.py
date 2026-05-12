@@ -1217,7 +1217,12 @@ class MCPPool:
         kept: list[Any] = []
         for _, tk in subprocess_pairs:
             n = self._toolkit_tool_count(tk)
-            if n <= remaining:
+            # n == 0 means the subprocess connected but contributed no
+            # tools (or failed to connect). Including it would sneak past
+            # any budget — keeping the noisy tail of dead subprocess MCPs
+            # even on the tightest cap. Only keep when there's something
+            # to contribute and the budget can absorb it.
+            if n > 0 and n <= remaining:
                 kept.append(tk)
                 remaining -= n
         return kept + in_process
@@ -1245,7 +1250,9 @@ class MCPPool:
         )
         for spec in subprocess_specs:
             n = self._tool_counts.get(spec.name, 0)
-            if n <= remaining:
+            # Symmetric with agno path: zero-tool subprocesses contribute
+            # nothing, so don't let them sneak past the budget filter.
+            if n > 0 and n <= remaining:
                 base[spec.name] = spec.claude_sdk_entry()
                 remaining -= n
         return base
