@@ -2631,9 +2631,10 @@ class MemoryDB:
     @staticmethod
     def _parse_metadata(raw: str | None) -> dict:
         try:
-            return json.loads(raw or "{}")
+            parsed = json.loads(raw or "{}")
         except (TypeError, ValueError):
             return {}
+        return parsed if isinstance(parsed, dict) else {}
 
     async def list_all_sessions(
         self,
