@@ -92,6 +92,13 @@ dependencies = [
     # extra; promote to core since the network layer cannot work
     # without it.
     "aiohttp>=3.9",
+    # email-validator: pydantic.EmailStr defers to it at runtime, and
+    # openagent.spec imports it at build time so PyInstaller can bundle
+    # the .dist-info metadata that ``importlib.metadata.version`` needs.
+    # Pre-2026-05-12 builds worked by accident via pip cache; declaring
+    # it explicit so the CI build is reproducible (v0.13.2 release run
+    # failed with ModuleNotFoundError when the cache miss occurred).
+    "email-validator>=2.0",
 ]
 
 [project.optional-dependencies]
