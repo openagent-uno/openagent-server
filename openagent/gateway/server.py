@@ -16,7 +16,7 @@ from typing import Any, Awaitable, Callable, TYPE_CHECKING
 from openagent.gateway import protocol as P
 from openagent.gateway.commands import command_help_text
 from openagent.gateway.sessions import SessionManager
-from openagent.gateway.api import vault, config, health, logs, control, usage, providers, models, scheduled_tasks, workflow_tasks, mcps, marketplace, sessions as sessions_api, system as system_api
+from openagent.gateway.api import vault, config, health, logs, control, usage, providers, models, scheduled_tasks, workflow_tasks, mcps, marketplace, sessions as sessions_api, system as system_api, claude_setup as claude_setup_api
 from openagent.network import peers as peers_api
 from openagent.network.auth.middleware import make_auth_middleware
 from openagent.network.transport.aiohttp_iroh_site import IrohSite
@@ -422,6 +422,10 @@ class Gateway:
             ("POST", "/api/peers", peers_api.handle_create),
             ("DELETE", "/api/peers/{network_id}", peers_api.handle_delete),
             ("GET", "/api/peers/{network_id}/agents", peers_api.handle_list_agents),
+            # Claude Code CLI setup & auth
+            ("GET", "/api/claude/status", claude_setup_api.handle_status),
+            ("POST", "/api/claude/install", claude_setup_api.handle_install),
+            ("POST", "/api/claude/auth/login", claude_setup_api.handle_auth_login),
         )
         for method, path, handler in routes:
             app.router.add_route(method, path, handler)

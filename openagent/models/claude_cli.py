@@ -39,6 +39,7 @@ from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 from openagent.core.logging import elog
+from openagent.models import claude_install
 from openagent.models.base import BaseModel, ModelResponse
 from openagent.models.catalog import (
     claude_cli_model_spec,
@@ -118,6 +119,24 @@ def _known_sdk_session_ids_from_db(
 # (``sdk_sessions`` table) so the 24h+ case survives a restart.
 DEFAULT_IDLE_TTL = 86400
 
+# Error messages surfaced when the claude binary is missing or not authed.
+CLAUDE_NOT_INSTALLED = """\
+Claude Code CLI not found and auto-install failed.
+
+Install manually:
+  macOS:  brew install --cask claude-code
+  Linux:  curl -fsSL https://claude.ai/install.sh | bash
+  Win:    irm https://claude.ai/install.ps1 | iex
+
+Then run:  claude auth login
+"""
+
+CLAUDE_NOT_AUTHED = """\
+Claude Code is installed but not authenticated.
+
+Run:  claude auth login
+"""
+
 # One retry on any non-CancelledError. A hung subprocess that was
 # cancelled by the bridge timeout unwinds via CancelledError, never a
 # retry — the bridge already decided the turn is done.
@@ -159,6 +178,13 @@ def _install_sdk_log_filters() -> None:
 
 
 _install_sdk_log_filters()
+
+# Pre-flight cache: avoid re-checking the claude binary + auth on every
+# fresh ClaudeCLI instance. Set to the last known-good state after the
+# first successful _check_claude_ready call.
+_preflight_binary_path: str = ""
+_preflight_auth_ok: bool = False
+_preflight_done: bool = False
 
 
 @dataclass
@@ -364,6 +390,49 @@ class ClaudeCLI(BaseModel):
             session.sdk_session_id = sdk_sid
         session.hydrated = True
 
+    async def _check_claude_ready(
+        self, session: _Session
+    ) -> tuple[str, bool]:
+        """Ensure the claude binary is present and authenticated.
+
+        Called before the first SDK subprocess spawn. Results are cached
+        at module level so repeated ClaudeCLI instances don't re-spawn
+        the auth subprocess.
+
+        Returns ``(binary_path, auth_ok)``. May auto-install the binary if
+        ``OPENAGENT_CLAUDE_AUTO_INSTALL`` is set (default: true).
+        """
+        global _preflight_binary_path, _preflight_auth_ok, _preflight_done
+
+        if _preflight_done and _preflight_binary_path and _preflight_auth_ok:
+            return _preflight_binary_path, _preflight_auth_ok
+
+        _auto_install = os.environ.get("OPENAGENT_CLAUDE_AUTO_INSTALL", "1") != "0"
+
+        binary = claude_install.find_claude_binary()
+        if binary is None and _auto_install:
+            logger.info("Claude Code binary not found — attempting auto-install…")
+            binary = await asyncio.to_thread(claude_install.ensure_claude_binary)
+
+        if binary is None:
+            logger.warning("Claude Code CLI not found")
+            _preflight_done = True
+            _preflight_binary_path = ""
+            _preflight_auth_ok = False
+            return "", False
+
+        auth = await asyncio.to_thread(
+            claude_install.check_claude_auth, binary_path=binary
+        )
+        _preflight_done = True
+        _preflight_binary_path = binary
+        _preflight_auth_ok = auth.logged_in
+
+        if not auth.logged_in:
+            logger.warning("Claude Code CLI not authenticated (binary at %s)", binary)
+
+        return binary, auth.logged_in
+
     async def _ensure_client(self, session: _Session, system: str | None) -> Any:
         """Return a live ``ClaudeSDKClient`` for ``session``, creating if needed.
 
@@ -393,6 +462,16 @@ class ClaudeCLI(BaseModel):
         if session.client is not None:
             session.last_active = time.time()
             return session.client
+
+        # Pre-flight: ensure the claude binary is installed and authed.
+        # This runs once per fresh session (before the first subprocess
+        # spawn) rather than on every message.
+        if session.sdk_session_id is None:
+            binary_path, auth_ok = await self._check_claude_ready(session)
+            if not binary_path:
+                raise RuntimeError(CLAUDE_NOT_INSTALLED)
+            if not auth_ok:
+                raise RuntimeError(CLAUDE_NOT_AUTHED)
 
         await self._hydrate_from_db(session)
 
