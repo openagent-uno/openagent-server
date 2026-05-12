@@ -34,20 +34,46 @@ HOST_DIR = SCRIPT_DIR / "host"
 PIDFILE = HOST_DIR / ".agent-chrome.pid"
 SYSTEM = platform.system()  # Darwin | Linux | Windows
 
-# Chromium cache location (prefer /Applications, fall back to ~/.openagent)
+# Chromium cache location (prefer /Applications, fall back to ~/.openagent/chromium)
+_CHROMIUM_BINARY: Path | None = None
+_CHROMIUM_DIR: Path
 if SYSTEM == "Darwin":
     CHROMIUM_APP = "/Applications/Chromium.app"
-    CHROMIUM_BINARY = Path(CHROMIUM_APP) / "Contents" / "MacOS" / "Chromium"
-    CHROMIUM_DIR = Path.home() / ".openagent" / "chromium"
+    # Check user-installed (homebrew cask) first, then downloaded cache
+    _SYSTEM_CHROMIUM = Path(CHROMIUM_APP) / "Contents" / "MacOS" / "Chromium"
+    _CACHED_APP = Path.home() / ".openagent" / "chromium" / "Chromium.app"
+    _LOCAL_CHROMIUM = _CACHED_APP / "Contents" / "MacOS" / "Chromium"
+    _CHROMIUM_DIR = Path.home() / ".openagent" / "chromium"
 elif SYSTEM == "Linux":
-    CHROMIUM_DIR = Path.home() / ".openagent" / "chromium"
-    CHROMIUM_BINARY = CHROMIUM_DIR / "chrome"
+    _CHROMIUM_DIR = Path.home() / ".openagent" / "chromium"
+    _LOCAL_CHROMIUM = _CHROMIUM_DIR / "chrome"
+    _SYSTEM_CHROMIUM = _LOCAL_CHROMIUM  # same location on Linux
 elif SYSTEM == "Windows":
-    CHROMIUM_DIR = Path.home() / ".openagent" / "chromium"
-    CHROMIUM_BINARY = CHROMIUM_DIR / "chrome.exe"
+    _CHROMIUM_DIR = Path.home() / ".openagent" / "chromium"
+    _LOCAL_CHROMIUM = _CHROMIUM_DIR / "chrome.exe"
+    _SYSTEM_CHROMIUM = _LOCAL_CHROMIUM  # same location on Windows
 else:
-    CHROMIUM_DIR = Path.home() / ".openagent" / "chromium"
-    CHROMIUM_BINARY = CHROMIUM_DIR / "chrome"
+    _CHROMIUM_DIR = Path.home() / ".openagent" / "chromium"
+    _LOCAL_CHROMIUM = _CHROMIUM_DIR / "chrome"
+    _SYSTEM_CHROMIUM = _LOCAL_CHROMIUM  # same location
+
+
+def get_chromium_binary() -> Path:
+    """Return the path to the Chromium binary, preferring cached location."""
+    global _CHROMIUM_BINARY
+    if _CHROMIUM_BINARY is not None:
+        return _CHROMIUM_BINARY
+    # Check system-installed first (homebrew cask, etc.)
+    if _SYSTEM_CHROMIUM.is_file():
+        _CHROMIUM_BINARY = _SYSTEM_CHROMIUM
+        return _CHROMIUM_BINARY
+    # Check cached download location
+    if _LOCAL_CHROMIUM.is_file():
+        _CHROMIUM_BINARY = _LOCAL_CHROMIUM
+        return _CHROMIUM_BINARY
+    # Neither exists — return the cached path (caller will download)
+    _CHROMIUM_BINARY = _LOCAL_CHROMIUM
+    return _CHROMIUM_BINARY
 
 # ============================================================
 #  Chromium download
@@ -81,61 +107,71 @@ def _download(url: str, dest: Path):
     print(" done.")
 
 def _ensure_chromium() -> Path:
-    if CHROMIUM_BINARY.is_file():
-        age_days = (time.time() - CHROMIUM_BINARY.stat().st_mtime) / 86400
+    global _CHROMIUM_BINARY
+    binary = get_chromium_binary()
+    if binary.is_file():
+        age_days = (time.time() - binary.stat().st_mtime) / 86400
         if age_days < 30:
-            return CHROMIUM_BINARY
+            return binary
         print("  Chromium >30 days old, re-downloading...")
 
-    CHROMIUM_DIR.mkdir(parents=True, exist_ok=True)
+    _CHROMIUM_DIR.mkdir(parents=True, exist_ok=True)
     url, archive = _chromium_url()
-    zip_path = CHROMIUM_DIR / archive
+    zip_path = _CHROMIUM_DIR / archive
     _download(url, zip_path)
     print("  Extracting...")
 
     with zipfile.ZipFile(zip_path, "r") as zf:
-        zf.extractall(CHROMIUM_DIR)
+        zf.extractall(_CHROMIUM_DIR)
     zip_path.unlink()
 
     # --- macOS ----------------------------------------------------------
     if SYSTEM == "Darwin":
-        src = CHROMIUM_DIR / "chrome-mac" / "Chromium.app"
-        dst = CHROMIUM_DIR / "Chromium.app"
+        src = _CHROMIUM_DIR / "chrome-mac" / "Chromium.app"
+        dst = _CACHED_APP
         if src.is_dir():
             if dst.is_dir():
                 shutil.rmtree(dst)
             shutil.move(str(src), str(dst))
-            shutil.rmtree(CHROMIUM_DIR / "chrome-mac", ignore_errors=True)
+            shutil.rmtree(_CHROMIUM_DIR / "chrome-mac", ignore_errors=True)
         subprocess.run(["xattr", "-cr", str(dst)], check=False, capture_output=True)
         subprocess.run(["codesign", "--force", "--deep", "--sign", "-", str(dst)],
                        check=False, capture_output=True)
-        CHROMIUM_BINARY.chmod(CHROMIUM_BINARY.stat().st_mode | stat.S_IEXEC)
+        _LOCAL_CHROMIUM.chmod(_LOCAL_CHROMIUM.stat().st_mode | stat.S_IEXEC)
+        # Update the cached binary path to point at the freshly-downloaded
+        # Chromium so subsequent checks use the correct location.
+        _CHROMIUM_BINARY = _LOCAL_CHROMIUM
+        binary = _LOCAL_CHROMIUM
 
     # --- Linux ----------------------------------------------------------
     elif SYSTEM == "Linux":
-        src = CHROMIUM_DIR / "chrome-linux"
+        src = _CHROMIUM_DIR / "chrome-linux"
         if src.is_dir():
             for f in src.iterdir():
-                d = CHROMIUM_DIR / f.name
+                d = _CHROMIUM_DIR / f.name
                 if d.is_dir():
                     shutil.rmtree(d, ignore_errors=True)
                 shutil.move(str(f), str(d))
             shutil.rmtree(src, ignore_errors=True)
-        CHROMIUM_BINARY.chmod(0o755)
+        _LOCAL_CHROMIUM.chmod(0o755)
+        _CHROMIUM_BINARY = _LOCAL_CHROMIUM
+        binary = _LOCAL_CHROMIUM
 
     # --- Windows --------------------------------------------------------
     elif SYSTEM == "Windows":
-        src = CHROMIUM_DIR / "chrome-win"
+        src = _CHROMIUM_DIR / "chrome-win"
         if src.is_dir():
             for f in src.iterdir():
-                d = CHROMIUM_DIR / f.name
+                d = _CHROMIUM_DIR / f.name
                 if d.is_dir():
                     shutil.rmtree(d, ignore_errors=True)
                 shutil.move(str(f), str(d))
             shutil.rmtree(src, ignore_errors=True)
+        _CHROMIUM_BINARY = _LOCAL_CHROMIUM
+        binary = _LOCAL_CHROMIUM
 
-    print(f"  Chromium ready: {CHROMIUM_BINARY}")
-    return CHROMIUM_BINARY
+    print(f"  Chromium ready: {binary}")
+    return binary
 
 # ============================================================
 #  Native messaging manifest  (uses `args` for direct node launch)
@@ -222,10 +258,11 @@ def _is_running(profile: str) -> bool:
 def launch() -> bool:
     _install_manifests()
 
-    if not CHROMIUM_BINARY.is_file():
+    binary = get_chromium_binary()
+    if not binary.is_file():
         print("Chromium not found — downloading...")
         try:
-            _ensure_chromium()
+            binary = _ensure_chromium()
         except Exception as e:
             print(f"  Failed: {e}", file=sys.stderr)
             print("  Install Chromium manually:  brew install chromium", file=sys.stderr)
@@ -239,7 +276,7 @@ def launch() -> bool:
         return True
 
     args = [
-        str(CHROMIUM_BINARY),
+        str(binary),
         f"--user-data-dir={profile}",
         f"--load-extension={ext_path}",
         "--no-first-run",

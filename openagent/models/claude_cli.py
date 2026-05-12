@@ -1083,9 +1083,13 @@ class ClaudeCLI(BaseModel):
                     tool_names_out=tool_names_called,
                     tool_calls_out=tool_calls_detail,
                 )
-                input_tokens, output_tokens, _ = await self._record_usage(
-                    sid, usage_meta
-                )
+                input_tokens, output_tokens = 0, 0
+                try:
+                    input_tokens, output_tokens, _ = await self._record_usage(
+                        sid, usage_meta
+                    )
+                except Exception:
+                    pass
                 self._persist_turn(
                     sid,
                     prompt=prompt,
@@ -1232,9 +1236,13 @@ class ClaudeCLI(BaseModel):
                 except (asyncio.CancelledError, Exception):
                     pass
             if _result:
-                input_tokens, output_tokens, _ = await self._record_usage(
-                    sid, _result.get("usage_meta", {})
-                )
+                input_tokens, output_tokens = 0, 0
+                try:
+                    input_tokens, output_tokens, _ = await self._record_usage(
+                        sid, _result.get("usage_meta", {})
+                    )
+                except Exception:
+                    pass
                 self._persist_turn(
                     sid,
                     prompt=prompt,
@@ -1385,15 +1393,6 @@ class ClaudeCLI(BaseModel):
         output_tokens: int = 0,
         model: str | None = None,
     ) -> None:
-        """Write one turn's data to ``chat_session_runs``.
-
-        Mirrors what Agno does via ``SqliteDb`` when it persists a
-        session run after ``arun()``. This gives Claude CLI sessions
-        the same queryable turn history (actions, messages, MCP tool
-        calls, token usage) that Agno sessions already have in the
-        database, so session listing/deletion/reporting works across
-        both frameworks.
-        """
         if self._db is None:
             return
         messages: list[dict] = [
@@ -1414,8 +1413,6 @@ class ClaudeCLI(BaseModel):
 
         async def _write() -> None:
             try:
-                # Upsert session metadata so this session shows up in
-                # the persisted list, carrying the model and framework.
                 await self._db.upsert_session(
                     session_id, client_id=session_id,
                     title=prompt[:120],
@@ -1439,9 +1436,21 @@ class ClaudeCLI(BaseModel):
                     tool_calls=len(tool_calls or []),
                 )
             except Exception as e:
-                logger.debug("claude_cli _persist_turn failed: %s", e)
+                logger.warning("claude_cli _persist_turn failed: %s", e)
 
-        loop.create_task(_write())
+        task = loop.create_task(_write())
+        bucket = self._pending_writes.setdefault(session_id, set())
+        bucket.add(task)
+
+        def _discard(t: asyncio.Task, sid: str = session_id) -> None:
+            b = self._pending_writes.get(sid)
+            if b is None:
+                return
+            b.discard(t)
+            if not b:
+                self._pending_writes.pop(sid, None)
+
+        task.add_done_callback(_discard)
 
 
 class ClaudeCLIRegistry(BaseModel):

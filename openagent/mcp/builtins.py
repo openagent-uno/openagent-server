@@ -381,31 +381,41 @@ def _run_agent_in_chrome_auto_setup(base_dir: Path) -> None:
     # browser is untouched.  No file modification — Chrome's own flag
     # loads the extension.  On subsequent starts this is a no-op when
     # the dedicated Chrome is already running.
+    #
+    # The first run downloads ~150 MB of Chromium, which may take a
+    # while over slow or relayed connections.  A long timeout + a
+    # background thread keeps the bootstrap loop from blocking other
+    # MCP servers while the download completes.
     launcher = base_dir / "auto-install-extension.py"
     if not launcher.exists():
         logger.warning("agent-in-chrome: auto-install-extension.py not found at %s", launcher)
         return
 
-    try:
-        proc = subprocess.run(
-            [sys.executable, str(launcher)],
-            cwd=str(base_dir),
-            check=False,
-            capture_output=True,
-            timeout=30,
-        )
-        if proc.stdout:
-            for line in proc.stdout.decode(errors="replace").splitlines():
-                if line.strip():
-                    logger.info("agent-in-chrome: %s", line.strip())
-        if proc.stderr:
-            for line in proc.stderr.decode(errors="replace").splitlines():
-                if line.strip():
-                    logger.warning("agent-in-chrome: %s", line.strip())
-    except subprocess.TimeoutExpired:
-        logger.warning("agent-in-chrome: Chrome launch timed out")
-    except Exception as exc:
-        logger.warning("agent-in-chrome: Chrome launch failed: %s", exc)
+    import threading
+
+    def _launch_chrome_worker() -> None:
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(launcher)],
+                cwd=str(base_dir),
+                check=False,
+                capture_output=True,
+                timeout=180,       # 3 min for ~150 MB download over slow links
+            )
+            if proc.stdout:
+                for line in proc.stdout.decode(errors="replace").splitlines():
+                    if line.strip():
+                        logger.info("agent-in-chrome: %s", line.strip())
+            if proc.stderr:
+                for line in proc.stderr.decode(errors="replace").splitlines():
+                    if line.strip():
+                        logger.warning("agent-in-chrome: %s", line.strip())
+        except subprocess.TimeoutExpired:
+            logger.warning("agent-in-chrome: Chrome launch timed out (180 s)")
+        except Exception as exc:
+            logger.warning("agent-in-chrome: Chrome launch failed: %s", exc)
+
+    threading.Thread(target=_launch_chrome_worker, name="agent-in-chrome-setup", daemon=True).start()
 
 
 def resolve_builtin_entry(name: str, env: dict[str, str] | None = None) -> dict[str, Any]:
