@@ -5,7 +5,10 @@ survives reboots, and auto-restarts on crash.
 
 - Linux: systemd user service with Restart=always, RestartSec=5,
   DISPLAY=:1 for VNC/computer-use on headless VPS
-- macOS: launchd plist with KeepAlive + RunAtLoad
+- macOS: launchd plist with unconditional KeepAlive + RunAtLoad
+  (parity with systemd's Restart=always — relaunches on any exit,
+  including clean ones; remove the job with ``launchctl bootout`` to
+  stop for good)
 - Windows: .bat startup script + Task Scheduler entry with auto-restart
 """
 
@@ -232,13 +235,26 @@ def _macos_plist_path(agent_dir: Path | None = None) -> Path:
     return Path.home() / "Library" / "LaunchAgents" / f"{svc_name}.plist"
 
 
-def _macos_install(agent_dir: Path | None = None) -> str:
+def _build_macos_plist(agent_dir: Path | None = None) -> str:
+    """Render the launchd plist for this agent.
+
+    KeepAlive is unconditional (``<true/>``) so launchd restarts the
+    agent on **any** exit, matching the Linux unit's ``Restart=always``.
+    The previous ``{SuccessfulExit: false}`` form only restarted on
+    non-zero exits, which silently left the agent dead whenever it
+    stopped cleanly (SIGTERM from the OS, an internal graceful stop, a
+    user-issued ``launchctl stop``, etc.) — those exit-0 paths happen
+    in normal operation and the user expects the agent to come back.
+    To stop the agent permanently, use ``launchctl bootout`` (or
+    ``openagent service uninstall``); the unconditional KeepAlive is
+    intentionally hard to defeat without removing the job.
+    """
     svc_name, _, _ = _service_names(agent_dir)
     cmd = _get_openagent_cmd(agent_dir)
     log_dir = _get_log_dir(agent_dir)
     args_xml = "\n        ".join(f"<string>{c}</string>" for c in cmd)
 
-    plist = textwrap.dedent(f"""\
+    return textwrap.dedent(f"""\
         <?xml version="1.0" encoding="UTF-8"?>
         <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
           "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -259,10 +275,7 @@ def _macos_install(agent_dir: Path | None = None) -> str:
             <true/>
 
             <key>KeepAlive</key>
-            <dict>
-                <key>SuccessfulExit</key>
-                <false/>
-            </dict>
+            <true/>
 
             <key>ThrottleInterval</key>
             <integer>5</integer>
@@ -280,6 +293,10 @@ def _macos_install(agent_dir: Path | None = None) -> str:
         </dict>
         </plist>
     """)
+
+
+def _macos_install(agent_dir: Path | None = None) -> str:
+    plist = _build_macos_plist(agent_dir)
 
     path = _macos_plist_path(agent_dir)
     path.parent.mkdir(parents=True, exist_ok=True)

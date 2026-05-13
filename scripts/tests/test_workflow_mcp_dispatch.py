@@ -527,3 +527,110 @@ async def t_validate_args_wins_over_arguments(ctx: TestContext) -> None:
 
     assert config["args"] == {"command": "echo args"}, config["args"]
     assert config["arguments"] == {"command": "echo arguments"}, config["arguments"]
+
+
+@test(
+    "workflow_mcp_dispatch",
+    "validate_graph flags required args set to None or empty string",
+)
+async def t_validate_rejects_empty_required_args(ctx: TestContext) -> None:
+    """Required args present as ``None`` or ``""`` are as broken as
+    missing keys — they crash mid-DAG with an opaque MCP error.
+
+    LLM-authored workflows routinely emit ``{"text": null}`` or
+    ``{"text": ""}`` when the model couldn't synthesise a value but
+    still wanted to honour the schema's key set. Passing those through
+    means the user only learns about the bug after the run starts, in
+    a ``trace_json`` failure that names the MCP error rather than the
+    config field.
+
+    Templated values (``"{{ ctx.inputs.x }}"``) are non-empty strings
+    and must continue to pass — the validator doesn't resolve them.
+    """
+    from openagent.workflow.validate import ValidationError, validate_graph
+
+    inventory = {"messaging": {"send": {"required": ["chat_id", "text"]}}}
+
+    def _graph(args: dict) -> dict:
+        return {
+            "version": 1,
+            "nodes": [
+                {
+                    "id": "n1",
+                    "type": "mcp-tool",
+                    "config": {
+                        "mcp_name": "messaging",
+                        "tool_name": "send",
+                        "args": args,
+                    },
+                },
+            ],
+            "edges": [],
+            "variables": {},
+        }
+
+    # text: None → flagged
+    raised = False
+    try:
+        validate_graph(_graph({"chat_id": "1", "text": None}), mcp_inventory=inventory)
+    except ValidationError as exc:
+        raised = True
+        assert "['text']" in str(exc), str(exc)
+        assert exc.node_id == "n1", exc.node_id
+        assert exc.field == "args", exc.field
+    assert raised, "validate_graph should reject text=None"
+
+    # text: "" → flagged
+    raised = False
+    try:
+        validate_graph(_graph({"chat_id": "1", "text": ""}), mcp_inventory=inventory)
+    except ValidationError as exc:
+        raised = True
+        assert "['text']" in str(exc), str(exc)
+    assert raised, "validate_graph should reject text=''"
+
+    # Both missing and empty → both reported
+    raised = False
+    try:
+        validate_graph(_graph({"text": ""}), mcp_inventory=inventory)
+    except ValidationError as exc:
+        raised = True
+        msg = str(exc)
+        assert "chat_id" in msg and "text" in msg, msg
+    assert raised, "validate_graph should report both missing chat_id and empty text"
+
+    # Templated value → still passes (non-empty string, validator
+    # doesn't resolve templates).
+    validate_graph(
+        _graph({"chat_id": "1", "text": "{{ nodes.n0.output.body }}"}),
+        mcp_inventory=inventory,
+    )
+
+    # Literal non-empty values → still pass.
+    validate_graph(
+        _graph({"chat_id": "1", "text": "hello"}),
+        mcp_inventory=inventory,
+    )
+
+    # Numeric / boolean falsy values for non-required args don't trip
+    # the check (regression guard against ``in (None, "")`` mistakenly
+    # treating ``0`` or ``False`` as empty when they're legitimate
+    # values for typed args).
+    inventory_with_num = {"foo": {"bar": {"required": ["count", "flag"]}}}
+    graph_num = {
+        "version": 1,
+        "nodes": [
+            {
+                "id": "n1",
+                "type": "mcp-tool",
+                "config": {
+                    "mcp_name": "foo",
+                    "tool_name": "bar",
+                    "args": {"count": 0, "flag": False},
+                },
+            },
+        ],
+        "edges": [],
+        "variables": {},
+    }
+    validate_graph(graph_num, mcp_inventory=inventory_with_num)

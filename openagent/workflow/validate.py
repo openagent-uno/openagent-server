@@ -156,16 +156,21 @@ def _check_mcp_tool(
                 field="tool_name",
             )
 
-    # Best-effort args sanity: only flag plain-missing required keys.
-    # Templated values like ``"{{ctx.inputs.x}}"`` are valid strings
-    # and count as present — we don't try to resolve them here.
+    # Best-effort args sanity: flag both plain-missing required keys
+    # AND keys present with a ``None`` / empty-string value (matching
+    # the convention used by :func:`_check_config` for required config
+    # fields). LLM-authored workflows routinely emit ``{"text": null}``
+    # or ``{"text": ""}`` when they couldn't fill in a value; passing
+    # those through would crash mid-DAG with an opaque MCP error.
+    # Templated values like ``"{{ctx.inputs.x}}"`` are valid non-empty
+    # strings and count as set — we don't try to resolve them here.
     args = config.get("args") or {}
     if not isinstance(args, dict):
         return  # type check elsewhere catches this
     schema = tools.get(tool_name) or {}
     required = schema.get("required") if isinstance(schema, dict) else None
     if isinstance(required, list):
-        missing = [k for k in required if k not in args]
+        missing = [k for k in required if args.get(k) in (None, "")]
         if missing:
             raise ValidationError(
                 f"node {node_id}: tool {mcp_name}.{tool_name} requires "
