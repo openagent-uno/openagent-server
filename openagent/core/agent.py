@@ -23,6 +23,24 @@ _FROZEN_RUNTIME_PRELOADS = (
     "openagent.models.discovery",
     "openagent.channels.voice",
     "openagent.channels.tts_local",
+    # Agno submodules that ``agno_provider`` (and ``mcp.pool``) import
+    # lazily on first use. Like the openagent modules above, they live
+    # in the PyInstaller archive; a sibling-service binary swap on
+    # performa breaks the deferred zlib extraction and surfaces as
+    # ``zlib.error: Error -3 ... incorrect header check`` raised out of
+    # ``_ensure_team``/``_dispatch`` and reported as ``agent.run.error``.
+    "agno.agent",
+    "agno.team",
+    "agno.db.sqlite",
+    "agno.db.base",
+    "agno.session.agent",
+    "agno.run.agent",
+    "agno.run.base",
+    "agno.run.team",
+    "agno.models.utils",
+    "agno.models.message",
+    "agno.tools",
+    "agno.tools.mcp",
 )
 
 

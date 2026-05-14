@@ -73,6 +73,39 @@ async def t_no_stale_refs(ctx: TestContext) -> None:
                 raise AssertionError(f"stale tool_factory ref in {p}: {stripped}")
 
 
+@test("imports", "frozen preload list covers agno modules that agno_provider lazy-imports")
+async def t_frozen_preload_covers_lazy_agno(ctx: TestContext) -> None:
+    """The PyInstaller archive lazy-loads agno submodules on first use.
+    When a sibling service swaps the on-disk binary mid-run, that
+    deferred zlib extraction blows up with ``zlib.error: Error -3 …
+    incorrect header check`` and propagates as ``agent.run.error``.
+
+    Pin the specific agno submodules ``agno_provider._ensure_team``
+    (and the surrounding hot paths) lazy-import so the preloader keeps
+    them resident in ``sys.modules`` and the runtime never has to crack
+    the PYZ archive after startup."""
+    import openagent.core.agent as agent_mod
+
+    required = {
+        "agno.agent",
+        "agno.team",
+        "agno.db.sqlite",
+        "agno.session.agent",
+        "agno.run.agent",
+        "agno.run.team",
+        "agno.models.utils",
+        "agno.tools.mcp",
+    }
+    missing = required - set(agent_mod._FROZEN_RUNTIME_PRELOADS)
+    assert not missing, (
+        f"agno modules missing from _FROZEN_RUNTIME_PRELOADS: {sorted(missing)}"
+    )
+
+    import importlib
+    for module_name in agent_mod._FROZEN_RUNTIME_PRELOADS:
+        importlib.import_module(module_name)
+
+
 @test("imports", "frozen runtime preloader warms late imports without aborting startup")
 async def t_frozen_runtime_preload(ctx: TestContext) -> None:
     import openagent.core.agent as agent_mod
