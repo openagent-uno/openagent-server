@@ -323,6 +323,25 @@ def _find_node_binary() -> str | None:
     return shutil.which("node")
 
 
+def _resolve_subprocess_python() -> str | None:
+    """Return an executable suitable for running a bundled ``*.py`` script.
+
+    In a PyInstaller frozen bundle ``sys.executable`` is the openagent CLI
+    binary, not a Python interpreter — handing it a ``.py`` path makes
+    Click parse the path as a subcommand and surface a misleading
+    "No such command" error. Fall back to a system Python in that case.
+    Returns ``None`` if the bundle is frozen and no system Python is on
+    PATH, signalling that the caller should skip the subprocess.
+    """
+    if not is_frozen():
+        return sys.executable
+    for name in ("python3", "python"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
 def _run_agent_in_chrome_auto_setup(base_dir: Path) -> None:
     """Run the idempotent auto-setup for agent-in-chrome.
 
@@ -391,12 +410,20 @@ def _run_agent_in_chrome_auto_setup(base_dir: Path) -> None:
         logger.warning("agent-in-chrome: auto-install-extension.py not found at %s", launcher)
         return
 
+    python_exe = _resolve_subprocess_python()
+    if python_exe is None:
+        logger.warning(
+            "agent-in-chrome: skipping Chromium auto-install — no system python3 "
+            "found on PATH (frozen bundle cannot use itself as a Python interpreter)"
+        )
+        return
+
     import threading
 
     def _launch_chrome_worker() -> None:
         try:
             proc = subprocess.run(
-                [sys.executable, str(launcher)],
+                [python_exe, str(launcher)],
                 cwd=str(base_dir),
                 check=False,
                 capture_output=True,

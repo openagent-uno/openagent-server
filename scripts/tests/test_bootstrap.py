@@ -9,6 +9,8 @@ filesystem instead of the OpenAgent vault.
 """
 from __future__ import annotations
 
+from unittest.mock import patch
+
 from ._framework import TestContext, test
 
 
@@ -115,6 +117,41 @@ async def t_pool_loads_vault(ctx: TestContext) -> None:
         assert vault.command[0].endswith("npx") or vault.command[0] == "npx"
     finally:
         await db.close()
+
+
+@test("bootstrap", "_resolve_subprocess_python falls back to system python when frozen")
+async def t_resolve_subprocess_python_frozen(ctx: TestContext) -> None:
+    """In a frozen bundle ``sys.executable`` is the openagent Click CLI,
+    not a Python interpreter — calling it with a ``.py`` path makes Click
+    emit a misleading ``No such command`` error. ``_resolve_subprocess_python``
+    must look up a system python instead so the Chromium auto-install
+    subprocess actually runs Python."""
+    import openagent.mcp.builtins as builtins_mod
+
+    with patch.object(builtins_mod, "is_frozen", return_value=False):
+        # Non-frozen: must hand back the running interpreter unchanged.
+        import sys as _sys
+        assert builtins_mod._resolve_subprocess_python() == _sys.executable
+
+    with patch.object(builtins_mod, "is_frozen", return_value=True):
+        # Frozen + python on PATH: must hand back the system python,
+        # never ``sys.executable`` (which would be the openagent binary).
+        with patch.object(
+            builtins_mod.shutil, "which",
+            side_effect=lambda name: "/usr/bin/python3" if name == "python3" else None,
+        ):
+            resolved = builtins_mod._resolve_subprocess_python()
+            assert resolved == "/usr/bin/python3", (
+                f"frozen mode must use system python3, got {resolved!r}"
+            )
+
+        # Frozen + no system python: returns None so caller can skip cleanly
+        # instead of feeding the .py path to Click as a subcommand.
+        with patch.object(builtins_mod.shutil, "which", return_value=None):
+            resolved = builtins_mod._resolve_subprocess_python()
+            assert resolved is None, (
+                f"frozen mode with no system python must return None, got {resolved!r}"
+            )
 
 
 @test("bootstrap", "ensure_builtin_mcps does not reset disabled rows")
