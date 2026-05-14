@@ -314,7 +314,12 @@ class BackgroundShell:
         """
         if self._proc is None or self._proc.returncode is not None:
             return
-        pgid = os.getpgid(self._proc.pid)
+        try:
+            pgid = os.getpgid(self._proc.pid)
+        except ProcessLookupError:
+            # Process exited between the returncode check above and now —
+            # before asyncio's SIGCHLD handler reaped it. Nothing to kill.
+            return
         sig_map = {
             "TERM": signal_module.SIGTERM,
             "INT": signal_module.SIGINT,

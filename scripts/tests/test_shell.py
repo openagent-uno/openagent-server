@@ -376,6 +376,47 @@ async def t_bg_kill_escalate(ctx: TestContext) -> None:
     assert bg.signal in ("KILL", "9"), f"expected KILL, got {bg.signal}"
 
 
+@test("shell", "BackgroundShell.kill swallows ProcessLookupError from race-exited proc")
+async def t_bg_kill_race_exited(ctx: TestContext) -> None:
+    """Regression for ``ProcessLookupError: [Errno 3] No such process`` in
+    ``run_with_timeout`` (observed on lyra music, 2026-05-14): the
+    subprocess can exit between the ``returncode is not None`` check at
+    the top of ``kill`` and the ``os.getpgid`` call below it. Before the
+    fix, that race surfaced an unhandled traceback through
+    ``shell_exec`` and the timeout path failed loudly. After: ``kill``
+    treats it as 'already gone' and returns cleanly."""
+    import asyncio
+    import os as os_mod
+    from unittest.mock import patch
+    from openagent.mcp.servers.shell.shells import BackgroundShell
+
+    bg = BackgroundShell(
+        shell_id="sh_race",
+        command="sleep 30",
+        cwd=None,
+        env=None,
+    )
+    await bg.start()
+    await asyncio.sleep(0.05)
+
+    # Simulate the race: the proc handle still says returncode=None but the
+    # OS-level process has already gone, so getpgid raises.
+    with patch.object(
+        os_mod, "getpgid",
+        side_effect=ProcessLookupError(3, "No such process"),
+    ):
+        # Must NOT raise — the previous code bubbled ProcessLookupError up.
+        await bg.kill(signal_name="TERM", grace_seconds=0.1)
+
+    # Clean up the real process so it doesn't outlive the test.
+    try:
+        bg._proc.kill()
+        await bg._proc.wait()
+    except Exception:
+        pass
+    await bg.finalise()
+
+
 @test("shell", "BackgroundShell.run_with_timeout: fast command returns normally")
 async def t_bg_run_with_timeout_ok(ctx: TestContext) -> None:
     from openagent.mcp.servers.shell.shells import BackgroundShell
