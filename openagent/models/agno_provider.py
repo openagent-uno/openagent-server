@@ -487,6 +487,15 @@ class AgnoProvider(BaseModel):
             allowed.append(toolkit)
         return allowed, sorted(filtered)
 
+    @staticmethod
+    def _is_session_corruption_error(error_msg: str) -> bool:
+        lowered = error_msg.lower()
+        return (
+            "tool_call_id" in lowered
+            or "deserialize the json body" in lowered
+            or "missing field" in lowered
+        )
+
     def _rewrite_provider_error_detail(self, detail: str) -> str:
         provider_name, _model_id = self._runtime_parts()
         lowered = (detail or "").lower()
@@ -963,17 +972,37 @@ class AgnoProvider(BaseModel):
                 )
             except Exception as e:
                 raw_error = str(e) or repr(e)
-                rewritten_error = self._rewrite_provider_error_detail(raw_error)
-                elog(
-                    "agno.error",
-                    model=self.model,
-                    session_id=sid,
-                    error_type=type(e).__name__,
-                    error=rewritten_error,
-                )
-                if rewritten_error != raw_error:
-                    raise AgnoProviderError(rewritten_error) from e
-                raise
+                # When a previous run left a message with a missing
+                # ``tool_call_id`` (e.g. an interrupted tool call),
+                # Agno's ``add_history_to_context=True`` injects it
+                # into the API request and the provider's
+                # deserialization fails.  Wipe the corrupted session
+                # and retry once with a clean history.
+                if sid != "default" and self._is_session_corruption_error(raw_error):
+                    elog(
+                        "agno.session_corrupt",
+                        session_id=sid,
+                        error=raw_error[:300],
+                    )
+                    try:
+                        await self.forget_session(sid)
+                    except Exception as fe:
+                        logger.debug("agno session recovery forget %s: %s", sid, fe)
+                    response = await runner.arun(
+                        prompt, session_id=sid, user_id="openagent"
+                    )
+                else:
+                    rewritten_error = self._rewrite_provider_error_detail(raw_error)
+                    elog(
+                        "agno.error",
+                        model=self.model,
+                        session_id=sid,
+                        error_type=type(e).__name__,
+                        error=rewritten_error,
+                    )
+                    if rewritten_error != raw_error:
+                        raise AgnoProviderError(rewritten_error) from e
+                    raise
         finally:
             root_logger.removeHandler(capture)
 
@@ -1257,13 +1286,25 @@ class AgnoProvider(BaseModel):
                 if response.content:
                     yield response.content
         except Exception as e:
-            elog(
-                "agno.stream.fallback",
-                level="warning",
-                model=self.model,
-                error_type=type(e).__name__,
-                error=str(e) or repr(e),
-            )
+            raw_error = str(e) or repr(e)
+            if sid != "default" and self._is_session_corruption_error(raw_error):
+                elog(
+                    "agno.stream.corrupt_session",
+                    session_id=sid,
+                    error=raw_error[:300],
+                )
+                try:
+                    await self.forget_session(sid)
+                except Exception as fe:
+                    logger.debug("agno stream recovery forget %s: %s", sid, fe)
+            else:
+                elog(
+                    "agno.stream.fallback",
+                    level="warning",
+                    model=self.model,
+                    error_type=type(e).__name__,
+                    error=raw_error,
+                )
             response = await self.generate(
                 messages,
                 system=system,
