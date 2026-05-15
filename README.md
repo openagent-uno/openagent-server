@@ -31,6 +31,7 @@ OpenAgent turns an LLM into a persistent agent that can remember, act, and stay 
 ## Why OpenAgent
 
 - Model-agnostic execution with Claude CLI/API, Z.ai GLM, Ollama, LM Studio, vLLM, and OpenAI-compatible endpoints
+- **P2P networking** over Iroh QUIC with coordinator-signed device certificates — no shared tokens, no open ports
 - Bundled MCP tools for filesystem, editor, shell, web search, browser automation, messaging, scheduling, and vault operations
 - Obsidian-compatible markdown memory with wikilinks, frontmatter, and graph-friendly notes
 - Native service installation, cron scheduling, dream mode maintenance, and auto-update support
@@ -72,7 +73,11 @@ Run multiple independent agents in parallel, each with its own data directory:
 ./openagent serve ./agent-home
 ```
 
-Each directory contains its own `openagent.yaml`, database, memories, and logs. Ports are auto-allocated to avoid conflicts.
+Each directory contains its own `openagent.yaml`, database, memories, and logs. Each agent gets its own Iroh identity and network configuration.
+
+### Connecting to your agent
+
+On first run, `openagent serve` prints an invite ticket (`oa1...`). Paste this into the desktop app or CLI to connect securely over Iroh P2P. No port forwarding, no shared tokens.
 
 ## Desktop App
 
@@ -89,6 +94,7 @@ cd app
 The canonical documentation now lives on the website:
 
 - [Getting Started](https://openagent.uno/guide/getting-started)
+- [Invitation System & Networking](https://openagent.uno/guide/invitation-system)
 - [Desktop App](https://openagent.uno/guide/desktop-app)
 - [Models](https://openagent.uno/guide/models)
 - [MCP Tools](https://openagent.uno/guide/mcp)

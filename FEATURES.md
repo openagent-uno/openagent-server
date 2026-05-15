@@ -10,7 +10,7 @@ A complete inventory of what OpenAgent does today, organized by user-visible cap
 - **Single-turn and streaming dispatch** via `Agent.run()` / `Agent.run_stream()`, with token-level deltas plus an `iteration_break` event so downstream consumers (TTS, UI) don't split sentences across tool calls.
 - **Provider-native session resume**: each OpenAgent `session_id` (e.g. `tg:155490357`) maps to the underlying SDK session in SQLite, so Claude SDK and Agno conversations survive process restarts.
 - **Hot model swap**: `swap_model()` replaces the active model atomically while in-flight `generate()` calls drain on the old instance — no resource leaks during config edits.
-- **Autoloop**: background shell jobs (`shell_exec` with `run_in_background=True`) are polled after each turn; if any complete, the agent re-enters with the event summary, capped by `autoloop_cap` (default 100) to prevent runaway chains.
+- **Autoloop**: background shell jobs (`shell_exec` with `run_in_background=True`) are polled after each turn; if any complete, the agent re-enters with the event summary, capped by `autoloop_cap` (default 25) to prevent runaway chains.
 - **Composed system prompt**: framework guidelines (MCP dormancy hints, context format) are prepended to the user's prompt; `<session-id>` is injected so the agent can self-reference.
 - **Attachment context**: file paths handed to `run()` are surfaced with read instructions, letting the agent inspect them via Read or MCP tools.
 
@@ -70,11 +70,51 @@ Providers and models live **only** in SQLite (`providers`, `models` tables). `op
 | **Discord** | DMs and channels, attachments, user/server context, async message handling |
 | **WhatsApp** | GreenAPI client, media uploads, delivery tracking |
 
-All bridges connect via WebSocket to the gateway, translate platform events into the unified protocol, and append the detected model name to replies. Each is configured per-bridge with token, allowed-user list, and optional model override.
+All bridges connect via WebSocket to the gateway over the internal Iroh transport, translate platform events into the unified protocol, and append the detected model name to replies. Each is configured per-bridge with token, allowed-user list, and optional model override.
 
 ---
 
-## 5. Workflow Engine
+## 5. Networking & Invitation System
+
+### Iroh P2P transport
+All client-agent communication uses **Iroh QUIC** — a modern P2P networking library with built-in encryption, NAT traversal via relays, and end-to-end authentication. No open TCP ports, no port forwarding. Every Iroh node has an Ed25519 identity with a stable NodeId derived from its public key.
+
+### Network roles
+- **Standalone** — no network, no gateway, local-only agent
+- **Coordinator** — owns the network, mints invites, signs device certificates, runs the JSON-RPC coordinator service
+- **Member** — joined a coordinator's network, connects via Iroh with a device certificate
+
+### Invite tickets
+Compact copy-pasteable invite tickets (`oa1...` ~120-180 chars) using base32-encoded CBOR. A single ticket carries the coordinator's NodeId, network UUID + name, invite code (96 bits of entropy), role, and optional relay/address hints for direct connectivity.
+
+### Ticket minting
+```bash
+openagent network invite --role user        # User invite
+openagent network invite --role device      # Device invite (pre-bound to handle)
+openagent network invite --role agent       # Agent invite (for multi-agent federation)
+```
+Invites have configurable TTL (default 7 days) and use counts. Admin cert required for minting.
+
+### Auto-bootstrap
+On first `openagent serve`, the server auto-promotes to coordinator: generates an Iroh identity, creates a network UUID, and mints a one-shot user invite printed to the console. No separate `network init` step.
+
+### Authentication: device certificates
+Every client presents a **coordinator-signed device certificate** on every stream. Certs bind `(handle, device_pubkey, network_id)` with a 30-day TTL, obtained through an SRP-6a PAKE login flow that never transmits the plaintext password.
+
+### Coordinator JSON-RPC service
+Embedded in every coordinator agent over ALPN `openagent/coordinator/1`. Nine methods: `register`, `login_init`, `login_finish`, `list_agents`, `add_agent`, `remove_agent`, `revoke_device`, `create_invitation`, `network_info`. CBOR-encoded, length-prefixed frames over Iroh bi-streams.
+
+### Gateway authentication middleware
+Every gateway request passes through `NetworkAuthState` middleware: verify Ed25519 signature against pinned coordinator pubkey, check expiry, verify network_id, check revocation status. Failed auth → `401 unauthorized`.
+
+### Revocation
+Immediate server-side revocation via `openagent network revoke-device <pubkey>`. The next request from that device is rejected regardless of cert TTL.
+
+See [Invitation System & Networking](docs/guide/invitation-system.md) for the full architecture.
+
+---
+
+## 6. Workflow Engine
 
 ### Block catalog ([openagent/workflow/blocks.py](openagent/workflow/blocks.py))
 
@@ -106,7 +146,7 @@ Five canonical patterns (scheduled Telegram ping, branch-on-health-check, AI-the
 
 ---
 
-## 6. Scheduling & Automation
+## 7. Scheduling & Automation
 
 Two-tier scheduler ([openagent/core/scheduler.py](openagent/core/scheduler.py), [openagent/memory/schedule.py](openagent/memory/schedule.py)):
 
@@ -117,7 +157,7 @@ Two-tier scheduler ([openagent/core/scheduler.py](openagent/core/scheduler.py), 
 
 ---
 
-## 7. Memory & Persistence
+## 8. Memory & Persistence
 
 ### SQLite-backed runtime state ([openagent/memory/db.py](openagent/memory/db.py))
 - `sdk_sessions` — provider session resume.
@@ -134,7 +174,7 @@ Two-tier scheduler ([openagent/core/scheduler.py](openagent/core/scheduler.py), 
 
 ---
 
-## 8. MCP Ecosystem
+## 9. MCP Ecosystem
 
 ### Built-in servers ([openagent/mcp/builtins.py](openagent/mcp/builtins.py))
 - **Shell** — multi-session concurrent execution, event draining (`completed`, `timed_out`, `killed`), `run_in_background` for long jobs, autoloop integration.
@@ -149,12 +189,12 @@ Loaded from the `mcps` DB table — stdio (command + env) or HTTP/SSE URL. Pool 
 
 ---
 
-## 9. Gateway & API Surface
+## 10. Gateway & API Surface
 
 ### WebSocket (`/ws`)
-Unified chat protocol. Client commands include `stop`, `new`, `clear`, `reset`, `status`, `queue`, `help`, `usage`, `update`, `restart`. Each carries `session_id` so multiple chat tabs stay isolated.
+Unified chat protocol over Iroh QUIC with device certificate authentication. Client commands include `stop`, `new`, `clear`, `reset`, `status`, `queue`, `help`, `usage`, `update`, `restart`. Each carries `session_id` so multiple chat tabs stay isolated.
 
-Server messages: `auth_ok`/`auth_error`, `response`, `status`, `queued`, `pong`, `audio_start` / `audio_chunk` / `audio_end`, and `resource_event` (broadcast on MCP/workflow/task/vault/config mutations — drives UI refetch).
+Server messages: `auth_ok`/`auth_error`, `delta` (streaming), `response`, `status`, `queued`, `pong`, `audio_start` / `audio_chunk` / `audio_end`, and `resource_event` (broadcast on MCP/workflow/task/vault/config mutations — drives UI refetch).
 
 ### REST endpoints
 - **Health & config**: `/api/health`, `/api/config`, `/api/restart`, `/api/logs`, `/api/usage`
@@ -167,30 +207,27 @@ Server messages: `auth_ok`/`auth_error`, `response`, `status`, `queued`, `pong`,
 - **Vault**: `/api/vault/notes`, `/api/vault/graph`, `/api/vault/search`
 - **Uploads**: `/api/upload`
 
-Optional bearer-token auth (`gateway_token`) per bridge.
+Optional bearer-token auth per bridge (legacy; device certs preferred).
 
 ---
 
-## 10. CLI & Operations
+## 11. CLI & Operations
 
 ### Commands ([openagent/cli.py](openagent/cli.py))
 - `openagent init <agent_dir>` — scaffold config, DB, vault, logs.
-- `openagent serve [agent_dir] [--channel telegram|discord|whatsapp]` — start the server.
-- `openagent migrate --to <dest>` — copy global config/DB/vault to a new agent directory (multi-tenant).
-- `openagent _mcp-server <name>` — internal entry for frozen-binary subprocess MCPs.
+- `openagent serve [agent_dir] [--channel telegram|discord|whatsapp]` — start the server (auto-bootstraps network on first run).
+- `openagent network invite --role user|device|agent` — mint invite tickets.
+- `openagent network invites` — list active invite tickets.
+- `openagent network revoke-device <pubkey>` — revoke a device.
+- `openagent service install|uninstall|status` — OS service management.
+- `openagent migrate --to <dest>` — copy global config/DB/vault to a new agent directory.
 
 ### Multi-agent
-Each directory is self-contained (`openagent.yaml`, SQLite, vault, logs). Ports auto-allocate; agents run in parallel without contention.
-
-### Self-update ([openagent/updater.py](openagent/updater.py))
-- Pulls signed releases from `geroale/OpenAgent` on GitHub.
-- Checksum verification.
-- In-place binary swap: Unix uses rename → `.old`; Windows uses `.pending.exe` swap on restart.
-- Triggered manually (`POST /api/restart`) or on a configured cron interval.
+Each directory is self-contained (`openagent.yaml`, SQLite, vault, logs). Each gets its own Iroh identity and network configuration. Agents run in parallel without contention.
 
 ---
 
-## 11. Desktop & Universal App UI
+## 12. Desktop & Universal App UI
 
 The Expo/React Native app runs unchanged on iOS, Android, web, and Electron. Seven main tabs:
 
@@ -233,7 +270,7 @@ Four sub-views:
 - Dream mode (nightly reflection, HH:MM).
 - Manager review (weekly cron, default `0 9 * * MON`).
 - Auto-update toggle, mode, check interval.
-- Saved accounts (host, port, token, isLocal); active account picker; agent version + connected client count.
+- Saved accounts (handle, network name, coordinator NodeId); active account picker; agent version + connected client count.
 
 ### Electron-specific
 - Single-instance lock.
@@ -244,12 +281,13 @@ Four sub-views:
 
 ---
 
-## 12. Configuration
+## 13. Configuration
 
 YAML-driven via `openagent.yaml` ([openagent/core/config.py](openagent/core/config.py)) with hot-reload through `PATCH /api/config`:
 - Channels (per-bridge tokens, allowed users, model overrides).
-- MCPs (custom registrations, env vars).
 - System prompt and agent identity.
+- Network role and name (coordinator/member/standalone).
+- Memory paths (db_path, vault_path).
 - Shell settings (`autoloop_cap`, `wake_wait_window_seconds`).
 - Dream mode, manager review, auto-update.
 
@@ -257,7 +295,7 @@ YAML-driven via `openagent.yaml` ([openagent/core/config.py](openagent/core/conf
 
 ---
 
-## 13. Distribution
+## 14. Distribution
 
 | Artifact | Channel |
 |---|---|
