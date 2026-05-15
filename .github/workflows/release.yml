@@ -10,75 +10,6 @@ permissions:
   id-token: write
 
 jobs:
-  # ── Desktop app → GitHub Release (macOS, Windows, Linux) ──
-  desktop:
-    strategy:
-      fail-fast: false  # don't cancel other platforms on one failure
-      matrix:
-        include:
-          - os: macos-latest
-            build_flag: --mac
-          - os: windows-latest
-            build_flag: --win
-          - os: ubuntu-latest
-            build_flag: --linux
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      - name: Install Linux build deps
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y rpm libarchive-tools
-      - name: Install universal deps
-        working-directory: app/universal
-        run: npm install
-      - name: Build web app
-        working-directory: app/universal
-        run: npx expo export --platform web
-      - name: Install desktop deps
-        working-directory: app/desktop
-        run: npm install
-      - name: Copy web build and fix paths
-        run: |
-          rm -rf app/desktop/web-build
-          cp -r app/universal/dist app/desktop/web-build
-          sed -i.bak 's|href="/|href="./|g; s|src="/|src="./|g' app/desktop/web-build/index.html
-          rm -f app/desktop/web-build/index.html.bak
-        shell: bash
-      - name: Import macOS signing certificate
-        if: runner.os == 'macOS'
-        env:
-          CSC_LINK: ${{ secrets.CSC_LINK }}
-          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
-        run: |
-          if [ -z "$CSC_LINK" ]; then
-            echo "⚠️  CSC_LINK not set — build will be unsigned"
-          fi
-      - name: Build Electron app
-        working-directory: app/desktop
-        run: npx tsc && node ./scripts/bundle-main.js && npx electron-builder ${{ matrix.build_flag }} --publish never
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CSC_LINK: ${{ runner.os == 'macOS' && secrets.CSC_LINK || '' }}
-          CSC_KEY_PASSWORD: ${{ runner.os == 'macOS' && secrets.CSC_KEY_PASSWORD || '' }}
-          APPLE_ID: ${{ runner.os == 'macOS' && secrets.APPLE_ID || '' }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ runner.os == 'macOS' && secrets.APPLE_APP_SPECIFIC_PASSWORD || '' }}
-          APPLE_TEAM_ID: ${{ runner.os == 'macOS' && secrets.APPLE_TEAM_ID || '' }}
-      - uses: actions/upload-artifact@v4
-        with:
-          name: desktop-${{ matrix.os }}
-          path: |
-            app/desktop/release/*.dmg
-            app/desktop/release/*.zip
-            app/desktop/release/*.exe
-            app/desktop/release/*.AppImage
-            app/desktop/release/*.deb
-            app/desktop/release/*.yml
-            app/desktop/release/*.yaml
-
-  # ── Rust computer-control binary per platform ──
   computer-control-binary:
     strategy:
       fail-fast: false
@@ -102,7 +33,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - name: Install Linux build deps (X11 + Wayland + PipeWire + Mesa for xcap/enigo)
+      - name: Install Linux build deps
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
@@ -115,7 +46,7 @@ jobs:
       - name: Build release binary
         working-directory: openagent/mcp/servers/computer-control
         run: cargo build --release --target ${{ matrix.target }}
-      - name: Sign Rust binary (macOS only — required for stable TCC identity)
+      - name: Sign Rust binary (macOS only)
         if: runner.os == 'macOS'
         env:
           CSC_LINK: ${{ secrets.CSC_LINK }}
@@ -124,7 +55,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${CSC_LINK:-}" ]; then
-            echo "CSC_LINK not set — leaving binary unsigned (TCC grant will not persist across updates)"
+            echo "CSC_LINK not set — leaving binary unsigned"
             exit 0
           fi
           KEYCHAIN=$RUNNER_TEMP/cc-sign.keychain
@@ -156,7 +87,6 @@ jobs:
           name: computer-control-${{ matrix.out_dir }}
           path: openagent/mcp/servers/computer-control/target/${{ matrix.target }}/release/openagent-computer-control${{ matrix.ext }}
 
-  # ── openagent server standalone executable (macOS, Linux, Windows) ──
   executable:
     needs: computer-control-binary
     strategy:
@@ -204,14 +134,6 @@ jobs:
         run: pyinstaller openagent.spec --clean --noconfirm
       - name: Stage computer-control sidecar next to dist/openagent
         shell: bash
-        # The Rust binary must ship SEPARATELY from the PyInstaller
-        # onefile — not inside it. Bundling it as data (the old layout)
-        # caused PyInstaller to strip the Developer-ID signature on
-        # macOS arm64 and re-sign ad-hoc, which breaks TCC persistence
-        # for Accessibility / Screen Recording. openagent.spec now
-        # excludes the computer-control dir; at runtime,
-        # ``builtins._resolve_native_binary`` looks for
-        # ``<sys.executable>/../openagent-computer-control[.exe]``.
         run: |
           set -euo pipefail
           src="openagent/mcp/servers/computer-control/bin/${{ matrix.cc_target }}/openagent-computer-control${{ matrix.cc_ext }}"
@@ -229,19 +151,6 @@ jobs:
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         shell: bash
-        # Produces a signed + notarized + stapled openagent.app bundle
-        # AND a signed + notarized + stapled .pkg installer that drops
-        # openagent.app into /Applications and a CLI convenience symlink
-        # at /usr/local/bin/openagent pointing into the bundle.
-        #
-        # The Rust computer-control sidecar gets copied into
-        # openagent.app/Contents/MacOS/ BEFORE the deep sign runs, so
-        # the whole bundle (outer PyInstaller binary + nested Rust
-        # binary) is sealed together under com.openagent.server. macOS
-        # TCC treats the bundle as a single app for permission grants,
-        # keyed by CFBundleIdentifier rather than cdhash — so
-        # Accessibility and Screen Recording grants persist across
-        # every future openagent release.
         run: |
           bash scripts/sign-notarize-macos.sh \
             dist/openagent.app \
@@ -260,54 +169,9 @@ jobs:
             dist/openagent-*.sha256
             dist/openagent-*.pkg
 
-  # ── openagent-cli standalone executable (macOS, Linux, Windows) ──
-  cli:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-latest
-          - os: ubuntu-latest
-          - os: windows-latest
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Install CLI deps + PyInstaller
-        working-directory: cli
-        run: pip install -e . pyinstaller
-      - name: Build CLI executable
-        run: pyinstaller cli.spec --clean --noconfirm
-      - name: Sign + notarize macOS CLI binary (+ build stapled .pkg)
-        if: runner.os == 'macOS'
-        env:
-          CSC_LINK: ${{ secrets.CSC_LINK }}
-          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
-          CSC_LINK_INSTALLER: ${{ secrets.CSC_LINK_INSTALLER }}
-          CSC_KEY_PASSWORD_INSTALLER: ${{ secrets.CSC_KEY_PASSWORD_INSTALLER }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        shell: bash
-        run: bash scripts/sign-notarize-macos.sh dist/openagent-cli com.openagent.cli /usr/local/bin
-      - name: Package + checksum
-        shell: bash
-        run: bash scripts/package-release.sh openagent-cli dist
-      - uses: actions/upload-artifact@v4
-        with:
-          name: cli-${{ matrix.os }}
-          path: |
-            dist/openagent-cli-*.tar.gz
-            dist/openagent-cli-*.zip
-            dist/openagent-cli-*.sha256
-            dist/openagent-cli-*.pkg
-
-  # ── GitHub Release with all artifacts ──
   release:
-    needs: [desktop, executable, cli]
-    if: always() && needs.executable.result == 'success' && needs.cli.result == 'success'
+    needs: executable
+    if: always() && needs.executable.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -328,6 +192,4 @@ jobs:
             artifacts/**/*.AppImage
             artifacts/**/*.deb
             artifacts/**/*.pkg
-            artifacts/**/*.yml
-            artifacts/**/*.yaml
           generate_release_notes: true
