@@ -53,6 +53,10 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_setup",
     "test_serve_singleton",
     "test_cli_cleanup",
+    # importlib.metadata fallback for frozen bundles — defense in depth
+    # against the agno Team-run crash when pydantic dist-info goes missing
+    # under sys._MEIPASS.
+    "test_frozen_metadata_patch",
     "test_catalog",
     "test_channels",
     "test_formatting",
@@ -112,6 +116,13 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_db_metadata_parse",
     "test_db_providers",
     "test_db_session_bindings",
+    # Concurrent ``add_session_run`` must not drop runs — per-session
+    # asyncio.Lock guards the read-modify-write of agno_sessions.runs.
+    "test_db_session_run_lock",
+    # Cross-device chat visibility: ``upsert_session`` writes the user
+    # handle as the row owner and ``list_all_sessions`` soft-falls back
+    # to legacy device-pubkey rows via ``network_devices``.
+    "test_sessions_cross_device",
     "test_db_workflow_claim",
     "test_smart_router_hybrid",
     "test_agno_tool_filter",
@@ -121,6 +132,9 @@ _TEST_MODULES: tuple[str, ...] = (
     # chunk through the router (TTFB-killing for voice mode).
     "test_smart_router_stream",
     "test_claude_cli_stream",
+    # Persistence-order regression: text and tool blocks must land in the
+    # SDK stream order, not bunched user -> assistant_text -> tools.
+    "test_claude_cli_ordering",
     "test_behavior_contract",
     "test_mcp_manager_guards",
     "test_provider_manager",
@@ -184,6 +198,10 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_updater",
     "test_bridges",
     "test_bridge_session",
+    # Discord on_message receive-path tests — pin the
+    # allowed-users-bypass-mention gate behaviour and confirm silent
+    # drops emit a diagnostic event.
+    "test_discord_bridge_receive",
     "test_shell",
     # 7. Optional Claude CLI path (needs --include-claude)
     "test_claude_cli",

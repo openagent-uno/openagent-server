@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
@@ -433,6 +434,14 @@ class MemoryDB:
     def __init__(self, db_path: str = "openagent.db"):
         self.db_path = db_path
         self._conn: aiosqlite.Connection | None = None
+        # Per-session locks so concurrent add_session_run calls for the
+        # same session_id serialise through the read-modify-write of the
+        # ``runs`` JSON blob — without this, two simultaneous writes
+        # both read the pre-state, append independently, and clobber
+        # one another (one run vanishes). Different sessions still
+        # race in parallel (no shared lock), so this is per-row at
+        # worst, not global.
+        self._session_run_locks: dict[str, asyncio.Lock] = {}
 
     async def connect(self) -> None:
         if self._conn is not None:
@@ -2645,7 +2654,14 @@ class MemoryDB:
         """Return every session in ``agno_sessions``, ordered by
         ``updated_at`` descending. Metadata columns (client_id, title,
         model, framework) are extracted from the ``metadata`` JSON
-        column when present."""
+        column when present.
+
+        When ``client_id`` is provided, results are filtered to rows
+        whose ``metadata.client_id`` either matches it directly OR is
+        a device pubkey bound to the same user handle in
+        ``network_devices`` (soft-fallback for legacy rows persisted
+        before sessions were stamped with the handle).
+        """
         conn = await self._ensure_connected()
         cursor = await conn.execute(
             "SELECT session_id, metadata, created_at, updated_at "
@@ -2667,8 +2683,43 @@ class MemoryDB:
                 "last_active_at": row[3],
             })
         if client_id:
-            results = [r for r in results if r["client_id"] == client_id]
+            legacy_pubkeys = await self._pubkeys_for_handle(client_id)
+            results = [
+                r for r in results
+                if r["client_id"] == client_id or r["client_id"] in legacy_pubkeys
+            ]
         return results
+
+    async def _pubkeys_for_handle(self, handle: str) -> set[str]:
+        """Return every device pubkey (lowercase hex) bound to ``handle``.
+
+        ``network_devices.device_pubkey`` is a BLOB written by the
+        coordinator store; we hex-encode here so the comparison matches
+        the ``device_pubkey_hex`` stamped by the auth middleware on
+        each request. Returns an empty set when the table is missing
+        (e.g. agent-only nodes that never paired through a coordinator)
+        or when no devices are registered for that handle."""
+        if not handle:
+            return set()
+        conn = await self._ensure_connected()
+        try:
+            cursor = await conn.execute(
+                "SELECT device_pubkey FROM network_devices WHERE user_handle = ?",
+                (handle,),
+            )
+            rows = await cursor.fetchall()
+        except Exception:
+            # Table absent on this DB shape — treat as no legacy
+            # devices rather than blowing up the entire listing.
+            return set()
+        out: set[str] = set()
+        for r in rows:
+            raw = r[0]
+            if isinstance(raw, (bytes, bytearray, memoryview)):
+                out.add(bytes(raw).hex())
+            elif isinstance(raw, str):
+                out.add(raw.lower())
+        return out
 
     async def upsert_session(
         self,
@@ -2678,9 +2729,15 @@ class MemoryDB:
         title: str | None = None,
         model: str | None = None,
         framework: str | None = None,
+        device_id: str | None = None,
     ) -> None:
         """Create or update the ``agno_sessions`` row, merging the
-        display metadata into the ``metadata`` JSON column."""
+        display metadata into the ``metadata`` JSON column.
+
+        ``client_id`` is the row's *owner* — preferably the user handle
+        so the session list is cross-device. ``device_id`` (when set)
+        records which device first opened the session, so per-device
+        routing (sticky-device retries, WS reconnect) still works."""
         conn = await self._ensure_connected()
         now = int(time.time())
         existing = await (
@@ -2692,6 +2749,8 @@ class MemoryDB:
         meta = self._parse_metadata(existing[0] if existing else None)
         if client_id:
             meta["client_id"] = client_id
+        if device_id:
+            meta["device_id"] = device_id
         if title:
             meta["title"] = title[:200]
         if model:
@@ -2759,10 +2818,40 @@ class MemoryDB:
     ) -> str:
         """Append one turn to ``agno_sessions.runs``. The run is stored
         in Agno's ``RunOutput`` shape so it is queryable alongside runs
-        produced by ``SqliteDb``."""
-        import time as _time
+        produced by ``SqliteDb``.
+
+        Wraps the read-modify-write of the ``runs`` JSON blob in a
+        per-session asyncio.Lock so concurrent appends (e.g. two
+        ``_persist_turn`` writes interleaving on the same session)
+        don't clobber one another.
+        """
         conn = await self._ensure_connected()
         rid = run_id or str(uuid.uuid4())
+        lock = self._session_run_locks.setdefault(session_id, asyncio.Lock())
+        async with lock:
+            return await self._add_session_run_locked(
+                conn, session_id, rid,
+                status=status, messages=messages, tool_calls=tool_calls,
+                input_tokens=input_tokens, output_tokens=output_tokens,
+                cost=cost, model=model,
+            )
+
+    async def _add_session_run_locked(
+        self,
+        conn: aiosqlite.Connection,
+        session_id: str,
+        rid: str,
+        *,
+        status: str,
+        messages: list[dict] | None,
+        tool_calls: list[dict] | None,
+        input_tokens: int,
+        output_tokens: int,
+        cost: float,
+        model: str | None,
+    ) -> str:
+        """Inner read-modify-write — caller holds ``_session_run_locks[session_id]``."""
+        import time as _time
         now = int(_time.time())
         run_obj = {
             "run_id": rid,
@@ -2799,6 +2888,7 @@ class MemoryDB:
                 run_obj["tools"].append({
                     "tool_name": tc.get("name", ""),
                     "tool_args": tc.get("input", {}),
+                    "tool_use_id": tc.get("id", "") or "",
                     "result": result,
                     "tool_call_error": "tool error" if tc.get("is_error") else None,
                 })

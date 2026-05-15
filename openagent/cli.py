@@ -148,8 +148,21 @@ def _cleanup_stale_openagent_frozen_extract_dirs(
 
 def _startup_cleanup() -> None:
     """Run frozen-binary cleanup tasks on startup."""
-    from openagent._frozen import executable_path, is_frozen, patch_ssl_for_frozen
+    from openagent._frozen import (
+        executable_path,
+        is_frozen,
+        patch_importlib_metadata_for_frozen,
+        patch_ssl_for_frozen,
+    )
 
+    # Must happen BEFORE the first ``import agno`` anywhere in the
+    # process. ``agno.tools.function`` does ``from importlib.metadata
+    # import version`` at module top, so we have to swap the function
+    # on the importlib.metadata module before that import binds the
+    # name. ``openagent`` itself does not pull in agno at package-init
+    # time (verified), so running this here — before any provider
+    # registry loads — is early enough.
+    patch_importlib_metadata_for_frozen()
     # Must happen BEFORE any bridge or MCP opens an HTTPS connection.
     # Without this, discord.py (via aiohttp) fails inside the PyInstaller
     # onefile bundle because the compiled-in OpenSSL CA path doesn't

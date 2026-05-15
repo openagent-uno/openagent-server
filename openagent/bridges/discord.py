@@ -96,6 +96,13 @@ class DiscordBridge(BaseBridge):
         @client.event
         async def on_ready():
             logger.info("Discord bridge connected as %s", client.user)
+            # Operator hint: surface the effective receive-side config so
+            # silent message drops are debuggable from events.jsonl alone.
+            elog("bridge.discord.config",
+                 allowed_users=len(self.allowed_users),
+                 allowed_guilds=len(self.allowed_guilds),
+                 listen_channels=len(self.listen_channels),
+                 dm_only=self.dm_only)
             try:
                 if self.allowed_guilds:
                     for gid in self.allowed_guilds:
@@ -113,18 +120,35 @@ class DiscordBridge(BaseBridge):
             if message.author == client.user:
                 return
             uid = str(message.author.id)
+            cid = str(getattr(message.channel, "id", "")) or None
+            gid = str(message.guild.id) if getattr(message, "guild", None) else None
             if uid not in self.allowed_users:
+                elog("bridge.discord.dropped", reason="not_allowed_user",
+                     user_id=uid, channel_id=cid)
                 return
 
             is_dm = isinstance(message.channel, discord.DMChannel)
             if not is_dm and self.dm_only:
+                elog("bridge.discord.dropped", reason="dm_only_rejecting_guild",
+                     user_id=uid, channel_id=cid, guild_id=gid)
                 return
-            if not is_dm and self.allowed_guilds and str(message.guild.id) not in self.allowed_guilds:
+            if not is_dm and self.allowed_guilds and gid not in self.allowed_guilds:
+                elog("bridge.discord.dropped", reason="guild_not_allowed",
+                     user_id=uid, channel_id=cid, guild_id=gid)
                 return
             if not is_dm:
                 mentioned = client.user and client.user in message.mentions
-                in_listen = str(message.channel.id) in self.listen_channels
-                if not mentioned and not in_listen:
+                in_listen = cid in self.listen_channels
+                # Authorized users bypass the @mention / listen_channels gate.
+                # Symmetry with Telegram: once a user is in allowed_users they
+                # can DM-style chat the bot in any channel without ceremony.
+                # Safe because DiscordBridge REQUIRES non-empty allowed_users
+                # at construction time (openagent/core/server.py:232-234), so
+                # this bypass is always narrowly scoped to vetted accounts.
+                is_allowed_user = bool(self.allowed_users) and uid in self.allowed_users
+                if not mentioned and not in_listen and not is_allowed_user:
+                    elog("bridge.discord.dropped", reason="no_mention_no_listen",
+                         user_id=uid, channel_id=cid, guild_id=gid)
                     return
 
             elog("bridge.message", bridge="discord", user_id=uid)

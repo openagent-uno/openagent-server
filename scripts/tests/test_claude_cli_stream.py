@@ -52,6 +52,7 @@ def _patch_run_once(inst, deltas: list[str], record: list[dict]):
         client: Any, prompt: str, sid: str,
         on_status: Any = None, on_delta: Any = None,
         tool_names_out: Any = None, tool_calls_out: Any = None,
+        assistant_blocks_out: Any = None,
     ) -> tuple[str, dict]:
         record.append({
             "session_id": sid,

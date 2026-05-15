@@ -38,9 +38,16 @@ async def handle_list(request):
     if db is None:
         return web.json_response({"error": "memory DB not available"}, status=500)
 
+    # Caller-supplied ``?client_id=`` still wins (power-user / debug
+    # listing). When absent, default to the authenticated user handle
+    # so the list is cross-device — every device the user has paired
+    # with this network sees the same sessions. The legacy device
+    # pubkey is kept available via ``request['client_id']`` for the
+    # RAM enrichment below (which is naturally per-device, since
+    # ``SessionManager`` keys by the live WS's client_id).
     client_id = (request.query.get("client_id") or "").strip() or None
     if not client_id:
-        client_id = request.get("client_id")
+        client_id = request.get("user_handle") or request.get("client_id")
 
     try:
         limit = min(int(request.query.get("limit", "50")), 200)
@@ -51,9 +58,12 @@ async def handle_list(request):
     # DB-backed sessions (chat_sessions + agno_sessions merged).
     rows = await db.list_all_sessions(client_id, limit=limit)
 
-    # Enrich with RAM queue/busy state from SessionManager.
-    if gateway is not None and client_id:
-        ram_sids = set(gateway.sessions.list_sessions(client_id))
+    # Enrich with RAM queue/busy state from SessionManager. RAM is
+    # keyed by device pubkey (the WebSocket's client_id), not by
+    # handle, so we look up using the device pubkey when available.
+    device_client_id = request.get("client_id")
+    if gateway is not None and device_client_id:
+        ram_sids = set(gateway.sessions.list_sessions(device_client_id))
         for r in rows:
             if r["session_id"] in ram_sids:
                 r["_live"] = True
@@ -120,17 +130,32 @@ async def handle_get_runs(request):
         if run_status in ("cancelled", "canceled"):
             continue
         run_tools = run.get("tools") or []
-        run_tools_map: dict[str, dict] = {}
+        # Two maps: by tool_use_id (the precise key — survives duplicate
+        # calls to the same tool name within a turn) and by name (legacy
+        # fallback for older rows that didn't persist tool_use_id).
+        run_tools_by_id: dict[str, dict] = {}
+        run_tools_by_name: dict[str, dict] = {}
         for t in run_tools:
             tn = t.get("tool_name") or t.get("name") or ""
-            if tn:
-                run_tools_map[tn] = {
-                    "tool": tn,
-                    "params": t.get("tool_args") or {},
-                    "status": "done",
-                    "result": t.get("result"),
-                    "error": None if not t.get("tool_call_error") else "tool error",
-                }
+            tid = t.get("tool_use_id") or t.get("id") or ""
+            if not tn and not tid:
+                continue
+            info = {
+                "tool": tn,
+                "params": t.get("tool_args") or {},
+                "status": "done",
+                "result": t.get("result"),
+                "error": None if not t.get("tool_call_error") else "tool error",
+            }
+            if tid:
+                run_tools_by_id[tid] = info
+            if tn and tn not in run_tools_by_name:
+                run_tools_by_name[tn] = info
+        # Skip messages that are pure assistant text echoing the final
+        # turn output when streaming-blocks already covered them — but
+        # also skip the original from_history bookkeeping rows.
+        # No deduping needed: the persistence layer now writes each
+        # text block exactly once in stream order.
         for m in run.get("messages", []) or []:
             role = m.get("role", "user")
             content = m.get("content", "")
@@ -138,7 +163,10 @@ async def handle_get_runs(request):
                 continue
             if m.get("from_history"):
                 continue
-            if not content and role == "assistant":
+            if not content and role == "assistant" and not m.get("tool_calls"):
+                # Empty assistant text without a parallel tool_call payload
+                # is noise — but a tool_use carrier message has empty content
+                # by design; keep those so the tool card renders in order.
                 continue
             msg_idx += 1
             entry: dict = {
@@ -148,8 +176,13 @@ async def handle_get_runs(request):
                 "timestamp": run.get("created_at", 0),
             }
             if role == "tool":
+                tcall_id = m.get("tool_call_id") or m.get("tool_use_id") or ""
                 tname = m.get("name") or m.get("tool_name") or ""
-                tool_info = run_tools_map.get(tname)
+                tool_info: dict | None = None
+                if tcall_id:
+                    tool_info = run_tools_by_id.get(tcall_id)
+                if tool_info is None and tname:
+                    tool_info = run_tools_by_name.get(tname)
                 if not tool_info:
                     try:
                         parsed = _json.loads(content)

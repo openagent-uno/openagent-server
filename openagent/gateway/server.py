@@ -724,8 +724,12 @@ class Gateway:
         # StreamSessions; a different device gets a fresh slot. The
         # client cannot pick its own ID anymore — that was a footgun
         # the old protocol allowed (one client could clobber another's
-        # sessions by guessing the ID).
+        # sessions by guessing the ID). ``user_handle`` is the same
+        # across every device a user has paired with this network;
+        # handlers that want cross-device session visibility read it
+        # instead of ``client_id``.
         client_id: str = cert.device_pubkey_hex
+        request["user_handle"] = cert.handle
         old_ws = self.clients.get(client_id)
         self.clients[client_id] = ws
         if old_ws is not None and old_ws is not ws:
@@ -793,7 +797,10 @@ class Gateway:
                         name=cmd_name,
                         session_id=cmd_sid,
                     )
-                    await self._handle_command(ws, client_id, cmd_name, cmd_sid)
+                    await self._handle_command(
+                        ws, client_id, cmd_name, cmd_sid,
+                        handle=cert.handle,
+                    )
 
                 # Stream protocol — typed event frames. Every text/voice/
                 # video/attachment message goes through here now (the
@@ -808,7 +815,9 @@ class Gateway:
                     P.AUDIO_CHUNK_IN, P.AUDIO_END_IN,
                     P.VIDEO_FRAME_IN, P.ATTACHMENT_IN, P.INTERRUPT,
                 ):
-                    await self._handle_stream_frame(ws, client_id, data)
+                    await self._handle_stream_frame(
+                        ws, client_id, data, handle=cert.handle,
+                    )
 
         except Exception as e:
             # Capture exception TYPE + traceback in addition to the bare
@@ -849,7 +858,8 @@ class Gateway:
         return ws
 
     async def _handle_command(
-        self, ws, client_id: str, name: str, session_id: str | None = None
+        self, ws, client_id: str, name: str, session_id: str | None = None,
+        *, handle: str | None = None,
     ) -> None:
         """Dispatch a WS command.
 
@@ -874,7 +884,7 @@ class Gateway:
                 stopped = sm.stop_current(client_id)
                 cleared = sm.clear_queue(client_id)
                 forgotten = await self._forget_all_client_sessions(client_id)
-            fresh_sid = sm.create_session(client_id)
+            fresh_sid = sm.create_session(client_id, handle=handle)
             parts = []
             if stopped:
                 parts.append("stopped current operation")
@@ -997,7 +1007,8 @@ class Gateway:
         return forgotten
 
     async def _handle_stream_frame(
-        self, ws, client_id: str, frame: dict
+        self, ws, client_id: str, frame: dict,
+        *, handle: str | None = None,
     ) -> None:
         """Decode a stream-protocol wire frame and dispatch into the
         matching :class:`StreamSession`.
@@ -1005,6 +1016,10 @@ class Gateway:
         Sessions are created on demand on the first frame for a given
         ``(client_id, session_id)`` pair. ``session_close`` (or the
         client WS dropping) tears them down.
+
+        ``handle`` is the authenticated user identity (same across
+        their devices) and is recorded as the session owner so the
+        chat list is cross-device.
         """
         from openagent.stream.session import StreamSession
         from openagent.stream.channel import RealtimeChannel
@@ -1012,7 +1027,21 @@ class Gateway:
         from openagent.stream.events import SessionClose, SessionOpen
 
         session_id = (frame.get("session_id") or "default").strip() or "default"
-        sid = self.sessions.get_or_create_session(client_id, session_id)
+        sid = self.sessions.get_or_create_session(
+            client_id, session_id, handle=handle,
+        )
+        # Bind the session_id to the user handle on the claude-cli
+        # registry too, so its independent persistence path
+        # (``_persist_turn``) records the same handle-scoped owner.
+        if handle:
+            try:
+                model_runtime = getattr(self.agent, "model", None)
+                if model_runtime is not None and hasattr(
+                    model_runtime, "set_session_handle"
+                ):
+                    model_runtime.set_session_handle(sid, handle)
+            except Exception:  # noqa: BLE001
+                pass
         key = (client_id, sid)
         evt = wire_to_event(frame)
         if evt is None:

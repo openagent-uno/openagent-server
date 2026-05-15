@@ -116,13 +116,28 @@ class SessionManager:
     # ── session persistence helpers ──
 
     def _persist_session(
-        self, session_id: str, client_id: str, title: str | None = None
+        self,
+        session_id: str,
+        client_id: str,
+        title: str | None = None,
+        *,
+        handle: str | None = None,
     ) -> None:
+        """Upsert the session metadata row.
+
+        ``handle`` (the authenticated user identity, same across all of
+        their devices) is what we record as the row's primary owner
+        when present, so the chat list is cross-device. ``client_id``
+        is the device pubkey — kept in metadata as ``device_id`` for
+        per-device routing (sticky-device retries, WS reconnection),
+        but the owner column tracks the user.
+        """
         if self._db is None:
             return
+        owner = (handle or "").strip() or client_id
         self._fire_and_forget(
             self._db.upsert_session(
-                session_id, client_id=client_id, title=title,
+                session_id, client_id=owner, title=title, device_id=client_id,
             )
         )
 
@@ -133,21 +148,30 @@ class SessionManager:
 
     # ── sessions ──
 
-    def create_session(self, client_id: str) -> str:
+    def create_session(self, client_id: str, *, handle: str | None = None) -> str:
         sid = f"{self.agent_name}:{client_id}:{uuid.uuid4().hex[:8]}"
         self._state(client_id).sessions[sid] = Session(id=sid, client_id=client_id)
-        self._persist_session(sid, client_id)
-        elog("session.create", client_id=client_id, session_id=sid)
+        self._persist_session(sid, client_id, handle=handle)
+        elog(
+            "session.create",
+            client_id=client_id, session_id=sid, handle=handle,
+        )
         return sid
 
-    def get_or_create_session(self, client_id: str, session_id: str) -> str:
+    def get_or_create_session(
+        self, client_id: str, session_id: str, *, handle: str | None = None,
+    ) -> str:
         st = self._state(client_id)
         created = False
         if session_id not in st.sessions:
             st.sessions[session_id] = Session(id=session_id, client_id=client_id)
-            self._persist_session(session_id, client_id)
+            self._persist_session(session_id, client_id, handle=handle)
             created = True
-        elog("session.attach", client_id=client_id, session_id=session_id, created=created)
+        elog(
+            "session.attach",
+            client_id=client_id, session_id=session_id,
+            created=created, handle=handle,
+        )
         return session_id
 
     def reset_session(self, client_id: str, session_id: str) -> str:

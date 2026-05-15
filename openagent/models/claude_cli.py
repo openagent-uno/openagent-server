@@ -243,6 +243,11 @@ class ClaudeCLI(BaseModel):
         # writes that affect its own row without blocking on unrelated
         # users' pending writes (important on multi-tenant bridges).
         self._pending_writes: dict[str, set[asyncio.Task]] = {}
+        # session_id -> authenticated user handle. Populated by the
+        # gateway right after the cert middleware verifies a frame, so
+        # ``_persist_turn`` can record the owner as the user (visible
+        # across devices) rather than the device pubkey (per-device).
+        self._session_handles: dict[str, str] = {}
 
     # ── wiring ─────────────────────────────────────────────────────────
 
@@ -257,6 +262,21 @@ class ClaudeCLI(BaseModel):
         race window between ``set_db`` and the first incoming message.
         """
         self._db = db
+
+    def set_session_handle(self, session_id: str, handle: str | None) -> None:
+        """Bind ``session_id`` to the authenticated user ``handle``.
+
+        ``_persist_turn`` reads this map to record session ownership by
+        handle (cross-device) instead of by device pubkey, so a user
+        logging in from a second device sees the sessions they created
+        on the first one. ``handle=None`` (or empty) clears the binding.
+        """
+        if not session_id:
+            return
+        if handle and handle.strip():
+            self._session_handles[session_id] = handle.strip()
+        else:
+            self._session_handles.pop(session_id, None)
 
     # ── session registry (tiny critical sections) ──────────────────────
 
@@ -866,6 +886,7 @@ class ClaudeCLI(BaseModel):
         on_delta: Callable[[str], Awaitable[None]] | None = None,
         tool_names_out: list[str] | None = None,
         tool_calls_out: list[dict] | None = None,
+        assistant_blocks_out: list[dict] | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """Send ``prompt`` and consume the SDK stream.
 
@@ -954,6 +975,16 @@ class ClaudeCLI(BaseModel):
                     block_text = getattr(block, "text", None)
                     if isinstance(block_text, str) and block_text:
                         streamed_text_parts.append(block_text)
+                        # Record interleaved order — the persistence path
+                        # uses this to re-emit text/tool_use blocks in the
+                        # original stream order. Without this, all text
+                        # was collapsed into a single trailing assistant
+                        # message and mid-turn TextBlocks (between tool
+                        # calls) were silently lost.
+                        if assistant_blocks_out is not None:
+                            assistant_blocks_out.append(
+                                {"type": "text", "text": block_text}
+                            )
                         # Block-level fallback: only fire on_delta if no
                         # partial events streamed this block already
                         # (older SDK / partials disabled / first-use
@@ -984,6 +1015,13 @@ class ClaudeCLI(BaseModel):
                                 "id": getattr(block, "id", None),
                             }
                             tool_calls_out.append(tool_call)
+                        if assistant_blocks_out is not None:
+                            assistant_blocks_out.append({
+                                "type": "tool_use",
+                                "id": getattr(block, "id", None),
+                                "name": str(tool_name),
+                                "input": getattr(block, "input", None),
+                            })
                     if on_status is not None:
                         await self._emit_tool_status(block, on_status)
             elif isinstance(message, UserMessage):
@@ -1002,6 +1040,13 @@ class ClaudeCLI(BaseModel):
                                     tc["output"] = getattr(block, "content", None)
                                     tc["is_error"] = bool(getattr(block, "is_error", None))
                                     break
+                        if assistant_blocks_out is not None:
+                            assistant_blocks_out.append({
+                                "type": "tool_result",
+                                "tool_use_id": tool_use_id,
+                                "content": getattr(block, "content", None),
+                                "is_error": bool(getattr(block, "is_error", False)),
+                            })
             elif isinstance(message, ResultMessage):
                 elog("claude_cli.stream_end", session_id=session_id)
                 result_text, usage_meta = self._capture_result(message, session_id)
@@ -1078,10 +1123,12 @@ class ClaudeCLI(BaseModel):
 
                 tool_names_called: list[str] = []
                 tool_calls_detail: list[dict] = []
+                assistant_blocks: list[dict] = []
                 result, usage_meta = await self._run_once(
                     client, prompt, sid, on_status,
                     tool_names_out=tool_names_called,
                     tool_calls_out=tool_calls_detail,
+                    assistant_blocks_out=assistant_blocks,
                 )
                 input_tokens, output_tokens = 0, 0
                 try:
@@ -1095,6 +1142,7 @@ class ClaudeCLI(BaseModel):
                     prompt=prompt,
                     assistant_text=result,
                     tool_calls=tool_calls_detail,
+                    assistant_blocks=assistant_blocks,
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     model=self._model_id_for_response(sid),
@@ -1193,16 +1241,19 @@ class ClaudeCLI(BaseModel):
                 await self._ensure_session_model(sid, client, self.model)
                 tool_names: list[str] = []
                 tool_calls: list[dict] = []
+                assistant_blocks: list[dict] = []
                 result_text, usage_meta = await self._run_once(
                     client, prompt, sid,
                     on_status=on_status, on_delta=on_delta,
                     tool_names_out=tool_names,
                     tool_calls_out=tool_calls,
+                    assistant_blocks_out=assistant_blocks,
                 )
                 _result.update(
                     result_text=result_text,
                     usage_meta=usage_meta,
                     tool_calls=tool_calls,
+                    assistant_blocks=assistant_blocks,
                 )
             except asyncio.CancelledError:
                 raise
@@ -1249,6 +1300,7 @@ class ClaudeCLI(BaseModel):
                     assistant_text=_result.get("result_text", "")
                         or "(Done — no final message was returned.)",
                     tool_calls=_result.get("tool_calls", []),
+                    assistant_blocks=_result.get("assistant_blocks", []),
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     model=self._model_id_for_response(sid),
@@ -1389,6 +1441,7 @@ class ClaudeCLI(BaseModel):
         prompt: str,
         assistant_text: str,
         tool_calls: list[dict] | None = None,
+        assistant_blocks: list[dict] | None = None,
         input_tokens: int = 0,
         output_tokens: int = 0,
         model: str | None = None,
@@ -1398,23 +1451,85 @@ class ClaudeCLI(BaseModel):
         messages: list[dict] = [
             {"role": "user", "content": prompt},
         ]
-        if assistant_text:
-            messages.append({"role": "assistant", "content": assistant_text})
-        for tc in (tool_calls or []):
-            messages.append({
-                "role": "tool",
-                "content": str(tc.get("output", "") or ""),
-                "name": tc.get("name", ""),
-            })
+        if assistant_blocks:
+            # Stream-order persistence: text and tool_use blocks are
+            # interleaved exactly as the model emitted them, so the
+            # frontend can render mid-turn assistant text between tool
+            # cards. Falls back to the legacy flat layout below when
+            # the caller didn't capture ordered blocks (older test
+            # harnesses, partial-call paths).
+            name_by_tool_use_id: dict[str, str] = {}
+            for blk in assistant_blocks:
+                btype = blk.get("type")
+                if btype == "text":
+                    text = blk.get("text") or ""
+                    if text:
+                        messages.append({"role": "assistant", "content": text})
+                elif btype == "tool_use":
+                    tu_id = blk.get("id") or ""
+                    tu_name = blk.get("name") or ""
+                    if tu_id:
+                        name_by_tool_use_id[tu_id] = tu_name
+                    args_raw = blk.get("input")
+                    try:
+                        args_str = _json.dumps(args_raw or {})
+                    except (TypeError, ValueError):
+                        args_str = "{}"
+                    messages.append({
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": tu_id,
+                            "type": "function",
+                            "function": {
+                                "name": tu_name,
+                                "arguments": args_str,
+                            },
+                        }],
+                    })
+                elif btype == "tool_result":
+                    tu_id = blk.get("tool_use_id") or ""
+                    content = blk.get("content")
+                    if content is not None and not isinstance(content, str):
+                        try:
+                            content = _json.dumps(content)
+                        except (TypeError, ValueError):
+                            content = str(content)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tu_id,
+                        "name": name_by_tool_use_id.get(tu_id, ""),
+                        "content": content or "",
+                    })
+        else:
+            # Legacy flat layout: assistant text first, then tools in
+            # one trailing block. Kept for callers that didn't thread
+            # ``assistant_blocks`` through (and for older tests).
+            if assistant_text:
+                messages.append({"role": "assistant", "content": assistant_text})
+            for tc in (tool_calls or []):
+                messages.append({
+                    "role": "tool",
+                    "content": str(tc.get("output", "") or ""),
+                    "name": tc.get("name", ""),
+                    "tool_call_id": tc.get("id", "") or "",
+                })
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
 
+        # Resolve the persisted owner: prefer the authenticated user
+        # handle (cross-device — every device that logs in as the same
+        # user sees the same sessions). Falls back to the session_id
+        # for legacy / non-network callers. ``set_session_handle`` is
+        # called by the gateway from the request middleware.
+        owner_id = self._session_handles.get(session_id) or session_id
+
         async def _write() -> None:
             try:
                 await self._db.upsert_session(
-                    session_id, client_id=session_id,
+                    session_id, client_id=owner_id,
                     title=prompt[:120],
                     model=model,
                     framework="claude-cli",
@@ -1496,6 +1611,9 @@ class ClaudeCLIRegistry(BaseModel):
         self._db: Any = None
         self._instances: dict[str, ClaudeCLI] = {}
         self._session_model: dict[str, str] = {}
+        # session_id -> user handle; mirrored onto each ClaudeCLI when
+        # spawned so ``_persist_turn`` records the owner correctly.
+        self._session_handles: dict[str, str] = {}
 
     @property
     def model(self) -> str | None:
@@ -1587,6 +1705,17 @@ class ClaudeCLIRegistry(BaseModel):
         else:
             self._session_model.pop(session_id, None)
 
+    def set_session_handle(self, session_id: str, handle: str | None) -> None:
+        """Bind ``session_id`` to a user ``handle`` (fans out to instances)."""
+        if not session_id:
+            return
+        if handle and handle.strip():
+            self._session_handles[session_id] = handle.strip()
+        else:
+            self._session_handles.pop(session_id, None)
+        for inst in self._instances.values():
+            inst.set_session_handle(session_id, handle)
+
     def set_default_model(self, model_id: str | None) -> None:
         """Change the fallback model used when a session has no pin."""
         self._default_model = (
@@ -1631,6 +1760,11 @@ class ClaudeCLIRegistry(BaseModel):
         )
         if self._db is not None:
             inst.set_db(self._db)
+        # Forward any pre-known handle so first-turn persistence writes
+        # the user-scoped owner immediately (no race with set_session_handle).
+        handle = self._session_handles.get(session_id)
+        if handle:
+            inst.set_session_handle(session_id, handle)
         self._instances[session_id] = inst
         elog(
             "claude_cli_registry.instance_created",

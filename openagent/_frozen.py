@@ -63,6 +63,76 @@ def patch_ssl_for_frozen() -> None:
         pass
 
 
+_METADATA_PATCHED = False
+
+# Packages whose dist-info can go missing inside the PyInstaller onefile
+# extract tree (sibling-swap, partial copies, race with cleanup) but
+# whose Python module is always already importable from the bundle. For
+# these, falling back to ``module.__version__`` is safe and matches what
+# ``importlib.metadata.version`` would have returned.
+_METADATA_FALLBACK_PACKAGES = frozenset({
+    "pydantic",
+    "pydantic_core",
+    "email_validator",
+})
+
+
+def patch_importlib_metadata_for_frozen() -> None:
+    """Make ``importlib.metadata.version`` survive a missing dist-info
+    for a small allowlist of packages (pydantic, pydantic_core,
+    email_validator).
+
+    Without this, every agno ``Team`` run in the PyInstaller onefile
+    bundle dies with::
+
+
+        ERROR Error in Team run: No package metadata was found for pydantic
+
+    because ``agno.tools.function._wrap_callable`` calls
+    ``importlib.metadata.version("pydantic")`` on every Team run and
+    the bundled ``pydantic-*.dist-info`` directory under
+    ``sys._MEIPASS`` is fragile — a sibling-swap during self-update
+    (the same failure mode patched for zlib in commit b394176) is
+    enough to invalidate it.
+
+    ``openagent.spec`` already ships the dist-info via
+    ``copy_metadata``; this is belt-and-braces defense for the cases
+    where the build-time fix doesn't survive runtime.
+
+    The wrapper only fires for the allowlist and only when the
+    underlying ``PackageNotFoundError`` is raised — pip-installed dev
+    setups hit the original ``version()`` path untouched.
+
+    No-op outside a frozen bundle. Idempotent.
+    """
+    global _METADATA_PATCHED
+    if not is_frozen():
+        return
+    if _METADATA_PATCHED:
+        return
+
+    import importlib
+    import importlib.metadata as _metadata
+
+    _original_version = _metadata.version
+
+    def _version_with_fallback(distribution_name: str) -> str:
+        try:
+            return _original_version(distribution_name)
+        except _metadata.PackageNotFoundError:
+            normalized = distribution_name.lower().replace("-", "_")
+            if normalized not in _METADATA_FALLBACK_PACKAGES:
+                raise
+            module = importlib.import_module(normalized)
+            module_version = getattr(module, "__version__", None)
+            if not isinstance(module_version, str):
+                raise
+            return module_version
+
+    _metadata.version = _version_with_fallback
+    _METADATA_PATCHED = True
+
+
 def bundle_dir() -> Path:
     """Return the directory containing bundled data files.
 

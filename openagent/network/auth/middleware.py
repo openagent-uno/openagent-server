@@ -121,9 +121,12 @@ def make_auth_middleware(state: NetworkAuthState):
         # authenticated identity. ``client_id`` was a freely-chosen
         # string in the legacy protocol; locking it to the device
         # pubkey hex prevents a reconnect from impersonating someone
-        # else's open StreamSessions.
+        # else's open StreamSessions. ``user_handle`` is the same user
+        # across all of their devices — used by the session list so
+        # device A's chats show up on device B after re-login.
         request["device_cert"] = cert
         request["client_id"] = cert.device_pubkey_hex
+        request["user_handle"] = cert.handle
         request["network_id"] = cert.network_id
         return await handler(request)
 
