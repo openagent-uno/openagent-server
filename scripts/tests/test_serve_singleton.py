@@ -16,7 +16,7 @@ import sys
 import time
 from pathlib import Path
 
-from openagent.core import serve_singleton
+from src.core import serve_singleton
 
 from ._framework import TestContext, test
 

@@ -13,7 +13,7 @@ from ._framework import TestContext, test
 
 @test("models_discovery", "openai-style parser handles /v1/models envelope")
 async def t_openai_parser_shape(ctx: TestContext) -> None:
-    from openagent.models.discovery import _parse_openai_style
+    from src.models.discovery import _parse_openai_style
 
     payload = {"data": [
         {"id": "gpt-4o-mini", "name": "GPT-4o mini"},
@@ -29,7 +29,7 @@ async def t_openai_parser_shape(ctx: TestContext) -> None:
 async def t_openai_parser_envelopes(ctx: TestContext) -> None:
     """z.ai and some self-hosts use ``models[]`` or bare arrays instead
     of OpenAI's canonical ``data[]``. Parser must handle all three."""
-    from openagent.models.discovery import _parse_openai_style
+    from src.models.discovery import _parse_openai_style
 
     # z.ai / self-hosted shape
     ids = [m["id"] for m in _parse_openai_style({"models": [{"id": "glm-5.1"}]})]
@@ -46,7 +46,7 @@ async def t_openai_parser_envelopes(ctx: TestContext) -> None:
 
 @test("models_discovery", "google parser strips models/ prefix")
 async def t_google_parser(ctx: TestContext) -> None:
-    from openagent.models.discovery import _parse_google
+    from src.models.discovery import _parse_google
 
     payload = {"models": [
         {"name": "models/gemini-2.5-pro", "displayName": "Gemini 2.5 Pro"},
@@ -59,7 +59,7 @@ async def t_google_parser(ctx: TestContext) -> None:
 
 @test("models_discovery", "OpenRouter filter strips vendor prefix + converts pricing")
 async def t_openrouter_filter(ctx: TestContext) -> None:
-    from openagent.models.discovery import _openrouter_filter_for
+    from src.models.discovery import _openrouter_filter_for
 
     catalog = [
         {

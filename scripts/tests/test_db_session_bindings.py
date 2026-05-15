@@ -14,7 +14,7 @@ from ._framework import TestContext, test
 
 @test("db_session_bindings", "set + get roundtrip for agno")
 async def t_agno_binding(ctx: TestContext) -> None:
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     tmp_db = ctx.db_path.with_name(f"sb-agno-{uuid.uuid4().hex[:8]}.db")
     try:
@@ -37,7 +37,7 @@ async def t_agno_binding(ctx: TestContext) -> None:
 
 @test("db_session_bindings", "claude-cli binding resolves via sdk_sessions")
 async def t_claude_cli_via_sdk_sessions(ctx: TestContext) -> None:
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     tmp_db = ctx.db_path.with_name(f"sb-cli-{uuid.uuid4().hex[:8]}.db")
     try:
@@ -57,7 +57,7 @@ async def t_claude_cli_via_sdk_sessions(ctx: TestContext) -> None:
 
 @test("db_session_bindings", "invalid framework is rejected at the CHECK constraint")
 async def t_invalid_framework(ctx: TestContext) -> None:
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     tmp_db = ctx.db_path.with_name(f"sb-invalid-{uuid.uuid4().hex[:8]}.db")
     try:

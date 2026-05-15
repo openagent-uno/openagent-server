@@ -14,8 +14,8 @@ from ._framework import TestContext, test
 
 @test("agno_stream", "stream zero-delta fallback yields generate() content")
 async def t_agno_stream_zero_delta_fallback(_ctx: TestContext) -> None:
-    from openagent.models.agno_provider import AgnoProvider
-    from openagent.models.base import ModelResponse
+    from src.models.agno_provider import AgnoProvider
+    from src.models.base import ModelResponse
 
     provider = AgnoProvider(
         model="openai:gpt-4o-mini",

@@ -27,7 +27,7 @@ from ._framework import TestContext, test
 
 @test("sessions_parallel", "two sessions on one client run concurrently")
 async def t_parallel_sessions(ctx: TestContext) -> None:
-    from openagent.gateway.sessions import SessionManager
+    from src.gateway.sessions import SessionManager
 
     sm = SessionManager(agent_name="test-agent")
     client = "ws:client-x"
@@ -69,7 +69,7 @@ async def t_fifo_within_session(ctx: TestContext) -> None:
     """Parallelism across sessions must not break ordering inside
     one session — consecutive messages from the same user still
     need to be handled in order."""
-    from openagent.gateway.sessions import SessionManager
+    from src.gateway.sessions import SessionManager
 
     sm = SessionManager(agent_name="test-agent")
     client = "ws:single"
@@ -102,7 +102,7 @@ async def t_queue_cap_per_session(ctx: TestContext) -> None:
     """MAX_QUEUE_SIZE limits each session independently — a noisy
     session shouldn't cause the next session's first message to be
     rejected."""
-    from openagent.gateway.sessions import MAX_QUEUE_SIZE, SessionManager
+    from src.gateway.sessions import MAX_QUEUE_SIZE, SessionManager
 
     sm = SessionManager(agent_name="test-agent")
     client = "ws:cap-test"

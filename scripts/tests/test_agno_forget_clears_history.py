@@ -96,7 +96,7 @@ async def t_forget_via_native_api(ctx: TestContext) -> None:
     if not _agno_available():
         raise TestSkip("agno not installed")
 
-    from openagent.models.agno_provider import AgnoProvider
+    from src.models.agno_provider import AgnoProvider
 
     db_file = ctx.test_dir / "agno-forget.db"
     _seed_agno_sessions_table(str(db_file))
@@ -119,7 +119,7 @@ async def t_forget_fallback_sql(ctx: TestContext) -> None:
     if not _agno_available():
         raise TestSkip("agno not installed")
 
-    from openagent.models.agno_provider import AgnoProvider
+    from src.models.agno_provider import AgnoProvider
     from agno.db.sqlite import SqliteDb
 
     db_file = ctx.test_dir / "agno-forget-fallback.db"
@@ -153,7 +153,7 @@ async def t_forget_nonexistent(ctx: TestContext) -> None:
     if not _agno_available():
         raise TestSkip("agno not installed")
 
-    from openagent.models.agno_provider import AgnoProvider
+    from src.models.agno_provider import AgnoProvider
 
     db_file = ctx.test_dir / "agno-forget-noop.db"
     # Brand-new DB file; schema not yet created — fallback must cope.

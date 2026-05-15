@@ -16,7 +16,7 @@ class _FakeToolkit:
 
 @test("agno_tool_filter", "deepseek filters incompatible computer_control toolkit families")
 async def t_deepseek_filters_computer_control(_ctx: TestContext) -> None:
-    from openagent.models.agno_provider import AgnoProvider
+    from src.models.agno_provider import AgnoProvider
 
     provider = AgnoProvider(model="deepseek:deepseek-v4-flash")
     provider.set_mcp_toolkits([
@@ -38,7 +38,7 @@ async def t_deepseek_filters_computer_control(_ctx: TestContext) -> None:
 
 @test("agno_tool_filter", "deepseek image_url provider error is rewritten into an actionable message")
 async def t_deepseek_rewrites_image_url_error(_ctx: TestContext) -> None:
-    from openagent.models.agno_provider import AgnoProvider
+    from src.models.agno_provider import AgnoProvider
 
     provider = AgnoProvider(model="deepseek:deepseek-v4-flash")
     rewritten = provider._rewrite_provider_error_detail(

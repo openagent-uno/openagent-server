@@ -44,7 +44,7 @@ jobs:
             libegl1-mesa-dev libgl1-mesa-dev libgbm-dev \
             pkg-config
       - name: Build release binary
-        working-directory: openagent/mcp/servers/computer-control
+        working-directory: src/mcp/servers/computer-control
         run: cargo build --release --target ${{ matrix.target }}
       - name: Sign Rust binary (macOS only)
         if: runner.os == 'macOS'
@@ -72,7 +72,7 @@ jobs:
           if [ -z "$IDENTITY" ]; then
             echo "No Developer ID Application identity found in CSC_LINK"; exit 1
           fi
-          BIN=openagent/mcp/servers/computer-control/target/${{ matrix.target }}/release/openagent-computer-control
+          BIN=src/mcp/servers/computer-control/target/${{ matrix.target }}/release/openagent-computer-control
           codesign --force \
             --sign "$IDENTITY" \
             --identifier com.openagent.computer-control \
@@ -85,7 +85,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: computer-control-${{ matrix.out_dir }}
-          path: openagent/mcp/servers/computer-control/target/${{ matrix.target }}/release/openagent-computer-control${{ matrix.ext }}
+          path: src/mcp/servers/computer-control/target/${{ matrix.target }}/release/openagent-computer-control${{ matrix.ext }}
 
   executable:
     needs: computer-control-binary
@@ -109,10 +109,10 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: computer-control-${{ matrix.cc_target }}
-          path: openagent/mcp/servers/computer-control/bin/${{ matrix.cc_target }}/
+          path: src/mcp/servers/computer-control/bin/${{ matrix.cc_target }}/
       - name: Make binary executable
         if: runner.os != 'Windows'
-        run: chmod +x openagent/mcp/servers/computer-control/bin/${{ matrix.cc_target }}/openagent-computer-control
+        run: chmod +x src/mcp/servers/computer-control/bin/${{ matrix.cc_target }}/openagent-computer-control
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -124,7 +124,7 @@ jobs:
       - name: Build Node MCPs
         shell: bash
         run: |
-          for mcp_dir in openagent/mcp/servers/shell openagent/mcp/servers/web-search openagent/mcp/servers/editor openagent/mcp/servers/chrome-devtools openagent/mcp/servers/messaging; do
+          for mcp_dir in src/mcp/servers/shell src/mcp/servers/web-search src/mcp/servers/editor src/mcp/servers/chrome-devtools src/mcp/servers/messaging; do
             if [ -d "$mcp_dir" ]; then
               echo "Building $mcp_dir..."
               (cd "$mcp_dir" && npm install --silent && npm run build --silent 2>/dev/null || true)
@@ -136,7 +136,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          src="openagent/mcp/servers/computer-control/bin/${{ matrix.cc_target }}/openagent-computer-control${{ matrix.cc_ext }}"
+          src="src/mcp/servers/computer-control/bin/${{ matrix.cc_target }}/openagent-computer-control${{ matrix.cc_ext }}"
           dst="dist/openagent-computer-control${{ matrix.cc_ext }}"
           cp "$src" "$dst"
           chmod +x "$dst" || true

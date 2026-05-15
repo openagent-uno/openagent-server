@@ -16,8 +16,8 @@ from ._framework import TestContext, test
 
 @test("bootstrap", "ensure_builtin_mcps seeds vault + filesystem (npx defaults)")
 async def t_seeds_npx_defaults(ctx: TestContext) -> None:
-    from openagent.memory.bootstrap import ensure_builtin_mcps
-    from openagent.memory.db import MemoryDB
+    from src.memory.bootstrap import ensure_builtin_mcps
+    from src.memory.db import MemoryDB
 
     db = MemoryDB(str(ctx.db_path))
     await db.connect()
@@ -48,9 +48,9 @@ async def t_seeds_npx_defaults(ctx: TestContext) -> None:
 
 @test("bootstrap", "ensure_builtin_mcps seeds every DEFAULT_MCPS entry on a fresh DB")
 async def t_seeds_every_default(ctx: TestContext) -> None:
-    from openagent.mcp.builtins import DEFAULT_MCPS
-    from openagent.memory.bootstrap import ensure_builtin_mcps
-    from openagent.memory.db import MemoryDB
+    from src.mcp.builtins import DEFAULT_MCPS
+    from src.memory.bootstrap import ensure_builtin_mcps
+    from src.memory.db import MemoryDB
 
     db = MemoryDB(str(ctx.db_path))
     await db.connect()
@@ -71,8 +71,8 @@ async def t_seeds_every_default(ctx: TestContext) -> None:
 
 @test("bootstrap", "ensure_builtin_mcps is idempotent (second boot adds zero)")
 async def t_idempotent(ctx: TestContext) -> None:
-    from openagent.memory.bootstrap import ensure_builtin_mcps
-    from openagent.memory.db import MemoryDB
+    from src.memory.bootstrap import ensure_builtin_mcps
+    from src.memory.db import MemoryDB
 
     db = MemoryDB(str(ctx.db_path))
     await db.connect()
@@ -94,9 +94,9 @@ async def t_pool_loads_vault(ctx: TestContext) -> None:
     write a row that ``_specs_from_db`` then rejects (e.g. missing command
     after column-shape changes), and the agent would still come up
     without the vault MCP — exactly the bug we're fixing."""
-    from openagent.mcp.pool import MCPPool
-    from openagent.memory.bootstrap import ensure_builtin_mcps
-    from openagent.memory.db import MemoryDB
+    from src.mcp.pool import MCPPool
+    from src.memory.bootstrap import ensure_builtin_mcps
+    from src.memory.db import MemoryDB
 
     db = MemoryDB(str(ctx.db_path))
     await db.connect()
@@ -126,7 +126,7 @@ async def t_resolve_subprocess_python_frozen(ctx: TestContext) -> None:
     emit a misleading ``No such command`` error. ``_resolve_subprocess_python``
     must look up a system python instead so the Chromium auto-install
     subprocess actually runs Python."""
-    import openagent.mcp.builtins as builtins_mod
+    import src.mcp.builtins as builtins_mod
 
     with patch.object(builtins_mod, "is_frozen", return_value=False):
         # Non-frozen: must hand back the running interpreter unchanged.
@@ -156,8 +156,8 @@ async def t_resolve_subprocess_python_frozen(ctx: TestContext) -> None:
 
 @test("bootstrap", "ensure_builtin_mcps does not reset disabled rows")
 async def t_preserves_disabled(ctx: TestContext) -> None:
-    from openagent.memory.bootstrap import ensure_builtin_mcps
-    from openagent.memory.db import MemoryDB
+    from src.memory.bootstrap import ensure_builtin_mcps
+    from src.memory.db import MemoryDB
 
     db = MemoryDB(str(ctx.db_path))
     await db.connect()

@@ -6,13 +6,13 @@ from ._framework import TestContext, test
 
 def _reset_shell_hub() -> None:
     """Isolate hub state between tests so they don't see leaked shells."""
-    from openagent.mcp.servers.shell import handlers
+    from src.mcp.servers.shell import handlers
     handlers._reset_hub_for_tests()
 
 
 @test("shell", "ShellEvent is a frozen dataclass with expected fields")
 async def t_shell_event_shape(ctx: TestContext) -> None:
-    from openagent.mcp.servers.shell.events import ShellEvent
+    from src.mcp.servers.shell.events import ShellEvent
 
     e = ShellEvent(
         shell_id="sh_abc",
@@ -41,7 +41,7 @@ async def t_shell_event_shape(ctx: TestContext) -> None:
 
 @test("shell", "ShellHub: register and get a shell by id")
 async def t_hub_register_get(ctx: TestContext) -> None:
-    from openagent.mcp.servers.shell.hub import ShellHub
+    from src.mcp.servers.shell.hub import ShellHub
 
     hub = ShellHub()
     hub.register(shell_id="sh_1", session_id="s1", command="echo hi")
@@ -53,7 +53,7 @@ async def t_hub_register_get(ctx: TestContext) -> None:
 
 @test("shell", "ShellHub: list_for_session filters by session")
 async def t_hub_list_for_session(ctx: TestContext) -> None:
-    from openagent.mcp.servers.shell.hub import ShellHub
+    from src.mcp.servers.shell.hub import ShellHub
 
     hub = ShellHub()
     hub.register(shell_id="sh_1", session_id="s1", command="a")
@@ -71,7 +71,7 @@ async def t_hub_list_for_session(ctx: TestContext) -> None:
 
 @test("shell", "ShellHub: has_running only true while not completed")
 async def t_hub_has_running(ctx: TestContext) -> None:
-    from openagent.mcp.servers.shell.hub import ShellHub
+    from src.mcp.servers.shell.hub import ShellHub
 
     hub = ShellHub()
     hub.register(shell_id="sh_1", session_id="s1", command="x")
@@ -82,7 +82,7 @@ async def t_hub_has_running(ctx: TestContext) -> None:
 
 @test("shell", "ShellHub: purge_session removes entries and reports killed ids")
 async def t_hub_purge_session(ctx: TestContext) -> None:
-    from openagent.mcp.servers.shell.hub import ShellHub
+    from src.mcp.servers.shell.hub import ShellHub
 
     hub = ShellHub()
     hub.register(shell_id="sh_1", session_id="s1", command="a")
@@ -98,8 +98,8 @@ async def t_hub_purge_session(ctx: TestContext) -> None:
 
 @test("shell", "ShellHub: post_event + drain returns events in FIFO order")
 async def t_hub_post_drain(ctx: TestContext) -> None:
-    from openagent.mcp.servers.shell.hub import ShellHub
-    from openagent.mcp.servers.shell.events import ShellEvent
+    from src.mcp.servers.shell.hub import ShellHub
+    from src.mcp.servers.shell.events import ShellEvent
 
     hub = ShellHub()
     e1 = ShellEvent("sh_1", "completed", 0, None, 10, 0, 1.0)
@@ -114,7 +114,7 @@ async def t_hub_post_drain(ctx: TestContext) -> None:
 
 @test("shell", "ShellHub: drain on unknown session returns []")
 async def t_hub_drain_unknown(ctx: TestContext) -> None:
-    from openagent.mcp.servers.shell.hub import ShellHub
+    from src.mcp.servers.shell.hub import ShellHub
 
     hub = ShellHub()
     assert hub.drain("nope") == []
@@ -123,8 +123,8 @@ async def t_hub_drain_unknown(ctx: TestContext) -> None:
 @test("shell", "ShellHub: wait resolves when an event is posted")
 async def t_hub_wait_wakes_up(ctx: TestContext) -> None:
     import asyncio
-    from openagent.mcp.servers.shell.hub import ShellHub
-    from openagent.mcp.servers.shell.events import ShellEvent
+    from src.mcp.servers.shell.hub import ShellHub
+    from src.mcp.servers.shell.events import ShellEvent
 
     hub = ShellHub()
     e = ShellEvent("sh_9", "completed", 0, None, 1, 0, 9.0)
@@ -144,7 +144,7 @@ async def t_hub_wait_wakes_up(ctx: TestContext) -> None:
 
 @test("shell", "ShellHub: wait returns [] on timeout")
 async def t_hub_wait_timeout(ctx: TestContext) -> None:
-    from openagent.mcp.servers.shell.hub import ShellHub
+    from src.mcp.servers.shell.hub import ShellHub
 
     hub = ShellHub()
     events = await hub.wait("s1", timeout=0.05)
@@ -153,8 +153,8 @@ async def t_hub_wait_timeout(ctx: TestContext) -> None:
 
 @test("shell", "ShellHub: queue cap drops oldest and keeps newest")
 async def t_hub_queue_cap(ctx: TestContext) -> None:
-    from openagent.mcp.servers.shell.hub import ShellHub
-    from openagent.mcp.servers.shell.events import ShellEvent
+    from src.mcp.servers.shell.hub import ShellHub
+    from src.mcp.servers.shell.events import ShellEvent
 
     hub = ShellHub()
     # Post more than the cap (200) — confirm the newest 200 survive.
@@ -170,7 +170,7 @@ async def t_hub_queue_cap(ctx: TestContext) -> None:
 @test("shell", "ShellHub: gc removes completed shells older than TTL")
 async def t_hub_gc(ctx: TestContext) -> None:
     import time
-    from openagent.mcp.servers.shell.hub import ShellHub
+    from src.mcp.servers.shell.hub import ShellHub
 
     hub = ShellHub()
     hub.register(shell_id="sh_old", session_id="s1", command="a")
@@ -191,7 +191,7 @@ async def t_hub_gc(ctx: TestContext) -> None:
 
 @test("shell", "ShellHub: shutdown purges every session and clears state")
 async def t_hub_shutdown(ctx: TestContext) -> None:
-    from openagent.mcp.servers.shell.hub import ShellHub
+    from src.mcp.servers.shell.hub import ShellHub
 
     hub = ShellHub()
     hub.register(shell_id="sh_1", session_id="s1", command="a")
@@ -216,7 +216,7 @@ async def _run_bg_to_completion(bg, *, max_wait: float = 2.5) -> None:
 
 @test("shell", "BackgroundShell: spawn echo and capture stdout + exit_code")
 async def t_bg_spawn_echo(ctx: TestContext) -> None:
-    from openagent.mcp.servers.shell.shells import BackgroundShell
+    from src.mcp.servers.shell.shells import BackgroundShell
 
     bg = BackgroundShell(
         shell_id="sh_echo",
@@ -234,7 +234,7 @@ async def t_bg_spawn_echo(ctx: TestContext) -> None:
 
 @test("shell", "BackgroundShell: non-zero exit is captured")
 async def t_bg_nonzero_exit(ctx: TestContext) -> None:
-    from openagent.mcp.servers.shell.shells import BackgroundShell
+    from src.mcp.servers.shell.shells import BackgroundShell
 
     bg = BackgroundShell(
         shell_id="sh_exit",
@@ -250,7 +250,7 @@ async def t_bg_nonzero_exit(ctx: TestContext) -> None:
 
 @test("shell", "BackgroundShell: stderr is captured separately")
 async def t_bg_stderr(ctx: TestContext) -> None:
-    from openagent.mcp.servers.shell.shells import BackgroundShell
+    from src.mcp.servers.shell.shells import BackgroundShell
 
     bg = BackgroundShell(
         shell_id="sh_err",
@@ -267,7 +267,7 @@ async def t_bg_stderr(ctx: TestContext) -> None:
 
 @test("shell", "BackgroundShell: read cursors advance (since_last semantics)")
 async def t_bg_read_cursor(ctx: TestContext) -> None:
-    from openagent.mcp.servers.shell.shells import BackgroundShell
+    from src.mcp.servers.shell.shells import BackgroundShell
 
     bg = BackgroundShell(
         shell_id="sh_cursor",
@@ -286,7 +286,7 @@ async def t_bg_read_cursor(ctx: TestContext) -> None:
 @test("shell", "BackgroundShell: write_stdin feeds a line to a running cat")
 async def t_bg_stdin_cat(ctx: TestContext) -> None:
     import asyncio
-    from openagent.mcp.servers.shell.shells import BackgroundShell
+    from src.mcp.servers.shell.shells import BackgroundShell
 
     bg = BackgroundShell(
         shell_id="sh_cat",
@@ -313,7 +313,7 @@ async def t_bg_stdin_cat(ctx: TestContext) -> None:
 @test("shell", "BackgroundShell: write_stdin with press_enter appends a newline")
 async def t_bg_stdin_press_enter(ctx: TestContext) -> None:
     import asyncio
-    from openagent.mcp.servers.shell.shells import BackgroundShell
+    from src.mcp.servers.shell.shells import BackgroundShell
 
     bg = BackgroundShell(
         shell_id="sh_cat2",
@@ -339,7 +339,7 @@ async def t_bg_stdin_press_enter(ctx: TestContext) -> None:
 @test("shell", "BackgroundShell: kill TERM stops a sleep")
 async def t_bg_kill_term(ctx: TestContext) -> None:
     import asyncio
-    from openagent.mcp.servers.shell.shells import BackgroundShell
+    from src.mcp.servers.shell.shells import BackgroundShell
 
     bg = BackgroundShell(
         shell_id="sh_sleep",
@@ -359,7 +359,7 @@ async def t_bg_kill_term(ctx: TestContext) -> None:
 @test("shell", "BackgroundShell: kill escalates to KILL if TERM ignored")
 async def t_bg_kill_escalate(ctx: TestContext) -> None:
     import asyncio
-    from openagent.mcp.servers.shell.shells import BackgroundShell
+    from src.mcp.servers.shell.shells import BackgroundShell
 
     # Trap TERM so only KILL works.
     bg = BackgroundShell(
@@ -388,7 +388,7 @@ async def t_bg_kill_race_exited(ctx: TestContext) -> None:
     import asyncio
     import os as os_mod
     from unittest.mock import patch
-    from openagent.mcp.servers.shell.shells import BackgroundShell
+    from src.mcp.servers.shell.shells import BackgroundShell
 
     bg = BackgroundShell(
         shell_id="sh_race",
@@ -419,7 +419,7 @@ async def t_bg_kill_race_exited(ctx: TestContext) -> None:
 
 @test("shell", "BackgroundShell.run_with_timeout: fast command returns normally")
 async def t_bg_run_with_timeout_ok(ctx: TestContext) -> None:
-    from openagent.mcp.servers.shell.shells import BackgroundShell
+    from src.mcp.servers.shell.shells import BackgroundShell
 
     bg = BackgroundShell(shell_id="sh_ok", command="echo abc", cwd=None, env=None)
     result = await bg.run_with_timeout(timeout_seconds=2.0)
@@ -431,7 +431,7 @@ async def t_bg_run_with_timeout_ok(ctx: TestContext) -> None:
 @test("shell", "BackgroundShell.run_with_timeout: slow command is killed")
 async def t_bg_run_with_timeout_kill(ctx: TestContext) -> None:
     import time
-    from openagent.mcp.servers.shell.shells import BackgroundShell
+    from src.mcp.servers.shell.shells import BackgroundShell
 
     bg = BackgroundShell(shell_id="sh_slow", command="sleep 30", cwd=None, env=None)
     t0 = time.time()
@@ -445,7 +445,7 @@ async def t_bg_run_with_timeout_kill(ctx: TestContext) -> None:
 @test("shell", "handlers.shell_exec: foreground success")
 async def t_handlers_exec_fg_ok(ctx: TestContext) -> None:
     _reset_shell_hub()
-    from openagent.mcp.servers.shell import handlers
+    from src.mcp.servers.shell import handlers
 
     out = await handlers.shell_exec(
         command="echo one-two-three",
@@ -462,7 +462,7 @@ async def t_handlers_exec_fg_ok(ctx: TestContext) -> None:
 @test("shell", "handlers.shell_exec: foreground timeout sets timed_out=True")
 async def t_handlers_exec_fg_timeout(ctx: TestContext) -> None:
     _reset_shell_hub()
-    from openagent.mcp.servers.shell import handlers
+    from src.mcp.servers.shell import handlers
 
     out = await handlers.shell_exec(
         command="sleep 10",
@@ -484,8 +484,8 @@ async def t_shell_exec_diag_events(ctx: TestContext) -> None:
     import logging as _logging
 
     _reset_shell_hub()
-    from openagent.core.logging import EVENT_LOGGER
-    from openagent.mcp.servers.shell import handlers
+    from src.core.logging import EVENT_LOGGER
+    from src.mcp.servers.shell import handlers
 
     captured: list[str] = []
 
@@ -531,7 +531,7 @@ async def t_shell_finalise_bounded_with_grandchild_holding_pipes(ctx: TestContex
     import asyncio as _asyncio
     import time as _time
 
-    from openagent.mcp.servers.shell.shells import (
+    from src.mcp.servers.shell.shells import (
         BackgroundShell,
         FINALISE_TIMEOUT,
     )
@@ -596,7 +596,7 @@ async def t_shell_finalise_bounded_with_grandchild_holding_pipes(ctx: TestContex
 @test("shell", "handlers.shell_which: existing command returns path")
 async def t_handlers_which_ok(ctx: TestContext) -> None:
     _reset_shell_hub()
-    from openagent.mcp.servers.shell import handlers
+    from src.mcp.servers.shell import handlers
 
     out = await handlers.shell_which(command="sh")
     assert out["available"] is True
@@ -606,7 +606,7 @@ async def t_handlers_which_ok(ctx: TestContext) -> None:
 @test("shell", "handlers.shell_which: missing command returns available=false")
 async def t_handlers_which_missing(ctx: TestContext) -> None:
     _reset_shell_hub()
-    from openagent.mcp.servers.shell import handlers
+    from src.mcp.servers.shell import handlers
 
     out = await handlers.shell_which(command="definitely_not_a_real_binary_xyz_123")
     assert out["available"] is False
@@ -615,7 +615,7 @@ async def t_handlers_which_missing(ctx: TestContext) -> None:
 @test("shell", "handlers.shell_exec background returns shell_id and posts terminal event")
 async def t_handlers_exec_bg_event(ctx: TestContext) -> None:
     import asyncio
-    from openagent.mcp.servers.shell import handlers
+    from src.mcp.servers.shell import handlers
 
     _reset_shell_hub()
     started = await handlers.shell_exec(
@@ -639,7 +639,7 @@ async def t_handlers_exec_bg_event(ctx: TestContext) -> None:
 @test("shell", "handlers.shell_output: returns delta and marks not running")
 async def t_handlers_output_delta(ctx: TestContext) -> None:
     import asyncio
-    from openagent.mcp.servers.shell import handlers
+    from src.mcp.servers.shell import handlers
 
     _reset_shell_hub()
     started = await handlers.shell_exec(
@@ -668,7 +668,7 @@ async def t_handlers_output_delta(ctx: TestContext) -> None:
 
 @test("shell", "handlers.shell_output: filter matches per-line regex")
 async def t_handlers_output_filter(ctx: TestContext) -> None:
-    from openagent.mcp.servers.shell import handlers
+    from src.mcp.servers.shell import handlers
 
     _reset_shell_hub()
     started = await handlers.shell_exec(
@@ -689,7 +689,7 @@ async def t_handlers_output_filter(ctx: TestContext) -> None:
 @test("shell", "handlers.shell_input writes to a running shell's stdin")
 async def t_handlers_input(ctx: TestContext) -> None:
     import asyncio
-    from openagent.mcp.servers.shell import handlers
+    from src.mcp.servers.shell import handlers
 
     _reset_shell_hub()
     started = await handlers.shell_exec(
@@ -712,7 +712,7 @@ async def t_handlers_input(ctx: TestContext) -> None:
 
 @test("shell", "handlers.shell_kill terminates a running shell")
 async def t_handlers_kill(ctx: TestContext) -> None:
-    from openagent.mcp.servers.shell import handlers
+    from src.mcp.servers.shell import handlers
 
     _reset_shell_hub()
     started = await handlers.shell_exec(
@@ -731,7 +731,7 @@ async def t_handlers_kill(ctx: TestContext) -> None:
 
 @test("shell", "handlers.shell_list returns running and recently-completed shells")
 async def t_handlers_list(ctx: TestContext) -> None:
-    from openagent.mcp.servers.shell import handlers
+    from src.mcp.servers.shell import handlers
 
     _reset_shell_hub()
     bg1 = await handlers.shell_exec(
@@ -761,7 +761,7 @@ async def t_handlers_list(ctx: TestContext) -> None:
 
 @test("shell", "adapters.build_sdk_server exposes the six tools")
 async def t_adapter_claude(ctx: TestContext) -> None:
-    from openagent.mcp.servers.shell.adapters import build_sdk_server
+    from src.mcp.servers.shell.adapters import build_sdk_server
 
     cfg = build_sdk_server()
     assert cfg is not None, "expected a non-None SDK server config"
@@ -771,7 +771,7 @@ async def t_adapter_claude(ctx: TestContext) -> None:
 
 @test("shell", "adapters.build_agno_toolkit exposes the six tools by name")
 async def t_adapter_agno(ctx: TestContext) -> None:
-    from openagent.mcp.servers.shell.adapters import build_agno_toolkit
+    from src.mcp.servers.shell.adapters import build_agno_toolkit
 
     tk = build_agno_toolkit()
     names = set()
@@ -792,7 +792,7 @@ async def t_adapter_agno(ctx: TestContext) -> None:
 @test("shell", "adapters.build_sdk_server: shell_exec schema has command required, run_in_background boolean")
 async def t_adapter_claude_schema(ctx: TestContext) -> None:
     import mcp.types as mcp_types
-    from openagent.mcp.servers.shell.adapters import build_sdk_server
+    from src.mcp.servers.shell.adapters import build_sdk_server
 
     cfg = build_sdk_server()
     server = cfg.get("instance")
@@ -823,7 +823,7 @@ async def t_adapter_claude_schema(ctx: TestContext) -> None:
 
 @test("shell", "MCPPool: in-process shell toolkit appears in agno_toolkits")
 async def t_pool_in_process_agno(ctx: TestContext) -> None:
-    from openagent.mcp.pool import MCPPool
+    from src.mcp.pool import MCPPool
 
     pool = MCPPool.from_config(
         mcp_config=[{"builtin": "shell"}],
@@ -843,7 +843,7 @@ async def t_pool_in_process_agno(ctx: TestContext) -> None:
 
 @test("shell", "MCPPool: in-process shell appears in claude_sdk_servers")
 async def t_pool_in_process_claude(ctx: TestContext) -> None:
-    from openagent.mcp.pool import MCPPool
+    from src.mcp.pool import MCPPool
 
     pool = MCPPool.from_config(
         mcp_config=[{"builtin": "shell"}],
@@ -864,7 +864,7 @@ async def t_pool_in_process_claude(ctx: TestContext) -> None:
 
 @test("shell", "MCPPool: bad adapter_module is isolated (pool stays healthy)")
 async def t_pool_in_process_import_failure(ctx: TestContext) -> None:
-    from openagent.mcp.pool import MCPPool, _ServerSpec
+    from src.mcp.pool import MCPPool, _ServerSpec
 
     # Construct a pool directly with a single broken in-process spec.
     broken = _ServerSpec(
@@ -886,7 +886,7 @@ async def t_pool_in_process_import_failure(ctx: TestContext) -> None:
 
 @test("shell", "handlers: shell_exec picks up session_id from contextvar when arg is None")
 async def t_handlers_session_ctxvar(ctx: TestContext) -> None:
-    from openagent.mcp.servers.shell import handlers, adapters
+    from src.mcp.servers.shell import handlers, adapters
 
     _reset_shell_hub()
     token = adapters.set_session_context("sess-CTX")
@@ -907,7 +907,7 @@ async def t_handlers_session_ctxvar(ctx: TestContext) -> None:
 
 @test("shell", "config.shell_settings returns defaults when unset")
 async def t_config_defaults(ctx: TestContext) -> None:
-    from openagent.core.config import shell_settings
+    from src.core.config import shell_settings
 
     s = shell_settings({})
     assert s.wake_wait_window_seconds == 60.0
@@ -916,7 +916,7 @@ async def t_config_defaults(ctx: TestContext) -> None:
 
 @test("shell", "config.shell_settings honours overrides")
 async def t_config_override(ctx: TestContext) -> None:
-    from openagent.core.config import shell_settings
+    from src.core.config import shell_settings
 
     s = shell_settings({"shell": {"wake_wait_window_seconds": 0, "autoloop_cap": 5}})
     assert s.wake_wait_window_seconds == 0.0
@@ -926,10 +926,10 @@ async def t_config_override(ctx: TestContext) -> None:
 @test("shell", "agent._run_inner: continues session when bg shell completes")
 async def t_agent_autoloop_continues(ctx: TestContext) -> None:
     import asyncio
-    from openagent.core.agent import Agent
-    from openagent.models.base import BaseModel, ModelResponse
-    from openagent.mcp.servers.shell import handlers, adapters
-    from openagent.mcp.servers.shell.events import ShellEvent
+    from src.core.agent import Agent
+    from src.models.base import BaseModel, ModelResponse
+    from src.mcp.servers.shell import handlers, adapters
+    from src.mcp.servers.shell.events import ShellEvent
 
     _reset_shell_hub()
 
@@ -982,8 +982,8 @@ async def t_agent_autoloop_continues(ctx: TestContext) -> None:
 
 @test("shell", "agent._run_inner: stops when no bg shells and no events")
 async def t_agent_autoloop_stops(ctx: TestContext) -> None:
-    from openagent.core.agent import Agent
-    from openagent.models.base import BaseModel, ModelResponse
+    from src.core.agent import Agent
+    from src.models.base import BaseModel, ModelResponse
 
     _reset_shell_hub()
 
@@ -1008,10 +1008,10 @@ async def t_agent_autoloop_stops(ctx: TestContext) -> None:
 
 @test("shell", "agent._run_inner: passive reminder on next turn")
 async def t_agent_passive_reminder(ctx: TestContext) -> None:
-    from openagent.core.agent import Agent
-    from openagent.models.base import BaseModel, ModelResponse
-    from openagent.mcp.servers.shell import handlers
-    from openagent.mcp.servers.shell.events import ShellEvent
+    from src.core.agent import Agent
+    from src.models.base import BaseModel, ModelResponse
+    from src.mcp.servers.shell import handlers
+    from src.mcp.servers.shell.events import ShellEvent
     import time
 
     _reset_shell_hub()
@@ -1048,9 +1048,9 @@ async def t_agent_passive_reminder(ctx: TestContext) -> None:
 
 @test("shell", "agent._run_inner: autoloop_cap stops runaway chains")
 async def t_agent_autoloop_cap(ctx: TestContext) -> None:
-    from openagent.core.agent import Agent
-    from openagent.models.base import BaseModel, ModelResponse
-    from openagent.mcp.servers.shell import handlers, adapters
+    from src.core.agent import Agent
+    from src.models.base import BaseModel, ModelResponse
+    from src.mcp.servers.shell import handlers, adapters
 
     _reset_shell_hub()
 
@@ -1090,9 +1090,9 @@ async def t_agent_autoloop_cap(ctx: TestContext) -> None:
 
 @test("shell", "agent.forget_session purges hub entries for that session")
 async def t_agent_forget_purges_hub(ctx: TestContext) -> None:
-    from openagent.core.agent import Agent
-    from openagent.models.base import BaseModel, ModelResponse
-    from openagent.mcp.servers.shell import handlers
+    from src.core.agent import Agent
+    from src.models.base import BaseModel, ModelResponse
+    from src.mcp.servers.shell import handlers
 
     _reset_shell_hub()
     handlers.get_hub().register(shell_id="sh_x", session_id="S-FOR", command="echo")
@@ -1110,9 +1110,9 @@ async def t_agent_forget_purges_hub(ctx: TestContext) -> None:
 
 @test("shell", "agent.shutdown clears the hub")
 async def t_agent_shutdown_clears_hub(ctx: TestContext) -> None:
-    from openagent.core.agent import Agent
-    from openagent.models.base import BaseModel, ModelResponse
-    from openagent.mcp.servers.shell import handlers
+    from src.core.agent import Agent
+    from src.models.base import BaseModel, ModelResponse
+    from src.mcp.servers.shell import handlers
 
     _reset_shell_hub()
     handlers.get_hub().register(shell_id="sh_y", session_id="S-SH", command="echo")

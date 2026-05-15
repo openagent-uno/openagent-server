@@ -44,7 +44,7 @@ class _SpyAgent:
 
 @test("scheduler_fresh_session", "run_task forgets session between firings (issue #5)")
 async def t_run_task_forgets_session(ctx: TestContext) -> None:
-    from openagent.core.scheduler import Scheduler
+    from src.core.scheduler import Scheduler
 
     agent = _SpyAgent()
     scheduler = Scheduler(db=None, agent=agent)  # type: ignore[arg-type]
@@ -74,7 +74,7 @@ class _RaisingAgent(_SpyAgent):
 
 @test("scheduler_fresh_session", "run_task forgets session even when the run raises")
 async def t_run_task_forgets_on_error(ctx: TestContext) -> None:
-    from openagent.core.scheduler import Scheduler
+    from src.core.scheduler import Scheduler
 
     agent = _RaisingAgent()
     scheduler = Scheduler(db=None, agent=agent)  # type: ignore[arg-type]

@@ -18,7 +18,7 @@ from ._framework import TestContext, test
 
 @test("db_workflow_claim", "claim picks up enqueued requests, marks them claimed")
 async def t_claim_basic(ctx: TestContext) -> None:
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     tmp_db = ctx.db_path.with_name(f"wfclaim-basic-{uuid.uuid4().hex[:8]}.db")
     try:
@@ -67,7 +67,7 @@ async def t_claim_under_open_transaction(ctx: TestContext) -> None:
     ``cannot start a transaction within a transaction``. Reproduce
     that connection state here and assert the claim path now succeeds.
     """
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     tmp_db = ctx.db_path.with_name(f"wfclaim-tx-{uuid.uuid4().hex[:8]}.db")
     try:
@@ -102,7 +102,7 @@ async def t_claim_under_open_transaction(ctx: TestContext) -> None:
 
 @test("db_workflow_claim", "claim limit honors the cap")
 async def t_claim_limit(ctx: TestContext) -> None:
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     tmp_db = ctx.db_path.with_name(f"wfclaim-lim-{uuid.uuid4().hex[:8]}.db")
     try:

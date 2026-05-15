@@ -14,7 +14,7 @@ from ._framework import TestContext, TestSkip, test
 
 @test("pool", "from_config builds expected number of specs")
 async def t_pool_specs(ctx: TestContext) -> None:
-    from openagent.mcp.pool import MCPPool
+    from src.mcp.pool import MCPPool
     pool = MCPPool.from_config(
         mcp_config=ctx.config.get("mcp"),
         include_defaults=True,
@@ -32,7 +32,7 @@ async def t_pool_specs(ctx: TestContext) -> None:
 
 @test("pool", "claude_sdk_servers shape (command/args/env)")
 async def t_pool_claude_shape(ctx: TestContext) -> None:
-    from openagent.mcp.pool import MCPPool
+    from src.mcp.pool import MCPPool
     pool = MCPPool.from_config(
         mcp_config=ctx.config.get("mcp"),
         include_defaults=True,
@@ -51,7 +51,7 @@ async def t_pool_claude_shape(ctx: TestContext) -> None:
 
 @test("pool", "connect_all + dormant detection + summary")
 async def t_pool_connect(ctx: TestContext) -> None:
-    from openagent.mcp.pool import MCPPool
+    from src.mcp.pool import MCPPool
     pool = MCPPool.from_config(
         mcp_config=ctx.config.get("mcp"),
         include_defaults=True,

@@ -5,8 +5,8 @@ import os
 import time
 from pathlib import Path
 
-from openagent import cli
-from openagent import _frozen
+from src import cli
+from src import _frozen
 
 from ._framework import TestContext, test
 

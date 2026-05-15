@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-cd "$(dirname "$0")/../openagent/mcp/servers/computer-control"
+cd "$(dirname "$0")/../src/mcp/servers/computer-control"
 
 TARGET="$(rustc -vV | sed -n 's|host: ||p')"
 case "$TARGET" in

@@ -15,8 +15,8 @@ from ._framework import TestContext, test
 
 @test("updater", "updater symbols exist + current __version__ is sane")
 async def t_updater_callable(ctx: TestContext) -> None:
-    import openagent
-    from openagent.updater import check_for_update, UpdateInfo, perform_self_update_sync
+    import src
+    from src.updater import check_for_update, UpdateInfo, perform_self_update_sync
     assert openagent.__version__ and isinstance(openagent.__version__, str)
     assert callable(check_for_update)
     assert callable(perform_self_update_sync)
@@ -67,8 +67,8 @@ class _FakeHTTPResponse:
 
 @test("updater", "check_for_update prefers server asset over CLI asset")
 async def t_updater_prefers_server_asset(ctx: TestContext) -> None:
-    import openagent
-    import openagent.updater as updater
+    import src
+    import src.updater as updater
 
     payload = {
         "tag_name": "v0.5.17",
@@ -117,7 +117,7 @@ async def t_apply_update_bundle_swap(ctx: TestContext) -> None:
     from pathlib import Path
     from unittest.mock import patch
     import platform
-    import openagent.updater as updater
+    import src.updater as updater
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -156,7 +156,7 @@ async def t_apply_update_bundle_swap(ctx: TestContext) -> None:
 
 @test("updater", "download_update rejects archives without server binary")
 async def t_updater_rejects_cli_only_archive(ctx: TestContext) -> None:
-    import openagent.updater as updater
+    import src.updater as updater
 
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tf:
@@ -190,7 +190,7 @@ async def t_updater_streaming_bound(ctx: TestContext) -> None:
     more than one chunk in memory.
     """
     import os
-    import openagent.updater as updater
+    import src.updater as updater
 
     # Build a tarball whose CONTENT is uncompressible (random bytes) so
     # the archive itself stays larger than the chunk size and we can
@@ -231,7 +231,7 @@ async def t_updater_streaming_checksum(ctx: TestContext) -> None:
     """The SHA is computed incrementally as chunks land — a mismatch
     must still raise so a corrupt download never gets installed."""
     import hashlib
-    import openagent.updater as updater
+    import src.updater as updater
 
     big_payload = b"Y" * (3 * updater._DOWNLOAD_CHUNK_SIZE)
     buf = io.BytesIO()
@@ -287,8 +287,8 @@ async def t_updater_skips_prerelease(ctx: TestContext) -> None:
     """``/releases/latest`` filters prereleases server-side, but the
     code now does its own check too. Without it, a future migration to
     ``/releases`` would auto-deploy RC builds to every production agent."""
-    import openagent
-    import openagent.updater as updater
+    import src
+    import src.updater as updater
 
     payload = {
         "tag_name": "v9.9.9-rc1",
@@ -318,8 +318,8 @@ async def t_updater_logs_bad_tag(ctx: TestContext) -> None:
     """Garbage tag values used to be swallowed silently — the agent
     looked healthy in events.jsonl while never receiving updates."""
     import logging
-    import openagent
-    import openagent.updater as updater
+    import src
+    import src.updater as updater
 
     payload = {"tag_name": "main", "assets": []}
 
@@ -355,7 +355,7 @@ async def t_apply_update_rollback_bare(ctx: TestContext) -> None:
     import tempfile
     from pathlib import Path
     from unittest.mock import patch
-    import openagent.updater as updater
+    import src.updater as updater
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -403,7 +403,7 @@ async def t_swap_lock_blocks(ctx: TestContext) -> None:
     import asyncio
     import tempfile
     from pathlib import Path
-    import openagent.updater as updater
+    import src.updater as updater
 
     if not hasattr(__import__("os"), "fork"):
         # Best-effort: skip on platforms without fcntl. The lock is a
@@ -459,12 +459,12 @@ async def t_try_elog_safe(ctx: TestContext) -> None:
     """Updater observability events fire from contexts where logging
     may not yet be wired. The helper must swallow every error so the
     update flow never aborts because of a logging side-effect."""
-    import openagent.updater as updater
+    import src.updater as updater
 
     def boom(*a, **kw):
         raise RuntimeError("logging not ready")
 
-    import openagent.core.logging as logmod
+    import src.core.logging as logmod
     with patch.object(logmod, "elog", side_effect=boom):
         # Should NOT raise.
         updater._try_elog("update.test", level="warning", foo=1)
@@ -485,7 +485,7 @@ async def t_run_upgrade_sibling_swap(ctx: TestContext) -> None:
     run_upgrade without calling perform_self_update_sync — the running
     process is stale and a restart will pick up the new binary.
     """
-    import openagent.core.server as server_mod
+    import src.core.server as server_mod
 
     sentinel_called = {"perform_self_update_sync": 0}
 
@@ -523,7 +523,7 @@ async def t_run_upgrade_sibling_swap(ctx: TestContext) -> None:
 async def t_run_upgrade_normal_path(ctx: TestContext) -> None:
     """Regression guard: the sibling-swap short-circuit must NOT fire
     when our on-disk binary still matches what we started with."""
-    import openagent.core.server as server_mod
+    import src.core.server as server_mod
 
     sentinel_called = {"perform_self_update_sync": 0}
 

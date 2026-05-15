@@ -54,7 +54,7 @@ def _reset_patch_state() -> None:
     """Clear the idempotency sentinel + restore the original ``version``
     function on ``importlib.metadata``. Safe to call even if the patch
     never ran."""
-    from openagent import _frozen
+    from src import _frozen
 
     _frozen._METADATA_PATCHED = False
 
@@ -63,7 +63,7 @@ def _reset_patch_state() -> None:
 async def t_version_falls_back_for_pydantic(ctx: TestContext) -> None:
     import pydantic
 
-    from openagent._frozen import patch_importlib_metadata_for_frozen
+    from src._frozen import patch_importlib_metadata_for_frozen
 
     prior = _force_frozen(True)
     orig_version = importlib.metadata.version
@@ -98,7 +98,7 @@ async def t_version_falls_back_for_pydantic(ctx: TestContext) -> None:
 
 @test("frozen_metadata_patch", "non-allowlisted names still raise PackageNotFoundError")
 async def t_non_allowlisted_still_raises(ctx: TestContext) -> None:
-    from openagent._frozen import patch_importlib_metadata_for_frozen
+    from src._frozen import patch_importlib_metadata_for_frozen
 
     prior = _force_frozen(True)
     orig_version = importlib.metadata.version
@@ -128,7 +128,7 @@ async def t_non_allowlisted_still_raises(ctx: TestContext) -> None:
 
 @test("frozen_metadata_patch", "patch is idempotent (calling twice does not double-wrap)")
 async def t_idempotent(ctx: TestContext) -> None:
-    from openagent._frozen import patch_importlib_metadata_for_frozen
+    from src._frozen import patch_importlib_metadata_for_frozen
 
     prior = _force_frozen(True)
     orig_version = importlib.metadata.version
@@ -150,7 +150,7 @@ async def t_idempotent(ctx: TestContext) -> None:
 
 @test("frozen_metadata_patch", "patch is a no-op when not running frozen")
 async def t_noop_when_not_frozen(ctx: TestContext) -> None:
-    from openagent._frozen import patch_importlib_metadata_for_frozen
+    from src._frozen import patch_importlib_metadata_for_frozen
 
     prior = _force_frozen(False)
     orig_version = importlib.metadata.version

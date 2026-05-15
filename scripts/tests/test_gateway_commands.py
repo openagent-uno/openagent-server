@@ -111,8 +111,8 @@ class _Harness:
     """Wire up SessionManager + fake agent + the real ``_handle_command``."""
 
     def __init__(self, *, known_ids: list[str] | None = None) -> None:
-        from openagent.gateway.sessions import SessionManager
-        from openagent.gateway.server import Gateway
+        from src.gateway.sessions import SessionManager
+        from src.gateway.server import Gateway
 
         self.sessions = SessionManager(agent_name="test-agent")
         self.agent = _FakeAgent(known_ids=known_ids)
@@ -177,7 +177,7 @@ async def t_stop_scoped_preserves_others(ctx: TestContext) -> None:
     """Two users on the same telegram bot. User B is mid-turn; user A
     issues /stop. A's stop must NOT interrupt B's running task.
     """
-    from openagent.gateway.sessions import _QueuedItem
+    from src.gateway.sessions import _QueuedItem
 
     h = _Harness()
     client = "bridge:telegram"

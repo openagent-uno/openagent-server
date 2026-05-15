@@ -52,7 +52,7 @@ Providers and models live **only** in SQLite (`providers`, `models` tables). `op
 ### Text-to-speech
 - LiteLLM-routed dispatch to OpenAI, ElevenLabs, Azure, Groq, Vertex AI.
 - Per-model config: voice ID, response format (default `mp3`), speed, bitrate.
-- **Sentence-aware chunking** ([openagent/channels/tts_chunker.py](openagent/channels/tts_chunker.py)) with code-block / markdown boundary handling so audio streams during the agent turn for low time-to-first-audio.
+- **Sentence-aware chunking** ([src/channels/tts_chunker.py](src/channels/tts_chunker.py)) with code-block / markdown boundary handling so audio streams during the agent turn for low time-to-first-audio.
 
 ### Voice mode (Web / Electron)
 - Always-on VAD mic loop.
@@ -116,7 +116,7 @@ See [Invitation System & Networking](docs/guide/invitation-system.md) for the fu
 
 ## 6. Workflow Engine
 
-### Block catalog ([openagent/workflow/blocks.py](openagent/workflow/blocks.py))
+### Block catalog ([src/workflow/blocks.py](src/workflow/blocks.py))
 
 **Triggers**
 - `trigger-manual` — Run button or HTTP POST.
@@ -141,14 +141,14 @@ See [Invitation System & Networking](docs/guide/invitation-system.md) for the fu
 ### Templating
 Jinja2 sandbox over `ctx.nodes`, `ctx.inputs`, `ctx.vars` for argument interpolation.
 
-### Bundled examples ([openagent/workflow/examples.py](openagent/workflow/examples.py))
+### Bundled examples ([src/workflow/examples.py](src/workflow/examples.py))
 Five canonical patterns (scheduled Telegram ping, branch-on-health-check, AI-then-send, parallel fetches + merge, loop-over-files). The agent receives them via `list_workflow_examples()` for intent matching.
 
 ---
 
 ## 7. Scheduling & Automation
 
-Two-tier scheduler ([openagent/core/scheduler.py](openagent/core/scheduler.py), [openagent/memory/schedule.py](openagent/memory/schedule.py)):
+Two-tier scheduler ([src/core/scheduler.py](src/core/scheduler.py), [src/memory/schedule.py](src/memory/schedule.py)):
 
 - **Scheduled Tasks** — single-prompt cron jobs in `scheduled_tasks`. Standard 5-field cron + one-shot `@once:<epoch>`. `next_run_at` recomputed on startup.
 - **Workflow Schedules** — every `trigger-schedule` block writes a `workflow_tasks` row driven by the same 30-second tick.
@@ -159,7 +159,7 @@ Two-tier scheduler ([openagent/core/scheduler.py](openagent/core/scheduler.py), 
 
 ## 8. Memory & Persistence
 
-### SQLite-backed runtime state ([openagent/memory/db.py](openagent/memory/db.py))
+### SQLite-backed runtime state ([src/memory/db.py](src/memory/db.py))
 - `sdk_sessions` — provider session resume.
 - `usage_log` — token/cost analytics.
 - `providers`, `models` — model catalog (the **source of truth**).
@@ -176,7 +176,7 @@ Two-tier scheduler ([openagent/core/scheduler.py](openagent/core/scheduler.py), 
 
 ## 9. MCP Ecosystem
 
-### Built-in servers ([openagent/mcp/builtins.py](openagent/mcp/builtins.py))
+### Built-in servers ([src/mcp/builtins.py](src/mcp/builtins.py))
 - **Shell** — multi-session concurrent execution, event draining (`completed`, `timed_out`, `killed`), `run_in_background` for long jobs, autoloop integration.
 - **Scheduler** — `create_one_shot_task`, `create_scheduled_task`.
 - **Workflow Manager** — `run_workflow`, `list_workflows`, `create_workflow`, `get_workflow_examples`.
@@ -213,7 +213,7 @@ Optional bearer-token auth per bridge (legacy; device certs preferred).
 
 ## 11. CLI & Operations
 
-### Commands ([openagent/cli.py](openagent/cli.py))
+### Commands ([src/cli.py](src/cli.py))
 - `openagent init <agent_dir>` — scaffold config, DB, vault, logs.
 - `openagent serve [agent_dir] [--channel telegram|discord|whatsapp]` — start the server (auto-bootstraps network on first run).
 - `openagent network invite --role user|device|agent` — mint invite tickets.
@@ -283,7 +283,7 @@ Four sub-views:
 
 ## 13. Configuration
 
-YAML-driven via `openagent.yaml` ([openagent/core/config.py](openagent/core/config.py)) with hot-reload through `PATCH /api/config`:
+YAML-driven via `openagent.yaml` ([src/core/config.py](src/core/config.py)) with hot-reload through `PATCH /api/config`:
 - Channels (per-bridge tokens, allowed users, model overrides).
 - System prompt and agent identity.
 - Network role and name (coordinator/member/standalone).

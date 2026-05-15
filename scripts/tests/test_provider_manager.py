@@ -13,8 +13,8 @@ from ._framework import TestContext, test
 
 @test("provider_manager", "add_provider writes api_key to DB (v0.12 framework-aware)")
 async def t_add_provider(ctx: TestContext) -> None:
-    import openagent.mcp.servers.model_manager.server as mgr
-    from openagent.memory.db import MemoryDB
+    import src.mcp.servers.model_manager.server as mgr
+    from src.memory.db import MemoryDB
 
     tmp_dir = ctx.db_path.parent / f"pmgr-{uuid.uuid4().hex[:8]}"
     tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -114,7 +114,7 @@ async def t_claude_cli_fallback(ctx: TestContext) -> None:
     stripped — claude-cli is billed via Pro/Max subscription, never per
     token. Uses a canned OpenRouter response so the test is hermetic."""
     import time
-    from openagent.models import discovery
+    from src.models import discovery
 
     prev = discovery._OPENROUTER_CACHE
     try:

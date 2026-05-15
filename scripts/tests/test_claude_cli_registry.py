@@ -50,7 +50,7 @@ async def _fake_generate_factory():
 
 @test("claude_cli_registry", "pin_session then generate forwards to the right instance")
 async def t_registry_pin_and_dispatch(ctx: TestContext) -> None:
-    from openagent.models.claude_cli import ClaudeCLIRegistry
+    from src.models.claude_cli import ClaudeCLIRegistry
 
     registry = ClaudeCLIRegistry(default_model="claude-sonnet-4-6")
     registry.pin_session("sess-a", "claude-sonnet-4-6")
@@ -78,7 +78,7 @@ async def t_registry_pin_and_dispatch(ctx: TestContext) -> None:
 
 @test("claude_cli_registry", "model_override beats default")
 async def t_registry_override_wins(ctx: TestContext) -> None:
-    from openagent.models.claude_cli import ClaudeCLIRegistry
+    from src.models.claude_cli import ClaudeCLIRegistry
 
     registry = ClaudeCLIRegistry(default_model="claude-sonnet-4-6")
 
@@ -99,7 +99,7 @@ async def t_registry_override_wins(ctx: TestContext) -> None:
 
 @test("claude_cli_registry", "fan-out: set_db applies to every instance")
 async def t_fan_out_set_db(ctx: TestContext) -> None:
-    from openagent.models.claude_cli import ClaudeCLIRegistry
+    from src.models.claude_cli import ClaudeCLIRegistry
 
     registry = ClaudeCLIRegistry(default_model="claude-sonnet-4-6")
     inst_a = registry._get_or_create("sess-a", "claude-sonnet-4-6")
@@ -116,8 +116,8 @@ async def t_fan_out_set_db(ctx: TestContext) -> None:
 
 @test("claude_cli_registry", "forget_session deletes DB-backed resume rows even without a live instance")
 async def t_registry_forget_without_live_instance_clears_db(ctx: TestContext) -> None:
-    from openagent.memory.db import MemoryDB
-    from openagent.models.claude_cli import ClaudeCLIRegistry
+    from src.memory.db import MemoryDB
+    from src.models.claude_cli import ClaudeCLIRegistry
 
     tmp = ctx.db_path.with_name(f"claude-reg-forget-{uuid.uuid4().hex[:8]}.db")
     try:
@@ -141,8 +141,8 @@ async def t_registry_forget_without_live_instance_clears_db(ctx: TestContext) ->
 
 @test("claude_cli_registry", "known_session_ids includes DB-backed resume rows")
 async def t_registry_known_session_ids_include_db_rows(ctx: TestContext) -> None:
-    from openagent.memory.db import MemoryDB
-    from openagent.models.claude_cli import ClaudeCLIRegistry
+    from src.memory.db import MemoryDB
+    from src.models.claude_cli import ClaudeCLIRegistry
 
     tmp = ctx.db_path.with_name(f"claude-reg-known-{uuid.uuid4().hex[:8]}.db")
     try:

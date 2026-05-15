@@ -41,8 +41,8 @@ echo
 # ── 1. openagent-framework ──
 echo "📦 openagent-framework → $NEW"
 sed -i.bak "s/version = \"$CURRENT\"/version = \"$NEW\"/" "$ROOT/pyproject.toml"
-sed -i.bak "s/__version__ = \".*\"/__version__ = \"$NEW\"/" "$ROOT/openagent/__init__.py"
-rm -f "$ROOT/pyproject.toml.bak" "$ROOT/openagent/__init__.py.bak"
+sed -i.bak "s/__version__ = \".*\"/__version__ = \"$NEW\"/" "$ROOT/src/__init__.py"
+rm -f "$ROOT/pyproject.toml.bak" "$ROOT/src/__init__.py.bak"
 
 # ── 2. openagent-cli ──
 echo "📦 openagent-cli → $NEW"
@@ -65,7 +65,7 @@ done
 echo ""
 echo "📤 Committing..."
 cd "$ROOT"
-git add pyproject.toml openagent/__init__.py \
+git add pyproject.toml src/__init__.py \
        cli/pyproject.toml cli/openagent_cli/__init__.py \
        app/desktop/package.json app/universal/package.json
 git commit -m "release: v$NEW"

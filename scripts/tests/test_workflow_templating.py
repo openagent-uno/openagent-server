@@ -17,7 +17,7 @@ from ._framework import TestContext, test
 
 @test("workflow_templating", "fromjson decodes a JSON string emitted by an ai-prompt upstream")
 async def t_fromjson_decodes_json_string(ctx: TestContext) -> None:
-    from openagent.workflow.templating import resolve_templates
+    from src.workflow.templating import resolve_templates
 
     # Mirrors a realistic loop.items_expr where the upstream ai-prompt
     # block ``n24`` emitted a JSON object whose ``batches`` key is the
@@ -39,7 +39,7 @@ async def t_fromjson_decodes_json_string(ctx: TestContext) -> None:
 
 @test("workflow_templating", "from_json alias matches fromjson")
 async def t_from_json_alias(ctx: TestContext) -> None:
-    from openagent.workflow.templating import resolve_templates
+    from src.workflow.templating import resolve_templates
 
     ctx_data = {"nodes": {"n": {"output": {"text": '[1, 2, 3]'}}}}
     via_fromjson = resolve_templates("{{ nodes.n.output.text | fromjson }}", ctx_data)
@@ -50,7 +50,7 @@ async def t_from_json_alias(ctx: TestContext) -> None:
 
 @test("workflow_templating", "fromjson passes non-string values through unchanged")
 async def t_fromjson_passthrough(ctx: TestContext) -> None:
-    from openagent.workflow.templating import resolve_templates
+    from src.workflow.templating import resolve_templates
 
     # Already-decoded list — applying the filter is a no-op, so callers
     # can chain it defensively without worrying about the upstream shape.
@@ -61,7 +61,7 @@ async def t_fromjson_passthrough(ctx: TestContext) -> None:
 
 @test("workflow_templating", "fromjson then index works inside a single placeholder")
 async def t_fromjson_then_index(ctx: TestContext) -> None:
-    from openagent.workflow.templating import resolve_templates
+    from src.workflow.templating import resolve_templates
 
     ctx_data = {"nodes": {"n": {"output": {"text": '{"k": [10, 20]}'}}}}
     out = resolve_templates("{{ (nodes.n.output.text | fromjson)['k'][1] }}", ctx_data)
@@ -70,7 +70,7 @@ async def t_fromjson_then_index(ctx: TestContext) -> None:
 
 @test("workflow_templating", "json filter still round-trips with fromjson")
 async def t_json_roundtrip(ctx: TestContext) -> None:
-    from openagent.workflow.templating import resolve_templates
+    from src.workflow.templating import resolve_templates
 
     # The pre-existing ``json`` filter serializes; ``fromjson`` reverses
     # it. Keeping the round-trip green guards against accidental

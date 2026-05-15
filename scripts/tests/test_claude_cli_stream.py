@@ -35,7 +35,7 @@ def _make_claude_cli(model: str = "claude-sonnet-4-6"):
     need a control-protocol-capable client. ``_run_once`` just records
     the kwargs it was called with and replays a fixed delta script.
     """
-    from openagent.models.claude_cli import ClaudeCLI
+    from src.models.claude_cli import ClaudeCLI
 
     inst = ClaudeCLI(model=model)
     return inst
@@ -148,7 +148,7 @@ async def t_registry_stream_per_session(_ctx: TestContext) -> None:
     instances. Pre-fix the registry didn't override stream at all
     (BaseModel default → one-shot generate); even after delegating, a
     bug here would re-introduce the shared 'default' subprocess."""
-    from openagent.models.claude_cli import ClaudeCLIRegistry
+    from src.models.claude_cli import ClaudeCLIRegistry
 
     registry = ClaudeCLIRegistry(default_model="claude-sonnet-4-6")
 
@@ -195,7 +195,7 @@ async def t_registry_stream_forwards_override(_ctx: TestContext) -> None:
     """SmartRouter calls registry.stream(..., model_override=runtime_id)
     so a session bound to claude-opus doesn't get a sonnet subprocess
     by accident."""
-    from openagent.models.claude_cli import ClaudeCLIRegistry
+    from src.models.claude_cli import ClaudeCLIRegistry
 
     registry = ClaudeCLIRegistry(default_model="claude-sonnet-4-6")
     seen_overrides: list[str | None] = []

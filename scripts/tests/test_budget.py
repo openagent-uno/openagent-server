@@ -13,8 +13,8 @@ from ._framework import TestContext, test
 
 @test("budget", "BudgetTracker.record + get_usage_summary")
 async def t_budget_record(ctx: TestContext) -> None:
-    from openagent.memory.db import MemoryDB
-    from openagent.models.budget import BudgetTracker
+    from src.memory.db import MemoryDB
+    from src.models.budget import BudgetTracker
 
     db = MemoryDB(str(ctx.db_path))
     await db.connect()
@@ -43,8 +43,8 @@ async def t_budget_compute_cost(ctx: TestContext) -> None:
     """compute_cost reads pricing from the OpenRouter cache — prime it
     with a known shape so the test doesn't depend on the live fetch."""
     import time
-    from openagent.models import discovery
-    from openagent.models.budget import BudgetTracker
+    from src.models import discovery
+    from src.models.budget import BudgetTracker
 
     prev = discovery._OPENROUTER_CACHE
     try:

@@ -10,7 +10,7 @@ from ._framework import TestContext, test
 
 @test("formatting", "markdown_to_telegram_html converts inline marks")
 async def t_markdown_to_telegram_html(ctx: TestContext) -> None:
-    from openagent.channels.formatting import markdown_to_telegram_html
+    from src.channels.formatting import markdown_to_telegram_html
 
     out = markdown_to_telegram_html("**bold** and *italic* plus `code`")
     assert "<b>bold</b>" in out, out
@@ -20,7 +20,7 @@ async def t_markdown_to_telegram_html(ctx: TestContext) -> None:
 
 @test("formatting", "markdown_to_telegram_html escapes raw HTML")
 async def t_markdown_telegram_escape(ctx: TestContext) -> None:
-    from openagent.channels.formatting import markdown_to_telegram_html
+    from src.channels.formatting import markdown_to_telegram_html
     # Raw HTML must be escaped so the bridge doesn't silently inject tags
     out = markdown_to_telegram_html("danger <script>alert(1)</script>")
     assert "<script>" not in out, out
@@ -29,7 +29,7 @@ async def t_markdown_telegram_escape(ctx: TestContext) -> None:
 
 @test("formatting", "markdown_to_whatsapp converts to WhatsApp syntax")
 async def t_markdown_to_whatsapp(ctx: TestContext) -> None:
-    from openagent.channels.formatting import markdown_to_whatsapp
+    from src.channels.formatting import markdown_to_whatsapp
     # WhatsApp uses *bold*, _italic_, ~strike~, ```code```
     out = markdown_to_whatsapp("**bold** and *italic*")
     assert "*bold*" in out, out

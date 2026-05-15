@@ -42,8 +42,8 @@ dependencies = [
     # LiteLLM: vendor-agnostic adapter for TTS/STT (similar to how Agno
     # wraps multiple LLM vendors). One ``providers`` row with
     # ``framework='litellm'`` + ``kind='tts'|'stt'`` + ``name=<vendor>``
-    # routes through ``litellm.aspeech`` / ``litellm.atranscription``.
-    # See ``openagent/channels/tts.py`` and ``openagent/channels/voice.py``.
+# routes through ``litellm.aspeech`` / ``litellm.atranscription``.
+# See ``src/channels/tts.py`` and ``src/channels/voice.py``.
     "litellm>=1.50.0",
     # Local STT fallback. Promoted from the ``voice`` extra to core so
     # the bundled installer ships voice-in working out of the box (no
@@ -63,7 +63,7 @@ dependencies = [
     # Already pulled in transitively by aiohttp / discord.py / openai-sdk
     # in current installs, but declaring it explicit so the streaming
     # TTS path doesn't quietly break if the transitive disappears in a
-    # future bump. ``openagent.channels.tts_streaming`` is the only
+    # future bump. ``src.channels.tts_streaming`` is the only
     # module that imports it.
     "websockets>=12.0",
     # Cross-platform system telemetry (CPU/RAM/disk/network/processes)
@@ -119,13 +119,13 @@ all = [
 ]
 
 [project.scripts]
-openagent = "openagent.cli:main"
+openagent = "src.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["openagent*"]
+include = ["src*"]
 
 [tool.setuptools.package-data]
-openagent = [
+src = [
     "mcp/servers/**/*.ts",
     "mcp/servers/**/*.json",
     "mcp/servers/**/*.py",

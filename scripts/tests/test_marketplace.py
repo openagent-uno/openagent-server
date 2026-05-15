@@ -31,7 +31,7 @@ from ._framework import TestContext, TestSkip, test
 
 @test("marketplace", "_synthesise_requirements walks packages + remotes")
 async def t_synth_requirements(ctx: TestContext) -> None:
-    from openagent.gateway.api.marketplace import _synthesise_requirements
+    from src.gateway.api.marketplace import _synthesise_requirements
 
     server = {
         "name": "io.example/test",
@@ -88,7 +88,7 @@ async def t_synth_requirements(ctx: TestContext) -> None:
 
 @test("marketplace", "_synthesise_requirements flags unknown runtime as unsupported")
 async def t_synth_unknown_runtime(ctx: TestContext) -> None:
-    from openagent.gateway.api.marketplace import _synthesise_requirements
+    from src.gateway.api.marketplace import _synthesise_requirements
 
     server = {
         "packages": [
@@ -104,7 +104,7 @@ async def t_runtime_inferred(ctx: TestContext) -> None:
     """Real-world: most registry entries set ``registryType: 'npm'`` and
     omit ``runtimeHint`` entirely. We must default to ``npx`` for those,
     not silently mark them as unsupported."""
-    from openagent.gateway.api.marketplace import (
+    from src.gateway.api.marketplace import (
         _resolve_runtime, _synthesise_requirements, _build_install_payload,
     )
 
@@ -141,7 +141,7 @@ async def t_runtime_inferred(ctx: TestContext) -> None:
 
 @test("marketplace", "npx install builds [npx, -y, identifier@version, ...args]")
 async def t_install_npx(ctx: TestContext) -> None:
-    from openagent.gateway.api.marketplace import _build_install_payload
+    from src.gateway.api.marketplace import _build_install_payload
 
     server = {
         "packages": [{
@@ -170,7 +170,7 @@ async def t_install_npx(ctx: TestContext) -> None:
 
 @test("marketplace", "uvx install builds [uvx, identifier==version, ...args]")
 async def t_install_uvx(ctx: TestContext) -> None:
-    from openagent.gateway.api.marketplace import _build_install_payload
+    from src.gateway.api.marketplace import _build_install_payload
 
     server = {
         "packages": [{
@@ -189,7 +189,7 @@ async def t_install_uvx(ctx: TestContext) -> None:
 
 @test("marketplace", "docker install wraps in docker run -i --rm <image>:<tag>")
 async def t_install_docker(ctx: TestContext) -> None:
-    from openagent.gateway.api.marketplace import _build_install_payload
+    from src.gateway.api.marketplace import _build_install_payload
 
     server = {
         "packages": [{
@@ -208,7 +208,7 @@ async def t_install_docker(ctx: TestContext) -> None:
 
 @test("marketplace", "missing required env var returns 'missing required env vars'")
 async def t_install_missing_env(ctx: TestContext) -> None:
-    from openagent.gateway.api.marketplace import _build_install_payload
+    from src.gateway.api.marketplace import _build_install_payload
 
     server = {
         "packages": [{
@@ -238,7 +238,7 @@ async def t_install_missing_env(ctx: TestContext) -> None:
 
 @test("marketplace", "unsupported runtime returns schema error (422 territory)")
 async def t_install_unsupported_runtime(ctx: TestContext) -> None:
-    from openagent.gateway.api.marketplace import _build_install_payload
+    from src.gateway.api.marketplace import _build_install_payload
 
     server = {"packages": [{"runtimeHint": "scratch", "identifier": "x"}]}
     _, err = _build_install_payload(
@@ -250,7 +250,7 @@ async def t_install_unsupported_runtime(ctx: TestContext) -> None:
 
 @test("marketplace", "remote install substitutes URL + header placeholders")
 async def t_install_remote_placeholders(ctx: TestContext) -> None:
-    from openagent.gateway.api.marketplace import _build_install_payload
+    from src.gateway.api.marketplace import _build_install_payload
 
     server = {
         "remotes": [{
@@ -274,7 +274,7 @@ async def t_install_remote_placeholders(ctx: TestContext) -> None:
 
 @test("marketplace", "named runtime args emit name then value")
 async def t_install_named_args(ctx: TestContext) -> None:
-    from openagent.gateway.api.marketplace import _resolve_arg_values
+    from src.gateway.api.marketplace import _resolve_arg_values
 
     args = [
         {"type": "named", "name": "--port", "value": "{port}"},
@@ -292,7 +292,7 @@ async def t_install_named_args(ctx: TestContext) -> None:
 
 @test("marketplace", "_default_install_name slugifies tail of registry name")
 async def t_default_name(ctx: TestContext) -> None:
-    from openagent.gateway.api.marketplace import _default_install_name
+    from src.gateway.api.marketplace import _default_install_name
 
     assert _default_install_name("io.github.foo/postgres") == "postgres"
     assert _default_install_name("io.modelcontextprotocol/servers-memory") == "servers-memory"
@@ -309,7 +309,7 @@ async def t_default_name(ctx: TestContext) -> None:
 @test("marketplace", "cache returns hit within TTL, evicts past TTL, caps at MAX")
 async def t_cache_lru(ctx: TestContext) -> None:
     import time
-    from openagent.gateway.api import marketplace as mp
+    from src.gateway.api import marketplace as mp
 
     cache: OrderedDict = OrderedDict()
     mp._cache_put(cache, ("a",), {"x": 1})

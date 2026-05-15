@@ -70,7 +70,7 @@ def _write_simple_png(path: str, color: tuple[int, int, int] = (255, 0, 0)) -> N
 
 @test("files", "parse_response_markers extracts IMAGE/FILE/VOICE/VIDEO markers")
 async def t_parse_response_markers(ctx: TestContext) -> None:
-    from openagent.channels.base import parse_response_markers
+    from src.channels.base import parse_response_markers
 
     text = (
         "Here's your report: [FILE:/tmp/report.pdf]\n"
@@ -298,8 +298,8 @@ async def t_agent_run_attachments_context(ctx: TestContext) -> None:
     gets prepended as a human-readable block with a read hint so the LLM
     knows to call the Read/filesystem MCP tool.
     """
-    from openagent.core.agent import Agent
-    from openagent.models.base import BaseModel, ModelResponse
+    from src.core.agent import Agent
+    from src.models.base import BaseModel, ModelResponse
 
     captured_messages: list[dict] = []
 

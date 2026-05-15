@@ -103,7 +103,7 @@ def _install_fake_sdk_types() -> None:
 
 async def _run_once_with(messages: list[Any], *, session_id: str = "test-sess") -> tuple[str, dict]:
     _install_fake_sdk_types()
-    from openagent.models.claude_cli import ClaudeCLI
+    from src.models.claude_cli import ClaudeCLI
 
     cli = ClaudeCLI(model=None, providers_config={"anthropic": {"models": ["claude-cli"]}})
     client = _FakeSDKClient(messages, startup_delay=0.0)
@@ -164,7 +164,7 @@ async def t_partial_messages_stream_per_token(ctx: TestContext) -> None:
     that's the entire reply at the end, indistinguishable from no
     streaming at all."""
     _install_fake_sdk_types()
-    from openagent.models.claude_cli import ClaudeCLI
+    from src.models.claude_cli import ClaudeCLI
 
     messages = [
         _FakeStreamEvent(event={"type": "content_block_start"}),
@@ -209,7 +209,7 @@ async def t_block_level_fallback_when_no_partials(ctx: TestContext) -> None:
     on_delta fallback must still fire so the user gets SOME streaming
     rather than nothing. The guard counter resets per block."""
     _install_fake_sdk_types()
-    from openagent.models.claude_cli import ClaudeCLI
+    from src.models.claude_cli import ClaudeCLI
 
     messages = [
         # No StreamEvents, just an AssistantMessage with text.
@@ -237,7 +237,7 @@ async def t_build_options_enables_partials(ctx: TestContext) -> None:
     _build_options. Removing it would disable token streaming silently
     — the existing tests above mock the SDK, so they wouldn't catch a
     real-world regression here."""
-    from openagent.models.claude_cli import ClaudeCLI
+    from src.models.claude_cli import ClaudeCLI
     cli = ClaudeCLI(model="claude-sonnet-4-6")
     opts = cli._build_options(system="test", sdk_session_id=None)
     # ClaudeAgentOptions is a dataclass; the field name stays as-is.
@@ -269,7 +269,7 @@ class _RecordingCLI:
 
     def __init__(self, outcomes):
         _install_fake_sdk_types()
-        from openagent.models.claude_cli import ClaudeCLI
+        from src.models.claude_cli import ClaudeCLI
 
         self.cli = ClaudeCLI(model=None, providers_config={"anthropic": {"models": ["claude-cli"]}})
         self.cli._get_client = self._fake_get_client  # type: ignore[assignment]

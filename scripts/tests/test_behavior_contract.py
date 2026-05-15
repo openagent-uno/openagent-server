@@ -42,7 +42,7 @@ class _FakeResp:
 
 
 async def _tmp_db(ctx: TestContext, tag: str):
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
     path = ctx.db_path.with_name(f"contract-{tag}-{uuid.uuid4().hex[:8]}.db")
     db = MemoryDB(str(path))
     await db.connect()
@@ -229,7 +229,7 @@ async def t_pin_fresh_session_seeds_binding(ctx: TestContext) -> None:
 
 @test("contract", "router honors pin: skips classifier, dispatches directly")
 async def t_router_honors_pin(ctx: TestContext) -> None:
-    from openagent.models.smart_router import SmartRouter
+    from src.models.smart_router import SmartRouter
 
     db, path = await _tmp_db(ctx, "pin-dispatch")
     try:
@@ -273,7 +273,7 @@ async def t_router_honors_pin(ctx: TestContext) -> None:
 
 @test("contract", "stale claude-cli binding with no enabled claude-cli model self-heals to agno")
 async def t_bound_framework_no_models_self_heals(ctx: TestContext) -> None:
-    from openagent.models.smart_router import SmartRouter
+    from src.models.smart_router import SmartRouter
 
     db, path = await _tmp_db(ctx, "no-cli-models")
     try:
@@ -341,7 +341,7 @@ async def t_unpin_preserves_framework(ctx: TestContext) -> None:
 
 @test("contract", "runtime_id format — agno = provider:model, claude-cli = claude-cli:provider:model")
 async def t_runtime_id_format(ctx: TestContext) -> None:
-    from openagent.models.catalog import build_runtime_model_id
+    from src.models.catalog import build_runtime_model_id
 
     assert build_runtime_model_id("openai", "gpt-4o-mini", "agno") == "openai:gpt-4o-mini"
     assert (

@@ -12,7 +12,7 @@ from ._framework import TestContext, test
 
 @test("setup", "linux unit omits resource limits by default")
 async def t_linux_unit_no_limits_by_default(ctx: TestContext) -> None:
-    import openagent.setup.installer as installer
+    import src.setup.installer as installer
 
     agent_dir = ctx.test_dir / "service-defaults"
     agent_dir.mkdir(parents=True, exist_ok=True)
@@ -31,7 +31,7 @@ async def t_linux_unit_no_limits_by_default(ctx: TestContext) -> None:
 
 @test("setup", "linux unit includes configured systemd overrides and omits nulls")
 async def t_linux_unit_systemd_overrides(ctx: TestContext) -> None:
-    import openagent.setup.installer as installer
+    import src.setup.installer as installer
 
     agent_dir = ctx.test_dir / "service-overrides"
     agent_dir.mkdir(parents=True, exist_ok=True)
@@ -78,7 +78,7 @@ async def t_macos_plist_keepalive_unconditional(ctx: TestContext) -> None:
     Linux already uses ``Restart=always``; this asserts the macOS side
     matches so behavior is consistent across platforms.
     """
-    import openagent.setup.installer as installer
+    import src.setup.installer as installer
 
     agent_dir = ctx.test_dir / "service-macos"
     agent_dir.mkdir(parents=True, exist_ok=True)

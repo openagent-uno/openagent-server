@@ -55,7 +55,7 @@ class _SlowWriteDB:
 
 @test("claude_cli_race", "forget_session drains pending writes before delete")
 async def t_forget_awaits_pending_write(ctx: TestContext) -> None:
-    from openagent.models.claude_cli import ClaudeCLI
+    from src.models.claude_cli import ClaudeCLI
 
     cli = ClaudeCLI(
         model="claude-sonnet-4-6",
@@ -92,7 +92,7 @@ async def t_forget_scoped_to_session(ctx: TestContext) -> None:
     target session's in-flight persist tasks. Other sessions' writes
     continue in the background, unaffected.
     """
-    from openagent.models.claude_cli import ClaudeCLI
+    from src.models.claude_cli import ClaudeCLI
 
     cli = ClaudeCLI(
         model="claude-sonnet-4-6",

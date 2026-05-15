@@ -10,7 +10,7 @@ from ._framework import TestContext, test
 
 @test("catalog", "split_runtime_id + model_id_from_runtime")
 async def t_catalog_split(ctx: TestContext) -> None:
-    from openagent.models.catalog import split_runtime_id, model_id_from_runtime
+    from src.models.catalog import split_runtime_id, model_id_from_runtime
     assert split_runtime_id("openai:gpt-4o-mini") == ("openai", "gpt-4o-mini")
     assert split_runtime_id("claude-cli/claude-sonnet-4-6") == ("claude-cli", "claude-sonnet-4-6")
     assert split_runtime_id("just-a-name") == ("just-a-name", "just-a-name")
@@ -22,8 +22,8 @@ async def t_pricing_missing(ctx: TestContext) -> None:
     """With no bundled table and a cold OpenRouter cache, an unknown
     model resolves to zero cost logged as 'missing' — not a crash."""
     import time
-    from openagent.models import discovery
-    from openagent.models.catalog import get_model_pricing, compute_cost
+    from src.models import discovery
+    from src.models.catalog import get_model_pricing, compute_cost
 
     prev = discovery._OPENROUTER_CACHE
     try:
@@ -40,8 +40,8 @@ async def t_pricing_live(ctx: TestContext) -> None:
     """User config metadata is no longer consulted for pricing. The
     OpenRouter cache is the only source for non-claude-cli models."""
     import time
-    from openagent.models import discovery
-    from openagent.models.catalog import get_model_pricing
+    from src.models import discovery
+    from src.models.catalog import get_model_pricing
 
     prev = discovery._OPENROUTER_CACHE
     try:
@@ -64,7 +64,7 @@ async def t_pricing_live(ctx: TestContext) -> None:
 @test("catalog", "claude-cli models have zero pricing (subscription billing)")
 async def t_claude_cli_zero_pricing(ctx: TestContext) -> None:
     """claude-cli dispatches via Claude Pro/Max; there is no per-token billing."""
-    from openagent.models.catalog import get_model_pricing, compute_cost
+    from src.models.catalog import get_model_pricing, compute_cost
 
     for ref in [
         "claude-cli:anthropic:claude-sonnet-4-6",
@@ -85,8 +85,8 @@ async def t_claude_cli_zero_pricing(ctx: TestContext) -> None:
 async def t_openrouter_cache_pricing(ctx: TestContext) -> None:
     """After discovery fetches OpenRouter's catalog, cost lookups consult it."""
     import time
-    from openagent.models import discovery
-    from openagent.models.catalog import get_model_pricing
+    from src.models import discovery
+    from src.models.catalog import get_model_pricing
 
     prev = discovery._OPENROUTER_CACHE
     try:

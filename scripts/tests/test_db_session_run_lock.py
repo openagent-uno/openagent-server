@@ -18,7 +18,7 @@ from ._framework import TestContext, test
 
 @test("db_session_run_lock", "20 concurrent add_session_run calls all land")
 async def t_concurrent_writes(ctx: TestContext) -> None:
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     tmp_db = ctx.db_path.with_name(f"runlock-{uuid.uuid4().hex[:8]}.db")
     try:
@@ -61,7 +61,7 @@ async def t_per_session_isolation(ctx: TestContext) -> None:
     """Per-session locking — not global. Two concurrent writes against
     different session_ids must each get their own row, no shared
     blocking."""
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     tmp_db = ctx.db_path.with_name(f"runlock-iso-{uuid.uuid4().hex[:8]}.db")
     try:

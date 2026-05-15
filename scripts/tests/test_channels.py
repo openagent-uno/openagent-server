@@ -12,7 +12,7 @@ from ._framework import TestContext, test
 
 @test("channels", "is_blocked_attachment rejects executables")
 async def t_is_blocked_attachment(ctx: TestContext) -> None:
-    from openagent.channels.base import is_blocked_attachment
+    from src.channels.base import is_blocked_attachment
 
     for bad in ("malware.exe", "script.bat", "payload.vbs", "trick.scr",
                 "weird.ps1", "macro.jse"):
@@ -26,7 +26,7 @@ async def t_is_blocked_attachment(ctx: TestContext) -> None:
 
 @test("channels", "build_attachment_context + prepend_context_block shape")
 async def t_build_attachment_context(ctx: TestContext) -> None:
-    from openagent.channels.base import (
+    from src.channels.base import (
         build_attachment_context, prepend_context_block,
     )
     ctx_block = build_attachment_context(
@@ -49,7 +49,7 @@ async def t_build_attachment_context(ctx: TestContext) -> None:
 
 @test("channels", "split_preserving_code_blocks keeps ``` balanced")
 async def t_split_code_blocks(ctx: TestContext) -> None:
-    from openagent.channels.base import split_preserving_code_blocks
+    from src.channels.base import split_preserving_code_blocks
 
     # Short text → returned verbatim (single chunk)
     out = split_preserving_code_blocks("short", max_len=100)

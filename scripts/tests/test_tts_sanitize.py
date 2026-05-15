@@ -23,7 +23,7 @@ from ._framework import TestContext, test
 
 
 def _sanitize(text: str) -> str:
-    from openagent.channels.tts import sanitize_for_tts
+    from src.channels.tts import sanitize_for_tts
     return sanitize_for_tts(text)
 
 

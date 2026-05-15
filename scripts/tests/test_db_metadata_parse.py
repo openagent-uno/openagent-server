@@ -18,7 +18,7 @@ from ._framework import TestContext, test
 
 @test("db_metadata_parse", "_parse_metadata coerces non-dict JSON to empty dict")
 async def t_parse_metadata_coerces(ctx: TestContext) -> None:
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     # None and empty-ish inputs.
     assert MemoryDB._parse_metadata(None) == {}
@@ -46,7 +46,7 @@ async def t_upsert_survives_null_metadata(ctx: TestContext) -> None:
     ``TypeError: 'NoneType' object does not support item assignment``.
     """
     import sqlite3
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     # Create the agno_sessions schema and seed a corrupt-metadata row.
     conn = sqlite3.connect(str(ctx.db_path))

@@ -37,7 +37,7 @@ echo "→ Building built-in Node MCPs..."
 
 NODE_MCPS=(shell web-search editor chrome-devtools messaging)
 for mcp in "${NODE_MCPS[@]}"; do
-    mcp_dir="openagent/mcp/servers/$mcp"
+    mcp_dir="src/mcp/servers/$mcp"
     if [ ! -d "$mcp_dir" ]; then
         echo "  ⚠ Skipping $mcp (directory not found)"
         continue
@@ -82,11 +82,11 @@ case "$ARCH" in
     *)       ARCH_NAME="$ARCH" ;;
 esac
 
-VERSION=$(python -c "import openagent; print(openagent.__version__)")
+VERSION=$(python -c "import src; print(src.__version__)")
 ARCHIVE_NAME="openagent-${VERSION}-${OS_NAME}-${ARCH_NAME}"
 
 cd dist
-tar czf "${ARCHIVE_NAME}.tar.gz" openagent/
+tar czf "${ARCHIVE_NAME}.tar.gz" src/
 shasum -a 256 "${ARCHIVE_NAME}.tar.gz" > "${ARCHIVE_NAME}.tar.gz.sha256"
 cd ..
 

@@ -39,7 +39,7 @@ async def _seed_device_binding(db, handle: str, pubkey_hex: str) -> None:
 
 @test("sessions_cross_device", "list_all_sessions matches by handle")
 async def t_match_by_handle(ctx: TestContext) -> None:
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     tmp_db = ctx.db_path.with_name(f"xd-handle-{uuid.uuid4().hex[:8]}.db")
     try:
@@ -63,7 +63,7 @@ async def t_legacy_pubkey_via_devices(ctx: TestContext) -> None:
     user later pairs device B (so ``network_devices`` binds pubkey_B to
     handle_A). Listing by handle_A must surface that row even though
     its ``client_id`` is still the pubkey form."""
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     tmp_db = ctx.db_path.with_name(f"xd-legacy-{uuid.uuid4().hex[:8]}.db")
     try:
@@ -103,7 +103,7 @@ async def t_device_id_preserved(ctx: TestContext) -> None:
     ``metadata.client_id`` AND the originating device in
     ``metadata.device_id`` so both pieces of routing information
     survive a process restart."""
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     tmp_db = ctx.db_path.with_name(f"xd-devid-{uuid.uuid4().hex[:8]}.db")
     try:

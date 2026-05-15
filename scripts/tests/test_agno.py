@@ -16,7 +16,7 @@ from ._framework import TestContext, TestSkip, have_openai_key, test
 async def t_agno_generate(ctx: TestContext) -> None:
     if not have_openai_key(ctx.config):
         raise TestSkip("no OpenAI API key in user config")
-    from openagent.models.agno_provider import AgnoProvider
+    from src.models.agno_provider import AgnoProvider
 
     pool = ctx.extras["pool"]
     provider = AgnoProvider(
@@ -39,7 +39,7 @@ async def t_agno_generate(ctx: TestContext) -> None:
 
 @test("agno", "list_mcp_servers tool exists in agent tools")
 async def t_agno_meta_tool(ctx: TestContext) -> None:
-    from openagent.models.agno_provider import AgnoProvider
+    from src.models.agno_provider import AgnoProvider
     pool = ctx.extras["pool"]
     provider = AgnoProvider(
         model="openai:gpt-4o-mini",
@@ -60,7 +60,7 @@ async def t_agno_compaction_flags(ctx: TestContext) -> None:
     DELIBERATELY OFF (see agno_provider.py): OpenAgent uses the vault
     for user-scoped persistence and we don't want the ``agno_memories``
     table created. Bumped ``num_history_runs`` default to 20."""
-    from openagent.models.agno_provider import AgnoProvider
+    from src.models.agno_provider import AgnoProvider
     pool = ctx.extras["pool"]
     provider = AgnoProvider(
         model="openai:gpt-4o-mini",
@@ -84,7 +84,7 @@ async def t_agno_compaction_flags(ctx: TestContext) -> None:
 async def t_agno_tool_families(ctx: TestContext) -> None:
     """_tool_families() must return one entry per connected MCP server,
     keyed by that server's tool_name_prefix."""
-    from openagent.models.agno_provider import AgnoProvider
+    from src.models.agno_provider import AgnoProvider
     pool = ctx.extras["pool"]
     provider = AgnoProvider(
         model="openai:gpt-4o-mini",
@@ -109,7 +109,7 @@ async def t_agno_tool_families(ctx: TestContext) -> None:
 async def t_agno_team_classifier_fallback(ctx: TestContext) -> None:
     """Empty system prompt (classifier) must NOT trigger Team — the
     routing round-trip would waste tokens on simple tier classification."""
-    from openagent.models.agno_provider import AgnoProvider
+    from src.models.agno_provider import AgnoProvider
     pool = ctx.extras["pool"]
     provider = AgnoProvider(
         model="openai:gpt-4o-mini",
@@ -128,7 +128,7 @@ async def t_agno_team_classifier_fallback(ctx: TestContext) -> None:
 async def t_agno_team_few_families_fallback(ctx: TestContext) -> None:
     """With 0 or 1 tool families, Team has nothing to route between;
     _ensure_team must return None so the caller uses single Agent."""
-    from openagent.models.agno_provider import AgnoProvider
+    from src.models.agno_provider import AgnoProvider
     provider = AgnoProvider(
         model="openai:gpt-4o-mini",
         api_key=ctx.config.get("providers", {}).get("openai", {}).get("api_key", "x"),
@@ -152,7 +152,7 @@ async def t_agno_team_build(ctx: TestContext) -> None:
     """With ≥2 tool families, _ensure_team must return a Team in route
     mode with one specialist member per family, and the team itself
     must have the compaction flags enabled."""
-    from openagent.models.agno_provider import AgnoProvider
+    from src.models.agno_provider import AgnoProvider
     pool = ctx.extras["pool"]
     if len(pool.agno_toolkits) < 2:
         raise TestSkip(f"test pool only has {len(pool.agno_toolkits)} toolkit(s)")

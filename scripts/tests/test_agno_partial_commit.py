@@ -29,7 +29,7 @@ async def t_synth_run_round_trip(_ctx: TestContext) -> None:
     except ImportError as e:
         raise TestSkip(f"agno not installed: {e}")
 
-    from openagent.models.agno_provider import AgnoProvider
+    from src.models.agno_provider import AgnoProvider
 
     fd, db_path = tempfile.mkstemp(prefix="oa_agno_commit_", suffix=".db")
     os.close(fd)
@@ -99,7 +99,7 @@ async def t_missing_session_noop(_ctx: TestContext) -> None:
     except ImportError as e:
         raise TestSkip(f"agno not installed: {e}")
 
-    from openagent.models.agno_provider import AgnoProvider
+    from src.models.agno_provider import AgnoProvider
 
     fd, db_path = tempfile.mkstemp(prefix="oa_agno_noop_", suffix=".db")
     os.close(fd)
@@ -122,7 +122,7 @@ async def t_empty_inputs_short_circuit(_ctx: TestContext) -> None:
     except ImportError as e:
         raise TestSkip(f"agno not installed: {e}")
 
-    from openagent.models.agno_provider import AgnoProvider
+    from src.models.agno_provider import AgnoProvider
 
     provider = AgnoProvider(
         model="agno:openai:gpt-4o-mini",

@@ -9,7 +9,7 @@ from ._framework import TestContext, test
 
 @test("cron", "MemoryDB.add_task + get_due_tasks")
 async def t_cron_dbroundtrip(ctx: TestContext) -> None:
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     # Use a throwaway DB path rather than ``ctx.db_path`` — the main
     # ``ctx.db_path`` is shared with the live gateway agent and the

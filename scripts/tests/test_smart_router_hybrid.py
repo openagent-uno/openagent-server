@@ -28,7 +28,7 @@ def _make_router(providers_config: list, routing: dict[str, str] | None = None):
     ``model.routing`` tiers, but v0.12 ignores it — the router reads the
     enabled catalog from ``providers_config`` on every turn.
     """
-    from openagent.models.smart_router import SmartRouter
+    from src.models.smart_router import SmartRouter
 
     del routing
     return SmartRouter(providers_config=providers_config)
@@ -73,7 +73,7 @@ def _providers_both_frameworks() -> list[dict[str, Any]]:
 @test("smart_router_hybrid", "fresh session uses classifier pick + records binding")
 async def t_fresh_agno(ctx: TestContext) -> None:
     import uuid as _uuid
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     tmp = ctx.db_path.with_name(f"sr-hybrid-{_uuid.uuid4().hex[:8]}.db")
     try:
@@ -111,7 +111,7 @@ async def t_fresh_agno(ctx: TestContext) -> None:
 @test("smart_router_hybrid", "bound-to-agno session stays on agno even if classifier picks claude-cli")
 async def t_bound_side_locked(ctx: TestContext) -> None:
     import uuid as _uuid
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     tmp = ctx.db_path.with_name(f"sr-lock-{_uuid.uuid4().hex[:8]}.db")
     try:
@@ -150,7 +150,7 @@ async def t_bound_side_locked(ctx: TestContext) -> None:
 @test("smart_router_hybrid", "bound-to-claude-cli routes via claude-cli only")
 async def t_bound_to_claude_cli(ctx: TestContext) -> None:
     import uuid as _uuid
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     tmp = ctx.db_path.with_name(f"sr-cli-{_uuid.uuid4().hex[:8]}.db")
     try:
@@ -187,7 +187,7 @@ async def t_bound_to_claude_cli(ctx: TestContext) -> None:
 @test("smart_router_hybrid", "stale bound side with no enabled models self-heals to the remaining framework")
 async def t_bound_side_empty(ctx: TestContext) -> None:
     import uuid as _uuid
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     tmp = ctx.db_path.with_name(f"sr-empty-{_uuid.uuid4().hex[:8]}.db")
     try:
@@ -235,7 +235,7 @@ async def t_bound_side_empty(ctx: TestContext) -> None:
 @test("smart_router_hybrid", "stale pinned model self-heals by unpinning then recovering onto an enabled framework")
 async def t_stale_pinned_model_self_heals(ctx: TestContext) -> None:
     import uuid as _uuid
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     tmp = ctx.db_path.with_name(f"sr-stale-pin-{_uuid.uuid4().hex[:8]}.db")
     try:
@@ -289,7 +289,7 @@ async def t_dual_framework_env_isolation(ctx: TestContext) -> None:
     must drop anything that's not agno.
     """
     import os as _os
-    from openagent.models.agno_provider import AgnoProvider
+    from src.models.agno_provider import AgnoProvider
 
     providers = [
         {"id": 1, "name": "anthropic", "framework": "agno",
@@ -322,7 +322,7 @@ async def t_classifier_resolution(ctx: TestContext) -> None:
          the catalog has zero enabled rows — caller skips classify and
          surfaces the standard "No model is currently enabled" error.
     """
-    from openagent.models.smart_router import _resolve_classifier_model
+    from src.models.smart_router import _resolve_classifier_model
 
     # 1. flagged wins over everything
     cfg = [{
@@ -441,7 +441,7 @@ async def t_classifier_no_mcp_injection(ctx: TestContext) -> None:
     classifier's ``_mcp_toolkits`` stayed empty while the dispatch
     providers picked up the toolkit.
     """
-    from openagent.models.smart_router import SmartRouter
+    from src.models.smart_router import SmartRouter
 
     class _FakePool:
         agno_toolkits = ["fake-toolkit-a", "fake-toolkit-b"]
@@ -487,7 +487,7 @@ async def t_rebuild_routing_hot_reload(ctx: TestContext) -> None:
     ``rebuild_routing``; the router must pick up the new classifier
     id AND drop any cached provider instance bound to the old id.
     """
-    from openagent.models.smart_router import SmartRouter
+    from src.models.smart_router import SmartRouter
 
     providers = [{
         "id": 1, "name": "openai", "framework": "agno",
@@ -557,7 +557,7 @@ async def t_forget_session_fans_out_to_forget(ctx: TestContext) -> None:
     to the underlying models' own ``forget_session`` (not
     ``close_session``) so resume state is actually erased.
     """
-    from openagent.models.smart_router import SmartRouter
+    from src.models.smart_router import SmartRouter
 
     providers = _providers_both_frameworks()
     router = SmartRouter(providers_config=providers)
@@ -597,7 +597,7 @@ async def t_forget_session_clears_dormant_claude_binding(ctx: TestContext) -> No
     failed to reset the session onto the remaining agno framework.
     """
     import uuid as _uuid
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     tmp = ctx.db_path.with_name(f"sr-clear-switch-{_uuid.uuid4().hex[:8]}.db")
     try:
@@ -647,7 +647,7 @@ async def t_known_session_ids_aggregates(ctx: TestContext) -> None:
     default), so post-restart /clear from telegram silently forgot
     nothing.
     """
-    from openagent.models.smart_router import SmartRouter
+    from src.models.smart_router import SmartRouter
 
     providers = _providers_both_frameworks()
     router = SmartRouter(providers_config=providers)

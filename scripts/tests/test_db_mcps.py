@@ -12,7 +12,7 @@ from ._framework import TestContext, test
 
 @test("db_mcps", "upsert + list + get roundtrip")
 async def t_upsert_roundtrip(ctx: TestContext) -> None:
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     db = MemoryDB(str(ctx.db_path))
     await db.connect()
@@ -46,7 +46,7 @@ async def t_upsert_roundtrip(ctx: TestContext) -> None:
 
 @test("db_mcps", "set_mcp_enabled flips enabled without losing other fields")
 async def t_set_enabled(ctx: TestContext) -> None:
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     db = MemoryDB(str(ctx.db_path))
     await db.connect()
@@ -66,7 +66,7 @@ async def t_set_enabled(ctx: TestContext) -> None:
 @test("db_mcps", "mcps_max_updated is monotonic across writes")
 async def t_max_updated_monotonic(ctx: TestContext) -> None:
     import asyncio
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     db = MemoryDB(str(ctx.db_path))
     await db.connect()
@@ -88,7 +88,7 @@ async def t_max_updated_monotonic(ctx: TestContext) -> None:
 
 @test("db_mcps", "schema creation is idempotent (connect twice)")
 async def t_schema_idempotent(ctx: TestContext) -> None:
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     # A fresh DB path — create, close, reopen. Both ``executescript`` runs
     # must succeed against the same file.

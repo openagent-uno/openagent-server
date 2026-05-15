@@ -31,7 +31,7 @@ class _FakeBridge:
     """Subclass stand-in that skips the WS connect."""
 
     def __init__(self) -> None:
-        from openagent.bridges.base import BaseBridge
+        from src.bridges.base import BaseBridge
 
         self._real = BaseBridge.__new__(BaseBridge)
         self._real.name = "fake"
@@ -50,7 +50,7 @@ class _FakeBridge:
         dispatch — DELTA is a no-op, RESPONSE latches text onto the
         collector, TURN_COMPLETE releases the awaiter. Used to drive
         the bridge end-to-end without a real WebSocket."""
-        from openagent.gateway import protocol as P
+        from src.gateway import protocol as P
 
         for data in frames:
             t = data.get("type")
@@ -79,7 +79,7 @@ class _FakeBridge:
 async def t_protocol_delta_constant(_ctx: TestContext) -> None:
     """Sanity guard — clients import this constant by name; drift in
     the spelling silently breaks the wire format."""
-    from openagent.gateway import protocol as P
+    from src.gateway import protocol as P
     assert hasattr(P, "DELTA"), "protocol.py must expose DELTA"
     assert P.DELTA == "delta", f"DELTA should be 'delta', got {P.DELTA!r}"
 
@@ -92,8 +92,8 @@ async def t_stream_delta_payload_shape(_ctx: TestContext) -> None:
     publishes ``OutTextDelta`` events and the wire codec serializes
     them to ``{type: "delta", text, session_id}``. The shape MUST
     stay stable so older clients keep typing-out tokens correctly."""
-    from openagent.stream.events import OutTextDelta
-    from openagent.stream.wire import event_to_wire
+    from src.stream.events import OutTextDelta
+    from src.stream.wire import event_to_wire
 
     payload = event_to_wire(OutTextDelta(
         session_id="s1", seq=3, ts_ms=42, text="hello",
@@ -110,7 +110,7 @@ async def t_basebridge_single_send_method(_ctx: TestContext) -> None:
     """The dual ``send_message_streaming`` API was retired when the
     progressive-delta UX was removed from Discord/Telegram. Guard
     against accidental re-introduction."""
-    from openagent.bridges.base import BaseBridge
+    from src.bridges.base import BaseBridge
     assert hasattr(BaseBridge, "send_message"), "send_message must exist"
     assert not hasattr(BaseBridge, "send_message_streaming"), (
         "send_message_streaming was retired — bridges run in answer-"
@@ -122,7 +122,7 @@ async def t_basebridge_single_send_method(_ctx: TestContext) -> None:
 async def t_basebridge_no_delta_callbacks_field(_ctx: TestContext) -> None:
     """No bridge consumes per-delta callbacks now; the storage map is
     dead state and was removed."""
-    from openagent.bridges.base import BaseBridge
+    from src.bridges.base import BaseBridge
     instance = BaseBridge.__new__(BaseBridge)
     BaseBridge.__init__(instance)  # type: ignore[misc]
     assert not hasattr(instance, "_delta_callbacks"), (

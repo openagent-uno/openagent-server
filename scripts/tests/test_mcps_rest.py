@@ -38,7 +38,7 @@ async def t_list_mcps(ctx: TestContext) -> None:
 
 @test("mcps_rest", "DELETE refuses builtin (kind != 'custom'), allows disable")
 async def t_delete_builtin_refused(ctx: TestContext) -> None:
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
     import uuid as _uuid
 
     tmp = ctx.db_path.with_name(f"mcps-builtin-{_uuid.uuid4().hex[:8]}.db")
@@ -56,7 +56,7 @@ async def t_delete_builtin_refused(ctx: TestContext) -> None:
         # Direct DB delete IS possible (belt and braces); the guard lives
         # one level up in the REST + MCP manager surfaces. Test the REST
         # path here since it's the one users hit.
-        from openagent.gateway.api import mcps as mcps_rest
+        from src.gateway.api import mcps as mcps_rest
 
         class _FakeRequest:
             match_info = {"name": "shell"}

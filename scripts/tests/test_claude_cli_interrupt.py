@@ -31,7 +31,7 @@ class _RecordingClient:
 
 @test("claude_interrupt", "live session forwards to client.interrupt()")
 async def t_live_session_forwards(_ctx: TestContext) -> None:
-    from openagent.models.claude_cli import ClaudeCLI, _Session
+    from src.models.claude_cli import ClaudeCLI, _Session
 
     cli = ClaudeCLI(model="claude-haiku-4-5-20251001")
     client = _RecordingClient()
@@ -44,7 +44,7 @@ async def t_live_session_forwards(_ctx: TestContext) -> None:
 
 @test("claude_interrupt", "missing session is silent no-op")
 async def t_missing_session_noop(_ctx: TestContext) -> None:
-    from openagent.models.claude_cli import ClaudeCLI
+    from src.models.claude_cli import ClaudeCLI
 
     cli = ClaudeCLI(model="claude-haiku-4-5-20251001")
     # No registered _Session for this id.
@@ -54,7 +54,7 @@ async def t_missing_session_noop(_ctx: TestContext) -> None:
 
 @test("claude_interrupt", "client.interrupt() failure is swallowed")
 async def t_failure_swallowed(_ctx: TestContext) -> None:
-    from openagent.models.claude_cli import ClaudeCLI, _Session
+    from src.models.claude_cli import ClaudeCLI, _Session
 
     cli = ClaudeCLI(model="claude-haiku-4-5-20251001")
     client = _RecordingClient(raise_on_interrupt=True)
@@ -68,7 +68,7 @@ async def t_failure_swallowed(_ctx: TestContext) -> None:
 
 @test("claude_interrupt", "registry forwards to per-session ClaudeCLI")
 async def t_registry_fanout(_ctx: TestContext) -> None:
-    from openagent.models.claude_cli import (
+    from src.models.claude_cli import (
         ClaudeCLI, ClaudeCLIRegistry, _Session,
     )
 
@@ -88,7 +88,7 @@ async def t_registry_fanout(_ctx: TestContext) -> None:
 
 @test("claude_interrupt", "session without live client is silent no-op")
 async def t_no_live_client(_ctx: TestContext) -> None:
-    from openagent.models.claude_cli import ClaudeCLI, _Session
+    from src.models.claude_cli import ClaudeCLI, _Session
 
     cli = ClaudeCLI(model="claude-haiku-4-5-20251001")
     # Session exists in cache but client is None (idle-closed state).

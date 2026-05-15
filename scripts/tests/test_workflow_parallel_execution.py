@@ -70,8 +70,8 @@ def _wait_workflow_graph(seconds: float) -> dict:
 
 @test("workflow_parallel", "two distinct workflows run concurrently in one tick")
 async def t_distinct_workflows_run_in_parallel(ctx: TestContext) -> None:
-    from openagent.core.scheduler import Scheduler
-    from openagent.memory.db import MemoryDB
+    from src.core.scheduler import Scheduler
+    from src.memory.db import MemoryDB
 
     db = MemoryDB(str(ctx.db_path))
     await db.connect()
@@ -127,8 +127,8 @@ async def t_same_workflow_runs_serialize(ctx: TestContext) -> None:
     would race on shared session ids and trace persistence. The lock is
     documented at ``openagent/workflow/executor.py:25`` as the design.
     """
-    from openagent.core.scheduler import Scheduler
-    from openagent.memory.db import MemoryDB
+    from src.core.scheduler import Scheduler
+    from src.memory.db import MemoryDB
 
     db = MemoryDB(str(ctx.db_path))
     await db.connect()

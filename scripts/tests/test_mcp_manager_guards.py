@@ -8,8 +8,8 @@ from ._framework import TestContext, test
 
 @test("mcp_manager_guards", "remove_mcp refuses kind='default' and kind='builtin'")
 async def t_remove_rejects_builtins(ctx: TestContext) -> None:
-    import openagent.mcp.servers.mcp_manager.server as mgr
-    from openagent.memory.db import MemoryDB
+    import src.mcp.servers.mcp_manager.server as mgr
+    from src.memory.db import MemoryDB
 
     tmp = ctx.db_path.with_name(f"mgrguard-{uuid.uuid4().hex[:8]}.db")
     try:

@@ -22,7 +22,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
-from openagent.mcp.builtins import resolve_builtin_entry  # noqa: E402
+from src.mcp.builtins import resolve_builtin_entry  # noqa: E402
 
 
 def _send(proc: subprocess.Popen, msg: dict) -> None:

@@ -52,8 +52,8 @@ async def _null_factory(_db):
 
 @test("barge_in", "_cancel_active_turn commits partial before cancelling")
 async def t_commit_before_cancel(_ctx: TestContext) -> None:
-    from openagent.stream.session import StreamSession
-    from openagent.stream.events import Interrupt, TextFinal, now_ms
+    from src.stream.session import StreamSession
+    from src.stream.events import Interrupt, TextFinal, now_ms
 
     agent = _RecordingAgent(["hel", "lo ", "world"])
     sess = StreamSession(agent, client_id="c", session_id="s")
@@ -98,7 +98,7 @@ async def t_commit_before_cancel(_ctx: TestContext) -> None:
 
 @test("barge_in", "empty partials skip commit")
 async def t_empty_partial_skips_commit(_ctx: TestContext) -> None:
-    from openagent.stream.session import StreamSession
+    from src.stream.session import StreamSession
 
     agent = _RecordingAgent([])
     sess = StreamSession(agent, client_id="c", session_id="s")
@@ -111,8 +111,8 @@ async def t_empty_partial_skips_commit(_ctx: TestContext) -> None:
 
 @test("barge_in", "commit failure does not break cancel path")
 async def t_commit_failure_swallowed(_ctx: TestContext) -> None:
-    from openagent.stream.session import StreamSession
-    from openagent.stream.events import Interrupt, TextFinal, now_ms
+    from src.stream.session import StreamSession
+    from src.stream.events import Interrupt, TextFinal, now_ms
 
     agent = _RecordingAgent(["hi", " there"], commit_raises=True)
     sess = StreamSession(agent, client_id="c", session_id="s")
@@ -142,7 +142,7 @@ async def t_agent_proxy(_ctx: TestContext) -> None:
     """``Agent.commit_partial_assistant`` is a thin proxy that forwards
     to ``self.model``. Verifies the routing without touching real
     providers."""
-    from openagent.core.agent import Agent
+    from src.core.agent import Agent
 
     class _StubModel:
         history_mode = "platform"

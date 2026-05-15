@@ -88,8 +88,8 @@ async def t_cli_dispatcher_covers_python_builtins(ctx: TestContext) -> None:
     on the VPS for three days. This check keeps the two lists in sync.
     """
     import inspect
-    from openagent import cli
-    from openagent.mcp.builtins import BUILTIN_MCP_SPECS
+    from src import cli
+    from src.mcp.builtins import BUILTIN_MCP_SPECS
 
     src = inspect.getsource(cli.mcp_server_cmd.callback)
     missing = [
@@ -174,7 +174,7 @@ async def t_pool_tool_budget(ctx: TestContext) -> None:
     kept — symmetry is the whole reason this lives in the pool, not
     in two parallel provider implementations.
     """
-    from openagent.mcp.pool import MCPPool
+    from src.mcp.pool import MCPPool
 
     pool = MCPPool.from_config([
         {"builtin": "tool-search"},

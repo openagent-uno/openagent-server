@@ -12,9 +12,9 @@ from ._framework import TestContext, TestSkip, free_port, have_openai_key, test
 
 @test("gateway", "gateway starts + /api/health works")
 async def t_gateway_health(ctx: TestContext) -> None:
-    from openagent.gateway.server import Gateway
-    from openagent.core.agent import Agent
-    from openagent.models.runtime import create_model_from_config
+    from src.gateway.server import Gateway
+    from src.core.agent import Agent
+    from src.models.runtime import create_model_from_config
 
     if not have_openai_key(ctx.config):
         raise TestSkip("no OpenAI API key")

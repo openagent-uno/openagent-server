@@ -13,7 +13,7 @@ from ._framework import TestContext, TestSkip, test
 
 @test("voice", "is_audio_file recognises common formats")
 async def t_is_audio_file(ctx: TestContext) -> None:
-    from openagent.channels.voice import is_audio_file
+    from src.channels.voice import is_audio_file
     for good in ("voice.mp3", "note.ogg", "recording.webm", "clip.m4a", "speech.wav"):
         assert is_audio_file(good), f"{good!r} should count as audio"
     for bad in ("photo.png", "doc.pdf", "script.py", None, ""):

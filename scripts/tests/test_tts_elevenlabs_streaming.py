@@ -21,7 +21,7 @@ from ._framework import TestContext, free_port, test
 
 def _make_cfg(**overrides: Any):
     """Build a minimal TTSConfig that opts into the WS streaming path."""
-    from openagent.channels.tts import TTSConfig
+    from src.channels.tts import TTSConfig
 
     base = dict(
         vendor="elevenlabs",
@@ -47,7 +47,7 @@ async def _async_iter(items: list[str]):
 
 @test("tts_streaming", "supports_token_stream gates correctly on vendor + flag")
 async def t_supports_gate(_ctx: TestContext) -> None:
-    from openagent.channels.tts_streaming import supports_token_stream
+    from src.channels.tts_streaming import supports_token_stream
 
     assert supports_token_stream(None) is False
     # Right vendor + flag → True
@@ -66,7 +66,7 @@ async def t_no_ws_returns_quickly(_ctx: TestContext) -> None:
     return without yielding anything (and without trying to connect).
     The turn_runner branch relies on this for a fast no-op when
     stream_input isn't set."""
-    from openagent.channels.tts_streaming import synthesize_token_stream
+    from src.channels.tts_streaming import synthesize_token_stream
 
     cfg = _make_cfg(stream_input=False)
     chunks: list[bytes] = []
@@ -120,7 +120,7 @@ async def t_ws_full_roundtrip(_ctx: TestContext) -> None:
     try:
         # Patch the WS URL template so the synth connects to our test
         # server instead of the real ElevenLabs endpoint.
-        from openagent.channels import tts_streaming
+        from src.channels import tts_streaming
         original_url = tts_streaming._ELEVENLABS_WS
         tts_streaming._ELEVENLABS_WS = f"ws://127.0.0.1:{port}/{{voice}}"
         try:
@@ -160,7 +160,7 @@ async def t_ws_connection_refused(_ctx: TestContext) -> None:
     """The voice pipeline relies on raised exceptions to fall back to
     the per-sentence REST path. A silent return on connection failure
     would leave the user with no audio AND no diagnostic."""
-    from openagent.channels import tts_streaming
+    from src.channels import tts_streaming
 
     # Point at a port nothing is listening on. ``free_port`` returns
     # an unbound port, which will refuse connection cleanly.
@@ -192,7 +192,7 @@ async def t_missing_voice_id(_ctx: TestContext) -> None:
     """ElevenLabs WS requires voice_id in the URL path. Catch this
     early instead of trying to connect to ``.../v1/text-to-speech//
     stream-input`` which would 400."""
-    from openagent.channels.tts_streaming import synthesize_token_stream
+    from src.channels.tts_streaming import synthesize_token_stream
 
     cfg = _make_cfg(voice_id="")
     raised: Exception | None = None
@@ -209,7 +209,7 @@ async def t_missing_api_key(_ctx: TestContext) -> None:
     """ElevenLabs WS auth is the BOS frame's xi_api_key. No key →
     immediate ValueError so we don't burn a connection that would
     fail on the first response."""
-    from openagent.channels.tts_streaming import synthesize_token_stream
+    from src.channels.tts_streaming import synthesize_token_stream
 
     cfg = _make_cfg(api_key=None)
     raised: Exception | None = None

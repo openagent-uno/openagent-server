@@ -24,7 +24,7 @@ def _find_claude_binary() -> str | None:
 async def t_claude_present(ctx: TestContext) -> None:
     if not _find_claude_binary():
         raise TestSkip("claude binary not on PATH")
-    from openagent.models.claude_cli import ClaudeCLI
+    from src.models.claude_cli import ClaudeCLI
     cli = ClaudeCLI(model=None, providers_config=ctx.config["providers"])
     assert cli._model_id_for_billing() == "claude-cli"
 
@@ -36,7 +36,7 @@ async def t_claude_minimal(ctx: TestContext) -> None:
     if not ctx.extras.get("include_claude"):
         raise TestSkip("claude tests require --include-claude")
     from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions, ResultMessage
-    from openagent.mcp.pool import MCPPool
+    from src.mcp.pool import MCPPool
 
     pool = ctx.extras.get("pool")
     own_pool = False
@@ -80,8 +80,8 @@ async def t_claude_provider_mcp_call(ctx: TestContext) -> None:
         raise TestSkip("claude binary not on PATH")
     if not ctx.extras.get("include_claude"):
         raise TestSkip("claude tests require --include-claude")
-    from openagent.models.claude_cli import ClaudeCLI
-    from openagent.mcp.pool import MCPPool
+    from src.models.claude_cli import ClaudeCLI
+    from src.mcp.pool import MCPPool
 
     pool = ctx.extras.get("pool")
     own_pool = False
@@ -118,9 +118,9 @@ async def t_claude_provider_mcp_call(ctx: TestContext) -> None:
 
 @test("claude-cli", "shell MCP round-trip: start bg shell, receive reminder, read output")
 async def t_claude_shell_bg_roundtrip(ctx: TestContext) -> None:
-    from openagent.core.agent import Agent
-    from openagent.models.claude_cli import ClaudeCLI
-    from openagent.mcp.servers.shell.handlers import get_hub
+    from src.core.agent import Agent
+    from src.models.claude_cli import ClaudeCLI
+    from src.mcp.servers.shell.handlers import get_hub
 
     pool = ctx.extras.get("pool")
     if pool is None:

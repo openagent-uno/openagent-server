@@ -11,7 +11,7 @@ from ._framework import TestContext, test
 
 @test("db_providers", "upsert + list + get roundtrip")
 async def t_providers_roundtrip(ctx: TestContext) -> None:
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     db = MemoryDB(str(ctx.db_path))
     await db.connect()
@@ -49,7 +49,7 @@ async def t_providers_roundtrip(ctx: TestContext) -> None:
 
 @test("db_providers", "upsert is idempotent and preserves id + created_at")
 async def t_providers_upsert_idempotent(ctx: TestContext) -> None:
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     db = MemoryDB(str(ctx.db_path))
     await db.connect()
@@ -77,7 +77,7 @@ async def t_claude_cli_rejects_api_key(ctx: TestContext) -> None:
     claude subprocess via ``ANTHROPIC_API_KEY``. The schema now rejects
     any api_key for claude-cli providers at the DB boundary — no
     downstream filter needed."""
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     db = MemoryDB(str(ctx.db_path))
     await db.connect()
@@ -104,7 +104,7 @@ async def t_claude_cli_rejects_api_key(ctx: TestContext) -> None:
 
 @test("db_providers", "same vendor under both frameworks coexists via UNIQUE(name, framework)")
 async def t_dual_framework_provider_rows(ctx: TestContext) -> None:
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     db = MemoryDB(str(ctx.db_path))
     await db.connect()
@@ -125,7 +125,7 @@ async def t_dual_framework_provider_rows(ctx: TestContext) -> None:
 
 @test("db_providers", "set_provider_enabled flips without touching other fields")
 async def t_providers_enable(ctx: TestContext) -> None:
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     db = MemoryDB(str(ctx.db_path))
     await db.connect()
@@ -150,7 +150,7 @@ async def t_providers_cascade_via_fk(ctx: TestContext) -> None:
     """Deleting a provider row should cascade-delete every model under
     it via ``ON DELETE CASCADE`` on ``models.provider_id``. This replaces
     the old manual ``delete_models_by_provider`` contract."""
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     db = MemoryDB(str(ctx.db_path))
     await db.connect()
@@ -175,7 +175,7 @@ async def t_providers_cascade_via_fk(ctx: TestContext) -> None:
 async def t_providers_registry_status(ctx: TestContext) -> None:
     """The gateway's hot-reload probe returns a 4-tuple; the last field
     must bump whenever providers change."""
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     db = MemoryDB(str(ctx.db_path))
     await db.connect()

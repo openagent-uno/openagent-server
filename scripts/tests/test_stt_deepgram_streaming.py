@@ -27,7 +27,7 @@ async def _audio_iter(chunks: list[bytes]):
 async def t_partial_then_final(_ctx: TestContext) -> None:
     import websockets
 
-    from openagent.channels import stt_deepgram
+    from src.channels import stt_deepgram
 
     received_chunks: list[bytes] = []
     received_close = False
@@ -104,7 +104,7 @@ async def t_no_websockets_no_op(_ctx: TestContext) -> None:
     import sys
     import importlib
 
-    from openagent.channels.stt_deepgram import DeepgramStreamingSTT
+    from src.channels.stt_deepgram import DeepgramStreamingSTT
 
     # Save+remove websockets so the inner ``import websockets`` raises.
     saved = sys.modules.pop("websockets", None)
@@ -135,8 +135,8 @@ async def t_no_websockets_no_op(_ctx: TestContext) -> None:
 
 @test("stt_deepgram", "resolve_stt picks DeepgramStreamingSTT for deepgram rows")
 async def t_resolve_picks_deepgram(_ctx: TestContext) -> None:
-    from openagent.channels.stt_base import resolve_stt
-    from openagent.channels.stt_deepgram import DeepgramStreamingSTT
+    from src.channels.stt_base import resolve_stt
+    from src.channels.stt_deepgram import DeepgramStreamingSTT
 
     class _StubDB:
         async def latest_audio_model(self, kind: str):
@@ -151,7 +151,7 @@ async def t_resolve_picks_deepgram(_ctx: TestContext) -> None:
 
     # ``resolve_stt`` reads via voice._resolve_stt_provider, which calls
     # latest_audio_model. Patch the helper so the stub plumbing matches.
-    from openagent.channels import voice as _voice
+    from src.channels import voice as _voice
 
     original = _voice._resolve_stt_provider
 
@@ -168,7 +168,7 @@ async def t_resolve_picks_deepgram(_ctx: TestContext) -> None:
 
 @test("stt_deepgram", "missing api_key raises ValueError")
 async def t_missing_api_key(_ctx: TestContext) -> None:
-    from openagent.channels.stt_deepgram import DeepgramStreamingSTT
+    from src.channels.stt_deepgram import DeepgramStreamingSTT
 
     raised: Exception | None = None
     try:
@@ -184,7 +184,7 @@ async def t_pcm_declares_linear16(_ctx: TestContext) -> None:
     the Deepgram URL must carry ``encoding=linear16&sample_rate=16000``
     so Deepgram's decoder doesn't wait for a container header. That's
     what unlocks sub-1 s TTFA partials."""
-    from openagent.channels.stt_deepgram import DeepgramStreamingSTT
+    from src.channels.stt_deepgram import DeepgramStreamingSTT
 
     stt = DeepgramStreamingSTT(api_key="k", model="nova-2")
     url = stt._ws_url(language="en", encoding="pcm16", sample_rate=16000)
@@ -198,7 +198,7 @@ async def t_webm_keeps_autodetect(_ctx: TestContext) -> None:
     """For WebM/Opus container chunks (the fallback path on browsers
     without AudioWorklet), Deepgram should auto-detect — explicit
     ``encoding`` would force the wrong decoder."""
-    from openagent.channels.stt_deepgram import DeepgramStreamingSTT
+    from src.channels.stt_deepgram import DeepgramStreamingSTT
 
     stt = DeepgramStreamingSTT(api_key="k", model="nova-2")
     url = stt._ws_url(language="en", encoding="webm", sample_rate=None)
@@ -212,7 +212,7 @@ async def t_pcm_stream_end_to_end(_ctx: TestContext) -> None:
     URL contains the right query params, transcript comes back."""
     import websockets
 
-    from openagent.channels import stt_deepgram
+    from src.channels import stt_deepgram
 
     received_url: dict[str, str] = {}
     received_chunks: list[bytes] = []

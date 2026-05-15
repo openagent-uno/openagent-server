@@ -15,7 +15,7 @@ from ._framework import TestContext, TestSkip, test
 @test("buffer_size", "ClaudeCLI._build_options sets max_buffer_size >= 32 MiB")
 async def t_default_buffer(ctx: TestContext) -> None:
     try:
-        from openagent.models.claude_cli import ClaudeCLI
+        from src.models.claude_cli import ClaudeCLI
     except ImportError as e:
         raise TestSkip(f"claude_cli unavailable: {e}")
 
@@ -34,7 +34,7 @@ async def t_default_buffer(ctx: TestContext) -> None:
 @test("buffer_size", "OPENAGENT_CLAUDE_SDK_BUFFER_MIB env override honored")
 async def t_env_override(ctx: TestContext) -> None:
     try:
-        from openagent.models.claude_cli import ClaudeCLI
+        from src.models.claude_cli import ClaudeCLI
     except ImportError as e:
         raise TestSkip(f"claude_cli unavailable: {e}")
 

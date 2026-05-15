@@ -34,7 +34,7 @@ class _FakeDBNoRows:
 
 @test("tts_local", "is_available reports False when piper not importable")
 async def t_is_available_when_missing(_ctx: TestContext) -> None:
-    from openagent.channels import tts_local
+    from src.channels import tts_local
 
     # Force the import inside is_available() to fail by removing piper
     # from sys.modules and shadowing the import path. The function
@@ -54,7 +54,7 @@ async def t_is_available_when_missing(_ctx: TestContext) -> None:
 
 @test("tts_local", "synthesize returns None when piper isn't loadable")
 async def t_synthesize_no_backend(_ctx: TestContext) -> None:
-    from openagent.channels import tts_local
+    from src.channels import tts_local
 
     # Patch is_available to True but make the actual import fail —
     # mirrors a partial install where the package metadata exists but
@@ -66,7 +66,7 @@ async def t_synthesize_no_backend(_ctx: TestContext) -> None:
 
 @test("tts_local", "_voice_url_path parses canonical voice names correctly")
 async def t_voice_url_path(_ctx: TestContext) -> None:
-    from openagent.channels.tts_local import _voice_url_path
+    from src.channels.tts_local import _voice_url_path
 
     # Standard cases — must match the rhasspy/piper-voices repo layout.
     assert _voice_url_path("en_US-amy-medium") == "en/en_US/amy/medium/en_US-amy-medium"
@@ -82,8 +82,8 @@ async def t_voice_url_path(_ctx: TestContext) -> None:
 
 @test("tts_local", "resolve_tts_provider returns local Piper config when piper is available")
 async def t_resolve_tts_uses_piper(_ctx: TestContext) -> None:
-    from openagent.channels import tts as tts_mod
-    from openagent.channels import tts_local
+    from src.channels import tts as tts_mod
+    from src.channels import tts_local
 
     # No DB row + piper available → synthetic local config wins.
     with patch.object(tts_local, "is_available", return_value=True):
@@ -96,8 +96,8 @@ async def t_resolve_tts_uses_piper(_ctx: TestContext) -> None:
 
 @test("tts_local", "resolve_tts_provider returns None when no row AND no piper")
 async def t_resolve_tts_none_when_no_backends(_ctx: TestContext) -> None:
-    from openagent.channels import tts as tts_mod
-    from openagent.channels import tts_local
+    from src.channels import tts as tts_mod
+    from src.channels import tts_local
 
     with patch.object(tts_local, "is_available", return_value=False):
         cfg = await tts_mod.resolve_tts_provider(_FakeDBNoRows())
@@ -106,7 +106,7 @@ async def t_resolve_tts_none_when_no_backends(_ctx: TestContext) -> None:
 
 @test("tts_local", "_resolve_voice_name picks language-matched voice when nothing pinned")
 async def t_resolve_voice_name_language(_ctx: TestContext) -> None:
-    from openagent.channels import tts_local
+    from src.channels import tts_local
 
     # Wrap in patch so an existing OPENAGENT_PIPER_VOICE in the env
     # doesn't override our test (CI environments shouldn't set it,
@@ -128,7 +128,7 @@ async def t_resolve_voice_name_language(_ctx: TestContext) -> None:
 
 @test("tts_local", "explicit voice overrides language hint")
 async def t_resolve_voice_name_explicit_wins(_ctx: TestContext) -> None:
-    from openagent.channels import tts_local
+    from src.channels import tts_local
 
     # Explicit voice must beat the language hint — covers the case
     # where a user wants a specific Piper voice across languages.
@@ -137,7 +137,7 @@ async def t_resolve_voice_name_explicit_wins(_ctx: TestContext) -> None:
 
 @test("tts_local", "OPENAGENT_PIPER_VOICE env var overrides language hint")
 async def t_resolve_voice_name_env_wins(_ctx: TestContext) -> None:
-    from openagent.channels import tts_local
+    from src.channels import tts_local
 
     # Same priority as explicit > env > language > default — the env
     # var should still win when no explicit voice is passed but a

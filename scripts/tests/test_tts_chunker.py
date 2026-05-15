@@ -12,7 +12,7 @@ from ._framework import TestContext, test
 
 @test("tts_chunker", "splits plain sentences on '. ' boundaries")
 async def t_basic_split(ctx: TestContext) -> None:
-    from openagent.channels.tts_chunker import SentenceChunker
+    from src.channels.tts_chunker import SentenceChunker
 
     c = SentenceChunker()
     out = c.feed(
@@ -28,7 +28,7 @@ async def t_basic_split(ctx: TestContext) -> None:
 
 @test("tts_chunker", "abbreviations (Dr. Smith, e.g.) do not break sentences")
 async def t_abbreviations(ctx: TestContext) -> None:
-    from openagent.channels.tts_chunker import SentenceChunker
+    from src.channels.tts_chunker import SentenceChunker
 
     c = SentenceChunker()
     out = c.feed("Dr. Smith said hi to the class today.")
@@ -57,7 +57,7 @@ async def t_abbreviations(ctx: TestContext) -> None:
 
 @test("tts_chunker", "decimals (3.14) do not break sentences")
 async def t_decimals(ctx: TestContext) -> None:
-    from openagent.channels.tts_chunker import SentenceChunker
+    from src.channels.tts_chunker import SentenceChunker
 
     c = SentenceChunker()
     out = c.feed("Pi is 3.14 here in this example today.")
@@ -69,7 +69,7 @@ async def t_decimals(ctx: TestContext) -> None:
 
 @test("tts_chunker", "code fences are skipped, placeholder emitted once")
 async def t_code_fences(ctx: TestContext) -> None:
-    from openagent.channels.tts_chunker import SentenceChunker
+    from src.channels.tts_chunker import SentenceChunker
 
     c = SentenceChunker()
     text = (
@@ -92,7 +92,7 @@ async def t_code_fences(ctx: TestContext) -> None:
 
 @test("tts_chunker", "flush() returns trailing partial below MIN_LEN")
 async def t_flush_trailing(ctx: TestContext) -> None:
-    from openagent.channels.tts_chunker import SentenceChunker
+    from src.channels.tts_chunker import SentenceChunker
 
     c = SentenceChunker()
     # No terminal punctuation — chunker should hold and flush the lot.
@@ -104,7 +104,7 @@ async def t_flush_trailing(ctx: TestContext) -> None:
 
 @test("tts_chunker", "streaming feed: partial deltas accumulate correctly")
 async def t_streaming_feed(ctx: TestContext) -> None:
-    from openagent.channels.tts_chunker import SentenceChunker
+    from src.channels.tts_chunker import SentenceChunker
 
     c = SentenceChunker()
     pieces = [
@@ -127,7 +127,7 @@ async def t_streaming_feed(ctx: TestContext) -> None:
 
 @test("tts_chunker", "iteration_break() forces flush across tool-loop turns")
 async def t_iteration_break(ctx: TestContext) -> None:
-    from openagent.channels.tts_chunker import SentenceChunker
+    from src.channels.tts_chunker import SentenceChunker
 
     c = SentenceChunker()
     c.feed("First half of a sentence wrapping ")
@@ -146,7 +146,7 @@ async def t_first_chunk_clause_early(ctx: TestContext) -> None:
     boundary set (CLAUSE_PUNCT + MIN_FIRST_LEN) so Piper can start
     synthesising sooner. Without this the user waits for the first
     full sentence which can be 3–5 s on long replies."""
-    from openagent.channels.tts_chunker import SentenceChunker
+    from src.channels.tts_chunker import SentenceChunker
 
     c = SentenceChunker()
     out = c.feed("Hello there friends, welcome to the demo today.")
@@ -161,7 +161,7 @@ async def t_first_chunk_clause_early(ctx: TestContext) -> None:
 async def t_second_chunk_strict(ctx: TestContext) -> None:
     """After the first chunk emits, clause boundaries should NOT
     split sentences anymore — that's the natural-prosody promise."""
-    from openagent.channels.tts_chunker import SentenceChunker
+    from src.channels.tts_chunker import SentenceChunker
 
     c = SentenceChunker()
     # First chunk: "Sure thing," at the comma (TTFB win).
@@ -186,7 +186,7 @@ async def t_iteration_break_rearms_first(ctx: TestContext) -> None:
     """Each tool-loop iteration deserves its own TTFB win — voice
     mode often pauses for tool calls between sentences and the user
     benefits from a quick spoken status when the agent resumes."""
-    from openagent.channels.tts_chunker import SentenceChunker
+    from src.channels.tts_chunker import SentenceChunker
 
     c = SentenceChunker()
     # "Sure thing now," is 14 chars — comfortably above MIN_FIRST_LEN.
@@ -211,7 +211,7 @@ async def t_first_chunk_too_short_defers(ctx: TestContext) -> None:
     (only 3 chars, below MIN_FIRST_LEN). It defers to the period.
     Otherwise we'd ship a 0.2s clip and Piper synth overhead would
     swamp the playback."""
-    from openagent.channels.tts_chunker import SentenceChunker
+    from src.channels.tts_chunker import SentenceChunker
 
     c = SentenceChunker()
     out = c.feed("Hi, world.")
@@ -225,7 +225,7 @@ async def t_first_chunk_too_short_defers(ctx: TestContext) -> None:
 
 @test("tts_chunker", "trailing partial backticks are deferred to next feed")
 async def t_partial_fence(ctx: TestContext) -> None:
-    from openagent.channels.tts_chunker import SentenceChunker
+    from src.channels.tts_chunker import SentenceChunker
 
     c = SentenceChunker()
     out1 = c.feed("Some prose here ``")  # 2 trailing ticks; could become ```

@@ -144,7 +144,7 @@ async def t_function_entrypoint_called(ctx: TestContext) -> None:
     Without the executor fix, calling ``fn(**args)`` on a Pydantic
     ``Function`` blows up here. With the fix, the call routes to
     ``fn.entrypoint``."""
-    from openagent.workflow.executor import (
+    from src.workflow.executor import (
         WorkflowExecutor, _RunCtx, _h_mcp_tool,
     )
 
@@ -183,7 +183,7 @@ async def t_async_function_raw_callable(ctx: TestContext) -> None:
     """In-process toolkits (e.g. ``tool-search``) register raw
     callables in ``async_functions`` — no ``Function`` wrapper. The
     ``or fn`` fallback in the executor must still invoke them."""
-    from openagent.workflow.executor import (
+    from src.workflow.executor import (
         WorkflowExecutor, _RunCtx, _h_mcp_tool,
     )
 
@@ -218,7 +218,7 @@ async def t_async_function_raw_callable(ctx: TestContext) -> None:
 async def t_sync_callable_no_await(ctx: TestContext) -> None:
     """A sync entrypoint returns a non-awaitable; the
     ``inspect.isawaitable`` branch must skip cleanly."""
-    from openagent.workflow.executor import (
+    from src.workflow.executor import (
         WorkflowExecutor, _RunCtx, _h_mcp_tool,
     )
 
@@ -255,7 +255,7 @@ async def t_sync_callable_no_await(ctx: TestContext) -> None:
 async def t_validate_rejects_uncallable_function(ctx: TestContext) -> None:
     """When a callability snapshot says a tool is non-callable,
     ``validate_graph`` must reject the graph before it ever runs."""
-    from openagent.workflow.validate import ValidationError, validate_graph
+    from src.workflow.validate import ValidationError, validate_graph
 
     graph = {
         "version": 1,
@@ -299,7 +299,7 @@ async def t_validate_rejects_uncallable_function(ctx: TestContext) -> None:
 async def t_callability_snapshot_shape(ctx: TestContext) -> None:
     """The helper must mark Function-with-entrypoint and raw callables
     as ``True``, and Function-without-entrypoint as ``False``."""
-    from openagent.workflow.validate import mcp_callability_from_pool
+    from src.workflow.validate import mcp_callability_from_pool
 
     Function = _agno_function_factory()
 
@@ -337,7 +337,7 @@ async def t_executor_revalidates_at_run_start(ctx: TestContext) -> None:
     so a stale tool reference (or the Function-not-callable bug class)
     fails as a finalized ``failed`` run with a clear error in
     ``trace_json``, not a mid-DAG ``TypeError``."""
-    from openagent.workflow.executor import WorkflowExecutor
+    from src.workflow.executor import WorkflowExecutor
 
     Function = _agno_function_factory()
 
@@ -388,7 +388,7 @@ async def t_validate_repairs_double_prefix(ctx: TestContext) -> None:
     must strip the redundant prefix and repair in place rather than
     raising a ValidationError. Regression for the mixout Git Sync
     workflow that kept crashing with ValidationError: shell_shell_exec."""
-    from openagent.workflow.validate import validate_graph
+    from src.workflow.validate import validate_graph
 
     config = {
         "mcp_name": "shell",
@@ -429,7 +429,7 @@ async def t_executor_accepts_arguments_alias(ctx: TestContext) -> None:
     ``TypeError: shell_exec() missing 1 required positional argument:
     'command'``. Regression for the Mixout Daily Release Check workflow
     (run 9b0eb495-…)."""
-    from openagent.workflow.executor import (
+    from src.workflow.executor import (
         WorkflowExecutor, _RunCtx, _h_mcp_tool,
     )
 
@@ -473,7 +473,7 @@ async def t_validate_repairs_arguments_alias(ctx: TestContext) -> None:
     """The validator must rename ``arguments`` → ``args`` so trace_json
     stays consistent and the missing-required-args check uses the right
     keys. Mirrors the existing tool_name auto-repair pattern."""
-    from openagent.workflow.validate import validate_graph
+    from src.workflow.validate import validate_graph
 
     config = {
         "mcp_name": "shell",
@@ -507,7 +507,7 @@ async def t_validate_args_wins_over_arguments(ctx: TestContext) -> None:
     """If a workflow has both keys (corrupt or hand-edited), the
     canonical ``args`` wins and ``arguments`` is left untouched.
     Repairing in this case would silently change behaviour."""
-    from openagent.workflow.validate import validate_graph
+    from src.workflow.validate import validate_graph
 
     config = {
         "mcp_name": "shell",
@@ -547,7 +547,7 @@ async def t_validate_rejects_empty_required_args(ctx: TestContext) -> None:
     Templated values (``"{{ ctx.inputs.x }}"``) are non-empty strings
     and must continue to pass — the validator doesn't resolve them.
     """
-    from openagent.workflow.validate import ValidationError, validate_graph
+    from src.workflow.validate import ValidationError, validate_graph
 
     inventory = {"messaging": {"send": {"required": ["chat_id", "text"]}}}
 

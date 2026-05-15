@@ -82,7 +82,7 @@ def _install_fake_sdk_client(monkeypatch_attr_target):
 
 @test("claude_cli_stale_resume", "stale resume → cleared + retried without --resume")
 async def t_stale_resume_self_heal(ctx: TestContext) -> None:
-    from openagent.models.claude_cli import ClaudeCLI, _Session
+    from src.models.claude_cli import ClaudeCLI, _Session
 
     restore: list[tuple] = []
     _install_fake_sdk_client(restore)
@@ -109,7 +109,7 @@ async def t_stale_resume_self_heal(ctx: TestContext) -> None:
 
 @test("claude_cli_stale_resume", "no stored resume → connect failure propagates untouched")
 async def t_no_resume_connect_failure_raises(ctx: TestContext) -> None:
-    from openagent.models.claude_cli import ClaudeCLI, _Session
+    from src.models.claude_cli import ClaudeCLI, _Session
 
     restore: list[tuple] = []
     _install_fake_sdk_client(restore)
@@ -145,7 +145,7 @@ async def t_no_resume_connect_failure_raises(ctx: TestContext) -> None:
 
 @test("claude_cli_stale_resume", "fresh retry failure still raises (non stale-resume errors)")
 async def t_fresh_retry_also_fails(ctx: TestContext) -> None:
-    from openagent.models.claude_cli import ClaudeCLI, _Session
+    from src.models.claude_cli import ClaudeCLI, _Session
 
     restore: list[tuple] = []
     _install_fake_sdk_client(restore)

@@ -50,7 +50,7 @@ def _install(restore: list[tuple]) -> None:
     "failed connect() invokes disconnect() to release subprocess",
 )
 async def t_failed_connect_calls_disconnect(ctx: TestContext) -> None:
-    from openagent.models.claude_cli import ClaudeCLI, _Session
+    from src.models.claude_cli import ClaudeCLI, _Session
 
     _LeakTrackingClient.instances.clear()
     restore: list[tuple] = []
@@ -89,7 +89,7 @@ async def t_stale_resume_first_attempt_disconnects(ctx: TestContext) -> None:
     also be disconnected — otherwise we still leak one process per stale
     resume hit.
     """
-    from openagent.models.claude_cli import ClaudeCLI, _Session
+    from src.models.claude_cli import ClaudeCLI, _Session
 
     class _FakeDB:
         def __init__(self, mapping):

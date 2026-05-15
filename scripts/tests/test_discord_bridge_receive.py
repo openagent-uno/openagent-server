@@ -170,7 +170,7 @@ async def _capture_on_message():
     """Boot a DiscordBridge with the fake discord shim and return its
     registered ``on_message`` callback, along with the bridge instance
     and the captured event log."""
-    from openagent.bridges.discord import DiscordBridge
+    from src.bridges.discord import DiscordBridge
 
     restore, recorded, _Done = _install_fake_discord_modules()
     bridge = DiscordBridge(
@@ -223,7 +223,7 @@ async def t_discord_authorized_user_no_mention_dispatched(ctx: TestContext) -> N
         def capture(event: str, *_a, **kw):
             events.append((event, kw))
 
-        import openagent.bridges.discord as dc_mod
+        import src.bridges.discord as dc_mod
         with patch.object(dc_mod, "elog", side_effect=capture):
             await on_message(msg)
 
@@ -270,7 +270,7 @@ async def t_discord_unauthorized_user_dropped_with_event(ctx: TestContext) -> No
         def capture(event: str, *_a, **kw):
             events.append((event, kw))
 
-        import openagent.bridges.discord as dc_mod
+        import src.bridges.discord as dc_mod
         with patch.object(dc_mod, "elog", side_effect=capture):
             await on_message(msg)
 
@@ -319,7 +319,7 @@ async def t_discord_disallowed_guild_drop(ctx: TestContext) -> None:
         def capture(event: str, *_a, **kw):
             events.append((event, kw))
 
-        import openagent.bridges.discord as dc_mod
+        import src.bridges.discord as dc_mod
         with patch.object(dc_mod, "elog", side_effect=capture):
             await on_message(msg)
 

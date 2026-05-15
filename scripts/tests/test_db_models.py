@@ -11,7 +11,7 @@ from ._framework import TestContext, test
 
 @test("db_models", "upsert + list + get roundtrip")
 async def t_models_roundtrip(ctx: TestContext) -> None:
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     db = MemoryDB(str(ctx.db_path))
     await db.connect()
@@ -47,7 +47,7 @@ async def t_models_roundtrip(ctx: TestContext) -> None:
 
 @test("db_models", "disable flips enabled, list_models(enabled_only) honors it")
 async def t_models_enable(ctx: TestContext) -> None:
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     db = MemoryDB(str(ctx.db_path))
     await db.connect()
@@ -73,7 +73,7 @@ async def t_cascade_delete(ctx: TestContext) -> None:
     """When a provider row is removed, every model under it is
     cascade-deleted via ``ON DELETE CASCADE`` — replacing the old
     manual ``delete_models_by_provider`` contract."""
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     db = MemoryDB(str(ctx.db_path))
     await db.connect()
@@ -105,7 +105,7 @@ async def t_registry_status_empty(ctx: TestContext) -> None:
     """The gate relies on ``registry_status`` returning zero once the
     effective catalog is empty. A model under a DISABLED provider
     can't dispatch anyway, so the count joins on provider.enabled."""
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     db = MemoryDB(str(ctx.db_path))
     await db.connect()
@@ -143,7 +143,7 @@ async def t_registry_status_empty(ctx: TestContext) -> None:
 
 @test("db_models", "get_model_by_runtime_id resolves to the enriched row")
 async def t_runtime_id_lookup(ctx: TestContext) -> None:
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     db = MemoryDB(str(ctx.db_path))
     await db.connect()
@@ -165,7 +165,7 @@ async def t_runtime_id_lookup(ctx: TestContext) -> None:
 
 @test("db_models", "upsert_model rejects orphan provider_id")
 async def t_reject_orphan(ctx: TestContext) -> None:
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     db = MemoryDB(str(ctx.db_path))
     await db.connect()
@@ -191,7 +191,7 @@ async def t_is_classifier_roundtrip(ctx: TestContext) -> None:
     resolver then picks the first flagged entry in deterministic
     catalog order (see test_smart_router_hybrid).
     """
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     db = MemoryDB(str(ctx.db_path))
     await db.connect()
@@ -249,7 +249,7 @@ async def t_is_classifier_legacy_migration(ctx: TestContext) -> None:
     import sqlite3
     import tempfile
     from pathlib import Path
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     tmp = tempfile.mkdtemp()
     path = Path(tmp) / "legacy.db"
@@ -303,7 +303,7 @@ async def t_is_classifier_legacy_migration(ctx: TestContext) -> None:
 
 @test("db_models", "config_state get/set roundtrip (bootstrap marker)")
 async def t_state_roundtrip(ctx: TestContext) -> None:
-    from openagent.memory.db import MemoryDB
+    from src.memory.db import MemoryDB
 
     db = MemoryDB(str(ctx.db_path))
     await db.connect()

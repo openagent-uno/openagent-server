@@ -114,7 +114,7 @@ async def t_interleaved_order(ctx: TestContext) -> None:
     """text -> tool_use -> tool_result -> text -> tool_use -> tool_result
     -> text -> ResultMessage. After ``_run_once`` runs, the
     ``assistant_blocks`` list must mirror that exact order."""
-    from openagent.models.claude_cli import ClaudeCLI
+    from src.models.claude_cli import ClaudeCLI
 
     monkey: dict = {}
     _patch_sdk_imports(monkey)
@@ -175,8 +175,8 @@ async def t_persist_turn_order(ctx: TestContext) -> None:
     text becomes a normal assistant row, tool_use becomes an assistant
     row with a ``tool_calls`` payload, tool_result becomes a tool row
     keyed by ``tool_call_id``."""
-    from openagent.memory.db import MemoryDB
-    from openagent.models.claude_cli import ClaudeCLI
+    from src.memory.db import MemoryDB
+    from src.models.claude_cli import ClaudeCLI
 
     tmp_db = ctx.db_path.with_name(f"order-{uuid.uuid4().hex[:8]}.db")
     try:
@@ -245,8 +245,8 @@ async def t_persist_turn_legacy(ctx: TestContext) -> None:
     """When the caller doesn't thread ``assistant_blocks`` through (older
     tests, partial paths), ``_persist_turn`` falls back to the flat
     user -> assistant -> tool layout. This guards back-compat."""
-    from openagent.memory.db import MemoryDB
-    from openagent.models.claude_cli import ClaudeCLI
+    from src.memory.db import MemoryDB
+    from src.models.claude_cli import ClaudeCLI
 
     tmp_db = ctx.db_path.with_name(f"legacy-{uuid.uuid4().hex[:8]}.db")
     try:

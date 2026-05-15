@@ -14,7 +14,7 @@ from ._framework import TestContext, test
 
 @test("bridges", "telegram bridge module imports")
 async def t_telegram_import(ctx: TestContext) -> None:
-    import openagent.bridges.telegram as mod  # noqa: F401
+    import src.bridges.telegram as mod  # noqa: F401
     # Either a TelegramBridge class or a start() coroutine — accept either shape
     has_class = any(inspect.isclass(obj) for _, obj in inspect.getmembers(mod))
     assert has_class, "telegram bridge exposes no class"
@@ -22,21 +22,21 @@ async def t_telegram_import(ctx: TestContext) -> None:
 
 @test("bridges", "discord bridge module imports")
 async def t_discord_import(ctx: TestContext) -> None:
-    import openagent.bridges.discord as mod  # noqa: F401
+    import src.bridges.discord as mod  # noqa: F401
     has_class = any(inspect.isclass(obj) for _, obj in inspect.getmembers(mod))
     assert has_class, "discord bridge exposes no class"
 
 
 @test("bridges", "whatsapp bridge module imports")
 async def t_whatsapp_import(ctx: TestContext) -> None:
-    import openagent.bridges.whatsapp as mod  # noqa: F401
+    import src.bridges.whatsapp as mod  # noqa: F401
     has_class = any(inspect.isclass(obj) for _, obj in inspect.getmembers(mod))
     assert has_class, "whatsapp bridge exposes no class"
 
 
 @test("bridges", "BaseBridge exists and has the expected lifecycle methods")
 async def t_bridge_base(ctx: TestContext) -> None:
-    from openagent.bridges.base import BaseBridge, format_tool_status
+    from src.bridges.base import BaseBridge, format_tool_status
     # Each concrete bridge subclasses BaseBridge; confirm the contract
     # surface we rely on is still there.
     for method in ("start", "stop", "send_message", "send_command"):
@@ -50,7 +50,7 @@ async def t_bridge_base(ctx: TestContext) -> None:
 @test("bridges", "BaseBridge treats listener exit as a reconnect signal")
 async def t_bridge_listener_exit_marks_gateway_lost(ctx: TestContext) -> None:
     import asyncio
-    from openagent.bridges.base import BaseBridge
+    from src.bridges.base import BaseBridge
 
     class _EmptyWS:
         def __aiter__(self):
@@ -83,7 +83,7 @@ class _FakeBridge:
     directly to simulate gateway responses."""
 
     def __init__(self) -> None:
-        from openagent.bridges.base import BaseBridge
+        from src.bridges.base import BaseBridge
 
         self._real = BaseBridge.__new__(BaseBridge)
         BaseBridge.__init__(self._real)
@@ -307,7 +307,7 @@ async def t_send_message_owner_cleanup_idempotent(ctx: TestContext) -> None:
                 # Race: the next turn's collector arrives while
                 # the original owner is still in its `await
                 # collector.done.wait()` -> finally transition.
-                from openagent.stream.collector import StreamCollector
+                from src.stream.collector import StreamCollector
                 fb._real._stream_pending[sid] = StreamCollector()
                 return
             await asyncio.sleep(0.001)
@@ -329,7 +329,7 @@ async def t_dispatch_turn_skips_duplicate(ctx: TestContext) -> None:
     handler (3 copies that drifted); it now lives ONCE in
     ``BaseBridge.dispatch_turn`` so a fix lands in every bridge at
     once. This test pins it."""
-    from openagent.bridges.base import BaseBridge
+    from src.bridges.base import BaseBridge
 
     chunks: list[str] = []
     attachments_sent: list = []
@@ -367,7 +367,7 @@ async def t_dispatch_turn_owner_renders(ctx: TestContext) -> None:
     response) must reach ``send_text_chunk`` so the user actually sees
     the merged reply. Pins that the short-circuit is correctly
     conditional and not always-on."""
-    from openagent.bridges.base import BaseBridge
+    from src.bridges.base import BaseBridge
 
     chunks: list[str] = []
 
@@ -397,7 +397,7 @@ async def t_dispatch_turn_cleans_owned_temp_attachments(ctx: TestContext) -> Non
     import tempfile
     from pathlib import Path
 
-    from openagent.bridges.base import BaseBridge
+    from src.bridges.base import BaseBridge
 
     sent_paths: list[str] = []
 
@@ -456,9 +456,9 @@ async def t_dispatch_turn_anchors_to_latest_in_spam(ctx: TestContext) -> None:
     seen) and posts against that. This test pins the new contract end
     to end through ``dispatch_turn``."""
     import asyncio
-    from openagent.bridges.base import BaseBridge
-    from openagent.stream.events import SessionOpen, TextFinal, now_ms
-    from openagent.stream.wire import event_to_wire
+    from src.bridges.base import BaseBridge
+    from src.stream.events import SessionOpen, TextFinal, now_ms
+    from src.stream.wire import event_to_wire
 
     posted_chunks: list[tuple[object, str]] = []
 
@@ -539,8 +539,8 @@ async def t_dispatch_turn_late_follower_does_not_poison(ctx: TestContext) -> Non
     check above gets refactored away, the corpse can't be re-targeted.
     """
     import asyncio
-    from openagent.bridges.base import BaseBridge
-    from openagent.stream.collector import StreamCollector
+    from src.bridges.base import BaseBridge
+    from src.stream.collector import StreamCollector
 
     bridge = BaseBridge.__new__(BaseBridge)
     bridge.name = "fake"
@@ -602,9 +602,9 @@ async def t_bridges_use_shared_dispatch(ctx: TestContext) -> None:
     caught here instead of in production."""
     import inspect
 
-    import openagent.bridges.telegram as tg
-    import openagent.bridges.discord as dc
-    import openagent.bridges.whatsapp as wa
+    import src.bridges.telegram as tg
+    import src.bridges.discord as dc
+    import src.bridges.whatsapp as wa
 
     for label, src in (
         ("telegram", inspect.getsource(tg.TelegramBridge)),
@@ -652,7 +652,7 @@ async def t_listen_gateway_diag_emits_on_crash(ctx: TestContext) -> None:
     ``except`` and emits ``bridge.listener_died`` so the next tick has
     actionable data."""
     from unittest.mock import patch
-    import openagent.bridges.base as bridge_mod
+    import src.bridges.base as bridge_mod
 
     fb = _FakeBridge()
     real = fb._real
@@ -696,7 +696,7 @@ async def t_telegram_concurrent_updates(ctx: TestContext) -> None:
     in place. Breaking this one silently brings back the "stop doesn't
     work mid-turn" bug.
     """
-    from openagent.bridges.telegram import TelegramBridge
+    from src.bridges.telegram import TelegramBridge
 
     calls: list[tuple[str, tuple, dict]] = []
 
@@ -835,7 +835,7 @@ class _FakeTgUpdate:
 
 
 def _fresh_telegram_bridge():
-    from openagent.bridges.telegram import TelegramBridge
+    from src.bridges.telegram import TelegramBridge
 
     bridge = TelegramBridge(token="fake", allowed_users=None)
     # We never start the WS gateway loop — just probe ``_is_fresh_update``
@@ -902,7 +902,7 @@ async def t_telegram_seen_set_bounded(ctx: TestContext) -> None:
     # We don't want an unbounded memory leak in long-running bots, and
     # after enough fresh updates have passed, a very old id is indistinct
     # from a never-seen one anyway.
-    from openagent.bridges.telegram import _SEEN_UPDATE_IDS_MAX
+    from src.bridges.telegram import _SEEN_UPDATE_IDS_MAX
 
     bridge = _fresh_telegram_bridge()
     first_id = 10
@@ -922,7 +922,7 @@ async def t_telegram_seen_set_bounded(ctx: TestContext) -> None:
 @test("bridges", "telegram stop force-cancels leaked polling task after updater.stop timeout")
 async def t_telegram_stop_force_cancels_leaked_poller(ctx: TestContext) -> None:
     import asyncio
-    import openagent.bridges.telegram as tg
+    import src.bridges.telegram as tg
 
     bridge = _fresh_telegram_bridge()
 
@@ -1027,7 +1027,7 @@ async def t_telegram_gateway_lost_stops_app(ctx: TestContext) -> None:
 # WhatsApp users in "Using bash…" pings.
 
 def _fresh_whatsapp_bridge():
-    from openagent.bridges.whatsapp import WhatsAppBridge
+    from src.bridges.whatsapp import WhatsAppBridge
 
     bridge = WhatsAppBridge.__new__(WhatsAppBridge)
     bridge.name = "whatsapp"
@@ -1069,7 +1069,7 @@ async def t_whatsapp_throttle_enforces_gap(ctx: TestContext) -> None:
     are dropped. Without this, a fast tool-loop would fire one bubble
     per tool call."""
     import asyncio
-    from openagent.bridges.whatsapp import WA_STATUS_THROTTLE_SECS
+    from src.bridges.whatsapp import WA_STATUS_THROTTLE_SECS
 
     bridge, sent = _fresh_whatsapp_bridge()
     chat = "1234@c.us"
@@ -1188,7 +1188,7 @@ async def t_on_status_no_leak_across_turns(ctx: TestContext) -> None:
         received_n1.append(line)
 
     # Hand-craft turn N (just finished, slot still holds finalised C1).
-    from openagent.stream.collector import StreamCollector
+    from src.stream.collector import StreamCollector
     c1 = StreamCollector()
     c1.done.set()
     fb._real._stream_pending[sid] = c1
@@ -1233,7 +1233,7 @@ async def t_dispatch_turn_voice_mirror_synth(ctx: TestContext) -> None:
     mode UX on bridges; if it regresses, voice replies become text-only
     and the user notices instantly."""
     import asyncio
-    from openagent.bridges.base import BaseBridge
+    from src.bridges.base import BaseBridge
 
     sent_attachments: list = []
     sent_chunks: list[tuple[object, str]] = []
@@ -1284,7 +1284,7 @@ async def t_dispatch_turn_voice_synth_failure_posts_text(ctx: TestContext) -> No
     """If TTS synthesis raises, the user must STILL see the text
     reply. ``maybe_prepend_voice_reply`` swallows the error and returns
     the original text; this test pins that contract end-to-end."""
-    from openagent.bridges.base import BaseBridge
+    from src.bridges.base import BaseBridge
 
     sent_chunks: list[str] = []
     sent_attachments: list = []
@@ -1331,8 +1331,8 @@ async def t_telegram_send_attachment_dispatch(ctx: TestContext) -> None:
     bubble). One regression here and every voice reply sounds broken."""
     import tempfile
     from pathlib import Path
-    from openagent.bridges.telegram import TelegramBridge
-    from openagent.channels.base import Attachment
+    from src.bridges.telegram import TelegramBridge
+    from src.channels.base import Attachment
 
     bridge = TelegramBridge.__new__(TelegramBridge)
     bridge.name = "telegram"
@@ -1378,8 +1378,8 @@ async def t_telegram_send_attachment_missing_file(ctx: TestContext) -> None:
     """A `[VOICE:/tmp/xxx.mp3]` marker can outlive the file (cleanup
     race or full disk). The send_attachment path must skip silently
     instead of raising and breaking the whole reply pipeline."""
-    from openagent.bridges.telegram import TelegramBridge
-    from openagent.channels.base import Attachment
+    from src.bridges.telegram import TelegramBridge
+    from src.channels.base import Attachment
 
     bridge = TelegramBridge.__new__(TelegramBridge)
     bridge.name = "telegram"
@@ -1402,7 +1402,7 @@ async def t_telegram_send_text_chunk_html_fallback(ctx: TestContext) -> None:
     markdown edge case) returns a 400 from Telegram. The bridge must
     retry as plain text so the user sees the message instead of a
     silent drop."""
-    from openagent.bridges.telegram import TelegramBridge
+    from src.bridges.telegram import TelegramBridge
 
     bridge = TelegramBridge.__new__(TelegramBridge)
     bridge.name = "telegram"
@@ -1428,7 +1428,7 @@ async def t_telegram_send_text_chunk_html_fallback(ctx: TestContext) -> None:
 async def t_dispatch_turn_post_status_raises(ctx: TestContext) -> None:
     """A status-bubble post failure (rate-limit, transient API error)
     must not abort the turn — the response is the load-bearing part."""
-    from openagent.bridges.base import BaseBridge
+    from src.bridges.base import BaseBridge
 
     sent_chunks: list[str] = []
 
@@ -1464,8 +1464,8 @@ async def t_dispatch_turn_post_status_raises(ctx: TestContext) -> None:
 async def t_dispatch_turn_attachment_raise(ctx: TestContext) -> None:
     """If one attachment send fails, the text reply must still land —
     otherwise a flaky CDN takes the whole conversation down."""
-    from openagent.bridges.base import BaseBridge
-    from openagent.channels.base import Attachment
+    from src.bridges.base import BaseBridge
+    from src.channels.base import Attachment
 
     sent_chunks: list[str] = []
 
@@ -1499,7 +1499,7 @@ async def t_dispatch_turn_chunk_raise_continues(ctx: TestContext) -> None:
     """A multi-chunk reply where chunk 1 errors must still try
     chunk 2. Otherwise a single bad message kills the rest of the
     response and the user thinks the turn died."""
-    from openagent.bridges.base import BaseBridge
+    from src.bridges.base import BaseBridge
 
     attempted: list[str] = []
     succeeded: list[str] = []

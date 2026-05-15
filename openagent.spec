@@ -6,7 +6,7 @@ Usage:
     ./scripts/build-executable.sh    # installs deps + builds Node MCPs + runs pyinstaller
 
 To run pyinstaller directly (skipping the helper) make sure the bundled Node
-MCPs in openagent/mcp/servers/ have been built first (npm install + npm run
+MCPs in src/mcp/servers/ have been built first (npm install + npm run
 build for each), then:
     pyinstaller openagent.spec --clean --noconfirm
 
@@ -35,13 +35,13 @@ from PyInstaller.utils.hooks import (
 # package is missing, which in the past produced a shipped binary that
 # crashed at first ``serve`` invocation with ``ModuleNotFoundError: jinja2``.
 # Importing here turns that silent failure into a loud build-time error.
-import jinja2  # noqa: F401 — openagent.workflow.templating
+import jinja2  # noqa: F401 — src.workflow.templating
 import markupsafe  # noqa: F401 — jinja2's required runtime dep
 import groq  # noqa: F401 — agno.models.groq (optional provider SDK, must ship in bundle)
 import litellm  # noqa: F401 — TTS / STT dispatch (channels/tts.py, channels/voice.py)
 import faster_whisper  # noqa: F401 — local-first STT fallback
 import psutil  # noqa: F401 — cross-platform host telemetry (api/system.py)
-import iroh  # noqa: F401 — P2P transport (openagent.network.iroh_node) — Rust FFI dylib must be bundled
+import iroh  # noqa: F401 — P2P transport (src.network.iroh_node) — Rust FFI dylib must be bundled
 import pydantic  # noqa: F401 — agno calls importlib.metadata.version("pydantic") at runtime
 import email_validator  # noqa: F401 — pydantic.EmailStr validation calls version("email-validator")
 
@@ -78,7 +78,7 @@ hiddenimports = [
     *collect_submodules("anyio"),
     # httpx (used by litellm)
     *collect_submodules("httpx"),
-    # jinja2 (openagent.workflow.templating — SandboxedEnvironment for {{expr}}).
+    # jinja2 (src.workflow.templating — SandboxedEnvironment for {{expr}}).
     # Explicit names are belt-and-suspenders next to ``collect_submodules``:
     # if the build env is ever missing jinja2 despite the top-of-file guard
     # (e.g. a future build script that bypasses ``pip install -e .[all]``),
@@ -109,7 +109,7 @@ hiddenimports = [
     *collect_submodules("jinja2"),
     *collect_submodules("markupsafe"),
     # openagent submodules
-    *collect_submodules("openagent"),
+    *collect_submodules("src"),
     # agno: loaded dynamically via importlib.import_module in agno_provider._load_agno_model_class;
     # PyInstaller can't trace dynamic imports so we collect all submodules explicitly.
     *collect_submodules("agno"),
@@ -165,7 +165,7 @@ binaries = collect_dynamic_libs("iroh")
 # Bundle the entire mcp/servers/ directory (built-in MCP servers).
 # Each Node MCP needs its dist/ and node_modules/ directories.
 
-mcps_dir = Path("openagent/mcp/servers")
+mcps_dir = Path("src/mcp/servers")
 
 datas = []
 if mcps_dir.exists():
@@ -186,12 +186,12 @@ if mcps_dir.exists():
     # permission grants survive across updates. See
     # ``scripts/sign-notarize-macos.sh`` (bundles the sidecar into
     # the .pkg alongside the onefile) and
-    # ``openagent/mcp/builtins.py::_resolve_native_binary`` (looks
+    # ``src/mcp/builtins.py::_resolve_native_binary`` (looks
     # for the sidecar next to ``sys.executable`` first).
     for child in mcps_dir.iterdir():
         if child.name == "computer-control":
             continue
-        datas.append((str(child), f"openagent/mcp/servers/{child.name}"))
+        datas.append((str(child), f"src/mcp/servers/{child.name}"))
 
 # litellm needs its JSON data files (model prices, cost maps, etc.)
 datas += collect_data_files("litellm", includes=["**/*.json", "**/*.yaml", "**/*.yml"])
@@ -221,7 +221,7 @@ datas += copy_metadata("email_validator")
 # ── Analysis ──
 
 a = Analysis(
-    ["openagent/cli.py"],
+    ["src/cli.py"],
     pathex=["."],
     binaries=binaries,
     datas=datas,

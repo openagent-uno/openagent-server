@@ -93,7 +93,7 @@ def _make_router_for_stream(
     DB — the caller patches ``_routing_decision`` to whichever runtime_id
     they want this turn to land on.
     """
-    from openagent.models.smart_router import SmartRouter
+    from src.models.smart_router import SmartRouter
 
     router = SmartRouter(providers_config=[])
     if registry is not None:
@@ -107,7 +107,7 @@ def _make_router_for_stream(
 
 def _stub_routing(router, runtime_id: str, *, bound_framework: str | None = None):
     """Force ``_routing_decision`` to return a specific runtime_id."""
-    from openagent.models.smart_router import RoutingDecision
+    from src.models.smart_router import RoutingDecision
 
     async def _fake(messages, session_id):
         return RoutingDecision(

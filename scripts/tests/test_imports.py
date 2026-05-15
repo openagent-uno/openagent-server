@@ -16,23 +16,23 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 @test("imports", "all openagent modules import")
 async def t_imports(ctx: TestContext) -> None:
-    import openagent
-    import openagent.cli  # noqa: F401
-    import openagent.core.agent  # noqa: F401
-    import openagent.core.server  # noqa: F401
-    import openagent.gateway.server  # noqa: F401
-    import openagent.gateway.sessions  # noqa: F401
-    import openagent.mcp  # noqa: F401
-    import openagent.mcp.pool  # noqa: F401
-    import openagent.mcp.builtins  # noqa: F401
-    import openagent.mcp.servers.scheduler.server  # noqa: F401
-    import openagent.models.agno_provider  # noqa: F401
-    import openagent.models.claude_cli  # noqa: F401
-    import openagent.models.smart_router  # noqa: F401
-    import openagent.models.runtime  # noqa: F401
-    import openagent.models.catalog  # noqa: F401
-    import openagent.models.budget  # noqa: F401
-    import openagent.memory.db  # noqa: F401
+    import src
+    import src.cli  # noqa: F401
+    import src.core.agent  # noqa: F401
+    import src.core.server  # noqa: F401
+    import src.gateway.server  # noqa: F401
+    import src.gateway.sessions  # noqa: F401
+    import src.mcp  # noqa: F401
+    import src.mcp.pool  # noqa: F401
+    import src.mcp.builtins  # noqa: F401
+    import src.mcp.servers.scheduler.server  # noqa: F401
+    import src.models.agno_provider  # noqa: F401
+    import src.models.claude_cli  # noqa: F401
+    import src.models.smart_router  # noqa: F401
+    import src.models.runtime  # noqa: F401
+    import src.models.catalog  # noqa: F401
+    import src.models.budget  # noqa: F401
+    import src.memory.db  # noqa: F401
     assert openagent.__version__
 
 
@@ -84,7 +84,7 @@ async def t_frozen_preload_covers_lazy_agno(ctx: TestContext) -> None:
     (and the surrounding hot paths) lazy-import so the preloader keeps
     them resident in ``sys.modules`` and the runtime never has to crack
     the PYZ archive after startup."""
-    import openagent.core.agent as agent_mod
+    import src.core.agent as agent_mod
 
     required = {
         "agno.agent",
@@ -108,7 +108,7 @@ async def t_frozen_preload_covers_lazy_agno(ctx: TestContext) -> None:
 
 @test("imports", "frozen runtime preloader warms late imports without aborting startup")
 async def t_frozen_runtime_preload(ctx: TestContext) -> None:
-    import openagent.core.agent as agent_mod
+    import src.core.agent as agent_mod
 
     imported: list[str] = []
 

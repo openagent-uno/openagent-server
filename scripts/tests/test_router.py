@@ -17,8 +17,8 @@ from ._framework import TestContext, TestSkip, have_openai_key, test
 async def t_router_usage_log(ctx: TestContext) -> None:
     if not have_openai_key(ctx.config):
         raise TestSkip("no OpenAI API key")
-    from openagent.memory.db import MemoryDB
-    from openagent.models.runtime import create_model_from_config, wire_model_runtime
+    from src.memory.db import MemoryDB
+    from src.models.runtime import create_model_from_config, wire_model_runtime
 
     pool = ctx.extras["pool"]
     db = MemoryDB(str(ctx.db_path))
@@ -45,8 +45,8 @@ async def t_router_usage_log(ctx: TestContext) -> None:
 async def t_router_classifies(ctx: TestContext) -> None:
     if not have_openai_key(ctx.config):
         raise TestSkip("no OpenAI API key")
-    from openagent.models.runtime import create_model_from_config, wire_model_runtime
-    from openagent.memory.db import MemoryDB
+    from src.models.runtime import create_model_from_config, wire_model_runtime
+    from src.memory.db import MemoryDB
 
     pool = ctx.extras["pool"]
     db = MemoryDB(str(ctx.db_path))
