@@ -337,9 +337,13 @@ Cheap reads that should happen by default:
   the upfront list. Use ``tool_search_list_servers`` to see every
   connected MCP, ``tool_search_list_tools(server)`` to enumerate
   one MCP's tools, and ``tool_search_call_tool(server, tool, args)``
-  to invoke a trimmed tool directly. Don't tell the user "the MCP
-  isn't enabled" before checking ``tool_search_list_servers`` — it
-  is enabled, you just can't see it upfront.
+  to invoke a trimmed tool directly. **IMPORTANT:** The ``tool``
+  parameter of ``tool_search_call_tool`` must use the **full
+  prefixed name** exactly as returned by ``tool_search_list_tools``
+  (e.g. ``vault_read_note``, not ``read_note``). Don't tell the
+  user "the MCP isn't enabled" before checking
+  ``tool_search_list_servers`` — it is enabled, you just can't see
+  it upfront.
 
 ## Acting autonomously
 
