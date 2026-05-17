@@ -154,13 +154,13 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
     },
     "shell": {
         "in_process": True,
-        "adapter_module": "openagent.mcp.servers.shell.adapters",
+        "adapter_module": "src.mcp.servers.shell.adapters",
         "sdk_server_factory": "build_sdk_server",
         "agno_toolkit_factory": "build_agno_toolkit",
     },
     "tool-search": {
         "in_process": True,
-        "adapter_module": "openagent.mcp.servers.tool_search.adapters",
+        "adapter_module": "src.mcp.servers.tool_search.adapters",
         "sdk_server_factory": "build_sdk_server",
         "agno_toolkit_factory": "build_agno_toolkit",
     },
@@ -190,22 +190,22 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
     },
     "scheduler": {
         "dir": "scheduler",
-        "command": ["python", "-m", "openagent.mcp.servers.scheduler.server"],
+        "command": ["python", "-m", "src.mcp.servers.scheduler.server"],
         "python": True,
     },
     "mcp-manager": {
         "dir": "mcp_manager",
-        "command": ["python", "-m", "openagent.mcp.servers.mcp_manager.server"],
+        "command": ["python", "-m", "src.mcp.servers.mcp_manager.server"],
         "python": True,
     },
     "model-manager": {
         "dir": "model_manager",
-        "command": ["python", "-m", "openagent.mcp.servers.model_manager.server"],
+        "command": ["python", "-m", "src.mcp.servers.model_manager.server"],
         "python": True,
     },
     "workflow-manager": {
         "dir": "workflow_manager",
-        "command": ["python", "-m", "openagent.mcp.servers.workflow_manager.server"],
+        "command": ["python", "-m", "src.mcp.servers.workflow_manager.server"],
         "python": True,
     },
 }
