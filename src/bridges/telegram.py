@@ -84,15 +84,32 @@ class _TypingAnimator:
     exits on its next wake-up (next refresh tick or immediately if the
     sleep is interrupted), the indicator vanishes naturally as soon as
     the next outbound message lands.
+
+    Optional ``placeholder_message`` slot holds the editable reply
+    bubble used by the streaming path (``stream_text``). When set, the
+    bridge edits this message in place as the model types instead of
+    waiting for the final response.
     """
 
     _TYPING_REFRESH_S = 4.0
+    # Telegram caps message edits at roughly 1/sec per chat; pushing
+    # past that yields 429s and the SDK retries with backoff. We stay
+    # below the cap with a small safety margin so a burst of deltas
+    # doesn't accidentally throttle the next user-facing edit either.
+    _STREAM_EDIT_MIN_INTERVAL_S = 1.1
 
     def __init__(self, bot, chat_id: int) -> None:
         self._bot = bot
         self._chat_id = chat_id
         self._stop = asyncio.Event()
         self._task: asyncio.Task | None = None
+        # Streaming state — populated only when ``stream_text`` is
+        # invoked; left None on non-streaming turns so the typing-dot
+        # behaviour stays unchanged.
+        self.placeholder_message: Any = None
+        self._last_edit_at: float = 0.0
+        self._pending_text: str | None = None
+        self._edit_lock = asyncio.Lock()
 
     async def start(self) -> None:
         async def _loop() -> None:
@@ -110,6 +127,40 @@ class _TypingAnimator:
                     pass
         self._task = asyncio.create_task(_loop())
 
+    async def stream_chunk(self, full_text: str) -> None:
+        """Edit the placeholder message with ``full_text``, rate-limited
+        to one edit per ``_STREAM_EDIT_MIN_INTERVAL_S``. Lazily posts
+        the placeholder on the first call so non-streaming turns never
+        leave an empty bubble.
+        """
+        import time as _time
+        if not full_text:
+            return
+        try:
+            if self.placeholder_message is None:
+                # Lazy post — first delta creates the bubble.
+                self.placeholder_message = await self._bot.send_message(
+                    chat_id=self._chat_id, text=full_text[:4000]
+                )
+                self._last_edit_at = _time.monotonic()
+                return
+            now = _time.monotonic()
+            if now - self._last_edit_at < self._STREAM_EDIT_MIN_INTERVAL_S:
+                # Buffer the latest text so the next edit catches up.
+                self._pending_text = full_text
+                return
+            async with self._edit_lock:
+                try:
+                    await self.placeholder_message.edit_text(full_text[:4000])
+                    self._last_edit_at = _time.monotonic()
+                    self._pending_text = None
+                except Exception:
+                    # Editing the same content (Telegram returns
+                    # "message is not modified") raises here; swallow.
+                    pass
+        except Exception:
+            pass
+
     async def stop(self) -> None:
         self._stop.set()
         if self._task is not None:
@@ -117,6 +168,17 @@ class _TypingAnimator:
                 await asyncio.wait_for(self._task, timeout=1.0)
             except (asyncio.TimeoutError, Exception):
                 pass
+        # Delete the placeholder if streaming was used — the final
+        # reply lands as a fresh chunked message via send_text_chunk
+        # and we don't want the user staring at a half-written
+        # duplicate. The tiny window between delete and send is
+        # unavoidable without bigger surgery in BaseBridge.dispatch_turn.
+        if self.placeholder_message is not None:
+            try:
+                await self.placeholder_message.delete()
+            except Exception:
+                pass
+            self.placeholder_message = None
 
 
 class TelegramBridge(BaseBridge):
@@ -678,6 +740,17 @@ class TelegramBridge(BaseBridge):
             return
         try:
             await status_msg.stop()
+        except Exception:
+            pass
+
+    async def stream_text(self, status_msg, text: str) -> None:
+        # Forward to the animator's streaming path. The animator
+        # itself manages the placeholder lifecycle + rate limiting so
+        # the bridge can stay stateless.
+        if status_msg is None:
+            return
+        try:
+            await status_msg.stream_chunk(text)
         except Exception:
             pass
 

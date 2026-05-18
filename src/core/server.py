@@ -250,6 +250,8 @@ def _build_agent(config: dict) -> Agent:
         ("skill_archive_days",     "OPENAGENT_CURATOR_SKILL_ARCHIVE_DAYS"),
         ("profile_archive_days",   "OPENAGENT_CURATOR_PROFILE_ARCHIVE_DAYS"),
         ("session_retention_days", "OPENAGENT_CURATOR_SESSION_RETENTION_DAYS"),
+        ("backup_interval_hours",  "OPENAGENT_CURATOR_BACKUP_INTERVAL_HOURS"),
+        ("backup_keep",            "OPENAGENT_CURATOR_BACKUP_KEEP"),
     ):
         if yaml_key in _cur_cfg:
             try:

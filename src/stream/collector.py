@@ -58,6 +58,16 @@ class StreamCollector(BatchedReply):
     # the collector — a brand-new collector taking over the slot can't
     # have its callback wiped by the previous owner's cleanup.
     on_status: Callable[[str], Awaitable[None]] | None = None
+    # Per-token delta callback for bridges that surface streaming
+    # responses (Telegram edits the placeholder message as the model
+    # types). Receives the *accumulated* text so far so bridges don't
+    # need to maintain their own buffer — the same string that would
+    # arrive as ``OutTextFinal`` if the turn ended right now.
+    on_delta: Callable[[str], Awaitable[None]] | None = None
+    # Rolling text buffer used by the delta path; ``OutTextFinal``
+    # overwrites it with the canonical reply, so this is only meaningful
+    # while the turn is still in flight.
+    _delta_buffer: str = ""
 
     def to_legacy_reply(self) -> dict:
         """Render the answer-response dict shape bridge / CLI callers expect."""
@@ -88,9 +98,22 @@ def fold_outbound_event(reply: BatchedReply, evt: Event) -> bool:
     uses internally.
     """
     if isinstance(evt, OutTextDelta):
-        # Bridges + CLI run in answer-response mode and don't need
-        # progressive deltas; ``OutTextFinal`` carries the canonical
-        # text. Drop silently.
+        # Bridges that opted into streaming (``on_delta`` set) get the
+        # running text so they can edit a placeholder message in-place.
+        # Non-streaming bridges still see the canonical reply land via
+        # ``OutTextFinal`` below.
+        if isinstance(reply, StreamCollector):
+            reply._delta_buffer = (reply._delta_buffer or "") + (evt.text or "")
+            cb = reply.on_delta
+            if cb is not None:
+                # Fire the callback as a background task so a slow
+                # bridge edit (e.g. Telegram rate-limit retry) never
+                # blocks the wire-event listener loop.
+                try:
+                    asyncio.create_task(cb(reply._delta_buffer))
+                except RuntimeError:
+                    # No running loop (test environment); skip silently.
+                    pass
         return False
     if isinstance(evt, OutTextFinal):
         reply.text = evt.text

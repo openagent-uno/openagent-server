@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from pathlib import Path
 from typing import Any
 
 from src.core.logging import elog
@@ -42,6 +43,12 @@ _DEFAULTS = {
     "skill_archive_days": 90,
     "profile_archive_days": 90,
     "session_retention_days": 90,
+    # Backup knobs — separate cadence (daily, by default) from the
+    # prune interval. ``backup_keep`` is "how many snapshots to retain
+    # before deleting the oldest"; the resulting on-disk floor is
+    # roughly ``backup_keep`` × the db size.
+    "backup_interval_hours": 24,
+    "backup_keep": 30,
 }
 
 
@@ -154,6 +161,75 @@ async def run_once(db: Any) -> dict[str, int]:
     return counts
 
 
+async def _maybe_backup(db: Any) -> None:
+    """Snapshot the SQLite DB to ``<agent_dir>/backups/`` when the last
+    backup is older than ``backup_interval_hours``. Uses
+    ``VACUUM INTO`` so the snapshot is atomic + WAL-consistent even
+    while writes are in flight. Trim older backups beyond ``backup_keep``.
+
+    No-op when the curator feature is off (the whole loop won't be
+    running) or when the DB exposes no path we can copy.
+    """
+    interval_h = _int_env(
+        "OPENAGENT_CURATOR_BACKUP_INTERVAL_HOURS",
+        _DEFAULTS["backup_interval_hours"],
+    )
+    keep = _int_env("OPENAGENT_CURATOR_BACKUP_KEEP", _DEFAULTS["backup_keep"])
+    db_path_str = getattr(db, "db_path", None) or os.environ.get("OPENAGENT_DB_PATH")
+    if not db_path_str:
+        return
+    db_path = Path(db_path_str)
+    backups_dir = db_path.parent / "backups"
+    backups_dir.mkdir(exist_ok=True)
+
+    # Find latest existing backup, decide whether we're due.
+    existing = sorted(backups_dir.glob("openagent-*.db"))
+    now = time.time()
+    if existing:
+        latest = existing[-1]
+        try:
+            age_s = now - latest.stat().st_mtime
+        except OSError:
+            age_s = float("inf")
+        if age_s < interval_h * 3600:
+            return  # last snapshot still fresh
+
+    snapshot_path = backups_dir / time.strftime("openagent-%Y%m%d-%H%M.db")
+    conn = getattr(db, "_conn", None)
+    if conn is None:
+        return
+    try:
+        # SQLite VACUUM INTO is the right tool: atomic, WAL-aware, no
+        # checkpoint needed. ``?`` parametrisation doesn't work for
+        # filenames in PRAGMA / VACUUM, so build the literal but
+        # escape single quotes defensively even though our path is
+        # under the agent_dir we own.
+        target_sql = str(snapshot_path).replace("'", "''")
+        await conn.execute(f"VACUUM INTO '{target_sql}'")
+    except Exception as e:
+        elog("curator.backup_error", error=str(e)[:200], target=str(snapshot_path))
+        return
+
+    # Retention: drop everything past the ``keep`` newest.
+    existing = sorted(backups_dir.glob("openagent-*.db"))
+    pruned = 0
+    if len(existing) > keep:
+        for p in existing[: len(existing) - keep]:
+            try:
+                p.unlink()
+                pruned += 1
+            except OSError:
+                pass
+
+    elog(
+        "curator.backup",
+        snapshot=str(snapshot_path),
+        size_bytes=snapshot_path.stat().st_size if snapshot_path.exists() else 0,
+        retained=min(len(existing), keep),
+        pruned=pruned,
+    )
+
+
 async def _curator_loop(db: Any) -> None:
     """Long-lived task: run_once → sleep → repeat. Stops on cancellation
     (server shutdown). Exceptions inside ``run_once`` are caught so a
@@ -164,6 +240,10 @@ async def _curator_loop(db: Any) -> None:
             await run_once(db)
         except Exception as e:
             elog("curator.loop_error", error=str(e)[:200])
+        try:
+            await _maybe_backup(db)
+        except Exception as e:
+            elog("curator.backup_loop_error", error=str(e)[:200])
         interval_h = _int_env("OPENAGENT_CURATOR_INTERVAL_HOURS", _DEFAULTS["interval_hours"])
         try:
             await asyncio.sleep(max(60, interval_h * 3600))

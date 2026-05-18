@@ -446,6 +446,7 @@ class BaseBridge:
         *,
         target: Any = None,
         on_status: Callable[[str], Awaitable[None]] | None = None,
+        on_delta: Callable[[str], Awaitable[None]] | None = None,
         input_was_voice: bool = False,
         source: str = "user_typed",
     ) -> dict:
@@ -494,6 +495,7 @@ class BaseBridge:
         if is_owner:
             collector = StreamCollector()
             collector.on_status = on_status
+            collector.on_delta = on_delta
             self._stream_pending[session_id] = collector
         else:
             collector = existing
@@ -569,6 +571,15 @@ class BaseBridge:
         line just stays in the chat)."""
         return None
 
+    async def stream_text(self, handle, text: str) -> None:
+        """Surface a streaming chunk of the in-flight reply. Default
+        is a no-op: bridges that can't edit (WhatsApp) just wait for
+        the final reply. Bridges with edit APIs (Telegram, Discord)
+        override to update the status message with the accumulated
+        text. ``text`` is always the *full accumulated* response so
+        far — the bridge doesn't have to maintain its own buffer."""
+        return None
+
     async def send_text_chunk(self, target, chunk: str) -> None:
         """Send one already-split chunk of response text. Subclasses
         own platform formatting (HTML render + fallback for Telegram,
@@ -607,6 +618,14 @@ class BaseBridge:
                 return
             try:
                 await self.update_status(status_handle, format_tool_status(raw))
+            except Exception:
+                pass
+
+        async def on_delta(running_text: str) -> None:
+            if status_handle is None or not running_text:
+                return
+            try:
+                await self.stream_text(status_handle, running_text)
             except Exception:
                 pass
 
@@ -658,6 +677,7 @@ class BaseBridge:
                 outbound_text, session_id,
                 target=target,
                 on_status=on_status,
+                on_delta=on_delta,
                 # Voice notes bypass the typed-burst coalescence window
                 # for instant barge-in (StreamSession STT-bypass path).
                 source="stt" if voice_detected else "user_typed",

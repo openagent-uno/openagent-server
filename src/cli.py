@@ -463,5 +463,204 @@ def mcp_server_cmd(name: str):
 main.add_command(network_group)
 
 
+@main.command()
+@click.option("--days", "-d", default=7, show_default=True, help="Look back this many days.")
+@click.option("--top-sessions", default=5, show_default=True, help="Show top N sessions by turn count.")
+@click.pass_context
+def insights(ctx, days: int, top_sessions: int) -> None:
+    """Show usage summary (tokens, cost, top sessions) for the last N days.
+
+    Reads from ``usage_log`` in the agent's SQLite DB. ``cost`` is the
+    value the runtime wrote at turn-end — accurate for paid providers
+    (Anthropic API, OpenAI) and 0.0 for subscription / free-tier
+    routes (claude-cli, Groq) where there is no per-token charge.
+    """
+    import sqlite3
+    import time
+    from rich.table import Table
+
+    agent_dir = paths.get_agent_dir() or Path(".").resolve()
+    db_file = agent_dir / "openagent.db"
+    if not db_file.exists():
+        console.print(f"[red]No DB at {db_file}[/red]")
+        raise SystemExit(1)
+
+    cutoff = time.time() - days * 86400.0
+
+    conn = sqlite3.connect(str(db_file))
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.execute(
+            "SELECT model, "
+            "       SUM(input_tokens)  AS input_tokens, "
+            "       SUM(output_tokens) AS output_tokens, "
+            "       SUM(cost)          AS cost_usd, "
+            "       COUNT(*)           AS turns "
+            "FROM usage_log "
+            "WHERE timestamp >= ? "
+            "GROUP BY model "
+            "ORDER BY turns DESC",
+            (cutoff,),
+        )
+        per_model = cur.fetchall()
+        cur.close()
+
+        cur = conn.execute(
+            "SELECT session_id, COUNT(*) AS turns, "
+            "       SUM(input_tokens) AS input_tokens, "
+            "       SUM(cost) AS cost_usd "
+            "FROM usage_log "
+            "WHERE timestamp >= ? AND session_id IS NOT NULL "
+            "GROUP BY session_id "
+            "ORDER BY turns DESC "
+            "LIMIT ?",
+            (cutoff, int(top_sessions)),
+        )
+        per_session = cur.fetchall()
+        cur.close()
+
+        cur = conn.execute(
+            "SELECT COUNT(*) AS turns, "
+            "       SUM(input_tokens) AS input_tokens, "
+            "       SUM(output_tokens) AS output_tokens, "
+            "       SUM(cost) AS cost_usd "
+            "FROM usage_log WHERE timestamp >= ?",
+            (cutoff,),
+        )
+        totals = cur.fetchone()
+        cur.close()
+    finally:
+        conn.close()
+
+    # ``usage_log`` only records *metered* turns (Agno). Subscription
+    # turns through claude-cli are reported via the per-turn event
+    # ``claude_cli.usage_received`` and stored only in events.jsonl.
+    # Parse those too so the insights view reflects the whole picture
+    # — otherwise a Telegram bot routed entirely on a Pro/Max
+    # subscription would show an empty table even after thousands of
+    # turns.
+    import json as _json
+    events_file = agent_dir / "logs" / "events.jsonl"
+    per_model_subs: dict[str, dict[str, float | int]] = {}
+    per_session_subs: dict[str, dict[str, float | int]] = {}
+    subs_total = {"turns": 0, "input_tokens": 0, "output_tokens": 0}
+    if events_file.exists():
+        try:
+            with events_file.open("r", encoding="utf-8", errors="ignore") as fh:
+                for line in fh:
+                    if '"claude_cli.usage_received"' not in line:
+                        continue
+                    try:
+                        evt = _json.loads(line)
+                    except Exception:
+                        continue
+                    if (evt.get("ts") or 0) < cutoff:
+                        continue
+                    model = evt.get("model") or "?"
+                    inp = int(evt.get("input_tokens") or 0)
+                    out = int(evt.get("output_tokens") or 0)
+                    sid = evt.get("session_id")
+                    bucket = per_model_subs.setdefault(
+                        model, {"turns": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
+                    )
+                    bucket["turns"] += 1
+                    bucket["input_tokens"] += inp
+                    bucket["output_tokens"] += out
+                    subs_total["turns"] += 1
+                    subs_total["input_tokens"] += inp
+                    subs_total["output_tokens"] += out
+                    if sid:
+                        sb = per_session_subs.setdefault(
+                            sid, {"turns": 0, "input_tokens": 0, "cost_usd": 0.0}
+                        )
+                        sb["turns"] += 1
+                        sb["input_tokens"] += inp
+        except OSError:
+            pass
+
+    # Merge metered + subscription views for the printable summary.
+    merged_total_turns = (totals["turns"] if totals else 0) + subs_total["turns"]
+    merged_in = (totals["input_tokens"] or 0 if totals else 0) + subs_total["input_tokens"]
+    merged_out = (totals["output_tokens"] or 0 if totals else 0) + subs_total["output_tokens"]
+    merged_cost = (totals["cost_usd"] or 0.0 if totals else 0.0)
+
+    console.print(
+        f"[bold]Usage over last {days} day{'s' if days != 1 else ''}[/bold]"
+    )
+    if merged_total_turns == 0:
+        console.print("[dim]No turns in the window.[/dim]")
+        return
+
+    console.print(
+        f"Total: {merged_total_turns} turns, "
+        f"{merged_in:,} in / {merged_out:,} out tokens, "
+        f"${merged_cost:.4f} metered (subscription turns excluded from cost)."
+    )
+
+    # Fold subscription rows into the same per-model dict, then sort
+    # by turn count so the biggest user of compute shows first
+    # regardless of which billing lane it took.
+    model_map: dict[str, dict[str, Any]] = {}
+    for r in per_model:
+        model_map[r["model"] or "?"] = {
+            "turns": r["turns"],
+            "input_tokens": r["input_tokens"] or 0,
+            "output_tokens": r["output_tokens"] or 0,
+            "cost_usd": r["cost_usd"] or 0.0,
+        }
+    for model, b in per_model_subs.items():
+        slot = model_map.setdefault(
+            model, {"turns": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
+        )
+        slot["turns"] += b["turns"]
+        slot["input_tokens"] += b["input_tokens"]
+        slot["output_tokens"] += b["output_tokens"]
+
+    if model_map:
+        t = Table(title="By model", show_lines=False)
+        t.add_column("model")
+        t.add_column("turns", justify="right")
+        t.add_column("input tok", justify="right")
+        t.add_column("output tok", justify="right")
+        t.add_column("cost (USD)", justify="right")
+        for model, b in sorted(model_map.items(), key=lambda kv: -kv[1]["turns"]):
+            t.add_row(
+                model,
+                str(b["turns"]),
+                f"{b['input_tokens']:,}",
+                f"{b['output_tokens']:,}",
+                f"${b['cost_usd']:.4f}" if b["cost_usd"] > 0 else "[dim]subscription[/dim]",
+            )
+        console.print(t)
+
+    session_map: dict[str, dict[str, Any]] = {}
+    for r in per_session:
+        session_map[r["session_id"] or "?"] = {
+            "turns": r["turns"],
+            "input_tokens": r["input_tokens"] or 0,
+            "cost_usd": r["cost_usd"] or 0.0,
+        }
+    for sid, b in per_session_subs.items():
+        slot = session_map.setdefault(sid, {"turns": 0, "input_tokens": 0, "cost_usd": 0.0})
+        slot["turns"] += b["turns"]
+        slot["input_tokens"] += b["input_tokens"]
+
+    if session_map:
+        top = sorted(session_map.items(), key=lambda kv: -kv[1]["turns"])[:top_sessions]
+        t = Table(title=f"Top {len(top)} session{'s' if len(top) != 1 else ''}")
+        t.add_column("session_id")
+        t.add_column("turns", justify="right")
+        t.add_column("input tok", justify="right")
+        t.add_column("cost", justify="right")
+        for sid, b in top:
+            t.add_row(
+                sid,
+                str(b["turns"]),
+                f"{b['input_tokens']:,}",
+                f"${b['cost_usd']:.4f}" if b["cost_usd"] > 0 else "[dim]sub[/dim]",
+            )
+        console.print(t)
+
+
 if __name__ == "__main__":
     main()
