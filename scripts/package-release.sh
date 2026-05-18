@@ -26,8 +26,9 @@ set -euo pipefail
 APP="${1:?usage: $0 <app> <dist-dir>}"
 DIST="${2:?usage: $0 <app> <dist-dir>}"
 
-# Python module name mirrors the app name with hyphens → underscores.
-MODULE="${APP//-/_}"
+# The PyPI package is ``openagent-framework``; its metadata carries the
+# version.  Use importlib.metadata to avoid importing ``src`` (heavy deps).
+PKG_NAME="openagent-framework"
 
 # ── Detect OS and arch in release-filename convention ────────────────
 
@@ -48,7 +49,7 @@ esac
 # Resolve the version from the installed Python package. Runs in the
 # repo root (the CI job's default cwd) so PyInstaller's dist/ tree
 # can't shadow the import.
-VERSION="$(python -c "import ${MODULE}; print(${MODULE}.__version__)")"
+VERSION="$(python -c "from importlib.metadata import version; print(version('${PKG_NAME}'))")"
 
 # Unified SHA-256 helper — macOS has ``shasum``, Linux/Git Bash have
 # ``sha256sum``. ``shasum -a 256`` on macOS and ``sha256sum`` on Linux
