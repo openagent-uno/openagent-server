@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 import time
 import uuid
 from dataclasses import dataclass
@@ -306,7 +307,17 @@ class CoordinatorService:
         elif existing_device.status != "active":
             raise _CoordinatorRpcError("revoked", "device has been revoked")
         else:
-            await self._store.touch_device(device_pubkey)
+            # ``last_seen`` is purely informational; never let DB
+            # contention (e.g. an agent under heavy session writes) take
+            # down the login path. The cert can be minted from in-memory
+            # state alone — keep going on transient SQLite errors.
+            try:
+                await self._store.touch_device(device_pubkey)
+            except sqlite3.OperationalError as e:
+                logger.warning(
+                    "touch_device failed for handle=%s (login proceeds): %s",
+                    state.handle, e,
+                )
 
         cert = issue_cert(
             coordinator_key=self._cfg.coordinator_key,

@@ -198,6 +198,11 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_updater",
     "test_bridges",
     "test_bridge_session",
+    # Coordinator login_finish must NOT die on SQLite locks for the
+    # non-critical touch_device write (lyra-agent outage 2026-05-18 —
+    # heavy Agno session writes held the writer lock and broke every
+    # returning device's login).
+    "test_coordinator_login_resilience",
     # Discord on_message receive-path tests — pin the
     # allowed-users-bypass-mention gate behaviour and confirm silent
     # drops emit a diagnostic event.
