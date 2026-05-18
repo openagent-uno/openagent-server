@@ -27,11 +27,12 @@ from urllib.request import urlopen, Request
 
 logger = logging.getLogger(__name__)
 
-# GitHub repository for release lookups. The previous owner ``geroale``
-# still resolves via GitHub's rename redirect, but pinning to the
-# canonical owner removes a silent single point of failure: if the
-# redirect is ever revoked (rename loop, namespace conflict) every
-# deployed agent would silently stop receiving updates.
+# GitHub repository for release lookups. Releases are cut from
+# ``openagent-uno/openagent-server`` since the 2026-04 monorepo split;
+# the historical ``geroale/OpenAgent`` host still resolves via GitHub's
+# rename redirect but we never depend on that — a silent revocation
+# (rename loop, namespace conflict) would otherwise stop every deployed
+# agent from receiving updates with no surfaced error.
 GITHUB_REPO = "openagent-uno/openagent-server"
 GITHUB_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -178,7 +179,7 @@ def check_for_update() -> UpdateInfo | None:
     import json
     import src
 
-    current = getattr(openagent, "__version__", "0.0.0")
+    current = getattr(src, "__version__", "0.0.0")
 
     try:
         req = Request(GITHUB_API, headers={"Accept": "application/vnd.github+json"})
@@ -508,7 +509,7 @@ def perform_self_update_sync() -> tuple[str, str]:
     info = check_for_update()
     if info is None:
         import src
-        v = getattr(openagent, "__version__", "unknown")
+        v = getattr(src, "__version__", "unknown")
         return v, v
 
     logger.info(

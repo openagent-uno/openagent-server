@@ -303,4 +303,4 @@ YAML-driven via `openagent.yaml` ([src/core/config.py](src/core/config.py)) with
 | CLI Client | `openagent-cli` package |
 | Desktop App | Platform-specific binaries (macOS / Windows / Linux) |
 
-Tagged GitHub releases at [geroale/OpenAgent](https://github.com/geroale/OpenAgent/releases) are the shared download point for all three.
+Tagged GitHub releases at [openagent-uno/openagent-server](https://github.com/openagent-uno/openagent-server/releases) are the canonical download point for the agent server; CLI and Desktop builds live in their own sibling repos.

@@ -33,7 +33,7 @@ async def t_imports(ctx: TestContext) -> None:
     import src.models.catalog  # noqa: F401
     import src.models.budget  # noqa: F401
     import src.memory.db  # noqa: F401
-    assert openagent.__version__
+    assert src.__version__
 
 
 @test("imports", "groq SDK in deps + agno collected in spec (bundle completeness)")
@@ -118,7 +118,7 @@ async def t_frozen_runtime_preload(ctx: TestContext) -> None:
             raise RuntimeError("boom")
         return object()
 
-    with patch("openagent._frozen.is_frozen", return_value=True), \
+    with patch("src._frozen.is_frozen", return_value=True), \
          patch.object(agent_mod, "_FROZEN_RUNTIME_PRELOADS", (
              "test.module.ok",
              "test.module.boom",

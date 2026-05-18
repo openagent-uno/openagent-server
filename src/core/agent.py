@@ -20,11 +20,11 @@ from src.core.logging import elog
 logger = logging.getLogger(__name__)
 
 _FROZEN_RUNTIME_PRELOADS = (
-    "openagent.models.discovery",
-    "openagent.channels.voice",
-    "openagent.channels.tts_local",
+    "src.models.discovery",
+    "src.channels.voice",
+    "src.channels.tts_local",
     # Agno submodules that ``agno_provider`` (and ``mcp.pool``) import
-    # lazily on first use. Like the openagent modules above, they live
+    # lazily on first use. Like the src modules above, they live
     # in the PyInstaller archive; a sibling-service binary swap on
     # performa breaks the deferred zlib extraction and surfaces as
     # ``zlib.error: Error -3 ... incorrect header check`` raised out of

@@ -49,7 +49,7 @@ def get_agent_dir() -> Path | None:
 
 _DEFAULT_YAML = textwrap.dedent("""\
     # OpenAgent agent configuration
-    # See https://github.com/geroale/OpenAgent for full reference.
+    # See https://github.com/openagent-uno/openagent-server for full reference.
     #
     # Providers, models, MCPs, and scheduled tasks are managed exclusively
     # through the SQLite database (configure them via the desktop app or

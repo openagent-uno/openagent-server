@@ -17,7 +17,7 @@ from ._framework import TestContext, test
 async def t_updater_callable(ctx: TestContext) -> None:
     import src
     from src.updater import check_for_update, UpdateInfo, perform_self_update_sync
-    assert openagent.__version__ and isinstance(openagent.__version__, str)
+    assert src.__version__ and isinstance(src.__version__, str)
     assert callable(check_for_update)
     assert callable(perform_self_update_sync)
     fields = getattr(UpdateInfo, "_fields", None)
@@ -93,7 +93,7 @@ async def t_updater_prefers_server_asset(ctx: TestContext) -> None:
     }
 
     with (
-        patch.object(openagent, "__version__", "0.5.16"),
+        patch.object(src, "__version__", "0.5.16"),
         patch.object(updater, "_asset_suffix", return_value="linux-x64.tar.gz"),
         patch.object(updater, "_ssl_context", return_value=None),
         patch.object(
@@ -141,7 +141,7 @@ async def t_apply_update_bundle_swap(ctx: TestContext) -> None:
         new_bin.write_bytes(b"new binary")
         new_bin.chmod(0o755)
 
-        with patch("openagent._frozen.executable_path", return_value=cur_bin), \
+        with patch("src._frozen.executable_path", return_value=cur_bin), \
              patch("platform.system", return_value="Darwin"):
             updater.apply_update(new_bin)
 
@@ -301,7 +301,7 @@ async def t_updater_skips_prerelease(ctx: TestContext) -> None:
         ],
     }
     with (
-        patch.object(openagent, "__version__", "0.5.16"),
+        patch.object(src, "__version__", "0.5.16"),
         patch.object(updater, "_asset_suffix", return_value="linux-x64.tar.gz"),
         patch.object(updater, "_ssl_context", return_value=None),
         patch.object(
@@ -326,11 +326,11 @@ async def t_updater_logs_bad_tag(ctx: TestContext) -> None:
     captured: list[logging.LogRecord] = []
     handler = logging.Handler()
     handler.emit = captured.append  # type: ignore[assignment]
-    upd_logger = logging.getLogger("openagent.updater")
+    upd_logger = logging.getLogger("src.updater")
     upd_logger.addHandler(handler)
     try:
         with (
-            patch.object(openagent, "__version__", "0.5.16"),
+            patch.object(src, "__version__", "0.5.16"),
             patch.object(updater, "_ssl_context", return_value=None),
             patch.object(
                 updater, "urlopen",
@@ -373,7 +373,7 @@ async def t_apply_update_rollback_bare(ctx: TestContext) -> None:
             raise OSError("simulated disk full")
 
         with (
-            patch("openagent._frozen.executable_path", return_value=cur),
+            patch("src._frozen.executable_path", return_value=cur),
             patch("platform.system", return_value="Linux"),
             patch.object(updater.shutil, "copy2", side_effect=boom),
         ):
@@ -503,10 +503,10 @@ async def t_run_upgrade_sibling_swap(ctx: TestContext) -> None:
             return _FakeStat()
 
     with patch.object(server_mod, "_INITIAL_EXECUTABLE_MTIME", 1000.0), \
-         patch.object(server_mod.openagent._frozen, "is_frozen", return_value=True), \
-         patch.object(server_mod.openagent._frozen, "executable_path", return_value=_FakePath()), \
+         patch.object(server_mod.src._frozen, "is_frozen", return_value=True), \
+         patch.object(server_mod.src._frozen, "executable_path", return_value=_FakePath()), \
          patch.object(server_mod, "_read_disk_binary_version", return_value="0.12.99"), \
-         patch("openagent.updater.perform_self_update_sync", side_effect=fake_perform_self_update_sync):
+         patch("src.updater.perform_self_update_sync", side_effect=fake_perform_self_update_sync):
         old, new = server_mod.run_upgrade()
 
     # The short-circuit MUST have fired — perform_self_update_sync
@@ -539,9 +539,9 @@ async def t_run_upgrade_normal_path(ctx: TestContext) -> None:
             return _FakeStat()
 
     with patch.object(server_mod, "_INITIAL_EXECUTABLE_MTIME", 1000.0), \
-         patch.object(server_mod.openagent._frozen, "is_frozen", return_value=True), \
-         patch.object(server_mod.openagent._frozen, "executable_path", return_value=_FakePath()), \
-         patch("openagent.updater.perform_self_update_sync", side_effect=fake_perform_self_update_sync):
+         patch.object(server_mod.src._frozen, "is_frozen", return_value=True), \
+         patch.object(server_mod.src._frozen, "executable_path", return_value=_FakePath()), \
+         patch("src.updater.perform_self_update_sync", side_effect=fake_perform_self_update_sync):
         old, new = server_mod.run_upgrade()
 
     assert sentinel_called["perform_self_update_sync"] == 1, (

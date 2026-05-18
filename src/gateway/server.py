@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, TYPE_CHECKING
 
@@ -63,6 +64,12 @@ class Gateway:
         self.clients: dict[str, object] = {}  # client_id → WebSocketResponse
         self._runner = None
         self._site: IrohSite | None = None
+        # Optional plain-TCP listener, enabled when OPENAGENT_HTTP_PORT is set.
+        # Lives alongside the IrohSite on the same AppRunner so HTTP and Iroh
+        # clients hit the same handler chain. Kept as an attribute so ``stop``
+        # can tear it down explicitly (the runner cleanup doesn't track
+        # externally-attached sites).
+        self._tcp_site = None
 
         # Per (client_id, session_id) StreamSession + RealtimeChannel
         # pair. Created on demand from inbound stream frames; closed on
@@ -261,6 +268,56 @@ class Gateway:
             role=self._network_state.role,
         )
 
+        # Optional plain-TCP HTTP listener. Enabled by setting
+        # ``OPENAGENT_HTTP_PORT`` (numeric) and ``OPENAGENT_HTTP_TOKEN``
+        # (shared secret) in the environment — both are required, since
+        # serving HTTP without auth would expose the full gateway API.
+        # The token-bypass path in ``make_auth_middleware`` accepts
+        # requests carrying ``X-OpenAgent-Token: <token>`` as authenticated.
+        #
+        # Common deployment: an L7 reverse proxy (Virgil orchestrator,
+        # ngrok) terminates client TLS and injects the token. The Iroh
+        # transport keeps working for native P2P clients in parallel.
+        http_port_raw = os.environ.get("OPENAGENT_HTTP_PORT", "").strip()
+        http_token_raw = os.environ.get("OPENAGENT_HTTP_TOKEN", "").strip()
+        if http_port_raw and http_token_raw:
+            try:
+                http_port = int(http_port_raw)
+            except ValueError:
+                logger.error(
+                    "OPENAGENT_HTTP_PORT=%r is not an integer — HTTP listener skipped",
+                    http_port_raw,
+                )
+            else:
+                http_host = os.environ.get("OPENAGENT_HTTP_HOST", "0.0.0.0").strip() or "0.0.0.0"
+                try:
+                    tcp_site = web.TCPSite(runner, http_host, http_port)
+                    await tcp_site.start()
+                    self._tcp_site = tcp_site
+                    elog(
+                        "gateway.http_listener.start",
+                        host=http_host,
+                        port=http_port,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("HTTP listener failed to start on %s:%d", http_host, http_port)
+                    elog(
+                        "gateway.http_listener.error",
+                        level="error",
+                        host=http_host,
+                        port=http_port,
+                        error=str(exc),
+                    )
+        elif http_port_raw or http_token_raw:
+            # One half set without the other is almost always a misconfig
+            # (forgot to mount the Secret, typo'd the env var name). Log
+            # loudly so the operator catches it before traffic arrives.
+            logger.warning(
+                "OPENAGENT_HTTP_PORT and OPENAGENT_HTTP_TOKEN must both be set to enable the HTTP listener; got port=%r token=%r — listener disabled",
+                http_port_raw,
+                "<set>" if http_token_raw else "",
+            )
+
         # Spin up host telemetry. Broadcast loop primes psutil's CPU
         # baseline on first tick, then emits one ``system_snapshot``
         # every ``BROADCAST_INTERVAL_S`` seconds — but only when at
@@ -286,6 +343,12 @@ class Gateway:
             except Exception as e:  # noqa: BLE001
                 logger.debug("iroh site stop failed: %s", e)
             self._site = None
+        if self._tcp_site is not None:
+            try:
+                await self._tcp_site.stop()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("tcp site stop failed: %s", e)
+            self._tcp_site = None
         if self._runner:
             await self._runner.cleanup()
             self._runner = None

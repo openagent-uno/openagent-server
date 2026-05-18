@@ -18,6 +18,8 @@ here, the cert has already been verified at the HTTP layer.
 from __future__ import annotations
 
 import logging
+import os
+import secrets
 import time
 from typing import TYPE_CHECKING
 
@@ -71,7 +73,18 @@ def make_auth_middleware(state: NetworkAuthState):
     We use a closure rather than reading from request.app because the
     state is gateway-wide, not per-request — and re-reading from the
     DB on every request would be slow.
+
+    When ``OPENAGENT_HTTP_TOKEN`` is set in the environment, requests
+    carrying a matching ``X-OpenAgent-Token`` header skip device-cert
+    verification entirely. This is the fast-path used by deployments
+    that front the gateway with a trusted reverse proxy (Virgil's
+    orchestrator, ngrok tunnels for local dev, etc.) where the Iroh
+    transport isn't reachable. The token is captured at middleware
+    construction time, not per-request, so changing the env var
+    requires a gateway restart.
     """
+
+    http_token = os.environ.get("OPENAGENT_HTTP_TOKEN", "").strip()
 
     @web.middleware
     async def auth_middleware(request: web.Request, handler):
@@ -79,6 +92,32 @@ def make_auth_middleware(state: NetworkAuthState):
         # up earlier in the chain) handles the actual response shape.
         if request.method == "OPTIONS":
             return await handler(request)
+
+        # HTTP token bypass: trusted reverse proxies present a shared
+        # secret in lieu of a device cert. We synthesize a minimal
+        # request['device_cert'] so downstream handlers don't need to
+        # branch on transport. The synthesized ``device_pubkey`` is 32
+        # random bytes per connection — that's what the gateway uses as
+        # the ``client_id`` dict key (StreamSession lookup, last-write-
+        # wins kick on collision), and a stable key would cause
+        # legitimate reconnects to kick each other in a loop.
+        if http_token:
+            provided = request.headers.get("X-OpenAgent-Token", "").strip()
+            if provided and secrets.compare_digest(provided, http_token):
+                handle_hint = request.headers.get("X-OpenAgent-Handle", "") or "http-bridge"
+                synthetic = DeviceCert(
+                    handle=handle_hint[:64],
+                    device_pubkey=secrets.token_bytes(32),
+                    network_id=state.network_id,
+                    issued_at=time.time(),
+                    expires_at=time.time() + 365 * 24 * 3600,
+                    capabilities=[],
+                )
+                request["device_cert"] = synthetic
+                request["client_id"] = synthetic.device_pubkey_hex
+                request["user_handle"] = synthetic.handle
+                request["network_id"] = synthetic.network_id
+                return await handler(request)
 
         wire = current_device_cert_wire()
         if not wire:

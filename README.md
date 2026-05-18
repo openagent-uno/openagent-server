@@ -15,13 +15,13 @@
   ·
   <a href="https://openagent.uno/guide/">Documentation</a>
   ·
-  <a href="https://github.com/geroale/OpenAgent/releases">Releases</a>
+  <a href="https://github.com/openagent-uno/openagent-server/releases">Releases</a>
 </p>
 
 <p align="center">
   <a href="https://pypi.org/project/openagent-framework/"><img alt="PyPI" src="https://img.shields.io/pypi/v/openagent-framework?style=flat-square&color=ef4136" /></a>
-  <a href="https://github.com/geroale/OpenAgent/releases"><img alt="GitHub Release" src="https://img.shields.io/github/v/release/geroale/OpenAgent?style=flat-square&color=f26b3d" /></a>
-  <a href="https://github.com/geroale/OpenAgent/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/geroale/OpenAgent?style=flat-square&color=fbb040" /></a>
+  <a href="https://github.com/openagent-uno/openagent-server/releases"><img alt="GitHub Release" src="https://img.shields.io/github/v/release/openagent-uno/openagent-server?style=flat-square&color=f26b3d" /></a>
+  <a href="https://github.com/openagent-uno/openagent-server/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/openagent-uno/openagent-server?style=flat-square&color=fbb040" /></a>
 </p>
 
 ## Overview
@@ -49,7 +49,7 @@ Tagged GitHub releases are the shared download point for all three.
 
 ### Option A: Standalone Executable (recommended)
 
-Download the latest executable for your platform from [GitHub Releases](https://github.com/geroale/OpenAgent/releases) and run:
+Download the latest executable for your platform from [GitHub Releases](https://github.com/openagent-uno/openagent-server/releases) and run:
 
 ```bash
 ./openagent serve ./my-agent
@@ -81,7 +81,7 @@ On first run, `openagent serve` prints an invite ticket (`oa1...`). Paste this i
 
 ## Desktop App
 
-Download packaged desktop builds from [GitHub Releases](https://github.com/geroale/OpenAgent/releases) or from the [OpenAgent downloads page](https://openagent.uno/downloads). To build locally:
+Download packaged desktop builds from [GitHub Releases](https://github.com/openagent-uno/openagent-server/releases) or from the [OpenAgent downloads page](https://openagent.uno/downloads). To build locally:
 
 ```bash
 cd app

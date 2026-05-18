@@ -42,8 +42,8 @@ RESTART_EXIT_CODE = 75
 # download/apply our own update against a now-stale archive layout.
 try:
     _INITIAL_EXECUTABLE_MTIME: float | None = (
-        openagent._frozen.executable_path().stat().st_mtime
-        if openagent._frozen.is_frozen()
+        src._frozen.executable_path().stat().st_mtime
+        if src._frozen.is_frozen()
         else None
     )
 except Exception:  # noqa: BLE001 — best-effort, never block startup
@@ -1007,7 +1007,7 @@ def _binary_replaced_by_sibling() -> bool:
         return False
     try:
         return (
-            openagent._frozen.executable_path().stat().st_mtime
+            src._frozen.executable_path().stat().st_mtime
             != _INITIAL_EXECUTABLE_MTIME
         )
     except Exception:  # noqa: BLE001
@@ -1021,7 +1021,7 @@ def _read_disk_binary_version() -> str | None:
     caller falls back to a synthetic placeholder."""
     import subprocess
     try:
-        path = openagent._frozen.executable_path()
+        path = src._frozen.executable_path()
         out = subprocess.check_output(
             [str(path), "--version"], timeout=10, stderr=subprocess.DEVNULL
         )
@@ -1047,7 +1047,7 @@ def run_upgrade() -> tuple[str, str]:
             # binary. Skip download/apply so we don't crash trying to
             # read the freshly-rewritten PyInstaller archive.
             import src
-            current = getattr(openagent, "__version__", "unknown")
+            current = getattr(src, "__version__", "unknown")
             new = _read_disk_binary_version() or f"{current}+sibling-swap"
             elog(
                 "update.swap_already_applied",
