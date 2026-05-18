@@ -188,6 +188,15 @@ async def _upsert_skill(
             tags=tag_payload,
             chars=len(markdown),
         )
+        try:
+            from src.core.hooks import fire as _hook_fire
+            _hook_fire(
+                "skill_saved",
+                name=name[:60],
+                sig_hash=sig_hash,
+            )
+        except Exception:
+            pass
     except Exception as e:
         elog("skills.persist_error", error=str(e)[:200])
 

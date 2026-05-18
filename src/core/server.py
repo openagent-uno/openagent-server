@@ -164,6 +164,12 @@ def _build_agent(config: dict) -> Agent:
             os.environ["GREEN_API_ID"] = wa["green_api_id"]
         if wa.get("green_api_token"):
             os.environ["GREEN_API_TOKEN"] = wa["green_api_token"]
+    if "slack" in channels_config:
+        sl = channels_config["slack"]
+        if sl.get("bot_token"):
+            os.environ["SLACK_BOT_TOKEN"] = sl["bot_token"]
+        if sl.get("app_token"):
+            os.environ["SLACK_APP_TOKEN"] = sl["app_token"]
 
     # Safety toggles — read from ``safety.*`` and export as env vars so the
     # SDK options builder + the per-turn guardrail tracker can read them
@@ -222,6 +228,45 @@ def _build_agent(config: dict) -> Agent:
         os.environ["OPENAGENT_SKILLS_ENABLED"] = (
             "1" if bool(_sk_cfg["enabled"]) else "0"
         )
+    _cur_cfg = (memory_cfg.get("curator") or {})
+    if "enabled" in _cur_cfg:
+        os.environ["OPENAGENT_CURATOR_ENABLED"] = (
+            "1" if bool(_cur_cfg["enabled"]) else "0"
+        )
+
+    # Quick commands + hooks — keep them in a process-local registry
+    # (see ``src.core.hooks``) since bridges + the agent runtime share
+    # the same process. The registry is replaced (not merged) on every
+    # ``create_agent`` so a config reload doesn't leak removed entries.
+    try:
+        from src.core.hooks import set_quick_commands, set_hooks
+        set_quick_commands(config.get("quick_commands") or {})
+        set_hooks(config.get("hooks") or {})
+    except Exception as e:  # noqa: BLE001
+        logger.warning("hooks/quick_commands registry init failed: %s", e)
+    for yaml_key, env_key in (
+        ("interval_hours",         "OPENAGENT_CURATOR_INTERVAL_HOURS"),
+        ("skill_stale_days",       "OPENAGENT_CURATOR_SKILL_STALE_DAYS"),
+        ("skill_archive_days",     "OPENAGENT_CURATOR_SKILL_ARCHIVE_DAYS"),
+        ("profile_archive_days",   "OPENAGENT_CURATOR_PROFILE_ARCHIVE_DAYS"),
+        ("session_retention_days", "OPENAGENT_CURATOR_SESSION_RETENTION_DAYS"),
+    ):
+        if yaml_key in _cur_cfg:
+            try:
+                os.environ[env_key] = str(int(_cur_cfg[yaml_key]))
+            except (TypeError, ValueError):
+                pass
+    # Convenience: ``memory.sessions.retention_days`` is a more
+    # discoverable alias for the same knob — wire it through too so
+    # operators don't have to remember it lives under curator.
+    _sess_cfg = (memory_cfg.get("sessions") or {})
+    if "retention_days" in _sess_cfg:
+        try:
+            os.environ["OPENAGENT_CURATOR_SESSION_RETENTION_DAYS"] = str(
+                int(_sess_cfg["retention_days"])
+            )
+        except (TypeError, ValueError):
+            pass
     db_path = memory_cfg.get("db_path", str(default_db_path()))
     db = MemoryDB(db_path)
 
@@ -320,6 +365,23 @@ def _build_bridges(config: dict, per_bridge_url: dict[str, str]) -> list:
                 personality=personality,
             ))
 
+        elif name == "slack":
+            from src.bridges.slack import SlackBridge
+            bot_token = cfg.get("bot_token") or os.environ.get("SLACK_BOT_TOKEN")
+            app_token = cfg.get("app_token") or os.environ.get("SLACK_APP_TOKEN")
+            if not bot_token or not app_token:
+                logger.warning("Slack tokens not configured; skipping")
+                continue
+            out.append(SlackBridge(
+                bot_token=bot_token,
+                app_token=app_token,
+                allowed_users=cfg.get("allowed_users"),
+                listen_channels=cfg.get("listen_channels"),
+                gateway_url=gateway_url,
+                gateway_token=None,
+                personality=personality,
+            ))
+
         else:
             logger.warning(f"Unknown channel: {name}")
 
@@ -345,6 +407,10 @@ class AgentServer:
 
         self._bridge_tasks: list[asyncio.Task] = []
         self._bridges: list = []
+        # Curator task — periodic prune of stale skills + user_profiles.
+        # Created in ``start()`` only when the feature is enabled; ``None``
+        # otherwise so ``stop()`` can short-circuit cleanly.
+        self._curator_task: asyncio.Task | None = None
         # One BridgeSession per bridge — see ``_build_bridge_session_and_bridges``.
         # Pre-v0.12.50 a single session was shared across all bridges, which
         # let two bridges collide on the gateway's client_id (handle="__bridge")
@@ -489,6 +555,15 @@ class AgentServer:
                 bridge.start(), name=f"bridge:{bridge.name}"
             ))
 
+        # 5. Curator — periodic prune of stale skills/user_profiles.
+        # No-op when ``memory.curator.enabled`` is false.
+        try:
+            from src.learning.curator import start as _curator_start
+            self._curator_task = _curator_start(self.agent.memory)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Curator failed to start: %s", e)
+            self._curator_task = None
+
     async def _build_bridge_session_and_bridges(self) -> None:
         """Provision the in-process bridge sessions + concrete bridges.
 
@@ -590,6 +665,15 @@ class AgentServer:
                     getattr(s, "bridge_name", "?"), e,
                 )
         self._bridge_sessions.clear()
+
+        # 1b. Curator (kill before the DB-owning Agent goes away)
+        if self._curator_task is not None:
+            self._curator_task.cancel()
+            try:
+                await asyncio.wait_for(self._curator_task, timeout=2)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                pass
+            self._curator_task = None
 
         # 2. Gateway
         if self._gateway:

@@ -208,6 +208,11 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
         "command": ["python", "-m", "src.mcp.servers.workflow_manager.server"],
         "python": True,
     },
+    "media-gen": {
+        "dir": "media_gen",
+        "command": ["python", "-m", "src.mcp.servers.media_gen.server"],
+        "python": True,
+    },
 }
 
 DEFAULT_MCPS: list[dict[str, Any]] = [

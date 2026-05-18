@@ -9,7 +9,11 @@ Telegram even though it runs async.
 
 The API key is resolved on every call (cheap dict read) so a rotation
 via ``UPDATE providers ... WHERE name='groq'`` takes effect on the next
-flush without a process restart.
+flush without a process restart. The Groq SDK *client itself* is cached
+at module level — instantiating ``AsyncGroq`` opens a fresh httpx
+session and pays a TLS handshake, which we'd otherwise burn on every
+classifier + profile flush + skill detect call (3 round-trips per
+post-turn cycle).
 """
 
 from __future__ import annotations
@@ -25,6 +29,13 @@ logger = logging.getLogger(__name__)
 
 
 _DEFAULT_MODEL = "llama-3.3-70b-versatile"
+
+# Cached AsyncGroq clients keyed by api_key. Keyed (rather than singleton)
+# so a key rotation lands cleanly — the old client stays connected for
+# in-flight requests, the new key spins up its own session. Same client
+# instance is reused across N concurrent ``complete()`` calls; the
+# underlying httpx pool handles per-request concurrency.
+_groq_client_cache: dict[str, Any] = {}
 
 
 async def _resolve_api_key(db: Any) -> Optional[str]:
@@ -89,7 +100,10 @@ async def complete(
     messages.append({"role": "user", "content": prompt})
 
     try:
-        client = AsyncGroq(api_key=api_key)
+        client = _groq_client_cache.get(api_key)
+        if client is None:
+            client = AsyncGroq(api_key=api_key)
+            _groq_client_cache[api_key] = client
         resp = await asyncio.wait_for(
             client.chat.completions.create(
                 model=model,

@@ -94,6 +94,19 @@ PERSONALITY_PRESETS: dict[str, str] = {
 }
 
 
+class _DBShim:
+    """Minimal duck-type the learning helpers expect — they read
+    ``shim._conn`` and call ``execute`` / ``commit`` on it. Decoupling
+    here lets the bridge own its own aiosqlite connection without
+    reaching into the agent's ``MemoryDB`` private attributes.
+    """
+
+    __slots__ = ("_conn",)
+
+    def __init__(self, conn):
+        self._conn = conn
+
+
 def resolve_personality_directive(personality: str | None) -> str | None:
     """Translate a ``personality`` config value into the system-style
     directive that gets prepended to the user turn. ``None`` / empty
@@ -184,6 +197,12 @@ class BaseBridge:
         # (no stale per-session callback dict to keep in sync).
         self._stream_opened: set[str] = set()
         self._stream_pending: dict[str, StreamCollector] = {}
+        # Cached aiosqlite connection used by the per-turn skills matcher.
+        # Opened lazily on first turn after the feature is enabled, kept
+        # alive for the lifetime of the bridge process. WAL journaling on
+        # the agent-owned connection lets this run concurrently without
+        # blocking writes.
+        self._learning_conn = None  # type: ignore[var-annotated]
 
     async def start(self) -> None:
         """Connect to Gateway and start the platform polling loop with retry."""
@@ -230,6 +249,34 @@ class BaseBridge:
         if self._http_session:
             await self._http_session.close()
             self._http_session = None
+        if self._learning_conn is not None:
+            try:
+                await self._learning_conn.close()
+            except Exception:
+                pass
+            self._learning_conn = None
+
+    async def _get_learning_db_shim(self):
+        """Return a duck-typed DB shim for the learning helpers, opening
+        the aiosqlite connection on first use and reusing it thereafter.
+        Returns ``None`` when the connection can't be opened — callers
+        treat that as "skill matcher unavailable, fall through cleanly".
+        """
+        if self._learning_conn is not None:
+            return _DBShim(self._learning_conn)
+        try:
+            import aiosqlite
+            from src.core.paths import default_db_path
+            conn = await aiosqlite.connect(str(default_db_path()), timeout=5.0)
+            conn.row_factory = aiosqlite.Row
+            # Match the agent-owned connection's WAL setting so reads
+            # don't block on its in-flight writes.
+            await conn.execute("PRAGMA busy_timeout = 5000")
+            self._learning_conn = conn
+            return _DBShim(conn)
+        except Exception as e:
+            elog("bridge.learning_db_open_failed", name=self.name, error=str(e)[:120])
+            return None
 
     def _resolve_orphaned_futures(self, reason: str) -> None:
         """Resolve all pending futures with an error so callers don't hang."""
@@ -563,6 +610,17 @@ class BaseBridge:
             except Exception:
                 pass
 
+        # Quick-command expansion runs FIRST so personality + skill
+        # overlays act on the expanded prompt, not the bare ``/recap``.
+        try:
+            from src.core.hooks import expand_quick_command
+            expanded = expand_quick_command(text)
+            if expanded is not None:
+                elog("quick_command.expanded", bridge=self.name, trigger=text.split()[0][:32])
+                text = expanded
+        except Exception:
+            pass
+
         # Optional per-bridge persona overlay. Prepended once on the user
         # turn so the model picks it up without changing the persistent
         # system prompt or the SDK session. The persona is delivered as a
@@ -578,30 +636,22 @@ class BaseBridge:
         # current user text and prepends them. Bridge-side so the LLM
         # roundtrip costs nothing extra; the matcher is a cheap
         # heuristic (no Groq call on the hot path). No-op when the
-        # feature is off or no skill scores high enough.
-        try:
-            from src.learning.skills import render_skills_for_system_prompt as _sk_render
-            from src.memory.db import MemoryDB  # noqa: F401  — local import keeps cycle safe
-            from src.core.paths import default_db_path
-            import aiosqlite
-            # We don't have the agent's MemoryDB handle here in the bridge,
-            # so open a short-lived read connection. The matcher only
-            # SELECTs (and bumps usage on a row-by-row UPDATE) which is
-            # WAL-safe alongside the agent's primary connection.
-            class _ConnShim:
-                def __init__(self, conn):
-                    self._conn = conn
-            _conn = await aiosqlite.connect(str(default_db_path()), timeout=5.0)
-            _conn.row_factory = aiosqlite.Row
+        # feature is off or no skill scores high enough. The connection
+        # is cached at the bridge instance (see ``_get_learning_db_shim``)
+        # so we don't pay the SQLite open/close per turn.
+        if os.environ.get("OPENAGENT_SKILLS_ENABLED", "0").strip().lower() in (
+            "1", "true", "yes", "on",
+        ):
             try:
-                skill_block = await _sk_render(_ConnShim(_conn), text)
-            finally:
-                await _conn.close()
-            if skill_block:
-                outbound_text = f"{skill_block}\n\n{outbound_text}"
-        except Exception:
-            # Never let learning shrapnel block a user turn.
-            pass
+                from src.learning.skills import render_skills_for_system_prompt as _sk_render
+                shim = await self._get_learning_db_shim()
+                if shim is not None:
+                    skill_block = await _sk_render(shim, text)
+                    if skill_block:
+                        outbound_text = f"{skill_block}\n\n{outbound_text}"
+            except Exception:
+                # Never let learning shrapnel block a user turn.
+                pass
 
         try:
             response = await self.send_message(
@@ -645,6 +695,21 @@ class BaseBridge:
 
         clean = self.append_model_feedback(clean, response.get("model"))
         await self.send_response_text(post_target, clean)
+
+        # Fire turn_end hook if registered. Fire-and-forget; never
+        # blocks the response path. ``response_chars`` is a coarse
+        # signal — hook authors who need more can read the events log.
+        try:
+            from src.core.hooks import fire as _hook_fire
+            _hook_fire(
+                "turn_end",
+                bridge=self.name,
+                session_id=session_id,
+                response_chars=len(clean or ""),
+                model=response.get("model") or "",
+            )
+        except Exception:
+            pass
 
     @staticmethod
     def _cleanup_owned_temp_artifact(path: str | None) -> None:

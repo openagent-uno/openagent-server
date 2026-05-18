@@ -298,6 +298,12 @@ class _Session:
     # definitions baseline. Reset on session reload from DB / explicit
     # forget. See ``safety.compression`` in the config / env vars.
     cumulative_input_tokens: int = 0
+    # Rolling buffer of recent (user_text, assistant_text) pairs used by
+    # the real-compression path: when the cumulative-tokens watchdog
+    # fires, we hand this buffer to Groq Llama for a summarisation that
+    # gets stitched into the next turn's system prompt. Bounded list so
+    # the per-session footprint stays small even on long-lived chats.
+    recent_turns: list[tuple[str, str]] = field(default_factory=list)
 
 
 class ClaudeCLI(BaseModel):
@@ -738,17 +744,15 @@ class ClaudeCLI(BaseModel):
             session.last_active = time.time()
 
     async def _maybe_compress_session(self, session_id: str, last_input_tokens: int) -> None:
-        """Reset the SDK session when cumulative input tokens exceed the
-        compression threshold. Hermes-flavoured but minimal: we drop the
-        live ``ClaudeSDKClient`` (next turn spawns a fresh subprocess
-        without ``--resume``) so the next turn's prompt prefix collapses
-        back to system_prompt + tool definitions. The vault MCP remains
-        the long-term memory of record — the agent loses verbatim recall
-        of the dropped turns but keeps anything it deliberately saved.
+        """When cumulative input tokens exceed the compression threshold,
+        summarise the recent_turns buffer via Groq Llama, persist the
+        summary under ``user_profile._compaction`` so the next session
+        spawn picks it up, then drop the live SDK client. The result:
+        the prompt prefix collapses back to (system_prompt + summary)
+        instead of (system_prompt + every-previous-turn).
 
         Disabled by default. Enable via ``safety.compression.enabled:
-        true`` in ``openagent.yaml`` (server.py exports the env var) or
-        directly with ``OPENAGENT_SAFETY_COMPRESSION=1``. Threshold via
+        true`` in ``openagent.yaml``. Threshold via
         ``OPENAGENT_SAFETY_COMPRESSION_THRESHOLD_TOKENS`` (default 80000).
         """
         if (
@@ -771,20 +775,86 @@ class ClaudeCLI(BaseModel):
         session.cumulative_input_tokens += max(int(last_input_tokens or 0), 0)
         if session.cumulative_input_tokens < threshold:
             return
-        # Crossed the threshold — drop the client and reset the counter.
-        # ``--resume`` is intentionally NOT discarded here: the SDK can
-        # still pick up the prior session if a follow-up turn benefits
-        # from it. The win is on the *current* live subprocess buffer,
-        # which would otherwise grow turn after turn.
         prior_total = session.cumulative_input_tokens
         session.cumulative_input_tokens = 0
+
+        # Summarise the recent_turns buffer before dropping the SDK
+        # client, so the next spawn re-establishes continuity from the
+        # summary instead of cold-starting.
+        summary_text: Optional[str] = None
+        recent = list(session.recent_turns)
+        session.recent_turns = []
+        if recent and self._db is not None:
+            try:
+                summary_text = await self._summarise_for_compaction(
+                    session_id, recent
+                )
+                if summary_text:
+                    from src.learning.user_profile import set_compaction
+                    await set_compaction(self._db, session_id, summary_text)
+            except Exception as e:
+                elog(
+                    "compression.summarise_error",
+                    session_id=session_id,
+                    error=str(e)[:200],
+                )
+
         await self._drop_client(session_id)
         elog(
             "compression.session_reset",
             session_id=session_id,
             cumulative_input_tokens=prior_total,
             threshold=threshold,
-            kind="drop_client",
+            kind="summary_and_drop" if summary_text else "drop_client",
+            summary_chars=len(summary_text or ""),
+        )
+        try:
+            from src.core.hooks import fire as _hook_fire
+            _hook_fire(
+                "compression",
+                session_id=session_id,
+                cumulative_input_tokens=prior_total,
+                summary_chars=len(summary_text or ""),
+            )
+        except Exception:
+            pass
+
+    async def _summarise_for_compaction(
+        self, session_id: str, recent: list[tuple[str, str]]
+    ) -> Optional[str]:
+        """Render the recent_turns buffer + ask Groq for a single
+        paragraph capturing it. Returns ``None`` when Groq is
+        unavailable / the model returned empty — the caller falls back
+        to a plain drop_client in that case (still better than ballooning
+        the SDK transcript)."""
+        # Render compactly — alternating User/Assistant lines, each
+        # capped so a runaway long turn doesn't blow the prompt.
+        rendered = []
+        for u, a in recent[-30:]:
+            rendered.append(f"USER: {(u or '')[:600]}")
+            rendered.append(f"ASSISTANT: {(a or '')[:600]}")
+        transcript = "\n\n".join(rendered)
+
+        from src.learning._groq import complete as groq_complete
+        system = (
+            "You compress the older portion of a chat so the assistant can "
+            "carry the conversation forward without keeping every word. "
+            "Read the turns and write ONE paragraph (≤ 1200 chars) that "
+            "captures: (a) what the user is trying to accomplish, (b) the "
+            "key decisions / outputs so far, (c) any open threads or "
+            "pending actions, (d) user preferences revealed (style, "
+            "language, tools to favour or avoid). Use third person "
+            '("The user wants…"). Output only the paragraph — no labels, '
+            "no markdown fences, no bullet list."
+        )
+        return await groq_complete(
+            db=self._db,
+            prompt=transcript,
+            system=system,
+            max_tokens=400,
+            timeout_s=20.0,
+            log_event="compression.summarise",
+            session_id=session_id,
         )
 
     async def close_session(self, session_id: str) -> None:
@@ -1401,13 +1471,23 @@ class ClaudeCLI(BaseModel):
                     output_tokens=output_tokens,
                     model=self._model_id_for_response(sid),
                 )
-                # Compression watchdog. Track cumulative input tokens and
-                # reset the SDK session when we cross the configured
-                # threshold so the next turn pays the system-prompt cost
-                # again from scratch instead of an ever-growing transcript.
-                # This is minimal — Hermes does a real summary; we drop
-                # the SDK conversation and let the persistent vault MCP
-                # be the long-term memory store. Off by default.
+                # Buffer the (user, assistant) pair for the compression
+                # summariser. Bounded so very long chats don't bloat the
+                # process — the summariser only reads the last 30 anyway.
+                try:
+                    async with self._registry_lock:
+                        _sess = self._sessions.get(sid)
+                    if _sess is not None:
+                        _sess.recent_turns.append((prompt, result))
+                        if len(_sess.recent_turns) > 30:
+                            _sess.recent_turns = _sess.recent_turns[-30:]
+                except Exception:
+                    pass
+                # Compression watchdog. Tracks cumulative input tokens and,
+                # when threshold is crossed, hands the recent_turns buffer
+                # to Groq for a summarisation that gets stitched back into
+                # the next turn's system prompt before dropping the SDK
+                # client. Off by default.
                 await self._maybe_compress_session(sid, input_tokens)
                 # Learning hooks — fire-and-forget so we never block the
                 # response path on Groq round-trips. Each module is a

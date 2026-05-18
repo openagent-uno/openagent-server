@@ -220,31 +220,68 @@ async def maybe_flush_after_turn(
 
 async def render_profile_for_system_prompt(db: Any, session_id: str) -> Optional[str]:
     """Return a system-message-ready string describing the user, or
-    ``None`` when no profile exists / feature is off. Used by the
-    Claude SDK options builder to prepend continuity context to the
-    persistent system_prompt at session start.
+    ``None`` when nothing to render. Combines two independent recalls:
+    the cross-session user profile (gated on ``user_profile.enabled``)
+    AND a per-session compaction summary written by the compression
+    watchdog (always rendered when present, since its mere existence
+    means the operator opted into compression).
     """
-    if not _is_enabled() or not session_id or not db:
+    if not session_id or not db:
         return None
     profile, _ = await _load_state(db, session_id)
     if not profile:
         return None
-    # Compact human-readable form — the model parses prose faster than
-    # raw JSON when it's just background context (vs. a tool input).
-    parts: list[str] = ["[Recall what we know about this user across sessions:]"]
-    prefs = profile.get("preferences") or []
-    if prefs:
-        parts.append("Preferences: " + "; ".join(str(p) for p in prefs[:8]))
-    projs = profile.get("ongoing_projects") or []
-    if projs:
-        parts.append("Ongoing: " + "; ".join(str(p) for p in projs[:5]))
-    style = profile.get("style")
-    if style:
-        parts.append(f"Style: {style}")
-    notes = profile.get("notes") or []
-    if notes:
-        parts.append("Notes: " + "; ".join(str(n) for n in notes[:8]))
-    if len(parts) == 1:
-        # Profile present but no usable keys yet.
+    parts: list[str] = []
+    # Cross-session profile — only when the user_profile feature is
+    # explicitly enabled. Compaction is a separate concern below.
+    if _is_enabled():
+        user_parts: list[str] = ["[Recall what we know about this user across sessions:]"]
+        prefs = profile.get("preferences") or []
+        if prefs:
+            user_parts.append("Preferences: " + "; ".join(str(p) for p in prefs[:8]))
+        projs = profile.get("ongoing_projects") or []
+        if projs:
+            user_parts.append("Ongoing: " + "; ".join(str(p) for p in projs[:5]))
+        style = profile.get("style")
+        if style:
+            user_parts.append(f"Style: {style}")
+        notes = profile.get("notes") or []
+        if notes:
+            user_parts.append("Notes: " + "; ".join(str(n) for n in notes[:8]))
+        if len(user_parts) > 1:
+            parts.append("\n".join(user_parts))
+    compaction = profile.get("_compaction")
+    if compaction:
+        parts.append(
+            "[Summary of earlier turns in this conversation (older context was compressed to save tokens):]\n"
+            f"{compaction}"
+        )
+    if not parts:
         return None
-    return "\n".join(parts)
+    return "\n\n".join(parts)
+
+
+async def set_compaction(db: Any, session_id: str, summary: str) -> None:
+    """Store a compaction summary on the user profile JSON under the
+    ``_compaction`` key. Used by the compression watchdog when it
+    summarises the recent turns before dropping the SDK client.
+    """
+    if not session_id or not db or not summary:
+        return
+    profile, count = await _load_state(db, session_id)
+    profile = profile or {}
+    profile["_compaction"] = summary.strip()[:_PROFILE_CHAR_LIMIT]
+    await _persist(db, session_id, profile, count)
+    elog("user_profile.compaction_stored", session_id=session_id, chars=len(summary))
+
+
+async def clear_compaction(db: Any, session_id: str) -> None:
+    """Drop the compaction summary — used when the model has clearly
+    moved past the older context (manual /clear, session forget, etc.)."""
+    if not session_id or not db:
+        return
+    profile, count = await _load_state(db, session_id)
+    if not profile or "_compaction" not in profile:
+        return
+    profile.pop("_compaction", None)
+    await _persist(db, session_id, profile, count)
