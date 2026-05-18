@@ -464,6 +464,66 @@ main.add_command(network_group)
 
 
 @main.command()
+@click.pass_context
+def doctor(ctx) -> None:
+    """Run health checks: Python version, config validity, vault path,
+    git/node/docker availability, and which channels are configured.
+
+    Exits 1 when any check fails so the command can be chained in
+    setup scripts / CI. Wraps the existing ``setup.bootstrap.run_doctor``
+    (which already encodes the check list) in a friendly rich.Table
+    front-end.
+    """
+    from rich.table import Table
+    from src.setup.bootstrap import run_doctor as _run_doctor
+
+    agent_dir = paths.get_agent_dir() or Path(".").resolve()
+    config_path = agent_dir / "openagent.yaml"
+
+    if config_path.exists():
+        import yaml as _yaml
+        try:
+            cfg = _yaml.safe_load(config_path.read_text()) or {}
+        except Exception as e:
+            console.print(f"[red]Failed to parse {config_path}: {e}[/red]")
+            raise SystemExit(1)
+    else:
+        console.print(
+            f"[yellow]No config at {config_path}; running with defaults.[/yellow]"
+        )
+        cfg = {}
+
+    rpt = _run_doctor(cfg, config_path)
+
+    t = Table(title=f"openagent doctor — {agent_dir}", show_lines=False)
+    t.add_column("check")
+    t.add_column("status")
+    t.add_column("message")
+    t.add_column("fix hint", overflow="fold")
+    status_style = {
+        "ok":   "green",
+        "warn": "yellow",
+        "fail": "red",
+        "skip": "dim",
+    }
+    for c in rpt.checks:
+        style = status_style.get(c.status, "white")
+        t.add_row(
+            c.name,
+            f"[{style}]{c.status}[/{style}]",
+            c.message or "",
+            c.fix_hint or "",
+        )
+    console.print(t)
+
+    if rpt.has_failures:
+        console.print("[red]One or more checks failed.[/red]")
+        raise SystemExit(1)
+    if rpt.has_warnings:
+        console.print("[yellow]Warnings present (non-blocking).[/yellow]")
+
+
+@main.command()
 @click.option("--days", "-d", default=7, show_default=True, help="Look back this many days.")
 @click.option("--top-sessions", default=5, show_default=True, help="Show top N sessions by turn count.")
 @click.pass_context
