@@ -425,6 +425,41 @@ CREATE TABLE IF NOT EXISTS network_invitations (
     used_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_invitations_expires ON network_invitations(expires_at);
+
+-- ── Learning tables ────────────────────────────────────────────────
+-- ``user_profiles`` accumulates a JSON summary of who the user is per
+-- session (preferences, ongoing projects, communication style). Flushed
+-- every N turns by ``src.learning.user_profile`` and injected back as
+-- system context at session resume so the bot doesn't restart cold.
+-- Hermes equivalent: ``memory.user_profile_enabled``.
+CREATE TABLE IF NOT EXISTS user_profiles (
+    session_id      TEXT PRIMARY KEY,
+    profile_json    TEXT NOT NULL DEFAULT '{}',
+    turn_count      INTEGER NOT NULL DEFAULT 0,
+    last_flushed_at REAL,
+    created_at      REAL NOT NULL,
+    updated_at      REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_user_profiles_updated ON user_profiles(updated_at);
+
+-- ``skills`` stores reusable how-tos the AI distils from recurring
+-- request patterns. ``signature_hash`` is a stable hash of the
+-- normalised trigger so the pattern detector can dedup. ``markdown``
+-- holds the actual playbook text the matcher injects at turn start
+-- when relevance hits a threshold. Hermes equivalent: skills + curator.
+CREATE TABLE IF NOT EXISTS skills (
+    id              TEXT PRIMARY KEY,
+    name            TEXT NOT NULL,
+    signature_hash  TEXT NOT NULL UNIQUE,
+    markdown        TEXT NOT NULL,
+    tags_json       TEXT NOT NULL DEFAULT '[]',
+    usage_count     INTEGER NOT NULL DEFAULT 0,
+    last_used_at    REAL,
+    created_at      REAL NOT NULL,
+    updated_at      REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_skills_usage ON skills(usage_count);
+CREATE INDEX IF NOT EXISTS idx_skills_last_used ON skills(last_used_at);
 """
 
 

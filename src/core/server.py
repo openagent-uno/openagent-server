@@ -202,6 +202,26 @@ def _build_agent(config: dict) -> Agent:
             pass
 
     memory_cfg = config.get("memory", {})
+    # Learning toggles — mapped to env vars so the post-turn hooks in
+    # ``src.learning`` can read them without plumbing the agent config
+    # through every callsite. Default off across the board.
+    _up_cfg = (memory_cfg.get("user_profile") or {})
+    if "enabled" in _up_cfg:
+        os.environ["OPENAGENT_USER_PROFILE_ENABLED"] = (
+            "1" if bool(_up_cfg["enabled"]) else "0"
+        )
+    if "flush_every_n_turns" in _up_cfg:
+        try:
+            os.environ["OPENAGENT_USER_PROFILE_FLUSH_EVERY"] = str(
+                int(_up_cfg["flush_every_n_turns"])
+            )
+        except (TypeError, ValueError):
+            pass
+    _sk_cfg = (memory_cfg.get("skills") or {})
+    if "enabled" in _sk_cfg:
+        os.environ["OPENAGENT_SKILLS_ENABLED"] = (
+            "1" if bool(_sk_cfg["enabled"]) else "0"
+        )
     db_path = memory_cfg.get("db_path", str(default_db_path()))
     db = MemoryDB(db_path)
 

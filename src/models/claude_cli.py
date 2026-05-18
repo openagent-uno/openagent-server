@@ -604,6 +604,29 @@ class ClaudeCLI(BaseModel):
 
         from claude_agent_sdk import ClaudeSDKClient
 
+        # Learning continuity: prepend a compact summary of what we know
+        # about this user across sessions. No-op when the feature is off,
+        # so the SDK options builder still sees ``system`` unchanged.
+        # Done here (not in ``_build_options``) so async DB I/O lives at
+        # the natural async boundary instead of inside the options dict
+        # constructor that we want to keep synchronous + side-effect-free.
+        effective_system = system
+        try:
+            from src.learning.user_profile import render_profile_for_system_prompt as _up_render
+            extra = await _up_render(self._db, session.session_id)
+            if extra:
+                effective_system = (
+                    f"{extra}\n\n{system}" if system else extra
+                )
+                elog(
+                    "user_profile.injected",
+                    session_id=session.session_id,
+                    size=len(extra),
+                )
+        except Exception:
+            # Never let a learning lookup block session creation.
+            pass
+
         elog(
             "model.session_create",
             session_id=session.session_id,
@@ -613,7 +636,7 @@ class ClaudeCLI(BaseModel):
 
         async def _connect_once(resume_id: str | None) -> Any:
             new_client = ClaudeSDKClient(
-                options=self._build_options(system=system, sdk_session_id=resume_id)
+                options=self._build_options(system=effective_system, sdk_session_id=resume_id)
             )
             try:
                 await new_client.connect()
@@ -1386,6 +1409,22 @@ class ClaudeCLI(BaseModel):
                 # the SDK conversation and let the persistent vault MCP
                 # be the long-term memory store. Off by default.
                 await self._maybe_compress_session(sid, input_tokens)
+                # Learning hooks — fire-and-forget so we never block the
+                # response path on Groq round-trips. Each module is a
+                # no-op when its feature flag is off, so the cost when
+                # disabled is one env lookup per turn.
+                try:
+                    from src.learning.user_profile import maybe_flush_after_turn as _up_flush
+                    await _up_flush(self._db, sid, prompt, result)
+                except Exception:
+                    # Learning paths must never sink a turn. Errors
+                    # already elog-ed inside the module.
+                    pass
+                try:
+                    from src.learning.skills import maybe_detect_after_turn as _sk_detect
+                    await _sk_detect(self._db, sid, prompt, result)
+                except Exception:
+                    pass
                 return ModelResponse(
                     content=result,
                     tool_names_called=tool_names_called,

@@ -574,6 +574,34 @@ class BaseBridge:
                 f"[Persona for this reply: {self._personality_directive}]\n\n"
                 f"{text}"
             )
+        # Auto-skills matcher — pulls the top relevant how-tos for the
+        # current user text and prepends them. Bridge-side so the LLM
+        # roundtrip costs nothing extra; the matcher is a cheap
+        # heuristic (no Groq call on the hot path). No-op when the
+        # feature is off or no skill scores high enough.
+        try:
+            from src.learning.skills import render_skills_for_system_prompt as _sk_render
+            from src.memory.db import MemoryDB  # noqa: F401  — local import keeps cycle safe
+            from src.core.paths import default_db_path
+            import aiosqlite
+            # We don't have the agent's MemoryDB handle here in the bridge,
+            # so open a short-lived read connection. The matcher only
+            # SELECTs (and bumps usage on a row-by-row UPDATE) which is
+            # WAL-safe alongside the agent's primary connection.
+            class _ConnShim:
+                def __init__(self, conn):
+                    self._conn = conn
+            _conn = await aiosqlite.connect(str(default_db_path()), timeout=5.0)
+            _conn.row_factory = aiosqlite.Row
+            try:
+                skill_block = await _sk_render(_ConnShim(_conn), text)
+            finally:
+                await _conn.close()
+            if skill_block:
+                outbound_text = f"{skill_block}\n\n{outbound_text}"
+        except Exception:
+            # Never let learning shrapnel block a user turn.
+            pass
 
         try:
             response = await self.send_message(
