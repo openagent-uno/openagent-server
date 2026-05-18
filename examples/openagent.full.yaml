@@ -1,0 +1,127 @@
+# OpenAgent full-config reference
+# =============================================================================
+# Every option this server reads, with a one-line "why" and the default it
+# falls back to when the key is missing. Most installs only need a small
+# subset — start with the bare ``openagent.yaml`` produced by ``openagent
+# init`` and copy stanzas from here as you turn features on.
+#
+# Convention: every recent feature ships off-by-default so an unset key
+# behaves like the pre-feature shipped code. Turning a section on is the
+# only way it engages.
+# =============================================================================
+
+# Display name shown in the network roster and on first-run banners.
+name: agent
+
+# ── Network identity ────────────────────────────────────────────────
+# Iroh transport keys + DERP relay. Defaults are usually correct;
+# self-host a DERP relay only when you need full data locality.
+network:
+  identity_path: ./identity.key
+  coordinator:
+    key_path: ./coordinator.key
+  derp_url: ""                # empty = Iroh's public DERP relay
+
+# ── Channels (platform bridges) ─────────────────────────────────────
+# Each bridge is opt-in: omit the section and the bridge isn't started.
+# ``personality`` accepts a preset name (casual, technical, teacher,
+# kawaii, pirate, noir, philosopher) OR a free-form string treated as
+# the literal persona directive.
+channels:
+  telegram:
+    token: "${TELEGRAM_BOT_TOKEN}"     # or hard-code; env wins if both set
+    allowed_users: []                  # list of Telegram user_ids ("12345"); empty = open
+    personality: casual
+
+  discord:
+    token: "${DISCORD_BOT_TOKEN}"
+    allowed_users: ["123456789012345678"]
+    allowed_guilds: []
+    listen_channels: []                # public channels to listen to
+    dm_only: false
+    personality: technical
+
+  whatsapp:
+    green_api_id: "${GREEN_API_ID}"
+    green_api_token: "${GREEN_API_TOKEN}"
+    allowed_users: []                  # phone numbers ("39…")
+    personality: casual
+
+  slack:
+    bot_token: "${SLACK_BOT_TOKEN}"    # xoxb-…
+    app_token: "${SLACK_APP_TOKEN}"    # xapp-… (socket mode)
+    allowed_users: ["U0123456789"]
+    listen_channels: ["C0123456789"]
+    personality: technical
+
+# ── Safety toggles ──────────────────────────────────────────────────
+# Three independent guardrails. All default off (or as noted) so the
+# server behaves like the pre-safety build until a stanza is added.
+safety:
+  guardrails:
+    enabled: true                       # DEFAULT — abort SDK turn on 5 same-tool failures
+                                        # or 5 identical error responses
+  approvals:
+    enabled: false                      # block destructive shell / git push --force / etc.
+    block_extra_patterns:               # additional regex fragments
+      - "\\bterraform\\s+destroy\\b"
+  compression:
+    enabled: false                      # summarise recent turns + drop SDK client at threshold
+    threshold_tokens: 80000             # cumulative input_tokens before trigger
+
+# ── Memory & learning ───────────────────────────────────────────────
+# All three subsections are independent — you can run user_profile
+# without skills, skills without user_profile, curator regardless.
+memory:
+  user_profile:
+    enabled: false                      # every Nth turn, flush a JSON "who is the user" summary
+    flush_every_n_turns: 10
+
+  skills:
+    enabled: false                      # detect + save reusable how-tos; matcher injects on relevant turns
+
+  curator:
+    enabled: false                      # background prune of stale skills/profiles + DB backup
+    interval_hours: 6
+    skill_stale_days: 14                # unused skills past this age get pruned
+    skill_archive_days: 90              # any skill past this gets pruned regardless of usage
+    profile_archive_days: 90
+    session_retention_days: 90
+    backup_interval_hours: 24
+    backup_keep: 30
+
+  sessions:
+    retention_days: 90                  # friendlier alias for curator.session_retention_days
+
+# ── Quick commands ──────────────────────────────────────────────────
+# Bridges expand ``/<trigger>`` to the configured prompt before the
+# agent sees it. Triggers are case-insensitive. Anything after the
+# trigger is appended as a second line.
+quick_commands:
+  recap: "Summarise the last 20 turns with bullets, English."
+  jokes: "Tell me three short jokes."
+  status: "What's the status of my ongoing projects?"
+
+# ── Hooks ───────────────────────────────────────────────────────────
+# Fire-and-forget shell commands triggered by named runtime events.
+# Event metadata arrives in OPENAGENT_EVENT_* env vars. Stdout captured
+# (4 KB cap) into events.jsonl.
+hooks:
+  on_turn_end:        "echo turn $OPENAGENT_EVENT_SESSION_ID >> ~/openagent/turns.log"
+  on_compression:     "logger -t openagent compressed $OPENAGENT_EVENT_SESSION_ID"
+  on_skill_saved:     "osascript -e 'display notification \"new skill: $OPENAGENT_EVENT_NAME\" with title \"OpenAgent\"'"
+
+# ── MCP runtime knobs ───────────────────────────────────────────────
+# Not yaml-configurable today — set via env at launch time:
+#   OPENAGENT_CLAUDE_TOOL_BUDGET=55   # default 200 — tools allowed in upfront list
+#   OPENAGENT_AGNO_TOOL_BUDGET=55     # default 128 — same for the Agno classifier path
+#   OPENAGENT_MCP_PRIORITY=vault,messaging,shell,editor,filesystem,web-search,scheduler
+#     # override the default priority order used when trimming above the budget.
+#     # Unlisted MCPs fall back to alphabetical, then get dropped.
+
+# ── Notes ───────────────────────────────────────────────────────────
+# Providers, models, MCP entries, scheduled tasks, and workflows are
+# managed exclusively through the SQLite database (configure via the
+# desktop app, the model-manager / mcp-manager / workflow-manager MCPs,
+# or the /api/* REST endpoints). This file only holds server-level
+# knobs.

@@ -349,6 +349,15 @@ class ClaudeCLI(BaseModel):
 
     def set_mcp_servers(self, servers: dict[str, dict]) -> None:
         self.mcp_servers = servers
+        # Visibility into the trim outcome — ``agent.initialize.done``
+        # reports the full pool size; this surfaces the *post-budget*
+        # view the model will actually receive on its next turn so the
+        # operator can confirm the budget knob took effect.
+        elog(
+            "claude_cli.mcp_servers_wired",
+            count=len(servers),
+            names=sorted(servers.keys()),
+        )
 
     def set_db(self, db: Any) -> None:
         """Wire the MemoryDB so per-call usage can be recorded.
@@ -2006,6 +2015,11 @@ class ClaudeCLIRegistry(BaseModel):
 
     def set_mcp_servers(self, servers: dict[str, dict]) -> None:
         self._mcp_servers = servers
+        elog(
+            "claude_cli.registry_mcp_wired",
+            count=len(servers),
+            names=sorted(servers.keys()),
+        )
         self._fanout_sync("set_mcp_servers", servers)
 
     async def cleanup_idle(self) -> Any:
