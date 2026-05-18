@@ -443,7 +443,7 @@ class Gateway:
             "node_id": self._network_state.identity.public_hex,
             "network": self._network_state.network_name,
             "role": self._network_state.role,
-            "version": getattr(openagent, "__version__", "?"),
+            "version": getattr(src, "__version__", "?"),
         }
 
     async def _handle_agent_info(self, request):
@@ -750,7 +750,7 @@ class Gateway:
         await self._safe_ws_send_json(ws, {
             "type": P.AUTH_OK,
             "agent_name": self.agent.name,
-            "version": getattr(openagent, "__version__", "?"),
+            "version": getattr(src, "__version__", "?"),
             "handle": cert.handle,
             # Human-readable name (``agent-personal``) so the renderer
             # can pass it back through as the ``network`` segment of

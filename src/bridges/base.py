@@ -52,6 +52,66 @@ VOICE_FALLBACK = "[Voice message could not be transcribed. Ask the user to type 
 BRIDGE_COALESCE_WINDOW_MS = 1500
 
 
+# Personality presets — overlay the agent's system style with a named
+# persona, per platform. Configured via ``channels.<bridge>.personality``
+# in ``openagent.yaml`` (value: a preset key from this dict, OR a free-form
+# string treated as the literal persona directive). Inspired by Hermes'
+# personality system.
+PERSONALITY_PRESETS: dict[str, str] = {
+    "casual": (
+        "Respond in a friendly, conversational tone — like texting a "
+        "knowledgeable friend. Skip corporate formality. Italian or "
+        "English, whichever the user speaks."
+    ),
+    "technical": (
+        "Respond as a senior engineer: precise, terse, code-first. "
+        "Include exact commands, paths, and gotchas. No marketing prose."
+    ),
+    "teacher": (
+        "Explain like a patient teacher — clear concepts, short examples, "
+        "name the trade-offs. Assume an attentive but non-expert audience."
+    ),
+    "kawaii": (
+        "You are a kawaii assistant! Use cute expressions like (◕‿◕), ★, ♪, "
+        "and ~! Add sparkles, be super enthusiastic, end sentences with desu~. "
+        "Stay helpful underneath the cuteness."
+    ),
+    "pirate": (
+        "Arrr! Ye be talkin' to a tech-savvy pirate. Speak like a proper "
+        "buccaneer, use nautical terms, treat every problem like treasure "
+        "waitin' to be plundered. Yo ho ho!"
+    ),
+    "noir": (
+        "Respond in 1940s detective noir voice: short hard sentences, rain "
+        "and shadow metaphors, world-weary observations. Underneath, give "
+        "the same accurate answer."
+    ),
+    "philosopher": (
+        "Frame each answer as a brief reflection: name the underlying "
+        "tension, offer the resolution, end with one sentence about why "
+        "it matters. Stay practical though — the user has work to do."
+    ),
+}
+
+
+def resolve_personality_directive(personality: str | None) -> str | None:
+    """Translate a ``personality`` config value into the system-style
+    directive that gets prepended to the user turn. ``None`` / empty
+    returns ``None`` (no overlay). A preset name resolves through
+    :data:`PERSONALITY_PRESETS`; any other string is treated as a literal
+    persona directive so users can drop in their own one-liner without
+    code changes (e.g. ``channels.telegram.personality: "Risponde sempre
+    in italiano informale"``).
+    """
+    if not personality:
+        return None
+    cleaned = personality.strip()
+    if not cleaned:
+        return None
+    preset = PERSONALITY_PRESETS.get(cleaned.lower())
+    return preset or cleaned
+
+
 def format_tool_status(raw: str) -> str:
     """Convert a raw status string (possibly JSON tool event) into a
     human-readable line suitable for Telegram/Discord/WhatsApp.
@@ -88,9 +148,18 @@ class BaseBridge:
     # splits the response. Overridden in subclasses.
     message_limit: int = 4000
 
-    def __init__(self, gateway_url: str = "ws://localhost:8765/ws", gateway_token: str | None = None):
+    def __init__(
+        self,
+        gateway_url: str = "ws://localhost:8765/ws",
+        gateway_token: str | None = None,
+        personality: str | None = None,
+    ):
         self.gateway_url = gateway_url
         self.gateway_token = gateway_token
+        # Resolved personality directive (already mapped through presets);
+        # ``None`` means no overlay. Wired into ``dispatch_turn`` so every
+        # user message picks it up automatically.
+        self._personality_directive = resolve_personality_directive(personality)
         self._ws = None
         self._ws_session = None  # aiohttp.ClientSession — must be closed
         self._http_session = None  # cached aiohttp.ClientSession for TTS/STT
@@ -494,9 +563,21 @@ class BaseBridge:
             except Exception:
                 pass
 
+        # Optional per-bridge persona overlay. Prepended once on the user
+        # turn so the model picks it up without changing the persistent
+        # system prompt or the SDK session. The persona is delivered as a
+        # bracketed directive rather than mixed into the user content so
+        # downstream summarisation can spot and preserve it intact.
+        outbound_text = text
+        if self._personality_directive:
+            outbound_text = (
+                f"[Persona for this reply: {self._personality_directive}]\n\n"
+                f"{text}"
+            )
+
         try:
             response = await self.send_message(
-                text, session_id,
+                outbound_text, session_id,
                 target=target,
                 on_status=on_status,
                 # Voice notes bypass the typed-burst coalescence window

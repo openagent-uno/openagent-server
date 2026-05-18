@@ -43,8 +43,9 @@ class WhatsAppBridge(BaseBridge):
         allowed_users: list[str] | None = None,
         gateway_url: str = "ws://localhost:8765/ws",
         gateway_token: str | None = None,
+        personality: str | None = None,
     ):
-        super().__init__(gateway_url, gateway_token)
+        super().__init__(gateway_url, gateway_token, personality=personality)
         self.instance_id = instance_id
         self.api_token = api_token
         self.allowed_users = set(str(u) for u in allowed_users) if allowed_users else None

@@ -481,6 +481,20 @@ class SmartRouter(BaseModel):
         if not self._classifier_model:
             elog("router.classify_skipped", session_id=session_id, reason="no_classifier_model")
             return None
+        # Short-circuit when the user has only one model enabled. The
+        # classifier LLM call (Opus subprocess + ~14k input tokens) adds
+        # 3-7 s per turn and is pointless when there's nothing to choose
+        # between. Saves the second ``claude`` subprocess spawn — gives
+        # Telegram a Hermes-class round-trip time on subscription billing.
+        if len(catalog) == 1:
+            only = catalog[0].runtime_id
+            elog(
+                "router.classify_skipped",
+                session_id=session_id,
+                reason="single_model_catalog",
+                chosen=only,
+            )
+            return only
 
         rendered_catalog = json.dumps(
             [

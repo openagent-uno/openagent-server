@@ -41,8 +41,9 @@ class DiscordBridge(BaseBridge):
         dm_only: bool = False,
         gateway_url: str = "ws://localhost:8765/ws",
         gateway_token: str | None = None,
+        personality: str | None = None,
     ):
-        super().__init__(gateway_url, gateway_token)
+        super().__init__(gateway_url, gateway_token, personality=personality)
         self.token = token
         self.allowed_users = set(str(u) for u in allowed_users)
         self.allowed_guilds = set(str(g) for g in (allowed_guilds or []))

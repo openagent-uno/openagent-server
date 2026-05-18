@@ -72,13 +72,61 @@ _SEEN_UPDATE_IDS_MAX = 256
 _MEDIA_GROUP_FLUSH_DELAY = 1.0
 
 
+class _TypingAnimator:
+    """Drives a continuous Telegram ``ChatAction.TYPING`` while a turn is
+    in flight. Replaces the ``⏳ Thinking...`` status reply used elsewhere
+    in this bridge so the user sees the platform's native typing dot —
+    matching the UX of Hermes / the Telegram bot SDK examples.
+
+    Telegram drops the typing indicator after ~5 s of silence; the loop
+    re-sends ``send_chat_action`` every ``_TYPING_REFRESH_S`` to keep the
+    dot alive without spamming. ``stop()`` flips the event so the loop
+    exits on its next wake-up (next refresh tick or immediately if the
+    sleep is interrupted), the indicator vanishes naturally as soon as
+    the next outbound message lands.
+    """
+
+    _TYPING_REFRESH_S = 4.0
+
+    def __init__(self, bot, chat_id: int) -> None:
+        self._bot = bot
+        self._chat_id = chat_id
+        self._stop = asyncio.Event()
+        self._task: asyncio.Task | None = None
+
+    async def start(self) -> None:
+        async def _loop() -> None:
+            from telegram.constants import ChatAction
+            while not self._stop.is_set():
+                try:
+                    await self._bot.send_chat_action(self._chat_id, ChatAction.TYPING)
+                except Exception:
+                    # Network blip or chat-removed; keep looping, the
+                    # outer dispatch will tear us down when the turn ends.
+                    pass
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=self._TYPING_REFRESH_S)
+                except asyncio.TimeoutError:
+                    pass
+        self._task = asyncio.create_task(_loop())
+
+    async def stop(self) -> None:
+        self._stop.set()
+        if self._task is not None:
+            try:
+                await asyncio.wait_for(self._task, timeout=1.0)
+            except (asyncio.TimeoutError, Exception):
+                pass
+
+
 class TelegramBridge(BaseBridge):
     name = "telegram"
     message_limit = TELEGRAM_MSG_LIMIT
 
     def __init__(self, token: str, allowed_users: list[str] | None = None,
-                 gateway_url: str = "ws://localhost:8765/ws", gateway_token: str | None = None):
-        super().__init__(gateway_url, gateway_token)
+                 gateway_url: str = "ws://localhost:8765/ws", gateway_token: str | None = None,
+                 personality: str | None = None):
+        super().__init__(gateway_url, gateway_token, personality=personality)
         self.token = token
         self.allowed_users = set(allowed_users) if allowed_users else None
         self._app = None
@@ -605,20 +653,31 @@ class TelegramBridge(BaseBridge):
     # so this file no longer carries any of that logic.
 
     async def post_status(self, msg, text: str):
+        # Surface the agent's in-flight state as Telegram's native typing
+        # action (matches Hermes' UX) instead of a "⏳ Thinking..." reply
+        # message. The animator self-refreshes every 4s — Telegram clears
+        # the typing indicator after ~5s of silence, so the loop period
+        # has to undercut that. ``update_status`` becomes a no-op since
+        # the typing dot replaces the spinner text entirely, and the agent
+        # actual reply lands a few seconds later.
         try:
-            return await msg.reply_text(f"⏳ {text}")
+            animator = _TypingAnimator(msg.get_bot(), msg.chat_id)
+            await animator.start()
+            return animator
         except Exception:
             return None
 
     async def update_status(self, status_msg, text: str) -> None:
-        try:
-            await status_msg.edit_text(f"⏳ {text}")
-        except Exception:
-            pass
+        # Intentional no-op: see ``post_status`` — tool-progress lines like
+        # "Using bash..." would clutter the chat. The typing indicator alone
+        # tells the user the agent is still working.
+        return None
 
     async def clear_status(self, status_msg) -> None:
+        if status_msg is None:
+            return
         try:
-            await status_msg.delete()
+            await status_msg.stop()
         except Exception:
             pass
 

@@ -82,6 +82,89 @@ def _sanitize_claude_model_id(model_id: str) -> str:
     return _MODEL_DOTTED_VERSION_RE.sub(r"\1-\2-\3", model_id)
 
 
+# Destructive shell / VCS / k8s patterns that ``can_use_tool`` rejects
+# when ``safety.approvals.enabled: true`` is set in the config. Conservative
+# list — additions go via env var ``OPENAGENT_SAFETY_BLOCK_EXTRA_PATTERNS``
+# (comma-separated regex fragments) so ops can extend without code edits.
+# Patterns match case-insensitively against the joined arg string of the
+# tool call. The match is intentionally substring-based; tighter parsing
+# (shlex-aware, AST for SQL, etc.) belongs in a future iteration.
+_DEFAULT_RISKY_PATTERNS: tuple[str, ...] = (
+    r"\brm\s+-[rfRF]+\s+/",          # rm -rf / or rm -rf /...
+    r"\bsudo\s+rm\b",
+    r"\bdd\s+if=",                    # dd raw disk write
+    r"\bmkfs(\.\w+)?\b",              # filesystem reformat
+    r">\s*/dev/sd[a-z]",              # write to raw block device
+    r"\bchmod\s+(-R\s+)?[0-7]{3,4}\s+/",  # chmod -R on root paths
+    r"\bgit\s+push\s+(?:--force\b|-f\b)",
+    r"\bgit\s+reset\s+--hard\s+(HEAD|origin)",
+    r"\bkubectl\s+delete\b",
+    r"\bdocker\s+(?:rm\s+-f|rmi\s+-f|system\s+prune\s+-a)",
+    r"\bdrop\s+(?:database|table)\s+",  # SQL destructive
+    r"\bshutdown\b|\breboot\b",
+    r"\bhalt\b|\bpoweroff\b",
+)
+
+
+def _compile_risky_patterns() -> list[re.Pattern]:
+    pats = list(_DEFAULT_RISKY_PATTERNS)
+    extra = (os.environ.get("OPENAGENT_SAFETY_BLOCK_EXTRA_PATTERNS") or "").strip()
+    if extra:
+        pats.extend(seg.strip() for seg in extra.split(",") if seg.strip())
+    return [re.compile(p, re.IGNORECASE) for p in pats]
+
+
+def _build_can_use_tool_callback():
+    """Return an async callback compatible with ``ClaudeAgentOptions.can_use_tool``.
+
+    The SDK calls this BEFORE every tool execution. We deny when the tool
+    args match any risky pattern, allow otherwise. Denial sends the model
+    a structured tool-error response so it can choose another path on
+    its own (typical: it explains the limitation to the user instead of
+    retrying). The block decision is logged for audit.
+
+    NB: this currently auto-denies — interactive per-call confirmation
+    (e.g. Telegram inline buttons) is a follow-up. The deny-vs-prompt
+    split lives here on purpose so adding the interactive path doesn't
+    require touching the SDK plumbing.
+    """
+    patterns = _compile_risky_patterns()
+
+    async def _can_use_tool(tool_name: str, tool_input: dict, *_args, **_kwargs):
+        # Flatten the input into a single searchable string. Tools like
+        # ``Bash`` carry the command in ``command``; ``Edit`` puts paths
+        # and content in their own keys. A flat join catches all of
+        # them with one matcher.
+        try:
+            flat = " ".join(
+                str(v) for v in (tool_input.values() if isinstance(tool_input, dict) else ())
+            )
+        except Exception:
+            flat = ""
+        for pat in patterns:
+            m = pat.search(flat)
+            if m:
+                elog(
+                    "safety.tool_blocked",
+                    tool=tool_name,
+                    pattern=pat.pattern,
+                    matched=m.group(0)[:120],
+                )
+                return {
+                    "behavior": "deny",
+                    "message": (
+                        f"Blocked by safety policy: pattern {pat.pattern!r} "
+                        f"matched in {tool_name} args. To allow this operation, "
+                        "either rephrase the command, ask the user to run it "
+                        "directly, or set ``safety.approvals.enabled: false`` "
+                        "in openagent.yaml."
+                    ),
+                }
+        return {"behavior": "allow"}
+
+    return _can_use_tool
+
+
 def _known_sdk_session_ids_from_db(
     db: Any,
     *,
@@ -208,6 +291,13 @@ class _Session:
     # ``ResultMessage.model_usage`` carries the right keys but None
     # values so diffing it is useless.
     last_actual_model: str | None = None
+    # Cumulative input tokens for this conversation across all turns.
+    # Drives the compression threshold: when this crosses the budget
+    # the next turn forces a fresh SDK session (``--resume`` discarded)
+    # so the prompt prefix shrinks back to the system prompt + tool
+    # definitions baseline. Reset on session reload from DB / explicit
+    # forget. See ``safety.compression`` in the config / env vars.
+    cumulative_input_tokens: int = 0
 
 
 class ClaudeCLI(BaseModel):
@@ -312,7 +402,24 @@ class ClaudeCLI(BaseModel):
     ) -> Any:
         from claude_agent_sdk import ClaudeAgentOptions
 
-        opts: dict[str, Any] = {"permission_mode": "bypassPermissions"}
+        # Safety approvals — pattern-match risky tool calls (destructive
+        # shell, force-push, etc.) and BLOCK them at the SDK level by
+        # routing through ``can_use_tool``. Off by default so existing
+        # workflows that need ``rm`` / ``git reset`` etc. don't break;
+        # opt in by setting ``safety.approvals.enabled: true`` in
+        # ``openagent.yaml`` (server.py maps that to the env var).
+        # Hermes' equivalent: ``approvals.mode: manual``.
+        _approvals_on = (
+            os.environ.get("OPENAGENT_SAFETY_APPROVALS", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
+        if _approvals_on:
+            opts: dict[str, Any] = {
+                "permission_mode": "default",
+                "can_use_tool": _build_can_use_tool_callback(),
+            }
+        else:
+            opts: dict[str, Any] = {"permission_mode": "bypassPermissions"}
         # Token-level streaming. Without this the SDK only emits one
         # ``AssistantMessage`` at the END of each block carrying the
         # entire reply — voice mode gets the whole text in a single
@@ -606,6 +713,56 @@ class ClaudeCLI(BaseModel):
         async with session.lock:
             await self._disconnect(session)
             session.last_active = time.time()
+
+    async def _maybe_compress_session(self, session_id: str, last_input_tokens: int) -> None:
+        """Reset the SDK session when cumulative input tokens exceed the
+        compression threshold. Hermes-flavoured but minimal: we drop the
+        live ``ClaudeSDKClient`` (next turn spawns a fresh subprocess
+        without ``--resume``) so the next turn's prompt prefix collapses
+        back to system_prompt + tool definitions. The vault MCP remains
+        the long-term memory of record — the agent loses verbatim recall
+        of the dropped turns but keeps anything it deliberately saved.
+
+        Disabled by default. Enable via ``safety.compression.enabled:
+        true`` in ``openagent.yaml`` (server.py exports the env var) or
+        directly with ``OPENAGENT_SAFETY_COMPRESSION=1``. Threshold via
+        ``OPENAGENT_SAFETY_COMPRESSION_THRESHOLD_TOKENS`` (default 80000).
+        """
+        if (
+            os.environ.get("OPENAGENT_SAFETY_COMPRESSION", "0").strip().lower()
+            not in ("1", "true", "yes", "on")
+        ):
+            return
+        try:
+            threshold = int(
+                os.environ.get("OPENAGENT_SAFETY_COMPRESSION_THRESHOLD_TOKENS", "80000")
+            )
+        except (TypeError, ValueError):
+            threshold = 80000
+        if threshold <= 0:
+            return
+        async with self._registry_lock:
+            session = self._sessions.get(session_id)
+        if session is None:
+            return
+        session.cumulative_input_tokens += max(int(last_input_tokens or 0), 0)
+        if session.cumulative_input_tokens < threshold:
+            return
+        # Crossed the threshold — drop the client and reset the counter.
+        # ``--resume`` is intentionally NOT discarded here: the SDK can
+        # still pick up the prior session if a follow-up turn benefits
+        # from it. The win is on the *current* live subprocess buffer,
+        # which would otherwise grow turn after turn.
+        prior_total = session.cumulative_input_tokens
+        session.cumulative_input_tokens = 0
+        await self._drop_client(session_id)
+        elog(
+            "compression.session_reset",
+            session_id=session_id,
+            cumulative_input_tokens=prior_total,
+            threshold=threshold,
+            kind="drop_client",
+        )
 
     async def close_session(self, session_id: str) -> None:
         """Explicitly release one Claude subprocess, keeping resume state."""
@@ -916,6 +1073,27 @@ class ClaudeCLI(BaseModel):
         streamed_text_parts: list[str] = []
         result_text = ""
         usage_meta: dict[str, Any] = {}
+
+        # Tool loop guardrails — abort the SDK stream when the model
+        # keeps invoking a broken tool. Hermes' equivalent: a same-tool
+        # failure streak past N turns, or an exact-error repeat past M
+        # turns, almost always means the underlying MCP is offline / the
+        # arguments are wrong in a way the model can't fix on its own.
+        # Without this guard a single offline MCP can drain hundreds of
+        # input tokens per minute as the agent retries forever.
+        #
+        # Disable by setting ``OPENAGENT_SAFETY_GUARDRAILS=0`` (default on).
+        # Server-side toggle lives under ``safety.guardrails.enabled`` in
+        # ``openagent.yaml`` — see ``core/server.py`` for the env mapping.
+        _guardrails_enabled = (
+            os.environ.get("OPENAGENT_SAFETY_GUARDRAILS", "1").strip().lower()
+            not in ("0", "false", "no", "off")
+        )
+        _GUARDRAIL_SAME_TOOL_HARDSTOP = 5
+        _GUARDRAIL_EXACT_ERROR_HARDSTOP = 5
+        _tool_failure_streak: dict[str, int] = {}
+        _last_tool_failure_signature: str | None = None
+        _exact_error_streak = 0
         # The first ``AssistantMessage.model`` seen in the stream is
         # the SDK's own claim for which model ran this turn. That's
         # the only authoritative per-turn signal the SDK exposes —
@@ -1028,18 +1206,71 @@ class ClaudeCLI(BaseModel):
                 for block in getattr(message, "content", None) or []:
                     tool_use_id = getattr(block, "tool_use_id", None)
                     if tool_use_id:
+                        _is_err = bool(getattr(block, "is_error", False))
                         elog(
                             "claude_cli.tool_use_result",
                             session_id=session_id,
                             tool_use_id=tool_use_id,
                             is_error=getattr(block, "is_error", None),
                         )
+                        # Guardrail tracking. Look up the originating
+                        # tool name to drive same-tool streak counting.
+                        _tool_name_for_streak: str | None = None
                         if tool_calls_out is not None:
                             for tc in tool_calls_out:
                                 if tc.get("id") == tool_use_id:
                                     tc["output"] = getattr(block, "content", None)
-                                    tc["is_error"] = bool(getattr(block, "is_error", None))
+                                    tc["is_error"] = _is_err
+                                    _tool_name_for_streak = tc.get("name")
                                     break
+                        if _is_err and _guardrails_enabled:
+                            # Same-tool repeated failure streak.
+                            if _tool_name_for_streak:
+                                _tool_failure_streak[_tool_name_for_streak] = (
+                                    _tool_failure_streak.get(_tool_name_for_streak, 0) + 1
+                                )
+                                _streak = _tool_failure_streak[_tool_name_for_streak]
+                                if _streak >= _GUARDRAIL_SAME_TOOL_HARDSTOP:
+                                    elog(
+                                        "claude_cli.guardrail_tripped",
+                                        session_id=session_id,
+                                        reason="same_tool_failure",
+                                        tool=_tool_name_for_streak,
+                                        streak=_streak,
+                                    )
+                                    raise RuntimeError(
+                                        f"Tool loop guardrail: '{_tool_name_for_streak}' "
+                                        f"failed {_streak} times consecutively — aborting turn."
+                                    )
+                            # Exact-error repeat streak (catches "MCP offline"
+                            # patterns where the model rotates between tools
+                            # but the error stays the same).
+                            _sig = str(getattr(block, "content", ""))[:200]
+                            if _sig and _sig == _last_tool_failure_signature:
+                                _exact_error_streak += 1
+                            else:
+                                _exact_error_streak = 1
+                                _last_tool_failure_signature = _sig
+                            if _exact_error_streak >= _GUARDRAIL_EXACT_ERROR_HARDSTOP:
+                                elog(
+                                    "claude_cli.guardrail_tripped",
+                                    session_id=session_id,
+                                    reason="exact_error_repeat",
+                                    streak=_exact_error_streak,
+                                    error_signature=_sig[:80],
+                                )
+                                raise RuntimeError(
+                                    f"Tool loop guardrail: same error returned "
+                                    f"{_exact_error_streak} turns in a row — aborting turn."
+                                )
+                        else:
+                            # Success — reset the streaks so a single
+                            # green call clears the slate. We want streaks
+                            # to fire only on *consecutive* failures.
+                            if _tool_name_for_streak:
+                                _tool_failure_streak.pop(_tool_name_for_streak, None)
+                            _exact_error_streak = 0
+                            _last_tool_failure_signature = None
                         if assistant_blocks_out is not None:
                             assistant_blocks_out.append({
                                 "type": "tool_result",
@@ -1147,6 +1378,14 @@ class ClaudeCLI(BaseModel):
                     output_tokens=output_tokens,
                     model=self._model_id_for_response(sid),
                 )
+                # Compression watchdog. Track cumulative input tokens and
+                # reset the SDK session when we cross the configured
+                # threshold so the next turn pays the system-prompt cost
+                # again from scratch instead of an ever-growing transcript.
+                # This is minimal — Hermes does a real summary; we drop
+                # the SDK conversation and let the persistent vault MCP
+                # be the long-term memory store. Off by default.
+                await self._maybe_compress_session(sid, input_tokens)
                 return ModelResponse(
                     content=result,
                     tool_names_called=tool_names_called,

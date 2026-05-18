@@ -43,6 +43,47 @@ from src.mcp.builtins import DEFAULT_MCPS, resolve_builtin_entry, resolve_defaul
 
 logger = logging.getLogger(__name__)
 
+
+# Priority order used by ``*_under_budget`` to decide which subprocess MCPs
+# appear in the upfront tool list when the total tool count exceeds the
+# budget. MCPs listed here win their slot before alphabetical order kicks
+# in; trimmed MCPs remain *connected* and reachable via ``tool-search`` —
+# the model just has to discover them lazily. Override at runtime by
+# setting ``OPENAGENT_MCP_PRIORITY`` to a comma-separated list of MCP
+# names (e.g. ``vault,messaging,shell``); names not in the list fall back
+# to alphabetical position.
+_DEFAULT_MCP_PRIORITY: tuple[str, ...] = (
+    "vault",        # long-term memory — keep hot, the user relies on it
+    "messaging",    # platform-native Telegram primitives
+    "shell",        # run commands / scripts
+    "editor",       # file edits
+    "filesystem",   # read/list paths
+    "web-search",   # quick lookup
+    "scheduler",    # cron / reminders
+)
+
+
+def _mcp_priority_order() -> tuple[str, ...]:
+    raw = (os.environ.get("OPENAGENT_MCP_PRIORITY") or "").strip()
+    if not raw:
+        return _DEFAULT_MCP_PRIORITY
+    parsed = tuple(seg.strip() for seg in raw.split(",") if seg.strip())
+    return parsed or _DEFAULT_MCP_PRIORITY
+
+
+def _mcp_priority_key(name: str) -> tuple[int, str]:
+    """Sort key: (priority-rank, name). Lower rank wins. Unknown MCPs get
+    a rank past every priority slot so the priority list always sorts
+    first; ties (and unknowns) fall back to alphabetical name order.
+    """
+    order = _mcp_priority_order()
+    try:
+        rank = order.index(name)
+    except ValueError:
+        rank = len(order)
+    return (rank, name)
+
+
 # Tokens that must be forwarded from os.environ into the messaging MCP
 # subprocess env. Agno's MCPTools and the Claude SDK both filter env to a
 # safe subset by default, so we have to copy these explicitly.
@@ -1212,7 +1253,7 @@ class MCPPool:
 
         subprocess_pairs = sorted(
             ((self._toolkit_name(tk), tk) for tk in self._agno_toolkits),
-            key=lambda p: p[0],
+            key=lambda p: _mcp_priority_key(p[0]),
         )
         kept: list[Any] = []
         for _, tk in subprocess_pairs:
@@ -1246,7 +1287,7 @@ class MCPPool:
 
         subprocess_specs = sorted(
             (s for s in self.specs if not s.in_process),
-            key=lambda s: s.name,
+            key=lambda s: _mcp_priority_key(s.name),
         )
         for spec in subprocess_specs:
             n = self._tool_counts.get(spec.name, 0)

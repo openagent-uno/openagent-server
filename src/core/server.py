@@ -165,6 +165,42 @@ def _build_agent(config: dict) -> Agent:
         if wa.get("green_api_token"):
             os.environ["GREEN_API_TOKEN"] = wa["green_api_token"]
 
+    # Safety toggles — read from ``safety.*`` and export as env vars so the
+    # SDK options builder + the per-turn guardrail tracker can read them
+    # without plumbing the agent config object through every callsite.
+    # Defaults preserve current behaviour: guardrails ON, approvals OFF.
+    safety_config = config.get("safety") or {}
+    _guardrails_cfg = (safety_config.get("guardrails") or {})
+    if "enabled" in _guardrails_cfg:
+        os.environ["OPENAGENT_SAFETY_GUARDRAILS"] = (
+            "1" if bool(_guardrails_cfg["enabled"]) else "0"
+        )
+    _approvals_cfg = (safety_config.get("approvals") or {})
+    if "enabled" in _approvals_cfg:
+        os.environ["OPENAGENT_SAFETY_APPROVALS"] = (
+            "1" if bool(_approvals_cfg["enabled"]) else "0"
+        )
+    if _approvals_cfg.get("block_extra_patterns"):
+        extras = _approvals_cfg["block_extra_patterns"]
+        if isinstance(extras, (list, tuple)):
+            os.environ["OPENAGENT_SAFETY_BLOCK_EXTRA_PATTERNS"] = ",".join(
+                str(p) for p in extras
+            )
+        elif isinstance(extras, str):
+            os.environ["OPENAGENT_SAFETY_BLOCK_EXTRA_PATTERNS"] = extras
+    _compression_cfg = (safety_config.get("compression") or {})
+    if "enabled" in _compression_cfg:
+        os.environ["OPENAGENT_SAFETY_COMPRESSION"] = (
+            "1" if bool(_compression_cfg["enabled"]) else "0"
+        )
+    if "threshold_tokens" in _compression_cfg:
+        try:
+            os.environ["OPENAGENT_SAFETY_COMPRESSION_THRESHOLD_TOKENS"] = str(
+                int(_compression_cfg["threshold_tokens"])
+            )
+        except (TypeError, ValueError):
+            pass
+
     memory_cfg = config.get("memory", {})
     db_path = memory_cfg.get("db_path", str(default_db_path()))
     db = MemoryDB(db_path)
@@ -209,6 +245,10 @@ def _build_bridges(config: dict, per_bridge_url: dict[str, str]) -> list:
             # either way we can't wire it up.
             continue
 
+        # Per-channel personality overlay (Hermes-style). Resolved later
+        # inside BaseBridge — here we just plumb the raw string through.
+        personality = cfg.get("personality")
+
         if name == "telegram":
             from src.bridges.telegram import TelegramBridge
             token = cfg.get("token") or os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -220,6 +260,7 @@ def _build_bridges(config: dict, per_bridge_url: dict[str, str]) -> list:
                 allowed_users=cfg.get("allowed_users"),
                 gateway_url=gateway_url,
                 gateway_token=None,
+                personality=personality,
             ))
 
         elif name == "discord":
@@ -240,6 +281,7 @@ def _build_bridges(config: dict, per_bridge_url: dict[str, str]) -> list:
                 dm_only=bool(cfg.get("dm_only", False)),
                 gateway_url=gateway_url,
                 gateway_token=None,
+                personality=personality,
             ))
 
         elif name == "whatsapp":
@@ -255,6 +297,7 @@ def _build_bridges(config: dict, per_bridge_url: dict[str, str]) -> list:
                 allowed_users=cfg.get("allowed_users"),
                 gateway_url=gateway_url,
                 gateway_token=None,
+                personality=personality,
             ))
 
         else:
