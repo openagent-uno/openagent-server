@@ -203,6 +203,13 @@ _TEST_MODULES: tuple[str, ...] = (
     # heavy Agno session writes held the writer lock and broke every
     # returning device's login).
     "test_coordinator_login_resilience",
+    # End-to-end multi-user: spin up an in-process coordinator, mint
+    # one invite per user, drive the full SRP-6a register+login wire
+    # flow for N distinct (handle, device) pairs. Confirms invitations
+    # are honoured, certs verify under the coordinator pubkey, and
+    # returning-device logins (the touch_device path) survive both
+    # clean and DB-lock-rigged runs.
+    "test_coordinator_e2e_multi_user",
     # Discord on_message receive-path tests — pin the
     # allowed-users-bypass-mention gate behaviour and confirm silent
     # drops emit a diagnostic event.
