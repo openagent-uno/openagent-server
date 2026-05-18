@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 # canonical owner removes a silent single point of failure: if the
 # redirect is ever revoked (rename loop, namespace conflict) every
 # deployed agent would silently stop receiving updates.
-GITHUB_REPO = "openagent-uno/OpenAgent"
+GITHUB_REPO = "openagent-uno/openagent-server"
 GITHUB_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
 
