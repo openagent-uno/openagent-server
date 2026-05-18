@@ -115,8 +115,7 @@ if [ "$WANT_PKG" = true ]; then
     # ``import openagent.app`` tries to resolve a non-existent
     # ``openagent.app`` submodule and the build fails.
     PKG_BASE="${BINARY_NAME%.app}"
-    MODULE="${PKG_BASE//-/_}"
-    PKG_VERSION="$(python -c "import ${MODULE}; print(${MODULE}.__version__)")"
+    PKG_VERSION="$(python -c "from importlib.metadata import version; print(version('openagent-framework'))")"
     PKG_ARCH_RAW="$(uname -m)"
     case "$PKG_ARCH_RAW" in
         x86_64|amd64)  PKG_ARCH="x64" ;;
