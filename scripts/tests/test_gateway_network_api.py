@@ -358,6 +358,200 @@ async def t_revoke(ctx: TestContext) -> None:
         await db.close()
 
 
+@test("gateway_network", "PATCH /users/{handle} suspends + activates")
+async def t_patch_user_status(ctx: TestContext) -> None:
+    from src.gateway.api.network import handle_patch_user
+    from src.network.coordinator.store import CoordinatorStore
+
+    agent_dir = ctx.test_dir / f"gwnet-patch-u-{uuid.uuid4().hex[:6]}"
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    db_path = agent_dir / "agent.db"
+    await _seed_coord(db_path, users=["alessandro"])
+
+    db = await _open_db(db_path)
+    try:
+        req = _make_request(
+            db, method="PATCH", path="/api/network/users/alessandro",
+            body=b'{"status":"suspended"}',
+            match_info={"handle": "alessandro"},
+        )
+        resp = await handle_patch_user(req)
+        import json
+        assert resp.status == 200, f"got {resp.status}: {resp.body!r}"
+        assert json.loads(resp.body)["status"] == "suspended"
+
+        # Verify it landed in the DB.
+        store = CoordinatorStore(db)
+        user = await store.get_user("alessandro")
+        assert user is not None
+        assert user.status == "suspended"
+
+        # Back to active.
+        req2 = _make_request(
+            db, method="PATCH", path="/api/network/users/alessandro",
+            body=b'{"status":"active"}',
+            match_info={"handle": "alessandro"},
+        )
+        resp2 = await handle_patch_user(req2)
+        assert resp2.status == 200
+        user = await store.get_user("alessandro")
+        assert user.status == "active"
+    finally:
+        await db.close()
+
+
+@test("gateway_network", "PATCH /users with bogus status → 400")
+async def t_patch_user_bad_status(ctx: TestContext) -> None:
+    from src.gateway.api.network import handle_patch_user
+
+    agent_dir = ctx.test_dir / f"gwnet-patch-bad-{uuid.uuid4().hex[:6]}"
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    db_path = agent_dir / "agent.db"
+    await _seed_coord(db_path, users=["alessandro"])
+
+    db = await _open_db(db_path)
+    try:
+        req = _make_request(
+            db, method="PATCH", path="/api/network/users/alessandro",
+            body=b'{"status":"banned"}',
+            match_info={"handle": "alessandro"},
+        )
+        resp = await handle_patch_user(req)
+        assert resp.status == 400, f"got {resp.status}: {resp.body!r}"
+    finally:
+        await db.close()
+
+
+@test("gateway_network", "DELETE /users/{handle} removes user + cascades devices")
+async def t_delete_user(ctx: TestContext) -> None:
+    from src.gateway.api.network import handle_delete_user
+    from src.network.coordinator.store import CoordinatorStore
+
+    agent_dir = ctx.test_dir / f"gwnet-del-u-{uuid.uuid4().hex[:6]}"
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    db_path = agent_dir / "agent.db"
+    await _seed_coord(db_path, users=["alessandro", "marco"])
+
+    # Seed a device for alessandro so we can verify the cascade.
+    db = await _open_db(db_path)
+    try:
+        store = CoordinatorStore(db)
+        await store.add_device(
+            device_pubkey=b"\x11" * 32, user_handle="alessandro",
+            label="laptop",
+        )
+        assert await store.user_has_devices("alessandro")
+
+        # Caller is marco; delete alessandro.
+        req = _make_request(
+            db, method="DELETE", path="/api/network/users/alessandro",
+            user_handle="marco",
+            match_info={"handle": "alessandro"},
+        )
+        resp = await handle_delete_user(req)
+        import json
+        assert resp.status == 200, f"got {resp.status}: {resp.body!r}"
+        assert json.loads(resp.body)["deleted"] is True
+
+        # User + their devices are gone.
+        assert await store.get_user("alessandro") is None
+        assert not await store.user_has_devices("alessandro")
+        # Marco is untouched.
+        assert await store.get_user("marco") is not None
+    finally:
+        await db.close()
+
+
+@test("gateway_network", "DELETE /users/{handle} refuses self-delete")
+async def t_self_delete_blocked(ctx: TestContext) -> None:
+    """Logged-in user can't delete their own account via the API —
+    they'd race their own response and end up in a weird state."""
+    from src.gateway.api.network import handle_delete_user
+
+    agent_dir = ctx.test_dir / f"gwnet-self-{uuid.uuid4().hex[:6]}"
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    db_path = agent_dir / "agent.db"
+    await _seed_coord(db_path, users=["alessandro"])
+
+    db = await _open_db(db_path)
+    try:
+        req = _make_request(
+            db, method="DELETE", path="/api/network/users/alessandro",
+            user_handle="alessandro",  # same as target!
+            match_info={"handle": "alessandro"},
+        )
+        resp = await handle_delete_user(req)
+        assert resp.status == 409, f"got {resp.status}: {resp.body!r}"
+    finally:
+        await db.close()
+
+
+@test("gateway_network", "PATCH /agents/{handle} edits label")
+async def t_patch_agent_label(ctx: TestContext) -> None:
+    from src.gateway.api.network import handle_patch_agent
+    from src.network.coordinator.store import CoordinatorStore
+
+    agent_dir = ctx.test_dir / f"gwnet-patch-a-{uuid.uuid4().hex[:6]}"
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    db_path = agent_dir / "agent.db"
+    coord_node = "cb" + "0" * 62
+    await _seed_coord(db_path, agents=[("lyra-agent", coord_node)])
+
+    db = await _open_db(db_path)
+    try:
+        req = _make_request(
+            db, method="PATCH", path="/api/network/agents/lyra-agent",
+            body=b'{"label":"Lyra music & ops"}',
+            match_info={"handle": "lyra-agent"},
+        )
+        resp = await handle_patch_agent(req)
+        assert resp.status == 200, f"got {resp.status}: {resp.body!r}"
+
+        # Verify it landed.
+        store = CoordinatorStore(db)
+        agents = await store.list_agents()
+        assert agents[0].label == "Lyra music & ops"
+    finally:
+        await db.close()
+
+
+@test("gateway_network", "DELETE /agents/{handle} refuses the coordinator's own agent")
+async def t_delete_self_agent_blocked(ctx: TestContext) -> None:
+    """Deleting the agent whose NodeId == coordinator's strands every
+    client — the gateway pickable list goes empty. Block that path
+    with a clear 409 + hint; foreign rows can still be removed."""
+    from src.gateway.api.network import handle_delete_agent
+
+    agent_dir = ctx.test_dir / f"gwnet-del-self-{uuid.uuid4().hex[:6]}"
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    db_path = agent_dir / "agent.db"
+    coord_node = "cb" + "0" * 62
+    await _seed_coord(db_path, agents=[
+        ("lyra-agent", coord_node),
+        ("foreign", "ff" + "8" * 62),
+    ])
+
+    db = await _open_db(db_path)
+    try:
+        # Refuse: trying to delete the coord's own agent.
+        req = _make_request(
+            db, method="DELETE", path="/api/network/agents/lyra-agent",
+            match_info={"handle": "lyra-agent"},
+        )
+        resp = await handle_delete_agent(req)
+        assert resp.status == 409, f"got {resp.status}: {resp.body!r}"
+
+        # Allow: foreign row can be cleaned up freely.
+        req2 = _make_request(
+            db, method="DELETE", path="/api/network/agents/foreign",
+            match_info={"handle": "foreign"},
+        )
+        resp2 = await handle_delete_agent(req2)
+        assert resp2.status == 200, f"got {resp2.status}: {resp2.body!r}"
+    finally:
+        await db.close()
+
+
 @test("gateway_network", "member-mode agent returns 404 on /users")
 async def t_member_mode_404(ctx: TestContext) -> None:
     """A member-mode agent doesn't own the user table — the HTTP

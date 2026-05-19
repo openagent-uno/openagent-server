@@ -174,6 +174,50 @@ class CoordinatorStore:
         )
         return [UserRow(**dict(row)) for row in await cur.fetchall()]
 
+    async def set_user_status(self, handle: str, status: str) -> bool:
+        """Flip a user between ``active`` and ``suspended``.
+
+        Suspended users can't login (``_m_login_init`` rejects on
+        ``status != 'active'``) but the account + devices stay in the
+        DB so the operator can re-activate without re-onboarding. A
+        soft delete, basically."""
+        if status not in ("active", "suspended"):
+            raise ValueError(f"invalid status: {status!r}")
+        cur = await self._conn.execute(
+            "UPDATE network_users SET status=? WHERE handle=?",
+            (status, handle),
+        )
+        await self._conn.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def delete_user(self, handle: str) -> bool:
+        """Hard-delete a user + cascade their device rows.
+
+        Any cert previously issued to one of those devices still
+        verifies cryptographically (it's an Ed25519 sig over a payload
+        that doesn't know the row exists), but the auth middleware
+        also looks up the device in ``network_devices`` at request
+        time — once the row is gone, the cert is dead.
+
+        ``network_invitations.bind_to_handle`` is left intact even if
+        it pointed at this user: the consume path checks the user
+        exists at redeem time, so a stale bind is just a no-op invite,
+        not a security hole.
+        """
+        # Deletes are in two statements rather than relying on FK
+        # CASCADE because the schema was created without ON DELETE
+        # CASCADE and adding it now would need a table rebuild.
+        await self._conn.execute(
+            "DELETE FROM network_devices WHERE user_handle=?",
+            (handle,),
+        )
+        cur = await self._conn.execute(
+            "DELETE FROM network_users WHERE handle=?",
+            (handle,),
+        )
+        await self._conn.commit()
+        return (cur.rowcount or 0) > 0
+
     # ── devices ────────────────────────────────────────────────────
 
     async def add_device(
@@ -280,6 +324,39 @@ class CoordinatorStore:
             (coord_node_id,),
         )
         return [AgentRow(**dict(row)) for row in await cur.fetchall()]
+
+    async def update_agent(
+        self,
+        handle: str,
+        *,
+        label: str | None = None,
+        owner_handle: str | None = None,
+    ) -> bool:
+        """Patch the cosmetic fields on an agent row.
+
+        ``handle`` and ``node_id`` are immutable here — changing the
+        handle would break clients caching the agent picker; changing
+        node_id would re-route gateway traffic without re-issuing
+        certs. Use ``register_agent`` (which UPSERTs) if you need
+        either of those, but understand the blast radius first.
+        """
+        sets: list[str] = []
+        params: list = []
+        if label is not None:
+            sets.append("label=?")
+            params.append(label)
+        if owner_handle is not None:
+            sets.append("owner_handle=?")
+            params.append(owner_handle)
+        if not sets:
+            return False
+        params.append(handle)
+        cur = await self._conn.execute(
+            f"UPDATE network_agents SET {', '.join(sets)} WHERE handle=?",
+            params,
+        )
+        await self._conn.commit()
+        return (cur.rowcount or 0) > 0
 
     async def remove_agent(self, handle: str) -> bool:
         cur = await self._conn.execute(

@@ -140,7 +140,7 @@ async def _do_register(ticket_str: str, password: str) -> int:
         print("  ✓ cert renewed", flush=True)
 
         # ── 3. Gateway WS handshake (exact path the Electron app takes) ──
-        print("\n[3/3] gateway WS auth (the Electron-app failure path)",
+        print("\n[3/4] gateway WS auth (the Electron-app failure path)",
               flush=True)
         try:
             agents = await coord_list_agents(
@@ -171,14 +171,85 @@ async def _do_register(ticket_str: str, password: str) -> int:
                   flush=True)
             await dialer.close()
             return 1
+        print(f"  ✓ AUTH_OK received: {auth_ok_payload[:120]}…", flush=True)
+
+        # ── 4. /api/network/* — members & invitations through the gateway ──
+        print("\n[4/4] /api/network/* (members + mint via gateway HTTP)",
+              flush=True)
+        try:
+            await _exercise_network_api(dialer, agent_node_id)
+        except Exception as e:  # noqa: BLE001
+            print(f"  ✗ network api failed: {type(e).__name__}: {e}",
+                  flush=True)
+            await dialer.close()
+            return 1
         await dialer.close()
-        print(f"  ✓ AUTH_OK received: {auth_ok_payload[:140]}…", flush=True)
 
     finally:
         await node.stop()
 
-    print(f"\nREGISTER + WS PASSED. Handle for pair step: {handle}", flush=True)
+    print(f"\nREGISTER + WS + NETWORK API PASSED. Handle: {handle}", flush=True)
     return 0
+
+
+async def _exercise_network_api(dialer, target_node_id: str) -> None:
+    """Drive list/mint/revoke against the live gateway's /api/network/*.
+
+    Mirrors what the desktop Members tab + the openagent-cli `users`/
+    `invite` commands do, end-to-end over Iroh+HTTP."""
+    import aiohttp
+
+    from src.network.client.session import LoopbackProxy
+
+    proxy = LoopbackProxy(dialer=dialer, target_node_id=target_node_id)
+    host, port = await proxy.start()
+    try:
+        async with aiohttp.ClientSession() as s:
+            base = f"http://{host}:{port}"
+            async with s.get(f"{base}/api/network/users") as r:
+                assert r.status == 200, f"GET /users → {r.status}"
+                users = (await r.json()).get("users", [])
+                print(f"  ✓ GET /users → {len(users)} user(s)",
+                      flush=True)
+
+            async with s.get(f"{base}/api/network/agents") as r:
+                assert r.status == 200, f"GET /agents → {r.status}"
+                agents = (await r.json()).get("agents", [])
+                print(f"  ✓ GET /agents → {len(agents)} agent(s) (first: "
+                      f"{agents[0]['handle'] if agents else '-'})",
+                      flush=True)
+
+            async with s.get(f"{base}/api/network/invitations") as r:
+                assert r.status == 200, f"GET /invitations → {r.status}"
+                pre = (await r.json()).get("invitations", [])
+                print(f"  ✓ GET /invitations → {len(pre)} active",
+                      flush=True)
+
+            # Smart mint — handle absent → user role, open invite.
+            async with s.post(
+                f"{base}/api/network/invitations",
+                json={"handle": "smoke-friend"},
+            ) as r:
+                assert r.status == 201, \
+                    f"POST /invitations → {r.status}: {await r.text()}"
+                minted = await r.json()
+                assert minted["role"] == "user", minted
+                assert minted["ticket"].startswith("oa1"), minted
+                print(f"  ✓ POST /invitations → role={minted['role']}, "
+                      f"code={minted['code']}, intent={minted['intent']!r}",
+                      flush=True)
+
+            # Idempotent revoke.
+            async with s.delete(
+                f"{base}/api/network/invitations/{minted['code']}",
+            ) as r:
+                assert r.status == 200, f"DELETE → {r.status}"
+                payload = await r.json()
+                assert payload.get("revoked") is True, payload
+                print(f"  ✓ DELETE /invitations/{minted['code'][:10]}… "
+                      f"→ revoked=True", flush=True)
+    finally:
+        await proxy.stop()
 
 
 async def _do_pair(ticket_str: str, handle: str, password: str) -> int:

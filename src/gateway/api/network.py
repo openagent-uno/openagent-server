@@ -253,6 +253,185 @@ async def handle_mint_invitation(request: "web.Request") -> "web.Response":
     }, status=201)
 
 
+async def handle_patch_user(request: "web.Request") -> "web.Response":
+    """PATCH /api/network/users/{handle} — flip status (active/suspended).
+
+    Soft-delete: leaves the account + devices in place so the operator
+    can re-activate without re-onboarding. Body: ``{"status": "active"
+    | "suspended"}``.
+    """
+    from aiohttp import web
+
+    result = await _store_or_404(request)
+    if isinstance(result, web.Response):
+        return result
+    store, _row = result
+
+    handle = (request.match_info.get("handle") or "").strip().lower()
+    if not handle:
+        return web.json_response({"error": "missing handle"}, status=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+
+    status = body.get("status")
+    if status not in ("active", "suspended"):
+        return web.json_response(
+            {"error": "status must be 'active' or 'suspended'"},
+            status=400,
+        )
+
+    user = await store.get_user(handle)
+    if user is None:
+        return web.json_response({"error": f"user {handle!r} not found"}, status=404)
+    updated = await store.set_user_status(handle, status)
+    return web.json_response({"handle": handle, "status": status, "updated": updated})
+
+
+async def handle_delete_user(request: "web.Request") -> "web.Response":
+    """DELETE /api/network/users/{handle} — hard-delete a user + devices.
+
+    Cascades into ``network_devices`` so existing certs for this user
+    stop verifying at the auth middleware (cert sig still valid; row
+    lookup fails). Existing live WS sessions stay open until they
+    drop; new connections are rejected.
+
+    Guard: an authenticated user can't delete themselves through this
+    endpoint — kicking yourself off mid-request would race the
+    response. Operators who really need to remove their own account
+    can do it from a *different* user's session, or by hand-editing
+    the DB while the agent is stopped.
+    """
+    from aiohttp import web
+
+    result = await _store_or_404(request)
+    if isinstance(result, web.Response):
+        return result
+    store, _row = result
+
+    handle = (request.match_info.get("handle") or "").strip().lower()
+    if not handle:
+        return web.json_response({"error": "missing handle"}, status=400)
+
+    caller = (request.get("user_handle") or "").strip().lower()
+    if caller == handle:
+        return web.json_response(
+            {
+                "error": "can't delete yourself through the API",
+                "hint": "use a different account to remove this one, "
+                        "or stop the agent and edit the DB by hand.",
+            },
+            status=409,
+        )
+
+    deleted = await store.delete_user(handle)
+    if not deleted:
+        return web.json_response({"error": f"user {handle!r} not found"}, status=404)
+    return web.json_response({"deleted": True, "handle": handle})
+
+
+async def handle_patch_agent(request: "web.Request") -> "web.Response":
+    """PATCH /api/network/agents/{handle} — edit label and/or owner_handle.
+
+    ``handle`` and ``node_id`` are intentionally not editable here —
+    they're the routing key clients cache; changing them silently
+    breaks every paired device's local agent picker. If you need to
+    re-key an agent, delete + re-register (and accept that clients
+    will need to re-resolve their target).
+    """
+    from aiohttp import web
+
+    result = await _store_or_404(request)
+    if isinstance(result, web.Response):
+        return result
+    store, _row = result
+
+    handle = (request.match_info.get("handle") or "").strip().lower()
+    if not handle:
+        return web.json_response({"error": "missing handle"}, status=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+
+    label = body.get("label")
+    owner_handle = body.get("owner_handle")
+    if label is not None and not isinstance(label, str):
+        return web.json_response({"error": "label must be a string"}, status=400)
+    if owner_handle is not None and not isinstance(owner_handle, str):
+        return web.json_response(
+            {"error": "owner_handle must be a string"},
+            status=400,
+        )
+    if label is None and owner_handle is None:
+        return web.json_response(
+            {"error": "PATCH must include at least one of: label, owner_handle"},
+            status=400,
+        )
+
+    updated = await store.update_agent(
+        handle,
+        label=label.strip() if isinstance(label, str) else None,
+        owner_handle=(owner_handle.strip().lower()
+                      if isinstance(owner_handle, str) and owner_handle.strip()
+                      else None),
+    )
+    if not updated:
+        return web.json_response({"error": f"agent {handle!r} not found"}, status=404)
+    return web.json_response({"updated": True, "handle": handle})
+
+
+async def handle_delete_agent(request: "web.Request") -> "web.Response":
+    """DELETE /api/network/agents/{handle} — drop an agent from the registry.
+
+    Guard: the agent whose ``node_id`` matches this coordinator's own
+    NodeId is the network's only working gateway — deleting it
+    strands every client (list_agents returns empty → no agent to
+    pick → WS dials fail). Block that path. Foreign-network rows
+    (the failure mode that surfaced as WS code 1006 on lyra) can be
+    removed freely.
+    """
+    from aiohttp import web
+
+    result = await _store_or_404(request)
+    if isinstance(result, web.Response):
+        return result
+    store, net_row = result
+
+    handle = (request.match_info.get("handle") or "").strip().lower()
+    if not handle:
+        return web.json_response({"error": "missing handle"}, status=400)
+
+    # Probe the row before deleting so we can refuse the self-agent
+    # case with a clear message instead of just rejecting the call.
+    agents = await store.list_agents()
+    target = next((a for a in agents if a.handle == handle), None)
+    if target is None:
+        return web.json_response({"error": f"agent {handle!r} not found"}, status=404)
+    coord_node_id = (net_row or {}).get("coordinator_node_id") or ""
+    if target.node_id == coord_node_id:
+        return web.json_response(
+            {
+                "error": "refusing to delete this agent: it's the "
+                         "coordinator's own gateway — removing it would "
+                         "strand every paired device.",
+                "hint": "use ``openagent network init`` on a fresh agent "
+                        "if you want to migrate to a different one.",
+            },
+            status=409,
+        )
+
+    deleted = await store.remove_agent(handle)
+    return web.json_response({"deleted": deleted, "handle": handle})
+
+
 async def handle_revoke_invitation(request: "web.Request") -> "web.Response":
     """DELETE /api/network/invitations/{code} — mark an invite spent.
 

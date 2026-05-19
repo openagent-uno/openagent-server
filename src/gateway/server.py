@@ -492,7 +492,11 @@ class Gateway:
             # Network directory + invitations (coordinator-only; member
             # agents 404 here — the client should ask the coordinator).
             ("GET",    "/api/network/users",                network_api.handle_list_users),
+            ("PATCH",  "/api/network/users/{handle}",       network_api.handle_patch_user),
+            ("DELETE", "/api/network/users/{handle}",       network_api.handle_delete_user),
             ("GET",    "/api/network/agents",               network_api.handle_list_agents),
+            ("PATCH",  "/api/network/agents/{handle}",      network_api.handle_patch_agent),
+            ("DELETE", "/api/network/agents/{handle}",      network_api.handle_delete_agent),
             ("GET",    "/api/network/invitations",          network_api.handle_list_invitations),
             ("POST",   "/api/network/invitations",          network_api.handle_mint_invitation),
             ("DELETE", "/api/network/invitations/{code}",   network_api.handle_revoke_invitation),
