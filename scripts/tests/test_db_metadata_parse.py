@@ -304,6 +304,94 @@ async def t_list_session_runs_unwraps(ctx: TestContext) -> None:
         await db.close()
 
 
+@test("db_metadata_parse", "add_session_run preserves Agno history when claude-cli appends")
+async def t_add_session_run_cross_framework(ctx: TestContext) -> None:
+    """Seed an ``agno_sessions`` row whose ``runs`` column is the
+    double-encoded shape Agno's serializer produces. Then call
+    ``add_session_run`` (the path claude-cli uses in ``_persist_turn``)
+    and assert the existing history is preserved — without the unwrap
+    in ``_add_session_run_locked``, the list-shape check resets ``runs``
+    to ``[]`` and the previous turns vanish.
+    """
+    import sqlite3
+    import json as _json
+    from src.memory.db import MemoryDB
+
+    prior_runs = [
+        {"run_id": "agno-r1", "messages": [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "ack"},
+        ], "status": "completed"},
+        {"run_id": "agno-r2", "messages": [
+            {"role": "user", "content": "second"},
+            {"role": "assistant", "content": "ok"},
+        ], "status": "completed"},
+    ]
+    double_runs = _json.dumps(_json.dumps(prior_runs))
+
+    conn = sqlite3.connect(str(ctx.db_path))
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agno_sessions (
+                session_id TEXT PRIMARY KEY,
+                session_type TEXT,
+                agent_id TEXT,
+                team_id TEXT,
+                workflow_id TEXT,
+                user_id TEXT,
+                session_data TEXT,
+                agent_data TEXT,
+                team_data TEXT,
+                workflow_data TEXT,
+                metadata TEXT,
+                runs TEXT,
+                summary TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO agno_sessions "
+            "(session_id, session_type, user_id, runs, "
+            " created_at, updated_at) "
+            "VALUES (?, 'agent', 'openagent', ?, 100, 200)",
+            ("session-cross-fw", double_runs),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    db = MemoryDB(str(ctx.db_path))
+    await db.connect()
+    try:
+        # claude-cli appends a new turn.
+        await db.add_session_run(
+            session_id="session-cross-fw",
+            status="completed",
+            messages=[
+                {"role": "user", "content": "third"},
+                {"role": "assistant", "content": "got it"},
+            ],
+            model="anthropic:claude-opus-4-7",
+            run_id="ccli-r3",
+        )
+        runs = await db.list_session_runs("session-cross-fw", limit=20)
+        # ``list_session_runs`` returns newest first.
+        run_ids_newest_first = [r["run_id"] for r in runs]
+        assert run_ids_newest_first == ["ccli-r3", "agno-r2", "agno-r1"], (
+            f"history wiped or reordered: {run_ids_newest_first}"
+        )
+        # The original Agno messages survived too — confirm by content.
+        agno_r1 = next(r for r in runs if r["run_id"] == "agno-r1")
+        assert agno_r1["messages"][0]["content"] == "first"
+        ccli_r3 = next(r for r in runs if r["run_id"] == "ccli-r3")
+        assert ccli_r3["messages"][0]["content"] == "third"
+    finally:
+        await db.close()
+
+
 @test("db_metadata_parse", "upsert_session survives a 'null' metadata row")
 async def t_upsert_survives_null_metadata(ctx: TestContext) -> None:
     """Pre-seed an ``agno_sessions`` row whose ``metadata`` column is the

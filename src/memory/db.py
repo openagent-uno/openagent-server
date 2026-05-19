@@ -3005,7 +3005,13 @@ class MemoryDB:
                     "result": result,
                     "tool_call_error": "tool error" if tc.get("is_error") else None,
                 })
-        # Read current runs array, append new run.
+        # Read current runs array, append new run. The same double-
+        # encoding shape that affects ``metadata`` and ``list_session_runs``
+        # can land here when Agno previously serialized this column with
+        # a stringified ``runs`` payload — unwrap one layer before the
+        # list-shape check so a cross-framework append (claude-cli
+        # writing to a session whose prior turns were Agno-written)
+        # doesn't silently wipe the history by resetting to ``[]``.
         cursor = await conn.execute(
             "SELECT runs FROM agno_sessions WHERE session_id = ?",
             (session_id,),
@@ -3015,6 +3021,11 @@ class MemoryDB:
             runs = json.loads(row[0] or "[]") if row else []
         except (TypeError, ValueError):
             runs = []
+        if isinstance(runs, str):
+            try:
+                runs = json.loads(runs)
+            except (TypeError, ValueError):
+                runs = []
         if not isinstance(runs, list):
             runs = []
         runs.append(run_obj)
