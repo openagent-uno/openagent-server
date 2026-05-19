@@ -8,6 +8,11 @@ Commands:
         coordinator signing key, writes the singleton ``network`` row,
         and registers this agent in its own ``network_agents`` table.
 
+    openagent network rename NEW_NAME
+        Update the network's display label. Cosmetic — ``network_id``,
+        identities, and pairings are unchanged, so existing devices
+        keep working without re-pairing.
+
     openagent network invite [--role user|device|agent] [--bind-to HANDLE]
         Mint a one-shot invite code. Coordinator-only. Prints the code
         in the human-friendly hyphenated form.
@@ -107,7 +112,9 @@ def network_group(ctx):
 )
 @click.option(
     "--personal", is_flag=True,
-    help="Auto-name the network ``<agent>-personal`` and skip prompts.",
+    help="Back-compat: name the network ``<agent>-personal``. New "
+         "installs default to ``<agent>`` (no suffix); this flag is "
+         "kept for scripted installs that depend on the older label.",
 )
 @click.pass_context
 def cmd_init(ctx, name: str | None, personal: bool):
@@ -138,7 +145,11 @@ async def auto_init_if_standalone(
     (auto-bootstrap on first run, so the user only needs one command).
     """
     agent_name = config.get("name", "openagent")
-    name = f"{agent_name}-personal"
+    # Per-agent network — name matches the agent, no decorative suffix.
+    # Older installs that landed on ``<agent>-personal`` keep that name
+    # (``set_network_role`` here is gated on no existing network row);
+    # they can rename via ``openagent network rename``.
+    name = agent_name
 
     db = await _open_db(config)
     try:
@@ -165,7 +176,7 @@ async def auto_init_if_standalone(
         )
         if not quiet:
             console.print(
-                f"[dim]No network configured — auto-created personal network "
+                f"[dim]No network configured — auto-created network "
                 f"[cyan]{name}[/cyan].[/dim]"
             )
         return await store.get_network_role()
@@ -294,7 +305,10 @@ async def _run_init(ctx, name: str | None, personal: bool):
     agent_name = config.get("name", "openagent")
 
     if name is None:
-        name = f"{agent_name}-personal" if personal else f"{agent_name}-net"
+        # Default to the bare agent name. ``--personal`` is retained for
+        # back-compat with scripted installs that explicitly want the
+        # ``<agent>-personal`` label.
+        name = f"{agent_name}-personal" if personal else agent_name
 
     db = await _open_db(config)
     try:
@@ -357,6 +371,64 @@ def _node_id_for(identity: Identity) -> str:
     from src.network.iroh_node import _node_id_from_secret
 
     return _node_id_from_secret(identity.secret_bytes)
+
+
+@network_group.command("rename")
+@click.argument("new_name")
+@click.pass_context
+def cmd_rename(ctx, new_name: str):
+    """Rename the network (cosmetic — does not re-pair devices).
+
+    Updates the ``name`` shown in CLI/UI and in newly minted invite
+    tickets. ``network_id`` and the coordinator identity stay put, so
+    existing devices keep their pairings.
+    """
+    asyncio.run(_run_rename(ctx, new_name))
+
+
+async def _run_rename(ctx, new_name: str):
+    config = ctx.obj["config"]
+    cleaned = new_name.strip()
+    if not cleaned:
+        console.print("[red]Empty name not allowed.[/red]")
+        raise click.Abort()
+
+    db = await _open_db(config)
+    try:
+        store = CoordinatorStore(db)
+        row = await store.get_network_role()
+        if row is None or row["role"] == "standalone":
+            console.print(
+                "[red]No network to rename.[/red] This agent is standalone — "
+                "run [cyan]openagent network init[/cyan] first."
+            )
+            raise click.Abort()
+        if row["role"] != "coordinator":
+            console.print(
+                f"[red]Cannot rename: this agent is a {row['role']!r}, not the "
+                "coordinator.[/red] Rename must be run on the coordinator side."
+            )
+            raise click.Abort()
+
+        old_name = row["name"] or ""
+        if cleaned == old_name:
+            console.print(f"[dim]Network is already named [cyan]{cleaned}[/cyan].[/dim]")
+            return
+
+        updated = await store.rename_network(cleaned)
+        if not updated:
+            console.print("[red]Rename failed (no network row updated).[/red]")
+            raise click.Abort()
+        console.print(
+            f"[green]Renamed:[/green] [dim]{old_name!r}[/dim] → [cyan]{cleaned}[/cyan]"
+        )
+        console.print(
+            "[dim]Existing pairings keep working — network_id is unchanged. "
+            "New invite tickets will carry the new name.[/dim]"
+        )
+    finally:
+        if db._conn is not None:
+            await db._conn.close()
 
 
 @network_group.command("status")

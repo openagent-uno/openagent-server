@@ -131,6 +131,21 @@ class CoordinatorStore:
         )
         await self._conn.commit()
 
+    async def rename_network(self, new_name: str) -> bool:
+        """Update the network's display name. Returns True if a row
+        was updated (i.e. there's a network to rename), False otherwise.
+
+        Purely cosmetic — ``network_id``, role, and identity columns are
+        untouched, so existing pairings keep working. New invite tickets
+        will carry the new name; tickets already in the wild still
+        validate by ``network_id``."""
+        cur = await self._conn.execute(
+            "UPDATE network SET name=? WHERE singleton=1",
+            (new_name,),
+        )
+        await self._conn.commit()
+        return (cur.rowcount or 0) > 0
+
     # ── users ──────────────────────────────────────────────────────
 
     async def get_user(self, handle: str) -> UserRow | None:

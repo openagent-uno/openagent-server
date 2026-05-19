@@ -246,7 +246,7 @@ def init(agent_dir: str):
 @click.argument("agent_dir", required=False, default=None)
 @click.option("--channel", "-ch", multiple=True, help="Channels to start (telegram, discord, whatsapp)")
 @click.option("--no-auto-init", is_flag=True,
-              help="Don't auto-create a personal network on first run; require explicit `network init`.")
+              help="Don't auto-create a network on first run; require explicit `network init`.")
 @click.pass_context
 def serve(ctx, agent_dir: str | None, channel: tuple[str, ...], no_auto_init: bool):
     """Start the OpenAgent server for an agent directory.
@@ -277,7 +277,7 @@ def serve(ctx, agent_dir: str | None, channel: tuple[str, ...], no_auto_init: bo
             mint_first_user_invite,
         )
 
-        # Pre-flight: auto-bootstrap a personal network if this is the
+        # Pre-flight: auto-bootstrap a per-agent network if this is the
         # first run. The user only ever needs ``openagent serve <dir>``.
         bootstrap_invite: tuple[str, dict] | None = None
         active_invites: list[dict] = []

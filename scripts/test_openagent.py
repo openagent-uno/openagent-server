@@ -210,6 +210,11 @@ _TEST_MODULES: tuple[str, ...] = (
     # returning-device logins (the touch_device path) survive both
     # clean and DB-lock-rigged runs.
     "test_coordinator_e2e_multi_user",
+    # Per-agent network naming: auto-bootstrap drops the legacy
+    # ``-personal`` suffix; ``rename_network`` is cosmetic (preserves
+    # network_id, coordinator identity, role) so existing pairings
+    # survive a rename.
+    "test_network_naming",
     # workflow_runs left in ``running`` by a prior process must be
     # reaped on startup — without this, the lyra-music ``dev-coverage``
     # zombies pin the executor's per-workflow lock forever and the
