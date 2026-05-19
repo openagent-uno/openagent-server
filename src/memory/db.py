@@ -2728,6 +2728,17 @@ class MemoryDB:
             parsed = json.loads(raw or "{}")
         except (TypeError, ValueError):
             return {}
+        # Some rows land here with metadata stored as a JSON-encoded string
+        # of a dict (Agno's ``serialize_session_json_fields`` re-encodes
+        # ``json.dumps`` when handed a stringified metadata field). Without
+        # this unwrap, every such row reports ``client_id == ""`` and gets
+        # dropped by the per-handle filter in ``list_all_sessions`` —
+        # ``/api/sessions`` returns empty, the desktop sidebar is blank.
+        if isinstance(parsed, str):
+            try:
+                parsed = json.loads(parsed)
+            except (TypeError, ValueError):
+                return {}
         return parsed if isinstance(parsed, dict) else {}
 
     async def list_all_sessions(
