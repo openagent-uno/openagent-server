@@ -2757,14 +2757,37 @@ class MemoryDB:
         a device pubkey bound to the same user handle in
         ``network_devices`` (soft-fallback for legacy rows persisted
         before sessions were stamped with the handle).
+
+        The filter runs in SQL so ``LIMIT`` is applied AFTER it — i.e.
+        callers get up to ``limit`` matching rows rather than ``limit``
+        unfiltered rows of which a handful happen to match. Without
+        this, real chat sessions get crowded out of the top page by
+        ``:classifier`` and ``workflow:`` rows whose ``updated_at`` is
+        more recent. The two-level ``json_extract(json_extract(metadata,
+        '$'), '$.client_id')`` works for both proper JSON-object rows
+        and the double-encoded form Agno's
+        ``serialize_session_json_fields`` path produces.
         """
         conn = await self._ensure_connected()
-        cursor = await conn.execute(
-            "SELECT session_id, metadata, created_at, updated_at "
-            "FROM agno_sessions "
-            "ORDER BY updated_at DESC LIMIT ?",
-            (int(limit),),
-        )
+        if client_id:
+            legacy_pubkeys = await self._pubkeys_for_handle(client_id)
+            candidates = [client_id, *sorted(legacy_pubkeys)]
+            placeholders = ",".join("?" * len(candidates))
+            cursor = await conn.execute(
+                f"SELECT session_id, metadata, created_at, updated_at "
+                f"FROM agno_sessions "
+                f"WHERE json_extract(json_extract(metadata, '$'), '$.client_id') "
+                f"  IN ({placeholders}) "
+                f"ORDER BY updated_at DESC LIMIT ?",
+                (*candidates, int(limit)),
+            )
+        else:
+            cursor = await conn.execute(
+                "SELECT session_id, metadata, created_at, updated_at "
+                "FROM agno_sessions "
+                "ORDER BY updated_at DESC LIMIT ?",
+                (int(limit),),
+            )
         results: list[dict] = []
         for row in await cursor.fetchall():
             sid = row[0]
@@ -2778,12 +2801,6 @@ class MemoryDB:
                 "created_at": row[2],
                 "last_active_at": row[3],
             })
-        if client_id:
-            legacy_pubkeys = await self._pubkeys_for_handle(client_id)
-            results = [
-                r for r in results
-                if r["client_id"] == client_id or r["client_id"] in legacy_pubkeys
-            ]
         return results
 
     async def _pubkeys_for_handle(self, handle: str) -> set[str]:
