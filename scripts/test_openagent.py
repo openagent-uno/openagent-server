@@ -215,6 +215,10 @@ _TEST_MODULES: tuple[str, ...] = (
     # network_id, coordinator identity, role) so existing pairings
     # survive a rename.
     "test_network_naming",
+    # list_agents: coordinator's own agent comes FIRST so default-picking
+    # clients (agents[0]) don't dial a foreign-network agent and
+    # surface as WS code 1006 (lyra-agent regression 2026-05-19).
+    "test_list_agents_ordering",
     # workflow_runs left in ``running`` by a prior process must be
     # reaped on startup — without this, the lyra-music ``dev-coverage``
     # zombies pin the executor's per-workflow lock forever and the

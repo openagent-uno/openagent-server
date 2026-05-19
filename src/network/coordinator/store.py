@@ -258,9 +258,26 @@ class CoordinatorStore:
         await self._conn.commit()
 
     async def list_agents(self) -> list[AgentRow]:
+        """Return all registered agents, with the coordinator's own
+        agent first.
+
+        Default-picking clients (CLI + desktop app both take
+        ``agents[0]``) need the agent whose gateway actually accepts
+        this network's certs — that's the agent co-located with the
+        coordinator (NodeId matches). Foreign-network agent rows are a
+        footgun: the cert from this network won't verify against their
+        ``state.network_id``, so dialing them yields a 401 / WS code
+        1006 with no obvious user-facing diagnostic. Keeping them in
+        the list (for operator inspection) but pushing them past the
+        default pick avoids the surprise.
+        """
+        role_row = await self.get_network_role()
+        coord_node_id = (role_row or {}).get("coordinator_node_id") or ""
         cur = await self._conn.execute(
             "SELECT handle, node_id, label, owner_handle, added_at, last_seen "
-            "FROM network_agents ORDER BY added_at",
+            "FROM network_agents "
+            "ORDER BY (node_id = ?) DESC, added_at",
+            (coord_node_id,),
         )
         return [AgentRow(**dict(row)) for row in await cur.fetchall()]
 
