@@ -248,6 +248,34 @@ async def _exercise_network_api(dialer, target_node_id: str) -> None:
                 assert payload.get("revoked") is True, payload
                 print(f"  ✓ DELETE /invitations/{minted['code'][:10]}… "
                       f"→ revoked=True", flush=True)
+
+            # PATCH /agents — relabel the coordinator's own agent and
+            # immediately revert. Cosmetic-only so this is safe to
+            # exercise against a live deployment.
+            agents_first = agents[0]
+            original_label = agents_first.get("label") or ""
+            async with s.patch(
+                f"{base}/api/network/agents/{agents_first['handle']}",
+                json={"label": f"{original_label} (smoked)"},
+            ) as r:
+                assert r.status == 200, f"PATCH → {r.status}: {await r.text()}"
+                print(f"  ✓ PATCH /agents/{agents_first['handle']} → label updated",
+                      flush=True)
+            async with s.patch(
+                f"{base}/api/network/agents/{agents_first['handle']}",
+                json={"label": original_label},
+            ) as r:
+                assert r.status == 200
+
+            # DELETE /agents on the coord's own row must REFUSE.
+            async with s.delete(
+                f"{base}/api/network/agents/{agents_first['handle']}",
+            ) as r:
+                assert r.status == 409, (
+                    f"deleting coord's own agent should 409, got {r.status}"
+                )
+                print(f"  ✓ DELETE /agents/{agents_first['handle']} → 409 "
+                      f"(coord agent protected)", flush=True)
     finally:
         await proxy.stop()
 

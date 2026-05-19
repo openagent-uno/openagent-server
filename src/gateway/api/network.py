@@ -88,13 +88,20 @@ async def handle_list_agents(request: "web.Request") -> "web.Response":
     Order matches what default-picking clients (CLI / app) see: the
     coordinator's own agent first, then federated entries by
     registration time. See ``CoordinatorStore.list_agents``.
+
+    Each row carries ``is_self``: true for the agent whose NodeId
+    matches the coordinator's. That's the agent the client is
+    currently talking to — UIs use this to hide the delete control
+    (the server refuses with 409 anyway, but no button is better than
+    a button that always errors) and to render a "this agent" badge.
     """
     from aiohttp import web
 
     result = await _store_or_404(request)
     if isinstance(result, web.Response):
         return result
-    store, _row = result
+    store, row = result
+    coord_node_id = (row or {}).get("coordinator_node_id") or ""
     agents = await store.list_agents()
     return web.json_response({
         "agents": [
@@ -105,6 +112,7 @@ async def handle_list_agents(request: "web.Request") -> "web.Response":
                 "owner_handle": a.owner_handle,
                 "added_at": a.added_at,
                 "last_seen": a.last_seen,
+                "is_self": a.node_id == coord_node_id,
             }
             for a in agents
         ],

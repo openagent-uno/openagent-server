@@ -146,12 +146,17 @@ async def t_list_users(ctx: TestContext) -> None:
         await db.close()
 
 
-@test("gateway_network", "GET /agents returns the coordinator's own agent first")
+@test("gateway_network",
+      "GET /agents returns the coordinator's own agent first + flags is_self")
 async def t_list_agents(ctx: TestContext) -> None:
     """Sanity-check the v0.13.17 ordering fix flows through the HTTP
     layer too: ``agents[0]`` must be the agent whose NodeId matches
     the coordinator's, otherwise default-picking clients would dial
-    a foreign-network gateway and 1006-out."""
+    a foreign-network gateway and 1006-out.
+
+    Also pins the ``is_self`` flag the desktop app uses to hide the
+    delete control on the current agent (the server refuses that
+    DELETE with 409, but no button > button that always errors)."""
     from src.gateway.api.network import handle_list_agents
 
     agent_dir = ctx.test_dir / f"gwnet-agents-{uuid.uuid4().hex[:6]}"
@@ -176,6 +181,11 @@ async def t_list_agents(ctx: TestContext) -> None:
         assert body["agents"][0]["handle"] == "lyra-agent", \
             f"coord agent must be first: {[a['handle'] for a in body['agents']]}"
         assert {a["handle"] for a in body["agents"]} == {"lyra-agent", "foreign-agent"}
+
+        # is_self flag — exactly one row matches (the coord's own).
+        flags = {a["handle"]: a["is_self"] for a in body["agents"]}
+        assert flags == {"lyra-agent": True, "foreign-agent": False}, \
+            f"is_self should mark only the coord agent: {flags}"
     finally:
         await db.close()
 
