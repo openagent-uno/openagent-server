@@ -224,6 +224,10 @@ _TEST_MODULES: tuple[str, ...] = (
     # ``--role`` flag from the default CLI surface. Existing scripts
     # passing --role still work (advanced, hidden).
     "test_invite_smart",
+    # /api/network/{users,agents,invitations} — gateway HTTP surface
+    # that the desktop app + openagent-cli use for the members UI
+    # and remote invite minting.
+    "test_gateway_network_api",
     # workflow_runs left in ``running`` by a prior process must be
     # reaped on startup — without this, the lyra-music ``dev-coverage``
     # zombies pin the executor's per-workflow lock forever and the

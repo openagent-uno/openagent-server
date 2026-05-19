@@ -499,6 +499,43 @@ def cmd_invite(ctx, handle: str | None, role: str | None, ttl: int, uses: int):
     asyncio.run(_run_invite(ctx, handle, role, ttl, uses))
 
 
+async def resolve_invite_intent(
+    store: CoordinatorStore,
+    *,
+    handle: str | None,
+    role: str | None,
+) -> tuple[str, str | None, str]:
+    """Map an operator-facing ``invite [HANDLE]`` request to the
+    underlying protocol triple ``(role, bind_to, intent_label)``.
+
+    Shared by the CLI (``_run_invite``) and the gateway HTTP handler
+    (``POST /api/network/invitations``) so both surfaces have the same
+    behaviour:
+
+      - no HANDLE                 → ('user', None, 'open invite …')
+      - HANDLE that doesn't exist → ('user', None, 'onboard HANDLE …')
+      - HANDLE that exists        → ('device', HANDLE, 'add a new device for HANDLE')
+      - explicit role             → honoured as-is, bind_to taken from HANDLE if present
+    """
+    cleaned = (handle or "").strip().lower() or None
+    if role is None:
+        if cleaned is None:
+            return "user", None, "open invite (any new user)"
+        existing = await store.get_user(cleaned)
+        if existing is not None:
+            return "device", cleaned, f"add a new device for {cleaned}"
+        return "user", None, f"onboard {cleaned} (new user)"
+    bind_to = cleaned
+    if role == "user":
+        return role, None, (
+            f"onboard {cleaned} (new user)" if cleaned
+            else "open invite (any new user)"
+        )
+    if role == "device":
+        return role, bind_to, f"add a new device for {bind_to or '<unbound>'}"
+    return role, bind_to, f"register an agent (owner={bind_to or 'system'})"
+
+
 async def _run_invite(
     ctx,
     handle: str | None,
@@ -520,39 +557,9 @@ async def _run_invite(
                           "Run ``openagent network init`` first.")
             return
 
-        # ── Auto-pick role from whether HANDLE exists ──
-        # The CLI surface gives one verb (``invite``); the protocol's
-        # role machinery stays under the hood (still useful at the
-        # network layer for least-privilege enforcement).
-        cleaned_handle = (handle or "").strip().lower() or None
-        intent_label: str
-        if role is None:
-            if cleaned_handle is None:
-                resolved_role = "user"
-                intent_label = "open invite (any new user)"
-                bind_to: str | None = None
-            else:
-                existing_user = await store.get_user(cleaned_handle)
-                if existing_user is not None:
-                    resolved_role = "device"
-                    bind_to = cleaned_handle
-                    intent_label = f"add a new device for {cleaned_handle}"
-                else:
-                    resolved_role = "user"
-                    bind_to = None
-                    intent_label = f"onboard {cleaned_handle} (new user)"
-        else:
-            resolved_role = role
-            bind_to = cleaned_handle if cleaned_handle else None
-            if resolved_role == "user":
-                intent_label = (
-                    f"onboard {cleaned_handle} (new user)" if cleaned_handle
-                    else "open invite (any new user)"
-                )
-            elif resolved_role == "device":
-                intent_label = f"add a new device for {bind_to or '<unbound>'}"
-            else:
-                intent_label = f"register an agent (owner={bind_to or 'system'})"
+        resolved_role, bind_to, intent_label = await resolve_invite_intent(
+            store, handle=handle, role=role,
+        )
 
         invite = await store.create_invitation(
             role=resolved_role,
