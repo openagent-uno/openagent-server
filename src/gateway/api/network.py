@@ -83,17 +83,19 @@ async def handle_list_users(request: "web.Request") -> "web.Response":
 
 
 async def handle_list_agents(request: "web.Request") -> "web.Response":
-    """GET /api/network/agents — agents registered on this network.
+    """GET /api/network/agents — *federated* agents on this network.
 
-    Order matches what default-picking clients (CLI / app) see: the
-    coordinator's own agent first, then federated entries by
-    registration time. See ``CoordinatorStore.list_agents``.
+    Filters out the row whose ``node_id == coordinator_node_id`` —
+    that's the agent the caller is already talking to, and is
+    routing/storage state, not a manageable peer. The desktop
+    Members tab and the ``openagent-cli agents`` view both render
+    this list directly; without the filter they'd surface a
+    "delete" affordance that 409s on every click.
 
-    Each row carries ``is_self``: true for the agent whose NodeId
-    matches the coordinator's. That's the agent the client is
-    currently talking to — UIs use this to hide the delete control
-    (the server refuses with 409 anyway, but no button is better than
-    a button that always errors) and to render a "this agent" badge.
+    The underlying ``network_agents`` row is *kept* (the coordinator
+    RPC ``list_agents`` still returns it — that's how new clients
+    discover the gateway target on first contact). Only the
+    authenticated-admin view hides it.
     """
     from aiohttp import web
 
@@ -112,9 +114,9 @@ async def handle_list_agents(request: "web.Request") -> "web.Response":
                 "owner_handle": a.owner_handle,
                 "added_at": a.added_at,
                 "last_seen": a.last_seen,
-                "is_self": a.node_id == coord_node_id,
             }
             for a in agents
+            if a.node_id != coord_node_id
         ],
     })
 

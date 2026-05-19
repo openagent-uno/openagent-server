@@ -147,16 +147,15 @@ async def t_list_users(ctx: TestContext) -> None:
 
 
 @test("gateway_network",
-      "GET /agents returns the coordinator's own agent first + flags is_self")
+      "GET /agents filters out the coordinator's own row (federated peers only)")
 async def t_list_agents(ctx: TestContext) -> None:
-    """Sanity-check the v0.13.17 ordering fix flows through the HTTP
-    layer too: ``agents[0]`` must be the agent whose NodeId matches
-    the coordinator's, otherwise default-picking clients would dial
-    a foreign-network gateway and 1006-out.
-
-    Also pins the ``is_self`` flag the desktop app uses to hide the
-    delete control on the current agent (the server refuses that
-    DELETE with 409, but no button > button that always errors)."""
+    """The authenticated /api/network/agents view hides the row whose
+    NodeId matches the coordinator's — it's routing storage, not a
+    manageable peer, and surfacing it gave the Members tab a delete
+    button that always 409'd. Federated rows (different NodeIds)
+    still come back. The underlying coordinator RPC list_agents
+    is *not* filtered — it's still how new clients find the gateway
+    target on first contact."""
     from src.gateway.api.network import handle_list_agents
 
     agent_dir = ctx.test_dir / f"gwnet-agents-{uuid.uuid4().hex[:6]}"
@@ -167,8 +166,8 @@ async def t_list_agents(ctx: TestContext) -> None:
     coord_node = "cb" + "0" * 62
     foreign = "ff" + "8" * 62
     await _seed_coord(db_path, agents=[
-        ("foreign-agent", foreign),  # registered first
-        ("lyra-agent",    coord_node),
+        ("foreign-agent", foreign),
+        ("lyra-agent",    coord_node),  # coord's own — should be filtered
     ])
 
     db = await _open_db(db_path)
@@ -178,14 +177,39 @@ async def t_list_agents(ctx: TestContext) -> None:
         assert resp.status == 200
         import json
         body = json.loads(resp.body)
-        assert body["agents"][0]["handle"] == "lyra-agent", \
-            f"coord agent must be first: {[a['handle'] for a in body['agents']]}"
-        assert {a["handle"] for a in body["agents"]} == {"lyra-agent", "foreign-agent"}
+        handles = [a["handle"] for a in body["agents"]]
+        assert handles == ["foreign-agent"], \
+            f"only federated peers should be returned, got: {handles}"
+        # Sanity: no leftover ``is_self`` field on the visible rows.
+        assert "is_self" not in body["agents"][0], \
+            "is_self was removed from the response shape; visible rows " \
+            "are by definition not self"
+    finally:
+        await db.close()
 
-        # is_self flag — exactly one row matches (the coord's own).
-        flags = {a["handle"]: a["is_self"] for a in body["agents"]}
-        assert flags == {"lyra-agent": True, "foreign-agent": False}, \
-            f"is_self should mark only the coord agent: {flags}"
+
+@test("gateway_network",
+      "GET /agents empty list when no federated peers (single-agent network)")
+async def t_list_agents_solo(ctx: TestContext) -> None:
+    """In the 1-agent-per-network setup (today's default on lyra),
+    the only registered agent IS the coordinator's own. Filtering
+    it out leaves an empty list — the UI uses that to render a
+    "no other agents" empty state."""
+    from src.gateway.api.network import handle_list_agents
+
+    agent_dir = ctx.test_dir / f"gwnet-solo-{uuid.uuid4().hex[:6]}"
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    db_path = agent_dir / "agent.db"
+    coord_node = "cb" + "0" * 62
+    await _seed_coord(db_path, agents=[("lyra-agent", coord_node)])
+
+    db = await _open_db(db_path)
+    try:
+        req = _make_request(db)
+        resp = await handle_list_agents(req)
+        assert resp.status == 200
+        import json
+        assert json.loads(resp.body)["agents"] == []
     finally:
         await db.close()
 
