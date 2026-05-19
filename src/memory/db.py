@@ -460,6 +460,25 @@ CREATE TABLE IF NOT EXISTS skills (
 );
 CREATE INDEX IF NOT EXISTS idx_skills_usage ON skills(usage_count);
 CREATE INDEX IF NOT EXISTS idx_skills_last_used ON skills(last_used_at);
+
+-- ``conversation_embeddings`` stores one row per persisted turn pair
+-- (user + assistant) with the OpenAI embedding serialised as a JSON
+-- float array. The ``memory-search`` MCP queries this table via cosine
+-- similarity so the agent can answer "remember when we discussed X?"
+-- across past sessions. Embedding vector size depends on the model
+-- (1536 for ``text-embedding-3-small``). Pruning is operator-managed
+-- via the curator (future) or manual ``DELETE WHERE timestamp < …``.
+CREATE TABLE IF NOT EXISTS conversation_embeddings (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id      TEXT NOT NULL,
+    role            TEXT NOT NULL,
+    text            TEXT NOT NULL,
+    embedding_json  TEXT NOT NULL,
+    model           TEXT NOT NULL,
+    timestamp       REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_conv_emb_session ON conversation_embeddings(session_id);
+CREATE INDEX IF NOT EXISTS idx_conv_emb_timestamp ON conversation_embeddings(timestamp);
 """
 
 

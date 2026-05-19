@@ -477,6 +477,24 @@ class ClaudeCLI(BaseModel):
         # version drift; if a future release loses the implicit default
         # we still benefit.
         opts.setdefault("betas", []).append("prompt-caching-2024-07-31")
+        # Extended thinking — Anthropic's "model reasons before
+        # responding" feature. Visibly better answers on multi-step
+        # reasoning tasks at the cost of ~budget_tokens worth of extra
+        # compute per turn. Off by default; enable via
+        # ``OPENAGENT_EXTENDED_THINKING_TOKENS=<int>`` env var or the
+        # yaml key ``model.extended_thinking_tokens``. Budget of 0 or
+        # missing → not enabled (Anthropic rejects budget < 1024).
+        try:
+            _thinking_budget = int(
+                os.environ.get("OPENAGENT_EXTENDED_THINKING_TOKENS", "0")
+            )
+        except (TypeError, ValueError):
+            _thinking_budget = 0
+        if _thinking_budget >= 1024:
+            opts["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": _thinking_budget,
+            }
         if self.mcp_servers:
             opts["mcp_servers"] = self.mcp_servers
             # ``--strict-mcp-config`` forces the claude binary to use ONLY
@@ -1522,6 +1540,11 @@ class ClaudeCLI(BaseModel):
                 try:
                     from src.learning.skills import maybe_detect_after_turn as _sk_detect
                     await _sk_detect(self._db, sid, prompt, result)
+                except Exception:
+                    pass
+                try:
+                    from src.learning.semantic_search import store_turn as _ss_store
+                    await _ss_store(self._db, sid, prompt, result)
                 except Exception:
                     pass
                 return ModelResponse(

@@ -228,11 +228,29 @@ def _build_agent(config: dict) -> Agent:
         os.environ["OPENAGENT_SKILLS_ENABLED"] = (
             "1" if bool(_sk_cfg["enabled"]) else "0"
         )
+    _ss_cfg = (memory_cfg.get("semantic_search") or {})
+    if "enabled" in _ss_cfg:
+        os.environ["OPENAGENT_SEMANTIC_SEARCH"] = (
+            "1" if bool(_ss_cfg["enabled"]) else "0"
+        )
     _cur_cfg = (memory_cfg.get("curator") or {})
     if "enabled" in _cur_cfg:
         os.environ["OPENAGENT_CURATOR_ENABLED"] = (
             "1" if bool(_cur_cfg["enabled"]) else "0"
         )
+
+    # Extended thinking budget. Surfaces as ``model.extended_thinking_tokens``
+    # in yaml so it stays in the same logical namespace as future
+    # model-runtime knobs. Anthropic requires the budget be at least
+    # 1024 to engage the feature; anything below disables it.
+    _model_cfg = config.get("model") or {}
+    if "extended_thinking_tokens" in _model_cfg:
+        try:
+            os.environ["OPENAGENT_EXTENDED_THINKING_TOKENS"] = str(
+                int(_model_cfg["extended_thinking_tokens"])
+            )
+        except (TypeError, ValueError):
+            pass
 
     # Quick commands + hooks — keep them in a process-local registry
     # (see ``src.core.hooks``) since bridges + the agent runtime share

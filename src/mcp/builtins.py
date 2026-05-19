@@ -213,6 +213,11 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
         "command": ["python", "-m", "src.mcp.servers.media_gen.server"],
         "python": True,
     },
+    "memory-search": {
+        "dir": "memory_search",
+        "command": ["python", "-m", "src.mcp.servers.memory_search.server"],
+        "python": True,
+    },
 }
 
 DEFAULT_MCPS: list[dict[str, Any]] = [

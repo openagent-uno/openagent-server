@@ -416,6 +416,77 @@ _LOOP_OVER_LIST = WorkflowExample(
 )
 
 
+# ── Example 6 ───────────────────────────────────────────────────────
+# Daily digest — a real, copy-pasteable workflow most users want as
+# their first scheduled job. The AI reads its own memory (vault + recent
+# turns) and pushes a morning summary to Telegram. The user only has to
+# fill in their chat_id; everything else is wired up.
+
+_DAILY_DIGEST = WorkflowExample(
+    name="daily-digest",
+    description=(
+        "Every morning at 8 a.m., ask the AI to recap yesterday — open "
+        "threads, decisions taken, follow-ups due today — pulling from "
+        "vault notes + recent conversation turns. Posts the digest to "
+        "your Telegram chat. Customise the time / chat_id and you're "
+        "done."
+    ),
+    patterns=("trigger-schedule", "ai-prompt", "mcp-tool", "self-recall"),
+    graph={
+        "version": 1,
+        "nodes": [
+            {
+                "id": "n1",
+                "type": "trigger-schedule",
+                "label": "Every morning 8 a.m.",
+                "position": {"x": 100, "y": 100},
+                "config": {"cron_expression": "0 8 * * *"},
+            },
+            {
+                "id": "n2",
+                "type": "ai-prompt",
+                "label": "Draft daily digest",
+                "position": {"x": 360, "y": 100},
+                "config": {
+                    "prompt": (
+                        "Write a brief daily digest (max 8 bullets) covering:\n"
+                        "1. What we discussed yesterday — pull from your "
+                        "vault + most recent session.\n"
+                        "2. Open threads / decisions still pending.\n"
+                        "3. Anything due today based on vault notes "
+                        "tagged ``followup`` or ``due:<date>``.\n\n"
+                        "Be terse, no preamble, no closing pleasantries. "
+                        "Skip sections that have nothing to report."
+                    ),
+                    "session_policy": "ephemeral",
+                },
+            },
+            {
+                "id": "n3",
+                "type": "mcp-tool",
+                "label": "Send to Telegram",
+                "position": {"x": 660, "y": 100},
+                "config": {
+                    "mcp_name": "messaging",
+                    "tool_name": "messaging_telegram_send_message",
+                    "args": {
+                        "chat_id": "<your_telegram_chat_id>",
+                        "text": "📅 Daily digest:\n\n{{nodes.n2.output.text}}",
+                    },
+                },
+            },
+        ],
+        "edges": [
+            {"id": "e1", "source": "n1", "target": "n2",
+             "sourceHandle": "out", "targetHandle": "in"},
+            {"id": "e2", "source": "n2", "target": "n3",
+             "sourceHandle": "out", "targetHandle": "in"},
+        ],
+        "variables": {},
+    },
+)
+
+
 # ── Public registry ─────────────────────────────────────────────────
 
 WORKFLOW_EXAMPLES: dict[str, WorkflowExample] = {
@@ -426,6 +497,7 @@ WORKFLOW_EXAMPLES: dict[str, WorkflowExample] = {
         _AI_THEN_TOOL,
         _PARALLEL_FETCH_MERGE,
         _LOOP_OVER_LIST,
+        _DAILY_DIGEST,
     )
 }
 
