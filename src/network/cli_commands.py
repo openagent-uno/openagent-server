@@ -465,28 +465,47 @@ async def _run_status(ctx):
 
 
 @network_group.command("invite")
+@click.argument("handle", required=False, default=None)
 @click.option(
     "--role",
     type=click.Choice(["user", "device", "agent"]),
-    default="user",
-    help="What this invite grants.",
-)
-@click.option(
-    "--bind-to", default=None,
-    help="For role=device: bind the invite to a specific user handle.",
+    default=None,
+    help="Advanced: force the invite's protocol role. Defaults to "
+         "auto-detect: existing handle → device-bound, new handle → user.",
 )
 @click.option(
     "--ttl", default=7 * 24 * 3600, show_default=True, type=int,
     help="Invite TTL in seconds.",
 )
-@click.option("--uses", default=1, show_default=True, type=int)
+@click.option(
+    "--uses", default=1, show_default=True, type=int,
+    help="Advanced: number of times the ticket can be redeemed.",
+)
 @click.pass_context
-def cmd_invite(ctx, role: str, bind_to: str | None, ttl: int, uses: int):
-    """Mint a one-shot invite code (coordinator-only)."""
-    asyncio.run(_run_invite(ctx, role, bind_to, ttl, uses))
+def cmd_invite(ctx, handle: str | None, role: str | None, ttl: int, uses: int):
+    """Mint an invite ticket.
+
+    Usage:
+
+    \b
+      openagent network invite                  # open invite (anyone joins)
+      openagent network invite marco            # auto: marco doesn't exist → onboarding invite
+      openagent network invite alessandro       # auto: alessandro exists → invite to add a new device
+
+    Coordinator-only. The CLI picks the right protocol role under the
+    hood — pass ``--role`` only for the rare cases where you want to
+    force one (e.g. federated agent registration).
+    """
+    asyncio.run(_run_invite(ctx, handle, role, ttl, uses))
 
 
-async def _run_invite(ctx, role: str, bind_to: str | None, ttl: int, uses: int):
+async def _run_invite(
+    ctx,
+    handle: str | None,
+    role: str | None,
+    ttl: int,
+    uses: int,
+):
     from src.network.coordinator_addr_cache import read_cache
     from src.network.ticket import InviteTicket
 
@@ -500,18 +519,49 @@ async def _run_invite(ctx, role: str, bind_to: str | None, ttl: int, uses: int):
             console.print("[red]Not a coordinator-mode agent.[/red] "
                           "Run ``openagent network init`` first.")
             return
+
+        # ── Auto-pick role from whether HANDLE exists ──
+        # The CLI surface gives one verb (``invite``); the protocol's
+        # role machinery stays under the hood (still useful at the
+        # network layer for least-privilege enforcement).
+        cleaned_handle = (handle or "").strip().lower() or None
+        intent_label: str
+        if role is None:
+            if cleaned_handle is None:
+                resolved_role = "user"
+                intent_label = "open invite (any new user)"
+                bind_to: str | None = None
+            else:
+                existing_user = await store.get_user(cleaned_handle)
+                if existing_user is not None:
+                    resolved_role = "device"
+                    bind_to = cleaned_handle
+                    intent_label = f"add a new device for {cleaned_handle}"
+                else:
+                    resolved_role = "user"
+                    bind_to = None
+                    intent_label = f"onboard {cleaned_handle} (new user)"
+        else:
+            resolved_role = role
+            bind_to = cleaned_handle if cleaned_handle else None
+            if resolved_role == "user":
+                intent_label = (
+                    f"onboard {cleaned_handle} (new user)" if cleaned_handle
+                    else "open invite (any new user)"
+                )
+            elif resolved_role == "device":
+                intent_label = f"add a new device for {bind_to or '<unbound>'}"
+            else:
+                intent_label = f"register an agent (owner={bind_to or 'system'})"
+
         invite = await store.create_invitation(
-            role=role,
+            role=resolved_role,
             created_by="cli",
             ttl_seconds=ttl,
             uses=uses,
             bind_to_handle=bind_to,
         )
         identity = load_or_create_identity(_identity_path(agent_dir))
-        # Optional address hints — only present when the coordinator
-        # has run at least once on this machine since the addr-cache
-        # feature shipped. Missing/empty = old behaviour (client falls
-        # back to iroh discovery on the dial).
         relay_url, addresses = read_cache(agent_dir)
         ticket = InviteTicket(
             code=invite.code,
@@ -525,15 +575,13 @@ async def _run_invite(ctx, role: str, bind_to: str | None, ttl: int, uses: int):
         )
         ticket_str = ticket.encode()
         console.print()
-        console.print(f"[green]Invite ticket — copy/paste this whole string:[/green]")
+        console.print(
+            f"[green]Invite ticket[/green] — [dim]{intent_label}, "
+            f"expires {time.ctime(invite.expires_at)}[/dim]"
+        )
         console.print(f"\n  [bold cyan]{ticket_str}[/bold cyan]\n")
         console.print(
-            f"  [dim]role={invite.role}"
-            + (f", bound to {bind_to}" if bind_to else "")
-            + f", uses={invite.uses_left}, expires {time.ctime(invite.expires_at)}[/dim]"
-        )
-        console.print(
-            f"\n  Redeem with: [cyan]openagent-cli connect {ticket_str}[/cyan]\n"
+            f"  Redeem with: [cyan]openagent-cli connect {ticket_str}[/cyan]\n"
         )
     finally:
         if db._conn is not None:

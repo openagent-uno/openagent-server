@@ -463,6 +463,40 @@ def mcp_server_cmd(name: str):
 main.add_command(network_group)
 
 
+@main.command("invite")
+@click.argument("handle", required=False, default=None)
+@click.option(
+    "--role",
+    type=click.Choice(["user", "device", "agent"]),
+    default=None,
+    help="Advanced: force the invite's protocol role. Defaults to "
+         "auto-detect from HANDLE.",
+)
+@click.option(
+    "--ttl", default=7 * 24 * 3600, show_default=True, type=int,
+    help="Invite TTL in seconds.",
+)
+@click.option(
+    "--uses", default=1, show_default=True, type=int,
+    help="Advanced: number of times the ticket can be redeemed.",
+)
+@click.pass_context
+def cmd_top_level_invite(ctx, handle, role, ttl, uses):
+    """Mint an invite ticket (shortcut for ``network invite``).
+
+    \b
+      openagent invite                  # open invite, anyone joins
+      openagent invite marco            # auto: onboarding invite for marco
+      openagent invite alessandro       # auto: new-device invite for alessandro
+    """
+    # Delegate to the existing implementation so the two surfaces stay
+    # in lockstep — we don't want ``openagent invite`` to behave
+    # differently from ``openagent network invite``.
+    from src.network.cli_commands import _run_invite
+
+    asyncio.run(_run_invite(ctx, handle, role, ttl, uses))
+
+
 @main.command()
 @click.pass_context
 def doctor(ctx) -> None:

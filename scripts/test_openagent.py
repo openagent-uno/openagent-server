@@ -219,6 +219,11 @@ _TEST_MODULES: tuple[str, ...] = (
     # clients (agents[0]) don't dial a foreign-network agent and
     # surface as WS code 1006 (lyra-agent regression 2026-05-19).
     "test_list_agents_ordering",
+    # ``openagent invite [HANDLE]`` auto-picks user-role for new
+    # handles + device-role bound for existing ones, dropping the
+    # ``--role`` flag from the default CLI surface. Existing scripts
+    # passing --role still work (advanced, hidden).
+    "test_invite_smart",
     # workflow_runs left in ``running`` by a prior process must be
     # reaped on startup — without this, the lyra-music ``dev-coverage``
     # zombies pin the executor's per-workflow lock forever and the
