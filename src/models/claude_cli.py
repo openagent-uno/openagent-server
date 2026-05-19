@@ -1921,10 +1921,17 @@ class ClaudeCLI(BaseModel):
 
         # Resolve the persisted owner: prefer the authenticated user
         # handle (cross-device — every device that logs in as the same
-        # user sees the same sessions). Falls back to the session_id
-        # for legacy / non-network callers. ``set_session_handle`` is
-        # called by the gateway from the request middleware.
-        owner_id = self._session_handles.get(session_id) or session_id
+        # user sees the same sessions). When the handle wasn't registered
+        # (process restart wiping the in-memory map; or the agent's
+        # ``model`` attribute wasn't a claude_cli runtime at the time
+        # the gateway received the first frame, so ``set_session_handle``
+        # never ran) we pass ``None`` and let ``upsert_session`` keep the
+        # existing ``client_id`` stamp — which ``_persist_session`` already
+        # set to the device pubkey on session-open, and the
+        # ``legacy_pubkeys`` fallback in ``list_all_sessions`` resolves to
+        # the right handle. The previous fallback to ``session_id`` made
+        # the row unfilterable (no handle ever matches its own session id).
+        owner_id = self._session_handles.get(session_id)
 
         async def _write() -> None:
             try:

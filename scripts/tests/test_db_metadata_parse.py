@@ -392,6 +392,80 @@ async def t_add_session_run_cross_framework(ctx: TestContext) -> None:
         await db.close()
 
 
+@test("db_metadata_parse", "claude_cli _persist_turn stamps the handle (not session_id) as client_id")
+async def t_claude_cli_persist_turn_stamps_handle(ctx: TestContext) -> None:
+    """When the gateway has called ``set_session_handle`` the persisted
+    row's ``client_id`` must be the handle. When it hasn't, the row's
+    ``client_id`` must NOT be overwritten with the bare session_id —
+    the previous behaviour did exactly that, making the row
+    unfilterable (no handle ever matches its own session id) and was
+    the source of the one stray claude-cli row on lyra whose
+    ``client_id`` was its own session_id.
+    """
+    from src.memory.db import MemoryDB
+    from src.models.claude_cli import ClaudeCLI
+
+    db = MemoryDB(str(ctx.db_path))
+    await db.connect()
+    try:
+        # --- Case A: gateway registered the handle → owner=handle ---
+        cli_a = ClaudeCLI()
+        cli_a.set_db(db)
+        cli_a.set_session_handle("session-with-handle", "alessandro")
+        cli_a._persist_turn(
+            "session-with-handle",
+            prompt="ping",
+            assistant_text="pong",
+            tool_calls=[],
+            input_tokens=1, output_tokens=1,
+            model="anthropic:claude-opus-4-7",
+        )
+        for t in list(cli_a._pending_writes.get("session-with-handle", set())):
+            await t
+        row = await db.get_session("session-with-handle")
+        assert row is not None
+        assert row["client_id"] == "alessandro", (
+            f"expected client_id='alessandro', got {row['client_id']!r}"
+        )
+
+        # --- Case B: no handle registered → client_id must NOT be the
+        # session_id; either left empty (fresh row) or preserved from a
+        # prior ``_persist_session`` stamp. Seed a device-pubkey stamp
+        # first, just like the gateway's session-open path would. The
+        # claude-cli write must NOT clobber it.
+        await db.upsert_session(
+            "session-no-handle",
+            client_id="dev-pubkey-feedface",
+            device_id="dev-pubkey-feedface",
+        )
+        cli_b = ClaudeCLI()
+        cli_b.set_db(db)
+        # NOTE: no set_session_handle call.
+        cli_b._persist_turn(
+            "session-no-handle",
+            prompt="ping",
+            assistant_text="pong",
+            tool_calls=[],
+            input_tokens=1, output_tokens=1,
+            model="anthropic:claude-opus-4-7",
+        )
+        for t in list(cli_b._pending_writes.get("session-no-handle", set())):
+            await t
+        row_b = await db.get_session("session-no-handle")
+        assert row_b is not None
+        assert row_b["client_id"] != "session-no-handle", (
+            "session_id leaked into client_id"
+        )
+        assert row_b["client_id"] == "dev-pubkey-feedface", (
+            f"prior pubkey stamp got clobbered: {row_b['client_id']!r}"
+        )
+        # framework + title metadata should still have landed.
+        assert row_b["framework"] == "claude-cli"
+        assert row_b["title"] == "ping"
+    finally:
+        await db.close()
+
+
 @test("db_metadata_parse", "upsert_session survives a 'null' metadata row")
 async def t_upsert_survives_null_metadata(ctx: TestContext) -> None:
     """Pre-seed an ``agno_sessions`` row whose ``metadata`` column is the
