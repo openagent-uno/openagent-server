@@ -210,6 +210,20 @@ _TEST_MODULES: tuple[str, ...] = (
     # returning-device logins (the touch_device path) survive both
     # clean and DB-lock-rigged runs.
     "test_coordinator_e2e_multi_user",
+    # workflow_runs left in ``running`` by a prior process must be
+    # reaped on startup — without this, the lyra-music ``dev-coverage``
+    # zombies pin the executor's per-workflow lock forever and the
+    # next scheduled tick can't make progress.
+    "test_workflow_orphan_reap",
+    # _finalize_run survives transient SQLite locks (Agno's SqliteDb
+    # writes racing OpenAgent's aiosqlite). Retries finalize on
+    # OperationalError; cosmetic update_workflow lock is non-fatal;
+    # retry is BOUNDED so we don't recreate the original loop.
+    "test_workflow_finalize_resilience",
+    # HTTP 402 / Insufficient Balance from any provider rewrites to a
+    # billing-hint message naming the provider — surfaces the actual
+    # config issue instead of looking like a transient provider blip.
+    "test_provider_402_rewrite",
     # Discord on_message receive-path tests — pin the
     # allowed-users-bypass-mention gate behaviour and confirm silent
     # drops emit a diagnostic event.

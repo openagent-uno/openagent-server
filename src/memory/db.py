@@ -1424,6 +1424,37 @@ class MemoryDB:
         rows = await cursor.fetchall()
         return [self._row_to_workflow_run(r) for r in rows]
 
+    async def reap_orphan_workflow_runs(self) -> int:
+        """Mark every workflow_run still in ``running`` as ``failed``.
+
+        Called by ``AgentServer.start()`` after the DB is open. A
+        ``running`` row that survives a process restart is by definition
+        a zombie — the WorkflowExecutor instance that owned it is gone,
+        the in-memory per-workflow lock is fresh, and there's no resume
+        path. Worse, a stuck row blocks the next scheduled run of the
+        same workflow because the executor's per-workflow ``asyncio.Lock``
+        would funnel a new run behind the (never-completing) old one if
+        the old in-process executor were still around — and the cosmetic
+        "running" badge in the UI never clears.
+
+        Closes that loop by finalizing every orphan with a clear error
+        marker so the schedule's next tick starts from a clean slate.
+        Returns the number of rows reaped (for telemetry).
+        """
+        conn = await self._ensure_connected()
+        now = time.time()
+        cursor = await conn.execute(
+            "UPDATE workflow_runs "
+            "SET status='failed', finished_at=?, "
+            "    error=COALESCE(error, '') || "
+            "          CASE WHEN error IS NULL OR error='' THEN '' ELSE ' | ' END || "
+            "          'reaped: orphan from prior process' "
+            "WHERE status='running'",
+            (now,),
+        )
+        await conn.commit()
+        return cursor.rowcount or 0
+
     async def prune_workflow_runs(
         self,
         workflow_id: str,

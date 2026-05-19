@@ -36,6 +36,7 @@ import asyncio
 import inspect
 import json
 import logging
+import sqlite3
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -498,8 +499,37 @@ class WorkflowExecutor:
             kwargs["outputs"] = outputs
         if error is not None:
             kwargs["error"] = error
-        await self.db.update_workflow_run(ctx.run_id, **kwargs)
-        await self.db.update_workflow(ctx.workflow_id, last_run_at=now)
+
+        # Critical: finalize the workflow_run row. If this write loses
+        # to writer-lock contention (e.g. Agno's SqliteDb hammering the
+        # same DB on a parallel run), the run is left in ``running`` and
+        # never recovers in this process — the next scheduled tick or a
+        # process restart has to reap it. Retry a few times with
+        # exponential backoff so transient locks don't strand the row.
+        for attempt in range(4):
+            try:
+                await self.db.update_workflow_run(ctx.run_id, **kwargs)
+                break
+            except sqlite3.OperationalError as e:
+                if attempt == 3:
+                    logger.error(
+                        "workflow %s finalize failed after 4 attempts (%s) — "
+                        "row left in %r state; AgentServer.start() will reap "
+                        "it as an orphan on the next process restart",
+                        ctx.run_id, e, "running",
+                    )
+                else:
+                    await asyncio.sleep(0.5 * (2 ** attempt))
+        # ``last_run_at`` on the workflow row is cosmetic (drives the
+        # list UI's "last run" column). A lock here doesn't damage
+        # state — log and continue.
+        try:
+            await self.db.update_workflow(ctx.workflow_id, last_run_at=now)
+        except sqlite3.OperationalError as e:
+            logger.warning(
+                "workflow %s: last_run_at update skipped (%s)",
+                ctx.workflow_id, e,
+            )
 
         # Wipe any shared-policy ai-prompt session carried across this run.
         # ephemeral nodes already forgot their own sessions at node-end;

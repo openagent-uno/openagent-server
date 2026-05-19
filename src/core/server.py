@@ -534,6 +534,21 @@ class AgentServer:
         # 1. Agent (connects MCPs, opens DB)
         await self.agent.initialize()
 
+        # 1.5. Reap any ``workflow_runs`` still in ``running`` state —
+        #      they're zombies from the prior process that we have no
+        #      way to resume. Without this, the UI shows them spinning
+        #      forever and any per-workflow lock in the new executor
+        #      would funnel a fresh scheduled run behind a stuck old
+        #      one. Cheap (one UPDATE on a small table) and idempotent.
+        try:
+            db = getattr(self.agent.memory, "db", None) if getattr(self.agent, "memory", None) else None
+            if db is not None and hasattr(db, "reap_orphan_workflow_runs"):
+                reaped = await db.reap_orphan_workflow_runs()
+                if reaped:
+                    elog("workflow.orphan_reaped", count=reaped)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("orphan workflow_run reap failed: %s", e)
+
         # 2. Build NetworkState now that the DB is open. iroh-py 0.35
         #    bakes the ALPN handler dict into NodeOptions at node
         #    construction time — every handler must be registered

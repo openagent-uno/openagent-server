@@ -505,6 +505,19 @@ class AgnoProvider(BaseModel):
                 "so Agno computer-control screenshots are incompatible with this "
                 "model. Use a non-DeepSeek model for computer-control / GUI tasks."
             )
+        # 402 / Insufficient Balance is a billing problem — it won't
+        # clear on retry, and a scheduled workflow hammering it just
+        # creates writer-lock contention on the agent's SQLite file.
+        # Surface a clear, actionable message so the operator knows
+        # exactly which provider to refill (or to swap out of the
+        # workflow's model config).
+        if "insufficient balance" in lowered or "error code: 402" in lowered:
+            return (
+                f"Provider '{provider_name}' returned HTTP 402 (Insufficient "
+                f"Balance). This is a billing issue — refill the provider "
+                f"account or change the workflow's model to a different "
+                f"provider. Retrying won't help."
+            )
         return detail
 
     def _provider_config(self) -> dict[str, Any]:
