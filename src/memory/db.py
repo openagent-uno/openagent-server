@@ -3065,6 +3065,17 @@ class MemoryDB:
             runs = json.loads(row[0])
         except (TypeError, ValueError):
             return []
+        # Same double-encoding shape as ``metadata`` — Agno's
+        # ``serialize_session_json_fields`` will store ``runs`` as a
+        # JSON-encoded string of a JSON array if handed a stringified
+        # value. Without this unwrap, every click on a session shows
+        # an empty message list because ``json.loads`` returns a str,
+        # ``isinstance(runs, list)`` is False, and we early-out to [].
+        if isinstance(runs, str):
+            try:
+                runs = json.loads(runs)
+            except (TypeError, ValueError):
+                return []
         if not isinstance(runs, list):
             return []
         return list(reversed(runs[-limit:]))

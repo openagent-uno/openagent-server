@@ -232,6 +232,78 @@ async def t_list_all_sessions_limit_post_filter(ctx: TestContext) -> None:
         await db.close()
 
 
+@test("db_metadata_parse", "list_session_runs unwraps double-encoded runs column")
+async def t_list_session_runs_unwraps(ctx: TestContext) -> None:
+    """The runs column is JSON too, and Agno's serialize path will
+    double-encode it the same way it does metadata. Without an
+    unwrap, ``list_session_runs`` sees a str (not a list) and
+    returns ``[]`` — clicking a session in the desktop shows no
+    messages even though the conversation history is there on disk.
+    """
+    import sqlite3
+    import json as _json
+    from src.memory.db import MemoryDB
+
+    real_runs = [{
+        "run_id": "r1",
+        "status": "completed",
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi back"},
+        ],
+        "created_at": 123,
+    }]
+    double_runs = _json.dumps(_json.dumps(real_runs))
+
+    conn = sqlite3.connect(str(ctx.db_path))
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agno_sessions (
+                session_id TEXT PRIMARY KEY,
+                session_type TEXT,
+                agent_id TEXT,
+                team_id TEXT,
+                workflow_id TEXT,
+                user_id TEXT,
+                session_data TEXT,
+                agent_data TEXT,
+                team_data TEXT,
+                workflow_data TEXT,
+                metadata TEXT,
+                runs TEXT,
+                summary TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO agno_sessions "
+            "(session_id, session_type, user_id, runs, "
+            " created_at, updated_at) "
+            "VALUES (?, 'agent', 'openagent', ?, 100, 200)",
+            ("session-runs-double", double_runs),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    db = MemoryDB(str(ctx.db_path))
+    await db.connect()
+    try:
+        runs = await db.list_session_runs("session-runs-double", limit=10)
+        assert len(runs) == 1, f"expected 1 run, got {len(runs)}: {runs}"
+        run = runs[0]
+        assert run["run_id"] == "r1"
+        msgs = run["messages"]
+        assert len(msgs) == 2
+        assert msgs[0]["role"] == "user" and msgs[0]["content"] == "hello"
+        assert msgs[1]["role"] == "assistant" and msgs[1]["content"] == "hi back"
+    finally:
+        await db.close()
+
+
 @test("db_metadata_parse", "upsert_session survives a 'null' metadata row")
 async def t_upsert_survives_null_metadata(ctx: TestContext) -> None:
     """Pre-seed an ``agno_sessions`` row whose ``metadata`` column is the
