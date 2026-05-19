@@ -130,36 +130,48 @@ class _TypingAnimator:
     async def stream_chunk(self, full_text: str) -> None:
         """Edit the placeholder message with ``full_text``, rate-limited
         to one edit per ``_STREAM_EDIT_MIN_INTERVAL_S``. Lazily posts
-        the placeholder on the first call so non-streaming turns never
-        leave an empty bubble.
+        the placeholder on the first call.
+
+        The whole body is serialised under ``_edit_lock`` because deltas
+        arrive on N concurrent tasks (``fold_outbound_event`` schedules
+        each one via ``asyncio.create_task``). Without the lock, the
+        first wave of deltas all see ``placeholder_message is None``
+        and race to send a separate message — the symptom that showed
+        up as a chat full of half-words. With the lock, exactly one
+        send + many edits happen.
         """
         import time as _time
         if not full_text:
             return
-        try:
-            if self.placeholder_message is None:
-                # Lazy post — first delta creates the bubble.
-                self.placeholder_message = await self._bot.send_message(
-                    chat_id=self._chat_id, text=full_text[:4000]
-                )
-                self._last_edit_at = _time.monotonic()
-                return
-            now = _time.monotonic()
-            if now - self._last_edit_at < self._STREAM_EDIT_MIN_INTERVAL_S:
-                # Buffer the latest text so the next edit catches up.
-                self._pending_text = full_text
-                return
-            async with self._edit_lock:
+        async with self._edit_lock:
+            try:
+                if self.placeholder_message is None:
+                    self.placeholder_message = await self._bot.send_message(
+                        chat_id=self._chat_id, text=full_text[:4000]
+                    )
+                    self._last_edit_at = _time.monotonic()
+                    self._pending_text = full_text
+                    return
+                now = _time.monotonic()
+                if now - self._last_edit_at < self._STREAM_EDIT_MIN_INTERVAL_S:
+                    # Stash the latest text; the next call past the
+                    # rate-limit window will land it.
+                    self._pending_text = full_text
+                    return
+                # Skip the edit when the visible text hasn't changed —
+                # Telegram returns ``message is not modified`` and would
+                # otherwise just swallow it, but avoiding the round-trip
+                # entirely keeps us inside the 1-edit/sec budget.
+                if self._pending_text == full_text:
+                    return
                 try:
                     await self.placeholder_message.edit_text(full_text[:4000])
                     self._last_edit_at = _time.monotonic()
-                    self._pending_text = None
+                    self._pending_text = full_text
                 except Exception:
-                    # Editing the same content (Telegram returns
-                    # "message is not modified") raises here; swallow.
                     pass
-        except Exception:
-            pass
+            except Exception:
+                pass
 
     async def stop(self) -> None:
         self._stop.set()
@@ -187,9 +199,16 @@ class TelegramBridge(BaseBridge):
 
     def __init__(self, token: str, allowed_users: list[str] | None = None,
                  gateway_url: str = "ws://localhost:8765/ws", gateway_token: str | None = None,
-                 personality: str | None = None):
+                 personality: str | None = None, streaming: bool = False):
         super().__init__(gateway_url, gateway_token, personality=personality)
         self.token = token
+        # Streaming: edit a placeholder message as the model types.
+        # Off by default because token-by-token Telegram bubbles feel
+        # noisy in practice — the user typically wants the response
+        # to land as one cohesive bubble. Operators that prefer the
+        # "ChatGPT-style live typing" feel turn it on explicitly via
+        # ``channels.telegram.streaming: true``.
+        self._streaming_enabled = bool(streaming)
         self.allowed_users = set(allowed_users) if allowed_users else None
         self._app = None
         # Highest update_id we've seen from Telegram. Used during shutdown
@@ -744,10 +763,11 @@ class TelegramBridge(BaseBridge):
             pass
 
     async def stream_text(self, status_msg, text: str) -> None:
-        # Forward to the animator's streaming path. The animator
-        # itself manages the placeholder lifecycle + rate limiting so
-        # the bridge can stay stateless.
-        if status_msg is None:
+        # Forward to the animator's streaming path. No-op when
+        # streaming is disabled — the user then just sees the typing
+        # indicator until the final reply lands as a single bubble,
+        # which is the default the bridge ships with.
+        if status_msg is None or not self._streaming_enabled:
             return
         try:
             await status_msg.stream_chunk(text)
