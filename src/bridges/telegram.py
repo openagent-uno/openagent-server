@@ -26,6 +26,12 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_MSG_LIMIT = 4096
 
+# Commands that wipe state — bridge intercepts them and shows an inline
+# Yes/No keyboard before firing the gateway command. Without the gate
+# an accidental ``/clear`` (fat-fingered while scrolling commands) nukes
+# the session silently.
+_DESTRUCTIVE_COMMANDS: set[str] = {"clear", "new", "reset"}
+
 
 @dataclass
 class _Extracted:
@@ -199,9 +205,22 @@ class TelegramBridge(BaseBridge):
 
     def __init__(self, token: str, allowed_users: list[str] | None = None,
                  gateway_url: str = "ws://localhost:8765/ws", gateway_token: str | None = None,
-                 personality: str | None = None, streaming: bool = False):
+                 personality: str | None = None, streaming: bool = False,
+                 allowed_chats: list[int] | None = None):
         super().__init__(gateway_url, gateway_token, personality=personality)
         self.token = token
+        # Group/supergroup chats the bot is allowed to listen in. ``None``
+        # = listen anywhere it's added (still gated by @mention / reply
+        # so it doesn't spam). Provide as a list of chat IDs (signed
+        # integers, negative for groups) to lock it down for work
+        # deployments.
+        self.allowed_chats: set[int] | None = (
+            {int(c) for c in allowed_chats} if allowed_chats is not None else None
+        )
+        # Populated lazily on first inbound update — Telegram's
+        # ``get_me`` is the canonical source. Used to detect mentions
+        # in group chats so the bot stays quiet unless addressed.
+        self._bot_username: str | None = None
         # Streaming: edit a placeholder message as the model types.
         # Off by default because token-by-token Telegram bubbles feel
         # noisy in practice — the user typically wants the response
@@ -237,7 +256,8 @@ class TelegramBridge(BaseBridge):
     async def _run(self) -> None:
         from telegram import BotCommand
         from telegram.ext import (
-            ApplicationBuilder, CommandHandler, MessageHandler, filters,
+            ApplicationBuilder, CallbackQueryHandler, CommandHandler,
+            MessageHandler, filters,
         )
 
         # concurrent_updates(True) is NOT optional: without it python-telegram-bot
@@ -258,8 +278,12 @@ class TelegramBridge(BaseBridge):
 
         # Register commands
         self._app.add_handler(CommandHandler("start", self._on_start))
+        self._app.add_handler(CommandHandler("export", self._on_export))
         for cmd in BRIDGE_COMMANDS:
             self._app.add_handler(CommandHandler(cmd, lambda u, c, _c=cmd: self._on_command(u, c, _c)))
+        # Inline-keyboard callbacks (destructive-command confirm + choice
+        # prompts emitted by the model via the ``[CHOICE: …]`` marker).
+        self._app.add_handler(CallbackQueryHandler(self._on_callback))
 
         # Messages (text, photo, voice, audio, documents, video)
         self._app.add_handler(MessageHandler(
@@ -518,7 +542,43 @@ class TelegramBridge(BaseBridge):
         if not self._is_fresh_update(update):
             return
         name = update.message.from_user.first_name or "there"
-        await update.message.reply_text(bridge_welcome_text(name))
+        # Friendly onboarding shape: welcome + brief capability blurb +
+        # three quick-start buttons so the user has something to tap
+        # on even before figuring out the keyboard. Each button just
+        # injects a starter prompt into a fresh turn — no per-user
+        # preference persistence is wired yet because the agent's own
+        # ``user_profile`` flush will pick those up over the next
+        # few turns naturally.
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        welcome = (
+            f"Ciao {name}! 👋\n\n"
+            "Sono il tuo agente personale. Posso:\n"
+            "• rispondere a domande, scrivere testi, analizzare immagini\n"
+            "• ricordarmi cose tra una conversazione e l'altra\n"
+            "• eseguire script, cercare sul web, accedere a file\n"
+            "• rispondere ai messaggi vocali con la voce\n\n"
+            "Inizia con qualcosa qui sotto o scrivimi liberamente."
+        )
+        starter_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                "💬 Cosa sai fare?",
+                callback_data="choice:0:Spiegami brevemente cosa puoi fare e come ti uso al meglio.",
+            )],
+            [InlineKeyboardButton(
+                "📝 Salva una nota",
+                callback_data="choice:0:Voglio salvare una nota nella tua memoria — ti dico cosa.",
+            )],
+            [InlineKeyboardButton(
+                "📋 Tutti i comandi",
+                callback_data="confirm_cmd:help",
+            )],
+        ])
+        try:
+            await update.message.reply_text(welcome, reply_markup=starter_kb)
+        except Exception:
+            # Fallback to the legacy plain welcome if the keyboard
+            # render fails (older Telegram clients, network blip).
+            await update.message.reply_text(bridge_welcome_text(name))
 
     async def _on_command(self, update, context, cmd):
         if not self._is_fresh_update(update):
@@ -528,11 +588,233 @@ class TelegramBridge(BaseBridge):
         user_id = str(update.message.from_user.id)
         if not self._is_authorized(user_id):
             return await update.message.reply_text("Unauthorized.")
-        # Scope scope-sensitive commands (/stop, /clear, /new, /reset) to
-        # just the user who issued them. Other users on the same bot keep
-        # their own conversations.
+        # Destructive commands route through an inline Yes/No prompt
+        # first. The callback handler (``_on_callback``) re-emits the
+        # original command only on confirmation.
+        if cmd in _DESTRUCTIVE_COMMANDS:
+            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Sì", callback_data=f"confirm_cmd:{cmd}"),
+                InlineKeyboardButton("❌ Annulla", callback_data="cancel_cmd"),
+            ]])
+            await update.message.reply_text(
+                f"Confermi `/{cmd}`? Cancellerà la storia della conversazione.",
+                reply_markup=kb,
+                parse_mode="Markdown",
+            )
+            return
+        # Scope scope-sensitive commands to just the user who issued them.
+        # Other users on the same bot keep their own conversations.
         result = await self.send_command(cmd, session_id=f"tg:{user_id}")
         await self.send_response_text(update.message, result)
+
+    async def _on_export(self, update, context) -> None:
+        """``/export`` — bundle the user's profile + skills + recent
+        turns into a zip and send it back as a Telegram document.
+        GDPR-friendly and lets users back up their context between
+        deployments. Heavy lifting (DB reads) runs against the cached
+        ``_learning_conn`` already opened for the skill matcher."""
+        if not self._is_fresh_update(update):
+            return
+        if not update.message:
+            return
+        user_id = str(update.message.from_user.id)
+        if not self._is_authorized(user_id):
+            return await update.message.reply_text("Unauthorized.")
+        import io
+        import json as _json
+        import zipfile
+        session_id = f"tg:{user_id}"
+        progress = await update.message.reply_text("📦 Preparo l'export...")
+        try:
+            shim = await self._get_learning_db_shim()
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                # User profile (the cross-session "who is the user" JSON).
+                if shim is not None:
+                    try:
+                        cur = await shim._conn.execute(
+                            "SELECT profile_json, turn_count, last_flushed_at "
+                            "FROM user_profiles WHERE session_id = ?",
+                            (session_id,),
+                        )
+                        row = await cur.fetchone()
+                        await cur.close()
+                    except Exception:
+                        row = None
+                    if row:
+                        zf.writestr(
+                            "user_profile.json",
+                            _json.dumps(
+                                {
+                                    "session_id": session_id,
+                                    "profile": _json.loads(row[0] or "{}"),
+                                    "turn_count": row[1],
+                                    "last_flushed_at": row[2],
+                                },
+                                ensure_ascii=False,
+                                indent=2,
+                            ),
+                        )
+                    else:
+                        zf.writestr(
+                            "user_profile.json",
+                            "{}",
+                        )
+                    # Skills — current implementation has a single global
+                    # set per agent; for a personal bot deployment they're
+                    # effectively this user's. Future multi-tenant should
+                    # filter by user_id.
+                    try:
+                        cur = await shim._conn.execute(
+                            "SELECT id, name, signature_hash, markdown, tags_json, "
+                            "       usage_count, last_used_at, created_at "
+                            "FROM skills ORDER BY usage_count DESC, last_used_at DESC NULLS LAST"
+                        )
+                        skills_rows = await cur.fetchall()
+                        await cur.close()
+                    except Exception:
+                        skills_rows = []
+                    skills_payload = []
+                    for r in skills_rows or []:
+                        try:
+                            tags = _json.loads(r[4] or "[]")
+                        except Exception:
+                            tags = []
+                        skills_payload.append({
+                            "id": r[0],
+                            "name": r[1],
+                            "signature_hash": r[2],
+                            "markdown": r[3],
+                            "tags": tags,
+                            "usage_count": r[5],
+                            "last_used_at": r[6],
+                            "created_at": r[7],
+                        })
+                    zf.writestr(
+                        "skills.json",
+                        _json.dumps(skills_payload, ensure_ascii=False, indent=2),
+                    )
+                    # Recent agno_session row (carries the Agno-tracked
+                    # turn transcript for this user's session).
+                    try:
+                        cur = await shim._conn.execute(
+                            "SELECT session_data, agent_data, runs, summary, "
+                            "       updated_at FROM agno_sessions WHERE session_id = ?",
+                            (session_id,),
+                        )
+                        sess = await cur.fetchone()
+                        await cur.close()
+                    except Exception:
+                        sess = None
+                    if sess:
+                        zf.writestr(
+                            "session.json",
+                            _json.dumps(
+                                {
+                                    "session_id": session_id,
+                                    "session_data": sess[0],
+                                    "agent_data": sess[1],
+                                    "runs": sess[2],
+                                    "summary": sess[3],
+                                    "updated_at": sess[4],
+                                },
+                                ensure_ascii=False,
+                                indent=2,
+                            ),
+                        )
+                # A friendly README so the user knows what's inside.
+                zf.writestr(
+                    "README.md",
+                    "# OpenAgent export\n\n"
+                    f"Export for session `{session_id}` generated at "
+                    f"{time.strftime('%Y-%m-%d %H:%M:%S')}.\n\n"
+                    "## Files\n\n"
+                    "- `user_profile.json` — the cross-session profile the bot keeps about you.\n"
+                    "- `skills.json` — reusable how-tos the bot has learned.\n"
+                    "- `session.json` — the latest conversation transcript.\n\n"
+                    "All data is your property. Use `/clear` in chat to "
+                    "wipe the live session at any time.\n",
+                )
+            buf.seek(0)
+            try:
+                await progress.delete()
+            except Exception:
+                pass
+            await update.message.reply_document(
+                document=buf,
+                filename=f"openagent-export-{time.strftime('%Y%m%d-%H%M%S')}.zip",
+                caption="📦 Ecco i tuoi dati — profilo, skill, ultima sessione.",
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.exception("/export failed: %s", e)
+            try:
+                await progress.edit_text(f"⚠️ Errore durante l'export: {str(e)[:200]}")
+            except Exception:
+                pass
+
+    async def _on_callback(self, update, context) -> None:
+        """Generic Telegram ``CallbackQuery`` handler.
+
+        Two callback families today, both routed by ``callback_data`` prefix:
+
+        - ``confirm_cmd:<name>`` / ``cancel_cmd`` — destructive command
+          confirmation flow (set up in ``_on_command``).
+        - ``choice:<turn_id>:<value>`` — inline-keyboard choice for
+          model-driven question prompts (rendered when the agent's
+          reply contains a ``[CHOICE: a | b | c]`` marker). The user's
+          click becomes a fresh agent turn carrying the chosen value.
+        """
+        cb = update.callback_query
+        if cb is None:
+            return
+        try:
+            await cb.answer()  # dismiss the loading spinner on the client
+        except Exception:
+            pass
+        user_id = str(cb.from_user.id) if cb.from_user else ""
+        if not self._is_authorized(user_id):
+            return
+        data = cb.data or ""
+        if data == "cancel_cmd":
+            try:
+                await cb.edit_message_text("Annullato.")
+            except Exception:
+                pass
+            return
+        if data.startswith("confirm_cmd:"):
+            cmd = data[len("confirm_cmd:"):]
+            result = await self.send_command(cmd, session_id=f"tg:{user_id}")
+            try:
+                await cb.edit_message_text(
+                    f"✅ Fatto: `/{cmd}`. {result or 'Conversazione resettata.'}",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
+            return
+        if data.startswith("choice:"):
+            # Format: choice:<turn_id>:<value> — the value is what we
+            # send back to the agent as the user's "click". Turn_id is
+            # ignored on the server side for now; future work can use
+            # it to attach the click to a specific pending turn.
+            _, _, payload = data.partition(":")
+            _, _, value = payload.partition(":")
+            if value:
+                try:
+                    await cb.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
+                # Treat the click as a normal user turn with the value
+                # as text. Lets the agent react in its existing loop.
+                fake_target = cb.message
+                if fake_target is not None:
+                    try:
+                        await self.dispatch_turn(
+                            fake_target, f"tg:{user_id}", value
+                        )
+                    except Exception:
+                        pass
 
     async def _extract_files(self, msg, tmp: str) -> _Extracted:
         """Download every attachment on a single Telegram ``Message`` to ``tmp``.
@@ -595,6 +877,51 @@ class TelegramBridge(BaseBridge):
         uid = str(msg.from_user.id)
         if not self._is_authorized(uid):
             return await msg.reply_text("Unauthorized.")
+        # Group-chat gate: in groups + supergroups the bot only speaks
+        # when @mentioned or replied-to, otherwise it would chatter on
+        # every unrelated message. Channels are ignored entirely (1-way
+        # broadcast surface, not a conversation). DMs always pass.
+        chat = msg.chat
+        chat_id = int(chat.id) if chat else 0
+        chat_type = (chat.type if chat else "").lower()
+        is_group = chat_type in ("group", "supergroup")
+        session_id = f"tg:{uid}"
+        if chat_type == "channel":
+            return
+        if is_group:
+            if (
+                self.allowed_chats is not None
+                and chat_id not in self.allowed_chats
+            ):
+                # Group is not on the whitelist (when one is set).
+                return
+            # Lazily resolve the bot's own username so we can match
+            # ``@bot_user`` mentions reliably.
+            if self._bot_username is None:
+                try:
+                    me = await context.bot.get_me()
+                    self._bot_username = (me.username or "").lower()
+                except Exception:
+                    self._bot_username = ""
+            text_for_mention = (msg.text or msg.caption or "").lower()
+            mentioned = bool(
+                self._bot_username
+                and f"@{self._bot_username}" in text_for_mention
+            )
+            replied_to_bot = bool(
+                getattr(msg, "reply_to_message", None) is not None
+                and getattr(msg.reply_to_message, "from_user", None) is not None
+                and getattr(msg.reply_to_message.from_user, "is_bot", False)
+            )
+            if not (mentioned or replied_to_bot):
+                return
+            # Strip the @mention from the prompt so the model doesn't
+            # waste tokens on it.
+            session_id = f"tg:group:{chat_id}"
+            if mentioned and self._bot_username:
+                # Mutate-safe: we re-read .text below from msg, so
+                # update the local handle the rest of the function uses.
+                pass  # actual strip happens after ``text`` is read below
 
         # Coalesce media groups: Telegram delivers each attachment in a
         # multi-file message as its own Update sharing ``media_group_id``,
@@ -608,9 +935,44 @@ class TelegramBridge(BaseBridge):
 
         elog("bridge.message", bridge="telegram", user_id=uid)
         text = msg.caption or msg.text or ""
+        # Reply threading — when the user replies-to a previous message
+        # (typically one of the bot's own answers), surface the quoted
+        # text to the model as context so "fix that line" / "translate
+        # this" / "elaborate on point 2" type follow-ups land coherently
+        # instead of getting interpreted against the whole prior session
+        # transcript blindly.
+        reply_to = getattr(msg, "reply_to_message", None)
+        if reply_to is not None:
+            quoted = (
+                getattr(reply_to, "text", None)
+                or getattr(reply_to, "caption", None)
+                or ""
+            )[:1500]
+            if quoted:
+                text = (
+                    f"[The user is replying to this earlier message: "
+                    f"{quoted!r}]\n\n{text}"
+                )
+        # Surface a transient STT status when the user sent a voice note —
+        # transcription routinely takes 1-3 s on Whisper-local and the
+        # user shouldn't be left staring at a silent chat. The message
+        # is deleted as soon as ``_extract_files`` returns so the
+        # following typing-indicator + reply flow stays clean.
+        transcribing_msg = None
+        if msg.voice is not None:
+            try:
+                transcribing_msg = await msg.reply_text("🎤 Trascrivo...")
+            except Exception:
+                transcribing_msg = None
         tmp = tempfile.mkdtemp(prefix="oa_tg_")
         try:
             extracted = await self._extract_files(msg, tmp)
+            if transcribing_msg is not None:
+                try:
+                    await transcribing_msg.delete()
+                except Exception:
+                    pass
+                transcribing_msg = None
             if extracted.text_addition:
                 text = f"{text}\n{extracted.text_addition}" if text else extracted.text_addition
 
@@ -620,8 +982,19 @@ class TelegramBridge(BaseBridge):
             if not text:
                 return
 
+            # Strip ``@bot_username`` from the text when this is a
+            # group-mention so the model doesn't see the boilerplate.
+            if is_group and self._bot_username:
+                mention_token = f"@{self._bot_username}"
+                # Remove first occurrence case-insensitively. Manual
+                # find rather than ``re.sub`` because we want to keep
+                # surrounding punctuation as-is.
+                lower = text.lower()
+                idx = lower.find(mention_token)
+                if idx != -1:
+                    text = (text[:idx] + text[idx + len(mention_token):]).strip()
             await self.dispatch_turn(
-                msg, f"tg:{uid}", text, voice_detected=extracted.voice_detected,
+                msg, session_id, text, voice_detected=extracted.voice_detected,
             )
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
@@ -771,6 +1144,47 @@ class TelegramBridge(BaseBridge):
             return
         try:
             await status_msg.stream_chunk(text)
+        except Exception:
+            pass
+
+    async def ack_follower(self, msg) -> None:
+        # Drop a 👀 reaction on follow-up messages that arrived while
+        # the bot was still composing the prior turn. Without this the
+        # user wonders why their second message is being ignored —
+        # server-side coalescence is folding it in, but invisibly.
+        try:
+            from telegram import ReactionTypeEmoji
+            await msg.set_reaction([ReactionTypeEmoji("👀")])
+        except Exception:
+            # Older clients / unsupported chat types just don't render
+            # the reaction — non-fatal.
+            pass
+
+    async def send_choice_buttons(self, msg, options: list[str]) -> None:
+        # Render the picker as a reply to ``msg`` so the buttons sit
+        # underneath the agent's last chunk. Telegram caps inline
+        # buttons at ~8 wide visually; we split into rows of 2 so the
+        # labels stay readable on mobile. ``callback_data`` carries a
+        # ``choice:<turn_id>:<value>`` payload that ``_on_callback``
+        # routes back into ``dispatch_turn``.
+        if not options:
+            return
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        # turn_id is a coarse correlation key; we don't yet thread it
+        # through the agent loop, so use the current message_id for
+        # uniqueness and to help operators debug callbacks in the log.
+        turn_id = str(getattr(msg, "message_id", "0"))
+        rows: list[list] = []
+        cur: list = []
+        for opt in options[:8]:
+            cur.append(InlineKeyboardButton(opt[:64], callback_data=f"choice:{turn_id}:{opt[:48]}"))
+            if len(cur) == 2:
+                rows.append(cur)
+                cur = []
+        if cur:
+            rows.append(cur)
+        try:
+            await msg.reply_text("Scegli:", reply_markup=InlineKeyboardMarkup(rows))
         except Exception:
             pass
 

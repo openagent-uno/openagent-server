@@ -107,6 +107,27 @@ class _DBShim:
         self._conn = conn
 
 
+# ``[CHOICE: a | b | c]`` marker the model can emit to request a
+# button-based pick from the user. Pipe-delimited so values can carry
+# spaces / punctuation without escaping. Captured non-greedy so a
+# response that legitimately contains square brackets afterwards
+# doesn't get swallowed by the regex.
+_CHOICE_MARKER_RE = __import__("re").compile(r"\[CHOICE:\s*([^\]]+)\]")
+
+
+def _extract_choice_marker(text: str) -> tuple[str, list[str]]:
+    """Find a single CHOICE marker, return (cleaned_text, options).
+    Multiple markers collapse to the first — the bot shouldn't be
+    asking two questions in one turn anyway."""
+    m = _CHOICE_MARKER_RE.search(text or "")
+    if m is None:
+        return text or "", []
+    raw = m.group(1)
+    opts = [seg.strip() for seg in raw.split("|") if seg.strip()]
+    cleaned = (text[: m.start()] + text[m.end():]).strip()
+    return cleaned, opts[:8]  # Telegram inline-keyboard practical cap
+
+
 def resolve_personality_directive(personality: str | None) -> str | None:
     """Translate a ``personality`` config value into the system-style
     directive that gets prepended to the user turn. ``None`` / empty
@@ -580,6 +601,17 @@ class BaseBridge:
         far — the bridge doesn't have to maintain its own buffer."""
         return None
 
+    async def ack_follower(self, target) -> None:
+        """Acknowledge a follow-up message that arrived while a turn
+        was still in flight. Server-side coalescence already folds it
+        into the owner's response, but without a visible ACK the user
+        sees their message go unanswered until the merged reply lands
+        — that read as "the bot ignored my second message". Bridges
+        with a per-message reaction primitive (Telegram, Discord)
+        override to flag the message with an emoji; bridges without
+        one stay quiet."""
+        return None
+
     async def send_text_chunk(self, target, chunk: str) -> None:
         """Send one already-split chunk of response text. Subclasses
         own platform formatting (HTML render + fallback for Telegram,
@@ -640,16 +672,25 @@ class BaseBridge:
         except Exception:
             pass
 
-        # Optional per-bridge persona overlay. Prepended once on the user
-        # turn so the model picks it up without changing the persistent
-        # system prompt or the SDK session. The persona is delivered as a
-        # bracketed directive rather than mixed into the user content so
-        # downstream summarisation can spot and preserve it intact.
-        outbound_text = text
+        # Universal language-mirror hint. Claude already tries to mirror
+        # by default, but stating it explicitly avoids the occasional
+        # English-default response when the user types a single ambiguous
+        # word ("ciao" vs "hello"). 30 tokens, fully cached after the
+        # first turn — basically free.
+        outbound_text = (
+            "[Respond in the user's own language, mirroring whatever "
+            "they write. If they mix languages, follow the most recent "
+            "message.]\n\n"
+        ) + text
+
+        # Optional per-bridge persona overlay. Prepended AFTER the
+        # language directive so persona presets that mention language
+        # (e.g. ``noir`` is naturally English-leaning) can still tilt
+        # the model when set.
         if self._personality_directive:
             outbound_text = (
                 f"[Persona for this reply: {self._personality_directive}]\n\n"
-                f"{text}"
+                f"{outbound_text}"
             )
         # Auto-skills matcher — pulls the top relevant how-tos for the
         # current user text and prepends them. Bridge-side so the LLM
@@ -682,6 +723,26 @@ class BaseBridge:
                 # for instant barge-in (StreamSession STT-bypass path).
                 source="stt" if voice_detected else "user_typed",
             )
+        except Exception as e:  # noqa: BLE001
+            # Hard failure of the gateway round-trip (network drop,
+            # protocol error, etc.). The user previously saw nothing
+            # because the exception bubbled past the dispatch loop and
+            # got swallowed at the bridge boundary; surface a friendly
+            # one-liner so they know something happened.
+            logger.exception("%s dispatch_turn send_message failed", self.name)
+            elog(
+                "bridge.dispatch_error",
+                bridge=self.name,
+                session_id=session_id,
+                error=str(e)[:200],
+            )
+            response = {
+                "type": "error",
+                "text": "Errore di trasporto: " + (str(e)[:200] or "ignoto"),
+                "model": None,
+                "attachments": [],
+                "target": target,
+            }
         finally:
             if status_handle is not None:
                 try:
@@ -692,6 +753,34 @@ class BaseBridge:
         # Concurrent message in the same burst — the owner posts the
         # merged reply; followers exit so the user sees ONE response.
         if response.get("type") == "duplicate":
+            # Tell the user we saw the follow-up so they don't think
+            # the bot ignored their second message. Bridge-specific
+            # primitive (Telegram → 👀 reaction; others no-op).
+            try:
+                await self.ack_follower(target)
+            except Exception:
+                pass
+            return
+
+        # Soft errors carried back by the gateway (model said "no",
+        # MCP died mid-turn, etc.) land here as ``type=error``. Replace
+        # the raw error text — which is often a stack trace or a JSON
+        # payload — with a friendly + actionable message and bail out
+        # before the normal attachment / chunking path tries to render
+        # it as a regular reply.
+        if response.get("type") == "error":
+            err_text = (response.get("text") or "").strip()
+            preview = err_text[:300] if err_text else "errore non noto"
+            user_msg = (
+                "⚠️ Ho avuto un problema a elaborare il messaggio.\n\n"
+                f"Dettagli: {preview}\n\n"
+                "Riprova tra qualche istante. Se continua, prova `/clear` "
+                "per ricominciare la conversazione."
+            )
+            try:
+                await self.send_response_text(target, user_msg)
+            except Exception:
+                pass
             return
 
         # Anchor the merged reply to the LATEST message the burst saw,
@@ -766,15 +855,33 @@ class BaseBridge:
 
         Shared by ``dispatch_turn`` and command handlers (``/clear``,
         ``/help``) so a long command result obeys the same chunking +
-        per-platform rendering as a normal reply.
+        per-platform rendering as a normal reply. Also peels off any
+        ``[CHOICE: a | b | c]`` marker the model emitted — the visible
+        text loses the marker, and the options become an inline
+        keyboard via ``send_choice_buttons`` (no-op on platforms that
+        can't render one).
         """
         if not text:
             return
-        for chunk in split_preserving_code_blocks(text, self.message_limit):
+        clean_text, choice_options = _extract_choice_marker(text)
+        for chunk in split_preserving_code_blocks(clean_text, self.message_limit):
             try:
                 await self.send_text_chunk(target, chunk)
             except Exception as e:  # noqa: BLE001
                 logger.error("%s text send error: %s", self.name, e)
+        if choice_options:
+            try:
+                await self.send_choice_buttons(target, choice_options)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("%s choice button send error: %s", self.name, e)
+
+    async def send_choice_buttons(self, target, options: list[str]) -> None:
+        """Render an inline picker for ``options``. Default no-op — only
+        bridges with a button primitive (Telegram, Discord) override.
+        WhatsApp, Slack-thread-only deployments etc. just drop the
+        buttons and rely on the user to type one of the options
+        back as plain text."""
+        return None
 
     # ── Voice helpers (shared by every bridge) ──────────────────────
 

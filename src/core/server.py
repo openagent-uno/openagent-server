@@ -329,6 +329,7 @@ def _build_bridges(config: dict, per_bridge_url: dict[str, str]) -> list:
                 gateway_token=None,
                 personality=personality,
                 streaming=bool(cfg.get("streaming", False)),
+                allowed_chats=cfg.get("allowed_chats"),
             ))
 
         elif name == "discord":
