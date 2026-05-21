@@ -17,7 +17,7 @@ from typing import Any, Awaitable, Callable, TYPE_CHECKING
 from src.gateway import protocol as P
 from src.gateway.commands import command_help_text
 from src.gateway.sessions import SessionManager
-from src.gateway.api import vault, config, health, logs, control, usage, providers, models, scheduled_tasks, workflow_tasks, mcps, marketplace, sessions as sessions_api, system as system_api, claude_setup as claude_setup_api, network as network_api
+from src.gateway.api import vault, config, health, logs, control, usage, providers, models, scheduled_tasks, workflow_tasks, mcps, marketplace, sessions as sessions_api, system as system_api, claude_setup as claude_setup_api, network as network_api, chat as chat_api
 from src.network import peers as peers_api
 from src.network.auth.middleware import make_auth_middleware
 from src.network.transport.aiohttp_iroh_site import IrohSite
@@ -500,6 +500,10 @@ class Gateway:
             ("GET",    "/api/network/invitations",          network_api.handle_list_invitations),
             ("POST",   "/api/network/invitations",          network_api.handle_mint_invitation),
             ("DELETE", "/api/network/invitations/{code}",   network_api.handle_revoke_invitation),
+
+            # iOS / external REST chat (no WebSocket required)
+            ("POST",   "/api/chat",                          chat_api.handle_chat),
+            ("POST",   "/api/health/ingest",                 chat_api.handle_health_ingest),
         )
         for method, path, handler in routes:
             app.router.add_route(method, path, handler)
