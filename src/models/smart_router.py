@@ -28,6 +28,7 @@ contradictory "platform" declaration that isn't true in practice.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass
@@ -50,6 +51,12 @@ logger = logging.getLogger(__name__)
 # ``sdk_sessions.provider``. Exported for tests.
 FRAMEWORK_AGNO = "agno"
 FRAMEWORK_CLAUDE_CLI = "claude-cli"
+
+# Hard ceiling on a single classifier call. Without this the whole turn can
+# stall indefinitely when the classifier provider hangs mid-stream — see
+# the deadlock where ``router.classify_start`` fires and no follow-up
+# event ever lands. Falls back to the bound-framework default on expiry.
+_CLASSIFIER_TIMEOUT = 30.0
 
 
 def _resolve_classifier_model(providers_config: Any) -> str:
@@ -551,10 +558,21 @@ class SmartRouter(BaseModel):
         )
         try:
             provider = self._get_classifier_provider()
-            resp = await provider.generate(
-                messages=[{"role": "user", "content": prompt}],
-                session_id=classifier_session_id,
+            resp = await asyncio.wait_for(
+                provider.generate(
+                    messages=[{"role": "user", "content": prompt}],
+                    session_id=classifier_session_id,
+                ),
+                timeout=_CLASSIFIER_TIMEOUT,
             )
+        except asyncio.TimeoutError:
+            elog(
+                "router.classify_timeout",
+                session_id=session_id,
+                classifier_model=self._classifier_model,
+                timeout=_CLASSIFIER_TIMEOUT,
+            )
+            return None
         except Exception as e:
             elog("router.classify_error", session_id=session_id, error=str(e))
             return None
