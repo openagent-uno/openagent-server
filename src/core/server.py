@@ -596,7 +596,7 @@ class AgentServer:
         # No-op when ``memory.curator.enabled`` is false.
         try:
             from src.learning.curator import start as _curator_start
-            self._curator_task = _curator_start(self.agent.memory)
+            self._curator_task = _curator_start(self.agent.memory_db)
         except Exception as e:  # noqa: BLE001
             logger.warning("Curator failed to start: %s", e)
             self._curator_task = None
