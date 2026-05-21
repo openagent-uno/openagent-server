@@ -479,6 +479,41 @@ CREATE TABLE IF NOT EXISTS conversation_embeddings (
 );
 CREATE INDEX IF NOT EXISTS idx_conv_emb_session ON conversation_embeddings(session_id);
 CREATE INDEX IF NOT EXISTS idx_conv_emb_timestamp ON conversation_embeddings(timestamp);
+
+-- ``skill_events`` stores inbound/outbound events pushed by central skill
+-- runners (e.g. telegram-ingester). Keyed on (skill_id, external_id) so
+-- repeated syncs are idempotent. ``content`` is the human-readable body;
+-- ``metadata_json`` carries skill-specific structured data.
+CREATE TABLE IF NOT EXISTS skill_events (
+    id              TEXT PRIMARY KEY,
+    skill_id        TEXT NOT NULL,
+    source          TEXT NOT NULL,
+    external_id     TEXT,
+    entity_id       TEXT,
+    timestamp       TEXT NOT NULL,
+    direction       TEXT,
+    channel         TEXT,
+    content         TEXT,
+    metadata_json   TEXT,
+    received_at     REAL NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_skill_events_external
+    ON skill_events (skill_id, external_id) WHERE external_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_skill_events_ts ON skill_events (skill_id, timestamp DESC);
+
+-- ``skill_entities`` stores contacts/groups/channels resolved by skills.
+-- Upserted on every sync; ``identifiers_json`` holds service-specific IDs
+-- (phone numbers, @handles, numeric IDs) for cross-referencing.
+CREATE TABLE IF NOT EXISTS skill_entities (
+    id              TEXT PRIMARY KEY,
+    skill_id        TEXT NOT NULL,
+    type            TEXT,
+    display_name    TEXT,
+    identifiers_json TEXT,
+    metadata_json   TEXT,
+    updated_at      REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_skill_entities_skill ON skill_entities (skill_id);
 """
 
 
