@@ -218,6 +218,11 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
         "command": ["python", "-m", "src.mcp.servers.memory_search.server"],
         "python": True,
     },
+    "skill-data": {
+        "dir": "skill_data",
+        "command": ["python", "-m", "src.mcp.servers.skill_data.server"],
+        "python": True,
+    },
 }
 
 DEFAULT_MCPS: list[dict[str, Any]] = [
@@ -234,6 +239,7 @@ DEFAULT_MCPS: list[dict[str, Any]] = [
     {"builtin": "mcp-manager", "_default": True},
     {"builtin": "model-manager", "_default": True},
     {"builtin": "workflow-manager", "_default": True},
+    {"builtin": "skill-data", "_default": True},
 ]
 
 
