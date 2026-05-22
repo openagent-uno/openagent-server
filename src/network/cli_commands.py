@@ -783,7 +783,10 @@ async def _run_loopback(ctx, target, handle_override, agent_handle, password_std
             raise click.Abort()
 
     store = user_store.load()
-    net = user_store.find(store, network_name)
+    # Scope the lookup to (network, handle): a user-invite redemption
+    # picks a NEW handle, so a row left by a different handle on the
+    # same network must not route the join into the re-login path.
+    net = user_store.find(store, network_name, handle)
 
     if password_stdin:
         password = sys.stdin.readline().rstrip("\r\n")
@@ -839,11 +842,8 @@ async def _run_loopback(ctx, target, handle_override, agent_handle, password_std
         )
         user_store.write_cert(net, cert_wire)
         user_store.save(store)
-    elif net.handle != handle:
-        await node.stop()
-        click.echo(f"network {network_name} bound to {net.handle}, not {handle}", err=True)
-        raise click.Abort()
     else:
+        # ``net`` matched this exact (network, handle) pair — refresh.
         try:
             cert_wire = await net_login(
                 node=node,

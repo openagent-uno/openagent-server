@@ -210,6 +210,10 @@ _TEST_MODULES: tuple[str, ...] = (
     # returning-device logins (the touch_device path) survive both
     # clean and DB-lock-rigged runs.
     "test_coordinator_e2e_multi_user",
+    # User store keyed by (name, handle): two handles can join one
+    # network from a single machine, so a user invite stays redeemable
+    # by anyone even when the network is already in the local store.
+    "test_user_store",
     # Per-agent network naming: auto-bootstrap drops the legacy
     # ``-personal`` suffix; ``rename_network`` is cosmetic (preserves
     # network_id, coordinator identity, role) so existing pairings

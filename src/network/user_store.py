@@ -147,9 +147,13 @@ def add_or_update(
     coordinator_pubkey_hex: str,
     handle: str,
 ) -> StoredNetwork:
-    """Idempotent insert/update by ``name``. Returns the stored row."""
+    """Idempotent insert/update by ``(name, handle)``. Returns the
+    stored row. Two handles on the same network are distinct rows — a
+    user invite redeemed under a new handle must not clobber the row a
+    prior handle wrote.
+    """
     for i, existing in enumerate(store.networks):
-        if existing.name == name:
+        if existing.name == name and existing.handle == handle:
             updated = StoredNetwork(
                 name=name,
                 network_id=network_id,
@@ -177,23 +181,31 @@ def add_or_update(
     return new_row
 
 
-def find(store: UserStore, name: str) -> StoredNetwork | None:
+def find(
+    store: UserStore, name: str, handle: str | None = None
+) -> StoredNetwork | None:
     """Look up a network by human name or by network_id.
 
     Older saved accounts may carry the network UUID instead of its
     name (a gateway bug echoed ``network_id`` as the ``network`` field
     in ``auth_ok``); accepting both keeps those accounts working
     without forcing a re-add.
+
+    When ``handle`` is given, only a row whose handle also matches is
+    returned — this lets two handles share one network name (e.g.
+    redeeming a user invite on a machine already joined under another
+    handle). With no ``handle``, returns the first row matching name/id.
     """
     for n in store.networks:
         if n.name == name or n.network_id == name:
-            return n
+            if handle is None or n.handle == handle:
+                return n
     return None
 
 
-def remove(store: UserStore, name: str) -> bool:
+def remove(store: UserStore, name: str, handle: str | None = None) -> bool:
     for i, n in enumerate(store.networks):
-        if n.name == name:
+        if n.name == name and (handle is None or n.handle == handle):
             del store.networks[i]
             cert = Path(n.cert_path)
             if cert.exists():
