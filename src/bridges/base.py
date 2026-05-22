@@ -182,6 +182,13 @@ class BaseBridge:
     # splits the response. Overridden in subclasses.
     message_limit: int = 4000
 
+    # Resolved per-bridge persona overlay read by ``dispatch_turn``.
+    # Class-level default of ``None`` (no overlay) so the attribute is
+    # always present even on bridges constructed via ``__new__`` without
+    # running ``__init__``; ``__init__`` overrides it with the value
+    # resolved from the ``personality`` config arg.
+    _personality_directive: str | None = None
+
     def __init__(
         self,
         gateway_url: str = "ws://localhost:8765/ws",

@@ -520,7 +520,13 @@ async def t_dispatch_turn_anchors_to_latest_in_spam(ctx: TestContext) -> None:
     assert "M1" in chunk and "M2" in chunk and "M3" in chunk, chunk
 
     # All three text_finals reached the gateway so the merge has them.
-    text_finals = sorted(p["text"] for p in sent if p["type"] == "text_final")
+    # ``dispatch_turn`` prepends a universal language-mirror directive to
+    # every outbound turn, so the wire text is "<directive>\n\nM<n>" — the
+    # per-message payload is the trailing marker.
+    text_finals = sorted(
+        p["text"].rsplit("\n\n", 1)[-1]
+        for p in sent if p["type"] == "text_final"
+    )
     assert text_finals == ["M1", "M2", "M3"], text_finals
 
 
@@ -820,6 +826,11 @@ class _FakeTgMessage:
         self.document = None
         self.video = None
         self.from_user = type("U", (), {"id": uid, "first_name": "t"})()
+        # Real DM ``telegram.Message``s carry a ``chat`` — ``_on_message``'s
+        # group-chat gate reads ``chat.type``/``chat.id``. A private chat
+        # (the only kind these replay-defense tests exercise) passes
+        # straight through the gate.
+        self.chat = type("C", (), {"id": int(uid), "type": "private"})()
         self.replies: list[str] = []
 
     async def reply_text(self, text, reply_markup=None):

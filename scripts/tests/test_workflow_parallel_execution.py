@@ -183,7 +183,7 @@ async def t_handle_run_no_shared_task_attr(ctx: TestContext) -> None:
     from pathlib import Path
 
     src = Path(__file__).resolve().parent.parent.parent / (
-        "openagent/gateway/api/workflow_tasks.py"
+        "src/gateway/api/workflow_tasks.py"
     )
     text = src.read_text()
     # Catch assignment specifically — the old broken identifier may

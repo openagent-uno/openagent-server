@@ -455,6 +455,14 @@ def mcp_server_cmd(name: str):
         from src.mcp.servers.workflow_manager.server import main as workflow_manager_main
         workflow_manager_main()
         return
+    if name == "media-gen":
+        from src.mcp.servers.media_gen.server import main as media_gen_main
+        media_gen_main()
+        return
+    if name == "memory-search":
+        from src.mcp.servers.memory_search.server import main as memory_search_main
+        memory_search_main()
+        return
 
     click.echo(f"Unknown MCP server: {name}", err=True)
     raise SystemExit(1)
