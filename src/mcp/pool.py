@@ -192,6 +192,29 @@ _DORMANT_RECOVERY_BACKOFF = 0.5
 # bridge polling delay.
 _STARTUP_STAGGER_SECONDS = 0.25
 
+# Error types that indicate the MCP session's underlying transport is
+# closed and no amount of re-calling ``session.initialize()`` will
+# recover it. When recovery exhausts its attempts AND every attempt
+# raised one of these, the in-place retry loop is structurally pointless
+# — we need a fresh subprocess + fresh stdio streams. ``connect_all``
+# acts on this by re-running ``_build_and_enter_toolkit`` for the spec
+# (see the re-spawn branch around line 685).
+#
+# Discovered 2026-05-23 on lyra-music/virgil v0.13.29: workflow-manager
+# specifically (not its sibling Python MCPs) repeatedly came up
+# dormant with the recovery loop emitting three identical
+# ``ClosedResourceError`` failures from ``send_nowait`` on the
+# stdio_client's write stream. Agno's blanket-except inside
+# ``MCPTools.initialize()`` swallows the original cause (a separate
+# Instrument task to surface that), but the *symptom* — dead session
+# inherited by recovery — is universal and worth handling without
+# waiting on the upstream root cause.
+_SESSION_DEAD_ERROR_TYPES = frozenset({
+    "ClosedResourceError",
+    "BrokenResourceError",
+    "EndOfStream",
+})
+
 
 def _install_agno_log_passthrough() -> None:
     """Re-emit Agno's ``log_error()`` messages through ``elog``.
@@ -537,6 +560,7 @@ class MCPPool:
         # ``mcp-tool`` blocks to the right toolkit.
         self._toolkit_by_name: dict[str, Any] = {}
         self._tool_counts: dict[str, int] = {name: 0 for name in (s.name for s in specs)}
+        self._last_recovery_error_type = {}
         self._connected = False
         self._lock = asyncio.Lock()
         # In-process MCP state — populated by connect_all for specs with
@@ -626,6 +650,7 @@ class MCPPool:
             self._toolkit_by_name.clear()
             self.specs = new_specs
             self._tool_counts = {s.name: 0 for s in new_specs}
+            self._last_recovery_error_type = {}
             self._connected = False
 
         # connect_all has its own lock; new subprocesses come up first.
@@ -681,6 +706,24 @@ class MCPPool:
                         # the stack); Agno just lost the init result. Retrying
                         # ``initialize()`` directly is cheap and usually wins.
                         count = await self._recover_dormant_toolkit(toolkit, spec)
+                        # Re-spawn escalation: when recovery's bypass loop
+                        # exhausts itself entirely on a "session dead"
+                        # signature (ClosedResourceError / BrokenResourceError
+                        # / EndOfStream — see _SESSION_DEAD_ERROR_TYPES), the
+                        # underlying anyio memory stream is gone and no
+                        # amount of re-calling initialize on this toolkit
+                        # will recover it. Throw the corpse away, build a
+                        # fresh subprocess + session pair, and try again.
+                        # Empirically the second spawn lands healthy because
+                        # PyInstaller's _MEI extract is already warm by
+                        # then, so the cold-start race that killed the
+                        # first attempt has resolved.
+                        if (
+                            count == 0
+                            and self._last_recovery_error_type.get(spec.name)
+                            in _SESSION_DEAD_ERROR_TYPES
+                        ):
+                            count = await self._respawn_after_dead_session(spec, toolkit)
                     self._tool_counts[spec.name] = count
                     elog("mcp.connect", name=spec.name, tools=count)
                     if count == 0:
@@ -765,6 +808,80 @@ class MCPPool:
         # resources tear down the way AsyncExitStack would have.
         for sup in reversed(supervisors):
             await self._shutdown_supervisor(sup)
+
+    async def _respawn_after_dead_session(
+        self, spec: _ServerSpec, dead_toolkit: Any,
+    ) -> int:
+        """Drop a dormant toolkit whose session is structurally dead and
+        bring up a fresh one for the same spec. Returns the new tool count
+        (0 if the re-spawn also failed).
+
+        Called from ``connect_all`` ONLY when ``_recover_dormant_toolkit``
+        exhausted its retry budget against a session-dead error
+        (``ClosedResourceError`` & friends — see ``_SESSION_DEAD_ERROR_TYPES``).
+        Re-spawn handles the cold-start race where the first subprocess
+        managed to spawn but lost its stdio streams during Agno's
+        swallowed init — by the second spawn PyInstaller's _MEI tree is
+        warm and the handshake lands cleanly.
+
+        The dead toolkit is removed from every pool registry (``_agno_toolkits``,
+        ``_toolkit_by_name``) BEFORE we attempt the re-spawn so that even
+        if the re-spawn fails the pool's view of the spec stays consistent
+        with "no toolkit loaded" rather than "dormant toolkit pinned".
+        The dead supervisor is shut down asynchronously so a stuck
+        SIGTERM cleanup cannot pin connect_all.
+        """
+        # Find and detach the dead supervisor; shut it down in the
+        # background so we don't pay its _MCP_CLOSE_TIMEOUT inline.
+        dead_sup: _ToolkitSupervisor | None = None
+        for sup in self._toolkit_supervisors:
+            if sup.name == spec.name:
+                dead_sup = sup
+                break
+        if dead_sup is not None:
+            self._toolkit_supervisors.remove(dead_sup)
+            asyncio.create_task(
+                self._shutdown_supervisor(dead_sup),
+                name=f"mcp-dead-shutdown:{spec.name}",
+            )
+        try:
+            self._agno_toolkits.remove(dead_toolkit)
+        except ValueError:
+            pass
+        # Don't pop from _toolkit_by_name yet — we'll overwrite it below
+        # if the re-spawn succeeds. Popping then re-inserting would leave
+        # a transient window where toolkit_by_name(spec.name) returns None
+        # for any caller racing with us.
+
+        elog(
+            "mcp.respawn_attempt",
+            level="warning",
+            name=spec.name,
+            reason="dead_session",
+            prior_error=self._last_recovery_error_type.get(spec.name, ""),
+        )
+        new_toolkit = await self._build_and_enter_toolkit(spec)
+        if new_toolkit is None:
+            # Re-spawn itself failed (subprocess never came up). Pop the
+            # by-name entry so the pool reports the spec as not-loaded
+            # consistently with the cleared _agno_toolkits.
+            self._toolkit_by_name.pop(spec.name, None)
+            elog("mcp.respawn_failed", level="warning", name=spec.name)
+            return 0
+        self._agno_toolkits.append(new_toolkit)
+        self._toolkit_by_name[spec.name] = new_toolkit
+        count = len(getattr(new_toolkit, "functions", {}) or {})
+        # If the FRESH toolkit also stealth-fails, run recovery one more
+        # time — but do NOT recurse into another re-spawn. A second-spawn
+        # session-dead is a real "this MCP is broken" signal and the
+        # caller (connect_all) will mark it dormant via the standard
+        # path. Capping at one re-spawn keeps the worst-case wallclock
+        # bounded for a permanently-broken MCP.
+        if count == 0:
+            count = await self._recover_dormant_toolkit(new_toolkit, spec)
+        if count > 0:
+            elog("mcp.respawn_succeeded", name=spec.name, tools=count)
+        return count
 
     async def _shutdown_supervisor(self, sup: _ToolkitSupervisor) -> None:
         """Tell one supervisor to exit its ``async with`` block and wait.
@@ -941,6 +1058,12 @@ class MCPPool:
         )
         return toolkit
 
+    # Last error from the most recent _recover_dormant_toolkit call,
+    # keyed by spec.name. Lets connect_all decide whether a dead session
+    # warrants a full re-spawn (see _SESSION_DEAD_ERROR_TYPES below).
+    # Populated even on success — empty string means "no error captured".
+    _last_recovery_error_type: dict[str, str]
+
     async def _recover_dormant_toolkit(
         self, toolkit: Any, spec: _ServerSpec,
     ) -> int:
@@ -976,6 +1099,12 @@ class MCPPool:
         / ``mcp.recovery_succeeded`` with enough fields to root-cause
         the next incident — see the PR description for the bug history.
         """
+        # Reset the per-attempt error trace BEFORE the loop. We populate
+        # ``_last_recovery_error_type[spec.name]`` from each attempt's
+        # exception class so ``connect_all`` can decide whether to escalate
+        # to a full re-spawn (see ``_SESSION_DEAD_ERROR_TYPES``).
+        self._last_recovery_error_type[spec.name] = ""
+
         # Detect the bypass path. We test for callable methods, not for
         # the MCPTools class, so a future Agno rewrite that keeps the
         # same shape still works.
@@ -1044,6 +1173,7 @@ class MCPPool:
             # BaseExceptionGroup vs CancelledError vs ConnectionError
             # vs ValueError each point at a different class of bug.
             if err is not None:
+                self._last_recovery_error_type[spec.name] = type(err).__name__
                 # Pull a short traceback summary — full traceback is too
                 # noisy for elog but the last frame usually identifies
                 # the failing call (e.g. anyio TaskGroup vs mcp.session).
