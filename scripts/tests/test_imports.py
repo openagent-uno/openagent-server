@@ -57,6 +57,67 @@ async def t_bundle_agno_groq(ctx: TestContext) -> None:
         "pyproject.toml must list groq as a dependency"
 
 
+@test("imports", "frozen BUILTIN_MCPS_DIR matches PyInstaller spec layout")
+async def t_frozen_builtin_mcps_dir_matches_spec(ctx: TestContext) -> None:
+    """Regression for the openagent→src rename (commit 4b5efb5) where
+    ``src/mcp/builtins.py`` kept resolving ``BUILTIN_MCPS_DIR`` as
+    ``<bundle>/openagent/mcp/servers`` while ``openagent.spec`` started
+    writing the MCP tree to ``<bundle>/src/mcp/servers``. The mismatch
+    silently disabled every Python/Node built-in MCP — workflow-manager,
+    messaging, scheduler, model-manager, mcp-manager, web-search,
+    media-gen, memory-search — because ``resolve_builtin_entry`` raised
+    FileNotFoundError on the missing directory. In-process MCPs (shell,
+    tool-search) bypass the directory check, masking the regression.
+
+    The two paths must stay in lockstep: this test asserts both that the
+    runtime constant points at ``src/mcp/servers`` AND that the spec
+    bundles MCPs at that same destination prefix."""
+    import importlib
+    import re
+    import sys
+    import tempfile
+
+    spec_text = (REPO_ROOT / "openagent.spec").read_text()
+    # The spec's append target must be ``src/mcp/servers/<name>``. If a
+    # future refactor changes the bundle layout, this test fails loudly.
+    assert re.search(
+        r'datas\.append\(\(str\(child\),\s*f?"src/mcp/servers/\{child\.name\}"\)\)',
+        spec_text,
+    ), (
+        "openagent.spec must bundle MCPs at 'src/mcp/servers/<name>'; "
+        "if the layout changed, update BUILTIN_MCPS_DIR in src/mcp/builtins.py too"
+    )
+
+    with tempfile.TemporaryDirectory() as bundle:
+        from pathlib import Path as _Path
+        bundle_path = _Path(bundle)
+        # Simulate the PyInstaller layout the spec produces.
+        (bundle_path / "src" / "mcp" / "servers" / "workflow_manager").mkdir(parents=True)
+
+        sys.modules.pop("src.mcp.builtins", None)
+        try:
+            with patch("src._frozen.is_frozen", return_value=True), \
+                 patch("src._frozen.sys") as sys_mock:
+                sys_mock._MEIPASS = str(bundle_path)
+                sys_mock.executable = str(bundle_path / "openagent")
+                builtins_mod = importlib.import_module("src.mcp.builtins")
+                resolved = builtins_mod.BUILTIN_MCPS_DIR
+                assert resolved == bundle_path / "src" / "mcp" / "servers", (
+                    f"frozen BUILTIN_MCPS_DIR must be <bundle>/src/mcp/servers, "
+                    f"got {resolved}"
+                )
+                assert (resolved / "workflow_manager").exists(), (
+                    "the resolved path must actually contain the bundled "
+                    "MCP directories — if this fails the runtime check in "
+                    "resolve_builtin_entry will raise FileNotFoundError"
+                )
+        finally:
+            sys.modules.pop("src.mcp.builtins", None)
+            # Re-import under real-frozen=False so later tests get the
+            # dev-layout constants back.
+            importlib.import_module("src.mcp.builtins")
+
+
 @test("imports", "no stale legacy refs (MCPRegistry / MCPTools / tool_factory)")
 async def t_no_stale_refs(ctx: TestContext) -> None:
     import re

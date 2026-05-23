@@ -17,20 +17,30 @@ from src._frozen import bundle_dir, is_frozen
 logger = logging.getLogger(__name__)
 
 if is_frozen():
-    BUILTIN_MCPS_DIR = bundle_dir() / "openagent" / "mcp" / "servers"
-    # Frozen layout: <bundle>/openagent/, so bundle_dir() is the parent of `openagent/`.
+    # Frozen layout: PyInstaller extracts the source tree at
+    # ``<bundle>/src/...`` (the spec adds each ``src/mcp/servers/<name>``
+    # entry with that destination prefix), so the bundled MCP directory
+    # must be looked up at ``<bundle>/src/mcp/servers``. This used to read
+    # ``openagent/mcp/servers`` from before the openagent→src package
+    # rename (commit 4b5efb5); the stale literal silently broke every
+    # Python/Node built-in MCP — workflow-manager, messaging, scheduler,
+    # model-manager, mcp-manager, web-search, media-gen, memory-search —
+    # because ``resolve_builtin_entry`` raised FileNotFoundError on the
+    # missing directory. In-process MCPs (shell, tool-search) bypass the
+    # directory check, which is why they kept working and masked the bug.
+    BUILTIN_MCPS_DIR = bundle_dir() / "src" / "mcp" / "servers"
     PACKAGE_PARENT_DIR = bundle_dir()
 else:
     BUILTIN_MCPS_DIR = Path(__file__).resolve().parent / "servers"
-    # Dev layout: this file is openagent/mcp/builtins.py, so .parent.parent.parent
-    # is the directory containing the `openagent/` package (the repo root).
+    # Dev layout: this file is src/mcp/builtins.py, so .parent.parent.parent
+    # is the directory containing the `src/` package (the repo root).
     PACKAGE_PARENT_DIR = Path(__file__).resolve().parent.parent.parent
 
 # CRITICAL: ``PACKAGE_PARENT_DIR`` is exported as PYTHONPATH for Python MCP
 # subprocesses so they can ``import src.mcp.servers.*``. It MUST be the
-# directory that *contains* ``openagent/`` — never ``openagent/`` itself, since
-# that would expose ``openagent.mcp`` as a top-level ``mcp`` and shadow the
-# third-party MCP SDK, causing a circular import in openagent/mcp/client.py.
+# directory that *contains* ``src/`` — never ``src/`` itself, since that
+# would expose ``src.mcp`` as a top-level ``mcp`` and shadow the
+# third-party MCP SDK, causing a circular import in src/mcp/client.py.
 
 
 def _native_binary_target() -> str:
@@ -70,7 +80,7 @@ def _resolve_native_binary(name: str) -> str:
        identifier has no stable TCC identity.) See ``openagent.spec``
        for the matching exclude.
 
-    2. **Bundled** under ``openagent/mcp/servers/<name>/bin/<target>/``.
+    2. **Bundled** under ``src/mcp/servers/<name>/bin/<target>/``.
        Used by dev installs that ``pip install -e .`` from source and
        have run ``bash scripts/build-<name>.sh`` to stage the artifact.
 
@@ -113,7 +123,7 @@ def _resolve_native_binary(name: str) -> str:
     except Exception:  # noqa: BLE001 — sys.executable resolution is best-effort
         pass
 
-    # 2. Staged under openagent/mcp/servers/<name>/bin/<target>/.
+    # 2. Staged under src/mcp/servers/<name>/bin/<target>/.
     path = BUILTIN_MCPS_DIR / name / "bin" / target / bin_name
     if path.exists():
         return str(path)
