@@ -907,6 +907,246 @@ async def _run_loopback(ctx, target, handle_override, agent_handle, password_std
         await node.stop()
 
 
+@network_group.command("join")
+@click.argument("ticket")
+@click.option("--handle", "handle_override", default=None,
+              help="Handle to register under in the remote network (default: agent name).")
+@click.option("--label", default=None, help="Human-readable label for this agent.")
+@click.pass_context
+def cmd_join(ctx, ticket: str, handle_override: str | None, label: str | None):
+    """Join a peer network using an agent invite ticket (oa1…).
+
+    No password required — authentication uses this agent's Iroh keypair.
+
+    \\b
+      openagent network join oa1abcdef…
+      openagent network join oa1abcdef… --handle myagent
+    """
+    asyncio.run(_run_join(ctx, ticket, handle_override, label))
+
+
+async def _run_join(ctx, ticket_str: str, handle_override: str | None, label: str | None):
+    from src.network.ticket import InviteTicket, TicketError
+    from src.network.client.login import agent_login
+    from src.network.peers import PeerStore, coordinator_node_id_to_pubkey_bytes
+    from src.network.auth.device_cert import verify_cert, CertVerificationError
+
+    agent_dir = _agent_dir_or_die()
+    config = ctx.obj["config"]
+    agent_name = config.get("name", "agent")
+
+    try:
+        ticket = InviteTicket.decode(ticket_str)
+    except TicketError as e:
+        console.print(f"[red]Invalid ticket:[/red] {e}")
+        raise click.Abort()
+
+    if ticket.role != "agent":
+        console.print(
+            f"[red]Ticket role is {ticket.role!r}.[/red] "
+            "``openagent network join`` expects role=agent tickets.\n"
+            "For user/device tickets use [cyan]openagent network loopback[/cyan]."
+        )
+        raise click.Abort()
+
+    handle = (handle_override or agent_name).strip().lower()
+    label = label or f"{agent_name} (federated)"
+
+    console.print(f"[dim]Joining network [cyan]{ticket.network_name}[/cyan] as [cyan]{handle}[/cyan]…[/dim]")
+
+    identity = load_or_create_identity(_identity_path(agent_dir))
+
+    from src.network.iroh_node import IrohNode
+    node = IrohNode(identity)
+    await node.start()
+    try:
+        node_id = await node.node_id()
+        coord_pubkey = coordinator_node_id_to_pubkey_bytes(ticket.coordinator_node_id)
+
+        try:
+            cert_wire = await agent_login(
+                node=node,
+                coordinator_node_id=ticket.coordinator_node_id,
+                coordinator_pubkey_bytes=coord_pubkey,
+                handle=handle,
+                node_id=node_id,
+                invite_code=ticket.code,
+                network_id=ticket.network_id,
+                label=label,
+            )
+        except Exception as e:
+            console.print(f"[red]Join failed:[/red] {e}")
+            raise click.Abort()
+
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+        pubkey = Ed25519PublicKey.from_public_bytes(coord_pubkey)
+        cert = verify_cert(cert_wire, coordinator_pubkey=pubkey,
+                           expected_network_id=ticket.network_id)
+
+        db = await _open_db(config)
+        try:
+            store = PeerStore(db)
+            await store.add_peer(
+                network_id=ticket.network_id,
+                name=ticket.network_name,
+                coordinator_node_id=ticket.coordinator_node_id,
+                coordinator_pubkey=coord_pubkey,
+                our_handle=handle,
+                join_type="agent",
+            )
+            await store.store_cert(
+                network_id=ticket.network_id,
+                handle=handle,
+                cert_wire=cert_wire,
+                expires_at=cert.expires_at,
+            )
+        finally:
+            if db._conn is not None:
+                await db._conn.close()
+
+        console.print(f"[green]✓ Joined[/green] [cyan]{ticket.network_name}[/cyan] as [cyan]{handle}[/cyan].")
+        console.print(f"  Cert valid until: [dim]{time.ctime(cert.expires_at)}[/dim]")
+        console.print(
+            f"\n  Now you can chat:\n"
+            f"    [cyan]openagent network peers chat {ticket.network_id} \"Hello!\"[/cyan]"
+        )
+    finally:
+        await node.stop()
+
+
+@network_group.command("peers")
+@click.pass_context
+def cmd_peers(ctx):
+    """List peer networks this agent has joined."""
+    asyncio.run(_run_peers(ctx))
+
+
+async def _run_peers(ctx):
+    config = ctx.obj["config"]
+    db = await _open_db(config)
+    try:
+        from src.network.peers import PeerStore
+        store = PeerStore(db)
+        rows = await store.list_peers()
+        if not rows:
+            console.print("[dim]No peer networks. Use [cyan]openagent network join <ticket>[/cyan].[/dim]")
+            return
+        table = Table(title=f"Peer networks ({len(rows)})")
+        table.add_column("Name", style="cyan")
+        table.add_column("Handle", style="dim")
+        table.add_column("Network ID", style="dim")
+        table.add_column("Type", style="dim")
+        table.add_column("Cert expires")
+        for r in rows:
+            cert = await store.get_cert(network_id=r.network_id, handle=r.our_handle)
+            exp = time.ctime(cert[1]) if cert else "[red]no cert[/red]"
+            table.add_row(r.name, r.our_handle, r.network_id[:16] + "…", r.join_type, exp)
+        console.print(table)
+    finally:
+        if db._conn is not None:
+            await db._conn.close()
+
+
+@network_group.command("chat")
+@click.argument("network_id_or_name")
+@click.argument("message")
+@click.option("--agent", "agent_handle", default=None,
+              help="Specific agent handle to target (default: first remote agent).")
+@click.option("--session", "session_id", default="cli-peer",
+              help="Session ID for conversation continuity.")
+@click.pass_context
+def cmd_peer_chat(ctx, network_id_or_name: str, message: str, agent_handle: str | None, session_id: str):
+    """Send a message to a peer agent and print its reply.
+
+    \\b
+      openagent network chat ff9efe9f… "What can you do?"
+      openagent network chat lyra-agent "Summarise today's news"
+    """
+    asyncio.run(_run_peer_chat(ctx, network_id_or_name, message, agent_handle, session_id))
+
+
+async def _run_peer_chat(ctx, network_id_or_name: str, message: str,
+                          agent_handle: str | None, session_id: str):
+    import aiohttp as _aiohttp
+    from src.network.peers import PeerStore, make_dialer_for_peer, coordinator_node_id_to_pubkey_bytes
+    from src.network.client.login import list_agents as coord_list_agents
+    from src.network.client.session import LoopbackProxy
+
+    agent_dir = _agent_dir_or_die()
+    config = ctx.obj["config"]
+    identity = load_or_create_identity(_identity_path(agent_dir))
+
+    from src.network.iroh_node import IrohNode
+    node = IrohNode(identity)
+    await node.start()
+
+    db = await _open_db(config)
+    try:
+        store = PeerStore(db)
+        rows = await store.list_peers()
+
+        # Match by network_id prefix or name.
+        peer = None
+        for r in rows:
+            if r.network_id.startswith(network_id_or_name) or r.name == network_id_or_name:
+                peer = r
+                break
+        if peer is None:
+            console.print(
+                f"[red]Unknown peer:[/red] {network_id_or_name!r}\n"
+                "Run [cyan]openagent network peers[/cyan] to list joined networks."
+            )
+            raise click.Abort()
+
+        console.print(f"[dim]Connecting to [cyan]{peer.name}[/cyan]…[/dim]")
+
+        try:
+            from src.network.client.login import LoginError
+            dialer = await make_dialer_for_peer(db=db, peer=peer, node=node)
+        except Exception as e:
+            console.print(f"[red]Auth failed:[/red] {e}")
+            raise click.Abort()
+
+        # List agents to find the target.
+        agents = await coord_list_agents(node=node, coordinator_node_id=peer.coordinator_node_id)
+        our_node_id = await node.node_id()
+        target = None
+        if agent_handle:
+            target = next((a for a in agents if a.get("handle") == agent_handle), None)
+        if target is None:
+            target = next((a for a in agents if a.get("node_id") != our_node_id), agents[0] if agents else None)
+        if target is None:
+            console.print("[red]No agents found in peer network.[/red]")
+            raise click.Abort()
+
+        console.print(f"[dim]→ {target.get('handle')} ({str(target.get('node_id',''))[:24]}…)[/dim]")
+
+        proxy = LoopbackProxy(dialer=dialer, target_node_id=target["node_id"])
+        try:
+            await proxy.start()
+            async with _aiohttp.ClientSession() as http:
+                async with http.post(
+                    f"{proxy.base_url}/api/chat",
+                    json={"message": message, "session_id": session_id},
+                    timeout=_aiohttp.ClientTimeout(total=120),
+                ) as resp:
+                    data = await resp.json()
+        finally:
+            await proxy.stop()
+
+        if data.get("errored"):
+            console.print(f"[red]Agent error:[/red] {data.get('response','')}")
+        else:
+            from rich.markdown import Markdown
+            console.print(Markdown(data.get("response", "(empty response)")))
+            if data.get("model"):
+                console.print(f"[dim]Model: {data['model']}[/dim]")
+    finally:
+        if db._conn is not None:
+            await db._conn.close()
+        await node.stop()
+
+
 def parse_handle_at_network(spec: str) -> tuple[str, str]:
     """Split ``alice@homelab`` into ``("alice", "homelab")``.
 

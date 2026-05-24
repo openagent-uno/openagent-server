@@ -131,6 +131,48 @@ class SessionDialer:
             self._connections.clear()
 
 
+class AgentDialer:
+    """Dialer for the ``openagent/agent/1`` ALPN.
+
+    Unlike ``SessionDialer``, no cert prefix is written — the Iroh QUIC
+    handshake itself proves node_id ownership, so the remote ``AgentSite``
+    authenticates the caller by the connection's ``remote_node_id()``.
+
+    Used by ``handle_peer_chat`` for agent-type peer networks (those that
+    joined via an agent invite ticket rather than SRP user login).
+    """
+
+    def __init__(self, *, node: IrohNode, target_node_id: str) -> None:
+        self._node = node
+        self.target_node_id = target_node_id
+        self._connection: object | None = None
+        self._lock = asyncio.Lock()
+
+    async def open_agent_stream(self) -> "GatewayStream":
+        """Open one bi-stream to the target using the AGENT ALPN (no cert prefix)."""
+        conn = await self._get_or_open()
+        bi = await conn.open_bi()
+        send, recv = bi.send(), bi.recv()
+        return GatewayStream(send=send, recv=recv, target_node_id=self.target_node_id)
+
+    async def _get_or_open(self) -> object:
+        async with self._lock:
+            if self._connection is None:
+                self._connection = await self._node.dial(
+                    self.target_node_id, NetworkAlpn.AGENT,
+                )
+            return self._connection
+
+    async def close(self) -> None:
+        async with self._lock:
+            if self._connection is not None:
+                try:
+                    self._connection.close(0, b"")
+                except Exception:
+                    pass
+                self._connection = None
+
+
 @dataclass
 class GatewayStream:
     """One open bi-stream after the cert prefix has been written.
@@ -172,12 +214,35 @@ class LoopbackProxy:
 
     ``start`` returns the (host, port) we bound on. Hand
     ``http://host:port`` to aiohttp's ``ClientSession`` — every request
-    gets a fresh Iroh stream with the cert prefix already attached.
+    gets a fresh Iroh stream opened by *stream_factory*.
+
+    Two factory patterns:
+
+    - Cert-based (GATEWAY ALPN): pass ``dialer`` + ``target_node_id``
+      and the proxy calls ``dialer.open_gateway_stream(target_node_id)``.
+    - Agent-based (AGENT ALPN): pass ``stream_factory`` directly —
+      typically ``AgentDialer.open_agent_stream``.
     """
 
-    def __init__(self, *, dialer: SessionDialer, target_node_id: str) -> None:
-        self._dialer = dialer
-        self._target = target_node_id
+    def __init__(
+        self,
+        *,
+        dialer: "SessionDialer | None" = None,
+        target_node_id: str | None = None,
+        stream_factory=None,
+    ) -> None:
+        if stream_factory is not None:
+            self._stream_factory = stream_factory
+        elif dialer is not None and target_node_id is not None:
+            # Legacy / cert-based path: capture as a lambda so the
+            # factory is always an async callable with no arguments.
+            _d, _t = dialer, target_node_id
+            self._stream_factory = lambda: _d.open_gateway_stream(_t)
+        else:
+            raise ValueError(
+                "LoopbackProxy requires either stream_factory or both dialer and target_node_id"
+            )
+        self._target = target_node_id or "unknown"
         self._server: asyncio.AbstractServer | None = None
         self._sockname: tuple[str, int] | None = None
 
@@ -217,7 +282,7 @@ class LoopbackProxy:
     ) -> None:
         """Pump bytes between the local TCP socket and a fresh Iroh stream."""
         try:
-            stream = await self._dialer.open_gateway_stream(self._target)
+            stream = await self._stream_factory()
         except Exception as e:  # noqa: BLE001
             logger.warning("loopback dial failed: %s", e)
             local_writer.close()

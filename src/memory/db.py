@@ -584,6 +584,7 @@ class MemoryDB:
         )
         await self._migrate_models_description_column()
         await self._migrate_legacy_tables_to_agno_sessions()
+        await self._migrate_peer_networks_join_type()
 
     async def _migrate_legacy_tables_to_agno_sessions(self) -> None:
         """One-time: fold sdk_sessions + chat_sessions + chat_session_runs
@@ -3118,6 +3119,22 @@ class MemoryDB:
             (key, value, time.time()),
         )
         await conn.commit()
+
+    async def _migrate_peer_networks_join_type(self) -> None:
+        """Add ``join_type`` to ``peer_networks`` (idempotent).
+
+        Distinguishes networks joined via agent_login (no-password Iroh auth)
+        from those joined via SRP-6a user login, so ``make_dialer_for_peer``
+        can pick the right refresh path without a password.
+        """
+        assert self._conn is not None
+        cursor = await self._conn.execute("PRAGMA table_info(peer_networks)")
+        cols = {r[1] for r in await cursor.fetchall()}
+        if "join_type" not in cols:
+            await self._conn.execute(
+                "ALTER TABLE peer_networks ADD COLUMN join_type TEXT NOT NULL DEFAULT 'user'"
+            )
+            await self._conn.commit()
 
     async def get_daily_usage(self, days: int = 7) -> list[dict]:
         """Day-by-day usage breakdown grouped by model."""

@@ -33,6 +33,7 @@ from src.network.auth.device_cert import (
 )
 from src.network.transport.aiohttp_iroh_site import (
     current_device_cert_wire,
+    current_is_authenticated_agent,
     current_peer_node_id,
 )
 
@@ -118,6 +119,31 @@ def make_auth_middleware(state: NetworkAuthState):
                 request["user_handle"] = synthetic.handle
                 request["network_id"] = synthetic.network_id
                 return await handler(request)
+
+        # Agent ALPN bypass: the Iroh QUIC handshake proves node_id
+        # ownership — no coordinator cert is needed. Synthesise a minimal
+        # DeviceCert so downstream handlers don't need to branch.
+        if current_is_authenticated_agent():
+            import hashlib as _hashlib
+            peer_id = current_peer_node_id() or "unknown-agent"
+            # Derive a stable synthetic device_pubkey from the peer's node_id.
+            # sha256 gives us a deterministic 32-byte key that's unique per
+            # peer without requiring the coordinator.
+            device_pubkey = _hashlib.sha256(f"agent:{peer_id}".encode()).digest()
+            handle = f"agent:{peer_id[:16]}"
+            synthetic = DeviceCert(
+                handle=handle,
+                device_pubkey=device_pubkey,
+                network_id=state.network_id,
+                issued_at=time.time(),
+                expires_at=time.time() + 3600,
+                capabilities=["agent"],
+            )
+            request["device_cert"] = synthetic
+            request["client_id"] = synthetic.device_pubkey_hex
+            request["user_handle"] = synthetic.handle
+            request["network_id"] = state.network_id
+            return await handler(request)
 
         wire = current_device_cert_wire()
         if not wire:
