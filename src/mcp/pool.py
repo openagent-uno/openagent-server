@@ -1235,6 +1235,7 @@ class MCPPool:
         """
         try:
             from agno.tools.mcp import MCPTools
+            from agno.tools.mcp.params import StreamableHTTPClientParams
             from mcp import StdioServerParameters
         except ImportError as exc:
             logger.error("Cannot build MCP toolkits — Agno or mcp SDK missing: %s", exc)
@@ -1256,8 +1257,17 @@ class MCPPool:
                 )
             elif spec.url:
                 # Streamable HTTP is Agno's default for URL-based servers.
-                toolkit = MCPTools(
+                # Headers (e.g. Authorization: Bearer …) MUST be passed via
+                # server_params — MCPTools' top-level kwargs don't surface
+                # them to the HTTP transport, so without this every auth-
+                # gated remote MCP gets a 401 and dies with
+                # anyio.ClosedResourceError on session.initialize.
+                http_params = StreamableHTTPClientParams(
                     url=spec.url,
+                    headers=spec.headers or None,
+                )
+                toolkit = MCPTools(
+                    server_params=http_params,
                     transport="streamable-http",
                     tool_name_prefix=_safe_prefix(spec.name),
                     timeout_seconds=_MCP_TIMEOUT_SECONDS,

@@ -275,6 +275,9 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_sessions_parallel_execution",
     # 10. MCPPool resilience — one bad MCP mustn't sink the whole pool
     "test_mcp_pool_resilience",
+    # MCPPool spec.headers forwarding — regression guard for the
+    # auth-gated remote MCP (mixout) 401 → ClosedResourceError chain.
+    "test_mcp_pool_headers",
     # 11. /api/files endpoint — agent-side attachment delivery to remote clients
     "test_files_endpoint",
 )
