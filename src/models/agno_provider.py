@@ -1019,6 +1019,32 @@ class AgnoProvider(BaseModel):
         finally:
             root_logger.removeHandler(capture)
 
+        # Agno's Agent.arun / Team.arun catches generic exceptions, sets
+        # ``run_response.status = RunStatus.error`` AND
+        # ``run_response.content = str(e)``, then RETURNS the response
+        # instead of re-raising (see agno/agent/_run.py:666-696 and
+        # agno/team/_run.py around RunStatus.error assignments). Without
+        # this check, openagent reads ``.content`` as a normal model
+        # output and the bridge ships the raw Python exception string
+        # (e.g. ``[Errno 2] No such file or directory``) to the user as
+        # if the model had written it. Translate the status signal back
+        # into an AgnoProviderError so the surrounding empty-stream /
+        # bridge layers format a clean error message.
+        status_obj = getattr(response, "status", None)
+        status_val = getattr(status_obj, "value", status_obj)
+        if isinstance(status_val, str) and status_val.upper() == "ERROR":
+            raw_error = (getattr(response, "content", None) or "").strip() \
+                or "agno run finished with status=error and no detail"
+            detail = self._rewrite_provider_error_detail(raw_error)
+            elog(
+                "agno.run_status_error",
+                level="error",
+                model=self.model,
+                session_id=sid,
+                detail=detail[:300],
+            )
+            raise AgnoProviderError(detail)
+
         # Agno occasionally returns a response whose ``.content`` is None or
         # empty string. Two cases to distinguish:
         #   1. A *legitimate* tool-only turn — no error logs captured. Fall

@@ -8,6 +8,7 @@ MCP servers without hardcoding.
 from __future__ import annotations
 
 import uuid
+from typing import Any
 
 from ._framework import TestContext, TestSkip, have_openai_key, test
 
@@ -187,3 +188,55 @@ async def t_agno_team_build(ctx: TestContext) -> None:
     provider.set_mcp_toolkits(pool.agno_toolkits)
     assert provider._ensure_team(system="You are a test bot.") is not team, \
         "set_mcp_toolkits must flush team cache"
+
+
+@test("agno", "generate raises AgnoProviderError on RunStatus.error")
+async def t_agno_generate_run_status_error(_ctx: TestContext) -> None:
+    """Agno's Agent.arun / Team.arun catches generic exceptions, sets
+    ``run_response.status = RunStatus.error`` and
+    ``run_response.content = str(e)``, then RETURNS the response instead
+    of re-raising. Without an explicit status check the provider treats
+    that error string as the model's output and the Telegram bridge
+    shows the user a raw Python exception (e.g. ``[Errno 2] No such file
+    or directory``) — caught in production on mixout with the
+    misconfigured ``deepseek:deepseek-v4-pro`` model. ``generate()``
+    must inspect ``response.status`` and raise ``AgnoProviderError`` so
+    the bridge formats a clean ``⚠️`` message instead.
+    """
+    from src.models.agno_provider import AgnoProvider, AgnoProviderError
+
+    provider = AgnoProvider(
+        model="deepseek:deepseek-v4-pro",
+        api_key="x",
+        providers_config=[],
+    )
+
+    class _ErroredResponse:
+        status = "ERROR"
+        content = "[Errno 2] No such file or directory"
+        metrics = None
+        tools: list[Any] = []
+
+    class _ErroredRunner:
+        async def arun(self, *_args: Any, **_kwargs: Any) -> _ErroredResponse:
+            return _ErroredResponse()
+
+    provider._compatible_mcp_toolkits = lambda: ([], [])  # type: ignore[assignment]
+    provider._ensure_team = lambda system="": _ErroredRunner()  # type: ignore[assignment]
+    provider._ensure_agent = lambda system=None: _ErroredRunner()  # type: ignore[assignment]
+
+    raised: AgnoProviderError | None = None
+    try:
+        await provider.generate(
+            messages=[{"role": "user", "content": "hi"}],
+            system="system-prompt",
+            session_id="agno-run-status-error",
+        )
+    except AgnoProviderError as e:
+        raised = e
+
+    assert raised is not None, "expected AgnoProviderError, got no exception"
+    # The original Python-OSError string must be preserved in the raised
+    # exception so logs/debugging keep the underlying cause — only the
+    # user-facing bridge wrapper is supposed to soften it.
+    assert "No such file" in str(raised), f"unexpected error: {raised!r}"
