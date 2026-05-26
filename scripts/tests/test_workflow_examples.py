@@ -99,3 +99,41 @@ async def t_examples_cover_pitfalls(ctx: TestContext) -> None:
     assert not missing, (
         f"examples don't cover these pitfall block types: {sorted(missing)}"
     )
+
+
+@test("workflow_examples", "_h_if routes a Jinja-False result to the false handle")
+async def t_if_block_false_routes(ctx: TestContext) -> None:
+    """Regression for the ``if not expr`` → ``if expr is None`` fix in
+    ``_h_if``: when a node's ``expression`` is a literal False (or any
+    Jinja template that evaluates to False), the block must compute
+    ``taken = "false"`` instead of raising ValueError. The original
+    handler used ``if not expr`` for the absent-key check, which
+    swallowed a legitimately-False expression as "missing config".
+    Co-tests the executor.py restoration (the entire WorkflowExecutor
+    class file was accidentally truncated to 60 lines in commit
+    a61b943; restoring it brings every workflow_finalize_resilience
+    test back to green at the same time).
+    """
+    from src.workflow.executor import NodeResult, _RunCtx, _h_if
+
+    ctx_obj = _RunCtx(run_id="r1", workflow_id="wf1", inputs={}, vars={})
+    # ``expression: False`` literal (YAML bool, not a string template).
+    cfg_false = {"expression": False}
+    result = await _h_if(exe=None, node={}, cfg=cfg_false, ctx=ctx_obj)
+    assert isinstance(result, NodeResult), type(result)
+    assert result.taken == frozenset({"false"}), result.taken
+    assert result.output["branch"] == "false", result.output
+
+    # Template that evaluates to True still routes to the true handle.
+    cfg_true = {"expression": "1 + 1 == 2"}
+    result = await _h_if(exe=None, node={}, cfg=cfg_true, ctx=ctx_obj)
+    assert result.taken == frozenset({"true"}), result.taken
+    assert result.output["branch"] == "true", result.output
+
+    # Missing key is the only legitimate ValueError trigger.
+    raised = False
+    try:
+        await _h_if(exe=None, node={}, cfg={}, ctx=ctx_obj)
+    except ValueError as e:
+        raised = "expression" in str(e)
+    assert raised, "_h_if must still raise when 'expression' key is absent"
