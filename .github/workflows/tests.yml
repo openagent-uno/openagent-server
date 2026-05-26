@@ -1,0 +1,52 @@
+name: Tests
+
+# Runs the end-to-end suite (``scripts/test_openagent.py``) on every PR
+# against ``main`` and every push to ``main``. Designed so branch
+# protection can declare this status check ``required`` — the exact
+# guard that would have blocked PR #1 / commit a61b943 from landing
+# the truncated ``executor.py`` (13 imports broke, suite was failing
+# but nothing enforced it).
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Allow a newer push on the same branch to cancel the previous run so
+# we don't waste minutes finishing a stale commit's tests.
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: end-to-end test suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Create venv + install package
+        run: |
+          uv venv
+          uv pip install -e .
+
+      - name: Run end-to-end suite
+        # ``test_openagent.sh`` execs ``.venv/bin/python scripts/test_openagent.py``.
+        # The runner enumerates every module in ``_TEST_MODULES`` and exits
+        # non-zero if any registered test fails — including the new
+        # repo-hygiene guards (LLM placeholder scan, test registration
+        # check, src smoke import).
+        run: bash scripts/test_openagent.sh

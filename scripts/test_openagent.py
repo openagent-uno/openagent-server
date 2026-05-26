@@ -126,6 +126,10 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_db_workflow_claim",
     "test_smart_router_hybrid",
     "test_agno_tool_filter",
+    # AgnoProvider.stream — hermetic zero-delta fallback coverage
+    # (Friday's stuck Telegram turns; provider falls back to its own
+    # generate() before control returns to Agent.run_stream).
+    "test_agno_stream",
     # SmartRouter.stream + ClaudeCLIRegistry.stream — token-streaming
     # dispatch for both frameworks. Pure-unit (stubs the registries) and
     # guards the bug where claude-cli replies came back as one giant
@@ -190,6 +194,10 @@ _TEST_MODULES: tuple[str, ...] = (
     # LLM (via list_workflow_examples / get_workflow_example) stays
     # accurate as block schemas evolve.
     "test_workflow_examples",
+    # Workflow templating filters — fromjson/from_json (load-bearing
+    # for ai-prompt → loop.items_expr chaining), regex/url filters,
+    # and the safety net that quietly returns "" on resolve errors.
+    "test_workflow_templating",
     # Scheduler must dispatch each due workflow as its own asyncio.Task
     # so different workflows on the same tick run concurrently. Companion
     # asserts the per-workflow lock keeps SAME-workflow runs ordered.
@@ -280,6 +288,15 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_mcp_pool_headers",
     # 11. /api/files endpoint — agent-side attachment delivery to remote clients
     "test_files_endpoint",
+    # 12. Repo-hygiene structural guards — added 2026-05-26 after PR #1
+    #     truncated src/workflow/executor.py from 990 to 60 lines via an
+    #     LLM-generated "CONTENT OMITTED FOR BREVITY" placeholder that
+    #     was committed verbatim. Three orthogonal guards: scan src/ for
+    #     LLM placeholder strings, assert every test_*.py is in this
+    #     list (so a new test file never silently goes unrun), and
+    #     importlib-walk every src/ module so a truncated file is
+    #     caught even if no behavioural test exercises its symbols.
+    "test_repo_hygiene",
 )
 
 
