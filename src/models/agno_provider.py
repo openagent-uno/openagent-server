@@ -960,6 +960,21 @@ class AgnoProvider(BaseModel):
         # "Non-retryable model provider error: ...", but does not re-raise.
         captured_errors: list[str] = []
 
+        # Force agno to attach exc_info to its log_error() calls so the
+        # capture handler below sees the underlying traceback. Default
+        # is off (AGNO_LOG_TRACEBACKS=false), which swallows everything
+        # past the formatted error string — fine for the OpenAI 403
+        # case (the string is enough) but useless for the
+        # ``[Errno 2] No such file or directory`` case on mixout where
+        # the bare OSError tells us nothing about WHICH file is
+        # missing. Diagnostic-only; doesn't change agno's control flow.
+        os.environ.setdefault("AGNO_LOG_TRACEBACKS", "true")
+        try:
+            from agno.utils.log import set_log_tracebacks as _agno_set_tb
+            _agno_set_tb(True)
+        except Exception:
+            pass
+
         class _ErrorCapture(logging.Handler):
             def emit(self, record: logging.LogRecord) -> None:
                 if record.levelno < logging.ERROR:
@@ -968,6 +983,20 @@ class AgnoProvider(BaseModel):
                     msg = record.getMessage()
                 except Exception:
                     msg = str(record.msg)
+                # When AGNO_LOG_TRACEBACKS is on, agno populates
+                # ``record.exc_info`` with the live exception. Append
+                # the formatted traceback to the captured entry so the
+                # subsequent ``agno.run_status_error`` diag event ships
+                # the originating file/line out to the fleet log — the
+                # only way to root-cause errors that agno catches and
+                # rewrites to a status=ERROR response.
+                if record.exc_info:
+                    try:
+                        import traceback as _tb
+                        tb_text = "".join(_tb.format_exception(*record.exc_info))
+                        msg = f"{msg}\n{tb_text}" if msg else tb_text
+                    except Exception:
+                        pass
                 if msg:
                     captured_errors.append(msg)
 
@@ -1036,12 +1065,19 @@ class AgnoProvider(BaseModel):
             raw_error = (getattr(response, "content", None) or "").strip() \
                 or "agno run finished with status=error and no detail"
             detail = self._rewrite_provider_error_detail(raw_error)
+            # Ship the captured ERROR-level log records (with tracebacks
+            # if AGNO_LOG_TRACEBACKS hooked them in) so the next fleet
+            # tick can root-cause WHY agno failed instead of guessing
+            # from the rewritten ``[Errno 2]`` string alone. Truncated
+            # per-entry to keep the event row JSON-friendly.
+            captured_snapshot = [c[:2000] for c in captured_errors[-3:]]
             elog(
                 "agno.run_status_error",
                 level="error",
                 model=self.model,
                 session_id=sid,
                 detail=detail[:300],
+                captured=captured_snapshot,
             )
             raise AgnoProviderError(detail)
 
