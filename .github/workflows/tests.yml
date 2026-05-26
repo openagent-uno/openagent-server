@@ -1,27 +1,13 @@
 name: Tests
 
-# Runs the end-to-end suite (``scripts/test_openagent.py``) on every PR
-# against ``main`` and every push to ``main``. Designed so branch
-# protection can declare this status check ``required`` — the exact
-# guard that would have blocked PR #1 / commit a61b943 from landing
-# the truncated ``executor.py`` (13 imports broke, suite was failing
-# but nothing enforced it).
-
 on:
   pull_request:
-    branches: [main]
+    branches:
+      - main
   push:
-    branches: [main]
-  # Manual dispatch lets us re-run the suite without a code push —
-  # handy when GitHub takes some time to register the workflow's
-  # check name with branch protection.
+    branches:
+      - main
   workflow_dispatch:
-
-# Allow a newer push on the same branch to cancel the previous run so
-# we don't waste minutes finishing a stale commit's tests.
-concurrency:
-  group: tests-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   test:
@@ -48,9 +34,4 @@ jobs:
           uv pip install -e .
 
       - name: Run end-to-end suite
-        # ``test_openagent.sh`` execs ``.venv/bin/python scripts/test_openagent.py``.
-        # The runner enumerates every module in ``_TEST_MODULES`` and exits
-        # non-zero if any registered test fails — including the new
-        # repo-hygiene guards (LLM placeholder scan, test registration
-        # check, src smoke import).
         run: bash scripts/test_openagent.sh
