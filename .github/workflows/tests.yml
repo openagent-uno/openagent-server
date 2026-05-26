@@ -12,6 +12,10 @@ on:
     branches: [main]
   push:
     branches: [main]
+  # Manual dispatch lets us re-run the suite without a code push —
+  # handy when GitHub takes some time to register the workflow's
+  # check name with branch protection.
+  workflow_dispatch:
 
 # Allow a newer push on the same branch to cancel the previous run so
 # we don't waste minutes finishing a stale commit's tests.
