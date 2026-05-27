@@ -1052,7 +1052,7 @@ async def t_coalesce_stt_folds_buffer(ctx: TestContext) -> None:
 @test("stream", "post_turn_hook receives the resource set tracked from OutToolStatus")
 async def t_post_turn_hook_resources(ctx: TestContext) -> None:
     """The gateway's resource-event broadcast pipes through this hook —
-    pin the wiring: every ``OutToolStatus`` whose JSON ``tool`` field
+    pin the wiring: every ``OutToolStatus`` whose JSON ``tool_name`` field
     matches one of the known MCP prefixes adds to the per-turn set,
     which fires once on TurnComplete."""
     import json as _json
@@ -1073,15 +1073,17 @@ async def t_post_turn_hook_resources(ctx: TestContext) -> None:
     # Drive _publish manually to avoid spinning up the full dispatch loop.
     await sess._publish(OutToolStatus(
         session_id="s", seq=1, ts_ms=now_ms(),
-        text=_json.dumps({"tool": "scheduler_add_task", "status": "running"}),
+        text=_json.dumps({"tool_name": "scheduler_add_task",
+                          "tool_call_error": False}),
     ))
     await sess._publish(OutToolStatus(
         session_id="s", seq=2, ts_ms=now_ms(),
-        text=_json.dumps({"tool": "Bash", "status": "running"}),
+        text=_json.dumps({"tool_name": "Bash", "tool_call_error": False}),
     ))
     await sess._publish(OutToolStatus(
         session_id="s", seq=3, ts_ms=now_ms(),
-        text=_json.dumps({"tool": "mcp__workflow_manager__run", "status": "done"}),
+        text=_json.dumps({"tool_name": "mcp__workflow_manager__run",
+                          "tool_call_error": False, "result": "ok"}),
     ))
     await sess._publish(TurnComplete(session_id="s", seq=4, ts_ms=now_ms()))
 

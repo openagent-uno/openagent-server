@@ -941,6 +941,7 @@ async def t_agent_autoloop_continues(ctx: TestContext) -> None:
 
         async def generate(
             self, messages, system=None, tools=None, on_status=None, session_id=None,
+            files=None,
         ) -> ModelResponse:
             content = messages[-1]["content"]
             self.turns.append(content)
@@ -989,7 +990,7 @@ async def t_agent_autoloop_stops(ctx: TestContext) -> None:
 
     class NoShellModel(BaseModel):
         history_mode = "provider"
-        async def generate(self, messages, system=None, tools=None, on_status=None, session_id=None):
+        async def generate(self, messages, system=None, tools=None, on_status=None, session_id=None, files=None):
             return ModelResponse(content="just text")
 
     agent = Agent(name="test", model=NoShellModel())
@@ -1026,7 +1027,7 @@ async def t_agent_passive_reminder(ctx: TestContext) -> None:
     class EchoModel(BaseModel):
         history_mode = "provider"
         last_input: str = ""
-        async def generate(self, messages, system=None, tools=None, on_status=None, session_id=None):
+        async def generate(self, messages, system=None, tools=None, on_status=None, session_id=None, files=None):
             EchoModel.last_input = messages[-1]["content"]
             return ModelResponse(content="ok")
 
@@ -1059,7 +1060,7 @@ async def t_agent_autoloop_cap(ctx: TestContext) -> None:
 
         def __init__(self): self.turns = 0
 
-        async def generate(self, messages, system=None, tools=None, on_status=None, session_id=None):
+        async def generate(self, messages, system=None, tools=None, on_status=None, session_id=None, files=None):
             self.turns += 1
             token = adapters.set_session_context(session_id)
             try:

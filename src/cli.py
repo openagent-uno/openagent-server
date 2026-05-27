@@ -7,8 +7,26 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import time
 from pathlib import Path
+
+# Suppress noisy ``tokenizers`` parallelism warning AND prevent
+# multiprocessing initialisation in tqdm — both are triggered by
+# huggingface_hub / faster_whisper during the eager Whisper model
+# prefetch on agent boot. tqdm's default lock factory is
+# ``multiprocessing.RLock``, which forks the resource_tracker daemon
+# and creates a process-lifetime POSIX semaphore (``mp-…``) that the
+# tracker then reports as "leaked" on process exit. Pinning tqdm to a
+# threading.RLock avoids the multiprocessing init entirely while
+# preserving per-process progress-bar ordering. Must run BEFORE any
+# downstream import of ``tqdm`` / ``huggingface_hub`` / ``faster_whisper``.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+try:
+    import tqdm as _tqdm  # noqa: F401
+    _tqdm.tqdm.set_lock(threading.RLock())
+except ImportError:
+    pass
 
 import click
 from rich.console import Console

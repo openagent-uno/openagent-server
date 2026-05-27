@@ -150,8 +150,10 @@ def format_tool_status(raw: str) -> str:
     """Convert a raw status string (possibly JSON tool event) into a
     human-readable line suitable for Telegram/Discord/WhatsApp.
 
-    Structured events look like: ``{"tool":"bash","status":"running",...}``
-    Plain strings like ``"Thinking..."`` are returned unchanged.
+    Structured events are Agno-native: ``{"tool_name": "bash",
+    "tool_call_error": false, "result": ...}``; phase is derived from
+    the bool + ``result`` presence. Plain strings like ``"Thinking..."``
+    pass through unchanged.
     """
     from src.channels.base import parse_status_event
     evt = parse_status_event(raw)

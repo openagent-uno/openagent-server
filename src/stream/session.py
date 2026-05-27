@@ -326,7 +326,8 @@ class StreamSession:
             return
         if not isinstance(data, dict):
             return
-        tool = data.get("tool")
+        # Agno-native wire shape uses ``tool_name``.
+        tool = data.get("tool_name")
         if not isinstance(tool, str):
             return
         for needle, resource in _MCP_PREFIX_TO_RESOURCE:

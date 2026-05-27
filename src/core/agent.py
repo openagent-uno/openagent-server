@@ -12,7 +12,7 @@ from src.channels.base import build_attachment_context, prepend_context_block
 from src.models.base import BaseModel, ModelResponse
 from src.memory.db import MemoryDB
 from src.mcp.pool import MCPPool
-from src.core.prompts import FRAMEWORK_SYSTEM_PROMPT
+from src.core.prompts import FRAMEWORK_SYSTEM_PROMPT, build_mcp_catalog_summary
 from src.models.runtime import wire_model_runtime
 
 from src.core.logging import elog
@@ -115,6 +115,69 @@ def _format_shell_reminder(events) -> str:
     )
     body = "\n".join(lines)
     return f"<system-reminder>\n{body}\n</system-reminder>"
+
+
+def _build_agno_files(attachments: list[dict] | None) -> list[Any] | None:
+    """Convert non-image attachments into Agno ``File`` objects.
+
+    The user uploads files as ``[{type, filename, path, ...}, ...]``.
+    Non-image attachments (json, csv, txt, pdf, etc.) are routed through
+    Agno's native ``files: Sequence[File]`` parameter on ``Team.arun`` /
+    ``Agent.arun`` so the leader doesn't paraphrase synthetic file paths
+    into delegation tasks; Agno propagates files to members natively (see
+    ``agno/team/_default_tools.py:713`` — ``member_agent.arun(..., files=files)``).
+
+    Image attachments keep the old prepend-context flow — they don't go
+    through Agno's ``images=`` channel today; the Read tool handles them
+    by local path.
+
+    Returns ``None`` when there's nothing to forward — keeps callers from
+    passing an empty list down through the dispatcher.
+    """
+    if not attachments:
+        return None
+    # Lazy import — keeps the ``agno.media`` load off the module-level
+    # frozen-runtime preloads and out of the import path for tests that
+    # don't exercise file uploads.
+    from agno.media import File as _AgnoFile
+
+    out: list[Any] = []
+    for a in attachments:
+        a_type = (a.get("type") or "file").lower()
+        if a_type == "image":
+            continue
+        a_path = a.get("path") or ""
+        if not a_path:
+            # No filepath → can't construct an Agno File; skip.
+            continue
+        a_name = a.get("filename") or None
+        a_mime = a.get("mime_type") or None
+        # ``mime_type`` is validated against Agno's whitelist; pass only
+        # when the upload reported one so a missing/unknown value doesn't
+        # raise inside the validator.
+        kwargs: dict[str, Any] = {"filepath": a_path}
+        if a_name:
+            kwargs["filename"] = a_name
+        if a_mime:
+            try:
+                # Agno's ``File.__init__`` validates ``mime_type`` against a
+                # whitelist; reject silently if it would raise so we don't
+                # crash a turn on an unrecognised content-type header.
+                if a_mime in _AgnoFile.valid_mime_types():
+                    kwargs["mime_type"] = a_mime
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            out.append(_AgnoFile(**kwargs))
+        except Exception as exc:  # noqa: BLE001
+            elog(
+                "agent.files.build_skip",
+                level="warning",
+                filename=a_name,
+                path=a_path,
+                error=str(exc) or type(exc).__name__,
+            )
+    return out or None
 
 
 _VAULT_WRITE_TOOLS = frozenset({
@@ -881,27 +944,34 @@ class Agent:
         # call tools that operate on its own session (e.g. pin_session).
         system = self._combined_system_prompt(session_id=session_id)
 
-        # Include local paths for attachments so the tool layer can inspect them.
+        # Split attachments into images (prepend-context flow, unchanged)
+        # and non-images (routed natively through Agno's ``files=`` param so
+        # the leader doesn't paraphrase synthetic file paths into delegation
+        # tasks). Image attachments still prepend a context block — the
+        # downstream Read tool resolves them by local path the same way it
+        # always has.
+        agno_files = _build_agno_files(attachments)
         if attachments:
-            files_info: list[str] = []
-            for a in attachments:
-                a_type = a.get("type", "file")
-                a_name = a.get("filename", "")
-                a_path = a.get("path", "")
-                if a_path:
-                    files_info.append(f"- {a_type}: {a_name} — local path: {a_path}")
-                else:
-                    files_info.append(f"- {a_type}: {a_name}")
-            message = prepend_context_block(
-                message,
-                build_attachment_context(
-                    files_info,
-                    read_hint=(
-                        "Use the Read tool (or an MCP tool) with the local path to inspect each file. "
-                        "For images, Read returns the image content for you to see directly."
+            image_atts = [a for a in attachments if (a.get("type") or "file") == "image"]
+            if image_atts:
+                files_info: list[str] = []
+                for a in image_atts:
+                    a_name = a.get("filename", "")
+                    a_path = a.get("path", "")
+                    if a_path:
+                        files_info.append(f"- image: {a_name} — local path: {a_path}")
+                    else:
+                        files_info.append(f"- image: {a_name}")
+                message = prepend_context_block(
+                    message,
+                    build_attachment_context(
+                        files_info,
+                        read_hint=(
+                            "Use the Read tool (or an MCP tool) with the local path to inspect each image. "
+                            "For images, Read returns the image content for you to see directly."
+                        ),
                     ),
-                ),
-            )
+                )
 
         from src.mcp.servers.shell.handlers import get_hub
         from src.mcp.servers.shell.adapters import set_session_context, reset_session_context
@@ -939,11 +1009,18 @@ class Agent:
 
                 token = set_session_context(session_id)
                 try:
+                    # ``files`` is forwarded native to Agno's ``arun(files=...)``
+                    # by AgnoProvider / TeamRouterProvider; subscription-CLI
+                    # adapters fall back to a minimal prepend. Only attach on
+                    # the first iteration so shell-reminder re-entries don't
+                    # re-send the same files.
+                    gen_files = agno_files if iter_count == 1 else None
                     response = await active_model.generate(
                         messages,
                         system=system,
                         on_status=_status,
                         session_id=session_id,
+                        files=gen_files,
                     )
                 finally:
                     reset_session_context(token)
@@ -1088,26 +1165,31 @@ class Agent:
         await _status("Loading context...")
         system = self._combined_system_prompt(session_id=session_id)
 
+        # Mirror ``_run_inner``: images keep the prepend; non-images route
+        # natively through Agno's ``files=`` parameter. See the comment in
+        # ``_run_inner`` for the full reasoning.
+        agno_files = _build_agno_files(attachments)
         if attachments:
-            files_info: list[str] = []
-            for a in attachments:
-                a_type = a.get("type", "file")
-                a_name = a.get("filename", "")
-                a_path = a.get("path", "")
-                if a_path:
-                    files_info.append(f"- {a_type}: {a_name} — local path: {a_path}")
-                else:
-                    files_info.append(f"- {a_type}: {a_name}")
-            message = prepend_context_block(
-                message,
-                build_attachment_context(
-                    files_info,
-                    read_hint=(
-                        "Use the Read tool (or an MCP tool) with the local path to inspect each file. "
-                        "For images, Read returns the image content for you to see directly."
+            image_atts = [a for a in attachments if (a.get("type") or "file") == "image"]
+            if image_atts:
+                files_info: list[str] = []
+                for a in image_atts:
+                    a_name = a.get("filename", "")
+                    a_path = a.get("path", "")
+                    if a_path:
+                        files_info.append(f"- image: {a_name} — local path: {a_path}")
+                    else:
+                        files_info.append(f"- image: {a_name}")
+                message = prepend_context_block(
+                    message,
+                    build_attachment_context(
+                        files_info,
+                        read_hint=(
+                            "Use the Read tool (or an MCP tool) with the local path to inspect each image. "
+                            "For images, Read returns the image content for you to see directly."
+                        ),
                     ),
-                ),
-            )
+                )
 
         from src.mcp.servers.shell.handlers import get_hub
         from src.mcp.servers.shell.adapters import set_session_context, reset_session_context
@@ -1179,6 +1261,11 @@ class Agent:
                         stream_kwargs["session_id"] = session_id
                     if "on_status" in sig_params:
                         stream_kwargs["on_status"] = _status
+                    # Only attach files on iteration 1: shell-reminder
+                    # re-entries reuse the same Agno session, which already
+                    # has the prior files in its run history.
+                    if "files" in sig_params and iter_count == 1 and agno_files:
+                        stream_kwargs["files"] = agno_files
                     async for delta in active_model.stream(
                         messages, **stream_kwargs,
                     ):
@@ -1381,6 +1468,9 @@ class Agent:
         """
         framework = FRAMEWORK_SYSTEM_PROMPT.replace(
             "{{OPENAGENT_VAULT_PATH}}", self._resolve_vault_path()
+        ).replace(
+            "{{MCP_CATALOG_SUMMARY}}",
+            build_mcp_catalog_summary(self._mcp),
         )
 
         user = (self.system_prompt or "").strip()

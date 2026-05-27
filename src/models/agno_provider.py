@@ -21,6 +21,7 @@ scheduling. We only need to compute and mirror cost back into the metrics so
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import inspect
 import logging
@@ -32,7 +33,7 @@ from src.core.logging import elog
 from src.models.base import BaseModel, ModelResponse
 from src.models.catalog import (
     DEFAULT_ZAI_BASE_URL,
-    FRAMEWORK_AGNO,
+    FRAMEWORK_API_BASED,
     _iter_provider_entries,
     compute_cost,
     model_id_from_runtime,
@@ -41,6 +42,56 @@ from src.models.catalog import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _ErrorCaptureHandler(logging.Handler):
+    """Append ERROR-level log records (with formatted traceback) to a list.
+
+    Used by :func:`_capture_log_errors` to surface provider failures Agno
+    swallows internally — see ``ModelResponse``-status-error handling in
+    :meth:`AgnoProvider.generate`.
+    """
+
+    def __init__(self, sink: list[str]):
+        super().__init__(level=logging.ERROR)
+        self._sink = sink
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if record.levelno < logging.ERROR:
+            return
+        try:
+            msg = record.getMessage()
+        except Exception:
+            msg = str(record.msg)
+        # AGNO_LOG_TRACEBACKS=true attaches exc_info to log_error() calls
+        # so we can ship the originating file/line out to the fleet log
+        # (otherwise agno's formatted error string is all we get).
+        if record.exc_info:
+            try:
+                import traceback as _tb
+                tb_text = "".join(_tb.format_exception(*record.exc_info))
+                msg = f"{msg}\n{tb_text}" if msg else tb_text
+            except Exception:
+                pass
+        if msg:
+            self._sink.append(msg)
+
+
+@contextlib.contextmanager
+def _capture_log_errors():
+    """Install a temporary root-logger handler that collects ERROR records.
+
+    Yields a list that callers can read after the block — useful to surface
+    provider failures Agno catches and rewrites to an empty response.
+    """
+    sink: list[str] = []
+    handler = _ErrorCaptureHandler(sink)
+    root_logger = logging.getLogger()
+    root_logger.addHandler(handler)
+    try:
+        yield sink
+    finally:
+        root_logger.removeHandler(handler)
 _INCOMPATIBLE_TOOL_FAMILIES_BY_PROVIDER: dict[str, frozenset[str]] = {
     # DeepSeek v4 flash/pro chat completions are text-only on the official
     # API, so Agno computer-control screenshot artifacts (image parts) fail
@@ -181,7 +232,15 @@ AGNO_PROVIDER_CLASSES: dict[str, tuple[str, str, dict[str, Any]]] = {
     "groq": ("agno.models.groq", "Groq", {}),
     "mistral": ("agno.models.mistral", "MistralChat", {}),
     "xai": ("agno.models.xai", "xAI", {}),
-    "deepseek": ("agno.models.deepseek", "DeepSeek", {}),
+    # ``_provider_overrides.DeepSeekTextOnly`` rewrites Agno multimodal
+    # attachments to text before they hit DeepSeek's chat completions API
+    # — the official endpoint rejects ``{type:"file"}`` /
+    # ``{type:"image_url"}`` / ``{type:"input_audio"}`` content parts
+    # with ``unknown variant '<x>', expected 'text'``. Files become inline
+    # ``<attachment>`` blocks (or a placeholder for binaries); images /
+    # audio become a single ``<media-omitted>`` block listing what was
+    # stripped.
+    "deepseek": ("src.models._provider_overrides", "DeepSeekTextOnly", {}),
     "cerebras": ("agno.models.cerebras", "Cerebras", {}),
     "zai": ("agno.models.openai.like", "OpenAILike", {"name": "ZAI"}),
 }
@@ -208,20 +267,18 @@ class AgnoProvider(BaseModel):
         self._db_path = db_path
         self._history_runs = history_runs
         # Pre-connected Agno MCPTools instances supplied by MCPPool. Shared
-        # across all AgnoProvider instances under the same SmartRouter so we
-        # don't spawn duplicate MCP server processes per tier.
+        # across all AgnoProvider instances under the same ModelDispatcher
+        # so we don't spawn duplicate MCP server processes per entry model.
         self._mcp_toolkits: list[Any] = []
         # One Agno Agent per (system_message) so the framework prompt is sent
         # as a real ``system`` role message — not buried inside the user
-        # prompt. Without this, gpt-4o-mini ignores procedural instructions
-        # like "introspect your tool list and group by prefix" and just
-        # confabulates ("vault, functions"). Cache stays small in practice:
-        # the classifier uses ``""`` (no system); the main call uses the
-        # static framework+user prompt; that's two entries.
+        # prompt. Without this, weak models ignore procedural instructions
+        # and confabulate. Cache stays small in practice: usually one or
+        # two entries (no-system vs the static framework+user prompt).
         self._agno_agents: dict[str, Any] = {}
         # Parallel cache for Team-mode runners. One Team per framework
         # system prompt, built only when ≥2 MCP tool families are connected.
-        # Classifier calls (empty system) never trigger Team construction.
+        # No-system calls never trigger Team construction.
         self._agno_teams: dict[str, Any] = {}
 
         self._inject_provider_keys()
@@ -366,7 +423,7 @@ class AgnoProvider(BaseModel):
         # claude-cli rows have api_key=NULL by schema, but be defensive
         # against legacy dict-shaped configs that might still be in play.
         for entry in _iter_provider_entries(self._providers_config):
-            if entry.get("framework", FRAMEWORK_AGNO) != FRAMEWORK_AGNO:
+            if entry.get("framework", FRAMEWORK_API_BASED) != FRAMEWORK_API_BASED:
                 continue
             name = str(entry.get("name") or "").strip()
             key = entry.get("api_key")
@@ -505,6 +562,18 @@ class AgnoProvider(BaseModel):
                 "so Agno computer-control screenshots are incompatible with this "
                 "model. Use a non-DeepSeek model for computer-control / GUI tasks."
             )
+        if provider_name == "deepseek" and "unknown variant `file`" in lowered:
+            # ``DeepSeekTextOnly`` should already inline file attachments
+            # as text — if we still see this, an unpatched DeepSeek class
+            # leaked through, or a member is using a different OpenAI-like
+            # provider that also rejects file parts.
+            return (
+                "DeepSeek's chat API doesn't accept file attachments as "
+                "content parts. File contents are normally inlined as text "
+                "for DeepSeek; if you see this, the file may be too large "
+                "or in a binary-only format. Switch to anthropic/openai for "
+                "richer file analysis."
+            )
         # 402 / Insufficient Balance is a billing problem — it won't
         # clear on retry, and a scheduled workflow hammering it just
         # creates writer-lock contention on the agent's SQLite file.
@@ -532,7 +601,7 @@ class AgnoProvider(BaseModel):
         for entry in _iter_provider_entries(self._providers_config):
             if str(entry.get("name") or "").strip() != provider_name:
                 continue
-            if entry.get("framework", FRAMEWORK_AGNO) != FRAMEWORK_AGNO:
+            if entry.get("framework", FRAMEWORK_API_BASED) != FRAMEWORK_API_BASED:
                 continue
             return dict(entry)
         return {}
@@ -592,47 +661,6 @@ class AgnoProvider(BaseModel):
             f"and retry. Original import error: {detail}"
         )
 
-    def _build_list_mcps_tool(self) -> Callable[..., str]:
-        """Return a callable the LLM can invoke to discover MCP servers.
-
-        Weak models (e.g. gpt-4o-mini) reliably fail to introspect 75+
-        function definitions and group them by their ``<server>_`` prefix —
-        empirically they confabulate ("vault, functions") even with the
-        full tool list and proper system role. Giving them a callable that
-        returns the authoritative server inventory means they don't need
-        to introspect at all: they call this tool, then relay the result.
-
-        The callable's docstring is its description for the LLM, which IS
-        the appropriate place to describe a tool (this isn't injecting MCP
-        names into the system prompt — server names are computed from the
-        live toolkit list at call time, not baked into any string).
-        """
-        toolkits, _filtered = self._compatible_mcp_toolkits()
-
-        def list_mcp_servers() -> str:
-            """List every MCP server wired to this agent and how many tools each provides.
-
-            Call this when the user asks ANY of: which MCPs do you have, what MCPs
-            are available, what can you do, what tools do you have, list your
-            capabilities, or anything semantically similar — in any language.
-            Returns a JSON array of ``{"server": str, "tools": int}`` items. Each
-            server's tools appear in your function list as ``<server>_<tool>``.
-            Use the returned data verbatim; do not invent or omit servers.
-            """
-            import json
-            result = []
-            for tk in toolkits:
-                prefix = (
-                    getattr(tk, "tool_name_prefix", None)
-                    or getattr(tk, "name", None)
-                    or "?"
-                )
-                count = len(getattr(tk, "functions", {}) or {})
-                result.append({"server": prefix, "tools": count})
-            return json.dumps(result, indent=2)
-
-        return list_mcp_servers
-
     def _ensure_agent(self, system: str | None = None):
         """Lazily construct one Agno Agent per unique system prompt.
 
@@ -641,9 +669,10 @@ class AgnoProvider(BaseModel):
         text. Agents are cached by the system string so we don't rebuild on
         every call. ``set_db`` and ``set_mcp_toolkits`` flush the cache.
 
-        Tools passed to AgnoAgent: every connected MCPTools toolkit plus a
-        ``list_mcp_servers`` meta-callable for inventory questions (see
-        :meth:`_build_list_mcps_tool`).
+        Tools passed to AgnoAgent: every connected MCPTools toolkit.
+        MCP discovery is handled uniformly by ``tool-search.list_servers``
+        (one of the tool-search MCP's meta-tools) — no per-agent meta
+        callable is attached upfront.
         """
         sys_key = (system or "").strip()
         cached = self._agno_agents.get(sys_key)
@@ -666,7 +695,6 @@ class AgnoProvider(BaseModel):
                 runner="agent",
             )
         agent_tools: list[Any] = list(compatible_toolkits)
-        agent_tools.append(self._build_list_mcps_tool())
         agent = AgnoAgent(
             model=self._build_agno_model(),
             db=SqliteDb(db_file=str(db_path)),
@@ -694,9 +722,8 @@ class AgnoProvider(BaseModel):
 
         Each ``MCPTools`` instance wraps exactly one MCP server, so the
         prefix doubles as a natural "tool family" identifier for Team-mode
-        routing. Uses the same resolution order as ``list_mcp_servers``
-        (``tool_name_prefix`` → ``name`` → ``"default"``). Empty dict when
-        no toolkits are connected.
+        routing. Uses ``tool_name_prefix`` → ``name`` → ``"default"`` as
+        the resolution order. Empty dict when no toolkits are connected.
         """
         compatible_toolkits, _filtered = self._compatible_mcp_toolkits()
         families: dict[str, list[Any]] = {}
@@ -713,12 +740,12 @@ class AgnoProvider(BaseModel):
         - fewer than 2 connected MCP tool families (nothing to route between)
         - Team import failure (older Agno or missing extra)
 
-        The team leader carries the framework prompt and the
-        ``list_mcp_servers`` meta-tool so inventory questions still work.
-        Members are thin specialists: each owns one family's toolkit and
-        a short role blurb the router uses to pick between them. Members
-        inherit the framework prompt too so when the leader synthesises
-        their output the persona is preserved.
+        The team leader carries the framework prompt and the full
+        toolkit list as a safety net. Members are thin specialists:
+        each owns one family's toolkit and a short role blurb the
+        router uses to pick between them. Members inherit the
+        framework prompt too so when the leader synthesises their
+        output the persona is preserved.
         """
         sys_key = (system or "").strip()
         if not sys_key:
@@ -780,7 +807,6 @@ class AgnoProvider(BaseModel):
         # operation the leader delegates to one specialist and never calls
         # these itself — so the fallback costs nothing on the happy path.
         leader_tools: list[Any] = list(compatible_toolkits)
-        leader_tools.append(self._build_list_mcps_tool())
 
         try:
             team = Team(
@@ -866,7 +892,8 @@ class AgnoProvider(BaseModel):
                 parts.append(f"[Tool:{msg.get('name', 'tool')}] {content}")
         return "\n\n".join(part for part in parts if part).strip()
 
-    def _metrics_to_dict(self, metrics: Any) -> dict[str, Any]:
+    @staticmethod
+    def _metrics_to_dict(metrics: Any) -> dict[str, Any]:
         """Coerce Agno's metrics (dataclass / Pydantic / dict / object) into a dict.
 
         Agno 2.x returns ``response.metrics`` as a ``RunMetrics`` dataclass;
@@ -892,10 +919,8 @@ class AgnoProvider(BaseModel):
             return {k: v for k, v in vars(metrics).items() if not k.startswith("_")}
         return {}
 
-    def _extract_metric(self, metrics: Any, *names: str) -> int:
-        data = metrics if isinstance(metrics, dict) else self._metrics_to_dict(metrics)
-        if not data:
-            return 0
+    @staticmethod
+    def _extract_metric(data: dict[str, Any], *names: str) -> int:
         for name in names:
             value = data.get(name)
             if value is not None:
@@ -912,6 +937,8 @@ class AgnoProvider(BaseModel):
         tools: list[dict[str, Any]] | None = None,
         on_status: Callable[[str], Awaitable[None]] | None = None,
         session_id: str | None = None,
+        files: list[Any] | None = None,
+        model_override: str | None = None,
     ) -> ModelResponse:
         """Run a single turn through Agno.
 
@@ -920,6 +947,10 @@ class AgnoProvider(BaseModel):
         instances via ``_mcp_toolkits`` and runs the full tool loop
         internally (including image-artifact extraction so screenshots no
         longer blow up the context).
+
+        ``files`` is forwarded as ``runtime.arun(..., files=files)`` so
+        the Agno runtime applies its native attachment handling (Team
+        propagates them to members during ``delegate_task_to_member``).
         """
         prompt = self._flatten_messages(messages)
         sid = session_id or "default"
@@ -951,15 +982,6 @@ class AgnoProvider(BaseModel):
             except Exception:
                 pass
 
-        # Capture ERROR-level log records from any logger during the run so
-        # that when Agno swallows a provider failure (e.g. OpenAI 403,
-        # rate-limit, model-not-allowed), we can surface the underlying
-        # message to the user instead of returning the silent empty-result
-        # placeholder. Agno logs the failure with strings like
-        # "API status error from OpenAI API: Error code: 403 - ..." and
-        # "Non-retryable model provider error: ...", but does not re-raise.
-        captured_errors: list[str] = []
-
         # Force agno to attach exc_info to its log_error() calls so the
         # capture handler below sees the underlying traceback. Default
         # is off (AGNO_LOG_TRACEBACKS=false), which swallows everything
@@ -975,43 +997,23 @@ class AgnoProvider(BaseModel):
         except Exception:
             pass
 
-        class _ErrorCapture(logging.Handler):
-            def emit(self, record: logging.LogRecord) -> None:
-                if record.levelno < logging.ERROR:
-                    return
-                try:
-                    msg = record.getMessage()
-                except Exception:
-                    msg = str(record.msg)
-                # When AGNO_LOG_TRACEBACKS is on, agno populates
-                # ``record.exc_info`` with the live exception. Append
-                # the formatted traceback to the captured entry so the
-                # subsequent ``agno.run_status_error`` diag event ships
-                # the originating file/line out to the fleet log — the
-                # only way to root-cause errors that agno catches and
-                # rewrites to a status=ERROR response.
-                if record.exc_info:
-                    try:
-                        import traceback as _tb
-                        tb_text = "".join(_tb.format_exception(*record.exc_info))
-                        msg = f"{msg}\n{tb_text}" if msg else tb_text
-                    except Exception:
-                        pass
-                if msg:
-                    captured_errors.append(msg)
-
-        capture = _ErrorCapture(level=logging.ERROR)
-        root_logger = logging.getLogger()
-        root_logger.addHandler(capture)
-        try:
+        # Capture ERROR-level log records from any logger during the run so
+        # that when Agno swallows a provider failure (e.g. OpenAI 403,
+        # rate-limit, model-not-allowed), we can surface the underlying
+        # message to the user instead of returning the silent empty-result
+        # placeholder. Agno logs the failure with strings like
+        # "API status error from OpenAI API: Error code: 403 - ..." and
+        # "Non-retryable model provider error: ...", but does not re-raise.
+        with _capture_log_errors() as captured_errors:
             # ``user_id`` is required by ``enable_agentic_memory``; we use a
             # stable constant so memory accumulates for the single-tenant
             # OpenAgent deployment. Multi-tenant deployments can wire a
             # real user_id through BaseModel.generate() in a follow-up.
+            arun_kwargs: dict[str, Any] = {"session_id": sid, "user_id": "openagent"}
+            if files:
+                arun_kwargs["files"] = files
             try:
-                response = await runner.arun(
-                    prompt, session_id=sid, user_id="openagent"
-                )
+                response = await runner.arun(prompt, **arun_kwargs)
             except Exception as e:
                 raw_error = str(e) or repr(e)
                 # When a previous run left a message with a missing
@@ -1030,9 +1032,7 @@ class AgnoProvider(BaseModel):
                         await self.forget_session(sid)
                     except Exception as fe:
                         logger.debug("agno session recovery forget %s: %s", sid, fe)
-                    response = await runner.arun(
-                        prompt, session_id=sid, user_id="openagent"
-                    )
+                    response = await runner.arun(prompt, **arun_kwargs)
                 else:
                     rewritten_error = self._rewrite_provider_error_detail(raw_error)
                     elog(
@@ -1045,8 +1045,6 @@ class AgnoProvider(BaseModel):
                     if rewritten_error != raw_error:
                         raise AgnoProviderError(rewritten_error) from e
                     raise
-        finally:
-            root_logger.removeHandler(capture)
 
         # Agno's Agent.arun / Team.arun catches generic exceptions, sets
         # ``run_response.status = RunStatus.error`` AND
@@ -1117,10 +1115,19 @@ class AgnoProvider(BaseModel):
 
         if on_status:
             tools = getattr(response, "tools", None) or []
+            # Symmetric with the streaming path: emit a (started, completed)
+            # pair per tool. ``generate()`` runs the turn to completion so
+            # the ToolExecution already carries the final ``result`` — for
+            # the started frame we shallow-clone it and null ``result`` so
+            # the UI's local phase derivation (result presence → completed)
+            # reads it as "running". Bridges that use ``generate()``
+            # otherwise saw only the completed state and couldn't show a
+            # spinner.
             for tool_exec in tools:
-                await self._emit_agno_tool_status(on_status, tool_exec, "running")
-            for tool_exec in tools:
-                await self._emit_agno_tool_status(on_status, tool_exec, "done")
+                await self._emit_agno_tool_status(
+                    on_status, tool_exec, phase="started",
+                )
+                await self._emit_agno_tool_status(on_status, tool_exec)
 
         metrics_obj = getattr(response, "metrics", None)
         metrics_dict = self._metrics_to_dict(metrics_obj)
@@ -1136,7 +1143,7 @@ class AgnoProvider(BaseModel):
 
         input_tokens = self._extract_metric(metrics_dict, "input_tokens", "prompt_tokens", "input")
         output_tokens = self._extract_metric(metrics_dict, "output_tokens", "completion_tokens", "output")
-        stop_reason = metrics_dict.get("stop_reason") if isinstance(metrics_dict, dict) else None
+        stop_reason = metrics_dict.get("stop_reason")
 
         # Compute cost from OpenAgent's catalog and mirror it back into Agno's
         # metrics so SessionMetrics.cost aggregation works for free.
@@ -1170,54 +1177,40 @@ class AgnoProvider(BaseModel):
         self,
         on_status: Callable[[str], Awaitable[None]],
         tool_exec: Any | None,
-        status: str,
         *,
         error_text: str | None = None,
+        phase: str | None = None,
     ) -> None:
         """Forward an Agno ``ToolExecution`` as a JSON status frame.
 
-        Shape matches ``claude_cli._emit_tool_status`` — the contract
-        with ``openagent/stream/session.py`` and the frontend's
-        ``handleServerMessage`` parser.
+        The wire shape is Agno's native ``ToolExecution.to_dict()`` —
+        the universal app derives phase locally from ``tool_call_error``
+        + ``result`` presence. Pass ``error_text`` for live
+        ``ToolCallErrorEvent``s so the error message rides in
+        ``result`` (the durable carrier the stored row will also have).
+        Pass ``phase="started"`` to null out ``result`` on the wire so
+        the UI's phase derivation reads the frame as "running" even
+        when the underlying ToolExecution already carries its final
+        result (the non-streaming ``generate()`` case).
         """
-        import json as _json
+        from src.models._tool_status import tool_exec_to_wire_json
 
-        tool_name = getattr(tool_exec, "tool_name", None) if tool_exec is not None else None
-        if not tool_name:
+        encoded = tool_exec_to_wire_json(
+            tool_exec, error_text=error_text, phase=phase,
+        )
+        if encoded is None:
             return
-        params = getattr(tool_exec, "tool_args", None)
-        result = getattr(tool_exec, "result", None) if tool_exec is not None else None
-        payload: dict[str, Any] = {
-            "tool": str(tool_name),
-            "params": params if isinstance(params, dict) else {},
-            "status": status,
-        }
-        if status == "done" and result is not None:
-            payload["result"] = str(result)
-        if status == "error" and error_text:
-            payload["error"] = str(error_text)
         try:
-            await on_status(_json.dumps(payload))
+            await on_status(encoded)
         except Exception:
             pass
 
     @staticmethod
-    def _save_stream_image(image: Any) -> str | None:
-        """Write an Agno ``Image`` from ``RunContentEvent`` to a temp file.
-
-        Returns a ``[IMAGE:/path]`` marker that ``parse_response_markers``
-        extracts downstream, or ``None`` when the image has no bytes.
-        """
-        path, _filename = _save_agno_image_to_disk(image)
-        if path is None:
-            return None
-        return f"\n[IMAGE:{path}]\n"
-
-    @staticmethod
-    def _save_tool_image(tool_exec: Any | None, image: Any) -> str | None:
-        """Write an Agno ``Image`` produced by a tool call to a temp file.
-
-        Returns a ``[IMAGE:/path]`` marker, or ``None`` when no bytes.
+    def _save_image(image: Any) -> str | None:
+        """Write an Agno ``Image`` (from stream content or tool result) to a
+        temp file. Returns a ``[IMAGE:/path]`` marker that
+        ``parse_response_markers`` extracts downstream, or ``None`` when
+        the image has no bytes.
         """
         path, _filename = _save_agno_image_to_disk(image)
         if path is None:
@@ -1231,6 +1224,8 @@ class AgnoProvider(BaseModel):
         tools: list[dict[str, Any]] | None = None,
         on_status: Callable[[str], Awaitable[None]] | None = None,
         session_id: str | None = None,
+        files: list[Any] | None = None,
+        model_override: str | None = None,
     ) -> AsyncIterator[str]:
         """Stream content deltas via Agno's native ``stream=True`` path.
 
@@ -1240,6 +1235,10 @@ class AgnoProvider(BaseModel):
         are written to disk and yielded as ``[IMAGE:/path]`` markers.
         On any failure, falls back to :meth:`generate` and yields the
         full content as one chunk so the caller still gets a reply.
+
+        ``files`` is forwarded to Agno's native ``runner.arun(files=...)``
+        so attachments propagate to Team members (see
+        ``agno/team/_default_tools.py:713``).
         """
         prompt = self._flatten_messages(messages)
         sid = session_id or "default"
@@ -1280,10 +1279,13 @@ class AgnoProvider(BaseModel):
             if AGNO_TEAM_EVENTS and TeamRunContentEvent is not None:
                 _content_event_types = (AgentRunContentEvent, TeamRunContentEvent)
 
-            stream = runner.arun(
-                prompt, session_id=sid, user_id="openagent", stream=True,
-                stream_events=True,
-            )
+            stream_kwargs: dict[str, Any] = {
+                "session_id": sid, "user_id": "openagent",
+                "stream": True, "stream_events": True,
+            }
+            if files:
+                stream_kwargs["files"] = files
+            stream = runner.arun(prompt, **stream_kwargs)
             try:
                 emitted = 0
                 async for event in stream:
@@ -1294,7 +1296,7 @@ class AgnoProvider(BaseModel):
                             yield text
                         image = getattr(event, "image", None)
                         if image is not None:
-                            marker = self._save_stream_image(image)
+                            marker = self._save_image(image)
                             if marker:
                                 yield marker
                         continue
@@ -1312,7 +1314,7 @@ class AgnoProvider(BaseModel):
                         if on_status is not None:
                             tool_exec = getattr(event, "tool", None)
                             await self._emit_agno_tool_status(
-                                on_status, tool_exec, "running",
+                                on_status, tool_exec,
                             )
                     elif et in ("ToolCallCompleted", "TeamToolCallCompleted") or isinstance(
                         event, _tool_completed
@@ -1320,11 +1322,11 @@ class AgnoProvider(BaseModel):
                         tool_exec = getattr(event, "tool", None)
                         if on_status is not None:
                             await self._emit_agno_tool_status(
-                                on_status, tool_exec, "done",
+                                on_status, tool_exec,
                             )
                         images = getattr(event, "images", None) or []
                         for img in images:
-                            marker = self._save_tool_image(tool_exec, img)
+                            marker = self._save_image(img)
                             if marker:
                                 yield marker
                     elif et in ("ToolCallError", "TeamToolCallError") or isinstance(
@@ -1334,7 +1336,7 @@ class AgnoProvider(BaseModel):
                             tool_exec = getattr(event, "tool", None)
                             error_text = getattr(event, "error", None)
                             await self._emit_agno_tool_status(
-                                on_status, tool_exec, "error",
+                                on_status, tool_exec,
                                 error_text=error_text,
                             )
             finally:
@@ -1357,6 +1359,7 @@ class AgnoProvider(BaseModel):
                     tools=tools,
                     on_status=on_status,
                     session_id=session_id,
+                    files=files,
                 )
                 if response.content:
                     yield response.content
@@ -1408,7 +1411,7 @@ class AgnoProvider(BaseModel):
         directly queryable and ``SessionMetrics`` sums correctly across runs.
 
         The canonical cost record still lives in OpenAgent's ``usage_log``
-        (written by ``SmartRouter``); this is the queryable mirror.
+        (written by ``ModelDispatcher``); this is the queryable mirror.
         """
         cost = compute_cost(
             model_ref=self.model,

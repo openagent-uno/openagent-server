@@ -15,6 +15,7 @@ import asyncio
 import logging
 import os
 import signal
+from typing import Any
 from src.core.agent import Agent
 from src.memory.db import MemoryDB
 from src.models.runtime import create_model_from_config, wire_model_runtime
@@ -753,7 +754,14 @@ class AgentServer:
             self._stop_event.set()
 
     async def wait(self) -> None:
-        """Block until stop() is called or a termination signal arrives."""
+        """Block until stop() is called or a termination signal arrives.
+
+        Belt-and-suspenders: loop.add_signal_handler is the primary path
+        (cooperates with asyncio); signal.signal is the C-extension
+        fallback (iroh/tokio in particular can block the selector enough
+        that the asyncio handler never fires). Both wired, both unwound
+        in finally.
+        """
         assert self._stop_event is not None, "Call start() first"
 
         loop = asyncio.get_running_loop()
@@ -762,13 +770,26 @@ class AgentServer:
         def _signal_handler() -> None:
             stop_event.set()
 
-        handled = []
+        def _legacy_handler(_signum, _frame) -> None:
+            # signal.signal handlers run in the main thread but outside
+            # the loop; bounce through call_soon_threadsafe so Event.set
+            # is invoked on the loop thread.
+            loop.call_soon_threadsafe(stop_event.set)
+
+        handled: list[int] = []
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
                 loop.add_signal_handler(sig, _signal_handler)
                 handled.append(sig)
             except (NotImplementedError, RuntimeError):
                 # Windows / non-main thread: fall back to KeyboardInterrupt
+                pass
+
+        prev_legacy: dict[int, Any] = {}
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                prev_legacy[sig] = signal.signal(sig, _legacy_handler)
+            except (OSError, ValueError):
                 pass
 
         try:
@@ -779,6 +800,11 @@ class AgentServer:
             for sig in handled:
                 try:
                     loop.remove_signal_handler(sig)
+                except Exception:
+                    pass
+            for sig, prev in prev_legacy.items():
+                try:
+                    signal.signal(sig, prev)
                 except Exception:
                     pass
 

@@ -44,7 +44,11 @@ async def t_bridge_base(ctx: TestContext) -> None:
     # format_tool_status is consumed by BaseBridge.dispatch_turn to
     # render the per-tool status pings the bridges show during a turn.
     assert format_tool_status("Thinking...") == "Thinking..."
-    assert format_tool_status('{"tool":"bash","status":"running"}') == "Using bash..."
+    # Agno-native wire shape: tool_name present, tool_call_error false,
+    # no result yet → derives status "running" → "Using bash..." line.
+    assert format_tool_status(
+        '{"tool_name":"bash","tool_call_error":false}'
+    ) == "Using bash..."
 
 
 @test("bridges", "BaseBridge treats listener exit as a reconnect signal")
@@ -1157,7 +1161,7 @@ async def t_status_frame_invokes_owner_callback(ctx: TestContext) -> None:
                 # STATUS frame BEFORE turn_complete.
                 await fb._real._handle_gateway_frame({
                     "type": "status", "session_id": sid,
-                    "text": '{"tool":"bash","status":"running"}',
+                    "text": '{"tool_name":"bash","tool_call_error":false}',
                 })
                 col = fb._real._stream_pending[sid]
                 col.text = "ok"
@@ -1462,7 +1466,7 @@ async def t_dispatch_turn_post_status_raises(ctx: TestContext) -> None:
     async def _fake_send_message(text, session_id, *, on_status=None, **kwargs):
         # Trigger on_status to confirm it's safely no-op when no handle.
         if on_status:
-            await on_status('{"tool":"bash","status":"running"}')
+            await on_status('{"tool_name":"bash","tool_call_error":false}')
         return {"type": "response", "text": "ok", "model": None,
                 "attachments": [], "target": None}
 

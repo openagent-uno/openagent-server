@@ -1,8 +1,6 @@
 """Regression guards for provider-specific Agno toolkit filtering."""
 from __future__ import annotations
 
-import json
-
 from ._framework import TestContext, test
 
 
@@ -31,9 +29,6 @@ async def t_deepseek_filters_computer_control(_ctx: TestContext) -> None:
 
     families = provider._tool_families()
     assert sorted(families.keys()) == ["browser", "files"], sorted(families.keys())
-
-    inventory = json.loads(provider._build_list_mcps_tool()())
-    assert [row["server"] for row in inventory] == ["files", "browser"], inventory
 
 
 @test("agno_tool_filter", "deepseek image_url provider error is rewritten into an actionable message")

@@ -191,6 +191,60 @@ _REGISTRATION_EXCEPTIONS: frozenset[str] = frozenset({
 })
 
 
+@test("repo_hygiene", "no stale 'from src.X' imports anywhere in src/ (incl. lazy)")
+async def t_no_stale_src_imports(_ctx: TestContext) -> None:
+    """AST-walk every ``src/`` file and verify every ``from src.X`` /
+    ``import src.X`` statement points at a module that actually exists,
+    INCLUDING lazy imports nested inside functions, classes, or
+    try/except blocks.
+
+    The plain smoke-import test (below) only catches stale module-level
+    imports — a stale ``from src.models.smart_router import SmartRouter``
+    hidden inside a handler function fires only when the HTTP endpoint
+    is called. This test catches it before deployment.
+    """
+    import ast
+    import pkgutil
+    import src as _src_pkg
+
+    valid_modules: set[str] = {"src"}
+    for _finder, name, _ispkg in pkgutil.walk_packages(
+        path=_src_pkg.__path__,  # type: ignore[attr-defined]
+        prefix="src.",
+    ):
+        valid_modules.add(name)
+
+    src_root = Path(_src_pkg.__file__).parent  # type: ignore[arg-type]
+    failures: list[tuple[str, int, str]] = []
+
+    for py_file in src_root.rglob("*.py"):
+        if "__pycache__" in py_file.parts:
+            continue
+        try:
+            tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            mods: list[tuple[str, int]] = []
+            if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("src."):
+                mods.append((node.module, node.lineno))
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name.startswith("src."):
+                        mods.append((alias.name, node.lineno))
+            for mod_name, lineno in mods:
+                if mod_name not in valid_modules:
+                    rel = py_file.relative_to(src_root.parent)
+                    failures.append((str(rel), lineno, mod_name))
+
+    assert not failures, (
+        "Stale src.* imports — targets don't exist as modules. Lazy "
+        "imports inside function bodies aren't caught by the smoke-"
+        "import test because the function never runs at import time:\n  "
+        + "\n  ".join(f"{file}:{line} → {mod}" for file, line, mod in failures)
+    )
+
+
 @test("repo_hygiene", "every src/ module imports cleanly (smoke)")
 async def t_every_src_module_imports(_ctx: TestContext) -> None:
     """Walk ``src/`` and ``importlib.import_module`` each Python

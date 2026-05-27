@@ -38,22 +38,6 @@ async def t_agno_generate(ctx: TestContext) -> None:
     assert resp.model == "openai:gpt-4o-mini"
 
 
-@test("agno", "list_mcp_servers tool exists in agent tools")
-async def t_agno_meta_tool(ctx: TestContext) -> None:
-    from src.models.agno_provider import AgnoProvider
-    pool = ctx.extras["pool"]
-    provider = AgnoProvider(
-        model="openai:gpt-4o-mini",
-        api_key=ctx.config.get("providers", {}).get("openai", {}).get("api_key", "x"),
-        providers_config=ctx.config["providers"],
-        db_path=str(ctx.db_path),
-    )
-    provider.set_mcp_toolkits(pool.agno_toolkits)
-    agent = provider._ensure_agent(system="test")
-    names = [getattr(t, "__name__", None) for t in agent.tools if callable(t)]
-    assert "list_mcp_servers" in names, f"meta-tool missing; tools: {names}"
-
-
 @test("agno", "compaction flags enabled on constructed agent")
 async def t_agno_compaction_flags(ctx: TestContext) -> None:
     """Session summaries must be ON by default so the agent gets

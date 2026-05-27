@@ -11,7 +11,12 @@ requires-python = ">=3.11"
 license = "MIT"
 
 dependencies = [
-    "agno>=1.0.0",
+    # agno>=2.6.0 introduced the multi-framework adapter
+    # ``agno.agents.claude.ClaudeAgent`` that wraps claude-agent-sdk as
+    # an Agno agent (so its sessions land in agno_sessions via SqliteDb).
+    # Pinned with an upper bound because the multi-framework feature is
+    # Beta and the surface can shift between minors.
+    "agno>=2.6.9,<3",
     "mcp>=1.0.0",
     "click>=8.1.0",
     "rich>=13.0.0",

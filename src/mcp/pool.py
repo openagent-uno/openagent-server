@@ -39,7 +39,12 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from src.core.logging import elog
-from src.mcp.builtins import DEFAULT_MCPS, resolve_builtin_entry, resolve_default_entry
+from src.mcp.builtins import (
+    BUILTIN_MCP_SPECS,
+    DEFAULT_MCPS,
+    resolve_builtin_entry,
+    resolve_default_entry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -572,6 +577,12 @@ class MCPPool:
         # ``from_config`` callers (tests) — reload is a no-op in that mode.
         self._db: Any = None
         self._db_path: str | None = None
+        # Cached rendered catalog summary (~16KB string injected into
+        # every chat-turn's system prompt). Computed lazily on first use,
+        # invalidated by ``reload()`` and ``connect_all`` because both
+        # may change ``self._tool_counts``. The render is a 1-2ms walk
+        # that adds up across every prompt construction.
+        self._catalog_summary_cache: str | None = None
 
     @classmethod
     def from_config(
@@ -652,6 +663,10 @@ class MCPPool:
             self._tool_counts = {s.name: 0 for s in new_specs}
             self._last_recovery_error_type = {}
             self._connected = False
+            # Server set + tool counts changed → drop the cached catalog
+            # summary; the next prompt render will rebuild it from the
+            # fresh self._tool_counts / self.specs.
+            self._catalog_summary_cache = None
 
         # connect_all has its own lock; new subprocesses come up first.
         await self.connect_all()
@@ -781,6 +796,11 @@ class MCPPool:
                 elog("mcp.connect", name=spec.name, tools=count, kind="in_process")
 
             self._connected = True
+            # Tool counts may have shifted during connect_all (dormant
+            # recoveries, fresh in-process tool registrations) — drop
+            # the cached catalog summary so the next prompt render
+            # rebuilds it.
+            self._catalog_summary_cache = None
 
     async def close_all(self) -> None:
         """Close every connected toolkit. Per-toolkit supervisors are closed
@@ -1408,6 +1428,36 @@ class MCPPool:
                 remaining -= n
         return kept + in_process
 
+    # ── Defer-all view (v0.14+) ─────────────────────────────────────────
+    #
+    # The router now feeds the model ONLY the tool-search MCP up front;
+    # every other MCP (in-process or subprocess) is reached via
+    # ``tool-search.call_tool``. Uniform discovery surface — the model
+    # never gets a mixed "some tools upfront, some deferred" picture
+    # that confuses delegation. Both views below return just the
+    # tool-search MCP so the wire layer can stay symmetrical across
+    # Agno (toolkits) and Claude SDK (mcp_servers config).
+
+    def agno_toolkits_tool_search_only(self) -> list[Any]:
+        """Return ONLY the ``tool-search`` in-process toolkit.
+
+        Used by ``wire_model_runtime`` to keep just the 4 meta-tools
+        (``list_servers`` / ``list_tools`` / ``describe_tool`` /
+        ``call_tool``) in the model's upfront tool list. All other
+        connected MCPs stay alive in the pool but are reached via
+        ``tool-search.call_tool``.
+        """
+        tk = self._toolkit_by_name.get("tool-search")
+        return [tk] if tk is not None else []
+
+    def claude_sdk_servers_tool_search_only(self) -> dict[str, dict[str, Any]]:
+        """Same as ``agno_toolkits_tool_search_only`` for the Claude SDK
+        ``mcp_servers`` config shape. Returns ``{"tool-search": <cfg>}``
+        when the in-process tool-search MCP is registered, else ``{}``.
+        """
+        cfg = self._in_process_sdk_servers.get("tool-search")
+        return {"tool-search": cfg} if cfg is not None else {}
+
     def claude_sdk_servers_under_budget(self, budget: int) -> dict[str, dict[str, Any]]:
         """Same idea as ``agno_toolkits_under_budget`` for Claude SDK config.
 
@@ -1443,6 +1493,63 @@ class MCPPool:
     def server_summary(self) -> dict[str, int]:
         """``{server_name: tool_count}`` for every configured server."""
         return dict(self._tool_counts)
+
+    def server_descriptions(self) -> dict[str, str]:
+        """``{server_name: 1-line description}`` for every configured server.
+
+        Pulled from the canonical builtin catalog when a spec matches a
+        known builtin (shell, vault, scheduler, …), then from the spec's
+        own ``description`` field if it set one, else empty so the
+        catalog-summary renderer falls back to a generic blurb. Used by
+        :func:`render_catalog_summary` to inject prior-knowledge hints
+        into the system prompt so the model doesn't burn a turn on
+        ``list_servers``.
+        """
+        out: dict[str, str] = {}
+        for spec in self.specs:
+            builtin = BUILTIN_MCP_SPECS.get(spec.name, {}) if isinstance(
+                BUILTIN_MCP_SPECS, dict
+            ) else {}
+            description = (
+                getattr(spec, "description", "")
+                or builtin.get("description", "")
+                or ""
+            )
+            if description:
+                out[spec.name] = description.strip()
+        return out
+
+    def render_catalog_summary(self) -> str:
+        """Cached markdown block listing every connected MCP server.
+
+        The rendered string is injected into every chat-turn's system
+        prompt at the ``{{MCP_CATALOG_SUMMARY}}`` placeholder. The
+        server set + tool counts only change on hot-reload, so we cache
+        the result and invalidate from ``reload()`` and ``connect_all``.
+        """
+        if self._catalog_summary_cache is None:
+            self._catalog_summary_cache = self._build_catalog_summary()
+        return self._catalog_summary_cache
+
+    def _build_catalog_summary(self) -> str:
+        """Render the catalog summary from live ``_tool_counts`` /
+        ``server_descriptions``. Internal — callers use the cached
+        :meth:`render_catalog_summary`.
+
+        Foregrounds ``vault`` (the model's only durable memory) with
+        stronger imperative wording. ``tool-search`` always lists last
+        because the model already knows about it (it's how the model
+        is reading this block).
+        """
+        summary = dict(self._tool_counts)
+        if not summary:
+            return "_(no MCPs connected.)_"
+        # Delegate the markdown shape to the shared renderer in
+        # ``src.core.prompts`` so the pool's cached output and the
+        # duck-typed test fallback can't drift apart.
+        from src.core.prompts import _render_catalog_summary_lines
+
+        return _render_catalog_summary_lines(summary, self.server_descriptions())
 
     def dormant_servers(self) -> list[str]:
         return sorted(name for name, count in self._tool_counts.items() if count == 0)

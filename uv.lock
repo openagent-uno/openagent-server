@@ -9,7 +9,7 @@ resolution-markers = [
 
 [[package]]
 name = "agno"
-version = "2.5.16"
+version = "2.6.9"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "docstring-parser" },
@@ -26,9 +26,9 @@ dependencies = [
     { name = "typer" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/08/ee/3d257eda3e081e25b7e47c58089623166bbd8c83f2bb29a677a5a29ad7fc/agno-2.5.16.tar.gz", hash = "sha256:f2a94cacd85aa82b865b06f9ea1700078f470c1ae589b1f673945e9c94c2865a", size = 1870305, upload-time = "2026-04-10T19:46:43.138Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ea/ed/f1e84585db5d53b323bf5ea8e8828d44b982b1f7dbcad07bc075cb5130ab/agno-2.6.9.tar.gz", hash = "sha256:f9ee6298ee43cfeafc4552613aa5b590bf5635a65d5b222a5da78457f6981f76", size = 2076756, upload-time = "2026-05-21T21:34:32.058Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/52/90/78c051d723b4039c08c9646d9a9cea3235aa009be27f2233caa3cf28471b/agno-2.5.16-py3-none-any.whl", hash = "sha256:af6cd78a41b161d0e3f07c1014db67d65e96e7b55751373eeaf386374a038981", size = 2222301, upload-time = "2026-04-10T19:46:40.808Z" },
+    { url = "https://files.pythonhosted.org/packages/c0/32/61c1c8c438e3099363f24ad6cc463def53ee36c37ea47bc1d5917dcedeb8/agno-2.6.9-py3-none-any.whl", hash = "sha256:940fe1c17f6403c0053b2b37ca895a6acfd01d726ea6fb9f48c040497d0fc2b3", size = 2460998, upload-time = "2026-05-21T21:34:29.489Z" },
 ]
 
 [[package]]
@@ -1763,7 +1763,7 @@ wheels = [
 
 [[package]]
 name = "openagent-framework"
-version = "0.13.14"
+version = "0.13.35"
 source = { editable = "." }
 dependencies = [
     { name = "agno" },
@@ -1824,7 +1824,7 @@ whatsapp = [
 
 [package.metadata]
 requires-dist = [
-    { name = "agno", specifier = ">=1.0.0" },
+    { name = "agno", specifier = ">=2.6.9,<3" },
     { name = "aiohttp", specifier = ">=3.9" },
     { name = "aiohttp", marker = "extra == 'all'", specifier = ">=3.9" },
     { name = "aiohttp", marker = "extra == 'websocket'", specifier = ">=3.9" },

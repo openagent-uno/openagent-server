@@ -38,6 +38,7 @@ import struct
 import tempfile
 import uuid
 import zlib
+from typing import Any
 
 from ._framework import TestContext, TestSkip, have_openai_key, test
 
@@ -289,28 +290,37 @@ async def t_attachment_marker_roundtrip(ctx: TestContext) -> None:
 # ── 5. Agent.run(attachments=[...]) builds context block ─────────────
 
 
-@test("files", "Agent.run(attachments=[...]) prepends attachment context")
+@test("files", "Agent.run(attachments=[...]) splits images (prepend) from files (Agno files=)")
 async def t_agent_run_attachments_context(ctx: TestContext) -> None:
     """Unit test for the Agent-level attachments plumbing.
 
-    Uses a stub model so we can inspect the outgoing messages without
-    burning tokens. Verifies that ``attachments=[{type, filename, path}]``
-    gets prepended as a human-readable block with a read hint so the LLM
-    knows to call the Read/filesystem MCP tool.
+    Uses a stub model so we can inspect the outgoing messages + the
+    ``files=`` kwarg without burning tokens. Verifies that:
+
+    - Image attachments are STILL prepended as a context block with a
+      read hint (no images= channel on the model layer yet).
+    - Non-image attachments are converted to ``agno.media.File`` objects
+      and passed through the new ``files=`` kwarg. The user's bare text
+      must NOT carry the synthetic "The user attached files:" prepend
+      for non-images — that's now Agno's native attachment path,
+      propagated to Team members via ``delegate_task_to_member``.
     """
     from src.core.agent import Agent
     from src.models.base import BaseModel, ModelResponse
 
     captured_messages: list[dict] = []
+    captured_files: list[Any] = []
 
     class StubModel(BaseModel):
         history_mode = "caller"
         async def generate(self, messages, system=None, tools=None,
-                           on_status=None, session_id=None, **_):
+                           on_status=None, session_id=None, files=None, **_):
             captured_messages.extend(messages)
+            if files:
+                captured_files.extend(files)
             return ModelResponse(content="ACK", input_tokens=1, output_tokens=1,
                                  model="stub")
-        async def stream(self, messages, system=None, tools=None):
+        async def stream(self, messages, system=None, tools=None, files=None):
             yield "ACK"
 
     agent = Agent(name="stub", model=StubModel(), system_prompt="s",
@@ -330,14 +340,27 @@ async def t_agent_run_attachments_context(ctx: TestContext) -> None:
         user_msg = captured_messages[0]
         assert user_msg["role"] == "user"
         content = user_msg["content"]
-        # Block lists each attachment with type + filename + path
+        # Image attachment still prepended (no images= channel yet).
         assert "image: chart.png" in content
         assert "/tmp/chart.png" in content
-        assert "file: doc.pdf" in content
-        assert "/tmp/doc.pdf" in content
-        # And mentions the read tool so the LLM knows what to do
         assert "Read" in content or "read" in content
-        # Plus the original message
+        # Original user text survives.
         assert "what's in the file?" in content
+        # CRITICAL: the non-image attachment must NOT appear in the prompt
+        # text — it routes through Agno's native ``files=`` instead.
+        assert "doc.pdf" not in content, (
+            f"non-image attachment leaked into prompt prepend; got: {content!r}"
+        )
+        assert "/tmp/doc.pdf" not in content, (
+            f"non-image local path leaked into prompt prepend; got: {content!r}"
+        )
+        # The non-image attachment surfaces as an Agno ``File`` on the
+        # ``files=`` kwarg.
+        assert len(captured_files) == 1, (
+            f"expected 1 File for the pdf; got {captured_files!r}"
+        )
+        f = captured_files[0]
+        assert getattr(f, "filename", None) == "doc.pdf", f
+        assert str(getattr(f, "filepath", "")) == "/tmp/doc.pdf", f
     finally:
         await agent.shutdown()

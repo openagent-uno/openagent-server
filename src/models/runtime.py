@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 from src.models.base import BaseModel, ModelResponse
@@ -12,39 +11,28 @@ from src.models.catalog import (
     framework_of,
     get_default_model_for_provider,
     is_claude_cli_model,
+    is_codex_cli_model,
+    is_subscription_cli_model,
     model_id_from_runtime,
     normalize_runtime_model_id,
 )
 
 
-# ── Tool-budget knobs ───────────────────────────────────────────────
+# ── Defer-all MCP wiring (v0.14+) ───────────────────────────────────
 #
-# LLM providers cap how many tools they accept per request:
-#   • OpenAI (Agno path on most accounts): 128
-#   • Claude Code in standard mode:        ~200
-# Above the cap, alphabetically-late MCPs get silently dropped — the
-# bug that hid ``workflow-manager`` from production sessions until
-# this layer existed. We trim the upfront tool list to the cap and let
-# the in-process ``tool-search`` MCP recover the rest on demand.
+# Every LLM gets ONLY the ``tool-search`` MCP up front. Its four meta-
+# tools (``list_servers`` / ``list_tools`` / ``describe_tool`` /
+# ``call_tool``) are the model's uniform interface to every other
+# connected MCP — there is no upfront/deferred split that varies by
+# tool count. Replaces the previous budget-trim heuristic that handed
+# the model some MCPs upfront and put the rest behind tool-search; in
+# practice that split confused the model about which capabilities
+# needed discovery.
 #
-# Defaults are conservative on purpose: the failure mode of
-# overshooting (silent tool truncation, or a hard 400 from OpenAI) is
-# worse than the cost of a single tool-search round-trip. Operators
-# can raise the budget via env when they know their provider tolerates
-# more (e.g. Claude SDK with ``ENABLE_TOOL_SEARCH=auto:0`` does its
-# own deferred-tool dance and effectively has no upfront cap).
-_DEFAULT_AGNO_TOOL_BUDGET = 128
-_DEFAULT_CLAUDE_TOOL_BUDGET = 200
-
-
-def _budget_from_env(name: str, default: int) -> int:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return default
-    try:
-        return max(0, int(raw))
-    except (TypeError, ValueError):
-        return default
+# Pre-knowledge of what's behind tool-search comes via the catalog
+# summary injected into the system prompt (see
+# :func:`src.core.prompts.build_mcp_catalog_summary`), so the model
+# rarely needs a discovery turn at all.
 
 
 def wire_model_runtime(
@@ -53,44 +41,29 @@ def wire_model_runtime(
     db: Any = None,
     mcp_pool: Any = None,
 ) -> BaseModel:
-    """Attach runtime dependencies to a model when it supports them.
+    """Attach runtime dependencies (DB, MCP pool) to a model.
 
-    Both providers consume from a single ``MCPPool`` that owns MCP
-    lifecycle for the process. AgnoProvider gets pre-connected Agno
-    ``MCPTools`` instances; ClaudeCLI gets the raw stdio config dict
-    that the Claude Agent SDK accepts as its ``mcp_servers`` parameter.
-
-    Budget-aware filtering: when ``mcp_pool.total_tool_count`` exceeds
-    the configured budget, the call below trims subprocess MCPs in
-    alphabetical order until the count fits. The in-process
-    ``tool-search`` MCP is always kept and exposes ``call_tool`` so
-    the model can still reach trimmed MCPs on demand. Both providers
-    use the same trimming rule — a single mechanism, not a Claude-only
-    or Agno-only path.
+    Wires only the ``tool-search`` MCP into the model's upfront tool
+    list. Every other MCP connected in ``mcp_pool`` stays reachable
+    via ``tool-search.call_tool``. AgnoProvider gets the in-process
+    ``MCPTools`` instance; ClaudeCLI gets the raw stdio config dict
+    that ``ClaudeAgentOptions.mcp_servers`` accepts.
     """
     if db is not None:
         set_db = getattr(model, "set_db", None)
         if callable(set_db):
             set_db(db)
     if mcp_pool is not None:
-        agno_budget = _budget_from_env(
-            "OPENAGENT_AGNO_TOOL_BUDGET", _DEFAULT_AGNO_TOOL_BUDGET,
-        )
-        claude_budget = _budget_from_env(
-            "OPENAGENT_CLAUDE_TOOL_BUDGET", _DEFAULT_CLAUDE_TOOL_BUDGET,
-        )
-        # AgnoProvider / SmartRouter: pre-connected Agno MCPTools instances.
+        # AgnoProvider / TeamRouterProvider: in-process MCPTools instance(s).
         set_mcp_toolkits = getattr(model, "set_mcp_toolkits", None)
         if callable(set_mcp_toolkits):
-            set_mcp_toolkits(mcp_pool.agno_toolkits_under_budget(agno_budget))
+            set_mcp_toolkits(mcp_pool.agno_toolkits_tool_search_only())
         # ClaudeCLI: raw stdio config for the Claude Agent SDK.
         set_mcp_servers = getattr(model, "set_mcp_servers", None)
         if callable(set_mcp_servers):
-            set_mcp_servers(
-                mcp_pool.claude_sdk_servers_under_budget(claude_budget)
-            )
-        # SmartRouter holds the pool itself so it can re-wire newly created
-        # tier providers as they're lazily instantiated.
+            set_mcp_servers(mcp_pool.claude_sdk_servers_tool_search_only())
+        # SmartRouter holds the pool itself so it can re-wire newly
+        # constructed per-session providers as they're lazily built.
         set_mcp_pool = getattr(model, "set_mcp_pool", None)
         if callable(set_mcp_pool):
             set_mcp_pool(mcp_pool)
@@ -109,11 +82,11 @@ def create_model_from_spec(
         providers_config = []
 
     if spec == "smart":
-        from src.models.smart_router import SmartRouter
+        from src.models.dispatcher import ModelDispatcher
 
-        model: BaseModel = SmartRouter(providers_config=providers_config)
+        model: BaseModel = ModelDispatcher(providers_config=providers_config)
     elif is_claude_cli_model(spec):
-        from src.models.claude_cli import ClaudeCLIRegistry
+        from src.models.claude_agent import ClaudeCLIRegistry
 
         bare = model_id_from_runtime(spec)
         default_model = bare if bare and bare != spec else None
@@ -123,6 +96,18 @@ def create_model_from_spec(
         # in the ``models`` table can coexist without duplicating
         # subprocesses per model.
         model = ClaudeCLIRegistry(
+            default_model=default_model,
+            providers_config=providers_config,
+        )
+    elif is_codex_cli_model(spec):
+        from src.models.codex_agent import CodexCLIRegistry
+
+        bare = model_id_from_runtime(spec)
+        default_model = bare if bare and bare != spec else None
+        # Same registry pattern as claude-cli: one CodexCLI per session,
+        # so multiple codex-cli entries in the ``models`` table coexist
+        # without duplicating AsyncCodex contexts per model.
+        model = CodexCLIRegistry(
             default_model=default_model,
             providers_config=providers_config,
         )
@@ -182,10 +167,11 @@ async def run_provider_smoke_test(
     if cfg is None:
         raise ValueError(f"Provider '{provider_name}' not configured")
 
-    # If caller supplied a model_id that already encodes a framework
-    # (e.g. ``claude-cli:anthropic:claude-opus-4-7``), honour it as-is.
-    # Otherwise resolve a default scoped to the provider row's framework.
-    if model_id and framework_of(model_id) == FRAMEWORK_CLAUDE_CLI:
+    # If caller supplied a model_id that already encodes a subscription
+    # framework (``claude-cli:anthropic:…`` or ``codex-cli:openai:…``),
+    # honour it as-is. Otherwise resolve a default scoped to the
+    # provider row's framework.
+    if model_id and is_subscription_cli_model(model_id):
         runtime_model = model_id
     else:
         runtime_model = model_id or get_default_model_for_provider(

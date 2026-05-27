@@ -15,7 +15,13 @@ from src.memory.schedule import (
     is_one_shot_expression,
     parse_one_shot_expression,
 )
-from src.models.catalog import LLM_FRAMEWORKS, SUPPORTED_FRAMEWORKS
+from src.models.catalog import (
+    FRAMEWORK_API_BASED,
+    FRAMEWORK_CLAUDE_CLI,
+    FRAMEWORK_CODEX_CLI,
+    LLM_FRAMEWORKS,
+    SUPPORTED_FRAMEWORKS,
+)
 
 
 VALID_MCP_KINDS = ("builtin", "custom", "default")
@@ -115,27 +121,28 @@ CREATE TABLE IF NOT EXISTS mcps (
 CREATE INDEX IF NOT EXISTS idx_mcps_enabled ON mcps(enabled);
 CREATE INDEX IF NOT EXISTS idx_mcps_updated ON mcps(updated_at);
 
--- LLM providers. One row per (vendor, framework) pair.
+-- LLM and media providers. One row per (vendor, framework) pair.
 --
--- OpenAgent vocabulary (v0.12+):
+-- OpenAgent vocabulary:
 --   - **provider**  = a concrete credential + dispatch pair. The same vendor
 --                     (``anthropic``) can appear as two rows — one with
---                     ``framework='agno'`` (direct API, needs ``api_key``) and
---                     one with ``framework='claude-cli'`` (local ``claude``
---                     subprocess, ``api_key`` MUST be NULL).
---   - **framework** = how OpenAgent dispatches calls for this provider row:
---                     ``agno`` (Agno SDK hits the vendor's REST API) or
---                     ``claude-cli`` (spawns the user's Pro/Max subscription
---                     via the local binary).
+--                     ``framework='api-based'`` (needs ``api_key``, native
+--                     ``agno.agent.Agent``) and one with
+--                     ``framework='claude-cli'`` (local ``claude`` subprocess
+--                     via ``agno.agents.claude.ClaudeAgent``; ``api_key``
+--                     MUST be NULL).
+--   - **framework** = which Agno class to instantiate for this row:
+--                     ``api-based`` (native ``Agent`` for LLM, or
+--                     ``litellm.aspeech``/``atranscription`` for TTS/STT)
+--                     or ``claude-cli`` (``ClaudeAgent`` adapter, LLM only).
 --
 -- ``UNIQUE(name, framework)`` lets the UI/API/MCP address a row by its
 -- (vendor, framework) pair; the surrogate ``id`` is what the ``models``
 -- table joins to.
 -- ``kind`` partitions the registry by capability:
---   ``llm`` — text generation (existing rows; ``framework`` ∈ {agno,claude-cli}).
---   ``tts`` — speech synthesis (e.g. ElevenLabs; ``framework='elevenlabs'``).
---   ``stt`` — speech-to-text (reserved; ASR is currently env-driven via
---             ``faster-whisper`` / OpenAI Whisper, so no rows yet).
+--   ``llm`` — text generation (framework ∈ {api-based, claude-cli}).
+--   ``tts`` — speech synthesis (framework='api-based'; routed via litellm).
+--   ``stt`` — speech-to-text (framework='api-based'; routed via litellm).
 -- Router/classifier code MUST filter to ``kind='llm'`` before iterating
 -- providers, so a TTS row never gets handed to the LLM dispatch path.
 CREATE TABLE IF NOT EXISTS providers (
@@ -174,10 +181,12 @@ CREATE INDEX IF NOT EXISTS idx_providers_name ON providers(name);
 --   ``llm`` — text generation (the SmartRouter / classifier picks one).
 --   ``tts`` — speech synthesis. ``metadata.voice_id`` carries the voice.
 --   ``stt`` — speech-to-text.
--- LLM rows route via the provider's framework (``agno`` / ``claude-cli``);
--- ``tts`` / ``stt`` rows always dispatch through LiteLLM
--- (``litellm.aspeech`` / ``atranscription``) using the provider's
--- ``name`` as the LiteLLM vendor prefix (``openai/tts-1``).
+-- LLM rows route via the provider's framework (``api-based`` builds an
+-- ``agno.agent.Agent`` from the provider's vendor class, ``claude-cli``
+-- builds an ``agno.agents.claude.ClaudeAgent``); ``tts`` / ``stt`` rows
+-- always dispatch through LiteLLM (``litellm.aspeech`` /
+-- ``atranscription``) using the provider's ``name`` as the LiteLLM
+-- vendor prefix (``openai/tts-1``).
 CREATE TABLE IF NOT EXISTS models (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     provider_id INTEGER NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
@@ -209,28 +218,22 @@ CREATE TABLE IF NOT EXISTS config_state (
     updated_at REAL NOT NULL
 );
 
--- Per-session runtime binding. SmartRouter dispatches fresh sessions
--- to either the Agno stack (``framework='agno'``) or the Claude CLI
--- registry (``framework='claude-cli'``) based on the classifier; once a
--- session has been served by one side its conversation state lives
--- there so the router must respect that lock on subsequent turns.
+-- Per-session model pin. Optional explicit user/agent choice of a
+-- specific runtime_id for a session; SmartRouter honours this pin
+-- before falling back to first-enabled. ``runtime_id`` is a human-
+-- readable label (e.g. ``claude-cli:anthropic:claude-opus-4-7``)
+-- derived from the provider + model rows at pin time; it's not a FK
+-- so a later model delete leaves a "stale pin" the router gracefully
+-- falls back from rather than throwing an integrity error.
 --
--- ``runtime_id`` is a human-readable label (e.g.
--- ``claude-cli:anthropic:claude-opus-4-7``) derived from the provider
--- + model rows at pin time; it's not a FK so a later model delete
--- leaves a "stale pin" the router gracefully falls back from rather
--- than throwing an integrity error.
---
--- Claude-cli bindings are ALSO persisted in ``sdk_sessions`` because
--- that table carries the SDK-native UUID needed for ``--resume``. This
--- table covers agno sessions + per-session explicit model pins for
--- both sides, plus it serves as a fast single-table lookup for
--- SmartRouter.
-CREATE TABLE IF NOT EXISTS session_bindings (
+-- v0.14+: replaces the old ``session_bindings`` table (which carried
+-- a framework lock on top of the pin). With history unified in Agno's
+-- ``agno_sessions`` across every framework, the lock is no longer
+-- needed — only the pin value itself survives.
+CREATE TABLE IF NOT EXISTS pinned_sessions (
     session_id TEXT PRIMARY KEY,
-    framework TEXT NOT NULL CHECK (framework IN ('agno','claude-cli')),
-    runtime_id TEXT,
-    bound_at REAL NOT NULL
+    runtime_id TEXT NOT NULL,
+    pinned_at REAL NOT NULL
 );
 
 -- Workflow graphs (n8n-style multi-block pipelines). The whole node/
@@ -488,14 +491,6 @@ class MemoryDB:
     def __init__(self, db_path: str = "openagent.db"):
         self.db_path = db_path
         self._conn: aiosqlite.Connection | None = None
-        # Per-session locks so concurrent add_session_run calls for the
-        # same session_id serialise through the read-modify-write of the
-        # ``runs`` JSON blob — without this, two simultaneous writes
-        # both read the pre-state, append independently, and clobber
-        # one another (one run vanishes). Different sessions still
-        # race in parallel (no shared lock), so this is per-row at
-        # worst, not global.
-        self._session_run_locks: dict[str, asyncio.Lock] = {}
 
     async def connect(self) -> None:
         if self._conn is not None:
@@ -566,13 +561,21 @@ class MemoryDB:
         )
         # Cleanup: the very first voice-chat preview shipped with
         # ``framework='elevenlabs'`` for TTS rows. The current code
-        # routes through LiteLLM (``framework='litellm'``), so any
+        # routes via litellm and lives under ``framework='api-based'``
+        # (the kind column carries the TTS vs LLM split now), so any
         # surviving ``elevenlabs`` row would be invisible to the
         # resolver. Convert them in place — the row's existing
         # ``api_key`` and ``metadata`` (voice_id, model_id) carry over
         # 1:1 because the LiteLLM ``elevenlabs/<model>`` shape uses the
         # same names.
         await self._migrate_legacy_elevenlabs_to_litellm()
+        # v0.14: collapse legacy framework values ``agno`` and
+        # ``litellm`` into the single ``api-based`` value (since Agno
+        # is now the execution engine for both LLM paths; ``kind``
+        # discriminates LLM vs TTS/STT). Idempotent. Runs after the
+        # kind-column migration so the rows are already in their final
+        # provider+kind shape.
+        await self._migrate_legacy_framework_names_to_api_based()
         # Add ``kind`` to the models table + fold any TTS/STT provider
         # rows (where ``model_id`` and ``voice_id`` lived in
         # ``metadata_json``) into proper model rows. The unified design:
@@ -585,6 +588,10 @@ class MemoryDB:
         await self._migrate_models_description_column()
         await self._migrate_legacy_tables_to_agno_sessions()
         await self._migrate_peer_networks_join_type()
+        # v0.14+: fold any legacy ``session_bindings`` rows (which used
+        # to carry per-session framework lock + pin) into the new
+        # ``pinned_sessions`` table that stores only the pin. Idempotent.
+        await self._migrate_session_bindings_to_pinned_sessions()
 
     async def _migrate_legacy_tables_to_agno_sessions(self) -> None:
         """One-time: fold sdk_sessions + chat_sessions + chat_session_runs
@@ -615,7 +622,7 @@ class MemoryDB:
             for row in await cursor.fetchall():
                 sid = row[0]
                 sdk_sid = row[1]
-                provider = row[2] or "claude-cli"
+                provider = row[2] or FRAMEWORK_CLAUDE_CLI
                 ts = row[3] or now
                 meta = json.dumps({
                     "sdk_session_id": sdk_sid,
@@ -770,7 +777,11 @@ class MemoryDB:
         await self._conn.commit()
 
     async def _migrate_legacy_elevenlabs_to_litellm(self) -> None:
-        """Idempotent UPDATE of pre-LiteLLM TTS rows to the new shape."""
+        """Idempotent UPDATE of pre-LiteLLM TTS rows. Historically targeted
+        ``framework='litellm'``; that value has since collapsed into
+        ``api-based`` (see :meth:`_migrate_legacy_framework_names_to_api_based`),
+        so we go straight to the canonical value here.
+        """
         assert self._conn is not None
         cursor = await self._conn.execute(
             "SELECT COUNT(*) FROM providers WHERE framework='elevenlabs'"
@@ -779,17 +790,17 @@ class MemoryDB:
         if not row or not row[0]:
             return
         # Some rows might collide with an existing (name='elevenlabs',
-        # framework='litellm') under the UNIQUE(name, framework)
+        # framework='api-based') under the UNIQUE(name, framework)
         # constraint. Pick a non-colliding name like 'elevenlabs-legacy'
         # in that case so we never lose data.
         await self._conn.execute(
             """
             UPDATE providers
-               SET framework='litellm',
+               SET framework='api-based',
                    name=CASE
                      WHEN EXISTS (
                        SELECT 1 FROM providers p2
-                       WHERE p2.framework='litellm' AND p2.name=providers.name
+                       WHERE p2.framework='api-based' AND p2.name=providers.name
                      ) THEN providers.name || '-legacy'
                      ELSE providers.name
                    END,
@@ -798,6 +809,81 @@ class MemoryDB:
             """,
             (time.time(),),
         )
+        await self._conn.commit()
+
+    async def _migrate_legacy_framework_names_to_api_based(self) -> None:
+        """Collapse legacy framework values into the canonical ``api-based``.
+
+        Pre-v0.14: providers.framework could be ``agno`` (LLM via native
+        Agno Agent), ``litellm`` (TTS/STT via litellm), or ``claude-cli``.
+        v0.14+: ``api-based`` and ``claude-cli`` (Agno is the execution
+        engine for both LLM paths and ``kind`` discriminates TTS/STT
+        from LLM). v0.14.x adds ``codex-cli`` for ChatGPT-subscription
+        OpenAI dispatch. Only ``agno`` and ``litellm`` collapse here —
+        ``codex-cli`` is a NEW value, not a legacy alias.
+
+        Idempotent: no-op when no legacy rows remain. Handles
+        UNIQUE(name, framework) collisions by suffixing colliding row
+        names with ``-legacy`` so no data is lost.
+        """
+        assert self._conn is not None
+        cursor = await self._conn.execute(
+            "SELECT COUNT(*) FROM providers WHERE framework IN ('agno','litellm')"
+        )
+        row = await cursor.fetchone()
+        if not row or not row[0]:
+            return
+        await self._conn.execute(
+            """
+            UPDATE providers
+               SET framework='api-based',
+                   name=CASE
+                     WHEN EXISTS (
+                       SELECT 1 FROM providers p2
+                       WHERE p2.framework='api-based' AND p2.name=providers.name
+                     ) THEN providers.name || '-legacy'
+                     ELSE providers.name
+                   END,
+                   updated_at=?
+             WHERE framework IN ('agno','litellm')
+            """,
+            (time.time(),),
+        )
+        await self._conn.commit()
+
+    async def _migrate_session_bindings_to_pinned_sessions(self) -> None:
+        """Fold legacy ``session_bindings`` rows into ``pinned_sessions``.
+
+        Pre-v0.14: ``session_bindings`` carried a per-session framework
+        lock AND an optional ``runtime_id`` pin. With history unified
+        in Agno's ``agno_sessions`` across every framework, the lock
+        is no longer needed — only the pin survives.
+
+        Idempotent: probes for the old table; copies any rows with a
+        non-null runtime_id into ``pinned_sessions`` (preserving the
+        pin), then drops the legacy table. Fresh installs (where
+        SCHEMA_SQL already created ``pinned_sessions``) skip everything.
+        """
+        assert self._conn is not None
+        cursor = await self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='session_bindings'"
+        )
+        row = await cursor.fetchone()
+        if not row or not row[0]:
+            return
+        cursor = await self._conn.execute(
+            "SELECT session_id, runtime_id, bound_at FROM session_bindings "
+            "WHERE runtime_id IS NOT NULL AND runtime_id != ''"
+        )
+        rows = await cursor.fetchall()
+        for sid, runtime_id, bound_at in rows:
+            await self._conn.execute(
+                "INSERT OR IGNORE INTO pinned_sessions "
+                "(session_id, runtime_id, pinned_at) VALUES (?, ?, ?)",
+                (sid, runtime_id, bound_at or time.time()),
+            )
+        await self._conn.execute("DROP TABLE session_bindings")
         await self._conn.commit()
 
     async def _migrate_models_description_column(self) -> None:
@@ -1726,84 +1812,31 @@ class MemoryDB:
 
     # ── Session store (agno_sessions) ──
     #
-    # agno_sessions is the single canonical table for all chat sessions.
-    # Agno writes via ``SqliteDb``; Claude CLI writes manually with the
-    # same column layout. SDK resume state lives in the ``metadata``
-    # JSON column so ``--resume`` survives restarts without a separate
-    # mapping table.
-
-    async def _ensure_agno_session_row(
-        self, session_id: str, *, metadata_updates: dict | None = None
-    ) -> None:
-        """Create the baseline agno_sessions row if it doesn't exist yet.
-        Fills in the minimum columns that both Agno and Claude CLI need.
-        """
-        conn = await self._ensure_connected()
-        now = int(time.time())
-        existing = await (
-            await conn.execute(
-                "SELECT 1 FROM agno_sessions WHERE session_id = ?", (session_id,)
-            )
-        ).fetchone()
-        if existing:
-            if metadata_updates:
-                meta = self._parse_metadata(None)
-                cursor = await conn.execute(
-                    "SELECT metadata FROM agno_sessions WHERE session_id = ?",
-                    (session_id,),
-                )
-                row = await cursor.fetchone()
-                if row:
-                    meta = self._parse_metadata(row[0])
-                meta.update(metadata_updates)
-                await conn.execute(
-                    "UPDATE agno_sessions SET metadata = ?, updated_at = ? "
-                    "WHERE session_id = ?",
-                    (json.dumps(meta), now, session_id),
-                )
-            await conn.commit()
-            return
-        await conn.execute(
-            "INSERT OR IGNORE INTO agno_sessions "
-            "(session_id, session_type, user_id, metadata, created_at, updated_at) "
-            "VALUES (?, 'agent', 'openagent', ?, ?, ?)",
-            (session_id, json.dumps(metadata_updates or {}), now, now),
-        )
-        await conn.commit()
-
-    async def get_sdk_session(self, session_id: str) -> str | None:
-        """Read the SDK session id from agno_sessions.metadata."""
-        conn = await self._ensure_connected()
-        cursor = await conn.execute(
-            "SELECT metadata FROM agno_sessions WHERE session_id = ?",
-            (session_id,),
-        )
-        row = await cursor.fetchone()
-        if not row or not row[0]:
-            return None
-        try:
-            meta = json.loads(row[0])
-        except (TypeError, ValueError):
-            return None
-        return meta.get("sdk_session_id")
-
-    async def set_sdk_session(
-        self,
-        session_id: str,
-        sdk_session_id: str,
-        provider: str | None = None,
-    ) -> None:
-        """Store SDK session id in agno_sessions.metadata."""
-        await self._ensure_agno_session_row(
-            session_id,
-            metadata_updates={
-                "sdk_session_id": sdk_session_id,
-                "provider": provider or "claude-cli",
-            },
-        )
+    # ``agno_sessions`` is the single canonical table for all chat
+    # sessions. Both the api-based path (native ``agno.agent.Agent``)
+    # and the claude-cli path (``agno.agents.claude.ClaudeAgent`` via
+    # OpenAgent's ``PersistentClaudeAgent`` subclass) persist through
+    # ``agno.db.sqlite.SqliteDb`` writing to this table.
+    #
+    # Claude SDK resume state now lives in ``agno_sessions.session_data``
+    # (the JSON column Agno writes via SqliteDb) under the
+    # ``sdk_session_id`` key — see ``src/models/claude_cli.py
+    # PersistentClaudeAgent``. The legacy ``metadata.sdk_session_id``
+    # path is gone; ``delete_sdk_session`` below stays as a thin shim
+    # so the gateway's session-delete handler keeps working on legacy
+    # rows.
 
     async def delete_sdk_session(self, session_id: str) -> None:
-        """Clear the SDK session id from metadata. The session row stays."""
+        """Clear any legacy claude-cli resume metadata from a session.
+
+        Pre-v0.14 the SDK session id was stored in
+        ``agno_sessions.metadata.sdk_session_id``. The new path keeps it
+        in ``session_data.sdk_session_id`` (Agno-managed) instead. This
+        helper survives so the gateway's ``DELETE /api/sessions/{id}``
+        handler — which we don't want to revisit yet — keeps a place to
+        scrub legacy data. The session row itself is deleted separately
+        via :meth:`delete_session`.
+        """
         conn = await self._ensure_connected()
         cursor = await conn.execute(
             "SELECT metadata FROM agno_sessions WHERE session_id = ?",
@@ -1816,6 +1849,8 @@ class MemoryDB:
             meta = json.loads(row[0] or "{}")
         except (TypeError, ValueError):
             meta = {}
+        if "sdk_session_id" not in meta and "provider" not in meta:
+            return  # already clean — no need to bump updated_at
         meta.pop("sdk_session_id", None)
         meta.pop("provider", None)
         await conn.execute(
@@ -1823,26 +1858,6 @@ class MemoryDB:
             (json.dumps(meta), int(time.time()), session_id),
         )
         await conn.commit()
-
-    async def get_all_sdk_sessions(self, provider: str | None = None) -> dict[str, str]:
-        """Return {session_id: sdk_session_id} for claude-cli sessions."""
-        conn = await self._ensure_connected()
-        cursor = await conn.execute(
-            "SELECT session_id, metadata FROM agno_sessions "
-            "WHERE json_extract(metadata, '$.sdk_session_id') IS NOT NULL"
-        )
-        rows = await cursor.fetchall()
-        result: dict[str, str] = {}
-        for row in rows:
-            try:
-                meta = json.loads(row[1] or "{}")
-            except (TypeError, ValueError):
-                continue
-            sid = meta.get("sdk_session_id")
-            p = meta.get("provider")
-            if sid and (provider is None or p == provider):
-                result[row[0]] = sid
-        return result
 
     # ── MCP Registry ──
 
@@ -2065,11 +2080,16 @@ class MemoryDB:
     ) -> int:
         """Upsert a provider row. Returns the provider's surrogate ``id``.
 
-        ``framework='claude-cli'`` providers MUST carry ``api_key=None``
-        (the subscription path authenticates through ``~/.claude/``; any
-        stored value would poison the subprocess). ``framework='agno'``
-        providers can be created with ``api_key=None`` (disabled-until-
-        configured state) but dispatch will fail until a key is set.
+        Subscription-CLI frameworks (``claude-cli`` / ``codex-cli``)
+        MUST carry ``api_key=None`` — auth flows through the local CLI's
+        subscription state (``~/.claude/`` for Claude Pro/Max,
+        ``~/.codex/`` for ChatGPT Plus/Pro). Any stored value would
+        poison the subprocess. ``framework='api-based'`` providers can
+        be created with ``api_key=None`` (disabled-until-configured
+        state) but dispatch will fail until a key is set.
+
+        Each subscription-CLI framework is tied to a single provider
+        name: ``claude-cli`` ↔ ``anthropic``, ``codex-cli`` ↔ ``openai``.
 
         ``kind`` defaults to ``'llm'`` (text generation). Use ``'tts'``
         for speech synthesis providers (e.g. ElevenLabs) or ``'stt'`` for
@@ -2080,26 +2100,41 @@ class MemoryDB:
             raise ValueError("name is required")
         if kind not in ("llm", "tts", "stt"):
             raise ValueError(f"invalid kind {kind!r}; expected llm/tts/stt")
-        # LLM-kind rows are still gated by the historical framework whitelist
-        # (agno / claude-cli). Audio kinds use their own framework values
-        # (e.g. 'elevenlabs') which the schema accepts but the LLM router
-        # never iterates.
+        # Legacy framework names ``agno`` / ``litellm`` collapsed into
+        # ``api-based`` in v0.14. Rewrite at the boundary so callers
+        # (older scripts, tests, third-party automations) keep working.
+        # Kept as raw strings — they match pre-rename DB values, not the
+        # current FRAMEWORK_* constants.
+        if framework in ("agno", "litellm"):
+            framework = FRAMEWORK_API_BASED
         if kind == "llm" and framework not in LLM_FRAMEWORKS:
             raise ValueError(
                 f"invalid framework {framework!r} for kind='llm'; "
                 f"expected one of {LLM_FRAMEWORKS}"
             )
-        if framework == "claude-cli" and api_key:
+        if framework == FRAMEWORK_CLAUDE_CLI and api_key:
             raise ValueError(
                 "claude-cli providers must not carry an api_key — the "
                 "local `claude` binary authenticates via the Pro/Max "
                 "subscription stored under ~/.claude/."
             )
-        if framework == "claude-cli" and name.strip().lower() != "anthropic":
+        if framework == FRAMEWORK_CLAUDE_CLI and name.strip().lower() != "anthropic":
             raise ValueError(
                 "claude-cli framework is only supported for the "
                 "'anthropic' provider — the local `claude` binary "
                 "dispatches Anthropic models via the Pro/Max subscription."
+            )
+        if framework == FRAMEWORK_CODEX_CLI and api_key:
+            raise ValueError(
+                "codex-cli providers must not carry an api_key — the "
+                "Codex SDK authenticates via the ChatGPT Plus/Pro "
+                "subscription stored under ~/.codex/."
+            )
+        if framework == FRAMEWORK_CODEX_CLI and name.strip().lower() != "openai":
+            raise ValueError(
+                "codex-cli framework is only supported for the "
+                "'openai' provider — the Codex SDK dispatches OpenAI "
+                "models via the ChatGPT Plus/Pro subscription."
             )
         now = time.time()
         conn = await self._ensure_connected()
@@ -2397,7 +2432,6 @@ class MemoryDB:
                     "model": r["m_model"],
                     "display_name": r["m_display_name"],
                     "tier_hint": r["m_tier_hint"],
-                    "description": r["m_description"],
                     "enabled": bool(r["m_enabled"]),
                     "is_classifier": bool(r["m_is_classifier"]),
                 })
@@ -2455,7 +2489,6 @@ class MemoryDB:
         model: str,
         display_name: str | None = None,
         tier_hint: str | None = None,
-        description: str | None = None,
         enabled: bool = True,
         is_classifier: bool = False,
         metadata: dict | None = None,
@@ -2483,13 +2516,12 @@ class MemoryDB:
         await conn.execute(
             """
             INSERT INTO models (provider_id, model, display_name, tier_hint,
-                                description, enabled, is_classifier, metadata_json,
+                                enabled, is_classifier, metadata_json,
                                 kind, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(provider_id, model) DO UPDATE SET
                 display_name = excluded.display_name,
                 tier_hint = excluded.tier_hint,
-                description = excluded.description,
                 enabled = excluded.enabled,
                 is_classifier = excluded.is_classifier,
                 metadata_json = excluded.metadata_json,
@@ -2501,7 +2533,6 @@ class MemoryDB:
                 str(model).strip(),
                 display_name,
                 tier_hint,
-                description,
                 1 if enabled else 0,
                 1 if is_classifier else 0,
                 json.dumps(dict(metadata or {})),
@@ -2587,93 +2618,30 @@ class MemoryDB:
             int(row[2] or 0), float(row[3] or 0.0),
         )
 
-    # ── Session Runtime Bindings ──
-
-    async def get_session_binding(self, session_id: str) -> str | None:
-        """Return ``"agno"`` / ``"claude-cli"`` or ``None`` if unbound.
-
-        Checks ``agno_sessions.metadata`` for a provider field first
-        (source of truth for claude-cli resume state), then falls back
-        to ``session_bindings`` for agno.
-        """
-        conn = await self._ensure_connected()
-        cursor = await conn.execute(
-            "SELECT metadata FROM agno_sessions WHERE session_id = ?",
-            (session_id,),
-        )
-        row = await cursor.fetchone()
-        if row and row[0]:
-            try:
-                meta = json.loads(row[0])
-            except (TypeError, ValueError):
-                meta = {}
-            provider = meta.get("provider")
-            if provider:
-                return str(provider)
-        cursor = await conn.execute(
-            "SELECT framework FROM session_bindings WHERE session_id = ?",
-            (session_id,),
-        )
-        row = await cursor.fetchone()
-        return str(row[0]) if row and row[0] else None
+    # ── Per-Session Pin ──
 
     async def get_session_pin(self, session_id: str) -> str | None:
         """Return the pinned ``runtime_id`` for ``session_id``, or ``None``.
 
         When non-null, SmartRouter dispatches this session straight to
-        ``runtime_id`` without consulting the classifier or the routing
-        tiers. Pinned sessions ignore budget degradation too — an
-        explicit user choice wins.
+        ``runtime_id`` without falling back to the catalog's
+        first-enabled. Pinned sessions ignore budget degradation too —
+        an explicit user choice wins.
         """
         conn = await self._ensure_connected()
         cursor = await conn.execute(
-            "SELECT runtime_id FROM session_bindings WHERE session_id = ?",
+            "SELECT runtime_id FROM pinned_sessions WHERE session_id = ?",
             (session_id,),
         )
         row = await cursor.fetchone()
         return str(row[0]) if row and row[0] else None
 
-    async def set_session_binding(
-        self,
-        session_id: str,
-        framework: str,
-        runtime_id: str | None = None,
-    ) -> None:
-        """Record that ``session_id`` is served by ``framework`` (agno / claude-cli).
-
-        Optional ``runtime_id`` pins the session to a specific model.
-        Used by SmartRouter after a first successful dispatch so
-        subsequent turns are forced to the same side. Claude-cli
-        *side* bindings land in ``sdk_sessions`` instead (via
-        ``set_sdk_session``); this table tracks agno side + per-session
-        explicit model pins for both sides.
-        """
-        if framework not in LLM_FRAMEWORKS:
-            raise ValueError(
-                f"invalid framework {framework!r}; session_bindings is for "
-                f"LLM dispatch only — expected one of {LLM_FRAMEWORKS}"
-            )
-        conn = await self._ensure_connected()
-        await conn.execute(
-            "INSERT INTO session_bindings (session_id, framework, bound_at, runtime_id) "
-            "VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(session_id) DO UPDATE SET "
-            "framework = excluded.framework, bound_at = excluded.bound_at, "
-            "runtime_id = excluded.runtime_id",
-            (session_id, framework, time.time(), runtime_id),
-        )
-        await conn.commit()
-
     async def pin_session_model(self, session_id: str, runtime_id: str) -> None:
         """Pin ``session_id`` to a specific model ``runtime_id``.
 
-        Framework lock: if the session has already been served by one
-        framework (rows in ``sdk_sessions`` for claude-cli, or in
-        ``session_bindings`` for agno), we refuse to pin it to a model
-        from the OTHER framework. Conversation state would split
-        across two stores and turns would lose context. Callers should
-        ``/clear`` or spawn a fresh session_id if they actually want to
-        switch frameworks.
+        With history unified in Agno's ``agno_sessions`` across every
+        framework, there is no framework lock anymore — any enabled
+        runtime_id can be pinned to any session at any time.
         """
         from src.models.catalog import framework_of
 
@@ -2684,39 +2652,25 @@ class MemoryDB:
             raise ValueError(
                 f"runtime_id {runtime_id!r} resolved to an unknown framework {target_framework!r}"
             )
-        existing = await self.get_session_binding(session_id)
-        if existing and existing != target_framework:
-            raise ValueError(
-                f"session {session_id!r} is bound to framework={existing!r} "
-                f"and cannot be pinned to a {target_framework!r} model — "
-                "conversation history lives in the current framework's "
-                "store. Use /clear (or a fresh session_id) first."
-            )
-        await self.set_session_binding(
-            session_id, target_framework, runtime_id=runtime_id,
-        )
-
-    async def unpin_session_model(self, session_id: str) -> None:
-        """Clear the per-session model pin, leaving the side-binding intact.
-
-        The ``runtime_id`` column is set to NULL; SmartRouter resumes
-        using the classifier/routing tiers for this session on the next
-        turn. The ``framework`` side-binding is *not* touched — a
-        session pinned to claude-cli stays on claude-cli even after
-        unpinning the specific model.
-        """
         conn = await self._ensure_connected()
         await conn.execute(
-            "UPDATE session_bindings SET runtime_id = NULL, bound_at = ? "
-            "WHERE session_id = ?",
-            (time.time(), session_id),
+            "INSERT INTO pinned_sessions (session_id, runtime_id, pinned_at) "
+            "VALUES (?, ?, ?) "
+            "ON CONFLICT(session_id) DO UPDATE SET "
+            "runtime_id = excluded.runtime_id, pinned_at = excluded.pinned_at",
+            (session_id, runtime_id, time.time()),
         )
         await conn.commit()
 
-    async def delete_session_binding(self, session_id: str) -> None:
+    async def unpin_session_model(self, session_id: str) -> None:
+        """Drop the per-session model pin.
+
+        SmartRouter resumes using the catalog's first-enabled model on
+        the next turn.
+        """
         conn = await self._ensure_connected()
         await conn.execute(
-            "DELETE FROM session_bindings WHERE session_id = ?",
+            "DELETE FROM pinned_sessions WHERE session_id = ?",
             (session_id,),
         )
         await conn.commit()
@@ -2798,7 +2752,7 @@ class MemoryDB:
                 "client_id": meta.get("client_id", ""),
                 "title": meta.get("title"),
                 "model": meta.get("model"),
-                "framework": meta.get("framework") or "agno",
+                "framework": meta.get("framework") or FRAMEWORK_API_BASED,
                 "created_at": row[2],
                 "last_active_at": row[3],
             })
@@ -2910,154 +2864,23 @@ class MemoryDB:
             "client_id": meta.get("client_id", ""),
             "title": meta.get("title"),
             "model": meta.get("model"),
-            "framework": meta.get("framework") or "agno",
+            "framework": meta.get("framework") or FRAMEWORK_API_BASED,
             "created_at": row[2],
             "last_active_at": row[3],
         }
 
-    # ── Session runs (Claude CLI writes, Agno writes via SqliteDb) ──
-
-    async def add_session_run(
-        self,
-        session_id: str,
-        *,
-        status: str = "completed",
-        messages: list[dict] | None = None,
-        tool_calls: list[dict] | None = None,
-        input_tokens: int = 0,
-        output_tokens: int = 0,
-        cost: float = 0.0,
-        model: str | None = None,
-        run_id: str | None = None,
-    ) -> str:
-        """Append one turn to ``agno_sessions.runs``. The run is stored
-        in Agno's ``RunOutput`` shape so it is queryable alongside runs
-        produced by ``SqliteDb``.
-
-        Wraps the read-modify-write of the ``runs`` JSON blob in a
-        per-session asyncio.Lock so concurrent appends (e.g. two
-        ``_persist_turn`` writes interleaving on the same session)
-        don't clobber one another.
-        """
-        conn = await self._ensure_connected()
-        rid = run_id or str(uuid.uuid4())
-        lock = self._session_run_locks.setdefault(session_id, asyncio.Lock())
-        async with lock:
-            return await self._add_session_run_locked(
-                conn, session_id, rid,
-                status=status, messages=messages, tool_calls=tool_calls,
-                input_tokens=input_tokens, output_tokens=output_tokens,
-                cost=cost, model=model,
-            )
-
-    async def _add_session_run_locked(
-        self,
-        conn: aiosqlite.Connection,
-        session_id: str,
-        rid: str,
-        *,
-        status: str,
-        messages: list[dict] | None,
-        tool_calls: list[dict] | None,
-        input_tokens: int,
-        output_tokens: int,
-        cost: float,
-        model: str | None,
-    ) -> str:
-        """Inner read-modify-write — caller holds ``_session_run_locks[session_id]``."""
-        import time as _time
-        now = int(_time.time())
-        run_obj = {
-            "run_id": rid,
-            "agent_id": "openagent",
-            "session_id": session_id,
-            "user_id": "openagent",
-            "content": "",
-            "messages": messages or [],
-            "status": status,
-            "metrics": {
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "cost": cost,
-            },
-        }
-        if model:
-            run_obj["model"] = model
-        if status == "completed":
-            for m in (messages or []):
-                if m.get("role") == "assistant":
-                    run_obj["content"] = m.get("content", "")
-                    break
-        # Store structured tool info so the frontend can render
-        # expandable tool-result cards instead of raw JSON text.
-        # The messages list already carries tool results from
-        # ``_persist_turn`` — this ``tools`` array mirrors Agno's
-        # ``RunOutput.tools`` shape.
-        if tool_calls:
-            run_obj["tools"] = []
-            for tc in tool_calls:
-                result = tc.get("output")
-                if result is not None and not isinstance(result, str):
-                    result = json.dumps(result)
-                run_obj["tools"].append({
-                    "tool_name": tc.get("name", ""),
-                    "tool_args": tc.get("input", {}),
-                    "tool_use_id": tc.get("id", "") or "",
-                    "result": result,
-                    "tool_call_error": "tool error" if tc.get("is_error") else None,
-                })
-        # Read current runs array, append new run. The same double-
-        # encoding shape that affects ``metadata`` and ``list_session_runs``
-        # can land here when Agno previously serialized this column with
-        # a stringified ``runs`` payload — unwrap one layer before the
-        # list-shape check so a cross-framework append (claude-cli
-        # writing to a session whose prior turns were Agno-written)
-        # doesn't silently wipe the history by resetting to ``[]``.
-        cursor = await conn.execute(
-            "SELECT runs FROM agno_sessions WHERE session_id = ?",
-            (session_id,),
-        )
-        row = await cursor.fetchone()
-        try:
-            runs = json.loads(row[0] or "[]") if row else []
-        except (TypeError, ValueError):
-            runs = []
-        if isinstance(runs, str):
-            try:
-                runs = json.loads(runs)
-            except (TypeError, ValueError):
-                runs = []
-        if not isinstance(runs, list):
-            runs = []
-        runs.append(run_obj)
-        await conn.execute(
-            "INSERT OR IGNORE INTO agno_sessions "
-            "(session_id, session_type, user_id, runs, created_at, updated_at) "
-            "VALUES (?, 'agent', 'openagent', ?, ?, ?)",
-            (session_id, json.dumps(runs), now, now),
-        )
-        await conn.execute(
-            "UPDATE agno_sessions SET runs = ?, updated_at = ? WHERE session_id = ?",
-            (json.dumps(runs), now, session_id),
-        )
-        await conn.commit()
-        return rid
-
-    async def commit_partial_session_run(
-        self,
-        session_id: str,
-        text: str,
-        *,
-        model: str | None = None,
-    ) -> str | None:
-        if not session_id or not text:
-            return None
-        return await self.add_session_run(
-            session_id=session_id,
-            status="cancelled",
-            messages=[{"role": "assistant", "content": text}],
-            model=model,
-        )
+    # ── Session runs (Agno's SqliteDb owns writes) ──
+    #
+    # ``agno_sessions.runs`` is now written exclusively by Agno's
+    # ``SqliteDb`` (via ``BaseExternalAgent._arun_stream`` /
+    # ``_arun_non_stream`` for ClaudeAgent, and the native Agent's own
+    # storage path for api-based runs). The manual ``add_session_run``
+    # / ``commit_partial_session_run`` mirror writes that the old
+    # claude_cli.py used (~150 LOC) are gone with the Agno migration.
+    #
+    # ``list_session_runs`` below keeps the read-side surface stable so
+    # the gateway's ``GET /api/sessions/{id}/runs`` endpoint can render
+    # history regardless of which framework wrote the row.
 
     async def list_session_runs(
         self,
@@ -3091,14 +2914,6 @@ class MemoryDB:
         if not isinstance(runs, list):
             return []
         return list(reversed(runs[-limit:]))
-
-    async def delete_session_runs(self, session_id: str) -> None:
-        conn = await self._ensure_connected()
-        await conn.execute(
-            "UPDATE agno_sessions SET runs = NULL, updated_at = ? WHERE session_id = ?",
-            (int(time.time()), session_id),
-        )
-        await conn.commit()
 
     # ── Generic state flags ──
 

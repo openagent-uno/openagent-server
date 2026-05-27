@@ -91,16 +91,18 @@ async def list_providers() -> list[dict[str, Any]]:
 @mcp.tool()
 async def add_provider(
     name: str,
-    framework: str = "agno",
+    framework: str = "api-based",
     api_key: str | None = None,
     base_url: str | None = None,
 ) -> dict[str, Any]:
     """Register (or update) an LLM provider row.
 
-    Under v0.12 the same vendor can be registered twice — once with
-    ``framework='agno'`` (direct API via Agno SDK, needs ``api_key``)
-    and once with ``framework='claude-cli'`` (the local ``claude``
-    binary / Pro/Max subscription, ``api_key`` MUST be None).
+    The same vendor can be registered twice — once with
+    ``framework='api-based'`` (native ``agno.agent.Agent`` against the
+    vendor's REST API, needs ``api_key``) and once with
+    ``framework='claude-cli'`` (``agno.agents.claude.ClaudeAgent``
+    wrapping the local ``claude`` binary / Pro/Max subscription;
+    ``api_key`` MUST be None).
 
     Provider keys live in the SQLite ``providers`` table. Writes are
     hot-reloaded on the next message via ``Agent.refresh_registries``.
@@ -109,11 +111,11 @@ async def add_provider(
     register specific model ids.
     """
     # ``MemoryDB.upsert_provider`` enforces framework + claude-cli key
-    # rules at the schema boundary; we just layer the agno-requires-key
+    # rules at the schema boundary; we just layer the api-based-requires-key
     # rule here since the DB allows NULL api_key for future "configured
-    # but disabled" agno rows.
-    if framework == "agno" and not (api_key or "").strip():
-        raise ValueError("agno providers require an api_key")
+    # but disabled" api-based rows.
+    if framework == "api-based" and not (api_key or "").strip():
+        raise ValueError("api-based providers require an api_key")
     db = await _get_db()
     pid = await db.upsert_provider(
         name=(name or "").strip(),
@@ -205,7 +207,6 @@ def _model_row(d: dict[str, Any]) -> dict[str, Any]:
         "model": d["model"],
         "display_name": d.get("display_name"),
         "tier_hint": d.get("tier_hint"),
-        "description": d.get("description"),
         "enabled": bool(d.get("enabled", True)),
         "is_classifier": bool(d.get("is_classifier", False)),
         "runtime_id": runtime_id,
@@ -282,7 +283,6 @@ async def add_model(
     model: str,
     display_name: str | None = None,
     tier_hint: str | None = None,
-    description: str | None = None,
     enabled: bool = True,
     is_classifier: bool = False,
 ) -> dict[str, Any]:
@@ -297,9 +297,6 @@ async def add_model(
       classifier describing the model's strengths: ``"vision"``,
       ``"200k context"``, ``"best for code"``, ``"fast + cheap"``, etc.
       The classifier treats it as advice and overrides freely.
-    - ``description`` (optional, free-form) is a human-readable note
-      stored alongside the model row. It surfaces in the UI and catalog
-      but has no effect on dispatch or routing.
     - ``is_classifier`` (optional) marks this row as an eligible
       SmartRouter classifier. Multiple rows can carry the flag; the
       router picks the first flagged row it sees each turn, so the
@@ -314,7 +311,6 @@ async def add_model(
         model=model.strip(),
         display_name=display_name,
         tier_hint=tier_hint,
-        description=description,
         enabled=enabled,
         is_classifier=bool(is_classifier),
     )
@@ -326,7 +322,6 @@ async def update_model(
     model_id: int,
     display_name: str | None = None,
     tier_hint: str | None = None,
-    description: str | None = None,
     enabled: bool | None = None,
     is_classifier: bool | None = None,
 ) -> dict[str, Any]:
@@ -339,9 +334,6 @@ async def update_model(
     classifiers" ordered by the catalog's deterministic order
     (provider name, framework, model).
 
-    ``description`` is a free-form note stored alongside the model; it
-    appears in the UI and catalog but has no effect on routing.
-
     Pricing isn't editable — it's resolved live on every billing event.
     """
     db = await _get_db()
@@ -353,7 +345,6 @@ async def update_model(
         model=existing["model"],
         display_name=display_name if display_name is not None else existing.get("display_name"),
         tier_hint=tier_hint if tier_hint is not None else existing.get("tier_hint"),
-        description=description if description is not None else existing.get("description"),
         enabled=enabled if enabled is not None else bool(existing.get("enabled", True)),
         is_classifier=(
             bool(is_classifier)

@@ -9,10 +9,9 @@ if TYPE_CHECKING:
 async def _usage_summary_for_agent(agent) -> dict:
     model = agent.model
 
-    # Check if the model has budget tracking
-    from src.models.smart_router import SmartRouter
+    from src.models.dispatcher import ModelDispatcher
 
-    if isinstance(model, SmartRouter) and model._budget:
+    if isinstance(model, ModelDispatcher) and model._budget:
         return await model._budget.get_usage_summary()
 
     # For non-smart models, return basic info

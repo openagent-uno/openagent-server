@@ -50,6 +50,7 @@ class BaseModel(ABC):
         tools: list[dict[str, Any]] | None = None,
         on_status: Callable[[str], Awaitable[None]] | None = None,
         session_id: str | None = None,
+        files: list[Any] | None = None,
     ) -> ModelResponse:
         """Generate a response from the model.
 
@@ -59,6 +60,9 @@ class BaseModel(ABC):
             tools: Optional list of tool definitions in a provider-neutral format:
                 [{"name": str, "description": str, "input_schema": dict}, ...]
             on_status: Optional async callback for live status updates (e.g. tool use).
+            files: Optional list of provider-native file attachments (Agno ``File`` objects).
+                Forwarded by Agno-backed providers as ``runtime.arun(..., files=...)``;
+                subscription-CLI providers may fall back to a minimal text prepend.
         """
         ...
 
@@ -67,9 +71,12 @@ class BaseModel(ABC):
         messages: list[dict[str, Any]],
         system: str | None = None,
         tools: list[dict[str, Any]] | None = None,
+        files: list[Any] | None = None,
     ) -> AsyncIterator[str]:
         """Stream response text chunks. Default: falls back to generate()."""
-        response = await self.generate(messages, system=system, tools=tools)
+        response = await self.generate(
+            messages, system=system, tools=tools, files=files,
+        )
         yield response.content
 
     def effective_model_id(self, session_id: str | None = None) -> str | None:
