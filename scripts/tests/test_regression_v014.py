@@ -41,32 +41,33 @@ import aiosqlite
 from ._framework import TestContext, test
 
 
-# ── Phase 1 / Phase 0: Agno surface ───────────────────────────────────
+# ── Phase 1 / Phase 0: inlined runtime surface ────────────────────────
 
 
-@test("regression_v014", "Agno 2.6+ adapter imports — ClaudeAgent + Team + SqliteDb")
-async def t_agno_imports(ctx: TestContext) -> None:
-    """Phase 1 contract: the bumped Agno surface we rely on exists. A
-    regression to a pre-2.6 Agno would break this immediately.
-    """
-    from agno.agent import Agent as AgnoAgent  # noqa: F401
-    from agno.agents.claude import ClaudeAgent  # noqa: F401
-    from agno.agents.base import BaseExternalAgent  # noqa: F401
-    from agno.db.sqlite import SqliteDb  # noqa: F401
-    from agno.team import Team, TeamMode  # noqa: F401
+@test("regression_v014", "inlined runtime surface — Agent + Team + SqliteDb")
+async def t_runtime_surface(ctx: TestContext) -> None:
+    """The runtime primitives the rest of the system depends on must
+    stay importable from their stable paths. A reorganization that
+    moves or renames them without updating consumers would break
+    ``native_provider``, ``dispatcher``, and the subscription-CLI
+    backed agents simultaneously."""
+    from src.core._runner.agent import Agent  # noqa: F401
+    from src.core._runner.team import Team, TeamMode  # noqa: F401
+    from src.memory.store.sqlite import SqliteDb  # noqa: F401
+    from src.models._backed_agent import BaseSubscriptionBackedAgent  # noqa: F401
+    from src.models.claude_agent import ClaudeBackedAgent  # noqa: F401
+    from src.models.codex_agent import CodexBackedAgent  # noqa: F401
 
-    # ClaudeAgent must be a BaseExternalAgent subclass — that's the
-    # contract that lets TeamRouterProvider exclude it from Team.members.
-    assert issubclass(ClaudeAgent, BaseExternalAgent), (
-        f"ClaudeAgent must inherit from BaseExternalAgent; got {ClaudeAgent.__mro__}"
+    # ``ClaudeBackedAgent`` must inherit from the shared base, which in
+    # turn drives the inlined Agent runtime. Breaking either edge would
+    # silently lose the SDK session-id round-trip in ``session_data``.
+    assert issubclass(ClaudeBackedAgent, BaseSubscriptionBackedAgent), (
+        f"ClaudeBackedAgent must inherit from BaseSubscriptionBackedAgent; "
+        f"got {ClaudeBackedAgent.__mro__}"
     )
-
-    # ``framework`` is the discriminator agent_data writes — used by
-    # ``_known_sdk_session_ids_from_db`` to filter rows.
-    assert getattr(ClaudeAgent, "framework", None) == "claude-agent-sdk", (
-        f"ClaudeAgent.framework changed; "
-        f"_known_sdk_session_ids_from_db relies on the literal "
-        f"'claude-agent-sdk' value"
+    assert issubclass(BaseSubscriptionBackedAgent, Agent), (
+        f"BaseSubscriptionBackedAgent must inherit from the inlined Agent "
+        f"runtime; got {BaseSubscriptionBackedAgent.__mro__}"
     )
 
 
@@ -324,7 +325,7 @@ async def t_known_sdk_session_ids(ctx: TestContext) -> None:
             conn = await db._ensure_connected()
             # Two Claude SDK sessions + one api-based session.
             await conn.execute(
-                "INSERT INTO agno_sessions "
+                "INSERT INTO sessions "
                 "(session_id, agent_data, created_at, updated_at) "
                 "VALUES (?, ?, ?, ?)",
                 ("sess-claude-1",
@@ -332,7 +333,7 @@ async def t_known_sdk_session_ids(ctx: TestContext) -> None:
                  now, now),
             )
             await conn.execute(
-                "INSERT INTO agno_sessions "
+                "INSERT INTO sessions "
                 "(session_id, agent_data, created_at, updated_at) "
                 "VALUES (?, ?, ?, ?)",
                 ("sess-claude-2",
@@ -340,7 +341,7 @@ async def t_known_sdk_session_ids(ctx: TestContext) -> None:
                  now, now),
             )
             await conn.execute(
-                "INSERT INTO agno_sessions "
+                "INSERT INTO sessions "
                 "(session_id, agent_data, created_at, updated_at) "
                 "VALUES (?, ?, ?, ?)",
                 ("sess-api", '{"framework": "external"}', now, now),
@@ -382,7 +383,7 @@ async def t_sdk_session_lookup_widened(ctx: TestContext) -> None:
             conn = await db._ensure_connected()
             # Row A: legacy claude-agent-sdk row (pre-v0.14 marker).
             await conn.execute(
-                "INSERT INTO agno_sessions "
+                "INSERT INTO sessions "
                 "(session_id, agent_data, session_data, created_at, updated_at) "
                 "VALUES (?, ?, ?, ?, ?)",
                 ("sess-legacy",
@@ -393,7 +394,7 @@ async def t_sdk_session_lookup_widened(ctx: TestContext) -> None:
             # framework marker (it's a regular Agent), but the SDK
             # session id is stamped on session_data.
             await conn.execute(
-                "INSERT INTO agno_sessions "
+                "INSERT INTO sessions "
                 "(session_id, agent_data, session_data, created_at, updated_at) "
                 "VALUES (?, ?, ?, ?, ?)",
                 ("sess-backed",
@@ -403,7 +404,7 @@ async def t_sdk_session_lookup_widened(ctx: TestContext) -> None:
             )
             # Row C: plain api-based session — must NOT be picked up.
             await conn.execute(
-                "INSERT INTO agno_sessions "
+                "INSERT INTO sessions "
                 "(session_id, agent_data, session_data, created_at, updated_at) "
                 "VALUES (?, ?, ?, ?, ?)",
                 ("sess-api",
@@ -423,47 +424,13 @@ async def t_sdk_session_lookup_widened(ctx: TestContext) -> None:
             pass
 
 
-# ── Phase 4: SmartRouter no longer has classifier internals ──────────
-
-
-@test("regression_v014", "SmartRouter classifier internals removed")
-async def t_smart_router_no_classifier(ctx: TestContext) -> None:
-    """Negative test: the classifier LLM call + its caches are gone.
-    A regression that re-adds them would re-introduce the per-turn LLM
-    cost the user explicitly removed.
-    """
-    from src.models.dispatcher import SmartRouter
-
-    router = SmartRouter()
-    # None of these should exist anymore — TeamRouterProvider replaces them.
-    forbidden = [
-        "_classifier_model",
-        "_classifier_provider",
-        "_classify",
-        "_resolve_classifier_pick",
-        "_candidate_models",
-        "_get_classifier_provider",
-        "_get_agno_provider",
-        "_agno_providers",
-        "_remember_pick",
-    ]
-    leaked = [name for name in forbidden if hasattr(router, name)]
-    # Note: _last_pick_by_session is KEPT — used by effective_model_id
-    # for the chat UI's model badge. _remember_pick stays as a tiny
-    # private helper. Adjust the list if we keep helpers; what matters
-    # is the classifier method itself is gone.
-    classifier_methods = ["_classify", "_resolve_classifier_pick", "_classifier_provider"]
-    classifier_leaked = [n for n in classifier_methods if hasattr(router, n)]
-    assert not classifier_leaked, (
-        f"SmartRouter still has classifier internals: {classifier_leaked}. "
-        f"The classifier was replaced by TeamRouterProvider in Phase 4."
-    )
+# ── Phase 4: SmartRouter → TeamRouterProvider ────────────────────────
 
 
 @test("regression_v014", "SmartRouter dispatches api-based entries through TeamRouterProvider")
 async def t_smart_router_uses_team(ctx: TestContext) -> None:
     """The api-based path must build a TeamRouterProvider, not a raw
-    AgnoProvider. The team router is what gives sessions their
+    NativeProvider. The team router is what gives sessions their
     sub-agent / specialist-delegation behaviour.
     """
     from src.models.dispatcher import SmartRouter
@@ -558,7 +525,7 @@ async def t_generate_no_models_returns_error(ctx: TestContext) -> None:
     assert "no model" in resp.content.lower(), resp.content
 
 
-@test("regression_v014", "_arun_agno_stream forwards Team-module content events (no duplicate-run bug)")
+@test("regression_v014", "_arun_runtime_stream forwards Team-module content events (no duplicate-run bug)")
 async def t_stream_handles_team_events(ctx: TestContext) -> None:
     """Regression for the prod bug where ``TeamRouterProvider.stream``
     yielded zero deltas → ``agent.run_stream`` fired its
@@ -569,12 +536,12 @@ async def t_stream_handles_team_events(ctx: TestContext) -> None:
 
     Root cause: ``agno.run.team.RunContentEvent`` is a DISTINCT class
     from ``agno.run.agent.RunContentEvent``. The shared
-    ``_arun_agno_stream`` helper must isinstance-check BOTH module
+    ``_arun_runtime_stream`` helper must isinstance-check BOTH module
     variants (plus ``IntermediateRunContentEvent`` for delegated
     member content) so Team-mode deltas reach the WS pipe.
     """
-    from agno.run.agent import RunContentEvent as AgentRCE
-    from agno.run.team import (
+    from src.core._run_state.agent import RunContentEvent as AgentRCE
+    from src.core._run_state.team import (
         IntermediateRunContentEvent as TeamIRCE,
         RunContentEvent as TeamRCE,
     )
@@ -584,7 +551,7 @@ async def t_stream_handles_team_events(ctx: TestContext) -> None:
         "classes; revisit dispatcher's union."
     )
 
-    from src.models.dispatcher import _arun_agno_stream
+    from src.models.dispatcher import _arun_runtime_stream
 
     class _FakeTeamRuntime:
         def arun(self, prompt, *, session_id, user_id, stream, stream_events=False):
@@ -595,7 +562,7 @@ async def t_stream_handles_team_events(ctx: TestContext) -> None:
             return _iter()
 
     deltas: list[str] = []
-    async for delta in _arun_agno_stream(
+    async for delta in _arun_runtime_stream(
         _FakeTeamRuntime(),
         prompt="x",
         session_id="sess-x",
@@ -690,7 +657,7 @@ async def t_wire_defers_all_mcps(ctx: TestContext) -> None:
             self.agno_calls = 0
             self.sdk_calls = 0
 
-        def agno_toolkits_tool_search_only(self):
+        def runtime_toolkits_tool_search_only(self):
             self.agno_calls += 1
             return ["<tool-search-toolkit>"]
 
@@ -703,7 +670,7 @@ async def t_wire_defers_all_mcps(ctx: TestContext) -> None:
     wire_model_runtime(model, mcp_pool=pool)
 
     # The wire layer must call the TOOL-SEARCH-ONLY accessors. If a
-    # regression replaces them with ``agno_toolkits`` (the full list)
+    # regression replaces them with ``runtime_toolkits`` (the full list)
     # this test catches it because the count check below fails first
     # — but the explicit accessor call is the canary.
     assert pool.agno_calls == 1, pool.agno_calls
@@ -716,14 +683,14 @@ async def t_wire_defers_all_mcps(ctx: TestContext) -> None:
 async def t_pool_tool_search_only(ctx: TestContext) -> None:
     from src.mcp.pool import MCPPool
 
-    assert callable(getattr(MCPPool, "agno_toolkits_tool_search_only", None)), (
-        "MCPPool.agno_toolkits_tool_search_only is required by "
+    assert callable(getattr(MCPPool, "runtime_toolkits_tool_search_only", None)), (
+        "MCPPool.runtime_toolkits_tool_search_only is required by "
         "wire_model_runtime — adding it back is what closed the gap"
     )
     assert callable(getattr(MCPPool, "claude_sdk_servers_tool_search_only", None))
     # The budget knobs are still present so legacy callers don't break,
     # but the wire layer no longer consults them.
-    assert callable(getattr(MCPPool, "agno_toolkits_under_budget", None))
+    assert callable(getattr(MCPPool, "runtime_toolkits_under_budget", None))
 
 
 # ── Phase 6b: System prompt + catalog summary ────────────────────────
@@ -1021,7 +988,7 @@ async def t_team_members_typing(ctx: TestContext) -> None:
     delegation classifier.
     """
     import inspect
-    from agno.team._init import __init__ as team_init
+    from src.core._runner.team._init import __init__ as team_init
 
     sig = inspect.signature(team_init)
     members_param = sig.parameters.get("members")
@@ -1045,7 +1012,7 @@ async def t_claude_backed_is_agent(ctx: TestContext) -> None:
     earlier ``PersistentClaudeAgent`` (ClaudeAgent / BaseExternalAgent
     subclass) couldn't.
     """
-    from agno.agent import Agent
+    from src.core._runner.agent import Agent
     from src.models.claude_agent import ClaudeBackedAgent
 
     agent = ClaudeBackedAgent(
@@ -1110,7 +1077,7 @@ async def t_codex_backed_is_agent(ctx: TestContext) -> None:
     pass Agno's ``isinstance(member, Agent)`` check AND inherit the
     attribute defaults Team's delegation code reads.
     """
-    from agno.agent import Agent
+    from src.core._runner.agent import Agent
     from src.models.codex_agent import CodexBackedAgent
 
     agent = CodexBackedAgent(

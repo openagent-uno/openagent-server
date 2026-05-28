@@ -719,7 +719,7 @@ class TelegramBridge(BaseBridge):
                     try:
                         cur = await shim._conn.execute(
                             "SELECT session_data, agent_data, runs, summary, "
-                            "       updated_at FROM agno_sessions WHERE session_id = ?",
+                            "       updated_at FROM sessions WHERE session_id = ?",
                             (session_id,),
                         )
                         sess = await cur.fetchone()

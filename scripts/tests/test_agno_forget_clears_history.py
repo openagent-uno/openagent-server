@@ -1,8 +1,8 @@
-"""Regression: AgnoProvider.forget_session must wipe the stored
+"""Regression: NativeProvider.forget_session must wipe the stored
 session row so the next generate() on that session_id doesn't
 auto-load the prior transcript (and summary).
 
-Before the fix, ``AgnoProvider`` only inherited BaseModel's default
+Before the fix, ``NativeProvider`` only inherited BaseModel's default
 ``forget_session``, which called ``close_session`` — itself a no-op
 for Agno (nothing to disconnect; history lives in an SqliteDb). So
 ``/clear`` and the scheduler's per-fire forget never actually erased
@@ -10,7 +10,7 @@ agno-backed history; with ``add_history_to_context=True`` the very
 next turn loaded all prior messages plus the rolling session
 summary back into context.
 
-The fix: AgnoProvider implements a real ``forget_session`` that
+The fix: NativeProvider implements a real ``forget_session`` that
 calls ``SqliteDb.delete_session`` (Agno's native API), with a raw
 SQL fallback against the ``agno_sessions`` table for API drift.
 
@@ -27,25 +27,25 @@ from ._framework import TestContext, TestSkip, test
 
 def _agno_available() -> bool:
     try:
-        from agno.db.sqlite import SqliteDb  # noqa: F401
+        from src.memory.store.sqlite import SqliteDb  # noqa: F401
         return True
     except ImportError:
         return False
 
 
-def _seed_agno_sessions_table(db_path: str) -> None:
-    """Create the agno_sessions schema and give it one seeded row.
+def _seed_sessions_table(db_path: str) -> None:
+    """Create the ``sessions`` schema and give it one seeded row.
 
-    We use raw SQL because Agno's ORM upsert has NOT-NULL
-    constraints tied to its own helper code that's awkward to stub.
-    The column list mirrors Agno 2.x — enough for ``delete_session``
-    to match and delete by session_id.
+    We use raw SQL because the ORM upsert has NOT-NULL constraints tied
+    to its own helper code that's awkward to stub. The column list
+    mirrors the live schema — enough for ``delete_session`` to match
+    and delete by session_id.
     """
     conn = sqlite3.connect(db_path)
     try:
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS agno_sessions (
+            CREATE TABLE IF NOT EXISTS sessions (
                 session_id TEXT PRIMARY KEY,
                 session_type TEXT,
                 agent_id TEXT,
@@ -66,7 +66,7 @@ def _seed_agno_sessions_table(db_path: str) -> None:
         )
         conn.execute(
             """
-            INSERT OR REPLACE INTO agno_sessions
+            INSERT OR REPLACE INTO sessions
               (session_id, session_type, agent_id, user_id, runs, summary,
                created_at, updated_at)
             VALUES (?, 'agent', 'a1', 'openagent',
@@ -84,7 +84,7 @@ def _row_count(db_path: str, session_id: str) -> int:
     conn = sqlite3.connect(db_path)
     try:
         return conn.execute(
-            "SELECT COUNT(*) FROM agno_sessions WHERE session_id=?",
+            "SELECT COUNT(*) FROM sessions WHERE session_id=?",
             (session_id,),
         ).fetchone()[0]
     finally:
@@ -96,13 +96,13 @@ async def t_forget_via_native_api(ctx: TestContext) -> None:
     if not _agno_available():
         raise TestSkip("agno not installed")
 
-    from src.models.agno_provider import AgnoProvider
+    from src.models.native_provider import NativeProvider
 
     db_file = ctx.test_dir / "agno-forget.db"
-    _seed_agno_sessions_table(str(db_file))
+    _seed_sessions_table(str(db_file))
     assert _row_count(str(db_file), "tg:agno-user") == 1, "seed failed"
 
-    provider = AgnoProvider(
+    provider = NativeProvider(
         model="agno:openai/gpt-4o-mini",
         providers_config=[{"name": "openai", "framework": "agno"}],
         db_path=str(db_file),
@@ -119,11 +119,11 @@ async def t_forget_fallback_sql(ctx: TestContext) -> None:
     if not _agno_available():
         raise TestSkip("agno not installed")
 
-    from src.models.agno_provider import AgnoProvider
-    from agno.db.sqlite import SqliteDb
+    from src.models.native_provider import NativeProvider
+    from src.memory.store.sqlite import SqliteDb
 
     db_file = ctx.test_dir / "agno-forget-fallback.db"
-    _seed_agno_sessions_table(str(db_file))
+    _seed_sessions_table(str(db_file))
     assert _row_count(str(db_file), "tg:agno-user") == 1, "seed failed"
 
     # Break the native API to force the fallback path.
@@ -134,7 +134,7 @@ async def t_forget_fallback_sql(ctx: TestContext) -> None:
 
     SqliteDb.delete_session = _broken  # type: ignore[assignment]
     try:
-        provider = AgnoProvider(
+        provider = NativeProvider(
             model="agno:openai/gpt-4o-mini",
             providers_config=[{"name": "openai", "framework": "agno"}],
             db_path=str(db_file),
@@ -153,14 +153,14 @@ async def t_forget_nonexistent(ctx: TestContext) -> None:
     if not _agno_available():
         raise TestSkip("agno not installed")
 
-    from src.models.agno_provider import AgnoProvider
+    from src.models.native_provider import NativeProvider
 
     db_file = ctx.test_dir / "agno-forget-noop.db"
     # Brand-new DB file; schema not yet created — fallback must cope.
-    provider = AgnoProvider(
+    provider = NativeProvider(
         model="agno:openai/gpt-4o-mini",
         providers_config=[{"name": "openai", "framework": "agno"}],
         db_path=str(db_file),
     )
-    # Must not raise even though the DB has no agno_sessions table yet.
+    # Must not raise even though the DB has no ``sessions`` table yet.
     await provider.forget_session("tg:nobody")

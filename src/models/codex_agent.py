@@ -3,9 +3,9 @@
 Mirror of ``src/models/claude_agent.py`` for the OpenAI Codex CLI side.
 This module owns the entire codex-cli framework path:
 
-- ``CodexBackedAgent`` — ``agno.agent.Agent`` subclass that drives
+- ``CodexBackedAgent`` — runtime ``Agent`` subclass that drives
   ``openai_codex`` directly. Used wherever you'd otherwise reach for
-  the OpenAI Codex CLI but need the result to participate in an Agno
+  the OpenAI Codex CLI but need the result to participate in a runtime
   ``Team`` — as a member, as the leader's ``members[0]`` slot, or as
   both. A placeholder ``_NullModel`` satisfies ``Agent.__init__``;
   we override ``arun`` before any code path could reach
@@ -33,13 +33,13 @@ Key differences from the claude-cli flavor:
   ``set_mcp_servers`` is a no-op.
 - Streaming notifications are JSON-RPC method names
   (``item/agentMessage/delta``, ``turn/completed``) — translated to
-  Agno's ``RunContentEvent`` / ``ToolCall*Event`` the same way
+  the runtime's ``RunContentEvent`` / ``ToolCall*Event`` the same way
   ``ClaudeBackedAgent`` translates ``StreamEvent`` deltas.
 
-SDK session ids (thread ids) are round-tripped through Agno's session
-storage (``session.session_data["codex_session_id"]``) so restart-
-resume keeps working. Subscription billing is zero per the catalog;
-tokens × pricing aren't charged for the codex-cli framework.
+SDK session ids (thread ids) are round-tripped through the runtime's
+session storage (``session.session_data["codex_session_id"]``) so
+restart-resume keeps working. Subscription billing is zero per the
+catalog; tokens × pricing aren't charged for the codex-cli framework.
 """
 
 from __future__ import annotations
@@ -49,14 +49,14 @@ import os
 from typing import Any, AsyncIterator, Awaitable, Callable, ClassVar, Dict, Optional
 from uuid import uuid4
 
-from agno.models.response import ToolExecution
-from agno.run.agent import (
+from src.models.providers.response import ToolExecution
+from src.core._run_state.agent import (
     RunContentEvent,
     RunOutput,
     ToolCallCompletedEvent,
     ToolCallStartedEvent,
 )
-from agno.run.base import RunStatus
+from src.core._run_state.base import RunStatus
 
 from src.core.logging import elog
 from src.models._backed_agent import (
@@ -93,7 +93,7 @@ def _sdk() -> Any:
 
 
 def _known_sdk_session_ids_from_db(db: Any) -> list[str]:
-    """Return ``agno_sessions.session_id`` rows for codex-cli sessions.
+    """Return ``sessions.session_id`` rows for codex-cli sessions.
 
     ``CodexBackedAgent`` rows are stored as plain ``Agent`` rows (so
     ``agent_data.framework`` is absent), but the class stamps
@@ -104,7 +104,7 @@ def _known_sdk_session_ids_from_db(db: Any) -> list[str]:
     return _known_sdk_session_ids_by_key(db, json_key="codex_session_id")
 
 
-# ── Notification → Agno event translation ────────────────────────────
+# ── Notification → runtime event translation ─────────────────────────
 
 
 def _notification_method(notification: Any) -> str:
@@ -175,7 +175,7 @@ class CodexBackedAgent(BaseSubscriptionBackedAgent):
     """``Agent`` subclass whose ``arun`` drives ``openai_codex``.
 
     Use wherever you'd otherwise reach for the OpenAI Codex CLI but
-    need the result to participate in an Agno ``Team`` — as a member,
+    need the result to participate in a runtime ``Team`` — as a member,
     as the leader's ``members[0]`` slot, or as both.
 
     Constructor accepts the same shape as ``ClaudeBackedAgent``: a
@@ -301,7 +301,7 @@ class CodexBackedAgent(BaseSubscriptionBackedAgent):
 
     @staticmethod
     def _extract_tools_from_items(items: Any) -> list[ToolExecution]:
-        """Translate Codex SDK ``ThreadItem``s into Agno ``ToolExecution``s.
+        """Translate Codex SDK ``ThreadItem``s into runtime ``ToolExecution``s.
 
         Walks the ``items`` list and pulls each tool invocation into a
         ``ToolExecution`` carrying the call id, tool name, args, and
@@ -408,8 +408,14 @@ class CodexBackedAgent(BaseSubscriptionBackedAgent):
         user_id: Optional[str],
         session_id: Optional[str],
         run_id: str,
+        files: Optional[list[Any]] = None,
+        images: Optional[list[Any]] = None,
+        audio: Optional[list[Any]] = None,
+        videos: Optional[list[Any]] = None,
     ) -> RunOutput:
         prompt = _stringify_input(input)
+        if files:
+            prompt = _prepend_files_for_subscription_cli(prompt, files)
         self._hydrate_from_db(session_id)
 
         try:
@@ -460,8 +466,14 @@ class CodexBackedAgent(BaseSubscriptionBackedAgent):
         session_id: Optional[str],
         run_id: str,
         yield_run_output: bool,
+        files: Optional[list[Any]] = None,
+        images: Optional[list[Any]] = None,
+        audio: Optional[list[Any]] = None,
+        videos: Optional[list[Any]] = None,
     ) -> AsyncIterator[Any]:
         prompt = _stringify_input(input)
+        if files:
+            prompt = _prepend_files_for_subscription_cli(prompt, files)
         self._hydrate_from_db(session_id)
 
         emitted_tool_ids: set[str] = set()
@@ -684,6 +696,11 @@ class CodexCLI(BaseModel):
 
     # ── wiring ────────────────────────────────────────────────────────
 
+    def invalidate_agent_cache(self) -> None:
+        """Drop the cached backed Agent so the next call rebuilds it."""
+        self._agent = None
+        self._agent_system = None
+
     def set_mcp_servers(self, servers: dict[str, dict]) -> None:
         # Codex CLI manages its own built-in tools via the binary; MCP
         # wiring is a no-op here so the standard pipeline can call this
@@ -691,8 +708,10 @@ class CodexCLI(BaseModel):
         return None
 
     def set_db(self, db: Any) -> None:
+        if db is self._db:
+            return
         self._db = db
-        self._agent = None  # rebuild on next turn so SqliteDb points at new file
+        self.invalidate_agent_cache()
 
     def set_session_handle(self, session_id: str, handle: str | None) -> None:
         if not session_id:
@@ -726,7 +745,7 @@ class CodexCLI(BaseModel):
         return None
 
     async def forget_session(self, session_id: str) -> None:
-        """Erase the session row from ``agno_sessions`` so the next
+        """Erase the session row from the sessions table so the next
         message starts a fresh Codex thread (no resume).
         """
         if not session_id:
@@ -748,8 +767,7 @@ class CodexCLI(BaseModel):
         return None
 
     async def shutdown(self) -> None:
-        self._agent = None
-        self._agent_system = None
+        self.invalidate_agent_cache()
 
     def known_session_ids(self) -> list[str]:
         return _known_sdk_session_ids_from_db(self._db)
@@ -810,14 +828,16 @@ class CodexCLI(BaseModel):
         model_override: str | None = None,
         files: list[Any] | None = None,
     ) -> AsyncIterator[str]:
+        from src.models._tool_status import tool_exec_to_wire_json
+
         agent = self._ensure_agent(system)
         prompt = _last_user_prompt(messages)
         if files:
             prompt = _prepend_files_for_subscription_cli(prompt, files)
         sid = session_id or "default"
         user_id = self._session_handles.get(sid) or "openagent"
-        from agno.run.agent import RunContentEvent, ToolCallStartedEvent
 
+        stream_iter = None
         try:
             stream_iter = agent.arun(
                 prompt, session_id=sid, user_id=user_id, stream=True,
@@ -827,17 +847,35 @@ class CodexCLI(BaseModel):
                     delta = event.content or ""
                     if delta:
                         yield delta
-                elif on_status is not None and isinstance(event, ToolCallStartedEvent):
-                    tool = getattr(event, "tool", None)
-                    name = getattr(tool, "tool_name", None) if tool else None
-                    if name:
-                        try:
-                            await on_status(f"⚙ {name}")
-                        except Exception as e:  # noqa: BLE001
-                            logger.debug("on_status callback raised: %s", e)
+                    continue
+                if on_status is None:
+                    continue
+                tool = getattr(event, "tool", None)
+                if tool is None or not getattr(tool, "tool_name", None):
+                    continue
+                if isinstance(event, ToolCallStartedEvent):
+                    encoded = tool_exec_to_wire_json(tool, phase="started")
+                elif isinstance(event, ToolCallCompletedEvent):
+                    encoded = tool_exec_to_wire_json(tool)
+                else:
+                    continue
+                if encoded is None:
+                    continue
+                try:
+                    await on_status(encoded)
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("on_status callback raised: %s", e)
         except Exception as e:  # noqa: BLE001
             elog("codex_cli.stream_error", session_id=sid, error=str(e))
             raise
+        finally:
+            if stream_iter is not None:
+                aclose = getattr(stream_iter, "aclose", None)
+                if aclose is not None:
+                    try:
+                        await aclose()
+                    except Exception:  # noqa: BLE001
+                        pass
 
 
 class CodexCLIRegistry(BaseModel):
@@ -996,8 +1034,7 @@ class CodexCLIRegistry(BaseModel):
         if inst.model == target_model:
             return
         inst.model = target_model
-        inst._agent = None
-        inst._agent_system = None
+        inst.invalidate_agent_cache()
 
     # ── turn ──────────────────────────────────────────────────────────
 

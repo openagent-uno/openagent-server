@@ -42,7 +42,7 @@ def _seed_agno_runs(db_path: str, session_id: str, runs: list[dict]) -> None:
     try:
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS agno_sessions (
+            CREATE TABLE IF NOT EXISTS sessions (
                 session_id TEXT PRIMARY KEY,
                 session_type TEXT,
                 agent_id TEXT,
@@ -62,7 +62,7 @@ def _seed_agno_runs(db_path: str, session_id: str, runs: list[dict]) -> None:
             """
         )
         conn.execute(
-            "INSERT OR REPLACE INTO agno_sessions "
+            "INSERT OR REPLACE INTO sessions "
             "(session_id, session_type, user_id, runs, "
             " created_at, updated_at) "
             "VALUES (?, 'agent', 'openagent', ?, 100, 200)",
@@ -195,7 +195,7 @@ async def t_stored_pass_through(ctx: TestContext) -> None:
     assert wire == stored, (wire, stored)  # exact pass-through
 
 
-@test("rehydration_parity", "_arun_agno_stream emits JSON status for tool start + completion + error")
+@test("rehydration_parity", "_arun_runtime_stream emits JSON status for tool start + completion + error")
 async def t_dispatcher_stream_emits_json_status(ctx: TestContext) -> None:
     """Live team-mode turn: the dispatcher's tool-call frames must be
     structured JSON in Agno-native shape (so the UI's
@@ -203,13 +203,13 @@ async def t_dispatcher_stream_emits_json_status(ctx: TestContext) -> None:
     instead of the legacy ``f"⚙ {name}"`` plain text. Without this,
     the chip renders one way live and another way after rehydration.
     """
-    from agno.run.team import (
+    from src.core._run_state.team import (
         ToolCallCompletedEvent as TeamToolCallCompletedEvent,
         ToolCallErrorEvent as TeamToolCallErrorEvent,
         ToolCallStartedEvent as TeamToolCallStartedEvent,
         RunContentEvent as TeamRunContentEvent,
     )
-    from src.models.dispatcher import _arun_agno_stream
+    from src.models.dispatcher import _arun_runtime_stream
 
     # The same ToolExecution mutates between start + completion in
     # real Agno — result is None at start, populated at done. Mirror
@@ -268,7 +268,7 @@ async def t_dispatcher_stream_emits_json_status(ctx: TestContext) -> None:
         statuses.append(s)
 
     deltas: list[str] = []
-    async for d in _arun_agno_stream(
+    async for d in _arun_runtime_stream(
         _FakeRuntime(),
         prompt="x",
         session_id="sess-parity",
@@ -436,7 +436,7 @@ async def t_rehydration_nested_tools(ctx: TestContext) -> None:
     with the specialist's tool args + result.
 
     Live path: the IntermediateRunContentEvent + ToolCallStartedEvent
-    fires for the member's own tools through ``_arun_agno_stream``.
+    fires for the member's own tools through ``_arun_runtime_stream``.
     Rehydration path: those tools live in ``member_responses[*].tools``
     and the recursive expansion surfaces them at the right slot.
     """

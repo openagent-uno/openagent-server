@@ -19,7 +19,7 @@ def build_test_config(user_config_path: Path) -> tuple[dict, Path, Path]:
       - uses SmartRouter so classifier + tier routing runs in one config;
       - copies the user's ``providers:`` block so live tests can hit OpenAI
         with real keys, BUT strips ``anthropic`` (placeholder keys like
-        ``sk-test`` get exported as ``ANTHROPIC_API_KEY`` by AgnoProvider
+        ``sk-test`` get exported as ``ANTHROPIC_API_KEY`` by NativeProvider
         and then break the Claude CLI subscription auth path);
       - disables heavy MCPs (chrome-devtools, web-search, computer-control)
         that would slow the suite down without adding coverage;

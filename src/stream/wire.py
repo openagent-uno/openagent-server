@@ -43,6 +43,7 @@ from src.stream.events import (
     OutToolStatus,
     OutVideoFrame,
     SessionClose,
+    SessionCompacted,
     SessionOpen,
     TextDelta,
     TextFinal,
@@ -67,6 +68,7 @@ SESSION_CLOSE = "session_close"  # client → server stream close
 
 VIDEO_FRAME_OUT = "video_frame_out"  # server → client image frame
 TURN_COMPLETE = "turn_complete"  # server → client batched-channel sentinel
+SESSION_COMPACTED = "session_compacted"  # server → client in-place compaction landed
 
 
 def _b64encode(data: bytes) -> str:
@@ -132,6 +134,13 @@ def event_to_wire(evt: Event) -> dict[str, Any]:
         }
     if isinstance(evt, TurnComplete):
         return {**base, "type": TURN_COMPLETE}
+    if isinstance(evt, SessionCompacted):
+        return {
+            **base,
+            "type": SESSION_COMPACTED,
+            "summary_chars": evt.summary_chars,
+            "kept_runs_count": evt.kept_runs_count,
+        }
 
     # Inbound types — included for completeness (e.g. tests that
     # round-trip both directions). Servers don't usually emit these.

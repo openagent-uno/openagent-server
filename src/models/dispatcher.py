@@ -8,23 +8,22 @@ It owns two complementary responsibilities, colocated for clarity:
   matching :class:`TeamRouterProvider`. Also drives lifecycle
   (cleanup_idle, shutdown, close/forget_session) and budget telemetry.
 
-- :class:`TeamRouterProvider` — for one entry runtime_id, builds an
-  Agno ``Team(mode=coordinate)`` per session whose leader is that entry
+- :class:`TeamRouterProvider` — for one entry runtime_id, builds a
+  runtime ``Team(mode=coordinate)`` per session whose leader is that entry
   model and whose members are every OTHER enabled LLM model in the
-  catalog (api-based AND subscription-CLI). Agno's TeamMode.coordinate
+  catalog (api-based AND subscription-CLI). The runtime's TeamMode.coordinate
   lets the leader fire MULTIPLE ``delegate_task_to_member`` tool calls
-  per turn — Agno gathers them with ``asyncio.gather`` (see
-  ``agno.models.base.arun_function_calls``), so independent sub-tasks
-  run in parallel. The leader then synthesizes the member outputs into
-  the final user-facing reply.
+  per turn — the runtime gathers them with ``asyncio.gather``, so
+  independent sub-tasks run in parallel. The leader then synthesizes
+  the member outputs into the final user-facing reply.
 
   When the entry model is claude-cli / codex-cli, ``team.model`` (the
-  routing-classifier Agno calls to pick the next member) is the
+  routing classifier the runtime calls to pick the next member) is the
   cheapest available api-based model. With no api-based model in the
   catalog, the leader runs as a single agent via
   :class:`_SingleExternalAgentAdapter`.
 
-History is unified in Agno's ``agno_sessions`` SqliteDb across every
+History is unified in the runtime's sessions SqliteDb across every
 framework, so there's no longer a need to lock a session to one
 framework once it's been served by that side.
 
@@ -36,13 +35,13 @@ and external callers.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 from src.core.logging import elog
 from src.models._backed_agent import (
     _last_user_prompt,
-    _prepend_files_for_subscription_cli,
 )
 from src.models.base import BaseModel, ModelResponse
 from src.models.budget import BudgetTracker
@@ -67,12 +66,54 @@ logger = logging.getLogger(__name__)
 
 
 def _runtime_db_path(db: Any) -> str | None:
-    """Resolve OpenAgent's SQLite path so Agno's ``SqliteDb`` lands on
-    the same file (``agno_sessions`` table is shared)."""
+    """Resolve OpenAgent's SQLite path so the runtime's ``SqliteDb`` lands on
+    the same file (the sessions table is shared)."""
     if db is None:
         return None
     path = getattr(db, "db_path", None)
     return str(path) if path else None
+
+
+_SESSION_ID_TAG_RE = re.compile(r"\n*<session-id>[^<]*</session-id>\s*$")
+
+
+def _system_cache_key(system: str | None) -> str:
+    """Stable cache key for a system prompt that ignores the per-session
+    ``<session-id>`` tag the orchestrator appends.
+
+    Without this, every session generates a unique system prompt string
+    — so any cache keyed on the raw system text misses on every session
+    AND grows unbounded with session count.
+    """
+    if not system:
+        return ""
+    return _SESSION_ID_TAG_RE.sub("", system).strip()
+
+
+def _compose_member_system(system: str | None, role_blurb: str) -> str | None:
+    """Compose the per-member system prompt: framework prompt + persona
+    on top, a short ``Role`` block on the bottom that pins the
+    specialist to its area.
+
+    Mirrors the pattern at ``native_provider.py``'s internal Team (see
+    ``_ensure_team``) so both Team paths follow the same shape. Returns
+    ``None`` when no framework prompt is supplied — the single-model
+    classifier-only generate path can call into the dispatcher with
+    ``system=None`` and we mustn't synthesise a prompt out of thin air
+    in that case.
+    """
+    base = (system or "").strip()
+    if not base:
+        return None
+    role = (role_blurb or "").strip()
+    if not role:
+        return base
+    return (
+        f"{base}\n\n── Role ──\n"
+        f"You are this team's {role} specialist. Prefer tasks that fit "
+        f"that role; defer to the team leader when the request is "
+        f"outside your area."
+    )
 
 
 def _build_role_blurb(entry: CatalogModel) -> str:
@@ -88,9 +129,9 @@ def _build_role_blurb(entry: CatalogModel) -> str:
 
 
 def _member_identifier(runtime_id: str) -> str:
-    """Build a url-safe Agno member identifier from a runtime_id.
+    """Build a url-safe runtime member identifier from a runtime_id.
 
-    Agno's ``get_member_id`` runs the agent's ``name`` (when no explicit
+    The runtime's ``get_member_id`` runs the agent's ``name`` (when no explicit
     id is set) through ``url_safe_string`` — which strips colons. Feeding
     it a colon-laden ``specialist:claude-cli:anthropic:claude-opus-4.7``
     collapses the id to ``specialistclaude-clianthropicclaude-opus-4.7``
@@ -129,7 +170,7 @@ def _extract_delegated_member_id(tool_call: Any) -> str | None:
     return None
 
 
-async def _arun_agno_collect(
+async def _arun_runtime_collect(
     runtime: Any,
     *,
     prompt: str,
@@ -139,8 +180,11 @@ async def _arun_agno_collect(
     entry_runtime_id: str,
     on_delegate: Callable[[str], None] | None = None,
     files: list[Any] | None = None,
+    images: list[Any] | None = None,
+    audio: list[Any] | None = None,
+    videos: list[Any] | None = None,
 ) -> ModelResponse:
-    """Drive an Agno ``Team`` / ``Agent``-shaped runtime in non-stream
+    """Drive a runtime ``Team`` / ``Agent``-shaped runtime in non-stream
     mode and translate the resulting ``RunOutput`` into the
     ``ModelResponse`` shape the surrounding pipeline expects.
 
@@ -150,16 +194,24 @@ async def _arun_agno_collect(
     funnel the same five fields (content, tool names, input/output
     tokens, model) into ``ModelResponse``.
 
-    ``files`` is forwarded to ``runtime.arun(..., files=...)``. Agno
-    propagates the same files to members during
-    ``delegate_task_to_member`` — see
-    ``agno/team/_default_tools.py:713``.
+    Media kwargs (``files``/``images``/``audio``/``videos``) are
+    forwarded to ``runtime.arun(..., files=..., images=..., ...)``.
+    The runtime propagates the same media to members during
+    ``delegate_task_to_member`` — see ``_runner/team/_default_tools.py:713``.
+    Splitting by type matches AgentOS's ``process_image/audio/video/document``
+    convention.
     """
     arun_kwargs: dict[str, Any] = {
         "session_id": session_id, "user_id": user_id, "stream": False,
     }
     if files:
         arun_kwargs["files"] = files
+    if images:
+        arun_kwargs["images"] = images
+    if audio:
+        arun_kwargs["audio"] = audio
+    if videos:
+        arun_kwargs["videos"] = videos
     try:
         run_output = await runtime.arun(prompt, **arun_kwargs)
     except Exception as e:  # noqa: BLE001
@@ -187,7 +239,7 @@ async def _arun_agno_collect(
     )
 
 
-async def _arun_agno_stream(
+async def _arun_runtime_stream(
     runtime: Any,
     *,
     prompt: str,
@@ -197,8 +249,11 @@ async def _arun_agno_stream(
     error_event: str,
     on_delegate: Callable[[str], None] | None = None,
     files: list[Any] | None = None,
+    images: list[Any] | None = None,
+    audio: list[Any] | None = None,
+    videos: list[Any] | None = None,
 ) -> AsyncIterator[str]:
-    """Drive an Agno ``Team`` / ``Agent``-shaped runtime in stream mode
+    """Drive a runtime ``Team`` / ``Agent``-shaped runtime in stream mode
     and yield string deltas, optionally surfacing tool-call status
     pings via ``on_status``.
 
@@ -206,22 +261,21 @@ async def _arun_agno_stream(
     ``_SingleExternalAgentAdapter.stream`` — both call
     ``runtime.arun(prompt, stream=True)``.
 
-    Critical: Agno publishes ``RunContentEvent`` / ``ToolCallStartedEvent``
-    under TWO distinct modules — ``agno.run.agent`` for plain ``Agent``
-    runs and ``agno.run.team`` for ``Team(mode=route)`` runs. They are
-    NOT the same class, so isinstance against just one of them
-    swallows the other side's deltas and triggers the ``run_stream``
-    "no_deltas_yielded" fallback to ``generate()``, which then runs
-    the whole turn AGAIN and persists a duplicate row to
-    ``agno_sessions``. Union both modules below so Team deltas
-    actually reach the WS pipe.
+    Critical: the runtime publishes ``RunContentEvent`` / ``ToolCallStartedEvent``
+    under TWO distinct modules — one for plain ``Agent`` runs and one for
+    ``Team(mode=route)`` runs. They are NOT the same class, so isinstance
+    against just one of them swallows the other side's deltas and triggers
+    the ``run_stream`` "no_deltas_yielded" fallback to ``generate()``, which
+    then runs the whole turn AGAIN and persists a duplicate row to the
+    sessions table. Union both modules below so Team deltas actually
+    reach the WS pipe.
 
     ``IntermediateRunContentEvent`` (team-only) carries deltas from a
     delegated member back to the team leader — also string content,
     also worth surfacing to the user.
 
     Tool-call frames are emitted as **structured JSON status** (the
-    same envelope ``AgnoProvider._emit_agno_tool_status`` uses for
+    same envelope ``NativeProvider._emit_agno_tool_status`` uses for
     single-agent runs and the rehydration endpoint reconstructs from
     stored ``runs[].tools``). Without this, team-mode turns sent the
     legacy ``"⚙ <name>"`` plain text and the universal app rendered
@@ -230,20 +284,20 @@ async def _arun_agno_stream(
     reported as "team-member usages sometimes shown as tool components,
     sometimes as text response".
     """
-    from agno.run.agent import (
+    from src.core._run_state.agent import (
         RunContentEvent as _AgentRunContentEvent,
         ToolCallCompletedEvent as _AgentToolCallCompletedEvent,
         ToolCallErrorEvent as _AgentToolCallErrorEvent,
         ToolCallStartedEvent as _AgentToolCallStartedEvent,
     )
-    from agno.run.team import (
+    from src.core._run_state.team import (
         IntermediateRunContentEvent as _TeamIntermediateRunContentEvent,
         RunContentEvent as _TeamRunContentEvent,
         ToolCallCompletedEvent as _TeamToolCallCompletedEvent,
         ToolCallErrorEvent as _TeamToolCallErrorEvent,
         ToolCallStartedEvent as _TeamToolCallStartedEvent,
     )
-    from src.models._tool_status import tool_exec_to_wire_json
+    from src.models._tool_status import emit_tool_status
 
     content_event_types = (
         _AgentRunContentEvent,
@@ -263,35 +317,36 @@ async def _arun_agno_stream(
         _TeamToolCallErrorEvent,
     )
 
-    async def _emit_status(tool: Any, error_text: str | None = None) -> None:
-        if on_status is None:
-            return
-        encoded = tool_exec_to_wire_json(tool, error_text=error_text)
-        if encoded is None:
-            return
-        try:
-            await on_status(encoded)
-        except Exception as e:  # noqa: BLE001
-            logger.debug("on_status callback raised: %s", e)
+    async def _emit_status(
+        tool: Any, *, error_text: str | None = None, phase: str | None = None,
+    ) -> None:
+        await emit_tool_status(on_status, tool, error_text=error_text, phase=phase)
 
+    stream_iter = None
     try:
         # ``stream_events=True`` is REQUIRED to receive
         # ``ToolCallStartedEvent`` for the leader's ``delegate_task_to_member``
-        # call — without it Agno only yields ``RunContentEvent`` deltas
+        # call — without it the runtime only yields ``RunContentEvent`` deltas
         # (the specialist's text) and ``on_delegate`` would never fire,
         # leaving the chat-UI badge pinned to the team leader even when
         # a specialist actually wrote the response.
         #
-        # ``files`` is forwarded to ``runtime.arun(..., files=...)``. Agno
-        # propagates the same files to members during
+        # ``files`` is forwarded to ``runtime.arun(..., files=...)``. The
+        # runtime propagates the same files to members during
         # ``delegate_task_to_member`` (see
-        # ``agno/team/_default_tools.py:713``).
+        # ``_runner/team/_default_tools.py:713``).
         stream_kwargs: dict[str, Any] = {
             "session_id": session_id, "user_id": user_id, "stream": True,
             "stream_events": True,
         }
         if files:
             stream_kwargs["files"] = files
+        if images:
+            stream_kwargs["images"] = images
+        if audio:
+            stream_kwargs["audio"] = audio
+        if videos:
+            stream_kwargs["videos"] = videos
         stream_iter = runtime.arun(prompt, **stream_kwargs)
         async for event in stream_iter:
             if isinstance(event, content_event_types):
@@ -304,7 +359,7 @@ async def _arun_agno_stream(
                     member_id = _extract_delegated_member_id(tool)
                     if member_id:
                         on_delegate(member_id)
-                await _emit_status(tool)
+                await _emit_status(tool, phase="started")
             elif isinstance(event, tool_complete_event_types):
                 tool = getattr(event, "tool", None)
                 await _emit_status(tool)
@@ -315,6 +370,18 @@ async def _arun_agno_stream(
     except Exception as e:  # noqa: BLE001
         elog(error_event, session_id=session_id, error=str(e))
         raise
+    finally:
+        # aclose() the underlying async generator so a mid-stream
+        # consumer cancellation (WS close, downstream raise) doesn't
+        # leak the cursor / leader SqliteDb transaction that holds
+        # writer locks open.
+        if stream_iter is not None:
+            aclose = getattr(stream_iter, "aclose", None)
+            if aclose is not None:
+                try:
+                    await aclose()
+                except Exception:  # noqa: BLE001
+                    pass
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -323,7 +390,7 @@ async def _arun_agno_stream(
 
 
 class TeamRouterProvider(BaseModel):
-    """BaseModel facade over an Agno ``Team(mode=coordinate)`` per session.
+    """BaseModel facade over a runtime ``Team(mode=coordinate)`` per session.
 
     Construction is lazy: the first ``generate`` / ``stream`` for a
     session builds the team. Subsequent turns reuse the cached team.
@@ -338,7 +405,7 @@ class TeamRouterProvider(BaseModel):
       model in the catalog; the claude-cli ``ClaudeBackedAgent`` sits
       as ``members[0]`` so the routing model can still delegate to it.
     - **Members**: every OTHER enabled LLM model in the DB. Each
-      member is an ``agno.agent.Agent`` (api-based via ``AgnoProvider``)
+      member is a runtime ``Agent`` (api-based via ``NativeProvider``)
       or ``ClaudeBackedAgent`` (claude-cli) whose ``role`` comes from
       the DB row's ``tier_hint``.
 
@@ -355,14 +422,21 @@ class TeamRouterProvider(BaseModel):
         self,
         entry_runtime_id: str,
         providers_config: Any = None,
+        *,
+        history_runs: int = 20,
     ):
         self._entry_runtime_id = entry_runtime_id
         self._providers_config = providers_config if providers_config is not None else []
         self._db: Any = None
         self._mcp_pool: Any = None
+        self._history_runs = history_runs
         self._session_runtime: dict[str, Any] = {}  # session_id → Team or fallback
+        # session_id → stable hash of the system prompt the cached runtime
+        # was built with; used to invalidate when the system prompt
+        # changes (e.g. a workflow ai-prompt block with different system).
+        self._session_system_key: dict[str, str] = {}
         self._session_handles: dict[str, str] = {}
-        # session_id → {agno_member_id (dash form) → runtime_id (canonical
+        # session_id → {member_id (dash form) → runtime_id (canonical
         # colon form)}. Populated at team build time so the per-turn
         # ``delegate_task_to_member`` tool call can be translated back to
         # a runtime_id for the UI badge.
@@ -372,6 +446,10 @@ class TeamRouterProvider(BaseModel):
         # prefers this over the entry pick so the chat badge shows the
         # specialist that actually wrote the response, not the leader.
         self._last_delegation_by_session: dict[str, str] = {}
+        # Cached routing classifier model for subscription-CLI leaders.
+        # Invalidated by ``rebuild_routing``.
+        self._cached_routing_model: Any = None
+        self._cached_routing_model_built: bool = False
 
     @property
     def model(self) -> str | None:
@@ -380,12 +458,16 @@ class TeamRouterProvider(BaseModel):
     # ── wiring ────────────────────────────────────────────────────────
 
     def set_db(self, db: Any) -> None:
+        if db is self._db:
+            return
         self._db = db
-        self._session_runtime.clear()  # rebuild on next turn so new SqliteDb attaches
+        self._invalidate_session_cache()
 
     def set_mcp_pool(self, pool: Any) -> None:
+        if pool is self._mcp_pool:
+            return
         self._mcp_pool = pool
-        self._session_runtime.clear()
+        self._invalidate_session_cache()
 
     def set_session_handle(self, session_id: str, handle: str | None) -> None:
         if not session_id:
@@ -397,11 +479,25 @@ class TeamRouterProvider(BaseModel):
 
     def rebuild_routing(self, providers_config: Any = None) -> None:
         """Drop cached teams so the next turn picks up the fresh catalog."""
+        if providers_config is not None and providers_config is self._providers_config:
+            return
         if providers_config is not None:
             self._providers_config = providers_config
-        self._session_runtime.clear()
+        self._invalidate_session_cache()
 
-    # ── catalog → Agno objects ────────────────────────────────────────
+    def _invalidate_session_cache(self) -> None:
+        """Clear all per-session caches so the next turn rebuilds from
+        the current db / pool / providers_config. Also invalidates the
+        routing-classifier cache since the catalog may have changed.
+        """
+        self._session_runtime.clear()
+        self._session_system_key.clear()
+        self._session_member_map.clear()
+        self._last_delegation_by_session.clear()
+        self._cached_routing_model = None
+        self._cached_routing_model_built = False
+
+    # ── catalog → runtime objects ─────────────────────────────────────
 
     def _enabled_llm_models(self) -> list[CatalogModel]:
         """Return every enabled LLM model — api-based AND every
@@ -409,8 +505,8 @@ class TeamRouterProvider(BaseModel):
 
         Both subscription-CLI flavors join via an ``Agent`` subclass
         (``ClaudeBackedAgent`` / ``CodexBackedAgent``) so they pass
-        Agno's ``isinstance(member, Agent)`` check and can serve as
-        Team members or leaders.
+        the runtime's ``isinstance(member, Agent)`` check and can serve
+        as Team members or leaders.
         """
         out: list[CatalogModel] = []
         for entry in iter_configured_models(self._providers_config):
@@ -425,31 +521,50 @@ class TeamRouterProvider(BaseModel):
             out.append(entry)
         return out
 
-    def _build_api_agent_for(self, entry: CatalogModel, *, name: str, role: str | None) -> Any:
-        """Construct a single api-based ``agno.agent.Agent`` for ``entry``.
+    def _build_api_agent_for(
+        self,
+        entry: CatalogModel,
+        *,
+        name: str,
+        role: str | None,
+        system: str | None = None,
+    ) -> Any:
+        """Construct a single api-based runtime ``Agent`` for ``entry``.
 
-        Uses the existing ``AgnoProvider`` machinery to resolve model
+        Uses the existing ``NativeProvider`` machinery to resolve model
         class + API key + base URL from the providers_config, then
-        builds an ``Agent`` configured for membership in a Team.
-        """
-        from src.models.agno_provider import AgnoProvider
+        builds an ``Agent`` configured for membership in a Team — with
+        the tool-search toolkit attached so members can actually invoke
+        MCP tools after the leader delegates to them.
 
-        provider = AgnoProvider(
+        ``system`` is the OpenAgent framework prompt + user persona
+        prompt (composed upstream by ``Agent._combined_system_prompt``).
+        Vision §15 requires that this prompt be injected into every
+        agent the user can reach — leader and every team member alike —
+        so when the Team coordinator delegates to a member, the member
+        still runs with the full OpenAgent identity (vault, MCPs,
+        framework guidelines) and the user's persona.
+        """
+        from src.models.native_provider import NativeProvider
+
+        provider = NativeProvider(
             model=entry.runtime_id,
             providers_config=self._providers_config,
             db_path=_runtime_db_path(self._db),
         )
+        member_toolkits: list[Any] = []
         if self._mcp_pool is not None:
-            # Defer-all: only the ``tool-search`` toolkit is attached;
-            # all other MCPs are reached via ``tool-search.call_tool``.
-            provider.set_mcp_toolkits(self._mcp_pool.agno_toolkits_tool_search_only())
-        agno_model = provider._build_agno_model()  # noqa: SLF001 — internal helper, accepted
-        from agno.agent import Agent as AgnoAgent
+            member_toolkits = list(self._mcp_pool.runtime_toolkits_tool_search_only())
+            provider.set_mcp_toolkits(member_toolkits)
+        runtime_model = provider.build_runtime_model()
+        from src.core._runner.agent import Agent as AgnoAgent
 
         return AgnoAgent(
             name=name,
-            model=agno_model,
+            model=runtime_model,
+            tools=member_toolkits or None,
             role=role,
+            system_message=system or None,
             markdown=False,
         )
 
@@ -459,6 +574,7 @@ class TeamRouterProvider(BaseModel):
         *,
         name: str,
         role: str | None,
+        system: str | None = None,
     ) -> Any:
         """Construct a subscription-CLI Agent (``ClaudeBackedAgent`` or
         ``CodexBackedAgent``) for ``entry``.
@@ -467,6 +583,11 @@ class TeamRouterProvider(BaseModel):
         an MCP-server fan-out from the pool (its SDK accepts
         ``mcp_servers``); Codex doesn't (its built-in tools live in the
         CLI binary, sandboxed by ``approval_mode``).
+
+        ``system`` is forwarded as the SDK's system prompt — Claude
+        Code SDK reads it as ``system_prompt``, Codex SDK as
+        ``developer_instructions``. See ``_build_api_agent_for`` for
+        why per-agent injection is non-negotiable (vision §15).
         """
         framework = framework_of(entry.runtime_id)
         if framework == FRAMEWORK_CLAUDE_CLI:
@@ -487,6 +608,7 @@ class TeamRouterProvider(BaseModel):
                 mcp_servers=mcp_servers or None,
                 db=self._db,
                 role=role,
+                system=system,
             )
 
         # Codex — no MCP wiring, its tools live in the CLI binary.
@@ -497,29 +619,49 @@ class TeamRouterProvider(BaseModel):
             model_id=entry.model_id,
             db=self._db,
             role=role,
+            system=system,
         )
 
-    def _build_agent_for(self, entry: CatalogModel, *, name: str, role: str | None) -> Any:
+    def _build_agent_for(
+        self,
+        entry: CatalogModel,
+        *,
+        name: str,
+        role: str | None,
+        system: str | None = None,
+    ) -> Any:
         """Route to api-based / subscription-CLI builder by framework."""
         if framework_of(entry.runtime_id) in SUBSCRIPTION_CLI_FRAMEWORKS:
-            return self._build_subscription_agent_for(entry, name=name, role=role)
-        return self._build_api_agent_for(entry, name=name, role=role)
+            return self._build_subscription_agent_for(
+                entry, name=name, role=role, system=system,
+            )
+        return self._build_api_agent_for(
+            entry, name=name, role=role, system=system,
+        )
 
     def _cheapest_api_based_model(self, catalog: list[CatalogModel]) -> Any | None:
         """For claude-cli leaders we need SOMETHING as ``team.model`` for
-        the routing classifier call (Agno's Team always invokes
+        the routing classifier call (the runtime's Team always invokes
         ``team.model`` to decide which member handles the turn).
         Prefer the cheapest enabled api-based model in catalog.
 
-        Returns the Agno ``Model`` object, or ``None`` if no api-based
+        Cached on the provider instance until ``rebuild_routing`` fires
+        — the chosen routing model is invariant for a fixed catalog
+        across sessions, so building it per-session was waste.
+
+        Returns the runtime ``Model`` object, or ``None`` if no api-based
         model exists — in which case the caller falls back to single-
         agent dispatch.
         """
+        if self._cached_routing_model_built:
+            return self._cached_routing_model
         api_rows = [
             e for e in catalog
             if framework_of(e.runtime_id) == FRAMEWORK_API_BASED
         ]
         if not api_rows:
+            self._cached_routing_model = None
+            self._cached_routing_model_built = True
             return None
 
         def _score(entry: CatalogModel) -> int:
@@ -537,21 +679,23 @@ class TeamRouterProvider(BaseModel):
             return len(_CHEAP_HEURISTIC_KEYWORDS) * 2
 
         chosen = min(api_rows, key=_score)
-        # Build the Agno ``Model`` directly — we only need the routing
+        # Build the runtime ``Model`` directly — we only need the routing
         # classifier model, not a wrapper ``Agent`` we'd throw away.
-        from src.models.agno_provider import AgnoProvider
+        from src.models.native_provider import NativeProvider
 
         try:
-            provider = AgnoProvider(
+            provider = NativeProvider(
                 model=chosen.runtime_id,
                 providers_config=self._providers_config,
                 db_path=_runtime_db_path(self._db),
             )
-            return provider._build_agno_model()  # noqa: SLF001 — internal helper, accepted
+            self._cached_routing_model = provider.build_runtime_model()
         except Exception as e:  # noqa: BLE001
             logger.debug("_cheapest_api_based_model: build failed for %s: %s",
                          chosen.runtime_id, e)
-            return None
+            self._cached_routing_model = None
+        self._cached_routing_model_built = True
+        return self._cached_routing_model
 
     def _ensure_runtime(self, session_id: str, system: str | None) -> Any:
         """Return the cached Team / single-agent for ``session_id``, building
@@ -561,9 +705,14 @@ class TeamRouterProvider(BaseModel):
         - There's only one enabled LLM model (single-model deployment).
         - The entry model is claude-cli AND no api-based model exists
           to serve as ``team.model`` for the routing classifier.
+
+        Cache key is ``(session_id, system_hash)`` so changing the
+        framework prompt mid-session forces a fresh build instead of
+        silently reusing the cached Team's baked-in ``instructions``.
         """
+        sys_key = _system_cache_key(system)
         cached = self._session_runtime.get(session_id)
-        if cached is not None:
+        if cached is not None and self._session_system_key.get(session_id) == sys_key:
             return cached
 
         catalog = self._enabled_llm_models()
@@ -582,64 +731,26 @@ class TeamRouterProvider(BaseModel):
             )
 
         members_catalog = [e for e in catalog if e.runtime_id != entry.runtime_id]
-
-        # Resolve ``team.model``. For api-based leader: the leader's own
-        # model. For subscription-CLI leader (claude-cli / codex-cli):
-        # the cheapest available api-based model (Team always invokes
-        # team.model for routing decisions — the subscription-CLI
-        # agent's ``_NullModel`` placeholder can't satisfy that).
         entry_framework = framework_of(entry.runtime_id)
         is_subscription_leader = entry_framework in SUBSCRIPTION_CLI_FRAMEWORKS
-        leader_agent: Any = None
-        team_model: Any = None
-
-        if is_subscription_leader:
-            team_model = self._cheapest_api_based_model(catalog)
-            if team_model is None:
-                # No api-based model in the entire catalog — can't build
-                # a Team that has a routing model. Fall back to single-
-                # agent dispatch of the subscription-CLI leader.
-                fallback_agent = self._build_agent_for(
-                    entry, name=_member_identifier(entry.runtime_id), role=None,
-                )
-                # Wrap so the BaseModel-shaped interface ``generate`` /
-                # ``stream`` can call into the agent's ``arun``.
-                fallback = _SingleExternalAgentAdapter(
-                    fallback_agent,
-                    entry_runtime_id=entry.runtime_id,
-                    session_handles=self._session_handles,
-                )
-                self._session_runtime[session_id] = fallback
-                elog(
-                    "team_router.single_external_agent",
-                    session_id=session_id,
-                    entry=entry.runtime_id,
-                    framework=entry_framework,
-                    reason="no_api_based_routing_model",
-                )
-                return fallback
-            leader_agent = self._build_agent_for(entry, name="leader", role=None)
-        else:
-            leader_agent = self._build_api_agent_for(entry, name="leader", role=None)
-            team_model = leader_agent.model
 
         # Single-model api-based deployment: skip Team, run leader as a
-        # plain single agent via AgnoProvider. The subscription-CLI
-        # equivalent (no api-based routing model AND no members) is
-        # already handled above via ``_SingleExternalAgentAdapter``.
-        if not members_catalog:
-            from src.models.agno_provider import AgnoProvider
+        # plain single agent via NativeProvider. Done BEFORE we build a
+        # leader agent that the single-model path wouldn't use.
+        if not members_catalog and not is_subscription_leader:
+            from src.models.native_provider import NativeProvider
 
-            provider = AgnoProvider(
+            provider = NativeProvider(
                 model=entry.runtime_id,
                 providers_config=self._providers_config,
                 db_path=_runtime_db_path(self._db),
             )
             if self._mcp_pool is not None:
-                provider.set_mcp_toolkits(self._mcp_pool.agno_toolkits_tool_search_only())
+                provider.set_mcp_toolkits(self._mcp_pool.runtime_toolkits_tool_search_only())
             if self._db is not None:
                 provider.set_db(self._db)
             self._session_runtime[session_id] = provider
+            self._session_system_key[session_id] = sys_key
             elog(
                 "team_router.single_agent",
                 session_id=session_id,
@@ -648,19 +759,75 @@ class TeamRouterProvider(BaseModel):
             )
             return provider
 
+        # Resolve ``team.model``. For api-based leader: the leader's own
+        # model. For subscription-CLI leader (claude-cli / codex-cli):
+        # the cheapest available api-based model (Team always invokes
+        # team.model for routing decisions — the subscription-CLI
+        # agent's ``_NullModel`` placeholder can't satisfy that).
+        leader_agent: Any
+        team_model: Any
+
+        if is_subscription_leader:
+            team_model = self._cheapest_api_based_model(catalog)
+            if team_model is None:
+                # No api-based model in the entire catalog — can't build
+                # a Team that has a routing model. Fall back to single-
+                # agent dispatch of the subscription-CLI leader. Pass
+                # ``system`` so the lone agent still carries the OpenAgent
+                # framework prompt + user persona (vision §15).
+                fallback_agent = self._build_agent_for(
+                    entry,
+                    name=_member_identifier(entry.runtime_id),
+                    role=None,
+                    system=system,
+                )
+                fallback = _SingleExternalAgentAdapter(
+                    fallback_agent,
+                    entry_runtime_id=entry.runtime_id,
+                    session_handles=self._session_handles,
+                )
+                self._session_runtime[session_id] = fallback
+                self._session_system_key[session_id] = sys_key
+                elog(
+                    "team_router.single_external_agent",
+                    session_id=session_id,
+                    entry=entry.runtime_id,
+                    framework=entry_framework,
+                    reason="no_api_based_routing_model",
+                )
+                return fallback
+            leader_agent = self._build_agent_for(
+                entry, name="leader", role=None, system=system,
+            )
+        else:
+            leader_agent = self._build_api_agent_for(
+                entry, name="leader", role=None, system=system,
+            )
+            team_model = leader_agent.model
+
         # Multi-model: build Team(mode=coordinate). See the ``mode=``
         # kwarg below for why coordinate (not route).
-        from agno.db.sqlite import SqliteDb
-        from agno.team import Team, TeamMode
+        from src.memory.store.sqlite import SqliteDb
+        from src.core._runner.team import Team, TeamMode
 
+        # Vision §15: every member must run with the framework prompt +
+        # user persona injected as its own system_message — the Team's
+        # ``instructions=`` only feed the coordinator (team.model), they
+        # are NOT inherited by members at delegation time. Each member
+        # also gets a short Role suffix so the delegated specialist
+        # stays in its lane; the role blurb itself is *additionally*
+        # passed via the runtime's ``role=`` so the coordinator's
+        # ``<team_members>`` block keeps surfacing it for routing.
         members = [
             self._build_agent_for(
                 e,
                 name=_member_identifier(e.runtime_id),
                 role=_build_role_blurb(e),
+                system=_compose_member_system(system, _build_role_blurb(e)),
             )
             for e in members_catalog
         ]
+
         # Record member_id → runtime_id so the per-turn delegation tool
         # call can be reflected back to the chat UI as the specialist's
         # canonical runtime_id. ``leader`` maps to the entry runtime so
@@ -673,35 +840,16 @@ class TeamRouterProvider(BaseModel):
         db_path = _runtime_db_path(self._db)
         team_db = SqliteDb(db_file=db_path) if db_path else None
         # Pass our OpenAgent system prompt as ``instructions`` — NOT as
-        # ``system_message``. Agno's get_system_message returns early
+        # ``system_message``. The runtime's get_system_message returns early
         # when system_message is set, skipping the <team_members> block
-        # AND the mode-specific "how to delegate" instructions. The
-        # leader then sees our "delegate by default" exhortation without
-        # ever being shown the member list or the delegation tool name, and
-        # either answers directly or hallucinates member ids. Routing
-        # ``instructions`` through Agno's default prompt builder appends
-        # our content while preserving Agno's auto-injected team context.
-        # ``coordinate`` (not ``route``): the leader can fire MULTIPLE
-        # ``delegate_task_to_member`` tool calls in one turn. Agno
-        # collects them via ``asyncio.gather`` (see
-        # ``agno.models.base.arun_function_calls``), so independent
-        # sub-tasks run in parallel. Sequential dependencies still work
-        # — the leader simply waits for an output before issuing the
-        # next call. ``route`` would have capped the leader at one
-        # specialist per turn, defeating multi-domain decomposition.
-        # Attach the tool-search toolkit at the TEAM level too. Without
-        # this, the leader's only callable function is
-        # ``delegate_task_to_member`` — yet the system prompt teaches
-        # the model that tools follow ``<server>_<tool>`` naming, so it
-        # hallucinates calls like ``vault_write_note`` or
-        # ``tool_search_list_servers`` and Agno logs
-        # ``Function X not found``. With tool-search at the team level
-        # the brain can discover + invoke any MCP without delegating
-        # (``tool_search_call_tool``), or delegate when a specialist
-        # adds value. Each member still has its own copy of tool-search
-        # so delegated work also has tool access.
+        # AND the mode-specific "how to delegate" instructions.
+        # ``coordinate`` mode lets the leader fire multiple delegations
+        # per turn (gathered by the runtime via asyncio.gather).
+        # Tool-search at the team level so the leader can invoke MCPs
+        # directly via ``tool_search_call_tool`` without delegating;
+        # each member also has its own toolkit copy.
         team_tools = (
-            list(self._mcp_pool.agno_toolkits_tool_search_only())
+            list(self._mcp_pool.runtime_toolkits_tool_search_only())
             if self._mcp_pool is not None else None
         )
         team = Team(
@@ -713,16 +861,18 @@ class TeamRouterProvider(BaseModel):
             instructions=[system] if system else None,
             add_member_tools_to_context=True,
             add_history_to_context=True,
+            num_history_runs=self._history_runs,
             enable_session_summaries=True,
             markdown=False,
         )
         self._session_runtime[session_id] = team
+        self._session_system_key[session_id] = sys_key
         elog(
             "team_router.built",
             session_id=session_id,
             mode="coordinate",
             leader=entry.runtime_id,
-            leader_framework=framework_of(entry.runtime_id),
+            leader_framework=entry_framework,
             routing_model_id=getattr(team_model, "id", None),
             members=[e.runtime_id for e in members_catalog],
         )
@@ -731,27 +881,38 @@ class TeamRouterProvider(BaseModel):
     # ── lifecycle ────────────────────────────────────────────────────
 
     async def close_session(self, session_id: str) -> None:
-        runtime = self._session_runtime.pop(session_id, None)
-        # Agno Team / Agent don't expose a per-session close in this
-        # adapter shape; the SqliteDb persists the session for next
+        self._drop_session_state(session_id)
+        # The runtime's Team / Agent don't expose a per-session close in
+        # this adapter shape; the SqliteDb persists the session for next
         # boot. Nothing else to tear down.
-        del runtime
 
     async def forget_session(self, session_id: str) -> None:
-        self._session_runtime.pop(session_id, None)
+        self._drop_session_state(session_id)
         # Erase the persisted session row so the next turn starts fresh.
         db_path = _runtime_db_path(self._db)
         if not db_path:
             return
         try:
-            from agno.db.sqlite import SqliteDb
+            from src.memory.store.sqlite import SqliteDb
 
             SqliteDb(db_file=db_path).delete_session(session_id=session_id)
         except Exception as e:  # noqa: BLE001
             logger.debug("TeamRouterProvider.forget_session %s: %s", session_id, e)
 
+    def _drop_session_state(self, session_id: str) -> None:
+        """Remove every per-session entry for ``session_id``. Without
+        this, ``_session_member_map`` / ``_last_delegation_by_session``
+        keep stale references after close/forget and slowly leak memory.
+        """
+        if not session_id:
+            return
+        self._session_runtime.pop(session_id, None)
+        self._session_system_key.pop(session_id, None)
+        self._session_member_map.pop(session_id, None)
+        self._last_delegation_by_session.pop(session_id, None)
+
     async def commit_partial_assistant(self, session_id: str, text: str) -> None:
-        # Falls through to the underlying provider if it's an AgnoProvider
+        # Falls through to the underlying provider if it's an NativeProvider
         # (single-model deployment); Teams don't expose this surface.
         runtime = self._session_runtime.get(session_id)
         fn = getattr(runtime, "commit_partial_assistant", None) if runtime else None
@@ -762,23 +923,26 @@ class TeamRouterProvider(BaseModel):
                 logger.debug("TeamRouterProvider.commit_partial_assistant: %s", e)
 
     async def cleanup_idle(self) -> None:
-        for runtime in list(self._session_runtime.values()):
-            fn = getattr(runtime, "cleanup_idle", None)
-            if callable(fn):
-                try:
-                    await fn()
-                except Exception as e:  # noqa: BLE001
-                    logger.debug("TeamRouterProvider.cleanup_idle: %s", e)
+        await self._fan_out_runtimes("cleanup_idle")
 
     async def shutdown(self) -> None:
+        await self._fan_out_runtimes("shutdown")
+        self._invalidate_session_cache()
+
+    async def _fan_out_runtimes(self, method_name: str) -> None:
+        import asyncio as _asyncio
+
+        coros = []
         for runtime in list(self._session_runtime.values()):
-            fn = getattr(runtime, "shutdown", None)
+            fn = getattr(runtime, method_name, None)
             if callable(fn):
-                try:
-                    await fn()
-                except Exception as e:  # noqa: BLE001
-                    logger.debug("TeamRouterProvider.shutdown: %s", e)
-        self._session_runtime.clear()
+                coros.append(fn())
+        if not coros:
+            return
+        results = await _asyncio.gather(*coros, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
+                logger.debug("TeamRouterProvider.%s: %s", method_name, result)
 
     def known_session_ids(self) -> list[str]:
         return sorted(self._session_runtime.keys())
@@ -795,20 +959,25 @@ class TeamRouterProvider(BaseModel):
         return self._last_delegation_by_session.get(session_id)
 
     def _record_delegation(self, session_id: str, member_id: str) -> None:
-        """Look up the runtime_id for ``member_id`` (Agno-derived dash form)
+        """Look up the runtime_id for ``member_id`` (runtime-derived dash form)
         in the per-session map built at team-build time, and stash it as
-        the most recent delegation for badge lookup.
+        the most recent delegation for badge lookup. Skips when the same
+        delegation has already been recorded for this turn so the event
+        log doesn't fill up on multi-step delegations to the same member.
         """
         member_map = self._session_member_map.get(session_id) or {}
         runtime_id = member_map.get(member_id)
-        if runtime_id:
-            self._last_delegation_by_session[session_id] = runtime_id
-            elog(
-                "team_router.delegate",
-                session_id=session_id,
-                member_id=member_id,
-                runtime_id=runtime_id,
-            )
+        if not runtime_id:
+            return
+        if self._last_delegation_by_session.get(session_id) == runtime_id:
+            return
+        self._last_delegation_by_session[session_id] = runtime_id
+        elog(
+            "team_router.delegate",
+            session_id=session_id,
+            member_id=member_id,
+            runtime_id=runtime_id,
+        )
 
     # ── turn ──────────────────────────────────────────────────────────
 
@@ -821,10 +990,13 @@ class TeamRouterProvider(BaseModel):
         session_id: str | None = None,
         model_override: str | None = None,
         files: list[Any] | None = None,
+        images: list[Any] | None = None,
+        audio: list[Any] | None = None,
+        videos: list[Any] | None = None,
     ) -> ModelResponse:
         sid = session_id or "default"
         runtime = self._ensure_runtime(sid, system)
-        # Plain-AgnoProvider single-model path: forward the full args.
+        # Plain-NativeProvider single-model path: forward the full args.
         if isinstance(runtime, BaseModel):
             return await runtime.generate(
                 messages=messages,
@@ -833,17 +1005,17 @@ class TeamRouterProvider(BaseModel):
                 on_status=on_status,
                 session_id=sid,
                 model_override=model_override,
-                files=files,
+                files=files, images=images, audio=audio, videos=videos,
             )
 
-        # Agno Team path. Translate to the Team's run signature.
+        # Runtime Team path. Translate to the Team's run signature.
         # Clear the previous turn's delegation memo so this turn's badge
         # falls back to the leader when no delegate_task_to_member fires —
         # otherwise the model attribution stays pinned to whichever
         # specialist handled the LAST delegation indefinitely.
         self._last_delegation_by_session.pop(sid, None)
         user_id = self._session_handles.get(sid) or "openagent"
-        return await _arun_agno_collect(
+        return await _arun_runtime_collect(
             runtime,
             prompt=_last_user_prompt(messages),
             session_id=sid,
@@ -851,7 +1023,7 @@ class TeamRouterProvider(BaseModel):
             error_event="team_router.generate_error",
             entry_runtime_id=self._entry_runtime_id,
             on_delegate=lambda mid: self._record_delegation(sid, mid),
-            files=files,
+            files=files, images=images, audio=audio, videos=videos,
         )
 
     async def stream(
@@ -863,6 +1035,9 @@ class TeamRouterProvider(BaseModel):
         session_id: str | None = None,
         model_override: str | None = None,
         files: list[Any] | None = None,
+        images: list[Any] | None = None,
+        audio: list[Any] | None = None,
+        videos: list[Any] | None = None,
     ) -> AsyncIterator[str]:
         sid = session_id or "default"
         runtime = self._ensure_runtime(sid, system)
@@ -874,17 +1049,17 @@ class TeamRouterProvider(BaseModel):
                 on_status=on_status,
                 session_id=sid,
                 model_override=model_override,
-                files=files,
+                files=files, images=images, audio=audio, videos=videos,
             ):
                 yield delta
             return
 
-        # Agno Team streaming. Clear the previous turn's delegation memo
+        # Runtime Team streaming. Clear the previous turn's delegation memo
         # so a non-delegating turn falls back to the leader's badge
         # instead of staying pinned to the last specialist.
         self._last_delegation_by_session.pop(sid, None)
         user_id = self._session_handles.get(sid) or "openagent"
-        async for delta in _arun_agno_stream(
+        async for delta in _arun_runtime_stream(
             runtime,
             prompt=_last_user_prompt(messages),
             session_id=sid,
@@ -892,7 +1067,7 @@ class TeamRouterProvider(BaseModel):
             on_status=on_status,
             error_event="team_router.stream_error",
             on_delegate=lambda mid: self._record_delegation(sid, mid),
-            files=files,
+            files=files, images=images, audio=audio, videos=videos,
         ):
             yield delta
 
@@ -934,26 +1109,27 @@ class _SingleExternalAgentAdapter(BaseModel):
         session_id: str | None = None,
         model_override: str | None = None,
         files: list[Any] | None = None,
+        images: list[Any] | None = None,
+        audio: list[Any] | None = None,
+        videos: list[Any] | None = None,
     ) -> ModelResponse:
         sid = session_id or "default"
         user_id = self._session_handles.get(sid) or "openagent"
-        # Subscription-CLI SDKs (claude-cli, codex-cli) don't natively
-        # accept Agno's ``files=`` argument. Inline a minimal attachment
-        # block into the prompt as a fallback so the assistant still
-        # knows which files to read by local path. See
-        # ``src.channels.base.build_attachment_context`` for the wire
-        # shape — kept here to keep the call site explicit instead of
-        # hidden behind a side effect of the dispatcher import.
+        # All media kwargs flow through ``_arun_runtime_collect`` straight
+        # into the runtime's ``arun(files=..., images=..., ...)``. For
+        # subscription-CLI runtimes (claude-cli / codex-cli)
+        # ``_arun_stream`` translates them to inline text + sandbox-safe
+        # file writes. For native runtimes, the runtime consumes them as
+        # multimodal API content. Same shape, different consumers.
         prompt = _last_user_prompt(messages)
-        if files:
-            prompt = _prepend_files_for_subscription_cli(prompt, files)
-        return await _arun_agno_collect(
+        return await _arun_runtime_collect(
             self._agent,
             prompt=prompt,
             session_id=sid,
             user_id=user_id,
             error_event="team_router.single_external.generate_error",
             entry_runtime_id=self._entry_runtime_id,
+            files=files, images=images, audio=audio, videos=videos,
         )
 
     async def stream(
@@ -965,19 +1141,21 @@ class _SingleExternalAgentAdapter(BaseModel):
         session_id: str | None = None,
         model_override: str | None = None,
         files: list[Any] | None = None,
+        images: list[Any] | None = None,
+        audio: list[Any] | None = None,
+        videos: list[Any] | None = None,
     ) -> AsyncIterator[str]:
         sid = session_id or "default"
         user_id = self._session_handles.get(sid) or "openagent"
         prompt = _last_user_prompt(messages)
-        if files:
-            prompt = _prepend_files_for_subscription_cli(prompt, files)
-        async for delta in _arun_agno_stream(
+        async for delta in _arun_runtime_stream(
             self._agent,
             prompt=prompt,
             session_id=sid,
             user_id=user_id,
             on_status=on_status,
             error_event="team_router.single_external.stream_error",
+            files=files, images=images, audio=audio, videos=videos,
         ):
             yield delta
 
@@ -1013,7 +1191,7 @@ class ModelDispatcher(BaseModel):
       2. **First enabled** — fresh sessions with no pin pick the first
          enabled model in catalog order.
 
-    History is unified in Agno's ``agno_sessions`` SqliteDb across
+    History is unified in the runtime's sessions SqliteDb across
     every framework, so there's no longer a need to lock a session to
     one framework once it's been served by that side.
 
@@ -1075,26 +1253,27 @@ class ModelDispatcher(BaseModel):
         for provider in self._team_providers.values():
             wire_model_runtime(provider, mcp_pool=pool)
 
-    async def cleanup_idle(self) -> None:
+    def set_session_handle(self, session_id: str, handle: str | None) -> None:
+        """Bind a user handle to ``session_id`` across every cached
+        TeamRouterProvider so subsequent runtime calls pass it as
+        ``user_id``. Gateway calls this when accepting a WS frame.
+        """
         for provider in self._team_providers.values():
-            fn = getattr(provider, "cleanup_idle", None)
+            fn = getattr(provider, "set_session_handle", None)
             if callable(fn):
-                await fn()
+                fn(session_id, handle)
+
+    async def cleanup_idle(self) -> None:
+        await self._fan_out_async("cleanup_idle")
 
     async def shutdown(self) -> None:
-        for provider in self._team_providers.values():
-            fn = getattr(provider, "shutdown", None)
-            if callable(fn):
-                await fn()
+        await self._fan_out_async("shutdown")
 
     async def close_session(self, session_id: str) -> None:
         if not session_id:
             return
         self._last_pick_by_session.pop(session_id, None)
-        for provider in self._team_providers.values():
-            fn = getattr(provider, "close_session", None)
-            if callable(fn):
-                await fn(session_id)
+        await self._fan_out_async("close_session", session_id)
 
     async def forget_session(self, session_id: str) -> None:
         if not session_id:
@@ -1102,34 +1281,61 @@ class ModelDispatcher(BaseModel):
         self._last_pick_by_session.pop(session_id, None)
         if self._db is not None:
             # delete_sdk_session is kept callable for back-compat with
-            # gateway/clear code; the Agno-side persistence no longer
+            # gateway/clear code; the runtime-side persistence no longer
             # uses it, but legacy installs may still have rows.
             try:
                 await self._db.delete_sdk_session(session_id)
             except Exception as e:  # noqa: BLE001
                 logger.debug("delete_sdk_session %s: %s", session_id, e)
-        for provider in self._team_providers.values():
-            fn = getattr(provider, "forget_session", None)
-            if callable(fn):
-                await fn(session_id)
+        await self._fan_out_async("forget_session", session_id)
 
     async def commit_partial_assistant(self, session_id: str, text: str) -> None:
-        """Best-effort barge-in commit. Forwards to the bound provider.
-
-        Note: the Agno migration dropped Claude SDK's interrupt support,
-        so this only does meaningful work when the bound provider is
-        the team router for an api-based leader; claude-cli's
-        commit_partial_assistant is a no-op.
+        """Best-effort barge-in commit. Targets only the provider that
+        handled this session, not every cached provider — fanning out
+        to every provider per barge-in does N redundant sqlite reads
+        for sessions they don't know about.
         """
         if not session_id or not text:
             return
+        provider = self._provider_for_session(session_id)
+        if provider is None:
+            return
+        fn = getattr(provider, "commit_partial_assistant", None)
+        if not callable(fn):
+            return
+        try:
+            await fn(session_id, text)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("team provider commit_partial: %s", e)
+
+    def _provider_for_session(self, session_id: str) -> BaseModel | None:
+        """Return the TeamRouterProvider that handled ``session_id``,
+        falling back to ``None`` when the session hasn't been routed
+        yet (or the provider has since been evicted).
+        """
+        runtime_id = self._last_pick_by_session.get(session_id)
+        if not runtime_id:
+            return None
+        return self._team_providers.get(runtime_id)
+
+    async def _fan_out_async(self, method_name: str, *args: Any) -> None:
+        """Invoke ``method_name`` on every cached TeamRouterProvider
+        concurrently, swallowing per-provider errors so one bad provider
+        can't block shutdown / cleanup of the rest.
+        """
+        import asyncio as _asyncio
+
+        coros = []
         for provider in self._team_providers.values():
-            fn = getattr(provider, "commit_partial_assistant", None)
+            fn = getattr(provider, method_name, None)
             if callable(fn):
-                try:
-                    await fn(session_id, text)
-                except Exception as e:  # noqa: BLE001
-                    logger.debug("team provider commit_partial: %s", e)
+                coros.append(fn(*args))
+        if not coros:
+            return
+        results = await _asyncio.gather(*coros, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
+                logger.debug("dispatcher.%s: %s", method_name, result)
 
     def known_session_ids(self) -> list[str]:
         seen: set[str] = set()
@@ -1157,7 +1363,7 @@ class ModelDispatcher(BaseModel):
 
         Resolution order:
         1. Last delegation target recorded by any TeamRouterProvider for
-           this session — i.e. the specialist Agno's leader routed to.
+           this session — i.e. the specialist the leader routed to.
         2. Last entry pick (the session's leader) — for turns the leader
            answered directly without delegating.
 
@@ -1293,6 +1499,9 @@ class ModelDispatcher(BaseModel):
         on_status: Callable[[str], Awaitable[None]] | None = None,
         session_id: str | None = None,
         files: list[Any] | None = None,
+        images: list[Any] | None = None,
+        audio: list[Any] | None = None,
+        videos: list[Any] | None = None,
     ) -> ModelResponse:
         decision = await self._resolve_entry_model(session_id)
         if not decision.primary_model:
@@ -1316,7 +1525,7 @@ class ModelDispatcher(BaseModel):
         resp = await provider.generate(
             messages, system=system, tools=tools,
             on_status=on_status, session_id=session_id,
-            files=files,
+            files=files, images=images, audio=audio, videos=videos,
         )
 
         # Cost telemetry: subscription-CLI frameworks (claude-cli /
@@ -1363,6 +1572,49 @@ class ModelDispatcher(BaseModel):
             resp.model = runtime_id
         return resp
 
+    async def run_delegated(
+        self,
+        *,
+        model_id: str,
+        task: str,
+        parent_session_id: str | None,
+        pool: Any,
+        db: Any,
+    ) -> str:
+        """Run ``task`` on ``model_id`` as a sub-agent of the parent turn.
+
+        Used by the delegation MCP server to fulfil a leader's
+        ``delegate_task`` call. The sub-agent shares the parent's
+        session (so its trace lands in the same conversation) but
+        runs its own provider end-to-end — including MCP access.
+
+        Returns the final assistant text. Raises if the target id is
+        not in the enabled catalog or the underlying provider errors.
+        """
+        known = {m.runtime_id for m in self._enabled_catalog()}
+        if model_id not in known:
+            raise ValueError(
+                f"model_id {model_id!r} is not enabled. Known ids: {sorted(known)}"
+            )
+
+        provider = self._get_team_provider(model_id)
+        if pool is not None and hasattr(provider, "set_mcp_pool"):
+            provider.set_mcp_pool(pool)
+        if db is not None and hasattr(provider, "set_db"):
+            provider.set_db(db)
+
+        delegated_session_id = (
+            f"{parent_session_id}::sub::{model_id}" if parent_session_id else None
+        )
+
+        response = await provider.generate(
+            messages=[{"role": "user", "content": task}],
+            system=None,
+            on_status=None,
+            session_id=delegated_session_id,
+        )
+        return getattr(response, "content", "") or ""
+
     async def stream(
         self,
         messages: list[dict[str, Any]],
@@ -1371,6 +1623,9 @@ class ModelDispatcher(BaseModel):
         session_id: str | None = None,
         on_status: Callable[[str], Awaitable[None]] | None = None,
         files: list[Any] | None = None,
+        images: list[Any] | None = None,
+        audio: list[Any] | None = None,
+        videos: list[Any] | None = None,
     ) -> AsyncIterator[str]:
         decision = await self._resolve_entry_model(session_id)
         if not decision.primary_model:
@@ -1395,7 +1650,7 @@ class ModelDispatcher(BaseModel):
         async for chunk in provider.stream(
             messages, system=system, tools=tools,
             on_status=on_status, session_id=session_id,
-            files=files,
+            files=files, images=images, audio=audio, videos=videos,
         ):
             yield chunk
 

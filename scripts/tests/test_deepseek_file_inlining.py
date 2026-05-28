@@ -15,7 +15,7 @@ Pins:
     a base64 blob in the prompt
   - the original ``Message.files`` / ``Message.content`` are restored
     after serialization so subsequent reads aren't affected
-  - the wrapper is wired up in ``AGNO_PROVIDER_CLASSES`` so live runs
+  - the wrapper is wired up in ``RUNTIME_PROVIDER_CLASSES`` so live runs
     actually use it
 """
 from __future__ import annotations
@@ -28,7 +28,7 @@ from ._framework import TestContext, test
 def _make_file(*, content: bytes, mime: str, filename: str):
     """Build a minimal Agno ``File`` from in-memory bytes — keeps the
     test off-disk and independent of any tempfile cleanup."""
-    from agno.media import File as _AgnoFile
+    from src.stream.media import File as _AgnoFile
     return _AgnoFile(
         content=content,
         mime_type=mime,
@@ -37,18 +37,18 @@ def _make_file(*, content: bytes, mime: str, filename: str):
 
 
 def _make_image(*, content: bytes, mime: str = "image/png"):
-    from agno.media import Image as _AgnoImage
+    from src.stream.media import Image as _AgnoImage
     return _AgnoImage(content=content, mime_type=mime)
 
 
 def _make_audio(*, content: bytes, fmt: str = "wav"):
-    from agno.media import Audio as _AgnoAudio
+    from src.stream.media import Audio as _AgnoAudio
     return _AgnoAudio(content=content, format=fmt, mime_type=f"audio/{fmt}")
 
 
 def _make_message(*, content: str, files: list | None = None,
                   images: list | None = None, audios: list | None = None):
-    from agno.models.message import Message
+    from src.models.providers.message import Message
     return Message(role="user", content=content, files=files,
                    images=images, audio=audios)
 
@@ -214,7 +214,7 @@ async def t_no_attachments_passthrough(ctx: TestContext) -> None:
     # files=None (not an empty list) — the parent serializer reshapes
     # content into a parts-array whenever any of files/images/audio is set
     # (even ``[]``), so this case pins the truly-no-attachments fall-through.
-    from agno.models.message import Message
+    from src.models.providers.message import Message
     message = Message(role="user", content="plain text turn")
 
     serialized = _format(message)
@@ -222,13 +222,13 @@ async def t_no_attachments_passthrough(ctx: TestContext) -> None:
     assert serialized.get("content") == "plain text turn", serialized
 
 
-@test("deepseek_file_inlining", "AGNO_PROVIDER_CLASSES wires the patched class for deepseek")
+@test("deepseek_file_inlining", "RUNTIME_PROVIDER_CLASSES wires the patched class for deepseek")
 async def t_provider_wired(ctx: TestContext) -> None:
     """Without this wiring the fix would compile but not run in production."""
-    from src.models.agno_provider import AGNO_PROVIDER_CLASSES
+    from src.models.native_provider import RUNTIME_PROVIDER_CLASSES
 
-    entry = AGNO_PROVIDER_CLASSES.get("deepseek")
-    assert entry is not None, "deepseek entry missing from AGNO_PROVIDER_CLASSES"
+    entry = RUNTIME_PROVIDER_CLASSES.get("deepseek")
+    assert entry is not None, "deepseek entry missing from RUNTIME_PROVIDER_CLASSES"
     module_name, class_name, _kwargs = entry
     assert class_name == "DeepSeekTextOnly", \
         f"deepseek entry not pointed at the text-only subclass: {entry}"

@@ -85,6 +85,13 @@ _TEST_MODULES: tuple[str, ...] = (
     # assistant (interrupted) → user`` instead of two adjacent user
     # turns. Round-trips against a throwaway SqliteDb.
     "test_agno_partial_commit",
+    # In-session compaction (vision §2). When the cumulative stored
+    # history is about to overflow the model's context window, the
+    # oldest runs fold into a recap row so the next turn stays under
+    # the limit without forcing the user to restart. Tests cover the
+    # threshold check, the rewrite shape, the run-loop call site, the
+    # feature flag, and the wire-codec round trip for SessionCompacted.
+    "test_compaction",
     # DELTA frame plumbing for the unified streaming path (web chat +
     # bridges). Pure-unit; relies on the BaseBridge dispatch logic.
     "test_streaming",
@@ -147,7 +154,7 @@ _TEST_MODULES: tuple[str, ...] = (
     # --help`` to verify no resource_tracker warning at process exit.
     "test_regression_v014",
     # E2E unified flow — locks down four cross-cutting properties: (1)
-    # multi-member parallel delegation through _arun_agno_stream, (2)
+    # multi-member parallel delegation through _arun_runtime_stream, (2)
     # live↔rehydration parity for a synthetic multi-tool turn, (3)
     # coordinate-mode wiring + Agno's asyncio.gather contract, (4) the
     # zero-enabled-models short-circuit survives the coordinate-mode
@@ -194,6 +201,13 @@ _TEST_MODULES: tuple[str, ...] = (
     # DB-backed REST endpoints (/api/mcps, /api/models/db) — needs gateway.
     "test_mcps_rest",
     "test_voice",
+    # Voice receive end-to-end: real STT on real audio (WAV + Telegram's
+    # OGG/OPUS), real bridge fallback chain, real gateway STT route, real
+    # Telegram _extract_files. The prior unit tests mocked every layer
+    # boundary so a regression in the COMPOSITION (bridge → fallback →
+    # local Whisper → text) could pass all unit tests while production
+    # silently returned VOICE_FALLBACK. These pin the seams.
+    "test_voice_e2e",
     "test_files",
     # 6. Misc standalone
     "test_cron",
@@ -222,6 +236,15 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_dream",
     "test_updater",
     "test_bridges",
+    # Spam coalescing end-to-end: real StreamSession against a slow
+    # fake agent (every turn takes real time, mirroring LLM latency),
+    # 20-message bursts, bridge owner/follower under 20 concurrent
+    # send_message calls. Pins the wall-clock contract — coalesced
+    # bursts must not regress into serial N×latency dispatches — that
+    # the existing instant-return ``_RecordingAgent`` tests can't see.
+    # MUST run AFTER test_bridges so the _FakeBridge harness it imports
+    # is already loaded.
+    "test_spam_e2e",
     "test_bridge_session",
     # Coordinator login_finish must NOT die on SQLite locks for the
     # non-critical touch_device write (lyra-agent outage 2026-05-18 —

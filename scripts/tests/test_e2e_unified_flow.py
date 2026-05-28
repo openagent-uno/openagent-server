@@ -10,7 +10,7 @@ stack that no single existing test module exercises end-to-end:
    round-trip.
 
 2. **Live → rehydration parity** — a synthetic turn driven through
-   ``_arun_agno_stream`` is persisted to ``agno_sessions`` and replayed
+   ``_arun_runtime_stream`` is persisted to ``agno_sessions`` and replayed
    via the gateway's ``_expand_run_messages`` rehydration helper. The
    tool envelopes from the live wire and the rehydrated transcript
    must match field-for-field; member responses must carry the
@@ -32,7 +32,7 @@ stack that no single existing test module exercises end-to-end:
 5. **generate() emits symmetric (started, completed) tool frames** —
    the non-streaming path must produce the same two-phase wire shape as
    the streaming path so telegram / voice bridges that drive
-   ``AgnoProvider.generate()`` get a running-state chip before the
+   ``NativeProvider.generate()`` get a running-state chip before the
    completed one.
 
 6. **Nested specialist tool calls surface as chips in BOTH live and
@@ -89,7 +89,7 @@ def _seed_agno_runs(db_path: str, session_id: str, runs: list[dict]) -> None:
     try:
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS agno_sessions (
+            CREATE TABLE IF NOT EXISTS sessions (
                 session_id TEXT PRIMARY KEY,
                 session_type TEXT,
                 agent_id TEXT,
@@ -109,7 +109,7 @@ def _seed_agno_runs(db_path: str, session_id: str, runs: list[dict]) -> None:
             """
         )
         conn.execute(
-            "INSERT OR REPLACE INTO agno_sessions "
+            "INSERT OR REPLACE INTO sessions "
             "(session_id, session_type, user_id, runs, "
             " created_at, updated_at) "
             "VALUES (?, 'agent', 'openagent', ?, 100, 200)",
@@ -131,15 +131,15 @@ async def t_multi_member_delegation_emits_parallel_envelopes(ctx: TestContext) -
     ``tool_args``; the final synthesized text contains all three member
     outputs. Mirrors the Test 1 contract from the prompt.
 
-    The Agno surface is faked at the ``_arun_agno_stream`` seam so we
+    The Agno surface is faked at the ``_arun_runtime_stream`` seam so we
     don't depend on a real Team's classifier or LLM round-trip.
     """
-    from agno.run.team import (
+    from src.core._run_state.team import (
         RunContentEvent as TeamRunContentEvent,
         ToolCallCompletedEvent as TeamToolCallCompletedEvent,
         ToolCallStartedEvent as TeamToolCallStartedEvent,
     )
-    from src.models.dispatcher import _arun_agno_stream
+    from src.models.dispatcher import _arun_runtime_stream
 
     # Three delegations to three distinct specialists, each with its own
     # tool_call_id so the wire's tool_call_id field disambiguates them.
@@ -215,7 +215,7 @@ async def t_multi_member_delegation_emits_parallel_envelopes(ctx: TestContext) -
         delegated_member_ids.append(member_id)
 
     deltas: list[str] = []
-    async for d in _arun_agno_stream(
+    async for d in _arun_runtime_stream(
         _FakeTeamRuntime(),
         prompt="Do Q1 summary, scan tests, and draft a launch tagline.",
         session_id="sess-parallel",
@@ -289,13 +289,13 @@ async def t_multi_member_delegation_emits_parallel_envelopes(ctx: TestContext) -
 @test("e2e_unified_flow", "live wire envelopes match rehydrated envelopes field-for-field")
 async def t_live_rehydration_parity_for_synthetic_run(ctx: TestContext) -> None:
     """Drive a synthetic turn (2 tool calls + 1 delegate + content deltas)
-    through ``_arun_agno_stream``, then persist the equivalent run to
+    through ``_arun_runtime_stream``, then persist the equivalent run to
     ``agno_sessions`` and replay it via ``_expand_run_messages``. The
     tool envelopes from both paths must match field-for-field, and the
     member's assistant content must surface with the specialist's
     model badge.
     """
-    from agno.run.team import (
+    from src.core._run_state.team import (
         IntermediateRunContentEvent as TeamIRCE,
         RunContentEvent as TeamRunContentEvent,
         ToolCallCompletedEvent as TeamToolCallCompletedEvent,
@@ -303,7 +303,7 @@ async def t_live_rehydration_parity_for_synthetic_run(ctx: TestContext) -> None:
     )
     from src.gateway.api.sessions import _expand_run_messages
     from src.memory.db import MemoryDB
-    from src.models.dispatcher import _arun_agno_stream
+    from src.models.dispatcher import _arun_runtime_stream
 
     leader_model = "openai:gpt-4o-mini"
     specialist_model = "anthropic:claude-opus-4-7"
@@ -376,7 +376,7 @@ async def t_live_rehydration_parity_for_synthetic_run(ctx: TestContext) -> None:
     async def _on_status(s: str) -> None:
         live_statuses.append(s)
 
-    async for _ in _arun_agno_stream(
+    async for _ in _arun_runtime_stream(
         _FakeTeamRuntime(),
         prompt="What's in today's note and what's today's date?",
         session_id="sess-parity-e2e",
@@ -569,7 +569,7 @@ async def t_coordinate_mode_wired_and_agno_still_gathers(ctx: TestContext) -> No
     """
     import inspect
 
-    from agno.team import Team, TeamMode
+    from src.core._runner.team import Team, TeamMode
 
     from src.models.dispatcher import TeamRouterProvider
 
@@ -605,7 +605,7 @@ async def t_coordinate_mode_wired_and_agno_still_gathers(ctx: TestContext) -> No
     # inspect the source rather than calling it (calling would require a
     # real Model + function executor; the source-level check is what
     # locks the contract).
-    import agno.models.base as agno_base
+    import src.models.providers.base as agno_base
 
     assert hasattr(agno_base.Model, "arun_function_calls"), (
         "agno.models.base.Model.arun_function_calls disappeared — the "
@@ -667,21 +667,21 @@ async def t_no_models_short_circuit_intact(ctx: TestContext) -> None:
 @test("e2e_unified_flow",
       "generate() emits (started, completed) frames per tool symmetric with stream")
 async def t_generate_emits_symmetric_started_completed_per_tool(ctx: TestContext) -> None:
-    """Non-streaming ``AgnoProvider.generate()`` must emit a (started,
+    """Non-streaming ``NativeProvider.generate()`` must emit a (started,
     completed) pair per tool so bridges that drive it (telegram, voice)
     see the same wire shape as the streaming path. Started frame has
     ``result=None`` (UI's phase derivation reads it as "running"),
     completed frame carries the final result.
 
     Mirrors the wire contract locked in by Test 1 + the
-    ``_arun_agno_stream`` filter set. Hermetic — we drive the provider's
+    ``_arun_runtime_stream`` filter set. Hermetic — we drive the provider's
     inner ``runner.arun`` with a fake response carrying one ToolExecution.
     """
-    from src.models.agno_provider import AgnoProvider
+    from src.models.native_provider import NativeProvider
 
     # Bypass __init__: it pulls heavy Agno/MCP wiring. We just need
     # _emit_agno_tool_status's bound logic + a fake runner.
-    p = AgnoProvider.__new__(AgnoProvider)
+    p = NativeProvider.__new__(NativeProvider)
     p.model = "openai:gpt-4o-mini"
     p._providers_config = {}
     # Stub the cost-mirror so generate() doesn't crash on missing catalog.
@@ -772,11 +772,11 @@ async def t_delegation_parity_with_nested_tools(ctx: TestContext) -> None:
     Hermetic: a fake team runtime yields the leader's delegate +
     nested member tool events in the same order Agno would.
     """
-    from agno.run.agent import (
+    from src.core._run_state.agent import (
         ToolCallCompletedEvent as AgentToolCallCompletedEvent,
         ToolCallStartedEvent as AgentToolCallStartedEvent,
     )
-    from agno.run.team import (
+    from src.core._run_state.team import (
         IntermediateRunContentEvent as TeamIRCE,
         RunContentEvent as TeamRunContentEvent,
         ToolCallCompletedEvent as TeamToolCallCompletedEvent,
@@ -784,7 +784,7 @@ async def t_delegation_parity_with_nested_tools(ctx: TestContext) -> None:
     )
     from src.gateway.api.sessions import _expand_run_messages
     from src.memory.db import MemoryDB
-    from src.models.dispatcher import _arun_agno_stream
+    from src.models.dispatcher import _arun_runtime_stream
 
     leader_model = "openai:gpt-4o-mini"
     specialist_model = "anthropic:claude-opus-4-7"
@@ -865,7 +865,7 @@ async def t_delegation_parity_with_nested_tools(ctx: TestContext) -> None:
     async def _on_status(s: str) -> None:
         live_statuses.append(s)
 
-    async for _ in _arun_agno_stream(
+    async for _ in _arun_runtime_stream(
         _FakeTeamRuntime(),
         prompt="What's in today's vault?",
         session_id="sess-nested-parity",
@@ -1056,23 +1056,32 @@ async def t_attachments_native_files(ctx: TestContext) -> None:
     natively via ``delegate_task_to_member`` (see
     ``agno/team/_default_tools.py:713``).
 
-    Hermetic: fake the Agno runtime at the ``_arun_agno_stream`` seam
+    Hermetic: fake the Agno runtime at the ``_arun_runtime_stream`` seam
     and capture both ``input`` and ``files`` it receives. We assert the
     bare user text survived (no synthetic prepend) and that the
     ``files`` sequence carries one Agno ``File`` per non-image upload.
     """
-    from agno.media import File as AgnoFile
+    from src.stream.media import File as AgnoFile
 
-    from src.core.agent import _build_agno_files
-    from src.models.dispatcher import _arun_agno_stream
+    from src.core.agent import _build_runtime_media
+    from src.models.dispatcher import _arun_runtime_stream
 
-    # ── 1. ``_build_agno_files`` is the converter agent.py uses ────
+    def _files_only(attachments):
+        """Pluck the files element from the (images, audios, videos, files) tuple."""
+        result = _build_runtime_media(attachments)
+        if not result:
+            return None
+        files_list = result[3]
+        return files_list or None
+
+    # ── 1. The converter agent.py uses returns four parallel lists; this
+    # test pins the files slot specifically.
     atts = [
         {"type": "image", "filename": "chart.png", "path": "/tmp/chart.png"},
         {"type": "file",  "filename": "report.json", "path": "/tmp/report.json"},
         {"type": "file",  "filename": "notes.csv",   "path": "/tmp/notes.csv"},
     ]
-    files = _build_agno_files(atts)
+    files = _files_only(atts)
     assert files is not None and len(files) == 2, (
         f"image must be dropped from files=; got {files!r}"
     )
@@ -1082,14 +1091,14 @@ async def t_attachments_native_files(ctx: TestContext) -> None:
     assert str(by_name["report.json"].filepath) == "/tmp/report.json"
     assert str(by_name["notes.csv"].filepath) == "/tmp/notes.csv"
 
-    # Empty / image-only inputs → None so callers can skip threading.
-    assert _build_agno_files(None) is None
-    assert _build_agno_files([]) is None
-    assert _build_agno_files(
+    # Empty / image-only inputs → no files so callers can skip threading.
+    assert _files_only(None) is None
+    assert _files_only([]) is None
+    assert _files_only(
         [{"type": "image", "filename": "x.png", "path": "/tmp/x.png"}]
     ) is None
 
-    # ── 2. ``_arun_agno_stream`` forwards files= to runtime.arun ──
+    # ── 2. ``_arun_runtime_stream`` forwards files= to runtime.arun ──
     captured: dict[str, Any] = {}
 
     class _FakeRuntime:
@@ -1099,14 +1108,14 @@ async def t_attachments_native_files(ctx: TestContext) -> None:
             captured["files"] = files
             captured["session_id"] = session_id
             async def _iter():
-                from agno.run.agent import RunContentEvent
+                from src.core._run_state.agent import RunContentEvent
                 yield RunContentEvent(
                     content="ok", run_id="r", session_id=session_id,
                 )
             return _iter()
 
     deltas: list[str] = []
-    async for d in _arun_agno_stream(
+    async for d in _arun_runtime_stream(
         _FakeRuntime(),
         prompt="what's in the report?",
         session_id="sess-files",

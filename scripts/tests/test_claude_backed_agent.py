@@ -165,7 +165,7 @@ async def t_construction(ctx: TestContext) -> None:
     # MUST import without it.
     sys.modules.pop("claude_agent_sdk", None)
 
-    from agno.agent import Agent
+    from src.core._runner.agent import Agent
     from src.models.claude_agent import ClaudeBackedAgent
 
     agent = ClaudeBackedAgent(
@@ -207,8 +207,8 @@ async def t_arun_collect(ctx: TestContext) -> None:
     surfaced from the SDK's usage report.
     """
     state = _install_fake_sdk()
-    from agno.run.agent import RunOutput
-    from agno.run.base import RunStatus
+    from src.core._run_state.agent import RunOutput
+    from src.core._run_state.base import RunStatus
     from src.models.claude_agent import ClaudeBackedAgent
 
     state.script = [
@@ -355,8 +355,8 @@ async def t_stream_events(ctx: TestContext) -> None:
     dispatcher consumes from a member.
     """
     state = _install_fake_sdk()
-    from agno.run.agent import RunContentEvent, RunOutput, ToolCallStartedEvent
-    from agno.run.base import RunStatus
+    from src.core._run_state.agent import RunContentEvent, RunOutput, ToolCallStartedEvent
+    from src.core._run_state.base import RunStatus
     from src.models.claude_agent import ClaudeBackedAgent
 
     # Mix of token-level StreamEvents (text deltas) and a tool call

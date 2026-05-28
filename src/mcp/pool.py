@@ -1,9 +1,9 @@
 """Process-level pool of MCP toolkits, owned by the Agent.
 
 This replaces the previous in-house ``MCPRegistry`` + ``MCPTools`` pair. Both
-LLM backends (Agno for API-managed models, Claude Agent SDK for ClaudeCLI)
-ship their own production-grade MCP integrations, so OpenAgent owns only the
-*product* layer:
+LLM backends (the native runtime for API-managed models, Claude Agent SDK for
+ClaudeCLI) ship their own production-grade MCP integrations, so OpenAgent owns
+only the *product* layer:
 
   - which servers are configured (``DEFAULT_MCPS``, ``BUILTIN_MCP_SPECS``)
   - how to resolve a server name into a runnable command + env
@@ -11,10 +11,10 @@ ship their own production-grade MCP integrations, so OpenAgent owns only the
 
 Concretely:
 
-  - ``AgnoProvider`` consumes ``pool.agno_toolkits`` — a list of ``agno.tools.mcp.MCPTools``
-    instances that the pool owns and connects once. Multiple ``AgnoProvider``
-    tiers (under ``SmartRouter``) share the same toolkit list, so we don't
-    spawn N copies of each MCP server process.
+  - ``NativeProvider`` consumes ``pool.runtime_toolkits`` — a list of runtime
+    ``MCPTools`` instances that the pool owns and connects once. Multiple
+    ``NativeProvider`` tiers (under ``SmartRouter``) share the same toolkit
+    list, so we don't spawn N copies of each MCP server process.
 
   - ``ClaudeCLI`` consumes ``pool.claude_sdk_servers`` — the raw stdio config
     dict that the Claude Agent SDK accepts as its ``mcp_servers`` parameter.
@@ -90,8 +90,8 @@ def _mcp_priority_key(name: str) -> tuple[int, str]:
 
 
 # Tokens that must be forwarded from os.environ into the messaging MCP
-# subprocess env. Agno's MCPTools and the Claude SDK both filter env to a
-# safe subset by default, so we have to copy these explicitly.
+# subprocess env. The runtime's MCPTools and the Claude SDK both filter env
+# to a safe subset by default, so we have to copy these explicitly.
 _MESSAGING_TOKEN_ENV_VARS = (
     "TELEGRAM_BOT_TOKEN",
     "DISCORD_BOT_TOKEN",
@@ -99,12 +99,12 @@ _MESSAGING_TOKEN_ENV_VARS = (
     "GREEN_API_TOKEN",
 )
 
-# Per-MCP-call timeout. Agno's MCPTools defaults to 10s, which was too tight
-# for cold-start tool calls against npx-launched servers; we bumped to 30s
-# and then hit the opposite problem — 30s is *catastrophically* tight for
+# Per-MCP-call timeout. The runtime's MCPTools defaults to 10s, which was too
+# tight for cold-start tool calls against npx-launched servers; we bumped to
+# 30s and then hit the opposite problem — 30s is *catastrophically* tight for
 # tools that legitimately run for minutes, like ``shell_exec`` driving a
 # macOS Electron build. A 30-min ceiling matches the shell MCP's own
-# MAX_TIMEOUT so the Agno wrapper doesn't cut the call off before the tool
+# MAX_TIMEOUT so the runtime wrapper doesn't cut the call off before the tool
 # itself would. Individual MCP tools still enforce their own shorter bounds
 # (web-search: 6-10s per fetch, search-engine: 10s per query), so this cap
 # only kicks in when a tool is genuinely stuck past its own limit.
@@ -129,14 +129,14 @@ _MCP_CLOSE_TIMEOUT = 5
 
 # Dormant-MCP recovery, for the "stealth-fail" handshake mode.
 #
-# Agno's ``MCPTools.initialize()`` (≤ v2.6.4) wraps the actual init in
+# The runtime's ``MCPTools.initialize()`` (≤ v2.6.4) wraps the actual init in
 # ``except (RuntimeError, BaseException): log_error(...)``. When the wrapped
 # ``session.initialize()`` / ``build_tools()`` calls raise — typically
 # because anyio's TaskGroup surfaces a ``BaseExceptionGroup`` from a
-# concurrently-cancelled subprocess scope on a busy host — Agno swallows
-# the error, leaves ``_initialized = False``, returns from ``__aenter__``
-# normally, and reports zero tools. The pool sees a "successful" enter
-# with ``functions == {}`` and marks the MCP dormant for the rest of the
+# concurrently-cancelled subprocess scope on a busy host — the runtime
+# swallows the error, leaves ``_initialized = False``, returns from
+# ``__aenter__`` normally, and reports zero tools. The pool sees a "successful"
+# enter with ``functions == {}`` and marks the MCP dormant for the rest of the
 # session even though the subprocess is healthy and a second handshake
 # would succeed.
 #
@@ -148,7 +148,7 @@ _MCP_CLOSE_TIMEOUT = 5
 #
 # Mitigation: when the count comes back zero on a successfully-entered
 # toolkit, retry ``toolkit.initialize()`` directly a few times with light
-# backoff before giving up. The retry is idempotent on Agno's side
+# backoff before giving up. The retry is idempotent on the runtime side
 # (``if self._initialized: return``), and bounded so a permanently-broken
 # MCP still dormants out within a handful of seconds.
 _DORMANT_RECOVERY_ATTEMPTS = 3
@@ -178,12 +178,12 @@ _DORMANT_RECOVERY_BACKOFF = 0.5
 # Translation: the subprocess is still bootstrapping (PyInstaller
 # extract / npm cache miss / Python import graph) when we start
 # polling for its initialize() response. The pipe is empty; we time
-# out; Agno swallows; pool flags dormant.
+# out; the runtime swallows; pool flags dormant.
 #
 # Sleeping a fixed amount between subprocess spawns spreads the
 # disk-I/O and CPU cost over wallclock instead of stacking it inside
 # one cold-start window. Sequential ``for`` loop already serialises
-# at the Agno-pool level, but Claude SDK ALSO spawns its own
+# at the runtime-pool level, but Claude SDK ALSO spawns its own
 # subprocesses in parallel for its own session, and the OS scheduler
 # happily interleaves both. The stagger introduces a kernel-level
 # breathing room that lets the previous spawn at least finish its
@@ -209,7 +209,7 @@ _STARTUP_STAGGER_SECONDS = 0.25
 # specifically (not its sibling Python MCPs) repeatedly came up
 # dormant with the recovery loop emitting three identical
 # ``ClosedResourceError`` failures from ``send_nowait`` on the
-# stdio_client's write stream. Agno's blanket-except inside
+# stdio_client's write stream. The runtime's blanket-except inside
 # ``MCPTools.initialize()`` swallows the original cause (a separate
 # Instrument task to surface that), but the *symptom* — dead session
 # inherited by recovery — is universal and worth handling without
@@ -222,9 +222,9 @@ _SESSION_DEAD_ERROR_TYPES = frozenset({
 
 
 def _install_agno_log_passthrough() -> None:
-    """Re-emit Agno's ``log_error()`` messages through ``elog``.
+    """Re-emit the runtime's ``log_error()`` messages through ``elog``.
 
-    Agno's ``MCPTools.initialize()`` catches every exception and calls
+    The runtime's ``MCPTools.initialize()`` catches every exception and calls
     ``log_error("Failed to initialize MCP toolkit")`` — *without*
     ``exc_info``, so even at DEBUG you only see the string, not the
     underlying cause. The bypass path in ``_recover_dormant_toolkit``
@@ -243,7 +243,7 @@ def _install_agno_log_passthrough() -> None:
             try:
                 msg = record.getMessage()
                 # Filter to MCP-related ERROR/WARNING noise; we don't
-                # want to mirror every Agno log line into events.jsonl.
+                # want to mirror every runtime log line into events.jsonl.
                 if record.levelno < logging.WARNING:
                     return
                 if "mcp" not in msg.lower() and "MCP" not in record.name:
@@ -266,15 +266,15 @@ def _install_agno_log_passthrough() -> None:
 
 # Install the passthrough at module import so it's active before any
 # pool is built. Cheap (one handler registration), safe (idempotent),
-# and the only way to see Agno's first-attempt log line without
-# modifying Agno itself.
+# and the only way to see the runtime's first-attempt log line without
+# modifying the runtime itself.
 _install_agno_log_passthrough()
 
 
 def _safe_prefix(name: str) -> str:
     """Coerce a server name into a valid Python identifier prefix.
 
-    Agno emits tool names as ``<prefix>_<tool>``; ``computer-control`` →
+    The runtime emits tool names as ``<prefix>_<tool>``; ``computer-control`` →
     ``computer_control``. The hyphen would break OpenAI's function-name
     regex if not normalised.
     """
@@ -545,7 +545,7 @@ class MCPPool:
     def __init__(self, specs: list[_ServerSpec]):
         self.specs: list[_ServerSpec] = specs
         # Lazily populated on connect_all. Each toolkit gets its *own*
-        # supervisor task (parallel arrays, ``_agno_toolkits[i]`` is owned
+        # supervisor task (parallel arrays, ``_runtime_toolkits[i]`` is owned
         # by ``_toolkit_supervisors[i]``). The supervisor holds the
         # toolkit's ``AsyncExitStack`` for the toolkit's entire lifetime,
         # which guarantees ``__aenter__`` and ``__aexit__`` run on the
@@ -557,7 +557,7 @@ class MCPPool:
         # cancel scope in a different task than it was entered in" every
         # time shutdown happened on a different task than connect (every
         # /restart, essentially).
-        self._agno_toolkits: list[Any] = []
+        self._runtime_toolkits: list[Any] = []
         self._toolkit_supervisors: list[_ToolkitSupervisor] = []
         # Name-indexed view of every connected toolkit (subprocess + in-process).
         # Lets callers resolve ``toolkit_by_name("shell")`` without walking the
@@ -572,7 +572,7 @@ class MCPPool:
         # in_process=True. These are kept separate from subprocess toolkits
         # so close_all can handle them independently (no AsyncExitStack needed).
         self._in_process_sdk_servers: dict[str, Any] = {}
-        self._in_process_agno_toolkits: list[Any] = []
+        self._in_process_runtime_toolkits: list[Any] = []
         # DB reference for ``reload()``. Set by ``from_db``; ``None`` for
         # ``from_config`` callers (tests) — reload is a no-op in that mode.
         self._db: Any = None
@@ -633,8 +633,8 @@ class MCPPool:
         """Rebuild the pool in-place without a process restart.
 
         Order: build new specs → swap lists → connect new → close old.
-        We swap the backing lists in place (``self._agno_toolkits[:] = ...``)
-        so Agno providers that already captured ``pool.agno_toolkits`` by
+        We swap the backing lists in place (``self._runtime_toolkits[:] = ...``)
+        so providers that already captured ``pool.runtime_toolkits`` by
         reference see the new tools on their next turn. Old supervisors are
         torn down AFTER the new pool is live, so there is no window where
         a concurrent turn sees zero tools.
@@ -648,15 +648,15 @@ class MCPPool:
 
         async with self._lock:
             old_supervisors = list(self._toolkit_supervisors)
-            old_agno = list(self._agno_toolkits)
-            old_in_proc_agno = list(self._in_process_agno_toolkits)
-            # Clear in-place so existing references (pool.agno_toolkits returned
+            old_toolkits = list(self._runtime_toolkits)
+            old_in_proc_agno = list(self._in_process_runtime_toolkits)
+            # Clear in-place so existing references (pool.runtime_toolkits returned
             # by value is list[Any] built on each call, so that's fine; but
             # provider code may also have stashed ``pool``, and after reload
-            # calls pool.agno_toolkits again it must see the new list.)
+            # calls pool.runtime_toolkits again it must see the new list.)
             self._toolkit_supervisors.clear()
-            self._agno_toolkits.clear()
-            self._in_process_agno_toolkits.clear()
+            self._runtime_toolkits.clear()
+            self._in_process_runtime_toolkits.clear()
             self._in_process_sdk_servers.clear()
             self._toolkit_by_name.clear()
             self.specs = new_specs
@@ -679,7 +679,7 @@ class MCPPool:
         elog(
             "mcp.pool.reload",
             new_servers=len(new_specs),
-            old_toolkits=len(old_agno) + len(old_in_proc_agno),
+            old_toolkits=len(old_toolkits) + len(old_in_proc_agno),
         )
 
     # ── Lifecycle ────────────────────────────────────────────────────────
@@ -710,16 +710,17 @@ class MCPPool:
                 first_subprocess = False
                 toolkit = await self._build_and_enter_toolkit(spec)
                 if toolkit is not None:
-                    self._agno_toolkits.append(toolkit)
+                    self._runtime_toolkits.append(toolkit)
                     self._toolkit_by_name[spec.name] = toolkit
-                    # Agno MCPTools.functions is the dict of registered tools
+                    # MCPTools.functions is the dict of registered tools
                     # (populated during MCPTools.initialize()).
                     count = len(getattr(toolkit, "functions", {}) or {})
                     if count == 0:
                         # Stealth-fail recovery — see _DORMANT_RECOVERY_ATTEMPTS
                         # docstring above. The subprocess is alive (we entered
-                        # the stack); Agno just lost the init result. Retrying
-                        # ``initialize()`` directly is cheap and usually wins.
+                        # the stack); the runtime just lost the init result.
+                        # Retrying ``initialize()`` directly is cheap and
+                        # usually wins.
                         count = await self._recover_dormant_toolkit(toolkit, spec)
                         # Re-spawn escalation: when recovery's bypass loop
                         # exhausts itself entirely on a "session dead"
@@ -781,7 +782,7 @@ class MCPPool:
                     elog("mcp.error", level="warning", name=spec.name, error=str(e), phase="factory")
                     continue
                 self._in_process_sdk_servers[spec.name] = sdk_cfg
-                self._in_process_agno_toolkits.append(agno_tk)
+                self._in_process_runtime_toolkits.append(agno_tk)
                 self._toolkit_by_name[spec.name] = agno_tk
                 # Count both sync and async tool dicts — Toolkits with
                 # async-only callables register them in ``async_functions``
@@ -819,9 +820,9 @@ class MCPPool:
                 return
             supervisors = list(self._toolkit_supervisors)
             self._toolkit_supervisors.clear()
-            self._agno_toolkits.clear()
+            self._runtime_toolkits.clear()
             self._in_process_sdk_servers.clear()
-            self._in_process_agno_toolkits.clear()
+            self._in_process_runtime_toolkits.clear()
             self._toolkit_by_name.clear()
             self._connected = False
         # Close in reverse registration order so toolkits that share
@@ -840,11 +841,11 @@ class MCPPool:
         exhausted its retry budget against a session-dead error
         (``ClosedResourceError`` & friends — see ``_SESSION_DEAD_ERROR_TYPES``).
         Re-spawn handles the cold-start race where the first subprocess
-        managed to spawn but lost its stdio streams during Agno's
+        managed to spawn but lost its stdio streams during the runtime's
         swallowed init — by the second spawn PyInstaller's _MEI tree is
         warm and the handshake lands cleanly.
 
-        The dead toolkit is removed from every pool registry (``_agno_toolkits``,
+        The dead toolkit is removed from every pool registry (``_runtime_toolkits``,
         ``_toolkit_by_name``) BEFORE we attempt the re-spawn so that even
         if the re-spawn fails the pool's view of the spec stays consistent
         with "no toolkit loaded" rather than "dormant toolkit pinned".
@@ -865,7 +866,7 @@ class MCPPool:
                 name=f"mcp-dead-shutdown:{spec.name}",
             )
         try:
-            self._agno_toolkits.remove(dead_toolkit)
+            self._runtime_toolkits.remove(dead_toolkit)
         except ValueError:
             pass
         # Don't pop from _toolkit_by_name yet — we'll overwrite it below
@@ -884,11 +885,11 @@ class MCPPool:
         if new_toolkit is None:
             # Re-spawn itself failed (subprocess never came up). Pop the
             # by-name entry so the pool reports the spec as not-loaded
-            # consistently with the cleared _agno_toolkits.
+            # consistently with the cleared _runtime_toolkits.
             self._toolkit_by_name.pop(spec.name, None)
             elog("mcp.respawn_failed", level="warning", name=spec.name)
             return 0
-        self._agno_toolkits.append(new_toolkit)
+        self._runtime_toolkits.append(new_toolkit)
         self._toolkit_by_name[spec.name] = new_toolkit
         count = len(getattr(new_toolkit, "functions", {}) or {})
         # If the FRESH toolkit also stealth-fails, run recovery one more
@@ -949,7 +950,7 @@ class MCPPool:
            ``_MCP_CONNECT_TIMEOUT``. Signal the supervisor to stop, await
            it, return ``None``.
         2. ``asyncio.CancelledError`` / ``BaseExceptionGroup`` from
-           inside Agno's init — observed after a host disk-resize on a
+           inside the runtime's init — observed after a host disk-resize on a
            production agent. Caught inside the supervisor and reported
            via ``ready_event``.
         3. Regular ``Exception`` — logged + return ``None``.
@@ -1088,17 +1089,17 @@ class MCPPool:
         self, toolkit: Any, spec: _ServerSpec,
     ) -> int:
         """Re-run init against a stealth-failed handshake AND surface the
-        real exception that Agno's blanket ``except (RuntimeError,
+        real exception that the runtime's blanket ``except (RuntimeError,
         BaseException): log_error(...)`` would otherwise eat.
 
-        Two paths, picked by introspection so this still works on Agno
-        rewrites and on in-process Toolkits:
+        Two paths, picked by introspection so this still works across
+        runtime rewrites and on in-process Toolkits:
 
         1. **Bypass path (preferred)** — when the toolkit looks like
-           Agno's ``MCPTools`` (has ``session`` + ``build_tools``), we
-           skip ``initialize()`` and call its two underlying coroutines
+           the runtime's ``MCPTools`` (has ``session`` + ``build_tools``),
+           we skip ``initialize()`` and call its two underlying coroutines
            directly: ``session.initialize()`` then ``build_tools()``.
-           Identical work to what Agno's init does, but WITHOUT the
+           Identical work to what the runtime's init does, but WITHOUT the
            blanket-except, so the real exception propagates and we can
            log type, message, and traceback. The ``phase`` field tells
            ops which step blew up — ``session.initialize`` (handshake
@@ -1126,7 +1127,7 @@ class MCPPool:
         self._last_recovery_error_type[spec.name] = ""
 
         # Detect the bypass path. We test for callable methods, not for
-        # the MCPTools class, so a future Agno rewrite that keeps the
+        # the MCPTools class, so a future runtime rewrite that keeps the
         # same shape still works.
         session = getattr(toolkit, "session", None)
         build_tools = getattr(toolkit, "build_tools", None)
@@ -1141,10 +1142,10 @@ class MCPPool:
             return len(getattr(toolkit, "functions", {}) or {})
 
         for attempt in range(1, _DORMANT_RECOVERY_ATTEMPTS + 1):
-            # Reset Agno's idempotency flag: ``initialize()`` short-circuits
+            # Reset the idempotency flag: ``initialize()`` short-circuits
             # on ``self._initialized``, even when the previous attempt
             # left ``functions`` empty. Best-effort — the attribute may
-            # not exist on non-Agno toolkits.
+            # not exist on non-runtime toolkits.
             try:
                 toolkit._initialized = False  # type: ignore[attr-defined]
             except Exception:  # noqa: BLE001
@@ -1155,11 +1156,11 @@ class MCPPool:
             try:
                 async with asyncio.timeout(_DORMANT_RECOVERY_TIMEOUT):
                     if bypass_available:
-                        # Bypass Agno's blanket-except so the real error
-                        # surfaces. ``session.initialize`` is the MCP
+                        # Bypass the runtime's blanket-except so the real
+                        # error surfaces. ``session.initialize`` is the MCP
                         # protocol-level handshake (initialize/initialized
                         # message exchange); ``build_tools`` lists tools
-                        # and constructs Agno Function wrappers.
+                        # and constructs Function wrappers.
                         phase = "session.initialize"
                         await session.initialize()
                         phase = "build_tools"
@@ -1225,10 +1226,10 @@ class MCPPool:
                     bypassed_agno_swallow=bypass_available,
                 )
             else:
-                # No exception but functions still empty — Agno's
+                # No exception but functions still empty — the runtime's
                 # blanket-except triggered on the fallback path and
                 # we genuinely have no signal. Log so ops can grep
-                # for this case and bump up Agno's logger to DEBUG.
+                # for this case and bump up the runtime's logger to DEBUG.
                 elog(
                     "mcp.recovery_silent_fail",
                     level="warning",
@@ -1236,7 +1237,7 @@ class MCPPool:
                     attempt=attempt,
                     phase=phase,
                     note=(
-                        "Agno swallowed the init exception; enable "
+                        "the runtime swallowed the init exception; enable "
                         "logger 'agno' at DEBUG for the underlying "
                         "log_error message"
                     ),
@@ -1248,17 +1249,17 @@ class MCPPool:
         return 0
 
     async def _build_and_enter_toolkit(self, spec: _ServerSpec) -> Any | None:
-        """Construct an Agno ``MCPTools`` for one spec, enter it, return it.
+        """Construct an ``MCPTools`` for one spec, enter it, return it.
 
         Returns ``None`` on any failure and logs a warning — one bad MCP
         shouldn't kill the agent.
         """
         try:
-            from agno.tools.mcp import MCPTools
-            from agno.tools.mcp.params import StreamableHTTPClientParams
+            from src.mcp._runtime.mcp import MCPTools
+            from src.mcp._runtime.mcp.params import StreamableHTTPClientParams
             from mcp import StdioServerParameters
         except ImportError as exc:
-            logger.error("Cannot build MCP toolkits — Agno or mcp SDK missing: %s", exc)
+            logger.error("Cannot build MCP toolkits — runtime or mcp SDK missing: %s", exc)
             return None
 
         try:
@@ -1276,7 +1277,7 @@ class MCPPool:
                     timeout_seconds=_MCP_TIMEOUT_SECONDS,
                 )
             elif spec.url:
-                # Streamable HTTP is Agno's default for URL-based servers.
+                # Streamable HTTP is the runtime's default for URL-based servers.
                 # Headers (e.g. Authorization: Bearer …) MUST be passed via
                 # server_params — MCPTools' top-level kwargs don't surface
                 # them to the HTTP transport, so without this every auth-
@@ -1304,13 +1305,13 @@ class MCPPool:
     # ── Provider-facing accessors ───────────────────────────────────────
 
     @property
-    def agno_toolkits(self) -> list[Any]:
-        """Connected Agno ``MCPTools`` instances plus in-process Toolkits.
+    def runtime_toolkits(self) -> list[Any]:
+        """Connected ``MCPTools`` instances plus in-process Toolkits.
 
         Pass directly to ``Agent(tools=...)``; both subprocess MCPTools and
-        in-process Toolkit objects satisfy the same Agno interface.
+        in-process Toolkit objects satisfy the same runtime interface.
         """
-        return list(self._agno_toolkits) + list(self._in_process_agno_toolkits)
+        return list(self._runtime_toolkits) + list(self._in_process_runtime_toolkits)
 
     def toolkit_by_name(self, mcp_name: str) -> Any | None:
         """Resolve a connected toolkit by MCP name, or ``None`` when
@@ -1329,7 +1330,7 @@ class MCPPool:
         out: list[dict[str, Any]] = []
         for name, toolkit in self._toolkit_by_name.items():
             tools_meta: list[dict[str, Any]] = []
-            # Subprocess MCPs (Agno's MCPTools) populate ``functions``;
+            # Subprocess MCPs (the runtime's MCPTools) populate ``functions``;
             # in-process Toolkits with async-only callables (tool-search,
             # potentially future ones) populate ``async_functions``
             # instead. Merge both so the UI sees every exposed tool —
@@ -1341,7 +1342,7 @@ class MCPPool:
                 **(getattr(toolkit, "async_functions", {}) or {}),
             }
             for tool_name, fn in merged.items():
-                # Agno's MCPTools wraps the remote tool; it exposes
+                # The runtime's MCPTools wraps the remote tool; it exposes
                 # ``description`` and ``parameters`` on the function
                 # object after ``initialize()``. Fall back to empty
                 # strings/dicts rather than the inspect machinery so
@@ -1373,7 +1374,7 @@ class MCPPool:
     # that fits the budget; the trimmed-out MCPs stay reachable via
     # the ``tool-search`` in-process MCP, which the wire layer keeps
     # in the kept set unconditionally. The two paths share a single
-    # alphabetic-fill heuristic so Agno and Claude SDK behave the
+    # alphabetic-fill heuristic so the runtime and Claude SDK behave the
     # same way for the same budget — a deliberate symmetry the user
     # asked for ("non un sistema specifico per claude sdk").
 
@@ -1391,8 +1392,8 @@ class MCPPool:
                 return name
         return ""
 
-    def agno_toolkits_under_budget(self, budget: int) -> list[Any]:
-        """Subset of ``agno_toolkits`` whose combined tool count fits ``budget``.
+    def runtime_toolkits_under_budget(self, budget: int) -> list[Any]:
+        """Subset of ``runtime_toolkits`` whose combined tool count fits ``budget``.
 
         In-process toolkits (including ``tool-search``) are always
         included — they're cheap and ``tool-search`` is the recovery
@@ -1405,14 +1406,14 @@ class MCPPool:
         tests).
         """
         if budget < 0:
-            return self.agno_toolkits
+            return self.runtime_toolkits
 
-        in_process = list(self._in_process_agno_toolkits)
+        in_process = list(self._in_process_runtime_toolkits)
         used = sum(self._toolkit_tool_count(tk) for tk in in_process)
         remaining = max(0, budget - used)
 
         subprocess_pairs = sorted(
-            ((self._toolkit_name(tk), tk) for tk in self._agno_toolkits),
+            ((self._toolkit_name(tk), tk) for tk in self._runtime_toolkits),
             key=lambda p: _mcp_priority_key(p[0]),
         )
         kept: list[Any] = []
@@ -1436,9 +1437,9 @@ class MCPPool:
     # never gets a mixed "some tools upfront, some deferred" picture
     # that confuses delegation. Both views below return just the
     # tool-search MCP so the wire layer can stay symmetrical across
-    # Agno (toolkits) and Claude SDK (mcp_servers config).
+    # the runtime (toolkits) and Claude SDK (mcp_servers config).
 
-    def agno_toolkits_tool_search_only(self) -> list[Any]:
+    def runtime_toolkits_tool_search_only(self) -> list[Any]:
         """Return ONLY the ``tool-search`` in-process toolkit.
 
         Used by ``wire_model_runtime`` to keep just the 4 meta-tools
@@ -1451,7 +1452,7 @@ class MCPPool:
         return [tk] if tk is not None else []
 
     def claude_sdk_servers_tool_search_only(self) -> dict[str, dict[str, Any]]:
-        """Same as ``agno_toolkits_tool_search_only`` for the Claude SDK
+        """Same as ``runtime_toolkits_tool_search_only`` for the Claude SDK
         ``mcp_servers`` config shape. Returns ``{"tool-search": <cfg>}``
         when the in-process tool-search MCP is registered, else ``{}``.
         """
@@ -1459,7 +1460,7 @@ class MCPPool:
         return {"tool-search": cfg} if cfg is not None else {}
 
     def claude_sdk_servers_under_budget(self, budget: int) -> dict[str, dict[str, Any]]:
-        """Same idea as ``agno_toolkits_under_budget`` for Claude SDK config.
+        """Same idea as ``runtime_toolkits_under_budget`` for Claude SDK config.
 
         In-process SDK servers are always included; subprocess specs are
         added alphabetically until the budget would be exceeded. Tool
@@ -1481,7 +1482,7 @@ class MCPPool:
         )
         for spec in subprocess_specs:
             n = self._tool_counts.get(spec.name, 0)
-            # Symmetric with agno path: zero-tool subprocesses contribute
+            # Symmetric with runtime path: zero-tool subprocesses contribute
             # nothing, so don't let them sneak past the budget filter.
             if n > 0 and n <= remaining:
                 base[spec.name] = spec.claude_sdk_entry()

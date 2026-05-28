@@ -140,7 +140,7 @@ async def run_once(db: Any) -> dict[str, int]:
         # works against both shapes that might appear in a long-running
         # deployment.
         cur = await conn.execute(
-            "DELETE FROM agno_sessions WHERE updated_at < ?",
+            "DELETE FROM sessions WHERE updated_at < ?",
             (int(session_retention_cutoff),),
         )
         counts["sessions_pruned"] = cur.rowcount or 0

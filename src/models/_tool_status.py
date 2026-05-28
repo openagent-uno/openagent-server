@@ -13,7 +13,34 @@ synthetic status enum on the wire.
 from __future__ import annotations
 
 import json as _json
-from typing import Any
+import logging
+from typing import Any, Awaitable, Callable
+
+_logger = logging.getLogger(__name__)
+
+
+async def emit_tool_status(
+    on_status: Callable[[str], Awaitable[None]] | None,
+    tool_exec: Any,
+    *,
+    error_text: str | None = None,
+    phase: str | None = None,
+) -> None:
+    """Encode ``tool_exec`` and forward to ``on_status``.
+
+    Shared by every Agno tool-status emitter (NativeProvider, dispatcher
+    helpers, ClaudeCLI / CodexCLI) so the wire envelope and the
+    defensive on_status error handling can't drift across call sites.
+    """
+    if on_status is None:
+        return
+    encoded = tool_exec_to_wire_json(tool_exec, error_text=error_text, phase=phase)
+    if encoded is None:
+        return
+    try:
+        await on_status(encoded)
+    except Exception as e:  # noqa: BLE001
+        _logger.debug("on_status callback raised: %s", e)
 
 
 def tool_exec_to_wire_json(
@@ -76,4 +103,4 @@ def _to_dict(tool_exec: Any) -> dict[str, Any]:
     }
 
 
-__all__ = ["tool_exec_to_wire_json", "stored_tool_to_wire"]
+__all__ = ["emit_tool_status", "tool_exec_to_wire_json", "stored_tool_to_wire"]

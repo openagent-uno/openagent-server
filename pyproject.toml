@@ -11,12 +11,6 @@ requires-python = ">=3.11"
 license = "MIT"
 
 dependencies = [
-    # agno>=2.6.0 introduced the multi-framework adapter
-    # ``agno.agents.claude.ClaudeAgent`` that wraps claude-agent-sdk as
-    # an Agno agent (so its sessions land in agno_sessions via SqliteDb).
-    # Pinned with an upper bound because the multi-framework feature is
-    # Beta and the surface can shift between minors.
-    "agno>=2.6.9,<3",
     "mcp>=1.0.0",
     "click>=8.1.0",
     "rich>=13.0.0",
@@ -40,13 +34,13 @@ dependencies = [
     # doesn't silently drop it from the PyInstaller build env.
     "httpx>=0.24",
     "packaging>=21.0",
-    # Groq SDK: imported at module level by agno.models.groq when a groq-based
-    # provider is selected.  Declaring it here ensures it is installed in the
-    # build environment so PyInstaller bundles it (collect_submodules("groq")).
+    # Groq SDK: imported by src.models.providers.groq when a groq-based
+    # provider is selected. Declaring it here ensures it is installed in
+    # the build environment so PyInstaller bundles it
+    # (collect_submodules("groq")).
     "groq>=0.4.0",
-    # LiteLLM: vendor-agnostic adapter for TTS/STT (similar to how Agno
-    # wraps multiple LLM vendors). One ``providers`` row with
-    # ``framework='litellm'`` + ``kind='tts'|'stt'`` + ``name=<vendor>``
+    # LiteLLM: vendor-agnostic adapter for TTS/STT. One ``providers`` row
+    # with ``framework='litellm'`` + ``kind='tts'|'stt'`` + ``name=<vendor>``
 # routes through ``litellm.aspeech`` / ``litellm.atranscription``.
 # See ``src/channels/tts.py`` and ``src/channels/voice.py``.
     "litellm>=1.50.0",

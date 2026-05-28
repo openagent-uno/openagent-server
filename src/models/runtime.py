@@ -45,7 +45,7 @@ def wire_model_runtime(
 
     Wires only the ``tool-search`` MCP into the model's upfront tool
     list. Every other MCP connected in ``mcp_pool`` stays reachable
-    via ``tool-search.call_tool``. AgnoProvider gets the in-process
+    via ``tool-search.call_tool``. NativeProvider gets the in-process
     ``MCPTools`` instance; ClaudeCLI gets the raw stdio config dict
     that ``ClaudeAgentOptions.mcp_servers`` accepts.
     """
@@ -54,10 +54,10 @@ def wire_model_runtime(
         if callable(set_db):
             set_db(db)
     if mcp_pool is not None:
-        # AgnoProvider / TeamRouterProvider: in-process MCPTools instance(s).
+        # NativeProvider / TeamRouterProvider: in-process MCPTools instance(s).
         set_mcp_toolkits = getattr(model, "set_mcp_toolkits", None)
         if callable(set_mcp_toolkits):
-            set_mcp_toolkits(mcp_pool.agno_toolkits_tool_search_only())
+            set_mcp_toolkits(mcp_pool.runtime_toolkits_tool_search_only())
         # ClaudeCLI: raw stdio config for the Claude Agent SDK.
         set_mcp_servers = getattr(model, "set_mcp_servers", None)
         if callable(set_mcp_servers):
@@ -112,9 +112,9 @@ def create_model_from_spec(
             providers_config=providers_config,
         )
     else:
-        from src.models.agno_provider import AgnoProvider
+        from src.models.native_provider import NativeProvider
 
-        model = AgnoProvider(
+        model = NativeProvider(
             model=spec,
             providers_config=providers_config,
             db_path=getattr(db, "db_path", None),
@@ -127,11 +127,12 @@ def create_model_from_config(config: dict) -> BaseModel:
     """Instantiate the active model from the resolved OpenAgent config.
 
     Always returns a SmartRouter — SmartRouter is the single top-level
-    runtime and dispatches each session to either Agno or the Claude CLI
-    registry internally (see ``openagent.models.smart_router``). The
-    ``providers`` / ``models`` SQLite tables are the sole source of
-    truth for the catalog; SmartRouter starts empty and gets its routing
-    populated by ``Agent.initialize`` (and every hot-reload tick) via
+    runtime and dispatches each session to either the native API
+    provider or the Claude CLI registry internally (see
+    ``openagent.models.smart_router``). The ``providers`` / ``models``
+    SQLite tables are the sole source of truth for the catalog;
+    SmartRouter starts empty and gets its routing populated by
+    ``Agent.initialize`` (and every hot-reload tick) via
     ``rebuild_routing``. The yaml is never consulted for provider or
     model state.
     """
@@ -151,7 +152,7 @@ async def run_provider_smoke_test(
     """Run a minimal prompt through the configured runtime for one provider.
 
     When the same vendor is registered under both frameworks
-    (anthropic+agno AND anthropic+claude-cli), pass ``framework=`` to
+    (anthropic+api-based AND anthropic+claude-cli), pass ``framework=`` to
     disambiguate — otherwise the first matching entry wins.
     """
     # Resolve the provider row by (name, framework) pair. Fall back to

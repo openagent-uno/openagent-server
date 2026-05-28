@@ -161,12 +161,21 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
         "dir": "computer-control",
         "native": True,
         # No DISPLAY env — the Rust binary picks the right backend per OS.
+        "description": (
+            "screen, keyboard, and mouse control on the host. Use for "
+            "GUI tasks on apps without an MCP of their own"
+        ),
     },
     "shell": {
         "in_process": True,
         "adapter_module": "src.mcp.servers.shell.adapters",
         "sdk_server_factory": "build_sdk_server",
         "agno_toolkit_factory": "build_agno_toolkit",
+        "description": (
+            "execute bash commands on the host, foreground or "
+            "backgrounded. Preferred for file ops, builds, and ad-hoc "
+            "scripts when no specialised MCP fits"
+        ),
     },
     "tool-search": {
         "in_process": True,
@@ -174,59 +183,123 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
         "sdk_server_factory": "build_sdk_server",
         "agno_toolkit_factory": "build_agno_toolkit",
     },
+    "attachments": {
+        "in_process": True,
+        "adapter_module": "src.mcp.servers.attachments.adapters",
+        "sdk_server_factory": "build_sdk_server",
+        "agno_toolkit_factory": "build_agno_toolkit",
+        "description": (
+            "read and write files attached to the current turn — "
+            "screenshots, images, pasted text, uploads from the chat UI"
+        ),
+    },
     "web-search": {
         "dir": "web-search",
         "command": ["node", "dist/index.js"],
         "build": ["npm", "run", "build"],
         "install": ["npm", "install"],
         "env": {"NODE_TLS_REJECT_UNAUTHORIZED": "0"},
+        "description": (
+            "search the live web and fetch page contents. Use whenever "
+            "the answer depends on current information you may not have"
+        ),
     },
     "editor": {
         "dir": "editor",
         "command": ["node", "dist/index.js"],
         "build": ["npm", "run", "build"],
         "install": ["npm", "install"],
+        "description": (
+            "structured file editing — read, write, patch, search. "
+            "Preferred over raw shell ``cat`` / ``sed`` for code changes"
+        ),
     },
     "agent-in-chrome": {
         "dir": "agent-in-chrome/host",
         "command": ["node", "./mcp-server.js"],
         "install": ["npm", "install"],
+        "description": (
+            "drive a Chrome browser session (navigate, click, type, "
+            "screenshot, read the DOM). Use for live web tasks beyond "
+            "static web-search"
+        ),
     },
     "messaging": {
         "dir": "messaging",
         "command": ["node", "dist/index.js"],
         "build": ["npm", "run", "build"],
         "install": ["npm", "install"],
+        "description": (
+            "send messages on connected platforms (Telegram, Discord, "
+            "Slack, WhatsApp) when the user asks you to relay something"
+        ),
     },
     "scheduler": {
         "dir": "scheduler",
         "command": ["python", "-m", "src.mcp.servers.scheduler.server"],
         "python": True,
+        "description": (
+            "create, list, update, and remove cron-scheduled prompts. "
+            "Reach for it whenever the user asks for a recurring task"
+        ),
     },
     "mcp-manager": {
         "dir": "mcp_manager",
         "command": ["python", "-m", "src.mcp.servers.mcp_manager.server"],
         "python": True,
+        "description": (
+            "inspect and manage MCP servers — list connected ones, add "
+            "new ones, enable/disable, check health"
+        ),
     },
     "model-manager": {
         "dir": "model_manager",
         "command": ["python", "-m", "src.mcp.servers.model_manager.server"],
         "python": True,
+        "description": (
+            "manage the registered LLM models — list, enable/disable, "
+            "pin one for the current session, set the entry/router model"
+        ),
     },
     "workflow-manager": {
         "dir": "workflow_manager",
         "command": ["python", "-m", "src.mcp.servers.workflow_manager.server"],
         "python": True,
+        "description": (
+            "create and run multi-step workflows. Use for repeatable "
+            "structured processes that benefit from explicit DAGs over "
+            "ad-hoc sub-agent delegation"
+        ),
     },
     "media-gen": {
         "dir": "media_gen",
         "command": ["python", "-m", "src.mcp.servers.media_gen.server"],
         "python": True,
+        "description": (
+            "generate images, audio, or video via configured providers"
+        ),
     },
     "memory-search": {
         "dir": "memory_search",
         "command": ["python", "-m", "src.mcp.servers.memory_search.server"],
         "python": True,
+        "description": (
+            "semantic search across past conversations. Complements "
+            "vault: vault is your editable notes, this is everything "
+            "you've already said"
+        ),
+    },
+    "delegation": {
+        "dir": "delegation",
+        "in_process": True,
+        "adapter_module": "src.mcp.servers.delegation.adapters",
+        "description": (
+            "hand a sub-task to another registered model and get its "
+            "answer back. Use when a different model is cheaper, "
+            "faster, or better-scoped for the work — including from "
+            "inside a subscription-CLI agent that has no native "
+            "team-leader path"
+        ),
     },
 }
 
@@ -237,6 +310,7 @@ DEFAULT_MCPS: list[dict[str, Any]] = [
     {"builtin": "web-search", "_default": True},
     {"builtin": "shell", "_default": True},
     {"builtin": "tool-search", "_default": True},
+    {"builtin": "attachments", "_default": True},
     {"builtin": "computer-control", "_default": True},
     {"builtin": "agent-in-chrome", "_default": True},
     {"builtin": "messaging", "_default": True},
@@ -244,6 +318,7 @@ DEFAULT_MCPS: list[dict[str, Any]] = [
     {"builtin": "mcp-manager", "_default": True},
     {"builtin": "model-manager", "_default": True},
     {"builtin": "workflow-manager", "_default": True},
+    {"builtin": "delegation", "_default": True},
 ]
 
 

@@ -1,4 +1,4 @@
-"""AgnoProvider.stream — hermetic zero-delta fallback coverage.
+"""NativeProvider.stream — hermetic zero-delta fallback coverage.
 
 Friday's stuck Telegram turns were hitting an Agno streamed turn that
 finished with zero ``RunContentEvent`` deltas. The provider now falls back to
@@ -14,10 +14,10 @@ from ._framework import TestContext, test
 
 @test("agno_stream", "stream zero-delta fallback yields generate() content")
 async def t_agno_stream_zero_delta_fallback(_ctx: TestContext) -> None:
-    from src.models.agno_provider import AgnoProvider
+    from src.models.native_provider import NativeProvider
     from src.models.base import ModelResponse
 
-    provider = AgnoProvider(
+    provider = NativeProvider(
         model="openai:gpt-4o-mini",
         api_key="x",
         providers_config=[],

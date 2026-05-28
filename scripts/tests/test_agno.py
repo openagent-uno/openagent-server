@@ -1,4 +1,4 @@
-"""AgnoProvider live tests (hits OpenAI with real keys).
+"""NativeProvider live tests (hits OpenAI with real keys).
 
 Verifies that the provider actually generates a response, reports tokens,
 routes the system prompt as a system message (not as user text), and
@@ -17,16 +17,16 @@ from ._framework import TestContext, TestSkip, have_openai_key, test
 async def t_agno_generate(ctx: TestContext) -> None:
     if not have_openai_key(ctx.config):
         raise TestSkip("no OpenAI API key in user config")
-    from src.models.agno_provider import AgnoProvider
+    from src.models.native_provider import NativeProvider
 
     pool = ctx.extras["pool"]
-    provider = AgnoProvider(
+    provider = NativeProvider(
         model="openai:gpt-4o-mini",
         api_key=ctx.config["providers"]["openai"]["api_key"],
         providers_config=ctx.config["providers"],
         db_path=str(ctx.db_path),
     )
-    provider.set_mcp_toolkits(pool.agno_toolkits)
+    provider.set_mcp_toolkits(pool.runtime_toolkits)
     resp = await provider.generate(
         messages=[{"role": "user", "content": "Reply with the literal text PING_OK and nothing else."}],
         system="You are a test bot. Always follow the user's instruction exactly.",
@@ -45,15 +45,15 @@ async def t_agno_compaction_flags(ctx: TestContext) -> None:
     DELIBERATELY OFF (see agno_provider.py): OpenAgent uses the vault
     for user-scoped persistence and we don't want the ``agno_memories``
     table created. Bumped ``num_history_runs`` default to 20."""
-    from src.models.agno_provider import AgnoProvider
+    from src.models.native_provider import NativeProvider
     pool = ctx.extras["pool"]
-    provider = AgnoProvider(
+    provider = NativeProvider(
         model="openai:gpt-4o-mini",
         api_key=ctx.config.get("providers", {}).get("openai", {}).get("api_key", "x"),
         providers_config=ctx.config["providers"],
         db_path=str(ctx.db_path),
     )
-    provider.set_mcp_toolkits(pool.agno_toolkits)
+    provider.set_mcp_toolkits(pool.runtime_toolkits)
     agent = provider._ensure_agent(system="test")
     assert getattr(agent, "enable_session_summaries", False), \
         "enable_session_summaries must be True"
@@ -69,21 +69,21 @@ async def t_agno_compaction_flags(ctx: TestContext) -> None:
 async def t_agno_tool_families(ctx: TestContext) -> None:
     """_tool_families() must return one entry per connected MCP server,
     keyed by that server's tool_name_prefix."""
-    from src.models.agno_provider import AgnoProvider
+    from src.models.native_provider import NativeProvider
     pool = ctx.extras["pool"]
-    provider = AgnoProvider(
+    provider = NativeProvider(
         model="openai:gpt-4o-mini",
         api_key=ctx.config.get("providers", {}).get("openai", {}).get("api_key", "x"),
         providers_config=ctx.config["providers"],
         db_path=str(ctx.db_path),
     )
-    provider.set_mcp_toolkits(pool.agno_toolkits)
+    provider.set_mcp_toolkits(pool.runtime_toolkits)
     families = provider._tool_families()
     # Each toolkit should produce exactly one family entry — test pool
     # should ship at least one server, and whatever is there must map
     # to a non-empty family name.
-    assert len(families) == len(pool.agno_toolkits), \
-        f"family count {len(families)} != toolkit count {len(pool.agno_toolkits)}"
+    assert len(families) == len(pool.runtime_toolkits), \
+        f"family count {len(families)} != toolkit count {len(pool.runtime_toolkits)}"
     for family_name, toolkits in families.items():
         assert family_name and isinstance(family_name, str), \
             f"bad family key: {family_name!r}"
@@ -94,15 +94,15 @@ async def t_agno_tool_families(ctx: TestContext) -> None:
 async def t_agno_team_classifier_fallback(ctx: TestContext) -> None:
     """Empty system prompt (classifier) must NOT trigger Team — the
     routing round-trip would waste tokens on simple tier classification."""
-    from src.models.agno_provider import AgnoProvider
+    from src.models.native_provider import NativeProvider
     pool = ctx.extras["pool"]
-    provider = AgnoProvider(
+    provider = NativeProvider(
         model="openai:gpt-4o-mini",
         api_key=ctx.config.get("providers", {}).get("openai", {}).get("api_key", "x"),
         providers_config=ctx.config["providers"],
         db_path=str(ctx.db_path),
     )
-    provider.set_mcp_toolkits(pool.agno_toolkits)
+    provider.set_mcp_toolkits(pool.runtime_toolkits)
     assert provider._ensure_team(system="") is None, \
         "empty system must skip team path"
     assert provider._ensure_team(system="   ") is None, \
@@ -113,8 +113,8 @@ async def t_agno_team_classifier_fallback(ctx: TestContext) -> None:
 async def t_agno_team_few_families_fallback(ctx: TestContext) -> None:
     """With 0 or 1 tool families, Team has nothing to route between;
     _ensure_team must return None so the caller uses single Agent."""
-    from src.models.agno_provider import AgnoProvider
-    provider = AgnoProvider(
+    from src.models.native_provider import NativeProvider
+    provider = NativeProvider(
         model="openai:gpt-4o-mini",
         api_key=ctx.config.get("providers", {}).get("openai", {}).get("api_key", "x"),
         providers_config=ctx.config["providers"],
@@ -126,8 +126,8 @@ async def t_agno_team_few_families_fallback(ctx: TestContext) -> None:
         "zero toolkits must skip team path"
     # Single toolkit → one family → None.
     pool = ctx.extras["pool"]
-    if pool.agno_toolkits:
-        provider.set_mcp_toolkits([pool.agno_toolkits[0]])
+    if pool.runtime_toolkits:
+        provider.set_mcp_toolkits([pool.runtime_toolkits[0]])
         assert provider._ensure_team(system="hello") is None, \
             "single toolkit must skip team path"
 
@@ -137,17 +137,17 @@ async def t_agno_team_build(ctx: TestContext) -> None:
     """With ≥2 tool families, _ensure_team must return a Team in route
     mode with one specialist member per family, and the team itself
     must have the compaction flags enabled."""
-    from src.models.agno_provider import AgnoProvider
+    from src.models.native_provider import NativeProvider
     pool = ctx.extras["pool"]
-    if len(pool.agno_toolkits) < 2:
-        raise TestSkip(f"test pool only has {len(pool.agno_toolkits)} toolkit(s)")
-    provider = AgnoProvider(
+    if len(pool.runtime_toolkits) < 2:
+        raise TestSkip(f"test pool only has {len(pool.runtime_toolkits)} toolkit(s)")
+    provider = NativeProvider(
         model="openai:gpt-4o-mini",
         api_key=ctx.config.get("providers", {}).get("openai", {}).get("api_key", "x"),
         providers_config=ctx.config["providers"],
         db_path=str(ctx.db_path),
     )
-    provider.set_mcp_toolkits(pool.agno_toolkits)
+    provider.set_mcp_toolkits(pool.runtime_toolkits)
     team = provider._ensure_team(system="You are a test bot.")
     assert team is not None, "team should be built with ≥2 families"
     # Verify route mode
@@ -169,12 +169,12 @@ async def t_agno_team_build(ctx: TestContext) -> None:
     assert provider._ensure_team(system="You are a test bot.") is team, \
         "team must be cached by system prompt"
     # set_mcp_toolkits must flush the cache
-    provider.set_mcp_toolkits(pool.agno_toolkits)
+    provider.set_mcp_toolkits(pool.runtime_toolkits)
     assert provider._ensure_team(system="You are a test bot.") is not team, \
         "set_mcp_toolkits must flush team cache"
 
 
-@test("agno", "generate raises AgnoProviderError on RunStatus.error")
+@test("agno", "generate raises NativeProviderError on RunStatus.error")
 async def t_agno_generate_run_status_error(_ctx: TestContext) -> None:
     """Agno's Agent.arun / Team.arun catches generic exceptions, sets
     ``run_response.status = RunStatus.error`` and
@@ -184,12 +184,12 @@ async def t_agno_generate_run_status_error(_ctx: TestContext) -> None:
     shows the user a raw Python exception (e.g. ``[Errno 2] No such file
     or directory``) — caught in production on mixout with the
     misconfigured ``deepseek:deepseek-v4-pro`` model. ``generate()``
-    must inspect ``response.status`` and raise ``AgnoProviderError`` so
+    must inspect ``response.status`` and raise ``NativeProviderError`` so
     the bridge formats a clean ``⚠️`` message instead.
     """
-    from src.models.agno_provider import AgnoProvider, AgnoProviderError
+    from src.models.native_provider import NativeProvider, NativeProviderError
 
-    provider = AgnoProvider(
+    provider = NativeProvider(
         model="deepseek:deepseek-v4-pro",
         api_key="x",
         providers_config=[],
@@ -209,17 +209,17 @@ async def t_agno_generate_run_status_error(_ctx: TestContext) -> None:
     provider._ensure_team = lambda system="": _ErroredRunner()  # type: ignore[assignment]
     provider._ensure_agent = lambda system=None: _ErroredRunner()  # type: ignore[assignment]
 
-    raised: AgnoProviderError | None = None
+    raised: NativeProviderError | None = None
     try:
         await provider.generate(
             messages=[{"role": "user", "content": "hi"}],
             system="system-prompt",
             session_id="agno-run-status-error",
         )
-    except AgnoProviderError as e:
+    except NativeProviderError as e:
         raised = e
 
-    assert raised is not None, "expected AgnoProviderError, got no exception"
+    assert raised is not None, "expected NativeProviderError, got no exception"
     # The original Python-OSError string must be preserved in the raised
     # exception so logs/debugging keep the underlying cause — only the
     # user-facing bridge wrapper is supposed to soften it.

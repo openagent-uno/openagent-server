@@ -121,7 +121,7 @@ async def t_device_id_preserved(ctx: TestContext) -> None:
         # metadata to confirm device_id landed.
         conn = await db._ensure_connected()
         cur = await conn.execute(
-            "SELECT metadata FROM agno_sessions WHERE session_id = ?",
+            "SELECT metadata FROM sessions WHERE session_id = ?",
             (sid,),
         )
         row = await cur.fetchone()

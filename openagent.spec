@@ -37,12 +37,12 @@ from PyInstaller.utils.hooks import (
 # Importing here turns that silent failure into a loud build-time error.
 import jinja2  # noqa: F401 — src.workflow.templating
 import markupsafe  # noqa: F401 — jinja2's required runtime dep
-import groq  # noqa: F401 — agno.models.groq (optional provider SDK, must ship in bundle)
+import groq  # noqa: F401 — src.models.providers.groq (optional provider SDK, must ship in bundle)
 import litellm  # noqa: F401 — TTS / STT dispatch (channels/tts.py, channels/voice.py)
 import faster_whisper  # noqa: F401 — local-first STT fallback
 import psutil  # noqa: F401 — cross-platform host telemetry (api/system.py)
 import iroh  # noqa: F401 — P2P transport (src.network.iroh_node) — Rust FFI dylib must be bundled
-import pydantic  # noqa: F401 — agno calls importlib.metadata.version("pydantic") at runtime
+import pydantic  # noqa: F401 — runtime calls importlib.metadata.version("pydantic")
 import email_validator  # noqa: F401 — pydantic.EmailStr validation calls version("email-validator")
 
 block_cipher = None
@@ -108,12 +108,13 @@ hiddenimports = [
     "markupsafe",
     *collect_submodules("jinja2"),
     *collect_submodules("markupsafe"),
-    # openagent submodules
+    # openagent submodules — collect_submodules("src") walks the entire
+    # in-tree runtime including the inlined LLM provider drivers under
+    # src.models.providers.* which native_provider.py loads dynamically
+    # via importlib.import_module. No external agno collect is needed.
     *collect_submodules("src"),
-    # agno: loaded dynamically via importlib.import_module in agno_provider._load_agno_model_class;
-    # PyInstaller can't trace dynamic imports so we collect all submodules explicitly.
-    *collect_submodules("agno"),
-    # groq Python SDK: imported at module level by agno.models.groq.groq — must be bundled.
+    # groq Python SDK: imported at module level by
+    # src.models.providers.groq.groq — must be bundled.
     *collect_submodules("groq"),
     # Voice: faster-whisper (local STT) loaded lazily inside _load_local_model;
     # ctranslate2 is its native runtime backend.
@@ -141,14 +142,14 @@ hiddenimports = [
     "iroh",
     "iroh.iroh_ffi",
     *collect_submodules("iroh"),
-    # pydantic + pydantic-core: transitive deps of agno whose
-    # ``.dist-info`` metadata must be present in the frozen bundle so
-    # that ``importlib.metadata.version("pydantic")`` (called by
-    # agno.tools.function.Function._wrap_callable at runtime) and
-    # ``importlib.metadata.version("email-validator")`` (called by
-    # pydantic.networks.import_email_validator at runtime) succeed.
-    # Without the metadata, the agent raises "No package metadata was
-    # found for pydantic" on the first tool-registration pass.
+    # pydantic + pydantic-core: dist-info metadata must be present in
+    # the frozen bundle so that
+    # ``importlib.metadata.version("pydantic")`` (called by
+    # ``src.mcp._runtime.function.Function._wrap_callable`` at runtime)
+    # and ``importlib.metadata.version("email-validator")`` (called by
+    # pydantic.networks.import_email_validator) succeed. Without the
+    # metadata, the agent raises "No package metadata was found for
+    # pydantic" on the first tool-registration pass.
     *collect_submodules("pydantic"),
     *collect_submodules("pydantic_core"),
     *collect_submodules("email_validator"),

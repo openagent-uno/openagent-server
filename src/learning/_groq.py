@@ -1,6 +1,6 @@
 """Shared Groq HTTP client used by the learning hooks.
 
-Lives outside ``models/agno_provider.py`` because the learning workers
+Lives outside ``models/native_provider.py`` because the learning workers
 need a stripped-down completion call (single prompt → JSON or plain text)
 without the Agno MCP toolkits, history management, or streaming surface.
 A bare ``groq`` SDK request is ~200 ms; layering Agno adds 1-2 s of setup

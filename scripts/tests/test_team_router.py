@@ -259,7 +259,7 @@ def _install_stubs(provider, *, catalog: list[dict[str, Any]] | None = None,
 
         # For subscription-CLI leaders (claude-cli / codex-cli), scan
         # for an api-based row whose Model would serve as team.model.
-        # The real provider builds the Model via AgnoProvider; the stub
+        # The real provider builds the Model via NativeProvider; the stub
         # just records a sentinel reference.
         team_model = None
         if is_subscription_leader:
@@ -384,7 +384,7 @@ async def t_real_team_leader_prompt_contains_member_ids(ctx: TestContext) -> Non
     Mirrors the user's live catalog shape (deepseek leader + 2
     claude-cli specialists + 1 deepseek specialist).
     """
-    from agno.team._messages import _build_team_context
+    from src.core._runner.team._messages import _build_team_context
 
     from src.models.dispatcher import TeamRouterProvider
 
@@ -467,8 +467,8 @@ async def t_real_team_members_block_e2e(ctx: TestContext) -> None:
     ``get_members_system_message_content``, and verifies what the leader
     LLM would see.
     """
-    from agno.team import Team
-    from agno.utils.team import get_member_id
+    from src.core._runner.team import Team
+    from src.core._runner.utils.team import get_member_id
 
     from src.models.dispatcher import TeamRouterProvider
 
@@ -554,7 +554,7 @@ async def t_real_team_full_context_e2e(ctx: TestContext) -> None:
     areas of expertise (the parallel-delegation hook the user is
     relying on).
     """
-    from agno.team._messages import _build_team_context
+    from src.core._runner.team._messages import _build_team_context
 
     from src.models.dispatcher import TeamRouterProvider
 
@@ -600,6 +600,330 @@ async def t_real_team_full_context_e2e(ctx: TestContext) -> None:
     )
 
 
+@test(
+    "team_router",
+    "vision §15: every team member (leader + specialists) carries framework+persona system prompt",
+)
+async def t_real_team_every_agent_carries_framework_prompt_e2e(
+    ctx: TestContext,
+) -> None:
+    """Vision §15 regression: the OpenAgent framework prompt + the user's
+    persona prompt MUST be injected into every agent the user can reach.
+    The Team coordinator gets it via ``team.instructions``; that's NOT
+    enough — when the coordinator delegates to a member via
+    ``delegate_task_to_member``, the member is run as a standalone Agno
+    Agent whose system message comes from its OWN ``system_message=``,
+    not from the Team's ``instructions=``.
+
+    Before the fix, ``_build_api_agent_for`` and
+    ``_build_subscription_agent_for`` were called with only
+    ``role=<short-blurb>``. Delegated members ran with no framework
+    prompt (no vault discipline, no MCP awareness, no proactivity
+    guidance) and no persona — they had a one-line role blurb and
+    nothing else. This violated vision §15's "non-removable framework
+    prompt" guarantee for everyone except the coordinator.
+
+    The fix threads ``system=`` through ``_build_agent_for`` and stamps
+    it as ``system_message=`` on each Agno Agent (and as
+    ``system_prompt`` / ``developer_instructions`` on the
+    subscription-CLI agents). Members additionally get a short
+    ``── Role ──`` suffix telling them which specialty they own —
+    mirroring the existing ``agno_provider.py`` Team pattern.
+
+    Setup mirrors the user's live config: api-based leader, api-based
+    specialist, claude-cli specialist — so we cover both flavors of
+    member in one test.
+    """
+    from src.core._runner.agent import Agent as AgnoAgent
+    from src.core._runner.team import Team
+
+    from src.models.claude_agent import ClaudeBackedAgent
+    from src.models.dispatcher import TeamRouterProvider
+
+    framework_marker = (
+        "PRETEND_FRAMEWORK_SYSTEM_PROMPT: vault, MCPs, scheduler, federation."
+    )
+    persona_marker = (
+        "── User-specific identity and project context ──\n\n"
+        "I am the user's virgil agent; my voice is concise and technical."
+    )
+    composed_system = f"{framework_marker}\n\n{persona_marker}"
+
+    providers = [
+        {
+            "id": 1, "name": "openai", "framework": "api-based",
+            "api_key": "sk-test", "enabled": True,
+            "models": [
+                {"id": 10, "model": "gpt-4o-mini", "enabled": True,
+                 "tier_hint": "fast and cheap general-purpose chat"},
+                {"id": 11, "model": "gpt-5-coding", "enabled": True,
+                 "tier_hint": "best for coding"},
+            ],
+        },
+        {
+            "id": 2, "name": "anthropic", "framework": "claude-cli",
+            "enabled": True,
+            "models": [
+                {"id": 20, "model": "claude-opus-4.7", "enabled": True,
+                 "tier_hint": "best for complex reasoning"},
+            ],
+        },
+    ]
+    provider = TeamRouterProvider(
+        entry_runtime_id="openai:gpt-4o-mini",
+        providers_config=providers,
+    )
+    team = provider._ensure_runtime("sess-vision-15", system=composed_system)
+    assert isinstance(team, Team), type(team).__name__
+
+    # Coordinator still carries the prompt as instructions (this is the
+    # pre-existing wiring and remains correct — see t_team_uses_instructions).
+    assert team.instructions == [composed_system], (
+        "Coordinator must keep receiving the system prompt via "
+        "Team.instructions= so Agno's default team-context builder runs "
+        "and emits <team_members>/<how_to_respond>. Got: "
+        f"{team.instructions!r}"
+    )
+
+    # Every member — including the leader-at-index-0 — must independently
+    # carry framework + persona on its own system_message slot.
+    assert team.members, "Team built with zero members; nothing to check."
+    for member in team.members:
+        sys_text = _resolve_member_system_text(member)
+        assert sys_text is not None, (
+            f"Member {member.name!r} ({type(member).__name__}) has no "
+            f"resolved system text — framework prompt is missing. "
+            f"Vision §15 requires it on every agent."
+        )
+        assert framework_marker in sys_text, (
+            f"Member {member.name!r} ({type(member).__name__}) is missing "
+            f"the framework prompt marker. Got:\n{sys_text[:600]}"
+        )
+        assert persona_marker in sys_text, (
+            f"Member {member.name!r} ({type(member).__name__}) is missing "
+            f"the user persona marker. Got:\n{sys_text[:600]}"
+        )
+
+    # The leader (members[0]) is NOT given a Role suffix — it's the
+    # session's default model, not a specialist. Members other than the
+    # leader DO get a Role suffix so a delegated specialist stays in
+    # its lane.
+    leader = team.members[0]
+    assert leader.name == "leader", f"members[0] should be 'leader', got {leader.name!r}"
+    leader_sys = _resolve_member_system_text(leader)
+    assert "── Role ──" not in (leader_sys or ""), (
+        "Leader must NOT be tagged with a specialist Role suffix — it's "
+        "the session's default model, not a specialty member. Got:\n"
+        f"{leader_sys[:600]}"
+    )
+
+    specialists = [m for m in team.members if m.name != "leader"]
+    assert specialists, "Expected at least one specialist member."
+    for member in specialists:
+        sys_text = _resolve_member_system_text(member) or ""
+        assert "── Role ──" in sys_text, (
+            f"Specialist {member.name!r} must carry a Role suffix so a "
+            f"delegated turn knows its specialty. Got:\n{sys_text[:600]}"
+        )
+
+    # Cross-check the claude-cli specialist specifically: its system
+    # prompt lives in the SDK options (``system_prompt``), not on an
+    # Agno ``system_message`` slot. The fix forwards ``system=`` to
+    # ``build_claude_backed_agent`` which lifts it into the SDK options.
+    claude_specialists = [
+        m for m in specialists
+        if isinstance(m, ClaudeBackedAgent)
+    ]
+    assert claude_specialists, (
+        "Expected the claude-cli row to materialise as a "
+        "ClaudeBackedAgent member."
+    )
+    claude_sys = claude_specialists[0]._sdk_options.get("system_prompt")
+    assert claude_sys and framework_marker in claude_sys, (
+        f"ClaudeBackedAgent's SDK system_prompt must carry the framework "
+        f"prompt — the SDK will not see Agno's system_message slot. Got: "
+        f"{claude_sys!r}"
+    )
+    assert persona_marker in claude_sys, (
+        f"ClaudeBackedAgent's SDK system_prompt must carry the persona. "
+        f"Got: {claude_sys!r}"
+    )
+
+    # Sanity: api-based members are real Agno Agents (not BackedAgents).
+    api_specialists = [
+        m for m in specialists
+        if isinstance(m, AgnoAgent) and not isinstance(m, ClaudeBackedAgent)
+    ]
+    assert api_specialists, "Expected at least one api-based specialist."
+
+
+@test(
+    "team_router",
+    "vision §15: codex-cli member carries framework+persona via developer_instructions",
+)
+async def t_real_team_codex_member_carries_framework_prompt_e2e(
+    ctx: TestContext,
+) -> None:
+    """Codex SDK takes the system prompt as ``developer_instructions``,
+    not ``system_prompt``. The fix routes ``system=`` through
+    ``build_codex_backed_agent`` which lifts it into the right slot.
+    Without this, a delegated codex specialist runs with no OpenAgent
+    awareness at all (vision §15 violation, same as the claude-cli case
+    but in a different SDK field).
+    """
+    from src.core._runner.team import Team
+
+    from src.models.codex_agent import CodexBackedAgent
+    from src.models.dispatcher import TeamRouterProvider
+
+    framework_marker = "PRETEND_FRAMEWORK_SYSTEM_PROMPT_codex_case"
+    persona_marker = "── User-specific identity and project context ──"
+    composed_system = f"{framework_marker}\n\n{persona_marker}\n\nmy persona body"
+
+    providers = [
+        {
+            "id": 1, "name": "openai", "framework": "api-based",
+            "api_key": "sk-test", "enabled": True,
+            "models": [
+                {"id": 10, "model": "gpt-4o-mini", "enabled": True,
+                 "tier_hint": "fast leader"},
+            ],
+        },
+        {
+            "id": 2, "name": "openai-codex", "framework": "codex-cli",
+            "enabled": True,
+            "models": [
+                {"id": 20, "model": "gpt-5-codex", "enabled": True,
+                 "tier_hint": "best for codebase edits"},
+            ],
+        },
+    ]
+    provider = TeamRouterProvider(
+        entry_runtime_id="openai:gpt-4o-mini",
+        providers_config=providers,
+    )
+    team = provider._ensure_runtime("sess-vision-15-codex", system=composed_system)
+    assert isinstance(team, Team), type(team).__name__
+
+    codex_members = [m for m in team.members if isinstance(m, CodexBackedAgent)]
+    assert codex_members, (
+        "Expected the codex-cli row to materialise as a CodexBackedAgent."
+    )
+    codex_sys = codex_members[0]._sdk_options.get("developer_instructions")
+    assert codex_sys and framework_marker in codex_sys, (
+        f"CodexBackedAgent's developer_instructions must carry the "
+        f"framework prompt. Got: {codex_sys!r}"
+    )
+    assert persona_marker in codex_sys, (
+        f"CodexBackedAgent's developer_instructions must carry the "
+        f"persona. Got: {codex_sys!r}"
+    )
+
+
+@test(
+    "team_router",
+    "vision §15: single-external-agent fallback also carries framework+persona",
+)
+async def t_single_external_agent_fallback_carries_framework_prompt_e2e(
+    ctx: TestContext,
+) -> None:
+    """When a subscription-CLI leader has no api-based row to drive
+    Team.model, the dispatcher falls back to single-external-agent
+    dispatch. That fallback agent must ALSO carry the framework prompt
+    + persona — otherwise the user loses the vision §15 guarantee
+    entirely when their catalog is claude-cli-only or codex-cli-only.
+    """
+    from src.models.claude_agent import ClaudeBackedAgent
+    from src.models.dispatcher import TeamRouterProvider, _SingleExternalAgentAdapter
+
+    framework_marker = "PRETEND_FRAMEWORK_SYSTEM_PROMPT_fallback"
+    persona_marker = "PRETEND_PERSONA_fallback"
+    composed_system = f"{framework_marker}\n\n{persona_marker}"
+
+    providers: list[dict[str, Any]] = [
+        {
+            "id": 1, "name": "anthropic", "framework": "claude-cli",
+            "enabled": True,
+            "models": [
+                {"id": 10, "model": "claude-sonnet-4-6", "enabled": True,
+                 "tier_hint": "only model"},
+            ],
+        },
+    ]
+    provider = TeamRouterProvider(
+        entry_runtime_id="claude-cli:anthropic:claude-sonnet-4-6",
+        providers_config=providers,
+    )
+    runtime = provider._ensure_runtime("sess-fallback", system=composed_system)
+
+    assert isinstance(runtime, _SingleExternalAgentAdapter), (
+        f"Expected single-external-agent fallback; got {type(runtime).__name__}"
+    )
+    inner = runtime._agent  # type: ignore[attr-defined]
+    assert isinstance(inner, ClaudeBackedAgent), type(inner).__name__
+    sys_text = inner._sdk_options.get("system_prompt")
+    assert sys_text and framework_marker in sys_text, (
+        f"Fallback ClaudeBackedAgent must carry the framework prompt in "
+        f"its SDK system_prompt; got {sys_text!r}"
+    )
+    assert persona_marker in sys_text, (
+        f"Fallback ClaudeBackedAgent must carry the persona; got {sys_text!r}"
+    )
+
+
+@test("team_router", "_compose_member_system: composition is framework + persona + Role suffix")
+async def t_compose_member_system_unit(ctx: TestContext) -> None:
+    """Unit test for the helper that builds the per-member system
+    string. Documents the contract: framework+persona on top (so the
+    member sees vision §15's non-removable prompt first), then a short
+    Role block pinning the specialist to its lane.
+    """
+    from src.models.dispatcher import _compose_member_system
+
+    # Empty framework prompt → returns None. Some classifier-only paths
+    # call into the dispatcher with system=None; we must NOT synthesise
+    # a fake prompt out of thin air.
+    assert _compose_member_system(None, "any role") is None
+    assert _compose_member_system("", "any role") is None
+    assert _compose_member_system("   ", "best for coding") is None
+
+    # No role → returns framework prompt unchanged.
+    assert _compose_member_system("FRAMEWORK", "") == "FRAMEWORK"
+    assert _compose_member_system("FRAMEWORK", None) == "FRAMEWORK"  # type: ignore[arg-type]
+
+    # Standard case: framework + role.
+    out = _compose_member_system("FRAMEWORK_AND_PERSONA", "best for coding")
+    assert out is not None
+    assert out.startswith("FRAMEWORK_AND_PERSONA"), out
+    assert "── Role ──" in out
+    assert "best for coding" in out
+    # Role suffix mentions "defer to the team leader" so a delegated
+    # member knows what to do when handed a request outside its area.
+    assert "defer to the team leader" in out
+
+
+# ── helpers (shared by vision §15 tests above) ────────────────────────
+
+
+def _resolve_member_system_text(member: Any) -> str | None:
+    """Extract the resolved system-prompt text for any Team member
+    flavor (Agno Agent / ClaudeBackedAgent / CodexBackedAgent), so the
+    vision §15 assertions can be flavor-agnostic.
+
+    Agno Agent  → ``member.system_message`` (set directly).
+    ClaudeBackedAgent → ``member._sdk_options["system_prompt"]``.
+    CodexBackedAgent  → ``member._sdk_options["developer_instructions"]``.
+    """
+    from src.models.claude_agent import ClaudeBackedAgent
+    from src.models.codex_agent import CodexBackedAgent
+
+    if isinstance(member, ClaudeBackedAgent):
+        return member._sdk_options.get("system_prompt")
+    if isinstance(member, CodexBackedAgent):
+        return member._sdk_options.get("developer_instructions")
+    return getattr(member, "system_message", None)
+
+
 @test("team_router", "end-to-end: mixed api-based + claude-cli catalog yields clean ids for both")
 async def t_real_team_members_mixed_catalog_e2e(ctx: TestContext) -> None:
     """End-to-end with a realistic mixed catalog: api-based leader plus
@@ -608,8 +932,8 @@ async def t_real_team_members_mixed_catalog_e2e(ctx: TestContext) -> None:
     runtime_ids like ``claude-cli:anthropic:claude-opus-4.7`` survive the
     member-id derivation cleanly.
     """
-    from agno.team import Team
-    from agno.utils.team import get_member_id
+    from src.core._runner.team import Team
+    from src.core._runner.utils.team import get_member_id
 
     from src.models.dispatcher import TeamRouterProvider
 
@@ -672,7 +996,7 @@ async def t_member_identifier_url_safe(ctx: TestContext) -> None:
     Fix: build member names with dashes (which ``url_safe_string``
     preserves) so the id Agno generates equals the name we set.
     """
-    from agno.utils.string import url_safe_string
+    from src.core._runner.utils.string import url_safe_string
     from src.models.dispatcher import _member_identifier
 
     runtime_ids = (
@@ -739,7 +1063,7 @@ async def t_team_construction(ctx: TestContext) -> None:
 async def t_single_agent_fallback(ctx: TestContext) -> None:
     """When the DB has only one enabled api-based model, building a
     Team adds latency for no benefit. ``_ensure_runtime`` should
-    short-circuit to an AgnoProvider-shaped single-agent runtime.
+    short-circuit to an NativeProvider-shaped single-agent runtime.
     """
     from src.models.dispatcher import TeamRouterProvider
 
@@ -755,7 +1079,7 @@ async def t_single_agent_fallback(ctx: TestContext) -> None:
     assert recorded["team"] is None  # not built yet
 
     # Calling _ensure_runtime indirectly via the public API would
-    # require the real AgnoProvider; we verify the cache shape instead.
+    # require the real NativeProvider; we verify the cache shape instead.
     runtime = provider._ensure_runtime("sess-2", system=None)
     assert isinstance(runtime, _RecordedAgent), type(runtime).__name__
     assert runtime.model_id == "openai:gpt-4o-mini"
@@ -973,7 +1297,7 @@ async def t_effective_model_badge_after_delegation(ctx: TestContext) -> None:
     team-as-router architecture invisible to the user.
 
     Fix: ``_record_delegation`` snapshots ``member_id -> runtime_id``
-    at team-build time, ``_arun_agno_stream`` / ``_arun_agno_collect``
+    at team-build time, ``_arun_runtime_stream`` / ``_arun_runtime_collect``
     detect ``delegate_task_to_member`` tool calls and feed the
     member_id through, and ``ModelDispatcher.effective_model_id``
     prefers the delegation target over the entry pick. Test verifies
@@ -1224,7 +1548,7 @@ async def t_team_mode_coordinate(ctx: TestContext) -> None:
     turn (route mode's contract: "delegate to exactly one member"),
     defeating multi-domain decomposition.
     """
-    from agno.team import Team, TeamMode
+    from src.core._runner.team import Team, TeamMode
 
     from src.models.dispatcher import TeamRouterProvider
 
@@ -1317,7 +1641,7 @@ async def t_team_has_tool_search_tools(ctx: TestContext) -> None:
     leader brain can call ``tool_search_*`` directly. Each member
     still has its own copy so delegated work also has tool access.
     """
-    from agno.team import Team
+    from src.core._runner.team import Team
 
     from src.models.dispatcher import TeamRouterProvider
 
@@ -1332,7 +1656,7 @@ async def t_team_has_tool_search_tools(ctx: TestContext) -> None:
             self.name = name
 
     class _FakePool:
-        def agno_toolkits_tool_search_only(self) -> list[Any]:
+        def runtime_toolkits_tool_search_only(self) -> list[Any]:
             return [_FakeToolkit("tool-search")]
 
         def claude_sdk_servers_tool_search_only(self) -> dict[str, dict]:

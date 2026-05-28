@@ -80,7 +80,7 @@ class _StubDB:
 def _agno_function_factory():
     """Return Agno's ``Function`` class. Skip the test when Agno isn't
     importable rather than crashing the suite."""
-    from agno.tools.function import Function
+    from src.mcp._runtime.function import Function
     return Function
 
 

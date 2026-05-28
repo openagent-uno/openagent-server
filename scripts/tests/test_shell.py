@@ -821,7 +821,7 @@ async def t_adapter_claude_schema(ctx: TestContext) -> None:
         f"timeout type: {props.get('timeout')}"
 
 
-@test("shell", "MCPPool: in-process shell toolkit appears in agno_toolkits")
+@test("shell", "MCPPool: in-process shell toolkit appears in runtime_toolkits")
 async def t_pool_in_process_agno(ctx: TestContext) -> None:
     from src.mcp.pool import MCPPool
 
@@ -833,7 +833,7 @@ async def t_pool_in_process_agno(ctx: TestContext) -> None:
     )
     await pool.connect_all()
     try:
-        kits = pool.agno_toolkits
+        kits = pool.runtime_toolkits
         assert len(kits) == 1, f"expected 1 toolkit, got {len(kits)}: {kits}"
         kit = kits[0]
         assert getattr(kit, "name", None) == "shell"
@@ -878,7 +878,7 @@ async def t_pool_in_process_import_failure(ctx: TestContext) -> None:
     # connect_all must NOT raise — the broken spec is simply skipped.
     await pool.connect_all()
     try:
-        assert pool.agno_toolkits == []
+        assert pool.runtime_toolkits == []
         assert pool.claude_sdk_servers() == {}
     finally:
         await pool.close_all()
@@ -990,7 +990,7 @@ async def t_agent_autoloop_stops(ctx: TestContext) -> None:
 
     class NoShellModel(BaseModel):
         history_mode = "provider"
-        async def generate(self, messages, system=None, tools=None, on_status=None, session_id=None, files=None):
+        async def generate(self, messages, system=None, tools=None, on_status=None, session_id=None, files=None, images=None, audio=None, videos=None):
             return ModelResponse(content="just text")
 
     agent = Agent(name="test", model=NoShellModel())
@@ -1027,7 +1027,7 @@ async def t_agent_passive_reminder(ctx: TestContext) -> None:
     class EchoModel(BaseModel):
         history_mode = "provider"
         last_input: str = ""
-        async def generate(self, messages, system=None, tools=None, on_status=None, session_id=None, files=None):
+        async def generate(self, messages, system=None, tools=None, on_status=None, session_id=None, files=None, images=None, audio=None, videos=None):
             EchoModel.last_input = messages[-1]["content"]
             return ModelResponse(content="ok")
 
@@ -1060,7 +1060,7 @@ async def t_agent_autoloop_cap(ctx: TestContext) -> None:
 
         def __init__(self): self.turns = 0
 
-        async def generate(self, messages, system=None, tools=None, on_status=None, session_id=None, files=None):
+        async def generate(self, messages, system=None, tools=None, on_status=None, session_id=None, files=None, images=None, audio=None, videos=None):
             self.turns += 1
             token = adapters.set_session_context(session_id)
             try:

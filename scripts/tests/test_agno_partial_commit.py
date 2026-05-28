@@ -1,4 +1,4 @@
-"""AgnoProvider.commit_partial_assistant — synth-run injection round-trip.
+"""NativeProvider.commit_partial_assistant — synth-run injection round-trip.
 
 Verifies that a barge-in commit appends a synthetic ``RunOutput``
 carrying the partial assistant text to Agno's session row, so the next
@@ -20,16 +20,16 @@ from ._framework import TestContext, TestSkip, test
 @test("agno_partial_commit", "synth run lands in the agno_sessions row")
 async def t_synth_run_round_trip(_ctx: TestContext) -> None:
     try:
-        from agno.db.sqlite import SqliteDb
-        from agno.db.base import SessionType
-        from agno.session.agent import AgentSession
-        from agno.run.agent import RunOutput
-        from agno.run.base import RunStatus
-        from agno.models.message import Message
+        from src.memory.store.sqlite import SqliteDb
+        from src.memory.store.base import SessionType
+        from src.memory.sessions.agent import AgentSession
+        from src.core._run_state.agent import RunOutput
+        from src.core._run_state.base import RunStatus
+        from src.models.providers.message import Message
     except ImportError as e:
         raise TestSkip(f"agno not installed: {e}")
 
-    from src.models.agno_provider import AgnoProvider
+    from src.models.native_provider import NativeProvider
 
     fd, db_path = tempfile.mkstemp(prefix="oa_agno_commit_", suffix=".db")
     os.close(fd)
@@ -62,7 +62,7 @@ async def t_synth_run_round_trip(_ctx: TestContext) -> None:
 
         # Build a provider pointing at the same db_path. We don't need an
         # API key — commit_partial_assistant only does DB IO.
-        provider = AgnoProvider(
+        provider = NativeProvider(
             model="agno:openai:gpt-4o-mini",
             api_key=None,
             db_path=db_path,
@@ -95,16 +95,16 @@ async def t_synth_run_round_trip(_ctx: TestContext) -> None:
 @test("agno_partial_commit", "missing session row is a silent no-op")
 async def t_missing_session_noop(_ctx: TestContext) -> None:
     try:
-        from agno.db.sqlite import SqliteDb  # noqa: F401
+        from src.memory.store.sqlite import SqliteDb  # noqa: F401
     except ImportError as e:
         raise TestSkip(f"agno not installed: {e}")
 
-    from src.models.agno_provider import AgnoProvider
+    from src.models.native_provider import NativeProvider
 
     fd, db_path = tempfile.mkstemp(prefix="oa_agno_noop_", suffix=".db")
     os.close(fd)
     try:
-        provider = AgnoProvider(
+        provider = NativeProvider(
             model="agno:openai:gpt-4o-mini",
             api_key=None,
             db_path=db_path,
@@ -118,13 +118,13 @@ async def t_missing_session_noop(_ctx: TestContext) -> None:
 @test("agno_partial_commit", "empty inputs short-circuit")
 async def t_empty_inputs_short_circuit(_ctx: TestContext) -> None:
     try:
-        from agno.db.sqlite import SqliteDb  # noqa: F401
+        from src.memory.store.sqlite import SqliteDb  # noqa: F401
     except ImportError as e:
         raise TestSkip(f"agno not installed: {e}")
 
-    from src.models.agno_provider import AgnoProvider
+    from src.models.native_provider import NativeProvider
 
-    provider = AgnoProvider(
+    provider = NativeProvider(
         model="agno:openai:gpt-4o-mini",
         api_key=None,
         db_path=":memory:",

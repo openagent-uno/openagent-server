@@ -59,10 +59,10 @@ CREATE INDEX IF NOT EXISTS idx_usage_year_month ON usage_log(year_month);
 CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON usage_log(timestamp);
 
 -- Canonical session table — every chat conversation lives here.
--- Agno sessions are written natively by ``agno.db.sqlite.SqliteDb``
--- (which creates this table on first use via its own ORM). Claude
--- CLI sessions are inserted manually with the same column layout
--- so session listing, deletion, and reporting work uniformly across
+-- Sessions are written natively by the inlined ``SqliteDb`` (which
+-- creates this table on first use via its own ORM). Claude CLI
+-- sessions are inserted manually with the same column layout so
+-- session listing, deletion, and reporting work uniformly across
 -- both frameworks.
 --
 -- ``runs`` is a JSON array of RunOutput-shaped objects:
@@ -72,8 +72,13 @@ CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON usage_log(timestamp);
 -- ``metadata`` is a JSON object for framework-private state:
 --   - Claude CLI stores ``{"sdk_session_id": "...", "provider": "claude-cli"}``
 --     so ``--resume`` survives process restarts.
---   - Agno stores its own session/agent/team descriptors (managed by SqliteDb).
-CREATE TABLE IF NOT EXISTS agno_sessions (
+--   - The native path stores its own session/agent/team descriptors
+--     (managed by SqliteDb).
+--
+-- Renamed from ``agno_sessions`` in v0.14; legacy DBs are migrated
+-- transparently by ``_migrate_legacy_agno_sessions_to_sessions`` on
+-- bootstrap.
+CREATE TABLE IF NOT EXISTS sessions (
     session_id   TEXT PRIMARY KEY,
     session_type TEXT,
     agent_id     TEXT,
@@ -90,7 +95,7 @@ CREATE TABLE IF NOT EXISTS agno_sessions (
     created_at   INTEGER NOT NULL,
     updated_at   INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_agno_sessions_updated ON agno_sessions(updated_at);
+CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at);
 
 -- Configured MCP servers. The agent itself (via the mcp-manager MCP)
 -- can add/remove/toggle servers at runtime without a process restart.
@@ -513,8 +518,66 @@ class MemoryDB:
         # so without this the ON DELETE CASCADE on models.provider_id is
         # silently a no-op and deleting a provider orphans its models.
         await self._conn.execute("PRAGMA foreign_keys = ON")
+        # Pre-schema migration: rename the legacy ``agno_sessions`` table
+        # to ``sessions`` BEFORE ``executescript(SCHEMA_SQL)`` runs (so
+        # the latter's ``CREATE TABLE IF NOT EXISTS sessions`` doesn't
+        # create a fresh empty table alongside the legacy data).
+        await self._migrate_legacy_agno_sessions_to_sessions()
         await self._conn.executescript(SCHEMA_SQL)
         await self._apply_legacy_alters()
+        await self._conn.commit()
+
+    async def _migrate_legacy_agno_sessions_to_sessions(self) -> None:
+        """One-shot ALTER TABLE: rename ``agno_sessions`` to ``sessions``.
+
+        v0.14 dropped the ``agno_`` prefix on the canonical session table.
+        Existing user databases shipped with the old name; this migration
+        renames the table in place so no data is lost, then recreates the
+        ``updated_at`` index under the new name.
+
+        Idempotent:
+          - Fresh installs: neither table exists yet → no-op (SCHEMA_SQL
+            will create ``sessions`` next).
+          - Already-migrated installs: only ``sessions`` exists → no-op.
+          - Legacy installs: ``agno_sessions`` exists, ``sessions`` does
+            not → rename + reindex.
+          - Defensive (shouldn't happen): both exist → leave both alone
+            and log a warning. Dropping either would risk data loss.
+
+        Must run BEFORE ``executescript(SCHEMA_SQL)`` so the CREATE TABLE
+        IF NOT EXISTS for ``sessions`` doesn't create an empty table next
+        to the legacy ``agno_sessions``.
+        """
+        assert self._conn is not None
+        cursor = await self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+            "('agno_sessions', 'sessions')"
+        )
+        present = {r[0] for r in await cursor.fetchall()}
+        has_legacy = "agno_sessions" in present
+        has_new = "sessions" in present
+        if not has_legacy:
+            return  # fresh install or already migrated
+        if has_new:
+            # Both present — refuse to merge or drop either side. The
+            # operator can pick a winner manually.
+            try:
+                from src.core.logging import elog
+                elog(
+                    "memory.sessions_rename_skipped",
+                    level="warning",
+                    reason="both_tables_present",
+                    note="agno_sessions and sessions both exist; leaving as-is",
+                )
+            except Exception:
+                pass
+            return
+        # Legacy-only: rename in place. The old ``idx_agno_sessions_updated``
+        # follows the table automatically on RENAME, but its name still
+        # carries the legacy prefix — drop it and let SCHEMA_SQL recreate
+        # the index under the new name (``idx_sessions_updated``).
+        await self._conn.execute("ALTER TABLE agno_sessions RENAME TO sessions")
+        await self._conn.execute("DROP INDEX IF EXISTS idx_agno_sessions_updated")
         await self._conn.commit()
 
     async def _apply_legacy_alters(self) -> None:
@@ -586,19 +649,19 @@ class MemoryDB:
             "CREATE INDEX IF NOT EXISTS idx_models_kind ON models(kind)"
         )
         await self._migrate_models_description_column()
-        await self._migrate_legacy_tables_to_agno_sessions()
+        await self._migrate_legacy_tables_to_sessions()
         await self._migrate_peer_networks_join_type()
         # v0.14+: fold any legacy ``session_bindings`` rows (which used
         # to carry per-session framework lock + pin) into the new
         # ``pinned_sessions`` table that stores only the pin. Idempotent.
         await self._migrate_session_bindings_to_pinned_sessions()
 
-    async def _migrate_legacy_tables_to_agno_sessions(self) -> None:
+    async def _migrate_legacy_tables_to_sessions(self) -> None:
         """One-time: fold sdk_sessions + chat_sessions + chat_session_runs
-        into the canonical ``agno_sessions`` table, then drop them.
+        into the canonical ``sessions`` table, then drop them.
 
         Idempotent: probes for the old tables first; a fresh install
-        (where agno_sessions is the only session table from the start)
+        (where ``sessions`` is the only session table from the start)
         skips all work.
         """
         assert self._conn is not None
@@ -612,7 +675,7 @@ class MemoryDB:
 
         now = time.time()
 
-        # 1. Upsert sdk_sessions rows into agno_sessions, carrying the
+        # 1. Upsert sdk_sessions rows into sessions, carrying the
         #    SDK session id in the metadata JSON column.
         if "sdk_sessions" in legacy_tables:
             cursor = await self._conn.execute(
@@ -629,15 +692,16 @@ class MemoryDB:
                     "provider": provider,
                 })
                 await self._conn.execute(
-                    "INSERT OR IGNORE INTO agno_sessions "
+                    "INSERT OR IGNORE INTO sessions "
                     "(session_id, session_type, user_id, metadata, "
                     " created_at, updated_at) "
                     "VALUES (?, 'agent', 'openagent', ?, ?, ?)",
                     (sid, meta, ts, ts),
                 )
-                # If a row already existed (from agno), merge the SDK metadata.
+                # If a row already existed (created by the session store on
+                # an earlier provider run), merge the SDK metadata in.
                 await self._conn.execute(
-                    "UPDATE agno_sessions SET metadata = ? "
+                    "UPDATE sessions SET metadata = ? "
                     "WHERE session_id = ? AND (metadata IS NULL OR metadata = '' "
                     " OR json_extract(metadata, '$.sdk_session_id') IS NULL)",
                     (meta, sid),
@@ -664,7 +728,7 @@ class MemoryDB:
                     extra["framework"] = r.get("framework", "")
                 # Read existing metadata, merge.
                 cursor2 = await self._conn.execute(
-                    "SELECT metadata FROM agno_sessions WHERE session_id = ?", (sid,)
+                    "SELECT metadata FROM sessions WHERE session_id = ?", (sid,)
                 )
                 existing = await cursor2.fetchone()
                 try:
@@ -674,7 +738,7 @@ class MemoryDB:
                 meta.update(extra)
                 ts = r.get("updated_at") or r.get("created_at") or now
                 await self._conn.execute(
-                    "INSERT OR IGNORE INTO agno_sessions "
+                    "INSERT OR IGNORE INTO sessions "
                     "(session_id, session_type, user_id, metadata, "
                     " created_at, updated_at) "
                     "VALUES (?, 'agent', 'openagent', ?, ?, ?)",
@@ -682,7 +746,7 @@ class MemoryDB:
                 )
                 if existing:
                     await self._conn.execute(
-                        "UPDATE agno_sessions SET metadata = ?, updated_at = MAX(updated_at, ?) "
+                        "UPDATE sessions SET metadata = ?, updated_at = MAX(updated_at, ?) "
                         "WHERE session_id = ?",
                         (json.dumps(meta), ts, sid),
                     )
@@ -1839,7 +1903,7 @@ class MemoryDB:
         """
         conn = await self._ensure_connected()
         cursor = await conn.execute(
-            "SELECT metadata FROM agno_sessions WHERE session_id = ?",
+            "SELECT metadata FROM sessions WHERE session_id = ?",
             (session_id,),
         )
         row = await cursor.fetchone()
@@ -1854,7 +1918,7 @@ class MemoryDB:
         meta.pop("sdk_session_id", None)
         meta.pop("provider", None)
         await conn.execute(
-            "UPDATE agno_sessions SET metadata = ?, updated_at = ? WHERE session_id = ?",
+            "UPDATE sessions SET metadata = ?, updated_at = ? WHERE session_id = ?",
             (json.dumps(meta), int(time.time()), session_id),
         )
         await conn.commit()
@@ -2361,9 +2425,9 @@ class MemoryDB:
     async def materialise_providers_config(
         self, *, enabled_only: bool = False,
     ) -> list[dict]:
-        """Build the AgnoProvider-consumable providers_config from the DB.
+        """Build the NativeProvider-consumable providers_config from the DB.
 
-        Produces the flat list shape SmartRouter / AgnoProvider consume:
+        Produces the flat list shape SmartRouter / NativeProvider consume:
         one entry per (name, framework) pair, each carrying its nested
         ``models`` list. Used by :meth:`Agent._hydrate_providers_from_db`
         (``enabled_only=True``) and by the smoke-test endpoints that
@@ -2730,7 +2794,7 @@ class MemoryDB:
             placeholders = ",".join("?" * len(candidates))
             cursor = await conn.execute(
                 f"SELECT session_id, metadata, created_at, updated_at "
-                f"FROM agno_sessions "
+                f"FROM sessions "
                 f"WHERE json_extract(json_extract(metadata, '$'), '$.client_id') "
                 f"  IN ({placeholders}) "
                 f"ORDER BY updated_at DESC LIMIT ?",
@@ -2739,7 +2803,7 @@ class MemoryDB:
         else:
             cursor = await conn.execute(
                 "SELECT session_id, metadata, created_at, updated_at "
-                "FROM agno_sessions "
+                "FROM sessions "
                 "ORDER BY updated_at DESC LIMIT ?",
                 (int(limit),),
             )
@@ -2810,7 +2874,7 @@ class MemoryDB:
         now = int(time.time())
         existing = await (
             await conn.execute(
-                "SELECT metadata FROM agno_sessions WHERE session_id = ?",
+                "SELECT metadata FROM sessions WHERE session_id = ?",
                 (session_id,),
             )
         ).fetchone()
@@ -2827,13 +2891,13 @@ class MemoryDB:
             meta["framework"] = framework
         if existing:
             await conn.execute(
-                "UPDATE agno_sessions SET metadata = ?, updated_at = ? "
+                "UPDATE sessions SET metadata = ?, updated_at = ? "
                 "WHERE session_id = ?",
                 (json.dumps(meta), now, session_id),
             )
         else:
             await conn.execute(
-                "INSERT OR IGNORE INTO agno_sessions "
+                "INSERT OR IGNORE INTO sessions "
                 "(session_id, session_type, user_id, metadata, created_at, updated_at) "
                 "VALUES (?, 'agent', 'openagent', ?, ?, ?)",
                 (session_id, json.dumps(meta), now, now),
@@ -2843,7 +2907,7 @@ class MemoryDB:
     async def delete_session(self, session_id: str) -> None:
         conn = await self._ensure_connected()
         await conn.execute(
-            "DELETE FROM agno_sessions WHERE session_id = ?",
+            "DELETE FROM sessions WHERE session_id = ?",
             (session_id,),
         )
         await conn.commit()
@@ -2852,7 +2916,7 @@ class MemoryDB:
         conn = await self._ensure_connected()
         cursor = await conn.execute(
             "SELECT session_id, metadata, created_at, updated_at "
-            "FROM agno_sessions WHERE session_id = ?",
+            "FROM sessions WHERE session_id = ?",
             (session_id,),
         )
         row = await cursor.fetchone()
@@ -2890,7 +2954,7 @@ class MemoryDB:
     ) -> list[dict]:
         conn = await self._ensure_connected()
         cursor = await conn.execute(
-            "SELECT runs FROM agno_sessions WHERE session_id = ?",
+            "SELECT runs FROM sessions WHERE session_id = ?",
             (session_id,),
         )
         row = await cursor.fetchone()

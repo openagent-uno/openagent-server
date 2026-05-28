@@ -17,7 +17,7 @@ from ._framework import TestContext, TestSkip, test
 async def t_vault_roundtrip(ctx: TestContext) -> None:
     pool = ctx.extras["pool"]
     vault_tk = next(
-        (t for t in pool.agno_toolkits if getattr(t, "tool_name_prefix", "") == "vault"),
+        (t for t in pool.runtime_toolkits if getattr(t, "tool_name_prefix", "") == "vault"),
         None,
     )
     if vault_tk is None:
@@ -38,7 +38,7 @@ async def t_vault_roundtrip(ctx: TestContext) -> None:
 async def t_scheduler_roundtrip(ctx: TestContext) -> None:
     pool = ctx.extras["pool"]
     sched_tk = next(
-        (t for t in pool.agno_toolkits if getattr(t, "tool_name_prefix", "") == "scheduler"),
+        (t for t in pool.runtime_toolkits if getattr(t, "tool_name_prefix", "") == "scheduler"),
         None,
     )
     if sched_tk is None:
@@ -66,7 +66,7 @@ async def t_scheduler_roundtrip(ctx: TestContext) -> None:
 async def t_filesystem_list(ctx: TestContext) -> None:
     pool = ctx.extras["pool"]
     fs_tk = next(
-        (t for t in pool.agno_toolkits if getattr(t, "tool_name_prefix", "") == "filesystem"),
+        (t for t in pool.runtime_toolkits if getattr(t, "tool_name_prefix", "") == "filesystem"),
         None,
     )
     if fs_tk is None:
@@ -191,7 +191,7 @@ async def t_pool_tool_budget(ctx: TestContext) -> None:
             pool._tool_counts.get("tool-search", 0)
             + pool._tool_counts.get("shell", 0)
         )
-        agno_subset = pool.agno_toolkits_under_budget(in_process_count)
+        agno_subset = pool.runtime_toolkits_under_budget(in_process_count)
         sdk_subset = pool.claude_sdk_servers_under_budget(in_process_count)
         agno_names = {pool._toolkit_name(tk) for tk in agno_subset}
         assert agno_names == {"tool-search", "shell"}, (
@@ -204,7 +204,7 @@ async def t_pool_tool_budget(ctx: TestContext) -> None:
         # Generous budget should keep everything we explicitly added.
         # ``from_config`` may merge in additional defaults — assert subset
         # so the test stays robust to that.
-        agno_full = pool.agno_toolkits_under_budget(10_000)
+        agno_full = pool.runtime_toolkits_under_budget(10_000)
         sdk_full = pool.claude_sdk_servers_under_budget(10_000)
         agno_full_names = {pool._toolkit_name(tk) for tk in agno_full}
         expected = {"tool-search", "shell", "scheduler", "mcp-manager", "workflow-manager"}
@@ -216,8 +216,8 @@ async def t_pool_tool_budget(ctx: TestContext) -> None:
         )
 
         # ``budget < 0`` is the legacy bypass — should equal the unfiltered view.
-        assert {pool._toolkit_name(tk) for tk in pool.agno_toolkits_under_budget(-1)} \
-            == {pool._toolkit_name(tk) for tk in pool.agno_toolkits}, \
+        assert {pool._toolkit_name(tk) for tk in pool.runtime_toolkits_under_budget(-1)} \
+            == {pool._toolkit_name(tk) for tk in pool.runtime_toolkits}, \
             "budget=-1 must skip trimming entirely (legacy callers depend on it)"
     finally:
         await pool.close_all()

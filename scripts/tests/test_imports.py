@@ -26,7 +26,7 @@ async def t_imports(ctx: TestContext) -> None:
     import src.mcp.pool  # noqa: F401
     import src.mcp.builtins  # noqa: F401
     import src.mcp.servers.scheduler.server  # noqa: F401
-    import src.models.agno_provider  # noqa: F401
+    import src.models.native_provider  # noqa: F401
     import src.models.claude_agent  # noqa: F401
     import src.models.dispatcher  # noqa: F401
     import src.models.runtime  # noqa: F401
@@ -36,25 +36,33 @@ async def t_imports(ctx: TestContext) -> None:
     assert src.__version__
 
 
-@test("imports", "groq SDK in deps + agno collected in spec (bundle completeness)")
-async def t_bundle_agno_groq(ctx: TestContext) -> None:
-    """Verify that the PyInstaller spec collects agno submodules and that the
-    groq Python SDK is a declared project dependency.  Both are required so
-    ``agno.models.groq`` is importable from the frozen binary; the original
-    bug was a per-session ImportError on lyra-virgil whenever a groq model
-    was selected."""
+@test("imports", "groq SDK in deps + src.* collected in spec (bundle completeness)")
+async def t_bundle_groq_and_src(ctx: TestContext) -> None:
+    """Verify that the PyInstaller spec collects every ``src.*`` submodule
+    (including the inlined LLM provider drivers under
+    ``src.models.providers``) and that the groq Python SDK is a declared
+    project dependency. Both are required so
+    ``src.models.providers.groq`` is importable from the frozen binary;
+    the original incident was a per-session ImportError on lyra-virgil
+    whenever a groq model was selected."""
     import re
 
     spec_path = REPO_ROOT / "openagent.spec"
     spec_text = spec_path.read_text()
-    assert re.search(r'collect_submodules\("agno"\)', spec_text), \
-        "openagent.spec must have collect_submodules(\"agno\") in hiddenimports"
+    assert re.search(r'collect_submodules\("src"\)', spec_text), \
+        "openagent.spec must have collect_submodules(\"src\") in hiddenimports"
     assert re.search(r'collect_submodules\("groq"\)', spec_text), \
         "openagent.spec must have collect_submodules(\"groq\") in hiddenimports"
+    # Defensive check: agno should NOT be collected — the framework has
+    # been inlined and the dependency dropped.
+    assert not re.search(r'collect_submodules\("agno"\)', spec_text), \
+        "openagent.spec must NOT collect agno — the framework was inlined into src/"
 
     toml_text = (REPO_ROOT / "pyproject.toml").read_text()
     assert re.search(r'"groq[><=!]', toml_text) or re.search(r'"groq"', toml_text), \
         "pyproject.toml must list groq as a dependency"
+    assert not re.search(r'^\s*"agno[><=!"]', toml_text, re.MULTILINE), \
+        "pyproject.toml must NOT list agno as a dependency"
 
 
 @test("imports", "frozen BUILTIN_MCPS_DIR matches PyInstaller spec layout")
@@ -121,7 +129,7 @@ async def t_frozen_builtin_mcps_dir_matches_spec(ctx: TestContext) -> None:
 @test("imports", "no stale legacy refs (MCPRegistry / MCPTools / tool_factory)")
 async def t_no_stale_refs(ctx: TestContext) -> None:
     import re
-    for p in (REPO_ROOT / "openagent").rglob("*.py"):
+    for p in (REPO_ROOT / "src").rglob("*.py"):
         s = p.read_text()
         # Skip legitimate Agno MCPTools references — only flag our deleted classes.
         for line in s.split("\n"):
@@ -134,32 +142,32 @@ async def t_no_stale_refs(ctx: TestContext) -> None:
                 raise AssertionError(f"stale tool_factory ref in {p}: {stripped}")
 
 
-@test("imports", "frozen preload list covers agno modules that agno_provider lazy-imports")
-async def t_frozen_preload_covers_lazy_agno(ctx: TestContext) -> None:
-    """The PyInstaller archive lazy-loads agno submodules on first use.
+@test("imports", "frozen preload list covers runtime modules that native_provider lazy-imports")
+async def t_frozen_preload_covers_lazy_runtime(ctx: TestContext) -> None:
+    """The PyInstaller archive lazy-loads runtime submodules on first use.
     When a sibling service swaps the on-disk binary mid-run, that
     deferred zlib extraction blows up with ``zlib.error: Error -3 …
     incorrect header check`` and propagates as ``agent.run.error``.
 
-    Pin the specific agno submodules ``agno_provider._ensure_team``
-    (and the surrounding hot paths) lazy-import so the preloader keeps
-    them resident in ``sys.modules`` and the runtime never has to crack
+    Pin the specific submodules ``native_provider._ensure_team`` (and the
+    surrounding hot paths) lazy-import so the preloader keeps them
+    resident in ``sys.modules`` and the runtime never has to crack
     the PYZ archive after startup."""
     import src.core.agent as agent_mod
 
     required = {
-        "agno.agent",
-        "agno.team",
-        "agno.db.sqlite",
-        "agno.session.agent",
-        "agno.run.agent",
-        "agno.run.team",
-        "agno.models.utils",
-        "agno.tools.mcp",
+        "src.core._runner.agent",
+        "src.core._runner.team",
+        "src.memory.store.sqlite",
+        "src.memory.sessions.agent",
+        "src.core._run_state.agent",
+        "src.core._run_state.team",
+        "src.models.providers.utils",
+        "src.mcp._runtime.mcp",
     }
     missing = required - set(agent_mod._FROZEN_RUNTIME_PRELOADS)
     assert not missing, (
-        f"agno modules missing from _FROZEN_RUNTIME_PRELOADS: {sorted(missing)}"
+        f"runtime modules missing from _FROZEN_RUNTIME_PRELOADS: {sorted(missing)}"
     )
 
     import importlib

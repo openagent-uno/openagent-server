@@ -83,7 +83,7 @@ async def t_list_all_sessions_unwraps_double_encoded(ctx: TestContext) -> None:
     try:
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS agno_sessions (
+            CREATE TABLE IF NOT EXISTS sessions (
                 session_id TEXT PRIMARY KEY,
                 session_type TEXT,
                 agent_id TEXT,
@@ -103,7 +103,7 @@ async def t_list_all_sessions_unwraps_double_encoded(ctx: TestContext) -> None:
             """
         )
         conn.execute(
-            "INSERT INTO agno_sessions "
+            "INSERT INTO sessions "
             "(session_id, session_type, user_id, metadata, created_at, updated_at) "
             "VALUES (?, 'agent', 'openagent', ?, 100, 200)",
             ("session-broken-row", double),
@@ -144,7 +144,7 @@ async def t_list_all_sessions_limit_post_filter(ctx: TestContext) -> None:
     try:
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS agno_sessions (
+            CREATE TABLE IF NOT EXISTS sessions (
                 session_id TEXT PRIMARY KEY,
                 session_type TEXT,
                 agent_id TEXT,
@@ -168,7 +168,7 @@ async def t_list_all_sessions_limit_post_filter(ctx: TestContext) -> None:
         # above the alessandro rows below.
         for i in range(100):
             conn.execute(
-                "INSERT INTO agno_sessions "
+                "INSERT INTO sessions "
                 "(session_id, session_type, user_id, metadata, "
                 " created_at, updated_at) "
                 "VALUES (?, 'agent', 'openagent', ?, ?, ?)",
@@ -193,7 +193,7 @@ async def t_list_all_sessions_limit_post_filter(ctx: TestContext) -> None:
             ("session-d", double2, 5_003),
         ]:
             conn.execute(
-                "INSERT INTO agno_sessions "
+                "INSERT INTO sessions "
                 "(session_id, session_type, user_id, metadata, "
                 " created_at, updated_at) "
                 "VALUES (?, 'agent', 'openagent', ?, 1000, ?)",
@@ -259,7 +259,7 @@ async def t_list_session_runs_unwraps(ctx: TestContext) -> None:
     try:
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS agno_sessions (
+            CREATE TABLE IF NOT EXISTS sessions (
                 session_id TEXT PRIMARY KEY,
                 session_type TEXT,
                 agent_id TEXT,
@@ -279,7 +279,7 @@ async def t_list_session_runs_unwraps(ctx: TestContext) -> None:
             """
         )
         conn.execute(
-            "INSERT INTO agno_sessions "
+            "INSERT INTO sessions "
             "(session_id, session_type, user_id, runs, "
             " created_at, updated_at) "
             "VALUES (?, 'agent', 'openagent', ?, 100, 200)",
@@ -319,7 +319,7 @@ async def t_upsert_survives_null_metadata(ctx: TestContext) -> None:
     try:
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS agno_sessions (
+            CREATE TABLE IF NOT EXISTS sessions (
                 session_id TEXT PRIMARY KEY,
                 session_type TEXT,
                 agent_id TEXT,
@@ -340,7 +340,7 @@ async def t_upsert_survives_null_metadata(ctx: TestContext) -> None:
         )
         conn.execute(
             """
-            INSERT INTO agno_sessions
+            INSERT INTO sessions
               (session_id, session_type, user_id, metadata,
                created_at, updated_at)
             VALUES (?, 'agent', 'openagent', 'null', 100, 200)

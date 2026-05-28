@@ -1,11 +1,11 @@
-"""Agno provider subclasses with OpenAgent-specific behavior.
+"""Runtime provider subclasses with OpenAgent-specific behavior.
 
 DeepSeek's chat completions API only accepts plain ``text`` content
 parts — it rejects ``{type:"file"}`` with
 ``Failed to deserialize the JSON body into the target type: messages[N]:
 unknown variant 'file', expected 'text'`` and rejects ``image_url`` /
-``input_audio`` parts the same way. Agno's default ``DeepSeek`` class
-still emits all three when ``message.files`` / ``message.images`` /
+``input_audio`` parts the same way. The runtime's default ``DeepSeek``
+class still emits all three when ``message.files`` / ``message.images`` /
 ``message.audio`` is populated, so any session that ever stored a
 multimodal artifact (user upload, MCP-tool screenshot, prior turn from
 a multimodal model) crashes the turn — and every subsequent turn until
@@ -23,10 +23,10 @@ request:
   the user to switch to a multimodal model.
 
 The mutation is local to the serialization call — the original
-:class:`agno.models.message.Message` is restored in the ``finally``
-block so other components reading the same message later don't see
-``files=None`` / ``images=None`` unexpectedly (Agno's team mode can
-serialize the same in-memory Message multiple times).
+runtime ``Message`` is restored in the ``finally`` block so other
+components reading the same message later don't see ``files=None`` /
+``images=None`` unexpectedly (the runtime's team mode can serialize the
+same in-memory Message multiple times).
 """
 
 from __future__ import annotations
@@ -34,8 +34,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from agno.models.deepseek import DeepSeek
-from agno.models.message import Message
+from src.models.providers.deepseek import DeepSeek
+from src.models.providers.message import Message
 
 # ── Files ────────────────────────────────────────────────────────────
 
@@ -61,6 +61,13 @@ _BINARY_PLACEHOLDER_HINT = (
     "model (e.g. anthropic / openai) to analyze this file."
 )
 
+# Per-file size cap (bytes). DeepSeek's context can absorb the small
+# end of attachments; multi-MB JSON/CSV files would blow the prompt
+# budget and slow down every subsequent turn for the same session.
+# Truncate with a trailer so the model still sees the file shape but
+# the rest gets dropped.
+_MAX_INLINE_FILE_BYTES = 100_000
+
 
 def _is_text_readable(mime: str | None, filename: str | None) -> bool:
     if mime and (mime in _TEXT_READABLE_MIMES or mime.startswith("text/")):
@@ -78,7 +85,7 @@ def _is_text_readable(mime: str | None, filename: str | None) -> bool:
 
 
 def _file_to_inline_block(file: Any) -> str:
-    """Render one Agno ``File`` as an ``<attachment>`` text block.
+    """Render one runtime ``File`` as an ``<attachment>`` text block.
 
     Reads via ``file.get_content_bytes()`` (sync — DeepSeek's
     ``_format_message`` is sync). On any read error we still emit a
@@ -114,6 +121,12 @@ def _file_to_inline_block(file: Any) -> str:
             f"</attachment>"
         )
 
+    original_size = len(content_bytes)
+    truncated = False
+    if original_size > _MAX_INLINE_FILE_BYTES:
+        content_bytes = content_bytes[:_MAX_INLINE_FILE_BYTES]
+        truncated = True
+
     try:
         text = content_bytes.decode("utf-8", errors="replace")
     except Exception as exc:  # noqa: BLE001
@@ -123,9 +136,16 @@ def _file_to_inline_block(file: Any) -> str:
             f"</attachment>"
         )
 
+    trailer = ""
+    if truncated:
+        trailer = (
+            f"\n... (truncated: original size {original_size} bytes, "
+            f"showing first {_MAX_INLINE_FILE_BYTES})"
+        )
+
     return (
         f'<attachment filename="{filename}" mime="{mime}">\n'
-        f"{text}\n"
+        f"{text}{trailer}\n"
         f"</attachment>"
     )
 

@@ -48,7 +48,7 @@ def _coerce_to_jsonable(value: Any, _depth: int = 0) -> Any:
 
 
 def _functions_dict(toolkit: Any) -> dict[str, Any]:
-    """Merged sync + async functions for an Agno toolkit / MCPTools.
+    """Merged sync + async functions for a runtime toolkit / MCPTools.
 
     Subprocess MCPs populate ``functions``; in-process Toolkits with
     async tools populate ``async_functions``. We treat both as
@@ -71,7 +71,7 @@ async def _ensure_functions_loaded(toolkit: Any, server: str) -> dict[str, Any]:
     """Return the toolkit's tool dict, retrying ``initialize()`` once if empty.
 
     Mirrors ``MCPPool._recover_dormant_toolkit`` but scoped to a single
-    just-in-time attempt: if the upfront connect path swallowed an Agno
+    just-in-time attempt: if the upfront connect path swallowed a
     BaseException and left ``functions == {}``, the model would otherwise
     see a confusing ``"Available: []"`` error on a healthy MCP. Re-running
     ``initialize()`` here costs at most one cold-start handshake.
@@ -166,7 +166,7 @@ async def _call_tool_impl(
         args = {}
     if not isinstance(args, dict):
         raise ValueError(f"args must be a dict, got {type(args).__name__}")
-    # Agno's ``Function`` exposes ``entrypoint``; raw callables don't.
+    # The runtime's ``Function`` exposes ``entrypoint``; raw callables don't.
     # Prefer ``entrypoint`` when present (matches the test fixtures in
     # ``scripts/tests/test_mcp.py``) and fall back to direct call for
     # plain functions.
@@ -264,22 +264,22 @@ def build_sdk_server(*, pool: Any | None = None) -> Any:
     )
 
 
-# ── Agno adapter ────────────────────────────────────────────────────
+# ── Native runtime adapter ──────────────────────────────────────────
 
 
 def build_agno_toolkit(*, pool: Any | None = None) -> Any:
-    """Return an Agno ``Toolkit`` with the same four tools.
+    """Return a runtime ``Toolkit`` with the same four tools.
 
-    The Agno function names mirror the convention used by subprocess
+    The runtime function names mirror the convention used by subprocess
     MCPs: ``<sanitised-server-name>_<tool>``. The pool's
     ``_safe_prefix`` would normally do this for subprocess specs;
     in-process Toolkits skip that step (no ``tool_name_prefix``
     constructor arg), so we apply the prefix manually.
     """
-    from agno.tools import Toolkit
+    from src.mcp._runtime import Toolkit
 
     if pool is None:
-        raise RuntimeError("tool-search Agno adapter requires a pool kwarg")
+        raise RuntimeError("tool-search runtime adapter requires a pool kwarg")
 
     async def tool_search_list_servers() -> list[dict[str, Any]]:
         """List every connected MCP with its tool count.

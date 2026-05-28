@@ -256,6 +256,25 @@ class TurnComplete(Event):
     """
 
 
+@dataclass(frozen=True)
+class SessionCompacted(Event):
+    """In-place context compaction landed for this session.
+
+    Emitted by :func:`openagent.core.compaction.compact` right after the
+    oldest runs have been folded into a recap run and the session row has
+    been rewritten on disk. Lets the desktop UI render a "Compacted
+    earlier turns" affordance without forcing the user to restart — see
+    vision §2 (Streams: "the session compacts in place").
+
+    ``summary_chars`` is the length of the recap paragraph the model
+    produced; ``kept_runs_count`` is how many recent runs survived the
+    rewrite verbatim (the recap plus the last N untouched runs).
+    """
+
+    summary_chars: int = 0
+    kept_runs_count: int = 0
+
+
 __all__ = [
     "Event",
     "SessionOpen",
@@ -275,5 +294,6 @@ __all__ = [
     "OutToolStatus",
     "OutError",
     "TurnComplete",
+    "SessionCompacted",
     "now_ms",
 ]

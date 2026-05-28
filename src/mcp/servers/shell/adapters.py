@@ -1,8 +1,9 @@
 """Provider adapters for the in-process shell MCP.
 
-Both Claude Agent SDK and Agno accept in-process tool registration, so
-the shell tools live as plain async functions in ``handlers.py`` and
-we wrap them once per provider with the native decorator here.
+Both Claude Agent SDK and the native runtime accept in-process tool
+registration, so the shell tools live as plain async functions in
+``handlers.py`` and we wrap them once per provider with the native
+decorator here.
 """
 from __future__ import annotations
 
@@ -166,16 +167,16 @@ def build_sdk_server() -> Any:
     )
 
 
-# ── Agno ────────────────────────────────────────────────────────────
+# ── Native runtime ──────────────────────────────────────────────────
 
 def build_agno_toolkit() -> Any:
-    """Return an Agno ``Toolkit`` wrapping the six shell tools.
+    """Return a ``Toolkit`` wrapping the six shell tools.
 
-    The Toolkit pattern expects plain async callables; Agno introspects
-    signatures to build the tool schema. We re-export the handlers
-    directly (same names — match existing prompt conventions).
+    The Toolkit pattern expects plain async callables; the runtime
+    introspects signatures to build the tool schema. We re-export the
+    handlers directly (same names — match existing prompt conventions).
     """
-    from agno.tools import Toolkit
+    from src.mcp._runtime import Toolkit
 
     async def shell_exec(
         command: str,
@@ -190,7 +191,7 @@ def build_agno_toolkit() -> Any:
         return await handlers.shell_exec(
             command=command, cwd=cwd, env=env, timeout=timeout,
             run_in_background=run_in_background, stdin=stdin, description=description,
-            session_id=None,  # Agno tools don't receive session_id directly; see adapter wiring in pool.
+            session_id=None,  # runtime tools don't receive session_id directly; see adapter wiring in pool.
         )
 
     async def shell_output(

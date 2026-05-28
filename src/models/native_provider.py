@@ -1,31 +1,35 @@
-"""Agno-backed provider for API models.
+"""Native API provider for API models.
 
 OpenAgent owns the *product* layer:
 - provider/model catalog
 - pricing / budget reporting
 - gateway, channels, memory vault
 
-Agno owns the *runtime* layer:
+The runtime owns the *execution* layer:
 - API call execution
 - session history persistence
-- MCP tool orchestration (via ``agno.tools.mcp.MCPTools`` instances supplied
+- MCP tool orchestration (via runtime ``MCPTools`` instances supplied
   by the OpenAgent ``MCPPool`` — see ``openagent.mcp.pool``)
 
 Tool wiring: this provider does NOT wrap MCP tools manually. It receives a
-list of pre-connected Agno ``MCPTools`` instances from the pool and passes
-them straight to the Agno ``Agent``. Agno handles the tool loop, content-type
-serialisation (image artifacts, embedded resources, etc.), and per-call
-scheduling. We only need to compute and mirror cost back into the metrics so
-``agno_sessions.runs[*].metrics.cost`` stays queryable.
+list of pre-connected ``MCPTools`` instances from the pool and passes
+them straight to the runtime ``Agent``. The runtime handles the tool loop,
+content-type serialisation (image artifacts, embedded resources, etc.), and
+per-call scheduling. We only need to compute and mirror cost back into the
+metrics so ``sessions.runs[*].metrics.cost`` stays queryable.
 """
 
 from __future__ import annotations
 
 import contextlib
+import contextvars
+import functools
 import importlib
 import inspect
 import logging
 import os
+import re
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable
 
@@ -44,20 +48,31 @@ from src.models.catalog import (
 logger = logging.getLogger(__name__)
 
 
-class _ErrorCaptureHandler(logging.Handler):
-    """Append ERROR-level log records (with formatted traceback) to a list.
+# Per-coroutine sink for runtime ERROR log capture. The previous
+# implementation installed a global root-logger handler per generate()
+# call — under concurrent turns the handlers cross-pollinated and one
+# session's error message could surface as another session's failure.
+# A contextvar-backed handler isolates each capture to its own coroutine.
+_capture_sink_var: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
+    "runtime_capture_sink", default=None,
+)
 
-    Used by :func:`_capture_log_errors` to surface provider failures Agno
-    swallows internally — see ``ModelResponse``-status-error handling in
-    :meth:`AgnoProvider.generate`.
+
+class _ErrorCaptureHandler(logging.Handler):
+    """Append ERROR-level log records to the contextvar-scoped sink.
+
+    Installed exactly once at module import (see ``_install_capture_handler``)
+    on the runtime's named logger — NOT the root logger — so we don't see
+    every other library's errors and so add/remove churn under concurrent
+    turns is gone.
     """
 
-    def __init__(self, sink: list[str]):
+    def __init__(self) -> None:
         super().__init__(level=logging.ERROR)
-        self._sink = sink
 
     def emit(self, record: logging.LogRecord) -> None:
-        if record.levelno < logging.ERROR:
+        sink = _capture_sink_var.get()
+        if sink is None or record.levelno < logging.ERROR:
             return
         try:
             msg = record.getMessage()
@@ -65,7 +80,7 @@ class _ErrorCaptureHandler(logging.Handler):
             msg = str(record.msg)
         # AGNO_LOG_TRACEBACKS=true attaches exc_info to log_error() calls
         # so we can ship the originating file/line out to the fleet log
-        # (otherwise agno's formatted error string is all we get).
+        # (otherwise the runtime's formatted error string is all we get).
         if record.exc_info:
             try:
                 import traceback as _tb
@@ -74,48 +89,175 @@ class _ErrorCaptureHandler(logging.Handler):
             except Exception:
                 pass
         if msg:
-            self._sink.append(msg)
+            sink.append(msg)
+
+
+def _install_capture_handler() -> None:
+    """Idempotently attach :class:`_ErrorCaptureHandler` to the runtime's logger.
+
+    The handler is scoped to a contextvar so each generate() call sees
+    only the records emitted within its own coroutine. Safe to call
+    repeatedly (e.g. after a logging.basicConfig rewires the root).
+    """
+    runtime_logger = logging.getLogger("openagent")
+    if any(isinstance(h, _ErrorCaptureHandler) for h in runtime_logger.handlers):
+        return
+    runtime_logger.addHandler(_ErrorCaptureHandler())
 
 
 @contextlib.contextmanager
 def _capture_log_errors():
-    """Install a temporary root-logger handler that collects ERROR records.
+    """Scope a runtime ERROR-log sink to the current coroutine.
 
-    Yields a list that callers can read after the block — useful to surface
-    provider failures Agno catches and rewrites to an empty response.
+    The handler is installed once at module import; here we just
+    publish a per-call sink via contextvar so concurrent generate()
+    calls don't share records.
     """
     sink: list[str] = []
-    handler = _ErrorCaptureHandler(sink)
-    root_logger = logging.getLogger()
-    root_logger.addHandler(handler)
+    token = _capture_sink_var.set(sink)
     try:
         yield sink
     finally:
-        root_logger.removeHandler(handler)
+        _capture_sink_var.reset(token)
+
+
+# Configure runtime tracebacks ONCE at import time — used to run per
+# generate() call which was global-state thrash on the hot path.
+os.environ.setdefault("AGNO_LOG_TRACEBACKS", "true")
+try:
+    from src.core._runner.utils.log import set_log_tracebacks as _agno_set_log_tracebacks
+    _agno_set_log_tracebacks(True)
+except Exception:  # noqa: BLE001
+    pass
+_install_capture_handler()
+
+
+@functools.lru_cache(maxsize=64)
+def _model_class_accepted_params(cls: type) -> frozenset[str]:
+    """Cache the parameter names accepted by a runtime model class.
+
+    ``inspect.signature`` is expensive and was called from
+    ``_construct_model`` on every model build — once per Team member,
+    per session. The runtime class set is small and finite so an unbounded
+    cache is fine; the LRU cap is just defensive against pathological
+    test stubs.
+    """
+    return frozenset(inspect.signature(cls).parameters.keys())
+
+
+_SESSION_ID_TAG_RE = re.compile(r"\n*<session-id>[^<]*</session-id>\s*$")
+
+# Cap per-NativeProvider Agent and Team caches so a deployment with many
+# distinct session ids (each baked into the system prompt) doesn't leak
+# Agent objects forever.
+_AGENT_CACHE_MAX = 64
+
+
+@functools.lru_cache(maxsize=1)
+def _agno_event_types() -> dict[str, tuple]:
+    """Module-level cached tuples of runtime event types for isinstance checks.
+
+    The runtime publishes ``RunContentEvent`` / ``ToolCall*Event`` under TWO
+    modules — one for plain Agent runs and one for Team(mode=…) runs.
+    Each call site needs the union; this helper builds the tuples ONCE
+    so stream loops don't pay the import + tuple-rebuild cost on every
+    iteration.
+
+    Returns a dict with keys ``content``, ``tool_started``,
+    ``tool_completed``, ``tool_error``. Team types are silently
+    omitted on runtime builds that don't ship the team module.
+    """
+    from src.core._run_state.agent import (
+        RunContentEvent as AgentRunContentEvent,
+        ToolCallStartedEvent as AgentToolCallStartedEvent,
+        ToolCallCompletedEvent as AgentToolCallCompletedEvent,
+        ToolCallErrorEvent as AgentToolCallErrorEvent,
+    )
+    content: tuple = (AgentRunContentEvent,)
+    tool_started: tuple = (AgentToolCallStartedEvent,)
+    tool_completed: tuple = (AgentToolCallCompletedEvent,)
+    tool_error: tuple = (AgentToolCallErrorEvent,)
+    try:
+        from src.core._run_state.team import (
+            RunContentEvent as TeamRunContentEvent,
+            ToolCallStartedEvent as TeamToolCallStartedEvent,
+            ToolCallCompletedEvent as TeamToolCallCompletedEvent,
+            ToolCallErrorEvent as TeamToolCallErrorEvent,
+        )
+    except ImportError:
+        pass
+    else:
+        content = (AgentRunContentEvent, TeamRunContentEvent)
+        tool_started = (AgentToolCallStartedEvent, TeamToolCallStartedEvent)
+        tool_completed = (AgentToolCallCompletedEvent, TeamToolCallCompletedEvent)
+        tool_error = (AgentToolCallErrorEvent, TeamToolCallErrorEvent)
+    return {
+        "content": content,
+        "tool_started": tool_started,
+        "tool_completed": tool_completed,
+        "tool_error": tool_error,
+    }
+
+
+def _evict_oldest(cache: OrderedDict[str, Any], max_size: int) -> None:
+    """Pop the oldest entries from ``cache`` so it doesn't exceed ``max_size``."""
+    while len(cache) > max_size:
+        cache.popitem(last=False)
+
+
+def _system_cache_key(system: str | None) -> str:
+    """Stable cache key for a system prompt that ignores the per-session
+    ``<session-id>`` tag the orchestrator appends.
+
+    Without this, every session generates a unique system prompt
+    string, so ``_agno_agents`` / ``_agno_teams`` would miss on every
+    session AND grow unbounded with session count.
+    """
+    if not system:
+        return ""
+    return _SESSION_ID_TAG_RE.sub("", system).strip()
 _INCOMPATIBLE_TOOL_FAMILIES_BY_PROVIDER: dict[str, frozenset[str]] = {
     # DeepSeek v4 flash/pro chat completions are text-only on the official
-    # API, so Agno computer-control screenshot artifacts (image parts) fail
+    # API, so computer-control screenshot artifacts (image parts) fail
     # with "unknown variant image_url, expected text". Filter that toolkit
     # out up front instead of letting sessions crash mid-turn.
     "deepseek": frozenset({"computer_control"}),
 }
 
 
-class AgnoProviderError(RuntimeError):
-    """Raised when Agno's underlying provider failed (e.g. OpenAI 403,
-    rate-limit, model-not-allowed) but Agno swallowed the exception and
-    returned an empty response. We capture the ERROR log record(s) and
+class NativeProviderError(RuntimeError):
+    """Raised when the runtime's underlying provider failed (e.g. OpenAI 403,
+    rate-limit, model-not-allowed) but the runtime swallowed the exception
+    and returned an empty response. We capture the ERROR log record(s) and
     re-raise with a user-readable message so the chat UI can show what
     actually went wrong instead of a silent placeholder."""
 
 
+# Single per-process tempdir for tool-call image artifacts so each
+# image doesn't leak its own tempdir into ``$TMPDIR``. Resolved on first
+# call; cleaned up by the OS at reboot (we never created sub-dirs to
+# clean up between, just files within one shared dir).
+_AGNO_IMAGE_TMPDIR: str | None = None
+
+
+def _agno_image_tmpdir() -> str:
+    global _AGNO_IMAGE_TMPDIR
+    if _AGNO_IMAGE_TMPDIR is None:
+        import tempfile
+        _AGNO_IMAGE_TMPDIR = tempfile.mkdtemp(prefix="oa_agno_img_")
+    return _AGNO_IMAGE_TMPDIR
+
+
 def _save_agno_image_to_disk(image: Any) -> tuple[str | None, str | None]:
-    """Persist an Agno ``Image`` to a temp file. Returns ``(path, filename)``.
+    """Persist a runtime ``Image`` to a temp file. Returns ``(path, filename)``.
 
     Tries ``content`` (bytes) first, then ``filepath``, then ``url``.
     Returns ``(None, None)`` when no bytes can be resolved synchronously.
+    Files land in a single process-wide tempdir so a vision-heavy
+    session doesn't leak one tempdir per image.
     """
-    import tempfile, os
+    import os
+    from uuid import uuid4
 
     mime_type = getattr(image, "mime_type", None) or "image/png"
     fmt = getattr(image, "format", None)
@@ -148,53 +290,67 @@ def _save_agno_image_to_disk(image: Any) -> tuple[str | None, str | None]:
     if not content:
         return None, None
 
-    tmp = tempfile.mkdtemp(prefix="oa_agno_img_")
-    path = os.path.join(tmp, filename)
+    # Disambiguate per-image with a uuid prefix so two images named
+    # ``image.png`` in the same tempdir don't clobber each other.
+    safe_name = f"{uuid4().hex[:8]}-{filename}"
+    path = os.path.join(_agno_image_tmpdir(), safe_name)
     with open(path, "wb") as f:
         f.write(content)
     return os.path.realpath(path), filename
 
 
-def _extract_tool_names_from_agno_response(response: Any) -> list[str]:
-    """Best-effort extraction of executed tool names from an Agno RunResponse.
+def _is_error_status(status_obj: Any) -> bool:
+    """True when a runtime RunOutput status indicates an error.
 
-    Agno surfaces executed tools in different shapes across versions:
-    ``response.tools`` (list of ``ToolExecution`` with ``.tool_name``),
-    ``response.tool_executions``, or nested under ``response.run_response``.
-    We probe each candidate and return the first non-empty list of names.
-    Returns ``[]`` on miss — telemetry is best-effort, not load-bearing.
+    Compares against ``RunStatus.error`` enum (preferred — survives
+    enum-value renames). Falls back to the stringly-typed compare for
+    the case where status_obj is already a bare string (legacy runtime
+    versions / mock responses in tests).
     """
-    candidates = [
-        getattr(response, "tools", None),
-        getattr(response, "tool_executions", None),
-        getattr(getattr(response, "run_response", None), "tools", None),
-    ]
-    for candidate in candidates:
-        if not candidate:
-            continue
-        names: list[str] = []
-        for entry in candidate:
-            name = None
-            if isinstance(entry, dict):
-                name = entry.get("tool_name") or entry.get("name")
-            else:
-                name = getattr(entry, "tool_name", None) or getattr(entry, "name", None)
-            if name:
-                names.append(str(name))
-        if names:
-            return names
-    return []
+    if status_obj is None:
+        return False
+    try:
+        from src.core._run_state.base import RunStatus
+        if status_obj == RunStatus.error:
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    status_val = getattr(status_obj, "value", status_obj)
+    return isinstance(status_val, str) and status_val.upper() == "ERROR"
+
+
+def _extract_tool_names_from_agno_response(response: Any) -> list[str]:
+    """Extract executed tool names from a runtime RunOutput.
+
+    The runtime exposes ``RunOutput.tools: list[ToolExecution]``. We read
+    that directly. Older defensive ``tool_executions`` /
+    ``run_response.tools`` probes were removed — they hadn't matched
+    real runtime output since the 1.x line and only hid shape drift.
+    Returns ``[]`` on miss — tool telemetry is non-load-bearing.
+    """
+    tools = getattr(response, "tools", None)
+    if not tools:
+        return []
+    names: list[str] = []
+    for entry in tools:
+        name = (
+            entry.get("tool_name") if isinstance(entry, dict)
+            else getattr(entry, "tool_name", None)
+        )
+        if name:
+            names.append(str(name))
+    return names
 
 
 def _summarize_provider_errors(errs: list[str]) -> str:
     """Pick the most useful line from a list of captured ERROR log
-    messages. Agno emits a small flurry of three lines for one provider
-    failure ("API status error", "Non-retryable model provider error",
-    "Error in Team run") — the second one is the cleanest and shortest,
-    so we prefer that pattern, then fall back to the last record.
+    messages. The runtime emits a small flurry of three lines for one
+    provider failure ("API status error", "Non-retryable model provider
+    error", "Error in Team run") — the second one is the cleanest and
+    shortest, so we prefer that pattern, then fall back to the last record.
 
     Falls back to joining all of them when nothing matches the known
-    Agno phrasing.
+    runtime phrasing.
     """
     if not errs:
         return "Provider returned no content"
@@ -211,6 +367,24 @@ def _summarize_provider_errors(errs: list[str]) -> str:
     return errs[-1].strip()
 
 
+# Set of env var names NativeProvider has already populated this process.
+# Avoids redundant writes from per-member NativeProvider construction in
+# TeamRouterProvider, and skips re-walking the providers list once a
+# given providers_config has already been processed.
+_INJECTED_ENV_KEYS: set[str] = set()
+_PROVIDERS_CONFIG_INJECTED: set[int] = set()
+
+
+def _set_env_key_once(env_var: str | None, value: str) -> None:
+    if not env_var or not value:
+        return
+    if env_var in _INJECTED_ENV_KEYS:
+        return
+    if not os.environ.get(env_var):
+        os.environ[env_var] = value
+    _INJECTED_ENV_KEYS.add(env_var)
+
+
 PROVIDER_ENV_VARS = {
     "anthropic": "ANTHROPIC_API_KEY",
     "openai": "OPENAI_API_KEY",
@@ -224,30 +398,26 @@ PROVIDER_ENV_VARS = {
     "deepseek": "DEEPSEEK_API_KEY",
     "cerebras": "CEREBRAS_API_KEY",
 }
-AGNO_PROVIDER_CLASSES: dict[str, tuple[str, str, dict[str, Any]]] = {
-    "anthropic": ("agno.models.anthropic", "Claude", {}),
-    "openai": ("agno.models.openai", "OpenAIChat", {}),
-    "google": ("agno.models.google", "Gemini", {}),
-    "openrouter": ("agno.models.openrouter", "OpenRouter", {}),
-    "groq": ("agno.models.groq", "Groq", {}),
-    "mistral": ("agno.models.mistral", "MistralChat", {}),
-    "xai": ("agno.models.xai", "xAI", {}),
-    # ``_provider_overrides.DeepSeekTextOnly`` rewrites Agno multimodal
-    # attachments to text before they hit DeepSeek's chat completions API
-    # — the official endpoint rejects ``{type:"file"}`` /
+RUNTIME_PROVIDER_CLASSES: dict[str, tuple[str, str, dict[str, Any]]] = {
+    "anthropic": ("src.models.providers.anthropic", "Claude", {}),
+    "openai": ("src.models.providers.openai", "OpenAIChat", {}),
+    "google": ("src.models.providers.google", "Gemini", {}),
+    "groq": ("src.models.providers.groq", "Groq", {}),
+    # ``_provider_overrides.DeepSeekTextOnly`` rewrites multimodal
+    # attachments to text before they hit DeepSeek's chat completions
+    # API — the official endpoint rejects ``{type:"file"}`` /
     # ``{type:"image_url"}`` / ``{type:"input_audio"}`` content parts
-    # with ``unknown variant '<x>', expected 'text'``. Files become inline
-    # ``<attachment>`` blocks (or a placeholder for binaries); images /
-    # audio become a single ``<media-omitted>`` block listing what was
-    # stripped.
+    # with ``unknown variant '<x>', expected 'text'``. Files become
+    # inline ``<attachment>`` blocks (or a placeholder for binaries);
+    # images / audio become a single ``<media-omitted>`` block listing
+    # what was stripped.
     "deepseek": ("src.models._provider_overrides", "DeepSeekTextOnly", {}),
-    "cerebras": ("agno.models.cerebras", "Cerebras", {}),
-    "zai": ("agno.models.openai.like", "OpenAILike", {"name": "ZAI"}),
+    "zai": ("src.models.providers.openai.like", "OpenAILike", {"name": "ZAI"}),
 }
 
 
-class AgnoProvider(BaseModel):
-    """API model provider backed by Agno sessions and tool orchestration."""
+class NativeProvider(BaseModel):
+    """API model provider backed by the runtime's session and tool orchestration."""
 
     history_mode = "platform"
 
@@ -266,56 +436,73 @@ class AgnoProvider(BaseModel):
         self._base_url = base_url
         self._db_path = db_path
         self._history_runs = history_runs
-        # Pre-connected Agno MCPTools instances supplied by MCPPool. Shared
-        # across all AgnoProvider instances under the same ModelDispatcher
+        # Pre-connected MCPTools instances supplied by MCPPool. Shared
+        # across all NativeProvider instances under the same ModelDispatcher
         # so we don't spawn duplicate MCP server processes per entry model.
         self._mcp_toolkits: list[Any] = []
-        # One Agno Agent per (system_message) so the framework prompt is sent
-        # as a real ``system`` role message — not buried inside the user
-        # prompt. Without this, weak models ignore procedural instructions
-        # and confabulate. Cache stays small in practice: usually one or
-        # two entries (no-system vs the static framework+user prompt).
-        self._agno_agents: dict[str, Any] = {}
-        # Parallel cache for Team-mode runners. One Team per framework
-        # system prompt, built only when ≥2 MCP tool families are connected.
-        # No-system calls never trigger Team construction.
-        self._agno_teams: dict[str, Any] = {}
+        # Memoized result of ``_compatible_mcp_toolkits`` so the per-turn
+        # path doesn't re-walk the toolkit list.
+        self._compatible_cache: tuple[list[Any], list[str]] | None = None
+        # One runtime Agent per unique system prompt (the orchestrator
+        # appends a per-session ``<session-id>`` tag, so practically
+        # one entry per active session). Bounded LRU with
+        # ``_AGENT_CACHE_MAX`` entries to cap memory growth — see
+        # ``_evict_oldest``.
+        self._agno_agents: OrderedDict[str, Any] = OrderedDict()
+        self._agno_teams: OrderedDict[str, Any] = OrderedDict()
+        # Memoised provider-config row for this model. Resolved once at
+        # construction because the providers_config can't change for a
+        # given NativeProvider instance (rebuild_routing rebuilds the
+        # instance).
+        self._provider_config_cache: dict[str, Any] | None = None
+        # Path returned by ``_ensured_runtime_db_path`` after we've
+        # mkdir()'d the parent — cached so the ensure-agent hot path
+        # doesn't redo the stat+mkdir per cache miss.
+        self._ensured_db_path: Path | None = None
 
         self._inject_provider_keys()
 
     def set_db(self, db) -> None:
-        self._db_path = getattr(db, "db_path", self._db_path)
+        new_path = getattr(db, "db_path", self._db_path)
+        if new_path == self._db_path:
+            return
+        self._db_path = new_path
+        self._ensured_db_path = None
         # Force agent rebuild so the new SqliteDb path takes effect.
         self._agno_agents.clear()
         self._agno_teams.clear()
 
     def set_mcp_toolkits(self, toolkits: list[Any]) -> None:
-        """Receive the pool's pre-connected Agno ``MCPTools`` instances.
+        """Receive the pool's pre-connected ``MCPTools`` instances.
 
         Called by ``wire_model_runtime``. The pool owns lifecycle (entered
-        once at agent startup, exited at shutdown); we just hold references.
+        once at agent startup, exited at shutdown); we just hold
+        references. Always flushes the agent/team caches — the pool may
+        swap toolkits in place across hot-reload so we can't safely
+        skip rebuild even when the list looks identical.
         """
         self._mcp_toolkits = list(toolkits)
+        self._compatible_cache = None
         # Force agent/team rebuild so the new tool list is picked up.
         self._agno_agents.clear()
         self._agno_teams.clear()
 
     async def close_session(self, session_id: str) -> None:
-        """Agno persists session history in DB but keeps no per-session subprocess."""
+        """The runtime persists session history in DB but keeps no per-session subprocess."""
         return None
 
     async def forget_session(self, session_id: str) -> None:
-        """Erase Agno's stored history for ``session_id`` so the next
+        """Erase the runtime's stored history for ``session_id`` so the next
         call on that session id starts empty.
 
         Without this, ``add_history_to_context=True`` (see
         :meth:`_ensure_agent`) reloads the full prior transcript AND
         any rolling session summary on the next generate() — so the
         gateway's ``/clear`` and the scheduler's per-fire forget both
-        silently break for agno-backed models.
+        silently break for runtime-backed models.
 
-        Strategy: call Agno's native ``SqliteDb.delete_session`` (which
-        drops the ``agno_sessions`` row carrying both the transcript
+        Strategy: call the runtime's native ``SqliteDb.delete_session``
+        (which drops the sessions row carrying both the transcript
         and the summary). Fall back to raw SQL if the API ever changes.
         The ``_agno_agents`` / ``_agno_teams`` caches don't need to
         be invalidated — the live ``Agent`` re-reads history from the
@@ -327,116 +514,127 @@ class AgnoProvider(BaseModel):
         if not session_id:
             return
         try:
-            from agno.db.sqlite import SqliteDb
+            from src.memory.store.sqlite import SqliteDb
         except ImportError:
             return
 
         db_path = self._runtime_db_path()
-        try:
-            db = SqliteDb(db_file=db_path)
-        except Exception as e:
-            logger.debug("agno forget_session: SqliteDb init failed: %s", e)
-            await self._agno_fallback_sql_forget(db_path, session_id)
-            elog("agno.session_forget", session_id=session_id, db=db_path)
-            return
+        import asyncio as _asyncio
 
-        delete_fn = getattr(db, "delete_session", None)
-        deleted_via_api = False
-        if callable(delete_fn):
+        def _delete_via_api() -> bool:
+            """Sync helper: SqliteDb.delete_session is sync end-to-end."""
+            try:
+                db = SqliteDb(db_file=db_path)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("runtime forget_session: SqliteDb init failed: %s", e)
+                return False
+            delete_fn = getattr(db, "delete_session", None)
+            if not callable(delete_fn):
+                return False
             try:
                 result = delete_fn(session_id=session_id)
+                # Defensive — the runtime may switch to async one day.
                 if inspect.isawaitable(result):
-                    await result
-                deleted_via_api = True
-            except Exception as e:
+                    return False
+                return True
+            except Exception as e:  # noqa: BLE001
                 logger.debug(
-                    "agno delete_session failed for %s: %s", session_id, e,
+                    "runtime delete_session failed for %s: %s", session_id, e,
                 )
+                return False
+
+        deleted_via_api = await _asyncio.to_thread(_delete_via_api)
         if not deleted_via_api:
             await self._agno_fallback_sql_forget(db_path, session_id)
-        elog("agno.session_forget", session_id=session_id, db=db_path)
+        elog("runtime.session_forget", session_id=session_id, db=db_path)
 
     async def _agno_fallback_sql_forget(
         self, db_path: str, session_id: str
     ) -> None:
-        """Raw-SQL delete for when Agno's ``SqliteDb.delete_session``
+        """Raw-SQL delete for when the runtime's ``SqliteDb.delete_session``
         is unavailable or errors out.
 
-        Agno 2.x keeps session history and summary in ``agno_sessions``;
-        earlier/alternate schemas may call it ``sessions``. Drop the
-        row in whichever of those tables exists — a missing table is
-        a no-op, not an error. Read-only when no relevant table is
-        present (brand-new DB before Agno has created its schema).
+        Current schema keeps session history and summary in ``sessions``;
+        legacy installs may still carry it as ``agno_sessions`` if the
+        rename migration hasn't run yet on that file. We DELETE from
+        each candidate and catch the "no such table" OperationalError
+        instead of pre-scanning ``sqlite_master`` — a missing table is
+        a no-op. ``timeout=2.0`` avoids hanging the gateway ``/clear``
+        request when a writer holds the lock. Runs on a worker thread
+        so the sqlite I/O doesn't block the event loop.
         """
+        import asyncio as _asyncio
         import sqlite3
-        candidate_tables = ("agno_sessions", "sessions")
-        try:
-            conn = sqlite3.connect(db_path)
-        except Exception as e:
-            logger.debug("agno fallback sql: connect %s failed: %s", db_path, e)
-            return
-        try:
-            cur = conn.cursor()
-            present = {
-                row[0]
-                for row in cur.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                )
-            }
-            for table in candidate_tables:
-                if table not in present:
-                    continue
-                try:
-                    cur.execute(
-                        f"DELETE FROM {table} WHERE session_id = ?",
-                        (session_id,),
-                    )
-                except sqlite3.OperationalError as e:
-                    logger.debug(
-                        "agno fallback delete from %s for %s failed: %s",
-                        table, session_id, e,
-                    )
-            conn.commit()
-        finally:
-            conn.close()
+
+        candidate_tables = ("sessions", "agno_sessions")
+
+        def _run_sync() -> None:
+            try:
+                conn = sqlite3.connect(db_path, timeout=2.0)
+            except Exception as e:
+                logger.debug("runtime fallback sql: connect %s failed: %s", db_path, e)
+                return
+            try:
+                cur = conn.cursor()
+                for table in candidate_tables:
+                    try:
+                        cur.execute(
+                            f"DELETE FROM {table} WHERE session_id = ?",
+                            (session_id,),
+                        )
+                    except sqlite3.OperationalError as e:
+                        msg = str(e).lower()
+                        if "no such table" not in msg:
+                            logger.debug(
+                                "runtime fallback delete from %s for %s failed: %s",
+                                table, session_id, e,
+                            )
+                conn.commit()
+            finally:
+                conn.close()
+
+        await _asyncio.to_thread(_run_sync)
 
     def _provider_name(self) -> str:
         return split_runtime_id(self.model)[0]
 
     def _inject_provider_keys(self) -> None:
-        # NOTE: this mutates ``os.environ`` from a constructor — surprising but
-        # intentional. Agno's provider classes (``Claude``, ``OpenAIChat``,
-        # ``Gemini``, …) read API keys from process env vars, not from
-        # constructor args we pass through. We export keys here so Agno can find
-        # them. Two ``AgnoProvider`` instances with different keys for the same
-        # provider will race; in practice OpenAgent uses one key per provider so
-        # it's fine. Keys already in the env are not overwritten.
+        """Mirror configured API keys into ``os.environ`` for the runtime's
+        provider classes (which read from env, not constructor args).
+
+        Module-level deduplication: every key set is tracked in
+        :data:`_INJECTED_ENV_KEYS` so a fresh NativeProvider per Team
+        member per session doesn't re-walk the providers list or
+        re-write the same env vars. Existing env values are not
+        overwritten — once a key wins, it wins. (Hot-rotating an API
+        key requires a restart; documented limitation.)
+        """
         provider_name = self._provider_name()
         if self._api_key:
-            env_var = PROVIDER_ENV_VARS.get(provider_name)
-            if env_var and not os.environ.get(env_var):
-                os.environ[env_var] = self._api_key
-            if provider_name == "google" and not os.environ.get("GEMINI_API_KEY"):
-                os.environ["GEMINI_API_KEY"] = self._api_key
+            _set_env_key_once(PROVIDER_ENV_VARS.get(provider_name), self._api_key)
+            if provider_name == "google":
+                _set_env_key_once("GEMINI_API_KEY", self._api_key)
 
-        # Only agno-framework provider rows carry api_keys worth exporting.
-        # claude-cli rows have api_key=NULL by schema, but be defensive
-        # against legacy dict-shaped configs that might still be in play.
-        for entry in _iter_provider_entries(self._providers_config):
-            if entry.get("framework", FRAMEWORK_API_BASED) != FRAMEWORK_API_BASED:
-                continue
-            name = str(entry.get("name") or "").strip()
-            key = entry.get("api_key")
-            if not name or not key:
-                continue
-            env_var = PROVIDER_ENV_VARS.get(name)
-            if env_var and not os.environ.get(env_var):
-                os.environ[env_var] = key
-            if name == "google" and not os.environ.get("GEMINI_API_KEY"):
-                os.environ["GEMINI_API_KEY"] = key
+        # Only API-based provider rows carry api_keys worth exporting.
+        # claude-cli rows have api_key=NULL by schema. The module-level
+        # dedupe means we only do the providers-list walk on the FIRST
+        # NativeProvider per (config-hash, provider) pair.
+        config_id = id(self._providers_config)
+        if config_id not in _PROVIDERS_CONFIG_INJECTED:
+            for entry in _iter_provider_entries(self._providers_config):
+                if entry.get("framework", FRAMEWORK_API_BASED) != FRAMEWORK_API_BASED:
+                    continue
+                name = str(entry.get("name") or "").strip()
+                key = entry.get("api_key")
+                if not name or not key:
+                    continue
+                _set_env_key_once(PROVIDER_ENV_VARS.get(name), key)
+                if name == "google":
+                    _set_env_key_once("GEMINI_API_KEY", key)
+            _PROVIDERS_CONFIG_INJECTED.add(config_id)
 
-        if self._base_url and provider_name == "openai" and not os.environ.get("OPENAI_BASE_URL"):
-            os.environ["OPENAI_BASE_URL"] = self._base_url
+        if self._base_url and provider_name == "openai":
+            _set_env_key_once("OPENAI_BASE_URL", self._base_url)
 
     def _runtime_db_path(self) -> str:
         if self._db_path:
@@ -445,13 +643,28 @@ class AgnoProvider(BaseModel):
 
         return str(default_db_path())
 
-    async def commit_partial_assistant(self, session_id: str, text: str) -> None:
-        """Append a synthetic assistant run to Agno's session row.
+    def _ensured_runtime_db_path(self) -> Path:
+        """Return the runtime DB path with its parent dir ensured.
 
-        After barge-in, the in-flight Agno run is cancelled mid-stream and
-        nothing has been committed to ``agno_sessions.runs``. We append a
-        synthetic ``RunOutput`` with ``status=cancelled`` carrying the
-        partial assistant text, so the next turn (which reads the session
+        Caches the ensured-once result on the instance so the
+        ``_ensure_agent`` / ``_ensure_team`` hot paths don't repeat
+        stat()+mkdir() on every cache miss. ``set_db`` invalidates
+        the cache by zeroing ``_ensured_db_path``.
+        """
+        if self._ensured_db_path is not None:
+            return self._ensured_db_path
+        path = Path(self._runtime_db_path())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensured_db_path = path
+        return path
+
+    async def commit_partial_assistant(self, session_id: str, text: str) -> None:
+        """Append a synthetic assistant run to the runtime's session row.
+
+        After barge-in, the in-flight runtime run is cancelled mid-stream and
+        nothing has been committed to the sessions table's runs column. We
+        append a synthetic ``RunOutput`` with ``status=cancelled`` carrying
+        the partial assistant text, so the next turn (which reads the session
         via ``add_history_to_context=True``) sees ``user → assistant
         (interrupted) → user`` rather than two adjacent user turns.
 
@@ -462,61 +675,68 @@ class AgnoProvider(BaseModel):
         if not session_id or not text:
             return
         try:
-            from agno.db.sqlite import SqliteDb
-            from agno.db.base import SessionType
-            from agno.session.agent import AgentSession
-            from agno.run.agent import RunOutput
-            from agno.run.base import RunStatus
-            from agno.models.message import Message
+            from src.memory.store.sqlite import SqliteDb
+            from src.memory.store.base import SessionType
+            from src.memory.sessions.agent import AgentSession
+            from src.core._run_state.agent import RunOutput
+            from src.core._run_state.base import RunStatus
+            from src.models.providers.message import Message
         except ImportError as e:
-            logger.debug("agno commit_partial_assistant: import failed: %s", e)
+            logger.debug("runtime commit_partial_assistant: import failed: %s", e)
             return
 
         db_path = self._runtime_db_path()
-        try:
-            db = SqliteDb(db_file=db_path)
-        except Exception as e:  # noqa: BLE001
-            logger.debug("agno commit_partial_assistant: SqliteDb init failed: %s", e)
-            return
 
-        try:
-            session = db.get_session(
+        def _commit_sync() -> None:
+            # Sync helper: the runtime's SqliteDb is sync end-to-end. Run on a
+            # worker thread so barge-in doesn't stall the event loop.
+            try:
+                db = SqliteDb(db_file=db_path)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("runtime commit_partial_assistant: SqliteDb init failed: %s", e)
+                return
+
+            try:
+                session = db.get_session(
+                    session_id=session_id,
+                    session_type=SessionType.AGENT,
+                    deserialize=True,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.debug("runtime commit_partial_assistant: get_session %s: %s", session_id, e)
+                return
+
+            if not isinstance(session, AgentSession):
+                return
+
+            import time as _time
+            # ``agent_id`` is REQUIRED on the run dict — the runtime's
+            # ``AgentSession.from_dict`` filters out any run that lacks both
+            # ``agent_id`` and ``team_id`` when deserialising. Without it,
+            # our synth run round-trips through SqliteDb and silently
+            # disappears on the next read.
+            run = RunOutput(
+                run_id=f"interrupted-{int(_time.time() * 1000)}",
+                agent_id=session.agent_id,
                 session_id=session_id,
-                session_type=SessionType.AGENT,
-                deserialize=True,
+                user_id=session.user_id,
+                content=text,
+                messages=[Message(role="assistant", content=text)],
+                status=RunStatus.cancelled,
             )
-        except Exception as e:  # noqa: BLE001
-            logger.debug("agno commit_partial_assistant: get_session %s: %s", session_id, e)
-            return
+            try:
+                session.upsert_run(run)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("runtime commit_partial_assistant: upsert_run failed: %s", e)
+                return
+            try:
+                db.upsert_session(session, deserialize=False)
+                elog("runtime.barge_in_commit", session_id=session_id, chars=len(text))
+            except Exception as e:  # noqa: BLE001
+                logger.debug("runtime commit_partial_assistant: upsert_session failed: %s", e)
 
-        if not isinstance(session, AgentSession):
-            return
-
-        import time as _time
-        # ``agent_id`` is REQUIRED on the run dict — Agno's
-        # ``AgentSession.from_dict`` filters out any run that lacks both
-        # ``agent_id`` and ``team_id`` when deserialising. Without it,
-        # our synth run round-trips through SqliteDb and silently
-        # disappears on the next read.
-        run = RunOutput(
-            run_id=f"interrupted-{int(_time.time() * 1000)}",
-            agent_id=session.agent_id,
-            session_id=session_id,
-            user_id=session.user_id,
-            content=text,
-            messages=[Message(role="assistant", content=text)],
-            status=RunStatus.cancelled,
-        )
-        try:
-            session.upsert_run(run)
-        except Exception as e:  # noqa: BLE001
-            logger.debug("agno commit_partial_assistant: upsert_run failed: %s", e)
-            return
-        try:
-            db.upsert_session(session, deserialize=False)
-            elog("agno.barge_in_commit", session_id=session_id, chars=len(text))
-        except Exception as e:  # noqa: BLE001
-            logger.debug("agno commit_partial_assistant: upsert_session failed: %s", e)
+        import asyncio as _asyncio
+        await _asyncio.to_thread(_commit_sync)
 
     def _runtime_parts(self) -> tuple[str, str]:
         return split_runtime_id(self.model)
@@ -530,9 +750,13 @@ class AgnoProvider(BaseModel):
         )
 
     def _compatible_mcp_toolkits(self) -> tuple[list[Any], list[str]]:
+        if self._compatible_cache is not None:
+            allowed, filtered = self._compatible_cache
+            return list(allowed), list(filtered)
         provider_name, _model_id = self._runtime_parts()
         blocked = _INCOMPATIBLE_TOOL_FAMILIES_BY_PROVIDER.get(provider_name, frozenset())
         if not blocked:
+            self._compatible_cache = (list(self._mcp_toolkits), [])
             return list(self._mcp_toolkits), []
         allowed: list[Any] = []
         filtered: set[str] = set()
@@ -542,7 +766,8 @@ class AgnoProvider(BaseModel):
                 filtered.add(family)
                 continue
             allowed.append(toolkit)
-        return allowed, sorted(filtered)
+        self._compatible_cache = (allowed, sorted(filtered))
+        return list(allowed), sorted(filtered)
 
     @staticmethod
     def _is_session_corruption_error(error_msg: str) -> bool:
@@ -559,7 +784,7 @@ class AgnoProvider(BaseModel):
         if provider_name == "deepseek" and "unknown variant image_url" in lowered:
             return (
                 "DeepSeek's official chat API only accepts text message content, "
-                "so Agno computer-control screenshots are incompatible with this "
+                "so computer-control screenshots are incompatible with this "
                 "model. Use a non-DeepSeek model for computer-control / GUI tasks."
             )
         if provider_name == "deepseek" and "unknown variant `file`" in lowered:
@@ -590,21 +815,31 @@ class AgnoProvider(BaseModel):
         return detail
 
     def _provider_config(self) -> dict[str, Any]:
-        """Return the agno-framework provider entry matching this model's vendor.
+        """Return the API-based provider entry matching this model's vendor.
 
         v0.12 stores providers as a flat list where the same vendor can
-        appear twice (agno + claude-cli). AgnoProvider only cares about
-        the agno row — the claude-cli row lives in its own registry.
-        Falls back to the legacy dict-shape for early-boot / tests.
+        appear twice (API-based + claude-cli). NativeProvider only cares
+        about the API-based row — the claude-cli row lives in its own
+        registry. Falls back to the legacy dict-shape for early-boot / tests.
+
+        Memoised because providers_config is immutable per instance —
+        ``rebuild_routing`` constructs a fresh NativeProvider rather than
+        mutating an existing one. Caching saves an O(N_providers) walk
+        per ``_build_runtime_model`` (and there are 2 per turn — see
+        ``_resolved_api_key`` and ``_resolved_base_url``).
         """
+        if self._provider_config_cache is not None:
+            return self._provider_config_cache
         provider_name, _ = self._runtime_parts()
         for entry in _iter_provider_entries(self._providers_config):
             if str(entry.get("name") or "").strip() != provider_name:
                 continue
             if entry.get("framework", FRAMEWORK_API_BASED) != FRAMEWORK_API_BASED:
                 continue
-            return dict(entry)
-        return {}
+            self._provider_config_cache = dict(entry)
+            return self._provider_config_cache
+        self._provider_config_cache = {}
+        return self._provider_config_cache
 
     def _provider_setting(self, key: str) -> str | None:
         value = self._provider_config().get(key)
@@ -622,23 +857,28 @@ class AgnoProvider(BaseModel):
         return self._provider_setting("base_url")
 
     def _construct_model(self, cls: type, **kwargs: Any) -> Any:
-        accepted = inspect.signature(cls).parameters
+        accepted = _model_class_accepted_params(cls)
         filtered = {k: v for k, v in kwargs.items() if v is not None and k in accepted}
         return cls(**filtered)
 
-    def _load_agno_model_class(self, provider_name: str) -> tuple[type | None, dict[str, Any]]:
-        spec = AGNO_PROVIDER_CLASSES.get(provider_name)
+    def _load_runtime_model_class(self, provider_name: str) -> tuple[type | None, dict[str, Any]]:
+        spec = RUNTIME_PROVIDER_CLASSES.get(provider_name)
         if not spec:
             return None, {}
         module_name, class_name, extra_kwargs = spec
         module = importlib.import_module(module_name)
         return getattr(module, class_name), dict(extra_kwargs)
 
-    def _build_agno_model(self) -> Any:
+    def build_runtime_model(self) -> Any:
+        """Construct the underlying ``Model`` instance for this runtime.
+
+        Used by ``TeamRouterProvider`` to build the routing classifier
+        without instantiating a full ``Agent`` wrapper.
+        """
         provider_name, model_id = self._runtime_parts()
         api_key = self._resolved_api_key()
         base_url = self._resolved_base_url()
-        model_class, extra_kwargs = self._load_agno_model_class(provider_name)
+        model_class, extra_kwargs = self._load_runtime_model_class(provider_name)
         if model_class is not None:
             return self._construct_model(
                 model_class,
@@ -648,61 +888,61 @@ class AgnoProvider(BaseModel):
                 **extra_kwargs,
             )
 
-        from agno.models.utils import get_model
+        from src.models.providers.utils import get_model
 
         return get_model(self.model)
+
+    _build_runtime_model = build_runtime_model  # internal alias for back-compat
 
     def _missing_dependency_hint(self, exc: ImportError) -> str:
         detail = str(exc) or exc.__class__.__name__
         return (
-            "Agno runtime dependencies are incomplete. "
+            "Runtime dependencies are incomplete. "
             "Install OpenAgent's API-model dependencies (for example "
             "`sqlalchemy`, provider SDKs like `openai`/`anthropic`/`google-genai`) "
             f"and retry. Original import error: {detail}"
         )
 
     def _ensure_agent(self, system: str | None = None):
-        """Lazily construct one Agno Agent per unique system prompt.
+        """Lazily construct one runtime Agent per unique system prompt.
 
-        ``system_message`` is set at construction time so OpenAgent's framework
-        prompt reaches OpenAI as a real ``system`` role message, not as user
-        text. Agents are cached by the system string so we don't rebuild on
-        every call. ``set_db`` and ``set_mcp_toolkits`` flush the cache.
-
-        Tools passed to AgnoAgent: every connected MCPTools toolkit.
-        MCP discovery is handled uniformly by ``tool-search.list_servers``
-        (one of the tool-search MCP's meta-tools) — no per-agent meta
-        callable is attached upfront.
+        ``system_message`` is set at construction time so OpenAgent's
+        framework prompt reaches OpenAI as a real ``system`` role
+        message. The orchestrator appends a per-session ``<session-id>``
+        tag to the system prompt so each session generates a unique
+        key — meaning each session builds its own Agent. The cache is
+        capped at :data:`_AGENT_CACHE_MAX` with LRU eviction to bound
+        memory growth; eviction is enforced here AND in close_session
+        so long-running deployments don't leak Agents per dead session.
         """
         sys_key = (system or "").strip()
         cached = self._agno_agents.get(sys_key)
         if cached is not None:
+            self._agno_agents.move_to_end(sys_key)
             return cached
         try:
-            from agno.agent import Agent as AgnoAgent
-            from agno.db.sqlite import SqliteDb
+            from src.core._runner.agent import Agent as AgnoAgent
+            from src.memory.store.sqlite import SqliteDb
         except ImportError as exc:
             raise RuntimeError(self._missing_dependency_hint(exc)) from exc
 
-        db_path = Path(self._runtime_db_path())
-        db_path.parent.mkdir(parents=True, exist_ok=True)
+        db_path = self._ensured_runtime_db_path()
         compatible_toolkits, filtered_families = self._compatible_mcp_toolkits()
         if filtered_families:
-            elog(
-                "agno.toolkits_filtered",
+            elog("runtime.toolkits_filtered",
                 model=self.model,
                 filtered_families=filtered_families,
                 runner="agent",
             )
         agent_tools: list[Any] = list(compatible_toolkits)
         agent = AgnoAgent(
-            model=self._build_agno_model(),
+            model=self._build_runtime_model(),
             db=SqliteDb(db_file=str(db_path)),
             tools=agent_tools,
             system_message=sys_key or None,
             add_history_to_context=True,
             num_history_runs=self._history_runs,
-            # Agno maintains a rolling summary of older turns in the same
+            # The runtime maintains a rolling summary of older turns in the same
             # SqliteDb and injects it into context on each call. Combined
             # with ``num_history_runs=20`` this gives us long-horizon
             # recall without blowing the token budget on raw transcript.
@@ -710,11 +950,12 @@ class AgnoProvider(BaseModel):
             add_session_summary_to_context=True,
             # Agentic memory is disabled — OpenAgent uses the vault for
             # user-scoped persistence. Keeping it off avoids agno_memories
-            # table creation and keeps all state in agno_sessions.
+            # table creation and keeps all state in the sessions table.
             enable_agentic_memory=False,
             markdown=False,
         )
         self._agno_agents[sys_key] = agent
+        _evict_oldest(self._agno_agents, _AGENT_CACHE_MAX)
         return agent
 
     def _tool_families(self) -> dict[str, list[Any]]:
@@ -733,12 +974,12 @@ class AgnoProvider(BaseModel):
         return families
 
     def _ensure_team(self, system: str):
-        """Lazily construct an Agno Team in route mode for the main agent.
+        """Lazily construct a runtime Team in route mode for the main agent.
 
         Returns ``None`` when the team path is not applicable:
         - empty system prompt (classifier / no-framework-prompt calls)
         - fewer than 2 connected MCP tool families (nothing to route between)
-        - Team import failure (older Agno or missing extra)
+        - Team import failure (older runtime or missing extra)
 
         The team leader carries the framework prompt and the full
         toolkit list as a safety net. Members are thin specialists:
@@ -752,6 +993,7 @@ class AgnoProvider(BaseModel):
             return None
         cached = self._agno_teams.get(sys_key)
         if cached is not None:
+            self._agno_teams.move_to_end(sys_key)
             return cached
 
         compatible_toolkits, filtered_families = self._compatible_mcp_toolkits()
@@ -759,25 +1001,23 @@ class AgnoProvider(BaseModel):
         if len(families) < 2:
             return None
         if filtered_families:
-            elog(
-                "agno.toolkits_filtered",
+            elog("runtime.toolkits_filtered",
                 model=self.model,
                 filtered_families=filtered_families,
                 runner="team",
             )
 
         try:
-            from agno.agent import Agent as AgnoAgent
-            from agno.db.sqlite import SqliteDb
-            from agno.team import Team, TeamMode
+            from src.core._runner.agent import Agent as AgnoAgent
+            from src.memory.store.sqlite import SqliteDb
+            from src.core._runner.team import Team, TeamMode
         except ImportError as exc:
-            # Older Agno builds without the team module — fall back to
+            # Older runtime builds without the team module — fall back to
             # single-agent transparently instead of crashing the session.
-            elog("agno.team.unavailable", model=self.model, error=str(exc))
+            elog("runtime.team.unavailable", model=self.model, error=str(exc))
             return None
 
-        db_path = Path(self._runtime_db_path())
-        db_path.parent.mkdir(parents=True, exist_ok=True)
+        db_path = self._ensured_runtime_db_path()
 
         members: list[Any] = []
         for family, toolkits in families.items():
@@ -792,7 +1032,7 @@ class AgnoProvider(BaseModel):
                 f"leader if the request is outside your area."
             )
             member = AgnoAgent(
-                model=self._build_agno_model(),
+                model=self._build_runtime_model(),
                 tools=list(toolkits),
                 system_message=member_system,
                 name=f"{family}_specialist",
@@ -812,7 +1052,7 @@ class AgnoProvider(BaseModel):
             team = Team(
                 members=members,
                 mode=TeamMode.route,
-                model=self._build_agno_model(),
+                model=self._build_runtime_model(),
                 db=SqliteDb(db_file=str(db_path)),
                 tools=leader_tools,
                 system_message=sys_key,
@@ -831,10 +1071,9 @@ class AgnoProvider(BaseModel):
             )
         except Exception as exc:
             # If Team construction fails for any reason (signature drift
-            # between Agno versions, model incompatibility, …), log and
+            # between runtime versions, model incompatibility, …), log and
             # fall back rather than breaking the main generate path.
-            elog(
-                "agno.team.build_failed",
+            elog("runtime.team.build_failed",
                 model=self.model,
                 error_type=type(exc).__name__,
                 error=str(exc),
@@ -842,19 +1081,19 @@ class AgnoProvider(BaseModel):
             )
             return None
 
-        elog(
-            "agno.team.built",
+        elog("runtime.team.built",
             model=self.model,
             families=sorted(families.keys()),
             member_count=len(members),
         )
         self._agno_teams[sys_key] = team
+        _evict_oldest(self._agno_teams, _AGENT_CACHE_MAX)
         return team
 
     def _flatten_messages(self, messages: list[dict[str, Any]]) -> str:
         """Render conversation turns as a single user-side prompt for ``arun``.
 
-        The system prompt is NOT included here — it's set on the AgnoAgent via
+        The system prompt is NOT included here — it's set on the runtime Agent via
         ``system_message`` (see ``_ensure_agent``) so OpenAI receives it as a
         real ``system`` role message. Including it here would duplicate it as
         user text, undoing the fix that makes procedural instructions
@@ -894,9 +1133,9 @@ class AgnoProvider(BaseModel):
 
     @staticmethod
     def _metrics_to_dict(metrics: Any) -> dict[str, Any]:
-        """Coerce Agno's metrics (dataclass / Pydantic / dict / object) into a dict.
+        """Coerce the runtime's metrics (dataclass / Pydantic / dict / object) into a dict.
 
-        Agno 2.x returns ``response.metrics`` as a ``RunMetrics`` dataclass;
+        The runtime returns ``response.metrics`` as a ``RunMetrics`` dataclass;
         older versions returned a dict or a Pydantic model. Normalise so token
         and cost extraction works across versions.
         """
@@ -938,18 +1177,22 @@ class AgnoProvider(BaseModel):
         on_status: Callable[[str], Awaitable[None]] | None = None,
         session_id: str | None = None,
         files: list[Any] | None = None,
+        images: list[Any] | None = None,
+        audio: list[Any] | None = None,
+        videos: list[Any] | None = None,
         model_override: str | None = None,
     ) -> ModelResponse:
-        """Run a single turn through Agno.
+        """Run a single turn through the runtime.
 
         Note: ``tools`` is accepted for ``BaseModel`` compatibility but
-        ignored — Agno's Agent already holds the configured ``MCPTools``
-        instances via ``_mcp_toolkits`` and runs the full tool loop
-        internally (including image-artifact extraction so screenshots no
-        longer blow up the context).
+        ignored — the runtime's Agent already holds the configured
+        ``MCPTools`` instances via ``_mcp_toolkits`` and runs the full
+        tool loop internally (including image-artifact extraction so
+        screenshots no longer blow up the context).
 
-        ``files`` is forwarded as ``runtime.arun(..., files=files)`` so
-        the Agno runtime applies its native attachment handling (Team
+        Media kwargs (``files``/``images``/``audio``/``videos``) are
+        forwarded as ``runtime.arun(..., files=..., images=..., ...)``
+        so the runtime's native multimodal handling applies (Team
         propagates them to members during ``delegate_task_to_member``).
         """
         prompt = self._flatten_messages(messages)
@@ -966,8 +1209,7 @@ class AgnoProvider(BaseModel):
         if runner is None:
             runner = self._ensure_agent(system=system)
             runner_kind = "agent"
-        elog(
-            "agno.request",
+        elog("runtime.request",
             model=self.model,
             session_id=sid,
             prompt_len=len(prompt),
@@ -979,29 +1221,18 @@ class AgnoProvider(BaseModel):
         if on_status:
             try:
                 await on_status("Thinking...")
-            except Exception:
-                pass
+            except Exception as e:  # noqa: BLE001
+                logger.debug("on_status('Thinking...') raised: %s", e)
 
-        # Force agno to attach exc_info to its log_error() calls so the
-        # capture handler below sees the underlying traceback. Default
-        # is off (AGNO_LOG_TRACEBACKS=false), which swallows everything
-        # past the formatted error string — fine for the OpenAI 403
-        # case (the string is enough) but useless for the
-        # ``[Errno 2] No such file or directory`` case on mixout where
-        # the bare OSError tells us nothing about WHICH file is
-        # missing. Diagnostic-only; doesn't change agno's control flow.
-        os.environ.setdefault("AGNO_LOG_TRACEBACKS", "true")
-        try:
-            from agno.utils.log import set_log_tracebacks as _agno_set_tb
-            _agno_set_tb(True)
-        except Exception:
-            pass
+        # Note: AGNO_LOG_TRACEBACKS + set_log_tracebacks
+        # are configured once at module import so we don't pay the env
+        # dict + import lookup on every turn (used to run per generate()).
 
         # Capture ERROR-level log records from any logger during the run so
-        # that when Agno swallows a provider failure (e.g. OpenAI 403,
+        # that when the runtime swallows a provider failure (e.g. OpenAI 403,
         # rate-limit, model-not-allowed), we can surface the underlying
         # message to the user instead of returning the silent empty-result
-        # placeholder. Agno logs the failure with strings like
+        # placeholder. The runtime logs the failure with strings like
         # "API status error from OpenAI API: Error code: 403 - ..." and
         # "Non-retryable model provider error: ...", but does not re-raise.
         with _capture_log_errors() as captured_errors:
@@ -1012,79 +1243,81 @@ class AgnoProvider(BaseModel):
             arun_kwargs: dict[str, Any] = {"session_id": sid, "user_id": "openagent"}
             if files:
                 arun_kwargs["files"] = files
+            if images:
+                arun_kwargs["images"] = images
+            if audio:
+                arun_kwargs["audio"] = audio
+            if videos:
+                arun_kwargs["videos"] = videos
             try:
                 response = await runner.arun(prompt, **arun_kwargs)
             except Exception as e:
                 raw_error = str(e) or repr(e)
                 # When a previous run left a message with a missing
                 # ``tool_call_id`` (e.g. an interrupted tool call),
-                # Agno's ``add_history_to_context=True`` injects it
+                # the runtime's ``add_history_to_context=True`` injects it
                 # into the API request and the provider's
                 # deserialization fails.  Wipe the corrupted session
                 # and retry once with a clean history.
                 if sid != "default" and self._is_session_corruption_error(raw_error):
-                    elog(
-                        "agno.session_corrupt",
+                    elog("runtime.session_corrupt",
                         session_id=sid,
                         error=raw_error[:300],
                     )
                     try:
                         await self.forget_session(sid)
                     except Exception as fe:
-                        logger.debug("agno session recovery forget %s: %s", sid, fe)
+                        logger.debug("runtime session recovery forget %s: %s", sid, fe)
                     response = await runner.arun(prompt, **arun_kwargs)
                 else:
                     rewritten_error = self._rewrite_provider_error_detail(raw_error)
-                    elog(
-                        "agno.error",
+                    elog("runtime.error",
                         model=self.model,
                         session_id=sid,
                         error_type=type(e).__name__,
                         error=rewritten_error,
                     )
                     if rewritten_error != raw_error:
-                        raise AgnoProviderError(rewritten_error) from e
+                        raise NativeProviderError(rewritten_error) from e
                     raise
 
-        # Agno's Agent.arun / Team.arun catches generic exceptions, sets
+        # The runtime's Agent.arun / Team.arun catches generic exceptions, sets
         # ``run_response.status = RunStatus.error`` AND
         # ``run_response.content = str(e)``, then RETURNS the response
-        # instead of re-raising (see agno/agent/_run.py:666-696 and
-        # agno/team/_run.py around RunStatus.error assignments). Without
+        # instead of re-raising (see _runner/agent/_run.py:666-696 and
+        # _runner/team/_run.py around RunStatus.error assignments). Without
         # this check, openagent reads ``.content`` as a normal model
         # output and the bridge ships the raw Python exception string
         # (e.g. ``[Errno 2] No such file or directory``) to the user as
         # if the model had written it. Translate the status signal back
-        # into an AgnoProviderError so the surrounding empty-stream /
+        # into an NativeProviderError so the surrounding empty-stream /
         # bridge layers format a clean error message.
         status_obj = getattr(response, "status", None)
-        status_val = getattr(status_obj, "value", status_obj)
-        if isinstance(status_val, str) and status_val.upper() == "ERROR":
+        if _is_error_status(status_obj):
             raw_error = (getattr(response, "content", None) or "").strip() \
-                or "agno run finished with status=error and no detail"
+                or "runtime run finished with status=error and no detail"
             detail = self._rewrite_provider_error_detail(raw_error)
             # Ship the captured ERROR-level log records (with tracebacks
             # if AGNO_LOG_TRACEBACKS hooked them in) so the next fleet
-            # tick can root-cause WHY agno failed instead of guessing
+            # tick can root-cause WHY the runtime failed instead of guessing
             # from the rewritten ``[Errno 2]`` string alone. Truncated
             # per-entry to keep the event row JSON-friendly.
             captured_snapshot = [c[:2000] for c in captured_errors[-3:]]
-            elog(
-                "agno.run_status_error",
+            elog("runtime.run_status_error",
                 level="error",
                 model=self.model,
                 session_id=sid,
                 detail=detail[:300],
                 captured=captured_snapshot,
             )
-            raise AgnoProviderError(detail)
+            raise NativeProviderError(detail)
 
-        # Agno occasionally returns a response whose ``.content`` is None or
+        # The runtime occasionally returns a response whose ``.content`` is None or
         # empty string. Two cases to distinguish:
         #   1. A *legitimate* tool-only turn — no error logs captured. Fall
         #      back to the placeholder so bridges don't ship zero bytes.
-        #   2. A *swallowed provider failure* — Agno logged ERRORs but did
-        #      not re-raise (this is the OpenAI 403 / rate-limit case the
+        #   2. A *swallowed provider failure* — the runtime logged ERRORs but
+        #      did not re-raise (this is the OpenAI 403 / rate-limit case the
         #      user reported). Raise a clean exception with the captured
         #      message so ``agent.run()`` formats it for the chat UI.
         raw_content = getattr(response, "content", None)
@@ -1095,16 +1328,14 @@ class AgnoProvider(BaseModel):
                 detail = self._rewrite_provider_error_detail(
                     _summarize_provider_errors(captured_errors)
                 )
-                elog(
-                    "agno.provider_error",
+                elog("runtime.provider_error",
                     level="error",
                     model=self.model,
                     session_id=sid,
                     detail=detail[:300],
                 )
-                raise AgnoProviderError(detail)
-            elog(
-                "agno.empty_result",
+                raise NativeProviderError(detail)
+            elog("runtime.empty_result",
                 level="warning",
                 model=self.model,
                 session_id=sid,
@@ -1132,9 +1363,8 @@ class AgnoProvider(BaseModel):
         metrics_obj = getattr(response, "metrics", None)
         metrics_dict = self._metrics_to_dict(metrics_obj)
 
-        # Trace event so we can debug if Agno changes the metrics shape again.
-        elog(
-            "agno.metrics.shape",
+        # Trace event so we can debug if the runtime changes the metrics shape again.
+        elog("runtime.metrics.shape",
             model=self.model,
             session_id=sid,
             type=type(metrics_obj).__name__ if metrics_obj is not None else "None",
@@ -1145,7 +1375,7 @@ class AgnoProvider(BaseModel):
         output_tokens = self._extract_metric(metrics_dict, "output_tokens", "completion_tokens", "output")
         stop_reason = metrics_dict.get("stop_reason")
 
-        # Compute cost from OpenAgent's catalog and mirror it back into Agno's
+        # Compute cost from OpenAgent's catalog and mirror it back into the runtime's
         # metrics so SessionMetrics.cost aggregation works for free.
         cost = self._compute_and_mirror_cost(
             metrics_obj=metrics_obj,
@@ -1154,8 +1384,7 @@ class AgnoProvider(BaseModel):
             session_id=sid,
         )
 
-        elog(
-            "agno.generate",
+        elog("runtime.generate",
             model=self.model,
             session_id=sid,
             input_tokens=input_tokens,
@@ -1175,39 +1404,28 @@ class AgnoProvider(BaseModel):
 
     async def _emit_agno_tool_status(
         self,
-        on_status: Callable[[str], Awaitable[None]],
+        on_status: Callable[[str], Awaitable[None]] | None,
         tool_exec: Any | None,
         *,
         error_text: str | None = None,
         phase: str | None = None,
     ) -> None:
-        """Forward an Agno ``ToolExecution`` as a JSON status frame.
+        """Forward a runtime ``ToolExecution`` as a JSON status frame.
 
-        The wire shape is Agno's native ``ToolExecution.to_dict()`` —
-        the universal app derives phase locally from ``tool_call_error``
-        + ``result`` presence. Pass ``error_text`` for live
-        ``ToolCallErrorEvent``s so the error message rides in
-        ``result`` (the durable carrier the stored row will also have).
-        Pass ``phase="started"`` to null out ``result`` on the wire so
-        the UI's phase derivation reads the frame as "running" even
-        when the underlying ToolExecution already carries its final
-        result (the non-streaming ``generate()`` case).
+        Thin wrapper that delegates to the shared
+        :func:`src.models._tool_status.emit_tool_status` so live
+        streaming, generate-time emissions, and the dispatcher's
+        team-path emitter all use the same encoder + error handling.
         """
-        from src.models._tool_status import tool_exec_to_wire_json
+        from src.models._tool_status import emit_tool_status
 
-        encoded = tool_exec_to_wire_json(
-            tool_exec, error_text=error_text, phase=phase,
+        await emit_tool_status(
+            on_status, tool_exec, error_text=error_text, phase=phase,
         )
-        if encoded is None:
-            return
-        try:
-            await on_status(encoded)
-        except Exception:
-            pass
 
     @staticmethod
     def _save_image(image: Any) -> str | None:
-        """Write an Agno ``Image`` (from stream content or tool result) to a
+        """Write a runtime ``Image`` (from stream content or tool result) to a
         temp file. Returns a ``[IMAGE:/path]`` marker that
         ``parse_response_markers`` extracts downstream, or ``None`` when
         the image has no bytes.
@@ -1225,9 +1443,12 @@ class AgnoProvider(BaseModel):
         on_status: Callable[[str], Awaitable[None]] | None = None,
         session_id: str | None = None,
         files: list[Any] | None = None,
+        images: list[Any] | None = None,
+        audio: list[Any] | None = None,
+        videos: list[Any] | None = None,
         model_override: str | None = None,
     ) -> AsyncIterator[str]:
-        """Stream content deltas via Agno's native ``stream=True`` path.
+        """Stream content deltas via the runtime's native ``stream=True`` path.
 
         Yields raw text strings as they arrive from the LLM. Tool-call
         events are forwarded to ``on_status`` in the same JSON format
@@ -1236,9 +1457,10 @@ class AgnoProvider(BaseModel):
         On any failure, falls back to :meth:`generate` and yields the
         full content as one chunk so the caller still gets a reply.
 
-        ``files`` is forwarded to Agno's native ``runner.arun(files=...)``
-        so attachments propagate to Team members (see
-        ``agno/team/_default_tools.py:713``).
+        Media kwargs (``files``/``images``/``audio``/``videos``) are
+        forwarded to the runtime's native ``runner.arun(...)`` so multimodal
+        attachments propagate to Team members (see
+        ``_runner/team/_default_tools.py:713``).
         """
         prompt = self._flatten_messages(messages)
         sid = session_id or "default"
@@ -1246,50 +1468,39 @@ class AgnoProvider(BaseModel):
         runner = self._ensure_team(system=system or "")
         if runner is None:
             runner = self._ensure_agent(system=system)
-        elog(
-            "agno.stream.start",
+        elog("runtime.stream.start",
             model=self.model,
             prompt_len=len(prompt),
             mcp_toolkits=len(compatible_toolkits),
             filtered_families=filtered_families or None,
         )
-        try:
-            from agno.run.agent import (
-                RunContentEvent as AgentRunContentEvent,
-                ToolCallStartedEvent as AgentToolCallStartedEvent,
-                ToolCallCompletedEvent as AgentToolCallCompletedEvent,
-                ToolCallErrorEvent as AgentToolCallErrorEvent,
-            )
-            try:
-                from agno.run.team import (
-                    RunContentEvent as TeamRunContentEvent,
-                    ToolCallStartedEvent as TeamToolCallStartedEvent,
-                    ToolCallCompletedEvent as TeamToolCallCompletedEvent,
-                    ToolCallErrorEvent as TeamToolCallErrorEvent,
-                )
-            except ImportError:
-                TeamRunContentEvent = None  # type: ignore
-                TeamToolCallStartedEvent = None  # type: ignore
-                TeamToolCallCompletedEvent = None  # type: ignore
-                TeamToolCallErrorEvent = None  # type: ignore
-                AGNO_TEAM_EVENTS = False
-            else:
-                AGNO_TEAM_EVENTS = True
-            _content_event_types: tuple = (AgentRunContentEvent,)
-            if AGNO_TEAM_EVENTS and TeamRunContentEvent is not None:
-                _content_event_types = (AgentRunContentEvent, TeamRunContentEvent)
+        # Pull the event-type tuples ONCE per call (cached at module
+        # level via _agno_event_types) so the per-iteration loop doesn't
+        # rebuild them on every non-content event.
+        event_types = _agno_event_types()
+        content_types = event_types["content"]
+        tool_started_types = event_types["tool_started"]
+        tool_completed_types = event_types["tool_completed"]
+        tool_error_types = event_types["tool_error"]
 
+        try:
             stream_kwargs: dict[str, Any] = {
                 "session_id": sid, "user_id": "openagent",
                 "stream": True, "stream_events": True,
             }
             if files:
                 stream_kwargs["files"] = files
+            if images:
+                stream_kwargs["images"] = images
+            if audio:
+                stream_kwargs["audio"] = audio
+            if videos:
+                stream_kwargs["videos"] = videos
             stream = runner.arun(prompt, **stream_kwargs)
             try:
                 emitted = 0
                 async for event in stream:
-                    if isinstance(event, _content_event_types):
+                    if isinstance(event, content_types):
                         text = getattr(event, "content", None) or ""
                         if text:
                             emitted += len(text)
@@ -1300,56 +1511,38 @@ class AgnoProvider(BaseModel):
                             if marker:
                                 yield marker
                         continue
-                    et = getattr(event, "event", "")
-                    _tool_started = (AgentToolCallStartedEvent,)
-                    _tool_completed = (AgentToolCallCompletedEvent,)
-                    _tool_error = (AgentToolCallErrorEvent,)
-                    if AGNO_TEAM_EVENTS:
-                        _tool_started = (AgentToolCallStartedEvent, TeamToolCallStartedEvent)
-                        _tool_completed = (AgentToolCallCompletedEvent, TeamToolCallCompletedEvent)
-                        _tool_error = (AgentToolCallErrorEvent, TeamToolCallErrorEvent)
-                    if et in ("ToolCallStarted", "TeamToolCallStarted") or isinstance(
-                        event, _tool_started
-                    ):
+                    if isinstance(event, tool_started_types):
                         if on_status is not None:
-                            tool_exec = getattr(event, "tool", None)
                             await self._emit_agno_tool_status(
-                                on_status, tool_exec,
+                                on_status, getattr(event, "tool", None),
+                                phase="started",
                             )
-                    elif et in ("ToolCallCompleted", "TeamToolCallCompleted") or isinstance(
-                        event, _tool_completed
-                    ):
+                    elif isinstance(event, tool_completed_types):
                         tool_exec = getattr(event, "tool", None)
                         if on_status is not None:
                             await self._emit_agno_tool_status(
                                 on_status, tool_exec,
                             )
-                        images = getattr(event, "images", None) or []
-                        for img in images:
+                        for img in getattr(event, "images", None) or []:
                             marker = self._save_image(img)
                             if marker:
                                 yield marker
-                    elif et in ("ToolCallError", "TeamToolCallError") or isinstance(
-                        event, _tool_error
-                    ):
+                    elif isinstance(event, tool_error_types):
                         if on_status is not None:
-                            tool_exec = getattr(event, "tool", None)
-                            error_text = getattr(event, "error", None)
                             await self._emit_agno_tool_status(
-                                on_status, tool_exec,
-                                error_text=error_text,
+                                on_status, getattr(event, "tool", None),
+                                error_text=getattr(event, "error", None),
                             )
             finally:
                 aclose = getattr(stream, "aclose", None)
                 if aclose is not None:
                     try:
                         await aclose()
-                    except Exception:
+                    except Exception:  # noqa: BLE001
                         pass
-            elog("agno.stream.done", model=self.model, chars=emitted)
+            elog("runtime.stream.done", model=self.model, chars=emitted)
             if emitted == 0:
-                elog(
-                    "agno.stream.empty_fallback",
+                elog("runtime.stream.empty_fallback",
                     model=self.model,
                     session_id=sid,
                 )
@@ -1359,25 +1552,23 @@ class AgnoProvider(BaseModel):
                     tools=tools,
                     on_status=on_status,
                     session_id=session_id,
-                    files=files,
+                    files=files, images=images, audio=audio, videos=videos,
                 )
                 if response.content:
                     yield response.content
         except Exception as e:
             raw_error = str(e) or repr(e)
             if sid != "default" and self._is_session_corruption_error(raw_error):
-                elog(
-                    "agno.stream.corrupt_session",
+                elog("runtime.stream.corrupt_session",
                     session_id=sid,
                     error=raw_error[:300],
                 )
                 try:
                     await self.forget_session(sid)
                 except Exception as fe:
-                    logger.debug("agno stream recovery forget %s: %s", sid, fe)
+                    logger.debug("runtime stream recovery forget %s: %s", sid, fe)
             else:
-                elog(
-                    "agno.stream.fallback",
+                elog("runtime.stream.fallback",
                     level="warning",
                     model=self.model,
                     error_type=type(e).__name__,
@@ -1401,13 +1592,13 @@ class AgnoProvider(BaseModel):
         output_tokens: int,
         session_id: str,
     ) -> float:
-        """Compute cost from OpenAgent's catalog and write it onto Agno's metrics.
+        """Compute cost from OpenAgent's catalog and write it onto the runtime's metrics.
 
-        Agno propagates the ``cost`` field through ``MessageMetrics → RunMetrics
+        The runtime propagates the ``cost`` field through ``MessageMetrics → RunMetrics
         → SessionMetrics``, but never populates it (provider SDKs don't return
         cost). By mutating ``metrics_obj.cost`` (and the per-(provider, id)
-        entries in ``metrics.details``) we make Agno's session-level cost
-        aggregation work — so ``agno_sessions.runs[*].metrics.cost`` becomes
+        entries in ``metrics.details``) we make the runtime's session-level cost
+        aggregation work — so ``sessions.runs[*].metrics.cost`` becomes
         directly queryable and ``SessionMetrics`` sums correctly across runs.
 
         The canonical cost record still lives in OpenAgent's ``usage_log``
@@ -1420,8 +1611,7 @@ class AgnoProvider(BaseModel):
         )
 
         if input_tokens == 0 and output_tokens == 0:
-            elog(
-                "agno.cost_skipped",
+            elog("runtime.cost_skipped",
                 model=self.model,
                 session_id=session_id,
                 reason="zero_tokens",
@@ -1429,8 +1619,7 @@ class AgnoProvider(BaseModel):
             return cost
 
         if metrics_obj is None:
-            elog(
-                "agno.cost_skipped",
+            elog("runtime.cost_skipped",
                 model=self.model,
                 session_id=session_id,
                 reason="no_metrics_object",
@@ -1463,8 +1652,7 @@ class AgnoProvider(BaseModel):
                         except (AttributeError, TypeError):
                             pass
 
-        elog(
-            "agno.cost_mirrored",
+        elog("runtime.cost_mirrored",
             model=self.model,
             session_id=session_id,
             cost_usd=cost,

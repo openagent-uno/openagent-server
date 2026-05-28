@@ -2,10 +2,10 @@
 
 This module owns the entire claude-cli framework path:
 
-- ``ClaudeBackedAgent`` — ``agno.agent.Agent`` subclass that drives
+- ``ClaudeBackedAgent`` — runtime ``Agent`` subclass that drives
   ``claude_agent_sdk`` directly. Used wherever you'd otherwise reach
-  for ``agno.agents.claude.ClaudeAgent`` but need the result to
-  participate in an Agno ``Team`` (as a member, as the leader's
+  for the runtime's built-in Claude agent but need the result to
+  participate in a runtime ``Team`` (as a member, as the leader's
   ``members[0]`` slot, or as both). A placeholder ``_NullModel``
   satisfies ``Agent.__init__``'s assumption that ``self.model`` is a
   real ``Model``; we override ``arun`` before any code path could
@@ -19,7 +19,7 @@ This module owns the entire claude-cli framework path:
 - ``_known_sdk_session_ids_from_db`` — gateway ``/clear`` fallback for
   legacy rows.
 
-SDK session ids are round-tripped through Agno's session storage
+SDK session ids are round-tripped through the runtime's session storage
 (``session.session_data["sdk_session_id"]``) so restart-resume keeps
 working.
 
@@ -37,14 +37,14 @@ import re
 from typing import Any, AsyncIterator, Awaitable, Callable, ClassVar, Dict, Optional
 from uuid import uuid4
 
-from agno.models.response import ToolExecution
-from agno.run.agent import (
+from src.models.providers.response import ToolExecution
+from src.core._run_state.agent import (
     RunContentEvent,
     RunOutput,
     ToolCallCompletedEvent,
     ToolCallStartedEvent,
 )
-from agno.run.base import RunStatus
+from src.core._run_state.base import RunStatus
 
 from src.core.logging import elog
 from src.models._backed_agent import (
@@ -52,7 +52,6 @@ from src.models._backed_agent import (
     _known_sdk_session_ids_by_key,
     _last_user_prompt,
     _make_sqlite_db,
-    _prepend_files_for_subscription_cli,
     _stringify_input,
 )
 from src.models.base import BaseModel, ModelResponse
@@ -94,11 +93,11 @@ def _sanitize_claude_model_id(model_id: str | None) -> str | None:
 
 
 def _known_sdk_session_ids_from_db(db: Any) -> list[str]:
-    """Return ``agno_sessions.session_id`` rows for SDK-backed sessions.
+    """Return ``sessions.session_id`` rows for SDK-backed sessions.
 
     Two markers identify an SDK-backed session row:
 
-    - Legacy rows (pre-v0.14 ``ClaudeAgent`` adapter): Agno's
+    - Legacy rows (pre-v0.14 ``ClaudeAgent`` adapter): the runtime's
       ``BaseExternalAgent`` writes ``agent_data.framework =
       'claude-agent-sdk'``.
     - New ``ClaudeBackedAgent`` rows: stored as plain ``Agent`` rows
@@ -128,8 +127,8 @@ def _known_sdk_session_ids_from_db(db: Any) -> list[str]:
 class ClaudeBackedAgent(BaseSubscriptionBackedAgent):
     """``Agent`` subclass whose ``arun`` drives ``claude_agent_sdk``.
 
-    Use wherever you'd otherwise reach for ``agno.agents.claude.ClaudeAgent``
-    but need the result to participate in an Agno ``Team`` — as a
+    Use wherever you'd otherwise reach for the runtime's built-in Claude
+    agent but need the result to participate in a runtime ``Team`` — as a
     member, as the leader's ``members[0]`` slot, or as both.
 
     Constructor accepts the same shape as the previous
@@ -234,6 +233,10 @@ class ClaudeBackedAgent(BaseSubscriptionBackedAgent):
         user_id: Optional[str],
         session_id: Optional[str],
         run_id: str,
+        files: Optional[list[Any]] = None,
+        images: Optional[list[Any]] = None,
+        audio: Optional[list[Any]] = None,
+        videos: Optional[list[Any]] = None,
     ) -> RunOutput:
         """Drain ``_arun_stream`` and return its terminal ``RunOutput``.
 
@@ -252,6 +255,7 @@ class ClaudeBackedAgent(BaseSubscriptionBackedAgent):
             session_id=session_id,
             run_id=run_id,
             yield_run_output=True,
+            files=files, images=images, audio=audio, videos=videos,
         ):
             if isinstance(event, RunOutput):
                 final_output = event
@@ -272,9 +276,24 @@ class ClaudeBackedAgent(BaseSubscriptionBackedAgent):
         session_id: Optional[str],
         run_id: str,
         yield_run_output: bool,
+        files: Optional[list[Any]] = None,
+        images: Optional[list[Any]] = None,
+        audio: Optional[list[Any]] = None,
+        videos: Optional[list[Any]] = None,
     ) -> AsyncIterator[Any]:
         sdk = _sdk()
         prompt = _stringify_input(input)
+        # AgentOS-aligned translation: text content inlined, binary
+        # written to a sandbox-safe path under the CLI's effective cwd.
+        # Replaces the older path-based ``_prepend_files_for_subscription_cli``
+        # which broke on Claude CLI's sandbox.
+        from src.models._backed_agent import _inline_attachments_for_subscription_cli
+        cwd = self._sdk_options.get("cwd")
+        prompt = _inline_attachments_for_subscription_cli(
+            prompt,
+            files=files, images=images, audio=audio, videos=videos,
+            cwd=cwd, session_id=session_id, run_id=run_id,
+        )
         self._hydrate_from_db(session_id)
         options = self._build_options(streaming=True, session_id=session_id)
 
@@ -455,8 +474,19 @@ def _build_sdk_options(
         max_turns = int(max_turns_raw) if max_turns_raw else 20
     except ValueError:
         max_turns = 20
+    # ``bypassPermissions`` matches OpenAgent's pre-approval model. The SDK
+    # default (``"default"``) prompts a human for every Write / Bash / MCP
+    # call — fine for the interactive ``claude`` CLI where the user clicks
+    # "Allow", broken in an agent server where no one is sitting there. The
+    # framework prompt at ``src.core.prompts.FRAMEWORK_SYSTEM_PROMPT``
+    # already tells the model "tool calls are pre-approved" — this option
+    # is what makes that statement true at the SDK boundary. Override via
+    # ``OPENAGENT_CLAUDE_PERMISSION=default`` (or any other SDK-recognised
+    # mode) when you want stricter behaviour.
     opts: dict[str, Any] = {
-        "permission_mode": os.environ.get("OPENAGENT_CLAUDE_PERMISSION", "default"),
+        "permission_mode": os.environ.get(
+            "OPENAGENT_CLAUDE_PERMISSION", "bypassPermissions",
+        ),
         "max_turns": max_turns,
     }
     if system:
@@ -529,9 +559,22 @@ class ClaudeCLI(BaseModel):
 
     # ── wiring ────────────────────────────────────────────────────────
 
-    def set_mcp_servers(self, servers: dict[str, dict]) -> None:
-        self.mcp_servers = dict(servers or {})
+    def invalidate_agent_cache(self) -> None:
+        """Drop the cached backed Agent so the next call rebuilds it.
+
+        Public hook called from the registry's ``_retune_model`` after
+        a per-session model swap — keeps the registry out of private
+        attribute mutation.
+        """
         self._agent = None
+        self._agent_system = None
+
+    def set_mcp_servers(self, servers: dict[str, dict]) -> None:
+        new_servers = dict(servers or {})
+        if new_servers == self.mcp_servers:
+            return
+        self.mcp_servers = new_servers
+        self.invalidate_agent_cache()
         elog(
             "claude_cli.mcp_servers_wired",
             count=len(self.mcp_servers),
@@ -539,9 +582,11 @@ class ClaudeCLI(BaseModel):
         )
 
     def set_db(self, db: Any) -> None:
+        if db is self._db:
+            return
         self._db = db
         # Rebuild the agent so its ``SqliteDb`` points at the new file.
-        self._agent = None
+        self.invalidate_agent_cache()
 
     def set_session_handle(self, session_id: str, handle: str | None) -> None:
         if not session_id:
@@ -568,7 +613,7 @@ class ClaudeCLI(BaseModel):
         self._agent_system = system or None
         return self._agent
 
-    # ── lifecycle (mostly no-ops post-Agno) ───────────────────────────
+    # ── lifecycle (mostly no-ops) ─────────────────────────────────────
 
     async def close_session(self, session_id: str) -> None:
         # ``ClaudeBackedAgent`` doesn't keep a persistent subprocess
@@ -577,7 +622,7 @@ class ClaudeCLI(BaseModel):
         return None
 
     async def forget_session(self, session_id: str) -> None:
-        """Erase the session row from ``agno_sessions`` so the next
+        """Erase the session row from the sessions table so the next
         message starts a fresh SDK transcript with no ``--resume``.
         """
         if not session_id:
@@ -600,8 +645,7 @@ class ClaudeCLI(BaseModel):
         return None
 
     async def shutdown(self) -> None:
-        self._agent = None
-        self._agent_system = None
+        self.invalidate_agent_cache()
 
     def known_session_ids(self) -> list[str]:
         return _known_sdk_session_ids_from_db(self._db)
@@ -617,23 +661,27 @@ class ClaudeCLI(BaseModel):
         session_id: str | None = None,
         model_override: str | None = None,
         files: list[Any] | None = None,
+        images: list[Any] | None = None,
+        audio: list[Any] | None = None,
+        videos: list[Any] | None = None,
     ) -> ModelResponse:
         # ``tools`` is ignored: the Claude SDK doesn't accept
         # provider-neutral tool defs — its tools come from
         # ``allowed_tools`` + ``mcp_servers``.
         agent = self._ensure_agent(system)
         prompt = _last_user_prompt(messages)
-        # Claude SDK doesn't accept Agno's ``files=`` natively; inline the
-        # paths so the assistant can Read them. See
-        # ``src.models.dispatcher._prepend_files_for_subscription_cli``
-        # for the matching pattern used by the team-router fallback.
-        if files:
-            prompt = _prepend_files_for_subscription_cli(prompt, files)
+        # All four media kwargs flow through the runtime's ``arun`` signature
+        # into ``ClaudeBackedAgent._arun_stream``, which translates them
+        # for the Claude CLI subprocess (text inlined into the prompt,
+        # binary written to a sandbox-safe path inside the CLI's cwd).
+        # Same shape the runtime's native model adapters consume — easy
+        # swap to an API-direct provider with no caller changes.
         sid = session_id or "default"
         user_id = self._session_handles.get(sid) or "openagent"
         try:
             run_output = await agent.arun(
                 prompt, session_id=sid, user_id=user_id, stream=False,
+                files=files, images=images, audio=audio, videos=videos,
             )
         except Exception as e:  # noqa: BLE001
             elog("claude_cli.generate_error", session_id=sid, error=str(e))
@@ -665,39 +713,60 @@ class ClaudeCLI(BaseModel):
         session_id: str | None = None,
         model_override: str | None = None,
         files: list[Any] | None = None,
+        images: list[Any] | None = None,
+        audio: list[Any] | None = None,
+        videos: list[Any] | None = None,
     ) -> AsyncIterator[str]:
+        from src.models._tool_status import tool_exec_to_wire_json
+
         agent = self._ensure_agent(system)
         prompt = _last_user_prompt(messages)
-        if files:
-            prompt = _prepend_files_for_subscription_cli(prompt, files)
+        # See ``generate`` above for the media-kwargs contract.
         sid = session_id or "default"
         user_id = self._session_handles.get(sid) or "openagent"
-        # Lazy-import the event types so the module loads without agno.
-        from agno.run.agent import RunContentEvent, ToolCallStartedEvent
 
+        stream_iter = None
         try:
             # ``arun(stream=True)`` returns an async iterator directly
-            # (matching Agno's contract — sync function, returns
-            # AsyncIterator); awaiting it would raise.
+            # (the runtime's contract — sync function, returns AsyncIterator).
             stream_iter = agent.arun(
                 prompt, session_id=sid, user_id=user_id, stream=True,
+                files=files, images=images, audio=audio, videos=videos,
             )
             async for event in stream_iter:
                 if isinstance(event, RunContentEvent):
                     delta = event.content or ""
                     if delta:
                         yield delta
-                elif on_status is not None and isinstance(event, ToolCallStartedEvent):
-                    tool = getattr(event, "tool", None)
-                    name = getattr(tool, "tool_name", None) if tool else None
-                    if name:
-                        try:
-                            await on_status(f"⚙ {name}")
-                        except Exception as e:  # noqa: BLE001
-                            logger.debug("on_status callback raised: %s", e)
+                    continue
+                if on_status is None:
+                    continue
+                tool = getattr(event, "tool", None)
+                if tool is None or not getattr(tool, "tool_name", None):
+                    continue
+                if isinstance(event, ToolCallStartedEvent):
+                    encoded = tool_exec_to_wire_json(tool, phase="started")
+                elif isinstance(event, ToolCallCompletedEvent):
+                    encoded = tool_exec_to_wire_json(tool)
+                else:
+                    continue
+                if encoded is None:
+                    continue
+                try:
+                    await on_status(encoded)
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("on_status callback raised: %s", e)
         except Exception as e:  # noqa: BLE001
             elog("claude_cli.stream_error", session_id=sid, error=str(e))
             raise
+        finally:
+            if stream_iter is not None:
+                aclose = getattr(stream_iter, "aclose", None)
+                if aclose is not None:
+                    try:
+                        await aclose()
+                    except Exception:  # noqa: BLE001
+                        pass
 
 
 class ClaudeCLIRegistry(BaseModel):
@@ -810,7 +879,7 @@ class ClaudeCLIRegistry(BaseModel):
         self._session_model.pop(session_id, None)
 
     async def commit_partial_assistant(self, session_id: str, text: str) -> None:
-        # Barge-in support dropped with the Agno migration; intentional
+        # Barge-in support dropped with the runtime migration; intentional
         # no-op so the gateway's interrupt path stays callable.
         return None
 
@@ -873,8 +942,7 @@ class ClaudeCLIRegistry(BaseModel):
         if inst.model == target_model:
             return
         inst.model = target_model
-        inst._agent = None
-        inst._agent_system = None
+        inst.invalidate_agent_cache()
 
     # ── turn ──────────────────────────────────────────────────────────
 
@@ -887,6 +955,9 @@ class ClaudeCLIRegistry(BaseModel):
         session_id: str | None = None,
         model_override: str | None = None,
         files: list[Any] | None = None,
+        images: list[Any] | None = None,
+        audio: list[Any] | None = None,
+        videos: list[Any] | None = None,
     ) -> ModelResponse:
         sid = session_id or "default"
         target_model = self._resolve_model(sid, model_override)
@@ -900,6 +971,9 @@ class ClaudeCLIRegistry(BaseModel):
             session_id=sid,
             model_override=target_model,
             files=files,
+            images=images,
+            audio=audio,
+            videos=videos,
         )
 
     async def stream(
@@ -911,6 +985,9 @@ class ClaudeCLIRegistry(BaseModel):
         session_id: str | None = None,
         model_override: str | None = None,
         files: list[Any] | None = None,
+        images: list[Any] | None = None,
+        audio: list[Any] | None = None,
+        videos: list[Any] | None = None,
     ) -> AsyncIterator[str]:
         sid = session_id or "default"
         target_model = self._resolve_model(sid, model_override)
@@ -923,5 +1000,8 @@ class ClaudeCLIRegistry(BaseModel):
             session_id=sid,
             model_override=target_model,
             files=files,
+            images=images,
+            audio=audio,
+            videos=videos,
         ):
             yield delta

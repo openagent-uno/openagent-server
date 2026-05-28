@@ -653,15 +653,57 @@ def _maybe_prime_openrouter_cache() -> None:
     loop.create_task(_prime())
 
 
+# Cached reverse map of OpenAgent provider name → OpenRouter vendor prefix.
+# Built lazily on first pricing lookup and reused thereafter — used to
+# avoid scanning ``_OPENROUTER_VENDOR_MAP`` per lookup.
+_REVERSE_VENDOR_MAP_CACHE: dict[str, str] | None = None
+
+# Cached id → entry index over the OpenRouter catalog, keyed by the
+# cache timestamp so a refresh invalidates it automatically. Replaces
+# the previous linear scan that walked every entry per pricing lookup.
+_OPENROUTER_INDEX: tuple[float, dict[str, dict[str, Any]]] | None = None
+
+
+def _get_reverse_vendor_map(discovery_module: Any) -> dict[str, str]:
+    global _REVERSE_VENDOR_MAP_CACHE
+    if _REVERSE_VENDOR_MAP_CACHE is None:
+        _REVERSE_VENDOR_MAP_CACHE = {
+            our_name: vendor
+            for vendor, our_name in discovery_module._OPENROUTER_VENDOR_MAP.items()
+        }
+    return _REVERSE_VENDOR_MAP_CACHE
+
+
+def _get_openrouter_index(
+    cache: tuple[float, list[dict[str, Any]]],
+) -> dict[str, dict[str, Any]]:
+    """Return ``{entry['id']: entry}`` over the OpenRouter catalog,
+    rebuilt whenever the cache timestamp changes.
+    """
+    global _OPENROUTER_INDEX
+    cache_ts, entries = cache
+    if _OPENROUTER_INDEX is not None and _OPENROUTER_INDEX[0] == cache_ts:
+        return _OPENROUTER_INDEX[1]
+    index: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        entry_id = str(entry.get("id") or "")
+        if entry_id:
+            index[entry_id] = entry
+    _OPENROUTER_INDEX = (cache_ts, index)
+    return index
+
+
 def _openrouter_pricing_lookup(runtime_id: str) -> dict[str, float] | None:
     """Look up pricing for ``runtime_id`` in the OpenRouter cache.
 
     Reads ``discovery._OPENROUTER_CACHE`` without triggering a fetch —
-    this is a hot path and must not block on network. The cache is
-    primed the first time anyone hits ``/api/models/available`` or
-    ``list_provider_models``; subsequent pricing lookups amortize for
-    free. Returns ``None`` when the cache is empty or the model isn't
-    in OpenRouter's catalog.
+    this is a hot path and must not block on network. Uses an
+    indexed-by-id map (rebuilt on cache refresh) so the lookup is
+    O(1) instead of a linear scan over ~300 catalog entries per call.
+    Returns ``None`` when the cache is empty or the model isn't in
+    OpenRouter's catalog.
     """
     try:
         from src.models import discovery
@@ -670,35 +712,27 @@ def _openrouter_pricing_lookup(runtime_id: str) -> dict[str, float] | None:
     cache = getattr(discovery, "_OPENROUTER_CACHE", None)
     if not cache or ":" not in runtime_id:
         return None
-    _ts, entries = cache
     provider, bare = runtime_id.split(":", 1)
-    # Reverse the _OPENROUTER_VENDOR_MAP: our provider → OpenRouter's vendor prefix.
-    want_prefix = None
-    for vendor, our_name in discovery._OPENROUTER_VENDOR_MAP.items():
-        if our_name == provider:
-            want_prefix = vendor
-            break
+    reverse_map = _get_reverse_vendor_map(discovery)
+    want_prefix = reverse_map.get(provider)
     if not want_prefix:
         return None
     target = f"{want_prefix}/{bare}"
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        if str(entry.get("id") or "") != target:
-            continue
-        pricing = entry.get("pricing") or {}
-        try:
-            input_cost = float(pricing.get("prompt") or 0.0) * 1_000_000
-            output_cost = float(pricing.get("completion") or 0.0) * 1_000_000
-        except (TypeError, ValueError):
-            return None
-        if input_cost <= 0 and output_cost <= 0:
-            return None
-        return {
-            "input_cost_per_million": input_cost,
-            "output_cost_per_million": output_cost,
-        }
-    return None
+    entry = _get_openrouter_index(cache).get(target)
+    if entry is None:
+        return None
+    pricing = entry.get("pricing") or {}
+    try:
+        input_cost = float(pricing.get("prompt") or 0.0) * 1_000_000
+        output_cost = float(pricing.get("completion") or 0.0) * 1_000_000
+    except (TypeError, ValueError):
+        return None
+    if input_cost <= 0 and output_cost <= 0:
+        return None
+    return {
+        "input_cost_per_million": input_cost,
+        "output_cost_per_million": output_cost,
+    }
 
 
 def _log_pricing(model_ref: str, runtime_id: str, source: str, input_cpm: float, output_cpm: float) -> None:

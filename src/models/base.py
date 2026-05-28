@@ -51,6 +51,9 @@ class BaseModel(ABC):
         on_status: Callable[[str], Awaitable[None]] | None = None,
         session_id: str | None = None,
         files: list[Any] | None = None,
+        images: list[Any] | None = None,
+        audio: list[Any] | None = None,
+        videos: list[Any] | None = None,
     ) -> ModelResponse:
         """Generate a response from the model.
 
@@ -60,9 +63,19 @@ class BaseModel(ABC):
             tools: Optional list of tool definitions in a provider-neutral format:
                 [{"name": str, "description": str, "input_schema": dict}, ...]
             on_status: Optional async callback for live status updates (e.g. tool use).
-            files: Optional list of provider-native file attachments (Agno ``File`` objects).
-                Forwarded by Agno-backed providers as ``runtime.arun(..., files=...)``;
-                subscription-CLI providers may fall back to a minimal text prepend.
+            files: Documents/attachments — Agno ``File`` objects (PDF, JSON,
+                text, markdown, …). Forwarded as ``runtime.arun(..., files=...)``;
+                subscription-CLI providers inline text content or write
+                binary to a sandbox-safe path.
+            images: Image attachments — Agno ``Image`` objects with ``content=bytes``.
+                Routed to ``arun(..., images=...)`` for native multimodal handling.
+            audio: Audio attachments — Agno ``Audio`` objects. Routed to ``arun(..., audio=...)``.
+            videos: Video attachments — Agno ``Video`` objects. Routed to ``arun(..., videos=...)``.
+
+            Splitting media by type at the call boundary matches AgentOS's
+            ``process_image / process_audio / process_video / process_document``
+            convention so Agno's model adapters get the right shape for
+            their multimodal API calls.
         """
         ...
 
@@ -72,10 +85,14 @@ class BaseModel(ABC):
         system: str | None = None,
         tools: list[dict[str, Any]] | None = None,
         files: list[Any] | None = None,
+        images: list[Any] | None = None,
+        audio: list[Any] | None = None,
+        videos: list[Any] | None = None,
     ) -> AsyncIterator[str]:
         """Stream response text chunks. Default: falls back to generate()."""
         response = await self.generate(
-            messages, system=system, tools=tools, files=files,
+            messages, system=system, tools=tools,
+            files=files, images=images, audio=audio, videos=videos,
         )
         yield response.content
 
