@@ -166,16 +166,16 @@ def _infer_mime(filename: str | None, declared: str | None) -> str | None:
 def _build_runtime_media(
     attachments: list[dict] | None,
 ) -> tuple[list[Any], list[Any], list[Any], list[Any]]:
-    """Convert wire-format attachments into Agno media objects, AgentOS-style.
+    """Convert wire-format attachments into runtime media objects, AgentOS-style.
 
     Mirrors the per-MIME dispatch in
-    ``agno.os.routers.agents.router:process_image/audio/video/document``:
-    reads each upload's bytes once and constructs typed Agno media
+    ``the runtime media-ingest path:process_image/audio/video/document``:
+    reads each upload's bytes once and constructs typed runtime media
     objects with ``content=bytes`` (NOT ``filepath=...``). Returns four
     parallel lists — ``(images, audios, videos, files)`` — ready to be
     routed to ``arun``'s separate kwargs.
 
-    Why content=bytes instead of filepath: Agno's model adapters
+    Why content=bytes instead of filepath: the runtime's model adapters
     consume bytes directly (base64 → multimodal API content). The
     filepath shape exists only as a back-compat input form, and it
     forces every downstream consumer (subscription-CLI wrappers in
@@ -188,7 +188,7 @@ def _build_runtime_media(
     """
     if not attachments:
         return ([], [], [], [])
-    from src.stream.media import Audio, File as _AgnoFile, Image, Video
+    from src.stream.media import Audio, File as _RuntimeFile, Image, Video
 
     images: list[Any] = []
     audios: list[Any] = []
@@ -204,38 +204,58 @@ def _build_runtime_media(
                  filename=a_name, reason="no_path")
             continue
 
+        content: bytes | None
         try:
             with open(a_path, "rb") as fh:
                 content = fh.read()
         except OSError as exc:
+            # The bytes weren't readable (file not on disk yet, permission,
+            # NFS hiccup, …). Don't drop the attachment — fall back to
+            # ``filepath=`` so the runtime still sees it. Downstream
+            # consumers that need bytes can re-read on demand; tools that
+            # just need a path (file-search MCPs, shell, etc.) still work.
             elog("agent.media.read_skip", level="warning",
                  filename=a_name, path=a_path, error=str(exc))
-            continue
+            content = None
 
         ext = (a_name.rsplit(".", 1)[-1].lower() if a_name and "." in a_name else None)
 
         try:
             if a_mime in _AGNO_IMAGE_MIMES:
-                images.append(Image(content=content, format=ext, mime_type=a_mime))
+                if content is not None:
+                    images.append(Image(content=content, format=ext, mime_type=a_mime))
+                else:
+                    images.append(Image(filepath=a_path, format=ext, mime_type=a_mime))
             elif a_mime in _AGNO_AUDIO_MIMES:
-                audios.append(Audio(content=content, format=ext, mime_type=a_mime))
+                if content is not None:
+                    audios.append(Audio(content=content, format=ext, mime_type=a_mime))
+                else:
+                    audios.append(Audio(filepath=a_path, format=ext, mime_type=a_mime))
             elif a_mime in _AGNO_VIDEO_MIMES:
-                videos.append(Video(content=content, format=ext, mime_type=a_mime))
+                if content is not None:
+                    videos.append(Video(content=content, format=ext, mime_type=a_mime))
+                else:
+                    videos.append(Video(filepath=a_path, format=ext, mime_type=a_mime))
             else:
-                # File path. Agno's ``File.__init__`` validates
-                # ``mime_type`` against a whitelist; drop the MIME if
-                # it's unrecognised rather than crash the turn.
+                # File path. The runtime's ``File`` accepts ``content``
+                # AND ``filepath`` together (unlike Image/Audio/Video,
+                # which require exactly one source). We pass both when
+                # the bytes are available so downstream code can pick
+                # whichever it prefers — multimodal APIs consume content,
+                # file-search tools follow the path.
                 file_kwargs: dict[str, Any] = {
-                    "content": content,
+                    "filepath": a_path,
                     "filename": a_name,
                     "format": ext,
                 }
+                if content is not None:
+                    file_kwargs["content"] = content
                 try:
-                    if a_mime in _AgnoFile.valid_mime_types():
+                    if a_mime in _RuntimeFile.valid_mime_types():
                         file_kwargs["mime_type"] = a_mime
                 except Exception:  # noqa: BLE001
                     pass
-                files.append(_AgnoFile(**file_kwargs))
+                files.append(_RuntimeFile(**file_kwargs))
         except Exception as exc:  # noqa: BLE001
             elog("agent.media.build_skip", level="warning",
                  filename=a_name, mime=a_mime, error=str(exc) or type(exc).__name__)
@@ -308,8 +328,8 @@ class Agent:
     memory vault, dormant-MCP detection). Tool execution and the per-call
     tool loop are delegated to the active provider:
 
-      - ``NativeProvider`` consumes ``MCPPool.runtime_toolkits`` (Agno ``MCPTools``
-        instances) and Agno's ``Agent`` runs the loop internally, including
+      - ``NativeProvider`` consumes ``MCPPool.runtime_toolkits`` (``MCPTools``
+        instances) and the runtime ``Agent`` runs the loop internally, including
         proper image-artifact handling for binary tool results.
       - ``ClaudeCLI`` consumes ``MCPPool.claude_sdk_servers()`` (raw stdio
         config) and the Claude Agent SDK manages everything itself.
@@ -513,7 +533,7 @@ class Agent:
         in-memory SessionManager (which starts empty after a restart) and
         forget conversations whose bridge session ids were hydrated back
         into the model from disk. Also includes sessions persisted in the
-        ``agno_sessions`` table so that Claude CLI sessions without a live
+        ``sessions`` table so that Claude CLI sessions without a live
         SDK session mapping still appear in the list.
         """
         import sqlite3
@@ -550,7 +570,7 @@ class Agent:
 
         Called by ``StreamSession._cancel_active_turn`` when the user
         interrupts a turn mid-flight. Forwards to ``self.model`` so the
-        bound provider (Claude SDK / Agno) can either issue a clean
+        bound provider (Claude SDK / API-based) can either issue a clean
         interrupt control-request or inject a synthetic run into its
         history store. Best-effort: provider failures log and swallow.
         """
@@ -831,7 +851,7 @@ class Agent:
         catalog. SmartRouter / NativeProvider consume the v0.12 flat-list
         shape — each entry already carries its ``framework`` and its
         nested ``models`` list, so the same vendor can appear twice
-        (anthropic+agno AND anthropic+claude-cli) without a key
+        (anthropic+api-based AND anthropic+claude-cli) without a key
         collision. Delegates the SQL materialisation to MemoryDB so
         smoke-test endpoints can reuse the same shape.
         """
@@ -980,7 +1000,7 @@ class Agent:
         """Run a single agent turn, continuing the session automatically when
         background shells complete during or shortly after it.
 
-        Providers handle the internal tool-loop (Agno via its Agent, Claude
+        Providers handle the internal tool-loop (API-based via its Agent, Claude
         SDK via its native MCP support), so each call to ``model.generate``
         returns post-tool-loop content. This method adds a wrapper loop
         above ``generate`` that:
@@ -989,7 +1009,7 @@ class Agent:
            (shell_exec+run_in_background=True) for ``session_id``.
         2. If any terminal event landed, formats it as a ``<system-reminder>``
            and re-enters ``generate`` on the same session — same subprocess
-           (Claude), same Agno history — so the model sees the completion
+           (Claude), same runtime history — so the model sees the completion
            mid-conversation.
         3. If no events landed but shells are still running, awaits
            ``hub.wait`` up to ``shell.wake_wait_window_seconds`` before
@@ -1008,13 +1028,41 @@ class Agent:
         system = self._combined_system_prompt(session_id=session_id)
 
         # AgentOS-aligned media handling: split attachments by MIME and
-        # construct typed Agno media objects (Image / Audio / Video /
+        # construct typed runtime media objects (Image / Audio / Video /
         # File) with ``content=bytes``, then pass each list to ``arun``'s
-        # corresponding kwarg. Agno-native model adapters consume the
+        # corresponding kwarg. API-native model adapters consume the
         # bytes directly (multimodal API content). Subscription-CLI
         # backends translate at the wrapper layer — text inlined, binary
         # written to a sandbox-safe path.
-        agno_images, agno_audios, agno_videos, agno_files = _build_runtime_media(attachments)
+        media_images, media_audios, media_videos, media_files = _build_runtime_media(attachments)
+
+        # Images still get a textual prepend (no images= channel on the
+        # model layer for subscription-CLI providers) — but non-image
+        # attachments are now routed natively through the runtime's
+        # ``files=`` kwarg so the leader doesn't paraphrase synthetic
+        # file-info blocks into delegation tasks.
+        if attachments:
+            from src.channels.base import build_attachment_context, prepend_context_block
+            image_atts = [a for a in attachments if (a.get("type") or "file") == "image"]
+            if image_atts:
+                files_info: list[str] = []
+                for a in image_atts:
+                    a_name = a.get("filename", "")
+                    a_path = a.get("path", "")
+                    if a_path:
+                        files_info.append(f"- image: {a_name} — local path: {a_path}")
+                    else:
+                        files_info.append(f"- image: {a_name}")
+                message = prepend_context_block(
+                    message,
+                    build_attachment_context(
+                        files_info,
+                        read_hint=(
+                            "Use the Read tool (or an MCP tool) with the local path to inspect each image. "
+                            "For images, Read returns the image content for you to see directly."
+                        ),
+                    ),
+                )
 
         from src.mcp.servers.shell.handlers import get_hub
         from src.mcp.servers.shell.adapters import set_session_context, reset_session_context
@@ -1087,7 +1135,7 @@ class Agent:
                     dispatcher=active_model,
                 )
                 try:
-                    # ``files`` is forwarded native to Agno's ``arun(files=...)``
+                    # ``files`` is forwarded native to the runtime's ``arun(files=...)``
                     # by NativeProvider / TeamRouterProvider; subscription-CLI
                     # adapters fall back to a minimal prepend. Only attach on
                     # the first iteration so shell-reminder re-entries don't
@@ -1101,10 +1149,10 @@ class Agent:
                         system=system,
                         on_status=_status,
                         session_id=session_id,
-                        files=agno_files if first else None,
-                        images=agno_images if first else None,
-                        audio=agno_audios if first else None,
-                        videos=agno_videos if first else None,
+                        files=media_files if first else None,
+                        images=media_images if first else None,
+                        audio=media_audios if first else None,
+                        videos=media_videos if first else None,
                     )
                 finally:
                     reset_session_context(token)
@@ -1252,7 +1300,31 @@ class Agent:
 
         # AgentOS-aligned media: see ``_run_inner`` above for the full
         # rationale. Same per-MIME split + content=bytes construction.
-        agno_images, agno_audios, agno_videos, agno_files = _build_runtime_media(attachments)
+        media_images, media_audios, media_videos, media_files = _build_runtime_media(attachments)
+
+        # Same images-prepend / files=-passthrough split as ``_run_inner``.
+        if attachments:
+            from src.channels.base import build_attachment_context, prepend_context_block
+            image_atts = [a for a in attachments if (a.get("type") or "file") == "image"]
+            if image_atts:
+                files_info: list[str] = []
+                for a in image_atts:
+                    a_name = a.get("filename", "")
+                    a_path = a.get("path", "")
+                    if a_path:
+                        files_info.append(f"- image: {a_name} — local path: {a_path}")
+                    else:
+                        files_info.append(f"- image: {a_name}")
+                message = prepend_context_block(
+                    message,
+                    build_attachment_context(
+                        files_info,
+                        read_hint=(
+                            "Use the Read tool (or an MCP tool) with the local path to inspect each image. "
+                            "For images, Read returns the image content for you to see directly."
+                        ),
+                    ),
+                )
 
         from src.mcp.servers.shell.handlers import get_hub
         from src.mcp.servers.shell.adapters import set_session_context, reset_session_context
@@ -1281,7 +1353,7 @@ class Agent:
 
         # When the streaming autoloop yields zero deltas (claude_cli
         # tool-only turns, smart_router → claude_cli with empty content,
-        # agno when no RunContentEvent fires), we fall back to a
+        # the runtime when no RunContentEvent fires), we fall back to a
         # one-shot generate() so callers always receive text. The real
         # ModelResponse from that call wins for last_response_meta()
         # over the synthetic placeholder.
@@ -1331,9 +1403,9 @@ class Agent:
                     # Pass session_id and on_status so SmartRouter.stream
                     # can run the same classifier + binding logic that
                     # ``generate`` uses. Without these, voice turns would
-                    # route to "first enabled agno model" instead of the
+                    # route to "first enabled api-based model" instead of the
                     # session's bound side, which 403'd on users whose
-                    # first agno model was an OpenAI model their key
+                    # first api-based model was an OpenAI model their key
                     # couldn't access.
                     #
                     # Introspect once instead of try/except TypeError around
@@ -1358,17 +1430,17 @@ class Agent:
                     if "on_status" in sig_params:
                         stream_kwargs["on_status"] = _status
                     # Only attach media on iteration 1: shell-reminder
-                    # re-entries reuse the same Agno session, which
+                    # re-entries reuse the same the runtime session, which
                     # already has the prior files in its run history.
                     if iter_count == 1:
-                        if "files" in sig_params and agno_files:
-                            stream_kwargs["files"] = agno_files
-                        if "images" in sig_params and agno_images:
-                            stream_kwargs["images"] = agno_images
-                        if "audio" in sig_params and agno_audios:
-                            stream_kwargs["audio"] = agno_audios
-                        if "videos" in sig_params and agno_videos:
-                            stream_kwargs["videos"] = agno_videos
+                        if "files" in sig_params and media_files:
+                            stream_kwargs["files"] = media_files
+                        if "images" in sig_params and media_images:
+                            stream_kwargs["images"] = media_images
+                        if "audio" in sig_params and media_audios:
+                            stream_kwargs["audio"] = media_audios
+                        if "videos" in sig_params and media_videos:
+                            stream_kwargs["videos"] = media_videos
                     async for delta in active_model.stream(
                         messages, **stream_kwargs,
                     ):
@@ -1513,7 +1585,7 @@ class Agent:
         # runtime actually picked for the session, not a generic
         # instance attribute. ``getattr(active_model, "model_name",
         # None)`` (the previous code) returned ``None`` for every
-        # provider in tree (claude_cli/agno expose ``self.model``;
+        # provider in tree (claude_cli/api-based expose ``self.model``;
         # SmartRouter exposes neither), which silently dropped the
         # model badge from the chat UI after the streaming migration.
         # ``effective_model_id`` is the provider-aware accessor.

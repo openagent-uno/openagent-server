@@ -131,7 +131,7 @@ async def t_no_stale_refs(ctx: TestContext) -> None:
     import re
     for p in (REPO_ROOT / "src").rglob("*.py"):
         s = p.read_text()
-        # Skip legitimate Agno MCPTools references — only flag our deleted classes.
+        # Skip legitimate runtime MCPTools references — only flag our deleted classes.
         for line in s.split("\n"):
             stripped = line.strip()
             if stripped.startswith("#"):

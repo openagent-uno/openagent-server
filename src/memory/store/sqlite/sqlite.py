@@ -104,7 +104,7 @@ class SqliteDb(BaseDb):
             ValueError: If none of the tables are provided.
         """
         if id is None:
-            seed = db_url or db_file or str(db_engine.url) if db_engine else "sqlite:///agno.db"
+            seed = db_url or db_file or str(db_engine.url) if db_engine else "sqlite:///openagent_runtime.db"
             id = generate_id(seed)
 
         super().__init__(
@@ -138,7 +138,7 @@ class SqliteDb(BaseDb):
                 _engine = create_engine(f"sqlite:///{db_path}")
             else:
                 # If none of db_engine, db_url, or db_file are provided, create a db in the current directory
-                default_db_path = Path("./agno.db").resolve()
+                default_db_path = Path("./openagent_runtime.db").resolve()
                 _engine = create_engine(f"sqlite:///{default_db_path}")
                 db_file = str(default_db_path)
                 log_debug(f"Created SQLite database: {default_db_path}")
@@ -747,9 +747,26 @@ class SqliteDb(BaseDb):
             with self.Session() as sess, sess.begin():
                 stmt = select(table).where(table.c.session_id == session_id)
 
-                # Filtering
+                # Filtering. ``user_id IS NULL`` is included as a soft
+                # match for unclaimed rows — the gateway used to create
+                # bare session rows with no owner and the runtime would
+                # later upsert them with the authenticated handle. If
+                # we filtered strictly here, ``runs`` from the unowned
+                # state would be invisible to the first authenticated
+                # read, the runtime would create an empty in-memory
+                # TeamSession, and its UPSERT would *overwrite* the
+                # existing runs (the conflict-update WHERE accepts
+                # NULL). This is the exact regression the 2026-05-28
+                # "LLM forgets previous messages" bug was tracking.
+                # Mirroring the upsert's WHERE here keeps read/write
+                # symmetric.
                 if user_id is not None:
-                    stmt = stmt.where(table.c.user_id == user_id)
+                    stmt = stmt.where(
+                        or_(
+                            table.c.user_id == user_id,
+                            table.c.user_id.is_(None),
+                        )
+                    )
 
                 result = sess.execute(stmt).fetchone()
                 if result is None:
@@ -2911,62 +2928,14 @@ class SqliteDb(BaseDb):
             return []
 
     # -- Migrations --
-
-    def migrate_table_from_v1_to_v2(self, v1_db_schema: str, v1_table_name: str, v1_table_type: str):
-        """Migrate all content in the given table to the right v2 table"""
-
-        from src.memory.store.migrations.v1_to_v2 import (
-            get_all_table_content,
-            parse_agent_sessions,
-            parse_memories,
-            parse_team_sessions,
-            parse_workflow_sessions,
-        )
-
-        # Get all content from the old table
-        old_content: list[dict[str, Any]] = get_all_table_content(
-            db=self,
-            db_schema=v1_db_schema,
-            table_name=v1_table_name,
-        )
-        if not old_content:
-            log_info(f"No content to migrate from table {v1_table_name}")
-            return
-
-        # Parse the content into the new format
-        memories: List[UserMemory] = []
-        sessions: Sequence[Union[AgentSession, TeamSession, WorkflowSession]] = []
-        if v1_table_type == "agent_sessions":
-            sessions = parse_agent_sessions(old_content)
-        elif v1_table_type == "team_sessions":
-            sessions = parse_team_sessions(old_content)
-        elif v1_table_type == "workflow_sessions":
-            sessions = parse_workflow_sessions(old_content)
-        elif v1_table_type == "memories":
-            memories = parse_memories(old_content)
-        else:
-            raise ValueError(f"Invalid table type: {v1_table_type}")
-
-        # Insert the new content into the new table
-        if v1_table_type == "agent_sessions":
-            for session in sessions:
-                self.upsert_session(session)
-            log_info(f"Migrated {len(sessions)} Agent sessions to table: {self.session_table_name}")
-
-        elif v1_table_type == "team_sessions":
-            for session in sessions:
-                self.upsert_session(session)
-            log_info(f"Migrated {len(sessions)} Team sessions to table: {self.session_table_name}")
-
-        elif v1_table_type == "workflow_sessions":
-            for session in sessions:
-                self.upsert_session(session)
-            log_info(f"Migrated {len(sessions)} Workflow sessions to table: {self.session_table_name}")
-
-        elif v1_table_type == "memories":
-            for memory in memories:
-                self.upsert_user_memory(memory)
-            log_info(f"Migrated {len(memories)} memories to table: {self.memory_table}")
+    #
+    # The historical "v1 → v2" migration (parsing legacy agno table rows
+    # into the current schema) has been removed: OpenAgent's only legacy
+    # state worth carrying forward is the ``agno_sessions`` → ``sessions``
+    # table rename, which lives in ``src/memory/db.py::bootstrap`` and
+    # runs on every connect. The schema-internal v1→v2 transform no
+    # longer ships and ``src.memory.store.migrations.v1_to_v2`` was
+    # dropped along with the unused agno provider tables.
 
     # -- Culture methods --
 

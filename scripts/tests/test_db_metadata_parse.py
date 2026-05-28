@@ -40,7 +40,7 @@ async def t_parse_metadata_coerces(ctx: TestContext) -> None:
 
 @test("db_metadata_parse", "_parse_metadata unwraps double-JSON-encoded dicts")
 async def t_parse_metadata_unwraps_double_encoded(ctx: TestContext) -> None:
-    """Some writers (Agno's serialize_session_json_fields when handed a
+    """Some writers (the runtime's serialize_session_json_fields when handed a
     stringified metadata field) store metadata as ``json.dumps(json_str)``
     — a JSON-encoded string whose decoded value is itself a JSON object.
     The parser must recover the inner dict so the session-list filter in
@@ -234,7 +234,7 @@ async def t_list_all_sessions_limit_post_filter(ctx: TestContext) -> None:
 
 @test("db_metadata_parse", "list_session_runs unwraps double-encoded runs column")
 async def t_list_session_runs_unwraps(ctx: TestContext) -> None:
-    """The runs column is JSON too, and Agno's serialize path will
+    """The runs column is JSON too, and the runtime's serialize path will
     double-encode it the same way it does metadata. Without an
     unwrap, ``list_session_runs`` sees a str (not a list) and
     returns ``[]`` — clicking a session in the desktop shows no
@@ -306,7 +306,7 @@ async def t_list_session_runs_unwraps(ctx: TestContext) -> None:
 
 @test("db_metadata_parse", "upsert_session survives a 'null' metadata row")
 async def t_upsert_survives_null_metadata(ctx: TestContext) -> None:
-    """Pre-seed an ``agno_sessions`` row whose ``metadata`` column is the
+    """Pre-seed an ``sessions`` row whose ``metadata`` column is the
     literal ``'null'`` (decodes to ``None``), then call
     ``upsert_session``. Before the fix this raised
     ``TypeError: 'NoneType' object does not support item assignment``.
@@ -314,7 +314,7 @@ async def t_upsert_survives_null_metadata(ctx: TestContext) -> None:
     import sqlite3
     from src.memory.db import MemoryDB
 
-    # Create the agno_sessions schema and seed a corrupt-metadata row.
+    # Create the legacy agno_sessions schema and seed a corrupt-metadata row.
     conn = sqlite3.connect(str(ctx.db_path))
     try:
         conn.execute(

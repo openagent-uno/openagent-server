@@ -64,21 +64,21 @@ class RunCancelledException(Exception):
         self.error_id = "run_cancelled_error"
 
 
-class AgnoError(Exception):
+class OpenAgentError(Exception):
     """Exception raised when an internal error occurs."""
 
     def __init__(self, message: str, status_code: int = 500):
         super().__init__(message)
         self.message = message
         self.status_code = status_code
-        self.type = "agno_error"
-        self.error_id = "agno_error"
+        self.type = "openagent_runtime_error"
+        self.error_id = "openagent_runtime_error"
 
     def __str__(self) -> str:
         return str(self.message)
 
 
-class ModelAuthenticationError(AgnoError):
+class ModelAuthenticationError(OpenAgentError):
     """Raised when model authentication fails."""
 
     def __init__(self, message: str, status_code: int = 401, model_name: Optional[str] = None):
@@ -89,7 +89,7 @@ class ModelAuthenticationError(AgnoError):
         self.error_id = "model_authentication_error"
 
 
-class ModelProviderError(AgnoError):
+class ModelProviderError(OpenAgentError):
     """Exception raised when a model provider returns an error."""
 
     # Patterns that indicate a context window / token limit exceeded error
@@ -241,7 +241,7 @@ class RetryableModelProviderError(Exception):
     retry_guidance_message: Optional[str] = None
 
 
-class RemoteServerUnavailableError(AgnoError):
+class RemoteServerUnavailableError(OpenAgentError):
     """Exception raised when a remote server is unavailable.
 
     This can happen due to:
@@ -264,7 +264,7 @@ class RemoteServerUnavailableError(AgnoError):
         self.error_id = "remote_server_unavailable_error"
 
 
-class PathSecurityError(AgnoError):
+class PathSecurityError(OpenAgentError):
     """Exception raised when path validation rejects user-supplied input."""
 
     def __init__(self, message: str = "Path security violation"):

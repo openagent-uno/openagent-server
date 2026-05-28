@@ -55,7 +55,7 @@ async def handle_list(request):
         limit = 50
 
     gateway = request.app.get("gateway")
-    # DB-backed sessions (chat_sessions + agno_sessions merged).
+    # DB-backed sessions (chat_sessions + sessions merged).
     rows = await db.list_all_sessions(client_id, limit=limit)
 
     # Enrich with RAM queue/busy state from SessionManager. RAM is
@@ -110,7 +110,7 @@ def _build_run_tool_index(
     calls of the same name in one turn) and by tool_name (legacy
     fallback for rows that didn't persist tool_call_id).
 
-    Each value is Agno's native ``ToolExecution.to_dict()`` shape — the
+    Each value is the runtime's native ``ToolExecution.to_dict()`` shape — the
     universal app consumes that directly via ``ToolInfo`` and derives
     phase locally from ``tool_call_error`` + ``result`` presence.
     """
@@ -156,7 +156,7 @@ def _expand_run_messages(
     parent_images: list | None = None,
     is_member_run: bool = False,
 ) -> list[dict]:
-    """Expand ONE Agno run dict into the flat ``ChatMessage`` shape the
+    """Expand ONE runtime run dict into the flat ``ChatMessage`` shape the
     universal app expects, mirroring the live-wire event ordering.
 
     Recurses into ``member_responses`` whenever the leader's
@@ -168,7 +168,7 @@ def _expand_run_messages(
     ``IntermediateRunContentEvent``, tool calls via the unified
     STATUS frame); the rehydration walk now matches that 1-for-1.
 
-    The recursive design follows Agno's stored shape exactly — a
+    The recursive design follows the runtime's stored shape exactly — a
     ``TeamRunOutput`` (with ``member_responses``) and a ``RunOutput``
     (without) reuse the same expansion because a member's tool calls
     live in its own ``runs[]``-equivalent ``tools`` list.
@@ -190,8 +190,8 @@ def _expand_run_messages(
     run_model = run.get("model") or parent_model
 
     # Index member responses by member_id AND by stored index so we can
-    # splice each delegation result inline. Agno stores ``agent_id`` on
-    # the nested RunOutput (the AgnoAgent's name → url_safe_string),
+    # splice each delegation result inline. the runtime stores ``agent_id`` on
+    # the nested RunOutput (the RuntimeAgent's name → url_safe_string),
     # which matches the ``member_id`` argument the leader passed to
     # ``delegate_task_to_member``. ``member_idx_by_run_id`` plus the
     # parallel ``agent_id`` map lets the splicing loop below find the
@@ -231,7 +231,7 @@ def _expand_run_messages(
             continue
         # Member runs (nested under member_responses) carry the leader-
         # generated task prompt as their first user message. That's an
-        # internal Agno artifact, not the human's input — surfacing it
+        # internal runtime artifact, not the human's input — surfacing it
         # would make the synthetic prompt show up in the chat IN PLACE
         # OF the user's actual message (which lives at the top-level
         # team run). Skip it; the specialist's assistant content and
@@ -357,7 +357,7 @@ def _expand_run_messages(
 async def handle_get_runs(request):
     """GET /api/sessions/{session_id}/runs — turn history as flat messages.
 
-    Returns messages extracted from ``agno_sessions.runs`` in the shape
+    Returns messages extracted from ``sessions.runs`` in the shape
     the frontend's ChatMessage array expects: ``{id, role, text, timestamp,
     toolInfo?, attachments?, model?}``. Query: ``?limit=20``.
 

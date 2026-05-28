@@ -551,7 +551,7 @@ class Groq(Model):
 
     def _get_metrics(self, response_usage: CompletionUsage) -> MessageMetrics:
         """
-        Parse the given Groq usage into an Agno MessageMetrics object.
+        Parse the given Groq usage into a runtime MessageMetrics object.
 
         Args:
             response_usage: Usage data from Groq

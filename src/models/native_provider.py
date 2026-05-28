@@ -507,7 +507,7 @@ class NativeProvider(BaseModel):
         The ``_agno_agents`` / ``_agno_teams`` caches don't need to
         be invalidated — the live ``Agent`` re-reads history from the
         DB on every ``arun()``, so deletion takes effect immediately.
-        Agentic memory rows (``agno_memories``) are user-scoped by
+        Agentic memory rows (``runtime_memories``) are user-scoped by
         design; wiping them per-session would contradict the product
         model (user-level preferences should survive /clear).
         """
@@ -555,7 +555,7 @@ class NativeProvider(BaseModel):
         is unavailable or errors out.
 
         Current schema keeps session history and summary in ``sessions``;
-        legacy installs may still carry it as ``agno_sessions`` if the
+        legacy installs may still carry it as ``sessions`` if the
         rename migration hasn't run yet on that file. We DELETE from
         each candidate and catch the "no such table" OperationalError
         instead of pre-scanning ``sqlite_master`` — a missing table is
@@ -921,7 +921,7 @@ class NativeProvider(BaseModel):
             self._agno_agents.move_to_end(sys_key)
             return cached
         try:
-            from src.core._runner.agent import Agent as AgnoAgent
+            from src.core._runner.agent import Agent as RuntimeAgent
             from src.memory.store.sqlite import SqliteDb
         except ImportError as exc:
             raise RuntimeError(self._missing_dependency_hint(exc)) from exc
@@ -935,7 +935,7 @@ class NativeProvider(BaseModel):
                 runner="agent",
             )
         agent_tools: list[Any] = list(compatible_toolkits)
-        agent = AgnoAgent(
+        agent = RuntimeAgent(
             model=self._build_runtime_model(),
             db=SqliteDb(db_file=str(db_path)),
             tools=agent_tools,
@@ -949,7 +949,7 @@ class NativeProvider(BaseModel):
             enable_session_summaries=True,
             add_session_summary_to_context=True,
             # Agentic memory is disabled — OpenAgent uses the vault for
-            # user-scoped persistence. Keeping it off avoids agno_memories
+            # user-scoped persistence. Keeping it off avoids the legacy agno_memories
             # table creation and keeps all state in the sessions table.
             enable_agentic_memory=False,
             markdown=False,
@@ -1008,7 +1008,7 @@ class NativeProvider(BaseModel):
             )
 
         try:
-            from src.core._runner.agent import Agent as AgnoAgent
+            from src.core._runner.agent import Agent as RuntimeAgent
             from src.memory.store.sqlite import SqliteDb
             from src.core._runner.team import Team, TeamMode
         except ImportError as exc:
@@ -1031,7 +1031,7 @@ class NativeProvider(BaseModel):
                 f"specialist. Prefer {family} tools; defer to the team "
                 f"leader if the request is outside your area."
             )
-            member = AgnoAgent(
+            member = RuntimeAgent(
                 model=self._build_runtime_model(),
                 tools=list(toolkits),
                 system_message=member_system,

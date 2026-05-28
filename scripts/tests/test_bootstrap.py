@@ -300,7 +300,7 @@ async def t_migrate_agno_sessions_renamed(ctx: TestContext) -> None:
 
 @test("bootstrap", "_migrate_legacy_agno_sessions_to_sessions skips when both tables exist")
 async def t_migrate_agno_sessions_both_present(ctx: TestContext) -> None:
-    """Defensive case: if both ``agno_sessions`` and ``sessions`` exist
+    """Defensive case: if both ``sessions`` and ``sessions`` exist
     (shouldn't happen in practice, but operator-staged DBs can land in
     that shape), the migration must leave both alone — no merge, no
     drop. We only assert that connect() doesn't blow up and both tables

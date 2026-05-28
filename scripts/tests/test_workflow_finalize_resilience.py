@@ -1,8 +1,8 @@
 """WorkflowExecutor._finalize_run survives transient SQLite locks.
 
 The lyra-music 2026-05-19 regression: a workflow's ``ai-prompt`` node
-hits HTTP 402 from DeepSeek. Inside the node Agno's SqliteDb
-hammers ``agno_sessions`` from a SQLAlchemy connection while
+hits HTTP 402 from DeepSeek. Inside the node the runtime's SqliteDb
+hammers ``sessions`` from a SQLAlchemy connection while
 OpenAgent's aiosqlite connection on the same file tries to write the
 final ``workflow_runs`` row. Whichever loses the busy_timeout race
 raises ``sqlite3.OperationalError: database is locked`` — and if the

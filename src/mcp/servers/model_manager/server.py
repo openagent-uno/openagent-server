@@ -98,9 +98,9 @@ async def add_provider(
     """Register (or update) an LLM provider row.
 
     The same vendor can be registered twice — once with
-    ``framework='api-based'`` (native ``agno.agent.Agent`` against the
+    ``framework='api-based'`` (native runtime ``Agent`` against the
     vendor's REST API, needs ``api_key``) and once with
-    ``framework='claude-cli'`` (``agno.agents.claude.ClaudeAgent``
+    ``framework='claude-cli'`` (the runtime's Claude SDK adapter
     wrapping the local ``claude`` binary / Pro/Max subscription;
     ``api_key`` MUST be None).
 
@@ -269,7 +269,7 @@ async def list_supported_providers() -> list[str]:
 async def list_supported_frameworks() -> list[str]:
     """Every runtime OpenAgent can dispatch through.
 
-    - ``agno``: direct provider API call via the Agno SDK. Works for
+    - ``api-based``: direct provider API call via the inlined runtime. Works for
       every supported vendor.
     - ``claude-cli``: the local ``claude`` binary (Claude Pro/Max
       subscription). Only dispatches Anthropic models.
@@ -442,7 +442,7 @@ async def pin_session(session_id: str, runtime_id: str) -> dict[str, Any]:
 
     Raises if the pinned model belongs to a different framework than
     the session's existing binding (pinning a claude-cli session to an
-    agno model would split conversation history across two stores).
+    API-based model would split conversation history across two stores).
     Use ``unpin_session`` to release.
     """
     session_id = (session_id or "").strip()
@@ -469,7 +469,7 @@ async def unpin_session(session_id: str) -> dict[str, Any]:
 
     The session returns to normal SmartRouter routing (classifier →
     tier → model) on the next turn, while keeping its framework
-    binding (agno or claude-cli) intact.
+    binding (api-based or claude-cli) intact.
     """
     session_id = (session_id or "").strip()
     if not session_id:

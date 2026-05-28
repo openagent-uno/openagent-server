@@ -7,6 +7,8 @@ typed execution steps, and efficient multi-turn conversations.
 Requires `google-genai>=2.0.0`.
 """
 
+from __future__ import annotations
+
 import base64
 import json
 from collections.abc import AsyncIterator
@@ -79,11 +81,47 @@ try:
     DeltaGoogleSearchResult = step_delta.DeltaGoogleSearchResult
     DeltaMCPServerToolResult = step_delta.DeltaMCPServerToolResult
     DeltaURLContextResult = step_delta.DeltaURLContextResult
-except ImportError:
-    raise ImportError(
+    _GENAI_INTERACTIONS_IMPORT_ERROR: Optional[str] = None
+except ImportError as _e:
+    # google-genai is optional — defer the failure until someone actually
+    # tries to instantiate the model.
+    _GENAI_INTERACTIONS_IMPORT_ERROR = (
         "`google-genai` not installed or not at the latest version. "
-        "Please install it using `pip install -U google-genai`"
+        "Please install it using `pip install -U google-genai` "
+        f"(original error: {_e})"
     )
+    genai = None  # type: ignore[assignment]
+    GeminiClient = None  # type: ignore[assignment,misc]
+    interaction_types = None  # type: ignore[assignment]
+    step_delta = None  # type: ignore[assignment]
+    # Step types — referenced inside isinstance tuples but only executed
+    # in code paths that run an active interaction (i.e. after the import
+    # would have already succeeded).
+    AudioContent = CodeExecutionCallStep = CodeExecutionResultStep = None  # type: ignore[assignment,misc]
+    FileSearchCallStep = FileSearchResultStep = None  # type: ignore[assignment,misc]
+    FunctionCallStep = FunctionResultStep = None  # type: ignore[assignment,misc]
+    GoogleMapsCallStep = GoogleMapsResultStep = None  # type: ignore[assignment,misc]
+    GoogleSearchCallStep = GoogleSearchResultStep = None  # type: ignore[assignment,misc]
+    ImageContent = MCPServerToolCallStep = MCPServerToolResultStep = None  # type: ignore[assignment,misc]
+    ModelOutputStep = TextContent = ThoughtStep = None  # type: ignore[assignment,misc]
+    URLContextCallStep = URLContextResultStep = None  # type: ignore[assignment,misc]
+    DeltaArgumentsDelta = DeltaImage = DeltaText = None  # type: ignore[assignment,misc]
+    DeltaThoughtSignature = DeltaThoughtSummary = None  # type: ignore[assignment,misc]
+    DeltaCodeExecutionCall = DeltaFileSearchCall = None  # type: ignore[assignment,misc]
+    DeltaGoogleMapsCall = DeltaGoogleSearchCall = None  # type: ignore[assignment,misc]
+    DeltaMCPServerToolCall = DeltaURLContextCall = None  # type: ignore[assignment,misc]
+    DeltaCodeExecutionResult = DeltaFileSearchResult = None  # type: ignore[assignment,misc]
+    DeltaFunctionResult = DeltaGoogleMapsResult = None  # type: ignore[assignment,misc]
+    DeltaGoogleSearchResult = DeltaMCPServerToolResult = None  # type: ignore[assignment,misc]
+    DeltaURLContextResult = None  # type: ignore[assignment,misc]
+
+
+def _require_genai_interactions() -> None:
+    """Raise ImportError the first time we actually need the
+    google-genai Interactions API. Lets the module import cleanly for
+    tooling but still surfaces a clear error when the model is used."""
+    if _GENAI_INTERACTIONS_IMPORT_ERROR is not None:
+        raise ImportError(_GENAI_INTERACTIONS_IMPORT_ERROR)
 
 # Tuples used to detect call/result steps generically across all tool families.
 _CALL_STEP_TYPES = (
@@ -259,6 +297,7 @@ class GeminiInteractions(Model):
 
         Note: The Interactions API requires a Gemini API key and is not available on Vertex AI.
         """
+        _require_genai_interactions()
         if self.client:
             return self.client
 
@@ -475,7 +514,7 @@ class GeminiInteractions(Model):
 
         if system_message and not use_agent_path:
             # Agent path (Deep Research, etc.) rejects `system_instruction` and
-            # treats anything in `input` as the research request. Agno's
+            # treats anything in `input` as the research request. The runtime's
             # auto-injected formatting boilerplate is not user research intent,
             # so it is dropped on the agent path rather than folded in.
             kwargs["system_instruction"] = system_message
@@ -616,7 +655,7 @@ class GeminiInteractions(Model):
         return kwargs
 
     def _parse_image_content(self, content_item: Any) -> Optional[Image]:
-        """Parse an ImageContent response item into an Agno Image."""
+        """Parse an ImageContent response item into a runtime Image."""
         image_data = getattr(content_item, "data", None)
         mime_type = getattr(content_item, "mime_type", None) or "image/png"
 
@@ -635,7 +674,7 @@ class GeminiInteractions(Model):
         return None
 
     def _parse_audio_content(self, content_item: Any) -> Optional[Audio]:
-        """Parse an AudioContent response item into an Agno Audio."""
+        """Parse an AudioContent response item into a runtime Audio."""
         audio_data = getattr(content_item, "data", None)
         mime_type = getattr(content_item, "mime_type", None) or "audio/wav"
 

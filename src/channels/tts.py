@@ -2,7 +2,7 @@
 
 Two backends, picked in order:
 
-1. **DB-configured cloud TTS via LiteLLM.** Mirrors the Agno pattern on
+1. **DB-configured cloud TTS via LiteLLM.** Mirrors the runtime pattern on
    the LLM side: one ``framework='litellm'`` adapter dispatches to many
    vendors (OpenAI TTS, ElevenLabs, Azure, Groq, Vertex AI, …) via
    :func:`litellm.aspeech`. The provider row's ``name`` is the vendor,

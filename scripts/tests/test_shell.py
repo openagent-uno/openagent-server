@@ -769,17 +769,17 @@ async def t_adapter_claude(ctx: TestContext) -> None:
     assert "instance" in cfg or "server" in cfg or "type" in cfg, f"unexpected shape: {cfg!r}"
 
 
-@test("shell", "adapters.build_agno_toolkit exposes the six tools by name")
+@test("shell", "adapters.build_runtime_toolkit exposes the six tools by name")
 async def t_adapter_agno(ctx: TestContext) -> None:
-    from src.mcp.servers.shell.adapters import build_agno_toolkit
+    from src.mcp.servers.shell.adapters import build_runtime_toolkit
 
-    tk = build_agno_toolkit()
+    tk = build_runtime_toolkit()
     names = set()
     for attr in ("functions",):
         container = getattr(tk, attr, None)
         if isinstance(container, dict):
             names.update(container.keys())
-    # Agno's Toolkit populates .functions on init with the callables it
+    # the runtime's Toolkit populates .functions on init with the callables it
     # was given; names come from the function __name__.
     if not names:
         # Fallback: look at the underlying tools list.
@@ -872,7 +872,7 @@ async def t_pool_in_process_import_failure(ctx: TestContext) -> None:
         in_process=True,
         adapter_module="openagent.mcp.servers.does_not_exist",
         sdk_server_factory="build_sdk_server",
-        agno_toolkit_factory="build_agno_toolkit",
+        runtime_toolkit_factory="build_runtime_toolkit",
     )
     pool = MCPPool(specs=[broken])
     # connect_all must NOT raise — the broken spec is simply skipped.
@@ -941,7 +941,7 @@ async def t_agent_autoloop_continues(ctx: TestContext) -> None:
 
         async def generate(
             self, messages, system=None, tools=None, on_status=None, session_id=None,
-            files=None,
+            files=None, images=None, audio=None, videos=None, **_kwargs,
         ) -> ModelResponse:
             content = messages[-1]["content"]
             self.turns.append(content)

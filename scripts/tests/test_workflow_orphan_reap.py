@@ -2,7 +2,7 @@
 
 Regression pin for lyra-music 2026-05-19: the ``dev-coverage`` workflow
 hit DeepSeek's HTTP 402 (Insufficient Balance) on every scheduled tick.
-Each retry hammered ``agno_sessions`` while OpenAgent's executor was
+Each retry hammered ``sessions`` while OpenAgent's executor was
 trying to finalize the run, the two writers contended on the same
 SQLite file, ``update_workflow_run`` lost the race, and the row was
 left in ``running`` forever. After a process restart, the next tick

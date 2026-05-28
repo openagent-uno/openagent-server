@@ -949,7 +949,7 @@ class Gateway:
                 elog("gateway.client_disconnect", client_id=client_id)
                 # Tear down any stream sessions belonging to this client
                 # so the agent's per-session resources (claude-cli
-                # subprocesses, agno session rows) get a clean release.
+                # subprocesses, runtime session rows) get a clean release.
                 await self._close_stream_sessions_for(client_id)
             elif client_id:
                 elog(

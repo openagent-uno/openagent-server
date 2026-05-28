@@ -26,10 +26,10 @@ from ._framework import TestContext, test
 
 
 def _make_file(*, content: bytes, mime: str, filename: str):
-    """Build a minimal Agno ``File`` from in-memory bytes — keeps the
+    """Build a minimal runtime ``File`` from in-memory bytes — keeps the
     test off-disk and independent of any tempfile cleanup."""
-    from src.stream.media import File as _AgnoFile
-    return _AgnoFile(
+    from src.stream.media import File as _RuntimeFile
+    return _RuntimeFile(
         content=content,
         mime_type=mime,
         filename=filename,
@@ -37,13 +37,13 @@ def _make_file(*, content: bytes, mime: str, filename: str):
 
 
 def _make_image(*, content: bytes, mime: str = "image/png"):
-    from src.stream.media import Image as _AgnoImage
-    return _AgnoImage(content=content, mime_type=mime)
+    from src.stream.media import Image as _RuntimeImage
+    return _RuntimeImage(content=content, mime_type=mime)
 
 
 def _make_audio(*, content: bytes, fmt: str = "wav"):
-    from src.stream.media import Audio as _AgnoAudio
-    return _AgnoAudio(content=content, format=fmt, mime_type=f"audio/{fmt}")
+    from src.stream.media import Audio as _RuntimeAudio
+    return _RuntimeAudio(content=content, format=fmt, mime_type=f"audio/{fmt}")
 
 
 def _make_message(*, content: str, files: list | None = None,
@@ -109,7 +109,7 @@ async def t_json_file_inlined(ctx: TestContext) -> None:
 
 @test("deepseek_file_inlining", "binary file becomes omitted placeholder, no base64 blob")
 async def t_binary_file_placeholder(ctx: TestContext) -> None:
-    # ``%PDF-1.4`` magic + a few non-text bytes — Agno's File doesn't
+    # ``%PDF-1.4`` magic + a few non-text bytes — the runtime's File doesn't
     # validate PDF structure, only that one of content/url/filepath is set.
     blob = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n1 0 obj\n<<>>endobj\n"
     file = _make_file(content=blob, mime="application/pdf", filename="report.pdf")
@@ -130,7 +130,7 @@ async def t_binary_file_placeholder(ctx: TestContext) -> None:
 @test("deepseek_file_inlining", "image attachment stripped → media-omitted placeholder")
 async def t_image_stripped(ctx: TestContext) -> None:
     # Even tiny ``content=b'\\x89PNG...'`` triggers the parent path; we just
-    # need an Agno Image instance — its serializer would normally emit
+    # need a runtime Image instance — its serializer would normally emit
     # an image_url content part DeepSeek can't parse.
     img = _make_image(content=b"\x89PNG\r\n\x1a\nfake-image-bytes", mime="image/png")
     message = _make_message(content="What's in this picture?", images=[img])
@@ -189,7 +189,7 @@ async def t_mixed_attachments(ctx: TestContext) -> None:
 
 @test("deepseek_file_inlining", "original message state restored across files/images/audio")
 async def t_message_state_restored(ctx: TestContext) -> None:
-    """Critical for Agno's team mode: a member might serialize the same
+    """Critical for the runtime's team mode: a member might serialize the same
     in-memory Message instance multiple times. Mutating any of files /
     images / audio / content to ``None`` permanently would silently
     drop attachments on the second pass."""

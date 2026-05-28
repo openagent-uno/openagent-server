@@ -13,7 +13,7 @@ from typing import Any
 from ._framework import TestContext, TestSkip, have_openai_key, test
 
 
-@test("agno", "live generate + tokens + cost + system_message routing")
+@test("runtime", "live generate + tokens + cost + system_message routing")
 async def t_agno_generate(ctx: TestContext) -> None:
     if not have_openai_key(ctx.config):
         raise TestSkip("no OpenAI API key in user config")
@@ -30,7 +30,7 @@ async def t_agno_generate(ctx: TestContext) -> None:
     resp = await provider.generate(
         messages=[{"role": "user", "content": "Reply with the literal text PING_OK and nothing else."}],
         system="You are a test bot. Always follow the user's instruction exactly.",
-        session_id=f"agno-test-{uuid.uuid4().hex[:8]}",
+        session_id=f"runtime-test-{uuid.uuid4().hex[:8]}",
     )
     assert "PING_OK" in resp.content.upper(), f"unexpected response: {resp.content!r}"
     assert resp.input_tokens > 0, "no input tokens reported"
@@ -38,12 +38,12 @@ async def t_agno_generate(ctx: TestContext) -> None:
     assert resp.model == "openai:gpt-4o-mini"
 
 
-@test("agno", "compaction flags enabled on constructed agent")
+@test("runtime", "compaction flags enabled on constructed agent")
 async def t_agno_compaction_flags(ctx: TestContext) -> None:
     """Session summaries must be ON by default so the agent gets
     long-horizon recall without blowing token budget. Agentic memory is
-    DELIBERATELY OFF (see agno_provider.py): OpenAgent uses the vault
-    for user-scoped persistence and we don't want the ``agno_memories``
+    DELIBERATELY OFF (see src/models/native_provider.py): OpenAgent uses the vault
+    for user-scoped persistence and we don't want the ``runtime_memories``
     table created. Bumped ``num_history_runs`` default to 20."""
     from src.models.native_provider import NativeProvider
     pool = ctx.extras["pool"]
@@ -65,7 +65,7 @@ async def t_agno_compaction_flags(ctx: TestContext) -> None:
         f"num_history_runs should be ≥20, got {getattr(agent, 'num_history_runs', None)}"
 
 
-@test("agno", "tool_families groups toolkits by prefix")
+@test("runtime", "tool_families groups toolkits by prefix")
 async def t_agno_tool_families(ctx: TestContext) -> None:
     """_tool_families() must return one entry per connected MCP server,
     keyed by that server's tool_name_prefix."""
@@ -90,7 +90,7 @@ async def t_agno_tool_families(ctx: TestContext) -> None:
         assert len(toolkits) >= 1, f"empty family {family_name}"
 
 
-@test("agno", "team construction: classifier path stays on single agent")
+@test("runtime", "team construction: classifier path stays on single agent")
 async def t_agno_team_classifier_fallback(ctx: TestContext) -> None:
     """Empty system prompt (classifier) must NOT trigger Team — the
     routing round-trip would waste tokens on simple tier classification."""
@@ -109,7 +109,7 @@ async def t_agno_team_classifier_fallback(ctx: TestContext) -> None:
         "whitespace-only system must skip team path"
 
 
-@test("agno", "team construction: <2 families falls back to single agent")
+@test("runtime", "team construction: <2 families falls back to single agent")
 async def t_agno_team_few_families_fallback(ctx: TestContext) -> None:
     """With 0 or 1 tool families, Team has nothing to route between;
     _ensure_team must return None so the caller uses single Agent."""
@@ -132,7 +132,7 @@ async def t_agno_team_few_families_fallback(ctx: TestContext) -> None:
             "single toolkit must skip team path"
 
 
-@test("agno", "team construction: ≥2 families builds route-mode Team")
+@test("runtime", "team construction: ≥2 families builds route-mode Team")
 async def t_agno_team_build(ctx: TestContext) -> None:
     """With ≥2 tool families, _ensure_team must return a Team in route
     mode with one specialist member per family, and the team itself
@@ -174,9 +174,9 @@ async def t_agno_team_build(ctx: TestContext) -> None:
         "set_mcp_toolkits must flush team cache"
 
 
-@test("agno", "generate raises NativeProviderError on RunStatus.error")
+@test("runtime", "generate raises NativeProviderError on RunStatus.error")
 async def t_agno_generate_run_status_error(_ctx: TestContext) -> None:
-    """Agno's Agent.arun / Team.arun catches generic exceptions, sets
+    """the runtime's Agent.arun / Team.arun catches generic exceptions, sets
     ``run_response.status = RunStatus.error`` and
     ``run_response.content = str(e)``, then RETURNS the response instead
     of re-raising. Without an explicit status check the provider treats
@@ -214,7 +214,7 @@ async def t_agno_generate_run_status_error(_ctx: TestContext) -> None:
         await provider.generate(
             messages=[{"role": "user", "content": "hi"}],
             system="system-prompt",
-            session_id="agno-run-status-error",
+            session_id="runtime-run-status-error",
         )
     except NativeProviderError as e:
         raised = e

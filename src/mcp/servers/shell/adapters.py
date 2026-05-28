@@ -169,7 +169,7 @@ def build_sdk_server() -> Any:
 
 # ── Native runtime ──────────────────────────────────────────────────
 
-def build_agno_toolkit() -> Any:
+def build_runtime_toolkit() -> Any:
     """Return a ``Toolkit`` wrapping the six shell tools.
 
     The Toolkit pattern expects plain async callables; the runtime

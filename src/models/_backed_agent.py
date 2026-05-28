@@ -22,7 +22,7 @@ CLI-side helpers (consumed by the registry providers):
 
 - ``_last_user_prompt(messages)`` — message-list to plain string.
 - ``_known_sdk_session_ids_by_key(db, json_key, …)`` — SQL probe for
-  ``agno_sessions`` rows that have an SDK session id stamped, used by
+  ``sessions`` rows that have an SDK session id stamped, used by
   the gateway's ``/clear`` legacy-row fallback.
 - ``_make_sqlite_db(db)`` — build a runtime ``SqliteDb`` pointing at the
   same file as the OpenAgent ``MemoryDB``.
@@ -634,7 +634,7 @@ def _known_sdk_session_ids_by_key(
     json_key: str,
     extra_or_clauses: list[str] | None = None,
 ) -> list[str]:
-    """Return ``agno_sessions.session_id`` rows for SDK-backed sessions.
+    """Return ``sessions.session_id`` rows for SDK-backed sessions.
 
     Shared SQL skeleton: every subscription-CLI ``*BackedAgent`` row
     stamps ``session_data[json_key]`` with the SDK's own session id once
@@ -654,7 +654,7 @@ def _known_sdk_session_ids_by_key(
 
 
 def all_subscription_session_ids(db: Any) -> list[str]:
-    """Return every ``agno_sessions`` row whose data identifies it as a
+    """Return every ``sessions`` row whose data identifies it as a
     subscription-CLI-backed session.
 
     Single SQL query coalescing every known marker — ``session_data``'s

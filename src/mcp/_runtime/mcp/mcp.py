@@ -28,7 +28,7 @@ except (ImportError, ModuleNotFoundError):
 
 class MCPTools(Toolkit):
     """
-    A toolkit for integrating Model Context Protocol (MCP) servers with Agno agents.
+    A toolkit for integrating Model Context Protocol (MCP) servers with the runtime.
     This allows agents to access tools, resources, and prompts exposed by MCP servers.
 
     Can be used in three ways:

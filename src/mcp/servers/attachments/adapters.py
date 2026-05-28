@@ -119,7 +119,7 @@ def build_sdk_server() -> Any:
 
 # ── Native runtime ──────────────────────────────────────────────────
 
-def build_agno_toolkit() -> Any:
+def build_runtime_toolkit() -> Any:
     """Return a ``Toolkit`` exposing ``send_file_to_user``.
 
     Follows the runtime Toolkit pattern: plain async callables with type

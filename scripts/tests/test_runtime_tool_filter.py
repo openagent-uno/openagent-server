@@ -1,4 +1,4 @@
-"""Regression guards for provider-specific Agno toolkit filtering."""
+"""Regression guards for provider-specific runtime toolkit filtering."""
 from __future__ import annotations
 
 from ._framework import TestContext, test
@@ -12,7 +12,7 @@ class _FakeToolkit:
         }
 
 
-@test("agno_tool_filter", "deepseek filters incompatible computer_control toolkit families")
+@test("runtime_tool_filter", "deepseek filters incompatible computer_control toolkit families")
 async def t_deepseek_filters_computer_control(_ctx: TestContext) -> None:
     from src.models.native_provider import NativeProvider
 
@@ -31,7 +31,7 @@ async def t_deepseek_filters_computer_control(_ctx: TestContext) -> None:
     assert sorted(families.keys()) == ["browser", "files"], sorted(families.keys())
 
 
-@test("agno_tool_filter", "deepseek image_url provider error is rewritten into an actionable message")
+@test("runtime_tool_filter", "deepseek image_url provider error is rewritten into an actionable message")
 async def t_deepseek_rewrites_image_url_error(_ctx: TestContext) -> None:
     from src.models.native_provider import NativeProvider
 

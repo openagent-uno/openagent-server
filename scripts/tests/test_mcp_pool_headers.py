@@ -11,7 +11,7 @@ from YAML and from DB rows, but ``_build_and_enter_toolkit`` constructed
 ``server_params=`` argument — so the headers never reached the wire. Every
 auth-gated remote MCP returned 401, the underlying anyio stream half-closed,
 and ``session.initialize().send_nowait()`` raised
-``anyio.ClosedResourceError`` inside Agno's blanket-except, leaving the MCP
+``anyio.ClosedResourceError`` inside the runtime's blanket-except, leaving the MCP
 flagged dormant.
 
 The fix passes a ``StreamableHTTPClientParams(url=..., headers=...)`` via
@@ -27,8 +27,8 @@ from typing import Any
 from ._framework import TestContext, test
 
 
-def _install_fake_agno() -> tuple[dict[str, Any], type]:
-    """Stub ``agno.tools.mcp`` and ``agno.tools.mcp.params`` so the lazy
+def _install_fake_runtime() -> tuple[dict[str, Any], type]:
+    """Stub ``src.mcp._runtime.mcp`` and ``src.mcp._runtime.mcp.params`` so the lazy
     import inside ``_build_and_enter_toolkit`` resolves to our fakes.
 
     Returns ``(captured, FakeStreamableHTTPClientParams)``. ``captured``
@@ -42,7 +42,7 @@ def _install_fake_agno() -> tuple[dict[str, Any], type]:
             self.kwargs = kwargs
 
         async def __aenter__(self) -> "FakeMCPTools":
-            # Mimic Agno's MCPTools enter: present an empty tool dict.
+            # Mimic the runtime's MCPTools enter: present an empty tool dict.
             self.functions = {}
             return self
 
@@ -56,22 +56,22 @@ def _install_fake_agno() -> tuple[dict[str, Any], type]:
             self.headers = headers
             self.rest = rest
 
-    # agno.tools.mcp
-    fake_mcp_mod = types.ModuleType("agno.tools.mcp")
+    # src.mcp._runtime.mcp.mcp
+    fake_mcp_mod = types.ModuleType("src.mcp._runtime.mcp.mcp")
     fake_mcp_mod.MCPTools = FakeMCPTools  # type: ignore[attr-defined]
 
-    # agno.tools.mcp.params
-    fake_params_mod = types.ModuleType("agno.tools.mcp.params")
+    # src.mcp._runtime.mcp.params
+    fake_params_mod = types.ModuleType("src.mcp._runtime.mcp.params")
     fake_params_mod.StreamableHTTPClientParams = (  # type: ignore[attr-defined]
         FakeStreamableHTTPClientParams
     )
 
-    sys.modules["agno.tools.mcp"] = fake_mcp_mod
-    sys.modules["agno.tools.mcp.params"] = fake_params_mod
+    sys.modules["src.mcp._runtime.mcp.mcp"] = fake_mcp_mod
+    sys.modules["src.mcp._runtime.mcp.params"] = fake_params_mod
     return captured, FakeStreamableHTTPClientParams
 
 
-def _restore_real_agno(saved: dict[str, Any]) -> None:
+def _restore_real_runtime(saved: dict[str, Any]) -> None:
     for key, mod in saved.items():
         if mod is None:
             sys.modules.pop(key, None)
@@ -86,10 +86,10 @@ def _restore_real_agno(saved: dict[str, Any]) -> None:
 async def t_headers_forwarded_to_transport(ctx: TestContext) -> None:
     # Save originals so we don't poison the rest of the suite.
     saved = {
-        "agno.tools.mcp": sys.modules.get("agno.tools.mcp"),
-        "agno.tools.mcp.params": sys.modules.get("agno.tools.mcp.params"),
+        "src.mcp._runtime.mcp.mcp": sys.modules.get("src.mcp._runtime.mcp.mcp"),
+        "src.mcp._runtime.mcp.params": sys.modules.get("src.mcp._runtime.mcp.params"),
     }
-    captured, fake_params_cls = _install_fake_agno()
+    captured, fake_params_cls = _install_fake_runtime()
     try:
         from src.mcp.pool import MCPPool, _ServerSpec
 
@@ -130,4 +130,4 @@ async def t_headers_forwarded_to_transport(ctx: TestContext) -> None:
             f"server_params; got url={captured.get('url')!r}"
         )
     finally:
-        _restore_real_agno(saved)
+        _restore_real_runtime(saved)

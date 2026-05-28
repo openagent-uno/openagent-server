@@ -109,15 +109,15 @@ async def t_dual_framework_provider_rows(ctx: TestContext) -> None:
     db = MemoryDB(str(ctx.db_path))
     await db.connect()
     try:
-        agno_id = await db.upsert_provider(
+        api_id = await db.upsert_provider(
             name="anthropic", framework="api-based", api_key="sk-ant-live",
         )
         cli_id = await db.upsert_provider(name="anthropic", framework="claude-cli")
-        assert agno_id != cli_id
+        assert api_id != cli_id
         listed = await db.list_providers()
         pairs = sorted((r["name"], r["framework"]) for r in listed)
         assert pairs == [("anthropic", "api-based"), ("anthropic", "claude-cli")]
-        await db.delete_provider(agno_id)
+        await db.delete_provider(api_id)
         await db.delete_provider(cli_id)
     finally:
         await db.close()

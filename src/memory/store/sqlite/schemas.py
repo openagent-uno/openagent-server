@@ -112,7 +112,7 @@ TRACE_TABLE_SCHEMA = {
 }
 
 
-def _get_span_table_schema(traces_table_name: str = "agno_traces") -> dict[str, Any]:
+def _get_span_table_schema(traces_table_name: str = "runtime_traces") -> dict[str, Any]:
     """Get the span table schema with the correct foreign key reference.
 
     Args:
@@ -270,7 +270,7 @@ APPROVAL_TABLE_SCHEMA = {
 }
 
 
-def _get_schedule_runs_table_schema(schedules_table_name: str = "agno_schedules") -> dict[str, Any]:
+def _get_schedule_runs_table_schema(schedules_table_name: str = "runtime_schedules") -> dict[str, Any]:
     """Get the schedule runs table schema with a foreign key to the schedules table."""
     return {
         "id": {"type": String, "primary_key": True, "nullable": False},
@@ -298,8 +298,8 @@ def _get_schedule_runs_table_schema(schedules_table_name: str = "agno_schedules"
 
 def get_table_schema_definition(
     table_type: str,
-    traces_table_name: str = "agno_traces",
-    schedules_table_name: str = "agno_schedules",
+    traces_table_name: str = "runtime_traces",
+    schedules_table_name: str = "runtime_schedules",
 ) -> dict[str, Any]:
     """
     Get the expected schema definition for the given table.

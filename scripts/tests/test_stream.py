@@ -578,7 +578,7 @@ class _RecordingAgent:
     test doesn't have to coordinate two release events.
 
     Yields an empty delta IMMEDIATELY before any blocking — this mirrors
-    what real providers (claude-cli, agno) signal once the prompt has
+    what real providers (claude-cli, api-based) signal once the prompt has
     actually been delivered to the SDK, which is the engagement signal
     ``StreamTurnRunner`` uses to flip ``_current_turn_started=True`` and
     take the partial-commit path on cancel rather than salvaging the

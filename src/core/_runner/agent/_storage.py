@@ -308,6 +308,11 @@ def read_or_create_session(
 
         agent_session = cast(AgentSession, read_session(agent, session_id=session_id, user_id=user_id))
 
+    # Claim unowned rows — see ``aread_or_create_session`` below for
+    # the long version of why.
+    if agent_session is not None and user_id and not agent_session.user_id:
+        agent_session.user_id = user_id
+
     if agent_session is None:
         # Creating new session if none found
         log_debug(f"Creating new AgentSession: {session_id}")
@@ -372,6 +377,12 @@ async def aread_or_create_session(
             agent_session = cast(AgentSession, await aread_session(agent, session_id=session_id, user_id=user_id))
         else:
             agent_session = cast(AgentSession, read_session(agent, session_id=session_id, user_id=user_id))
+
+    # Claim unowned rows on first authenticated read — see the long
+    # comment in ``team/_storage.py::_aread_or_create_session`` for the
+    # rationale. Same bug, same fix on the agent side.
+    if agent_session is not None and user_id and not agent_session.user_id:
+        agent_session.user_id = user_id
 
     if agent_session is None:
         # Creating new session if none found

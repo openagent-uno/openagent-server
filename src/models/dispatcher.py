@@ -402,18 +402,21 @@ class TeamRouterProvider(BaseModel):
     - **Leader**: the entry model for the session (api-based OR
       claude-cli — both can drive the conversation). When the leader
       is claude-cli, ``team.model`` is the cheapest enabled api-based
-      model in the catalog; the claude-cli ``ClaudeBackedAgent`` sits
-      as ``members[0]`` so the routing model can still delegate to it.
+      model in the catalog if any exists; otherwise it's a
+      ``ClaudeSdkRoutingModel`` wrapping the cheapest enabled claude-cli
+      model. The claude-cli ``ClaudeBackedAgent`` sits as ``members[0]``
+      so the routing model can still delegate to it.
     - **Members**: every OTHER enabled LLM model in the DB. Each
       member is a runtime ``Agent`` (api-based via ``NativeProvider``)
       or ``ClaudeBackedAgent`` (claude-cli) whose ``role`` comes from
       the DB row's ``tier_hint``.
 
     When there's no other enabled LLM model (single-model deployment),
-    or when the leader is claude-cli AND no api-based model exists to
-    serve as the routing model, the team is skipped and the leader
-    runs as a single agent to avoid an empty-team / null-routing
-    failure mode.
+    the team is skipped and the leader runs as a single agent. Per
+    vision §3 — any registered model can serve as the router, so the
+    null-routing fallback that used to fire when only subscription-CLI
+    models were enabled no longer applies; a ``ClaudeSdkRoutingModel``
+    is built from the cheapest claude-cli row instead.
     """
 
     history_mode = "platform"
@@ -557,9 +560,9 @@ class TeamRouterProvider(BaseModel):
             member_toolkits = list(self._mcp_pool.runtime_toolkits_tool_search_only())
             provider.set_mcp_toolkits(member_toolkits)
         runtime_model = provider.build_runtime_model()
-        from src.core._runner.agent import Agent as AgnoAgent
+        from src.core._runner.agent import Agent as RuntimeAgent
 
-        return AgnoAgent(
+        return RuntimeAgent(
             name=name,
             model=runtime_model,
             tools=member_toolkits or None,
@@ -639,30 +642,28 @@ class TeamRouterProvider(BaseModel):
             entry, name=name, role=role, system=system,
         )
 
-    def _cheapest_api_based_model(self, catalog: list[CatalogModel]) -> Any | None:
-        """For claude-cli leaders we need SOMETHING as ``team.model`` for
-        the routing classifier call (the runtime's Team always invokes
-        ``team.model`` to decide which member handles the turn).
-        Prefer the cheapest enabled api-based model in catalog.
+    def _choose_routing_model(self, catalog: list[CatalogModel]) -> Any | None:
+        """Pick a runtime ``Model`` to serve as ``team.model``.
+
+        The runtime's Team always invokes ``team.model`` to decide which
+        member handles the turn. For api-based leaders the leader's own
+        model is used; this helper supplies the routing model for
+        subscription-CLI leaders (Claude SDK).
+
+        Order:
+          1. The cheapest enabled api-based model in catalog (preferred —
+             cheap classifiers minimise routing cost).
+          2. The cheapest enabled claude-cli model, wrapped in a
+             ``ClaudeSdkRoutingModel`` (vision §3: any registered model
+             can serve as the router, including subscription-CLI ones).
+          3. ``None`` if neither exists (single-agent fallback).
 
         Cached on the provider instance until ``rebuild_routing`` fires
         — the chosen routing model is invariant for a fixed catalog
         across sessions, so building it per-session was waste.
-
-        Returns the runtime ``Model`` object, or ``None`` if no api-based
-        model exists — in which case the caller falls back to single-
-        agent dispatch.
         """
         if self._cached_routing_model_built:
             return self._cached_routing_model
-        api_rows = [
-            e for e in catalog
-            if framework_of(e.runtime_id) == FRAMEWORK_API_BASED
-        ]
-        if not api_rows:
-            self._cached_routing_model = None
-            self._cached_routing_model_built = True
-            return None
 
         def _score(entry: CatalogModel) -> int:
             """Lower score = cheaper. Heuristic-tier keyword in the row
@@ -678,24 +679,77 @@ class TeamRouterProvider(BaseModel):
                     return len(_CHEAP_HEURISTIC_KEYWORDS) + i
             return len(_CHEAP_HEURISTIC_KEYWORDS) * 2
 
-        chosen = min(api_rows, key=_score)
-        # Build the runtime ``Model`` directly — we only need the routing
-        # classifier model, not a wrapper ``Agent`` we'd throw away.
-        from src.models.native_provider import NativeProvider
+        api_rows = [
+            e for e in catalog
+            if framework_of(e.runtime_id) == FRAMEWORK_API_BASED
+        ]
+        if api_rows:
+            chosen = min(api_rows, key=_score)
+            from src.models.native_provider import NativeProvider
+            try:
+                provider = NativeProvider(
+                    model=chosen.runtime_id,
+                    providers_config=self._providers_config,
+                    db_path=_runtime_db_path(self._db),
+                )
+                self._cached_routing_model = provider.build_runtime_model()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("_choose_routing_model: api-based build failed for %s: %s",
+                             chosen.runtime_id, e)
+                self._cached_routing_model = None
+            self._cached_routing_model_built = True
+            return self._cached_routing_model
 
-        try:
-            provider = NativeProvider(
-                model=chosen.runtime_id,
-                providers_config=self._providers_config,
-                db_path=_runtime_db_path(self._db),
-            )
-            self._cached_routing_model = provider.build_runtime_model()
-        except Exception as e:  # noqa: BLE001
-            logger.debug("_cheapest_api_based_model: build failed for %s: %s",
-                         chosen.runtime_id, e)
-            self._cached_routing_model = None
+        claude_rows = [
+            e for e in catalog
+            if framework_of(e.runtime_id) == FRAMEWORK_CLAUDE_CLI
+        ]
+        if claude_rows:
+            chosen = min(claude_rows, key=_score)
+            try:
+                self._cached_routing_model = self._build_claude_sdk_routing_model(chosen)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("_choose_routing_model: claude-cli build failed for %s: %s",
+                             chosen.runtime_id, e)
+                self._cached_routing_model = None
+            self._cached_routing_model_built = True
+            return self._cached_routing_model
+
+        self._cached_routing_model = None
         self._cached_routing_model_built = True
-        return self._cached_routing_model
+        return None
+
+    def _build_claude_sdk_routing_model(self, entry: CatalogModel) -> Any:
+        """Build a ``ClaudeSdkRoutingModel`` for ``entry`` (a claude-cli row).
+
+        The SDK gets the tool-search MCP from the pool (so the team
+        coordinator turn can reach MCP tools through tool-search the
+        same way the leader does) and the runtime tools the Team's
+        coordinator wants (``delegate_task_to_member``, ...) bridged
+        per-call inside ``aresponse_stream``.
+        """
+        from src.models.claude_agent import _sanitize_claude_model_id
+        from src.models.claude_routing_model import ClaudeSdkRoutingModel
+
+        extra_servers: dict[str, Any] = {}
+        if self._mcp_pool is not None:
+            try:
+                extra_servers = dict(
+                    self._mcp_pool.claude_sdk_servers_tool_search_only()
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.debug(
+                    "_build_claude_sdk_routing_model: mcp pool fetch: %s", e,
+                )
+                extra_servers = {}
+
+        sdk_model_id = _sanitize_claude_model_id(entry.model_id) or "default"
+        return ClaudeSdkRoutingModel(
+            id=entry.runtime_id,
+            provider=FRAMEWORK_CLAUDE_CLI,
+            sdk_model_id=sdk_model_id,
+            extra_mcp_servers=extra_servers or None,
+        )
 
     def _ensure_runtime(self, session_id: str, system: str | None) -> Any:
         """Return the cached Team / single-agent for ``session_id``, building
@@ -734,9 +788,10 @@ class TeamRouterProvider(BaseModel):
         entry_framework = framework_of(entry.runtime_id)
         is_subscription_leader = entry_framework in SUBSCRIPTION_CLI_FRAMEWORKS
 
-        # Single-model api-based deployment: skip Team, run leader as a
-        # plain single agent via NativeProvider. Done BEFORE we build a
-        # leader agent that the single-model path wouldn't use.
+        # No other LLM model to delegate to — a Team of one is degenerate
+        # (nothing to route TO). Skip Team in both flavors:
+        # - api-based leader → single-agent dispatch via NativeProvider.
+        # - subscription-CLI leader → single-external-agent fallback below.
         if not members_catalog and not is_subscription_leader:
             from src.models.native_provider import NativeProvider
 
@@ -768,13 +823,14 @@ class TeamRouterProvider(BaseModel):
         team_model: Any
 
         if is_subscription_leader:
-            team_model = self._cheapest_api_based_model(catalog)
+            # Single-model subscription-CLI deployment: skip Team — a
+            # 1-member team is degenerate (the leader can't delegate to
+            # anyone). Fall back to single-external-agent dispatch so
+            # the lone agent still carries the OpenAgent framework
+            # prompt + user persona (vision §15).
+            single_model_fallback = not members_catalog
+            team_model = None if single_model_fallback else self._choose_routing_model(catalog)
             if team_model is None:
-                # No api-based model in the entire catalog — can't build
-                # a Team that has a routing model. Fall back to single-
-                # agent dispatch of the subscription-CLI leader. Pass
-                # ``system`` so the lone agent still carries the OpenAgent
-                # framework prompt + user persona (vision §15).
                 fallback_agent = self._build_agent_for(
                     entry,
                     name=_member_identifier(entry.runtime_id),
@@ -793,7 +849,7 @@ class TeamRouterProvider(BaseModel):
                     session_id=session_id,
                     entry=entry.runtime_id,
                     framework=entry_framework,
-                    reason="no_api_based_routing_model",
+                    reason="single_model" if single_model_fallback else "no_routing_model",
                 )
                 return fallback
             leader_agent = self._build_agent_for(
@@ -874,6 +930,7 @@ class TeamRouterProvider(BaseModel):
             leader=entry.runtime_id,
             leader_framework=entry_framework,
             routing_model_id=getattr(team_model, "id", None),
+            routing_model_provider=getattr(team_model, "provider", None),
             members=[e.runtime_id for e in members_catalog],
         )
         return team

@@ -267,7 +267,7 @@ def build_sdk_server(*, pool: Any | None = None) -> Any:
 # ── Native runtime adapter ──────────────────────────────────────────
 
 
-def build_agno_toolkit(*, pool: Any | None = None) -> Any:
+def build_runtime_toolkit(*, pool: Any | None = None) -> Any:
     """Return a runtime ``Toolkit`` with the same four tools.
 
     The runtime function names mirror the convention used by subprocess

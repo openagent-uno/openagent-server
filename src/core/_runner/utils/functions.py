@@ -107,7 +107,7 @@ def cache_result(enable_cache: bool = True, cache_dir: Optional[str] = None, cac
             instance_cache_dir = (
                 getattr(instance, "cache_dir", cache_dir) if hasattr(instance, "cache_dir") else cache_dir
             )
-            base_cache_dir = instance_cache_dir or os.path.join(tempfile.gettempdir(), "agno_cache")
+            base_cache_dir = instance_cache_dir or os.path.join(tempfile.gettempdir(), "openagent_cache")
 
             # Create cache directory if it doesn't exist
             func_cache_dir = os.path.join(base_cache_dir, func.__module__, func.__qualname__)

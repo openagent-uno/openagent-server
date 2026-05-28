@@ -1,11 +1,11 @@
 """NativeProvider.commit_partial_assistant — synth-run injection round-trip.
 
 Verifies that a barge-in commit appends a synthetic ``RunOutput``
-carrying the partial assistant text to Agno's session row, so the next
+carrying the partial assistant text to the runtime's session row, so the next
 turn's ``add_history_to_context=True`` reload sees ``user → assistant
 (interrupted) → user`` instead of two adjacent user turns.
 
-Uses Agno's real ``SqliteDb`` against a throwaway file so the upsert /
+Uses the runtime's real ``SqliteDb`` against a throwaway file so the upsert /
 get round-trip exercises the actual schema rather than a mocked stand-in.
 """
 from __future__ import annotations
@@ -17,7 +17,7 @@ import time
 from ._framework import TestContext, TestSkip, test
 
 
-@test("agno_partial_commit", "synth run lands in the agno_sessions row")
+@test("runtime_partial_commit", "synth run lands in the sessions row")
 async def t_synth_run_round_trip(_ctx: TestContext) -> None:
     try:
         from src.memory.store.sqlite import SqliteDb
@@ -27,7 +27,7 @@ async def t_synth_run_round_trip(_ctx: TestContext) -> None:
         from src.core._run_state.base import RunStatus
         from src.models.providers.message import Message
     except ImportError as e:
-        raise TestSkip(f"agno not installed: {e}")
+        raise TestSkip(f"API-based runtime not available: {e}")
 
     from src.models.native_provider import NativeProvider
 
@@ -36,7 +36,7 @@ async def t_synth_run_round_trip(_ctx: TestContext) -> None:
     try:
         # Seed the DB with a session that has one prior run, like a normal
         # multi-turn conversation would. ``created_at`` is required by
-        # the agno_sessions schema (NOT NULL in v2.x).
+        # the sessions schema (NOT NULL in v2.x).
         db = SqliteDb(db_file=db_path)
         now = int(time.time())
         seeded_session = AgentSession(
@@ -63,7 +63,7 @@ async def t_synth_run_round_trip(_ctx: TestContext) -> None:
         # Build a provider pointing at the same db_path. We don't need an
         # API key — commit_partial_assistant only does DB IO.
         provider = NativeProvider(
-            model="agno:openai:gpt-4o-mini",
+            model="api-based:openai:gpt-4o-mini",
             api_key=None,
             db_path=db_path,
         )
@@ -92,12 +92,12 @@ async def t_synth_run_round_trip(_ctx: TestContext) -> None:
         os.unlink(db_path)
 
 
-@test("agno_partial_commit", "missing session row is a silent no-op")
+@test("runtime_partial_commit", "missing session row is a silent no-op")
 async def t_missing_session_noop(_ctx: TestContext) -> None:
     try:
         from src.memory.store.sqlite import SqliteDb  # noqa: F401
     except ImportError as e:
-        raise TestSkip(f"agno not installed: {e}")
+        raise TestSkip(f"API-based runtime not available: {e}")
 
     from src.models.native_provider import NativeProvider
 
@@ -105,7 +105,7 @@ async def t_missing_session_noop(_ctx: TestContext) -> None:
     os.close(fd)
     try:
         provider = NativeProvider(
-            model="agno:openai:gpt-4o-mini",
+            model="api-based:openai:gpt-4o-mini",
             api_key=None,
             db_path=db_path,
         )
@@ -115,17 +115,17 @@ async def t_missing_session_noop(_ctx: TestContext) -> None:
         os.unlink(db_path)
 
 
-@test("agno_partial_commit", "empty inputs short-circuit")
+@test("runtime_partial_commit", "empty inputs short-circuit")
 async def t_empty_inputs_short_circuit(_ctx: TestContext) -> None:
     try:
         from src.memory.store.sqlite import SqliteDb  # noqa: F401
     except ImportError as e:
-        raise TestSkip(f"agno not installed: {e}")
+        raise TestSkip(f"API-based runtime not available: {e}")
 
     from src.models.native_provider import NativeProvider
 
     provider = NativeProvider(
-        model="agno:openai:gpt-4o-mini",
+        model="api-based:openai:gpt-4o-mini",
         api_key=None,
         db_path=":memory:",
     )

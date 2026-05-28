@@ -501,7 +501,7 @@ class WorkflowExecutor:
             kwargs["error"] = error
 
         # Critical: finalize the workflow_run row. If this write loses
-        # to writer-lock contention (e.g. Agno's SqliteDb hammering the
+        # to writer-lock contention (e.g. the runtime SqliteDb hammering the
         # same DB on a parallel run), the run is left in ``running`` and
         # never recovers in this process — the next scheduled tick or a
         # process restart has to reap it. Retry a few times with
@@ -669,7 +669,7 @@ async def _h_mcp_tool(
     }
     fn = functions.get(tool_name)
     if fn is None:
-        # Agno prefixes remote tools with the MCP name (``messaging_…``).
+        # the runtime prefixes remote tools with the MCP name (``messaging_…``).
         # LLM-authored workflows often emit the bare upstream name; auto-
         # repair that one specific mismatch instead of failing.
         prefixed = f"{mcp_name}_{tool_name}"
@@ -685,9 +685,9 @@ async def _h_mcp_tool(
         raise ValueError(
             f"mcp-tool: 'args' must be an object, got {type(args).__name__}"
         )
-    # Agno's ``MCPTools`` registers remote tools as ``Function``
+    # the runtime ``MCPTools`` registers remote tools as ``Function``
     # descriptors (Pydantic models with no ``__call__``); the actual
-    # callable lives on ``.entrypoint`` (Agno binds ``tool_name`` via
+    # callable lives on ``.entrypoint`` (the runtime binds ``tool_name`` via
     # ``functools.partial`` so a bare ``(**args)`` call works). In-
     # process toolkits register raw callables. Mirror the established
     # pattern from ``tool_search/adapters.py:129``.
@@ -737,7 +737,7 @@ async def _h_ai_prompt(
     finally:
         # ephemeral: each node owns a unique session_id never reused in
         # this run — so forget now to wipe provider-native resume state
-        # (claude-cli's sdk_sessions row, agno's history rows). Otherwise
+        # (claude-cli's sdk_sessions row, the runtime's history rows). Otherwise
         # a re-run of the same workflow could inherit transcript through
         # persisted resume ids (same bug class as scheduler issue #5).
         # shared: every ai-prompt node in the run shares one session_id

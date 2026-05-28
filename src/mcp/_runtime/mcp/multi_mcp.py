@@ -31,7 +31,7 @@ except (ImportError, ModuleNotFoundError):
 
 class MultiMCPTools(Toolkit):
     """
-    A toolkit for integrating multiple Model Context Protocol (MCP) servers with Agno agents.
+    A toolkit for integrating multiple Model Context Protocol (MCP) servers with the runtime.
     This allows agents to access tools, resources, and prompts exposed by MCP servers.
 
     Can be used in three ways:

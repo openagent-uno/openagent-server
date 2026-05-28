@@ -1,6 +1,6 @@
 """Cross-device session visibility — handle-keyed listing + legacy fallback.
 
-Pre-fix the gateway filtered ``agno_sessions`` by the WebSocket's
+Pre-fix: the gateway filtered ``sessions`` by the WebSocket's
 ``client_id`` = device pubkey hex. Every device a user owned had a
 different pubkey, so device B logged in as the same user could never
 see device A's chats. The fix has two halves:

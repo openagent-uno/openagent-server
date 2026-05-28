@@ -28,7 +28,7 @@ from pathlib import Path
 
 # Silence noisy third-party loggers; test output is already explicit.
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
-for noisy in ("agno", "agno.tools", "agno.tools.mcp", "openai", "httpx",
+for noisy in ("openagent", "src.mcp", "src.models", "openai", "httpx",
               "httpcore", "asyncio", "openagent.mcp.client", "openagent.mcp.pool"):
     logging.getLogger(noisy).setLevel(logging.ERROR)
 
@@ -54,7 +54,7 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_serve_singleton",
     "test_cli_cleanup",
     # importlib.metadata fallback for frozen bundles — defense in depth
-    # against the agno Team-run crash when pydantic dist-info goes missing
+    # against the runtime Team-run crash when pydantic dist-info goes missing
     # under sys._MEIPASS.
     "test_frozen_metadata_patch",
     "test_catalog",
@@ -80,11 +80,20 @@ _TEST_MODULES: tuple[str, ...] = (
     # StreamSession's STT pump. Local fake-WS server exercises the
     # full audio → CloseStream → final protocol.
     "test_stt_deepgram_streaming",
-    # AgnoProvider.commit_partial_assistant injects a synthetic run
-    # into the agno_sessions row so the next turn sees ``user →
+    # NativeProvider.commit_partial_assistant injects a synthetic run
+    # into the sessions row so the next turn sees ``user →
     # assistant (interrupted) → user`` instead of two adjacent user
     # turns. Round-trips against a throwaway SqliteDb.
-    "test_agno_partial_commit",
+    "test_runtime_partial_commit",
+    # Session continuity across multiple turns. The agno→inline migration
+    # exposed a latent IndexError on ``runs=[]`` and a key-vs-truthy
+    # dispatch bug in ``AgentSession.from_dict`` / ``TeamSession.from_dict``
+    # that together silently overwrote the runs column each turn — the
+    # LLM appeared to have no memory of the previous message because
+    # only the latest run survived. Tests cover the DB round-trip, the
+    # gateway/runtime upsert interleave, session_type mismatches, and
+    # an end-to-end three-turn Team accumulation.
+    "test_session_continuity",
     # In-session compaction (vision §2). When the cumulative stored
     # history is about to overflow the model's context window, the
     # oldest runs fold into a recap row so the next turn stays under
@@ -103,7 +112,7 @@ _TEST_MODULES: tuple[str, ...] = (
     # Guards the contract that voice mode (and the soon-to-be-streaming
     # web chat) always gets text even when the streaming provider yields
     # zero deltas (claude_cli tool-only turns, smart_router → claude_cli
-    # with empty content, agno when no RunContentEvent fires).
+    # with empty content, the runtime when no RunContentEvent fires).
     "test_agent_run_stream",
     # New DB-backed registry tests: pure CRUD against ctx.db_path, no pool.
     "test_db_mcps",
@@ -111,9 +120,9 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_bootstrap",
     "test_db_models",
     # Regression: MemoryDB._parse_metadata must always return a dict (mixout
-    # crash 2026-05-12, agno_sessions row with literal 'null' metadata).
+    # crash 2026-05-12, sessions row with literal 'null' metadata).
     "test_db_metadata_parse",
-    # Live wire / rehydrated transcript parity: the same Agno
+    # Live wire / rehydrated transcript parity: the same runtime
     # ToolExecution must produce byte-identical envelopes on both the
     # live STATUS frame and the GET /api/sessions/{id}/runs response,
     # and the rehydration walk must recurse into member_responses so
@@ -129,7 +138,7 @@ _TEST_MODULES: tuple[str, ...] = (
     # ClaudeBackedAgent — Agent subclass that drives claude_agent_sdk
     # directly. Pure-unit: monkey-patches sys.modules['claude_agent_sdk']
     # with a fake module so no SDK binary is required. Pins the four
-    # contracts that let claude-cli rows participate in Agno Teams:
+    # contracts that let claude-cli rows participate in runtime Teams:
     # Agent isinstance, arun → RunOutput, session-id round-trip via
     # session_data, and streaming events.
     "test_claude_backed_agent",
@@ -140,12 +149,12 @@ _TEST_MODULES: tuple[str, ...] = (
     # events, SDK-error raise, and lazy import on slim installs.
     "test_codex_backed_agent",
     # TeamRouterProvider — the v0.14 sub-agent architecture. Verifies
-    # Agno Team(mode=route) construction from DB rows, role blurbs from
+    # Team(mode=route) construction from DB rows, role blurbs from
     # tier_hint/description, single-agent fallback, claude-cli as
     # MEMBER (via ClaudeBackedAgent) and as LEADER (with the cheapest
     # api-based model as the routing classifier).
     "test_team_router",
-    # Regression lock-down for the v0.14 Agno-consolidation refactor.
+    # Regression lock-down for the v0.14 runtime-consolidation refactor.
     # Covers every fix from Phases 1-10: framework collapse, claude_cli
     # rewrite, SmartRouter classifier removal, db.py helper deletion,
     # defer-all MCP wiring, system prompt placeholders, curator wiring,
@@ -156,15 +165,15 @@ _TEST_MODULES: tuple[str, ...] = (
     # E2E unified flow — locks down four cross-cutting properties: (1)
     # multi-member parallel delegation through _arun_runtime_stream, (2)
     # live↔rehydration parity for a synthetic multi-tool turn, (3)
-    # coordinate-mode wiring + Agno's asyncio.gather contract, (4) the
+    # coordinate-mode wiring + the runtime's asyncio.gather contract, (4) the
     # zero-enabled-models short-circuit survives the coordinate-mode
     # change. Pure-unit; no LLM call.
     "test_e2e_unified_flow",
-    "test_agno_tool_filter",
-    # AgnoProvider.stream — hermetic zero-delta fallback coverage
+    "test_runtime_tool_filter",
+    # NativeProvider.stream — hermetic zero-delta fallback coverage
     # (Friday's stuck Telegram turns; provider falls back to its own
     # generate() before control returns to Agent.run_stream).
-    "test_agno_stream",
+    "test_runtime_stream",
     "test_behavior_contract",
     "test_mcp_manager_guards",
     "test_provider_manager",
@@ -180,13 +189,13 @@ _TEST_MODULES: tuple[str, ...] = (
     # throwaway DB to avoid touching the shared pool fixture.
     "test_pool_reload",
     # 3. Provider-level live tests (need pool)
-    "test_agno",
-    # AgnoProvider.forget_session must wipe stored history so the
+    "test_runtime",
+    # NativeProvider.forget_session must wipe stored history so the
     # scheduler's per-fire forget and the gateway's /clear actually
-    # reach Agno's SqliteDb-backed session store. Runs here (not in
+    # reach the runtime's SqliteDb-backed session store. Runs here (not in
     # provider live tests) because it uses a synthetic DB and doesn't
     # need the pool fixture.
-    "test_agno_forget_clears_history",
+    "test_runtime_forget_clears_history",
     "test_router",
     "test_mcp",
     "test_budget",
@@ -248,7 +257,7 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_bridge_session",
     # Coordinator login_finish must NOT die on SQLite locks for the
     # non-critical touch_device write (lyra-agent outage 2026-05-18 —
-    # heavy Agno session writes held the writer lock and broke every
+    # heavy runtime session writes held the writer lock and broke every
     # returning device's login).
     "test_coordinator_login_resilience",
     # End-to-end multi-user: spin up an in-process coordinator, mint
@@ -285,7 +294,7 @@ _TEST_MODULES: tuple[str, ...] = (
     # zombies pin the executor's per-workflow lock forever and the
     # next scheduled tick can't make progress.
     "test_workflow_orphan_reap",
-    # _finalize_run survives transient SQLite locks (Agno's SqliteDb
+    # _finalize_run survives transient SQLite locks (the runtime's SqliteDb
     # writes racing OpenAgent's aiosqlite). Retries finalize on
     # OperationalError; cosmetic update_workflow lock is non-fatal;
     # retry is BOUNDED so we don't recreate the original loop.
@@ -409,7 +418,7 @@ def main() -> int:
                 last_cat = cat
             # Long-running categories get extra timeout headroom
             timeout = 180 if cat in (
-                "agno", "router", "sessions", "files", "claude_cli"
+                "runtime", "router", "sessions", "files", "claude_cli"
             ) else 60
             res = await run_one(cat, name, fn, ctx, timeout=timeout)
             results.append(res)

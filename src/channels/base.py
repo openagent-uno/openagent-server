@@ -19,11 +19,11 @@ class ToolStatusEvent:
     The agent fires status events in two shapes (the chat store and
     every bridge / turn runner has historically had to detect both):
 
-      * JSON (Agno-native ``ToolExecution.to_dict()``):
+      * JSON (API-native ``ToolExecution.to_dict()``):
         ``{"tool_name": "ReadFile", "tool_call_error": false, "result": ..., ...}``
       * Plain: ``"Using ReadFile..."``
 
-    Phase is derived from the Agno fields: ``tool_call_error`` → error,
+    Phase is derived from the runtime fields: ``tool_call_error`` → error,
     ``result`` present → done, otherwise → running. This dataclass
     normalises both shapes so callers can branch on ``status`` without
     re-parsing.
@@ -43,7 +43,7 @@ def parse_status_event(raw: str) -> Optional[ToolStatusEvent]:
     if not text:
         return None
 
-    # JSON shape first — Agno's native ``ToolExecution.to_dict()``.
+    # JSON shape first — the runtime's native ``ToolExecution.to_dict()``.
     try:
         parsed = json.loads(text)
         if isinstance(parsed, dict) and parsed.get("tool_name"):

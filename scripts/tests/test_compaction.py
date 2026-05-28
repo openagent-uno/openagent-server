@@ -15,8 +15,8 @@ Covers the five contracts of ``src.core.compaction``:
    compaction cleanly.
 
 All tests work against a throwaway SQLite file directly — the
-compaction module reads/writes ``agno_sessions.runs`` via raw SQL, so
-it doesn't need agno installed to exercise the contract.
+compaction module reads/writes the ``sessions.runs`` column via raw SQL, so
+it doesn't need the runtime installed to exercise the contract.
 """
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ from ._framework import TestContext, test
 def _make_session_row(
     db_path: str, session_id: str, runs: list[dict],
 ) -> None:
-    """Seed an agno_sessions row with the given runs JSON.
+    """Seed an sessions row with the given runs JSON.
 
     The compaction module reads / writes the row with raw SQL, so we
     create the schema by hand here. Matches the canonical schema in

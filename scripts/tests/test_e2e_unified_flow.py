@@ -10,17 +10,17 @@ stack that no single existing test module exercises end-to-end:
    round-trip.
 
 2. **Live → rehydration parity** — a synthetic turn driven through
-   ``_arun_runtime_stream`` is persisted to ``agno_sessions`` and replayed
+   ``_arun_runtime_stream`` is persisted to ``sessions`` and replayed
    via the gateway's ``_expand_run_messages`` rehydration helper. The
    tool envelopes from the live wire and the rehydrated transcript
    must match field-for-field; member responses must carry the
    specialist's model badge.
 
 3. **Coordinate-mode parallelism wiring** — ``TeamRouterProvider``
-   builds the Team in ``TeamMode.coordinate``, and Agno upstream still
+   builds the Team in ``TeamMode.coordinate``, and the runtime still
    gathers parallel function calls via ``asyncio.gather`` at the path
-   the architecture relies on (``agno.models.base.arun_function_calls``).
-   If a future Agno upgrade removes the gather, our parallelism
+   the architecture relies on (``the runtime's tool-loop``).
+   If a future runtime upgrade removes the gather, our parallelism
    assumption breaks silently — this test catches that.
 
 4. **No-models short-circuit unaffected** — coordinate-mode shouldn't
@@ -39,12 +39,12 @@ stack that no single existing test module exercises end-to-end:
    rehydration** — the user's primary contract: when a team leader
    delegates to a specialist who then fires its OWN tools, the live
    wire and rehydrated transcript must both render the nested tools as
-   their own chips in the same order. Agno emits these as
-   ``agno.run.agent.ToolCallStartedEvent`` / ``ToolCallCompletedEvent``
+   their own chips in the same order. the runtime emits these as
+   ``src.core._run_state.agent.ToolCallStartedEvent`` / ``ToolCallCompletedEvent``
    (member is an Agent, NOT a Team), passed through unchanged by the
    team's iterator when ``stream_member_events`` is True (default).
 
-No live LLM calls — every Agno surface is faked via the same shapes
+No live LLM calls — every runtime surface is faked via the same shapes
 already exercised in ``test_team_router`` / ``test_rehydration_parity``.
 """
 from __future__ import annotations
@@ -63,7 +63,7 @@ from ._framework import TestContext, test
 
 @dataclass
 class _FakeToolExec:
-    """Minimal stand-in for Agno's ``ToolExecution`` dataclass.
+    """Minimal stand-in for the runtime's ``ToolExecution`` dataclass.
 
     Mirrors the shape ``src.models._tool_status`` reads. Tests that
     need a delegate-tool call set ``tool_name='delegate_task_to_member'``
@@ -79,7 +79,7 @@ class _FakeToolExec:
 
 
 def _seed_agno_runs(db_path: str, session_id: str, runs: list[dict]) -> None:
-    """Seed an ``agno_sessions`` row carrying ``runs`` as JSON.
+    """Seed an ``sessions`` row carrying ``runs`` as JSON.
 
     Copied from ``test_rehydration_parity`` to keep this module
     self-contained — the schema/shape is the contract test_rehydration_parity
@@ -131,7 +131,7 @@ async def t_multi_member_delegation_emits_parallel_envelopes(ctx: TestContext) -
     ``tool_args``; the final synthesized text contains all three member
     outputs. Mirrors the Test 1 contract from the prompt.
 
-    The Agno surface is faked at the ``_arun_runtime_stream`` seam so we
+    The runtime surface is faked at the ``_arun_runtime_stream`` seam so we
     don't depend on a real Team's classifier or LLM round-trip.
     """
     from src.core._run_state.team import (
@@ -143,7 +143,7 @@ async def t_multi_member_delegation_emits_parallel_envelopes(ctx: TestContext) -
 
     # Three delegations to three distinct specialists, each with its own
     # tool_call_id so the wire's tool_call_id field disambiguates them.
-    # In real Agno, the SAME ToolExecution mutates: result is None at
+    # In the runtime, the SAME ToolExecution mutates: result is None at
     # start, populated at completion. Mirror that so the wire shape
     # (which is verbatim ``to_dict()``) carries the right per-phase
     # values the UI's local phase derivation reads.
@@ -174,9 +174,9 @@ async def t_multi_member_delegation_emits_parallel_envelopes(ctx: TestContext) -
         def arun(self, prompt, *, session_id, user_id, stream, stream_events=False):
             async def _iter():
                 # Coordinate mode: leader fires all three delegations before
-                # any of them complete — mimics how Agno's
+                # any of them complete — mimics how the runtime's
                 # ``arun_function_calls`` opens by yielding tool_call_started
-                # for every call (see agno/models/base.py:2515).
+                # for every call (see src/models/providers/base.py).
                 for d in delegations:
                     yield TeamToolCallStartedEvent(
                         tool=d, run_id="r", session_id=session_id,
@@ -184,7 +184,7 @@ async def t_multi_member_delegation_emits_parallel_envelopes(ctx: TestContext) -
                 # Then completion events as asyncio.gather harvests results.
                 # Set ``result`` on the shared exec before yielding so
                 # the completed envelope on the wire carries it (this
-                # matches Agno's in-place mutation).
+                # matches the runtime's in-place mutation).
                 for d in delegations:
                     d.result = results_by_id[d.tool_call_id]
                     yield TeamToolCallCompletedEvent(
@@ -290,7 +290,7 @@ async def t_multi_member_delegation_emits_parallel_envelopes(ctx: TestContext) -
 async def t_live_rehydration_parity_for_synthetic_run(ctx: TestContext) -> None:
     """Drive a synthetic turn (2 tool calls + 1 delegate + content deltas)
     through ``_arun_runtime_stream``, then persist the equivalent run to
-    ``agno_sessions`` and replay it via ``_expand_run_messages``. The
+    ``sessions`` and replay it via ``_expand_run_messages``. The
     tool envelopes from both paths must match field-for-field, and the
     member's assistant content must surface with the specialist's
     model badge.
@@ -309,11 +309,11 @@ async def t_live_rehydration_parity_for_synthetic_run(ctx: TestContext) -> None:
     specialist_model = "anthropic:claude-opus-4-7"
     specialist_member_id = "anthropic-claude-opus-4-7"
 
-    # In real Agno, the same ToolExecution mutates between start +
+    # In the runtime, the same ToolExecution mutates between start +
     # completion — ``result`` is None at start and populated at done.
     # Mirror that by leaving result=None and setting it before yielding
     # the completed event, so the wire shape (verbatim ToolExecution
-    # to_dict) matches what Agno would emit.
+    # to_dict) matches what the runtime would emit.
     vault_tool = _FakeToolExec(
         tool_name="vault_read_note",
         tool_call_id="call_vault",
@@ -404,7 +404,7 @@ async def t_live_rehydration_parity_for_synthetic_run(ctx: TestContext) -> None:
     }, live_done_by_id
 
     # ── Rehydration path ───────────────────────────────────────────
-    # Build the on-disk shape Agno would have written. This is the same
+    # Build the on-disk shape the runtime would have written. This is the same
     # contract test_rehydration_parity walks; we recompose it here as
     # the parallel record of the live turn above.
     team_run = {
@@ -507,7 +507,7 @@ async def t_live_rehydration_parity_for_synthetic_run(ctx: TestContext) -> None:
     )
 
     # Field-for-field equality on the keys the UI's renderer reads.
-    # Rehydration may surface additional Agno-native fields (metrics,
+    # Rehydration may surface additional runtime-native fields (metrics,
     # child_run_id, etc.) that the live path's _FakeToolExec doesn't
     # expose — assert the UI-load-bearing subset matches.
     ui_fields = ("tool_name", "tool_call_id", "tool_args", "result",
@@ -550,21 +550,21 @@ async def t_live_rehydration_parity_for_synthetic_run(ctx: TestContext) -> None:
 # ── Test 3: coordinate-mode parallelism wiring lock-down ──────────────
 
 
-@test("e2e_unified_flow", "Team built in coordinate mode and Agno still gathers in parallel")
+@test("e2e_unified_flow", "Team built in coordinate mode and the runtime still gathers in parallel")
 async def t_coordinate_mode_wired_and_agno_still_gathers(ctx: TestContext) -> None:
     """Two-part contract:
 
     1. ``TeamRouterProvider`` builds the Team with ``mode=coordinate`` so
        the leader can fire multiple ``delegate_task_to_member`` calls in
        a single turn (vs ``route`` which caps the leader at one).
-    2. Agno upstream still gathers parallel function calls via
-       ``asyncio.gather`` at ``agno.models.base.arun_function_calls``.
+    2. the runtime still gathers parallel function calls via
+       ``asyncio.gather`` at ``the runtime's tool-loop``.
        This is the wire-level mechanism that makes the parallelism real
-       — if an Agno upgrade ever serialises function calls, our
+       — if an runtime upgrade ever serialises function calls, our
        multi-domain decomposition silently degrades to sequential.
 
     A failure here is a flag: either we built the Team wrong, or the
-    Agno SDK changed and the parallelism architecture is no longer
+    the runtime SDK changed and the parallelism architecture is no longer
     real. Both deserve a loud test failure.
     """
     import inspect
@@ -601,23 +601,23 @@ async def t_coordinate_mode_wired_and_agno_still_gathers(ctx: TestContext) -> No
         f"mode=TeamMode.coordinate to Team(...)."
     )
 
-    # (2) Agno's arun_function_calls still uses asyncio.gather. We
+    # (2) the runtime's arun_function_calls still uses asyncio.gather. We
     # inspect the source rather than calling it (calling would require a
     # real Model + function executor; the source-level check is what
     # locks the contract).
-    import src.models.providers.base as agno_base
+    import src.models.providers.base as providers_base
 
-    assert hasattr(agno_base.Model, "arun_function_calls"), (
-        "agno.models.base.Model.arun_function_calls disappeared — the "
+    assert hasattr(providers_base.Model, "arun_function_calls"), (
+        "src.models.providers.base.Model.arun_function_calls disappeared — the "
         "parallel-delegation architecture has lost its underlying "
         "primitive. Re-evaluate the coordinate-mode wiring."
     )
-    src = inspect.getsource(agno_base.Model.arun_function_calls)
+    src = inspect.getsource(providers_base.Model.arun_function_calls)
     assert "asyncio.gather" in src, (
-        "agno.models.base.Model.arun_function_calls no longer uses "
+        "src.models.providers.base.Model.arun_function_calls no longer uses "
         "asyncio.gather — parallel ``delegate_task_to_member`` calls "
         "would now serialise, defeating coordinate-mode's multi-member "
-        "decomposition. Pin Agno or rebuild parallelism in OpenAgent."
+        "decomposition. Pin the runtime or rebuild parallelism in OpenAgent."
     )
 
 
@@ -679,7 +679,7 @@ async def t_generate_emits_symmetric_started_completed_per_tool(ctx: TestContext
     """
     from src.models.native_provider import NativeProvider
 
-    # Bypass __init__: it pulls heavy Agno/MCP wiring. We just need
+    # Bypass __init__: it pulls heavy runtime/MCP wiring. We just need
     # _emit_agno_tool_status's bound logic + a fake runner.
     p = NativeProvider.__new__(NativeProvider)
     p.model = "openai:gpt-4o-mini"
@@ -761,16 +761,16 @@ async def t_delegation_parity_with_nested_tools(ctx: TestContext) -> None:
     rehydrated transcript must render the specialist's nested tools
     as their own chips — same order, same envelope.
 
-    Audit finding: Agno's ``Team`` yields member events through its
+    Audit finding: the runtime's ``Team`` yields member events through its
     iterator when ``stream_member_events=True`` (default). A member
-    Agent's tool call fires ``agno.run.agent.ToolCallStartedEvent`` /
+    Agent's tool call fires ``src.core._run_state.agent.ToolCallStartedEvent`` /
     ``ToolCallCompletedEvent`` — exactly the types the dispatcher
     already includes in ``tool_start_event_types`` /
     ``tool_complete_event_types``. So the live path SHOULD already
     surface them; this test pins that contract.
 
     Hermetic: a fake team runtime yields the leader's delegate +
-    nested member tool events in the same order Agno would.
+    nested member tool events in the same order the runtime would.
     """
     from src.core._run_state.agent import (
         ToolCallCompletedEvent as AgentToolCallCompletedEvent,
@@ -820,7 +820,7 @@ async def t_delegation_parity_with_nested_tools(ctx: TestContext) -> None:
                     tool=delegate_tool, run_id="r", session_id=session_id,
                 )
                 # 2. Specialist's nested tools — Agent-typed events
-                # because the member is an Agent. Agno's team iterator
+                # because the member is an Agent. the runtime's team iterator
                 # passes them through unmodified when stream_member_events
                 # is True (the default).
                 yield AgentToolCallStartedEvent(
@@ -883,7 +883,7 @@ async def t_delegation_parity_with_nested_tools(ctx: TestContext) -> None:
         f"{len(live_envelopes)}: {[e.get('tool_name') for e in live_envelopes]}"
     )
     live_tool_order = [e["tool_name"] for e in live_envelopes]
-    # The wire order Agno produces: delegate-start → shell-start/done →
+    # The wire order the runtime produces: delegate-start → shell-start/done →
     # vault-start/done → delegate-done. Pins the user's contract that
     # nested chips appear BETWEEN the delegate start + done (the
     # delegate envelope wraps the specialist's work).
@@ -1039,29 +1039,29 @@ async def t_delegation_parity_with_nested_tools(ctx: TestContext) -> None:
     )
 
 
-# ── Test 7: non-image attachments route via Agno's native files= ──────
+# ── Test 7: non-image attachments route via the runtime's native files= ──────
 
 
 @test("e2e_unified_flow",
       "non-image attachments route via files= not prepend (clean stored user msg)")
 async def t_attachments_native_files(ctx: TestContext) -> None:
-    """Non-image attachments must reach Agno via the native ``files=``
+    """Non-image attachments must reach the runtime via the native ``files=``
     parameter on ``Team.arun`` / ``Agent.arun`` — NOT as a synthetic
     "The user attached files: …" prepend in the user's text.
 
     The prior behavior (prepend a file-info block) caused the team
     leader to paraphrase the synthetic path into delegation tasks
     like "Read the file at /tmp/X.json using whatever tool…". Routing
-    through ``files=`` lets Agno propagate the attachment to members
+    through ``files=`` lets the runtime propagate the attachment to members
     natively via ``delegate_task_to_member`` (see
-    ``agno/team/_default_tools.py:713``).
+    ``src/core/_runner/team/_default_tools.py``).
 
-    Hermetic: fake the Agno runtime at the ``_arun_runtime_stream`` seam
+    Hermetic: fake the runtime at the ``_arun_runtime_stream`` seam
     and capture both ``input`` and ``files`` it receives. We assert the
     bare user text survived (no synthetic prepend) and that the
-    ``files`` sequence carries one Agno ``File`` per non-image upload.
+    ``files`` sequence carries one runtime ``File`` per non-image upload.
     """
-    from src.stream.media import File as AgnoFile
+    from src.stream.media import File as RuntimeFile
 
     from src.core.agent import _build_runtime_media
     from src.models.dispatcher import _arun_runtime_stream
@@ -1085,7 +1085,7 @@ async def t_attachments_native_files(ctx: TestContext) -> None:
     assert files is not None and len(files) == 2, (
         f"image must be dropped from files=; got {files!r}"
     )
-    assert all(isinstance(f, AgnoFile) for f in files), files
+    assert all(isinstance(f, RuntimeFile) for f in files), files
     by_name = {f.filename: f for f in files}
     assert set(by_name) == {"report.json", "notes.csv"}, list(by_name)
     assert str(by_name["report.json"].filepath) == "/tmp/report.json"
@@ -1129,9 +1129,9 @@ async def t_attachments_native_files(ctx: TestContext) -> None:
     # The user's bare text survives — no synthetic prepend.
     assert captured["prompt"] == "what's in the report?", captured
     assert "The user attached files:" not in (captured["prompt"] or ""), (
-        f"synthetic prepend leaked into Agno input: {captured['prompt']!r}"
+        f"synthetic prepend leaked into runtime input: {captured['prompt']!r}"
     )
-    # The Agno File sequence arrived natively on the ``files=`` kwarg.
+    # The runtime File sequence arrived natively on the ``files=`` kwarg.
     assert captured["files"] is not None, captured
     assert len(captured["files"]) == 2, captured
     routed_names = {f.filename for f in captured["files"]}

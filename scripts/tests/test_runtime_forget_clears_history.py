@@ -4,15 +4,15 @@ auto-load the prior transcript (and summary).
 
 Before the fix, ``NativeProvider`` only inherited BaseModel's default
 ``forget_session``, which called ``close_session`` — itself a no-op
-for Agno (nothing to disconnect; history lives in an SqliteDb). So
+for API-based (nothing to disconnect; history lives in an SqliteDb). So
 ``/clear`` and the scheduler's per-fire forget never actually erased
-agno-backed history; with ``add_history_to_context=True`` the very
+API-backed history; with ``add_history_to_context=True`` the very
 next turn loaded all prior messages plus the rolling session
 summary back into context.
 
 The fix: NativeProvider implements a real ``forget_session`` that
-calls ``SqliteDb.delete_session`` (Agno's native API), with a raw
-SQL fallback against the ``agno_sessions`` table for API drift.
+calls ``SqliteDb.delete_session`` (the runtime's native API), with a raw
+SQL fallback against the ``sessions`` table for API drift.
 
 These tests cover both paths: the API path with a seeded real row,
 and the fallback path with a pre-created table + the native API
@@ -73,7 +73,7 @@ def _seed_sessions_table(db_path: str) -> None:
                     '[{"messages":[{"role":"user","content":"secret word is banana"}]}]',
                     'prior summary', 100, 200)
             """,
-            ("tg:agno-user",),
+            ("tg:runtime-user",),
         )
         conn.commit()
     finally:
@@ -91,40 +91,40 @@ def _row_count(db_path: str, session_id: str) -> int:
         conn.close()
 
 
-@test("agno_forget", "forget_session wipes row via Agno native API")
+@test("runtime_forget", "forget_session wipes row via the runtime native API")
 async def t_forget_via_native_api(ctx: TestContext) -> None:
     if not _agno_available():
-        raise TestSkip("agno not installed")
+        raise TestSkip("API-based runtime not available")
 
     from src.models.native_provider import NativeProvider
 
-    db_file = ctx.test_dir / "agno-forget.db"
+    db_file = ctx.test_dir / "runtime-forget.db"
     _seed_sessions_table(str(db_file))
-    assert _row_count(str(db_file), "tg:agno-user") == 1, "seed failed"
+    assert _row_count(str(db_file), "tg:runtime-user") == 1, "seed failed"
 
     provider = NativeProvider(
-        model="agno:openai/gpt-4o-mini",
+        model="api-based:openai/gpt-4o-mini",
         providers_config=[{"name": "openai", "framework": "agno"}],
         db_path=str(db_file),
     )
-    await provider.forget_session("tg:agno-user")
+    await provider.forget_session("tg:runtime-user")
 
-    assert _row_count(str(db_file), "tg:agno-user") == 0, (
+    assert _row_count(str(db_file), "tg:runtime-user") == 0, (
         "session row survived forget_session via native API"
     )
 
 
-@test("agno_forget", "forget_session falls back to raw SQL when API fails")
+@test("runtime_forget", "forget_session falls back to raw SQL when API fails")
 async def t_forget_fallback_sql(ctx: TestContext) -> None:
     if not _agno_available():
-        raise TestSkip("agno not installed")
+        raise TestSkip("API-based runtime not available")
 
     from src.models.native_provider import NativeProvider
     from src.memory.store.sqlite import SqliteDb
 
-    db_file = ctx.test_dir / "agno-forget-fallback.db"
+    db_file = ctx.test_dir / "runtime-forget-fallback.db"
     _seed_sessions_table(str(db_file))
-    assert _row_count(str(db_file), "tg:agno-user") == 1, "seed failed"
+    assert _row_count(str(db_file), "tg:runtime-user") == 1, "seed failed"
 
     # Break the native API to force the fallback path.
     original = SqliteDb.delete_session
@@ -135,30 +135,30 @@ async def t_forget_fallback_sql(ctx: TestContext) -> None:
     SqliteDb.delete_session = _broken  # type: ignore[assignment]
     try:
         provider = NativeProvider(
-            model="agno:openai/gpt-4o-mini",
+            model="api-based:openai/gpt-4o-mini",
             providers_config=[{"name": "openai", "framework": "agno"}],
             db_path=str(db_file),
         )
-        await provider.forget_session("tg:agno-user")
+        await provider.forget_session("tg:runtime-user")
     finally:
         SqliteDb.delete_session = original  # type: ignore[assignment]
 
-    assert _row_count(str(db_file), "tg:agno-user") == 0, (
+    assert _row_count(str(db_file), "tg:runtime-user") == 0, (
         "session row survived forget_session fallback path"
     )
 
 
-@test("agno_forget", "forget_session on nonexistent session is a no-op")
+@test("runtime_forget", "forget_session on nonexistent session is a no-op")
 async def t_forget_nonexistent(ctx: TestContext) -> None:
     if not _agno_available():
-        raise TestSkip("agno not installed")
+        raise TestSkip("API-based runtime not available")
 
     from src.models.native_provider import NativeProvider
 
-    db_file = ctx.test_dir / "agno-forget-noop.db"
+    db_file = ctx.test_dir / "runtime-forget-noop.db"
     # Brand-new DB file; schema not yet created — fallback must cope.
     provider = NativeProvider(
-        model="agno:openai/gpt-4o-mini",
+        model="api-based:openai/gpt-4o-mini",
         providers_config=[{"name": "openai", "framework": "agno"}],
         db_path=str(db_file),
     )

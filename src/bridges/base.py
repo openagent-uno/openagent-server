@@ -150,7 +150,7 @@ def format_tool_status(raw: str) -> str:
     """Convert a raw status string (possibly JSON tool event) into a
     human-readable line suitable for Telegram/Discord/WhatsApp.
 
-    Structured events are Agno-native: ``{"tool_name": "bash",
+    Structured events are API-native: ``{"tool_name": "bash",
     "tool_call_error": false, "result": ...}``; phase is derived from
     the bool + ``result`` presence. Plain strings like ``"Thinking..."``
     pass through unchanged.

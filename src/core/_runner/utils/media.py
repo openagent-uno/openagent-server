@@ -248,7 +248,7 @@ def download_knowledge_filters_sample_data(
         download_path.parent.mkdir(parents=True, exist_ok=True)
 
         download_file(
-            f"https://agno-public.s3.us-east-1.amazonaws.com/demo_data/filters/{filename}", str(download_path)
+            f"https://raw.githubusercontent.com/openagent-uno/openagent-server/main/assets/demo_data/filters/{filename}", str(download_path)
         )
         file_paths.append(str(download_path))
     return file_paths

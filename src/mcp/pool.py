@@ -221,7 +221,7 @@ _SESSION_DEAD_ERROR_TYPES = frozenset({
 })
 
 
-def _install_agno_log_passthrough() -> None:
+def _install_runtime_log_passthrough() -> None:
     """Re-emit the runtime's ``log_error()`` messages through ``elog``.
 
     The runtime's ``MCPTools.initialize()`` catches every exception and calls
@@ -230,15 +230,15 @@ def _install_agno_log_passthrough() -> None:
     underlying cause. The bypass path in ``_recover_dormant_toolkit``
     surfaces the real exception on retry; this handler closes the
     gap for the *first* attempt by routing the swallowed log line
-    through our event stream, where ops can grep ``agno.log_capture``
+    through our event stream, where ops can grep ``runtime.log_capture``
     to confirm the stealth-fail is happening (vs. some other zero-
     tools cause).
 
     Idempotent: only attaches one passthrough handler per process.
     """
-    agno_logger = logging.getLogger("agno")
+    runtime_logger = logging.getLogger("openagent")
 
-    class _AgnoPassthrough(logging.Handler):
+    class _RuntimePassthrough(logging.Handler):
         def emit(self, record: logging.LogRecord) -> None:
             try:
                 msg = record.getMessage()
@@ -249,7 +249,7 @@ def _install_agno_log_passthrough() -> None:
                 if "mcp" not in msg.lower() and "MCP" not in record.name:
                     return
                 elog(
-                    "agno.log_capture",
+                    "runtime.log_capture",
                     level="warning",
                     logger=record.name,
                     levelname=record.levelname,
@@ -258,17 +258,17 @@ def _install_agno_log_passthrough() -> None:
             except Exception:  # noqa: BLE001 — handler must never raise
                 pass
 
-    if not any(isinstance(h, _AgnoPassthrough) for h in agno_logger.handlers):
-        agno_logger.addHandler(_AgnoPassthrough())
+    if not any(isinstance(h, _RuntimePassthrough) for h in runtime_logger.handlers):
+        runtime_logger.addHandler(_RuntimePassthrough())
         # Don't block propagation — just observe.
-        agno_logger.setLevel(min(agno_logger.level or logging.WARNING, logging.WARNING))
+        runtime_logger.setLevel(min(runtime_logger.level or logging.WARNING, logging.WARNING))
 
 
 # Install the passthrough at module import so it's active before any
 # pool is built. Cheap (one handler registration), safe (idempotent),
 # and the only way to see the runtime's first-attempt log line without
 # modifying the runtime itself.
-_install_agno_log_passthrough()
+_install_runtime_log_passthrough()
 
 
 def _safe_prefix(name: str) -> str:
@@ -302,7 +302,7 @@ class _ServerSpec:
     in_process: bool = False
     adapter_module: str | None = None
     sdk_server_factory: str = "build_sdk_server"
-    agno_toolkit_factory: str = "build_agno_toolkit"
+    runtime_toolkit_factory: str = "build_runtime_toolkit"
 
     @property
     def is_stdio(self) -> bool:
@@ -505,7 +505,7 @@ def _spec_from_kwargs(kwargs: dict[str, Any]) -> _ServerSpec:
         in_process=bool(kwargs.get("in_process", False)),
         adapter_module=kwargs.get("adapter_module"),
         sdk_server_factory=kwargs.get("sdk_server_factory", "build_sdk_server"),
-        agno_toolkit_factory=kwargs.get("agno_toolkit_factory", "build_agno_toolkit"),
+        runtime_toolkit_factory=kwargs.get("runtime_toolkit_factory", "build_runtime_toolkit"),
     )
 
 
@@ -753,14 +753,14 @@ class MCPPool:
                 try:
                     mod = importlib.import_module(spec.adapter_module)  # type: ignore[arg-type]
                     sdk_factory = getattr(mod, spec.sdk_server_factory, None)
-                    agno_factory = getattr(mod, spec.agno_toolkit_factory, None)
+                    runtime_factory = getattr(mod, spec.runtime_toolkit_factory, None)
                 except Exception as e:  # noqa: BLE001
                     elog("mcp.error", level="warning", name=spec.name, error=str(e), phase="import")
                     continue
-                if sdk_factory is None or agno_factory is None:
+                if sdk_factory is None or runtime_factory is None:
                     logger.warning(
                         "in-process MCP '%s' missing factories (%s / %s) — skipping",
-                        spec.name, spec.sdk_server_factory, spec.agno_toolkit_factory,
+                        spec.name, spec.sdk_server_factory, spec.runtime_toolkit_factory,
                     )
                     continue
                 # Inject ``pool=self`` only for factories that accept it.
@@ -777,21 +777,21 @@ class MCPPool:
 
                 try:
                     sdk_cfg = sdk_factory(**_factory_kwargs(sdk_factory))
-                    agno_tk = agno_factory(**_factory_kwargs(agno_factory))
+                    runtime_tk = runtime_factory(**_factory_kwargs(runtime_factory))
                 except Exception as e:  # noqa: BLE001
                     elog("mcp.error", level="warning", name=spec.name, error=str(e), phase="factory")
                     continue
                 self._in_process_sdk_servers[spec.name] = sdk_cfg
-                self._in_process_runtime_toolkits.append(agno_tk)
-                self._toolkit_by_name[spec.name] = agno_tk
+                self._in_process_runtime_toolkits.append(runtime_tk)
+                self._toolkit_by_name[spec.name] = runtime_tk
                 # Count both sync and async tool dicts — Toolkits with
                 # async-only callables register them in ``async_functions``
                 # and leave ``functions`` empty, so the prior hardcoded
                 # ``count = 6`` (a leftover from when shell was the only
                 # in-process MCP) under-counted in general.
                 count = (
-                    len(getattr(agno_tk, "functions", {}) or {})
-                    + len(getattr(agno_tk, "async_functions", {}) or {})
+                    len(getattr(runtime_tk, "functions", {}) or {})
+                    + len(getattr(runtime_tk, "async_functions", {}) or {})
                 )
                 self._tool_counts[spec.name] = count
                 elog("mcp.connect", name=spec.name, tools=count, kind="in_process")
@@ -1238,7 +1238,7 @@ class MCPPool:
                     phase=phase,
                     note=(
                         "the runtime swallowed the init exception; enable "
-                        "logger 'agno' at DEBUG for the underlying "
+                        "logger 'openagent' at DEBUG for the underlying "
                         "log_error message"
                     ),
                 )
@@ -1255,7 +1255,12 @@ class MCPPool:
         shouldn't kill the agent.
         """
         try:
-            from src.mcp._runtime.mcp import MCPTools
+            # Import directly from the submodule (not via the package
+            # ``__init__``) so test fakes installed in ``sys.modules`` at
+            # ``src.mcp._runtime.mcp.mcp`` are picked up — going through
+            # the package re-uses the real class cached at first
+            # import-time.
+            from src.mcp._runtime.mcp.mcp import MCPTools
             from src.mcp._runtime.mcp.params import StreamableHTTPClientParams
             from mcp import StdioServerParameters
         except ImportError as exc:

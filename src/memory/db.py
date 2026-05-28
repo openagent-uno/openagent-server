@@ -75,7 +75,7 @@ CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON usage_log(timestamp);
 --   - The native path stores its own session/agent/team descriptors
 --     (managed by SqliteDb).
 --
--- Renamed from ``agno_sessions`` in v0.14; legacy DBs are migrated
+-- Renamed from the legacy ``agno_sessions`` in v0.14; legacy DBs are migrated
 -- transparently by ``_migrate_legacy_agno_sessions_to_sessions`` on
 -- bootstrap.
 CREATE TABLE IF NOT EXISTS sessions (
@@ -132,11 +132,11 @@ CREATE INDEX IF NOT EXISTS idx_mcps_updated ON mcps(updated_at);
 --   - **provider**  = a concrete credential + dispatch pair. The same vendor
 --                     (``anthropic``) can appear as two rows — one with
 --                     ``framework='api-based'`` (needs ``api_key``, native
---                     ``agno.agent.Agent``) and one with
+--                     the runtime ``Agent``) and one with
 --                     ``framework='claude-cli'`` (local ``claude`` subprocess
---                     via ``agno.agents.claude.ClaudeAgent``; ``api_key``
+--                     via the runtime's Claude subscription-CLI agent; ``api_key``
 --                     MUST be NULL).
---   - **framework** = which Agno class to instantiate for this row:
+--   - **framework** = which runtime class to instantiate for this row:
 --                     ``api-based`` (native ``Agent`` for LLM, or
 --                     ``litellm.aspeech``/``atranscription`` for TTS/STT)
 --                     or ``claude-cli`` (``ClaudeAgent`` adapter, LLM only).
@@ -187,8 +187,8 @@ CREATE INDEX IF NOT EXISTS idx_providers_name ON providers(name);
 --   ``tts`` — speech synthesis. ``metadata.voice_id`` carries the voice.
 --   ``stt`` — speech-to-text.
 -- LLM rows route via the provider's framework (``api-based`` builds an
--- ``agno.agent.Agent`` from the provider's vendor class, ``claude-cli``
--- builds an ``agno.agents.claude.ClaudeAgent``); ``tts`` / ``stt`` rows
+-- the runtime ``Agent`` from the provider's vendor class, ``claude-cli``
+-- builds an the runtime's Claude subscription-CLI agent); ``tts`` / ``stt`` rows
 -- always dispatch through LiteLLM (``litellm.aspeech`` /
 -- ``atranscription``) using the provider's ``name`` as the LiteLLM
 -- vendor prefix (``openai/tts-1``).
@@ -232,8 +232,8 @@ CREATE TABLE IF NOT EXISTS config_state (
 -- falls back from rather than throwing an integrity error.
 --
 -- v0.14+: replaces the old ``session_bindings`` table (which carried
--- a framework lock on top of the pin). With history unified in Agno's
--- ``agno_sessions`` across every framework, the lock is no longer
+-- a framework lock on top of the pin). With history unified in
+-- the runtime's ``sessions`` across every framework, the lock is no longer
 -- needed — only the pin value itself survives.
 CREATE TABLE IF NOT EXISTS pinned_sessions (
     session_id TEXT PRIMARY KEY,
@@ -518,19 +518,63 @@ class MemoryDB:
         # so without this the ON DELETE CASCADE on models.provider_id is
         # silently a no-op and deleting a provider orphans its models.
         await self._conn.execute("PRAGMA foreign_keys = ON")
-        # Pre-schema migration: rename the legacy ``agno_sessions`` table
+        # Pre-schema migration: rename the legacy session table
         # to ``sessions`` BEFORE ``executescript(SCHEMA_SQL)`` runs (so
         # the latter's ``CREATE TABLE IF NOT EXISTS sessions`` doesn't
         # create a fresh empty table alongside the legacy data).
         await self._migrate_legacy_agno_sessions_to_sessions()
         await self._conn.executescript(SCHEMA_SQL)
         await self._apply_legacy_alters()
+        # Post-schema migration: clear the sentinel ``user_id='openagent'``
+        # that the old gateway INSERT hardcoded — see
+        # ``upsert_session`` for the full bug write-up. NULL lets the
+        # runtime's same-user UPSERT WHERE clause claim the row on the
+        # next turn, which restores run accumulation for sessions that
+        # were left in the broken state on disk.
+        await self._migrate_openagent_user_sentinel_to_null()
         await self._conn.commit()
+
+    async def _migrate_openagent_user_sentinel_to_null(self) -> None:
+        """One-shot UPDATE: convert the sentinel ``user_id='openagent'`` on
+        sessions rows to NULL so the runtime's same-user UPSERT path can
+        claim them.
+
+        Background. The gateway used to INSERT new session rows with a
+        hardcoded ``user_id='openagent'`` (since fixed in
+        ``upsert_session``). The runtime side, meanwhile, writes back
+        with the authenticated user handle (e.g. ``'alessandro'``). The
+        runtime's ``SqliteDb.upsert_session`` carries a defensive
+        ``user_id == new OR user_id IS NULL`` filter on its
+        on_conflict_do_update — so any pre-existing row with the
+        ``'openagent'`` sentinel rejected the runtime's UPDATE and the
+        ``runs`` column stayed pinned to whatever was there at first
+        write. The user-facing symptom was "the LLM doesn't remember
+        previous messages" — each turn overwrote, then silently failed
+        to overwrite, the previous turn's transcript.
+
+        This migration is idempotent: rows already at NULL or any other
+        value are untouched. Safe to run on every connect."""
+        assert self._conn is not None
+        # Only sessions touched by the broken gateway carry the sentinel;
+        # rows the runtime wrote first will have a real handle there
+        # already, and a real handle MUST NOT be widened to NULL — that
+        # would let a different user claim the row on its next turn.
+        try:
+            await self._conn.execute(
+                "UPDATE sessions SET user_id = NULL "
+                "WHERE user_id = 'openagent'"
+            )
+        except Exception:
+            # ``sessions`` not present yet on a brand-new DB — the
+            # SCHEMA_SQL CREATE TABLE just above created it but on
+            # legacy paths the migration order may surprise us. Quiet
+            # no-op is the right behaviour here.
+            pass
 
     async def _migrate_legacy_agno_sessions_to_sessions(self) -> None:
         """One-shot ALTER TABLE: rename ``agno_sessions`` to ``sessions``.
 
-        v0.14 dropped the ``agno_`` prefix on the canonical session table.
+        v0.14 dropped the legacy ``agno_`` prefix on the canonical session table.
         Existing user databases shipped with the old name; this migration
         renames the table in place so no data is lost, then recreates the
         ``updated_at`` index under the new name.
@@ -633,7 +677,7 @@ class MemoryDB:
         # same names.
         await self._migrate_legacy_elevenlabs_to_litellm()
         # v0.14: collapse legacy framework values ``agno`` and
-        # ``litellm`` into the single ``api-based`` value (since Agno
+        # ``litellm`` into the single ``api-based`` value (since the runtime
         # is now the execution engine for both LLM paths; ``kind``
         # discriminates LLM vs TTS/STT). Idempotent. Runs after the
         # kind-column migration so the rows are already in their final
@@ -759,7 +803,7 @@ class MemoryDB:
                     await self._conn.execute(f"DROP TABLE IF EXISTS {table}")
                 except Exception:
                     pass
-        # Drop agno_memories — agentic memory is disabled.
+        # Drop the legacy agno_memories table — agentic memory is disabled (vault MCP only).
         try:
             await self._conn.execute("DROP TABLE IF EXISTS agno_memories")
         except Exception:
@@ -878,9 +922,9 @@ class MemoryDB:
     async def _migrate_legacy_framework_names_to_api_based(self) -> None:
         """Collapse legacy framework values into the canonical ``api-based``.
 
-        Pre-v0.14: providers.framework could be ``agno`` (LLM via native
-        Agno Agent), ``litellm`` (TTS/STT via litellm), or ``claude-cli``.
-        v0.14+: ``api-based`` and ``claude-cli`` (Agno is the execution
+        Pre-v0.14: providers.framework could be ``agno`` (legacy LLM via native
+        the runtime Agent), ``litellm`` (TTS/STT via litellm), or ``claude-cli``.
+        v0.14+: ``api-based`` and ``claude-cli`` (API-based is the execution
         engine for both LLM paths and ``kind`` discriminates TTS/STT
         from LLM). v0.14.x adds ``codex-cli`` for ChatGPT-subscription
         OpenAI dispatch. Only ``agno`` and ``litellm`` collapse here —
@@ -920,7 +964,7 @@ class MemoryDB:
 
         Pre-v0.14: ``session_bindings`` carried a per-session framework
         lock AND an optional ``runtime_id`` pin. With history unified
-        in Agno's ``agno_sessions`` across every framework, the lock
+        in the canonical ``sessions`` table across every framework, the lock
         is no longer needed — only the pin survives.
 
         Idempotent: probes for the old table; copies any rows with a
@@ -1874,16 +1918,16 @@ class MemoryDB:
             total += r["total_cost"]
         return {"total": round(total, 6), "by_model": by_model}
 
-    # ── Session store (agno_sessions) ──
+    # ── Session store (sessions) ──
     #
-    # ``agno_sessions`` is the single canonical table for all chat
-    # sessions. Both the api-based path (native ``agno.agent.Agent``)
-    # and the claude-cli path (``agno.agents.claude.ClaudeAgent`` via
+    # ``sessions`` is the single canonical table for all chat
+    # sessions. Both the api-based path (native the runtime ``Agent``)
+    # and the claude-cli path (the runtime's Claude subscription-CLI agent via
     # OpenAgent's ``PersistentClaudeAgent`` subclass) persist through
-    # ``agno.db.sqlite.SqliteDb`` writing to this table.
+    # the runtime's ``SqliteDb`` writing to this table.
     #
-    # Claude SDK resume state now lives in ``agno_sessions.session_data``
-    # (the JSON column Agno writes via SqliteDb) under the
+    # Claude SDK resume state now lives in ``sessions.session_data``
+    # (the JSON column the runtime writes via SqliteDb) under the
     # ``sdk_session_id`` key — see ``src/models/claude_cli.py
     # PersistentClaudeAgent``. The legacy ``metadata.sdk_session_id``
     # path is gone; ``delete_sdk_session`` below stays as a thin shim
@@ -1894,8 +1938,8 @@ class MemoryDB:
         """Clear any legacy claude-cli resume metadata from a session.
 
         Pre-v0.14 the SDK session id was stored in
-        ``agno_sessions.metadata.sdk_session_id``. The new path keeps it
-        in ``session_data.sdk_session_id`` (Agno-managed) instead. This
+        ``sessions.metadata.sdk_session_id``. The new path keeps it
+        in ``session_data.sdk_session_id`` (runtime-managed) instead. This
         helper survives so the gateway's ``DELETE /api/sessions/{id}``
         handler — which we don't want to revisit yet — keeps a place to
         scrub legacy data. The session row itself is deleted separately
@@ -2169,7 +2213,7 @@ class MemoryDB:
         # (older scripts, tests, third-party automations) keep working.
         # Kept as raw strings — they match pre-rename DB values, not the
         # current FRAMEWORK_* constants.
-        if framework in ("agno", "litellm"):
+        if framework in ("agno", "litellm"):  # legacy values; map to api-based
             framework = FRAMEWORK_API_BASED
         if kind == "llm" and framework not in LLM_FRAMEWORKS:
             raise ValueError(
@@ -2703,7 +2747,7 @@ class MemoryDB:
     async def pin_session_model(self, session_id: str, runtime_id: str) -> None:
         """Pin ``session_id`` to a specific model ``runtime_id``.
 
-        With history unified in Agno's ``agno_sessions`` across every
+        With history unified in ``sessions`` across every
         framework, there is no framework lock anymore — any enabled
         runtime_id can be pinned to any session at any time.
         """
@@ -2739,7 +2783,7 @@ class MemoryDB:
         )
         await conn.commit()
 
-    # ── Session list / CRUD (agno_sessions) ──
+    # ── Session list / CRUD (sessions) ──
 
     @staticmethod
     def _parse_metadata(raw: str | None) -> dict:
@@ -2748,7 +2792,7 @@ class MemoryDB:
         except (TypeError, ValueError):
             return {}
         # Some rows land here with metadata stored as a JSON-encoded string
-        # of a dict (Agno's ``serialize_session_json_fields`` re-encodes
+        # of a dict (the runtime's ``serialize_session_json_fields`` re-encodes
         # ``json.dumps`` when handed a stringified metadata field). Without
         # this unwrap, every such row reports ``client_id == ""`` and gets
         # dropped by the per-handle filter in ``list_all_sessions`` —
@@ -2766,7 +2810,7 @@ class MemoryDB:
         *,
         limit: int = 50,
     ) -> list[dict]:
-        """Return every session in ``agno_sessions``, ordered by
+        """Return every session in ``sessions``, ordered by
         ``updated_at`` descending. Metadata columns (client_id, title,
         model, framework) are extracted from the ``metadata`` JSON
         column when present.
@@ -2784,7 +2828,7 @@ class MemoryDB:
         ``:classifier`` and ``workflow:`` rows whose ``updated_at`` is
         more recent. The two-level ``json_extract(json_extract(metadata,
         '$'), '$.client_id')`` works for both proper JSON-object rows
-        and the double-encoded form Agno's
+        and the double-encoded form the runtime's
         ``serialize_session_json_fields`` path produces.
         """
         conn = await self._ensure_connected()
@@ -2863,18 +2907,35 @@ class MemoryDB:
         framework: str | None = None,
         device_id: str | None = None,
     ) -> None:
-        """Create or update the ``agno_sessions`` row, merging the
-        display metadata into the ``metadata`` JSON column.
+        """Create or update the ``sessions`` row, merging the display
+        metadata into the ``metadata`` JSON column.
 
         ``client_id`` is the row's *owner* — preferably the user handle
         so the session list is cross-device. ``device_id`` (when set)
         records which device first opened the session, so per-device
-        routing (sticky-device retries, WS reconnect) still works."""
+        routing (sticky-device retries, WS reconnect) still works.
+
+        **Bug fix (2026-05-28): runs were silently dropped between
+        turns.** The old INSERT hardcoded ``user_id='openagent'`` while
+        the runtime's TeamRouterProvider writes back with
+        ``user_id=<handle>`` (e.g. ``'alessandro'``). The runtime's
+        ``SqliteDb.upsert_session`` carries a defensive WHERE clause
+        ``user_id == new OR user_id IS NULL`` on its
+        ``on_conflict_do_update``, so the row's pre-existing
+        ``'openagent'`` blocked the runtime's UPDATE — the runs column
+        stayed pinned to whatever was there at first write (typically
+        one run from before the gateway set the session handle), and
+        every subsequent turn appeared to lose its history.
+
+        Fix: use the handle as ``user_id`` when one is known (writing
+        through the same channel the runtime later reads/writes on),
+        and fall back to ``NULL`` so the runtime can claim the row.
+        Hardcoded ``'openagent'`` is gone."""
         conn = await self._ensure_connected()
         now = int(time.time())
         existing = await (
             await conn.execute(
-                "SELECT metadata FROM sessions WHERE session_id = ?",
+                "SELECT metadata, user_id FROM sessions WHERE session_id = ?",
                 (session_id,),
             )
         ).fetchone()
@@ -2889,18 +2950,38 @@ class MemoryDB:
             meta["model"] = model
         if framework:
             meta["framework"] = framework
+
+        # Resolve the row owner. ``client_id`` is the cross-device user
+        # handle when the gateway is authenticated — use it as user_id
+        # so the runtime's same-user UPSERT path stays unblocked.
+        resolved_user_id: str | None = (client_id or "").strip() or None
+
         if existing:
-            await conn.execute(
-                "UPDATE sessions SET metadata = ?, updated_at = ? "
-                "WHERE session_id = ?",
-                (json.dumps(meta), now, session_id),
+            # Only widen user_id when the existing row has a NULL owner
+            # OR matches the handle we're writing now. Never overwrite
+            # a different owner — multi-handle defence.
+            existing_user_id = existing[1] if len(existing) > 1 else None
+            update_user_id = resolved_user_id is not None and (
+                existing_user_id is None or existing_user_id == resolved_user_id
             )
+            if update_user_id:
+                await conn.execute(
+                    "UPDATE sessions SET metadata = ?, user_id = ?, updated_at = ? "
+                    "WHERE session_id = ?",
+                    (json.dumps(meta), resolved_user_id, now, session_id),
+                )
+            else:
+                await conn.execute(
+                    "UPDATE sessions SET metadata = ?, updated_at = ? "
+                    "WHERE session_id = ?",
+                    (json.dumps(meta), now, session_id),
+                )
         else:
             await conn.execute(
                 "INSERT OR IGNORE INTO sessions "
                 "(session_id, session_type, user_id, metadata, created_at, updated_at) "
-                "VALUES (?, 'agent', 'openagent', ?, ?, ?)",
-                (session_id, json.dumps(meta), now, now),
+                "VALUES (?, 'agent', ?, ?, ?, ?)",
+                (session_id, resolved_user_id, json.dumps(meta), now, now),
             )
         await conn.commit()
 
@@ -2933,14 +3014,14 @@ class MemoryDB:
             "last_active_at": row[3],
         }
 
-    # ── Session runs (Agno's SqliteDb owns writes) ──
+    # ── Session runs (the runtime SqliteDb owns writes) ──
     #
-    # ``agno_sessions.runs`` is now written exclusively by Agno's
+    # ``sessions.runs`` is now written exclusively by the runtime's
     # ``SqliteDb`` (via ``BaseExternalAgent._arun_stream`` /
     # ``_arun_non_stream`` for ClaudeAgent, and the native Agent's own
     # storage path for api-based runs). The manual ``add_session_run``
     # / ``commit_partial_session_run`` mirror writes that the old
-    # claude_cli.py used (~150 LOC) are gone with the Agno migration.
+    # claude_cli.py used (~150 LOC) are gone with the inlined-runtime migration.
     #
     # ``list_session_runs`` below keeps the read-side surface stable so
     # the gateway's ``GET /api/sessions/{id}/runs`` endpoint can render
@@ -2964,7 +3045,7 @@ class MemoryDB:
             runs = json.loads(row[0])
         except (TypeError, ValueError):
             return []
-        # Same double-encoding shape as ``metadata`` — Agno's
+        # Same double-encoding shape as ``metadata`` — the runtime's
         # ``serialize_session_json_fields`` will store ``runs`` as a
         # JSON-encoded string of a JSON array if handed a stringified
         # value. Without this unwrap, every click on a session shows

@@ -107,7 +107,7 @@ async def t_usage_daily(ctx: TestContext) -> None:
 async def t_providers_list(ctx: TestContext) -> None:
     """Providers live in the ``providers`` SQLite table. Under v0.12
     the response is a flat list — the same vendor can appear twice
-    (anthropic+agno and anthropic+claude-cli), so a name-keyed dict
+    (anthropic+api-based and anthropic+claude-cli), so a name-keyed dict
     would collide."""
     port = ctx.extras.get("gateway_port")
     if not port:

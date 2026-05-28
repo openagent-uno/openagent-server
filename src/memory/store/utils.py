@@ -322,15 +322,10 @@ def db_from_dict(db_data: Dict[str, Any]) -> Optional[Union["BaseDb"]]:
         Database instance or None if creation fails
     """
     db_type = db_data.get("type")
-    if db_type == "postgres":
-        try:
-            from src.memory.store.postgres import PostgresDb
-
-            return PostgresDb.from_dict(db_data)
-        except Exception as e:
-            log_error(f"Error reconstructing PostgresDb from dictionary: {str(e)}")
-            return None
-    elif db_type == "sqlite":
+    # OpenAgent ships only the SQLite backend (vision §17). Configs that
+    # still mention "postgres" are legacy — log loudly so the operator can
+    # migrate them, but don't crash.
+    if db_type == "sqlite":
         try:
             from src.memory.store.sqlite import SqliteDb
 
@@ -338,9 +333,14 @@ def db_from_dict(db_data: Dict[str, Any]) -> Optional[Union["BaseDb"]]:
         except Exception as e:
             log_error(f"Error reconstructing SqliteDb from dictionary: {str(e)}")
             return None
-    else:
-        log_warning(f"Unknown database type: {db_type}")
+    if db_type == "postgres":
+        log_error(
+            "Postgres persistence is not supported in this OpenAgent build; "
+            "use type='sqlite' instead. Returning None."
+        )
         return None
+    log_warning(f"Unknown database type: {db_type}")
+    return None
 
 
 def _clone_db_with_table_overrides(
@@ -364,21 +364,6 @@ def _clone_db_with_table_overrides(
     caller can decide how to fall back.
     """
     overrides: Dict[str, Any] = {key: db_data[key] for key in DB_TABLE_NAME_KEYS if key in db_data}
-
-    try:
-        from src.memory.store.postgres import PostgresDb
-
-        if isinstance(source_db, PostgresDb):
-            return PostgresDb(
-                db_url=source_db.db_url,
-                db_engine=source_db.db_engine,
-                db_schema=source_db.db_schema,
-                id=source_db.id,
-                **overrides,
-            )
-    except Exception as e:
-        log_error(f"Error cloning PostgresDb with table overrides: {str(e)}")
-        return None
 
     try:
         from src.memory.store.sqlite import SqliteDb

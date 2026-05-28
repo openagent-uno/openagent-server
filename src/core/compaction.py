@@ -20,7 +20,7 @@ The flow per turn, called from ``Agent._run_inner`` *before* the next
 2. :func:`compact` summarises everything except the most recent
    ``OPENAGENT_COMPACTION_KEEP_RUNS`` (default 4) runs into one
    synthetic "session recap" run, then rewrites
-   ``agno_sessions.runs`` in place as ``[recap_run] + last_N_runs``.
+   ``sessions.runs`` in place as ``[recap_run] + last_N_runs``.
    The recap run carries ``metadata={"compaction": True}`` so it is
    identifiable on inspection and so a future compaction pass doesn't
    try to re-summarise an already-compacted span.
@@ -40,13 +40,13 @@ What compaction is NOT:
 
 * It does **not** touch ``src.learning.user_profile`` — that subsystem
   summarises *across* sessions, this one folds turns *within* one.
-* It does **not** delegate to the dropped agno ``CompressionManager``
+* It does **not** delegate to the dropped ``CompressionManager`` subsystem
   stubs in ``src.core._runner._stubs``. The runtime there is a typing
   shim; the real work lives here, with raw SQL against
-  ``agno_sessions.runs`` so it works regardless of whether the
+  ``sessions.runs`` so it works regardless of whether the
   underlying provider is api-based, claude-cli, or codex-cli.
 * It does **not** mutate the model's runtime caches. The next
-  ``generate()`` re-reads ``agno_sessions.runs`` via Agno's
+  ``generate()`` re-reads ``sessions.runs`` via the runtime's
   ``add_history_to_context``, so the freshly rewritten row is what the
   next call sees.
 """
@@ -151,7 +151,7 @@ def _extract_run_text(run: dict[str, Any]) -> str:
     about how much the next ``add_history_to_context=True`` call will
     serialise back into a prompt. Robust to legacy shapes (string vs
     dict content, missing keys) since older sessions may predate the
-    current Agno schema.
+    current schema.
     """
     chunks: list[str] = []
     content = run.get("content")
@@ -183,7 +183,7 @@ def _resolve_model_id(model: Any) -> str | None:
 
     Providers expose this under a handful of attributes — ``self.model``
     (NativeProvider, ClaudeCLI), ``effective_model_id(session_id)``
-    (SmartRouter), ``id`` (Agno Model wrapper). We try them in order and
+    (SmartRouter), ``id`` (runtime Model wrapper). We try them in order and
     accept the first stringy result. Returns ``None`` when nothing
     sticks; callers use that to fall back to the generic ``gpt-4o``
     tokenizer.
@@ -209,7 +209,7 @@ def _resolve_max_context(model: Any) -> int:
     """Best-effort lookup of the model's max input context window.
 
     Providers in this tree don't (yet) carry an authoritative context
-    limit on the provider object — Agno's ``Model`` exposes one in some
+    limit on the provider object — the runtime's ``Model`` exposes one in some
     versions but our wrappers don't surface it. We try a few common
     names and otherwise fall back to ``_FALLBACK_MAX_CONTEXT``. The
     threshold check is intentionally conservative (default 0.75) so the
@@ -250,14 +250,14 @@ def _resolve_db_path(agent: Any) -> str | None:
 
 
 def _load_runs(db_path: str, session_id: str) -> list[dict[str, Any]]:
-    """Read ``agno_sessions.runs`` for *session_id* as a list of dicts.
+    """Read ``sessions.runs`` for *session_id* as a list of dicts.
 
     Returns ``[]`` on any condition that means "nothing to compact":
     missing table, missing row, NULL/empty runs column, or a parse
     failure. We use raw sqlite3 (sync, short-lived connection) because
     this runs inside the per-turn hot path and the overhead is well
     under a millisecond on a small DB. The schema-defensive double
-    json.loads matches ``MemoryDB.list_session_runs`` — Agno's writer
+    json.loads matches ``MemoryDB.list_session_runs`` — the runtime's writer
     sometimes serialises the runs column as a JSON-encoded string of a
     JSON array.
     """
@@ -280,7 +280,7 @@ def _load_runs(db_path: str, session_id: str) -> list[dict[str, Any]]:
         try:
             runs = json.loads(row[0])
             if isinstance(runs, str):
-                # Agno's double-encoding edge case — unwrap once more.
+                # the runtime's double-encoding edge case — unwrap once more.
                 runs = json.loads(runs)
         except (TypeError, ValueError):
             return []
@@ -290,7 +290,7 @@ def _load_runs(db_path: str, session_id: str) -> list[dict[str, Any]]:
 
 
 def _save_runs(db_path: str, session_id: str, runs: list[dict[str, Any]]) -> None:
-    """Persist *runs* back to ``agno_sessions.runs`` for *session_id*.
+    """Persist *runs* back to ``sessions.runs`` for *session_id*.
 
     Touches the row's ``updated_at`` so the session-list UI orders the
     compacted session correctly and so the gateway's hot-reload probe
@@ -343,7 +343,7 @@ def should_compact(session_id: str | None, model: Any, *, agent: Any) -> bool:
       keep-window (nothing to fold).
     * Returns ``True`` when ``cumulative_input_tokens / max_context >
       threshold``. ``cumulative_input_tokens`` is the sum of estimated
-      tokens across every stored run, which is what Agno will replay
+      tokens across every stored run, which is what the runtime will replay
       into the next prompt via ``add_history_to_context=True``.
 
     The estimate is deliberately conservative — we count every stored
@@ -475,7 +475,7 @@ async def compact(
 
     Reads the stored runs, summarises everything older than the last
     ``OPENAGENT_COMPACTION_KEEP_RUNS`` (default 4), and writes
-    ``[recap_run] + last_N_runs`` back to ``agno_sessions.runs``. The
+    ``[recap_run] + last_N_runs`` back to ``sessions.runs``. The
     recap run is tagged with ``metadata={"compaction": True}`` so it's
     identifiable on inspection and so future compaction passes can
     detect "this was already compacted" without re-parsing.

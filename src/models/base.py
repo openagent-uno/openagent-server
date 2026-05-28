@@ -63,18 +63,18 @@ class BaseModel(ABC):
             tools: Optional list of tool definitions in a provider-neutral format:
                 [{"name": str, "description": str, "input_schema": dict}, ...]
             on_status: Optional async callback for live status updates (e.g. tool use).
-            files: Documents/attachments — Agno ``File`` objects (PDF, JSON,
+            files: Documents/attachments — runtime ``File`` objects (PDF, JSON,
                 text, markdown, …). Forwarded as ``runtime.arun(..., files=...)``;
                 subscription-CLI providers inline text content or write
                 binary to a sandbox-safe path.
-            images: Image attachments — Agno ``Image`` objects with ``content=bytes``.
+            images: Image attachments — runtime ``Image`` objects with ``content=bytes``.
                 Routed to ``arun(..., images=...)`` for native multimodal handling.
-            audio: Audio attachments — Agno ``Audio`` objects. Routed to ``arun(..., audio=...)``.
-            videos: Video attachments — Agno ``Video`` objects. Routed to ``arun(..., videos=...)``.
+            audio: Audio attachments — runtime ``Audio`` objects. Routed to ``arun(..., audio=...)``.
+            videos: Video attachments — runtime ``Video`` objects. Routed to ``arun(..., videos=...)``.
 
             Splitting media by type at the call boundary matches AgentOS's
             ``process_image / process_audio / process_video / process_document``
-            convention so Agno's model adapters get the right shape for
+            convention so the runtime's model adapters get the right shape for
             their multimodal API calls.
         """
         ...
@@ -104,7 +104,7 @@ class BaseModel(ABC):
         return a ``ModelResponse`` from ``stream()``, so the agent has
         to synthesize one and needs to know which model to credit.
 
-        Default reads ``self.model`` (set by ClaudeCLI and Agno).
+        Default reads ``self.model`` (set by ClaudeCLI and the API-based runtime).
         SmartRouter overrides because it picks per-session and a single
         instance attribute can't capture which routed model handled the
         latest turn. ``None`` is acceptable — the chat UI just hides the
@@ -143,7 +143,7 @@ class BaseModel(ABC):
         interrupts a reply mid-flight. Provider-managed models (Claude
         SDK) translate this into a control-request interrupt so the
         SDK's session log records what was emitted up to the cut. Platform-
-        managed models (Agno) inject a synthetic run into their session
+        managed models (API-based) inject a synthetic run into their session
         store so the next turn sees coherent history. Default no-op for
         caller-managed models (no hidden history state to maintain).
         """

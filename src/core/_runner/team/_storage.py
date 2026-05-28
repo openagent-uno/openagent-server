@@ -247,6 +247,11 @@ def _read_or_create_session(team: "Team", session_id: str, user_id: Optional[str
     if team.db is not None and team.parent_team_id is None and team.workflow_id is None:
         team_session = cast(TeamSession, _read_session(team, session_id=session_id, user_id=user_id))
 
+    # Claim unowned rows on first authenticated read — see the long
+    # comment on the async sibling ``_aread_or_create_session`` below.
+    if team_session is not None and user_id and not team_session.user_id:
+        team_session.user_id = user_id
+
     # Create new session if none found
     if team_session is None:
         log_debug(f"Creating new TeamSession: {session_id}")
@@ -313,6 +318,20 @@ async def _aread_or_create_session(team: "Team", session_id: str, user_id: Optio
             team_session = cast(TeamSession, await _aread_session(team, session_id=session_id, user_id=user_id))
         else:
             team_session = cast(TeamSession, _read_session(team, session_id=session_id, user_id=user_id))
+
+    # Claim unowned rows on first authenticated read. The 2026-05-28
+    # bug surfaced this seam: the gateway used to create rows with
+    # ``user_id`` hardcoded to 'openagent' (or, after my first attempted
+    # fix, NULL). The runtime's strict-equality WHERE clause on UPSERT
+    # would not apply when the caller's user_id mismatched. The read
+    # now also matches NULL (see ``SqliteDb.get_session``), but if we
+    # leave the loaded session.user_id at NULL, the row stays
+    # *unowned* forever — and on the next turn the runtime's UPSERT
+    # writes user_id=NULL again, perpetuating the unowned state.
+    # Stamp the caller's user_id here so the row gets claimed on the
+    # very next save and history accumulates correctly.
+    if team_session is not None and user_id and not team_session.user_id:
+        team_session.user_id = user_id
 
     # Create new session if none found
     if team_session is None:

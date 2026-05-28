@@ -140,7 +140,7 @@ concatenate raw sub-agent outputs or echo "specialist X said …".
   the user dictated verbatim).
 
 **How to delegate.**
-- Team-leader path: use the member's exact ``id`` from
+- Team-leader path: use the member's exact `id` from
   ``<team_members>`` (NOT the friendly name, NOT a guess).
 - Universal path: call ``list_delegatable_models`` first to get the
   exact ``runtime_id`` strings, then pass one of them to

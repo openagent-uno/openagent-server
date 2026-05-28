@@ -44,7 +44,7 @@ async def t_bridge_base(ctx: TestContext) -> None:
     # format_tool_status is consumed by BaseBridge.dispatch_turn to
     # render the per-tool status pings the bridges show during a turn.
     assert format_tool_status("Thinking...") == "Thinking..."
-    # Agno-native wire shape: tool_name present, tool_call_error false,
+    # runtime-native wire shape: tool_name present, tool_call_error false,
     # no result yet → derives status "running" → "Using bash..." line.
     assert format_tool_status(
         '{"tool_name":"bash","tool_call_error":false}'

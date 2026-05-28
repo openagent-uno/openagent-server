@@ -170,7 +170,7 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
         "in_process": True,
         "adapter_module": "src.mcp.servers.shell.adapters",
         "sdk_server_factory": "build_sdk_server",
-        "agno_toolkit_factory": "build_agno_toolkit",
+        "runtime_toolkit_factory": "build_runtime_toolkit",
         "description": (
             "execute bash commands on the host, foreground or "
             "backgrounded. Preferred for file ops, builds, and ad-hoc "
@@ -181,13 +181,13 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
         "in_process": True,
         "adapter_module": "src.mcp.servers.tool_search.adapters",
         "sdk_server_factory": "build_sdk_server",
-        "agno_toolkit_factory": "build_agno_toolkit",
+        "runtime_toolkit_factory": "build_runtime_toolkit",
     },
     "attachments": {
         "in_process": True,
         "adapter_module": "src.mcp.servers.attachments.adapters",
         "sdk_server_factory": "build_sdk_server",
-        "agno_toolkit_factory": "build_agno_toolkit",
+        "runtime_toolkit_factory": "build_runtime_toolkit",
         "description": (
             "read and write files attached to the current turn — "
             "screenshots, images, pasted text, uploads from the chat UI"
@@ -340,7 +340,7 @@ def _default_filesystem_roots() -> list[str]:
       ``/etc/hosts`` for a diagnostic, can't open ``/tmp/foo`` from an
       attachment, can't inspect a project outside ``$HOME``) without
       adding any real protection against a compromised tool call.
-    - LLM UX: the Claude / Agno tools see stable, uniform descriptions
+    - LLM UX: the Claude / runtime tools see stable, uniform descriptions
       regardless of which machine the agent runs on. There's no "oops,
       the path is outside the sandbox" surprise that forces a
       re-prompt.
@@ -556,7 +556,7 @@ def resolve_builtin_entry(name: str, env: dict[str, str] | None = None) -> dict[
             "in_process": True,
             "adapter_module": spec["adapter_module"],
             "sdk_server_factory": spec.get("sdk_server_factory", "build_sdk_server"),
-            "agno_toolkit_factory": spec.get("agno_toolkit_factory", "build_agno_toolkit"),
+            "runtime_toolkit_factory": spec.get("runtime_toolkit_factory", "build_runtime_toolkit"),
         }
 
     mcp_dir = BUILTIN_MCPS_DIR / spec["dir"]

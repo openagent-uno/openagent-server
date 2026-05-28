@@ -82,7 +82,7 @@ def _check_mcp_tool(
 
     Auto-repair: when ``tool_name`` doesn't exist on the MCP but
     ``f"{mcp_name}_{tool_name}"`` does, the block's config is rewritten
-    in place. Agno prefixes remote tool names with the MCP name; LLM-
+    in place. the runtime prefixes remote tool names with the MCP name; LLM-
     authored workflows routinely emit the bare upstream name (e.g.
     ``telegram_send_message`` instead of ``messaging_telegram_send_message``).
     Auto-repair eliminates that whole failure class without forcing the
@@ -92,7 +92,7 @@ def _check_mcp_tool(
     ``{mcp_name: {tool_name: bool}}``) is a parallel snapshot built by
     :func:`mcp_callability_from_pool`. When supplied, the resolved tool
     must be invocable — either a raw callable in the toolkit, or an
-    Agno ``Function`` descriptor with a non-None ``entrypoint``. A
+    runtime ``Function`` descriptor with a non-None ``entrypoint``. A
     ``False`` here means the executor would fail at run-time with
     ``TypeError: 'Function' object is not callable``; we surface it as
     a clear validation error instead.
@@ -116,7 +116,7 @@ def _check_mcp_tool(
     if tool_name not in tools:
         prefixed = f"{mcp_name}_{tool_name}"
         if prefixed in tools:
-            # Forward repair: bare upstream name → Agno-prefixed name.
+            # Forward repair: bare upstream name → prefixed name.
             config["tool_name"] = prefixed
             tool_name = prefixed
         else:
@@ -141,7 +141,7 @@ def _check_mcp_tool(
             )
 
     # Callability: catch the case where the toolkit registered a
-    # non-callable (e.g. an Agno ``Function`` descriptor whose
+    # non-callable (e.g. a runtime ``Function`` descriptor whose
     # ``entrypoint`` never got bound). The executor would otherwise
     # raise ``TypeError: 'Function' object is not callable`` mid-DAG.
     if callability is not None:
@@ -362,7 +362,7 @@ def mcp_callability_from_pool(pool: Any) -> dict[str, dict[str, bool]] | None:
 
     A tool is considered callable when the toolkit registers either:
     a raw Python callable (in-process toolkits like ``tool-search``);
-    or an Agno ``Function`` descriptor whose ``entrypoint`` field is
+    or a runtime ``Function`` descriptor whose ``entrypoint`` field is
     itself callable (the standard subprocess-MCP shape).
 
     Returns ``None`` when the pool can't be introspected — same

@@ -2,8 +2,8 @@
 
 Lives outside ``models/native_provider.py`` because the learning workers
 need a stripped-down completion call (single prompt → JSON or plain text)
-without the Agno MCP toolkits, history management, or streaming surface.
-A bare ``groq`` SDK request is ~200 ms; layering Agno adds 1-2 s of setup
+without the runtime MCP toolkits, history management, or streaming surface.
+A bare ``groq`` SDK request is ~200 ms; layering the runtime adds 1-2 s of setup
 overhead per call which would make the post-turn flush noticeable on
 Telegram even though it runs async.
 
@@ -54,7 +54,7 @@ async def _resolve_api_key(db: Any) -> Optional[str]:
     except Exception:
         return None
     for row in rows or []:
-        # Accept any framework — Groq under Agno carries the key in the
+        # Accept any framework — Groq under the runtime carries the key in the
         # same ``api_key`` column regardless of which dispatch layer
         # wraps it. ``provider.name == "groq"`` is the canonical match
         # per ``catalog.SUPPORTED_PROVIDERS``.

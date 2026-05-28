@@ -290,7 +290,7 @@ async def t_attachment_marker_roundtrip(ctx: TestContext) -> None:
 # ── 5. Agent.run(attachments=[...]) builds context block ─────────────
 
 
-@test("files", "Agent.run(attachments=[...]) splits images (prepend) from files (Agno files=)")
+@test("files", "Agent.run(attachments=[...]) splits images (prepend) from files (runtime files=)")
 async def t_agent_run_attachments_context(ctx: TestContext) -> None:
     """Unit test for the Agent-level attachments plumbing.
 
@@ -299,10 +299,10 @@ async def t_agent_run_attachments_context(ctx: TestContext) -> None:
 
     - Image attachments are STILL prepended as a context block with a
       read hint (no images= channel on the model layer yet).
-    - Non-image attachments are converted to ``agno.media.File`` objects
+    - Non-image attachments are converted to ``src.stream.media.File`` objects
       and passed through the new ``files=`` kwarg. The user's bare text
       must NOT carry the synthetic "The user attached files:" prepend
-      for non-images — that's now Agno's native attachment path,
+      for non-images — that's now the runtime's native attachment path,
       propagated to Team members via ``delegate_task_to_member``.
     """
     from src.core.agent import Agent
@@ -347,14 +347,14 @@ async def t_agent_run_attachments_context(ctx: TestContext) -> None:
         # Original user text survives.
         assert "what's in the file?" in content
         # CRITICAL: the non-image attachment must NOT appear in the prompt
-        # text — it routes through Agno's native ``files=`` instead.
+        # text — it routes through the runtime's native ``files=`` instead.
         assert "doc.pdf" not in content, (
             f"non-image attachment leaked into prompt prepend; got: {content!r}"
         )
         assert "/tmp/doc.pdf" not in content, (
             f"non-image local path leaked into prompt prepend; got: {content!r}"
         )
-        # The non-image attachment surfaces as an Agno ``File`` on the
+        # The non-image attachment surfaces as an runtime ``File`` on the
         # ``files=`` kwarg.
         assert len(captured_files) == 1, (
             f"expected 1 File for the pdf; got {captured_files!r}"

@@ -15,7 +15,7 @@ two routes produced different shapes for the SAME underlying event.
 also dropped on the rehydration walk.
 
 This module locks in the parity: both routes go through the shared
-:mod:`src.models._tool_status` encoder which emits Agno's native
+:mod:`src.models._tool_status` encoder which emits the runtime's native
 ``ToolExecution.to_dict()`` shape, and the rehydration walk recurses
 into ``member_responses`` so delegated content surfaces with the
 specialist's own model attribution.
@@ -35,7 +35,7 @@ from ._framework import TestContext, test
 
 
 def _seed_agno_runs(db_path: str, session_id: str, runs: list[dict]) -> None:
-    """Seed an ``agno_sessions`` row carrying ``runs`` as JSON."""
+    """Seed an ``sessions`` row carrying ``runs`` as JSON."""
     import json as _json
 
     conn = sqlite3.connect(db_path)
@@ -75,11 +75,11 @@ def _seed_agno_runs(db_path: str, session_id: str, runs: list[dict]) -> None:
 
 @dataclass
 class _FakeToolExec:
-    """Minimal stand-in for Agno's ``ToolExecution`` dataclass.
+    """Minimal stand-in for the runtime's ``ToolExecution`` dataclass.
 
     Only the attributes the shared status encoder reads
     (:mod:`src.models._tool_status`) are populated; everything else
-    falls through to ``None`` so the encoder treats it as a real Agno
+    falls through to ``None`` so the encoder treats it as a the runtime
     object.
     """
     tool_name: str
@@ -120,7 +120,7 @@ async def t_shared_encoder_parity(ctx: TestContext) -> None:
     assert live_payload["tool_call_error"] is False
     assert live_payload["result"] == "ok"
 
-    # Same tool, same args, after Agno persisted it as a ToolExecution
+    # Same tool, same args, after the runtime persisted it as a ToolExecution
     # dict — the rehydration walker reconstructs the SAME payload.
     stored = {
         "tool_name": "vault_write_note",
@@ -158,7 +158,7 @@ async def t_encoder_error_path(ctx: TestContext) -> None:
     assert live["tool_call_error"] is True
     assert live["result"] == "exit 1"
 
-    # Stored rows pass through verbatim — what Agno wrote is what the UI sees.
+    # Stored rows pass through verbatim — what the runtime wrote is what the UI sees.
     stored = stored_tool_to_wire({
         "tool_name": "shell_run",
         "tool_call_id": "x",
@@ -173,10 +173,10 @@ async def t_encoder_error_path(ctx: TestContext) -> None:
     assert stored["result"] is None
 
 
-@test("rehydration_parity", "stored_tool_to_wire is exact pass-through of Agno-native dict")
+@test("rehydration_parity", "stored_tool_to_wire is exact pass-through of the runtime-native dict")
 async def t_stored_pass_through(ctx: TestContext) -> None:
     """The rehydration encoder MUST NOT translate field names or drop
-    keys — the UI consumes Agno's ``ToolExecution.to_dict()`` shape
+    keys — the UI consumes the runtime's ``ToolExecution.to_dict()`` shape
     verbatim, including fields we don't render today (metrics,
     child_run_id, etc.). This locks the contract.
     """
@@ -198,7 +198,7 @@ async def t_stored_pass_through(ctx: TestContext) -> None:
 @test("rehydration_parity", "_arun_runtime_stream emits JSON status for tool start + completion + error")
 async def t_dispatcher_stream_emits_json_status(ctx: TestContext) -> None:
     """Live team-mode turn: the dispatcher's tool-call frames must be
-    structured JSON in Agno-native shape (so the UI's
+    structured JSON in the runtime-native shape (so the UI's
     ``handleServerMessage`` parser hits the ``toolInfo`` branch)
     instead of the legacy ``f"⚙ {name}"`` plain text. Without this,
     the chip renders one way live and another way after rehydration.
@@ -212,7 +212,7 @@ async def t_dispatcher_stream_emits_json_status(ctx: TestContext) -> None:
     from src.models.dispatcher import _arun_runtime_stream
 
     # The same ToolExecution mutates between start + completion in
-    # real Agno — result is None at start, populated at done. Mirror
+    # the runtime — result is None at start, populated at done. Mirror
     # that since the wire shape is verbatim ``to_dict()``.
     delegate_tool = _FakeToolExec(
         tool_name="delegate_task_to_member",
@@ -281,7 +281,7 @@ async def t_dispatcher_stream_emits_json_status(ctx: TestContext) -> None:
     # Deltas pass through unchanged.
     assert deltas == ["hi ", "done"], deltas
 
-    # Status frames — every one must parse as JSON in Agno-native shape.
+    # Status frames — every one must parse as JSON in the runtime-native shape.
     # Three tools × started + (completed | error) = 6 frames.
     assert len(statuses) == 6, (
         f"expected 6 status frames (2 per tool), got {len(statuses)}: {statuses}"
@@ -331,9 +331,9 @@ async def t_rehydration_walks_member_responses(ctx: TestContext) -> None:
     specialist_model = "anthropic:claude-haiku-4-5"
 
     # Stored shape: a TeamRunOutput.to_dict() with one delegate tool
-    # call and one member response. Matches Agno's actual on-disk shape
-    # (see agno.run.team.TeamRunOutput.to_dict and
-    # agno.models.response.ToolExecution.to_dict).
+    # call and one member response. Matches the runtime's actual on-disk shape
+    # (see src.core._run_state.team.TeamRunOutput.to_dict and
+    # src.models.providers.response.ToolExecution.to_dict).
     team_run = {
         "run_id": "team-run-1",
         "team_id": "openagent-test",
@@ -351,7 +351,7 @@ async def t_rehydration_walks_member_responses(ctx: TestContext) -> None:
                      "function": {"name": "delegate_task_to_member"}},
                 ],
             },
-            # Tool result — content is the specialist's text (Agno
+            # Tool result — content is the specialist's text (the runtime
             # stores it here for the leader to use).
             {
                 "role": "tool",
@@ -399,7 +399,7 @@ async def t_rehydration_walks_member_responses(ctx: TestContext) -> None:
     msg_counter = [0]
     out = _expand_run_messages(team_run, timestamp=1234, msg_counter=msg_counter)
 
-    # Pluck just the fields that matter for parity (using Agno-native field names).
+    # Pluck just the fields that matter for parity (using the runtime-native field names).
     summary = [
         (m["role"], (m.get("toolInfo", {}) or {}).get("tool_name"),
          bool((m.get("toolInfo", {}) or {}).get("tool_call_error")),
@@ -412,7 +412,7 @@ async def t_rehydration_walks_member_responses(ctx: TestContext) -> None:
     #   model=specialist) → assistant(leader synthesis, model=leader)
     #
     # The member run's first user-role message is the leader-generated
-    # task prompt — an internal Agno artifact, not the human's input.
+    # task prompt — an internal the runtime artifact, not the human's input.
     # ``is_member_run=True`` on recursion filters it out so the chat
     # transcript shows only the user's REAL prompt at the top.
     assert summary[0] == ("user", None, False, None), summary
@@ -420,7 +420,7 @@ async def t_rehydration_walks_member_responses(ctx: TestContext) -> None:
     assert summary[2] == ("assistant", None, False, specialist_model), summary
     assert summary[3] == ("assistant", None, False, leader_model), summary
 
-    # toolInfo on the delegate row must carry Agno's native fields.
+    # toolInfo on the delegate row must carry the runtime's native fields.
     delegate_msg = out[1]
     assert delegate_msg["toolInfo"]["tool_call_id"] == "call_delegate_1"
     assert delegate_msg["toolInfo"]["tool_args"]["member_id"] == "anthropic-claude-haiku-4-5"
@@ -522,7 +522,7 @@ async def t_rehydration_solo_run_envelope(ctx: TestContext) -> None:
     toolInfo dict matches what a live STATUS frame would have carried.
 
     Hermetic — no gateway needed; we exercise the rehydration helpers
-    directly against a seeded ``agno_sessions`` row.
+    directly against a seeded ``sessions`` row.
     """
     from src.gateway.api.sessions import _expand_run_messages
     from src.memory.db import MemoryDB
@@ -571,7 +571,7 @@ async def t_rehydration_solo_run_envelope(ctx: TestContext) -> None:
             # Reconstruct what the LIVE wire would have emitted for
             # the SAME tool execution and verify the rehydrated
             # envelope IS a superset of the live one (rehydration
-            # preserves whatever Agno persisted; live has only the
+            # preserves whatever the runtime persisted; live has only the
             # subset _FakeToolExec exposes).
             live_envelope_json = tool_exec_to_wire_json(
                 _FakeToolExec(
@@ -683,7 +683,7 @@ async def t_member_user_prompt_filtered(ctx: TestContext) -> None:
     """Bug: when the leader delegates via ``delegate_task_to_member``,
     the leader generates a synthetic prompt (e.g. "Read the file at
     /tmp/X using whatever tool…") and passes it to the specialist.
-    Agno stores that prompt as a ``user``-role message inside the
+    the runtime stores that prompt as a ``user``-role message inside the
     specialist's nested run under ``member_responses``.
 
     Before the fix, ``_expand_run_messages`` recursed into the member

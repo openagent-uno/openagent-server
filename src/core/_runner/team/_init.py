@@ -465,10 +465,10 @@ def set_id(team: "Team") -> None:
 def _set_debug(team: "Team", debug_mode: Optional[bool] = None) -> None:
     # Get the debug level from the environment variable or the default debug level
     debug_level: Literal[1, 2] = (
-        cast(Literal[1, 2], int(env)) if (env := getenv("AGNO_DEBUG_LEVEL")) in ("1", "2") else team.debug_level
+        cast(Literal[1, 2], int(env)) if (env := getenv("OPENAGENT_DEBUG_LEVEL")) in ("1", "2") else team.debug_level
     )
     # If the default debug mode is set, or passed on run, or via environment variable, set the debug mode to True
-    if team.debug_mode or debug_mode or getenv("AGNO_DEBUG", "false").lower() == "true":
+    if team.debug_mode or debug_mode or getenv("OPENAGENT_DEBUG", "false").lower() == "true":
         set_log_level_to_debug(source_type="team", level=debug_level)
     else:
         set_log_level_to_info(source_type="team")
@@ -477,7 +477,7 @@ def _set_debug(team: "Team", debug_mode: Optional[bool] = None) -> None:
 def _set_telemetry(team: "Team") -> None:
     """Override telemetry settings based on environment variables."""
 
-    telemetry_env = getenv("AGNO_TELEMETRY")
+    telemetry_env = getenv("OPENAGENT_TELEMETRY")
     if telemetry_env is not None:
         team.telemetry = telemetry_env.lower() == "true"
 

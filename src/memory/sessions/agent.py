@@ -59,12 +59,35 @@ class AgentSession:
 
         runs = data.get("runs")
         serialized_runs: List[Union[RunOutput, TeamRunOutput]] = []
-        if runs is not None and isinstance(runs[0], dict):
+        # Latent bug: ``isinstance(runs[0], dict)`` raises IndexError when
+        # ``runs == []``. SqliteDb sometimes returns the empty-list shape
+        # (the runtime stored ``runs=[]`` instead of ``runs=null``) and the
+        # IndexError used to bubble out of ``get_session``, get swallowed
+        # by ``read_session``'s blanket-except, and trigger the
+        # "create new session" branch that overwrites the row. Guard
+        # with ``isinstance(runs, list) and runs`` so empty list is a
+        # quiet no-op.
+        if isinstance(runs, list) and runs and isinstance(runs[0], dict):
             for run in runs:
-                if "agent_id" in run:
+                # A run dict may have BOTH ``agent_id`` and ``team_id``
+                # keys (TeamRunOutputs serialised with ``agent_id=None``
+                # still carry the key in some Agno versions). Dispatch by
+                # whichever id is *truthy*, with ``team_id`` winning when
+                # both are set — TeamRunOutput is the richer shape.
+                team_id_val = run.get("team_id")
+                agent_id_val = run.get("agent_id")
+                if team_id_val:
+                    serialized_runs.append(TeamRunOutput.from_dict(run))
+                elif agent_id_val:
                     serialized_runs.append(RunOutput.from_dict(run))
                 elif "team_id" in run:
                     serialized_runs.append(TeamRunOutput.from_dict(run))
+                elif "agent_id" in run:
+                    serialized_runs.append(RunOutput.from_dict(run))
+                else:
+                    # Unidentifiable shape — best-effort decode as AgentRun
+                    # since AgentSession is the more permissive container.
+                    serialized_runs.append(RunOutput.from_dict(run))
 
         summary = data.get("summary")
         if summary is not None and isinstance(summary, dict):

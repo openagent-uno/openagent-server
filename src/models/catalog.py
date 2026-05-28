@@ -1,7 +1,7 @@
 """Catalog helpers for configured providers, models, and pricing.
 
 This module deliberately keeps product-facing provider/model metadata under
-OpenAgent control instead of delegating it to the runtime. Agno is the
+OpenAgent control instead of delegating it to the inlined runtime. The runtime is the
 execution engine for both LLM paths — ``api-based`` (native ``Agent``) and
 ``claude-cli`` (``ClaudeAgent`` adapter) — while OpenAgent remains the
 source of truth for:
@@ -30,10 +30,10 @@ DEFAULT_ZAI_BASE_URL = "https://api.z.ai/api/paas/v4"
 
 # OpenAgent vocabulary:
 #   - **provider**  : the model's vendor / owner (anthropic, openai, google, …).
-#   - **framework** : the adapter OpenAgent uses to instantiate the Agno
-#                     agent — ``api-based`` (native ``agno.agent.Agent`` with
-#                     the provider's API key) or ``claude-cli`` (Agno's
-#                     ``agno.agents.claude.ClaudeAgent`` adapter wrapping
+#   - **framework** : the adapter OpenAgent uses to instantiate the runtime
+#                     agent — ``api-based`` (native runtime ``Agent`` with
+#                     the provider's API key) or ``claude-cli`` (the runtime's
+#                     Claude SDK adapter wrapping
 #                     the local ``claude`` binary, no API key).
 #   - **kind**      : ``llm`` / ``tts`` / ``stt``. The runtime dispatches by
 #                     kind first; framework only matters for ``kind='llm'``.
@@ -67,7 +67,7 @@ SUPPORTED_PROVIDERS = [
 ]
 
 # Framework values written to ``providers.framework``. Three values:
-#   - ``api-based``  → ``agno.agent.Agent`` for LLM, ``litellm.aspeech`` /
+#   - ``api-based``  → runtime ``Agent`` for LLM, ``litellm.aspeech`` /
 #                      ``litellm.atranscription`` for TTS/STT.
 #   - ``claude-cli`` → ``ClaudeBackedAgent`` (drives ``claude_agent_sdk``
 #                      against the user's Claude Pro/Max subscription).
@@ -77,8 +77,7 @@ FRAMEWORK_API_BASED = "api-based"
 FRAMEWORK_CLAUDE_CLI = "claude-cli"
 FRAMEWORK_CODEX_CLI = "codex-cli"
 
-# Transitional aliases — the old framework names ``agno`` (LLM native
-# Agno) and ``litellm`` (TTS/STT) collapse into the single ``api-based``
+# Transitional aliases — the old framework names ``agno`` (legacy: LLM native runtime) and ``litellm`` (TTS/STT) collapse into the single ``api-based``
 # value above. A DB migration rewrites existing rows; these aliases stay
 # for one release so any stragglers in code or tests don't crash. Delete
 # in a follow-up cleanup once the codebase is fully on FRAMEWORK_API_BASED.
@@ -95,7 +94,7 @@ SUPPORTED_FRAMEWORKS = LLM_FRAMEWORKS
 # Subscription-CLI frameworks: ChatGPT/Claude-subscription-backed paths.
 # Both share these traits the router cares about:
 #   - billed against a user subscription, not per-token via API
-#   - cannot serve as Agno Team's ``team.model`` (the routing classifier)
+#   - cannot serve as the runtime Team's ``team.model`` (the routing classifier)
 #     because their backing ``Agent.model`` is a placeholder
 # ``team_router._cheapest_api_based_model`` is consulted for these
 # leaders, and pricing returns zero for them.
@@ -121,7 +120,7 @@ class CatalogModel:
     # DB-level marker (mirror of ``models.is_classifier``) kept on the
     # catalog row so model_manager surfaces the flag in /api/models
     # responses. No router currently consumes this — SmartRouter was
-    # retired in v0.14 in favour of agno's Team-based routing.
+    # retired in v0.14 in favour of the runtime's Team-based routing.
     is_classifier: bool = False
 
 
@@ -559,7 +558,7 @@ def get_default_model_for_provider(
 ) -> str | None:
     """Return the first configured runtime_id for ``provider_name``.
 
-    When a provider is registered under both frameworks (anthropic+agno
+    When a provider is registered under both frameworks (anthropic+api-based
     AND anthropic+claude-cli), pass ``framework=`` to disambiguate.
     """
     for entry in iter_configured_models(providers_config):

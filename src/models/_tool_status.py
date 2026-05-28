@@ -1,6 +1,6 @@
-"""Agno-native ToolExecution → wire JSON.
+"""API-native ToolExecution → wire JSON.
 
-The universal app consumes Agno's native ``ToolExecution.to_dict()``
+The universal app consumes the runtime's native ``ToolExecution.to_dict()``
 shape directly. This module is the single conversion point so live
 streaming and rehydration emit byte-identical JSON for the same
 ``ToolExecution``.
@@ -28,7 +28,7 @@ async def emit_tool_status(
 ) -> None:
     """Encode ``tool_exec`` and forward to ``on_status``.
 
-    Shared by every Agno tool-status emitter (NativeProvider, dispatcher
+    Shared by every runtime tool-status emitter (NativeProvider, dispatcher
     helpers, ClaudeCLI / CodexCLI) so the wire envelope and the
     defensive on_status error handling can't drift across call sites.
     """
@@ -49,11 +49,11 @@ def tool_exec_to_wire_json(
     error_text: str | None = None,
     phase: str | None = None,
 ) -> str | None:
-    """Live-path encoder: Agno ``ToolExecution`` → JSON string.
+    """Live-path encoder: runtime ``ToolExecution`` → JSON string.
 
     When ``error_text`` is given (``ToolCallErrorEvent``) the encoder
     sets ``tool_call_error=True`` and stashes the message in ``result``
-    — Agno's error event carries the text inline but the stored
+    — the runtime's error event carries the text inline but the stored
     ``ToolExecution`` only keeps the bool, so ``result`` is the durable
     carrier the UI inspects.
 
@@ -76,7 +76,7 @@ def tool_exec_to_wire_json(
 def stored_tool_to_wire(stored: dict[str, Any]) -> dict[str, Any] | None:
     """Rehydration-path encoder: stored ``ToolExecution`` dict → wire dict.
 
-    Stored rows are already in Agno's native shape; this just gates on
+    Stored rows are already in the runtime's native shape; this just gates on
     ``tool_name`` presence so the UI doesn't render empty chips.
     """
     if not stored.get("tool_name"):

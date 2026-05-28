@@ -23,7 +23,7 @@ from ._framework import TestContext, test
 def _make_provider(model: str = "deepseek:deepseek-chat"):
     """Construct an NativeProvider without triggering provider init.
 
-    NativeProvider.__init__ pulls in heavy Agno modules; tests just need
+    NativeProvider.__init__ pulls in heavy runtime modules; tests just need
     the rewriter's bound methods, so we bypass __init__ and set the
     one field the rewriter reads (``self.model``)."""
     from src.models.native_provider import NativeProvider

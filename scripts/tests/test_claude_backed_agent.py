@@ -6,11 +6,11 @@ refactor work:
   1. Construction does not crash even on a slim install (the
      ``claude_agent_sdk`` import is lazy — inside the agent's
      methods, not at module load), and the constructed instance
-     IS an ``agno.agent.Agent`` so Team's ``isinstance(member, Agent)``
+     IS an ``runtime ``Agent```` so Team's ``isinstance(member, Agent)``
      check passes.
   2. ``arun(stream=False)`` drives the SDK and assembles a
      ``RunOutput`` with ``status=completed``, content, tools, and
-     metrics — the shape Agno's Team consumes from a member run.
+     metrics — the shape the runtime's Team consumes from a member run.
   3. The SDK session id round-trips through ``session.session_data``
      so restart-resume keeps the same SDK transcript across boots.
   4. ``arun(stream=True)`` is an async iterator that emits
@@ -275,7 +275,7 @@ async def t_session_persistence(ctx: TestContext) -> None:
     """The SDK session id must round-trip through
     ``session.session_data`` so restart-resume keeps the same SDK
     transcript. We use a minimal in-memory DB stub that mirrors
-    Agno's ``SqliteDb.get_session`` / ``upsert_session`` surface.
+    the runtime's ``SqliteDb.get_session`` / ``upsert_session`` surface.
     """
     state = _install_fake_sdk()
     from src.models.claude_agent import ClaudeBackedAgent
@@ -351,7 +351,7 @@ async def t_stream_events(ctx: TestContext) -> None:
     """``arun(stream=True, yield_run_output=True)`` must yield a
     ``RunContentEvent`` per token-level delta (or AssistantMessage
     TextBlock when StreamEvents aren't flowing) and a single terminal
-    ``RunOutput`` at the end — the contract Agno Team's streaming
+    ``RunOutput`` at the end — the contract the runtime Team's streaming
     dispatcher consumes from a member.
     """
     state = _install_fake_sdk()

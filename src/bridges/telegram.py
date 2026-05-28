@@ -714,7 +714,7 @@ class TelegramBridge(BaseBridge):
                         "skills.json",
                         _json.dumps(skills_payload, ensure_ascii=False, indent=2),
                     )
-                    # Recent agno_session row (carries the Agno-tracked
+                    # Recent session row (carries the runtime-tracked
                     # turn transcript for this user's session).
                     try:
                         cur = await shim._conn.execute(

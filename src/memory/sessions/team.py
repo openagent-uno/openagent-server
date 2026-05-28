@@ -63,11 +63,24 @@ class TeamSession:
 
         runs = data.get("runs")
         serialized_runs: List[Union[TeamRunOutput, RunOutput]] = []
-        if runs is not None and isinstance(runs[0], dict):
+        # Same latent IndexError + agent_id/team_id dispatch bug as
+        # ``AgentSession.from_dict`` — see the long comment there for the
+        # rationale. Empty list must be a quiet no-op; the truthy-id
+        # check beats the ``in`` check because some serialisations carry
+        # the key with a ``None`` value.
+        if isinstance(runs, list) and runs and isinstance(runs[0], dict):
             for run in runs:
-                if "agent_id" in run:
+                team_id_val = run.get("team_id")
+                agent_id_val = run.get("agent_id")
+                if team_id_val:
+                    serialized_runs.append(TeamRunOutput.from_dict(run))
+                elif agent_id_val:
                     serialized_runs.append(RunOutput.from_dict(run))
                 elif "team_id" in run:
+                    serialized_runs.append(TeamRunOutput.from_dict(run))
+                elif "agent_id" in run:
+                    serialized_runs.append(RunOutput.from_dict(run))
+                else:
                     serialized_runs.append(TeamRunOutput.from_dict(run))
 
         return cls(

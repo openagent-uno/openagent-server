@@ -1,11 +1,11 @@
-"""Regression tests for the v0.14 Agno-consolidation refactor.
+"""Regression tests for the v0.14 runtime-consolidation refactor.
 
 Locks down every fix landed in Phases 1-10 so future churn can't quietly
 undo them:
 
-  - Phase 1: Agno bump (claude_agent SDK adapter import path).
+  - Phase 1: runtime bump (claude_agent SDK adapter import path).
   - Phase 2: Framework rename (agno/litellm → api-based) + legacy aliases.
-  - Phase 3: ClaudeCLI shim over Agno ClaudeAgent with session_data
+  - Phase 3: ClaudeCLI shim over the inlined ClaudeAgent with session_data
     round-trip for SDK session id (resume across restarts).
   - Phase 4: SmartRouter classifier removed; TeamRouterProvider built
     on first dispatch.
@@ -251,7 +251,7 @@ async def t_upsert_provider_legacy_compat(ctx: TestContext) -> None:
 async def t_claude_backed_agent_roundtrip(ctx: TestContext) -> None:
     """The whole point of ``ClaudeBackedAgent`` (replacing the v0.14
     ``PersistentClaudeAgent`` ClaudeAgent subclass) is to survive
-    process restarts AND participate in Agno Teams. The SDK session id
+    process restarts AND participate in runtime Teams. The SDK session id
     must round-trip through ``session.session_data`` so the next boot
     can ``--resume`` the same SDK subprocess transcript.
     """
@@ -310,7 +310,7 @@ async def t_claude_backed_agent_roundtrip(ctx: TestContext) -> None:
 async def t_known_sdk_session_ids(ctx: TestContext) -> None:
     """Phase 3 swapped the legacy metadata.sdk_session_id query for a
     framework-typed read of ``agent_data.framework``. The new helper
-    must find rows that Agno's SqliteDb wrote with
+    must find rows that the runtime's SqliteDb wrote with
     framework='claude-agent-sdk'.
     """
     from src.memory.db import MemoryDB
@@ -530,12 +530,12 @@ async def t_stream_handles_team_events(ctx: TestContext) -> None:
     """Regression for the prod bug where ``TeamRouterProvider.stream``
     yielded zero deltas → ``agent.run_stream`` fired its
     "no_deltas_yielded" fallback to ``generate()`` → the team ran the
-    whole turn AGAIN, persisting a duplicate row to ``agno_sessions``
+    whole turn AGAIN, persisting a duplicate row to ``sessions``
     → the next user turn saw the orphan in history and the model
     replied "I already answered above".
 
-    Root cause: ``agno.run.team.RunContentEvent`` is a DISTINCT class
-    from ``agno.run.agent.RunContentEvent``. The shared
+    Root cause: ``src.core._run_state.team.RunContentEvent`` is a DISTINCT class
+    from ``src.core._run_state.agent.RunContentEvent``. The shared
     ``_arun_runtime_stream`` helper must isinstance-check BOTH module
     variants (plus ``IntermediateRunContentEvent`` for delegated
     member content) so Team-mode deltas reach the WS pipe.
@@ -547,7 +547,7 @@ async def t_stream_handles_team_events(ctx: TestContext) -> None:
     )
 
     assert AgentRCE is not TeamRCE, (
-        "Test premise broke: Agno collapsed the two RunContentEvent "
+        "Test premise broke: the runtime collapsed the two RunContentEvent "
         "classes; revisit dispatcher's union."
     )
 
@@ -598,7 +598,7 @@ async def t_stream_no_models_returns_error(ctx: TestContext) -> None:
 @test("regression_v014", "deleted db.py helpers stay deleted")
 async def t_db_helpers_deleted(ctx: TestContext) -> None:
     """Negative test on Phase 5: the manual mirror-write helpers (which
-    duplicated what Agno's SqliteDb does for free) must not be
+    duplicated what the runtime's SqliteDb does for free) must not be
     re-added by mistake.
     """
     from src.memory.db import MemoryDB
@@ -616,7 +616,7 @@ async def t_db_helpers_deleted(ctx: TestContext) -> None:
     leaked = [name for name in deleted if hasattr(MemoryDB, name)]
     assert not leaked, (
         f"Manual mirror-write helpers must not be re-added: {leaked}. "
-        f"Agno's SqliteDb owns these now."
+        f"the runtime's SqliteDb owns these now."
     )
 
     # The back-compat shim stays so existing gateway DELETE handlers
@@ -654,11 +654,11 @@ async def t_wire_defers_all_mcps(ctx: TestContext) -> None:
 
     class _StubPool:
         def __init__(self) -> None:
-            self.agno_calls = 0
+            self.api_calls = 0
             self.sdk_calls = 0
 
         def runtime_toolkits_tool_search_only(self):
-            self.agno_calls += 1
+            self.api_calls += 1
             return ["<tool-search-toolkit>"]
 
         def claude_sdk_servers_tool_search_only(self):
@@ -673,7 +673,7 @@ async def t_wire_defers_all_mcps(ctx: TestContext) -> None:
     # regression replaces them with ``runtime_toolkits`` (the full list)
     # this test catches it because the count check below fails first
     # — but the explicit accessor call is the canary.
-    assert pool.agno_calls == 1, pool.agno_calls
+    assert pool.api_calls == 1, pool.api_calls
     assert pool.sdk_calls == 1, pool.sdk_calls
     assert model.toolkit_calls == [["<tool-search-toolkit>"]]
     assert model.sdk_calls == [{"tool-search": {"type": "sdk"}}]
@@ -978,11 +978,11 @@ async def t_subprocess_no_semaphore_leak(ctx: TestContext) -> None:
 
 @test("regression_v014", "Team.members typing still constrains to Agent | Team")
 async def t_team_members_typing(ctx: TestContext) -> None:
-    """Agno's Team.members is typed Union[List[Union[Agent, "Team"]],
+    """the runtime's Team.members is typed Union[List[Union[Agent, "Team"]],
     Callable]. ClaudeBackedAgent works as a member precisely because
-    it inherits from ``agno.agent.Agent`` (and not from
-    ``BaseExternalAgent`` like ``agno.agents.claude.ClaudeAgent``).
-    If Agno widened the union to include external agents we'd want to
+    it inherits from ``runtime ``Agent```` (and not from
+    ``BaseExternalAgent`` like the runtime's ClaudeAgent SDK adapter).
+    If the runtime widened the union to include external agents we'd want to
     know — the routing-model fallback in team_router.py exists
     specifically because Team always invokes team.model for the
     delegation classifier.
@@ -1006,8 +1006,8 @@ async def t_team_members_typing(ctx: TestContext) -> None:
 @test("regression_v014", "ClaudeBackedAgent IS an Agent (Team accepts it as member)")
 async def t_claude_backed_is_agent(ctx: TestContext) -> None:
     """The whole point of ``ClaudeBackedAgent``: a claude-cli row can
-    participate in an Agno ``Team`` as a member OR as the leader's
-    members[0] slot because it subclasses ``agno.agent.Agent`` (and
+    participate in an runtime ``Team`` as a member OR as the leader's
+    members[0] slot because it subclasses ``runtime ``Agent```` (and
     therefore passes Team's ``isinstance(member, Agent)`` check). The
     earlier ``PersistentClaudeAgent`` (ClaudeAgent / BaseExternalAgent
     subclass) couldn't.
@@ -1073,8 +1073,8 @@ async def t_team_includes_claude_cli(ctx: TestContext) -> None:
 @test("regression_v014", "CodexBackedAgent IS an Agent (Team accepts it as member)")
 async def t_codex_backed_is_agent(ctx: TestContext) -> None:
     """``CodexBackedAgent`` is the codex-cli equivalent of
-    ``ClaudeBackedAgent`` — both subclass ``agno.agent.Agent`` so they
-    pass Agno's ``isinstance(member, Agent)`` check AND inherit the
+    ``ClaudeBackedAgent`` — both subclass ``runtime ``Agent```` so they
+    pass the runtime's ``isinstance(member, Agent)`` check AND inherit the
     attribute defaults Team's delegation code reads.
     """
     from src.core._runner.agent import Agent

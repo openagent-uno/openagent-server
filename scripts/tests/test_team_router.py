@@ -1,19 +1,19 @@
-"""TeamRouterProvider — sub-agent delegation via Agno ``Team(mode=coordinate)``.
+"""TeamRouterProvider — sub-agent delegation via the runtime ``Team(mode=coordinate)``.
 
 Verifies the v0.14 sub-agent architecture: a session's user-selected
 entry model becomes the team leader; every OTHER enabled
 ``framework='api-based'`` model in the DB joins as a specialist whose
 ``role`` blurb comes from the DB's ``tier_hint``. The leader delegates
-per-turn natively via Agno's TeamMode.coordinate — so a session that
+per-turn natively via the runtime's TeamMode.coordinate — so a session that
 started on a fast/cheap model can pick up an "expert at coding"
 specialist when the user asks for code, a marketing specialist when
 the user asks for copy, or BOTH in parallel for multi-domain prompts,
 all under one session id.
 
-Tests here stub Agno's ``Team`` and ``Agent`` so no real LLM call is
+Tests here stub the runtime's ``Team`` and ``Agent`` so no real LLM call is
 made. We focus on:
   - the team structure (leader, members, role blurbs)
-  - the catalog → Agno-object translation
+  - the catalog → runtime-object translation
   - the single-agent fallback for one-model deployments
   - the model-switching flow: leader → specialist → response wraps back
     through TeamRouterProvider into ``ModelResponse``
@@ -90,7 +90,7 @@ def _single_model_catalog() -> list[dict[str, Any]]:
 
 def _catalog_with_claude_cli() -> list[dict[str, Any]]:
     """Mixed catalog — one api-based + one claude-cli. The claude-cli
-    row MUST be excluded from team membership (Agno's Team.members
+    row MUST be excluded from team membership (the runtime's Team.members
     type rejects BaseExternalAgent subclasses), so the api-based-only
     Team builder should silently skip it.
     """
@@ -120,15 +120,15 @@ def _catalog_with_claude_cli() -> list[dict[str, Any]]:
 
 
 class _RecordedAgent:
-    """Stand-in for ``agno.agent.Agent`` used to inspect Team construction
-    without spawning a real Agno agent (which would try to import vendor
+    """Stand-in for the runtime ``Agent`` used to inspect Team construction
+    without spawning a the runtime agent (which would try to import vendor
     SDKs and resolve API keys at instantiation time)."""
 
     def __init__(self, *, name: str, role: str | None, model_id: str):
         self.name = name
         self.role = role
         self.model_id = model_id
-        # Agno's Team reads ``.model`` to surface as the leader's model;
+        # the runtime's Team reads ``.model`` to surface as the leader's model;
         # we stamp a recognisable sentinel so assertions can match.
         self.model = f"<stub-model:{model_id}>"
 
@@ -138,11 +138,11 @@ class _RecordedAgent:
 
 class _StubTeam:
     """Records construction args + intercepts ``arun`` so we can verify
-    the team's shape without invoking real Agno team routing.
+    the team's shape without invoking the runtime team routing.
 
     Crucially: an ``arun(prompt)`` call is dispatched to a chosen
     member based on a simple keyword match against the member's role —
-    a stand-in for what Agno's TeamMode.coordinate would do natively
+    a stand-in for what the runtime's TeamMode.coordinate would do natively
     (single-best-member delegation; the real coordinate mode would
     fan out to multiple members when a prompt has parallel sub-tasks,
     but the keyword-pick stub keeps the test deterministic). The chosen
@@ -170,7 +170,7 @@ class _StubTeam:
         """Naive role-based picker — looks for a routing override
         keyword in the prompt, falls back to the leader (members[0]).
 
-        Mimics Agno's TeamMode.coordinate at the surface level: the
+        Mimics the runtime's TeamMode.coordinate at the surface level: the
         test prompt "help me refactor this Python code" matches the
         ``coding`` override and dispatches to the coding specialist.
         """
@@ -187,7 +187,7 @@ class _FakeRunOutput:
     def __init__(self, content: str, chosen_name: str):
         self.content = content
         self.chosen_name = chosen_name
-        # Agno's RunOutput surface that TeamRouterProvider reads.
+        # the runtime's RunOutput surface that TeamRouterProvider reads.
         self.tools = []
 
         class _Metrics:
@@ -198,9 +198,9 @@ class _FakeRunOutput:
 
 def _install_stubs(provider, *, catalog: list[dict[str, Any]] | None = None,
                    on_team: Any = None) -> dict[str, Any]:
-    """Patch ``TeamRouterProvider._build_agent_for`` and the Agno
+    """Patch ``TeamRouterProvider._build_agent_for`` and the runtime
     ``Team`` import path inside ``_ensure_runtime`` so the test never
-    talks to a real Agno class.
+    talks to a the runtime class.
 
     Returns a recorder dict with the constructed leader + members and
     the stubbed Team instance so the test can assert against them.
@@ -257,28 +257,29 @@ def _install_stubs(provider, *, catalog: list[dict[str, Any]] | None = None,
             framework_of(entry.runtime_id) in SUBSCRIPTION_CLI_FRAMEWORKS
         )
 
-        # For subscription-CLI leaders (claude-cli / codex-cli), scan
-        # for an api-based row whose Model would serve as team.model.
-        # The real provider builds the Model via NativeProvider; the stub
-        # just records a sentinel reference.
+        # For subscription-CLI leaders (claude-cli / codex-cli), pick a
+        # ``team.model`` for the coordinator turn. The real provider's
+        # ``_choose_routing_model`` prefers api-based and falls back to
+        # claude-cli (via ClaudeSdkRoutingModel); we route through it
+        # here so the stub mirrors the dispatcher's choice precisely.
         team_model = None
         if is_subscription_leader:
-            api_rows = [
-                e for e in llm_catalog
-                if framework_of(e.runtime_id) == FRAMEWORK_API_BASED
-            ]
-            if not api_rows:
-                # No api-based fallback → single-external-agent path.
+            if not members_catalog:
+                # Single-model subscription-CLI catalog → single-external-
+                # agent fallback (team-of-one is degenerate).
                 stub = fake_build_agent_for(
                     entry, name=f"single:{entry.runtime_id}", role=None,
                 )
                 provider._session_runtime[session_id] = stub
                 return stub
-            routing_entry = api_rows[0]
-            routing_agent = fake_build_agent_for(
-                routing_entry, name=f"routing:{routing_entry.runtime_id}", role=None,
-            )
-            team_model = routing_agent.model
+            team_model = provider._choose_routing_model(llm_catalog)
+            if team_model is None:
+                # No model in the catalog at all → single-external-agent.
+                stub = fake_build_agent_for(
+                    entry, name=f"single:{entry.runtime_id}", role=None,
+                )
+                provider._session_runtime[session_id] = stub
+                return stub
             recorded["team_model"] = team_model
 
         if not members_catalog:
@@ -345,13 +346,13 @@ async def t_role_blurb(ctx: TestContext) -> None:
 @test("team_router", "Team built with instructions= not system_message= so <team_members> survives")
 async def t_team_uses_instructions(ctx: TestContext) -> None:
     """Regression: passing our OpenAgent system prompt as
-    ``system_message`` made Agno's ``get_system_message`` return early
-    (agno/team/_messages.py:393) and skip building the ``<team_members>``
+    ``system_message`` made the runtime's ``get_system_message`` return early
+    (src/core/_runner/team/_messages.py) and skip building the ``<team_members>``
     block AND the mode-specific "use only the member id" instructions.
     The leader then saw our "delegate by default" exhortation without
     ever being shown the actual member list, and answered directly
     instead of dispatching. Wiring the prompt through ``instructions=``
-    preserves Agno's auto-injected team context while still appending
+    preserves the runtime's auto-injected team context while still appending
     our content.
 
     Source-level lock-down: ``Team(..., instructions=[system] if system else None, ...)``
@@ -363,11 +364,11 @@ async def t_team_uses_instructions(ctx: TestContext) -> None:
 
     src = inspect.getsource(TeamRouterProvider._ensure_runtime)
     assert "instructions=[system] if system else None" in src, (
-        "Team must receive our prompt via instructions= so Agno's default "
+        "Team must receive our prompt via instructions= so the runtime's default "
         "team-context builder runs and emits the <team_members> block."
     )
     assert "system_message=system" not in src, (
-        "Passing system_message= makes Agno skip <team_members> and the "
+        "Passing system_message= makes the runtime skip <team_members> and the "
         "mode-specific delegation instructions — leader can't dispatch."
     )
 
@@ -375,7 +376,7 @@ async def t_team_uses_instructions(ctx: TestContext) -> None:
 @test("team_router", "end-to-end: leader's system prompt contains every specialist's clean id")
 async def t_real_team_leader_prompt_contains_member_ids(ctx: TestContext) -> None:
     """End-to-end regression for the live my-agent bug — the leader
-    must see EACH specialist's clean id in the same prompt where Agno
+    must see EACH specialist's clean id in the same prompt where the runtime
     instructs it to ``Use only the member's ID — do not prefix it with
     the team ID.`` If the id appears with the colon-stripped form (e.g.
     ``claude-clianthropicclaude-opus-4.7``) the leader will fail to
@@ -456,14 +457,14 @@ async def t_real_team_members_block_e2e(ctx: TestContext) -> None:
            into stripped ids that no longer matched the system-message
            name — leader saw two identifiers and hallucinated placeholders.
 
-    Bug 2: passing our OpenAgent prompt as ``system_message`` made Agno's
+    Bug 2: passing our OpenAgent prompt as ``system_message`` made the runtime's
            ``get_system_message`` skip building ``<team_members>`` and
            the route-mode delegation instructions — leader had no idea
            which members existed.
 
     This test bypasses ``_install_stubs`` and exercises the real
-    ``_ensure_runtime`` path: constructs a real ``Agno.team.Team``,
-    renders the actual ``<team_members>`` block via Agno's own
+    ``_ensure_runtime`` path: constructs a real runtime ``Team``,
+    renders the actual ``<team_members>`` block via the runtime's own
     ``get_members_system_message_content``, and verifies what the leader
     LLM would see.
     """
@@ -496,18 +497,18 @@ async def t_real_team_members_block_e2e(ctx: TestContext) -> None:
     )
 
     assert isinstance(team, Team), (
-        "Expected real Agno Team; got " + type(team).__name__
+        "Expected real the runtime Team; got " + type(team).__name__
     )
 
-    # Bug 2 fix: system_message stays unset so Agno builds the default
+    # Bug 2 fix: system_message stays unset so the runtime builds the default
     # team prompt; our content rides in via instructions.
     assert team.system_message is None, (
-        "team.system_message must be None — setting it makes Agno's "
+        "team.system_message must be None — setting it makes the runtime's "
         "get_system_message return early and skip <team_members>."
     )
     assert team.instructions == ["OPENAGENT_PROMPT_MARKER"], (
         "Our OpenAgent system prompt must be threaded through "
-        "Team.instructions so Agno's default prompt builder appends it "
+        "Team.instructions so the runtime's default prompt builder appends it "
         "to the team-context block."
     )
 
@@ -544,7 +545,7 @@ async def t_real_team_full_context_e2e(ctx: TestContext) -> None:
     """End-to-end render of the COMPLETE prompt-prefix the leader LLM
     sees — opening + ``<team_members>`` + ``<how_to_respond>`` mode
     instructions. This is what got skipped when we previously passed
-    ``system_message=`` (Agno returned the message early and the
+    ``system_message=`` (the runtime returned the message early and the
     ``<how_to_respond>`` block — "Use only the member's ID, do not
     prefix it with the team ID" — never reached the leader, so the
     leader had no instructions on the delegation tool format).
@@ -611,7 +612,7 @@ async def t_real_team_every_agent_carries_framework_prompt_e2e(
     persona prompt MUST be injected into every agent the user can reach.
     The Team coordinator gets it via ``team.instructions``; that's NOT
     enough — when the coordinator delegates to a member via
-    ``delegate_task_to_member``, the member is run as a standalone Agno
+    ``delegate_task_to_member``, the member is run as a standalone the runtime
     Agent whose system message comes from its OWN ``system_message=``,
     not from the Team's ``instructions=``.
 
@@ -624,17 +625,17 @@ async def t_real_team_every_agent_carries_framework_prompt_e2e(
     prompt" guarantee for everyone except the coordinator.
 
     The fix threads ``system=`` through ``_build_agent_for`` and stamps
-    it as ``system_message=`` on each Agno Agent (and as
+    it as ``system_message=`` on each the runtime Agent (and as
     ``system_prompt`` / ``developer_instructions`` on the
     subscription-CLI agents). Members additionally get a short
     ``── Role ──`` suffix telling them which specialty they own —
-    mirroring the existing ``agno_provider.py`` Team pattern.
+    mirroring the existing ``native_provider.py`` Team pattern.
 
     Setup mirrors the user's live config: api-based leader, api-based
     specialist, claude-cli specialist — so we cover both flavors of
     member in one test.
     """
-    from src.core._runner.agent import Agent as AgnoAgent
+    from src.core._runner.agent import Agent as RuntimeAgent
     from src.core._runner.team import Team
 
     from src.models.claude_agent import ClaudeBackedAgent
@@ -680,7 +681,7 @@ async def t_real_team_every_agent_carries_framework_prompt_e2e(
     # pre-existing wiring and remains correct — see t_team_uses_instructions).
     assert team.instructions == [composed_system], (
         "Coordinator must keep receiving the system prompt via "
-        "Team.instructions= so Agno's default team-context builder runs "
+        "Team.instructions= so the runtime's default team-context builder runs "
         "and emits <team_members>/<how_to_respond>. Got: "
         f"{team.instructions!r}"
     )
@@ -728,7 +729,7 @@ async def t_real_team_every_agent_carries_framework_prompt_e2e(
 
     # Cross-check the claude-cli specialist specifically: its system
     # prompt lives in the SDK options (``system_prompt``), not on an
-    # Agno ``system_message`` slot. The fix forwards ``system=`` to
+    # runtime ``system_message`` slot. The fix forwards ``system=`` to
     # ``build_claude_backed_agent`` which lifts it into the SDK options.
     claude_specialists = [
         m for m in specialists
@@ -741,7 +742,7 @@ async def t_real_team_every_agent_carries_framework_prompt_e2e(
     claude_sys = claude_specialists[0]._sdk_options.get("system_prompt")
     assert claude_sys and framework_marker in claude_sys, (
         f"ClaudeBackedAgent's SDK system_prompt must carry the framework "
-        f"prompt — the SDK will not see Agno's system_message slot. Got: "
+        f"prompt — the SDK will not see the runtime's system_message slot. Got: "
         f"{claude_sys!r}"
     )
     assert persona_marker in claude_sys, (
@@ -749,10 +750,10 @@ async def t_real_team_every_agent_carries_framework_prompt_e2e(
         f"Got: {claude_sys!r}"
     )
 
-    # Sanity: api-based members are real Agno Agents (not BackedAgents).
+    # Sanity: api-based members are the runtime Agents (not BackedAgents).
     api_specialists = [
         m for m in specialists
-        if isinstance(m, AgnoAgent) and not isinstance(m, ClaudeBackedAgent)
+        if isinstance(m, RuntimeAgent) and not isinstance(m, ClaudeBackedAgent)
     ]
     assert api_specialists, "Expected at least one api-based specialist."
 
@@ -907,10 +908,10 @@ async def t_compose_member_system_unit(ctx: TestContext) -> None:
 
 def _resolve_member_system_text(member: Any) -> str | None:
     """Extract the resolved system-prompt text for any Team member
-    flavor (Agno Agent / ClaudeBackedAgent / CodexBackedAgent), so the
+    flavor (the runtime Agent / ClaudeBackedAgent / CodexBackedAgent), so the
     vision §15 assertions can be flavor-agnostic.
 
-    Agno Agent  → ``member.system_message`` (set directly).
+    the runtime Agent  → ``member.system_message`` (set directly).
     ClaudeBackedAgent → ``member._sdk_options["system_prompt"]``.
     CodexBackedAgent  → ``member._sdk_options["developer_instructions"]``.
     """
@@ -983,10 +984,10 @@ async def t_real_team_members_mixed_catalog_e2e(ctx: TestContext) -> None:
     )
 
 
-@test("team_router", "_member_identifier produces names whose Agno id matches byte-for-byte")
+@test("team_router", "_member_identifier produces names whose the runtime id matches byte-for-byte")
 async def t_member_identifier_url_safe(ctx: TestContext) -> None:
     """Regression: in a live my-agent session a deepseek leader tried to
-    delegate to ``coding-agent-id-placeholder`` because Agno's
+    delegate to ``coding-agent-id-placeholder`` because the runtime's
     ``get_member_id`` ran the colon-laden member name through
     ``url_safe_string`` and produced a stripped id that no longer matched
     the human-readable name shown in the team system message. The leader
@@ -994,7 +995,7 @@ async def t_member_identifier_url_safe(ctx: TestContext) -> None:
     a placeholder when picking one.
 
     Fix: build member names with dashes (which ``url_safe_string``
-    preserves) so the id Agno generates equals the name we set.
+    preserves) so the id the runtime generates equals the name we set.
     """
     from src.core._runner.utils.string import url_safe_string
     from src.models.dispatcher import _member_identifier
@@ -1009,7 +1010,7 @@ async def t_member_identifier_url_safe(ctx: TestContext) -> None:
         name = _member_identifier(rid)
         assert ":" not in name, f"colons must be replaced: {name!r}"
         assert url_safe_string(name) == name, (
-            f"Agno's url_safe_string transforms {name!r} → "
+            f"the runtime's url_safe_string transforms {name!r} → "
             f"{url_safe_string(name)!r}; the leader will see divergent "
             f"id/name and hallucinate placeholder delegations."
         )
@@ -1093,7 +1094,7 @@ async def t_single_agent_fallback(ctx: TestContext) -> None:
 @test("team_router", "claude-cli row joins Team as a specialist member")
 async def t_claude_cli_member(ctx: TestContext) -> None:
     """After the ``ClaudeBackedAgent`` refactor, claude-cli rows ARE
-    eligible for Team membership — they subclass ``agno.agent.Agent``
+    eligible for Team membership — they subclass ``runtime ``Agent````
     and pass Team's isinstance(Agent) checks. With an api-based entry
     leader, a claude-cli row in the catalog must appear as a specialist
     member so the leader can delegate to it.
@@ -1133,7 +1134,7 @@ async def t_claude_cli_member(ctx: TestContext) -> None:
 async def t_claude_cli_leader(ctx: TestContext) -> None:
     """When the entry is claude-cli, the ``ClaudeBackedAgent`` sits as
     ``members[0]`` (so the routing model can delegate to it). But
-    Agno's Team invokes ``team.model`` for the routing-classifier
+    the runtime's Team invokes ``team.model`` for the routing-classifier
     call, and ClaudeBackedAgent's placeholder ``_NullModel`` can't
     drive that — so TeamRouterProvider picks the cheapest enabled
     api-based model as ``team.model``.
@@ -1206,6 +1207,57 @@ async def t_claude_cli_only_fallback(ctx: TestContext) -> None:
     assert "claude-sonnet-4-6" in runtime.model_id
 
 
+@test("team_router", "multi claude-cli catalog → Team built with ClaudeSdkRoutingModel as team.model")
+async def t_multi_claude_cli_team_with_sdk_routing(ctx: TestContext) -> None:
+    """When the catalog has MULTIPLE claude-cli rows (e.g. sonnet leader +
+    opus member) and no api-based row, the dispatcher should still build
+    a Team — using a ``ClaudeSdkRoutingModel`` wrapping the cheapest
+    claude-cli model as ``team.model``. Otherwise the leader couldn't
+    delegate to the member, and the user's vision §3 setup ("any
+    registered model can serve as the router") would silently fail.
+    """
+    from src.models.claude_routing_model import ClaudeSdkRoutingModel
+    from src.models.dispatcher import TeamRouterProvider
+
+    providers: list[dict[str, Any]] = [
+        {
+            "id": 1, "name": "anthropic", "framework": "claude-cli",
+            "api_key": None, "enabled": True,
+            "models": [
+                {"id": 1, "model": "claude-sonnet-4-6", "enabled": True,
+                 "is_classifier": True, "tier_hint": "best for simple reasoning"},
+                {"id": 2, "model": "claude-opus-4-7", "enabled": True,
+                 "tier_hint": "best for coding, complex reasoning"},
+            ],
+        },
+    ]
+    provider = TeamRouterProvider(
+        entry_runtime_id="claude-cli:anthropic:claude-sonnet-4-6",
+        providers_config=providers,
+    )
+    recorded = _install_stubs(provider)
+
+    runtime = provider._ensure_runtime("sess-multi-claude", system="X")
+
+    assert recorded["team"] is not None, (
+        "multi-claude-cli catalog should build a Team — the SDK routing "
+        "model handles the coordinator turn so opus can be delegated to"
+    )
+    team_model = recorded["team_model"]
+    assert isinstance(team_model, ClaudeSdkRoutingModel), (
+        f"team.model should be ClaudeSdkRoutingModel; got {type(team_model).__name__}"
+    )
+    assert team_model.provider == "claude-cli"
+    # The cheapest model is sonnet (tier_hint "best for simple reasoning"
+    # scores cheaper than opus's "complex reasoning" hint).
+    assert "claude-sonnet-4-6" in (team_model.sdk_model_id or "")
+    # Members include opus (the leader sonnet is also added as members[0]).
+    member_names = [m.name for m in recorded["team"].members]
+    assert any("claude-opus-4-7" in n for n in member_names), (
+        f"opus must be in the team members; got {member_names}"
+    )
+
+
 @test("team_router", "leader delegates coding task to coding specialist, response flows back")
 async def t_coding_delegation_flow(ctx: TestContext) -> None:
     """End-to-end model-switching scenario:
@@ -1222,7 +1274,7 @@ async def t_coding_delegation_flow(ctx: TestContext) -> None:
     a heavier specialist handles the actual coding turn, then control
     returns to the leader for the next turn.
 
-    Note: with coordinate-mode the real Agno leader MAY fire multiple
+    Note: with coordinate-mode the the runtime leader MAY fire multiple
     delegations per turn — the stub here picks a single best member
     by keyword for determinism, but the assertion is "the coding
     specialist's output is part of the reply", not "exactly one
@@ -1280,7 +1332,7 @@ async def t_coding_delegation_flow(ctx: TestContext) -> None:
 
     # Outer ModelResponse.model is the entry runtime_id — the leader's
     # identity. The fact that a specialist actually handled the turn
-    # lives in the trace / Agno's TeamRunEvent, not in our coarse
+    # lives in the trace / the runtime's TeamRunEvent, not in our coarse
     # ModelResponse. This is intentional: the chat UI's model badge
     # tracks the SESSION's entry model, not per-turn specialist swaps.
     assert resp2.model == "openai:gpt-4o-mini"
@@ -1336,7 +1388,7 @@ async def t_effective_model_badge_after_delegation(ctx: TestContext) -> None:
     assert badge_no_delegate == "openai:gpt-4o-mini", badge_no_delegate
 
     # Sanity: _extract_delegated_member_id pulls member_id from a typical
-    # Agno tool-call shape (used by the stream/collect helpers).
+    # the runtime tool-call shape (used by the stream/collect helpers).
     class _FakeToolCall:
         tool_name = "delegate_task_to_member"
         tool_args = {"member_id": coding_member_id, "task": "..."}
@@ -1395,7 +1447,7 @@ async def t_rebuild_invalidates_cache(ctx: TestContext) -> None:
 def _catalog_with_codex_cli() -> list[dict[str, Any]]:
     """Mixed catalog — one api-based + one codex-cli row. The codex-cli
     row joins the Team via ``CodexBackedAgent`` (subclasses
-    ``agno.agent.Agent``), so it passes Agno's isinstance check just
+    ``runtime ``Agent````), so it passes the runtime's isinstance check just
     like the claude-cli flavor.
     """
     return [
@@ -1423,7 +1475,7 @@ def _catalog_with_codex_cli() -> list[dict[str, Any]]:
 @test("team_router", "codex-cli row joins Team as a specialist member")
 async def t_codex_cli_member(ctx: TestContext) -> None:
     """A codex-cli row participates in Team membership via
-    ``CodexBackedAgent`` (an ``agno.agent.Agent`` subclass). With an
+    ``CodexBackedAgent`` (an ``runtime ``Agent```` subclass). With an
     api-based entry leader, the codex-cli row appears as a specialist
     member so the leader can delegate to it.
     """
@@ -1461,7 +1513,7 @@ async def t_codex_cli_leader(ctx: TestContext) -> None:
     ``members[0]``. ``team.model`` falls back to the cheapest enabled
     api-based model (just like the claude-cli leader path) because
     ``CodexBackedAgent``'s placeholder ``_NullModel`` can't drive
-    Agno's routing classifier.
+    the runtime's routing classifier.
     """
     from src.models.dispatcher import TeamRouterProvider
 
@@ -1540,8 +1592,8 @@ async def t_codex_cli_only_fallback(ctx: TestContext) -> None:
 async def t_team_mode_coordinate(ctx: TestContext) -> None:
     """The Team is built in ``coordinate`` mode, not ``route``. This is
     what lets the leader fire MULTIPLE ``delegate_task_to_member`` tool
-    calls in a single turn — Agno gathers them via
-    ``asyncio.gather`` (see ``agno.models.base.arun_function_calls``),
+    calls in a single turn — the runtime gathers them via
+    ``asyncio.gather`` (see ``the runtime's tool-loop``),
     so independent sub-tasks run in parallel.
 
     Without coordinate mode, the leader is capped at one specialist per
@@ -1564,7 +1616,7 @@ async def t_team_mode_coordinate(ctx: TestContext) -> None:
         f"multiple members per turn; got {team.mode!r}"
     )
     # Coordinate mode also implies these booleans — see
-    # ``agno/team/_init.py`` normalization.
+    # ``src/core/_runner/team/_init.py`` normalization.
     assert team.respond_directly is False, (
         "coordinate mode requires respond_directly=False so the leader "
         "synthesizes member outputs instead of returning them verbatim"
@@ -1590,7 +1642,7 @@ async def t_delegation_memo_clears_between_turns(ctx: TestContext) -> None:
     from each stored run's data — never sticky.
 
     Fix: each ``generate``/``stream`` clears the per-session memo
-    before kicking off the Agno run. If a delegation fires in this
+    before kicking off the runtime run. If a delegation fires in this
     turn, it's recorded; otherwise the badge falls back to the leader.
     """
     from src.models.dispatcher import TeamRouterProvider
@@ -1630,11 +1682,11 @@ async def t_delegation_memo_clears_between_turns(ctx: TestContext) -> None:
 async def t_team_has_tool_search_tools(ctx: TestContext) -> None:
     """Bug: live console logged ``Function tool_search_list_servers not
     found`` because tool-search was attached only to individual member
-    Agents, never to the Team itself. Agno's Team.model (the routing
+    Agents, never to the Team itself. the runtime's Team.model (the routing
     classifier) saw zero callable functions other than
     ``delegate_task_to_member`` — yet the system prompt taught the
     model that tool_search_* names are directly callable, so the
-    leader hallucinated those calls and Agno's function-call lookup
+    leader hallucinated those calls and the runtime's function-call lookup
     failed.
 
     Fix: attach the tool-search toolkit to ``Team(tools=...)`` so the

@@ -171,7 +171,7 @@ async def handle_list_db(request: web.Request) -> web.Response:
 
     Query params:
       - ``provider_id`` (int) — filter to a single provider row
-      - ``framework`` (``agno`` / ``claude-cli``) — filter by framework
+      - ``framework`` (``api-based`` / ``claude-cli``) — filter by framework
       - ``enabled_only`` (bool) — skip disabled model rows
 
     When Piper is importable AND no kind='tts' row exists yet, a

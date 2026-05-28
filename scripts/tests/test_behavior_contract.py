@@ -77,14 +77,14 @@ async def t_provider_triple(ctx: TestContext) -> None:
 async def t_dual_framework_rows(ctx: TestContext) -> None:
     db, path = await _tmp_db(ctx, "dual")
     try:
-        agno_pid = await db.upsert_provider(
+        api_pid = await db.upsert_provider(
             name="anthropic", framework="api-based", api_key="sk-ant",
         )
         cli_pid = await db.upsert_provider(
             name="anthropic", framework="claude-cli",
         )
-        assert agno_pid != cli_pid
-        await db.upsert_model(provider_id=agno_pid, model="claude-sonnet-4-6")
+        assert api_pid != cli_pid
+        await db.upsert_model(provider_id=api_pid, model="claude-sonnet-4-6")
         await db.upsert_model(provider_id=cli_pid, model="claude-sonnet-4-6")
         # Both rows live side by side: same (provider_name, model), different
         # framework. The composite runtime_id distinguishes them.
@@ -142,7 +142,7 @@ async def t_fk_cascade_deletes_models(ctx: TestContext) -> None:
 
 @test("contract", "cross-framework pin is accepted (no framework lock post-v0.14)")
 async def t_cross_framework_pin_accepted(ctx: TestContext) -> None:
-    """v0.14+: with history unified in Agno's ``agno_sessions`` across
+    """v0.14+: with history unified in the runtime's ``sessions`` across
     every framework, the per-session framework lock is gone. Any
     enabled runtime_id can be pinned to any session at any time.
     """
@@ -180,10 +180,10 @@ async def t_pin_overwrite(ctx: TestContext) -> None:
         )
         await db.upsert_model(provider_id=pid, model="gpt-4o-mini")
         await db.upsert_model(provider_id=pid, model="gpt-4o")
-        await db.pin_session_model("sess-agno", "openai:gpt-4o-mini")
-        assert await db.get_session_pin("sess-agno") == "openai:gpt-4o-mini"
-        await db.pin_session_model("sess-agno", "openai:gpt-4o")
-        assert await db.get_session_pin("sess-agno") == "openai:gpt-4o"
+        await db.pin_session_model("sess-api", "openai:gpt-4o-mini")
+        assert await db.get_session_pin("sess-api") == "openai:gpt-4o-mini"
+        await db.pin_session_model("sess-api", "openai:gpt-4o")
+        assert await db.get_session_pin("sess-api") == "openai:gpt-4o"
     finally:
         await db.close()
         _cleanup(path)
@@ -228,7 +228,7 @@ async def t_unpin_drops_pin(ctx: TestContext) -> None:
         _cleanup(path)
 
 
-@test("contract", "runtime_id format — agno = provider:model, claude-cli = claude-cli:provider:model")
+@test("contract", "runtime_id format — api-based = provider:model, claude-cli = claude-cli:provider:model")
 async def t_runtime_id_format(ctx: TestContext) -> None:
     from src.models.catalog import build_runtime_model_id
 
@@ -237,7 +237,7 @@ async def t_runtime_id_format(ctx: TestContext) -> None:
         build_runtime_model_id("anthropic", "claude-sonnet-4-6", "claude-cli")
         == "claude-cli:anthropic:claude-sonnet-4-6"
     )
-    # Agno anthropic uses the 2-part form (no claude-cli prefix).
+    # the runtime anthropic uses the 2-part form (no claude-cli prefix).
     assert (
         build_runtime_model_id("anthropic", "claude-sonnet-4-6", "api-based")
         == "anthropic:claude-sonnet-4-6"

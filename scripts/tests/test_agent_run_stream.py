@@ -42,7 +42,7 @@ class _FakeModel:
         model_name: str = "fake/test-model",
     ):
         # ``self.model`` is the attribute real providers set
-        # (claude_cli, agno) and the new ``BaseModel.effective_model_id``
+        # (claude_cli, api-based) and the new ``BaseModel.effective_model_id``
         # default reads. We mirror it on ``self.model_name`` only for
         # backwards-compatibility with older test code that referenced
         # the legacy attribute name.

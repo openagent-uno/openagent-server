@@ -1,6 +1,6 @@
 """NativeProvider.stream — hermetic zero-delta fallback coverage.
 
-Friday's stuck Telegram turns were hitting an Agno streamed turn that
+Friday's stuck Telegram turns were hitting a runtime streamed turn that
 finished with zero ``RunContentEvent`` deltas. The provider now falls back to
 its own ``generate()`` before control returns to Agent.run_stream, which keeps
 the reply on the provider side of the cancellation-poison boundary.
@@ -12,7 +12,7 @@ from typing import Any
 from ._framework import TestContext, test
 
 
-@test("agno_stream", "stream zero-delta fallback yields generate() content")
+@test("runtime_stream", "stream zero-delta fallback yields generate() content")
 async def t_agno_stream_zero_delta_fallback(_ctx: TestContext) -> None:
     from src.models.native_provider import NativeProvider
     from src.models.base import ModelResponse
@@ -59,10 +59,10 @@ async def t_agno_stream_zero_delta_fallback(_ctx: TestContext) -> None:
     async for chunk in provider.stream(
         [{"role": "user", "content": "hi"}],
         system="system-prompt",
-        session_id="agno-zero-delta",
+        session_id="runtime-zero-delta",
     ):
         yielded.append(chunk)
 
     assert yielded == ["Recovered from zero-delta stream"], yielded
     assert len(generate_calls) == 1, generate_calls
-    assert generate_calls[0]["session_id"] == "agno-zero-delta", generate_calls
+    assert generate_calls[0]["session_id"] == "runtime-zero-delta", generate_calls

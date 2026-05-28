@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import base64
 import json
@@ -30,6 +32,7 @@ from src.core._runner.utils.gemini import (
 from src.core._runner.utils.log import log_debug, log_error, log_info, log_warning
 from src.core._runner.utils.tokens import count_schema_tokens, count_text_tokens, count_tool_tokens
 
+_GENAI_IMPORT_ERROR: Optional[str] = None
 try:
     from google import genai
     from google.genai import Client as GeminiClient
@@ -57,15 +60,38 @@ try:
         File as GeminiFile,
     )
     from google.oauth2.service_account import Credentials
-except ImportError:
-    raise ImportError(
-        "`google-genai` not installed or not at the latest version. Please install it using `pip install -U google-genai`"
+except ImportError as _e:
+    # google-genai is optional — defer the failure until someone actually
+    # tries to instantiate the model. Module-level raises break the
+    # smoke-import test on hosts that haven't installed the SDK.
+    _GENAI_IMPORT_ERROR = (
+        "`google-genai` not installed or not at the latest version. "
+        "Please install it using `pip install -U google-genai` "
+        f"(original error: {_e})"
     )
+    genai = None  # type: ignore[assignment]
+    GeminiClient = None  # type: ignore[assignment,misc]
+    ClientError = ServerError = Exception  # type: ignore[assignment,misc]
+    Content = DynamicRetrievalConfig = FileSearch = None  # type: ignore[assignment,misc]
+    FunctionCallingConfigMode = GenerateContentConfig = None  # type: ignore[assignment,misc]
+    GenerateContentResponse = GenerateContentResponseUsageMetadata = None  # type: ignore[assignment,misc]
+    GoogleSearch = GoogleSearchRetrieval = GroundingMetadata = None  # type: ignore[assignment,misc]
+    Operation = Part = Retrieval = ThinkingConfig = Tool = None  # type: ignore[assignment,misc]
+    UrlContext = VertexAISearch = GeminiFile = Credentials = None  # type: ignore[assignment,misc]
 
 try:
     from google.genai.types import ToolParallelAiSearch
 except ImportError:
     ToolParallelAiSearch = None
+
+
+def _require_genai() -> None:
+    """Raise a descriptive ImportError the first time we actually need
+    google-genai on hosts where it isn't installed. Lets the module import
+    cleanly for tooling (smoke test, autocompletion, etc.) but still
+    surfaces a clear error when the Gemini provider is used."""
+    if _GENAI_IMPORT_ERROR is not None:
+        raise ImportError(_GENAI_IMPORT_ERROR)
 
 
 @dataclass
@@ -166,6 +192,7 @@ class Gemini(Model):
         Returns:
             GeminiClient: The GeminiClient client.
         """
+        _require_genai()
         if self.client:
             return self.client
         client_params: Dict[str, Any] = {}
@@ -1489,7 +1516,7 @@ class Gemini(Model):
 
     def _get_metrics(self, response_usage: GenerateContentResponseUsageMetadata) -> MessageMetrics:
         """
-        Parse the given Google Gemini usage into an Agno MessageMetrics object.
+        Parse the given Google Gemini usage into a runtime MessageMetrics object.
 
         Args:
             response_usage: Usage data from Google Gemini
