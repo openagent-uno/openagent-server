@@ -7,8 +7,26 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import time
 from pathlib import Path
+
+# Suppress noisy ``tokenizers`` parallelism warning AND prevent
+# multiprocessing initialisation in tqdm — both are triggered by
+# huggingface_hub / faster_whisper during the eager Whisper model
+# prefetch on agent boot. tqdm's default lock factory is
+# ``multiprocessing.RLock``, which forks the resource_tracker daemon
+# and creates a process-lifetime POSIX semaphore (``mp-…``) that the
+# tracker then reports as "leaked" on process exit. Pinning tqdm to a
+# threading.RLock avoids the multiprocessing init entirely while
+# preserving per-process progress-bar ordering. Must run BEFORE any
+# downstream import of ``tqdm`` / ``huggingface_hub`` / ``faster_whisper``.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+try:
+    import tqdm as _tqdm  # noqa: F401
+    _tqdm.tqdm.set_lock(threading.RLock())
+except ImportError:
+    pass
 
 import click
 from rich.console import Console
@@ -155,13 +173,13 @@ def _startup_cleanup() -> None:
         patch_ssl_for_frozen,
     )
 
-    # Must happen BEFORE the first ``import agno`` anywhere in the
-    # process. ``agno.tools.function`` does ``from importlib.metadata
+    # Must happen BEFORE the first ``import src.mcp._runtime.function``
+    # anywhere in the process. That module does ``from importlib.metadata
     # import version`` at module top, so we have to swap the function
     # on the importlib.metadata module before that import binds the
-    # name. ``openagent`` itself does not pull in agno at package-init
-    # time (verified), so running this here — before any provider
-    # registry loads — is early enough.
+    # name. The top-level ``src`` package does not pull in the runtime
+    # at init time (verified), so running this here — before any
+    # provider registry loads — is early enough.
     patch_importlib_metadata_for_frozen()
     # Must happen BEFORE any bridge or MCP opens an HTTPS connection.
     # Without this, discord.py (via aiohttp) fails inside the PyInstaller
@@ -220,6 +238,19 @@ def _global_default_paths() -> tuple[Path, Path, Path]:
 @click.pass_context
 def main(ctx, config: str, agent_dir: str | None, verbose: bool):
     """OpenAgent runtime CLI."""
+    # macOS launchd hands processes a 256 NOFILE soft limit; a
+    # multi-MCP agent (each MCP holds ~3 stdio pipes, plus WS
+    # clients, HTTP pools, SQLite, watchers) burns through that
+    # and crashes mid-frame on the next import or socket open.
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target = 65536 if hard == resource.RLIM_INFINITY else min(65536, hard)
+        if soft < target:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+    except Exception:
+        pass
+
     ctx.ensure_object(dict)
     ctx.obj["verbose"] = verbose
 
@@ -455,6 +486,14 @@ def mcp_server_cmd(name: str):
         from src.mcp.servers.workflow_manager.server import main as workflow_manager_main
         workflow_manager_main()
         return
+    if name == "media-gen":
+        from src.mcp.servers.media_gen.server import main as media_gen_main
+        media_gen_main()
+        return
+    if name == "memory-search":
+        from src.mcp.servers.memory_search.server import main as memory_search_main
+        memory_search_main()
+        return
 
     click.echo(f"Unknown MCP server: {name}", err=True)
     raise SystemExit(1)
@@ -626,7 +665,7 @@ def insights(ctx, days: int, top_sessions: int) -> None:
     finally:
         conn.close()
 
-    # ``usage_log`` only records *metered* turns (Agno). Subscription
+    # ``usage_log`` only records *metered* turns (API-based providers). Subscription
     # turns through claude-cli are reported via the per-turn event
     # ``claude_cli.usage_received`` and stored only in events.jsonl.
     # Parse those too so the insights view reflects the whole picture

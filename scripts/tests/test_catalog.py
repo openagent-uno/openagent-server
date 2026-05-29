@@ -75,7 +75,7 @@ async def t_claude_cli_zero_pricing(ctx: TestContext) -> None:
         assert p["input_cost_per_million"] == 0.0, f"{ref} leaked pricing: {p}"
         assert p["output_cost_per_million"] == 0.0, f"{ref} leaked pricing: {p}"
 
-    # claude-cli short-circuits even when the corresponding agno model
+    # claude-cli short-circuits even when the corresponding api-based model
     # has live pricing in OpenRouter — different framework, different
     # billing surface.
     assert compute_cost("claude-cli:anthropic:claude-sonnet-4-6", 10_000, 5_000) == 0.0

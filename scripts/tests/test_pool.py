@@ -2,10 +2,10 @@
 
 Verifies the pool builds the right set of specs from config, emits the
 correct Claude SDK schema, connects + detects dormant servers, and keeps
-the ``<server>_<tool>`` namespacing that Agno relies on.
+the ``<server>_<tool>`` namespacing that the runtime relies on.
 
 The ``connect_all`` test stashes the live pool into ``ctx.extras["pool"]``
-so downstream MCP / agno / router / gateway tests can reuse it.
+so downstream MCP / runtime / router / gateway tests can reuse it.
 """
 from __future__ import annotations
 
@@ -79,7 +79,7 @@ async def t_pool_namespacing(ctx: TestContext) -> None:
     if pool is None:
         raise TestSkip("requires pool fixture")
     seen_prefixes = set()
-    for tk in pool.agno_toolkits:
+    for tk in pool.runtime_toolkits:
         prefix = getattr(tk, "tool_name_prefix", None)
         if not prefix:
             continue

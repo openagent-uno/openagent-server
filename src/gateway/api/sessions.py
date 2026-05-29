@@ -55,7 +55,7 @@ async def handle_list(request):
         limit = 50
 
     gateway = request.app.get("gateway")
-    # DB-backed sessions (chat_sessions + agno_sessions merged).
+    # DB-backed sessions (chat_sessions + sessions merged).
     rows = await db.list_all_sessions(client_id, limit=limit)
 
     # Enrich with RAM queue/busy state from SessionManager. RAM is
@@ -102,15 +102,272 @@ async def handle_delete(request):
     })
 
 
+def _build_run_tool_index(
+    run_tools: list[dict],
+) -> tuple[dict[str, dict], dict[str, dict]]:
+    """Two lookup maps for ``runs[].tools[]`` entries used by the
+    rehydration walk: by tool_call_id (precise — survives duplicate
+    calls of the same name in one turn) and by tool_name (legacy
+    fallback for rows that didn't persist tool_call_id).
+
+    Each value is the runtime's native ``ToolExecution.to_dict()`` shape — the
+    universal app consumes that directly via ``ToolInfo`` and derives
+    phase locally from ``tool_call_error`` + ``result`` presence.
+    """
+    from src.models._tool_status import stored_tool_to_wire
+
+    by_id: dict[str, dict] = {}
+    by_name: dict[str, dict] = {}
+    for t in run_tools or []:
+        info = stored_tool_to_wire(t)
+        if info is None:
+            continue
+        tid = t.get("tool_call_id") or t.get("tool_use_id") or t.get("id") or ""
+        tn = t.get("tool_name") or t.get("name") or info.get("tool_name") or ""
+        if tid:
+            by_id[str(tid)] = info
+        if tn and tn not in by_name:
+            by_name[str(tn)] = info
+    return by_id, by_name
+
+
+def _attachments_from_images(imgs: list) -> list[dict]:
+    out: list[dict] = []
+    for img in imgs or []:
+        if not isinstance(img, dict):
+            continue
+        fp = img.get("filepath") or img.get("url") or ""
+        fn = (
+            img.get("filename")
+            or (fp.split("/")[-1] if "/" in fp else "")
+            or "image.png"
+        )
+        if fp:
+            out.append({"type": "image", "path": fp, "filename": fn})
+    return out
+
+
+def _expand_run_messages(
+    run: dict,
+    *,
+    timestamp: int,
+    msg_counter: list[int],
+    parent_model: str | None = None,
+    parent_images: list | None = None,
+    is_member_run: bool = False,
+) -> list[dict]:
+    """Expand ONE runtime run dict into the flat ``ChatMessage`` shape the
+    universal app expects, mirroring the live-wire event ordering.
+
+    Recurses into ``member_responses`` whenever the leader's
+    ``delegate_task_to_member`` tool call sits in the message stream —
+    so a specialist's nested tool calls and its delegated content
+    surface as their own tool chips + assistant messages with the
+    specialist's model attribution. This is what the live path
+    produces during streaming (specialist deltas via
+    ``IntermediateRunContentEvent``, tool calls via the unified
+    STATUS frame); the rehydration walk now matches that 1-for-1.
+
+    The recursive design follows the runtime's stored shape exactly — a
+    ``TeamRunOutput`` (with ``member_responses``) and a ``RunOutput``
+    (without) reuse the same expansion because a member's tool calls
+    live in its own ``runs[]``-equivalent ``tools`` list.
+    """
+    out: list[dict] = []
+    run_status = str(run.get("status", "")).lower()
+    if run_status in ("cancelled", "canceled"):
+        return out
+
+    run_tools = run.get("tools") or []
+    run_tools_by_id, run_tools_by_name = _build_run_tool_index(run_tools)
+
+    # Per-run model attribution. TeamRunOutput.to_dict() omits the
+    # top-level ``model`` for the leader when it's a Team route — the
+    # downstream UI then needs the entry_runtime_id we computed for the
+    # synthetic ModelResponse. ``parent_model`` lets a recursing caller
+    # override (used so member_responses inherit the team's leader
+    # badge only when their own ``model`` is absent).
+    run_model = run.get("model") or parent_model
+
+    # Index member responses by member_id AND by stored index so we can
+    # splice each delegation result inline. the runtime stores ``agent_id`` on
+    # the nested RunOutput (the RuntimeAgent's name → url_safe_string),
+    # which matches the ``member_id`` argument the leader passed to
+    # ``delegate_task_to_member``. ``member_idx_by_run_id`` plus the
+    # parallel ``agent_id`` map lets the splicing loop below find the
+    # right member by id or by stored child_run_id without re-scanning.
+    members_by_index: list[dict] = [
+        mr for mr in (run.get("member_responses") or [])
+        if isinstance(mr, dict)
+    ]
+    members_by_id: dict[str, int] = {}
+    members_by_run_id: dict[str, int] = {}
+    for idx, mr in enumerate(members_by_index):
+        aid = str(mr.get("agent_id") or mr.get("team_id") or "")
+        if aid:
+            members_by_id.setdefault(aid, idx)
+        rid = str(mr.get("run_id") or "")
+        if rid:
+            members_by_run_id.setdefault(rid, idx)
+
+    # Track which member responses we've already spliced so we can
+    # tack on any unmatched ones at the end (defensive against odd
+    # rows where the leader's messages don't carry the delegate tool
+    # results — happens with mid-turn cancellations).
+    spliced_member_ids: set[int] = set()
+
+    images_for_assistant = (
+        (parent_images if parent_images is not None else run.get("images")) or []
+    )
+
+    for m in run.get("messages") or []:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        if role == "system":
+            continue
+        if m.get("from_history"):
+            continue
+        # Member runs (nested under member_responses) carry the leader-
+        # generated task prompt as their first user message. That's an
+        # internal runtime artifact, not the human's input — surfacing it
+        # would make the synthetic prompt show up in the chat IN PLACE
+        # OF the user's actual message (which lives at the top-level
+        # team run). Skip it; the specialist's assistant content and
+        # tool calls still appear.
+        if is_member_run and role == "user":
+            continue
+
+        # Tool-result message — render as a tool chip with the same
+        # JSON envelope the live wire uses. Inline the nested member
+        # run (if any) right after, so the specialist's own tool
+        # calls + content appear in the correct slot in the
+        # transcript.
+        if role == "tool":
+            msg_counter[0] += 1
+            tcall_id = m.get("tool_call_id") or m.get("tool_use_id") or ""
+            tname = m.get("name") or m.get("tool_name") or ""
+            tool_info: dict | None = None
+            if tcall_id:
+                tool_info = run_tools_by_id.get(str(tcall_id))
+            if tool_info is None and tname:
+                tool_info = run_tools_by_name.get(str(tname))
+            entry: dict = {
+                "id": f"run-msg-{msg_counter[0]}",
+                "role": "tool",
+                "text": content,
+                "timestamp": timestamp,
+            }
+            if tool_info:
+                entry["toolInfo"] = tool_info
+            out.append(entry)
+
+            # If this tool result came from a delegate_task_to_member
+            # call, splice the matching member_responses entry inline.
+            # Match by args.member_id → tools[].child_run_id → next
+            # un-spliced member (in stored order, for legacy rows).
+            if (
+                tool_info
+                and tool_info.get("tool_name") == "delegate_task_to_member"
+            ):
+                member_idx: int | None = None
+                params = tool_info.get("tool_args") or {}
+                member_id_arg = (
+                    str(params.get("member_id") or "")
+                    if isinstance(params, dict) else ""
+                )
+                if member_id_arg:
+                    member_idx = members_by_id.get(member_id_arg)
+                if member_idx is None and tcall_id:
+                    matching_tool = next(
+                        (t for t in run_tools
+                         if str(t.get("tool_call_id")
+                                or t.get("tool_use_id") or "") == str(tcall_id)),
+                        None,
+                    )
+                    if matching_tool:
+                        child_rid = str(matching_tool.get("child_run_id") or "")
+                        if child_rid:
+                            member_idx = members_by_run_id.get(child_rid)
+                if member_idx is None:
+                    member_idx = next(
+                        (i for i in range(len(members_by_index))
+                         if i not in spliced_member_ids),
+                        None,
+                    )
+
+                if member_idx is not None:
+                    spliced_member_ids.add(member_idx)
+                    out.extend(_expand_run_messages(
+                        members_by_index[member_idx],
+                        timestamp=timestamp,
+                        msg_counter=msg_counter,
+                        parent_model=run_model,
+                        is_member_run=True,
+                    ))
+            continue
+
+        # Empty assistant text without a tool-call carrier payload is
+        # noise (an LLM that yielded zero deltas). Tool-call carriers
+        # have empty content by design and are dropped here too — the
+        # ``tool`` role message that follows carries the structured
+        # ``toolInfo`` chip the UI renders.
+        if not content and role == "assistant":
+            continue
+
+        msg_counter[0] += 1
+        entry = {
+            "id": f"run-msg-{msg_counter[0]}",
+            "role": role,
+            "text": content,
+            "timestamp": timestamp,
+        }
+        if role == "assistant":
+            # Specialist (member) runs carry their own model id; fall
+            # back to the leader's badge only when the member row
+            # lacks one (very old rows, or external-agent shims).
+            if run_model:
+                entry["model"] = run_model
+            atts = _attachments_from_images(images_for_assistant)
+            if atts:
+                entry["attachments"] = atts
+                images_for_assistant = []  # only emit once per run
+        out.append(entry)
+
+    # Any member_responses that weren't spliced inline (e.g. the
+    # leader's stored messages don't carry the delegate result, which
+    # happens when the row was committed mid-turn) get appended after
+    # the leader's content so the specialist's contribution still
+    # appears in the transcript.
+    for idx, mr in enumerate(members_by_index):
+        if idx in spliced_member_ids:
+            continue
+        out.extend(_expand_run_messages(
+            mr,
+            timestamp=timestamp,
+            msg_counter=msg_counter,
+            parent_model=run_model,
+            is_member_run=True,
+        ))
+
+    return out
+
+
 async def handle_get_runs(request):
     """GET /api/sessions/{session_id}/runs — turn history as flat messages.
 
-    Returns messages extracted from ``agno_sessions.runs`` in the shape
+    Returns messages extracted from ``sessions.runs`` in the shape
     the frontend's ChatMessage array expects: ``{id, role, text, timestamp,
     toolInfo?, attachments?, model?}``. Query: ``?limit=20``.
+
+    The expansion walks ``member_responses`` recursively so a delegated
+    specialist's tool calls + content appear with the specialist's own
+    model attribution — matching what the live stream emitted at turn
+    time. See :func:`_expand_run_messages` for the per-run logic and
+    :mod:`src.models._tool_status` for the shared status envelope.
     """
     from aiohttp import web
-    import json as _json
 
     db = _db(request)
     if db is None:
@@ -124,89 +381,13 @@ async def handle_get_runs(request):
 
     runs = await db.list_session_runs(session_id, limit=limit)
     messages: list[dict] = []
-    msg_idx = 0
+    msg_counter = [0]  # mutable counter shared across recursive expansions
     for run in reversed(runs):
-        run_status = str(run.get("status", "")).lower()
-        if run_status in ("cancelled", "canceled"):
-            continue
-        run_tools = run.get("tools") or []
-        # Two maps: by tool_use_id (the precise key — survives duplicate
-        # calls to the same tool name within a turn) and by name (legacy
-        # fallback for older rows that didn't persist tool_use_id).
-        run_tools_by_id: dict[str, dict] = {}
-        run_tools_by_name: dict[str, dict] = {}
-        for t in run_tools:
-            tn = t.get("tool_name") or t.get("name") or ""
-            tid = t.get("tool_use_id") or t.get("id") or ""
-            if not tn and not tid:
-                continue
-            info = {
-                "tool": tn,
-                "params": t.get("tool_args") or {},
-                "status": "done",
-                "result": t.get("result"),
-                "error": None if not t.get("tool_call_error") else "tool error",
-            }
-            if tid:
-                run_tools_by_id[tid] = info
-            if tn and tn not in run_tools_by_name:
-                run_tools_by_name[tn] = info
-        # Skip messages that are pure assistant text echoing the final
-        # turn output when streaming-blocks already covered them — but
-        # also skip the original from_history bookkeeping rows.
-        # No deduping needed: the persistence layer now writes each
-        # text block exactly once in stream order.
-        for m in run.get("messages", []) or []:
-            role = m.get("role", "user")
-            content = m.get("content", "")
-            if role == "system":
-                continue
-            if m.get("from_history"):
-                continue
-            if not content and role == "assistant" and not m.get("tool_calls"):
-                # Empty assistant text without a parallel tool_call payload
-                # is noise — but a tool_use carrier message has empty content
-                # by design; keep those so the tool card renders in order.
-                continue
-            msg_idx += 1
-            entry: dict = {
-                "id": f"run-msg-{msg_idx}",
-                "role": role,
-                "text": content,
-                "timestamp": run.get("created_at", 0),
-            }
-            if role == "tool":
-                tcall_id = m.get("tool_call_id") or m.get("tool_use_id") or ""
-                tname = m.get("name") or m.get("tool_name") or ""
-                tool_info: dict | None = None
-                if tcall_id:
-                    tool_info = run_tools_by_id.get(tcall_id)
-                if tool_info is None and tname:
-                    tool_info = run_tools_by_name.get(tname)
-                if not tool_info:
-                    try:
-                        parsed = _json.loads(content)
-                        if isinstance(parsed, dict) and parsed.get("tool"):
-                            tool_info = parsed
-                    except Exception:
-                        pass
-                if tool_info:
-                    entry["toolInfo"] = tool_info
-            if role == "assistant":
-                entry["model"] = run.get("model")
-                imgs = run.get("images") or []
-                if imgs:
-                    atts = []
-                    for img in imgs:
-                        fp = img.get("filepath") or img.get("url") or ""
-                        fn = (img.get("filename") or
-                              (fp.split("/")[-1] if "/" in fp else "") or
-                              "image.png")
-                        if fp:
-                            atts.append({"type": "image", "path": fp, "filename": fn})
-                    if atts:
-                        entry["attachments"] = atts
-            messages.append(entry)
+        messages.extend(_expand_run_messages(
+            run,
+            timestamp=int(run.get("created_at", 0) or 0),
+            msg_counter=msg_counter,
+        ))
     return web.json_response({
         "session_id": session_id,
         "messages": messages,

@@ -43,6 +43,11 @@ class NetworkAlpn:
 
     GATEWAY = b"openagent/gateway/1"
     COORDINATOR = b"openagent/coordinator/1"
+    # Direct agent-to-agent protocol. Authenticates by Iroh node_id
+    # (the QUIC handshake proves key ownership) — no coordinator cert
+    # required. Used when two OpenAgent instances federate: the remote
+    # agent doesn't need to have issued us a cert.
+    AGENT = b"openagent/agent/1"
 
 
 # Per-connection handler signature. The transport layer wraps the
@@ -236,12 +241,28 @@ class IrohNode:
 
     # ── Outbound ─────────────────────────────────────────────────────
 
-    async def dial(self, node_id: str, alpn: bytes) -> "iroh.Connection":
+    async def dial(
+        self,
+        node_id: str,
+        alpn: bytes,
+        *,
+        relay_url: str | None = None,
+        addresses: list[str] | None = None,
+    ) -> "iroh.Connection":
         """Open an outbound connection to *node_id* using *alpn*.
 
         ``node_id`` is the canonical hex (or base32) string a peer
         printed; iroh-py 0.35's ``NodeAddr`` constructor wants a
         ``PublicKey`` object, not a string, so we wrap it first.
+
+        ``relay_url`` and ``addresses`` are *first-contact hints* that
+        let the dial skip iroh's discovery system — useful when the
+        local pkarr/DNS layer hasn't yet seen the target (e.g. just
+        after the coordinator restarted, or on hosts where mDNS is
+        gated by an OS permission prompt). The invite ticket already
+        carries both fields; this is what callers should pass for
+        first-contact dials. Omit them once the peer is in your
+        discovery cache.
 
         Iroh wraps every transport failure in an opaque ``IrohError``
         whose ``str()`` is empty — so a "coordinator not running" looks
@@ -253,7 +274,7 @@ class IrohNode:
         if self._endpoint is None:
             raise RuntimeError("IrohNode.dial() called before start")
         pubkey = iroh.PublicKey.from_string(node_id)
-        addr = iroh.NodeAddr(pubkey, None, [])
+        addr = iroh.NodeAddr(pubkey, relay_url, list(addresses or []))
         try:
             return await self._endpoint.connect(addr, alpn)
         except Exception as e:

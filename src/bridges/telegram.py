@@ -118,19 +118,38 @@ class _TypingAnimator:
         self._edit_lock = asyncio.Lock()
 
     async def start(self) -> None:
+        from telegram.constants import ChatAction
+        # First action awaited synchronously so Telegram registers TYPING
+        # before dispatch_turn proceeds to the model round-trip. Without
+        # this the chat-list preview can miss the "typing…" state for
+        # sub-second turns: the reply lands before the client has had
+        # time to switch the preview off the user's last message.
+        try:
+            await self._bot.send_chat_action(self._chat_id, ChatAction.TYPING)
+        except Exception as e:  # noqa: BLE001
+            elog(
+                "bridge.telegram.typing_action_failed",
+                chat_id=self._chat_id, phase="initial", error=str(e)[:200],
+            )
         async def _loop() -> None:
-            from telegram.constants import ChatAction
             while not self._stop.is_set():
-                try:
-                    await self._bot.send_chat_action(self._chat_id, ChatAction.TYPING)
-                except Exception:
-                    # Network blip or chat-removed; keep looping, the
-                    # outer dispatch will tear us down when the turn ends.
-                    pass
                 try:
                     await asyncio.wait_for(self._stop.wait(), timeout=self._TYPING_REFRESH_S)
                 except asyncio.TimeoutError:
                     pass
+                if self._stop.is_set():
+                    break
+                try:
+                    await self._bot.send_chat_action(self._chat_id, ChatAction.TYPING)
+                except Exception as e:  # noqa: BLE001
+                    # Network blip or chat-removed; keep looping, the
+                    # outer dispatch will tear us down when the turn ends.
+                    # Surface via elog so silent throttling/permission
+                    # issues become diagnosable instead of disappearing.
+                    elog(
+                        "bridge.telegram.typing_action_failed",
+                        chat_id=self._chat_id, phase="keepalive", error=str(e)[:200],
+                    )
         self._task = asyncio.create_task(_loop())
 
     async def stream_chunk(self, full_text: str) -> None:
@@ -695,12 +714,12 @@ class TelegramBridge(BaseBridge):
                         "skills.json",
                         _json.dumps(skills_payload, ensure_ascii=False, indent=2),
                     )
-                    # Recent agno_session row (carries the Agno-tracked
+                    # Recent session row (carries the runtime-tracked
                     # turn transcript for this user's session).
                     try:
                         cur = await shim._conn.execute(
                             "SELECT session_data, agent_data, runs, summary, "
-                            "       updated_at FROM agno_sessions WHERE session_id = ?",
+                            "       updated_at FROM sessions WHERE session_id = ?",
                             (session_id,),
                         )
                         sess = await cur.fetchone()

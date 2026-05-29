@@ -36,12 +36,12 @@ async def t_add_provider(ctx: TestContext) -> None:
 
         result = await mgr.add_provider(
             "zai",
-            framework="agno",
+            framework="api-based",
             api_key="zai-test-key",
             base_url="https://api.z.ai/api/paas/v4",
         )
         assert result["name"] == "zai"
-        assert result["framework"] == "agno"
+        assert result["framework"] == "api-based"
         assert result["has_api_key"] is True
         assert result["base_url"] == "https://api.z.ai/api/paas/v4"
         provider_id = result["id"]
@@ -54,7 +54,7 @@ async def t_add_provider(ctx: TestContext) -> None:
             row = await db.get_provider(provider_id)
             assert row is not None
             assert row["name"] == "zai"
-            assert row["framework"] == "agno"
+            assert row["framework"] == "api-based"
             assert row["api_key"] == "zai-test-key"
             assert row["base_url"] == "https://api.z.ai/api/paas/v4"
         finally:
@@ -62,7 +62,7 @@ async def t_add_provider(ctx: TestContext) -> None:
 
         listed = await mgr.list_providers()
         zai = next(
-            (p for p in listed if p["name"] == "zai" and p["framework"] == "agno"),
+            (p for p in listed if p["name"] == "zai" and p["framework"] == "api-based"),
             None,
         )
         assert zai is not None

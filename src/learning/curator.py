@@ -132,15 +132,15 @@ async def run_once(db: Any) -> dict[str, int]:
         counts["profiles_archived"] = cur.rowcount or 0
         await cur.close()
 
-        # Prune dormant Agno sessions. ``updated_at`` is bumped on every
+        # Prune dormant the runtime sessions. ``updated_at`` is bumped on every
         # turn, so a row that hasn't moved in retention_days is a
-        # session the user has clearly abandoned. ``agno_sessions``
+        # session the user has clearly abandoned. ``sessions``
         # stores ts as INTEGER epoch seconds (unlike the REAL we use
         # in our newer tables) — coerce the cutoff so the comparison
         # works against both shapes that might appear in a long-running
         # deployment.
         cur = await conn.execute(
-            "DELETE FROM agno_sessions WHERE updated_at < ?",
+            "DELETE FROM sessions WHERE updated_at < ?",
             (int(session_retention_cutoff),),
         )
         counts["sessions_pruned"] = cur.rowcount or 0

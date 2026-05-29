@@ -1,9 +1,10 @@
 """Catalog helpers for configured providers, models, and pricing.
 
 This module deliberately keeps product-facing provider/model metadata under
-OpenAgent control instead of delegating it to the runtime. Agno is used as the
-execution engine for API-backed models, while OpenAgent remains the source of
-truth for:
+OpenAgent control instead of delegating it to the inlined runtime. The runtime is the
+execution engine for both LLM paths — ``api-based`` (native ``Agent``) and
+``claude-cli`` (``ClaudeAgent`` adapter) — while OpenAgent remains the
+source of truth for:
 
 - configured providers
 - enabled/disabled models
@@ -27,26 +28,30 @@ _LOGGED_PRICING: set[tuple[str, str]] = set()
 # the rest of the provider/model catalog.
 DEFAULT_ZAI_BASE_URL = "https://api.z.ai/api/paas/v4"
 
-# OpenAgent vocabulary (since v0.10.0):
+# OpenAgent vocabulary:
 #   - **provider**  : the model's vendor / owner (anthropic, openai, google, …).
-#   - **framework** : the runtime OpenAgent dispatches through — ``agno``
-#                     (direct Agno SDK against the provider's API) or
-#                     ``claude-cli`` (the local ``claude`` binary wrapping
-#                     Anthropic models).
+#   - **framework** : the adapter OpenAgent uses to instantiate the runtime
+#                     agent — ``api-based`` (native runtime ``Agent`` with
+#                     the provider's API key) or ``claude-cli`` (the runtime's
+#                     Claude SDK adapter wrapping
+#                     the local ``claude`` binary, no API key).
+#   - **kind**      : ``llm`` / ``tts`` / ``stt``. The runtime dispatches by
+#                     kind first; framework only matters for ``kind='llm'``.
+#                     TTS/STT rows always have framework='api-based' and
+#                     route through ``litellm.aspeech`` / ``atranscription``.
 #   - **model**     : the bare model id (``gpt-4o-mini``, ``claude-sonnet-4-6``).
 #
-# ``runtime_id`` encodes all three. Layout:
-#   - ``agno``        framework (the default): ``<provider>:<model>``
-#                                              (backward-compat with v0.9.x).
-#   - ``claude-cli``  framework             : ``claude-cli:<provider>:<model>``
+# ``runtime_id`` encodes provider+model (and framework for claude-cli). Layout:
+#   - ``api-based`` framework (the default): ``<provider>:<model>``.
+#   - ``claude-cli`` framework             : ``claude-cli:<provider>:<model>``
 #                                              where provider is always
 #                                              ``anthropic`` in practice.
 #
-# Rationale: most provider+model pairs only run under agno, so keeping the
-# two-part form for them keeps existing usage_log rows and user references
-# valid. Only claude-cli entries gain the three-part form, which is the
-# minimum needed to distinguish "anthropic via Agno API" from "anthropic
-# via Claude CLI subscription".
+# Rationale: most provider+model pairs only run via the api-based adapter,
+# so keeping the two-part form for them keeps existing usage_log rows and
+# user references valid. Only claude-cli entries gain the three-part form,
+# which is the minimum needed to distinguish "anthropic via API" from
+# "anthropic via Claude SDK subscription".
 SUPPORTED_PROVIDERS = [
     "anthropic",
     "openai",
@@ -61,21 +66,39 @@ SUPPORTED_PROVIDERS = [
     "local",
 ]
 
-FRAMEWORK_AGNO = "agno"
+# Framework values written to ``providers.framework``. Three values:
+#   - ``api-based``  → runtime ``Agent`` for LLM, ``litellm.aspeech`` /
+#                      ``litellm.atranscription`` for TTS/STT.
+#   - ``claude-cli`` → ``ClaudeBackedAgent`` (drives ``claude_agent_sdk``
+#                      against the user's Claude Pro/Max subscription).
+#   - ``codex-cli``  → ``CodexBackedAgent`` (drives ``openai_codex``
+#                      against the user's ChatGPT Plus/Pro subscription).
+FRAMEWORK_API_BASED = "api-based"
 FRAMEWORK_CLAUDE_CLI = "claude-cli"
-# Vendor-agnostic adapter for TTS/STT — single dispatch path through
-# ``litellm.aspeech`` / ``litellm.atranscription``. The provider row's
-# ``name`` carries the vendor (``openai``, ``elevenlabs``, ``azure``,
-# ``groq``, …) and ``metadata.model_id`` carries the vendor-specific
-# model id, mirroring how Agno wraps multiple LLM vendors today.
-FRAMEWORK_LITELLM = "litellm"
-# LLM-dispatch frameworks. The classifier/router/text-LLM code paths
-# iterate over these only — TTS/STT providers (kind != 'llm') live in
-# the same ``providers`` table but are addressed by capability-specific
-# code (``channels/tts.py`` and ``channels/voice.py``), not the LLM
-# dispatcher.
-LLM_FRAMEWORKS = (FRAMEWORK_AGNO, FRAMEWORK_CLAUDE_CLI)
-SUPPORTED_FRAMEWORKS = (FRAMEWORK_AGNO, FRAMEWORK_CLAUDE_CLI, FRAMEWORK_LITELLM)
+FRAMEWORK_CODEX_CLI = "codex-cli"
+
+# Transitional aliases — the old framework names ``agno`` (legacy: LLM native runtime) and ``litellm`` (TTS/STT) collapse into the single ``api-based``
+# value above. A DB migration rewrites existing rows; these aliases stay
+# for one release so any stragglers in code or tests don't crash. Delete
+# in a follow-up cleanup once the codebase is fully on FRAMEWORK_API_BASED.
+FRAMEWORK_AGNO = FRAMEWORK_API_BASED
+FRAMEWORK_LITELLM = FRAMEWORK_API_BASED
+
+# LLM-dispatch frameworks. The router and LLM code paths iterate over
+# these — TTS/STT providers (kind != 'llm') live in the same ``providers``
+# table but are addressed by capability-specific code (``channels/tts.py``
+# and ``channels/voice.py``) keyed off ``kind``, not the LLM dispatcher.
+LLM_FRAMEWORKS = (FRAMEWORK_API_BASED, FRAMEWORK_CLAUDE_CLI, FRAMEWORK_CODEX_CLI)
+SUPPORTED_FRAMEWORKS = LLM_FRAMEWORKS
+
+# Subscription-CLI frameworks: ChatGPT/Claude-subscription-backed paths.
+# Both share these traits the router cares about:
+#   - billed against a user subscription, not per-token via API
+#   - cannot serve as the runtime Team's ``team.model`` (the routing classifier)
+#     because their backing ``Agent.model`` is a placeholder
+# ``team_router._cheapest_api_based_model`` is consulted for these
+# leaders, and pricing returns zero for them.
+SUBSCRIPTION_CLI_FRAMEWORKS = (FRAMEWORK_CLAUDE_CLI, FRAMEWORK_CODEX_CLI)
 
 
 @dataclass(frozen=True)
@@ -84,21 +107,20 @@ class CatalogModel:
     model_id: str
     runtime_id: str
     history_mode: str
-    framework: str = FRAMEWORK_AGNO
+    framework: str = FRAMEWORK_API_BASED
     disabled: bool = False
     display_name: str | None = None
     tier_hint: str | None = None
-    description: str | None = None
     metadata: dict[str, Any] | None = None
     # v0.12 fields — the provider's surrogate id and (name, framework)
     # pair resolved at hydration time so routing doesn't have to re-split
     # the runtime_id back apart. ``provider_id = 0`` indicates a seed
     # entry from yaml routing hints (no backing provider row yet).
     provider_id: int = 0
-    # When True, SmartRouter uses this row as its classifier model.
-    # At most one row should carry the flag; the router picks the first
-    # flagged entry from the catalog on turn 1 of a fresh session, and
-    # falls back to the first enabled entry when no row is flagged.
+    # DB-level marker (mirror of ``models.is_classifier``) kept on the
+    # catalog row so model_manager surfaces the flag in /api/models
+    # responses. No router currently consumes this — SmartRouter was
+    # retired in v0.14 in favour of the runtime's Team-based routing.
     is_classifier: bool = False
 
 
@@ -134,15 +156,18 @@ def _entry_metadata(entry: Any) -> dict[str, Any]:
 def build_runtime_model_id(
     provider_name: str,
     model_id: str,
-    framework: str = FRAMEWORK_AGNO,
+    framework: str = FRAMEWORK_API_BASED,
 ) -> str:
     """Canonical runtime_id for a (framework, provider, model) triple.
 
-    Agno entries produce ``<provider>:<model>`` (preserved from v0.9.x).
-    Claude-CLI entries produce ``claude-cli:<provider>:<model>`` — and
-    if the caller passed ``provider=claude-cli`` (pre-v0.10 vocabulary)
-    we treat it as legacy shorthand for ``provider=anthropic,
-    framework=claude-cli``.
+    api-based entries produce ``<provider>:<model>`` (preserved from v0.9.x).
+    Subscription-CLI entries use a 3-part form:
+      - ``claude-cli:<provider>:<model>`` — provider is always
+        ``anthropic`` in practice.
+      - ``codex-cli:<provider>:<model>``  — provider is always
+        ``openai`` in practice.
+    Legacy shorthands ``claude-cli/<model>`` / ``codex-cli/<model>`` are
+    accepted and rewritten to the canonical form.
     """
     raw = str(model_id or "").strip()
     if not raw:
@@ -169,10 +194,30 @@ def build_runtime_model_id(
             effective_provider = "anthropic"
         return f"{FRAMEWORK_CLAUDE_CLI}:{effective_provider}:{raw}"
 
-    # Agno framework — legacy 2-part form.
+    # codex-cli mirror of the claude-cli logic above.
+    if raw.startswith("codex-cli/"):
+        _, rest = raw.split("/", 1)
+        if ":" in rest:
+            prov, model = rest.split(":", 1)
+            return f"{FRAMEWORK_CODEX_CLI}:{prov}:{model}"
+        return f"{FRAMEWORK_CODEX_CLI}:openai:{rest}"
+    if raw.startswith(f"{FRAMEWORK_CODEX_CLI}:"):
+        tail = raw[len(FRAMEWORK_CODEX_CLI) + 1:]
+        if tail.count(":") >= 1:
+            return raw
+        return f"{FRAMEWORK_CODEX_CLI}:openai:{tail}"
+    if framework == FRAMEWORK_CODEX_CLI:
+        effective_provider = provider_name or "openai"
+        if effective_provider == FRAMEWORK_CODEX_CLI:
+            effective_provider = "openai"
+        return f"{FRAMEWORK_CODEX_CLI}:{effective_provider}:{raw}"
+
+    # api-based framework — 2-part form.
     if provider_name == FRAMEWORK_CLAUDE_CLI:
         # Caller passed the deprecated pseudo-provider. Treat as framework hint.
         return f"{FRAMEWORK_CLAUDE_CLI}:anthropic:{raw}"
+    if provider_name == FRAMEWORK_CODEX_CLI:
+        return f"{FRAMEWORK_CODEX_CLI}:openai:{raw}"
     if ":" in raw:
         return raw
     if "/" in raw:
@@ -185,14 +230,14 @@ def normalize_runtime_model_id(model_ref: str, providers_config: Any = None) -> 
     raw = str(model_ref or "").strip()
     if not raw:
         return raw
-    if is_claude_cli_model(raw):
+    if is_claude_cli_model(raw) or is_codex_cli_model(raw):
         return raw
     if ":" in raw:
         return raw
     configured_names = _configured_provider_names(providers_config)
     if "/" in raw:
         prefix, rest = raw.split("/", 1)
-        if prefix == FRAMEWORK_CLAUDE_CLI:
+        if prefix in (FRAMEWORK_CLAUDE_CLI, FRAMEWORK_CODEX_CLI):
             return raw
         if prefix in SUPPORTED_PROVIDERS or prefix in configured_names:
             return f"{prefix}:{rest}"
@@ -205,7 +250,7 @@ def normalize_runtime_model_id(model_ref: str, providers_config: Any = None) -> 
         for raw_model in entry.get("models") or []:
             if _entry_model_id(raw_model) == raw:
                 return build_runtime_model_id(
-                    provider_name, raw, entry.get("framework") or FRAMEWORK_AGNO,
+                    provider_name, raw, entry.get("framework") or FRAMEWORK_API_BASED,
                 )
     return raw
 
@@ -214,7 +259,7 @@ def _iter_provider_entries(providers_config: Any) -> list[dict[str, Any]]:
     """Yield a list of provider dicts regardless of the config shape.
 
     Accepts the v0.12 flat list, the pre-v0.12 name-keyed dict (including
-    the special ``claude-cli`` bucket), or ``None``.
+    the special ``claude-cli`` / ``codex-cli`` buckets), or ``None``.
     """
     if providers_config is None:
         return []
@@ -231,10 +276,16 @@ def _iter_provider_entries(providers_config: Any) -> list[dict[str, Any]]:
                     "framework": FRAMEWORK_CLAUDE_CLI,
                     **cfg,
                 })
+            elif name == FRAMEWORK_CODEX_CLI:
+                out.append({
+                    "name": "openai",
+                    "framework": FRAMEWORK_CODEX_CLI,
+                    **cfg,
+                })
             else:
                 out.append({
                     "name": name,
-                    "framework": cfg.get("framework") or FRAMEWORK_AGNO,
+                    "framework": cfg.get("framework") or FRAMEWORK_API_BASED,
                     **cfg,
                 })
         return out
@@ -268,9 +319,36 @@ def is_claude_cli_model(model_ref: str | None) -> bool:
     )
 
 
+def is_codex_cli_model(model_ref: str | None) -> bool:
+    """True when ``model_ref`` is dispatched via the codex-cli framework.
+
+    Canonical form ``codex-cli:<provider>:<model>``; legacy shorthand
+    ``codex-cli`` / ``codex-cli/<model>`` also accepted.
+    """
+    raw = str(model_ref or "").strip()
+    return (
+        raw == FRAMEWORK_CODEX_CLI
+        or raw.startswith(f"{FRAMEWORK_CODEX_CLI}:")
+        or raw.startswith(f"{FRAMEWORK_CODEX_CLI}/")
+    )
+
+
+def is_subscription_cli_model(model_ref: str | None) -> bool:
+    """True for any subscription-CLI framework (claude-cli OR codex-cli)."""
+    return is_claude_cli_model(model_ref) or is_codex_cli_model(model_ref)
+
+
 def framework_of(model_ref: str | None) -> str:
-    """``"claude-cli"`` when the ref belongs to that framework, else ``"agno"``."""
-    return FRAMEWORK_CLAUDE_CLI if is_claude_cli_model(model_ref) else FRAMEWORK_AGNO
+    """Return the framework name for ``model_ref``.
+
+    ``claude-cli`` / ``codex-cli`` when the ref carries the matching
+    prefix; otherwise ``api-based``.
+    """
+    if is_claude_cli_model(model_ref):
+        return FRAMEWORK_CLAUDE_CLI
+    if is_codex_cli_model(model_ref):
+        return FRAMEWORK_CODEX_CLI
+    return FRAMEWORK_API_BASED
 
 
 def claude_cli_model_spec(model_id: str | None = None) -> str:
@@ -287,15 +365,26 @@ def claude_cli_model_spec(model_id: str | None = None) -> str:
     return f"{FRAMEWORK_CLAUDE_CLI}:anthropic:{raw}"
 
 
+def codex_cli_model_spec(model_id: str | None = None) -> str:
+    """Build the canonical codex-cli runtime_id from a bare model id."""
+    raw = str(model_id or "").strip()
+    if not raw:
+        return FRAMEWORK_CODEX_CLI
+    return f"{FRAMEWORK_CODEX_CLI}:openai:{raw}"
+
+
 def split_runtime_id(runtime_id: str) -> tuple[str, str]:
     """Split a runtime id into ``(provider, model_id)`` for billing / display.
 
-    v0.10 forms:
+    v0.10+ forms:
       - ``<provider>:<model>``                  → (provider, model)
       - ``claude-cli:<provider>:<model>``       → (provider, model)
+      - ``codex-cli:<provider>:<model>``        → (provider, model)
     Legacy forms still accepted:
       - ``claude-cli/<model>``                  → ("claude-cli", model)
       - ``claude-cli``                          → ("claude-cli", "claude-cli")
+      - ``codex-cli/<model>``                   → ("codex-cli", model)
+      - ``codex-cli``                           → ("codex-cli", "codex-cli")
       - bare ``<id>``                           → (id, id)
     """
     if runtime_id.startswith(f"{FRAMEWORK_CLAUDE_CLI}:"):
@@ -305,6 +394,13 @@ def split_runtime_id(runtime_id: str) -> tuple[str, str]:
             return provider, model_id
         # claude-cli:<model> — legacy, assume anthropic.
         return "anthropic", tail
+    if runtime_id.startswith(f"{FRAMEWORK_CODEX_CLI}:"):
+        tail = runtime_id[len(FRAMEWORK_CODEX_CLI) + 1:]
+        if ":" in tail:
+            provider, model_id = tail.split(":", 1)
+            return provider, model_id
+        # codex-cli:<model> — legacy, assume openai.
+        return "openai", tail
     if ":" in runtime_id:
         provider, model_id = runtime_id.split(":", 1)
         return provider, model_id
@@ -321,7 +417,7 @@ def model_id_from_runtime(runtime_id: str) -> str:
 
 def model_history_mode(model_ref: str, providers_config: Any = None) -> str:
     runtime_id = normalize_runtime_model_id(model_ref, providers_config)
-    if is_claude_cli_model(runtime_id):
+    if is_subscription_cli_model(runtime_id):
         return "provider"
     return "platform"
 
@@ -339,7 +435,7 @@ def iter_configured_models(
     .. code-block:: python
 
         [
-          {"id": 1, "name": "openai", "framework": "agno",
+          {"id": 1, "name": "openai", "framework": "api-based",
            "api_key": "sk-…", "base_url": None, "enabled": True,
            "models": [{"id": 10, "model": "gpt-4o-mini", …}, …]},
           {"id": 2, "name": "anthropic", "framework": "claude-cli",
@@ -369,7 +465,7 @@ def iter_configured_models(
                 entry_framework = FRAMEWORK_CLAUDE_CLI
             else:
                 entry_name = provider_name
-                entry_framework = cfg.get("framework") or FRAMEWORK_AGNO
+                entry_framework = cfg.get("framework") or FRAMEWORK_API_BASED
             normalised.append({
                 "id": cfg.get("id") or 0,
                 "name": entry_name,
@@ -385,7 +481,7 @@ def iter_configured_models(
 
     for entry in normalised:
         provider_name = str(entry.get("name") or "").strip()
-        provider_framework = entry.get("framework") or FRAMEWORK_AGNO
+        provider_framework = entry.get("framework") or FRAMEWORK_API_BASED
         if not provider_name:
             continue
         if entry.get("enabled") is False:
@@ -415,7 +511,7 @@ def iter_configured_models(
             )
             mode = (
                 "provider"
-                if provider_framework == FRAMEWORK_CLAUDE_CLI
+                if provider_framework in SUBSCRIPTION_CLI_FRAMEWORKS
                 else "platform"
             )
             if history_mode and mode != history_mode:
@@ -425,7 +521,6 @@ def iter_configured_models(
             seen.add(runtime_id)
 
             tier_hint = model_metadata.get("tier_hint")
-            description = model_metadata.get("description")
             display_name = (
                 model_metadata.get("display_name")
                 or model_metadata.get("name")
@@ -441,7 +536,6 @@ def iter_configured_models(
                     disabled=is_disabled,
                     display_name=str(display_name) if display_name else None,
                     tier_hint=str(tier_hint) if tier_hint else None,
-                    description=str(description) if description else None,
                     metadata=model_metadata or None,
                     provider_id=provider_id,
                     is_classifier=is_classifier,
@@ -464,7 +558,7 @@ def get_default_model_for_provider(
 ) -> str | None:
     """Return the first configured runtime_id for ``provider_name``.
 
-    When a provider is registered under both frameworks (anthropic+agno
+    When a provider is registered under both frameworks (anthropic+api-based
     AND anthropic+claude-cli), pass ``framework=`` to disambiguate.
     """
     for entry in iter_configured_models(providers_config):
@@ -493,12 +587,15 @@ def get_model_pricing(model_ref: str, providers_config: dict | None = None) -> d
     """
     runtime_id = normalize_runtime_model_id(model_ref, providers_config)
 
-    # 1. claude-cli is the local subprocess wrapping the user's Claude
-    # Pro/Max subscription — no per-token billing, ever. Short-circuit
-    # before any lookup so we don't accidentally attribute Anthropic API
-    # pricing to a claude-cli session.
+    # 1. Subscription-CLI frameworks (claude-cli / codex-cli) dispatch
+    # against the user's Pro/Max or ChatGPT Plus/Pro subscription —
+    # no per-token billing, ever. Short-circuit before any lookup so we
+    # don't accidentally attribute API pricing to a subscription session.
     if is_claude_cli_model(runtime_id):
         _log_pricing(model_ref, runtime_id, "claude_cli_subscription", 0.0, 0.0)
+        return {"input_cost_per_million": 0.0, "output_cost_per_million": 0.0}
+    if is_codex_cli_model(runtime_id):
+        _log_pricing(model_ref, runtime_id, "codex_cli_subscription", 0.0, 0.0)
         return {"input_cost_per_million": 0.0, "output_cost_per_million": 0.0}
 
     # 2. Online catalog (OpenRouter). Resolved from a process-wide cache
@@ -555,15 +652,57 @@ def _maybe_prime_openrouter_cache() -> None:
     loop.create_task(_prime())
 
 
+# Cached reverse map of OpenAgent provider name → OpenRouter vendor prefix.
+# Built lazily on first pricing lookup and reused thereafter — used to
+# avoid scanning ``_OPENROUTER_VENDOR_MAP`` per lookup.
+_REVERSE_VENDOR_MAP_CACHE: dict[str, str] | None = None
+
+# Cached id → entry index over the OpenRouter catalog, keyed by the
+# cache timestamp so a refresh invalidates it automatically. Replaces
+# the previous linear scan that walked every entry per pricing lookup.
+_OPENROUTER_INDEX: tuple[float, dict[str, dict[str, Any]]] | None = None
+
+
+def _get_reverse_vendor_map(discovery_module: Any) -> dict[str, str]:
+    global _REVERSE_VENDOR_MAP_CACHE
+    if _REVERSE_VENDOR_MAP_CACHE is None:
+        _REVERSE_VENDOR_MAP_CACHE = {
+            our_name: vendor
+            for vendor, our_name in discovery_module._OPENROUTER_VENDOR_MAP.items()
+        }
+    return _REVERSE_VENDOR_MAP_CACHE
+
+
+def _get_openrouter_index(
+    cache: tuple[float, list[dict[str, Any]]],
+) -> dict[str, dict[str, Any]]:
+    """Return ``{entry['id']: entry}`` over the OpenRouter catalog,
+    rebuilt whenever the cache timestamp changes.
+    """
+    global _OPENROUTER_INDEX
+    cache_ts, entries = cache
+    if _OPENROUTER_INDEX is not None and _OPENROUTER_INDEX[0] == cache_ts:
+        return _OPENROUTER_INDEX[1]
+    index: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        entry_id = str(entry.get("id") or "")
+        if entry_id:
+            index[entry_id] = entry
+    _OPENROUTER_INDEX = (cache_ts, index)
+    return index
+
+
 def _openrouter_pricing_lookup(runtime_id: str) -> dict[str, float] | None:
     """Look up pricing for ``runtime_id`` in the OpenRouter cache.
 
     Reads ``discovery._OPENROUTER_CACHE`` without triggering a fetch —
-    this is a hot path and must not block on network. The cache is
-    primed the first time anyone hits ``/api/models/available`` or
-    ``list_provider_models``; subsequent pricing lookups amortize for
-    free. Returns ``None`` when the cache is empty or the model isn't
-    in OpenRouter's catalog.
+    this is a hot path and must not block on network. Uses an
+    indexed-by-id map (rebuilt on cache refresh) so the lookup is
+    O(1) instead of a linear scan over ~300 catalog entries per call.
+    Returns ``None`` when the cache is empty or the model isn't in
+    OpenRouter's catalog.
     """
     try:
         from src.models import discovery
@@ -572,35 +711,27 @@ def _openrouter_pricing_lookup(runtime_id: str) -> dict[str, float] | None:
     cache = getattr(discovery, "_OPENROUTER_CACHE", None)
     if not cache or ":" not in runtime_id:
         return None
-    _ts, entries = cache
     provider, bare = runtime_id.split(":", 1)
-    # Reverse the _OPENROUTER_VENDOR_MAP: our provider → OpenRouter's vendor prefix.
-    want_prefix = None
-    for vendor, our_name in discovery._OPENROUTER_VENDOR_MAP.items():
-        if our_name == provider:
-            want_prefix = vendor
-            break
+    reverse_map = _get_reverse_vendor_map(discovery)
+    want_prefix = reverse_map.get(provider)
     if not want_prefix:
         return None
     target = f"{want_prefix}/{bare}"
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        if str(entry.get("id") or "") != target:
-            continue
-        pricing = entry.get("pricing") or {}
-        try:
-            input_cost = float(pricing.get("prompt") or 0.0) * 1_000_000
-            output_cost = float(pricing.get("completion") or 0.0) * 1_000_000
-        except (TypeError, ValueError):
-            return None
-        if input_cost <= 0 and output_cost <= 0:
-            return None
-        return {
-            "input_cost_per_million": input_cost,
-            "output_cost_per_million": output_cost,
-        }
-    return None
+    entry = _get_openrouter_index(cache).get(target)
+    if entry is None:
+        return None
+    pricing = entry.get("pricing") or {}
+    try:
+        input_cost = float(pricing.get("prompt") or 0.0) * 1_000_000
+        output_cost = float(pricing.get("completion") or 0.0) * 1_000_000
+    except (TypeError, ValueError):
+        return None
+    if input_cost <= 0 and output_cost <= 0:
+        return None
+    return {
+        "input_cost_per_million": input_cost,
+        "output_cost_per_million": output_cost,
+    }
 
 
 def _log_pricing(model_ref: str, runtime_id: str, source: str, input_cpm: float, output_cpm: float) -> None:

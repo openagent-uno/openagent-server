@@ -125,7 +125,7 @@ async def t_create_db_model(ctx: TestContext) -> None:
     if not _agent_has_db(ctx):
         raise TestSkip("gateway fixture has no MemoryDB wired")
 
-    # Create an agno openai provider row first so models can FK to it.
+    # Create an api-based openai provider row first so models can FK to it.
     async with aiohttp.ClientSession() as sess:
         async with sess.post(
             f"http://127.0.0.1:{port}/api/providers",

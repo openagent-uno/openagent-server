@@ -40,8 +40,42 @@ def _parse_frontmatter(content: str) -> tuple[dict, str]:
     return {}, content
 
 
+def _tags_list(meta: dict) -> list[str]:
+    """Normalize a frontmatter ``tags`` value to a list.
+
+    YAML parses ``tags: foo`` as a bare scalar string (and ``tags:``
+    with no value as ``None``). Clients type this field as a string
+    array and call array ops on it (``tags.slice(...).join(...)``) — a
+    stray scalar leaking through crashes them. Always hand back a list.
+    """
+    tags = meta.get("tags")
+    if isinstance(tags, str):
+        return [tags]
+    if isinstance(tags, list):
+        return tags
+    return []
+
+
 def _scan_wikilinks(content: str) -> list[str]:
     return _WIKILINK_RE.findall(content)
+
+
+def _link_key(s: str) -> str:
+    """Normalize a wikilink target — or a note's vault-relative path — to
+    a comparison key: lowercased, no surrounding slashes, no ``.md``
+    suffix, and with any ``#heading`` / ``^block`` anchor dropped.
+
+    Vault notes link each other by folder-relative path
+    (``[[infra/scheduled-jobs]]``) far more than by bare name; keying the
+    graph lookup on the bare filename stem alone dropped ~70% of edges.
+    """
+    k = s.lower().strip().lstrip("/")
+    k = k.split("#", 1)[0].split("^", 1)[0].strip()
+    if k.startswith("./"):
+        k = k[2:]
+    if k.endswith(".md"):
+        k = k[:-3]
+    return k
 
 
 def _resolve_vault(request) -> Path:
@@ -67,7 +101,7 @@ async def handle_list(request):
         notes.append({
             "path": rel,
             "title": meta.get("title", md.stem),
-            "tags": meta.get("tags", []),
+            "tags": _tags_list(meta),
             "type": meta.get("type", ""),
             "modified": stat.st_mtime,
             "size": stat.st_size,
@@ -141,7 +175,7 @@ async def handle_search(request):
             results.append({
                 "path": str(md.relative_to(vault)),
                 "title": meta.get("title", md.stem),
-                "tags": meta.get("tags", []),
+                "tags": _tags_list(meta),
             })
     return web.json_response({"results": results})
 
@@ -153,6 +187,11 @@ async def handle_graph(request):
         return web.json_response({"nodes": [], "edges": []})
 
     nodes, edges = [], []
+    # Resolve wikilinks by folder path AND by bare note name: notes link
+    # each other both ways — ``[[infra/scheduled-jobs]]`` (path) and
+    # ``[[scheduled-jobs]]`` (bare). ``path_map`` is the exact match;
+    # ``stem_map`` is the last-segment fallback for bare links.
+    path_map: dict[str, str] = {}
     stem_map: dict[str, str] = {}
     note_data: dict[str, dict] = {}
 
@@ -160,23 +199,27 @@ async def handle_graph(request):
         rel = str(md.relative_to(vault))
         content = md.read_text(errors="replace")
         meta, _ = _parse_frontmatter(content)
-        stem_map[md.stem.lower()] = rel
+        path_map[_link_key(rel)] = rel
+        stem_map.setdefault(md.stem.lower(), rel)
         note_data[rel] = {"meta": meta, "links": _scan_wikilinks(content)}
 
     for rel, data in note_data.items():
         meta = data["meta"]
-        tags = meta.get("tags", [])
-        if isinstance(tags, str):
-            tags = [tags]
         nodes.append({
             "id": rel,
             "label": meta.get("title", Path(rel).stem),
-            "tags": tags,
+            "tags": _tags_list(meta),
             "type": meta.get("type", ""),
         })
+        # Dedup per source: a note that mentions the same target several
+        # times must not stack duplicate edges (they skew the force
+        # layout's degree-based sizing/colour).
+        seen: set[str] = set()
         for link in data["links"]:
-            target = stem_map.get(link.lower().strip())
-            if target and target != rel:
+            key = _link_key(link)
+            target = path_map.get(key) or stem_map.get(key.rsplit("/", 1)[-1])
+            if target and target != rel and target not in seen:
+                seen.add(target)
                 edges.append({"source": rel, "target": target})
 
     return web.json_response({"nodes": nodes, "edges": edges})

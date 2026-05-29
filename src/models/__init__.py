@@ -1,12 +1,12 @@
 from src.models.base import BaseModel, ModelResponse, ToolCall
-from src.models.agno_provider import AgnoProvider
-from src.models.claude_cli import ClaudeCLI
-from src.models.smart_router import SmartRouter
+from src.models.native_provider import NativeProvider
+from src.models.claude_agent import ClaudeCLI
+from src.models.dispatcher import ModelDispatcher, SmartRouter
 from src.models.budget import BudgetTracker
 
 __all__ = [
     "BaseModel", "ModelResponse", "ToolCall",
-    "AgnoProvider",
+    "NativeProvider",
     "ClaudeCLI",
-    "SmartRouter", "BudgetTracker",
+    "ModelDispatcher", "SmartRouter", "BudgetTracker",
 ]

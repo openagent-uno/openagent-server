@@ -17,20 +17,30 @@ from src._frozen import bundle_dir, is_frozen
 logger = logging.getLogger(__name__)
 
 if is_frozen():
-    BUILTIN_MCPS_DIR = bundle_dir() / "openagent" / "mcp" / "servers"
-    # Frozen layout: <bundle>/openagent/, so bundle_dir() is the parent of `openagent/`.
+    # Frozen layout: PyInstaller extracts the source tree at
+    # ``<bundle>/src/...`` (the spec adds each ``src/mcp/servers/<name>``
+    # entry with that destination prefix), so the bundled MCP directory
+    # must be looked up at ``<bundle>/src/mcp/servers``. This used to read
+    # ``openagent/mcp/servers`` from before the openagent→src package
+    # rename (commit 4b5efb5); the stale literal silently broke every
+    # Python/Node built-in MCP — workflow-manager, messaging, scheduler,
+    # model-manager, mcp-manager, web-search, media-gen, memory-search —
+    # because ``resolve_builtin_entry`` raised FileNotFoundError on the
+    # missing directory. In-process MCPs (shell, tool-search) bypass the
+    # directory check, which is why they kept working and masked the bug.
+    BUILTIN_MCPS_DIR = bundle_dir() / "src" / "mcp" / "servers"
     PACKAGE_PARENT_DIR = bundle_dir()
 else:
     BUILTIN_MCPS_DIR = Path(__file__).resolve().parent / "servers"
-    # Dev layout: this file is openagent/mcp/builtins.py, so .parent.parent.parent
-    # is the directory containing the `openagent/` package (the repo root).
+    # Dev layout: this file is src/mcp/builtins.py, so .parent.parent.parent
+    # is the directory containing the `src/` package (the repo root).
     PACKAGE_PARENT_DIR = Path(__file__).resolve().parent.parent.parent
 
 # CRITICAL: ``PACKAGE_PARENT_DIR`` is exported as PYTHONPATH for Python MCP
 # subprocesses so they can ``import src.mcp.servers.*``. It MUST be the
-# directory that *contains* ``openagent/`` — never ``openagent/`` itself, since
-# that would expose ``openagent.mcp`` as a top-level ``mcp`` and shadow the
-# third-party MCP SDK, causing a circular import in openagent/mcp/client.py.
+# directory that *contains* ``src/`` — never ``src/`` itself, since that
+# would expose ``src.mcp`` as a top-level ``mcp`` and shadow the
+# third-party MCP SDK, causing a circular import in src/mcp/client.py.
 
 
 def _native_binary_target() -> str:
@@ -70,7 +80,7 @@ def _resolve_native_binary(name: str) -> str:
        identifier has no stable TCC identity.) See ``openagent.spec``
        for the matching exclude.
 
-    2. **Bundled** under ``openagent/mcp/servers/<name>/bin/<target>/``.
+    2. **Bundled** under ``src/mcp/servers/<name>/bin/<target>/``.
        Used by dev installs that ``pip install -e .`` from source and
        have run ``bash scripts/build-<name>.sh`` to stage the artifact.
 
@@ -113,7 +123,7 @@ def _resolve_native_binary(name: str) -> str:
     except Exception:  # noqa: BLE001 — sys.executable resolution is best-effort
         pass
 
-    # 2. Staged under openagent/mcp/servers/<name>/bin/<target>/.
+    # 2. Staged under src/mcp/servers/<name>/bin/<target>/.
     path = BUILTIN_MCPS_DIR / name / "bin" / target / bin_name
     if path.exists():
         return str(path)
@@ -151,18 +161,37 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
         "dir": "computer-control",
         "native": True,
         # No DISPLAY env — the Rust binary picks the right backend per OS.
+        "description": (
+            "screen, keyboard, and mouse control on the host. Use for "
+            "GUI tasks on apps without an MCP of their own"
+        ),
     },
     "shell": {
         "in_process": True,
         "adapter_module": "src.mcp.servers.shell.adapters",
         "sdk_server_factory": "build_sdk_server",
-        "agno_toolkit_factory": "build_agno_toolkit",
+        "runtime_toolkit_factory": "build_runtime_toolkit",
+        "description": (
+            "execute bash commands on the host, foreground or "
+            "backgrounded. Preferred for file ops, builds, and ad-hoc "
+            "scripts when no specialised MCP fits"
+        ),
     },
     "tool-search": {
         "in_process": True,
         "adapter_module": "src.mcp.servers.tool_search.adapters",
         "sdk_server_factory": "build_sdk_server",
-        "agno_toolkit_factory": "build_agno_toolkit",
+        "runtime_toolkit_factory": "build_runtime_toolkit",
+    },
+    "attachments": {
+        "in_process": True,
+        "adapter_module": "src.mcp.servers.attachments.adapters",
+        "sdk_server_factory": "build_sdk_server",
+        "runtime_toolkit_factory": "build_runtime_toolkit",
+        "description": (
+            "read and write files attached to the current turn — "
+            "screenshots, images, pasted text, uploads from the chat UI"
+        ),
     },
     "web-search": {
         "dir": "web-search",
@@ -170,53 +199,107 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
         "build": ["npm", "run", "build"],
         "install": ["npm", "install"],
         "env": {"NODE_TLS_REJECT_UNAUTHORIZED": "0"},
+        "description": (
+            "search the live web and fetch page contents. Use whenever "
+            "the answer depends on current information you may not have"
+        ),
     },
     "editor": {
         "dir": "editor",
         "command": ["node", "dist/index.js"],
         "build": ["npm", "run", "build"],
         "install": ["npm", "install"],
+        "description": (
+            "structured file editing — read, write, patch, search. "
+            "Preferred over raw shell ``cat`` / ``sed`` for code changes"
+        ),
     },
     "agent-in-chrome": {
         "dir": "agent-in-chrome/host",
         "command": ["node", "./mcp-server.js"],
         "install": ["npm", "install"],
+        "description": (
+            "drive a Chrome browser session (navigate, click, type, "
+            "screenshot, read the DOM). Use for live web tasks beyond "
+            "static web-search"
+        ),
     },
     "messaging": {
         "dir": "messaging",
         "command": ["node", "dist/index.js"],
         "build": ["npm", "run", "build"],
         "install": ["npm", "install"],
+        "description": (
+            "send messages on connected platforms (Telegram, Discord, "
+            "Slack, WhatsApp) when the user asks you to relay something"
+        ),
     },
     "scheduler": {
         "dir": "scheduler",
         "command": ["python", "-m", "src.mcp.servers.scheduler.server"],
         "python": True,
+        "description": (
+            "create, list, update, and remove cron-scheduled prompts. "
+            "Reach for it whenever the user asks for a recurring task"
+        ),
     },
     "mcp-manager": {
         "dir": "mcp_manager",
         "command": ["python", "-m", "src.mcp.servers.mcp_manager.server"],
         "python": True,
+        "description": (
+            "inspect and manage MCP servers — list connected ones, add "
+            "new ones, enable/disable, check health"
+        ),
     },
     "model-manager": {
         "dir": "model_manager",
         "command": ["python", "-m", "src.mcp.servers.model_manager.server"],
         "python": True,
+        "description": (
+            "manage the registered LLM models — list, enable/disable, "
+            "pin one for the current session, set the entry/router model"
+        ),
     },
     "workflow-manager": {
         "dir": "workflow_manager",
         "command": ["python", "-m", "src.mcp.servers.workflow_manager.server"],
         "python": True,
+        "description": (
+            "create and run multi-step workflows. Use for repeatable "
+            "structured processes that benefit from explicit DAGs over "
+            "ad-hoc sub-agent delegation"
+        ),
     },
     "media-gen": {
         "dir": "media_gen",
         "command": ["python", "-m", "src.mcp.servers.media_gen.server"],
         "python": True,
+        "description": (
+            "generate images, audio, or video via configured providers"
+        ),
     },
     "memory-search": {
         "dir": "memory_search",
         "command": ["python", "-m", "src.mcp.servers.memory_search.server"],
         "python": True,
+        "description": (
+            "semantic search across past conversations. Complements "
+            "vault: vault is your editable notes, this is everything "
+            "you've already said"
+        ),
+    },
+    "delegation": {
+        "dir": "delegation",
+        "in_process": True,
+        "adapter_module": "src.mcp.servers.delegation.adapters",
+        "description": (
+            "hand a sub-task to another registered model and get its "
+            "answer back. Use when a different model is cheaper, "
+            "faster, or better-scoped for the work — including from "
+            "inside a subscription-CLI agent that has no native "
+            "team-leader path"
+        ),
     },
     "skill-data": {
         "dir": "skill_data",
@@ -232,6 +315,7 @@ DEFAULT_MCPS: list[dict[str, Any]] = [
     {"builtin": "web-search", "_default": True},
     {"builtin": "shell", "_default": True},
     {"builtin": "tool-search", "_default": True},
+    {"builtin": "attachments", "_default": True},
     {"builtin": "computer-control", "_default": True},
     {"builtin": "agent-in-chrome", "_default": True},
     {"builtin": "messaging", "_default": True},
@@ -240,6 +324,7 @@ DEFAULT_MCPS: list[dict[str, Any]] = [
     {"builtin": "model-manager", "_default": True},
     {"builtin": "workflow-manager", "_default": True},
     {"builtin": "skill-data", "_default": True},
+    {"builtin": "delegation", "_default": True},
 ]
 
 
@@ -261,7 +346,7 @@ def _default_filesystem_roots() -> list[str]:
       ``/etc/hosts`` for a diagnostic, can't open ``/tmp/foo`` from an
       attachment, can't inspect a project outside ``$HOME``) without
       adding any real protection against a compromised tool call.
-    - LLM UX: the Claude / Agno tools see stable, uniform descriptions
+    - LLM UX: the Claude / runtime tools see stable, uniform descriptions
       regardless of which machine the agent runs on. There's no "oops,
       the path is outside the sandbox" surprise that forces a
       re-prompt.
@@ -477,7 +562,7 @@ def resolve_builtin_entry(name: str, env: dict[str, str] | None = None) -> dict[
             "in_process": True,
             "adapter_module": spec["adapter_module"],
             "sdk_server_factory": spec.get("sdk_server_factory", "build_sdk_server"),
-            "agno_toolkit_factory": spec.get("agno_toolkit_factory", "build_agno_toolkit"),
+            "runtime_toolkit_factory": spec.get("runtime_toolkit_factory", "build_runtime_toolkit"),
         }
 
     mcp_dir = BUILTIN_MCPS_DIR / spec["dir"]

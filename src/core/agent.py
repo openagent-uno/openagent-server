@@ -8,11 +8,10 @@ import inspect
 import logging
 from typing import Any, AsyncIterator, Callable, Awaitable
 
-from src.channels.base import build_attachment_context, prepend_context_block
 from src.models.base import BaseModel, ModelResponse
 from src.memory.db import MemoryDB
 from src.mcp.pool import MCPPool
-from src.core.prompts import FRAMEWORK_SYSTEM_PROMPT
+from src.core.prompts import FRAMEWORK_SYSTEM_PROMPT, build_mcp_catalog_summary
 from src.models.runtime import wire_model_runtime
 
 from src.core.logging import elog
@@ -23,24 +22,25 @@ _FROZEN_RUNTIME_PRELOADS = (
     "src.models.discovery",
     "src.channels.voice",
     "src.channels.tts_local",
-    # Agno submodules that ``agno_provider`` (and ``mcp.pool``) import
-    # lazily on first use. Like the src modules above, they live
-    # in the PyInstaller archive; a sibling-service binary swap on
-    # performa breaks the deferred zlib extraction and surfaces as
-    # ``zlib.error: Error -3 ... incorrect header check`` raised out of
-    # ``_ensure_team``/``_dispatch`` and reported as ``agent.run.error``.
-    "agno.agent",
-    "agno.team",
-    "agno.db.sqlite",
-    "agno.db.base",
-    "agno.session.agent",
-    "agno.run.agent",
-    "agno.run.base",
-    "agno.run.team",
-    "agno.models.utils",
-    "agno.models.message",
-    "agno.tools",
-    "agno.tools.mcp",
+    # Runtime submodules that ``native_provider`` (and ``mcp.pool``)
+    # import lazily on first use. Like the src modules above, they
+    # live in the PyInstaller archive; a sibling-service binary swap
+    # on performa breaks the deferred zlib extraction and surfaces as
+    # ``zlib.error: Error -3 ... incorrect header check`` raised out
+    # of ``_ensure_team``/``_dispatch`` and reported as
+    # ``agent.run.error``.
+    "src.core._runner.agent",
+    "src.core._runner.team",
+    "src.memory.store.sqlite",
+    "src.memory.store.base",
+    "src.memory.sessions.agent",
+    "src.core._run_state.agent",
+    "src.core._run_state.base",
+    "src.core._run_state.team",
+    "src.models.providers.utils",
+    "src.models.providers.message",
+    "src.mcp._runtime",
+    "src.mcp._runtime.mcp",
 )
 
 
@@ -48,7 +48,7 @@ def _format_run_error(e: BaseException) -> str:
     """Produce a chat-renderable error string for any agent-run failure.
 
     Two shapes:
-      - ``AgnoProviderError`` carries an already-clean provider message
+      - ``NativeProviderError`` carries an already-clean provider message
         (e.g. "API status error from OpenAI API: 403 - You are not
         allowed to sample from this model"). Prefix with a stable
         marker so bridges and the app can detect it as an error and
@@ -56,9 +56,9 @@ def _format_run_error(e: BaseException) -> str:
       - Anything else falls back to ``Error: <ClassName>: <repr>`` so
         the user sees *something* even on novel exception types.
     """
-    from src.models.agno_provider import AgnoProviderError
+    from src.models.native_provider import NativeProviderError
 
-    if isinstance(e, AgnoProviderError):
+    if isinstance(e, NativeProviderError):
         return f"⚠️ Model provider error\n\n{e}"
     msg = str(e) or repr(e)
     return f"⚠️ {type(e).__name__}: {msg}" if msg else f"⚠️ {type(e).__name__}"
@@ -115,6 +115,152 @@ def _format_shell_reminder(events) -> str:
     )
     body = "\n".join(lines)
     return f"<system-reminder>\n{body}\n</system-reminder>"
+
+
+_AGNO_IMAGE_MIMES = frozenset({
+    "image/png", "image/jpeg", "image/jpg", "image/gif", "image/webp",
+    "image/bmp", "image/tiff", "image/tif", "image/avif", "image/heic", "image/heif",
+})
+_AGNO_AUDIO_MIMES = frozenset({
+    "audio/wav", "audio/wave", "audio/mp3", "audio/mpeg", "audio/ogg",
+    "audio/mp4", "audio/m4a", "audio/aac", "audio/flac", "audio/webm",
+})
+_AGNO_VIDEO_MIMES = frozenset({
+    "video/x-flv", "video/quicktime", "video/mpeg", "video/mpegs", "video/mpgs",
+    "video/mpg", "video/mp4", "video/webm", "video/wmv", "video/3gpp",
+})
+
+# Extension → MIME fallback for clients that don't send Content-Type.
+_EXT_TO_MIME = {
+    "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+    "gif": "image/gif", "webp": "image/webp", "bmp": "image/bmp",
+    "tiff": "image/tiff", "tif": "image/tiff", "avif": "image/avif",
+    "heic": "image/heic", "heif": "image/heif",
+    "wav": "audio/wav", "mp3": "audio/mpeg", "ogg": "audio/ogg",
+    "m4a": "audio/m4a", "aac": "audio/aac", "flac": "audio/flac",
+    "mp4": "video/mp4", "mov": "video/quicktime", "webm": "video/webm",
+    "mkv": "video/x-matroska", "wmv": "video/wmv",
+    "pdf": "application/pdf", "json": "application/json",
+    "txt": "text/plain", "md": "text/markdown", "csv": "text/csv",
+    "html": "text/html", "css": "text/css", "xml": "text/xml",
+    "rtf": "text/rtf", "py": "text/x-python", "js": "text/javascript",
+    "yaml": "text/plain", "yml": "text/plain", "log": "text/plain",
+}
+
+
+def _infer_mime(filename: str | None, declared: str | None) -> str | None:
+    """MIME inference matching AgentOS's permissive shape.
+
+    Prefers the upload's declared Content-Type when present; falls back
+    to the filename extension. Returns ``None`` only when we can't
+    guess at all — the caller decides what to do with that.
+    """
+    if declared:
+        return declared
+    if not filename or "." not in filename:
+        return None
+    ext = filename.rsplit(".", 1)[-1].lower()
+    return _EXT_TO_MIME.get(ext)
+
+
+def _build_runtime_media(
+    attachments: list[dict] | None,
+) -> tuple[list[Any], list[Any], list[Any], list[Any]]:
+    """Convert wire-format attachments into runtime media objects, AgentOS-style.
+
+    Mirrors the per-MIME dispatch in
+    ``the runtime media-ingest path:process_image/audio/video/document``:
+    reads each upload's bytes once and constructs typed runtime media
+    objects with ``content=bytes`` (NOT ``filepath=...``). Returns four
+    parallel lists — ``(images, audios, videos, files)`` — ready to be
+    routed to ``arun``'s separate kwargs.
+
+    Why content=bytes instead of filepath: the runtime's model adapters
+    consume bytes directly (base64 → multimodal API content). The
+    filepath shape exists only as a back-compat input form, and it
+    forces every downstream consumer (subscription-CLI wrappers in
+    particular) to think about sandbox allow-lists. With bytes in
+    memory, downstream code can inline text, base64-encode for an API,
+    or write to a known-safe location — its choice.
+
+    Anything we can't classify by MIME is skipped with a structured
+    warning so a flaky upload doesn't tank the whole turn.
+    """
+    if not attachments:
+        return ([], [], [], [])
+    from src.stream.media import Audio, File as _RuntimeFile, Image, Video
+
+    images: list[Any] = []
+    audios: list[Any] = []
+    videos: list[Any] = []
+    files: list[Any] = []
+
+    for a in attachments:
+        a_path = a.get("path") or ""
+        a_name = a.get("filename") or (a_path.rsplit("/", 1)[-1] if a_path else None)
+        a_mime = _infer_mime(a_name, a.get("mime_type"))
+        if not a_path:
+            elog("agent.media.skip", level="warning",
+                 filename=a_name, reason="no_path")
+            continue
+
+        content: bytes | None
+        try:
+            with open(a_path, "rb") as fh:
+                content = fh.read()
+        except OSError as exc:
+            # The bytes weren't readable (file not on disk yet, permission,
+            # NFS hiccup, …). Don't drop the attachment — fall back to
+            # ``filepath=`` so the runtime still sees it. Downstream
+            # consumers that need bytes can re-read on demand; tools that
+            # just need a path (file-search MCPs, shell, etc.) still work.
+            elog("agent.media.read_skip", level="warning",
+                 filename=a_name, path=a_path, error=str(exc))
+            content = None
+
+        ext = (a_name.rsplit(".", 1)[-1].lower() if a_name and "." in a_name else None)
+
+        try:
+            if a_mime in _AGNO_IMAGE_MIMES:
+                if content is not None:
+                    images.append(Image(content=content, format=ext, mime_type=a_mime))
+                else:
+                    images.append(Image(filepath=a_path, format=ext, mime_type=a_mime))
+            elif a_mime in _AGNO_AUDIO_MIMES:
+                if content is not None:
+                    audios.append(Audio(content=content, format=ext, mime_type=a_mime))
+                else:
+                    audios.append(Audio(filepath=a_path, format=ext, mime_type=a_mime))
+            elif a_mime in _AGNO_VIDEO_MIMES:
+                if content is not None:
+                    videos.append(Video(content=content, format=ext, mime_type=a_mime))
+                else:
+                    videos.append(Video(filepath=a_path, format=ext, mime_type=a_mime))
+            else:
+                # File path. The runtime's ``File`` accepts ``content``
+                # AND ``filepath`` together (unlike Image/Audio/Video,
+                # which require exactly one source). We pass both when
+                # the bytes are available so downstream code can pick
+                # whichever it prefers — multimodal APIs consume content,
+                # file-search tools follow the path.
+                file_kwargs: dict[str, Any] = {
+                    "filepath": a_path,
+                    "filename": a_name,
+                    "format": ext,
+                }
+                if content is not None:
+                    file_kwargs["content"] = content
+                try:
+                    if a_mime in _RuntimeFile.valid_mime_types():
+                        file_kwargs["mime_type"] = a_mime
+                except Exception:  # noqa: BLE001
+                    pass
+                files.append(_RuntimeFile(**file_kwargs))
+        except Exception as exc:  # noqa: BLE001
+            elog("agent.media.build_skip", level="warning",
+                 filename=a_name, mime=a_mime, error=str(exc) or type(exc).__name__)
+
+    return (images, audios, videos, files)
 
 
 _VAULT_WRITE_TOOLS = frozenset({
@@ -182,8 +328,8 @@ class Agent:
     memory vault, dormant-MCP detection). Tool execution and the per-call
     tool loop are delegated to the active provider:
 
-      - ``AgnoProvider`` consumes ``MCPPool.agno_toolkits`` (Agno ``MCPTools``
-        instances) and Agno's ``Agent`` runs the loop internally, including
+      - ``NativeProvider`` consumes ``MCPPool.runtime_toolkits`` (``MCPTools``
+        instances) and the runtime ``Agent`` runs the loop internally, including
         proper image-artifact handling for binary tool results.
       - ``ClaudeCLI`` consumes ``MCPPool.claude_sdk_servers()`` (raw stdio
         config) and the Claude Agent SDK manages everything itself.
@@ -198,7 +344,7 @@ class Agent:
     Usage:
         agent = Agent(
             name="assistant",
-            model=AgnoProvider(model="anthropic:claude-sonnet-4-20250514"),
+            model=NativeProvider(model="anthropic:claude-sonnet-4-20250514"),
             system_prompt="You are a helpful assistant.",
             mcp_pool=None,  # ``initialize`` rebuilds from the ``mcps`` DB table
             memory=MemoryDB("agent.db"),
@@ -387,7 +533,7 @@ class Agent:
         in-memory SessionManager (which starts empty after a restart) and
         forget conversations whose bridge session ids were hydrated back
         into the model from disk. Also includes sessions persisted in the
-        ``agno_sessions`` table so that Claude CLI sessions without a live
+        ``sessions`` table so that Claude CLI sessions without a live
         SDK session mapping still appear in the list.
         """
         import sqlite3
@@ -408,7 +554,7 @@ class Agent:
                     conn = sqlite3.connect(str(db_path), timeout=0.2)
                     try:
                         rows = conn.execute(
-                            "SELECT session_id FROM agno_sessions"
+                            "SELECT session_id FROM sessions"
                         ).fetchall()
                         sids.update(str(r[0]) for r in rows if r and r[0])
                     finally:
@@ -424,7 +570,7 @@ class Agent:
 
         Called by ``StreamSession._cancel_active_turn`` when the user
         interrupts a turn mid-flight. Forwards to ``self.model`` so the
-        bound provider (Claude SDK / Agno) can either issue a clean
+        bound provider (Claude SDK / API-based) can either issue a clean
         interrupt control-request or inject a synthetic run into its
         history store. Best-effort: provider failures log and swallow.
         """
@@ -504,7 +650,7 @@ class Agent:
                 await ensure_builtin_mcps(self._db)
                 # Provider keys and the model catalog are DB-backed. Pull
                 # the rows into ``self._providers_config`` so SmartRouter
-                # / AgnoProvider see the materialised view.
+                # / NativeProvider see the materialised view.
                 await self._hydrate_providers_from_db()
                 self._providers_last_updated = await self._db.providers_max_updated()
                 self._models_last_updated = await self._db.models_max_updated()
@@ -635,7 +781,7 @@ class Agent:
         models are enabled. Returns ``(reloaded_anything, enabled_models)``.
 
         Provider edits (``api_key``, ``base_url``) invalidate the cached
-        ``providers_config`` dict that SmartRouter hands to AgnoProvider
+        ``providers_config`` dict that SmartRouter hands to NativeProvider
         — without this hook, adding a key would require a restart.
         """
         if self._db is None:
@@ -670,7 +816,7 @@ class Agent:
                 logger.debug("providers hydrate failed: %s", exc)
 
         # Models or providers changed → rebuild router. Providers affect
-        # routing because AgnoProvider's api_key lookup goes through
+        # routing because NativeProvider's api_key lookup goes through
         # ``providers_config``; models affect it because the classifier
         # picks from the materialised models list.
         models_changed = models_updated > getattr(self, "_models_last_updated", 0.0)
@@ -702,10 +848,10 @@ class Agent:
         """Pull provider + model rows from the DB into ``self._providers_config``.
 
         The DB is the source of truth for provider keys AND the model
-        catalog. SmartRouter / AgnoProvider consume the v0.12 flat-list
+        catalog. SmartRouter / NativeProvider consume the v0.12 flat-list
         shape — each entry already carries its ``framework`` and its
         nested ``models`` list, so the same vendor can appear twice
-        (anthropic+agno AND anthropic+claude-cli) without a key
+        (anthropic+api-based AND anthropic+claude-cli) without a key
         collision. Delegates the SQL materialisation to MemoryDB so
         smoke-test endpoints can reuse the same shape.
         """
@@ -854,7 +1000,7 @@ class Agent:
         """Run a single agent turn, continuing the session automatically when
         background shells complete during or shortly after it.
 
-        Providers handle the internal tool-loop (Agno via its Agent, Claude
+        Providers handle the internal tool-loop (API-based via its Agent, Claude
         SDK via its native MCP support), so each call to ``model.generate``
         returns post-tool-loop content. This method adds a wrapper loop
         above ``generate`` that:
@@ -863,7 +1009,7 @@ class Agent:
            (shell_exec+run_in_background=True) for ``session_id``.
         2. If any terminal event landed, formats it as a ``<system-reminder>``
            and re-enters ``generate`` on the same session — same subprocess
-           (Claude), same Agno history — so the model sees the completion
+           (Claude), same runtime history — so the model sees the completion
            mid-conversation.
         3. If no events landed but shells are still running, awaits
            ``hub.wait`` up to ``shell.wake_wait_window_seconds`` before
@@ -881,30 +1027,49 @@ class Agent:
         # call tools that operate on its own session (e.g. pin_session).
         system = self._combined_system_prompt(session_id=session_id)
 
-        # Include local paths for attachments so the tool layer can inspect them.
+        # AgentOS-aligned media handling: split attachments by MIME and
+        # construct typed runtime media objects (Image / Audio / Video /
+        # File) with ``content=bytes``, then pass each list to ``arun``'s
+        # corresponding kwarg. API-native model adapters consume the
+        # bytes directly (multimodal API content). Subscription-CLI
+        # backends translate at the wrapper layer — text inlined, binary
+        # written to a sandbox-safe path.
+        media_images, media_audios, media_videos, media_files = _build_runtime_media(attachments)
+
+        # Images still get a textual prepend (no images= channel on the
+        # model layer for subscription-CLI providers) — but non-image
+        # attachments are now routed natively through the runtime's
+        # ``files=`` kwarg so the leader doesn't paraphrase synthetic
+        # file-info blocks into delegation tasks.
         if attachments:
-            files_info: list[str] = []
-            for a in attachments:
-                a_type = a.get("type", "file")
-                a_name = a.get("filename", "")
-                a_path = a.get("path", "")
-                if a_path:
-                    files_info.append(f"- {a_type}: {a_name} — local path: {a_path}")
-                else:
-                    files_info.append(f"- {a_type}: {a_name}")
-            message = prepend_context_block(
-                message,
-                build_attachment_context(
-                    files_info,
-                    read_hint=(
-                        "Use the Read tool (or an MCP tool) with the local path to inspect each file. "
-                        "For images, Read returns the image content for you to see directly."
+            from src.channels.base import build_attachment_context, prepend_context_block
+            image_atts = [a for a in attachments if (a.get("type") or "file") == "image"]
+            if image_atts:
+                files_info: list[str] = []
+                for a in image_atts:
+                    a_name = a.get("filename", "")
+                    a_path = a.get("path", "")
+                    if a_path:
+                        files_info.append(f"- image: {a_name} — local path: {a_path}")
+                    else:
+                        files_info.append(f"- image: {a_name}")
+                message = prepend_context_block(
+                    message,
+                    build_attachment_context(
+                        files_info,
+                        read_hint=(
+                            "Use the Read tool (or an MCP tool) with the local path to inspect each image. "
+                            "For images, Read returns the image content for you to see directly."
+                        ),
                     ),
-                ),
-            )
+                )
 
         from src.mcp.servers.shell.handlers import get_hub
         from src.mcp.servers.shell.adapters import set_session_context, reset_session_context
+        from src.mcp.servers.delegation.handlers import (
+            install_context as install_delegation_context,
+            reset_context as reset_delegation_context,
+        )
         from src.core.config import shell_settings
 
         hub = get_hub()
@@ -934,19 +1099,64 @@ class Agent:
                     )
                     break
 
+                # In-session compaction (vision §2): before driving the
+                # model, check whether the cumulative stored history is
+                # about to breach the model's context budget. If so,
+                # fold the oldest runs into a recap row first so the
+                # next ``add_history_to_context=True`` reload stays
+                # under the limit. The reactive ContextWindowExceeded
+                # fallback (src/models/providers/fallback.py) still
+                # backstops this in case the heuristic underestimates.
+                if iter_count == 1 and session_id:
+                    try:
+                        from src.core.compaction import should_compact, compact
+                        if should_compact(session_id, active_model, agent=self):
+                            await compact(
+                                session_id, active_model, self,
+                                on_status=_status,
+                            )
+                    except Exception as exc:  # noqa: BLE001 — never block a turn
+                        elog(
+                            "runtime.compaction.error",
+                            level="warning",
+                            session_id=session_id,
+                            error_type=type(exc).__name__,
+                            error=str(exc) or repr(exc),
+                        )
+
                 messages: list[dict[str, Any]] = [{"role": "user", "content": current_input}]
                 await _status("Thinking...")
 
                 token = set_session_context(session_id)
+                delegation_tokens = install_delegation_context(
+                    session_id=session_id,
+                    pool=self._mcp,
+                    db=self._db,
+                    dispatcher=active_model,
+                )
                 try:
+                    # ``files`` is forwarded native to the runtime's ``arun(files=...)``
+                    # by NativeProvider / TeamRouterProvider; subscription-CLI
+                    # adapters fall back to a minimal prepend. Only attach on
+                    # the first iteration so shell-reminder re-entries don't
+                    # re-send the same files.
+                    # Only forward media on the first iteration so a
+                    # shell-reminder re-entry doesn't re-attach the same
+                    # files (the agent already saw them).
+                    first = iter_count == 1
                     response = await active_model.generate(
                         messages,
                         system=system,
                         on_status=_status,
                         session_id=session_id,
+                        files=media_files if first else None,
+                        images=media_images if first else None,
+                        audio=media_audios if first else None,
+                        videos=media_videos if first else None,
                     )
                 finally:
                     reset_session_context(token)
+                    reset_delegation_context(delegation_tokens)
 
                 last_response = response
 
@@ -1088,29 +1298,40 @@ class Agent:
         await _status("Loading context...")
         system = self._combined_system_prompt(session_id=session_id)
 
+        # AgentOS-aligned media: see ``_run_inner`` above for the full
+        # rationale. Same per-MIME split + content=bytes construction.
+        media_images, media_audios, media_videos, media_files = _build_runtime_media(attachments)
+
+        # Same images-prepend / files=-passthrough split as ``_run_inner``.
         if attachments:
-            files_info: list[str] = []
-            for a in attachments:
-                a_type = a.get("type", "file")
-                a_name = a.get("filename", "")
-                a_path = a.get("path", "")
-                if a_path:
-                    files_info.append(f"- {a_type}: {a_name} — local path: {a_path}")
-                else:
-                    files_info.append(f"- {a_type}: {a_name}")
-            message = prepend_context_block(
-                message,
-                build_attachment_context(
-                    files_info,
-                    read_hint=(
-                        "Use the Read tool (or an MCP tool) with the local path to inspect each file. "
-                        "For images, Read returns the image content for you to see directly."
+            from src.channels.base import build_attachment_context, prepend_context_block
+            image_atts = [a for a in attachments if (a.get("type") or "file") == "image"]
+            if image_atts:
+                files_info: list[str] = []
+                for a in image_atts:
+                    a_name = a.get("filename", "")
+                    a_path = a.get("path", "")
+                    if a_path:
+                        files_info.append(f"- image: {a_name} — local path: {a_path}")
+                    else:
+                        files_info.append(f"- image: {a_name}")
+                message = prepend_context_block(
+                    message,
+                    build_attachment_context(
+                        files_info,
+                        read_hint=(
+                            "Use the Read tool (or an MCP tool) with the local path to inspect each image. "
+                            "For images, Read returns the image content for you to see directly."
+                        ),
                     ),
-                ),
-            )
+                )
 
         from src.mcp.servers.shell.handlers import get_hub
         from src.mcp.servers.shell.adapters import set_session_context, reset_session_context
+        from src.mcp.servers.delegation.handlers import (
+            install_context as install_delegation_context,
+            reset_context as reset_delegation_context,
+        )
         from src.core.config import shell_settings
 
         hub = get_hub()
@@ -1132,7 +1353,7 @@ class Agent:
 
         # When the streaming autoloop yields zero deltas (claude_cli
         # tool-only turns, smart_router → claude_cli with empty content,
-        # agno when no RunContentEvent fires), we fall back to a
+        # the runtime when no RunContentEvent fires), we fall back to a
         # one-shot generate() so callers always receive text. The real
         # ModelResponse from that call wins for last_response_meta()
         # over the synthetic placeholder.
@@ -1145,17 +1366,46 @@ class Agent:
                          session_id=session_id, cap=cap)
                     break
 
+                # Streaming twin of the in-session compaction call in
+                # _run_inner. See that branch (or src/core/compaction.py)
+                # for the rationale — vision §2 "the session compacts in
+                # place". Only runs on the first iteration so shell-
+                # reminder re-entries don't pay the threshold check on
+                # every loop.
+                if iter_count == 1 and session_id:
+                    try:
+                        from src.core.compaction import should_compact, compact
+                        if should_compact(session_id, active_model, agent=self):
+                            await compact(
+                                session_id, active_model, self,
+                                on_status=_status,
+                            )
+                    except Exception as exc:  # noqa: BLE001 — never block a turn
+                        elog(
+                            "runtime.compaction.error",
+                            level="warning",
+                            session_id=session_id,
+                            error_type=type(exc).__name__,
+                            error=str(exc) or repr(exc),
+                        )
+
                 messages: list[dict[str, Any]] = [{"role": "user", "content": current_input}]
                 await _status("Thinking...")
 
                 token = set_session_context(session_id)
+                delegation_tokens = install_delegation_context(
+                    session_id=session_id,
+                    pool=self._mcp,
+                    db=self._db,
+                    dispatcher=active_model,
+                )
                 try:
                     # Pass session_id and on_status so SmartRouter.stream
                     # can run the same classifier + binding logic that
                     # ``generate`` uses. Without these, voice turns would
-                    # route to "first enabled agno model" instead of the
+                    # route to "first enabled api-based model" instead of the
                     # session's bound side, which 403'd on users whose
-                    # first agno model was an OpenAI model their key
+                    # first api-based model was an OpenAI model their key
                     # couldn't access.
                     #
                     # Introspect once instead of try/except TypeError around
@@ -1179,6 +1429,18 @@ class Agent:
                         stream_kwargs["session_id"] = session_id
                     if "on_status" in sig_params:
                         stream_kwargs["on_status"] = _status
+                    # Only attach media on iteration 1: shell-reminder
+                    # re-entries reuse the same the runtime session, which
+                    # already has the prior files in its run history.
+                    if iter_count == 1:
+                        if "files" in sig_params and media_files:
+                            stream_kwargs["files"] = media_files
+                        if "images" in sig_params and media_images:
+                            stream_kwargs["images"] = media_images
+                        if "audio" in sig_params and media_audios:
+                            stream_kwargs["audio"] = media_audios
+                        if "videos" in sig_params and media_videos:
+                            stream_kwargs["videos"] = media_videos
                     async for delta in active_model.stream(
                         messages, **stream_kwargs,
                     ):
@@ -1189,6 +1451,7 @@ class Agent:
                     stream_finished_cleanly = True
                 finally:
                     reset_session_context(token)
+                    reset_delegation_context(delegation_tokens)
 
                 events = hub.drain(session_id)
                 if not events:
@@ -1322,7 +1585,7 @@ class Agent:
         # runtime actually picked for the session, not a generic
         # instance attribute. ``getattr(active_model, "model_name",
         # None)`` (the previous code) returned ``None`` for every
-        # provider in tree (claude_cli/agno expose ``self.model``;
+        # provider in tree (claude_cli/api-based expose ``self.model``;
         # SmartRouter exposes neither), which silently dropped the
         # model badge from the chat UI after the streaming migration.
         # ``effective_model_id`` is the provider-aware accessor.
@@ -1381,6 +1644,9 @@ class Agent:
         """
         framework = FRAMEWORK_SYSTEM_PROMPT.replace(
             "{{OPENAGENT_VAULT_PATH}}", self._resolve_vault_path()
+        ).replace(
+            "{{MCP_CATALOG_SUMMARY}}",
+            build_mcp_catalog_summary(self._mcp),
         )
 
         user = (self.system_prompt or "").strip()

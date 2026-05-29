@@ -12,15 +12,65 @@ from pathlib import Path
 from ._framework import free_port
 
 
+def _providers_from_user_db(user_config_path: Path) -> dict[str, dict]:
+    """Mine the user's SQLite DB next to ``openagent.yaml`` for live LLM
+    keys.
+
+    Source of truth for providers is the DB (see MEMORY.md: "providers/
+    models come only from SQLite, never openagent.yaml"). The test
+    framework's old behaviour of reading the YAML's ``providers:`` block
+    is now a no-op for any real install — the block is empty. Loading
+    from the sibling ``openagent.db`` lets the live tests boot against
+    whatever the user has configured (e.g. DeepSeek + Claude CLI) without
+    duplicating the keys into the YAML.
+
+    Returns ``{provider_name: {api_key: ..., base_url: ...}}`` for every
+    *enabled*, *api-based* LLM provider with a non-empty key. Subscription
+    providers (claude-cli, codex-cli) are intentionally dropped — they
+    have no API key and exporting an empty one as
+    ``ANTHROPIC_API_KEY`` breaks the CLI auth path.
+    """
+    db_path = user_config_path.parent / "openagent.db"
+    if not db_path.exists():
+        return {}
+    import sqlite3
+    try:
+        con = sqlite3.connect(str(db_path))
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            "SELECT name, framework, api_key, base_url FROM providers "
+            "WHERE enabled = 1 AND kind = 'llm' AND api_key IS NOT NULL "
+            "AND LENGTH(api_key) > 0"
+        ).fetchall()
+        con.close()
+    except sqlite3.Error:
+        return {}
+    out: dict[str, dict] = {}
+    for r in rows:
+        framework = (r["framework"] or "").strip()
+        # Subscription frameworks don't carry usable API keys for the
+        # native test path — drop them.
+        if framework in ("claude-cli", "codex-cli"):
+            continue
+        entry: dict[str, str] = {"api_key": r["api_key"]}
+        if r["base_url"]:
+            entry["base_url"] = r["base_url"]
+        out[r["name"]] = entry
+    return out
+
+
 def build_test_config(user_config_path: Path) -> tuple[dict, Path, Path]:
     """Create ``/tmp/openagent-test-<uuid>/`` with a minimal ``openagent.yaml``.
 
     The generated config:
       - uses SmartRouter so classifier + tier routing runs in one config;
-      - copies the user's ``providers:`` block so live tests can hit OpenAI
-        with real keys, BUT strips ``anthropic`` (placeholder keys like
-        ``sk-test`` get exported as ``ANTHROPIC_API_KEY`` by AgnoProvider
-        and then break the Claude CLI subscription auth path);
+      - merges providers from BOTH the user's ``providers:`` YAML block
+        (legacy path) AND the sibling ``openagent.db`` (current source
+        of truth) so live tests can hit real APIs without forcing users
+        to duplicate their keys into the YAML — strips ``anthropic``
+        regardless (placeholder keys like ``sk-test`` get exported as
+        ``ANTHROPIC_API_KEY`` by NativeProvider and then break the
+        Claude CLI subscription auth path);
       - disables heavy MCPs (chrome-devtools, web-search, computer-control)
         that would slow the suite down without adding coverage;
       - points the memory DB at the temp dir so the user's real DB is
@@ -36,6 +86,12 @@ def build_test_config(user_config_path: Path) -> tuple[dict, Path, Path]:
 
     user_cfg = yaml.safe_load(user_config_path.read_text()) if user_config_path.exists() else {}
     user_providers = dict(user_cfg.get("providers", {}))
+    # The DB is the source of truth (MEMORY.md). Pull live keys from it
+    # so a YAML without ``providers:`` still unblocks the live tests.
+    for name, entry in _providers_from_user_db(user_config_path).items():
+        # YAML wins if it set the same provider — preserves the explicit
+        # override path for someone debugging keys via the file.
+        user_providers.setdefault(name, entry)
     if "anthropic" in user_providers:
         # Placeholder anthropic keys confuse the claude binary subscription
         # auth path. Claude CLI does not need an API key.

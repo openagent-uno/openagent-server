@@ -1,6 +1,6 @@
 """MCP usage tests — drive vault/scheduler/filesystem tools directly.
 
-These tests invoke the underlying ``entrypoint`` on Agno's registered
+These tests invoke the underlying ``entrypoint`` on the runtime's registered
 callables rather than going through the LLM, so they're fast and
 deterministic. They confirm the MCP servers actually execute work end
 to end, not just that they loaded.
@@ -17,7 +17,7 @@ from ._framework import TestContext, TestSkip, test
 async def t_vault_roundtrip(ctx: TestContext) -> None:
     pool = ctx.extras["pool"]
     vault_tk = next(
-        (t for t in pool.agno_toolkits if getattr(t, "tool_name_prefix", "") == "vault"),
+        (t for t in pool.runtime_toolkits if getattr(t, "tool_name_prefix", "") == "vault"),
         None,
     )
     if vault_tk is None:
@@ -38,7 +38,7 @@ async def t_vault_roundtrip(ctx: TestContext) -> None:
 async def t_scheduler_roundtrip(ctx: TestContext) -> None:
     pool = ctx.extras["pool"]
     sched_tk = next(
-        (t for t in pool.agno_toolkits if getattr(t, "tool_name_prefix", "") == "scheduler"),
+        (t for t in pool.runtime_toolkits if getattr(t, "tool_name_prefix", "") == "scheduler"),
         None,
     )
     if sched_tk is None:
@@ -66,7 +66,7 @@ async def t_scheduler_roundtrip(ctx: TestContext) -> None:
 async def t_filesystem_list(ctx: TestContext) -> None:
     pool = ctx.extras["pool"]
     fs_tk = next(
-        (t for t in pool.agno_toolkits if getattr(t, "tool_name_prefix", "") == "filesystem"),
+        (t for t in pool.runtime_toolkits if getattr(t, "tool_name_prefix", "") == "filesystem"),
         None,
     )
     if fs_tk is None:
@@ -170,19 +170,27 @@ async def t_pool_tool_budget(ctx: TestContext) -> None:
     tools for the provider's cap, drop subprocess MCPs alphabetically
     until they fit, but never drop in-process MCPs (especially
     ``tool-search``, which is the model's only way back to the
-    trimmed ones). Both Agno and Claude SDK views must agree on what's
+    trimmed ones). Both the runtime and Claude SDK views must agree on what's
     kept — symmetry is the whole reason this lives in the pool, not
     in two parallel provider implementations.
     """
     from src.mcp.pool import MCPPool
 
-    pool = MCPPool.from_config([
-        {"builtin": "tool-search"},
-        {"builtin": "shell"},
-        {"builtin": "scheduler"},
-        {"builtin": "mcp-manager"},
-        {"builtin": "workflow-manager"},
-    ])
+    # ``include_defaults=False`` keeps the test hermetic: the pool
+    # contains exactly the five MCPs listed below. Otherwise ``vault``,
+    # ``filesystem``, ``attachments``, ``delegation`` (etc.) would also
+    # load as defaults and skew the budget arithmetic — the tight-budget
+    # assertion below is keyed off ``tool-search`` + ``shell`` only.
+    pool = MCPPool.from_config(
+        [
+            {"builtin": "tool-search"},
+            {"builtin": "shell"},
+            {"builtin": "scheduler"},
+            {"builtin": "mcp-manager"},
+            {"builtin": "workflow-manager"},
+        ],
+        include_defaults=False,
+    )
     await pool.connect_all()
     try:
         # Budget so tight only in-process fits → both views should keep
@@ -191,11 +199,11 @@ async def t_pool_tool_budget(ctx: TestContext) -> None:
             pool._tool_counts.get("tool-search", 0)
             + pool._tool_counts.get("shell", 0)
         )
-        agno_subset = pool.agno_toolkits_under_budget(in_process_count)
+        runtime_subset = pool.runtime_toolkits_under_budget(in_process_count)
         sdk_subset = pool.claude_sdk_servers_under_budget(in_process_count)
-        agno_names = {pool._toolkit_name(tk) for tk in agno_subset}
-        assert agno_names == {"tool-search", "shell"}, (
-            f"agno tight budget kept the wrong set: {agno_names}"
+        runtime_names = {pool._toolkit_name(tk) for tk in runtime_subset}
+        assert runtime_names == {"tool-search", "shell"}, (
+            f"runtime tight budget kept the wrong set: {runtime_names}"
         )
         assert set(sdk_subset) == {"tool-search", "shell"}, (
             f"sdk tight budget kept the wrong set: {set(sdk_subset)}"
@@ -204,20 +212,20 @@ async def t_pool_tool_budget(ctx: TestContext) -> None:
         # Generous budget should keep everything we explicitly added.
         # ``from_config`` may merge in additional defaults — assert subset
         # so the test stays robust to that.
-        agno_full = pool.agno_toolkits_under_budget(10_000)
+        runtime_full = pool.runtime_toolkits_under_budget(10_000)
         sdk_full = pool.claude_sdk_servers_under_budget(10_000)
-        agno_full_names = {pool._toolkit_name(tk) for tk in agno_full}
+        runtime_full_names = {pool._toolkit_name(tk) for tk in runtime_full}
         expected = {"tool-search", "shell", "scheduler", "mcp-manager", "workflow-manager"}
-        assert expected <= agno_full_names, (
-            f"generous agno budget dropped something: {expected - agno_full_names}"
+        assert expected <= runtime_full_names, (
+            f"generous runtime budget dropped something: {expected - runtime_full_names}"
         )
         assert expected <= set(sdk_full), (
             f"generous sdk budget dropped something: {expected - set(sdk_full)}"
         )
 
         # ``budget < 0`` is the legacy bypass — should equal the unfiltered view.
-        assert {pool._toolkit_name(tk) for tk in pool.agno_toolkits_under_budget(-1)} \
-            == {pool._toolkit_name(tk) for tk in pool.agno_toolkits}, \
+        assert {pool._toolkit_name(tk) for tk in pool.runtime_toolkits_under_budget(-1)} \
+            == {pool._toolkit_name(tk) for tk in pool.runtime_toolkits}, \
             "budget=-1 must skip trimming entirely (legacy callers depend on it)"
     finally:
         await pool.close_all()

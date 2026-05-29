@@ -60,7 +60,6 @@ async def handle_catalog(request: web.Request) -> web.Response:
                 "runtime_id": entry.runtime_id,
                 "history_mode": entry.history_mode,
                 "tier_hint": entry.tier_hint,
-                "description": entry.description,
                 "input_cost_per_million": round(float(pricing["input_cost_per_million"] or 0.0), 4),
                 "output_cost_per_million": round(float(pricing["output_cost_per_million"] or 0.0), 4),
             }
@@ -121,7 +120,6 @@ def _shape_model(row: dict[str, Any]) -> dict[str, Any]:
         "model": row["model"],
         "display_name": display_name,
         "tier_hint": row.get("tier_hint"),
-        "description": row.get("description"),
         "enabled": bool(row.get("enabled", True)),
         "is_classifier": bool(row.get("is_classifier", False)),
         "provider_enabled": bool(row.get("provider_enabled", True)),
@@ -157,7 +155,6 @@ def _synthetic_piper_row() -> dict[str, Any]:
         "model": "piper",
         "display_name": f"(local) Piper · {voice}",
         "tier_hint": "Bundled offline TTS — auto-downloads ~25 MB on first use",
-        "description": None,
         "enabled": True,
         "is_classifier": False,
         "provider_enabled": True,
@@ -174,7 +171,7 @@ async def handle_list_db(request: web.Request) -> web.Response:
 
     Query params:
       - ``provider_id`` (int) — filter to a single provider row
-      - ``framework`` (``agno`` / ``claude-cli``) — filter by framework
+      - ``framework`` (``api-based`` / ``claude-cli``) — filter by framework
       - ``enabled_only`` (bool) — skip disabled model rows
 
     When Piper is importable AND no kind='tts' row exists yet, a
@@ -260,7 +257,6 @@ async def handle_create_db(request: web.Request) -> web.Response:
             model=model,
             display_name=body.get("display_name"),
             tier_hint=body.get("tier_hint") or body.get("notes"),
-            description=body.get("description"),
             enabled=bool(body.get("enabled", True)),
             is_classifier=bool(body.get("is_classifier", False)),
             metadata=body.get("metadata") or None,
@@ -298,7 +294,6 @@ async def handle_update_db(request: web.Request) -> web.Response:
             model=body.get("model", existing["model"]),
             display_name=body.get("display_name", existing.get("display_name")),
             tier_hint=body.get("tier_hint", existing.get("tier_hint")),
-            description=body.get("description", existing.get("description")),
             enabled=bool(body.get("enabled", existing.get("enabled", True))),
             is_classifier=(
                 bool(desired_classifier)

@@ -10,7 +10,7 @@ telegram completely unresponsive. Root cause chain:
     uv tool bin dir), turning ``workspace-mcp`` into a dead symlink.
   - systemd tried to spawn openagent, openagent tried to connect every
     MCP in ``MCPPool.connect_all`` via ``AsyncExitStack.enter_async_context``.
-  - The google-workspace entry hit a broken handshake. Agno's internal
+  - The google-workspace entry hit a broken handshake. the runtime's internal
     ``initialize()`` swallowed ``BaseException`` (CancelledError /
     BaseExceptionGroup), but the *shared* ``AsyncExitStack`` was now in
     a half-entered state across task boundaries.
@@ -49,7 +49,7 @@ from ._framework import TestContext, test
 
 
 class _FakeToolkit:
-    """Stand-in for ``agno.tools.mcp.MCPTools``.
+    """Stand-in for ``src.mcp._runtime.mcp.MCPTools``.
 
     Supports injection of:
 
@@ -57,7 +57,7 @@ class _FakeToolkit:
       - ``enter_hang``: when True, ``__aenter__`` awaits forever (until
         cancelled) — used to verify the handshake timeout.
       - ``aexit_exc``: exception raised from ``__aexit__`` (which is what
-        ``AsyncExitStack.aclose`` calls on shutdown — Agno + anyio use
+        ``AsyncExitStack.aclose`` calls on shutdown — the runtime + anyio use
         this path for proper cancel-scope teardown).
       - ``tool_count``: value used to populate ``functions`` after enter.
 
@@ -102,7 +102,7 @@ class _FakeToolkit:
 
 
 class _StealthFailToolkit(_FakeToolkit):
-    """Models the Agno bug: ``__aenter__`` returns OK with an empty tools
+    """Models the underlying MCPTools bug: ``__aenter__`` returns OK with an empty tools
     dict (because the wrapped ``initialize`` swallowed a BaseException),
     but a follow-up ``initialize()`` call succeeds.
 
@@ -124,14 +124,14 @@ class _StealthFailToolkit(_FakeToolkit):
 
     async def __aenter__(self) -> "_StealthFailToolkit":
         # Stealth-fail: enter succeeds, but functions stays empty until
-        # something forces another initialize() (just like real Agno).
+        # something forces another initialize() (just like the runtime).
         self.entered = True
         self.functions = {}
         return self
 
     async def initialize(self) -> None:
         self.initialize_calls += 1
-        # Agno's idempotency guard: skip if already initialized.
+        # the runtime's idempotency guard: skip if already initialized.
         if self._initialized:
             return
         if (
@@ -143,16 +143,68 @@ class _StealthFailToolkit(_FakeToolkit):
             }
             self._initialized = True
             return
-        # Mimic Agno: log the error and silently leave _initialized=False.
+        # Mimic the runtime: log the error and silently leave _initialized=False.
         # No exception propagates to the caller.
 
 
-def _install_pool_fakes(monkey_specs: list[tuple[str, _FakeToolkit]]) -> Any:
+class _DeadSessionStealthFailToolkit(_FakeToolkit):
+    """Models the lyra-2026-05-23 workflow-manager bug.
+
+    Same stealth-fail entry as ``_StealthFailToolkit`` (functions={} after
+    __aenter__), BUT the bypass-path recovery in
+    ``_recover_dormant_toolkit`` raises ``anyio.ClosedResourceError`` on
+    ``session.initialize()`` because the stdio_client's memory streams
+    were closed when the runtime's blanket-except swallowed the underlying
+    cause. No amount of in-place retries can fix this — only a fresh
+    subprocess + session pair recovers.
+
+    The pool's expected behaviour: detect the dead-session error class
+    via ``_SESSION_DEAD_ERROR_TYPES``, drop the corpse, call
+    ``_build_and_enter_toolkit`` again. The second instance (provided
+    by the test's ``_install_pool_fakes`` ``rebuild`` map) returns a
+    healthy toolkit with its full tool count.
+    """
+
+    def __init__(
+        self,
+        name: str = "dead-session",
+        *,
+        tool_count: int = 4,
+    ) -> None:
+        super().__init__(name=name, tool_count=tool_count)
+        # Bypass detection in _recover_dormant_toolkit checks for
+        # callable .session.initialize + .build_tools, so we model
+        # a session that always raises ClosedResourceError.
+        class _DeadSession:
+            async def initialize(self_inner) -> None:
+                import anyio  # local import — anyio is already a transitive dep
+                raise anyio.ClosedResourceError()
+        self.session = _DeadSession()
+        self._initialized = False
+        self.session_initialize_calls = 0
+        self.build_tools_calls = 0
+
+    async def __aenter__(self) -> "_DeadSessionStealthFailToolkit":
+        self.entered = True
+        self.functions = {}
+        return self
+
+    async def build_tools(self) -> None:
+        # Never reached because session.initialize raises first, but
+        # provided for shape-completeness so the bypass detection passes.
+        self.build_tools_calls += 1
+
+
+def _install_pool_fakes(
+    monkey_specs: list[tuple[str, _FakeToolkit]],
+    *,
+    rebuild: dict[str, _FakeToolkit] | None = None,
+) -> Any:
     """Install a fake ``_build_and_enter_toolkit`` on ``MCPPool``.
 
     Returns the pool. Each spec name maps to a pre-built fake toolkit —
     the pool's build function looks up the toolkit by spec name instead
-    of importing Agno. This keeps the test independent from Agno's
+    of importing the runtime. This keeps the test independent from the runtime's
     current API and gives each test a deterministic per-spec toolkit.
     """
     from src.mcp.pool import MCPPool, _ServerSpec
@@ -160,9 +212,24 @@ def _install_pool_fakes(monkey_specs: list[tuple[str, _FakeToolkit]]) -> Any:
     specs = [_ServerSpec(name=name, command=["/bin/true"]) for name, _ in monkey_specs]
     pool = MCPPool(specs)
     by_name = dict(monkey_specs)
+    rebuild_map = dict(rebuild or {})
+    build_calls: dict[str, int] = {}
 
     async def _fake_build(self: MCPPool, spec: _ServerSpec) -> Any:
-        toolkit = by_name[spec.name]
+        # On re-spawn, the pool calls _build_and_enter_toolkit a SECOND
+        # time for the same spec. Tests that exercise the re-spawn path
+        # pre-register a replacement toolkit in ``rebuild`` keyed by
+        # spec name; on the SECOND (and later) call for that spec we
+        # hand back the replacement so the test can assert "fresh
+        # subprocess" semantics. First call always returns the original
+        # toolkit so a non-re-spawning code path doesn't accidentally
+        # mask a regression by picking the healthy fixture on attempt 1.
+        n = build_calls.get(spec.name, 0)
+        build_calls[spec.name] = n + 1
+        if n >= 1 and spec.name in rebuild_map:
+            toolkit = rebuild_map[spec.name]
+        else:
+            toolkit = by_name[spec.name]
         # Enter the toolkit directly; let the new pool do its own bounded
         # wait and BaseException isolation around this call.
         return await pool._safe_enter(toolkit, spec)  # type: ignore[attr-defined]
@@ -278,13 +345,13 @@ async def t_handshake_hang_times_out(ctx: TestContext) -> None:
 
 @test(
     "mcp_pool_resilience",
-    "Stealth-failed Agno init recovers via post-enter initialize() retry",
+    "Stealth-failed runtime init recovers via post-enter initialize() retry",
 )
 async def t_stealth_fail_recovers(ctx: TestContext) -> None:
-    """The mixout-2026-05 regression. Agno's ``MCPTools.initialize()`` wraps
+    """The mixout-2026-05 regression. the runtime's ``MCPTools.initialize()`` wraps
     its real init in ``except (RuntimeError, BaseException): log_error(...)``.
     When the wrapped init raises a ``BaseExceptionGroup`` from anyio's
-    TaskGroup (typical under host load), Agno swallows it, leaves
+    TaskGroup (typical under host load), the runtime swallows it, leaves
     ``_initialized=False``, and ``__aenter__`` returns OK with zero tools.
     16/20 MCPs went silently dormant on a busy persona because of this.
 
@@ -344,6 +411,110 @@ async def t_stealth_fail_gives_up(ctx: TestContext) -> None:
         f"expected 2 recovery attempts, got {dead.initialize_calls}"
     )
     await pool.close_all()
+
+
+@test(
+    "mcp_pool_resilience",
+    "Dead-session stealth-fail triggers full re-spawn (lyra workflow-manager regression)",
+)
+async def t_dead_session_respawns(ctx: TestContext) -> None:
+    """The lyra-2026-05-23 workflow-manager regression: the runtime's first
+    ``__aenter__`` stealth-failed (functions={}) but the underlying
+    stdio_client streams were already closed, so the in-place bypass
+    retry loop in ``_recover_dormant_toolkit`` emitted three identical
+    ``ClosedResourceError`` failures and gave up.
+
+    Before this fix the MCP went dormant forever (workflows referencing
+    it crashed every run, mc.dormant on every boot). The pool must now
+    detect the dead-session error class, throw the corpse away, and
+    re-spawn via ``_build_and_enter_toolkit`` — the second spawn lands
+    healthy because PyInstaller's _MEI extract is already warm.
+
+    Cap is one re-spawn per spec per ``connect_all``: if the fresh
+    toolkit ALSO comes up dead-session, it stays dormant rather than
+    looping forever.
+    """
+    from src.mcp import pool as pool_mod
+
+    good = _FakeToolkit("good", tool_count=2)
+    dead = _DeadSessionStealthFailToolkit("workflow-manager", tool_count=18)
+    # On re-spawn the pool gets a healthy replacement — exactly what
+    # happens in production where the second subprocess hits a warm
+    # _MEI tree and the handshake completes normally.
+    fresh = _FakeToolkit("workflow-manager", tool_count=18)
+
+    pool = _install_pool_fakes(
+        [("good", good), ("workflow-manager", dead)],
+        rebuild={"workflow-manager": fresh},
+    )
+
+    # Keep the recovery loop tight so the test stays fast — the
+    # behavioural assertion is "re-spawn happens", not "respect the
+    # production timeout".
+    saved_attempts = pool_mod._DORMANT_RECOVERY_ATTEMPTS
+    saved_backoff = pool_mod._DORMANT_RECOVERY_BACKOFF
+    pool_mod._DORMANT_RECOVERY_ATTEMPTS = 2
+    pool_mod._DORMANT_RECOVERY_BACKOFF = 0.01
+    try:
+        await pool.connect_all()
+    finally:
+        pool_mod._DORMANT_RECOVERY_ATTEMPTS = saved_attempts
+        pool_mod._DORMANT_RECOVERY_BACKOFF = saved_backoff
+
+    summary = pool.server_summary()
+    assert summary == {"good": 2, "workflow-manager": 18}, summary
+    assert "workflow-manager" not in pool.dormant_servers(), (
+        f"workflow-manager should have re-spawned cleanly; "
+        f"dormant={pool.dormant_servers()}"
+    )
+    assert fresh.entered, (
+        "the fresh replacement toolkit was never entered — "
+        "re-spawn path didn't fire"
+    )
+    # Resolving by name must point at the FRESH toolkit, not the corpse.
+    assert pool.toolkit_by_name("workflow-manager") is fresh
+    await pool.close_all()
+
+
+@test(
+    "mcp_pool_resilience",
+    "Re-spawn caps at one per spec — second dead-session attempt stays dormant",
+)
+async def t_dead_session_respawn_capped(ctx: TestContext) -> None:
+    """A permanently-broken MCP that stealth-fails with dead-session on
+    BOTH spawn attempts must end up dormant within bounded wall-time.
+    The re-spawn loop is not allowed to recurse — that would let a
+    truly broken MCP block every ``connect_all`` indefinitely.
+    """
+    from src.mcp import pool as pool_mod
+
+    dead_a = _DeadSessionStealthFailToolkit("broken", tool_count=3)
+    dead_b = _DeadSessionStealthFailToolkit("broken", tool_count=3)
+
+    pool = _install_pool_fakes(
+        [("broken", dead_a)],
+        rebuild={"broken": dead_b},
+    )
+
+    saved_attempts = pool_mod._DORMANT_RECOVERY_ATTEMPTS
+    saved_backoff = pool_mod._DORMANT_RECOVERY_BACKOFF
+    pool_mod._DORMANT_RECOVERY_ATTEMPTS = 2
+    pool_mod._DORMANT_RECOVERY_BACKOFF = 0.01
+    try:
+        t0 = asyncio.get_event_loop().time()
+        await pool.connect_all()
+        elapsed = asyncio.get_event_loop().time() - t0
+    finally:
+        pool_mod._DORMANT_RECOVERY_ATTEMPTS = saved_attempts
+        pool_mod._DORMANT_RECOVERY_BACKOFF = saved_backoff
+
+    # Wall-time bound: with two recovery passes of 2 attempts each plus
+    # the re-spawn, we still need to come out well under a couple seconds.
+    # A regression that re-spawned more than once would push past this.
+    assert elapsed < 3.0, f"connect_all took {elapsed:.1f}s — re-spawn is recursing"
+    assert pool.server_summary() == {"broken": 0}
+    assert "broken" in pool.dormant_servers()
+    assert dead_b.entered, "re-spawn fresh toolkit must still get a single attempt"
 
 
 @test(

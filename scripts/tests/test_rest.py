@@ -107,7 +107,7 @@ async def t_usage_daily(ctx: TestContext) -> None:
 async def t_providers_list(ctx: TestContext) -> None:
     """Providers live in the ``providers`` SQLite table. Under v0.12
     the response is a flat list — the same vendor can appear twice
-    (anthropic+agno and anthropic+claude-cli), so a name-keyed dict
+    (anthropic+api-based and anthropic+claude-cli), so a name-keyed dict
     would collide."""
     port = ctx.extras.get("gateway_port")
     if not port:
@@ -243,3 +243,85 @@ async def t_vault_search(ctx: TestContext) -> None:
             async with http.delete(
                 f"http://127.0.0.1:{port}/api/vault/notes/{note_path}") as r:
                 pass  # best-effort cleanup
+
+
+@test("vault_rest", "/api/vault/notes normalizes a scalar frontmatter tag to a list")
+async def t_vault_tags_scalar(ctx: TestContext) -> None:
+    """Regression: YAML parses ``tags: solo`` as a string. The app types
+    ``tags`` as a string array and runs ``tags.slice(...).join(...)`` on
+    it — a scalar leaking through crashes the Memory view."""
+    port = ctx.extras.get("gateway_port")
+    if not port:
+        raise TestSkip("gateway not running")
+    import aiohttp
+    marker = uuid.uuid4().hex[:8]
+    note_path = f"test/scalartag-{marker}.md"
+    content = f"---\ntags: solo\n---\n# scalar tag {marker}\n"
+    async with aiohttp.ClientSession() as http:
+        async with http.put(f"http://127.0.0.1:{port}/api/vault/notes/{note_path}",
+                            json={"content": content}) as r:
+            assert r.status == 200, f"PUT returned {r.status}"
+        try:
+            async with http.get(f"http://127.0.0.1:{port}/api/vault/notes") as r:
+                assert r.status == 200
+                notes = (await r.json()).get("notes") or []
+            row = next((n for n in notes if n.get("path") == note_path), None)
+            assert row is not None, f"note not listed: {note_path}"
+            assert isinstance(row["tags"], list), (
+                f"tags must be a list, got {type(row['tags']).__name__}: "
+                f"{row['tags']!r}"
+            )
+            assert row["tags"] == ["solo"], f"tags={row['tags']!r}"
+
+            # Search results carry the same normalized shape.
+            async with http.get(f"http://127.0.0.1:{port}/api/vault/search",
+                                params={"q": marker}) as r:
+                assert r.status == 200
+                results = (await r.json()).get("results") or []
+            srow = next((n for n in results if n.get("path") == note_path), None)
+            assert srow is not None, f"search didn't find marker {marker}"
+            assert isinstance(srow["tags"], list), (
+                f"search tags must be a list, got {srow['tags']!r}"
+            )
+        finally:
+            async with http.delete(
+                f"http://127.0.0.1:{port}/api/vault/notes/{note_path}") as r:
+                pass  # best-effort cleanup
+
+
+@test("vault_rest", "graph edges resolve folder-path wikilinks, not just bare names")
+async def t_vault_graph_pathlinks(ctx: TestContext) -> None:
+    """Regression: notes link each other by folder-relative path
+    (``[[dir/note]]``), often with a ``#heading`` anchor. The graph
+    builder keyed only on the bare filename stem, so path-style links
+    produced no edge and the Memory graph showed disconnected nodes."""
+    port = ctx.extras.get("gateway_port")
+    if not port:
+        raise TestSkip("gateway not running")
+    import aiohttp
+    m = uuid.uuid4().hex[:6]
+    a = f"test/glink-{m}/alpha.md"
+    b = f"test/glink-{m}/beta.md"
+    async with aiohttp.ClientSession() as http:
+        # alpha links beta by folder path, with a heading anchor.
+        async with http.put(f"http://127.0.0.1:{port}/api/vault/notes/{a}",
+                            json={"content": f"# alpha\n\nsee [[test/glink-{m}/beta#intro]]\n"}) as r:
+            assert r.status == 200
+        async with http.put(f"http://127.0.0.1:{port}/api/vault/notes/{b}",
+                            json={"content": "# beta\n\n## intro\nhi\n"}) as r:
+            assert r.status == 200
+        try:
+            async with http.get(f"http://127.0.0.1:{port}/api/vault/graph") as r:
+                assert r.status == 200
+                graph = await r.json()
+            edges = graph.get("edges") or []
+            hit = any(
+                isinstance(e, dict) and e.get("source") == a and e.get("target") == b
+                for e in edges
+            )
+            assert hit, f"path-style wikilink produced no edge {a} -> {b}"
+        finally:
+            for p in (a, b):
+                async with http.delete(
+                    f"http://127.0.0.1:{port}/api/vault/notes/{p}") as r:
+                    pass  # best-effort cleanup

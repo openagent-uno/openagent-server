@@ -769,17 +769,17 @@ async def t_adapter_claude(ctx: TestContext) -> None:
     assert "instance" in cfg or "server" in cfg or "type" in cfg, f"unexpected shape: {cfg!r}"
 
 
-@test("shell", "adapters.build_agno_toolkit exposes the six tools by name")
+@test("shell", "adapters.build_runtime_toolkit exposes the six tools by name")
 async def t_adapter_agno(ctx: TestContext) -> None:
-    from src.mcp.servers.shell.adapters import build_agno_toolkit
+    from src.mcp.servers.shell.adapters import build_runtime_toolkit
 
-    tk = build_agno_toolkit()
+    tk = build_runtime_toolkit()
     names = set()
     for attr in ("functions",):
         container = getattr(tk, attr, None)
         if isinstance(container, dict):
             names.update(container.keys())
-    # Agno's Toolkit populates .functions on init with the callables it
+    # the runtime's Toolkit populates .functions on init with the callables it
     # was given; names come from the function __name__.
     if not names:
         # Fallback: look at the underlying tools list.
@@ -821,7 +821,7 @@ async def t_adapter_claude_schema(ctx: TestContext) -> None:
         f"timeout type: {props.get('timeout')}"
 
 
-@test("shell", "MCPPool: in-process shell toolkit appears in agno_toolkits")
+@test("shell", "MCPPool: in-process shell toolkit appears in runtime_toolkits")
 async def t_pool_in_process_agno(ctx: TestContext) -> None:
     from src.mcp.pool import MCPPool
 
@@ -833,7 +833,7 @@ async def t_pool_in_process_agno(ctx: TestContext) -> None:
     )
     await pool.connect_all()
     try:
-        kits = pool.agno_toolkits
+        kits = pool.runtime_toolkits
         assert len(kits) == 1, f"expected 1 toolkit, got {len(kits)}: {kits}"
         kit = kits[0]
         assert getattr(kit, "name", None) == "shell"
@@ -872,13 +872,13 @@ async def t_pool_in_process_import_failure(ctx: TestContext) -> None:
         in_process=True,
         adapter_module="openagent.mcp.servers.does_not_exist",
         sdk_server_factory="build_sdk_server",
-        agno_toolkit_factory="build_agno_toolkit",
+        runtime_toolkit_factory="build_runtime_toolkit",
     )
     pool = MCPPool(specs=[broken])
     # connect_all must NOT raise — the broken spec is simply skipped.
     await pool.connect_all()
     try:
-        assert pool.agno_toolkits == []
+        assert pool.runtime_toolkits == []
         assert pool.claude_sdk_servers() == {}
     finally:
         await pool.close_all()
@@ -941,6 +941,7 @@ async def t_agent_autoloop_continues(ctx: TestContext) -> None:
 
         async def generate(
             self, messages, system=None, tools=None, on_status=None, session_id=None,
+            files=None, images=None, audio=None, videos=None, **_kwargs,
         ) -> ModelResponse:
             content = messages[-1]["content"]
             self.turns.append(content)
@@ -989,7 +990,7 @@ async def t_agent_autoloop_stops(ctx: TestContext) -> None:
 
     class NoShellModel(BaseModel):
         history_mode = "provider"
-        async def generate(self, messages, system=None, tools=None, on_status=None, session_id=None):
+        async def generate(self, messages, system=None, tools=None, on_status=None, session_id=None, files=None, images=None, audio=None, videos=None):
             return ModelResponse(content="just text")
 
     agent = Agent(name="test", model=NoShellModel())
@@ -1026,7 +1027,7 @@ async def t_agent_passive_reminder(ctx: TestContext) -> None:
     class EchoModel(BaseModel):
         history_mode = "provider"
         last_input: str = ""
-        async def generate(self, messages, system=None, tools=None, on_status=None, session_id=None):
+        async def generate(self, messages, system=None, tools=None, on_status=None, session_id=None, files=None, images=None, audio=None, videos=None):
             EchoModel.last_input = messages[-1]["content"]
             return ModelResponse(content="ok")
 
@@ -1059,7 +1060,7 @@ async def t_agent_autoloop_cap(ctx: TestContext) -> None:
 
         def __init__(self): self.turns = 0
 
-        async def generate(self, messages, system=None, tools=None, on_status=None, session_id=None):
+        async def generate(self, messages, system=None, tools=None, on_status=None, session_id=None, files=None, images=None, audio=None, videos=None):
             self.turns += 1
             token = adapters.set_session_context(session_id)
             try:

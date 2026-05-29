@@ -19,11 +19,14 @@ class ToolStatusEvent:
     The agent fires status events in two shapes (the chat store and
     every bridge / turn runner has historically had to detect both):
 
-      * JSON: ``{"tool": "ReadFile", "status": "running", ...}``
+      * JSON (API-native ``ToolExecution.to_dict()``):
+        ``{"tool_name": "ReadFile", "tool_call_error": false, "result": ..., ...}``
       * Plain: ``"Using ReadFile..."``
 
-    This dataclass normalizes them into a single shape so callers can
-    branch on ``status`` without re-parsing.
+    Phase is derived from the runtime fields: ``tool_call_error`` → error,
+    ``result`` present → done, otherwise → running. This dataclass
+    normalises both shapes so callers can branch on ``status`` without
+    re-parsing.
     """
     tool: str
     status: str  # "running" / "done" / "error"
@@ -40,14 +43,20 @@ def parse_status_event(raw: str) -> Optional[ToolStatusEvent]:
     if not text:
         return None
 
-    # JSON shape first.
+    # JSON shape first — the runtime's native ``ToolExecution.to_dict()``.
     try:
         parsed = json.loads(text)
-        if isinstance(parsed, dict) and parsed.get("tool"):
+        if isinstance(parsed, dict) and parsed.get("tool_name"):
+            is_err = bool(parsed.get("tool_call_error"))
+            has_result = parsed.get("result") is not None
+            status = "error" if is_err else ("done" if has_result else "running")
+            err_text: str | None = None
+            if is_err and parsed.get("result") is not None:
+                err_text = str(parsed["result"])
             return ToolStatusEvent(
-                tool=str(parsed["tool"]),
-                status=str(parsed.get("status") or "running"),
-                error=(str(parsed["error"]) if parsed.get("error") else None),
+                tool=str(parsed["tool_name"]),
+                status=status,
+                error=err_text,
             )
     except (json.JSONDecodeError, ValueError, TypeError):
         pass

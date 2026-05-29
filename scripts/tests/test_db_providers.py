@@ -18,7 +18,7 @@ async def t_providers_roundtrip(ctx: TestContext) -> None:
     try:
         pid = await db.upsert_provider(
             name="openai",
-            framework="agno",
+            framework="api-based",
             api_key="sk-test-key",
             base_url="https://api.openai.com/v1",
             enabled=True,
@@ -29,16 +29,16 @@ async def t_providers_roundtrip(ctx: TestContext) -> None:
         assert row is not None
         assert row["id"] == pid
         assert row["name"] == "openai"
-        assert row["framework"] == "agno"
+        assert row["framework"] == "api-based"
         assert row["api_key"] == "sk-test-key"
         assert row["base_url"] == "https://api.openai.com/v1"
         assert row["enabled"] is True
         assert row["metadata"] == {"tier": "paid"}
 
         listed = await db.list_providers()
-        assert [(r["name"], r["framework"]) for r in listed] == [("openai", "agno")]
+        assert [(r["name"], r["framework"]) for r in listed] == [("openai", "api-based")]
 
-        row_by_name = await db.get_provider_by_name("openai", "agno")
+        row_by_name = await db.get_provider_by_name("openai", "api-based")
         assert row_by_name is not None and row_by_name["id"] == pid
 
         await db.delete_provider(pid)
@@ -54,10 +54,10 @@ async def t_providers_upsert_idempotent(ctx: TestContext) -> None:
     db = MemoryDB(str(ctx.db_path))
     await db.connect()
     try:
-        pid1 = await db.upsert_provider(name="zai", framework="agno", api_key="key-1")
+        pid1 = await db.upsert_provider(name="zai", framework="api-based", api_key="key-1")
         first = await db.get_provider(pid1)
         pid2 = await db.upsert_provider(
-            name="zai", framework="agno",
+            name="zai", framework="api-based",
             api_key="key-2", base_url="https://api.z.ai/api/paas/v4",
         )
         assert pid1 == pid2, "upsert on same (name, framework) must keep the same id"
@@ -109,15 +109,15 @@ async def t_dual_framework_provider_rows(ctx: TestContext) -> None:
     db = MemoryDB(str(ctx.db_path))
     await db.connect()
     try:
-        agno_id = await db.upsert_provider(
-            name="anthropic", framework="agno", api_key="sk-ant-live",
+        api_id = await db.upsert_provider(
+            name="anthropic", framework="api-based", api_key="sk-ant-live",
         )
         cli_id = await db.upsert_provider(name="anthropic", framework="claude-cli")
-        assert agno_id != cli_id
+        assert api_id != cli_id
         listed = await db.list_providers()
         pairs = sorted((r["name"], r["framework"]) for r in listed)
-        assert pairs == [("anthropic", "agno"), ("anthropic", "claude-cli")]
-        await db.delete_provider(agno_id)
+        assert pairs == [("anthropic", "api-based"), ("anthropic", "claude-cli")]
+        await db.delete_provider(api_id)
         await db.delete_provider(cli_id)
     finally:
         await db.close()
@@ -131,7 +131,7 @@ async def t_providers_enable(ctx: TestContext) -> None:
     await db.connect()
     try:
         pid = await db.upsert_provider(
-            name="anthropic", framework="agno", api_key="sk-ant-test",
+            name="anthropic", framework="api-based", api_key="sk-ant-test",
         )
         await db.set_provider_enabled(pid, False)
         row = await db.get_provider(pid)
@@ -156,7 +156,7 @@ async def t_providers_cascade_via_fk(ctx: TestContext) -> None:
     await db.connect()
     try:
         pid = await db.upsert_provider(
-            name="groq", framework="agno", api_key="gk-test",
+            name="groq", framework="api-based", api_key="gk-test",
         )
         mid1 = await db.upsert_model(provider_id=pid, model="llama-3.1-70b")
         mid2 = await db.upsert_model(provider_id=pid, model="llama-3.1-8b")
@@ -184,7 +184,7 @@ async def t_providers_registry_status(ctx: TestContext) -> None:
         assert prov_updated == 0.0, "empty table → 0.0"
 
         pid = await db.upsert_provider(
-            name="cerebras", framework="agno", api_key="cb-test",
+            name="cerebras", framework="api-based", api_key="cb-test",
         )
         *_, prov_updated_after = await db.registry_status()
         assert prov_updated_after > prov_updated

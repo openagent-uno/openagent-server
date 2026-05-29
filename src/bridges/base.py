@@ -150,8 +150,10 @@ def format_tool_status(raw: str) -> str:
     """Convert a raw status string (possibly JSON tool event) into a
     human-readable line suitable for Telegram/Discord/WhatsApp.
 
-    Structured events look like: ``{"tool":"bash","status":"running",...}``
-    Plain strings like ``"Thinking..."`` are returned unchanged.
+    Structured events are API-native: ``{"tool_name": "bash",
+    "tool_call_error": false, "result": ...}``; phase is derived from
+    the bool + ``result`` presence. Plain strings like ``"Thinking..."``
+    pass through unchanged.
     """
     from src.channels.base import parse_status_event
     evt = parse_status_event(raw)
@@ -181,6 +183,13 @@ class BaseBridge:
     # Per-platform message size limit used by ``dispatch_turn`` when it
     # splits the response. Overridden in subclasses.
     message_limit: int = 4000
+
+    # Resolved per-bridge persona overlay read by ``dispatch_turn``.
+    # Class-level default of ``None`` (no overlay) so the attribute is
+    # always present even on bridges constructed via ``__new__`` without
+    # running ``__init__``; ``__init__`` overrides it with the value
+    # resolved from the ``personality`` config arg.
+    _personality_directive: str | None = None
 
     def __init__(
         self,
@@ -955,13 +964,39 @@ class BaseBridge:
         fallback, ``VOICE_FALLBACK`` if both produce nothing.
 
         Used by every bridge for inbound voice notes — keeps the
-        gateway-vs-local routing logic in one place.
+        gateway-vs-local routing logic in one place. When both paths
+        come back empty we log a structured ``voice.fallback_used``
+        event so the user (and us in support) can see WHICH leg failed
+        without having to enable debug logging mid-incident.
         """
+        from pathlib import Path as _Path
         from src.channels.voice import transcribe as transcribe_local
+
         text = await self.transcribe_via_gateway(file_path)
-        if not text:
-            text = await transcribe_local(file_path)
-        return text or VOICE_FALLBACK
+        if text:
+            return text
+        text = await transcribe_local(file_path)
+        if text:
+            return text
+        try:
+            size = _Path(file_path).stat().st_size
+        except OSError:
+            size = -1
+        elog(
+            "voice.fallback_used",
+            level="warning",
+            bridge=self.name,
+            filename=_Path(file_path).name,
+            file_bytes=size,
+            hint=(
+                "Both the gateway STT endpoint and local faster-whisper "
+                "returned empty. Check voice.transcribe.local_* events "
+                "above for the cause; common fixes: install voice extras "
+                "for faster-whisper, set OPENAGENT_VOICE_LANG=<iso639-1>, "
+                "or configure an STT provider row in the DB."
+            ),
+        )
+        return VOICE_FALLBACK
 
     async def synthesise_voice_reply(self, text: str) -> bytes | None:
         """POST text to ``/api/tts/synthesize`` and return the audio bytes."""

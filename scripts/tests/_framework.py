@@ -117,3 +117,27 @@ async def run_one(category: str, name: str, fn: TestFn,
 def have_openai_key(config: dict) -> bool:
     key = (config.get("providers", {}).get("openai", {}) or {}).get("api_key", "")
     return bool(key) and not key.startswith("sk-test") and not key.startswith("${")
+
+
+def have_any_live_llm_key(config: dict) -> bool:
+    """True if at least one configured provider has a real API key.
+
+    Used by tests that just need *any* working LLM (gateway lifecycle,
+    REST endpoints, file uploads, vault round-trips, …). The older
+    ``have_openai_key`` gate was overly tight — many of these tests
+    don't actually use OpenAI; they were gated on it as a heuristic for
+    "live keys are available". This helper widens that to any provider
+    so a user configured with DeepSeek / Groq / Gemini still gets the
+    gateway-dependent tests run instead of skipped.
+    """
+    providers = config.get("providers", {}) or {}
+    for entry in providers.values():
+        if not isinstance(entry, dict):
+            continue
+        key = entry.get("api_key", "") or ""
+        if not key:
+            continue
+        if key.startswith("sk-test") or key.startswith("${"):
+            continue
+        return True
+    return False

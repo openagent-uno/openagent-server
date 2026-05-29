@@ -1,6 +1,6 @@
 """Regression: ``mcp-tool`` blocks must dispatch to subprocess MCPs
 correctly. Without the fix, ``_h_mcp_tool`` would do ``fn(**args)``
-on Agno's ``Function`` Pydantic descriptor (which has no ``__call__``)
+on the runtime ``Function`` Pydantic descriptor (which has no ``__call__``)
 and the workflow would die with::
 
     TypeError: 'Function' object is not callable
@@ -78,9 +78,9 @@ class _StubDB:
 
 
 def _agno_function_factory():
-    """Return Agno's ``Function`` class. Skip the test when Agno isn't
+    """Return the runtime ``Function`` class. Skip the test when the runtime isn't
     importable rather than crashing the suite."""
-    from agno.tools.function import Function
+    from src.mcp._runtime.function import Function
     return Function
 
 
@@ -120,7 +120,7 @@ def _make_pool(toolkits: dict[str, Any]) -> Any:
 
 
 class _ToolkitStub:
-    """Mimics Agno's ``MCPTools`` shape for our purposes: ``functions``
+    """Mimics the runtime ``MCPTools`` shape for our purposes: ``functions``
     dict (subprocess MCPs) + ``async_functions`` dict (in-process
     toolkits). The executor's ``_h_mcp_tool`` merges both, exactly
     like the live pool does."""
@@ -138,7 +138,7 @@ class _ToolkitStub:
 # ── Direct executor tests (per-handler) ─────────────────────────────
 
 
-@test("workflow_mcp_dispatch", "mcp-tool calls Agno Function.entrypoint")
+@test("workflow_mcp_dispatch", "mcp-tool calls runtime Function.entrypoint")
 async def t_function_entrypoint_called(ctx: TestContext) -> None:
     """Regression for ``TypeError: 'Function' object is not callable``.
     Without the executor fix, calling ``fn(**args)`` on a Pydantic

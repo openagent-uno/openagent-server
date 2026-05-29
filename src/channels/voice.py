@@ -136,6 +136,12 @@ async def _load_local_model():
 async def _transcribe_local(file_path: str, *, language: str | None = None) -> str | None:
     model = await _load_local_model()
     if model is None:
+        elog(
+            "voice.transcribe.local_skipped",
+            level="warning",
+            filename=Path(file_path).name,
+            reason="faster_whisper_unavailable",
+        )
         return None
     try:
         def _run() -> str:
@@ -154,9 +160,36 @@ async def _transcribe_local(file_path: str, *, language: str | None = None) -> s
                 len(text), language or "auto",
             )
             return text
+        # Empty result is usually VAD eating non-speech audio or the
+        # model failing to detect speech in the user's language. Surface
+        # WHY at the log so the bridge's VOICE_FALLBACK isn't a silent
+        # mystery.
+        try:
+            size = Path(file_path).stat().st_size
+        except OSError:
+            size = -1
+        elog(
+            "voice.transcribe.local_empty",
+            level="warning",
+            filename=Path(file_path).name,
+            file_bytes=size,
+            language=language or "auto",
+            hint=(
+                "VAD filter dropped all frames (silence / non-speech) "
+                "or the model couldn't detect speech. Set "
+                "OPENAGENT_VOICE_LANG=<iso639-1> if the user speaks a "
+                "non-English language."
+            ),
+        )
         return None
     except Exception as e:  # noqa: BLE001
-        logger.warning("faster-whisper transcription failed: %s", e)
+        elog(
+            "voice.transcribe.local_failed",
+            level="warning",
+            filename=Path(file_path).name,
+            error=str(e)[:200],
+            error_type=type(e).__name__,
+        )
         return None
 
 

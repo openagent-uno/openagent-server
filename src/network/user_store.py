@@ -38,6 +38,14 @@ class StoredNetwork:
     added_at: float
     cert_path: str  # relative to the user dir
     last_login_at: float | None = None
+    # First-contact addressing hints carried by the invite ticket.
+    # Persisted so subsequent refresh_cert / re-login calls can also
+    # skip iroh discovery — important on hosts where pkarr/DNS is
+    # flaky or where the coordinator's UDP port changes across
+    # restarts (e.g. K8s pods where iroh picks a fresh ephemeral port
+    # every boot).
+    coordinator_relay_url: str | None = None
+    coordinator_addresses: list[str] = field(default_factory=list)
 
     @property
     def coordinator_pubkey_bytes(self) -> bytes:
@@ -89,6 +97,8 @@ def load() -> UserStore:
             added_at=float(n.get("added_at", time.time())),
             cert_path=n.get("cert_path") or "",
             last_login_at=n.get("last_login_at"),
+            coordinator_relay_url=n.get("coordinator_relay_url") or None,
+            coordinator_addresses=list(n.get("coordinator_addresses") or []),
         )
         for n in raw.get("networks", [])
     ]
@@ -126,6 +136,11 @@ def save(store: UserStore) -> None:
         lines.append(f'cert_path = "{_escape(n.cert_path)}"')
         if n.last_login_at is not None:
             lines.append(f"last_login_at = {n.last_login_at}")
+        if n.coordinator_relay_url:
+            lines.append(f'coordinator_relay_url = "{_escape(n.coordinator_relay_url)}"')
+        if n.coordinator_addresses:
+            addrs = ", ".join(f'"{_escape(a)}"' for a in n.coordinator_addresses)
+            lines.append(f"coordinator_addresses = [{addrs}]")
     body = "\n".join(lines) + "\n"
 
     tmp = p.with_suffix(".toml.tmp")
@@ -146,10 +161,17 @@ def add_or_update(
     coordinator_node_id: str,
     coordinator_pubkey_hex: str,
     handle: str,
+    coordinator_relay_url: str | None = None,
+    coordinator_addresses: list[str] | None = None,
 ) -> StoredNetwork:
-    """Idempotent insert/update by ``name``. Returns the stored row."""
+    """Idempotent insert/update by ``(name, handle)``. Returns the
+    stored row. Two handles on the same network are distinct rows — a
+    user invite redeemed under a new handle must not clobber the row a
+    prior handle wrote.
+    """
+    addrs = list(coordinator_addresses or [])
     for i, existing in enumerate(store.networks):
-        if existing.name == name:
+        if existing.name == name and existing.handle == handle:
             updated = StoredNetwork(
                 name=name,
                 network_id=network_id,
@@ -159,6 +181,8 @@ def add_or_update(
                 added_at=existing.added_at,
                 cert_path=str(cert_path_for(network_id, handle)),
                 last_login_at=existing.last_login_at,
+                coordinator_relay_url=coordinator_relay_url or existing.coordinator_relay_url,
+                coordinator_addresses=addrs or existing.coordinator_addresses,
             )
             store.networks[i] = updated
             return updated
@@ -170,6 +194,8 @@ def add_or_update(
         handle=handle,
         added_at=time.time(),
         cert_path=str(cert_path_for(network_id, handle)),
+        coordinator_relay_url=coordinator_relay_url,
+        coordinator_addresses=addrs,
     )
     store.networks.append(new_row)
     if store.active_network is None:
@@ -177,23 +203,31 @@ def add_or_update(
     return new_row
 
 
-def find(store: UserStore, name: str) -> StoredNetwork | None:
+def find(
+    store: UserStore, name: str, handle: str | None = None
+) -> StoredNetwork | None:
     """Look up a network by human name or by network_id.
 
     Older saved accounts may carry the network UUID instead of its
     name (a gateway bug echoed ``network_id`` as the ``network`` field
     in ``auth_ok``); accepting both keeps those accounts working
     without forcing a re-add.
+
+    When ``handle`` is given, only a row whose handle also matches is
+    returned — this lets two handles share one network name (e.g.
+    redeeming a user invite on a machine already joined under another
+    handle). With no ``handle``, returns the first row matching name/id.
     """
     for n in store.networks:
         if n.name == name or n.network_id == name:
-            return n
+            if handle is None or n.handle == handle:
+                return n
     return None
 
 
-def remove(store: UserStore, name: str) -> bool:
+def remove(store: UserStore, name: str, handle: str | None = None) -> bool:
     for i, n in enumerate(store.networks):
-        if n.name == name:
+        if n.name == name and (handle is None or n.handle == handle):
             del store.networks[i]
             cert = Path(n.cert_path)
             if cert.exists():

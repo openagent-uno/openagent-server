@@ -50,6 +50,10 @@ class BaseModel(ABC):
         tools: list[dict[str, Any]] | None = None,
         on_status: Callable[[str], Awaitable[None]] | None = None,
         session_id: str | None = None,
+        files: list[Any] | None = None,
+        images: list[Any] | None = None,
+        audio: list[Any] | None = None,
+        videos: list[Any] | None = None,
     ) -> ModelResponse:
         """Generate a response from the model.
 
@@ -59,6 +63,19 @@ class BaseModel(ABC):
             tools: Optional list of tool definitions in a provider-neutral format:
                 [{"name": str, "description": str, "input_schema": dict}, ...]
             on_status: Optional async callback for live status updates (e.g. tool use).
+            files: Documents/attachments — runtime ``File`` objects (PDF, JSON,
+                text, markdown, …). Forwarded as ``runtime.arun(..., files=...)``;
+                subscription-CLI providers inline text content or write
+                binary to a sandbox-safe path.
+            images: Image attachments — runtime ``Image`` objects with ``content=bytes``.
+                Routed to ``arun(..., images=...)`` for native multimodal handling.
+            audio: Audio attachments — runtime ``Audio`` objects. Routed to ``arun(..., audio=...)``.
+            videos: Video attachments — runtime ``Video`` objects. Routed to ``arun(..., videos=...)``.
+
+            Splitting media by type at the call boundary matches AgentOS's
+            ``process_image / process_audio / process_video / process_document``
+            convention so the runtime's model adapters get the right shape for
+            their multimodal API calls.
         """
         ...
 
@@ -67,9 +84,16 @@ class BaseModel(ABC):
         messages: list[dict[str, Any]],
         system: str | None = None,
         tools: list[dict[str, Any]] | None = None,
+        files: list[Any] | None = None,
+        images: list[Any] | None = None,
+        audio: list[Any] | None = None,
+        videos: list[Any] | None = None,
     ) -> AsyncIterator[str]:
         """Stream response text chunks. Default: falls back to generate()."""
-        response = await self.generate(messages, system=system, tools=tools)
+        response = await self.generate(
+            messages, system=system, tools=tools,
+            files=files, images=images, audio=audio, videos=videos,
+        )
         yield response.content
 
     def effective_model_id(self, session_id: str | None = None) -> str | None:
@@ -80,7 +104,7 @@ class BaseModel(ABC):
         return a ``ModelResponse`` from ``stream()``, so the agent has
         to synthesize one and needs to know which model to credit.
 
-        Default reads ``self.model`` (set by ClaudeCLI and Agno).
+        Default reads ``self.model`` (set by ClaudeCLI and the API-based runtime).
         SmartRouter overrides because it picks per-session and a single
         instance attribute can't capture which routed model handled the
         latest turn. ``None`` is acceptable — the chat UI just hides the
@@ -119,7 +143,7 @@ class BaseModel(ABC):
         interrupts a reply mid-flight. Provider-managed models (Claude
         SDK) translate this into a control-request interrupt so the
         SDK's session log records what was emitted up to the cut. Platform-
-        managed models (Agno) inject a synthetic run into their session
+        managed models (API-based) inject a synthetic run into their session
         store so the next turn sees coherent history. Default no-op for
         caller-managed models (no hidden history state to maintain).
         """

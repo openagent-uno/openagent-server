@@ -49,6 +49,11 @@ _current_cert_wire: contextvars.ContextVar[bytes | None] = contextvars.ContextVa
 _current_peer_node_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "openagent_peer_node_id", default=None,
 )
+# Set to True by AgentSite (openagent/agent/1 ALPN) to signal that this
+# stream is authenticated by Iroh node_id rather than a coordinator cert.
+_is_authenticated_agent: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "openagent_is_authenticated_agent", default=False,
+)
 
 
 def current_device_cert_wire() -> bytes | None:
@@ -59,6 +64,15 @@ def current_device_cert_wire() -> bytes | None:
 def current_peer_node_id() -> str | None:
     """Return the dialing peer's NodeId for the in-flight request."""
     return _current_peer_node_id.get()
+
+
+def current_is_authenticated_agent() -> bool:
+    """Return True when the in-flight request arrived via the AGENT ALPN.
+
+    The auth middleware checks this to skip cert verification and
+    synthesise a DeviceCert for the peer agent instead.
+    """
+    return _is_authenticated_agent.get()
 
 
 CERT_LEN_BYTES = 4

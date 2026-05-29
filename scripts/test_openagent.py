@@ -28,7 +28,7 @@ from pathlib import Path
 
 # Silence noisy third-party loggers; test output is already explicit.
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
-for noisy in ("agno", "agno.tools", "agno.tools.mcp", "openai", "httpx",
+for noisy in ("openagent", "src.mcp", "src.models", "openai", "httpx",
               "httpcore", "asyncio", "openagent.mcp.client", "openagent.mcp.pool"):
     logging.getLogger(noisy).setLevel(logging.ERROR)
 
@@ -54,7 +54,7 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_serve_singleton",
     "test_cli_cleanup",
     # importlib.metadata fallback for frozen bundles — defense in depth
-    # against the agno Team-run crash when pydantic dist-info goes missing
+    # against the runtime Team-run crash when pydantic dist-info goes missing
     # under sys._MEIPASS.
     "test_frozen_metadata_patch",
     "test_catalog",
@@ -80,19 +80,27 @@ _TEST_MODULES: tuple[str, ...] = (
     # StreamSession's STT pump. Local fake-WS server exercises the
     # full audio → CloseStream → final protocol.
     "test_stt_deepgram_streaming",
-    # Barge-in commit: StreamSession._cancel_active_turn calls
-    # Agent.commit_partial_assistant with the accumulated deltas BEFORE
-    # cancelling the in-flight turn. Pure-unit; no provider live calls.
-    "test_barge_in_commit",
-    # ClaudeCLI.commit_partial_assistant routes to client.interrupt()
-    # so the SDK's session log records what was emitted up to the
-    # interrupt — keeps --resume coherent post-barge-in.
-    "test_claude_cli_interrupt",
-    # AgnoProvider.commit_partial_assistant injects a synthetic run
-    # into the agno_sessions row so the next turn sees ``user →
+    # NativeProvider.commit_partial_assistant injects a synthetic run
+    # into the sessions row so the next turn sees ``user →
     # assistant (interrupted) → user`` instead of two adjacent user
     # turns. Round-trips against a throwaway SqliteDb.
-    "test_agno_partial_commit",
+    "test_runtime_partial_commit",
+    # Session continuity across multiple turns. The agno→inline migration
+    # exposed a latent IndexError on ``runs=[]`` and a key-vs-truthy
+    # dispatch bug in ``AgentSession.from_dict`` / ``TeamSession.from_dict``
+    # that together silently overwrote the runs column each turn — the
+    # LLM appeared to have no memory of the previous message because
+    # only the latest run survived. Tests cover the DB round-trip, the
+    # gateway/runtime upsert interleave, session_type mismatches, and
+    # an end-to-end three-turn Team accumulation.
+    "test_session_continuity",
+    # In-session compaction (vision §2). When the cumulative stored
+    # history is about to overflow the model's context window, the
+    # oldest runs fold into a recap row so the next turn stays under
+    # the limit without forcing the user to restart. Tests cover the
+    # threshold check, the rewrite shape, the run-loop call site, the
+    # feature flag, and the wire-codec round trip for SessionCompacted.
+    "test_compaction",
     # DELTA frame plumbing for the unified streaming path (web chat +
     # bridges). Pure-unit; relies on the BaseBridge dispatch logic.
     "test_streaming",
@@ -104,7 +112,7 @@ _TEST_MODULES: tuple[str, ...] = (
     # Guards the contract that voice mode (and the soon-to-be-streaming
     # web chat) always gets text even when the streaming provider yields
     # zero deltas (claude_cli tool-only turns, smart_router → claude_cli
-    # with empty content, agno when no RunContentEvent fires).
+    # with empty content, the runtime when no RunContentEvent fires).
     "test_agent_run_stream",
     # New DB-backed registry tests: pure CRUD against ctx.db_path, no pool.
     "test_db_mcps",
@@ -112,29 +120,60 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_bootstrap",
     "test_db_models",
     # Regression: MemoryDB._parse_metadata must always return a dict (mixout
-    # crash 2026-05-12, agno_sessions row with literal 'null' metadata).
+    # crash 2026-05-12, sessions row with literal 'null' metadata).
     "test_db_metadata_parse",
+    # Live wire / rehydrated transcript parity: the same runtime
+    # ToolExecution must produce byte-identical envelopes on both the
+    # live STATUS frame and the GET /api/sessions/{id}/runs response,
+    # and the rehydration walk must recurse into member_responses so
+    # delegated specialists' tool calls + content surface with the
+    # specialist's own model attribution. Pure-unit; no gateway needed.
+    "test_rehydration_parity",
     "test_db_providers",
-    "test_db_session_bindings",
-    # Concurrent ``add_session_run`` must not drop runs — per-session
-    # asyncio.Lock guards the read-modify-write of agno_sessions.runs.
-    "test_db_session_run_lock",
     # Cross-device chat visibility: ``upsert_session`` writes the user
     # handle as the row owner and ``list_all_sessions`` soft-falls back
     # to legacy device-pubkey rows via ``network_devices``.
     "test_sessions_cross_device",
     "test_db_workflow_claim",
-    "test_smart_router_hybrid",
-    "test_agno_tool_filter",
-    # SmartRouter.stream + ClaudeCLIRegistry.stream — token-streaming
-    # dispatch for both frameworks. Pure-unit (stubs the registries) and
-    # guards the bug where claude-cli replies came back as one giant
-    # chunk through the router (TTFB-killing for voice mode).
-    "test_smart_router_stream",
-    "test_claude_cli_stream",
-    # Persistence-order regression: text and tool blocks must land in the
-    # SDK stream order, not bunched user -> assistant_text -> tools.
-    "test_claude_cli_ordering",
+    # ClaudeBackedAgent — Agent subclass that drives claude_agent_sdk
+    # directly. Pure-unit: monkey-patches sys.modules['claude_agent_sdk']
+    # with a fake module so no SDK binary is required. Pins the four
+    # contracts that let claude-cli rows participate in runtime Teams:
+    # Agent isinstance, arun → RunOutput, session-id round-trip via
+    # session_data, and streaming events.
+    "test_claude_backed_agent",
+    # CodexBackedAgent — mirror of test_claude_backed_agent for the
+    # codex-cli framework (OpenAI Codex CLI / ChatGPT Plus/Pro). Same
+    # six contracts via a fake sys.modules['openai_codex']: Agent
+    # isinstance, arun → RunOutput, codex_session_id round-trip, stream
+    # events, SDK-error raise, and lazy import on slim installs.
+    "test_codex_backed_agent",
+    # TeamRouterProvider — the v0.14 sub-agent architecture. Verifies
+    # Team(mode=route) construction from DB rows, role blurbs from
+    # tier_hint/description, single-agent fallback, claude-cli as
+    # MEMBER (via ClaudeBackedAgent) and as LEADER (with the cheapest
+    # api-based model as the routing classifier).
+    "test_team_router",
+    # Regression lock-down for the v0.14 runtime-consolidation refactor.
+    # Covers every fix from Phases 1-10: framework collapse, claude_cli
+    # rewrite, SmartRouter classifier removal, db.py helper deletion,
+    # defer-all MCP wiring, system prompt placeholders, curator wiring,
+    # signal handler hardening, and the tqdm/multiprocessing semaphore
+    # leak. The end-to-end subprocess test spawns ``python -m src.cli
+    # --help`` to verify no resource_tracker warning at process exit.
+    "test_regression_v014",
+    # E2E unified flow — locks down four cross-cutting properties: (1)
+    # multi-member parallel delegation through _arun_runtime_stream, (2)
+    # live↔rehydration parity for a synthetic multi-tool turn, (3)
+    # coordinate-mode wiring + the runtime's asyncio.gather contract, (4) the
+    # zero-enabled-models short-circuit survives the coordinate-mode
+    # change. Pure-unit; no LLM call.
+    "test_e2e_unified_flow",
+    "test_runtime_tool_filter",
+    # NativeProvider.stream — hermetic zero-delta fallback coverage
+    # (Friday's stuck Telegram turns; provider falls back to its own
+    # generate() before control returns to Agent.run_stream).
+    "test_runtime_stream",
     "test_behavior_contract",
     "test_mcp_manager_guards",
     "test_provider_manager",
@@ -143,8 +182,6 @@ _TEST_MODULES: tuple[str, ...] = (
     # MCP marketplace — pure schema-mapping unit tests, plus one REST
     # shape check that skips when no gateway fixture is wired.
     "test_marketplace",
-    # ClaudeCLI buffer fix — computer-control screenshot regression guard.
-    "test_buffer_size",
     # 2. MCP pool — sets ctx.extras["pool"] for everything below
     "test_pool",
     # MCPPool.from_db + reload — runs right after test_pool so it inherits
@@ -152,13 +189,13 @@ _TEST_MODULES: tuple[str, ...] = (
     # throwaway DB to avoid touching the shared pool fixture.
     "test_pool_reload",
     # 3. Provider-level live tests (need pool)
-    "test_agno",
-    # AgnoProvider.forget_session must wipe stored history so the
+    "test_runtime",
+    # NativeProvider.forget_session must wipe stored history so the
     # scheduler's per-fire forget and the gateway's /clear actually
-    # reach Agno's SqliteDb-backed session store. Runs here (not in
+    # reach the runtime's SqliteDb-backed session store. Runs here (not in
     # provider live tests) because it uses a synthetic DB and doesn't
     # need the pool fixture.
-    "test_agno_forget_clears_history",
+    "test_runtime_forget_clears_history",
     "test_router",
     "test_mcp",
     "test_budget",
@@ -173,6 +210,13 @@ _TEST_MODULES: tuple[str, ...] = (
     # DB-backed REST endpoints (/api/mcps, /api/models/db) — needs gateway.
     "test_mcps_rest",
     "test_voice",
+    # Voice receive end-to-end: real STT on real audio (WAV + Telegram's
+    # OGG/OPUS), real bridge fallback chain, real gateway STT route, real
+    # Telegram _extract_files. The prior unit tests mocked every layer
+    # boundary so a regression in the COMPOSITION (bridge → fallback →
+    # local Whisper → text) could pass all unit tests while production
+    # silently returned VOICE_FALLBACK. These pin the seams.
+    "test_voice_e2e",
     "test_files",
     # 6. Misc standalone
     "test_cron",
@@ -190,6 +234,10 @@ _TEST_MODULES: tuple[str, ...] = (
     # LLM (via list_workflow_examples / get_workflow_example) stays
     # accurate as block schemas evolve.
     "test_workflow_examples",
+    # Workflow templating filters — fromjson/from_json (load-bearing
+    # for ai-prompt → loop.items_expr chaining), regex/url filters,
+    # and the safety net that quietly returns "" on resolve errors.
+    "test_workflow_templating",
     # Scheduler must dispatch each due workflow as its own asyncio.Task
     # so different workflows on the same tick run concurrently. Companion
     # asserts the per-workflow lock keeps SAME-workflow runs ordered.
@@ -197,10 +245,19 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_dream",
     "test_updater",
     "test_bridges",
+    # Spam coalescing end-to-end: real StreamSession against a slow
+    # fake agent (every turn takes real time, mirroring LLM latency),
+    # 20-message bursts, bridge owner/follower under 20 concurrent
+    # send_message calls. Pins the wall-clock contract — coalesced
+    # bursts must not regress into serial N×latency dispatches — that
+    # the existing instant-return ``_RecordingAgent`` tests can't see.
+    # MUST run AFTER test_bridges so the _FakeBridge harness it imports
+    # is already loaded.
+    "test_spam_e2e",
     "test_bridge_session",
     # Coordinator login_finish must NOT die on SQLite locks for the
     # non-critical touch_device write (lyra-agent outage 2026-05-18 —
-    # heavy Agno session writes held the writer lock and broke every
+    # heavy runtime session writes held the writer lock and broke every
     # returning device's login).
     "test_coordinator_login_resilience",
     # End-to-end multi-user: spin up an in-process coordinator, mint
@@ -210,6 +267,10 @@ _TEST_MODULES: tuple[str, ...] = (
     # returning-device logins (the touch_device path) survive both
     # clean and DB-lock-rigged runs.
     "test_coordinator_e2e_multi_user",
+    # User store keyed by (name, handle): two handles can join one
+    # network from a single machine, so a user invite stays redeemable
+    # by anyone even when the network is already in the local store.
+    "test_user_store",
     # Per-agent network naming: auto-bootstrap drops the legacy
     # ``-personal`` suffix; ``rename_network`` is cosmetic (preserves
     # network_id, coordinator identity, role) so existing pairings
@@ -233,7 +294,7 @@ _TEST_MODULES: tuple[str, ...] = (
     # zombies pin the executor's per-workflow lock forever and the
     # next scheduled tick can't make progress.
     "test_workflow_orphan_reap",
-    # _finalize_run survives transient SQLite locks (Agno's SqliteDb
+    # _finalize_run survives transient SQLite locks (the runtime's SqliteDb
     # writes racing OpenAgent's aiosqlite). Retries finalize on
     # OperationalError; cosmetic update_workflow lock is non-fatal;
     # retry is BOUNDED so we don't recreate the original loop.
@@ -242,26 +303,16 @@ _TEST_MODULES: tuple[str, ...] = (
     # billing-hint message naming the provider — surfaces the actual
     # config issue instead of looking like a transient provider blip.
     "test_provider_402_rewrite",
+    # DeepSeek file attachments get inlined as text content because
+    # DeepSeek's chat API rejects {type:"file"} parts; the patched
+    # DeepSeekInlineFiles subclass handles attachments via
+    # _format_message override.
+    "test_deepseek_file_inlining",
     # Discord on_message receive-path tests — pin the
     # allowed-users-bypass-mention gate behaviour and confirm silent
     # drops emit a diagnostic event.
     "test_discord_bridge_receive",
     "test_shell",
-    # 7. Optional Claude CLI path (needs --include-claude)
-    "test_claude_cli",
-    # 8. Unit tests for claude_cli text-recovery regression
-    "test_claude_cli_text_recovery",
-    # Stale-resume self-heal — same monkey-patching pattern.
-    "test_claude_cli_stale_resume",
-    # Failed connect() must call disconnect() so the partially-spawned
-    # claude subprocess doesn't leak (performa boss outage 2026-05-07).
-    "test_claude_cli_connect_cleanup",
-    # forget_session must drain pending sdk_session writes so a
-    # background persist can't resurrect the deleted resume id.
-    "test_claude_cli_forget_drains_writes",
-    # ClaudeCLIRegistry dispatch — runs right after text-recovery since it
-    # shares the claude_cli module's monkey-patching patterns.
-    "test_claude_cli_registry",
     # 9. Gateway /stop, /clear, /new command semantics
     "test_gateway_commands",
     # SessionManager must run sessions in parallel on one client
@@ -271,8 +322,20 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_sessions_parallel_execution",
     # 10. MCPPool resilience — one bad MCP mustn't sink the whole pool
     "test_mcp_pool_resilience",
+    # MCPPool spec.headers forwarding — regression guard for the
+    # auth-gated remote MCP (mixout) 401 → ClosedResourceError chain.
+    "test_mcp_pool_headers",
     # 11. /api/files endpoint — agent-side attachment delivery to remote clients
     "test_files_endpoint",
+    # 12. Repo-hygiene structural guards — added 2026-05-26 after PR #1
+    #     truncated src/workflow/executor.py from 990 to 60 lines via an
+    #     LLM-generated "CONTENT OMITTED FOR BREVITY" placeholder that
+    #     was committed verbatim. Three orthogonal guards: scan src/ for
+    #     LLM placeholder strings, assert every test_*.py is in this
+    #     list (so a new test file never silently goes unrun), and
+    #     importlib-walk every src/ module so a truncated file is
+    #     caught even if no behavioural test exercises its symbols.
+    "test_repo_hygiene",
 )
 
 
@@ -355,7 +418,7 @@ def main() -> int:
                 last_cat = cat
             # Long-running categories get extra timeout headroom
             timeout = 180 if cat in (
-                "agno", "router", "sessions", "files", "claude_cli"
+                "runtime", "router", "sessions", "files", "claude_cli"
             ) else 60
             res = await run_one(cat, name, fn, ctx, timeout=timeout)
             results.append(res)

@@ -1,10 +1,10 @@
 """Regression guard for the frozen-bundle importlib.metadata fix.
 
-Production agno ``Team`` runs were dying with::
+Production runtime ``Team`` runs were dying with::
 
     ERROR Error in Team run: No package metadata was found for pydantic
 
-because ``agno.tools.function._wrap_callable`` calls
+because ``src.mcp._runtime.function._wrap_callable`` calls
 ``importlib.metadata.version("pydantic")`` on every Team run and the
 bundled ``pydantic-*.dist-info`` directory under ``sys._MEIPASS``
 sometimes disappears between launch and that call (sibling-swap, self-

@@ -62,6 +62,8 @@ async def register(
     device_identity: Identity,
     network_id: str,
     label: str | None = None,
+    relay_url: str | None = None,
+    addresses: list[str] | None = None,
 ) -> bytes:
     """Register a new ``handle@network`` and return the wire-encoded cert.
 
@@ -81,6 +83,8 @@ async def register(
             "handle": handle,
             "pake_record": pake_payload,
         },
+        relay_url=relay_url,
+        addresses=addresses,
     )
     return await login(
         node=node,
@@ -92,6 +96,8 @@ async def register(
         network_id=network_id,
         invite_code=invite_code,
         label=label,
+        relay_url=relay_url,
+        addresses=addresses,
     )
 
 
@@ -106,6 +112,8 @@ async def login(
     network_id: str,
     invite_code: str | None = None,
     label: str | None = None,
+    relay_url: str | None = None,
+    addresses: list[str] | None = None,
 ) -> bytes:
     """Run an SRP-6a login; return the issued cert wire bytes.
 
@@ -120,6 +128,8 @@ async def login(
         coordinator_node_id=coordinator_node_id,
         method="login_init",
         params={"handle": handle, "ke1": client.A},
+        relay_url=relay_url,
+        addresses=addresses,
     )
     state_id = init_resp["state_id"]
     server_response = init_resp["response"]
@@ -141,6 +151,8 @@ async def login(
         coordinator_node_id=coordinator_node_id,
         method="login_finish",
         params=finish_params,
+        relay_url=relay_url,
+        addresses=addresses,
     )
     cert_wire = bytes(finish_resp["cert"])
     server_proof = bytes(finish_resp["m2"])
@@ -191,6 +203,8 @@ async def refresh_cert(
     password: str,
     device_identity: Identity,
     network_id: str,
+    relay_url: str | None = None,
+    addresses: list[str] | None = None,
 ) -> bytes:
     """Re-run login to get a fresh cert. Same wire as ``login``."""
     return await login(
@@ -201,13 +215,71 @@ async def refresh_cert(
         password=password,
         device_identity=device_identity,
         network_id=network_id,
+        relay_url=relay_url,
+        addresses=addresses,
     )
+
+
+async def agent_login(
+    *,
+    node: IrohNode,
+    coordinator_node_id: str,
+    coordinator_pubkey_bytes: bytes,
+    handle: str,
+    node_id: str,
+    invite_code: str,
+    network_id: str = "",
+    label: str | None = None,
+    relay_url: str | None = None,
+    addresses: list[str] | None = None,
+) -> bytes:
+    """Authenticate an agent using its Iroh identity (no password needed).
+
+    Calls the coordinator's ``agent_login`` RPC, which verifies that the
+    caller's Iroh peer_node_id matches ``node_id`` (the QUIC handshake is the
+    proof of key ownership).  Returns the wire-encoded device cert.
+
+    The returned cert has ``capabilities=["agent"]`` and uses the agent's
+    Iroh pubkey as ``device_pubkey``, so the same identity that dials the
+    coordinator now authenticates against the target gateway.
+    """
+    params: dict = {
+        "invite": invite_code,
+        "handle": handle,
+        "node_id": node_id,
+    }
+    if label:
+        params["label"] = label
+
+    result = await _rpc(
+        node=node,
+        coordinator_node_id=coordinator_node_id,
+        method="agent_login",
+        params=params,
+        relay_url=relay_url,
+        addresses=addresses,
+    )
+    cert_wire = bytes(result["cert"])
+
+    # Sanity-check: verify the cert is signed by the pinned coordinator pubkey.
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    pubkey = Ed25519PublicKey.from_public_bytes(coordinator_pubkey_bytes)
+    cert = verify_cert(
+        cert_wire,
+        coordinator_pubkey=pubkey,
+        expected_network_id=network_id or None,
+    )
+    if cert.handle != handle.strip().lower():
+        raise LoginError(f"cert handle mismatch (got {cert.handle!r}, expected {handle!r})")
+    return cert_wire
 
 
 async def fetch_network_info(
     *,
     node: IrohNode,
     coordinator_node_id: str,
+    relay_url: str | None = None,
+    addresses: list[str] | None = None,
 ) -> dict:
     """Fetch the coordinator's self-description (used for first-add of a network)."""
     return await _rpc(
@@ -215,6 +287,8 @@ async def fetch_network_info(
         coordinator_node_id=coordinator_node_id,
         method="network_info",
         params={},
+        relay_url=relay_url,
+        addresses=addresses,
     )
 
 
@@ -222,6 +296,8 @@ async def list_agents(
     *,
     node: IrohNode,
     coordinator_node_id: str,
+    relay_url: str | None = None,
+    addresses: list[str] | None = None,
 ) -> list[dict]:
     """List the agents registered in this network (handle + node_id pairs)."""
     resp = await _rpc(
@@ -229,6 +305,8 @@ async def list_agents(
         coordinator_node_id=coordinator_node_id,
         method="list_agents",
         params={},
+        relay_url=relay_url,
+        addresses=addresses,
     )
     return resp.get("agents") or []
 
@@ -243,9 +321,14 @@ async def _rpc(
     method: str,
     params: dict,
     timeout: float = 30.0,
+    relay_url: str | None = None,
+    addresses: list[str] | None = None,
 ) -> dict:
     """Open a coordinator stream, send one CBOR-framed request, read the response."""
-    connection = await node.dial(coordinator_node_id, NetworkAlpn.COORDINATOR)
+    connection = await node.dial(
+        coordinator_node_id, NetworkAlpn.COORDINATOR,
+        relay_url=relay_url, addresses=addresses,
+    )
     bi = await connection.open_bi()
     # iroh-py 0.35: BiStream.send() / .recv() are methods returning the
     # underlying SendStream / RecvStream — invoking them once unwraps the

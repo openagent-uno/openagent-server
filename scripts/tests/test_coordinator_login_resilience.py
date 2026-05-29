@@ -1,6 +1,6 @@
 """Coordinator ``_m_login_finish`` is resilient to non-critical DB locks.
 
-Real-world failure mode (2026-05-18, lyra-agent): heavy Agno session
+Real-world failure mode (2026-05-18, lyra-agent): heavy runtime session
 writes held the SQLite writer lock for an extended period. The
 coordinator's ``login_finish`` happens to call ``store.touch_device``
 to update ``last_seen`` — a purely cosmetic field — and the lock made

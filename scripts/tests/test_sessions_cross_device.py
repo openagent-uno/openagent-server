@@ -1,6 +1,6 @@
 """Cross-device session visibility — handle-keyed listing + legacy fallback.
 
-Pre-fix the gateway filtered ``agno_sessions`` by the WebSocket's
+Pre-fix: the gateway filtered ``sessions`` by the WebSocket's
 ``client_id`` = device pubkey hex. Every device a user owned had a
 different pubkey, so device B logged in as the same user could never
 see device A's chats. The fix has two halves:
@@ -46,7 +46,7 @@ async def t_match_by_handle(ctx: TestContext) -> None:
         db = MemoryDB(str(tmp_db))
         await db.connect()
         sid = f"xd-{uuid.uuid4().hex[:8]}"
-        await db.upsert_session(sid, client_id="alice", title="Hi", framework="agno")
+        await db.upsert_session(sid, client_id="alice", title="Hi", framework="api-based")
         rows = await db.list_all_sessions("alice", limit=50)
         assert any(r["session_id"] == sid for r in rows), rows
         await db.close()
@@ -82,7 +82,7 @@ async def t_legacy_pubkey_via_devices(ctx: TestContext) -> None:
         pubkey_other = uuid.uuid4().hex + uuid.uuid4().hex
         sid_foreign = f"foreign-{uuid.uuid4().hex[:8]}"
         await db.upsert_session(
-            sid_foreign, client_id=pubkey_other, title="foreign", framework="agno",
+            sid_foreign, client_id=pubkey_other, title="foreign", framework="api-based",
         )
         rows = await db.list_all_sessions("handle_A", limit=50)
         ids = {r["session_id"] for r in rows}
@@ -112,7 +112,7 @@ async def t_device_id_preserved(ctx: TestContext) -> None:
         sid = f"sid-{uuid.uuid4().hex[:8]}"
         pubkey = uuid.uuid4().hex + uuid.uuid4().hex
         await db.upsert_session(
-            sid, client_id="alice", device_id=pubkey, framework="agno",
+            sid, client_id="alice", device_id=pubkey, framework="api-based",
         )
         s = await db.get_session(sid)
         assert s is not None
@@ -121,7 +121,7 @@ async def t_device_id_preserved(ctx: TestContext) -> None:
         # metadata to confirm device_id landed.
         conn = await db._ensure_connected()
         cur = await conn.execute(
-            "SELECT metadata FROM agno_sessions WHERE session_id = ?",
+            "SELECT metadata FROM sessions WHERE session_id = ?",
             (sid,),
         )
         row = await cur.fetchone()

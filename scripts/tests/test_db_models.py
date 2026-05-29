@@ -17,7 +17,7 @@ async def t_models_roundtrip(ctx: TestContext) -> None:
     await db.connect()
     try:
         pid = await db.upsert_provider(
-            name="openai", framework="agno", api_key="sk-test",
+            name="openai", framework="api-based", api_key="sk-test",
         )
         mid = await db.upsert_model(
             provider_id=pid,
@@ -53,7 +53,7 @@ async def t_models_enable(ctx: TestContext) -> None:
     await db.connect()
     try:
         pid = await db.upsert_provider(
-            name="openai", framework="agno", api_key="sk-test",
+            name="openai", framework="api-based", api_key="sk-test",
         )
         mid = await db.upsert_model(provider_id=pid, model="gpt-flip")
         await db.set_model_enabled(mid, False)
@@ -79,10 +79,10 @@ async def t_cascade_delete(ctx: TestContext) -> None:
     await db.connect()
     try:
         zai_id = await db.upsert_provider(
-            name="zai", framework="agno", api_key="zk",
+            name="zai", framework="api-based", api_key="zk",
         )
         oai_id = await db.upsert_provider(
-            name="openai", framework="agno", api_key="sk",
+            name="openai", framework="api-based", api_key="sk",
         )
         await db.upsert_model(provider_id=zai_id, model="glm-5")
         await db.upsert_model(provider_id=zai_id, model="glm-4.5")
@@ -111,7 +111,7 @@ async def t_registry_status_empty(ctx: TestContext) -> None:
     await db.connect()
     try:
         oai_id = await db.upsert_provider(
-            name="openai", framework="agno", api_key="sk",
+            name="openai", framework="api-based", api_key="sk",
         )
         ant_id = await db.upsert_provider(
             name="anthropic", framework="claude-cli",
@@ -197,7 +197,7 @@ async def t_is_classifier_roundtrip(ctx: TestContext) -> None:
     await db.connect()
     try:
         pid = await db.upsert_provider(
-            name="openai", framework="agno", api_key="sk-test",
+            name="openai", framework="api-based", api_key="sk-test",
         )
         mid1 = await db.upsert_model(provider_id=pid, model="gpt-cls-a")
         mid2 = await db.upsert_model(provider_id=pid, model="gpt-cls-b")

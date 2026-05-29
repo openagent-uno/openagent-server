@@ -82,13 +82,13 @@ def patch_importlib_metadata_for_frozen() -> None:
     for a small allowlist of packages (pydantic, pydantic_core,
     email_validator).
 
-    Without this, every agno ``Team`` run in the PyInstaller onefile
+    Without this, every runtime ``Team`` run in the PyInstaller onefile
     bundle dies with::
 
 
         ERROR Error in Team run: No package metadata was found for pydantic
 
-    because ``agno.tools.function._wrap_callable`` calls
+    because ``the runtime's tool-wrapping function`` calls
     ``importlib.metadata.version("pydantic")`` on every Team run and
     the bundled ``pydantic-*.dist-info`` directory under
     ``sys._MEIPASS`` is fragile — a sibling-swap during self-update

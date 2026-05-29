@@ -64,6 +64,9 @@ class Gateway:
         self.clients: dict[str, object] = {}  # client_id → WebSocketResponse
         self._runner = None
         self._site: IrohSite | None = None
+        # AgentSite handles the openagent/agent/1 ALPN — direct agent-to-agent
+        # federation without coordinator-issued certs.
+        self._agent_site = None
         # Optional plain-TCP listener, enabled when OPENAGENT_HTTP_PORT is set.
         # Lives alongside the IrohSite on the same AppRunner so HTTP and Iroh
         # clients hit the same handler chain. Kept as an attribute so ``stop``
@@ -214,8 +217,19 @@ class Gateway:
                 return
             await site._handle_stream(connection)
 
+        async def _agent_handler(connection):
+            site = self._agent_site
+            if site is None:
+                try:
+                    connection.close(0, b"agent site not ready")
+                except Exception:
+                    pass
+                return
+            await site._handle_stream(connection)
+
         from src.network.iroh_node import NetworkAlpn as _Alpn
         self._network_state.iroh_node.register_handler(_Alpn.GATEWAY, _gateway_handler)
+        self._network_state.iroh_node.register_handler(_Alpn.AGENT, _agent_handler)
 
     async def start(self) -> None:
         from aiohttp import web
@@ -259,6 +273,12 @@ class Gateway:
         # need a constructed runner, hence the deferred wiring.
         self._site = IrohSite(runner, self._network_state.iroh_node)
         await self._site.start()
+
+        # Start the AGENT ALPN site — same runner, different ALPN.
+        from src.network.transport.agent_iroh_site import AgentSite
+        self._agent_site = AgentSite(runner, self._network_state.iroh_node)
+        await self._agent_site.start()
+
         node_id = await self._network_state.node_id()
         elog(
             "gateway.start",
@@ -481,10 +501,13 @@ class Gateway:
             # is per-agent so federation state can differ between
             # peers in the same home network.
             ("GET", "/api/network/info", self._handle_network_info),
-            ("GET", "/api/peers", peers_api.handle_list),
-            ("POST", "/api/peers", peers_api.handle_create),
-            ("DELETE", "/api/peers/{network_id}", peers_api.handle_delete),
-            ("GET", "/api/peers/{network_id}/agents", peers_api.handle_list_agents),
+            ("GET",  "/api/peers",                          peers_api.handle_list),
+            ("POST", "/api/peers/join",                     peers_api.handle_join),
+            ("POST", "/api/peers",                          peers_api.handle_create),
+            ("DELETE", "/api/peers/{network_id}",           peers_api.handle_delete),
+            ("POST", "/api/peers/{network_id}/refresh",     peers_api.handle_refresh),
+            ("POST", "/api/peers/{network_id}/chat",        peers_api.handle_peer_chat),
+            ("GET",  "/api/peers/{network_id}/agents",      peers_api.handle_list_agents),
             # Claude Code CLI setup & auth
             ("GET", "/api/claude/status", claude_setup_api.handle_status),
             ("POST", "/api/claude/install", claude_setup_api.handle_install),
@@ -931,7 +954,7 @@ class Gateway:
                 elog("gateway.client_disconnect", client_id=client_id)
                 # Tear down any stream sessions belonging to this client
                 # so the agent's per-session resources (claude-cli
-                # subprocesses, agno session rows) get a clean release.
+                # subprocesses, runtime session rows) get a clean release.
                 await self._close_stream_sessions_for(client_id)
             elif client_id:
                 elog(

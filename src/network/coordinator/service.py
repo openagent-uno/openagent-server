@@ -376,6 +376,74 @@ class CoordinatorService:
         )
         return {"ok": True}
 
+    async def _m_agent_login(self, params: dict, *, peer_node_id: str) -> dict:
+        """Password-free cert issuance for agents that own an Iroh keypair.
+
+        The Iroh QUIC handshake already proves that the caller controls the
+        private key corresponding to ``peer_node_id``.  We use that proof as
+        the authentication factor instead of SRP-6a — no password needed.
+
+        Flow:
+          1. Caller sends {invite, handle, node_id, label?}.
+          2. We verify ``peer_node_id == node_id`` (the Iroh handshake is the
+             proof of key ownership).
+          3. Consume the ``role=agent`` invite.
+          4. Register the agent in ``network_agents``.
+          5. Issue a device cert with ``device_pubkey`` derived from ``node_id``
+             and return it.  The cert ``capabilities`` include ``"agent"`` so
+             the gateway can distinguish agent sessions from human sessions.
+        """
+        invite_code = _required(params, "invite", str)
+        handle = _required(params, "handle", str).strip().lower()
+        node_id = _required(params, "node_id", str)
+        label = params.get("label")
+
+        # Security: the Iroh transport proved the caller owns node_id's key.
+        # If the stated node_id doesn't match the stream's peer, reject.
+        if peer_node_id.lower() != node_id.lower():
+            raise _CoordinatorRpcError(
+                "unauthorized",
+                f"node_id mismatch: claimed {node_id!r} but stream is from {peer_node_id!r}",
+            )
+
+        inv = await self._store.consume_invitation(invite_code)
+        if inv is None or inv.role != "agent":
+            raise _CoordinatorRpcError(
+                "invalid_invite", "agent invite missing/expired/wrong-role",
+            )
+
+        owner_handle = inv.bind_to_handle or "system"
+
+        # Upsert the agent in the directory.
+        await self._store.register_agent(
+            handle=handle, node_id=node_id, owner_handle=owner_handle, label=label,
+        )
+
+        # Derive the 32-byte Ed25519 pubkey from the Iroh node_id.
+        # ``coordinator_node_id_to_pubkey_bytes`` is defined in peers.py but
+        # uses only iroh — import locally to avoid a circular import.
+        import iroh as _iroh
+        pk = _iroh.PublicKey.from_string(node_id)
+        device_pubkey = bytes(pk.to_bytes())
+
+        cert_wire = issue_cert(
+            coordinator_key=self._cfg.coordinator_key,
+            handle=handle,
+            device_pubkey=device_pubkey,
+            network_id=self._cfg.network_id,
+            capabilities=["agent"],
+        )
+        elog(
+            "coordinator.agent_login",
+            handle=handle,
+            node_id=node_id[:24] + "…",
+        )
+        return {
+            "cert": cert_wire,
+            "network_id": self._cfg.network_id,
+            "name": self._cfg.network_name,
+        }
+
     async def _m_remove_agent(self, params: dict, *, peer_node_id: str) -> dict:
         cert = self._verify_admin_cert(_required(params, "cert", bytes))
         handle = _required(params, "handle", str)
@@ -444,6 +512,7 @@ CoordinatorService._METHODS = {
     "login_finish": CoordinatorService._m_login_finish,
     "list_agents": CoordinatorService._m_list_agents,
     "add_agent": CoordinatorService._m_add_agent,
+    "agent_login": CoordinatorService._m_agent_login,
     "remove_agent": CoordinatorService._m_remove_agent,
     "revoke_device": CoordinatorService._m_revoke_device,
     "create_invitation": CoordinatorService._m_create_invitation,
