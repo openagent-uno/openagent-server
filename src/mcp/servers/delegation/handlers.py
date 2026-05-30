@@ -150,25 +150,15 @@ async def list_delegatable_models() -> dict[str, Any]:
     db = _db_var.get()
     if db is None:
         return {"status": "error", "models": [], "error": "no db context"}
-    try:
-        rows = await db.list_enabled_models()
-    except AttributeError:
-        # MemoryDB API surface name may differ; fall back to a raw query.
-        rows = await db.fetch_all(
-            "SELECT runtime_id, display_name, framework FROM models WHERE enabled = 1"
-        )
+    rows = await db.list_models_enriched(enabled_only=True, kind="llm")
     return {
         "status": "ok",
         "models": [
             {
-                "runtime_id": r["runtime_id"] if isinstance(r, dict) else r[0],
-                "display_name": (
-                    r["display_name"] if isinstance(r, dict) else r[1]
-                ),
-                "framework": (
-                    r["framework"] if isinstance(r, dict) else r[2]
-                ),
+                "runtime_id": r["runtime_id"],
+                "display_name": r["display_name"],
+                "framework": r["framework"],
             }
-            for r in (rows or [])
+            for r in rows
         ],
     }
