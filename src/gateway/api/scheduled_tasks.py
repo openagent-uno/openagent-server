@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from src.core.builtin_tasks import BUILTIN_TASK_NAMES
 from src.core.logging import elog
-from src.memory.schedule import decorate_scheduled_task
+from src.memory.schedule import decorate_scheduled_task, epoch_to_iso
 
 
 def _resolve_scheduler(request):
@@ -71,6 +71,16 @@ def _serialize(row: dict) -> dict:
     return decorate_scheduled_task(row)
 
 
+def _serialize_run(row: dict) -> dict:
+    """Add ISO mirrors for the epoch timestamp columns — matches the
+    ``_decorate_run`` helper on the workflow-runs endpoint."""
+    out = dict(row)
+    for key in ("started_at", "finished_at"):
+        epoch = out.get(key)
+        out[f"{key}_iso"] = epoch_to_iso(epoch) if epoch else None
+    return out
+
+
 async def handle_list(request):
     from aiohttp import web
 
@@ -98,6 +108,28 @@ async def handle_get(request):
         # their existence — same behaviour as a non-existent id.
         return web.json_response({"error": f"Task {task_id!r} not found"}, status=404)
     return web.json_response(_serialize(row))
+
+
+async def handle_runs_list(request):
+    """GET /api/scheduled-tasks/{id}/runs — per-firing execution history
+    (newest first), the scheduled-task analogue of
+    ``/api/workflows/{id}/runs``."""
+    from aiohttp import web
+
+    scheduler, err = _resolve_scheduler(request)
+    if err is not None:
+        return err
+
+    task_id = request.match_info["id"]
+    row = await scheduler.db.get_task(task_id)
+    if row is None or _is_builtin(row):
+        # Treat builtins as 404 here too — same as handle_get.
+        return web.json_response({"error": f"Task {task_id!r} not found"}, status=404)
+
+    limit = int(request.query.get("limit", 20))
+    status = request.query.get("status") or None
+    runs = await scheduler.db.list_task_runs(task_id, limit=limit, status=status)
+    return web.json_response({"runs": [_serialize_run(r) for r in runs]})
 
 
 async def handle_create(request):

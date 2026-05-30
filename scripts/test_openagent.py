@@ -222,6 +222,10 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_cron",
     # Issue #5 regression — scheduler must start each firing in a fresh session.
     "test_scheduler_fresh_session",
+    # Scheduled-task execution history (task_runs) — DB layer + the
+    # Scheduler recording each firing's status/output preview, mirroring
+    # workflow_runs. Backs GET /api/scheduled-tasks/{id}/runs.
+    "test_task_runs",
     # Workflow ai-prompt must forget/release at the right moment (same
     # bug class as scheduler issue #5 but for workflows).
     "test_workflow_forgets_session",

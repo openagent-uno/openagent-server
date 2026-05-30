@@ -45,6 +45,26 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
 CREATE INDEX IF NOT EXISTS idx_tasks_enabled ON scheduled_tasks(enabled);
 CREATE INDEX IF NOT EXISTS idx_tasks_next_run ON scheduled_tasks(next_run);
 
+-- Per-firing execution history for scheduled_tasks. The Scheduler opens
+-- a row when it fires a task and flips it to success/failed when the
+-- agent turn returns, capturing an output/error preview + timing. This
+-- is the scheduled-task analogue of ``workflow_runs`` — it's what lets
+-- the dashboard show a task's run history instead of only a single
+-- ``last_run`` timestamp. Reads: ``GET /api/scheduled-tasks/{id}/runs``.
+CREATE TABLE IF NOT EXISTS task_runs (
+    id          TEXT PRIMARY KEY,
+    task_id     TEXT NOT NULL REFERENCES scheduled_tasks(id) ON DELETE CASCADE,
+    trigger     TEXT NOT NULL DEFAULT 'schedule',
+    status      TEXT NOT NULL,
+    started_at  REAL NOT NULL,
+    finished_at REAL,
+    output      TEXT,
+    error       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_taskruns_task    ON task_runs(task_id);
+CREATE INDEX IF NOT EXISTS idx_taskruns_started ON task_runs(started_at);
+CREATE INDEX IF NOT EXISTS idx_taskruns_status  ON task_runs(status);
+
 CREATE TABLE IF NOT EXISTS usage_log (
     id TEXT PRIMARY KEY,
     timestamp REAL NOT NULL,
@@ -1282,6 +1302,115 @@ class MemoryDB:
         )
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
+
+    # ── Task Runs (scheduled-task execution history) ──
+    #
+    # Mirrors the Workflow Runs API below: a row is opened ``running`` by
+    # the Scheduler when a task fires and flipped to ``success`` /
+    # ``failed`` (with an output/error preview + ``finished_at``) when the
+    # agent turn returns.
+
+    @staticmethod
+    def _row_to_task_run(row: aiosqlite.Row) -> dict:
+        return dict(row)
+
+    async def add_task_run(
+        self,
+        *,
+        task_id: str,
+        trigger: str = "schedule",
+        run_id: str | None = None,
+    ) -> str:
+        conn = await self._ensure_connected()
+        rid = run_id or str(uuid.uuid4())
+        await conn.execute(
+            "INSERT INTO task_runs "
+            "(id, task_id, trigger, status, started_at) "
+            "VALUES (?, ?, ?, 'running', ?)",
+            (rid, task_id, trigger, time.time()),
+        )
+        await conn.commit()
+        return rid
+
+    async def update_task_run(self, run_id: str, **kwargs: Any) -> None:
+        """Partial update. Only ``status`` / ``finished_at`` / ``output`` /
+        ``error`` are writable."""
+        allowed = {"status", "finished_at", "output", "error"}
+        updates = {k: v for k, v in kwargs.items() if k in allowed}
+        if not updates:
+            return
+        conn = await self._ensure_connected()
+        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        await conn.execute(
+            f"UPDATE task_runs SET {set_clause} WHERE id = ?",
+            list(updates.values()) + [run_id],
+        )
+        await conn.commit()
+
+    async def get_task_run(self, run_id: str) -> dict | None:
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            "SELECT * FROM task_runs WHERE id = ?", (run_id,),
+        )
+        row = await cursor.fetchone()
+        return self._row_to_task_run(row) if row else None
+
+    async def list_task_runs(
+        self,
+        task_id: str,
+        *,
+        limit: int = 20,
+        status: str | None = None,
+    ) -> list[dict]:
+        conn = await self._ensure_connected()
+        clauses = ["task_id = ?"]
+        params: list[Any] = [task_id]
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        params.append(int(limit))
+        cursor = await conn.execute(
+            f"SELECT * FROM task_runs WHERE {' AND '.join(clauses)} "
+            "ORDER BY started_at DESC LIMIT ?",
+            params,
+        )
+        rows = await cursor.fetchall()
+        return [self._row_to_task_run(r) for r in rows]
+
+    async def reap_orphan_task_runs(self) -> int:
+        """Mark every ``task_runs`` row still ``running`` as ``failed`` —
+        the scheduled-task analogue of ``reap_orphan_workflow_runs``. A
+        ``running`` row that survives a process restart is a zombie: the
+        firing that owned it is gone and there is no resume path, so the
+        cosmetic "running" badge would otherwise never clear. Called from
+        ``AgentServer.start()``. Returns the number of rows reaped."""
+        conn = await self._ensure_connected()
+        now = time.time()
+        cursor = await conn.execute(
+            "UPDATE task_runs "
+            "SET status='failed', finished_at=?, "
+            "    error=COALESCE(error, '') || "
+            "          CASE WHEN error IS NULL OR error='' THEN '' ELSE ' | ' END || "
+            "          'reaped: orphan from prior process' "
+            "WHERE status='running'",
+            (now,),
+        )
+        await conn.commit()
+        return cursor.rowcount or 0
+
+    async def prune_task_runs(self, task_id: str, *, keep_last: int = 50) -> int:
+        """Delete all but the most recent ``keep_last`` runs for a task.
+        Returns the number of rows removed."""
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            "DELETE FROM task_runs WHERE id IN ("
+            "  SELECT id FROM task_runs WHERE task_id = ? "
+            "  ORDER BY started_at DESC LIMIT -1 OFFSET ?"
+            ")",
+            (task_id, int(keep_last)),
+        )
+        await conn.commit()
+        return cursor.rowcount or 0
 
     # ── Workflow Tasks ──
 

@@ -547,6 +547,12 @@ class AgentServer:
                 reaped = await db.reap_orphan_workflow_runs()
                 if reaped:
                     elog("workflow.orphan_reaped", count=reaped)
+                # Same treatment for scheduled-task run history — a row
+                # left ``running`` by a prior process is a zombie.
+                if hasattr(db, "reap_orphan_task_runs"):
+                    reaped_tasks = await db.reap_orphan_task_runs()
+                    if reaped_tasks:
+                        elog("task.orphan_reaped", count=reaped_tasks)
         except Exception as e:  # noqa: BLE001
             logger.warning("orphan workflow_run reap failed: %s", e)
 

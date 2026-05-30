@@ -52,6 +52,12 @@ def _no_broadcast(resource: str, action: str, id: str | None = None) -> None:
     return None
 
 
+# Cap the stored task-run output preview. The full transcript still lives
+# in the agent's session history; ``task_runs.output`` is only a preview
+# for the dashboard's run list, so a chatty turn can't bloat the DB.
+_MAX_TASK_RUN_OUTPUT = 4000
+
+
 class Scheduler:
     """Background scheduler that runs agent prompts on cron schedules.
 
@@ -172,13 +178,26 @@ class Scheduler:
                 elog("scheduler.loop_error", level="error", error=str(e))
             await asyncio.sleep(CHECK_INTERVAL)
 
-    async def run_task(self, task: dict) -> None:
+    async def run_task(self, task: dict, *, trigger: str = "schedule") -> None:
         """Execute a single task. Extension point: override or monkey-patch
         this to intercept specific tasks (e.g. auto-update, which uses a
         direct pip subprocess instead of going through the agent)."""
         task_name = task["name"]
         session_id = f"scheduler:{task['id']}"
         elog("task.run", name=task_name)
+        # Record this firing in ``task_runs`` so the dashboard can show a
+        # per-task execution history (status / output preview / timing) —
+        # the scheduled-task analogue of ``workflow_runs``. Best-effort:
+        # logging must never stop the task from running, so the db touch
+        # is guarded and skipped entirely when there's no db (e.g. a
+        # Scheduler constructed with ``db=None`` in unit tests).
+        run_id: str | None = None
+        if self.db is not None:
+            try:
+                run_id = await self.db.add_task_run(task_id=task["id"], trigger=trigger)
+            except Exception as e:  # noqa: BLE001
+                elog("task.run_record_failed", level="warning",
+                     name=task_name, error=str(e))
         try:
             # Pick up any providers/models the REST or MCP layer wrote
             # since the last tick. The gateway fires refresh_registries on
@@ -197,8 +216,14 @@ class Scheduler:
                 session_id=session_id,
             )
             elog("task.done", name=task_name, preview=str(response)[:100])
+            await self._record_task_finish(
+                run_id, task, status="success", output=str(response),
+            )
         except Exception as e:
             elog("task.error", level="error", name=task_name, error=str(e))
+            await self._record_task_finish(
+                run_id, task, status="failed", error=str(e),
+            )
         finally:
             # Scheduled firings are fire-and-forget — each tick must run in
             # a fresh session with no memory of prior firings. ``forget_session``
@@ -212,6 +237,35 @@ class Scheduler:
                 await self.agent.forget_session(session_id)
             except Exception as e:
                 elog("scheduler.forget_failed", task=task_name, error=str(e))
+
+    async def _record_task_finish(
+        self,
+        run_id: str | None,
+        task: dict,
+        *,
+        status: str,
+        output: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        """Finalize the ``task_runs`` row opened in ``run_task``. No-op when
+        recording was skipped (no db, or the open failed). Best-effort: a
+        failure here is logged, never raised, so a logging hiccup can't
+        turn a healthy task run into a reported failure."""
+        if run_id is None or self.db is None:
+            return
+        try:
+            updates: dict = {"status": status, "finished_at": time.time()}
+            if output is not None:
+                updates["output"] = output[:_MAX_TASK_RUN_OUTPUT]
+            if error is not None:
+                updates["error"] = error[:_MAX_TASK_RUN_OUTPUT]
+            await self.db.update_task_run(run_id, **updates)
+            # Keep the per-task history bounded.
+            await self.db.prune_task_runs(task["id"])
+            self._broadcast("scheduled_task", "updated", task["id"])
+        except Exception as e:  # noqa: BLE001
+            elog("task.run_finish_failed", level="warning",
+                 name=task.get("name"), error=str(e))
 
     async def _check_and_run(self) -> None:
         """Check for due tasks and execute them.

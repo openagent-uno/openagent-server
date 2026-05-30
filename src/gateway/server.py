@@ -423,6 +423,7 @@ class Gateway:
             ("GET", "/api/scheduled-tasks", scheduled_tasks.handle_list),
             ("POST", "/api/scheduled-tasks", scheduled_tasks.handle_create),
             ("GET", "/api/scheduled-tasks/{id}", scheduled_tasks.handle_get),
+            ("GET", "/api/scheduled-tasks/{id}/runs", scheduled_tasks.handle_runs_list),
             ("PATCH", "/api/scheduled-tasks/{id}", scheduled_tasks.handle_update),
             ("DELETE", "/api/scheduled-tasks/{id}", scheduled_tasks.handle_delete),
             # Workflow engine (n8n-style multi-block pipelines). Same
