@@ -120,6 +120,8 @@ async def _decorate_workflow(db, row: dict) -> dict:
         epoch = out.get(key)
         out[f"{key}_iso"] = epoch_to_iso(epoch) if epoch else None
     out["enabled"] = bool(out.get("enabled"))
+    raw_cap = out.get("max_concurrent_runs")
+    out["max_concurrent_runs"] = int(raw_cap) if raw_cap is not None else None
     out["trigger_types"] = trigger_types_from_graph(out.get("graph"))
     schedules = await db.list_schedules(workflow_id=out["id"])
     out["schedules"] = [_decorate_schedule(s) for s in schedules]
@@ -206,12 +208,30 @@ async def handle_create(request):
     except ValidationError as exc:
         return web.json_response({"error": f"graph validation failed: {exc}"}, status=400)
 
+    cap_raw = body.get("max_concurrent_runs", None)
+    if cap_raw is not None:
+        try:
+            cap = int(cap_raw)
+        except (TypeError, ValueError):
+            return web.json_response(
+                {"error": "max_concurrent_runs must be an integer or null"},
+                status=400,
+            )
+        if cap < 1:
+            return web.json_response(
+                {"error": "max_concurrent_runs must be >= 1 (or null for unlimited)"},
+                status=400,
+            )
+    else:
+        cap = None
+
     try:
         workflow_id = await scheduler.db.add_workflow(
             name=name,
             description=body.get("description") or None,
             graph=graph,
             enabled=bool(body.get("enabled", True)),
+            max_concurrent_runs=cap,
         )
     except Exception as exc:  # integrity error on duplicate name, etc.
         if "UNIQUE" in str(exc):
@@ -270,6 +290,25 @@ async def handle_update(request):
 
     if "enabled" in body:
         updates["enabled"] = bool(body["enabled"])
+
+    if "max_concurrent_runs" in body:
+        cap_raw = body["max_concurrent_runs"]
+        if cap_raw is None:
+            updates["max_concurrent_runs"] = None
+        else:
+            try:
+                cap = int(cap_raw)
+            except (TypeError, ValueError):
+                return web.json_response(
+                    {"error": "max_concurrent_runs must be an integer or null"},
+                    status=400,
+                )
+            if cap < 1:
+                return web.json_response(
+                    {"error": "max_concurrent_runs must be >= 1 (or null for unlimited)"},
+                    status=400,
+                )
+            updates["max_concurrent_runs"] = cap
 
     new_graph: dict | None = None
     if any(k in body for k in ("nodes", "edges", "variables")):

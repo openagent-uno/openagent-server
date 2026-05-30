@@ -21,8 +21,13 @@ Responsibilities:
   error but keeps walking. ``branch`` routes to an ``error`` handle if
   one exists.
 - Concurrency: batches of currently-ready nodes run in parallel via
-  ``asyncio.gather``, so ``parallel`` blocks really do fan out. A
-  per-workflow lock prevents overlapping runs of the *same* workflow.
+  ``asyncio.gather``, so ``parallel`` blocks really do fan out.
+  Overlapping runs of the *same* workflow are governed by the row's
+  ``max_concurrent_runs`` column: ``NULL`` (default) means unlimited,
+  ``1`` fully serializes, ``N>1`` admits up to N concurrent runs via
+  a per-workflow ``asyncio.Semaphore``. The semaphore's capacity tracks
+  the live setting — an update to the column resizes it on the next
+  run.
 
 The executor does **not** run in the workflow-manager MCP subprocess —
 it lives in the main OpenAgent process so it can call ``agent.run()``
@@ -33,6 +38,7 @@ via the ``workflow_run_requests`` queue table.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import json
 import logging
@@ -109,6 +115,22 @@ class _RunCtx:
         }
 
 
+@dataclass
+class _ConcurrencyGate:
+    """Per-workflow admission gate.
+
+    ``capacity`` is the cached value of the workflow row's
+    ``max_concurrent_runs`` column at the time the semaphore was last
+    sized. ``None`` means unlimited — no semaphore, no gating.
+
+    The executor rebuilds the semaphore when the live value diverges
+    from ``capacity``, so an operator can edit the cap mid-life without
+    restarting the agent.
+    """
+    capacity: int | None
+    sem: asyncio.Semaphore | None
+
+
 class WorkflowExecutor:
     """Runs workflows against the live Agent and MCPPool. One instance
     per main process is enough — per-run state lives in ``_RunCtx``.
@@ -117,8 +139,71 @@ class WorkflowExecutor:
     def __init__(self, agent: Any, db: MemoryDB):
         self.agent = agent
         self.db = db
-        self._locks: dict[str, asyncio.Lock] = {}
+        self._gates: dict[str, _ConcurrencyGate] = {}
+        self._gates_lock = asyncio.Lock()
         self._trace_lock = asyncio.Lock()
+
+    def _resolve_capacity(self, workflow: dict) -> int | None:
+        """Pull ``max_concurrent_runs`` off the workflow row, normalised.
+
+        Values come from the gateway / MCP / scheduler — they may arrive
+        as ``None``, an int, a stringified int, or be missing entirely.
+        Anything we can't parse falls back to unlimited (None) so a
+        malformed config does not silently stall every run.
+        """
+        raw = workflow.get("max_concurrent_runs")
+        if raw is None:
+            return None
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "workflow %s: unparseable max_concurrent_runs=%r; treating "
+                "as unlimited", workflow.get("id"), raw,
+            )
+            return None
+        if value < 1:
+            logger.warning(
+                "workflow %s: max_concurrent_runs=%d is invalid; treating "
+                "as unlimited", workflow.get("id"), value,
+            )
+            return None
+        return value
+
+    async def _acquire_slot(self, workflow: dict) -> contextlib.AbstractAsyncContextManager:
+        """Return a context manager that holds an execution slot for the
+        workflow. Default (no cap) → a no-op context. ``cap=N`` → an
+        ``asyncio.Semaphore`` rebuilt whenever the cap changes.
+
+        The semaphore's identity may swap between calls when the cap is
+        edited mid-life, but each individual run keeps a reference to
+        the semaphore it acquired and releases against the same one —
+        so a dynamic resize cannot strand a permit.
+        """
+        capacity = self._resolve_capacity(workflow)
+        if capacity is None:
+            return contextlib.nullcontext()
+
+        workflow_id = workflow["id"]
+        async with self._gates_lock:
+            gate = self._gates.get(workflow_id)
+            if gate is None or gate.capacity != capacity:
+                gate = _ConcurrencyGate(
+                    capacity=capacity, sem=asyncio.Semaphore(capacity),
+                )
+                self._gates[workflow_id] = gate
+            sem = gate.sem
+
+        @contextlib.asynccontextmanager
+        async def _holder():
+            assert sem is not None  # narrowed by capacity check above
+            await sem.acquire()
+            try:
+                yield
+            finally:
+                sem.release()
+
+        return _holder()
 
     # ── public API ──────────────────────────────────────────────────
 
@@ -144,9 +229,9 @@ class WorkflowExecutor:
         graph = workflow.get("graph") or {}
 
         workflow_id = workflow["id"]
-        lock = self._locks.setdefault(workflow_id, asyncio.Lock())
+        slot = await self._acquire_slot(workflow)
 
-        async with lock:
+        async with slot:
             run_id = await self.db.add_workflow_run(
                 workflow_id=workflow_id,
                 trigger=trigger,

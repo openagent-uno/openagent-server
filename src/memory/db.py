@@ -257,17 +257,23 @@ CREATE TABLE IF NOT EXISTS pinned_sessions (
 -- for the migration that backfills ``workflow_schedules`` from the
 -- first release's row-level cron.
 CREATE TABLE IF NOT EXISTS workflow_tasks (
-    id              TEXT PRIMARY KEY,
-    name            TEXT NOT NULL UNIQUE,
-    description     TEXT,
-    graph_json      TEXT NOT NULL DEFAULT '{"version":1,"nodes":[],"edges":[],"variables":{}}',
-    trigger_kind    TEXT NOT NULL DEFAULT 'manual',  -- DEPRECATED, ignored
-    cron_expression TEXT,                             -- DEPRECATED, ignored
-    enabled         INTEGER NOT NULL DEFAULT 1,
-    last_run_at     REAL,
-    next_run_at     REAL,                              -- DEPRECATED, ignored
-    created_at      REAL NOT NULL,
-    updated_at      REAL NOT NULL
+    id                  TEXT PRIMARY KEY,
+    name                TEXT NOT NULL UNIQUE,
+    description         TEXT,
+    graph_json          TEXT NOT NULL DEFAULT '{"version":1,"nodes":[],"edges":[],"variables":{}}',
+    trigger_kind        TEXT NOT NULL DEFAULT 'manual',  -- DEPRECATED, ignored
+    cron_expression     TEXT,                             -- DEPRECATED, ignored
+    enabled             INTEGER NOT NULL DEFAULT 1,
+    last_run_at         REAL,
+    next_run_at         REAL,                              -- DEPRECATED, ignored
+    -- Optional cap on overlapping runs of THIS workflow. NULL means
+    -- unlimited (default) — overlapping runs all execute concurrently.
+    -- 1 → fully serialized (matches the pre-v0.14.2 behaviour). N>1 →
+    -- up to N runs in flight, additional callers wait on a per-workflow
+    -- ``asyncio.Semaphore`` inside ``WorkflowExecutor``.
+    max_concurrent_runs INTEGER,
+    created_at          REAL NOT NULL,
+    updated_at          REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_wf_enabled  ON workflow_tasks(enabled);
 
@@ -699,6 +705,18 @@ class MemoryDB:
         # to carry per-session framework lock + pin) into the new
         # ``pinned_sessions`` table that stores only the pin. Idempotent.
         await self._migrate_session_bindings_to_pinned_sessions()
+
+        # v0.14.2: per-workflow concurrency cap. NULL = unlimited (new
+        # default — overlapping runs all execute). Old DBs predate the
+        # column; ``CREATE TABLE IF NOT EXISTS`` doesn't add it, so we
+        # ALTER once here.
+        cursor = await self._conn.execute("PRAGMA table_info(workflow_tasks)")
+        cols = {row[1] for row in await cursor.fetchall()}
+        if "max_concurrent_runs" not in cols:
+            await self._conn.execute(
+                "ALTER TABLE workflow_tasks ADD COLUMN max_concurrent_runs INTEGER"
+            )
+            await self._conn.commit()
 
     async def _migrate_legacy_tables_to_sessions(self) -> None:
         """One-time: fold sdk_sessions + chat_sessions + chat_session_runs
@@ -1283,6 +1301,11 @@ class MemoryDB:
         except (TypeError, ValueError):
             d["graph"] = {"version": 1, "nodes": [], "edges": [], "variables": {}}
         d["enabled"] = bool(d.get("enabled"))
+        # ``max_concurrent_runs`` is an INTEGER column with NULL =
+        # unlimited. Normalize to an ``int | None`` (the column may be
+        # absent in legacy rows when reading mid-migration).
+        raw_cap = d.get("max_concurrent_runs")
+        d["max_concurrent_runs"] = int(raw_cap) if raw_cap is not None else None
         # Drop deprecated row-level fields — they're still stored on the
         # table for backwards-compatibility but callers should not read
         # them. ``_migrate_workflow_schedules_from_legacy_columns``
@@ -1329,23 +1352,28 @@ class MemoryDB:
         description: str | None = None,
         graph: dict | None = None,
         enabled: bool = True,
+        max_concurrent_runs: int | None = None,
     ) -> str:
         if not name or not name.strip():
             raise ValueError("name is required")
+        if max_concurrent_runs is not None and max_concurrent_runs < 1:
+            raise ValueError("max_concurrent_runs must be >= 1 or NULL (unlimited)")
         graph_payload = graph or {"version": 1, "nodes": [], "edges": [], "variables": {}}
         conn = await self._ensure_connected()
         workflow_id = str(uuid.uuid4())
         now = time.time()
         await conn.execute(
             "INSERT INTO workflow_tasks "
-            "(id, name, description, graph_json, enabled, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "(id, name, description, graph_json, enabled, "
+            " max_concurrent_runs, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 workflow_id,
                 name.strip(),
                 description,
                 json.dumps(graph_payload),
                 1 if enabled else 0,
+                max_concurrent_runs,
                 now,
                 now,
             ),
@@ -1359,13 +1387,25 @@ class MemoryDB:
         ``workflow_schedules`` — callers should invoke
         ``sync_workflow_schedules`` after any graph write.
         """
-        allowed_direct = {"name", "description", "enabled", "last_run_at"}
+        allowed_direct = {
+            "name", "description", "enabled", "last_run_at",
+            "max_concurrent_runs",
+        }
         updates: dict[str, Any] = {}
         for k, v in kwargs.items():
             if k == "graph" and v is not None:
                 updates["graph_json"] = json.dumps(v)
             elif k in allowed_direct:
-                updates[k] = (1 if v else 0) if k == "enabled" and isinstance(v, bool) else v
+                if k == "enabled" and isinstance(v, bool):
+                    updates[k] = 1 if v else 0
+                elif k == "max_concurrent_runs":
+                    if v is not None and v < 1:
+                        raise ValueError(
+                            "max_concurrent_runs must be >= 1 or NULL (unlimited)"
+                        )
+                    updates[k] = v
+                else:
+                    updates[k] = v
         if not updates:
             return
         updates["updated_at"] = time.time()

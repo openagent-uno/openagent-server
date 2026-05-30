@@ -21,10 +21,12 @@ Wall-clock timing is the cleanest signal here — same approach as
 two distinct workflows must finish in ~0.5 s total (parallel), not
 ~1.0 s (serialized).
 
-The companion test pins the *intended* per-workflow serialization: the
-executor still holds one ``asyncio.Lock`` per workflow id, so two runs
-of the SAME workflow remain ordered. That's a different invariant and
-this test exists to keep a future refactor from accidentally dropping it.
+Same-workflow concurrency is governed by the workflow row's
+``max_concurrent_runs`` column. ``NULL`` (default) means unlimited —
+two runs of one workflow execute concurrently. ``1`` fully serializes;
+``N>1`` admits up to N concurrent runs via a per-workflow semaphore in
+``WorkflowExecutor``. The cap-aware tests below pin each of these
+contracts so a future refactor can't silently regress them.
 """
 from __future__ import annotations
 
@@ -118,14 +120,17 @@ async def t_distinct_workflows_run_in_parallel(ctx: TestContext) -> None:
         await db.close()
 
 
-@test("workflow_parallel", "two runs of the SAME workflow still serialize")
-async def t_same_workflow_runs_serialize(ctx: TestContext) -> None:
-    """Pins the executor's per-workflow lock as intentional behaviour.
+@test(
+    "workflow_parallel",
+    "default (no cap) → two runs of the SAME workflow run concurrently",
+)
+async def t_same_workflow_unlimited_default(ctx: TestContext) -> None:
+    """v0.14.2 default: ``max_concurrent_runs`` is NULL → unlimited.
 
-    Even after the dispatcher fix, ``WorkflowExecutor._locks[workflow_id]``
-    must keep two runs of one workflow ordered — concurrent same-id runs
-    would race on shared session ids and trace persistence. The lock is
-    documented at ``openagent/workflow/executor.py:25`` as the design.
+    The executor must not gate concurrent runs of one workflow when no
+    cap is set; this is the new contract that supersedes the previous
+    per-workflow ``asyncio.Lock``. Two 0.5 s runs of one cap-less
+    workflow should finish in ≈0.5 s, not ≈1.0 s.
     """
     from src.core.scheduler import Scheduler
     from src.memory.db import MemoryDB
@@ -135,7 +140,7 @@ async def t_same_workflow_runs_serialize(ctx: TestContext) -> None:
     scheduler = Scheduler(db=db, agent=_StubAgent())  # type: ignore[arg-type]
 
     wf = await db.add_workflow(
-        name="wf-serial-same", graph=_wait_workflow_graph(0.5),
+        name="wf-unlimited-default", graph=_wait_workflow_graph(0.5),
     )
     try:
         await db.enqueue_workflow_run_request(workflow_id=wf, trigger="api")
@@ -154,12 +159,162 @@ async def t_same_workflow_runs_serialize(ctx: TestContext) -> None:
         assert len(runs) == 2, runs
         assert all(r["status"] == "success" for r in runs), runs
 
-        # Serial via per-workflow lock: ≈1.0 s. Parallel (lock removed):
-        # ≈0.5 s. 0.9 s asserts the lock is in effect with headroom for
-        # any executor speedup short of full parallelism.
+        # Default-unlimited: ≈0.5 s. A regression that reintroduces the
+        # per-workflow lock would push this past 0.85 s.
+        assert total < 0.85, (
+            f"two cap-less runs of one workflow serialized; "
+            f"total={total:.3f}s — default concurrency cap is not unlimited"
+        )
+    finally:
+        await db.delete_workflow(wf)
+        await db.close()
+
+
+@test(
+    "workflow_parallel",
+    "max_concurrent_runs=1 → two runs of the SAME workflow serialize",
+)
+async def t_same_workflow_cap_one_serializes(ctx: TestContext) -> None:
+    """Setting the cap to 1 must reproduce the pre-v0.14.2 behaviour:
+    concurrent runs of one workflow execute one at a time. Two 0.5 s
+    runs should finish in ≈1.0 s, not ≈0.5 s.
+    """
+    from src.core.scheduler import Scheduler
+    from src.memory.db import MemoryDB
+
+    db = MemoryDB(str(ctx.db_path))
+    await db.connect()
+    scheduler = Scheduler(db=db, agent=_StubAgent())  # type: ignore[arg-type]
+
+    wf = await db.add_workflow(
+        name="wf-cap-1",
+        graph=_wait_workflow_graph(0.5),
+        max_concurrent_runs=1,
+    )
+    try:
+        await db.enqueue_workflow_run_request(workflow_id=wf, trigger="api")
+        await db.enqueue_workflow_run_request(workflow_id=wf, trigger="api")
+
+        start = time.monotonic()
+        await scheduler._check_and_run()
+        in_flight = list(scheduler._workflow_tasks)
+        assert len(in_flight) == 2, (
+            f"expected 2 dispatched tasks, got {len(in_flight)}"
+        )
+        await asyncio.gather(*in_flight, return_exceptions=True)
+        total = time.monotonic() - start
+
+        runs = await db.list_workflow_runs(wf, limit=2)
+        assert len(runs) == 2, runs
+        assert all(r["status"] == "success" for r in runs), runs
+
+        # Cap=1 forces serial execution: ≈1.0 s. Anything below 0.9 s
+        # means the semaphore is not in effect.
         assert total >= 0.9, (
-            f"per-workflow lock appears to have been removed; "
-            f"total={total:.3f}s — runs of one workflow are now interleaving"
+            f"max_concurrent_runs=1 did not serialize; "
+            f"total={total:.3f}s — semaphore not respected"
+        )
+    finally:
+        await db.delete_workflow(wf)
+        await db.close()
+
+
+@test(
+    "workflow_parallel",
+    "max_concurrent_runs=2 → 3 runs cap at 2 concurrent, third queues",
+)
+async def t_same_workflow_cap_n_admits_n(ctx: TestContext) -> None:
+    """With cap=2 and three concurrently-enqueued 0.5 s runs, the third
+    must wait for the first batch to free a permit. Wall clock ≈1.0 s.
+    No cap: ≈0.5 s. cap=1: ≈1.5 s. cap=2 sits in the middle, so a
+    band [0.9 s, 1.3 s] discriminates correctly.
+    """
+    from src.core.scheduler import Scheduler
+    from src.memory.db import MemoryDB
+
+    db = MemoryDB(str(ctx.db_path))
+    await db.connect()
+    scheduler = Scheduler(db=db, agent=_StubAgent())  # type: ignore[arg-type]
+
+    wf = await db.add_workflow(
+        name="wf-cap-2",
+        graph=_wait_workflow_graph(0.5),
+        max_concurrent_runs=2,
+    )
+    try:
+        for _ in range(3):
+            await db.enqueue_workflow_run_request(workflow_id=wf, trigger="api")
+
+        start = time.monotonic()
+        await scheduler._check_and_run()
+        in_flight = list(scheduler._workflow_tasks)
+        assert len(in_flight) == 3, (
+            f"expected 3 dispatched tasks, got {len(in_flight)}"
+        )
+        await asyncio.gather(*in_flight, return_exceptions=True)
+        total = time.monotonic() - start
+
+        runs = await db.list_workflow_runs(wf, limit=3)
+        assert len(runs) == 3, runs
+        assert all(r["status"] == "success" for r in runs), runs
+
+        assert 0.9 <= total < 1.3, (
+            f"max_concurrent_runs=2 with 3 runs took {total:.3f}s; "
+            f"expected ≈1.0s (≥0.9, <1.3) — the cap is either too "
+            f"permissive (<0.9s acts like ∞) or too restrictive (≥1.3s "
+            f"acts like cap=1)"
+        )
+    finally:
+        await db.delete_workflow(wf)
+        await db.close()
+
+
+@test(
+    "workflow_parallel",
+    "executor live-resizes its semaphore when max_concurrent_runs is edited",
+)
+async def t_cap_resize_takes_effect(ctx: TestContext) -> None:
+    """Editing ``max_concurrent_runs`` mid-life must not require a
+    restart: the next ``run()`` call rebuilds the semaphore against the
+    fresh value. Start serialized (cap=1, ~1.0 s for two runs), then
+    edit to ``None`` (unlimited) and assert two more runs finish in
+    parallel (~0.5 s).
+    """
+    from src.core.scheduler import Scheduler
+    from src.memory.db import MemoryDB
+
+    db = MemoryDB(str(ctx.db_path))
+    await db.connect()
+    scheduler = Scheduler(db=db, agent=_StubAgent())  # type: ignore[arg-type]
+
+    wf = await db.add_workflow(
+        name="wf-cap-resize",
+        graph=_wait_workflow_graph(0.4),
+        max_concurrent_runs=1,
+    )
+    try:
+        await db.enqueue_workflow_run_request(workflow_id=wf, trigger="api")
+        await db.enqueue_workflow_run_request(workflow_id=wf, trigger="api")
+        start = time.monotonic()
+        await scheduler._check_and_run()
+        await asyncio.gather(*list(scheduler._workflow_tasks), return_exceptions=True)
+        serial_total = time.monotonic() - start
+        assert serial_total >= 0.7, (
+            f"cap=1 phase ran in {serial_total:.3f}s — expected ≥0.7s "
+            f"(serial)"
+        )
+
+        # Resize → unlimited and replay.
+        await db.update_workflow(wf, max_concurrent_runs=None)
+        await db.enqueue_workflow_run_request(workflow_id=wf, trigger="api")
+        await db.enqueue_workflow_run_request(workflow_id=wf, trigger="api")
+        start = time.monotonic()
+        await scheduler._check_and_run()
+        await asyncio.gather(*list(scheduler._workflow_tasks), return_exceptions=True)
+        parallel_total = time.monotonic() - start
+        assert parallel_total < 0.7, (
+            f"after resize to unlimited, two runs took {parallel_total:.3f}s — "
+            f"expected <0.7s (parallel); semaphore was not dropped"
         )
     finally:
         await db.delete_workflow(wf)

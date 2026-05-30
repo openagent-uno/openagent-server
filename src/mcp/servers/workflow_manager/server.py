@@ -91,6 +91,9 @@ def _decorate_workflow_row(row: aiosqlite.Row) -> dict[str, Any]:
     except (TypeError, ValueError):
         d["graph"] = {"version": 1, "nodes": [], "edges": [], "variables": {}}
     d["enabled"] = bool(d.get("enabled"))
+    # Normalize the optional concurrency cap. NULL/missing → unlimited.
+    raw_cap = d.get("max_concurrent_runs")
+    d["max_concurrent_runs"] = int(raw_cap) if raw_cap is not None else None
     # Drop deprecated v0.12.10 row-level fields; schedules now live
     # in workflow_schedules.
     for deprecated in ("trigger_kind", "cron_expression", "next_run_at"):
@@ -368,6 +371,7 @@ async def create_workflow(
     nodes: list[dict] | None = None,
     edges: list[dict] | None = None,
     variables: dict | None = None,
+    max_concurrent_runs: int | None = None,
 ) -> dict[str, Any]:
     """Create a new workflow.
 
@@ -380,6 +384,13 @@ async def create_workflow(
     - ``trigger-schedule`` blocks with a ``cron_expression`` in their
       ``config`` automatically appear in ``workflow_schedules`` and
       are fired by the main-process scheduler.
+    - ``max_concurrent_runs`` (optional, default ``None``) caps how many
+      runs of THIS workflow can execute at the same time. ``None`` means
+      unlimited — every run starts immediately. ``1`` fully serializes
+      (each run waits for the previous one). ``N>1`` admits up to N
+      simultaneous runs; further callers queue. The cap applies whether
+      a run is triggered manually, by the AI, on a schedule, or by
+      another workflow.
 
     Schema (the validator enforces this):
 
@@ -418,6 +429,10 @@ async def create_workflow(
     """
     if not name or not name.strip():
         raise ValueError("name is required")
+    if max_concurrent_runs is not None and max_concurrent_runs < 1:
+        raise ValueError(
+            "max_concurrent_runs must be >= 1 or null (unlimited)"
+        )
     graph = {
         "version": 1,
         "nodes": nodes or [],
@@ -435,13 +450,15 @@ async def create_workflow(
     try:
         await conn.execute(
             "INSERT INTO workflow_tasks "
-            "(id, name, description, graph_json, enabled, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, 1, ?, ?)",
+            "(id, name, description, graph_json, enabled, "
+            " max_concurrent_runs, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
             (
                 workflow_id,
                 name.strip(),
                 description or None,
                 json.dumps(graph),
+                max_concurrent_runs,
                 now,
                 now,
             ),
@@ -464,6 +481,8 @@ async def update_workflow(
     edges: list[dict] | None = None,
     variables: dict | None = None,
     enabled: bool | None = None,
+    max_concurrent_runs: int | None = None,
+    clear_max_concurrent_runs: bool = False,
 ) -> dict[str, Any]:
     """Patch-style update. Only fields you pass are changed.
 
@@ -476,6 +495,12 @@ async def update_workflow(
     when the workflow fires. Per-block schedules are kept in
     ``workflow_schedules`` via ``_sync_workflow_schedules`` on every
     write.
+
+    ``max_concurrent_runs`` (optional, integer >= 1) sets the cap on
+    overlapping runs of this workflow. To remove an existing cap (revert
+    to unlimited), pass ``clear_max_concurrent_runs=True`` — MCP tool
+    args cannot distinguish "not provided" from ``None``, so the
+    explicit clear-flag is needed to reset the column to NULL.
     """
     conn = await _get_conn()
     row = await _resolve_workflow(conn, id_or_name)
@@ -491,6 +516,15 @@ async def update_workflow(
         updates["description"] = description or None
     if enabled is not None:
         updates["enabled"] = 1 if enabled else 0
+    if clear_max_concurrent_runs:
+        updates["max_concurrent_runs"] = None
+    elif max_concurrent_runs is not None:
+        if max_concurrent_runs < 1:
+            raise ValueError(
+                "max_concurrent_runs must be >= 1 or use "
+                "clear_max_concurrent_runs=true to reset to unlimited"
+            )
+        updates["max_concurrent_runs"] = max_concurrent_runs
 
     new_graph: dict | None = None
     if nodes is not None or edges is not None or variables is not None:
