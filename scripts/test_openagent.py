@@ -242,6 +242,11 @@ _TEST_MODULES: tuple[str, ...] = (
     # the ``TypeError: 'Function' object is not callable`` regression
     # that broke LLM-authored workflows touching subprocess MCPs.
     "test_workflow_mcp_dispatch",
+    # A workflow mcp-tool block calling delegation.delegate_task must run
+    # with an installed delegation context (mirrors agent.run). Guards
+    # the "delegate_task called outside an agent turn" regression that
+    # broke workflows delegating to sub-agents (Vision §8).
+    "test_workflow_delegation_context",
     # Canonical workflow examples — every example must round-trip
     # through validate_graph so the "reference manual" we ship to the
     # LLM (via list_workflow_examples / get_workflow_example) stays
