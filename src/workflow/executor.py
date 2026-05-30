@@ -56,7 +56,9 @@ from src.workflow.templating import (
     resolve_templates,
 )
 from src.workflow.validate import (
+    _safe_prefix,
     mcp_callability_from_pool,
+    mcp_errors_from_pool,
     mcp_inventory_from_pool,
     validate_graph,
 )
@@ -301,6 +303,7 @@ class WorkflowExecutor:
                     graph,
                     mcp_inventory=mcp_inventory_from_pool(pool),
                     mcp_callability=mcp_callability_from_pool(pool),
+                    mcp_errors=mcp_errors_from_pool(pool),
                 )
                 await self._walk(graph, ctx, on_status, entry_node_id=entry_node_id)
             except WorkflowExecutionError as exc:
@@ -787,10 +790,12 @@ async def _h_mcp_tool(
     }
     fn = functions.get(tool_name)
     if fn is None:
-        # the runtime prefixes remote tools with the MCP name (``messaging_…``).
+        # the runtime prefixes remote tools with the SAFE MCP name
+        # (non-alnum → "_", so ``aaa-support`` → ``aaa_support_…``).
         # LLM-authored workflows often emit the bare upstream name; auto-
-        # repair that one specific mismatch instead of failing.
-        prefixed = f"{mcp_name}_{tool_name}"
+        # repair that one specific mismatch instead of failing. Use the
+        # safe prefix or a hyphenated MCP name never matches.
+        prefixed = f"{_safe_prefix(mcp_name)}_{tool_name}"
         if prefixed in functions:
             tool_name = prefixed
             fn = functions[tool_name]

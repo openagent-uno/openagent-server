@@ -24,6 +24,19 @@ from typing import Any
 from src.workflow.blocks import BLOCK_CATALOG, BlockSpec
 
 
+def _safe_prefix(name: str) -> str:
+    """Mirror of ``MCPPool._safe_prefix``: the runtime emits remote tool
+    names as ``<safe_prefix>_<tool>`` where every non-alphanumeric char in
+    the MCP name becomes ``_`` (``aaa-support`` → ``aaa_support``). The
+    bare→prefixed auto-repair below MUST use this, not the raw MCP name —
+    otherwise a hyphenated MCP name builds the wrong prefix
+    (``aaa-support_threads_list``) and never matches the registered tool
+    (``aaa_support_threads_list``), so the repair silently no-ops and the
+    block fails validation with a tool the pool actually exposes.
+    """
+    return "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in name)
+
+
 class ValidationError(ValueError):
     """Raised by :func:`validate_graph` with an actionable message."""
 
@@ -74,6 +87,7 @@ def _check_mcp_tool(
     config: dict[str, Any],
     inventory: dict[str, dict[str, Any]],
     callability: dict[str, dict[str, bool]] | None = None,
+    errors: dict[str, str] | None = None,
 ) -> None:
     """Validate (and lightly repair) an ``mcp-tool`` block's mcp_name +
     tool_name against the live ``inventory`` snapshot.
@@ -114,16 +128,20 @@ def _check_mcp_tool(
         )
 
     if tool_name not in tools:
-        prefixed = f"{mcp_name}_{tool_name}"
+        # The runtime prefixes remote tools with the SAFE name (non-alnum
+        # → "_"), so for ``aaa-support`` the bare ``threads_list`` maps to
+        # ``aaa_support_threads_list`` — build the prefix the same way.
+        safe = _safe_prefix(mcp_name)
+        prefixed = f"{safe}_{tool_name}"
         if prefixed in tools:
             # Forward repair: bare upstream name → prefixed name.
             config["tool_name"] = prefixed
             tool_name = prefixed
         else:
-            # Reverse repair: strip a redundant leading mcp_name_ prefix
+            # Reverse repair: strip a redundant leading <safe>_ prefix
             # (e.g. shell_shell_exec → shell_exec). Happens when an LLM
             # emits mcp_name + "_" + already-prefixed tool_name.
-            mcp_prefix = f"{mcp_name}_"
+            mcp_prefix = f"{safe}_"
             if tool_name.startswith(mcp_prefix):
                 stripped = tool_name[len(mcp_prefix):]
                 if stripped in tools:
@@ -131,6 +149,26 @@ def _check_mcp_tool(
                     tool_name = stripped
 
         if tool_name not in tools:
+            if not tools:
+                # Present-but-empty: the MCP is loaded but exposes 0 tools.
+                # That is almost never a wrong tool name — it is a failed
+                # connect/handshake (a 401 from a missing/invalid auth
+                # header, or an unreachable URL) that the runtime swallowed,
+                # leaving a registered toolkit with no functions. Surface
+                # the captured cause instead of the misleading
+                # "has no tool X. Available: []" that sends users (and
+                # agents) hunting for a nonexistent naming bug.
+                err = (errors or {}).get(mcp_name)
+                reason = f" Last connect error: {err}." if err else ""
+                raise ValidationError(
+                    f"node {node_id}: MCP {mcp_name!r} is loaded but exposes "
+                    f"no tools — it likely failed to connect or authenticate "
+                    f"(e.g. a 401 from a missing/invalid Authorization header, "
+                    f"or an unreachable URL).{reason} Fix the MCP's config and "
+                    f"re-enable it.",
+                    node_id=node_id,
+                    field="mcp_name",
+                )
             suggestions = difflib.get_close_matches(tool_name, tools.keys(), n=3)
             hint = f" Did you mean: {suggestions}?" if suggestions else ""
             raise ValidationError(
@@ -231,6 +269,7 @@ def validate_graph(
     *,
     mcp_inventory: dict[str, dict[str, Any]] | None = None,
     mcp_callability: dict[str, dict[str, bool]] | None = None,
+    mcp_errors: dict[str, str] | None = None,
 ) -> None:
     """Validate a ``graph_json`` payload. Raises ``ValidationError`` on
     the first problem found; returns ``None`` on success.
@@ -301,7 +340,7 @@ def validate_graph(
             config["args"] = config.pop("arguments")
         _check_config(nid, spec, config)
         if ntype == "mcp-tool" and mcp_inventory is not None:
-            _check_mcp_tool(nid, config, mcp_inventory, mcp_callability)
+            _check_mcp_tool(nid, config, mcp_inventory, mcp_callability, mcp_errors)
 
     for edge in edges:
         if not isinstance(edge, dict):
@@ -386,3 +425,24 @@ def mcp_callability_from_pool(pool: Any) -> dict[str, dict[str, bool]] | None:
             per[tool_name] = bool(callable(entrypoint) or callable(fn))
         out[mcp_name] = per
     return out
+
+
+def mcp_errors_from_pool(pool: Any) -> dict[str, str] | None:
+    """Snapshot the pool's per-MCP last connect/handshake error into
+    ``{mcp_name: error_str}``.
+
+    Lets :func:`validate_graph` explain a present-but-empty MCP (0 tools)
+    with the real cause the runtime swallowed — e.g. ``401 Unauthorized``
+    from a missing Authorization header — instead of the misleading
+    "has no tool X. Available: []".
+
+    Returns ``None`` when the pool can't be introspected — same
+    convention as :func:`mcp_inventory_from_pool`. Pass alongside the
+    inventory to :func:`validate_graph`.
+    """
+    if pool is None:
+        return None
+    errs = getattr(pool, "_last_connect_error", None)
+    if not isinstance(errs, dict):
+        return None
+    return {k: str(v) for k, v in errs.items() if v}

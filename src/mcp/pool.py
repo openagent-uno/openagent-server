@@ -566,6 +566,12 @@ class MCPPool:
         self._toolkit_by_name: dict[str, Any] = {}
         self._tool_counts: dict[str, int] = {name: 0 for name in (s.name for s in specs)}
         self._last_recovery_error_type = {}
+        # Per-MCP last connect/handshake error, keyed by spec name. Set when
+        # an MCP ends up dormant (0 tools) so callers — the workflow
+        # validator, the UI — can surface the real cause (e.g. a 401 the
+        # runtime's blanket-except swallowed) instead of a bare empty tool
+        # list. Cleared the moment the MCP connects with tools.
+        self._last_connect_error: dict[str, str] = {}
         self._connected = False
         self._lock = asyncio.Lock()
         # In-process MCP state — populated by connect_all for specs with
@@ -662,6 +668,7 @@ class MCPPool:
             self.specs = new_specs
             self._tool_counts = {s.name: 0 for s in new_specs}
             self._last_recovery_error_type = {}
+            self._last_connect_error = {}
             self._connected = False
             # Server set + tool counts changed → drop the cached catalog
             # summary; the next prompt render will rebuild it from the
@@ -741,8 +748,21 @@ class MCPPool:
                         ):
                             count = await self._respawn_after_dead_session(spec, toolkit)
                     self._tool_counts[spec.name] = count
+                    if count > 0:
+                        self._last_connect_error.pop(spec.name, None)
                     elog("mcp.connect", name=spec.name, tools=count)
                     if count == 0:
+                        # Ensure a dormant MCP carries *some* cause for the
+                        # validator/UI even when recovery saw no explicit
+                        # exception (the runtime's blanket-except swallowed
+                        # it). A specific cause set in _recover_dormant_toolkit
+                        # (e.g. "401 Unauthorized") takes precedence.
+                        self._last_connect_error.setdefault(
+                            spec.name,
+                            "connected but exposed 0 tools — the handshake or "
+                            "tools/list likely failed (check the MCP's URL, "
+                            "Authorization header, and transport)",
+                        )
                         elog("mcp.dormant", level="warning", name=spec.name)
 
             # 2. In-process MCPs — loaded by importing the adapter module and
@@ -1179,6 +1199,7 @@ class MCPPool:
 
             count = len(getattr(toolkit, "functions", {}) or {})
             if count > 0:
+                self._last_connect_error.pop(spec.name, None)
                 elog(
                     "mcp.recovery_succeeded",
                     name=spec.name,
@@ -1195,6 +1216,13 @@ class MCPPool:
             # vs ValueError each point at a different class of bug.
             if err is not None:
                 self._last_recovery_error_type[spec.name] = type(err).__name__
+                # Remember a human-readable cause so the workflow validator
+                # and UI can explain a present-but-empty MCP (0 tools) with
+                # the REAL reason — e.g. "401 Unauthorized" from a missing
+                # Authorization header — instead of a bare empty tool list.
+                self._last_connect_error[spec.name] = (
+                    f"{type(err).__name__}: {str(err)[:200]}"
+                )
                 # Pull a short traceback summary — full traceback is too
                 # noisy for elog but the last frame usually identifies
                 # the failing call (e.g. anyio TaskGroup vs mcp.session).
@@ -1357,7 +1385,14 @@ class MCPPool:
                     "description": getattr(fn, "description", "") or "",
                     "parameters_schema": getattr(fn, "parameters", None) or {},
                 })
-            out.append({"mcp_name": name, "tools": tools_meta})
+            entry: dict[str, Any] = {"mcp_name": name, "tools": tools_meta}
+            err = self._last_connect_error.get(name)
+            if err and not tools_meta:
+                # Surface the connect cause for a present-but-empty MCP so
+                # the UI / API can explain 0 tools (e.g. a 401 from a missing
+                # Authorization header) rather than showing a blank list.
+                entry["error"] = err
+            out.append(entry)
         return out
 
     def claude_sdk_servers(self) -> dict[str, dict[str, Any]]:

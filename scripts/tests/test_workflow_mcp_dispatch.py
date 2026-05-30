@@ -634,3 +634,89 @@ async def t_validate_rejects_empty_required_args(ctx: TestContext) -> None:
         "variables": {},
     }
     validate_graph(graph_num, mcp_inventory=inventory_with_num)
+
+
+@test(
+    "workflow_mcp_dispatch",
+    "validate_graph repairs a bare tool name for a HYPHENATED MCP (aaa-support)",
+)
+async def t_validate_repairs_hyphenated_prefix(ctx: TestContext) -> None:
+    """The runtime prefixes remote tools with the SAFE name (non-alnum →
+    "_"), so ``aaa-support``'s ``threads_list`` registers as
+    ``aaa_support_threads_list``. The bare→prefixed auto-repair must use
+    the safe prefix, not the raw mcp_name — otherwise it builds
+    ``aaa-support_threads_list`` (hyphen), never matches, and the block
+    fails validation against a tool the pool actually exposes. Regression
+    for lyra's customer-support-coverage workflow."""
+    from src.workflow.validate import validate_graph
+
+    config = {"mcp_name": "aaa-support", "tool_name": "threads_list", "args": {}}
+    graph = {
+        "version": 1,
+        "nodes": [{"id": "n1", "type": "mcp-tool", "config": config}],
+        "edges": [],
+        "variables": {},
+    }
+    inventory = {
+        "aaa-support": {
+            "aaa_support_threads_list": {},
+            "aaa_support_thread_brief": {},
+        },
+    }
+    # Must not raise — the bare name auto-repairs to the safe-prefixed one.
+    validate_graph(graph, mcp_inventory=inventory)
+    assert config["tool_name"] == "aaa_support_threads_list", config["tool_name"]
+
+
+@test(
+    "workflow_mcp_dispatch",
+    "validate_graph explains a present-but-empty MCP with its connect error",
+)
+async def t_validate_empty_mcp_surfaces_connect_error(ctx: TestContext) -> None:
+    """When an MCP is loaded but exposes 0 tools (a swallowed 401 /
+    handshake failure), validation must say so and surface the captured
+    cause — NOT the misleading "has no tool X. Available: []" that sent
+    lyra (and a human triager) hunting for a nonexistent naming bug."""
+    from src.workflow.validate import ValidationError, validate_graph
+
+    config = {"mcp_name": "aaa-support", "tool_name": "threads_list", "args": {}}
+    graph = {
+        "version": 1,
+        "nodes": [{"id": "n2", "type": "mcp-tool", "config": config}],
+        "edges": [],
+        "variables": {},
+    }
+    inventory = {"aaa-support": {}}  # present but empty
+    errors = {"aaa-support": "HTTPStatusError: 401 Unauthorized"}
+
+    raised = False
+    try:
+        validate_graph(graph, mcp_inventory=inventory, mcp_errors=errors)
+    except ValidationError as exc:
+        raised = True
+        msg = str(exc)
+        assert "exposes no tools" in msg, msg
+        assert "401" in msg, msg
+        # Points at the MCP/config, not a bogus tool-name typo.
+        assert exc.field == "mcp_name", exc.field
+        assert "Available: []" not in msg, msg
+    assert raised, "validate_graph should explain a present-but-empty MCP"
+
+
+@test(
+    "workflow_mcp_dispatch",
+    "mcp_errors_from_pool snapshots pool._last_connect_error (drops blanks)",
+)
+async def t_mcp_errors_from_pool(ctx: TestContext) -> None:
+    from src.workflow.validate import mcp_errors_from_pool
+
+    class _Pool:
+        _last_connect_error = {
+            "aaa-support": "HTTPStatusError: 401 Unauthorized",
+            "healthy": "",  # connected fine → blank, must be dropped
+        }
+
+    out = mcp_errors_from_pool(_Pool())
+    assert out == {"aaa-support": "HTTPStatusError: 401 Unauthorized"}, out
+    assert mcp_errors_from_pool(None) is None
+    assert mcp_errors_from_pool(object()) is None  # no attr → None
