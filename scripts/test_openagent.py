@@ -225,6 +225,15 @@ _TEST_MODULES: tuple[str, ...] = (
     # Workflow ai-prompt must forget/release at the right moment (same
     # bug class as scheduler issue #5 but for workflows).
     "test_workflow_forgets_session",
+    # Workflow ai-prompt + model_override must still expose universal
+    # delegation MCP — TeamRouterProvider lacks run_delegated, so the
+    # delegation context must be installed with self.model (the
+    # canonical ModelDispatcher), not active_model.
+    "test_workflow_ai_prompt_delegation",
+    # Vision §15: leader and every team member must run with the same
+    # framework+persona system prompt and the same deferred-MCP setup
+    # (tool-search only, everything else discovered through it).
+    "test_team_member_parity",
     # mcp-tool dispatch + validator callability check — guards against
     # the ``TypeError: 'Function' object is not callable`` regression
     # that broke LLM-authored workflows touching subprocess MCPs.

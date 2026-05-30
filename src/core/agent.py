@@ -1128,11 +1128,23 @@ class Agent:
                 await _status("Thinking...")
 
                 token = set_session_context(session_id)
+                # ``delegate_task`` MCP routes through ``dispatcher.run_delegated``,
+                # which only ``ModelDispatcher`` (the canonical ``self.model``)
+                # implements — a per-turn ``TeamRouterProvider`` built by
+                # ``model_override`` is pinned to one entry runtime and can't
+                # dispatch to other models. Live chat happens to pass because
+                # ``active_model is self.model`` there; the workflow ai-prompt
+                # block with ``model_override`` is the path that breaks.
+                delegation_dispatcher = (
+                    self.model
+                    if hasattr(self.model, "run_delegated")
+                    else active_model
+                )
                 delegation_tokens = install_delegation_context(
                     session_id=session_id,
                     pool=self._mcp,
                     db=self._db,
-                    dispatcher=active_model,
+                    dispatcher=delegation_dispatcher,
                 )
                 try:
                     # ``files`` is forwarded native to the runtime's ``arun(files=...)``
@@ -1393,11 +1405,20 @@ class Agent:
                 await _status("Thinking...")
 
                 token = set_session_context(session_id)
+                # See ``_run_inner`` above: delegation must route through the
+                # canonical ``ModelDispatcher`` (``self.model``), not the
+                # per-turn ``active_model`` which may be a ``TeamRouterProvider``
+                # built by ``model_override`` and lacks ``run_delegated``.
+                delegation_dispatcher = (
+                    self.model
+                    if hasattr(self.model, "run_delegated")
+                    else active_model
+                )
                 delegation_tokens = install_delegation_context(
                     session_id=session_id,
                     pool=self._mcp,
                     db=self._db,
-                    dispatcher=active_model,
+                    dispatcher=delegation_dispatcher,
                 )
                 try:
                     # Pass session_id and on_status so SmartRouter.stream
