@@ -252,6 +252,37 @@ class WorkflowExecutor:
                 except Exception:  # noqa: BLE001
                     pass
 
+            # Bind the delegation context for the whole run so any
+            # ``mcp-tool`` block that calls ``delegation.delegate_task``
+            # sees a live dispatcher / db / pool — the same binding
+            # ``agent.run`` wraps each chat turn in (agent.py:1143). The
+            # in-process delegation handler reads these contextvars and,
+            # when they are unset, refuses with "delegate_task called
+            # outside an agent turn". ``ai-prompt`` blocks get the
+            # context for free because they route through ``agent.run``;
+            # ``mcp-tool`` blocks reach the handler directly, so the
+            # executor must install it. Vision §8 makes a workflow that
+            # delegates to sub-agents the preferred shape, so this is the
+            # supported path, not an escape hatch. ``contextvars`` set
+            # here propagate into the ``asyncio.gather`` node tasks the
+            # walker spawns (they copy the current context at creation),
+            # so parallel and looped mcp-tool nodes inherit it too.
+            from src.mcp.servers.delegation.handlers import (
+                install_context as install_delegation_context,
+                reset_context as reset_delegation_context,
+            )
+
+            agent_model = getattr(self.agent, "model", None)
+            delegation_tokens = install_delegation_context(
+                session_id=f"workflow:{workflow_id}:{run_id}",
+                pool=getattr(self.agent, "_mcp", None),
+                db=getattr(self.agent, "_db", None) or self.db,
+                # Only ``ModelDispatcher`` implements ``run_delegated``;
+                # mirror the guard at agent.py:1138 so a non-dispatching
+                # active model leaves dispatcher unset (the handler then
+                # errors cleanly instead of calling a missing method).
+                dispatcher=agent_model if hasattr(agent_model, "run_delegated") else None,
+            )
             try:
                 # Run-start re-validation with the live pool. The
                 # workflow-manager MCP subprocess validates without
@@ -287,6 +318,8 @@ class WorkflowExecutor:
                 await self._finalize_run(
                     ctx, status="success", outputs=outputs,
                 )
+            finally:
+                reset_delegation_context(delegation_tokens)
 
             final = await self.db.get_workflow_run(run_id)
             if final is None:
