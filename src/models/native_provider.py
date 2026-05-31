@@ -44,6 +44,8 @@ from src.models.catalog import (
     DEFAULT_XAI_BASE_URL,
     DEFAULT_ZAI_BASE_URL,
     FRAMEWORK_API_BASED,
+    FULL_SESSION_HISTORY_RUNS,
+    RUNTIME_SESSION_USER_ID,
     _iter_provider_entries,
     compute_cost,
     model_id_from_runtime,
@@ -439,6 +441,12 @@ RUNTIME_PROVIDER_CLASSES: dict[str, tuple[str, str, dict[str, Any]]] = {
     # OpenAI schema, so OpenAILike covers the common path.
     "xai": ("src.models.providers.openai.like", "OpenAILike", {"name": "xAI"}),
     "mistral": ("src.models.providers.openai.like", "OpenAILike", {"name": "Mistral"}),
+    # Self-hosted OpenAI-compatible servers (Ollama / vLLM / LM Studio /
+    # llama.cpp). No default base_url — the operator supplies one via the
+    # provider's ``base_url`` (enforced in ``_resolved_base_url``). Keyless
+    # servers get a placeholder api_key in ``_resolved_api_key`` so the
+    # OpenAI SDK client still initialises.
+    "local": ("src.models.providers.openai.like", "OpenAILike", {"name": "Local"}),
 }
 
 
@@ -457,6 +465,15 @@ PROVIDER_DEFAULT_BASE_URLS: dict[str, str] = {
 }
 
 
+# Providers whose endpoint is operator-specific and has no sensible default:
+# self-hosted OpenAI-compatible servers (Ollama / vLLM / LM Studio /
+# llama.cpp). Unlike the hosted vendors above, these have NO
+# ``PROVIDER_DEFAULT_BASE_URLS`` entry — the operator MUST configure a
+# ``base_url``. ``_resolved_base_url`` hard-fails when it's missing rather
+# than letting ``OpenAILike`` silently fall back to OpenAI's own endpoint.
+PROVIDER_REQUIRES_BASE_URL: frozenset[str] = frozenset({"local"})
+
+
 class NativeProvider(BaseModel):
     """API model provider backed by the runtime's session and tool orchestration."""
 
@@ -469,7 +486,7 @@ class NativeProvider(BaseModel):
         base_url: str | None = None,
         providers_config: dict | None = None,
         db_path: str | None = None,
-        history_runs: int = 20,
+        history_runs: int = FULL_SESSION_HISTORY_RUNS,
     ):
         self._providers_config = providers_config or {}
         self.model = normalize_runtime_model_id(model, self._providers_config)
@@ -887,16 +904,37 @@ class NativeProvider(BaseModel):
         return str(value).strip() if value is not None else None
 
     def _resolved_api_key(self) -> str | None:
-        return self._api_key or self._provider_setting("api_key")
+        explicit = self._api_key or self._provider_setting("api_key")
+        if explicit:
+            return explicit
+        provider_name, _ = self._runtime_parts()
+        if provider_name in PROVIDER_REQUIRES_BASE_URL:
+            # Local servers (Ollama / vLLM / LM Studio) ignore the key, but the
+            # OpenAI SDK client refuses to initialise without one — supply a
+            # harmless placeholder so a keyless local setup still works. A real
+            # key (e.g. a vLLM ``--api-key``) configured on the provider wins
+            # above via ``explicit``.
+            return "local"
+        return explicit
 
     def _resolved_base_url(self) -> str | None:
         provider_name, _ = self._runtime_parts()
         if self._base_url:
             return self._base_url
+        configured = self._provider_setting("base_url")
         default = PROVIDER_DEFAULT_BASE_URLS.get(provider_name)
         if default is not None:
-            return self._provider_setting("base_url") or default
-        return self._provider_setting("base_url")
+            return configured or default
+        if not configured and provider_name in PROVIDER_REQUIRES_BASE_URL:
+            raise ValueError(
+                f"The '{provider_name}' provider requires a base_url pointing "
+                "at your OpenAI-compatible server's /v1 root — e.g. "
+                "http://localhost:11434/v1 (Ollama), http://localhost:8000/v1 "
+                "(vLLM), or http://localhost:1234/v1 (LM Studio). Set it on the "
+                "provider via model-manager add_provider/update_provider or the "
+                "Providers UI."
+            )
+        return configured
 
     def _construct_model(self, cls: type, **kwargs: Any) -> Any:
         accepted = _model_class_accepted_params(cls)
@@ -983,11 +1021,15 @@ class NativeProvider(BaseModel):
             tools=agent_tools,
             system_message=sys_key or None,
             add_history_to_context=True,
+            # Replay the ENTIRE stored transcript for this session, not a
+            # trailing window (vision §16). ``_history_runs`` defaults to
+            # ``FULL_SESSION_HISTORY_RUNS`` so the runtime's ``runs[-N:]``
+            # slice returns everything; in-place compaction
+            # (src/core/compaction.py, vision §2) is what bounds the actual
+            # token footprint when the context limit nears.
             num_history_runs=self._history_runs,
-            # The runtime maintains a rolling summary of older turns in the same
-            # SqliteDb and injects it into context on each call. Combined
-            # with ``num_history_runs=20`` this gives us long-horizon
-            # recall without blowing the token budget on raw transcript.
+            # The runtime also maintains a rolling summary of older turns in
+            # the same SqliteDb and injects it into context on each call.
             enable_session_summaries=True,
             add_session_summary_to_context=True,
             # Agentic memory is disabled — OpenAgent uses the vault for
@@ -1278,11 +1320,16 @@ class NativeProvider(BaseModel):
         # "API status error from OpenAI API: Error code: 403 - ..." and
         # "Non-retryable model provider error: ...", but does not re-raise.
         with _capture_log_errors() as captured_errors:
-            # ``user_id`` is required by ``enable_agentic_memory``; we use a
-            # stable constant so memory accumulates for the single-tenant
-            # OpenAgent deployment. Multi-tenant deployments can wire a
-            # real user_id through BaseModel.generate() in a follow-up.
-            arun_kwargs: dict[str, Any] = {"session_id": sid, "user_id": "openagent"}
+            # The ``sessions``-row owner is the single stable
+            # ``RUNTIME_SESSION_USER_ID`` sentinel for EVERY surface — see
+            # the constant's definition in catalog.py. The runtime store
+            # gates its history read + runs write on ``user_id == <this>
+            # OR IS NULL``; a stable value is what keeps the conversation
+            # readable/writable across turns and restarts. Per-user
+            # separation lives in ``session_id`` (e.g. ``tg:<uid>``).
+            arun_kwargs: dict[str, Any] = {
+                "session_id": sid, "user_id": RUNTIME_SESSION_USER_ID,
+            }
             if files:
                 arun_kwargs["files"] = files
             if images:
@@ -1527,7 +1574,7 @@ class NativeProvider(BaseModel):
 
         try:
             stream_kwargs: dict[str, Any] = {
-                "session_id": sid, "user_id": "openagent",
+                "session_id": sid, "user_id": RUNTIME_SESSION_USER_ID,
                 "stream": True, "stream_events": True,
             }
             if files:

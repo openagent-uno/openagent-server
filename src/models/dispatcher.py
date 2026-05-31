@@ -50,6 +50,8 @@ from src.models.catalog import (
     FRAMEWORK_API_BASED,
     FRAMEWORK_CLAUDE_CLI,
     FRAMEWORK_CODEX_CLI,
+    FULL_SESSION_HISTORY_RUNS,
+    RUNTIME_SESSION_USER_ID,
     SUBSCRIPTION_CLI_FRAMEWORKS,
     framework_of,
     is_subscription_cli_model,
@@ -426,7 +428,7 @@ class TeamRouterProvider(BaseModel):
         entry_runtime_id: str,
         providers_config: Any = None,
         *,
-        history_runs: int = 20,
+        history_runs: int = FULL_SESSION_HISTORY_RUNS,
     ):
         self._entry_runtime_id = entry_runtime_id
         self._providers_config = providers_config if providers_config is not None else []
@@ -473,6 +475,14 @@ class TeamRouterProvider(BaseModel):
         self._invalidate_session_cache()
 
     def set_session_handle(self, session_id: str, handle: str | None) -> None:
+        # NOTE: the runtime ``sessions``-row owner is the single stable
+        # ``RUNTIME_SESSION_USER_ID`` sentinel (see ``generate``/``stream``),
+        # NOT this handle. Binding it here used to drive that column, which
+        # made the owner flip mid-session (the gateway wrote the handle, the
+        # runtime fell back to "openagent" before this propagated) and the
+        # agent forgot the conversation. The map is retained for callers
+        # that want the authenticated handle for other purposes; it no
+        # longer gates history read/write.
         if not session_id:
             return
         if handle and handle.strip():
@@ -1071,7 +1081,11 @@ class TeamRouterProvider(BaseModel):
         # otherwise the model attribution stays pinned to whichever
         # specialist handled the LAST delegation indefinitely.
         self._last_delegation_by_session.pop(sid, None)
-        user_id = self._session_handles.get(sid) or "openagent"
+        # Stable sessions-row owner for every surface (see catalog.py);
+        # tenancy is carried by ``session_id``, not this column, so the
+        # runtime can always read/write the row regardless of which
+        # handle (if any) the gateway bound to the session.
+        user_id = RUNTIME_SESSION_USER_ID
         return await _arun_runtime_collect(
             runtime,
             prompt=_last_user_prompt(messages),
@@ -1115,7 +1129,11 @@ class TeamRouterProvider(BaseModel):
         # so a non-delegating turn falls back to the leader's badge
         # instead of staying pinned to the last specialist.
         self._last_delegation_by_session.pop(sid, None)
-        user_id = self._session_handles.get(sid) or "openagent"
+        # Stable sessions-row owner for every surface (see catalog.py);
+        # tenancy is carried by ``session_id``, not this column, so the
+        # runtime can always read/write the row regardless of which
+        # handle (if any) the gateway bound to the session.
+        user_id = RUNTIME_SESSION_USER_ID
         async for delta in _arun_runtime_stream(
             runtime,
             prompt=_last_user_prompt(messages),
@@ -1171,7 +1189,11 @@ class _SingleExternalAgentAdapter(BaseModel):
         videos: list[Any] | None = None,
     ) -> ModelResponse:
         sid = session_id or "default"
-        user_id = self._session_handles.get(sid) or "openagent"
+        # Stable sessions-row owner for every surface (see catalog.py);
+        # tenancy is carried by ``session_id``, not this column, so the
+        # runtime can always read/write the row regardless of which
+        # handle (if any) the gateway bound to the session.
+        user_id = RUNTIME_SESSION_USER_ID
         # All media kwargs flow through ``_arun_runtime_collect`` straight
         # into the runtime's ``arun(files=..., images=..., ...)``. For
         # subscription-CLI runtimes (claude-cli / codex-cli)
@@ -1203,7 +1225,11 @@ class _SingleExternalAgentAdapter(BaseModel):
         videos: list[Any] | None = None,
     ) -> AsyncIterator[str]:
         sid = session_id or "default"
-        user_id = self._session_handles.get(sid) or "openagent"
+        # Stable sessions-row owner for every surface (see catalog.py);
+        # tenancy is carried by ``session_id``, not this column, so the
+        # runtime can always read/write the row regardless of which
+        # handle (if any) the gateway bound to the session.
+        user_id = RUNTIME_SESSION_USER_ID
         prompt = _last_user_prompt(messages)
         async for delta in _arun_runtime_stream(
             self._agent,

@@ -39,6 +39,38 @@ DEFAULT_CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1"
 DEFAULT_XAI_BASE_URL = "https://api.x.ai/v1"
 DEFAULT_MISTRAL_BASE_URL = "https://api.mistral.ai/v1"
 
+# ── Session continuity (vision §16) ───────────────────────────────────
+#
+# The runtime persists every conversation's transcript in the shared
+# ``sessions`` SQLite table, keyed by ``session_id``. Two constants make
+# that durable end-to-end:
+#
+# ``RUNTIME_SESSION_USER_ID`` — the single, stable owner the runtime
+#   stamps on (and reads back from) every ``sessions`` row. The runtime
+#   store gates BOTH its history read and its runs write on
+#   ``user_id == <this> OR user_id IS NULL`` (see
+#   ``src/memory/store/sqlite/sqlite.py``). Using one constant on every
+#   path — live chat, Telegram/Discord/WhatsApp bridges, scheduler,
+#   workflows, sub-agents — keeps the row readable/writable no matter
+#   which surface the turn arrived on. Per-user separation is carried by
+#   the ``session_id`` itself (e.g. ``tg:<uid>``), never by this column,
+#   so one owner is correct for the single-tenant agent (vision §17).
+#   The gateway is metadata-only on this table and must NEVER write a
+#   different value here — doing so silently blocks the runtime's
+#   read/write and the agent "forgets" the conversation every turn.
+#   (See ``MemoryDB.upsert_session`` and ``_migrate_reclaim_session_owners``.)
+#
+# ``FULL_SESSION_HISTORY_RUNS`` — the ``num_history_runs`` handed to the
+#   runtime Agent/Team so ``add_history_to_context=True`` replays the
+#   ENTIRE stored transcript into context, not a trailing N-turn window.
+#   The runtime slices ``runs[-N:]``; this (effectively unbounded) N
+#   returns everything. In-place compaction (``src/core/compaction.py``,
+#   vision §2) keeps the actual token footprint under the model's context
+#   limit by folding the oldest runs into a recap row when the threshold
+#   is crossed — so "load the whole session" stays safe.
+RUNTIME_SESSION_USER_ID = "openagent"
+FULL_SESSION_HISTORY_RUNS = 10_000_000
+
 # OpenAgent vocabulary:
 #   - **provider**  : the model's vendor / owner (anthropic, openai, google, …).
 #   - **framework** : the adapter OpenAgent uses to instantiate the runtime

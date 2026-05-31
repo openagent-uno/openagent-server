@@ -551,44 +551,47 @@ class MemoryDB:
         await self._migrate_legacy_agno_sessions_to_sessions()
         await self._conn.executescript(SCHEMA_SQL)
         await self._apply_legacy_alters()
-        # Post-schema migration: clear the sentinel ``user_id='openagent'``
-        # that the old gateway INSERT hardcoded — see
-        # ``upsert_session`` for the full bug write-up. NULL lets the
-        # runtime's same-user UPSERT WHERE clause claim the row on the
-        # next turn, which restores run accumulation for sessions that
-        # were left in the broken state on disk.
-        await self._migrate_openagent_user_sentinel_to_null()
+        # Post-schema migration: reclaim any ``sessions`` row whose owner
+        # was pinned to a value the runtime won't match (legacy
+        # ``'openagent'`` sentinel, device handle, or the ``__bridge``
+        # cert handle), so the runtime can read its history + persist new
+        # runs again. See ``upsert_session`` and ``RUNTIME_SESSION_USER_ID``.
+        await self._migrate_reclaim_session_owners()
         await self._conn.commit()
 
-    async def _migrate_openagent_user_sentinel_to_null(self) -> None:
-        """One-shot UPDATE: convert the sentinel ``user_id='openagent'`` on
-        sessions rows to NULL so the runtime's same-user UPSERT path can
-        claim them.
+    async def _migrate_reclaim_session_owners(self) -> None:
+        """One-shot UPDATE: NULL any ``sessions.user_id`` the runtime won't
+        match, so it can reclaim the row and resume the conversation.
 
-        Background. The gateway used to INSERT new session rows with a
-        hardcoded ``user_id='openagent'`` (since fixed in
-        ``upsert_session``). The runtime side, meanwhile, writes back
-        with the authenticated user handle (e.g. ``'alessandro'``). The
-        runtime's ``SqliteDb.upsert_session`` carries a defensive
-        ``user_id == new OR user_id IS NULL`` filter on its
-        on_conflict_do_update — so any pre-existing row with the
-        ``'openagent'`` sentinel rejected the runtime's UPDATE and the
-        ``runs`` column stayed pinned to whatever was there at first
-        write. The user-facing symptom was "the LLM doesn't remember
-        previous messages" — each turn overwrote, then silently failed
-        to overwrite, the previous turn's transcript.
+        The runtime owns the ``user_id`` column and stamps the single
+        stable ``RUNTIME_SESSION_USER_ID`` ("openagent") sentinel on every
+        session; its history read AND its runs write are gated by
+        ``user_id == 'openagent' OR user_id IS NULL`` (see
+        ``src/memory/store/sqlite/sqlite.py``). Earlier builds let the
+        gateway pin a *different* value here — first the legacy
+        ``'openagent'`` INSERT sentinel, then (after that was "fixed") the
+        authenticated device handle or the ``__bridge`` cert handle every
+        bridge connection carries. Any such row is invisible to the
+        runtime: it can neither load the stored transcript nor append to
+        it, so the agent "forgot" the conversation on every turn (the
+        2026-05 Telegram session-reset bug).
 
-        This migration is idempotent: rows already at NULL or any other
-        value are untouched. Safe to run on every connect."""
+        Setting those owners back to NULL makes the runtime's ``IS NULL``
+        soft-match fire on the next turn — it reads the existing ``runs``
+        (history restored) and re-claims the row as ``'openagent'`` on
+        write. Rows already at ``'openagent'`` or NULL are left untouched.
+        Idempotent; safe to run on every connect. Tenancy is carried by
+        ``session_id`` (e.g. ``tg:<uid>``), never by this column, so
+        collapsing owners to one is correct for the single-tenant agent
+        (vision §17)."""
         assert self._conn is not None
-        # Only sessions touched by the broken gateway carry the sentinel;
-        # rows the runtime wrote first will have a real handle there
-        # already, and a real handle MUST NOT be widened to NULL — that
-        # would let a different user claim the row on its next turn.
+        # Literal ``'openagent'`` mirrors ``RUNTIME_SESSION_USER_ID`` in
+        # ``src/models/catalog.py`` — kept as a literal here to avoid the
+        # memory layer importing the models layer. Keep the two in sync.
         try:
             await self._conn.execute(
                 "UPDATE sessions SET user_id = NULL "
-                "WHERE user_id = 'openagent'"
+                "WHERE user_id IS NOT NULL AND user_id != 'openagent'"
             )
         except Exception:
             # ``sessions`` not present yet on a brand-new DB — the
@@ -3080,31 +3083,31 @@ class MemoryDB:
         metadata into the ``metadata`` JSON column.
 
         ``client_id`` is the row's *owner* — preferably the user handle
-        so the session list is cross-device. ``device_id`` (when set)
-        records which device first opened the session, so per-device
-        routing (sticky-device retries, WS reconnect) still works.
+        so the session list is cross-device — and is stored in the
+        ``metadata`` JSON (which is what ``list_all_sessions`` keys off).
+        ``device_id`` (when set) records which device first opened the
+        session, so per-device routing (sticky-device retries, WS
+        reconnect) still works.
 
-        **Bug fix (2026-05-28): runs were silently dropped between
-        turns.** The old INSERT hardcoded ``user_id='openagent'`` while
-        the runtime's TeamRouterProvider writes back with
-        ``user_id=<handle>`` (e.g. ``'alessandro'``). The runtime's
-        ``SqliteDb.upsert_session`` carries a defensive WHERE clause
-        ``user_id == new OR user_id IS NULL`` on its
-        ``on_conflict_do_update``, so the row's pre-existing
-        ``'openagent'`` blocked the runtime's UPDATE — the runs column
-        stayed pinned to whatever was there at first write (typically
-        one run from before the gateway set the session handle), and
-        every subsequent turn appeared to lose its history.
-
-        Fix: use the handle as ``user_id`` when one is known (writing
-        through the same channel the runtime later reads/writes on),
-        and fall back to ``NULL`` so the runtime can claim the row.
-        Hardcoded ``'openagent'`` is gone."""
+        **The gateway is metadata-only on this table — it must NOT write
+        ``user_id``.** That column is owned exclusively by the runtime,
+        which stamps the single stable ``RUNTIME_SESSION_USER_ID``
+        ("openagent") sentinel on every session and gates BOTH its
+        history read and its runs write on ``user_id == <that> OR
+        user_id IS NULL`` (see ``src/memory/store/sqlite/sqlite.py``).
+        Whenever the gateway stamped a *different* value here — the old
+        ``'openagent'`` sentinel, then later the device handle /
+        ``__bridge`` — that mismatch silently blocked the runtime from
+        reading prior runs AND from persisting new ones, so the agent
+        "forgot" the conversation every turn (the 2026-05 Telegram
+        session-reset bug). Leaving ``user_id`` NULL lets the runtime
+        claim and own the row; tenancy is carried by ``session_id``
+        (e.g. ``tg:<uid>``), never by this column."""
         conn = await self._ensure_connected()
         now = int(time.time())
         existing = await (
             await conn.execute(
-                "SELECT metadata, user_id FROM sessions WHERE session_id = ?",
+                "SELECT metadata FROM sessions WHERE session_id = ?",
                 (session_id,),
             )
         ).fetchone()
@@ -3120,37 +3123,21 @@ class MemoryDB:
         if framework:
             meta["framework"] = framework
 
-        # Resolve the row owner. ``client_id`` is the cross-device user
-        # handle when the gateway is authenticated — use it as user_id
-        # so the runtime's same-user UPSERT path stays unblocked.
-        resolved_user_id: str | None = (client_id or "").strip() or None
-
         if existing:
-            # Only widen user_id when the existing row has a NULL owner
-            # OR matches the handle we're writing now. Never overwrite
-            # a different owner — multi-handle defence.
-            existing_user_id = existing[1] if len(existing) > 1 else None
-            update_user_id = resolved_user_id is not None and (
-                existing_user_id is None or existing_user_id == resolved_user_id
+            # Metadata-only update — never touch ``user_id`` (runtime-owned).
+            await conn.execute(
+                "UPDATE sessions SET metadata = ?, updated_at = ? "
+                "WHERE session_id = ?",
+                (json.dumps(meta), now, session_id),
             )
-            if update_user_id:
-                await conn.execute(
-                    "UPDATE sessions SET metadata = ?, user_id = ?, updated_at = ? "
-                    "WHERE session_id = ?",
-                    (json.dumps(meta), resolved_user_id, now, session_id),
-                )
-            else:
-                await conn.execute(
-                    "UPDATE sessions SET metadata = ?, updated_at = ? "
-                    "WHERE session_id = ?",
-                    (json.dumps(meta), now, session_id),
-                )
         else:
+            # INSERT with a NULL owner so the runtime can claim the row on
+            # its first turn (its read/write WHERE accepts ``user_id IS NULL``).
             await conn.execute(
                 "INSERT OR IGNORE INTO sessions "
                 "(session_id, session_type, user_id, metadata, created_at, updated_at) "
-                "VALUES (?, 'agent', ?, ?, ?, ?)",
-                (session_id, resolved_user_id, json.dumps(meta), now, now),
+                "VALUES (?, 'agent', NULL, ?, ?, ?)",
+                (session_id, json.dumps(meta), now, now),
             )
         await conn.commit()
 

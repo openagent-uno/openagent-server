@@ -449,22 +449,27 @@ async def t_team_claim_unowned_preserves_runs(_ctx: TestContext) -> None:
 
 @test(
     "session_continuity",
-    "user_id sentinel 'openagent' is migrated to NULL on bootstrap",
+    "reclaim migration NULLs every owner the runtime won't match",
 )
-async def t_user_id_sentinel_migration(_ctx: TestContext) -> None:
-    """Pre-existing rows with ``user_id='openagent'`` (the old gateway
-    sentinel) must be migrated to NULL so the runtime can UPSERT them.
-    The runtime's WHERE clause is ``user_id == new OR user_id IS NULL``;
-    a stale sentinel blocks every subsequent UPDATE and the runs
-    silently never accumulate."""
-    import asyncio
+async def t_reclaim_session_owners_migration(_ctx: TestContext) -> None:
+    """Any ``sessions.user_id`` the runtime can't match must be migrated to
+    NULL on bootstrap so the runtime reclaims the row (and its stored runs)
+    on the next turn.
+
+    The runtime owns ``user_id`` and stamps the single stable
+    ``RUNTIME_SESSION_USER_ID`` ("openagent") on every session; its
+    read/write is gated by ``user_id == 'openagent' OR user_id IS NULL``.
+    Earlier builds let the gateway pin a *different* value (the ``__bridge``
+    cert handle every bridge carries, or an authenticated device handle),
+    which made the row invisible to the runtime — the agent forgot the
+    conversation every turn. The migration NULLs those so the runtime's
+    ``IS NULL`` soft-match fires; rows already at 'openagent' (runtime-owned)
+    or NULL (already claimable) are left untouched."""
     from src.memory.db import MemoryDB
 
-    fd, db_path = tempfile.mkstemp(prefix="oa_sentinel_", suffix=".db")
+    fd, db_path = tempfile.mkstemp(prefix="oa_reclaim_", suffix=".db")
     os.close(fd)
     try:
-        # Seed with the broken-state row: user_id='openagent' on a
-        # legitimately authenticated session.
         conn = sqlite3.connect(db_path)
         conn.executescript("""
         CREATE TABLE sessions (
@@ -479,17 +484,18 @@ async def t_user_id_sentinel_migration(_ctx: TestContext) -> None:
         );
         """)
         now = int(time.time())
-        conn.execute(
-            "INSERT INTO sessions (session_id, session_type, user_id, metadata, created_at, updated_at) "
-            "VALUES ('S-broken', 'agent', 'openagent', '{}', ?, ?)",
-            (now, now),
-        )
-        # Defensive: real-handle rows must NOT be touched by the migration.
-        conn.execute(
-            "INSERT INTO sessions (session_id, session_type, user_id, metadata, created_at, updated_at) "
-            "VALUES ('S-real', 'agent', 'alessandro', '{}', ?, ?)",
-            (now, now),
-        )
+        # Seed the four owner states the migration must distinguish.
+        for sid, owner in (
+            ("S-bridge", "'__bridge'"),     # bridge cert handle — must reclaim
+            ("S-handle", "'alessandro'"),   # device handle — must reclaim
+            ("S-owned", "'openagent'"),     # runtime owner — must stay
+            ("S-null", "NULL"),             # already claimable — must stay NULL
+        ):
+            conn.execute(
+                "INSERT INTO sessions (session_id, session_type, user_id, "
+                "metadata, created_at, updated_at) "
+                f"VALUES ('{sid}', 'agent', {owner}, '{{}}', {now}, {now})"
+            )
         conn.commit()
         conn.close()
 
@@ -497,24 +503,28 @@ async def t_user_id_sentinel_migration(_ctx: TestContext) -> None:
         db = MemoryDB(db_path=db_path)
         await db.connect()
         try:
-            row1 = await (
-                await db._conn.execute(
-                    "SELECT user_id FROM sessions WHERE session_id = 'S-broken'"
-                )
-            ).fetchone()
-            row2 = await (
-                await db._conn.execute(
-                    "SELECT user_id FROM sessions WHERE session_id = 'S-real'"
-                )
-            ).fetchone()
+            owners = {}
+            for sid in ("S-bridge", "S-handle", "S-owned", "S-null"):
+                row = await (
+                    await db._conn.execute(
+                        "SELECT user_id FROM sessions WHERE session_id = ?", (sid,)
+                    )
+                ).fetchone()
+                owners[sid] = row[0]
         finally:
             await db.close()
 
-        assert row1[0] is None, (
-            f"sentinel 'openagent' should migrate to NULL; got {row1[0]!r}"
+        assert owners["S-bridge"] is None, (
+            f"'__bridge' owner must be reclaimed to NULL; got {owners['S-bridge']!r}"
         )
-        assert row2[0] == "alessandro", (
-            f"real handle must not be touched; got {row2[0]!r}"
+        assert owners["S-handle"] is None, (
+            f"device handle owner must be reclaimed to NULL; got {owners['S-handle']!r}"
+        )
+        assert owners["S-owned"] == "openagent", (
+            f"runtime-owned row must be untouched; got {owners['S-owned']!r}"
+        )
+        assert owners["S-null"] is None, (
+            f"NULL owner must stay NULL; got {owners['S-null']!r}"
         )
     finally:
         os.unlink(db_path)
@@ -522,13 +532,18 @@ async def t_user_id_sentinel_migration(_ctx: TestContext) -> None:
 
 @test(
     "session_continuity",
-    "gateway INSERT uses handle as user_id (no more 'openagent' sentinel)",
+    "gateway upsert is metadata-only: never stamps user_id, owner stays NULL",
 )
-async def t_gateway_insert_uses_handle(_ctx: TestContext) -> None:
-    """The fixed gateway must write ``user_id=<handle>`` (not the
-    ``'openagent'`` sentinel) so the runtime's UPSERT can update the
-    row on subsequent turns. A handle-less call (no client_id) writes
-    NULL, which is also runtime-claimable."""
+async def t_gateway_insert_writes_null_owner(_ctx: TestContext) -> None:
+    """The gateway is metadata-only on the ``sessions`` table — it must
+    leave ``user_id`` NULL so the runtime (sole owner of that column) can
+    claim the row. The owner handle still lands in ``metadata.client_id``
+    (what ``list_all_sessions`` keys off), so cross-device listing is
+    unaffected. This is the fix for the Telegram session-reset bug: the
+    gateway used to stamp the ``__bridge`` cert handle here, which the
+    runtime ("openagent") could never match, so it could neither read
+    prior runs nor persist new ones."""
+    import json
     from src.memory.db import MemoryDB
 
     fd, db_path = tempfile.mkstemp(prefix="oa_gw_insert_", suffix=".db")
@@ -537,15 +552,14 @@ async def t_gateway_insert_uses_handle(_ctx: TestContext) -> None:
         db = MemoryDB(db_path=db_path)
         await db.connect()
         try:
+            # Bridge-shaped call: owner is the "__bridge" cert handle.
             await db.upsert_session(
-                "S-with-handle", client_id="alessandro", title="t1",
+                "S-bridge", client_id="__bridge", title="t1",
             )
-            await db.upsert_session(
-                "S-no-handle", title="t2",
-            )
+            await db.upsert_session("S-no-handle", title="t2")
             row1 = await (
                 await db._conn.execute(
-                    "SELECT user_id FROM sessions WHERE session_id = 'S-with-handle'"
+                    "SELECT user_id, metadata FROM sessions WHERE session_id = 'S-bridge'"
                 )
             ).fetchone()
             row2 = await (
@@ -556,12 +570,16 @@ async def t_gateway_insert_uses_handle(_ctx: TestContext) -> None:
         finally:
             await db.close()
 
-        assert row1[0] == "alessandro", (
-            f"gateway INSERT must use handle as user_id; got {row1[0]!r}"
+        assert row1[0] is None, (
+            f"gateway must NOT stamp user_id (runtime-owned); got {row1[0]!r}"
         )
         assert row2[0] is None, (
-            f"handle-less INSERT must use NULL (NOT 'openagent'); "
-            f"got {row2[0]!r}"
+            f"handle-less INSERT must leave user_id NULL; got {row2[0]!r}"
+        )
+        # The owner still lives in metadata.client_id for the session list.
+        meta = json.loads(row1[1] or "{}")
+        assert meta.get("client_id") == "__bridge", (
+            f"owner must persist in metadata.client_id; got {meta!r}"
         )
     finally:
         os.unlink(db_path)
@@ -672,6 +690,125 @@ async def t_team_three_turns_accumulate(_ctx: TestContext) -> None:
             f"expected 3 runs after 3 Team turns, got {len(s.runs or [])}; "
             "the runtime is dropping runs across turns — see "
             "_acleanup_and_store / asave_session in core/_runner/team/_run.py"
+        )
+    finally:
+        os.unlink(db_path)
+
+
+@test(
+    "session_continuity",
+    "bridge session: gateway NULL-owner row, runtime accumulates across a restart",
+)
+async def t_bridge_session_survives_restart(_ctx: TestContext) -> None:
+    """End-to-end version of the Telegram session-reset bug + fix.
+
+    A per-user bridge session (``session_id='tg:<uid>'``) must persist and
+    keep loading its full history across a process restart — with /clear the
+    only thing that wipes it:
+
+    1. Gateway ``MemoryDB.upsert_session('tg:42', client_id='__bridge')``
+       creates the metadata row with ``user_id=NULL`` (the owner lives in
+       ``metadata.client_id``).
+    2. Runtime turn 1: read with ``user_id=RUNTIME_SESSION_USER_ID``, build a
+       TeamSession, append run r1, save → the runtime CLAIMS the NULL row.
+    3. RESTART: a brand-new SqliteDb instance (no in-memory caches) reads the
+       same session — it MUST see r1 (history survived the restart and the
+       gateway/runtime user_id interplay).
+    4. Runtime turn 2: append r2, save.
+    5. Final read shows BOTH runs and the stable runtime owner.
+
+    Pre-fix, step 1 stamped ``user_id='__bridge'``, which the runtime
+    ("openagent") could never match — so step 2 saw no history and its save
+    was rejected, and every turn reset the conversation.
+    """
+    from src.memory.db import MemoryDB
+    from src.memory.store.sqlite import SqliteDb
+    from src.memory.store.base import SessionType
+    from src.memory.sessions import TeamSession
+    from src.core._run_state.team import TeamRunOutput
+    from src.models.providers.message import Message
+    from src.models.catalog import RUNTIME_SESSION_USER_ID
+
+    fd, db_path = tempfile.mkstemp(prefix="oa_bridge_restart_", suffix=".db")
+    os.close(fd)
+    try:
+        sid = "tg:42"
+        now = int(time.time())
+
+        def _new_run(run_id: str, body: str) -> "TeamRunOutput":
+            return TeamRunOutput(
+                run_id=run_id, team_id="T", session_id=sid,
+                user_id=RUNTIME_SESSION_USER_ID, content=body,
+                messages=[Message(role="assistant", content=run_id)],
+            )
+
+        # 1. Gateway creates the metadata row (NULL owner).
+        gw = MemoryDB(db_path=db_path)
+        await gw.connect()
+        try:
+            await gw.upsert_session(sid, client_id="__bridge", title="Telegram")
+            seeded = await (
+                await gw._conn.execute(
+                    "SELECT user_id FROM sessions WHERE session_id = ?", (sid,)
+                )
+            ).fetchone()
+        finally:
+            await gw.close()
+        assert seeded[0] is None, (
+            f"gateway must seed a NULL owner, not the bridge handle; got {seeded[0]!r}"
+        )
+
+        # 2. Runtime turn 1 — claim the row and write run r1.
+        db1 = SqliteDb(db_file=db_path, session_table="sessions")
+        s1 = db1.get_session(
+            session_id=sid, session_type=SessionType.TEAM,
+            user_id=RUNTIME_SESSION_USER_ID,
+        )
+        if s1 is None:
+            s1 = TeamSession(
+                session_id=sid, team_id="T",
+                user_id=RUNTIME_SESSION_USER_ID, created_at=now,
+            )
+        s1.upsert_run(_new_run("r1", "reply 1"))
+        db1.upsert_session(s1)
+
+        # 3. RESTART — fresh store instance, same file, no in-memory caches.
+        db2 = SqliteDb(db_file=db_path, session_table="sessions")
+        s_reload = db2.get_session(
+            session_id=sid, session_type=SessionType.TEAM,
+            user_id=RUNTIME_SESSION_USER_ID,
+        )
+        assert s_reload is not None, (
+            "post-restart read returned None — the runtime would start a "
+            "fresh empty session and overwrite history (the reset bug)"
+        )
+        assert len(s_reload.runs or []) == 1 and s_reload.runs[0].run_id == "r1", (
+            f"history lost across restart; got {len(s_reload.runs or [])} runs"
+        )
+
+        # 4. Turn 2 — append r2.
+        s_reload.upsert_run(_new_run("r2", "reply 2"))
+        db2.upsert_session(s_reload)
+
+        # 5. Final read — both runs survive, stable runtime owner.
+        final = db2.get_session(
+            session_id=sid, session_type=SessionType.TEAM,
+            user_id=RUNTIME_SESSION_USER_ID,
+        )
+        assert final is not None
+        assert {r.run_id for r in (final.runs or [])} == {"r1", "r2"}, (
+            f"runs failed to accumulate across the restart; got "
+            f"{[r.run_id for r in (final.runs or [])]}"
+        )
+        # The gateway pre-created the row as NULL; the runtime loads it via
+        # the ``user_id IS NULL`` soft-match and (per _read_or_create_session)
+        # only stamps a real owner when it *creates* a session, not when it
+        # loads one — so the row legitimately stays NULL here. Both NULL
+        # (still unclaimed, permanently matchable) and the runtime sentinel
+        # keep the row readable/writable forever; what must NEVER happen is
+        # the owner drifting to a value the runtime can't match.
+        assert final.user_id in (None, RUNTIME_SESSION_USER_ID), (
+            f"owner drifted to a value the runtime can't match; got {final.user_id!r}"
         )
     finally:
         os.unlink(db_path)
