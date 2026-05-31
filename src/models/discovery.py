@@ -47,6 +47,12 @@ _OPENAI_STYLE: dict[str, tuple[str, str]] = {
     "openrouter": ("https://openrouter.ai/api",         "/v1/models"),
     "moonshot":   ("https://api.moonshot.ai",           "/v1/models"),
     "qwen":       ("https://dashscope-intl.aliyuncs.com/compatible-mode", "/v1/models"),
+    # Self-hosted OpenAI-compatible servers (Ollama / vLLM / LM Studio).
+    # base_url is operator-supplied (the provider's ``/v1`` root); the path is
+    # ``/models`` so a configured ``…/v1`` base yields ``…/v1/models``. The
+    # static default targets Ollama's port as a best-effort fallback when no
+    # base_url is set.
+    "local":      ("http://localhost:11434/v1",         "/models"),
 }
 
 _GOOGLE_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models"
@@ -288,6 +294,12 @@ async def list_provider_models(
     provider = provider.lower().strip()
     if not provider:
         return []
+
+    # Local servers (Ollama / vLLM / LM Studio) usually need no key, but the
+    # ``if api_key:`` gate below would skip discovery entirely without one.
+    # Synthesise a placeholder so we still query the configured /v1/models.
+    if provider == "local" and not api_key:
+        api_key = "local"
 
     # Audio-only vendors short-circuit to the bundled catalog — they
     # don't expose a discovery endpoint and the model set is small and
