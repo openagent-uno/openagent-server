@@ -6,7 +6,7 @@ Before the fix, ``_h_ai_prompt`` always called ``release_session`` in
 its finally block — the same bug class as scheduler issue #5, just for
 workflows. With ephemeral policy each node had its own unique session
 id that was never wiped, so ``sdk_sessions`` grew unboundedly and
-claude-cli kept resuming the old transcript. With shared policy the
+the provider kept resuming the old transcript. With shared policy the
 first firing of the workflow populated a session id keyed on
 ``(workflow_id, run_id)``; the next manual run with a different run_id
 was fine, but the rows never got cleaned up.

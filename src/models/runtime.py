@@ -6,14 +6,8 @@ from typing import Any
 
 from src.models.base import BaseModel, ModelResponse
 from src.models.catalog import (
-    FRAMEWORK_CLAUDE_CLI,
     _iter_provider_entries,
-    framework_of,
     get_default_model_for_provider,
-    is_claude_cli_model,
-    is_codex_cli_model,
-    is_subscription_cli_model,
-    model_id_from_runtime,
     normalize_runtime_model_id,
 )
 
@@ -46,8 +40,7 @@ def wire_model_runtime(
     Wires only the ``tool-search`` MCP into the model's upfront tool
     list. Every other MCP connected in ``mcp_pool`` stays reachable
     via ``tool-search.call_tool``. NativeProvider gets the in-process
-    ``MCPTools`` instance; ClaudeCLI gets the raw stdio config dict
-    that ``ClaudeAgentOptions.mcp_servers`` accepts.
+    ``MCPTools`` instance.
     """
     if db is not None:
         set_db = getattr(model, "set_db", None)
@@ -58,10 +51,6 @@ def wire_model_runtime(
         set_mcp_toolkits = getattr(model, "set_mcp_toolkits", None)
         if callable(set_mcp_toolkits):
             set_mcp_toolkits(mcp_pool.runtime_toolkits_tool_search_only())
-        # ClaudeCLI: raw stdio config for the Claude Agent SDK.
-        set_mcp_servers = getattr(model, "set_mcp_servers", None)
-        if callable(set_mcp_servers):
-            set_mcp_servers(mcp_pool.claude_sdk_servers_tool_search_only())
         # SmartRouter holds the pool itself so it can re-wire newly
         # constructed per-session providers as they're lazily built.
         set_mcp_pool = getattr(model, "set_mcp_pool", None)
@@ -85,32 +74,6 @@ def create_model_from_spec(
         from src.models.dispatcher import ModelDispatcher
 
         model: BaseModel = ModelDispatcher(providers_config=providers_config)
-    elif is_claude_cli_model(spec):
-        from src.models.claude_agent import ClaudeCLIRegistry
-
-        bare = model_id_from_runtime(spec)
-        default_model = bare if bare and bare != spec else None
-        # The registry hosts one ClaudeCLI per session; the model the
-        # live subprocess is pinned to can change mid-session via
-        # ClaudeSDKClient.set_model(), so multiple claude-cli entries
-        # in the ``models`` table can coexist without duplicating
-        # subprocesses per model.
-        model = ClaudeCLIRegistry(
-            default_model=default_model,
-            providers_config=providers_config,
-        )
-    elif is_codex_cli_model(spec):
-        from src.models.codex_agent import CodexCLIRegistry
-
-        bare = model_id_from_runtime(spec)
-        default_model = bare if bare and bare != spec else None
-        # Same registry pattern as claude-cli: one CodexCLI per session,
-        # so multiple codex-cli entries in the ``models`` table coexist
-        # without duplicating AsyncCodex contexts per model.
-        model = CodexCLIRegistry(
-            default_model=default_model,
-            providers_config=providers_config,
-        )
     else:
         from src.models.native_provider import NativeProvider
 
@@ -127,9 +90,8 @@ def create_model_from_config(config: dict) -> BaseModel:
     """Instantiate the active model from the resolved OpenAgent config.
 
     Always returns a SmartRouter — SmartRouter is the single top-level
-    runtime and dispatches each session to either the native API
-    provider or the Claude CLI registry internally (see
-    ``openagent.models.smart_router``). The ``providers`` / ``models``
+    runtime and dispatches each session to the native API provider
+    internally (see ``openagent.models.smart_router``). The ``providers`` / ``models``
     SQLite tables are the sole source of truth for the catalog;
     SmartRouter starts empty and gets its routing populated by
     ``Agent.initialize`` (and every hot-reload tick) via
@@ -151,9 +113,9 @@ async def run_provider_smoke_test(
 ) -> tuple[str, ModelResponse]:
     """Run a minimal prompt through the configured runtime for one provider.
 
-    When the same vendor is registered under both frameworks
-    (anthropic+api-based AND anthropic+claude-cli), pass ``framework=`` to
-    disambiguate — otherwise the first matching entry wins.
+    When the same vendor is registered under more than one framework,
+    pass ``framework=`` to disambiguate — otherwise the first matching
+    entry wins.
     """
     # Resolve the provider row by (name, framework) pair. Fall back to
     # the first entry that matches by name when framework is unspecified.
@@ -168,21 +130,16 @@ async def run_provider_smoke_test(
     if cfg is None:
         raise ValueError(f"Provider '{provider_name}' not configured")
 
-    # If caller supplied a model_id that already encodes a subscription
-    # framework (``claude-cli:anthropic:…`` or ``codex-cli:openai:…``),
-    # honour it as-is. Otherwise resolve a default scoped to the
-    # provider row's framework.
-    if model_id and is_subscription_cli_model(model_id):
-        runtime_model = model_id
-    else:
-        runtime_model = model_id or get_default_model_for_provider(
-            provider_name,
-            providers_config,
-            framework=cfg.get("framework"),
-        )
-        if not runtime_model:
-            raise ValueError(f"No models configured for provider '{provider_name}'")
-        runtime_model = normalize_runtime_model_id(runtime_model, providers_config)
+    # Resolve a model: the caller's explicit model_id, else a default
+    # scoped to the provider row's framework.
+    runtime_model = model_id or get_default_model_for_provider(
+        provider_name,
+        providers_config,
+        framework=cfg.get("framework"),
+    )
+    if not runtime_model:
+        raise ValueError(f"No models configured for provider '{provider_name}'")
+    runtime_model = normalize_runtime_model_id(runtime_model, providers_config)
 
     provider = create_model_from_spec(
         runtime_model,

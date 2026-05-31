@@ -82,17 +82,14 @@ Two delegation paths exist depending on how you're running:
      time of the slowest.
 
   2. **Universal delegation MCP** — at any time (whether you're a team
-     leader, a solo agent, or a subscription-CLI runtime), you can
-     reach ANY registered model via the ``delegation`` MCP server:
+     leader or a solo agent), you can reach ANY registered model via
+     the ``delegation`` MCP server:
 
        ``tool_search_call_tool(server="delegation", tool="list_delegatable_models", args={})``
        ``tool_search_call_tool(server="delegation", tool="delegate_task", args={"model_id": "<runtime_id>", "task": "<full prompt>"})``
 
-     This is the path subscription-CLI agents (Claude SDK, Codex SDK)
-     use to fan out work — they have no native team-leader tool but
-     they can still call delegation MCP tools through tool-search.
-     Api-based agents not running as a leader can use it too when
-     they need a model that isn't in their team.
+     Agents not running as a team leader can use this to reach a model
+     that isn't in their team.
 
 **Hard rule.** For any user prompt that is more than a one-line
 acknowledgement or a trivial confirmation, decompose and delegate.

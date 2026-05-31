@@ -17,8 +17,6 @@ from src.memory.schedule import (
 )
 from src.models.catalog import (
     FRAMEWORK_API_BASED,
-    FRAMEWORK_CLAUDE_CLI,
-    FRAMEWORK_CODEX_CLI,
     LLM_FRAMEWORKS,
     SUPPORTED_FRAMEWORKS,
 )
@@ -80,18 +78,13 @@ CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON usage_log(timestamp);
 
 -- Canonical session table — every chat conversation lives here.
 -- Sessions are written natively by the inlined ``SqliteDb`` (which
--- creates this table on first use via its own ORM). Claude CLI
--- sessions are inserted manually with the same column layout so
--- session listing, deletion, and reporting work uniformly across
--- both frameworks.
+-- creates this table on first use via its own ORM).
 --
 -- ``runs`` is a JSON array of RunOutput-shaped objects:
 --   [{"run_id": "...", "messages": [{"role":"user","content":"..."},...],
 --     "status":"completed", "metrics":{...}, ...}]
 --
 -- ``metadata`` is a JSON object for framework-private state:
---   - Claude CLI stores ``{"sdk_session_id": "...", "provider": "claude-cli"}``
---     so ``--resume`` survives process restarts.
 --   - The native path stores its own session/agent/team descriptors
 --     (managed by SqliteDb).
 --
@@ -149,23 +142,20 @@ CREATE INDEX IF NOT EXISTS idx_mcps_updated ON mcps(updated_at);
 -- LLM and media providers. One row per (vendor, framework) pair.
 --
 -- OpenAgent vocabulary:
---   - **provider**  = a concrete credential + dispatch pair. The same vendor
---                     (``anthropic``) can appear as two rows — one with
---                     ``framework='api-based'`` (needs ``api_key``, native
---                     the runtime ``Agent``) and one with
---                     ``framework='claude-cli'`` (local ``claude`` subprocess
---                     via the runtime's Claude subscription-CLI agent; ``api_key``
---                     MUST be NULL).
+--   - **provider**  = a concrete credential + dispatch pair, e.g.
+--                     ``anthropic`` with ``framework='api-based'`` (needs
+--                     ``api_key``, native the runtime ``Agent``).
 --   - **framework** = which runtime class to instantiate for this row:
 --                     ``api-based`` (native ``Agent`` for LLM, or
---                     ``litellm.aspeech``/``atranscription`` for TTS/STT)
---                     or ``claude-cli`` (``ClaudeAgent`` adapter, LLM only).
+--                     ``litellm.aspeech``/``atranscription`` for TTS/STT).
+--                     The only shipped framework; the column stays the
+--                     seam for adding more later.
 --
 -- ``UNIQUE(name, framework)`` lets the UI/API/MCP address a row by its
 -- (vendor, framework) pair; the surrogate ``id`` is what the ``models``
 -- table joins to.
 -- ``kind`` partitions the registry by capability:
---   ``llm`` — text generation (framework ∈ {api-based, claude-cli}).
+--   ``llm`` — text generation (framework='api-based').
 --   ``tts`` — speech synthesis (framework='api-based'; routed via litellm).
 --   ``stt`` — speech-to-text (framework='api-based'; routed via litellm).
 -- Router/classifier code MUST filter to ``kind='llm'`` before iterating
@@ -206,9 +196,8 @@ CREATE INDEX IF NOT EXISTS idx_providers_name ON providers(name);
 --   ``llm`` — text generation (the SmartRouter / classifier picks one).
 --   ``tts`` — speech synthesis. ``metadata.voice_id`` carries the voice.
 --   ``stt`` — speech-to-text.
--- LLM rows route via the provider's framework (``api-based`` builds an
--- the runtime ``Agent`` from the provider's vendor class, ``claude-cli``
--- builds an the runtime's Claude subscription-CLI agent); ``tts`` / ``stt`` rows
+-- LLM rows route via the provider's framework (``api-based`` builds
+-- the runtime ``Agent`` from the provider's vendor class); ``tts`` / ``stt`` rows
 -- always dispatch through LiteLLM (``litellm.aspeech`` /
 -- ``atranscription``) using the provider's ``name`` as the LiteLLM
 -- vendor prefix (``openai/tts-1``).
@@ -246,7 +235,7 @@ CREATE TABLE IF NOT EXISTS config_state (
 -- Per-session model pin. Optional explicit user/agent choice of a
 -- specific runtime_id for a session; SmartRouter honours this pin
 -- before falling back to first-enabled. ``runtime_id`` is a human-
--- readable label (e.g. ``claude-cli:anthropic:claude-opus-4-7``)
+-- readable label (e.g. ``anthropic:claude-opus-4-7``)
 -- derived from the provider + model rows at pin time; it's not a FK
 -- so a later model delete leaves a "stale pin" the router gracefully
 -- falls back from rather than throwing an integrity error.
@@ -712,6 +701,11 @@ class MemoryDB:
         # kind-column migration so the rows are already in their final
         # provider+kind shape.
         await self._migrate_legacy_framework_names_to_api_based()
+        # The claude-cli and codex-cli subscription-CLI adapters were
+        # removed — drop any provider rows still on those frameworks so a
+        # pre-existing DB can't surface them in the catalog. Their
+        # ``models`` rows cascade via the FK ON DELETE. Idempotent.
+        await self._migrate_drop_subscription_cli_providers()
         # Add ``kind`` to the models table + fold any TTS/STT provider
         # rows (where ``model_id`` and ``voice_id`` lived in
         # ``metadata_json``) into proper model rows. The unified design:
@@ -770,7 +764,9 @@ class MemoryDB:
             for row in await cursor.fetchall():
                 sid = row[0]
                 sdk_sid = row[1]
-                provider = row[2] or FRAMEWORK_CLAUDE_CLI
+                # Legacy ``sdk_sessions`` was the retired claude-cli resume
+                # store; preserve the historical provider label verbatim.
+                provider = row[2] or "claude-cli"
                 ts = row[3] or now
                 meta = json.dumps({
                     "sdk_session_id": sdk_sid,
@@ -963,13 +959,11 @@ class MemoryDB:
     async def _migrate_legacy_framework_names_to_api_based(self) -> None:
         """Collapse legacy framework values into the canonical ``api-based``.
 
-        Pre-v0.14: providers.framework could be ``agno`` (legacy LLM via native
-        the runtime Agent), ``litellm`` (TTS/STT via litellm), or ``claude-cli``.
-        v0.14+: ``api-based`` and ``claude-cli`` (API-based is the execution
-        engine for both LLM paths and ``kind`` discriminates TTS/STT
-        from LLM). v0.14.x adds ``codex-cli`` for ChatGPT-subscription
-        OpenAI dispatch. Only ``agno`` and ``litellm`` collapse here —
-        ``codex-cli`` is a NEW value, not a legacy alias.
+        Pre-v0.14: providers.framework could be ``agno`` (legacy LLM via
+        the native runtime Agent) or ``litellm`` (TTS/STT via litellm).
+        v0.14+: ``api-based`` is the single execution engine and ``kind``
+        discriminates TTS/STT from LLM. Only ``agno`` and ``litellm``
+        collapse here.
 
         Idempotent: no-op when no legacy rows remain. Handles
         UNIQUE(name, framework) collisions by suffixing colliding row
@@ -997,6 +991,31 @@ class MemoryDB:
              WHERE framework IN ('agno','litellm')
             """,
             (time.time(),),
+        )
+        await self._conn.commit()
+
+    async def _migrate_drop_subscription_cli_providers(self) -> None:
+        """Delete provider rows on the retired ``claude-cli`` / ``codex-cli``
+        frameworks.
+
+        The subscription-CLI adapters were removed. A pre-existing DB may
+        still hold ``providers`` rows on those frameworks (added when the
+        adapters shipped); leaving them would let the catalog surface a
+        framework the runtime can no longer dispatch. Their ``models`` rows
+        cascade-delete via the FK ``ON DELETE CASCADE``.
+
+        Idempotent: no-op when no such rows remain.
+        """
+        assert self._conn is not None
+        cursor = await self._conn.execute(
+            "SELECT COUNT(*) FROM providers "
+            "WHERE framework IN ('claude-cli','codex-cli')"
+        )
+        row = await cursor.fetchone()
+        if not row or not row[0]:
+            return
+        await self._conn.execute(
+            "DELETE FROM providers WHERE framework IN ('claude-cli','codex-cli')"
         )
         await self._conn.commit()
 
@@ -2092,30 +2111,23 @@ class MemoryDB:
 
     # ── Session store (sessions) ──
     #
-    # ``sessions`` is the single canonical table for all chat
-    # sessions. Both the api-based path (native the runtime ``Agent``)
-    # and the claude-cli path (the runtime's Claude subscription-CLI agent via
-    # OpenAgent's ``PersistentClaudeAgent`` subclass) persist through
+    # ``sessions`` is the single canonical table for all chat sessions:
+    # the api-based path (native the runtime ``Agent``) persists through
     # the runtime's ``SqliteDb`` writing to this table.
     #
-    # Claude SDK resume state now lives in ``sessions.session_data``
-    # (the JSON column the runtime writes via SqliteDb) under the
-    # ``sdk_session_id`` key — see ``src/models/claude_cli.py
-    # PersistentClaudeAgent``. The legacy ``metadata.sdk_session_id``
-    # path is gone; ``delete_sdk_session`` below stays as a thin shim
-    # so the gateway's session-delete handler keeps working on legacy
-    # rows.
+    # ``delete_sdk_session`` below stays as a thin shim that scrubs the
+    # legacy ``metadata.sdk_session_id`` / ``provider`` keys (written by
+    # the retired subscription-CLI path) so the gateway's session-delete
+    # handler keeps working on older rows.
 
     async def delete_sdk_session(self, session_id: str) -> None:
-        """Clear any legacy claude-cli resume metadata from a session.
+        """Clear legacy subscription-CLI resume metadata from a session.
 
-        Pre-v0.14 the SDK session id was stored in
-        ``sessions.metadata.sdk_session_id``. The new path keeps it
-        in ``session_data.sdk_session_id`` (runtime-managed) instead. This
-        helper survives so the gateway's ``DELETE /api/sessions/{id}``
-        handler — which we don't want to revisit yet — keeps a place to
-        scrub legacy data. The session row itself is deleted separately
-        via :meth:`delete_session`.
+        The retired claude-cli path stored an SDK session id in
+        ``sessions.metadata.sdk_session_id``. This helper survives so the
+        gateway's ``DELETE /api/sessions/{id}`` handler keeps a place to
+        scrub that legacy data. The session row itself is deleted
+        separately via :meth:`delete_session`.
         """
         conn = await self._ensure_connected()
         cursor = await conn.execute(
@@ -2360,16 +2372,9 @@ class MemoryDB:
     ) -> int:
         """Upsert a provider row. Returns the provider's surrogate ``id``.
 
-        Subscription-CLI frameworks (``claude-cli`` / ``codex-cli``)
-        MUST carry ``api_key=None`` — auth flows through the local CLI's
-        subscription state (``~/.claude/`` for Claude Pro/Max,
-        ``~/.codex/`` for ChatGPT Plus/Pro). Any stored value would
-        poison the subprocess. ``framework='api-based'`` providers can
-        be created with ``api_key=None`` (disabled-until-configured
-        state) but dispatch will fail until a key is set.
-
-        Each subscription-CLI framework is tied to a single provider
-        name: ``claude-cli`` ↔ ``anthropic``, ``codex-cli`` ↔ ``openai``.
+        ``framework='api-based'`` providers may be created with
+        ``api_key=None`` (a disabled-until-configured state) but dispatch
+        will fail until a key is set.
 
         ``kind`` defaults to ``'llm'`` (text generation). Use ``'tts'``
         for speech synthesis providers (e.g. ElevenLabs) or ``'stt'`` for
@@ -2391,30 +2396,6 @@ class MemoryDB:
             raise ValueError(
                 f"invalid framework {framework!r} for kind='llm'; "
                 f"expected one of {LLM_FRAMEWORKS}"
-            )
-        if framework == FRAMEWORK_CLAUDE_CLI and api_key:
-            raise ValueError(
-                "claude-cli providers must not carry an api_key — the "
-                "local `claude` binary authenticates via the Pro/Max "
-                "subscription stored under ~/.claude/."
-            )
-        if framework == FRAMEWORK_CLAUDE_CLI and name.strip().lower() != "anthropic":
-            raise ValueError(
-                "claude-cli framework is only supported for the "
-                "'anthropic' provider — the local `claude` binary "
-                "dispatches Anthropic models via the Pro/Max subscription."
-            )
-        if framework == FRAMEWORK_CODEX_CLI and api_key:
-            raise ValueError(
-                "codex-cli providers must not carry an api_key — the "
-                "Codex SDK authenticates via the ChatGPT Plus/Pro "
-                "subscription stored under ~/.codex/."
-            )
-        if framework == FRAMEWORK_CODEX_CLI and name.strip().lower() != "openai":
-            raise ValueError(
-                "codex-cli framework is only supported for the "
-                "'openai' provider — the Codex SDK dispatches OpenAI "
-                "models via the ChatGPT Plus/Pro subscription."
             )
         now = time.time()
         conn = await self._ensure_connected()
@@ -2743,7 +2724,7 @@ class MemoryDB:
 
         Used by session-pin + REST/MCP paths where the caller still speaks
         the composite string (``openai:gpt-4o-mini``,
-        ``claude-cli:anthropic:claude-opus-4-7``). Returns the same shape
+        ``anthropic:claude-opus-4-7``). Returns the same shape
         as :meth:`list_models_enriched`, or ``None`` when no matching
         (provider_name, framework, model) row exists.
         """
@@ -3173,11 +3154,10 @@ class MemoryDB:
     # ── Session runs (the runtime SqliteDb owns writes) ──
     #
     # ``sessions.runs`` is now written exclusively by the runtime's
-    # ``SqliteDb`` (via ``BaseExternalAgent._arun_stream`` /
-    # ``_arun_non_stream`` for ClaudeAgent, and the native Agent's own
-    # storage path for api-based runs). The manual ``add_session_run``
-    # / ``commit_partial_session_run`` mirror writes that the old
-    # claude_cli.py used (~150 LOC) are gone with the inlined-runtime migration.
+    # ``SqliteDb`` (the native Agent's own storage path for api-based
+    # runs). The manual ``add_session_run`` / ``commit_partial_session_run``
+    # mirror writes that the retired adapters used are gone with the
+    # inlined-runtime migration.
     #
     # ``list_session_runs`` below keeps the read-side surface stable so
     # the gateway's ``GET /api/sessions/{id}/runs`` endpoint can render

@@ -41,8 +41,8 @@ class _FakeModel:
         generate_raises: BaseException | None = None,
         model_name: str = "fake/test-model",
     ):
-        # ``self.model`` is the attribute real providers set
-        # (claude_cli, api-based) and the new ``BaseModel.effective_model_id``
+        # ``self.model`` is the attribute real api-based providers set
+        # and the new ``BaseModel.effective_model_id``
         # default reads. We mirror it on ``self.model_name`` only for
         # backwards-compatibility with older test code that referenced
         # the legacy attribute name.
@@ -358,7 +358,7 @@ class _SignatureFreeModel:
 class _MidStreamTypeErrorModel:
     """``stream`` accepts the kwargs but raises TypeError MID-iteration
     (after yielding ``yield_count`` deltas). Mirrors a hypothetical
-    SDK shape change inside ``claude_cli._run_once``: the signature
+    SDK shape change inside a provider's ``_run_once``: the signature
     matches but the body explodes once a real message arrives.
 
     Before Part B's introspection fix, ``Agent._run_inner_stream``

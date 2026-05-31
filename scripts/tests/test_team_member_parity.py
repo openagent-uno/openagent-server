@@ -10,10 +10,9 @@ The dispatcher implements this by:
 - ``_compose_member_system(system, role_blurb)`` — wraps the leader's
   ``framework + persona`` base with a short ``── Role ──`` suffix for
   members; same base text in both.
-- ``_build_api_agent_for`` and ``_build_subscription_agent_for`` —
-  both pull the tool-search toolkit (the single in-process MCP that
-  fronts every other capability per vision §6) from the same pool
-  accessor.
+- ``_build_api_agent_for`` — pulls the tool-search toolkit (the single
+  in-process MCP that fronts every other capability per vision §6) from
+  the same pool accessor for both the leader and every member.
 
 This file pins those invariants so a refactor can't quietly diverge
 leader vs. member setup.
@@ -78,15 +77,10 @@ class _FakePool:
     def __init__(self, ts: _FakeToolSearchToolkit) -> None:
         self._ts = ts
         self.runtime_calls = 0
-        self.claude_sdk_calls = 0
 
     def runtime_toolkits_tool_search_only(self) -> list[Any]:
         self.runtime_calls += 1
         return [self._ts]
-
-    def claude_sdk_servers_tool_search_only(self) -> dict[str, dict[str, Any]]:
-        self.claude_sdk_calls += 1
-        return {"tool-search": {"command": "noop"}}
 
 
 def _make_provider(pool: _FakePool):
@@ -206,63 +200,3 @@ async def t_api_system_prompt_parity(_ctx: TestContext) -> None:
     # Member additionally carries the role suffix; leader doesn't.
     assert "── Role ──" not in (leader_sys or ""), leader_sys
     assert "── Role ──" in member_sys, member_sys
-
-
-# ── Subscription-CLI builders: smoke check that the same pool accessor
-# is reached. Avoids invoking the SDK (no claude/codex binary in CI).
-# ──────────────────────────────────────────────────────────────────────
-
-
-@test(
-    "team_member_parity",
-    "claude-cli builder uses claude_sdk_servers_tool_search_only for both leader+member",
-)
-async def t_claude_cli_mcp_accessor(_ctx: TestContext) -> None:
-    from src.models.dispatcher import TeamRouterProvider
-    from src.models import claude_agent as ca_mod
-
-    ts = _FakeToolSearchToolkit()
-    pool = _FakePool(ts)
-    provider = TeamRouterProvider(
-        entry_runtime_id="claude-cli:anthropic:claude-opus-4-7",
-        providers_config=[],
-    )
-    provider._mcp_pool = pool  # type: ignore[attr-defined]
-
-    captured: list[dict[str, Any]] = []
-
-    def fake_build(**kwargs):
-        captured.append(kwargs)
-        return object()
-
-    original = ca_mod.build_claude_backed_agent
-    ca_mod.build_claude_backed_agent = fake_build  # type: ignore[assignment]
-    try:
-        entry = _entry(
-            runtime_id="claude-cli:anthropic:claude-opus-4-7",
-        )
-        # The dataclass is frozen; rebuild with the claude-cli framework.
-        from src.models.catalog import CatalogModel
-        entry = CatalogModel(
-            provider="anthropic", model_id="claude-opus-4-7",
-            runtime_id="claude-cli:anthropic:claude-opus-4-7",
-            history_mode="platform", framework="claude-cli",
-        )
-        provider._build_subscription_agent_for(
-            entry, name="leader", role=None, system="BASE",
-        )
-        provider._build_subscription_agent_for(
-            entry, name="member-coder", role="coding",
-            system="BASE\n\n── Role ──\n…",
-        )
-    finally:
-        ca_mod.build_claude_backed_agent = original  # type: ignore[assignment]
-
-    # Same accessor invoked both times → same MCP setup.
-    assert pool.claude_sdk_calls == 2, pool.claude_sdk_calls
-    # The framework prompt reached the SDK in both calls.
-    systems = [c.get("system") for c in captured]
-    assert all(s and s.startswith("BASE") for s in systems), systems
-    # Both builds got the SAME mcp-servers dict — identical tool-search wiring.
-    mcp_dicts = [c.get("mcp_servers") for c in captured]
-    assert all(d and "tool-search" in d for d in mcp_dicts), mcp_dicts

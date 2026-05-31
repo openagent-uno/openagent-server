@@ -27,7 +27,6 @@ async def t_imports(ctx: TestContext) -> None:
     import src.mcp.builtins  # noqa: F401
     import src.mcp.servers.scheduler.server  # noqa: F401
     import src.models.native_provider  # noqa: F401
-    import src.models.claude_agent  # noqa: F401
     import src.models.dispatcher  # noqa: F401
     import src.models.runtime  # noqa: F401
     import src.models.catalog  # noqa: F401

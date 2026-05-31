@@ -13,9 +13,8 @@ Vocabulary:
   - **model id**: the surrogate integer PK on ``models`` rows. Returned
     by ``add_model`` / ``list_models``. Used by
     ``enable_model`` / ``disable_model`` / ``remove_model``.
-  - **runtime_id**: composite string like
-    ``claude-cli:anthropic:claude-opus-4-7`` — derived at read time,
-    used for session pins and classifier output.
+  - **runtime_id**: composite string like ``anthropic:claude-opus-4-7``
+    — derived at read time, used for session pins and classifier output.
 
 Transport: stdio. Storage: the shared OpenAgent SQLite DB via
 ``OPENAGENT_DB_PATH`` (set by MCPPool at launch).
@@ -97,12 +96,9 @@ async def add_provider(
 ) -> dict[str, Any]:
     """Register (or update) an LLM provider row.
 
-    The same vendor can be registered twice — once with
-    ``framework='api-based'`` (native runtime ``Agent`` against the
-    vendor's REST API, needs ``api_key``) and once with
-    ``framework='claude-cli'`` (the runtime's Claude SDK adapter
-    wrapping the local ``claude`` binary / Pro/Max subscription;
-    ``api_key`` MUST be None).
+    Providers use ``framework='api-based'`` (the native runtime ``Agent``
+    against the vendor's REST API, needs ``api_key``) — the only shipped
+    framework.
 
     Provider keys live in the SQLite ``providers`` table. Writes are
     hot-reloaded on the next message via ``Agent.refresh_registries``.
@@ -110,10 +106,10 @@ async def add_provider(
     see what the vendor exposes under that key, then ``add_model`` to
     register specific model ids.
     """
-    # ``MemoryDB.upsert_provider`` enforces framework + claude-cli key
-    # rules at the schema boundary; we just layer the api-based-requires-key
-    # rule here since the DB allows NULL api_key for future "configured
-    # but disabled" api-based rows.
+    # ``MemoryDB.upsert_provider`` enforces framework rules at the schema
+    # boundary; we just layer the api-based-requires-key rule here since
+    # the DB allows NULL api_key for future "configured but disabled"
+    # api-based rows.
     if framework == "api-based" and not (api_key or "").strip():
         raise ValueError("api-based providers require an api_key")
     db = await _get_db()
@@ -150,8 +146,8 @@ async def update_provider(
         new_key = api_key.strip() or None
     if base_url is not None:
         new_base = base_url.strip() or None
-    # Roundtrip through ``upsert_provider`` so the claude-cli api_key
-    # rejection stays a single-source rule (see MemoryDB.upsert_provider).
+    # Roundtrip through ``upsert_provider`` so the framework/api_key
+    # rules stay a single-source rule (see MemoryDB.upsert_provider).
     await db.upsert_provider(
         name=row["name"],
         framework=row["framework"],
@@ -270,9 +266,7 @@ async def list_supported_frameworks() -> list[str]:
     """Every runtime OpenAgent can dispatch through.
 
     - ``api-based``: direct provider API call via the inlined runtime. Works for
-      every supported vendor.
-    - ``claude-cli``: the local ``claude`` binary (Claude Pro/Max
-      subscription). Only dispatches Anthropic models.
+      every supported vendor. (Currently the only shipped framework.)
     """
     return list(VALID_FRAMEWORKS)
 
@@ -435,14 +429,10 @@ async def pin_session(session_id: str, runtime_id: str) -> dict[str, Any]:
     """Pin ``session_id`` to a specific model ``runtime_id`` forever.
 
     ``runtime_id`` stays a human-readable composite string
-    (``openai:gpt-4o-mini`` or ``claude-cli:anthropic:claude-opus-4-7``)
-    because the agent finds its current pin via the
-    ``<session-id>...</session-id>`` tag in the framework system
+    (``openai:gpt-4o-mini``) because the agent finds its current pin via
+    the ``<session-id>...</session-id>`` tag in the framework system
     prompt, and those tags are rendered with the derived runtime_id.
 
-    Raises if the pinned model belongs to a different framework than
-    the session's existing binding (pinning a claude-cli session to an
-    API-based model would split conversation history across two stores).
     Use ``unpin_session`` to release.
     """
     session_id = (session_id or "").strip()
@@ -468,8 +458,7 @@ async def unpin_session(session_id: str) -> dict[str, Any]:
     """Clear the per-session model pin on ``session_id``.
 
     The session returns to normal SmartRouter routing (classifier →
-    tier → model) on the next turn, while keeping its framework
-    binding (api-based or claude-cli) intact.
+    tier → model) on the next turn.
     """
     session_id = (session_id or "").strip()
     if not session_id:

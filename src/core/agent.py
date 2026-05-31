@@ -178,8 +178,8 @@ def _build_runtime_media(
     Why content=bytes instead of filepath: the runtime's model adapters
     consume bytes directly (base64 → multimodal API content). The
     filepath shape exists only as a back-compat input form, and it
-    forces every downstream consumer (subscription-CLI wrappers in
-    particular) to think about sandbox allow-lists. With bytes in
+    forces every downstream consumer to think about sandbox
+    allow-lists. With bytes in
     memory, downstream code can inline text, base64-encode for an API,
     or write to a known-safe location — its choice.
 
@@ -331,10 +331,8 @@ class Agent:
       - ``NativeProvider`` consumes ``MCPPool.runtime_toolkits`` (``MCPTools``
         instances) and the runtime ``Agent`` runs the loop internally, including
         proper image-artifact handling for binary tool results.
-      - ``ClaudeCLI`` consumes ``MCPPool.claude_sdk_servers()`` (raw stdio
-        config) and the Claude Agent SDK manages everything itself.
 
-    Either way, ``Agent.run`` is a single ``model.generate`` call — the
+    ``Agent.run`` is a single ``model.generate`` call — the
     provider returns the final content after running its own tool loop.
 
     Long-term memory lives in the Obsidian-style vault exposed through MCP.
@@ -570,9 +568,9 @@ class Agent:
 
         Called by ``StreamSession._cancel_active_turn`` when the user
         interrupts a turn mid-flight. Forwards to ``self.model`` so the
-        bound provider (Claude SDK / API-based) can either issue a clean
-        interrupt control-request or inject a synthetic run into its
-        history store. Best-effort: provider failures log and swallow.
+        bound provider can either issue a clean interrupt control-request
+        or inject a synthetic run into its history store. Best-effort:
+        provider failures log and swallow.
         """
         if not session_id or not text or self.model is None:
             return
@@ -850,9 +848,8 @@ class Agent:
         The DB is the source of truth for provider keys AND the model
         catalog. SmartRouter / NativeProvider consume the v0.12 flat-list
         shape — each entry already carries its ``framework`` and its
-        nested ``models`` list, so the same vendor can appear twice
-        (anthropic+api-based AND anthropic+claude-cli) without a key
-        collision. Delegates the SQL materialisation to MemoryDB so
+        nested ``models`` list. Delegates the SQL materialisation to
+        MemoryDB so
         smoke-test endpoints can reuse the same shape.
         """
         if self._db is None:
@@ -1031,16 +1028,13 @@ class Agent:
         # construct typed runtime media objects (Image / Audio / Video /
         # File) with ``content=bytes``, then pass each list to ``arun``'s
         # corresponding kwarg. API-native model adapters consume the
-        # bytes directly (multimodal API content). Subscription-CLI
-        # backends translate at the wrapper layer — text inlined, binary
-        # written to a sandbox-safe path.
+        # bytes directly (multimodal API content).
         media_images, media_audios, media_videos, media_files = _build_runtime_media(attachments)
 
-        # Images still get a textual prepend (no images= channel on the
-        # model layer for subscription-CLI providers) — but non-image
-        # attachments are now routed natively through the runtime's
-        # ``files=`` kwarg so the leader doesn't paraphrase synthetic
-        # file-info blocks into delegation tasks.
+        # Images still get a textual prepend — but non-image attachments
+        # are now routed natively through the runtime's ``files=`` kwarg
+        # so the leader doesn't paraphrase synthetic file-info blocks into
+        # delegation tasks.
         if attachments:
             from src.channels.base import build_attachment_context, prepend_context_block
             image_atts = [a for a in attachments if (a.get("type") or "file") == "image"]
@@ -1148,8 +1142,7 @@ class Agent:
                 )
                 try:
                     # ``files`` is forwarded native to the runtime's ``arun(files=...)``
-                    # by NativeProvider / TeamRouterProvider; subscription-CLI
-                    # adapters fall back to a minimal prepend. Only attach on
+                    # by NativeProvider / TeamRouterProvider. Only attach on
                     # the first iteration so shell-reminder re-entries don't
                     # re-send the same files.
                     # Only forward media on the first iteration so a
@@ -1363,9 +1356,8 @@ class Agent:
             pre = _format_shell_reminder(pending)
             current_input = f"{pre}\n\n{current_input}"
 
-        # When the streaming autoloop yields zero deltas (claude_cli
-        # tool-only turns, smart_router → claude_cli with empty content,
-        # the runtime when no RunContentEvent fires), we fall back to a
+        # When the streaming autoloop yields zero deltas (tool-only turns,
+        # or the runtime when no RunContentEvent fires), we fall back to a
         # one-shot generate() so callers always receive text. The real
         # ModelResponse from that call wins for last_response_meta()
         # over the synthetic placeholder.
@@ -1431,10 +1423,9 @@ class Agent:
                     #
                     # Introspect once instead of try/except TypeError around
                     # the iteration body — a catch-all TypeError swallows
-                    # errors raised mid-iteration (e.g. an SDK shape change
-                    # inside ``claude_cli._run_once``) and the silent retry
+                    # errors raised mid-iteration and the silent retry
                     # without ``session_id`` collides on the ``"default"``
-                    # subprocess, which then yields zero deltas → fallback
+                    # session, which then yields zero deltas → fallback
                     # at line 1089 fires → caller sees ONE giant delta.
                     stream_kwargs: dict[str, Any] = {"system": system}
                     try:
@@ -1496,7 +1487,7 @@ class Agent:
 
             # Empty-stream safety net: some providers emit zero deltas
             # for tool-only turns, empty completions, or non-streamable
-            # backends (claude-cli through smart_router). Without this
+            # backends. Without this
             # fallback voice mode (and the soon-to-be-streaming web
             # chat) would surface a confusing "(no output)" message
             # while ``Agent.run()`` worked fine for the same prompt.
@@ -1606,7 +1597,7 @@ class Agent:
         # runtime actually picked for the session, not a generic
         # instance attribute. ``getattr(active_model, "model_name",
         # None)`` (the previous code) returned ``None`` for every
-        # provider in tree (claude_cli/api-based expose ``self.model``;
+        # provider in tree (NativeProvider exposes ``self.model``;
         # SmartRouter exposes neither), which silently dropped the
         # model badge from the chat UI after the streaming migration.
         # ``effective_model_id`` is the provider-aware accessor.

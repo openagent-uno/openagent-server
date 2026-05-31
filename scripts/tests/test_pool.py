@@ -30,25 +30,6 @@ async def t_pool_specs(ctx: TestContext) -> None:
     assert "web-search" not in names
 
 
-@test("pool", "claude_sdk_servers shape (command/args/env)")
-async def t_pool_claude_shape(ctx: TestContext) -> None:
-    from src.mcp.pool import MCPPool
-    pool = MCPPool.from_config(
-        mcp_config=ctx.config.get("mcp"),
-        include_defaults=True,
-        disable=["chrome-devtools", "web-search", "computer-control", "mcp-manager", "model-manager"],
-        db_path=str(ctx.db_path),
-    )
-    sdk = pool.claude_sdk_servers()
-    assert sdk, "claude_sdk_servers returned empty"
-    for name, entry in sdk.items():
-        if "command" in entry:
-            assert isinstance(entry["command"], str), f"{name}: command must be str"
-            assert isinstance(entry["args"], list), f"{name}: args must be list"
-        elif "url" in entry:
-            assert entry.get("type") in ("http", "sse"), f"{name}: missing type"
-
-
 @test("pool", "connect_all + dormant detection + summary")
 async def t_pool_connect(ctx: TestContext) -> None:
     from src.mcp.pool import MCPPool

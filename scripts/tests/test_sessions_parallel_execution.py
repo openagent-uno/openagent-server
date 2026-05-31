@@ -4,8 +4,8 @@ Before the fix, ``SessionManager`` had a single pending queue and a
 single worker task per CLIENT. Two chat tabs in the app share one
 websocket (hence one client_id), so a slow turn in tab A would block
 tab B's turn entirely — even though the two conversations are fully
-context-isolated at the model level (per-session locks in ClaudeCLI
-and per-session keys in NativeProvider's SqliteDb). The symptom: reply
+context-isolated at the model level (per-session keys in
+NativeProvider's SqliteDb). The symptom: reply
 times looked serialized in the UI.
 
 The fix introduces per-session ``_SessionState`` with its own queue

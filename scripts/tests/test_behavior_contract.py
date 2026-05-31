@@ -5,13 +5,14 @@ catalog + SmartRouter + session pin are supposed to behave.
 Together they cover:
 
   1. Models live ONLY in the ``models`` DB table (not in yaml).
-  2. Each provider row carries ``(name, framework)`` — same vendor under
-     both frameworks is two separate rows by design (UNIQUE(name, framework)).
+  2. Each provider row carries ``(name, framework)`` — distinct vendors
+     are separate rows by design (UNIQUE(name, framework)). ``api-based``
+     is the only shipped framework.
   3. Models carry a ``provider_id`` FK; framework is inherited from the
      provider row, never stored on the model directly.
-  4. ``runtime_id`` (``openai:gpt-4o-mini``,
-     ``claude-cli:anthropic:claude-opus-4-7``) is derived at read time,
-     not stored in any table.
+  4. ``runtime_id`` (``openai:gpt-4o-mini``) is the 2-part
+     ``provider:model`` form, derived at read time, not stored in any
+     table.
   5. SmartRouter resolves the per-session entry model (pin →
      first-enabled); per-turn delegation lives inside the Team.
   6. Per-session pin survives across turns and restarts (rows in
@@ -73,48 +74,26 @@ async def t_provider_triple(ctx: TestContext) -> None:
         _cleanup(path)
 
 
-@test("contract", "same vendor under two frameworks are distinct provider rows")
-async def t_dual_framework_rows(ctx: TestContext) -> None:
+@test("contract", "distinct vendors are distinct provider rows with 2-part runtime ids")
+async def t_distinct_vendor_rows(ctx: TestContext) -> None:
     db, path = await _tmp_db(ctx, "dual")
     try:
-        api_pid = await db.upsert_provider(
+        ant_pid = await db.upsert_provider(
             name="anthropic", framework="api-based", api_key="sk-ant",
         )
-        cli_pid = await db.upsert_provider(
-            name="anthropic", framework="claude-cli",
+        oai_pid = await db.upsert_provider(
+            name="openai", framework="api-based", api_key="sk-oai",
         )
-        assert api_pid != cli_pid
-        await db.upsert_model(provider_id=api_pid, model="claude-sonnet-4-6")
-        await db.upsert_model(provider_id=cli_pid, model="claude-sonnet-4-6")
-        # Both rows live side by side: same (provider_name, model), different
-        # framework. The composite runtime_id distinguishes them.
+        assert ant_pid != oai_pid
+        await db.upsert_model(provider_id=ant_pid, model="claude-sonnet-4-6")
+        await db.upsert_model(provider_id=oai_pid, model="gpt-4o-mini")
+        # Each row's runtime_id is the 2-part provider:model form.
         enriched = await db.list_models_enriched()
         rids = sorted(r["runtime_id"] for r in enriched)
         assert rids == [
             "anthropic:claude-sonnet-4-6",
-            "claude-cli:anthropic:claude-sonnet-4-6",
+            "openai:gpt-4o-mini",
         ], rids
-    finally:
-        await db.close()
-        _cleanup(path)
-
-
-@test("contract", "claude-cli provider forbids api_key (sentinel class of bug fixed at schema)")
-async def t_claude_cli_provider_rejects_api_key(ctx: TestContext) -> None:
-    """v0.11.5 added a code-level filter for the ``api_key='claude-cli'``
-    sentinel. v0.12 removes the whole class of bug by rejecting any
-    non-empty api_key on a claude-cli provider row at the DB boundary."""
-    db, path = await _tmp_db(ctx, "cli-nokey")
-    try:
-        raised = False
-        try:
-            await db.upsert_provider(
-                name="anthropic", framework="claude-cli", api_key="x",
-            )
-        except ValueError as e:
-            raised = True
-            assert "api_key" in str(e).lower()
-        assert raised, "claude-cli provider must reject api_key"
     finally:
         await db.close()
         _cleanup(path)
@@ -140,30 +119,31 @@ async def t_fk_cascade_deletes_models(ctx: TestContext) -> None:
         _cleanup(path)
 
 
-@test("contract", "cross-framework pin is accepted (no framework lock post-v0.14)")
-async def t_cross_framework_pin_accepted(ctx: TestContext) -> None:
-    """v0.14+: with history unified in the runtime's ``sessions`` across
-    every framework, the per-session framework lock is gone. Any
-    enabled runtime_id can be pinned to any session at any time.
+@test("contract", "cross-vendor pin swap is accepted (no framework lock post-v0.14)")
+async def t_cross_vendor_pin_accepted(ctx: TestContext) -> None:
+    """v0.14+: with history unified in the runtime's ``sessions``, the
+    per-session framework lock is gone. Any enabled runtime_id can be
+    pinned to any session at any time, and re-pinning to a different
+    vendor swaps cleanly.
     """
     db, path = await _tmp_db(ctx, "cross-pin")
     try:
-        cli_pid = await db.upsert_provider(
-            name="anthropic", framework="claude-cli",
+        ant_pid = await db.upsert_provider(
+            name="anthropic", framework="api-based", api_key="sk-ant",
         )
-        await db.upsert_model(provider_id=cli_pid, model="claude-opus-4-6")
+        await db.upsert_model(provider_id=ant_pid, model="claude-opus-4-6")
         api_pid = await db.upsert_provider(
             name="openai", framework="api-based", api_key="sk-x",
         )
         await db.upsert_model(provider_id=api_pid, model="gpt-4o-mini")
         await db.pin_session_model(
-            "sess-cross", "claude-cli:anthropic:claude-opus-4-6",
+            "sess-cross", "anthropic:claude-opus-4-6",
         )
         assert (
             await db.get_session_pin("sess-cross")
-            == "claude-cli:anthropic:claude-opus-4-6"
+            == "anthropic:claude-opus-4-6"
         )
-        # Swap pin to the other framework: no exception.
+        # Swap pin to the other vendor: no exception.
         await db.pin_session_model("sess-cross", "openai:gpt-4o-mini")
         assert await db.get_session_pin("sess-cross") == "openai:gpt-4o-mini"
     finally:
@@ -193,17 +173,17 @@ async def t_pin_overwrite(ctx: TestContext) -> None:
 async def t_pin_fresh_session(ctx: TestContext) -> None:
     db, path = await _tmp_db(ctx, "fresh-pin")
     try:
-        cli_pid = await db.upsert_provider(
-            name="anthropic", framework="claude-cli",
+        pid = await db.upsert_provider(
+            name="anthropic", framework="api-based", api_key="sk-ant",
         )
-        await db.upsert_model(provider_id=cli_pid, model="claude-sonnet-4-6")
+        await db.upsert_model(provider_id=pid, model="claude-sonnet-4-6")
         assert await db.get_session_pin("fresh") is None
         await db.pin_session_model(
-            "fresh", "claude-cli:anthropic:claude-sonnet-4-6",
+            "fresh", "anthropic:claude-sonnet-4-6",
         )
         assert (
             await db.get_session_pin("fresh")
-            == "claude-cli:anthropic:claude-sonnet-4-6"
+            == "anthropic:claude-sonnet-4-6"
         )
     finally:
         await db.close()
@@ -214,12 +194,12 @@ async def t_pin_fresh_session(ctx: TestContext) -> None:
 async def t_unpin_drops_pin(ctx: TestContext) -> None:
     db, path = await _tmp_db(ctx, "unpin")
     try:
-        cli_pid = await db.upsert_provider(
-            name="anthropic", framework="claude-cli",
+        pid = await db.upsert_provider(
+            name="anthropic", framework="api-based", api_key="sk-ant",
         )
-        await db.upsert_model(provider_id=cli_pid, model="claude-sonnet-4-6")
+        await db.upsert_model(provider_id=pid, model="claude-sonnet-4-6")
         await db.pin_session_model(
-            "sess-unpin", "claude-cli:anthropic:claude-sonnet-4-6",
+            "sess-unpin", "anthropic:claude-sonnet-4-6",
         )
         await db.unpin_session_model("sess-unpin")
         assert await db.get_session_pin("sess-unpin") is None
@@ -228,17 +208,18 @@ async def t_unpin_drops_pin(ctx: TestContext) -> None:
         _cleanup(path)
 
 
-@test("contract", "runtime_id format — api-based = provider:model, claude-cli = claude-cli:provider:model")
+@test("contract", "runtime_id format — always 2-part provider:model (framework arg ignored)")
 async def t_runtime_id_format(ctx: TestContext) -> None:
     from src.models.catalog import build_runtime_model_id
 
     assert build_runtime_model_id("openai", "gpt-4o-mini", "api-based") == "openai:gpt-4o-mini"
     assert (
-        build_runtime_model_id("anthropic", "claude-sonnet-4-6", "claude-cli")
-        == "claude-cli:anthropic:claude-sonnet-4-6"
-    )
-    # the runtime anthropic uses the 2-part form (no claude-cli prefix).
-    assert (
         build_runtime_model_id("anthropic", "claude-sonnet-4-6", "api-based")
+        == "anthropic:claude-sonnet-4-6"
+    )
+    # The framework argument is accepted for signature stability but
+    # ignored — every entry is the 2-part provider:model form.
+    assert (
+        build_runtime_model_id("anthropic", "claude-sonnet-4-6", "made-up-cli")
         == "anthropic:claude-sonnet-4-6"
     )

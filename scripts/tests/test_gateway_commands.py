@@ -4,16 +4,15 @@ Bug history
 -----------
 
 **2026-04-16, v0.5.25**: ``/clear`` only called ``SessionManager.clear_queue``
-— dropped pending messages but left the Claude SDK session id mapping
-intact. Next message from the user arrived with the same bridge session
-id (``tg:<uid>``), ``ClaudeCLI._get_client`` found the stored
-``sdk_session_id``, spawned claude with ``--resume <old>``, and the
-previous transcript came back.
+— dropped pending messages but left the provider's resume session id
+mapping intact. Next message from the user arrived with the same bridge
+session id (``tg:<uid>``), the provider found the stored resume id,
+resumed the prior transcript, and the previous conversation came back.
 
 **2026-04-16, v0.5.26**: introduced ``forget_session`` but
 ``_forget_all_client_sessions`` only iterated ``SessionManager.list_sessions``.
-After an openagent restart that list is empty (RAM-only) while
-``ClaudeCLI._sdk_sessions`` had rehydrated from sqlite, so /clear
+After an openagent restart that list is empty (RAM-only) while the
+provider's session map had rehydrated from sqlite, so /clear
 forgot nothing. v0.5.27 patched it by also iterating the model's
 ``known_session_ids()`` filtered by a bridge prefix.
 
@@ -41,8 +40,8 @@ from ._framework import TestContext, test
 class _FakeModel:
     """Records close_session / forget_session calls so tests can assert.
 
-    ``known_ids`` simulates the provider's hydrated map of session_ids — the
-    real ClaudeCLI populates this from sqlite on startup.
+    ``known_ids`` simulates the provider's hydrated map of session_ids — a
+    real provider populates this from sqlite on startup.
     """
 
     def __init__(self, known_ids: list[str] | None = None) -> None:

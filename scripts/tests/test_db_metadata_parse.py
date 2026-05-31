@@ -360,13 +360,13 @@ async def t_upsert_survives_null_metadata(ctx: TestContext) -> None:
             client_id="client-xyz",
             title="restored",
             model="anthropic:claude-opus-4-7",
-            framework="claude_cli",
+            framework="api-based",
         )
         row = await db.get_session("tg:bad-meta")
         assert row is not None
         assert row["client_id"] == "client-xyz"
         assert row["title"] == "restored"
         assert row["model"] == "anthropic:claude-opus-4-7"
-        assert row["framework"] == "claude_cli"
+        assert row["framework"] == "api-based"
     finally:
         await db.close()

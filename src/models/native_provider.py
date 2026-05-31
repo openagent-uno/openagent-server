@@ -673,10 +673,9 @@ class NativeProvider(BaseModel):
             if provider_name == "google":
                 _set_env_key_once("GEMINI_API_KEY", self._api_key)
 
-        # Only API-based provider rows carry api_keys worth exporting.
-        # claude-cli rows have api_key=NULL by schema. The module-level
-        # dedupe means we only do the providers-list walk on the FIRST
-        # NativeProvider per (config-hash, provider) pair.
+        # API-based provider rows carry the api_keys worth exporting.
+        # The module-level dedupe means we only do the providers-list
+        # walk on the FIRST NativeProvider per (config-hash, provider) pair.
         config_id = id(self._providers_config)
         if config_id not in _PROVIDERS_CONFIG_INJECTED:
             for entry in _iter_provider_entries(self._providers_config):
@@ -875,10 +874,9 @@ class NativeProvider(BaseModel):
     def _provider_config(self) -> dict[str, Any]:
         """Return the API-based provider entry matching this model's vendor.
 
-        v0.12 stores providers as a flat list where the same vendor can
-        appear twice (API-based + claude-cli). NativeProvider only cares
-        about the API-based row — the claude-cli row lives in its own
-        registry. Falls back to the legacy dict-shape for early-boot / tests.
+        v0.12 stores providers as a flat list. NativeProvider resolves
+        the API-based row for this model's vendor. Falls back to the
+        legacy dict-shape for early-boot / tests.
 
         Memoised because providers_config is immutable per instance —
         ``rebuild_routing`` constructs a fresh NativeProvider rather than
@@ -1540,8 +1538,8 @@ class NativeProvider(BaseModel):
         """Stream content deltas via the runtime's native ``stream=True`` path.
 
         Yields raw text strings as they arrive from the LLM. Tool-call
-        events are forwarded to ``on_status`` in the same JSON format
-        used by claude-cli, and image/file artifacts from tool results
+        events are forwarded to ``on_status`` in a normalized JSON
+        format, and image/file artifacts from tool results
         are written to disk and yielded as ``[IMAGE:/path]`` markers.
         On any failure, falls back to :meth:`generate` and yields the
         full content as one chunk so the caller still gets a reply.

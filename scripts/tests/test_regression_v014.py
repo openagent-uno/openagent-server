@@ -3,10 +3,8 @@
 Locks down every fix landed in Phases 1-10 so future churn can't quietly
 undo them:
 
-  - Phase 1: runtime bump (claude_agent SDK adapter import path).
+  - Phase 1: runtime bump (inlined Agent/Team import paths).
   - Phase 2: Framework rename (agno/litellm → api-based) + legacy aliases.
-  - Phase 3: ClaudeCLI shim over the inlined ClaudeAgent with session_data
-    round-trip for SDK session id (resume across restarts).
   - Phase 4: SmartRouter classifier removed; TeamRouterProvider built
     on first dispatch.
   - Phase 5: db.py SDK metadata helpers deleted; back-compat shims left.
@@ -41,75 +39,36 @@ import aiosqlite
 from ._framework import TestContext, test
 
 
-# ── Phase 1 / Phase 0: inlined runtime surface ────────────────────────
-
-
-@test("regression_v014", "inlined runtime surface — Agent + Team + SqliteDb")
-async def t_runtime_surface(ctx: TestContext) -> None:
-    """The runtime primitives the rest of the system depends on must
-    stay importable from their stable paths. A reorganization that
-    moves or renames them without updating consumers would break
-    ``native_provider``, ``dispatcher``, and the subscription-CLI
-    backed agents simultaneously."""
-    from src.core._runner.agent import Agent  # noqa: F401
-    from src.core._runner.team import Team, TeamMode  # noqa: F401
-    from src.memory.store.sqlite import SqliteDb  # noqa: F401
-    from src.models._backed_agent import BaseSubscriptionBackedAgent  # noqa: F401
-    from src.models.claude_agent import ClaudeBackedAgent  # noqa: F401
-    from src.models.codex_agent import CodexBackedAgent  # noqa: F401
-
-    # ``ClaudeBackedAgent`` must inherit from the shared base, which in
-    # turn drives the inlined Agent runtime. Breaking either edge would
-    # silently lose the SDK session-id round-trip in ``session_data``.
-    assert issubclass(ClaudeBackedAgent, BaseSubscriptionBackedAgent), (
-        f"ClaudeBackedAgent must inherit from BaseSubscriptionBackedAgent; "
-        f"got {ClaudeBackedAgent.__mro__}"
-    )
-    assert issubclass(BaseSubscriptionBackedAgent, Agent), (
-        f"BaseSubscriptionBackedAgent must inherit from the inlined Agent "
-        f"runtime; got {BaseSubscriptionBackedAgent.__mro__}"
-    )
-
-
 # ── Phase 2: Framework value collapse ─────────────────────────────────
 
 
-@test("regression_v014", "catalog constants collapsed — api-based + claude-cli + codex-cli")
+@test("regression_v014", "catalog constants collapsed — api-based only")
 async def t_catalog_constants(ctx: TestContext) -> None:
-    """The three framework values are the only LLM-routing discriminators.
-    Legacy aliases preserved for one release so external callers don't
-    crash; new code should reference FRAMEWORK_API_BASED directly.
-
-    codex-cli was added in v0.14.x as the third LLM framework (mirror
-    of claude-cli for the OpenAI Codex CLI / ChatGPT Plus subscription
-    path).
+    """``api-based`` is now the only LLM-routing framework. The
+    claude-cli / codex-cli subscription adapters were removed, so the
+    LLM framework tuple collapses to a single value. Legacy aliases
+    (``agno`` / ``litellm``) are preserved for one release so external
+    callers don't crash; new code should reference FRAMEWORK_API_BASED
+    directly.
     """
     from src.models.catalog import (
         FRAMEWORK_AGNO,
         FRAMEWORK_API_BASED,
-        FRAMEWORK_CLAUDE_CLI,
-        FRAMEWORK_CODEX_CLI,
         FRAMEWORK_LITELLM,
         LLM_FRAMEWORKS,
-        SUBSCRIPTION_CLI_FRAMEWORKS,
         SUPPORTED_FRAMEWORKS,
     )
 
     assert FRAMEWORK_API_BASED == "api-based"
-    assert FRAMEWORK_CLAUDE_CLI == "claude-cli"
-    assert FRAMEWORK_CODEX_CLI == "codex-cli"
     assert FRAMEWORK_AGNO == FRAMEWORK_API_BASED, (
         "FRAMEWORK_AGNO must be a back-compat alias for FRAMEWORK_API_BASED"
     )
     assert FRAMEWORK_LITELLM == FRAMEWORK_API_BASED, (
         "FRAMEWORK_LITELLM must be a back-compat alias for FRAMEWORK_API_BASED"
     )
-    assert LLM_FRAMEWORKS == ("api-based", "claude-cli", "codex-cli")
+    assert LLM_FRAMEWORKS == ("api-based",)
     assert SUPPORTED_FRAMEWORKS == LLM_FRAMEWORKS, (
         "TTS/STT now discriminated by `kind`, not framework value"
-    )
-    assert SUBSCRIPTION_CLI_FRAMEWORKS == ("claude-cli", "codex-cli"), (
-        "SUBSCRIPTION_CLI_FRAMEWORKS groups the two subscription-billed paths"
     )
 
 
@@ -154,7 +113,6 @@ async def t_framework_migration(ctx: TestContext) -> None:
                 [
                     ("openai", "agno", "sk-x", "llm", 1.0, 1.0),
                     ("elevenlabs", "litellm", "el-x", "tts", 1.0, 1.0),
-                    ("anthropic", "claude-cli", None, "llm", 1.0, 1.0),
                 ],
             )
             await conn.execute(
@@ -173,7 +131,7 @@ async def t_framework_migration(ctx: TestContext) -> None:
                 "SELECT DISTINCT framework FROM providers ORDER BY framework"
             )
             frameworks = [r[0] for r in await cur.fetchall()]
-            assert frameworks == ["api-based", "claude-cli"], frameworks
+            assert frameworks == ["api-based"], frameworks
 
             # The legacy session_bindings row carried a runtime_id; the
             # v0.14+ migration folds it into ``pinned_sessions`` and
@@ -197,9 +155,7 @@ async def t_framework_migration(ctx: TestContext) -> None:
             cur = await conn.execute(
                 "SELECT DISTINCT framework FROM providers ORDER BY framework"
             )
-            assert [r[0] for r in await cur.fetchall()] == [
-                "api-based", "claude-cli",
-            ]
+            assert [r[0] for r in await cur.fetchall()] == ["api-based"]
     finally:
         try:
             tmp_db.unlink()
@@ -232,189 +188,6 @@ async def t_upsert_provider_legacy_compat(ctx: TestContext) -> None:
             )
             row = await db.get_provider(pid_litellm)
             assert row["framework"] == "api-based", row["framework"]
-        finally:
-            await db.close()
-    finally:
-        try:
-            tmp_db.unlink()
-        except FileNotFoundError:
-            pass
-
-
-# ── Phase 3: ClaudeBackedAgent session-data round-trip ──────────────
-
-
-@test(
-    "regression_v014",
-    "ClaudeBackedAgent persists SDK session id via session.session_data",
-)
-async def t_claude_backed_agent_roundtrip(ctx: TestContext) -> None:
-    """The whole point of ``ClaudeBackedAgent`` (replacing the v0.14
-    ``PersistentClaudeAgent`` ClaudeAgent subclass) is to survive
-    process restarts AND participate in runtime Teams. The SDK session id
-    must round-trip through ``session.session_data`` so the next boot
-    can ``--resume`` the same SDK subprocess transcript.
-    """
-    from src.models.claude_agent import ClaudeBackedAgent
-
-    class _FakeSession:
-        def __init__(self, sdk_id: str | None = None) -> None:
-            self.session_data: dict[str, Any] | None = (
-                {"sdk_session_id": sdk_id} if sdk_id else None
-            )
-
-    class _FakeDb:
-        """Minimal DB facade: get_session / upsert_session — the only
-        two methods ClaudeBackedAgent calls for SDK-id round-trip.
-        """
-
-        def __init__(self) -> None:
-            self.sessions: dict[str, _FakeSession] = {}
-
-        def get_session(self, *, session_id: str, **kwargs: Any) -> _FakeSession | None:
-            return self.sessions.get(session_id)
-
-        def upsert_session(self, *, session: _FakeSession) -> None:
-            # Track by id by reading the stamped session_data; tests
-            # call upsert manually below to seed.
-            pass
-
-    db = _FakeDb()
-    db.sessions["sess-x"] = _FakeSession(sdk_id="previous-uuid")
-
-    agent = ClaudeBackedAgent(
-        name="t", sdk_model_id="claude-sonnet-4-6", sdk_options={}, db=db,
-    )
-
-    # Hydration pulls the previous SDK id from session_data.
-    agent._hydrate_from_db("sess-x")
-    assert agent._sdk_session_ids.get("sess-x") == "previous-uuid", (
-        "_hydrate_from_db must pull sdk_session_id from session_data"
-    )
-
-    # Now simulate the SDK reporting a NEW session id mid-run.
-    agent._sdk_session_ids["sess-x"] = "new-uuid-xyz"
-    agent._save_to_db("sess-x")
-    assert db.sessions["sess-x"].session_data["sdk_session_id"] == "new-uuid-xyz", (
-        "_save_to_db must write the latest sdk_session_id back into session_data"
-    )
-
-    # Empty session_data should still get populated.
-    db.sessions["sess-y"] = _FakeSession(sdk_id=None)
-    agent._sdk_session_ids["sess-y"] = "fresh-uuid"
-    agent._save_to_db("sess-y")
-    assert db.sessions["sess-y"].session_data == {"sdk_session_id": "fresh-uuid"}
-
-
-@test("regression_v014", "_known_sdk_session_ids_from_db queries agent_data.framework")
-async def t_known_sdk_session_ids(ctx: TestContext) -> None:
-    """Phase 3 swapped the legacy metadata.sdk_session_id query for a
-    framework-typed read of ``agent_data.framework``. The new helper
-    must find rows that the runtime's SqliteDb wrote with
-    framework='claude-agent-sdk'.
-    """
-    from src.memory.db import MemoryDB
-    from src.models.claude_agent import _known_sdk_session_ids_from_db
-
-    tmp_db = ctx.db_path.with_name(f"sdk-{uuid.uuid4().hex[:8]}.db")
-    try:
-        db = MemoryDB(str(tmp_db))
-        await db.connect()
-        try:
-            now = 1.0
-            conn = await db._ensure_connected()
-            # Two Claude SDK sessions + one api-based session.
-            await conn.execute(
-                "INSERT INTO sessions "
-                "(session_id, agent_data, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?)",
-                ("sess-claude-1",
-                 '{"framework": "claude-agent-sdk", "agent_id": "x"}',
-                 now, now),
-            )
-            await conn.execute(
-                "INSERT INTO sessions "
-                "(session_id, agent_data, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?)",
-                ("sess-claude-2",
-                 '{"framework": "claude-agent-sdk", "agent_id": "y"}',
-                 now, now),
-            )
-            await conn.execute(
-                "INSERT INTO sessions "
-                "(session_id, agent_data, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?)",
-                ("sess-api", '{"framework": "external"}', now, now),
-            )
-            await conn.commit()
-
-            ids = _known_sdk_session_ids_from_db(db)
-            assert ids == ["sess-claude-1", "sess-claude-2"], ids
-        finally:
-            await db.close()
-    finally:
-        try:
-            tmp_db.unlink()
-        except FileNotFoundError:
-            pass
-
-
-@test(
-    "regression_v014",
-    "_known_sdk_session_ids_from_db finds ClaudeBackedAgent sessions via session_data.sdk_session_id",
-)
-async def t_sdk_session_lookup_widened(ctx: TestContext) -> None:
-    """``ClaudeBackedAgent`` rows are stored as plain ``Agent`` rows
-    (no ``agent_data.framework = 'claude-agent-sdk'`` marker). They DO
-    write ``session_data.sdk_session_id`` though, and the gateway's
-    ``/clear`` legacy-row fallback must still find them after a cold
-    restart (before ``TeamRouterProvider.known_session_ids`` has been
-    warmed back up).
-    """
-    from src.memory.db import MemoryDB
-    from src.models.claude_agent import _known_sdk_session_ids_from_db
-
-    tmp_db = ctx.db_path.with_name(f"sdkw-{uuid.uuid4().hex[:8]}.db")
-    try:
-        db = MemoryDB(str(tmp_db))
-        await db.connect()
-        try:
-            now = 1.0
-            conn = await db._ensure_connected()
-            # Row A: legacy claude-agent-sdk row (pre-v0.14 marker).
-            await conn.execute(
-                "INSERT INTO sessions "
-                "(session_id, agent_data, session_data, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                ("sess-legacy",
-                 '{"framework": "claude-agent-sdk", "agent_id": "old"}',
-                 None, now, now),
-            )
-            # Row B: new ClaudeBackedAgent row — agent_data has no
-            # framework marker (it's a regular Agent), but the SDK
-            # session id is stamped on session_data.
-            await conn.execute(
-                "INSERT INTO sessions "
-                "(session_id, agent_data, session_data, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                ("sess-backed",
-                 '{"agent_id": "claude-backed"}',
-                 '{"sdk_session_id": "abc-1234-uuid"}',
-                 now, now),
-            )
-            # Row C: plain api-based session — must NOT be picked up.
-            await conn.execute(
-                "INSERT INTO sessions "
-                "(session_id, agent_data, session_data, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                ("sess-api",
-                 '{"framework": "external", "agent_id": "api"}',
-                 '{}', now, now),
-            )
-            await conn.commit()
-
-            ids = _known_sdk_session_ids_from_db(db)
-            assert ids == ["sess-backed", "sess-legacy"], ids
         finally:
             await db.close()
     finally:
@@ -644,39 +417,28 @@ async def t_wire_defers_all_mcps(ctx: TestContext) -> None:
     class _StubModel:
         def __init__(self) -> None:
             self.toolkit_calls: list[Any] = []
-            self.sdk_calls: list[Any] = []
 
         def set_mcp_toolkits(self, toolkits: Any) -> None:
             self.toolkit_calls.append(list(toolkits))
 
-        def set_mcp_servers(self, servers: Any) -> None:
-            self.sdk_calls.append(dict(servers))
-
     class _StubPool:
         def __init__(self) -> None:
             self.api_calls = 0
-            self.sdk_calls = 0
 
         def runtime_toolkits_tool_search_only(self):
             self.api_calls += 1
             return ["<tool-search-toolkit>"]
 
-        def claude_sdk_servers_tool_search_only(self):
-            self.sdk_calls += 1
-            return {"tool-search": {"type": "sdk"}}
-
     model = _StubModel()
     pool = _StubPool()
     wire_model_runtime(model, mcp_pool=pool)
 
-    # The wire layer must call the TOOL-SEARCH-ONLY accessors. If a
-    # regression replaces them with ``runtime_toolkits`` (the full list)
+    # The wire layer must call the TOOL-SEARCH-ONLY accessor. If a
+    # regression replaces it with ``runtime_toolkits`` (the full list)
     # this test catches it because the count check below fails first
     # — but the explicit accessor call is the canary.
     assert pool.api_calls == 1, pool.api_calls
-    assert pool.sdk_calls == 1, pool.sdk_calls
     assert model.toolkit_calls == [["<tool-search-toolkit>"]]
-    assert model.sdk_calls == [{"tool-search": {"type": "sdk"}}]
 
 
 @test("regression_v014", "MCPPool exposes the tool-search-only accessors")
@@ -687,7 +449,6 @@ async def t_pool_tool_search_only(ctx: TestContext) -> None:
         "MCPPool.runtime_toolkits_tool_search_only is required by "
         "wire_model_runtime — adding it back is what closed the gap"
     )
-    assert callable(getattr(MCPPool, "claude_sdk_servers_tool_search_only", None))
     # The budget knobs are still present so legacy callers don't break,
     # but the wire layer no longer consults them.
     assert callable(getattr(MCPPool, "runtime_toolkits_under_budget", None))
@@ -973,19 +734,18 @@ async def t_subprocess_no_semaphore_leak(ctx: TestContext) -> None:
     )
 
 
-# ── Team membership: ClaudeBackedAgent passes Agent typing ─────────
+# ── Team membership: runtime Agent typing ─────────────────────────
 
 
 @test("regression_v014", "Team.members typing still constrains to Agent | Team")
 async def t_team_members_typing(ctx: TestContext) -> None:
     """the runtime's Team.members is typed Union[List[Union[Agent, "Team"]],
-    Callable]. ClaudeBackedAgent works as a member precisely because
-    it inherits from ``runtime ``Agent```` (and not from
-    ``BaseExternalAgent`` like the runtime's ClaudeAgent SDK adapter).
-    If the runtime widened the union to include external agents we'd want to
-    know — the routing-model fallback in team_router.py exists
-    specifically because Team always invokes team.model for the
-    delegation classifier.
+    Callable]. Every team member the dispatcher builds is a plain
+    ``runtime ``Agent```` so it passes Team's ``isinstance(member, Agent)``
+    check. If the runtime widened the union to include external agents
+    we'd want to know — the routing-model wiring in dispatcher.py
+    assumes Team always invokes team.model for the delegation
+    classifier.
     """
     import inspect
     from src.core._runner.team._init import __init__ as team_init
@@ -998,60 +758,34 @@ async def t_team_members_typing(ctx: TestContext) -> None:
     assert "Agent" in annotation and "Team" in annotation
     assert "BaseExternalAgent" not in annotation and "ClaudeAgent" not in annotation, (
         f"Team.members union widened to {annotation}; "
-        f"team_router.py's routing-model fallback may be reconsidered "
+        f"dispatcher.py's routing-model wiring may be reconsidered "
         f"if external agents are now allowed"
     )
 
 
-@test("regression_v014", "ClaudeBackedAgent IS an Agent (Team accepts it as member)")
-async def t_claude_backed_is_agent(ctx: TestContext) -> None:
-    """The whole point of ``ClaudeBackedAgent``: a claude-cli row can
-    participate in an runtime ``Team`` as a member OR as the leader's
-    members[0] slot because it subclasses ``runtime ``Agent```` (and
-    therefore passes Team's ``isinstance(member, Agent)`` check). The
-    earlier ``PersistentClaudeAgent`` (ClaudeAgent / BaseExternalAgent
-    subclass) couldn't.
+@test("regression_v014", "TeamRouterProvider membership catalog is api-based only")
+async def t_team_membership_api_based_only(ctx: TestContext) -> None:
+    """After the claude-cli / codex-cli adapter removal, the only LLM
+    framework is ``api-based``. ``_enabled_llm_models`` must surface the
+    enabled api-based rows so the leader can delegate to them as
+    specialist members.
     """
-    from src.core._runner.agent import Agent
-    from src.models.claude_agent import ClaudeBackedAgent
-
-    agent = ClaudeBackedAgent(
-        name="x", sdk_model_id="claude-sonnet-4-6", sdk_options={},
-    )
-    assert isinstance(agent, Agent), (
-        "ClaudeBackedAgent must subclass Agent so Team accepts it as a member"
-    )
-    # The Agent attribute defaults Team's delegation code reads must
-    # be present. AttributeError on these → Team crashes mid-delegation.
-    for attr in ("knowledge_filters", "num_history_runs", "store_media",
-                 "store_tool_messages", "store_history_messages",
-                 "send_media_to_model", "add_history_to_context"):
-        assert hasattr(agent, attr), (
-            f"ClaudeBackedAgent missing Agent attribute {attr!r} — "
-            f"Team's delegation code will AttributeError"
-        )
-
-
-@test("regression_v014", "TeamRouterProvider includes claude-cli rows as members")
-async def t_team_includes_claude_cli(ctx: TestContext) -> None:
-    """Regression for the v0.14.x refactor: ``_enabled_llm_models``
-    (formerly ``_enabled_api_models``) now returns claude-cli AND
-    api-based rows. If a future change reverts to filtering claude-cli
-    out of the membership catalog, this test catches it.
-    """
-    from src.models.catalog import FRAMEWORK_API_BASED, FRAMEWORK_CLAUDE_CLI, framework_of
+    from src.models.catalog import FRAMEWORK_API_BASED, framework_of
     from src.models.dispatcher import TeamRouterProvider
 
     providers = [
         {
             "id": 1, "name": "openai", "framework": "api-based",
             "api_key": "sk-test", "enabled": True,
-            "models": [{"id": 10, "model": "gpt-4o-mini", "enabled": True}],
+            "models": [
+                {"id": 10, "model": "gpt-4o-mini", "enabled": True},
+                {"id": 11, "model": "gpt-4o", "enabled": True},
+            ],
         },
         {
-            "id": 2, "name": "anthropic", "framework": "claude-cli",
-            "api_key": None, "enabled": True,
-            "models": [{"id": 20, "model": "claude-sonnet-4-6", "enabled": True}],
+            "id": 2, "name": "anthropic", "framework": "api-based",
+            "api_key": "sk-ant", "enabled": True,
+            "models": [{"id": 20, "model": "claude-opus-4-7", "enabled": True}],
         },
     ]
     provider = TeamRouterProvider(
@@ -1060,182 +794,9 @@ async def t_team_includes_claude_cli(ctx: TestContext) -> None:
     )
 
     catalog = provider._enabled_llm_models()
+    runtime_ids = {e.runtime_id for e in catalog}
+    assert runtime_ids == {
+        "openai:gpt-4o-mini", "openai:gpt-4o", "anthropic:claude-opus-4-7",
+    }, runtime_ids
     frameworks = {framework_of(e.runtime_id) for e in catalog}
-    assert FRAMEWORK_API_BASED in frameworks, frameworks
-    assert FRAMEWORK_CLAUDE_CLI in frameworks, (
-        f"_enabled_llm_models missing claude-cli rows: {[e.runtime_id for e in catalog]}"
-    )
-
-
-# ── codex-cli framework (v0.14.x third framework) ───────────────────
-
-
-@test("regression_v014", "CodexBackedAgent IS an Agent (Team accepts it as member)")
-async def t_codex_backed_is_agent(ctx: TestContext) -> None:
-    """``CodexBackedAgent`` is the codex-cli equivalent of
-    ``ClaudeBackedAgent`` — both subclass ``runtime ``Agent```` so they
-    pass the runtime's ``isinstance(member, Agent)`` check AND inherit the
-    attribute defaults Team's delegation code reads.
-    """
-    from src.core._runner.agent import Agent
-    from src.models.codex_agent import CodexBackedAgent
-
-    agent = CodexBackedAgent(
-        name="x", sdk_model_id="gpt-5", sdk_options={},
-    )
-    assert isinstance(agent, Agent), (
-        "CodexBackedAgent must subclass Agent so Team accepts it as a member"
-    )
-    for attr in ("knowledge_filters", "num_history_runs", "store_media",
-                 "store_tool_messages", "store_history_messages",
-                 "send_media_to_model", "add_history_to_context"):
-        assert hasattr(agent, attr), (
-            f"CodexBackedAgent missing Agent attribute {attr!r} — "
-            f"Team's delegation code will AttributeError"
-        )
-
-
-@test("regression_v014", "TeamRouterProvider includes codex-cli rows as members")
-async def t_team_includes_codex_cli(ctx: TestContext) -> None:
-    """``_enabled_llm_models`` accepts api-based, claude-cli, AND
-    codex-cli. A revert to filtering codex-cli out of the membership
-    catalog would break the third-framework feature.
-    """
-    from src.models.catalog import (
-        FRAMEWORK_API_BASED,
-        FRAMEWORK_CODEX_CLI,
-        framework_of,
-    )
-    from src.models.dispatcher import TeamRouterProvider
-
-    providers = [
-        {
-            "id": 1, "name": "openai", "framework": "api-based",
-            "api_key": "sk-test", "enabled": True,
-            "models": [{"id": 10, "model": "gpt-4o-mini", "enabled": True}],
-        },
-        {
-            "id": 2, "name": "openai", "framework": "codex-cli",
-            "api_key": None, "enabled": True,
-            "models": [{"id": 20, "model": "gpt-5", "enabled": True}],
-        },
-    ]
-    provider = TeamRouterProvider(
-        entry_runtime_id="openai:gpt-4o-mini",
-        providers_config=providers,
-    )
-
-    catalog = provider._enabled_llm_models()
-    frameworks = {framework_of(e.runtime_id) for e in catalog}
-    assert FRAMEWORK_API_BASED in frameworks, frameworks
-    assert FRAMEWORK_CODEX_CLI in frameworks, (
-        f"_enabled_llm_models missing codex-cli rows: {[e.runtime_id for e in catalog]}"
-    )
-
-
-@test(
-    "regression_v014",
-    "catalog framework_of / is_codex_cli_model split codex-cli runtime_ids",
-)
-async def t_catalog_codex_helpers(ctx: TestContext) -> None:
-    """Locks the per-runtime_id helpers for codex-cli: ``framework_of``
-    returns ``codex-cli``; ``is_codex_cli_model`` matches both the
-    canonical 3-part form and the legacy shorthand; pricing for any
-    codex-cli runtime_id returns zero (subscription-billed).
-    """
-    from src.models.catalog import (
-        FRAMEWORK_CODEX_CLI,
-        codex_cli_model_spec,
-        framework_of,
-        get_model_pricing,
-        is_codex_cli_model,
-        is_subscription_cli_model,
-        split_runtime_id,
-    )
-
-    canonical = "codex-cli:openai:gpt-5"
-    legacy_short = "codex-cli/gpt-5"
-    plain_codex = "codex-cli"
-    api = "openai:gpt-5"
-
-    assert framework_of(canonical) == FRAMEWORK_CODEX_CLI
-    assert framework_of(legacy_short) == FRAMEWORK_CODEX_CLI
-    assert framework_of(plain_codex) == FRAMEWORK_CODEX_CLI
-    assert framework_of(api) == "api-based"
-
-    assert is_codex_cli_model(canonical)
-    assert is_codex_cli_model(legacy_short)
-    assert is_codex_cli_model(plain_codex)
-    assert not is_codex_cli_model(api)
-    assert not is_codex_cli_model("claude-cli:anthropic:claude-sonnet-4-6")
-
-    assert is_subscription_cli_model(canonical)
-    assert is_subscription_cli_model("claude-cli:anthropic:claude-sonnet-4-6")
-    assert not is_subscription_cli_model(api)
-
-    # codex_cli_model_spec builds canonical 3-part form.
-    assert codex_cli_model_spec("gpt-5") == canonical
-
-    # split_runtime_id handles the codex-cli prefix correctly.
-    assert split_runtime_id(canonical) == ("openai", "gpt-5")
-    assert split_runtime_id("codex-cli:openai:gpt-5") == ("openai", "gpt-5")
-
-    # Subscription-billed → zero pricing for any codex-cli model.
-    pricing = get_model_pricing(canonical)
-    assert pricing == {
-        "input_cost_per_million": 0.0,
-        "output_cost_per_million": 0.0,
-    }, pricing
-
-
-@test(
-    "regression_v014",
-    "upsert_provider accepts codex-cli for openai with no api_key",
-)
-async def t_upsert_codex_cli_provider(ctx: TestContext) -> None:
-    """``framework='codex-cli'`` providers MUST be ``name='openai'`` AND
-    carry ``api_key=None`` (auth flows through ChatGPT subscription).
-    """
-    from src.memory.db import MemoryDB
-
-    tmp_db = ctx.db_path.with_name(f"cdxups-{uuid.uuid4().hex[:8]}.db")
-    try:
-        db = MemoryDB(str(tmp_db))
-        await db.connect()
-        try:
-            # Happy path: openai + codex-cli + no api_key.
-            pid = await db.upsert_provider(
-                name="openai", framework="codex-cli", api_key=None,
-            )
-            row = await db.get_provider(pid)
-            assert row["framework"] == "codex-cli", row["framework"]
-            assert row["name"] == "openai", row["name"]
-
-            # Bad path: api_key set → reject (would poison the subprocess).
-            raised = False
-            try:
-                await db.upsert_provider(
-                    name="openai", framework="codex-cli", api_key="sk-x",
-                )
-            except ValueError as e:
-                raised = True
-                assert "codex-cli" in str(e) and "api_key" in str(e), str(e)
-            assert raised
-
-            # Bad path: wrong vendor name → reject.
-            raised = False
-            try:
-                await db.upsert_provider(
-                    name="anthropic", framework="codex-cli", api_key=None,
-                )
-            except ValueError as e:
-                raised = True
-                assert "openai" in str(e), str(e)
-            assert raised
-        finally:
-            await db.close()
-    finally:
-        try:
-            tmp_db.unlink()
-        except FileNotFoundError:
-            pass
+    assert frameworks == {FRAMEWORK_API_BASED}, frameworks

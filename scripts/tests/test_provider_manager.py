@@ -68,17 +68,17 @@ async def t_add_provider(ctx: TestContext) -> None:
         assert zai is not None
         assert zai["has_api_key"] is True
 
-        # claude-cli providers reject api_key at the MCP layer (same
-        # contract as the DB layer) — exercises the v0.11 sentinel
-        # regression guard.
+        # An unknown framework is rejected at the MCP layer (same contract
+        # as the DB layer): ``api-based`` is the only shipped framework.
         raised = False
         try:
             await mgr.add_provider(
-                "anthropic", framework="claude-cli", api_key="claude-cli",
+                "anthropic", framework="made-up-cli", api_key="x",
             )
-        except ValueError:
+        except ValueError as e:
             raised = True
-        assert raised, "claude-cli provider must reject api_key"
+            assert "invalid framework" in str(e).lower()
+        assert raised, "add_provider must reject an unknown framework"
 
         # remove_provider deletes the DB row.
         await mgr.remove_provider(provider_id)
@@ -107,12 +107,11 @@ async def t_add_provider(ctx: TestContext) -> None:
             pass
 
 
-@test("provider_manager", "claude-cli discovery lists Anthropic models from OpenRouter w/o pricing")
-async def t_claude_cli_fallback(ctx: TestContext) -> None:
-    """When the user asks for the claude-cli "provider" list, we surface
-    the Anthropic catalog from OpenRouter (the picker) but with pricing
-    stripped — claude-cli is billed via Pro/Max subscription, never per
-    token. Uses a canned OpenRouter response so the test is hermetic."""
+@test("provider_manager", "discovery lists a vendor's models from the OpenRouter catalog")
+async def t_discovery_lists_vendor_models(ctx: TestContext) -> None:
+    """``discovery.list_provider_models`` surfaces a vendor's catalog from
+    OpenRouter (the model picker), carrying whatever pricing OpenRouter
+    reports. Uses a canned OpenRouter response so the test is hermetic."""
     import time
     from src.models import discovery
 
@@ -128,9 +127,7 @@ async def t_claude_cli_fallback(ctx: TestContext) -> None:
         ids = {e["id"] for e in entries}
         assert "claude-sonnet-4.5" in ids, ids
         assert "claude-opus-4.6" in ids, ids
-        # The entries carry pricing — claude-cli's cost exclusion happens
-        # in catalog.get_model_pricing, not in discovery. This test
-        # documents the split: discovery surfaces whatever OpenRouter has.
+        # discovery surfaces whatever OpenRouter has, pricing included.
         assert any(e.get("output_cost_per_million") for e in entries)
     finally:
         discovery._OPENROUTER_CACHE = prev

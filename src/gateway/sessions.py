@@ -6,8 +6,7 @@ in order, but different sessions on the same client run in parallel.
 This matches the user-facing model where two chat tabs in the app (or
 two telegram users multiplexed onto one bridge client) shouldn't block
 each other — prior to this design all messages from a client serialised
-through a single queue, defeating the per-session locks in ClaudeCLI
-and NativeProvider.
+through a single queue, defeating the per-session locks in NativeProvider.
 
 Stop/clear semantics stay session-scoped: ``/stop`` from one tab
 cancels only that tab's in-flight turn; the legacy unscoped form used

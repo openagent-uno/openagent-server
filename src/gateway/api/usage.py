@@ -56,8 +56,8 @@ async def handle_pricing(request: web.Request) -> web.Response:
         return _web.json_response({"pricing": {}})
 
     # get_model_pricing no longer consults providers_config (it resolves
-    # via OpenRouter / the claude-cli subscription short-circuit), so we
-    # don't need to materialise the DB catalog just to hand it in.
+    # via OpenRouter), so we don't need to materialise the DB catalog
+    # just to hand it in.
     summary = await db.get_usage_summary()
     pricing = {
         model_id: get_model_pricing(model_id)

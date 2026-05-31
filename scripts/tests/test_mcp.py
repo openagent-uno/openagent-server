@@ -170,9 +170,7 @@ async def t_pool_tool_budget(ctx: TestContext) -> None:
     tools for the provider's cap, drop subprocess MCPs alphabetically
     until they fit, but never drop in-process MCPs (especially
     ``tool-search``, which is the model's only way back to the
-    trimmed ones). Both the runtime and Claude SDK views must agree on what's
-    kept — symmetry is the whole reason this lives in the pool, not
-    in two parallel provider implementations.
+    trimmed ones).
     """
     from src.mcp.pool import MCPPool
 
@@ -193,34 +191,26 @@ async def t_pool_tool_budget(ctx: TestContext) -> None:
     )
     await pool.connect_all()
     try:
-        # Budget so tight only in-process fits → both views should keep
-        # tool-search + shell, drop every subprocess MCP.
+        # Budget so tight only in-process fits → keep tool-search + shell,
+        # drop every subprocess MCP.
         in_process_count = (
             pool._tool_counts.get("tool-search", 0)
             + pool._tool_counts.get("shell", 0)
         )
         runtime_subset = pool.runtime_toolkits_under_budget(in_process_count)
-        sdk_subset = pool.claude_sdk_servers_under_budget(in_process_count)
         runtime_names = {pool._toolkit_name(tk) for tk in runtime_subset}
         assert runtime_names == {"tool-search", "shell"}, (
             f"runtime tight budget kept the wrong set: {runtime_names}"
-        )
-        assert set(sdk_subset) == {"tool-search", "shell"}, (
-            f"sdk tight budget kept the wrong set: {set(sdk_subset)}"
         )
 
         # Generous budget should keep everything we explicitly added.
         # ``from_config`` may merge in additional defaults — assert subset
         # so the test stays robust to that.
         runtime_full = pool.runtime_toolkits_under_budget(10_000)
-        sdk_full = pool.claude_sdk_servers_under_budget(10_000)
         runtime_full_names = {pool._toolkit_name(tk) for tk in runtime_full}
         expected = {"tool-search", "shell", "scheduler", "mcp-manager", "workflow-manager"}
         assert expected <= runtime_full_names, (
             f"generous runtime budget dropped something: {expected - runtime_full_names}"
-        )
-        assert expected <= set(sdk_full), (
-            f"generous sdk budget dropped something: {expected - set(sdk_full)}"
         )
 
         # ``budget < 0`` is the legacy bypass — should equal the unfiltered view.

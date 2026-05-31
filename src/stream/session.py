@@ -148,7 +148,7 @@ class StreamSession:
         # in-flight turn; the runner flips ``_current_turn_started`` on
         # the FIRST event from ``agent.run_stream`` (the engagement
         # signal — soonest reliable indicator that the prompt reached
-        # the provider, post claude-cli spawn / runtime arun). Cancels
+        # the provider, post runtime arun). Cancels
         # before that point salvage the input back into the burst;
         # cancels after take the partial-commit path.
         self._current_turn_msg: TextFinal | None = None

@@ -11,21 +11,14 @@ It owns two complementary responsibilities, colocated for clarity:
 - :class:`TeamRouterProvider` — for one entry runtime_id, builds a
   runtime ``Team(mode=coordinate)`` per session whose leader is that entry
   model and whose members are every OTHER enabled LLM model in the
-  catalog (api-based AND subscription-CLI). The runtime's TeamMode.coordinate
+  catalog. The runtime's TeamMode.coordinate
   lets the leader fire MULTIPLE ``delegate_task_to_member`` tool calls
   per turn — the runtime gathers them with ``asyncio.gather``, so
   independent sub-tasks run in parallel. The leader then synthesizes
   the member outputs into the final user-facing reply.
 
-  When the entry model is claude-cli / codex-cli, ``team.model`` (the
-  routing classifier the runtime calls to pick the next member) is the
-  cheapest available api-based model. With no api-based model in the
-  catalog, the leader runs as a single agent via
-  :class:`_SingleExternalAgentAdapter`.
-
-History is unified in the runtime's sessions SqliteDb across every
-framework, so there's no longer a need to lock a session to one
-framework once it's been served by that side.
+History is unified in the runtime's sessions SqliteDb, so there's no
+need to lock a session to one framework once it's been served.
 
 ``SmartRouter`` (the pre-rename name) stays available as an alias at
 the bottom of this module for transitional compatibility with tests
@@ -40,21 +33,14 @@ from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 from src.core.logging import elog
-from src.models._backed_agent import (
-    _last_user_prompt,
-)
 from src.models.base import BaseModel, ModelResponse
 from src.models.budget import BudgetTracker
 from src.models.catalog import (
     CatalogModel,
     FRAMEWORK_API_BASED,
-    FRAMEWORK_CLAUDE_CLI,
-    FRAMEWORK_CODEX_CLI,
     FULL_SESSION_HISTORY_RUNS,
     RUNTIME_SESSION_USER_ID,
-    SUBSCRIPTION_CLI_FRAMEWORKS,
     framework_of,
-    is_subscription_cli_model,
     iter_configured_models,
 )
 from src.models.runtime import wire_model_runtime
@@ -65,6 +51,34 @@ logger = logging.getLogger(__name__)
 # ════════════════════════════════════════════════════════════════════
 #  Module-level helpers (shared by TeamRouterProvider + fallback)
 # ════════════════════════════════════════════════════════════════════
+
+
+def _last_user_prompt(messages: list[dict[str, Any]] | None) -> str:
+    """Render the latest user turn as a plain string for ``arun``.
+
+    The runtime owns persisted history, so we only push the LATEST user
+    message; earlier turns are replayed from the sessions store. Content
+    blocks (text, image_url) are flattened to their text portions — image
+    parts are dropped because ``arun``'s prompt arg accepts only text.
+    """
+    for msg in reversed(messages or []):
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for part in content:
+                if isinstance(part, str):
+                    parts.append(part)
+                elif isinstance(part, dict) and part.get("type") == "text":
+                    text = part.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+            return " ".join(p for p in parts if p)
+        return str(content) if content is not None else ""
+    return ""
 
 
 def _runtime_db_path(db: Any) -> str | None:
@@ -135,8 +149,8 @@ def _member_identifier(runtime_id: str) -> str:
 
     The runtime's ``get_member_id`` runs the agent's ``name`` (when no explicit
     id is set) through ``url_safe_string`` — which strips colons. Feeding
-    it a colon-laden ``specialist:claude-cli:anthropic:claude-opus-4.7``
-    collapses the id to ``specialistclaude-clianthropicclaude-opus-4.7``
+    it a colon-laden ``specialist:anthropic:claude-opus-4.7``
+    collapses the id to ``specialistanthropicclaude-opus-4.7``
     while the system message still surfaces the original name, so the
     leader LLM sees two divergent identifiers for the same member and
     hallucinates placeholder ids when delegating.
@@ -145,13 +159,6 @@ def _member_identifier(runtime_id: str) -> str:
     swap yields an id that matches the name byte-for-byte.
     """
     return runtime_id.replace(":", "-")
-
-
-# Heuristic keywords for "cheapest" routing-model selection when the
-# entry is a claude-cli row. Order matters: earlier matches win.
-_CHEAP_HEURISTIC_KEYWORDS: tuple[str, ...] = (
-    "cheap", "fast", "mini", "nano", "haiku", "small", "lite", "flash",
-)
 
 
 def _extract_delegated_member_id(tool_call: Any) -> str | None:
@@ -190,11 +197,10 @@ async def _arun_runtime_collect(
     mode and translate the resulting ``RunOutput`` into the
     ``ModelResponse`` shape the surrounding pipeline expects.
 
-    Shared by ``TeamRouterProvider.generate`` (multi-model Team path)
-    and ``_SingleExternalAgentAdapter.generate`` (single-agent
-    fallback) — both call ``runtime.arun(prompt, stream=False)`` and
-    funnel the same five fields (content, tool names, input/output
-    tokens, model) into ``ModelResponse``.
+    Used by ``TeamRouterProvider.generate`` (the Team path) — it calls
+    ``runtime.arun(prompt, stream=False)`` and funnels the same five
+    fields (content, tool names, input/output tokens, model) into
+    ``ModelResponse``.
 
     Media kwargs (``files``/``images``/``audio``/``videos``) are
     forwarded to ``runtime.arun(..., files=..., images=..., ...)``.
@@ -259,8 +265,7 @@ async def _arun_runtime_stream(
     and yield string deltas, optionally surfacing tool-call status
     pings via ``on_status``.
 
-    Shared by ``TeamRouterProvider.stream`` and
-    ``_SingleExternalAgentAdapter.stream`` — both call
+    Used by ``TeamRouterProvider.stream`` — it calls
     ``runtime.arun(prompt, stream=True)``.
 
     Critical: the runtime publishes ``RunContentEvent`` / ``ToolCallStartedEvent``
@@ -401,24 +406,14 @@ class TeamRouterProvider(BaseModel):
 
     The team includes:
 
-    - **Leader**: the entry model for the session (api-based OR
-      claude-cli — both can drive the conversation). When the leader
-      is claude-cli, ``team.model`` is the cheapest enabled api-based
-      model in the catalog if any exists; otherwise it's a
-      ``ClaudeSdkRoutingModel`` wrapping the cheapest enabled claude-cli
-      model. The claude-cli ``ClaudeBackedAgent`` sits as ``members[0]``
-      so the routing model can still delegate to it.
-    - **Members**: every OTHER enabled LLM model in the DB. Each
-      member is a runtime ``Agent`` (api-based via ``NativeProvider``)
-      or ``ClaudeBackedAgent`` (claude-cli) whose ``role`` comes from
-      the DB row's ``tier_hint``.
+    - **Leader**: the entry model for the session. ``team.model`` (the
+      routing classifier) is the leader's own model.
+    - **Members**: every OTHER enabled LLM model in the DB. Each member
+      is a runtime ``Agent`` (api-based via ``NativeProvider``) whose
+      ``role`` comes from the DB row's ``tier_hint``.
 
     When there's no other enabled LLM model (single-model deployment),
-    the team is skipped and the leader runs as a single agent. Per
-    vision §3 — any registered model can serve as the router, so the
-    null-routing fallback that used to fire when only subscription-CLI
-    models were enabled no longer applies; a ``ClaudeSdkRoutingModel``
-    is built from the cheapest claude-cli row instead.
+    the team is skipped and the leader runs as a single agent.
     """
 
     history_mode = "platform"
@@ -451,10 +446,6 @@ class TeamRouterProvider(BaseModel):
         # prefers this over the entry pick so the chat badge shows the
         # specialist that actually wrote the response, not the leader.
         self._last_delegation_by_session: dict[str, str] = {}
-        # Cached routing classifier model for subscription-CLI leaders.
-        # Invalidated by ``rebuild_routing``.
-        self._cached_routing_model: Any = None
-        self._cached_routing_model_built: bool = False
 
     @property
     def model(self) -> str | None:
@@ -500,36 +491,27 @@ class TeamRouterProvider(BaseModel):
 
     def _invalidate_session_cache(self) -> None:
         """Clear all per-session caches so the next turn rebuilds from
-        the current db / pool / providers_config. Also invalidates the
-        routing-classifier cache since the catalog may have changed.
+        the current db / pool / providers_config.
         """
         self._session_runtime.clear()
         self._session_system_key.clear()
         self._session_member_map.clear()
         self._last_delegation_by_session.clear()
-        self._cached_routing_model = None
-        self._cached_routing_model_built = False
 
     # ── catalog → runtime objects ─────────────────────────────────────
 
     def _enabled_llm_models(self) -> list[CatalogModel]:
-        """Return every enabled LLM model — api-based AND every
-        subscription-CLI framework (claude-cli, codex-cli).
+        """Return every enabled api-based LLM model.
 
-        Both subscription-CLI flavors join via an ``Agent`` subclass
-        (``ClaudeBackedAgent`` / ``CodexBackedAgent``) so they pass
-        the runtime's ``isinstance(member, Agent)`` check and can serve
-        as Team members or leaders.
+        Each joins the Team as a runtime ``Agent`` (via ``NativeProvider``)
+        so it passes the runtime's ``isinstance(member, Agent)`` check and
+        can serve as a Team member or leader.
         """
         out: list[CatalogModel] = []
         for entry in iter_configured_models(self._providers_config):
             if entry.disabled:
                 continue
-            if framework_of(entry.runtime_id) not in (
-                FRAMEWORK_API_BASED,
-                FRAMEWORK_CLAUDE_CLI,
-                FRAMEWORK_CODEX_CLI,
-            ):
+            if framework_of(entry.runtime_id) != FRAMEWORK_API_BASED:
                 continue
             out.append(entry)
         return out
@@ -581,60 +563,6 @@ class TeamRouterProvider(BaseModel):
             markdown=False,
         )
 
-    def _build_subscription_agent_for(
-        self,
-        entry: CatalogModel,
-        *,
-        name: str,
-        role: str | None,
-        system: str | None = None,
-    ) -> Any:
-        """Construct a subscription-CLI Agent (``ClaudeBackedAgent`` or
-        ``CodexBackedAgent``) for ``entry``.
-
-        Routes by ``entry.runtime_id``'s framework prefix. Claude grabs
-        an MCP-server fan-out from the pool (its SDK accepts
-        ``mcp_servers``); Codex doesn't (its built-in tools live in the
-        CLI binary, sandboxed by ``approval_mode``).
-
-        ``system`` is forwarded as the SDK's system prompt — Claude
-        Code SDK reads it as ``system_prompt``, Codex SDK as
-        ``developer_instructions``. See ``_build_api_agent_for`` for
-        why per-agent injection is non-negotiable (vision §15).
-        """
-        framework = framework_of(entry.runtime_id)
-        if framework == FRAMEWORK_CLAUDE_CLI:
-            from src.models.claude_agent import build_claude_backed_agent
-
-            mcp_servers: dict[str, dict] = {}
-            if self._mcp_pool is not None:
-                try:
-                    mcp_servers = dict(self._mcp_pool.claude_sdk_servers_tool_search_only())
-                except Exception as e:  # noqa: BLE001
-                    logger.debug(
-                        "team_router: claude_sdk_servers_tool_search_only: %s", e,
-                    )
-                    mcp_servers = {}
-            return build_claude_backed_agent(
-                name=name,
-                model_id=entry.model_id,
-                mcp_servers=mcp_servers or None,
-                db=self._db,
-                role=role,
-                system=system,
-            )
-
-        # Codex — no MCP wiring, its tools live in the CLI binary.
-        from src.models.codex_agent import build_codex_backed_agent
-
-        return build_codex_backed_agent(
-            name=name,
-            model_id=entry.model_id,
-            db=self._db,
-            role=role,
-            system=system,
-        )
-
     def _build_agent_for(
         self,
         entry: CatalogModel,
@@ -643,132 +571,22 @@ class TeamRouterProvider(BaseModel):
         role: str | None,
         system: str | None = None,
     ) -> Any:
-        """Route to api-based / subscription-CLI builder by framework."""
-        if framework_of(entry.runtime_id) in SUBSCRIPTION_CLI_FRAMEWORKS:
-            return self._build_subscription_agent_for(
-                entry, name=name, role=role, system=system,
-            )
+        """Build a runtime ``Agent`` for ``entry``.
+
+        The per-framework member-build seam — currently only the
+        ``api-based`` framework ships, so this delegates straight to
+        ``_build_api_agent_for``.
+        """
         return self._build_api_agent_for(
             entry, name=name, role=role, system=system,
-        )
-
-    def _choose_routing_model(self, catalog: list[CatalogModel]) -> Any | None:
-        """Pick a runtime ``Model`` to serve as ``team.model``.
-
-        The runtime's Team always invokes ``team.model`` to decide which
-        member handles the turn. For api-based leaders the leader's own
-        model is used; this helper supplies the routing model for
-        subscription-CLI leaders (Claude SDK).
-
-        Order:
-          1. The cheapest enabled api-based model in catalog (preferred —
-             cheap classifiers minimise routing cost).
-          2. The cheapest enabled claude-cli model, wrapped in a
-             ``ClaudeSdkRoutingModel`` (vision §3: any registered model
-             can serve as the router, including subscription-CLI ones).
-          3. ``None`` if neither exists (single-agent fallback).
-
-        Cached on the provider instance until ``rebuild_routing`` fires
-        — the chosen routing model is invariant for a fixed catalog
-        across sessions, so building it per-session was waste.
-        """
-        if self._cached_routing_model_built:
-            return self._cached_routing_model
-
-        def _score(entry: CatalogModel) -> int:
-            """Lower score = cheaper. Heuristic-tier keyword in the row
-            beats no keyword; model_id keyword beats tier_hint
-            keyword (the id is more specific).
-            """
-            hint = (entry.tier_hint or "").lower()
-            mid = (entry.model_id or "").lower()
-            for i, kw in enumerate(_CHEAP_HEURISTIC_KEYWORDS):
-                if kw in mid:
-                    return i
-                if kw in hint:
-                    return len(_CHEAP_HEURISTIC_KEYWORDS) + i
-            return len(_CHEAP_HEURISTIC_KEYWORDS) * 2
-
-        api_rows = [
-            e for e in catalog
-            if framework_of(e.runtime_id) == FRAMEWORK_API_BASED
-        ]
-        if api_rows:
-            chosen = min(api_rows, key=_score)
-            from src.models.native_provider import NativeProvider
-            try:
-                provider = NativeProvider(
-                    model=chosen.runtime_id,
-                    providers_config=self._providers_config,
-                    db_path=_runtime_db_path(self._db),
-                )
-                self._cached_routing_model = provider.build_runtime_model()
-            except Exception as e:  # noqa: BLE001
-                logger.debug("_choose_routing_model: api-based build failed for %s: %s",
-                             chosen.runtime_id, e)
-                self._cached_routing_model = None
-            self._cached_routing_model_built = True
-            return self._cached_routing_model
-
-        claude_rows = [
-            e for e in catalog
-            if framework_of(e.runtime_id) == FRAMEWORK_CLAUDE_CLI
-        ]
-        if claude_rows:
-            chosen = min(claude_rows, key=_score)
-            try:
-                self._cached_routing_model = self._build_claude_sdk_routing_model(chosen)
-            except Exception as e:  # noqa: BLE001
-                logger.debug("_choose_routing_model: claude-cli build failed for %s: %s",
-                             chosen.runtime_id, e)
-                self._cached_routing_model = None
-            self._cached_routing_model_built = True
-            return self._cached_routing_model
-
-        self._cached_routing_model = None
-        self._cached_routing_model_built = True
-        return None
-
-    def _build_claude_sdk_routing_model(self, entry: CatalogModel) -> Any:
-        """Build a ``ClaudeSdkRoutingModel`` for ``entry`` (a claude-cli row).
-
-        The SDK gets the tool-search MCP from the pool (so the team
-        coordinator turn can reach MCP tools through tool-search the
-        same way the leader does) and the runtime tools the Team's
-        coordinator wants (``delegate_task_to_member``, ...) bridged
-        per-call inside ``aresponse_stream``.
-        """
-        from src.models.claude_agent import _sanitize_claude_model_id
-        from src.models.claude_routing_model import ClaudeSdkRoutingModel
-
-        extra_servers: dict[str, Any] = {}
-        if self._mcp_pool is not None:
-            try:
-                extra_servers = dict(
-                    self._mcp_pool.claude_sdk_servers_tool_search_only()
-                )
-            except Exception as e:  # noqa: BLE001
-                logger.debug(
-                    "_build_claude_sdk_routing_model: mcp pool fetch: %s", e,
-                )
-                extra_servers = {}
-
-        sdk_model_id = _sanitize_claude_model_id(entry.model_id) or "default"
-        return ClaudeSdkRoutingModel(
-            id=entry.runtime_id,
-            provider=FRAMEWORK_CLAUDE_CLI,
-            sdk_model_id=sdk_model_id,
-            extra_mcp_servers=extra_servers or None,
         )
 
     def _ensure_runtime(self, session_id: str, system: str | None) -> Any:
         """Return the cached Team / single-agent for ``session_id``, building
         it when absent.
 
-        Skips the team build when:
-        - There's only one enabled LLM model (single-model deployment).
-        - The entry model is claude-cli AND no api-based model exists
-          to serve as ``team.model`` for the routing classifier.
+        Skips the team build when there's only one enabled LLM model
+        (single-model deployment) — the lone leader runs as a single agent.
 
         Cache key is ``(session_id, system_hash)`` so changing the
         framework prompt mid-session forces a fresh build instead of
@@ -796,13 +614,11 @@ class TeamRouterProvider(BaseModel):
 
         members_catalog = [e for e in catalog if e.runtime_id != entry.runtime_id]
         entry_framework = framework_of(entry.runtime_id)
-        is_subscription_leader = entry_framework in SUBSCRIPTION_CLI_FRAMEWORKS
 
         # No other LLM model to delegate to — a Team of one is degenerate
-        # (nothing to route TO). Skip Team in both flavors:
-        # - api-based leader → single-agent dispatch via NativeProvider.
-        # - subscription-CLI leader → single-external-agent fallback below.
-        if not members_catalog and not is_subscription_leader:
+        # (nothing to route TO). Skip Team and dispatch the lone leader as
+        # a single agent via NativeProvider.
+        if not members_catalog:
             from src.models.native_provider import NativeProvider
 
             provider = NativeProvider(
@@ -824,52 +640,12 @@ class TeamRouterProvider(BaseModel):
             )
             return provider
 
-        # Resolve ``team.model``. For api-based leader: the leader's own
-        # model. For subscription-CLI leader (claude-cli / codex-cli):
-        # the cheapest available api-based model (Team always invokes
-        # team.model for routing decisions — the subscription-CLI
-        # agent's ``_NullModel`` placeholder can't satisfy that).
-        leader_agent: Any
-        team_model: Any
-
-        if is_subscription_leader:
-            # Single-model subscription-CLI deployment: skip Team — a
-            # 1-member team is degenerate (the leader can't delegate to
-            # anyone). Fall back to single-external-agent dispatch so
-            # the lone agent still carries the OpenAgent framework
-            # prompt + user persona (vision §15).
-            single_model_fallback = not members_catalog
-            team_model = None if single_model_fallback else self._choose_routing_model(catalog)
-            if team_model is None:
-                fallback_agent = self._build_agent_for(
-                    entry,
-                    name=_member_identifier(entry.runtime_id),
-                    role=None,
-                    system=system,
-                )
-                fallback = _SingleExternalAgentAdapter(
-                    fallback_agent,
-                    entry_runtime_id=entry.runtime_id,
-                    session_handles=self._session_handles,
-                )
-                self._session_runtime[session_id] = fallback
-                self._session_system_key[session_id] = sys_key
-                elog(
-                    "team_router.single_external_agent",
-                    session_id=session_id,
-                    entry=entry.runtime_id,
-                    framework=entry_framework,
-                    reason="single_model" if single_model_fallback else "no_routing_model",
-                )
-                return fallback
-            leader_agent = self._build_agent_for(
-                entry, name="leader", role=None, system=system,
-            )
-        else:
-            leader_agent = self._build_api_agent_for(
-                entry, name="leader", role=None, system=system,
-            )
-            team_model = leader_agent.model
+        # Resolve ``team.model`` — the leader's own model (the Team always
+        # invokes team.model for routing decisions).
+        leader_agent = self._build_api_agent_for(
+            entry, name="leader", role=None, system=system,
+        )
+        team_model = leader_agent.model
 
         # Multi-model: build Team(mode=coordinate). See the ``mode=``
         # kwarg below for why coordinate (not route).
@@ -1147,102 +923,6 @@ class TeamRouterProvider(BaseModel):
             yield delta
 
 
-class _SingleExternalAgentAdapter(BaseModel):
-    """``BaseModel`` shim around a single subscription-CLI ``Agent``.
-
-    Used when the entry model is claude-cli / codex-cli AND no
-    api-based model exists to serve as ``team.model`` for the routing
-    classifier — we skip Team entirely and drive the agent (a
-    ``ClaudeBackedAgent`` or ``CodexBackedAgent``) directly. Exposes
-    the ``generate`` / ``stream`` interface the surrounding pipeline
-    expects.
-    """
-
-    history_mode = "platform"
-
-    def __init__(
-        self,
-        agent: Any,
-        *,
-        entry_runtime_id: str,
-        session_handles: dict[str, str],
-    ) -> None:
-        self._agent = agent
-        self._entry_runtime_id = entry_runtime_id
-        self._session_handles = session_handles
-
-    @property
-    def model(self) -> str | None:
-        return self._entry_runtime_id
-
-    async def generate(
-        self,
-        messages: list[dict[str, Any]],
-        system: str | None = None,
-        tools: list[dict[str, Any]] | None = None,
-        on_status: Callable[[str], Awaitable[None]] | None = None,
-        session_id: str | None = None,
-        model_override: str | None = None,
-        files: list[Any] | None = None,
-        images: list[Any] | None = None,
-        audio: list[Any] | None = None,
-        videos: list[Any] | None = None,
-    ) -> ModelResponse:
-        sid = session_id or "default"
-        # Stable sessions-row owner for every surface (see catalog.py);
-        # tenancy is carried by ``session_id``, not this column, so the
-        # runtime can always read/write the row regardless of which
-        # handle (if any) the gateway bound to the session.
-        user_id = RUNTIME_SESSION_USER_ID
-        # All media kwargs flow through ``_arun_runtime_collect`` straight
-        # into the runtime's ``arun(files=..., images=..., ...)``. For
-        # subscription-CLI runtimes (claude-cli / codex-cli)
-        # ``_arun_stream`` translates them to inline text + sandbox-safe
-        # file writes. For native runtimes, the runtime consumes them as
-        # multimodal API content. Same shape, different consumers.
-        prompt = _last_user_prompt(messages)
-        return await _arun_runtime_collect(
-            self._agent,
-            prompt=prompt,
-            session_id=sid,
-            user_id=user_id,
-            error_event="team_router.single_external.generate_error",
-            entry_runtime_id=self._entry_runtime_id,
-            files=files, images=images, audio=audio, videos=videos,
-        )
-
-    async def stream(
-        self,
-        messages: list[dict[str, Any]],
-        system: str | None = None,
-        tools: list[dict[str, Any]] | None = None,
-        on_status: Callable[[str], Awaitable[None]] | None = None,
-        session_id: str | None = None,
-        model_override: str | None = None,
-        files: list[Any] | None = None,
-        images: list[Any] | None = None,
-        audio: list[Any] | None = None,
-        videos: list[Any] | None = None,
-    ) -> AsyncIterator[str]:
-        sid = session_id or "default"
-        # Stable sessions-row owner for every surface (see catalog.py);
-        # tenancy is carried by ``session_id``, not this column, so the
-        # runtime can always read/write the row regardless of which
-        # handle (if any) the gateway bound to the session.
-        user_id = RUNTIME_SESSION_USER_ID
-        prompt = _last_user_prompt(messages)
-        async for delta in _arun_runtime_stream(
-            self._agent,
-            prompt=prompt,
-            session_id=sid,
-            user_id=user_id,
-            on_status=on_status,
-            error_event="team_router.single_external.stream_error",
-            files=files, images=images, audio=audio, videos=videos,
-        ):
-            yield delta
-
-
 # ════════════════════════════════════════════════════════════════════
 #  ModelDispatcher — entry resolution + lifecycle + budget
 # ════════════════════════════════════════════════════════════════════
@@ -1262,9 +942,7 @@ class ModelDispatcher(BaseModel):
     Resolves the entry runtime_id for a session (pin → first-enabled),
     holds one cached :class:`TeamRouterProvider` per entry runtime_id,
     forwards lifecycle hooks (cleanup_idle, shutdown, close/forget
-    session) and records cost telemetry against the api-based path
-    (subscription-CLI runs are billed against the user's Pro/Max
-    subscription and skipped).
+    session) and records cost telemetry against the api-based path.
 
     Entry-model resolution (no classifier LLM call):
 
@@ -1429,15 +1107,6 @@ class ModelDispatcher(BaseModel):
                     seen.update(fn())
                 except Exception as e:  # noqa: BLE001
                     logger.debug("known_session_ids team: %s", e)
-        if self._db is not None:
-            try:
-                # Single SQL scan coalescing claude+codex markers — see
-                # ``all_subscription_session_ids`` for the OR'd predicate.
-                from src.models._backed_agent import all_subscription_session_ids
-
-                seen.update(all_subscription_session_ids(self._db))
-            except Exception as e:  # noqa: BLE001
-                logger.debug("known_session_ids db snapshot: %s", e)
         return sorted(seen)
 
     def effective_model_id(self, session_id: str | None = None) -> str | None:
@@ -1480,7 +1149,7 @@ class ModelDispatcher(BaseModel):
 
         Used by the workflow engine's ``ai-prompt`` block for explicit
         model overrides. Routes through the same dispatch as the
-        regular path: every runtime (api-based or claude-cli) gets a
+        regular path: every runtime gets a
         TeamRouterProvider keyed on that runtime so the team-as-router
         delegation still applies inside a workflow's ai-prompt block.
         """
@@ -1611,19 +1280,8 @@ class ModelDispatcher(BaseModel):
             files=files, images=images, audio=audio, videos=videos,
         )
 
-        # Cost telemetry: subscription-CLI frameworks (claude-cli /
-        # codex-cli) bill against the user's Pro/Max or ChatGPT
-        # Plus/Pro subscription (no per-token cost), so skip cost
-        # recording for those paths. api-based runs go through the
-        # BudgetTracker.
-        if is_subscription_cli_model(runtime_id):
-            elog(
-                "router.cost_skipped",
-                session_id=session_id,
-                model=runtime_id,
-                reason="subscription_billed",
-            )
-        elif self._budget:
+        # Cost telemetry: api-based runs go through the BudgetTracker.
+        if self._budget:
             cost = BudgetTracker.compute_cost(
                 runtime_id, resp.input_tokens, resp.output_tokens,
             )

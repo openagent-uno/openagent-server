@@ -461,14 +461,14 @@ async def t_rehydration_nested_tools(ctx: TestContext) -> None:
         "tools": [{
             "tool_name": "delegate_task_to_member",
             "tool_call_id": "call_d1",
-            "tool_args": {"member_id": "claude-cli-vault-specialist",
+            "tool_args": {"member_id": "api-based-vault-specialist",
                           "task_description": "Read today's note"},
             "result": "Note says: meeting at 3pm",
             "tool_call_error": False,
         }],
         "member_responses": [{
             "run_id": "vault-member-run",
-            "agent_id": "claude-cli-vault-specialist",
+            "agent_id": "api-based-vault-specialist",
             "status": "completed",
             "model": "anthropic:claude-opus-4-7",
             "messages": [

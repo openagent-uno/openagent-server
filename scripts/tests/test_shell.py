@@ -759,16 +759,6 @@ async def t_handlers_list(ctx: TestContext) -> None:
     await handlers.get_hub().wait("sess-L", timeout=3.0)
 
 
-@test("shell", "adapters.build_sdk_server exposes the six tools")
-async def t_adapter_claude(ctx: TestContext) -> None:
-    from src.mcp.servers.shell.adapters import build_sdk_server
-
-    cfg = build_sdk_server()
-    assert cfg is not None, "expected a non-None SDK server config"
-    # McpSdkServerConfig is a TypedDict / dict in the SDK. Smoke check.
-    assert "instance" in cfg or "server" in cfg or "type" in cfg, f"unexpected shape: {cfg!r}"
-
-
 @test("shell", "adapters.build_runtime_toolkit exposes the six tools by name")
 async def t_adapter_agno(ctx: TestContext) -> None:
     from src.mcp.servers.shell.adapters import build_runtime_toolkit
@@ -787,38 +777,6 @@ async def t_adapter_agno(ctx: TestContext) -> None:
         names = {t.__name__ for t in tools if callable(t)}
     for expected in ("shell_exec", "shell_output", "shell_input", "shell_kill", "shell_list", "shell_which"):
         assert expected in names, f"missing tool {expected} in {names}"
-
-
-@test("shell", "adapters.build_sdk_server: shell_exec schema has command required, run_in_background boolean")
-async def t_adapter_claude_schema(ctx: TestContext) -> None:
-    import mcp.types as mcp_types
-    from src.mcp.servers.shell.adapters import build_sdk_server
-
-    cfg = build_sdk_server()
-    server = cfg.get("instance")
-    assert server is not None, f"expected instance in cfg, got keys: {list(cfg.keys())}"
-
-    # The MCP server (mcp.server.lowlevel.server.Server) populates _tool_cache
-    # lazily on the first list_tools call. Trigger it now.
-    list_tools_handler = server.request_handlers.get(mcp_types.ListToolsRequest)
-    assert list_tools_handler is not None, "no ListToolsRequest handler found"
-    await list_tools_handler(mcp_types.ListToolsRequest(method="tools/list"))
-
-    tool_cache: dict = getattr(server, "_tool_cache", {})
-    exec_tool = tool_cache.get("shell_exec")
-    assert exec_tool is not None, (
-        f"couldn't locate shell_exec in _tool_cache; available: {list(tool_cache.keys())}"
-    )
-
-    # mcp.types.Tool uses inputSchema (camelCase).
-    schema = getattr(exec_tool, "inputSchema", None)
-    assert isinstance(schema, dict), f"schema shape: {schema!r}"
-    assert schema.get("required") == ["command"], f"required: {schema.get('required')}"
-    props = schema.get("properties", {})
-    assert props.get("run_in_background", {}).get("type") == "boolean", \
-        f"run_in_background type: {props.get('run_in_background')}"
-    assert props.get("timeout", {}).get("type") == "integer", \
-        f"timeout type: {props.get('timeout')}"
 
 
 @test("shell", "MCPPool: in-process shell toolkit appears in runtime_toolkits")
@@ -841,27 +799,6 @@ async def t_pool_in_process_agno(ctx: TestContext) -> None:
         await pool.close_all()
 
 
-@test("shell", "MCPPool: in-process shell appears in claude_sdk_servers")
-async def t_pool_in_process_claude(ctx: TestContext) -> None:
-    from src.mcp.pool import MCPPool
-
-    pool = MCPPool.from_config(
-        mcp_config=[{"builtin": "shell"}],
-        include_defaults=False,
-        disable=None,
-        db_path=str(ctx.db_path),
-    )
-    await pool.connect_all()
-    try:
-        servers = pool.claude_sdk_servers()
-        assert "shell" in servers
-        cfg = servers["shell"]
-        # McpSdkServerConfig is a dict with SDK-specific keys.
-        assert isinstance(cfg, dict) and cfg, f"expected non-empty dict, got {cfg!r}"
-    finally:
-        await pool.close_all()
-
-
 @test("shell", "MCPPool: bad adapter_module is isolated (pool stays healthy)")
 async def t_pool_in_process_import_failure(ctx: TestContext) -> None:
     from src.mcp.pool import MCPPool, _ServerSpec
@@ -871,7 +808,6 @@ async def t_pool_in_process_import_failure(ctx: TestContext) -> None:
         name="broken_shell",
         in_process=True,
         adapter_module="openagent.mcp.servers.does_not_exist",
-        sdk_server_factory="build_sdk_server",
         runtime_toolkit_factory="build_runtime_toolkit",
     )
     pool = MCPPool(specs=[broken])
@@ -879,7 +815,6 @@ async def t_pool_in_process_import_failure(ctx: TestContext) -> None:
     await pool.connect_all()
     try:
         assert pool.runtime_toolkits == []
-        assert pool.claude_sdk_servers() == {}
     finally:
         await pool.close_all()
 

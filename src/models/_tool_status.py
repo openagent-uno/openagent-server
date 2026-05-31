@@ -28,9 +28,9 @@ async def emit_tool_status(
 ) -> None:
     """Encode ``tool_exec`` and forward to ``on_status``.
 
-    Shared by every runtime tool-status emitter (NativeProvider, dispatcher
-    helpers, ClaudeCLI / CodexCLI) so the wire envelope and the
-    defensive on_status error handling can't drift across call sites.
+    Shared by every runtime tool-status emitter (NativeProvider,
+    dispatcher helpers) so the wire envelope and the defensive
+    on_status error handling can't drift across call sites.
     """
     if on_status is None:
         return

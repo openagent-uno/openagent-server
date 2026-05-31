@@ -1,7 +1,7 @@
 """Semantic search over persisted conversation turns.
 
-Two halves: a *writer* path that fires from ``claude_cli`` after every
-turn to embed + store the user/assistant pair, and a *reader* path that
+Two halves: a *writer* path that fires after every turn to embed +
+store the user/assistant pair, and a *reader* path that
 the ``memory-search`` MCP server uses to answer cross-session recall
 queries ("remember when we discussed the launch deadline?").
 

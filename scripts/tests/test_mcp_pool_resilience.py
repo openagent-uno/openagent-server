@@ -17,7 +17,7 @@ telegram completely unresponsive. Root cause chain:
   - The outer ``except BaseException: stack.aclose()`` then triggered
     anyio's "Attempted to exit a cancel scope that isn't the current
     task's current cancel scope" invariant violation.
-  - The pool's lock was never released, the receive loop in ClaudeCLI
+  - The pool's lock was never released, the provider's receive loop
     hung in futex_wait, and systemd saw the process as "running".
 
 Four things have to be true after the fix:

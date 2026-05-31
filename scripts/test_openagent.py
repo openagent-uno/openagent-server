@@ -13,7 +13,6 @@ and registers with ``@test(category, name)``. This file just:
   4. tears down anything tests started (pool / gateway / agent).
 
 Run:  bash scripts/test_openagent.sh
-      bash scripts/test_openagent.sh --include-claude
       bash scripts/test_openagent.sh --only files,rest
 """
 from __future__ import annotations
@@ -111,8 +110,8 @@ _TEST_MODULES: tuple[str, ...] = (
     # Agent.run_stream empty-stream safety net — pure-unit, no fixtures.
     # Guards the contract that voice mode (and the soon-to-be-streaming
     # web chat) always gets text even when the streaming provider yields
-    # zero deltas (claude_cli tool-only turns, smart_router → claude_cli
-    # with empty content, the runtime when no RunContentEvent fires).
+    # zero deltas (tool-only turns, or the runtime when no
+    # RunContentEvent fires).
     "test_agent_run_stream",
     # New DB-backed registry tests: pure CRUD against ctx.db_path, no pool.
     "test_db_mcps",
@@ -135,32 +134,16 @@ _TEST_MODULES: tuple[str, ...] = (
     # to legacy device-pubkey rows via ``network_devices``.
     "test_sessions_cross_device",
     "test_db_workflow_claim",
-    # ClaudeBackedAgent — Agent subclass that drives claude_agent_sdk
-    # directly. Pure-unit: monkey-patches sys.modules['claude_agent_sdk']
-    # with a fake module so no SDK binary is required. Pins the four
-    # contracts that let claude-cli rows participate in runtime Teams:
-    # Agent isinstance, arun → RunOutput, session-id round-trip via
-    # session_data, and streaming events.
-    "test_claude_backed_agent",
-    # CodexBackedAgent — mirror of test_claude_backed_agent for the
-    # codex-cli framework (OpenAI Codex CLI / ChatGPT Plus/Pro). Same
-    # six contracts via a fake sys.modules['openai_codex']: Agent
-    # isinstance, arun → RunOutput, codex_session_id round-trip, stream
-    # events, SDK-error raise, and lazy import on slim installs.
-    "test_codex_backed_agent",
     # TeamRouterProvider — the v0.14 sub-agent architecture. Verifies
-    # Team(mode=route) construction from DB rows, role blurbs from
-    # tier_hint/description, single-agent fallback, claude-cli as
-    # MEMBER (via ClaudeBackedAgent) and as LEADER (with the cheapest
-    # api-based model as the routing classifier).
+    # Team(mode=coordinate) construction from DB rows, role blurbs from
+    # tier_hint/description, and the single-agent fallback.
     "test_team_router",
     # Regression lock-down for the v0.14 runtime-consolidation refactor.
-    # Covers every fix from Phases 1-10: framework collapse, claude_cli
-    # rewrite, SmartRouter classifier removal, db.py helper deletion,
-    # defer-all MCP wiring, system prompt placeholders, curator wiring,
-    # signal handler hardening, and the tqdm/multiprocessing semaphore
-    # leak. The end-to-end subprocess test spawns ``python -m src.cli
-    # --help`` to verify no resource_tracker warning at process exit.
+    # Covers framework collapse, SmartRouter classifier removal, db.py
+    # helper deletion, defer-all MCP wiring, system prompt placeholders,
+    # curator wiring, signal handler hardening, and the tqdm/multiprocessing
+    # semaphore leak. The end-to-end subprocess test spawns ``python -m
+    # src.cli --help`` to verify no resource_tracker warning at process exit.
     "test_regression_v014",
     # E2E unified flow — locks down four cross-cutting properties: (1)
     # multi-member parallel delegation through _arun_runtime_stream, (2)
@@ -374,10 +357,6 @@ def main() -> int:
         help="Path to the user's openagent.yaml (read-only, for API keys).",
     )
     parser.add_argument(
-        "--include-claude", action="store_true",
-        help="Include the live Claude CLI test (slow, requires claude binary).",
-    )
-    parser.add_argument(
         "--only", default="",
         help="Comma-separated category list (e.g. 'files,rest,channels').",
     )
@@ -414,7 +393,7 @@ def main() -> int:
     ctx = TestContext(
         test_dir=cfg_path.parent, config=cfg, config_path=cfg_path,
         db_path=db_path,
-        extras={"include_claude": args.include_claude},
+        extras={},
     )
 
     only_categories = {s.strip() for s in args.only.split(",") if s.strip()}
@@ -436,7 +415,7 @@ def main() -> int:
                 last_cat = cat
             # Long-running categories get extra timeout headroom
             timeout = 180 if cat in (
-                "runtime", "router", "sessions", "files", "claude_cli"
+                "runtime", "router", "sessions", "files"
             ) else 60
             res = await run_one(cat, name, fn, ctx, timeout=timeout)
             results.append(res)

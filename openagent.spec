@@ -55,8 +55,6 @@ hiddenimports = [
     *collect_submodules("litellm"),
     # mcp transports
     *collect_submodules("mcp"),
-    # claude-agent-sdk
-    *collect_submodules("claude_agent_sdk"),
     # croniter
     "croniter",
     # aiohttp

@@ -71,12 +71,11 @@ async def t_providers_upsert_idempotent(ctx: TestContext) -> None:
         await db.close()
 
 
-@test("db_providers", "claude-cli provider forbids api_key (sentinel class of bug)")
-async def t_claude_cli_rejects_api_key(ctx: TestContext) -> None:
-    """The v0.11.x ``api_key='claude-cli'`` sentinel poisoned the
-    claude subprocess via ``ANTHROPIC_API_KEY``. The schema now rejects
-    any api_key for claude-cli providers at the DB boundary — no
-    downstream filter needed."""
+@test("db_providers", "upsert_provider rejects an unknown framework")
+async def t_provider_rejects_invalid_framework(ctx: TestContext) -> None:
+    """``api-based`` is the only shipped LLM framework. Any other value
+    is rejected at the DB boundary by the generic ``kind=='llm' and
+    framework not in LLM_FRAMEWORKS`` guard."""
     from src.memory.db import MemoryDB
 
     db = MemoryDB(str(ctx.db_path))
@@ -85,40 +84,43 @@ async def t_claude_cli_rejects_api_key(ctx: TestContext) -> None:
         raised = False
         try:
             await db.upsert_provider(
-                name="anthropic", framework="claude-cli", api_key="claude-cli",
+                name="anthropic", framework="made-up-cli", api_key="x",
             )
         except ValueError as e:
             raised = True
-            assert "api_key" in str(e).lower()
-        assert raised, "upsert_provider must raise when claude-cli carries api_key"
+            assert "invalid framework" in str(e).lower()
+        assert raised, "upsert_provider must reject an unknown framework"
 
-        # But claude-cli WITHOUT api_key is the happy path.
-        pid = await db.upsert_provider(name="anthropic", framework="claude-cli")
+        # The happy path: an api-based provider without an api_key is a
+        # valid "configured-but-disabled" row.
+        pid = await db.upsert_provider(name="anthropic", framework="api-based")
         row = await db.get_provider(pid)
         assert row["api_key"] is None
-        assert row["framework"] == "claude-cli"
+        assert row["framework"] == "api-based"
         await db.delete_provider(pid)
     finally:
         await db.close()
 
 
-@test("db_providers", "same vendor under both frameworks coexists via UNIQUE(name, framework)")
-async def t_dual_framework_provider_rows(ctx: TestContext) -> None:
+@test("db_providers", "distinct vendors coexist as separate rows")
+async def t_distinct_provider_rows(ctx: TestContext) -> None:
     from src.memory.db import MemoryDB
 
     db = MemoryDB(str(ctx.db_path))
     await db.connect()
     try:
-        api_id = await db.upsert_provider(
+        ant_id = await db.upsert_provider(
             name="anthropic", framework="api-based", api_key="sk-ant-live",
         )
-        cli_id = await db.upsert_provider(name="anthropic", framework="claude-cli")
-        assert api_id != cli_id
+        oai_id = await db.upsert_provider(
+            name="openai", framework="api-based", api_key="sk-oai-live",
+        )
+        assert ant_id != oai_id
         listed = await db.list_providers()
         pairs = sorted((r["name"], r["framework"]) for r in listed)
-        assert pairs == [("anthropic", "api-based"), ("anthropic", "claude-cli")]
-        await db.delete_provider(api_id)
-        await db.delete_provider(cli_id)
+        assert pairs == [("anthropic", "api-based"), ("openai", "api-based")]
+        await db.delete_provider(ant_id)
+        await db.delete_provider(oai_id)
     finally:
         await db.close()
 

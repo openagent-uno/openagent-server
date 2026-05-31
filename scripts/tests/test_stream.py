@@ -578,7 +578,7 @@ class _RecordingAgent:
     test doesn't have to coordinate two release events.
 
     Yields an empty delta IMMEDIATELY before any blocking — this mirrors
-    what real providers (claude-cli, api-based) signal once the prompt has
+    what real api-based providers signal once the prompt has
     actually been delivered to the SDK, which is the engagement signal
     ``StreamTurnRunner`` uses to flip ``_current_turn_started=True`` and
     take the partial-commit path on cancel rather than salvaging the
@@ -1258,8 +1258,8 @@ async def t_quick_burst_from_quiet_coalesces(ctx: TestContext) -> None:
 
 @test("stream", "slow-spawn agent: barge-in during spawn salvages, no message lost")
 async def t_slow_spawn_salvage(ctx: TestContext) -> None:
-    """🔴 Production regression: claude-cli takes 5–10 s to cold-start
-    its subprocess + MCP pool. The runner used to set
+    """🔴 Production regression: a slow provider can take 5–10 s to
+    cold-start its subprocess + MCP pool. The runner used to set
     ``_current_turn_started=True`` at the top of ``run()`` (before the
     agent actually had the prompt), so a barge-in arriving during the
     spawn window saw "started" and skipped the salvage path — the
@@ -1286,7 +1286,7 @@ async def t_slow_spawn_salvage(ctx: TestContext) -> None:
                              attachments=None, on_status=None):
             self.calls += 1
             if self.calls == 1:
-                # Simulate claude-cli subprocess spawn — agent has the
+                # Simulate a slow provider's subprocess spawn — agent has the
                 # message in flight but hasn't yielded anything yet.
                 # CancelledError from a barge-in propagates here, before
                 # any event lands → salvage MUST trigger.

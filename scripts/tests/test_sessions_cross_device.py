@@ -76,7 +76,7 @@ async def t_legacy_pubkey_via_devices(ctx: TestContext) -> None:
         # Legacy row: client_id is the device pubkey, not the handle.
         sid_legacy = f"legacy-{uuid.uuid4().hex[:8]}"
         await db.upsert_session(
-            sid_legacy, client_id=pubkey_b, title="legacy", framework="claude-cli",
+            sid_legacy, client_id=pubkey_b, title="legacy", framework="api-based",
         )
         # Foreign row: a pubkey NOT bound to handle_A. Must NOT leak.
         pubkey_other = uuid.uuid4().hex + uuid.uuid4().hex

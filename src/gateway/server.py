@@ -17,7 +17,7 @@ from typing import Any, Awaitable, Callable, TYPE_CHECKING
 from src.gateway import protocol as P
 from src.gateway.commands import command_help_text
 from src.gateway.sessions import SessionManager
-from src.gateway.api import vault, config, health, logs, control, usage, providers, models, scheduled_tasks, workflow_tasks, mcps, marketplace, sessions as sessions_api, system as system_api, claude_setup as claude_setup_api, network as network_api, chat as chat_api
+from src.gateway.api import vault, config, health, logs, control, usage, providers, models, scheduled_tasks, workflow_tasks, mcps, marketplace, sessions as sessions_api, system as system_api, network as network_api, chat as chat_api
 from src.network import peers as peers_api
 from src.network.auth.middleware import make_auth_middleware
 from src.network.transport.aiohttp_iroh_site import IrohSite
@@ -509,10 +509,6 @@ class Gateway:
             ("POST", "/api/peers/{network_id}/refresh",     peers_api.handle_refresh),
             ("POST", "/api/peers/{network_id}/chat",        peers_api.handle_peer_chat),
             ("GET",  "/api/peers/{network_id}/agents",      peers_api.handle_list_agents),
-            # Claude Code CLI setup & auth
-            ("GET", "/api/claude/status", claude_setup_api.handle_status),
-            ("POST", "/api/claude/install", claude_setup_api.handle_install),
-            ("POST", "/api/claude/auth/login", claude_setup_api.handle_auth_login),
             # Network directory + invitations (coordinator-only; member
             # agents 404 here — the client should ask the coordinator).
             ("GET",    "/api/network/users",                network_api.handle_list_users),
@@ -949,8 +945,8 @@ class Gateway:
                 del self.clients[client_id]
                 elog("gateway.client_disconnect", client_id=client_id)
                 # Tear down any stream sessions belonging to this client
-                # so the agent's per-session resources (claude-cli
-                # subprocesses, runtime session rows) get a clean release.
+                # so the agent's per-session resources (runtime session
+                # rows) get a clean release.
                 await self._close_stream_sessions_for(client_id)
             elif client_id:
                 elog(
@@ -1132,9 +1128,8 @@ class Gateway:
         sid = self.sessions.get_or_create_session(
             client_id, session_id, handle=handle,
         )
-        # Bind the session_id to the user handle on the claude-cli
-        # registry too, so its independent persistence path
-        # (``_persist_turn``) records the same handle-scoped owner.
+        # Bind the session_id to the user handle on the model runtime so
+        # any handle-scoped persistence path records the same owner.
         if handle:
             try:
                 model_runtime = getattr(self.agent, "model", None)

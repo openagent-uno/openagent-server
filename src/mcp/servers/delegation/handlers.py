@@ -4,17 +4,16 @@ Surfaces a single tool, ``delegate_task``, that takes a target model's
 runtime id and a task and runs that model to completion, returning the
 final assistant text.
 
-This is the primitive that lets subscription-CLI agents (Claude SDK,
-Codex SDK) act as team leaders. They cannot make an LLM tool-call to
-``delegate_task_to_member`` the way the inlined ``TeamRunner`` expects,
-but they CAN call an MCP tool from inside their SDK loop. This server
-turns that MCP call into a real sub-agent run.
+This is the primitive that lets any agent delegate to another registered
+model — an alternative to the inlined ``TeamRunner``'s
+``delegate_task_to_member`` tool-call that works from any agent loop.
+This server turns the MCP call into a real sub-agent run.
 
 Vision §4 alignment: sub-agents share the parent's context — the same
 session id, the same MCP pool, the same files attached to the turn.
 The implementation defers as much as possible to the existing
-``NativeProvider`` / ``ClaudeBackedAgent`` / ``CodexBackedAgent``
-machinery so a delegated run looks identical to a user-initiated one.
+``NativeProvider`` machinery so a delegated run looks identical to a
+user-initiated one.
 
 The handler runs in-process (same Python interpreter as the agent that
 called it) so it has direct read access to the model catalog and the
@@ -78,8 +77,7 @@ async def delegate_task(model_id: str, task: str) -> dict[str, Any]:
 
     Args:
         model_id: runtime id of a model registered in the catalog, e.g.
-            ``"anthropic:claude-3-5-sonnet-20240620"``,
-            ``"openai:gpt-4o"``, ``"claude-cli:default"``.
+            ``"anthropic:claude-3-5-sonnet-20240620"``, ``"openai:gpt-4o"``.
         task: the prompt to send the delegated model.
 
     Returns:

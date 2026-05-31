@@ -44,7 +44,7 @@ What compaction is NOT:
   stubs in ``src.core._runner._stubs``. The runtime there is a typing
   shim; the real work lives here, with raw SQL against
   ``sessions.runs`` so it works regardless of whether the
-  underlying provider is api-based, claude-cli, or codex-cli.
+  underlying provider is api-based.
 * It does **not** mutate the model's runtime caches. The next
   ``generate()`` re-reads ``sessions.runs`` via the runtime's
   ``add_history_to_context``, so the freshly rewritten row is what the
@@ -182,7 +182,7 @@ def _resolve_model_id(model: Any) -> str | None:
     """Extract a human-readable model id from any provider shape.
 
     Providers expose this under a handful of attributes — ``self.model``
-    (NativeProvider, ClaudeCLI), ``effective_model_id(session_id)``
+    (NativeProvider), ``effective_model_id(session_id)``
     (SmartRouter), ``id`` (runtime Model wrapper). We try them in order and
     accept the first stringy result. Returns ``None`` when nothing
     sticks; callers use that to fall back to the generic ``gpt-4o``

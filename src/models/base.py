@@ -64,9 +64,7 @@ class BaseModel(ABC):
                 [{"name": str, "description": str, "input_schema": dict}, ...]
             on_status: Optional async callback for live status updates (e.g. tool use).
             files: Documents/attachments — runtime ``File`` objects (PDF, JSON,
-                text, markdown, …). Forwarded as ``runtime.arun(..., files=...)``;
-                subscription-CLI providers inline text content or write
-                binary to a sandbox-safe path.
+                text, markdown, …). Forwarded as ``runtime.arun(..., files=...)``.
             images: Image attachments — runtime ``Image`` objects with ``content=bytes``.
                 Routed to ``arun(..., images=...)`` for native multimodal handling.
             audio: Audio attachments — runtime ``Audio`` objects. Routed to ``arun(..., audio=...)``.
@@ -104,7 +102,7 @@ class BaseModel(ABC):
         return a ``ModelResponse`` from ``stream()``, so the agent has
         to synthesize one and needs to know which model to credit.
 
-        Default reads ``self.model`` (set by ClaudeCLI and the API-based runtime).
+        Default reads ``self.model`` (set by the API-based runtime).
         SmartRouter overrides because it picks per-session and a single
         instance attribute can't capture which routed model handled the
         latest turn. ``None`` is acceptable — the chat UI just hides the
@@ -152,8 +150,8 @@ class BaseModel(ABC):
     def known_session_ids(self) -> list[str]:
         """Return every session_id the provider currently has resume state for.
 
-        Provider-managed models (e.g. ClaudeCLI) override this to expose their
-        internal map so the gateway can wipe conversations across restarts.
+        Provider-managed models override this to expose their internal
+        map so the gateway can wipe conversations across restarts.
         The default implementation returns an empty list — nothing to list.
         """
         return []

@@ -1,8 +1,7 @@
 """Process-level pool of MCP toolkits, owned by the Agent.
 
-This replaces the previous in-house ``MCPRegistry`` + ``MCPTools`` pair. Both
-LLM backends (the native runtime for API-managed models, Claude Agent SDK for
-ClaudeCLI) ship their own production-grade MCP integrations, so OpenAgent owns
+This replaces the previous in-house ``MCPRegistry`` + ``MCPTools`` pair. The
+native runtime ships its own production-grade MCP integration, so OpenAgent owns
 only the *product* layer:
 
   - which servers are configured (``DEFAULT_MCPS``, ``BUILTIN_MCP_SPECS``)
@@ -15,11 +14,6 @@ Concretely:
     ``MCPTools`` instances that the pool owns and connects once. Multiple
     ``NativeProvider`` tiers (under ``SmartRouter``) share the same toolkit
     list, so we don't spawn N copies of each MCP server process.
-
-  - ``ClaudeCLI`` consumes ``pool.claude_sdk_servers`` — the raw stdio config
-    dict that the Claude Agent SDK accepts as its ``mcp_servers`` parameter.
-    The SDK spawns its own subprocesses per ``ClaudeSDKClient`` (one set per
-    session), as it always has — that's a Claude SDK constraint, not ours.
 
 The pool also exposes ``server_summary()`` and ``dormant_servers()`` so the
 Agent can inject runtime MCP state into the system prompt (e.g. "messaging
@@ -90,8 +84,8 @@ def _mcp_priority_key(name: str) -> tuple[int, str]:
 
 
 # Tokens that must be forwarded from os.environ into the messaging MCP
-# subprocess env. The runtime's MCPTools and the Claude SDK both filter env
-# to a safe subset by default, so we have to copy these explicitly.
+# subprocess env. The runtime's MCPTools filters env to a safe subset by
+# default, so we have to copy these explicitly.
 _MESSAGING_TOKEN_ENV_VARS = (
     "TELEGRAM_BOT_TOKEN",
     "DISCORD_BOT_TOKEN",
@@ -182,10 +176,8 @@ _DORMANT_RECOVERY_BACKOFF = 0.5
 #
 # Sleeping a fixed amount between subprocess spawns spreads the
 # disk-I/O and CPU cost over wallclock instead of stacking it inside
-# one cold-start window. Sequential ``for`` loop already serialises
-# at the runtime-pool level, but Claude SDK ALSO spawns its own
-# subprocesses in parallel for its own session, and the OS scheduler
-# happily interleaves both. The stagger introduces a kernel-level
+# one cold-start window. The sequential ``for`` loop already serialises
+# spawns at the runtime-pool level; the stagger adds kernel-level
 # breathing room that lets the previous spawn at least finish its
 # PyInstaller extract before the next one starts thrashing the same
 # /tmp filesystem.
@@ -301,33 +293,11 @@ class _ServerSpec:
     oauth: bool = False
     in_process: bool = False
     adapter_module: str | None = None
-    sdk_server_factory: str = "build_sdk_server"
     runtime_toolkit_factory: str = "build_runtime_toolkit"
 
     @property
     def is_stdio(self) -> bool:
         return bool(self.command)
-
-    def claude_sdk_entry(self) -> dict[str, Any]:
-        """Format this spec for the Claude Agent SDK's ``mcp_servers`` param.
-
-        SDK schema requires ``command`` to be a string (the executable) and
-        ``args`` to be a list of arg strings, NOT a single concatenated argv.
-        URL servers need an explicit ``type: "http"`` (or ``"sse"``).
-        """
-        if self.is_stdio:
-            full_cmd = (self.command or []) + self.args
-            entry: dict[str, Any] = {
-                "command": full_cmd[0],
-                "args": full_cmd[1:],
-            }
-            if self.env:
-                entry["env"] = self.env
-            return entry
-        entry = {"type": "http", "url": self.url}
-        if self.headers:
-            entry["headers"] = self.headers
-        return entry
 
 
 def _normalise_spec(spec: _ServerSpec) -> None:
@@ -336,9 +306,9 @@ def _normalise_spec(spec: _ServerSpec) -> None:
     Mutates ``spec`` in place. Two concerns rolled into one pass since both
     apply to the same spec list at the same point in the pipeline:
 
-    - Absolute command path: the Claude Agent SDK silently drops stdio MCPs
-      whose first argv arg can't be resolved on the subprocess ``$PATH``
-      (an issue under systemd). Resolving up-front avoids the footgun.
+    - Absolute command path: a stdio MCP whose first argv arg can't be
+      resolved on the subprocess ``$PATH`` is silently dropped (an issue
+      under systemd). Resolving up-front avoids the footgun.
 
     - Messaging tokens: the messaging MCP gates each platform's tools on
       ``TELEGRAM_BOT_TOKEN`` etc. We copy those env vars from our own
@@ -504,7 +474,6 @@ def _spec_from_kwargs(kwargs: dict[str, Any]) -> _ServerSpec:
         oauth=bool(kwargs.get("oauth")),
         in_process=bool(kwargs.get("in_process", False)),
         adapter_module=kwargs.get("adapter_module"),
-        sdk_server_factory=kwargs.get("sdk_server_factory", "build_sdk_server"),
         runtime_toolkit_factory=kwargs.get("runtime_toolkit_factory", "build_runtime_toolkit"),
     )
 
@@ -577,7 +546,6 @@ class MCPPool:
         # In-process MCP state — populated by connect_all for specs with
         # in_process=True. These are kept separate from subprocess toolkits
         # so close_all can handle them independently (no AsyncExitStack needed).
-        self._in_process_sdk_servers: dict[str, Any] = {}
         self._in_process_runtime_toolkits: list[Any] = []
         # DB reference for ``reload()``. Set by ``from_db``; ``None`` for
         # ``from_config`` callers (tests) — reload is a no-op in that mode.
@@ -663,7 +631,6 @@ class MCPPool:
             self._toolkit_supervisors.clear()
             self._runtime_toolkits.clear()
             self._in_process_runtime_toolkits.clear()
-            self._in_process_sdk_servers.clear()
             self._toolkit_by_name.clear()
             self.specs = new_specs
             self._tool_counts = {s.name: 0 for s in new_specs}
@@ -772,15 +739,14 @@ class MCPPool:
                     continue
                 try:
                     mod = importlib.import_module(spec.adapter_module)  # type: ignore[arg-type]
-                    sdk_factory = getattr(mod, spec.sdk_server_factory, None)
                     runtime_factory = getattr(mod, spec.runtime_toolkit_factory, None)
                 except Exception as e:  # noqa: BLE001
                     elog("mcp.error", level="warning", name=spec.name, error=str(e), phase="import")
                     continue
-                if sdk_factory is None or runtime_factory is None:
+                if runtime_factory is None:
                     logger.warning(
-                        "in-process MCP '%s' missing factories (%s / %s) — skipping",
-                        spec.name, spec.sdk_server_factory, spec.runtime_toolkit_factory,
+                        "in-process MCP '%s' missing factory (%s) — skipping",
+                        spec.name, spec.runtime_toolkit_factory,
                     )
                     continue
                 # Inject ``pool=self`` only for factories that accept it.
@@ -796,12 +762,10 @@ class MCPPool:
                     return {"pool": self} if "pool" in params else {}
 
                 try:
-                    sdk_cfg = sdk_factory(**_factory_kwargs(sdk_factory))
                     runtime_tk = runtime_factory(**_factory_kwargs(runtime_factory))
                 except Exception as e:  # noqa: BLE001
                     elog("mcp.error", level="warning", name=spec.name, error=str(e), phase="factory")
                     continue
-                self._in_process_sdk_servers[spec.name] = sdk_cfg
                 self._in_process_runtime_toolkits.append(runtime_tk)
                 self._toolkit_by_name[spec.name] = runtime_tk
                 # Count both sync and async tool dicts — Toolkits with
@@ -841,7 +805,6 @@ class MCPPool:
             supervisors = list(self._toolkit_supervisors)
             self._toolkit_supervisors.clear()
             self._runtime_toolkits.clear()
-            self._in_process_sdk_servers.clear()
             self._in_process_runtime_toolkits.clear()
             self._toolkit_by_name.clear()
             self._connected = False
@@ -1395,28 +1358,15 @@ class MCPPool:
             out.append(entry)
         return out
 
-    def claude_sdk_servers(self) -> dict[str, dict[str, Any]]:
-        base = {
-            spec.name: spec.claude_sdk_entry()
-            for spec in self.specs
-            if not spec.in_process
-        }
-        base.update(self._in_process_sdk_servers)
-        return base
-
     # ── Tool-budget filtering ───────────────────────────────────────────
     #
     # LLM providers cap how many tools they accept per request (OpenAI:
-    # 128; Claude Code in standard mode: ~200). When the pool exposes
-    # more tools than the cap, the provider silently drops the
-    # alphabetically-late ones — workflow-manager was the canary that
-    # surfaced this bug. The two methods below return a trimmed view
-    # that fits the budget; the trimmed-out MCPs stay reachable via
-    # the ``tool-search`` in-process MCP, which the wire layer keeps
-    # in the kept set unconditionally. The two paths share a single
-    # alphabetic-fill heuristic so the runtime and Claude SDK behave the
-    # same way for the same budget — a deliberate symmetry the user
-    # asked for ("non un sistema specifico per claude sdk").
+    # 128). When the pool exposes more tools than the cap, the provider
+    # silently drops the alphabetically-late ones — workflow-manager was
+    # the canary that surfaced this bug. The method below returns a
+    # trimmed view that fits the budget; the trimmed-out MCPs stay
+    # reachable via the ``tool-search`` in-process MCP, which the wire
+    # layer keeps in the kept set unconditionally.
 
     def _toolkit_tool_count(self, toolkit: Any) -> int:
         """Tool count for a toolkit, summing sync + async function dicts."""
@@ -1475,9 +1425,8 @@ class MCPPool:
     # every other MCP (in-process or subprocess) is reached via
     # ``tool-search.call_tool``. Uniform discovery surface — the model
     # never gets a mixed "some tools upfront, some deferred" picture
-    # that confuses delegation. Both views below return just the
-    # tool-search MCP so the wire layer can stay symmetrical across
-    # the runtime (toolkits) and Claude SDK (mcp_servers config).
+    # that confuses delegation. The view below returns just the
+    # tool-search MCP for the model's upfront tool list.
 
     def runtime_toolkits_tool_search_only(self) -> list[Any]:
         """Return ONLY the ``tool-search`` in-process toolkit.
@@ -1490,44 +1439,6 @@ class MCPPool:
         """
         tk = self._toolkit_by_name.get("tool-search")
         return [tk] if tk is not None else []
-
-    def claude_sdk_servers_tool_search_only(self) -> dict[str, dict[str, Any]]:
-        """Same as ``runtime_toolkits_tool_search_only`` for the Claude SDK
-        ``mcp_servers`` config shape. Returns ``{"tool-search": <cfg>}``
-        when the in-process tool-search MCP is registered, else ``{}``.
-        """
-        cfg = self._in_process_sdk_servers.get("tool-search")
-        return {"tool-search": cfg} if cfg is not None else {}
-
-    def claude_sdk_servers_under_budget(self, budget: int) -> dict[str, dict[str, Any]]:
-        """Same idea as ``runtime_toolkits_under_budget`` for Claude SDK config.
-
-        In-process SDK servers are always included; subprocess specs are
-        added alphabetically until the budget would be exceeded. Tool
-        counts are read from the pool's ``_tool_counts`` (populated by
-        ``connect_all``), so a fresh pool that hasn't connected yet
-        budgets every subprocess at zero — which means ``budget < 0``
-        is the right call before ``connect_all`` returns.
-        """
-        if budget < 0:
-            return self.claude_sdk_servers()
-
-        base: dict[str, dict[str, Any]] = dict(self._in_process_sdk_servers)
-        used = sum(self._tool_counts.get(name, 0) for name in base)
-        remaining = max(0, budget - used)
-
-        subprocess_specs = sorted(
-            (s for s in self.specs if not s.in_process),
-            key=lambda s: _mcp_priority_key(s.name),
-        )
-        for spec in subprocess_specs:
-            n = self._tool_counts.get(spec.name, 0)
-            # Symmetric with runtime path: zero-tool subprocesses contribute
-            # nothing, so don't let them sneak past the budget filter.
-            if n > 0 and n <= remaining:
-                base[spec.name] = spec.claude_sdk_entry()
-                remaining -= n
-        return base
 
     # ── Introspection (used by Agent for system prompt + health endpoints) ─
 

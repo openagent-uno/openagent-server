@@ -196,7 +196,7 @@ BLOCK_CATALOG: dict[str, BlockSpec] = {
                 "string",
                 description=(
                     "runtime_id such as 'openai:gpt-4o-mini' or "
-                    "'claude-cli:anthropic:claude-opus-4-7'. When set, "
+                    "'anthropic:claude-opus-4-7'. When set, "
                     "bypasses the SmartRouter and dispatches directly."
                 ),
             ),

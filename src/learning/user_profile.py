@@ -12,9 +12,9 @@ Why a profile JSON rather than a free-form transcript:
   • Structured keys (preferences / ongoing_projects / style / notes) let
     the matcher in ``skills`` cross-reference cleanly when both hooks
     are on without re-parsing prose.
-  • Survives the SDK session being dropped (e.g. by the compression
-    watchdog in ``models.claude_cli``), so the recap is independent of
-    Claude's own resume mechanism.
+  • Survives the runtime session being dropped (e.g. by the compaction
+    watchdog), so the recap is independent of the provider's own resume
+    mechanism.
 
 Opt-in via ``memory.user_profile.enabled: true`` in ``openagent.yaml``
 (see ``core/server.py`` for the env mapping). Default off.

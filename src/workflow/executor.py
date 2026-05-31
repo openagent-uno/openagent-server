@@ -860,13 +860,13 @@ async def _h_ai_prompt(
     finally:
         # ephemeral: each node owns a unique session_id never reused in
         # this run — so forget now to wipe provider-native resume state
-        # (claude-cli's sdk_sessions row, the runtime's history rows). Otherwise
-        # a re-run of the same workflow could inherit transcript through
-        # persisted resume ids (same bug class as scheduler issue #5).
+        # (the runtime's history rows). Otherwise a re-run of the same
+        # workflow could inherit transcript through persisted resume ids
+        # (same bug class as scheduler issue #5).
         # shared: every ai-prompt node in the run shares one session_id
-        # so successive nodes chain thought via claude-cli's --resume;
-        # we only release the subprocess here. _finalize_run calls
-        # forget_session on the shared sid once the run is done.
+        # so successive nodes chain thought via the runtime's history;
+        # we only release it here. _finalize_run calls forget_session on
+        # the shared sid once the run is done.
         method_name = "forget_session" if policy != "shared" else "release_session"
         fn = getattr(exe.agent, method_name, None)
         if callable(fn):

@@ -171,7 +171,7 @@ async def handle_list_db(request: web.Request) -> web.Response:
 
     Query params:
       - ``provider_id`` (int) — filter to a single provider row
-      - ``framework`` (``api-based`` / ``claude-cli``) — filter by framework
+      - ``framework`` (``api-based``) — filter by framework
       - ``enabled_only`` (bool) — skip disabled model rows
 
     When Piper is importable AND no kind='tts' row exists yet, a
@@ -358,8 +358,6 @@ async def handle_available_models(request: web.Request) -> web.Response:
 
     Dynamic provider catalog: tries the provider's /v1/models endpoint
     with the configured API key, falls back to the bundled catalog.
-    Claude-cli providers (no api_key) still return their bundled list
-    through discovery's offline path.
     """
     import asyncio
     from aiohttp import web as _web

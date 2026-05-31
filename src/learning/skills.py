@@ -14,7 +14,7 @@ Two halves:
   against the saved skills using a cheap tag-and-substring heuristic
   (no LLM call on the hot path), return the top ``MAX_INJECTED_SKILLS``
   matches, and surface them as a system-style hint that gets injected
-  alongside the user profile in ``models/claude_cli._ensure_client``.
+  alongside the user profile into the model's system prompt.
 
 Why no LLM matcher: the detector already pays the Groq round-trip in
 the background; layering another one on the user-visible path would

@@ -169,7 +169,6 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
     "shell": {
         "in_process": True,
         "adapter_module": "src.mcp.servers.shell.adapters",
-        "sdk_server_factory": "build_sdk_server",
         "runtime_toolkit_factory": "build_runtime_toolkit",
         "description": (
             "execute bash commands on the host, foreground or "
@@ -180,13 +179,11 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
     "tool-search": {
         "in_process": True,
         "adapter_module": "src.mcp.servers.tool_search.adapters",
-        "sdk_server_factory": "build_sdk_server",
         "runtime_toolkit_factory": "build_runtime_toolkit",
     },
     "attachments": {
         "in_process": True,
         "adapter_module": "src.mcp.servers.attachments.adapters",
-        "sdk_server_factory": "build_sdk_server",
         "runtime_toolkit_factory": "build_runtime_toolkit",
         "description": (
             "read and write files attached to the current turn — "
@@ -296,9 +293,7 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
         "description": (
             "hand a sub-task to another registered model and get its "
             "answer back. Use when a different model is cheaper, "
-            "faster, or better-scoped for the work — including from "
-            "inside a subscription-CLI agent that has no native "
-            "team-leader path"
+            "faster, or better-scoped for the work"
         ),
     },
 }
@@ -555,7 +550,6 @@ def resolve_builtin_entry(name: str, env: dict[str, str] | None = None) -> dict[
             "name": name,
             "in_process": True,
             "adapter_module": spec["adapter_module"],
-            "sdk_server_factory": spec.get("sdk_server_factory", "build_sdk_server"),
             "runtime_toolkit_factory": spec.get("runtime_toolkit_factory", "build_runtime_toolkit"),
         }
 

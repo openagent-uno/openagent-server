@@ -21,14 +21,13 @@ def _providers_from_user_db(user_config_path: Path) -> dict[str, dict]:
     framework's old behaviour of reading the YAML's ``providers:`` block
     is now a no-op for any real install — the block is empty. Loading
     from the sibling ``openagent.db`` lets the live tests boot against
-    whatever the user has configured (e.g. DeepSeek + Claude CLI) without
+    whatever the user has configured (e.g. DeepSeek + OpenAI) without
     duplicating the keys into the YAML.
 
     Returns ``{provider_name: {api_key: ..., base_url: ...}}`` for every
-    *enabled*, *api-based* LLM provider with a non-empty key. Subscription
-    providers (claude-cli, codex-cli) are intentionally dropped — they
-    have no API key and exporting an empty one as
-    ``ANTHROPIC_API_KEY`` breaks the CLI auth path.
+    *enabled* LLM provider with a non-empty key. Every provider is
+    api-based now, so the query's ``api_key`` non-empty filter already
+    excludes anything without a usable key.
     """
     db_path = user_config_path.parent / "openagent.db"
     if not db_path.exists():
@@ -47,11 +46,8 @@ def _providers_from_user_db(user_config_path: Path) -> dict[str, dict]:
         return {}
     out: dict[str, dict] = {}
     for r in rows:
-        framework = (r["framework"] or "").strip()
-        # Subscription frameworks don't carry usable API keys for the
-        # native test path — drop them.
-        if framework in ("claude-cli", "codex-cli"):
-            continue
+        # Every provider is api-based now; the SQL already filtered to
+        # rows with a non-empty api_key, so each one is usable as-is.
         entry: dict[str, str] = {"api_key": r["api_key"]}
         if r["base_url"]:
             entry["base_url"] = r["base_url"]
@@ -67,10 +63,7 @@ def build_test_config(user_config_path: Path) -> tuple[dict, Path, Path]:
       - merges providers from BOTH the user's ``providers:`` YAML block
         (legacy path) AND the sibling ``openagent.db`` (current source
         of truth) so live tests can hit real APIs without forcing users
-        to duplicate their keys into the YAML — strips ``anthropic``
-        regardless (placeholder keys like ``sk-test`` get exported as
-        ``ANTHROPIC_API_KEY`` by NativeProvider and then break the
-        Claude CLI subscription auth path);
+        to duplicate their keys into the YAML;
       - disables heavy MCPs (chrome-devtools, web-search, computer-control)
         that would slow the suite down without adding coverage;
       - points the memory DB at the temp dir so the user's real DB is
@@ -92,10 +85,6 @@ def build_test_config(user_config_path: Path) -> tuple[dict, Path, Path]:
         # YAML wins if it set the same provider — preserves the explicit
         # override path for someone debugging keys via the file.
         user_providers.setdefault(name, entry)
-    if "anthropic" in user_providers:
-        # Placeholder anthropic keys confuse the claude binary subscription
-        # auth path. Claude CLI does not need an API key.
-        del user_providers["anthropic"]
 
     # Widen the filesystem MCP roots so it can reach files the upload
     # endpoint writes. ``/api/upload`` uses ``tempfile.mkdtemp()``, which

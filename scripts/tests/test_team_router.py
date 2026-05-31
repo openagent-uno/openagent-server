@@ -88,34 +88,6 @@ def _single_model_catalog() -> list[dict[str, Any]]:
     ]
 
 
-def _catalog_with_claude_cli() -> list[dict[str, Any]]:
-    """Mixed catalog — one api-based + one claude-cli. The claude-cli
-    row MUST be excluded from team membership (the runtime's Team.members
-    type rejects BaseExternalAgent subclasses), so the api-based-only
-    Team builder should silently skip it.
-    """
-    return [
-        {
-            "id": 1, "name": "openai", "framework": "api-based",
-            "api_key": "sk-test", "enabled": True,
-            "models": [
-                {"id": 10, "model": "gpt-4o-mini", "enabled": True,
-                 "tier_hint": "fast general-purpose"},
-                {"id": 11, "model": "gpt-5-coding", "enabled": True,
-                 "tier_hint": "best for coding"},
-            ],
-        },
-        {
-            "id": 2, "name": "anthropic", "framework": "claude-cli",
-            "api_key": None, "enabled": True,
-            "models": [
-                {"id": 20, "model": "claude-sonnet-4-6", "enabled": True,
-                 "tier_hint": "best for complex multi-step reasoning"},
-            ],
-        },
-    ]
-
-
 # ── Stub builders ────────────────────────────────────────────────────
 
 
@@ -205,16 +177,10 @@ def _install_stubs(provider, *, catalog: list[dict[str, Any]] | None = None,
     Returns a recorder dict with the constructed leader + members and
     the stubbed Team instance so the test can assert against them.
     """
-    from src.models.catalog import (
-        FRAMEWORK_API_BASED,
-        SUBSCRIPTION_CLI_FRAMEWORKS,
-        framework_of,
-    )
-
     recorded: dict[str, Any] = {
         "members": [],   # list[_RecordedAgent] (all members incl. leader)
         "team": None,    # _StubTeam after construction
-        "team_model": None,  # the Model object set as team.model (for subscription leaders)
+        "team_model": None,  # the Model object set as team.model
     }
 
     def fake_build_agent_for(entry, *, name: str, role: str | None):
@@ -225,11 +191,9 @@ def _install_stubs(provider, *, catalog: list[dict[str, Any]] | None = None,
         return rec
 
     provider._build_agent_for = fake_build_agent_for  # type: ignore[assignment]
-    # The per-framework specialised builders also route through the same
-    # recorder so we can assert per-framework construction calls.
+    # The api-based specialised builder also routes through the same
+    # recorder so we can assert construction calls.
     provider._build_api_agent_for = fake_build_agent_for  # type: ignore[assignment]
-    provider._build_claude_agent_for = fake_build_agent_for  # type: ignore[assignment]
-    provider._build_codex_agent_for = fake_build_agent_for  # type: ignore[assignment]
 
     # Patch the lazy imports inside _ensure_runtime via a wrapper.
     original_ensure = provider._ensure_runtime
@@ -253,34 +217,6 @@ def _install_stubs(provider, *, catalog: list[dict[str, Any]] | None = None,
             llm_catalog[0],
         )
         members_catalog = [e for e in llm_catalog if e.runtime_id != entry.runtime_id]
-        is_subscription_leader = (
-            framework_of(entry.runtime_id) in SUBSCRIPTION_CLI_FRAMEWORKS
-        )
-
-        # For subscription-CLI leaders (claude-cli / codex-cli), pick a
-        # ``team.model`` for the coordinator turn. The real provider's
-        # ``_choose_routing_model`` prefers api-based and falls back to
-        # claude-cli (via ClaudeSdkRoutingModel); we route through it
-        # here so the stub mirrors the dispatcher's choice precisely.
-        team_model = None
-        if is_subscription_leader:
-            if not members_catalog:
-                # Single-model subscription-CLI catalog → single-external-
-                # agent fallback (team-of-one is degenerate).
-                stub = fake_build_agent_for(
-                    entry, name=f"single:{entry.runtime_id}", role=None,
-                )
-                provider._session_runtime[session_id] = stub
-                return stub
-            team_model = provider._choose_routing_model(llm_catalog)
-            if team_model is None:
-                # No model in the catalog at all → single-external-agent.
-                stub = fake_build_agent_for(
-                    entry, name=f"single:{entry.runtime_id}", role=None,
-                )
-                provider._session_runtime[session_id] = stub
-                return stub
-            recorded["team_model"] = team_model
 
         if not members_catalog:
             # Single-agent fallback — build_agent_for returns our stub.
@@ -292,9 +228,8 @@ def _install_stubs(provider, *, catalog: list[dict[str, Any]] | None = None,
 
         # Build leader + members + the stubbed Team.
         leader = fake_build_agent_for(entry, name="leader", role=None)
-        if not is_subscription_leader:
-            team_model = leader.model
-            recorded["team_model"] = team_model
+        team_model = leader.model
+        recorded["team_model"] = team_model
         from src.models.dispatcher import _build_role_blurb
         members = [
             fake_build_agent_for(e, name=f"specialist:{e.runtime_id}",
@@ -379,11 +314,11 @@ async def t_real_team_leader_prompt_contains_member_ids(ctx: TestContext) -> Non
     must see EACH specialist's clean id in the same prompt where the runtime
     instructs it to ``Use only the member's ID — do not prefix it with
     the team ID.`` If the id appears with the colon-stripped form (e.g.
-    ``claude-clianthropicclaude-opus-4.7``) the leader will fail to
+    ``anthropicclaude-opus-4.7``) the leader will fail to
     address it and hallucinate placeholder ids instead.
 
-    Mirrors the user's live catalog shape (deepseek leader + 2
-    claude-cli specialists + 1 deepseek specialist).
+    Mirrors a multi-provider catalog shape (deepseek leader + 1 deepseek
+    specialist + 2 anthropic specialists).
     """
     from src.core._runner.team._messages import _build_team_context
 
@@ -401,8 +336,8 @@ async def t_real_team_leader_prompt_contains_member_ids(ctx: TestContext) -> Non
             ],
         },
         {
-            "id": 2, "name": "anthropic", "framework": "claude-cli",
-            "enabled": True,
+            "id": 2, "name": "anthropic", "framework": "api-based",
+            "api_key": "sk-ant-test", "enabled": True,
             "models": [
                 {"id": 20, "model": "claude-opus-4.7", "enabled": True,
                  "tier_hint": "best for coding, complex reasoning"},
@@ -421,8 +356,8 @@ async def t_real_team_leader_prompt_contains_member_ids(ctx: TestContext) -> Non
     expected_ids = (
         "leader",
         "deepseek-deepseek-v4-pro",
-        "claude-cli-anthropic-claude-opus-4.7",
-        "claude-cli-anthropic-claude-sonnet-4.6",
+        "anthropic-claude-opus-4.7",
+        "anthropic-claude-sonnet-4.6",
     )
     for member_id in expected_ids:
         assert f'<member id="{member_id}"' in leader_prompt, (
@@ -437,8 +372,8 @@ async def t_real_team_leader_prompt_contains_member_ids(ctx: TestContext) -> Non
     )
 
     forbidden_collapsed_ids = (
-        'specialistclaude-clianthropicclaude-opus-4.7',
-        'claude-clianthropicclaude-opus-4.7',
+        'specialistanthropicclaude-opus-4.7',
+        'anthropicclaude-opus-4.7',
         'specialistdeepseekdeepseek-v4-pro',
     )
     for bad_id in forbidden_collapsed_ids:
@@ -616,8 +551,7 @@ async def t_real_team_every_agent_carries_framework_prompt_e2e(
     Agent whose system message comes from its OWN ``system_message=``,
     not from the Team's ``instructions=``.
 
-    Before the fix, ``_build_api_agent_for`` and
-    ``_build_subscription_agent_for`` were called with only
+    Before the fix, ``_build_api_agent_for`` was called with only
     ``role=<short-blurb>``. Delegated members ran with no framework
     prompt (no vault discipline, no MCP awareness, no proactivity
     guidance) and no persona — they had a one-line role blurb and
@@ -625,20 +559,17 @@ async def t_real_team_every_agent_carries_framework_prompt_e2e(
     prompt" guarantee for everyone except the coordinator.
 
     The fix threads ``system=`` through ``_build_agent_for`` and stamps
-    it as ``system_message=`` on each the runtime Agent (and as
-    ``system_prompt`` / ``developer_instructions`` on the
-    subscription-CLI agents). Members additionally get a short
-    ``── Role ──`` suffix telling them which specialty they own —
-    mirroring the existing ``native_provider.py`` Team pattern.
+    it as ``system_message=`` on each the runtime Agent. Members
+    additionally get a short ``── Role ──`` suffix telling them which
+    specialty they own — mirroring the existing ``native_provider.py``
+    Team pattern.
 
-    Setup mirrors the user's live config: api-based leader, api-based
-    specialist, claude-cli specialist — so we cover both flavors of
-    member in one test.
+    Setup mirrors the user's live config: api-based leader plus two
+    api-based specialists across two providers.
     """
     from src.core._runner.agent import Agent as RuntimeAgent
     from src.core._runner.team import Team
 
-    from src.models.claude_agent import ClaudeBackedAgent
     from src.models.dispatcher import TeamRouterProvider
 
     framework_marker = (
@@ -662,8 +593,8 @@ async def t_real_team_every_agent_carries_framework_prompt_e2e(
             ],
         },
         {
-            "id": 2, "name": "anthropic", "framework": "claude-cli",
-            "enabled": True,
+            "id": 2, "name": "anthropic", "framework": "api-based",
+            "api_key": "sk-ant-test", "enabled": True,
             "models": [
                 {"id": 20, "model": "claude-opus-4.7", "enabled": True,
                  "tier_hint": "best for complex reasoning"},
@@ -727,149 +658,10 @@ async def t_real_team_every_agent_carries_framework_prompt_e2e(
             f"delegated turn knows its specialty. Got:\n{sys_text[:600]}"
         )
 
-    # Cross-check the claude-cli specialist specifically: its system
-    # prompt lives in the SDK options (``system_prompt``), not on an
-    # runtime ``system_message`` slot. The fix forwards ``system=`` to
-    # ``build_claude_backed_agent`` which lifts it into the SDK options.
-    claude_specialists = [
-        m for m in specialists
-        if isinstance(m, ClaudeBackedAgent)
-    ]
-    assert claude_specialists, (
-        "Expected the claude-cli row to materialise as a "
-        "ClaudeBackedAgent member."
-    )
-    claude_sys = claude_specialists[0]._sdk_options.get("system_prompt")
-    assert claude_sys and framework_marker in claude_sys, (
-        f"ClaudeBackedAgent's SDK system_prompt must carry the framework "
-        f"prompt — the SDK will not see the runtime's system_message slot. Got: "
-        f"{claude_sys!r}"
-    )
-    assert persona_marker in claude_sys, (
-        f"ClaudeBackedAgent's SDK system_prompt must carry the persona. "
-        f"Got: {claude_sys!r}"
-    )
-
-    # Sanity: api-based members are the runtime Agents (not BackedAgents).
-    api_specialists = [
-        m for m in specialists
-        if isinstance(m, RuntimeAgent) and not isinstance(m, ClaudeBackedAgent)
-    ]
+    # Sanity: every api-based member is a plain runtime Agent carrying
+    # its system prompt on the ``system_message`` slot.
+    api_specialists = [m for m in specialists if isinstance(m, RuntimeAgent)]
     assert api_specialists, "Expected at least one api-based specialist."
-
-
-@test(
-    "team_router",
-    "vision §15: codex-cli member carries framework+persona via developer_instructions",
-)
-async def t_real_team_codex_member_carries_framework_prompt_e2e(
-    ctx: TestContext,
-) -> None:
-    """Codex SDK takes the system prompt as ``developer_instructions``,
-    not ``system_prompt``. The fix routes ``system=`` through
-    ``build_codex_backed_agent`` which lifts it into the right slot.
-    Without this, a delegated codex specialist runs with no OpenAgent
-    awareness at all (vision §15 violation, same as the claude-cli case
-    but in a different SDK field).
-    """
-    from src.core._runner.team import Team
-
-    from src.models.codex_agent import CodexBackedAgent
-    from src.models.dispatcher import TeamRouterProvider
-
-    framework_marker = "PRETEND_FRAMEWORK_SYSTEM_PROMPT_codex_case"
-    persona_marker = "── User-specific identity and project context ──"
-    composed_system = f"{framework_marker}\n\n{persona_marker}\n\nmy persona body"
-
-    providers = [
-        {
-            "id": 1, "name": "openai", "framework": "api-based",
-            "api_key": "sk-test", "enabled": True,
-            "models": [
-                {"id": 10, "model": "gpt-4o-mini", "enabled": True,
-                 "tier_hint": "fast leader"},
-            ],
-        },
-        {
-            "id": 2, "name": "openai-codex", "framework": "codex-cli",
-            "enabled": True,
-            "models": [
-                {"id": 20, "model": "gpt-5-codex", "enabled": True,
-                 "tier_hint": "best for codebase edits"},
-            ],
-        },
-    ]
-    provider = TeamRouterProvider(
-        entry_runtime_id="openai:gpt-4o-mini",
-        providers_config=providers,
-    )
-    team = provider._ensure_runtime("sess-vision-15-codex", system=composed_system)
-    assert isinstance(team, Team), type(team).__name__
-
-    codex_members = [m for m in team.members if isinstance(m, CodexBackedAgent)]
-    assert codex_members, (
-        "Expected the codex-cli row to materialise as a CodexBackedAgent."
-    )
-    codex_sys = codex_members[0]._sdk_options.get("developer_instructions")
-    assert codex_sys and framework_marker in codex_sys, (
-        f"CodexBackedAgent's developer_instructions must carry the "
-        f"framework prompt. Got: {codex_sys!r}"
-    )
-    assert persona_marker in codex_sys, (
-        f"CodexBackedAgent's developer_instructions must carry the "
-        f"persona. Got: {codex_sys!r}"
-    )
-
-
-@test(
-    "team_router",
-    "vision §15: single-external-agent fallback also carries framework+persona",
-)
-async def t_single_external_agent_fallback_carries_framework_prompt_e2e(
-    ctx: TestContext,
-) -> None:
-    """When a subscription-CLI leader has no api-based row to drive
-    Team.model, the dispatcher falls back to single-external-agent
-    dispatch. That fallback agent must ALSO carry the framework prompt
-    + persona — otherwise the user loses the vision §15 guarantee
-    entirely when their catalog is claude-cli-only or codex-cli-only.
-    """
-    from src.models.claude_agent import ClaudeBackedAgent
-    from src.models.dispatcher import TeamRouterProvider, _SingleExternalAgentAdapter
-
-    framework_marker = "PRETEND_FRAMEWORK_SYSTEM_PROMPT_fallback"
-    persona_marker = "PRETEND_PERSONA_fallback"
-    composed_system = f"{framework_marker}\n\n{persona_marker}"
-
-    providers: list[dict[str, Any]] = [
-        {
-            "id": 1, "name": "anthropic", "framework": "claude-cli",
-            "enabled": True,
-            "models": [
-                {"id": 10, "model": "claude-sonnet-4-6", "enabled": True,
-                 "tier_hint": "only model"},
-            ],
-        },
-    ]
-    provider = TeamRouterProvider(
-        entry_runtime_id="claude-cli:anthropic:claude-sonnet-4-6",
-        providers_config=providers,
-    )
-    runtime = provider._ensure_runtime("sess-fallback", system=composed_system)
-
-    assert isinstance(runtime, _SingleExternalAgentAdapter), (
-        f"Expected single-external-agent fallback; got {type(runtime).__name__}"
-    )
-    inner = runtime._agent  # type: ignore[attr-defined]
-    assert isinstance(inner, ClaudeBackedAgent), type(inner).__name__
-    sys_text = inner._sdk_options.get("system_prompt")
-    assert sys_text and framework_marker in sys_text, (
-        f"Fallback ClaudeBackedAgent must carry the framework prompt in "
-        f"its SDK system_prompt; got {sys_text!r}"
-    )
-    assert persona_marker in sys_text, (
-        f"Fallback ClaudeBackedAgent must carry the persona; got {sys_text!r}"
-    )
 
 
 @test("team_router", "_compose_member_system: composition is framework + persona + Role suffix")
@@ -907,31 +699,19 @@ async def t_compose_member_system_unit(ctx: TestContext) -> None:
 
 
 def _resolve_member_system_text(member: Any) -> str | None:
-    """Extract the resolved system-prompt text for any Team member
-    flavor (the runtime Agent / ClaudeBackedAgent / CodexBackedAgent), so the
-    vision §15 assertions can be flavor-agnostic.
+    """Extract the resolved system-prompt text for a Team member.
 
-    the runtime Agent  → ``member.system_message`` (set directly).
-    ClaudeBackedAgent → ``member._sdk_options["system_prompt"]``.
-    CodexBackedAgent  → ``member._sdk_options["developer_instructions"]``.
+    Every member is a plain runtime ``Agent`` whose system prompt lives
+    on ``member.system_message`` (set directly).
     """
-    from src.models.claude_agent import ClaudeBackedAgent
-    from src.models.codex_agent import CodexBackedAgent
-
-    if isinstance(member, ClaudeBackedAgent):
-        return member._sdk_options.get("system_prompt")
-    if isinstance(member, CodexBackedAgent):
-        return member._sdk_options.get("developer_instructions")
     return getattr(member, "system_message", None)
 
 
-@test("team_router", "end-to-end: mixed api-based + claude-cli catalog yields clean ids for both")
+@test("team_router", "end-to-end: multi-provider api-based catalog yields clean ids for all members")
 async def t_real_team_members_mixed_catalog_e2e(ctx: TestContext) -> None:
-    """End-to-end with a realistic mixed catalog: api-based leader plus
-    a claude-cli specialist (the exact shape the user hit in production).
-    Verifies both flavors emit ids matching their names — the colon-laden
-    runtime_ids like ``claude-cli:anthropic:claude-opus-4.7`` survive the
-    member-id derivation cleanly.
+    """End-to-end with a multi-provider api-based catalog: an openai
+    leader plus an anthropic specialist. Verifies the member-id
+    derivation produces ids matching their names for every provider.
     """
     from src.core._runner.team import Team
     from src.core._runner.utils.team import get_member_id
@@ -948,8 +728,8 @@ async def t_real_team_members_mixed_catalog_e2e(ctx: TestContext) -> None:
             ],
         },
         {
-            "id": 2, "name": "anthropic", "framework": "claude-cli",
-            "enabled": True,
+            "id": 2, "name": "anthropic", "framework": "api-based",
+            "api_key": "sk-ant-test", "enabled": True,
             "models": [
                 {"id": 20, "model": "claude-opus-4.7", "enabled": True,
                  "tier_hint": "best for coding, complex reasoning"},
@@ -966,18 +746,18 @@ async def t_real_team_members_mixed_catalog_e2e(ctx: TestContext) -> None:
     for member in team.members:
         derived_id = get_member_id(member)
         assert derived_id == member.name, (
-            f"mixed-catalog member id/name mismatch: name={member.name!r} "
+            f"multi-provider member id/name mismatch: name={member.name!r} "
             f"derived_id={derived_id!r}"
         )
 
     xml = team.get_members_system_message_content(indent=0)
-    # The claude-cli specialist's id is runtime_id with colons → dashes.
-    assert '<member id="claude-cli-anthropic-claude-opus-4.7"' in xml, (
-        f"claude-cli specialist's id must be the dash-form of the "
+    # The anthropic specialist's id is runtime_id with colons → dashes.
+    assert '<member id="anthropic-claude-opus-4.7"' in xml, (
+        f"anthropic specialist's id must be the dash-form of the "
         f"runtime_id, no colons stripped to nothing; got:\n{xml}"
     )
-    assert 'name="claude-cli-anthropic-claude-opus-4.7">' in xml, (
-        f"claude-cli specialist's name must match its id; got:\n{xml}"
+    assert 'name="anthropic-claude-opus-4.7">' in xml, (
+        f"anthropic specialist's name must match its id; got:\n{xml}"
     )
     assert "Role: best for coding, complex reasoning" in xml, (
         f"coding role must surface in the team-members block; got:\n{xml}"
@@ -1001,8 +781,8 @@ async def t_member_identifier_url_safe(ctx: TestContext) -> None:
     from src.models.dispatcher import _member_identifier
 
     runtime_ids = (
-        "claude-cli:anthropic:claude-opus-4.7",
-        "codex-cli:openai:gpt-5",
+        "anthropic:claude-opus-4.7",
+        "openai:gpt-5",
         "openai:gpt-4o-mini",
         "deepseek:deepseek-v4-flash",
     )
@@ -1091,173 +871,6 @@ async def t_single_agent_fallback(ctx: TestContext) -> None:
     assert recorded["members"][0].name == "single:openai:gpt-4o-mini"
 
 
-@test("team_router", "claude-cli row joins Team as a specialist member")
-async def t_claude_cli_member(ctx: TestContext) -> None:
-    """After the ``ClaudeBackedAgent`` refactor, claude-cli rows ARE
-    eligible for Team membership — they subclass ``runtime ``Agent````
-    and pass Team's isinstance(Agent) checks. With an api-based entry
-    leader, a claude-cli row in the catalog must appear as a specialist
-    member so the leader can delegate to it.
-    """
-    from src.models.dispatcher import TeamRouterProvider
-
-    providers = _catalog_with_claude_cli()
-    provider = TeamRouterProvider(
-        entry_runtime_id="openai:gpt-4o-mini",
-        providers_config=providers,
-    )
-    recorded = _install_stubs(provider)
-
-    await provider.generate(
-        [{"role": "user", "content": "hello"}],
-        session_id="sess-claude-member",
-    )
-
-    assert recorded["team"] is not None
-    team = recorded["team"]
-    member_names = [m.name for m in team.members]
-    # All three slots: api-based leader + api-based specialist + claude-cli specialist.
-    assert "leader" in member_names
-    assert "specialist:openai:gpt-5-coding" in member_names, member_names
-    # The claude-cli row IS now present as a specialist (was excluded in v0.14).
-    claude_members = [
-        n for n in member_names
-        if "claude-cli:anthropic:claude-sonnet-4-6" in n
-    ]
-    assert claude_members, (
-        f"claude-cli row missing from members: {member_names}. "
-        f"ClaudeBackedAgent should make it eligible."
-    )
-
-
-@test("team_router", "claude-cli row works as Team leader with api-based routing model")
-async def t_claude_cli_leader(ctx: TestContext) -> None:
-    """When the entry is claude-cli, the ``ClaudeBackedAgent`` sits as
-    ``members[0]`` (so the routing model can delegate to it). But
-    the runtime's Team invokes ``team.model`` for the routing-classifier
-    call, and ClaudeBackedAgent's placeholder ``_NullModel`` can't
-    drive that — so TeamRouterProvider picks the cheapest enabled
-    api-based model as ``team.model``.
-    """
-    from src.models.catalog import framework_of
-    from src.models.dispatcher import TeamRouterProvider
-
-    providers = _catalog_with_claude_cli()
-    # Entry is the claude-cli row this time.
-    provider = TeamRouterProvider(
-        entry_runtime_id="claude-cli:anthropic:claude-sonnet-4-6",
-        providers_config=providers,
-    )
-    recorded = _install_stubs(provider)
-
-    await provider.generate(
-        [{"role": "user", "content": "hello"}],
-        session_id="sess-claude-leader",
-    )
-
-    assert recorded["team"] is not None
-    team = recorded["team"]
-    # The claude-cli entry is members[0] (the "leader" slot).
-    assert team.members[0].name == "leader"
-    assert "claude-sonnet-4-6" in team.members[0].model_id, team.members[0].model_id
-    # team.model points at the api-based routing fallback, NOT the
-    # claude-cli leader's model. Without that, Team's leader LLM call
-    # would route through a no-op model and never dispatch.
-    assert recorded["team_model"] is not None
-    assert "gpt-4o-mini" in str(recorded["team_model"]) or "gpt-5-coding" in str(recorded["team_model"]), (
-        f"team.model must be an api-based fallback, got {recorded['team_model']!r}"
-    )
-    # The two api-based specialists must also appear as members.
-    member_names = [m.name for m in team.members]
-    assert "specialist:openai:gpt-4o-mini" in member_names, member_names
-    assert "specialist:openai:gpt-5-coding" in member_names, member_names
-
-
-@test("team_router", "claude-cli only catalog → single-agent fallback (no api-based routing model)")
-async def t_claude_cli_only_fallback(ctx: TestContext) -> None:
-    """When the catalog has ONLY claude-cli rows, there's no api-based
-    model to drive Team's routing classifier. We must skip Team and
-    fall back to single-agent dispatch (the ClaudeBackedAgent alone).
-    """
-    from src.models.dispatcher import TeamRouterProvider
-
-    providers: list[dict[str, Any]] = [
-        {
-            "id": 1, "name": "anthropic", "framework": "claude-cli",
-            "api_key": None, "enabled": True,
-            "models": [
-                {"id": 1, "model": "claude-sonnet-4-6", "enabled": True,
-                 "tier_hint": "general"},
-            ],
-        },
-    ]
-    provider = TeamRouterProvider(
-        entry_runtime_id="claude-cli:anthropic:claude-sonnet-4-6",
-        providers_config=providers,
-    )
-    recorded = _install_stubs(provider)
-
-    runtime = provider._ensure_runtime("sess-claude-only", system=None)
-
-    assert recorded["team"] is None, (
-        "claude-cli-only catalog should not build a Team — no api-based "
-        "model exists to drive Team.model's routing call"
-    )
-    assert isinstance(runtime, _RecordedAgent), type(runtime).__name__
-    assert "claude-sonnet-4-6" in runtime.model_id
-
-
-@test("team_router", "multi claude-cli catalog → Team built with ClaudeSdkRoutingModel as team.model")
-async def t_multi_claude_cli_team_with_sdk_routing(ctx: TestContext) -> None:
-    """When the catalog has MULTIPLE claude-cli rows (e.g. sonnet leader +
-    opus member) and no api-based row, the dispatcher should still build
-    a Team — using a ``ClaudeSdkRoutingModel`` wrapping the cheapest
-    claude-cli model as ``team.model``. Otherwise the leader couldn't
-    delegate to the member, and the user's vision §3 setup ("any
-    registered model can serve as the router") would silently fail.
-    """
-    from src.models.claude_routing_model import ClaudeSdkRoutingModel
-    from src.models.dispatcher import TeamRouterProvider
-
-    providers: list[dict[str, Any]] = [
-        {
-            "id": 1, "name": "anthropic", "framework": "claude-cli",
-            "api_key": None, "enabled": True,
-            "models": [
-                {"id": 1, "model": "claude-sonnet-4-6", "enabled": True,
-                 "is_classifier": True, "tier_hint": "best for simple reasoning"},
-                {"id": 2, "model": "claude-opus-4-7", "enabled": True,
-                 "tier_hint": "best for coding, complex reasoning"},
-            ],
-        },
-    ]
-    provider = TeamRouterProvider(
-        entry_runtime_id="claude-cli:anthropic:claude-sonnet-4-6",
-        providers_config=providers,
-    )
-    recorded = _install_stubs(provider)
-
-    runtime = provider._ensure_runtime("sess-multi-claude", system="X")
-
-    assert recorded["team"] is not None, (
-        "multi-claude-cli catalog should build a Team — the SDK routing "
-        "model handles the coordinator turn so opus can be delegated to"
-    )
-    team_model = recorded["team_model"]
-    assert isinstance(team_model, ClaudeSdkRoutingModel), (
-        f"team.model should be ClaudeSdkRoutingModel; got {type(team_model).__name__}"
-    )
-    assert team_model.provider == "claude-cli"
-    # The cheapest model is sonnet (tier_hint "best for simple reasoning"
-    # scores cheaper than opus's "complex reasoning" hint).
-    assert "claude-sonnet-4-6" in (team_model.sdk_model_id or "")
-    # Members include opus (the leader sonnet is also added as members[0]).
-    member_names = [m.name for m in recorded["team"].members]
-    assert any("claude-opus-4-7" in n for n in member_names), (
-        f"opus must be in the team members; got {member_names}"
-    )
-
-
 @test("team_router", "leader delegates coding task to coding specialist, response flows back")
 async def t_coding_delegation_flow(ctx: TestContext) -> None:
     """End-to-end model-switching scenario:
@@ -1343,7 +956,7 @@ async def t_coding_delegation_flow(ctx: TestContext) -> None:
 async def t_effective_model_badge_after_delegation(ctx: TestContext) -> None:
     """Regression for the user-visible "badge stuck on the leader"
     bug: even when the leader (e.g. ``deepseek-v4-flash``) correctly
-    delegates to a specialist (e.g. ``claude-cli:anthropic:claude-opus-4.7``)
+    delegates to a specialist (e.g. ``anthropic:claude-opus-4.7``)
     and the specialist actually writes the response, the chat UI was
     showing the LEADER's runtime_id as the model badge — making the
     team-as-router architecture invisible to the user.
@@ -1439,150 +1052,6 @@ async def t_rebuild_invalidates_cache(ctx: TestContext) -> None:
     # The marketing specialist is gone; only the coding specialist remains.
     assert "specialist:anthropic:claude-opus-marketing" not in member_names, member_names
     assert "specialist:openai:gpt-5-coding" in member_names, member_names
-
-
-# ── codex-cli tests (mirror of claude-cli ones above) ────────────────
-
-
-def _catalog_with_codex_cli() -> list[dict[str, Any]]:
-    """Mixed catalog — one api-based + one codex-cli row. The codex-cli
-    row joins the Team via ``CodexBackedAgent`` (subclasses
-    ``runtime ``Agent````), so it passes the runtime's isinstance check just
-    like the claude-cli flavor.
-    """
-    return [
-        {
-            "id": 1, "name": "openai", "framework": "api-based",
-            "api_key": "sk-test", "enabled": True,
-            "models": [
-                {"id": 10, "model": "gpt-4o-mini", "enabled": True,
-                 "tier_hint": "fast general-purpose"},
-                {"id": 11, "model": "claude-opus-coding", "enabled": True,
-                 "tier_hint": "best for coding"},
-            ],
-        },
-        {
-            "id": 2, "name": "openai", "framework": "codex-cli",
-            "api_key": None, "enabled": True,
-            "models": [
-                {"id": 20, "model": "gpt-5", "enabled": True,
-                 "tier_hint": "best for code-edit and shell tasks"},
-            ],
-        },
-    ]
-
-
-@test("team_router", "codex-cli row joins Team as a specialist member")
-async def t_codex_cli_member(ctx: TestContext) -> None:
-    """A codex-cli row participates in Team membership via
-    ``CodexBackedAgent`` (an ``runtime ``Agent```` subclass). With an
-    api-based entry leader, the codex-cli row appears as a specialist
-    member so the leader can delegate to it.
-    """
-    from src.models.dispatcher import TeamRouterProvider
-
-    providers = _catalog_with_codex_cli()
-    provider = TeamRouterProvider(
-        entry_runtime_id="openai:gpt-4o-mini",
-        providers_config=providers,
-    )
-    recorded = _install_stubs(provider)
-
-    await provider.generate(
-        [{"role": "user", "content": "hello"}],
-        session_id="sess-codex-member",
-    )
-
-    assert recorded["team"] is not None
-    team = recorded["team"]
-    member_names = [m.name for m in team.members]
-    assert "leader" in member_names
-    codex_members = [
-        n for n in member_names
-        if "codex-cli:openai:gpt-5" in n
-    ]
-    assert codex_members, (
-        f"codex-cli row missing from members: {member_names}. "
-        f"CodexBackedAgent should make it eligible."
-    )
-
-
-@test("team_router", "codex-cli row works as Team leader with api-based routing model")
-async def t_codex_cli_leader(ctx: TestContext) -> None:
-    """When the entry is codex-cli, the ``CodexBackedAgent`` sits as
-    ``members[0]``. ``team.model`` falls back to the cheapest enabled
-    api-based model (just like the claude-cli leader path) because
-    ``CodexBackedAgent``'s placeholder ``_NullModel`` can't drive
-    the runtime's routing classifier.
-    """
-    from src.models.dispatcher import TeamRouterProvider
-
-    providers = _catalog_with_codex_cli()
-    provider = TeamRouterProvider(
-        entry_runtime_id="codex-cli:openai:gpt-5",
-        providers_config=providers,
-    )
-    recorded = _install_stubs(provider)
-
-    await provider.generate(
-        [{"role": "user", "content": "hello"}],
-        session_id="sess-codex-leader",
-    )
-
-    assert recorded["team"] is not None
-    team = recorded["team"]
-    # The codex-cli entry is members[0] (the "leader" slot).
-    assert team.members[0].name == "leader"
-    assert "gpt-5" in team.members[0].model_id, team.members[0].model_id
-    # team.model points at the api-based routing fallback, NOT the
-    # codex-cli leader's model.
-    assert recorded["team_model"] is not None
-    assert (
-        "gpt-4o-mini" in str(recorded["team_model"])
-        or "claude-opus-coding" in str(recorded["team_model"])
-    ), (
-        f"team.model must be an api-based fallback, got {recorded['team_model']!r}"
-    )
-    # The api-based specialists must appear as members.
-    member_names = [m.name for m in team.members]
-    assert "specialist:openai:gpt-4o-mini" in member_names, member_names
-
-
-@test(
-    "team_router",
-    "codex-cli only catalog → single-agent fallback (no api-based routing model)",
-)
-async def t_codex_cli_only_fallback(ctx: TestContext) -> None:
-    """When the catalog has ONLY codex-cli rows, there's no api-based
-    model to drive Team's routing classifier. Skip Team and fall back
-    to single-agent dispatch (the CodexBackedAgent alone).
-    """
-    from src.models.dispatcher import TeamRouterProvider
-
-    providers: list[dict[str, Any]] = [
-        {
-            "id": 1, "name": "openai", "framework": "codex-cli",
-            "api_key": None, "enabled": True,
-            "models": [
-                {"id": 1, "model": "gpt-5", "enabled": True,
-                 "tier_hint": "general"},
-            ],
-        },
-    ]
-    provider = TeamRouterProvider(
-        entry_runtime_id="codex-cli:openai:gpt-5",
-        providers_config=providers,
-    )
-    recorded = _install_stubs(provider)
-
-    runtime = provider._ensure_runtime("sess-codex-only", system=None)
-
-    assert recorded["team"] is None, (
-        "codex-cli-only catalog should not build a Team — no api-based "
-        "model exists to drive Team.model's routing call"
-    )
-    assert isinstance(runtime, _RecordedAgent), type(runtime).__name__
-    assert "gpt-5" in runtime.model_id
 
 
 @test(
@@ -1710,9 +1179,6 @@ async def t_team_has_tool_search_tools(ctx: TestContext) -> None:
     class _FakePool:
         def runtime_toolkits_tool_search_only(self) -> list[Any]:
             return [_FakeToolkit("tool-search")]
-
-        def claude_sdk_servers_tool_search_only(self) -> dict[str, dict]:
-            return {}
 
     provider._mcp_pool = _FakePool()
     team = provider._ensure_runtime("sess-tools", system="MARKER")

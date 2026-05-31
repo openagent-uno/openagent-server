@@ -12,7 +12,7 @@ from ._framework import TestContext, test
 async def t_catalog_split(ctx: TestContext) -> None:
     from src.models.catalog import split_runtime_id, model_id_from_runtime
     assert split_runtime_id("openai:gpt-4o-mini") == ("openai", "gpt-4o-mini")
-    assert split_runtime_id("claude-cli/claude-sonnet-4-6") == ("claude-cli", "claude-sonnet-4-6")
+    assert split_runtime_id("anthropic:claude-opus-4-7") == ("anthropic", "claude-opus-4-7")
     assert split_runtime_id("just-a-name") == ("just-a-name", "just-a-name")
     assert model_id_from_runtime("openai:gpt-4o-mini") == "gpt-4o-mini"
 
@@ -38,7 +38,7 @@ async def t_pricing_missing(ctx: TestContext) -> None:
 @test("catalog", "live OpenRouter pricing wins over any stale config metadata")
 async def t_pricing_live(ctx: TestContext) -> None:
     """User config metadata is no longer consulted for pricing. The
-    OpenRouter cache is the only source for non-claude-cli models."""
+    OpenRouter cache is the only pricing source."""
     import time
     from src.models import discovery
     from src.models.catalog import get_model_pricing
@@ -59,26 +59,6 @@ async def t_pricing_live(ctx: TestContext) -> None:
         assert p["output_cost_per_million"] == 2.0, p
     finally:
         discovery._OPENROUTER_CACHE = prev
-
-
-@test("catalog", "claude-cli models have zero pricing (subscription billing)")
-async def t_claude_cli_zero_pricing(ctx: TestContext) -> None:
-    """claude-cli dispatches via Claude Pro/Max; there is no per-token billing."""
-    from src.models.catalog import get_model_pricing, compute_cost
-
-    for ref in [
-        "claude-cli:anthropic:claude-sonnet-4-6",
-        "claude-cli/claude-sonnet-4-6",
-        "claude-cli",
-    ]:
-        p = get_model_pricing(ref)
-        assert p["input_cost_per_million"] == 0.0, f"{ref} leaked pricing: {p}"
-        assert p["output_cost_per_million"] == 0.0, f"{ref} leaked pricing: {p}"
-
-    # claude-cli short-circuits even when the corresponding api-based model
-    # has live pricing in OpenRouter — different framework, different
-    # billing surface.
-    assert compute_cost("claude-cli:anthropic:claude-sonnet-4-6", 10_000, 5_000) == 0.0
 
 
 @test("catalog", "OpenRouter cache primes pricing lookup")

@@ -106,9 +106,9 @@ async def t_usage_daily(ctx: TestContext) -> None:
 @test("providers", "GET /api/providers lists DB-backed providers")
 async def t_providers_list(ctx: TestContext) -> None:
     """Providers live in the ``providers`` SQLite table. Under v0.12
-    the response is a flat list — the same vendor can appear twice
-    (anthropic+api-based and anthropic+claude-cli), so a name-keyed dict
-    would collide."""
+    the response is a flat list — the same vendor can appear more than
+    once (e.g. two anthropic entries with different base_urls), so a
+    name-keyed dict would collide."""
     port = ctx.extras.get("gateway_port")
     if not port:
         raise TestSkip("gateway not running")

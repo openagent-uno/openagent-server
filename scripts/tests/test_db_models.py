@@ -114,7 +114,7 @@ async def t_registry_status_empty(ctx: TestContext) -> None:
             name="openai", framework="api-based", api_key="sk",
         )
         ant_id = await db.upsert_provider(
-            name="anthropic", framework="claude-cli",
+            name="anthropic", framework="api-based", api_key="sk-ant",
         )
         mid_a = await db.upsert_model(provider_id=oai_id, model="gpt-gate-a")
         mid_b = await db.upsert_model(provider_id=ant_id, model="sonnet-gate")
@@ -127,7 +127,7 @@ async def t_registry_status_empty(ctx: TestContext) -> None:
         _, _, count, _ = await db.registry_status()
         assert count == 1, count
 
-        # Disable the claude-cli provider row → its model is effectively
+        # Disable the anthropic provider row → its model is effectively
         # disabled too, count drops to 0.
         await db.set_provider_enabled(ant_id, False)
         _, _, count, _ = await db.registry_status()
@@ -148,17 +148,19 @@ async def t_runtime_id_lookup(ctx: TestContext) -> None:
     db = MemoryDB(str(ctx.db_path))
     await db.connect()
     try:
-        cli_id = await db.upsert_provider(name="anthropic", framework="claude-cli")
-        await db.upsert_model(provider_id=cli_id, model="claude-opus-4-7")
-        row = await db.get_model_by_runtime_id("claude-cli:anthropic:claude-opus-4-7")
+        pid = await db.upsert_provider(
+            name="anthropic", framework="api-based", api_key="sk-ant",
+        )
+        await db.upsert_model(provider_id=pid, model="claude-opus-4-7")
+        row = await db.get_model_by_runtime_id("anthropic:claude-opus-4-7")
         assert row is not None
-        assert row["framework"] == "claude-cli"
+        assert row["framework"] == "api-based"
         assert row["provider_name"] == "anthropic"
         assert row["model"] == "claude-opus-4-7"
-        assert row["runtime_id"] == "claude-cli:anthropic:claude-opus-4-7"
+        assert row["runtime_id"] == "anthropic:claude-opus-4-7"
         # Unknown runtime_id → None (no exception).
         assert await db.get_model_by_runtime_id("openai:nonexistent") is None
-        await db.delete_provider(cli_id)
+        await db.delete_provider(pid)
     finally:
         await db.close()
 
@@ -276,8 +278,8 @@ async def t_is_classifier_legacy_migration(ctx: TestContext) -> None:
             created_at REAL NOT NULL, updated_at REAL NOT NULL,
             UNIQUE(provider_id, model)
         );
-        INSERT INTO providers (name, framework, enabled, created_at, updated_at)
-            VALUES ('anthropic', 'claude-cli', 1, 1.0, 1.0);
+        INSERT INTO providers (name, framework, api_key, enabled, created_at, updated_at)
+            VALUES ('anthropic', 'api-based', 'sk-ant', 1, 1.0, 1.0);
         INSERT INTO models (provider_id, model, enabled, created_at, updated_at)
             VALUES (1, 'claude-sonnet-4-6', 1, 1.0, 1.0);
         """

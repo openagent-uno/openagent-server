@@ -80,43 +80,6 @@ def _send_file_impl(path: str) -> dict:
     }
 
 
-# ── Claude Agent SDK ────────────────────────────────────────────────
-
-def build_sdk_server() -> Any:
-    """Return an ``McpSdkServerConfig`` exposing ``send_file_to_user``."""
-    from claude_agent_sdk import create_sdk_mcp_server, tool as sdk_tool
-
-    @sdk_tool(
-        "send_file_to_user",
-        (
-            "Deliver a file from the agent's filesystem to the user as a "
-            "chat attachment (image, video, voice note, or generic "
-            "document — auto-detected from the extension). Returns a "
-            "``marker`` field that you MUST include verbatim in your "
-            "reply for the file to actually be attached. Without this "
-            "tool, reading or quoting a path in prose attaches nothing."
-        ),
-        {
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Absolute path to the file on the agent's filesystem.",
-                },
-            },
-            "required": ["path"],
-        },
-    )
-    async def _send_file_to_user(args: dict) -> dict:
-        result = _send_file_impl(args.get("path", ""))
-        return {"content": [{"type": "text", "text": json.dumps(result, indent=2)}]}
-
-    return create_sdk_mcp_server(
-        "attachments",
-        tools=[_send_file_to_user],
-    )
-
-
 # ── Native runtime ──────────────────────────────────────────────────
 
 def build_runtime_toolkit() -> Any:

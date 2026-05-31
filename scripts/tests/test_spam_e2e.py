@@ -49,8 +49,8 @@ class _SlowAgent:
     Yields an empty engagement delta IMMEDIATELY (before the sleep) so
     the ``StreamSession`` flips ``_current_turn_started=True`` and a
     cancel during the body sleep takes the partial-commit path, not
-    the salvage path — matching real provider behaviour (claude-cli /
-    the runtime yields an early event the moment the prompt reaches the SDK).
+    the salvage path — matching real provider behaviour (the runtime
+    yields an early event the moment the prompt reaches the SDK).
 
     Completion tracking: ``_turn_ends`` is appended BEFORE the final
     ``done`` yield because the runner breaks its ``async for`` loop on
