@@ -27,6 +27,17 @@ _LOGGED_PRICING: set[tuple[str, str]] = set()
 # Provider-specific defaults. Keep here so they have a single home alongside
 # the rest of the provider/model catalog.
 DEFAULT_ZAI_BASE_URL = "https://api.z.ai/api/paas/v4"
+# OpenAI-compatible providers wired through ``OpenAILike`` (see
+# ``native_provider.RUNTIME_PROVIDER_CLASSES``). Each value is the full
+# versioned API root the OpenAI SDK appends ``/chat/completions`` to. A
+# per-provider ``providers.base_url`` DB value overrides these (e.g. the
+# Moonshot/DashScope China endpoints, or an OpenRouter proxy).
+DEFAULT_MOONSHOT_BASE_URL = "https://api.moonshot.ai/v1"
+DEFAULT_QWEN_BASE_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+DEFAULT_CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1"
+DEFAULT_XAI_BASE_URL = "https://api.x.ai/v1"
+DEFAULT_MISTRAL_BASE_URL = "https://api.mistral.ai/v1"
 
 # OpenAgent vocabulary:
 #   - **provider**  : the model's vendor / owner (anthropic, openai, google, …).
@@ -63,6 +74,8 @@ SUPPORTED_PROVIDERS = [
     "deepseek",
     "cerebras",
     "zai",
+    "moonshot",
+    "qwen",
     "local",
 ]
 

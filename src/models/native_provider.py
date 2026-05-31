@@ -36,6 +36,12 @@ from typing import Any, AsyncIterator, Awaitable, Callable
 from src.core.logging import elog
 from src.models.base import BaseModel, ModelResponse
 from src.models.catalog import (
+    DEFAULT_CEREBRAS_BASE_URL,
+    DEFAULT_MISTRAL_BASE_URL,
+    DEFAULT_MOONSHOT_BASE_URL,
+    DEFAULT_OPENROUTER_BASE_URL,
+    DEFAULT_QWEN_BASE_URL,
+    DEFAULT_XAI_BASE_URL,
     DEFAULT_ZAI_BASE_URL,
     FRAMEWORK_API_BASED,
     _iter_provider_entries,
@@ -397,6 +403,10 @@ PROVIDER_ENV_VARS = {
     "xai": "XAI_API_KEY",
     "deepseek": "DEEPSEEK_API_KEY",
     "cerebras": "CEREBRAS_API_KEY",
+    # Kimi (Moonshot) and Alibaba Qwen/DashScope — OpenAI-compatible,
+    # wired via OpenAILike in RUNTIME_PROVIDER_CLASSES below.
+    "moonshot": "MOONSHOT_API_KEY",
+    "qwen": "DASHSCOPE_API_KEY",
 }
 RUNTIME_PROVIDER_CLASSES: dict[str, tuple[str, str, dict[str, Any]]] = {
     "anthropic": ("src.models.providers.anthropic", "Claude", {}),
@@ -413,6 +423,37 @@ RUNTIME_PROVIDER_CLASSES: dict[str, tuple[str, str, dict[str, Any]]] = {
     # what was stripped.
     "deepseek": ("src.models._provider_overrides", "DeepSeekTextOnly", {}),
     "zai": ("src.models.providers.openai.like", "OpenAILike", {"name": "ZAI"}),
+    # OpenAI-compatible providers — same OpenAILike base as ZAI, each with a
+    # default base_url resolved in ``_resolved_base_url`` via
+    # ``PROVIDER_DEFAULT_BASE_URLS``. ``moonshot`` serves Kimi
+    # (``kimi-k2-*``); ``qwen`` is Alibaba DashScope's OpenAI-compatible mode.
+    # ``openrouter`` / ``cerebras`` were already advertised in
+    # SUPPORTED_PROVIDERS + discovery but had no driver and raised at build
+    # time — these entries close that gap.
+    "moonshot": ("src.models.providers.openai.like", "OpenAILike", {"name": "Moonshot"}),
+    "qwen": ("src.models.providers.openai.like", "OpenAILike", {"name": "Qwen"}),
+    "openrouter": ("src.models.providers.openai.like", "OpenAILike", {"name": "OpenRouter"}),
+    "cerebras": ("src.models.providers.openai.like", "OpenAILike", {"name": "Cerebras"}),
+    # xAI (Grok) and Mistral are OpenAI-compatible too. Mistral ships a
+    # native SDK upstream, but its ``/v1`` chat+tools endpoint speaks the
+    # OpenAI schema, so OpenAILike covers the common path.
+    "xai": ("src.models.providers.openai.like", "OpenAILike", {"name": "xAI"}),
+    "mistral": ("src.models.providers.openai.like", "OpenAILike", {"name": "Mistral"}),
+}
+
+
+# Default base_url per OpenAI-compatible provider built via ``OpenAILike``.
+# These vendors have no dedicated driver class — OpenAILike + the right
+# base_url IS the integration. A per-provider ``providers.base_url`` DB
+# value always wins over these defaults (see ``_resolved_base_url``).
+PROVIDER_DEFAULT_BASE_URLS: dict[str, str] = {
+    "zai": DEFAULT_ZAI_BASE_URL,
+    "moonshot": DEFAULT_MOONSHOT_BASE_URL,
+    "qwen": DEFAULT_QWEN_BASE_URL,
+    "openrouter": DEFAULT_OPENROUTER_BASE_URL,
+    "cerebras": DEFAULT_CEREBRAS_BASE_URL,
+    "xai": DEFAULT_XAI_BASE_URL,
+    "mistral": DEFAULT_MISTRAL_BASE_URL,
 }
 
 
@@ -852,8 +893,9 @@ class NativeProvider(BaseModel):
         provider_name, _ = self._runtime_parts()
         if self._base_url:
             return self._base_url
-        if provider_name == "zai":
-            return self._provider_setting("base_url") or DEFAULT_ZAI_BASE_URL
+        default = PROVIDER_DEFAULT_BASE_URLS.get(provider_name)
+        if default is not None:
+            return self._provider_setting("base_url") or default
         return self._provider_setting("base_url")
 
     def _construct_model(self, cls: type, **kwargs: Any) -> Any:

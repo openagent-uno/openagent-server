@@ -45,6 +45,8 @@ _OPENAI_STYLE: dict[str, tuple[str, str]] = {
     "cerebras":   ("https://api.cerebras.ai",           "/v1/models"),
     "zai":        ("https://api.z.ai/api/paas/v4",      "/models"),
     "openrouter": ("https://openrouter.ai/api",         "/v1/models"),
+    "moonshot":   ("https://api.moonshot.ai",           "/v1/models"),
+    "qwen":       ("https://dashscope-intl.aliyuncs.com/compatible-mode", "/v1/models"),
 }
 
 _GOOGLE_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models"
