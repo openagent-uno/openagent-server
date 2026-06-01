@@ -8,6 +8,7 @@ connect through this server.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -17,7 +18,8 @@ from typing import Any, Awaitable, Callable, TYPE_CHECKING
 from src.gateway import protocol as P
 from src.gateway.commands import command_help_text
 from src.gateway.sessions import SessionManager
-from src.gateway.api import vault, config, health, logs, control, usage, providers, models, scheduled_tasks, workflow_tasks, mcps, marketplace, sessions as sessions_api, system as system_api, network as network_api, chat as chat_api
+from src.gateway.terminals import TerminalManager
+from src.gateway.api import vault, config, health, logs, control, usage, providers, models, scheduled_tasks, workflow_tasks, mcps, marketplace, sessions as sessions_api, system as system_api, network as network_api, chat as chat_api, terminals as terminals_api
 from src.network import peers as peers_api
 from src.network.auth.middleware import make_auth_middleware
 from src.network.transport.aiohttp_iroh_site import IrohSite
@@ -61,6 +63,10 @@ class Gateway:
         self.config_path = config_path
         self._stop_event = stop_event
         self.sessions = SessionManager(agent_name=agent.name)
+        # PTY-backed interactive terminals (the "SSH terminal" surface).
+        # Keyed by (client_id, terminal_id); torn down per-client when a
+        # websocket drops so a closed app never leaks live shells.
+        self.terminals = TerminalManager()
         self.clients: dict[str, object] = {}  # client_id → WebSocketResponse
         self._runner = None
         self._site: IrohSite | None = None
@@ -350,6 +356,10 @@ class Gateway:
 
     async def stop(self) -> None:
         await self.sessions.shutdown()
+        try:
+            await self.terminals.close_all()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("terminal close_all on stop failed: %s", e)
         if self._system_broadcast_task is not None:
             self._system_broadcast_task.cancel()
             try:
@@ -496,6 +506,10 @@ class Gateway:
             # this REST handler exists for the initial paint and any
             # client that doesn't speak the WS feed.
             ("GET", "/api/system", system_api.handle_get),
+            # Interactive terminals — list the caller's live PTYs. The
+            # open/input/resize/close lifecycle runs over the WS via the
+            # ``terminal_*`` frames; this is just the initial-paint list.
+            ("GET", "/api/terminals", terminals_api.handle_list),
             # Network membership: peer networks (federation), and
             # info about this agent's home network. ``network/info``
             # works on both coordinator and member agents; ``peers``
@@ -917,6 +931,16 @@ class Gateway:
                         ws, client_id, data, handle=cert.handle,
                     )
 
+                # Interactive terminals — PTY frames from the desktop
+                # app's System tab or the CLI ``terminal`` command. The
+                # PTY lives on the gateway host; output flows back over
+                # this same ws as ``terminal_output``.
+                elif t in (
+                    P.TERMINAL_OPEN, P.TERMINAL_INPUT, P.TERMINAL_RESIZE,
+                    P.TERMINAL_SIGNAL, P.TERMINAL_CLOSE,
+                ):
+                    await self._handle_terminal_frame(ws, client_id, data)
+
         except Exception as e:
             # Capture exception TYPE + traceback in addition to the bare
             # ``str(e)``. The deflate-error class fired on the fleet from
@@ -948,6 +972,14 @@ class Gateway:
                 # so the agent's per-session resources (runtime session
                 # rows) get a clean release.
                 await self._close_stream_sessions_for(client_id)
+                # And kill any PTYs this client opened — a closed app or
+                # dropped link must not leave shells running on the host.
+                try:
+                    reaped = await self.terminals.close_for_client(client_id)
+                    if reaped:
+                        elog("terminal.client_cleanup", client_id=client_id, closed=reaped)
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("terminal client cleanup failed: %s", e)
             elif client_id:
                 elog(
                     "gateway.client_replaced",
@@ -1103,6 +1135,132 @@ class Gateway:
             total=len(sids),
         )
         return forgotten
+
+    async def _handle_terminal_frame(
+        self, ws, client_id: str, frame: dict,
+    ) -> None:
+        """Dispatch a PTY terminal frame (open/input/resize/signal/close).
+
+        Output and lifecycle events flow back over the *same* ``ws`` that
+        opened the terminal — the callbacks below close over it. A
+        terminal is bound to its websocket: when the connection drops,
+        the ``finally`` in :meth:`_handle_ws` calls
+        ``terminals.close_for_client`` so no shell outlives its client.
+        """
+        t = frame.get("type", "")
+        terminal_id = (frame.get("terminal_id") or "").strip()
+        if not terminal_id:
+            await self._safe_ws_send_json(ws, {
+                "type": P.TERMINAL_ERROR,
+                "terminal_id": "",
+                "error": "terminal_id is required",
+            })
+            return
+
+        if t == P.TERMINAL_OPEN:
+            # Refuse to spin up a PTY on a host that can't host one
+            # (Windows) — surface a clean error the UI can render.
+            from src.gateway.terminals import PTY_SUPPORTED
+
+            if not PTY_SUPPORTED:
+                await self._safe_ws_send_json(ws, {
+                    "type": P.TERMINAL_ERROR,
+                    "terminal_id": terminal_id,
+                    "error": "Interactive terminals aren't supported on this server's OS.",
+                })
+                return
+
+            cols = int(frame.get("cols") or 80)
+            rows = int(frame.get("rows") or 24)
+            cwd = frame.get("cwd") or None
+            shell = frame.get("shell") or None
+
+            async def _on_output(data: bytes, _tid=terminal_id, _ws=ws) -> None:
+                await self._safe_ws_send_json(_ws, {
+                    "type": P.TERMINAL_OUTPUT,
+                    "terminal_id": _tid,
+                    "data": base64.b64encode(data).decode("ascii"),
+                })
+
+            async def _on_exit(
+                exit_code, sig, _tid=terminal_id, _ws=ws
+            ) -> None:
+                await self._safe_ws_send_json(_ws, {
+                    "type": P.TERMINAL_EXIT,
+                    "terminal_id": _tid,
+                    "exit_code": exit_code,
+                    "signal": sig,
+                })
+
+            try:
+                session = await self.terminals.open(
+                    client_id=client_id,
+                    terminal_id=terminal_id,
+                    on_output=_on_output,
+                    on_exit=_on_exit,
+                    shell=shell,
+                    cwd=cwd,
+                    cols=cols,
+                    rows=rows,
+                )
+            except Exception as e:  # noqa: BLE001
+                elog(
+                    "terminal.open_failed",
+                    level="error",
+                    terminal_id=terminal_id,
+                    client_id=client_id,
+                    error=str(e),
+                )
+                await self._safe_ws_send_json(ws, {
+                    "type": P.TERMINAL_ERROR,
+                    "terminal_id": terminal_id,
+                    "error": f"Failed to open terminal: {e}",
+                })
+                return
+
+            await self._safe_ws_send_json(ws, {
+                "type": P.TERMINAL_READY,
+                "terminal_id": terminal_id,
+                "pid": session.pid,
+                "shell": session.shell,
+                "cols": session.cols,
+                "rows": session.rows,
+                "cwd": session.cwd,
+            })
+            return
+
+        if t == P.TERMINAL_INPUT:
+            raw = frame.get("data") or ""
+            try:
+                data = base64.b64decode(raw)
+            except Exception:  # noqa: BLE001 — malformed client frame
+                return
+            self.terminals.write(client_id, terminal_id, data)
+            return
+
+        if t == P.TERMINAL_RESIZE:
+            self.terminals.resize(
+                client_id, terminal_id,
+                int(frame.get("cols") or 80),
+                int(frame.get("rows") or 24),
+            )
+            return
+
+        if t == P.TERMINAL_SIGNAL:
+            self.terminals.signal(
+                client_id, terminal_id, str(frame.get("signal") or "INT"),
+            )
+            return
+
+        if t == P.TERMINAL_CLOSE:
+            await self.terminals.close(client_id, terminal_id)
+            await self._safe_ws_send_json(ws, {
+                "type": P.TERMINAL_EXIT,
+                "terminal_id": terminal_id,
+                "exit_code": None,
+                "signal": None,
+            })
+            return
 
     async def _handle_stream_frame(
         self, ws, client_id: str, frame: dict,

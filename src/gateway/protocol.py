@@ -120,4 +120,33 @@ SESSION_CLOSE = "session_close"
 VIDEO_FRAME_OUT = "video_frame_out"
 TURN_COMPLETE = "turn_complete"
 
+# Interactive terminals — a PTY on the host the gateway runs on, driven
+# live by a client (desktop app System tab, CLI ``terminal`` command).
+# Separate from the agent-facing ``shell`` MCP: this is the human "SSH
+# terminal" surface. See :mod:`src.gateway.terminals`. ``data`` fields
+# are base64-encoded raw bytes so binary-safe streams (UTF-8, control
+# sequences, even non-text) survive the JSON transport intact.
+#
+# Client → Server::
+#   {"type": "terminal_open",   "terminal_id": "...", "cols": N, "rows": N, "cwd": "...", "shell": "..."}
+#   {"type": "terminal_input",  "terminal_id": "...", "data": "<base64>"}
+#   {"type": "terminal_resize", "terminal_id": "...", "cols": N, "rows": N}
+#   {"type": "terminal_signal", "terminal_id": "...", "signal": "INT|TERM|HUP|QUIT|KILL"}
+#   {"type": "terminal_close",  "terminal_id": "..."}
+#
+# Server → Client::
+#   {"type": "terminal_ready",  "terminal_id": "...", "pid": N, "shell": "...", "cols": N, "rows": N}
+#   {"type": "terminal_output", "terminal_id": "...", "data": "<base64>"}
+#   {"type": "terminal_exit",   "terminal_id": "...", "exit_code": N|null, "signal": "..."|null}
+#   {"type": "terminal_error",  "terminal_id": "...", "error": "..."}
+TERMINAL_OPEN = "terminal_open"
+TERMINAL_INPUT = "terminal_input"
+TERMINAL_RESIZE = "terminal_resize"
+TERMINAL_SIGNAL = "terminal_signal"
+TERMINAL_CLOSE = "terminal_close"
+TERMINAL_READY = "terminal_ready"
+TERMINAL_OUTPUT = "terminal_output"
+TERMINAL_EXIT = "terminal_exit"
+TERMINAL_ERROR = "terminal_error"
+
 from src.gateway.commands import COMMANDS
