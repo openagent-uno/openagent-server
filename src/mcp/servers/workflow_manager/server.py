@@ -944,6 +944,131 @@ async def get_workflow_run(run_id: str) -> dict[str, Any]:
     return _decorate_run(row)
 
 
+@mcp.tool()
+async def stop_workflow(
+    id_or_name: str,
+    run_id: str | None = None,
+    wait: bool = True,
+    timeout_s: int = 30,
+) -> dict[str, Any]:
+    """Completely stop in-flight run(s) of a workflow.
+
+    Flags the workflow's currently-``running`` run(s) for cancellation; the
+    main OpenAgent process hard-stops each within a couple of seconds —
+    cancelling the executor mid-DAG and aborting any in-flight AI block —
+    then finalizes the run as ``cancelled``. Same DB-backed hand-off as
+    ``run_workflow``: this subprocess has no executor, so it can only signal
+    intent and (optionally) wait for the main process to act.
+
+    - ``id_or_name``: the workflow — full id, 8-char id prefix, or unique name.
+    - ``run_id``: stop only this one run. Omit to stop EVERY running run of
+      the workflow (the common case — most workflows have a single run).
+    - ``wait`` (default True): poll until the targeted run(s) leave the
+      ``running`` / ``cancelling`` state so the return reflects the real
+      outcome. ``wait=False`` returns the moment the flag is written.
+
+    Returns ``{workflow_id, name, stopped: [run_id...], count, runs: [{id,
+    status}], note}``. ``count`` is how many runs were flagged; ``0`` means
+    the workflow had nothing running.
+
+    Stopping a run does NOT stop the workflow from firing again. To do that,
+    disable it (``update_workflow(enabled=false)``) or remove its
+    ``trigger-schedule`` block. To stop a *scheduled-task* firing, use the
+    scheduler MCP's ``stop_scheduled_task``.
+    """
+    conn = await _get_conn()
+    row = await _resolve_workflow(conn, id_or_name)
+    workflow_id = row["id"]
+
+    # Snapshot exactly which running runs we're flagging, so we can report
+    # them and (optionally) poll those specific ids.
+    if run_id:
+        cursor = await conn.execute(
+            "SELECT id FROM workflow_runs "
+            "WHERE id = ? AND workflow_id = ? AND status = 'running'",
+            (run_id, workflow_id),
+        )
+    else:
+        cursor = await conn.execute(
+            "SELECT id FROM workflow_runs "
+            "WHERE workflow_id = ? AND status = 'running'",
+            (workflow_id,),
+        )
+    target_ids = [r["id"] for r in await cursor.fetchall()]
+
+    if not target_ids:
+        return {
+            "workflow_id": workflow_id,
+            "name": row["name"],
+            "stopped": [],
+            "count": 0,
+            "runs": [],
+            "note": (
+                f"No running run to stop for workflow {row['name']!r}"
+                + (f" (run_id {run_id!r})" if run_id else "")
+                + "."
+            ),
+        }
+
+    # The ``status='running'`` guard keeps the transition idempotent and
+    # avoids clobbering a run that finished between the SELECT and here.
+    placeholders = ",".join("?" for _ in target_ids)
+    await conn.execute(
+        f"UPDATE workflow_runs SET status = 'cancelling' "
+        f"WHERE id IN ({placeholders}) AND status = 'running'",
+        target_ids,
+    )
+    await conn.commit()
+
+    if wait:
+        runs = await _await_runs_terminal(conn, target_ids, timeout_s=timeout_s)
+    else:
+        runs = [{"id": rid, "status": "cancelling"} for rid in target_ids]
+
+    return {
+        "workflow_id": workflow_id,
+        "name": row["name"],
+        "stopped": target_ids,
+        "count": len(target_ids),
+        "runs": runs,
+        "note": (
+            f"Requested stop of {len(target_ids)} run(s); the main process "
+            "cancels them within ~2s."
+        ),
+    }
+
+
+async def _await_runs_terminal(
+    conn: aiosqlite.Connection,
+    run_ids: list[str],
+    *,
+    timeout_s: int,
+) -> list[dict[str, Any]]:
+    """Poll ``workflow_runs`` until each run id leaves ``running`` /
+    ``cancelling``, or the deadline passes. The main process is the writer
+    (cross-process, WAL); a fresh SELECT each pass sees its latest committed
+    status — exactly how ``run_workflow``'s wait-poller observes completion.
+    Returns ``[{id, status}]`` with the latest status for every requested id."""
+    deadline = time.monotonic() + max(1, timeout_s)
+    placeholders = ",".join("?" for _ in run_ids)
+    while True:
+        cursor = await conn.execute(
+            f"SELECT id, status FROM workflow_runs WHERE id IN ({placeholders})",
+            run_ids,
+        )
+        statuses = {r["id"]: r["status"] for r in await cursor.fetchall()}
+        pending = [
+            rid for rid in run_ids
+            if statuses.get(rid) in ("running", "cancelling")
+        ]
+        if not pending or time.monotonic() >= deadline:
+            return [
+                {"id": rid, "status": statuses.get(rid, "unknown")}
+                for rid in run_ids
+            ]
+        await asyncio.sleep(0.4)
+
+
 # ── entrypoint ───────────────────────────────────────────────────────
 
 

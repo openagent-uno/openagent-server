@@ -38,6 +38,20 @@ from src.core.logging import elog
 
 CHECK_INTERVAL = 30  # seconds between checking for due tasks
 
+# A "stop this run" request crosses the process boundary as a row flagged
+# ``status='cancelling'`` (written by the workflow-manager / scheduler MCP
+# subprocess, which can't reach the in-process executor or agent). The
+# scheduler drains those flags on a dedicated fast loop — far tighter than
+# CHECK_INTERVAL — so "completely stop" actually feels immediate instead of
+# waiting up to a full 30 s due-task tick.
+CANCEL_CHECK_INTERVAL = 2  # seconds between draining cancellation requests
+
+# Per-tick cap on how many ``cancelling`` rows a single drain processes. A
+# healthy system has ~0 at any moment; a high cap only matters after a mass
+# crash left stale flags. Hitting the cap is not data loss — the next tick
+# (2 s later) picks up the remainder — but we log it so a flood is visible.
+_CANCEL_SCAN_LIMIT = 500
+
 
 # Resource broadcast hook. ``AgentServer`` plugs the Gateway's
 # ``broadcast_resource_sync`` in here so that internal mutations (a
@@ -74,6 +88,10 @@ class Scheduler:
         self.db = db
         self.agent = agent
         self._task: asyncio.Task | None = None
+        # Dedicated loop that drains ``status='cancelling'`` rows. Kept
+        # separate from ``_task`` so the heavy due-task scan stays on its
+        # 30 s cadence while stop requests get acted on within seconds.
+        self._cancel_task: asyncio.Task | None = None
         # Lazy — created on first workflow tick.
         self._workflow_executor: WorkflowExecutor | None = None
         self._broadcast: BroadcastHook = broadcast or _no_broadcast
@@ -82,6 +100,14 @@ class Scheduler:
         # so different workflows actually run concurrently — the previous
         # design awaited each run inline, serialising the whole tick.
         self._workflow_tasks: set[asyncio.Task] = set()
+        # run_id → the ``asyncio.Task`` driving that run, so the
+        # cancellation drain can hard-stop a specific in-flight run by
+        # cancelling its task. Keyed by ``workflow_runs.id`` /
+        # ``task_runs.id`` (both UUIDs, so the two maps never collide).
+        # Entries are added the moment the run_id is known and removed in
+        # the run's ``finally`` — the map only ever holds live runs.
+        self._workflow_run_tasks: dict[str, asyncio.Task] = {}
+        self._scheduled_run_tasks: dict[str, asyncio.Task] = {}
 
     def _next_run(self, cron_expression: str, base: float | None = None) -> float:
         return next_run_for_expression(cron_expression, base)
@@ -93,6 +119,7 @@ class Scheduler:
         await self.db.connect()
         await self._recalculate_next_runs()
         self._task = asyncio.create_task(self._loop())
+        self._cancel_task = asyncio.create_task(self._cancellation_loop())
         elog("scheduler.start")
 
     async def stop(self) -> None:
@@ -104,6 +131,13 @@ class Scheduler:
             except asyncio.CancelledError:
                 pass
             self._task = None
+        if self._cancel_task:
+            self._cancel_task.cancel()
+            try:
+                await self._cancel_task
+            except asyncio.CancelledError:
+                pass
+            self._cancel_task = None
         # Let in-flight runs finish — matches the existing fire-and-forget
         # semantics of ``run_task``. Cancelling here would strand
         # ``workflow_runs`` rows in ``running`` and lose ai-prompt
@@ -178,6 +212,125 @@ class Scheduler:
                 elog("scheduler.loop_error", level="error", error=str(e))
             await asyncio.sleep(CHECK_INTERVAL)
 
+    # ── Run cancellation (cross-process "completely stop") ──
+    #
+    # The workflow-manager / scheduler MCP subprocesses can't reach the
+    # in-process executor or agent, so a "stop this run" request crosses the
+    # boundary as a row flagged ``status='cancelling'``. This loop turns the
+    # flag into a real hard stop: cancel the ``asyncio.Task`` driving the run
+    # (which unwinds the executor / agent turn, aborting any in-flight model
+    # call), then let the run's own cancellation handler finalize the row to
+    # ``cancelled``. A ``cancelling`` row with no live task — a stale flag
+    # left by a crash, or one written a hair after the run finished — is
+    # finalized directly so the badge never sticks.
+
+    async def _cancellation_loop(self) -> None:
+        """Drain ``status='cancelling'`` rows every CANCEL_CHECK_INTERVAL."""
+        while True:
+            try:
+                await self._drain_cancellations()
+            except Exception as e:  # noqa: BLE001
+                elog("scheduler.cancel_loop_error", level="error", error=str(e))
+            await asyncio.sleep(CANCEL_CHECK_INTERVAL)
+
+    async def _drain_cancellations(self) -> None:
+        """Act on every run flagged ``cancelling`` since the last drain."""
+        if self.db is None:
+            return
+        # Workflow runs.
+        try:
+            wf_runs = await self.db.get_workflow_runs_by_status(
+                "cancelling", limit=_CANCEL_SCAN_LIMIT,
+            )
+        except Exception as e:  # noqa: BLE001
+            elog("scheduler.cancel_scan_failed", level="warning",
+                 kind="workflow", error=str(e))
+            wf_runs = []
+        if len(wf_runs) >= _CANCEL_SCAN_LIMIT:
+            elog("scheduler.cancel_scan_capped", level="warning",
+                 kind="workflow", limit=_CANCEL_SCAN_LIMIT)
+        for run in wf_runs:
+            await self._apply_cancellation(
+                run, registry=self._workflow_run_tasks, kind="workflow",
+            )
+        # Scheduled-task runs — same shape, different table.
+        try:
+            task_runs = await self.db.get_task_runs_by_status(
+                "cancelling", limit=_CANCEL_SCAN_LIMIT,
+            )
+        except Exception as e:  # noqa: BLE001
+            elog("scheduler.cancel_scan_failed", level="warning",
+                 kind="scheduled_task", error=str(e))
+            task_runs = []
+        if len(task_runs) >= _CANCEL_SCAN_LIMIT:
+            elog("scheduler.cancel_scan_capped", level="warning",
+                 kind="scheduled_task", limit=_CANCEL_SCAN_LIMIT)
+        for run in task_runs:
+            await self._apply_cancellation(
+                run, registry=self._scheduled_run_tasks, kind="scheduled_task",
+            )
+
+    async def _apply_cancellation(
+        self, run: dict, *, registry: dict[str, asyncio.Task], kind: str,
+    ) -> None:
+        """Hard-stop one flagged run, or finalize it if no task owns it."""
+        run_id = run.get("id")
+        if not run_id:
+            return
+        task = registry.get(run_id)
+        if task is not None:
+            # Live run — request cancellation. Its handler finalizes the row
+            # to ``cancelled``. Idempotent: re-cancelling an already-
+            # cancelling task is harmless if it hasn't unwound by next drain.
+            if not task.done():
+                elog(
+                    "scheduler.cancel_requested", kind=kind, run_id=run_id,
+                    target=run.get("workflow_id") or run.get("task_id"),
+                )
+                task.cancel()
+            return
+        # No live task owns this row — a stale flag (crash) or a run that
+        # finished between the MCP write and now. Finalize directly so the
+        # UI doesn't sit on a phantom ``cancelling`` badge.
+        await self._finalize_orphan_cancellation(run, kind=kind)
+
+    async def _finalize_orphan_cancellation(self, run: dict, *, kind: str) -> None:
+        """Mark a ``cancelling`` row ``cancelled`` when no live task owns it.
+
+        Guarded so a write hiccup can't wedge the drain loop; the next tick
+        retries. The flag only lands on rows that were ``running``, so a
+        direct overwrite is safe — nothing else races to finalize it."""
+        run_id = run.get("id")
+        now = time.time()
+        try:
+            if kind == "workflow":
+                await self.db.update_workflow_run(
+                    run_id, status="cancelled", finished_at=now,
+                    error="Stopped (no live run to cancel)",
+                )
+                self._broadcast("workflow", "updated", run.get("workflow_id"))
+            else:
+                await self.db.update_task_run(
+                    run_id, status="cancelled", finished_at=now,
+                    error="Stopped (no live run to cancel)",
+                )
+                self._broadcast("scheduled_task", "updated", run.get("task_id"))
+            elog("scheduler.cancel_orphan_finalized", kind=kind, run_id=run_id)
+        except Exception as e:  # noqa: BLE001
+            elog("scheduler.cancel_finalize_failed", level="warning",
+                 kind=kind, run_id=run_id, error=str(e))
+
+    def _register_run(self, registry: dict[str, asyncio.Task], run_id: str) -> None:
+        """Bind the current run's ``asyncio.Task`` to ``run_id`` so the drain
+        can cancel it. Called from inside the run coroutine, where
+        ``current_task()`` is exactly that run's task."""
+        task = asyncio.current_task()
+        if task is not None:
+            registry[run_id] = task
+
+    def _unregister_run(self, registry: dict[str, asyncio.Task], run_id: str) -> None:
+        registry.pop(run_id, None)
+
     async def run_task(self, task: dict, *, trigger: str = "schedule") -> None:
         """Execute a single task. Extension point: override or monkey-patch
         this to intercept specific tasks (e.g. auto-update, which uses a
@@ -198,6 +351,10 @@ class Scheduler:
             except Exception as e:  # noqa: BLE001
                 elog("task.run_record_failed", level="warning",
                      name=task_name, error=str(e))
+        # Once the run row exists, bind this firing's task so the
+        # cancellation drain can hard-stop it on a "completely stop" request.
+        if run_id is not None:
+            self._register_run(self._scheduled_run_tasks, run_id)
         try:
             # Pick up any providers/models the REST or MCP layer wrote
             # since the last tick. The gateway fires refresh_registries on
@@ -219,12 +376,26 @@ class Scheduler:
             await self._record_task_finish(
                 run_id, task, status="success", output=str(response),
             )
+        except asyncio.CancelledError:
+            # A stop request (or shutdown) cancelled this firing mid-turn.
+            # Finalize the task_runs row as ``cancelled`` — not ``failed`` —
+            # before re-raising so the dashboard shows it was stopped, not
+            # that it errored. ``CancelledError`` is a BaseException, so the
+            # broad ``except Exception`` below never sees it; this branch is
+            # the only place the cancelled firing gets recorded.
+            elog("task.cancelled", name=task_name)
+            await self._record_task_finish(
+                run_id, task, status="cancelled", error="Stopped by user",
+            )
+            raise
         except Exception as e:
             elog("task.error", level="error", name=task_name, error=str(e))
             await self._record_task_finish(
                 run_id, task, status="failed", error=str(e),
             )
         finally:
+            if run_id is not None:
+                self._unregister_run(self._scheduled_run_tasks, run_id)
             # Scheduled firings are fire-and-forget — each tick must run in
             # a fresh session with no memory of prior firings. ``forget_session``
             # wipes the provider-native resume id, so the next firing spawns
@@ -443,6 +614,12 @@ class Scheduler:
                     request_id=request_id, error=str(e),
                 )
 
+        # Bind this run's task so the cancellation drain can hard-stop it.
+        # Safe to register before the executor opens the run row: the MCP
+        # only flags a row ``cancelling`` once it exists and is ``running``,
+        # so no cancel can target this run_id until the executor has created
+        # the row a few lines down.
+        self._register_run(self._workflow_run_tasks, run_id)
         try:
             try:
                 await self.agent.refresh_registries()
@@ -460,8 +637,28 @@ class Scheduler:
                 run_id=final.get("id"),
                 status=final.get("status"),
             )
+        except asyncio.CancelledError:
+            # A stop request (or shutdown) cancelled this run. The executor
+            # catches only ``Exception``, so ``CancelledError`` unwinds it
+            # with the row left ``running`` — finalize it to ``cancelled``
+            # here so the badge clears and the MCP's wait-poller stops. The
+            # in-flight model call was already aborted as the await chain
+            # unwound. Re-raise per asyncio convention.
+            elog("workflow.cancelled", name=wf_name, run_id=run_id)
+            try:
+                await self.db.update_workflow_run(
+                    run_id, status="cancelled", finished_at=time.time(),
+                    error="Stopped by user",
+                )
+                self._broadcast("workflow", "updated", wf.get("id"))
+            except Exception as e:  # noqa: BLE001
+                elog("workflow.cancel_finalize_failed", level="error",
+                     run_id=run_id, error=str(e))
+            raise
         except Exception as e:  # noqa: BLE001
             elog("workflow.error", level="error", name=wf_name, error=str(e))
+        finally:
+            self._unregister_run(self._workflow_run_tasks, run_id)
 
     # ── Task management helpers ──
 

@@ -300,6 +300,11 @@ _TEST_MODULES: tuple[str, ...] = (
     # OperationalError; cosmetic update_workflow lock is non-fatal;
     # retry is BOUNDED so we don't recreate the original loop.
     "test_workflow_finalize_resilience",
+    # Cross-process "completely stop a running run": the workflow-manager /
+    # scheduler MCP flags a run ``cancelling`` and the scheduler's drain loop
+    # hard-cancels the in-flight task and finalizes it ``cancelled`` (plus
+    # the orphan sweep for stale flags). Pins both MCP stop tools too.
+    "test_run_cancellation",
     # HTTP 402 / Insufficient Balance from any provider rewrites to a
     # billing-hint message naming the provider — surfaces the actual
     # config issue instead of looking like a transient provider blip.

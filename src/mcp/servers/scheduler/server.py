@@ -76,6 +76,7 @@ async def _get_conn() -> aiosqlite.Connection:
             path = _db_path()
             conn = await aiosqlite.connect(path)
             conn.row_factory = aiosqlite.Row
+            await conn.execute("PRAGMA busy_timeout = 10000")
             await conn.execute("PRAGMA journal_mode=WAL")
             await conn.executescript(SCHEMA_SQL)
             await conn.commit()
@@ -344,6 +345,113 @@ async def delete_scheduled_task(task_id: str) -> dict[str, Any]:
     await conn.execute("DELETE FROM scheduled_tasks WHERE id = ?", (full_id,))
     await conn.commit()
     return {"deleted": True, "id": full_id, "name": name}
+
+
+@mcp.tool()
+async def stop_scheduled_task(
+    task_id: str,
+    wait: bool = True,
+    timeout_s: int = 30,
+) -> dict[str, Any]:
+    """Completely stop the currently-running firing(s) of a scheduled task.
+
+    A scheduled task fires a full agent turn on its cron tick. This flags
+    any in-flight firing of the task for cancellation; the main OpenAgent
+    process hard-stops it within a couple of seconds — aborting the agent
+    turn and any in-flight model call — and records the run as ``cancelled``.
+    Same DB-backed hand-off as the other scheduler tools: this subprocess
+    only signals intent and (optionally) waits for the main process to act.
+
+    - ``task_id``: the scheduled task (full UUID or 8-char prefix).
+    - ``wait`` (default True): poll until the firing(s) actually stop, so the
+      return reflects the real outcome. ``wait=False`` returns immediately.
+
+    Returns ``{task_id, name, stopped: [run_id...], count, runs: [{id,
+    status}], note}``. ``count`` is how many firings were flagged; ``0``
+    means nothing was running.
+
+    This stops the *current run* only — it does not affect the schedule. To
+    stop the task from firing again, use ``update_scheduled_task(
+    enabled=false)`` (reversible) or ``delete_scheduled_task`` (permanent).
+    """
+    conn = await _get_conn()
+    full_id = await _resolve_task_id(conn, task_id)
+
+    cursor = await conn.execute(
+        "SELECT name FROM scheduled_tasks WHERE id = ?", (full_id,)
+    )
+    name_row = await cursor.fetchone()
+    name = name_row[0] if name_row else ""
+
+    cursor = await conn.execute(
+        "SELECT id FROM task_runs WHERE task_id = ? AND status = 'running'",
+        (full_id,),
+    )
+    target_ids = [r["id"] for r in await cursor.fetchall()]
+
+    if not target_ids:
+        return {
+            "task_id": full_id,
+            "name": name,
+            "stopped": [],
+            "count": 0,
+            "runs": [],
+            "note": f"No running firing to stop for task {name or full_id!r}.",
+        }
+
+    # The ``status='running'`` guard keeps the transition idempotent and
+    # avoids clobbering a firing that finished between the SELECT and here.
+    placeholders = ",".join("?" for _ in target_ids)
+    await conn.execute(
+        f"UPDATE task_runs SET status = 'cancelling' "
+        f"WHERE id IN ({placeholders}) AND status = 'running'",
+        target_ids,
+    )
+    await conn.commit()
+
+    if wait:
+        runs = await _await_task_runs_terminal(conn, target_ids, timeout_s=timeout_s)
+    else:
+        runs = [{"id": rid, "status": "cancelling"} for rid in target_ids]
+
+    return {
+        "task_id": full_id,
+        "name": name,
+        "stopped": target_ids,
+        "count": len(target_ids),
+        "runs": runs,
+        "note": (
+            f"Requested stop of {len(target_ids)} firing(s); the main "
+            "process cancels them within ~2s."
+        ),
+    }
+
+
+async def _await_task_runs_terminal(
+    conn: aiosqlite.Connection, run_ids: list[str], *, timeout_s: int,
+) -> list[dict[str, Any]]:
+    """Poll ``task_runs`` until each id leaves ``running`` / ``cancelling``,
+    or the deadline passes. The main process is the writer (cross-process,
+    WAL); a fresh SELECT each pass sees its latest committed status. Returns
+    ``[{id, status}]`` with the latest status for every requested id."""
+    deadline = time.monotonic() + max(1, timeout_s)
+    placeholders = ",".join("?" for _ in run_ids)
+    while True:
+        cursor = await conn.execute(
+            f"SELECT id, status FROM task_runs WHERE id IN ({placeholders})",
+            run_ids,
+        )
+        statuses = {r["id"]: r["status"] for r in await cursor.fetchall()}
+        pending = [
+            rid for rid in run_ids
+            if statuses.get(rid) in ("running", "cancelling")
+        ]
+        if not pending or time.monotonic() >= deadline:
+            return [
+                {"id": rid, "status": statuses.get(rid, "unknown")}
+                for rid in run_ids
+            ]
+        await asyncio.sleep(0.4)
 
 
 @mcp.tool()

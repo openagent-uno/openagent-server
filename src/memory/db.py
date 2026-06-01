@@ -1356,15 +1356,25 @@ class MemoryDB:
 
     async def update_task_run(self, run_id: str, **kwargs: Any) -> None:
         """Partial update. Only ``status`` / ``finished_at`` / ``output`` /
-        ``error`` are writable."""
+        ``error`` are writable.
+
+        Same cancellation invariant as ``update_workflow_run``: a firing
+        flagged ``status='cancelling'`` may only move to ``cancelled``, so a
+        natural finalize (``success`` / ``failed``) that races a "completely
+        stop" request is suppressed and the orphan sweep / cancel handler
+        records ``cancelled``.
+        """
         allowed = {"status", "finished_at", "output", "error"}
         updates = {k: v for k, v in kwargs.items() if k in allowed}
         if not updates:
             return
         conn = await self._ensure_connected()
         set_clause = ", ".join(f"{k} = ?" for k in updates)
+        where = "WHERE id = ?"
+        if "status" in updates and updates["status"] != "cancelled":
+            where += " AND status != 'cancelling'"
         await conn.execute(
-            f"UPDATE task_runs SET {set_clause} WHERE id = ?",
+            f"UPDATE task_runs SET {set_clause} {where}",
             list(updates.values()) + [run_id],
         )
         await conn.commit()
@@ -1399,6 +1409,23 @@ class MemoryDB:
         rows = await cursor.fetchall()
         return [self._row_to_task_run(r) for r in rows]
 
+    async def get_task_runs_by_status(
+        self, status: str, *, limit: int = 500,
+    ) -> list[dict]:
+        """Every ``task_runs`` row in ``status``, across all scheduled
+        tasks. Powers the scheduler's cancellation drain, which scans for
+        rows the scheduler MCP flagged ``cancelling`` and stops the
+        in-flight firing that owns each one. Backed by ``idx_taskruns_status``
+        so the scan stays cheap even when only a handful of rows ever match."""
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            "SELECT * FROM task_runs WHERE status = ? "
+            "ORDER BY started_at ASC LIMIT ?",
+            (status, int(limit)),
+        )
+        rows = await cursor.fetchall()
+        return [self._row_to_task_run(r) for r in rows]
+
     async def reap_orphan_task_runs(self) -> int:
         """Mark every ``task_runs`` row still ``running`` as ``failed`` —
         the scheduled-task analogue of ``reap_orphan_workflow_runs``. A
@@ -1417,8 +1444,22 @@ class MemoryDB:
             "WHERE status='running'",
             (now,),
         )
+        reaped = cursor.rowcount or 0
+        # A firing flagged 'cancelling' that the prior process never finalized
+        # (crash between the MCP flag and the scheduler's drain) is also an
+        # orphan — finalize it as 'cancelled' (the requested outcome), kept
+        # distinct from the 'failed' reap above.
+        cancel_cursor = await conn.execute(
+            "UPDATE task_runs "
+            "SET status='cancelled', finished_at=?, "
+            "    error=COALESCE(error, '') || "
+            "          CASE WHEN error IS NULL OR error='' THEN '' ELSE ' | ' END || "
+            "          'reaped: stop left pending by prior process' "
+            "WHERE status='cancelling'",
+            (now,),
+        )
         await conn.commit()
-        return cursor.rowcount or 0
+        return reaped + (cancel_cursor.rowcount or 0)
 
     async def prune_task_runs(self, task_id: str, *, keep_last: int = 50) -> int:
         """Delete all but the most recent ``keep_last`` runs for a task.
@@ -1760,7 +1801,19 @@ class MemoryDB:
 
     async def update_workflow_run(self, run_id: str, **kwargs: Any) -> None:
         """Partial update. ``outputs`` / ``trace`` (Python objects) are
-        serialized to their ``_json`` columns."""
+        serialized to their ``_json`` columns.
+
+        Cancellation invariant: once a run is flagged ``status='cancelling'``
+        (a "completely stop" request from the workflow-manager MCP), the only
+        status it may move to is ``cancelled``. A natural finalize that lands
+        in the stop window — the executor writing ``success`` / ``failed``
+        just after the flag — is suppressed (the UPDATE matches no row),
+        leaving the run ``cancelling`` for the scheduler's cancel handler or
+        orphan sweep to finalize as ``cancelled``. This keeps "stop"
+        authoritative over a run that completed a hair too late, so a flagged
+        run never escapes to a non-cancelled terminal state. Writes that don't
+        touch ``status`` (e.g. trace-only updates) are never gated.
+        """
         allowed_direct = {"status", "finished_at", "error"}
         updates: dict[str, Any] = {}
         for k, v in kwargs.items():
@@ -1773,9 +1826,12 @@ class MemoryDB:
         if not updates:
             return
         set_clause = ", ".join(f"{k} = ?" for k in updates)
+        where = "WHERE id = ?"
+        if "status" in updates and updates["status"] != "cancelled":
+            where += " AND status != 'cancelling'"
         conn = await self._ensure_connected()
         await conn.execute(
-            f"UPDATE workflow_runs SET {set_clause} WHERE id = ?",
+            f"UPDATE workflow_runs SET {set_clause} {where}",
             list(updates.values()) + [run_id],
         )
         await conn.commit()
@@ -1810,6 +1866,23 @@ class MemoryDB:
         rows = await cursor.fetchall()
         return [self._row_to_workflow_run(r) for r in rows]
 
+    async def get_workflow_runs_by_status(
+        self, status: str, *, limit: int = 500,
+    ) -> list[dict]:
+        """Every ``workflow_runs`` row in ``status``, across all workflows.
+        Powers the scheduler's cancellation drain, which scans for runs the
+        workflow-manager MCP flagged ``cancelling`` and stops the in-flight
+        executor that owns each one. Backed by ``idx_wfruns_status`` so the
+        scan stays cheap even when only a handful of rows ever match."""
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            "SELECT * FROM workflow_runs WHERE status = ? "
+            "ORDER BY started_at ASC LIMIT ?",
+            (status, int(limit)),
+        )
+        rows = await cursor.fetchall()
+        return [self._row_to_workflow_run(r) for r in rows]
+
     async def reap_orphan_workflow_runs(self) -> int:
         """Mark every workflow_run still in ``running`` as ``failed``.
 
@@ -1838,8 +1911,22 @@ class MemoryDB:
             "WHERE status='running'",
             (now,),
         )
+        reaped = cursor.rowcount or 0
+        # A run flagged 'cancelling' that the prior process never finalized
+        # (crash between the MCP flag and the scheduler's drain) is also an
+        # orphan — finalize it as 'cancelled' (the requested outcome), kept
+        # distinct from the 'failed' reap above.
+        cancel_cursor = await conn.execute(
+            "UPDATE workflow_runs "
+            "SET status='cancelled', finished_at=?, "
+            "    error=COALESCE(error, '') || "
+            "          CASE WHEN error IS NULL OR error='' THEN '' ELSE ' | ' END || "
+            "          'reaped: stop left pending by prior process' "
+            "WHERE status='cancelling'",
+            (now,),
+        )
         await conn.commit()
-        return cursor.rowcount or 0
+        return reaped + (cancel_cursor.rowcount or 0)
 
     async def prune_workflow_runs(
         self,
