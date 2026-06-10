@@ -342,6 +342,10 @@ _TEST_MODULES: tuple[str, ...] = (
     #     importlib-walk every src/ module so a truncated file is
     #     caught even if no behavioural test exercises its symbols.
     "test_repo_hygiene",
+    # Vault-save reminder: per-session turn counter injects a
+    #     memory-checkpoint prompt into the user turn every N turns
+    #     (default off; opt-in via memory.vault_reminder.enabled).
+    "test_vault_reminder",
 )
 
 

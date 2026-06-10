@@ -239,6 +239,18 @@ def _build_agent(config: dict) -> Agent:
         os.environ["OPENAGENT_CURATOR_ENABLED"] = (
             "1" if bool(_cur_cfg["enabled"]) else "0"
         )
+    _vr_cfg = (memory_cfg.get("vault_reminder") or {})
+    if "enabled" in _vr_cfg:
+        os.environ["OPENAGENT_VAULT_REMINDER_ENABLED"] = (
+            "1" if bool(_vr_cfg["enabled"]) else "0"
+        )
+    if "every_n_turns" in _vr_cfg:
+        try:
+            os.environ["OPENAGENT_VAULT_REMINDER_EVERY_N_TURNS"] = str(
+                int(_vr_cfg["every_n_turns"])
+            )
+        except (TypeError, ValueError):
+            pass
 
     # Extended thinking budget. Surfaces as ``model.extended_thinking_tokens``
     # in yaml so it stays in the same logical namespace as future

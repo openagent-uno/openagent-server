@@ -722,6 +722,20 @@ class BaseBridge:
                 # Never let learning shrapnel block a user turn.
                 pass
 
+        if os.environ.get("OPENAGENT_VAULT_REMINDER_ENABLED", "0").strip().lower() in (
+            "1", "true", "yes", "on",
+        ):
+            try:
+                from src.learning.vault_reminder import maybe_render_reminder as _vr_render
+                _vr_shim = await self._get_learning_db_shim()
+                if _vr_shim is not None:
+                    _reminder = await _vr_render(_vr_shim, session_id)
+                    if _reminder:
+                        outbound_text = f"{_reminder}\n\n{outbound_text}"
+            except Exception:
+                # Never let reminder logic block a user turn.
+                pass
+
         try:
             response = await self.send_message(
                 outbound_text, session_id,

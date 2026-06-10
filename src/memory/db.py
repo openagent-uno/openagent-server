@@ -502,6 +502,19 @@ CREATE TABLE IF NOT EXISTS conversation_embeddings (
 );
 CREATE INDEX IF NOT EXISTS idx_conv_emb_session ON conversation_embeddings(session_id);
 CREATE INDEX IF NOT EXISTS idx_conv_emb_timestamp ON conversation_embeddings(timestamp);
+-- ``vault_save_reminders`` tracks per-session turn counts so the
+-- reminder injector in ``src.learning.vault_reminder`` can fire
+-- a memory-checkpoint prompt into the user turn every N turns.
+-- Unlike ``user_profiles``, this table owns only the counter -- no
+-- profile payload -- so the two features can be enabled independently.
+CREATE TABLE IF NOT EXISTS vault_save_reminders (
+    session_id      TEXT PRIMARY KEY,
+    turn_count      INTEGER NOT NULL DEFAULT 0,
+    last_reminded_at REAL,
+    created_at      REAL NOT NULL,
+    updated_at      REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_vault_reminders_updated ON vault_save_reminders(updated_at);
 """
 
 
