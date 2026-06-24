@@ -665,6 +665,29 @@ async def t_git_autocommit_attr(ctx: TestContext) -> None:
         shutil.rmtree(d, ignore_errors=True)
 
 
+@test("vault_gate", "git: writes a trust-the-vault gitconfig (safe.directory) for containers")
+async def t_git_safe_directory(ctx: TestContext) -> None:
+    if not _has_git():
+        raise TestSkip("git not installed")
+    from src.memory.vault.gitrepo import VaultGit
+    d, vault, _idxp = _mkvault()
+    try:
+        (vault / "a.md").write_text("# A\n")
+        g = VaultGit(vault)
+        assert g.ensure_repo()
+        # the private global config exists and trusts all dirs, so git works
+        # even when the process uid != the vault-volume owner (root-in-k8s)
+        assert g._gitconfig.exists(), "gitconfig not written"
+        cfg = g._gitconfig.read_text()
+        assert "directory = *" in cfg, cfg
+        # and the commit env points git at it
+        import inspect
+        src = inspect.getsource(g._git)
+        assert "GIT_CONFIG_GLOBAL" in src and "GIT_CONFIG_SYSTEM" in src
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 @test("vault_gate", "git: disabled — mutations don't commit and never error")
 async def t_git_disabled(ctx: TestContext) -> None:
     import os

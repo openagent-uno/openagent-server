@@ -14,10 +14,12 @@ vault still works, just without history.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import shutil
 import subprocess
+import tempfile
 import threading
 from pathlib import Path
 from typing import Optional
@@ -71,6 +73,16 @@ class VaultGit:
         self.git_bin = git_bin if git_bin is not None else resolve_git_bin()
         self._lock = threading.RLock()
         self._repo_ready = False
+        # A private, self-contained global gitconfig. It trusts the vault dir
+        # regardless of ownership — essential in containers where OpenAgent
+        # runs as root but the vault volume is owned by another uid, which
+        # otherwise makes git refuse every operation with "dubious
+        # ownership". ``safe.directory`` is ONLY honoured from system/global
+        # config (not -c / env), so we point GIT_CONFIG_GLOBAL at this file.
+        self._gitconfig = (
+            Path(tempfile.gettempdir())
+            / f"openagent-vaultgit-{hashlib.sha1(str(self.vault_root).encode()).hexdigest()[:12]}.gitconfig"
+        )
 
     @property
     def available(self) -> bool:
@@ -78,8 +90,26 @@ class VaultGit:
 
     # ── low-level runner ──────────────────────────────────────────────
 
+    def _ensure_gitconfig(self) -> None:
+        try:
+            if not self._gitconfig.exists():
+                self._gitconfig.write_text(
+                    "[safe]\n\tdirectory = *\n[init]\n\tdefaultBranch = main\n"
+                )
+        except Exception:  # noqa: BLE001 — best-effort
+            pass
+
     def _git(self, *args: str, timeout: int = 60) -> subprocess.CompletedProcess:
         name, email = _author()
+        self._ensure_gitconfig()
+        # GIT_CONFIG_GLOBAL → our trust-the-vault config; GIT_CONFIG_SYSTEM →
+        # devnull so a restrictive system config can't re-impose the
+        # ownership check. Identity still passed via -c.
+        env = {
+            **os.environ,
+            "GIT_CONFIG_GLOBAL": str(self._gitconfig),
+            "GIT_CONFIG_SYSTEM": os.devnull,
+        }
         cmd = [
             self.git_bin, "-C", str(self.vault_root),
             "-c", f"user.name={name}",
@@ -90,7 +120,7 @@ class VaultGit:
             *args,
         ]
         return subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout,
+            cmd, capture_output=True, text=True, timeout=timeout, env=env,
         )
 
     def is_repo(self) -> bool:
