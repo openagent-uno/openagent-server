@@ -167,10 +167,10 @@ def _cleanup_stale_openagent_frozen_extract_dirs(
 def _startup_cleanup() -> None:
     """Run frozen-binary cleanup tasks on startup."""
     from src._frozen import (
-        executable_path,
         is_frozen,
         patch_importlib_metadata_for_frozen,
         patch_ssl_for_frozen,
+        swap_pending_if_any,
     )
 
     # Must happen BEFORE the first ``import src.mcp._runtime.function``
@@ -192,24 +192,21 @@ def _startup_cleanup() -> None:
     if not is_frozen():
         return
 
-    exe = executable_path()
+    # IMPORTANT: do NOT delete the ``.old`` / ``.app.old`` here. It is the
+    # last-known-good rollback target that the post-restart boot guard
+    # (:mod:`src.update_guard`) restores when a freshly-installed binary
+    # turns out to be unhealthy. Deleting it on every boot — as this used
+    # to — destroyed the only recovery artifact before the health check
+    # could ever use it, which on an unreachable box means a bad release
+    # bricks the agent permanently. The ``.old`` is now owned by the
+    # update guard: created on swap, consumed on rollback, or replaced by
+    # the next update's ``apply_update``.
 
-    old = exe.with_suffix(exe.suffix + ".old") if exe.suffix else exe.parent / (exe.name + ".old")
-    if old.exists():
-        try:
-            old.unlink()
-        except OSError:
-            pass
-
-    import platform
-
-    if platform.system() == "Windows":
-        pending = exe.parent / (exe.stem + ".pending.exe")
-        if pending.exists():
-            try:
-                shutil.move(str(pending), str(exe))
-            except OSError:
-                pass
+    # Windows: promote a staged ``*.pending.exe`` and re-exec. Delegating
+    # to the canonical helper (which keeps a ``.old`` backup and re-execs)
+    # instead of the previous inline ``shutil.move`` that kept no backup
+    # and never re-execed, so the user stayed on the old code.
+    swap_pending_if_any()
 
 
 def _reload_context_config(ctx, config_path: str) -> dict:
@@ -232,6 +229,11 @@ def _global_default_paths() -> tuple[Path, Path, Path]:
 
 
 @click.group()
+@click.version_option(
+    version=__import__("src").__version__,
+    prog_name="openagent",
+    message="%(prog)s %(version)s",
+)
 @click.option("--config", "-c", default="openagent.yaml", help="Config file path")
 @click.option("--agent-dir", "-d", default=None, help="Agent directory (config, DB, memories, logs)")
 @click.option("--verbose", "-v", is_flag=True, help="Enable debug logging")
@@ -258,6 +260,25 @@ def main(ctx, config: str, agent_dir: str | None, verbose: bool):
     setup_logging(verbose=verbose)
     _startup_cleanup()
 
+    # Self-update rollback boot guard. Runs ONLY on the serve path (the
+    # pre-swap selfcheck/version probes also pass through main() and must
+    # not be counted as boot attempts), and BEFORE config load so even a
+    # bad release that crashes parsing its own config still counts as a
+    # failed boot. After MAX_BOOT_ATTEMPTS boots that never reach the
+    # serving milestone, the guard restores the previous binary and we
+    # exit 75 so the supervisor relaunches the known-good version — the
+    # whole point of self-healing on a box we can't SSH into.
+    if ctx.invoked_subcommand == "serve":
+        try:
+            from src.update_guard import boot_guard
+            if boot_guard() == "rolled_back":
+                import os as _os
+                _os._exit(75)  # RESTART_EXIT_CODE; supervisor relaunches .old
+        except SystemExit:
+            raise
+        except Exception:  # noqa: BLE001 — guard must never block boot
+            pass
+
     if agent_dir is not None and config == "openagent.yaml":
         config = str(paths.default_config_path())
 
@@ -271,6 +292,83 @@ def init(agent_dir: str):
     path = paths.ensure_agent_dir(Path(agent_dir).expanduser().resolve())
     console.print(f"[green]Agent directory ready:[/green] {path}")
     console.print(f"[dim]Start with: openagent serve {path}[/dim]")
+
+
+@main.command()
+@click.option("--quiet", "-q", is_flag=True, help="Print only the bare version string.")
+@click.option("--expect", default=None, help="Fail (exit 3) unless the running version equals this.")
+def selfcheck(quiet: bool, expect: str | None) -> None:
+    """Prove this binary can start, then print its version.
+
+    Used by the self-updater's PRE-SWAP execution gate: before replacing
+    the live binary the updater runs ``<new-binary> selfcheck`` from the
+    current (known-good) process. Reaching this code at all means the
+    frozen bundle extracted, Python started, and the core import graph
+    (loaded at module import in this CLI) is intact — so a wrong-arch /
+    corrupt / missing-dylib build is caught BEFORE it can ever be swapped
+    in. Exit 0 = healthy; non-zero = do not install.
+    """
+    import src as _src
+    version = getattr(_src, "__version__", "unknown")
+    if expect is not None and version != expect:
+        if not quiet:
+            console.print(f"[red]version mismatch:[/red] running {version}, expected {expect}")
+        raise SystemExit(3)
+    if quiet:
+        print(version)
+    else:
+        console.print(f"openagent {version} [green]ok[/green]")
+
+
+@main.command()
+@click.option("--yes", "-y", is_flag=True, help="Apply without the confirmation prompt.")
+@click.option("--no-restart", is_flag=True, help="Apply the swap but don't restart the running service.")
+@click.pass_context
+def update(ctx, yes: bool, no_restart: bool) -> None:
+    """Check for, verify, and install the latest OpenAgent release.
+
+    The reliable LOCAL recovery path: runs the same fail-closed,
+    checksum-verified, pre-swap-self-checked flow as the auto-updater,
+    then bounces the installed service so the new binary takes over (the
+    running service is a separate process, so a swap alone wouldn't pick
+    it up). Use ``--no-restart`` to stage the swap and let the service
+    pick it up on its next restart.
+    """
+    from src.core.server import get_installed_version, run_upgrade
+
+    current = get_installed_version()
+    console.print(f"Current version: [bold]{current}[/bold]")
+    if not yes:
+        click.confirm("Check for and install updates now?", default=True, abort=True)
+
+    try:
+        old, new = run_upgrade()
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]Update failed:[/red] {exc}")
+        raise SystemExit(1)
+
+    if old == new:
+        console.print(f"[green]Already up-to-date[/green] (v{old}).")
+        return
+
+    console.print(f"[green]Installed[/green] v{old} → v{new}.")
+
+    if no_restart:
+        console.print("[dim]Service not restarted (--no-restart); it will pick up "
+                      "the new binary on its next restart.[/dim]")
+        return
+
+    # Bounce the installed service so the new binary takes over now.
+    try:
+        from src.setup.installer import restart_service
+        active_dir = paths.get_agent_dir()
+        msg = restart_service(active_dir)
+        console.print(f"[green]Restarted:[/green] {msg}")
+    except Exception as exc:  # noqa: BLE001
+        console.print(
+            f"[yellow]Update installed but could not auto-restart the service "
+            f"({exc}).[/yellow] Restart it manually to load v{new}."
+        )
 
 
 @main.command()
@@ -347,6 +445,19 @@ def serve(ctx, agent_dir: str | None, channel: tuple[str, ...], no_auto_init: bo
 
                 served = True
                 console.print(Panel(f"[bold]Serving[/bold]: {', '.join(active)}", border_style="green"))
+
+                # Reaching "serving" is the health milestone that confirms
+                # a pending self-update: gateway bound, scheduler up,
+                # bridges connected. Flip the update journal to confirmed
+                # so the boot guard stops counting this binary's restarts
+                # as failed update attempts. A binary that crash-loops
+                # before here never confirms — which is exactly what lets
+                # the guard roll it back.
+                try:
+                    from src.update_guard import mark_healthy
+                    mark_healthy()
+                except Exception:  # noqa: BLE001 — never break serving
+                    pass
 
                 # First-run hint: print the auto-minted invite so the
                 # user can connect without going looking for ``network
@@ -501,6 +612,9 @@ def mcp_server_cmd(name: str):
 
 main.add_command(network_group)
 
+from src.memory.vault.cli import vault_group  # noqa: E402
+main.add_command(vault_group)
+
 
 @main.command("invite")
 @click.argument("handle", required=False, default=None)
@@ -537,18 +651,30 @@ def cmd_top_level_invite(ctx, handle, role, ttl, uses):
 
 
 @main.command()
+@click.option("--fix", is_flag=True,
+              help="Attempt to install missing dependencies (e.g. git for the vault repo).")
 @click.pass_context
-def doctor(ctx) -> None:
+def doctor(ctx, fix: bool) -> None:
     """Run health checks: Python version, config validity, vault path,
     git/node/docker availability, and which channels are configured.
 
     Exits 1 when any check fails so the command can be chained in
     setup scripts / CI. Wraps the existing ``setup.bootstrap.run_doctor``
     (which already encodes the check list) in a friendly rich.Table
-    front-end.
+    front-end. ``--fix`` installs what it can (the vault needs git).
     """
     from rich.table import Table
     from src.setup.bootstrap import run_doctor as _run_doctor
+
+    if fix:
+        from src.setup.bootstrap import ensure_git as _ensure_git
+        import shutil as _shutil
+        if not _shutil.which("git"):
+            console.print("[cyan]Installing git for the memory-vault repo…[/cyan]")
+            got = _ensure_git()
+            console.print(f"[green]git: {got}[/green]" if got
+                          else "[yellow]Could not install git automatically — "
+                               "install it manually; the vault still works without history.[/yellow]")
 
     agent_dir = paths.get_agent_dir() or Path(".").resolve()
     config_path = agent_dir / "openagent.yaml"

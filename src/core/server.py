@@ -31,6 +31,7 @@ from src.core.logging import clear as clear_event_log, elog
 # subsequent ``from`` statements are dict lookups, not archive reads.
 import src._frozen  # noqa: F401 — preload for concurrent-update safety
 import src.updater  # noqa: F401 — preload for concurrent-update safety
+import src.update_guard  # noqa: F401 — preload for concurrent-update safety
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,18 @@ from src.core.builtin_tasks import (
     DREAM_MODE_TASK_NAME,
     MANAGER_REVIEW_TASK_NAME,
 )
+
+
+def _compose_task_hook(hook, nxt):
+    """Wrap *nxt* (the rest of the run_task chain) with *hook*.
+
+    Used by ``AgentServer._install_task_hook`` to build the dispatcher's
+    call chain. ``hook(task, next)`` runs its pre/post logic and calls
+    ``await next(task)`` to defer to the remaining hooks + the real
+    ``run_task``."""
+    async def _composed(task):
+        await hook(task, nxt)
+    return _composed
 
 DREAM_MODE_PROMPT = """\
 You are running in Dream Mode — a nightly maintenance routine.
@@ -251,6 +264,69 @@ def _build_agent(config: dict) -> Agent:
             )
         except (TypeError, ValueError):
             pass
+
+    # Vault quality subsystem (code-enforced gate, incremental index,
+    # derived artifacts, dream-mode maintenance). See ``src.memory.vault``.
+    # Export the resolved vault path so in-process consumers (the gate
+    # service, the native vault-gate MCP) target the SAME folder the agent
+    # and gateway use — they read OPENAGENT_VAULT_PATH first.
+    if memory_cfg.get("vault_path"):
+        try:
+            from pathlib import Path as _P
+            os.environ["OPENAGENT_VAULT_PATH"] = str(
+                _P(str(memory_cfg["vault_path"])).expanduser().resolve()
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    _vault_cfg = (memory_cfg.get("vault") or {})
+    for _k, _env in (
+        ("enabled",           "OPENAGENT_VAULT_ENABLED"),
+        ("enforce_taxonomy",  "OPENAGENT_VAULT_ENFORCE_TAXONOMY"),
+        ("check_em_dash",     "OPENAGENT_VAULT_CHECK_EM_DASH"),
+        ("strict",            "OPENAGENT_VAULT_STRICT"),
+        ("validate_on_write", "OPENAGENT_VAULT_VALIDATE_ON_WRITE"),
+    ):
+        if _k in _vault_cfg:
+            os.environ[_env] = "1" if bool(_vault_cfg[_k]) else "0"
+    for _k, _env in (
+        ("max_lines",    "OPENAGENT_VAULT_MAX_LINES"),
+        ("min_outlinks", "OPENAGENT_VAULT_MIN_OUTLINKS"),
+    ):
+        if _k in _vault_cfg:
+            try:
+                os.environ[_env] = str(int(_vault_cfg[_k]))
+            except (TypeError, ValueError):
+                pass
+    _vm_cfg = (_vault_cfg.get("maintenance") or {})
+    for _k, _env in (
+        ("enabled",            "OPENAGENT_VAULT_MAINTENANCE_ENABLED"),
+        ("autofix",            "OPENAGENT_VAULT_MAINTENANCE_AUTOFIX"),
+        ("regenerate_derived", "OPENAGENT_VAULT_MAINTENANCE_DERIVED"),
+    ):
+        if _k in _vm_cfg:
+            os.environ[_env] = "1" if bool(_vm_cfg[_k]) else "0"
+    if "interval_hours" in _vm_cfg:
+        try:
+            os.environ["OPENAGENT_VAULT_MAINTENANCE_INTERVAL_HOURS"] = str(
+                int(_vm_cfg["interval_hours"])
+            )
+        except (TypeError, ValueError):
+            pass
+    # Git-backed vault: every change is auto-committed with provenance.
+    _vgit_cfg = (_vault_cfg.get("git") or {})
+    if "enabled" in _vgit_cfg:
+        os.environ["OPENAGENT_VAULT_GIT_ENABLED"] = (
+            "1" if bool(_vgit_cfg["enabled"]) else "0")
+    if "autocommit_seconds" in _vgit_cfg:
+        try:
+            os.environ["OPENAGENT_VAULT_GIT_AUTOCOMMIT_SECONDS"] = str(
+                int(_vgit_cfg["autocommit_seconds"]))
+        except (TypeError, ValueError):
+            pass
+    for _k, _env in (("author_name", "OPENAGENT_VAULT_GIT_NAME"),
+                     ("author_email", "OPENAGENT_VAULT_GIT_EMAIL")):
+        if _vgit_cfg.get(_k):
+            os.environ[_env] = str(_vgit_cfg[_k])
 
     # Extended thinking budget. Surfaces as ``model.extended_thinking_tokens``
     # in yaml so it stays in the same logical namespace as future
@@ -554,7 +630,7 @@ class AgentServer:
         #      would funnel a fresh scheduled run behind a stuck old
         #      one. Cheap (one UPDATE on a small table) and idempotent.
         try:
-            db = getattr(self.agent.memory, "db", None) if getattr(self.agent, "memory", None) else None
+            db = getattr(self.agent, "_db", None)
             if db is not None and hasattr(db, "reap_orphan_workflow_runs"):
                 reaped = await db.reap_orphan_workflow_runs()
                 if reaped:
@@ -613,12 +689,36 @@ class AgentServer:
 
         # 5. Curator — periodic prune of stale skills/user_profiles.
         # No-op when ``memory.curator.enabled`` is false.
+        # ``self.agent._db`` is the live MemoryDB (the Agent exposes no
+        # ``.memory`` attribute — that was a long-standing typo that left
+        # both loops below silently dead).
         try:
             from src.learning.curator import start as _curator_start
-            self._curator_task = _curator_start(self.agent.memory)
+            self._curator_task = _curator_start(self.agent._db)
         except Exception as e:  # noqa: BLE001
             logger.warning("Curator failed to start: %s", e)
             self._curator_task = None
+
+        # 6. Vault maintenance — dream-mode pass over the memory vault: gate,
+        # mechanically fix, regenerate derived artifacts, write a dream-log.
+        # No-op when ``memory.vault.maintenance.enabled`` is false.
+        try:
+            from src.learning.vault_maintenance import start as _vault_maint_start
+            self._vault_maint_task = _vault_maint_start(self.agent._db)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Vault maintenance failed to start: %s", e)
+            self._vault_maint_task = None
+
+        # 7. Vault git — the memory vault is a git repo; commit every change
+        # automatically (with provenance). The loop is the safety net for
+        # edits made outside OpenAgent's own tools. No-op when git is absent
+        # or ``memory.vault.git.enabled`` is false.
+        try:
+            from src.memory.vault.autocommit import start as _vault_autocommit_start
+            self._vault_autocommit_task = _vault_autocommit_start()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Vault autocommit failed to start: %s", e)
+            self._vault_autocommit_task = None
 
     async def _build_bridge_session_and_bridges(self) -> None:
         """Provision the in-process bridge sessions + concrete bridges.
@@ -730,6 +830,29 @@ class AgentServer:
             except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
                 pass
             self._curator_task = None
+
+        # 1c. Vault maintenance + autocommit loops
+        for _attr in ("_vault_maint_task", "_vault_autocommit_task"):
+            _vt = getattr(self, _attr, None)
+            if _vt is not None:
+                _vt.cancel()
+                try:
+                    await asyncio.wait_for(_vt, timeout=2)
+                except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                    pass
+                setattr(self, _attr, None)
+        # Final sweep: commit anything still pending so a clean shutdown
+        # doesn't strand uncommitted vault edits.
+        try:
+            from src.memory.vault.service import get_service
+            await get_service().autocommit(origin={"kind": "shutdown"})
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            from src.memory.vault.service import close_all as _vault_close_all
+            await _vault_close_all()
+        except Exception:  # noqa: BLE001
+            pass
 
         # 2. Gateway
         if self._gateway:
@@ -928,14 +1051,46 @@ class AgentServer:
             await scheduler.disable_task(existing["id"])
 
     @staticmethod
-    def _wrap_scheduler_run_task(scheduler, wrapper) -> None:
-        """Compose a task wrapper around the scheduler run_task hook."""
-        original_run = scheduler.run_task
+    def _install_task_hook(scheduler, name: str, hook) -> None:
+        """Register/replace a named ``run_task`` hook idempotently.
 
-        async def _wrapped(task, _orig=original_run):
-            await wrapper(task, _orig)
+        A SINGLE dispatcher is installed over ``scheduler.run_task`` once;
+        every built-in task's hook lives in a registry keyed by name. Re-
+        syncing a task (e.g. when its config section is toggled at runtime
+        via ``/api/config``) replaces its hook in place instead of stacking
+        another monkey-patch layer — the previous ``_wrap_scheduler_run_task``
+        composed a fresh closure on every call, so a few config toggles
+        grew an unbounded wrapper chain and made ``_do_auto_update`` fire
+        once per accumulated layer.
 
-        scheduler.run_task = _wrapped  # type: ignore[method-assign]
+        Pass ``hook=None`` to remove a previously-registered hook.
+
+        Each hook has signature ``async hook(task, next)`` and calls
+        ``await next(task)`` to defer to the rest of the chain; the
+        innermost call is the scheduler's real ``run_task`` with all
+        original positional/keyword args (e.g. ``trigger=``) forwarded.
+        """
+        hooks = getattr(scheduler, "_oa_task_hooks", None)
+        if hooks is None:
+            hooks = {}
+            scheduler._oa_task_hooks = hooks
+            original_run = scheduler.run_task
+
+            async def _dispatch(task, *args, **kwargs):
+                async def _base(t):
+                    await original_run(t, *args, **kwargs)
+
+                chain = _base
+                for h in reversed(list(hooks.values())):
+                    chain = _compose_task_hook(h, chain)
+                await chain(task)
+
+            scheduler.run_task = _dispatch  # type: ignore[method-assign]
+
+        if hook is None:
+            hooks.pop(name, None)
+        else:
+            hooks[name] = hook
 
     async def _sync_dream_mode(self, scheduler) -> None:
         dream_cfg = self.config.get("dream_mode", {})
@@ -957,6 +1112,7 @@ class AgentServer:
             prompt=DREAM_MODE_PROMPT,
         )
 
+        dream_hook = None
         if enabled:
             async def _dream_run(task, _orig):
                 if task["name"] == DREAM_MODE_TASK_NAME:
@@ -968,7 +1124,8 @@ class AgentServer:
                 else:
                     await _orig(task)
 
-            self._wrap_scheduler_run_task(scheduler, _dream_run)
+            dream_hook = _dream_run
+        self._install_task_hook(scheduler, DREAM_MODE_TASK_NAME, dream_hook)
 
     async def _sync_manager_review(self, scheduler) -> None:
         """Weekly self-review: agent audits its own work as a project manager.
@@ -990,6 +1147,7 @@ class AgentServer:
             prompt=MANAGER_REVIEW_PROMPT,
         )
 
+        review_hook = None
         if enabled:
             async def _manager_review_run(task, _orig):
                 if task["name"] == MANAGER_REVIEW_TASK_NAME:
@@ -999,7 +1157,8 @@ class AgentServer:
                 else:
                     await _orig(task)
 
-            self._wrap_scheduler_run_task(scheduler, _manager_review_run)
+            review_hook = _manager_review_run
+        self._install_task_hook(scheduler, MANAGER_REVIEW_TASK_NAME, review_hook)
 
     async def _sync_auto_update(self, scheduler) -> None:
         update_cfg = self.config.get("auto_update", {})
@@ -1021,6 +1180,7 @@ class AgentServer:
             prompt=prompt,
         )
 
+        update_hook = None
         if enabled:
             agent = self.agent
             stop_event = self._stop_event
@@ -1034,7 +1194,8 @@ class AgentServer:
                 else:
                     await _orig(task)
 
-            self._wrap_scheduler_run_task(scheduler, _auto_update_run)
+            update_hook = _auto_update_run
+        self._install_task_hook(scheduler, AUTO_UPDATE_TASK_NAME, update_hook)
 
 
 # ── Auto-update helpers (used by AgentServer and the manual `update` command) ──
@@ -1046,7 +1207,7 @@ def get_installed_version() -> str:
     from src._frozen import is_frozen
     if is_frozen():
         import src
-        return getattr(openagent, "__version__", "unknown")
+        return getattr(src, "__version__", "unknown")
     try:
         from importlib.metadata import version
         return version(PACKAGE_NAME)
@@ -1094,18 +1255,22 @@ def _binary_replaced_by_sibling() -> bool:
 
 
 def _read_disk_binary_version() -> str | None:
-    """Ask the on-disk binary for its --version. Used after a sibling
+    """Ask the on-disk binary for its version. Used after a sibling
     swap so we can report the new version without trying to read the
     PyInstaller archive directly. Returns None on any failure — the
     caller falls back to a synthetic placeholder."""
     import subprocess
     try:
         path = src._frozen.executable_path()
+        # ``selfcheck --quiet`` prints the bare version and exits 0; it
+        # is the canonical version probe (the CLI has no ``--version``
+        # subcommand in older naming, and the group ``--version`` adds a
+        # prefix). 30 s because a frozen onefile cold-extracts on first
+        # launch.
         out = subprocess.check_output(
-            [str(path), "--version"], timeout=10, stderr=subprocess.DEVNULL
+            [str(path), "selfcheck", "--quiet"], timeout=30, stderr=subprocess.DEVNULL
         )
-        line = out.decode("utf-8", "replace").strip().splitlines()[-1]
-        # ``--version`` prints e.g. "openagent 0.12.42" — last token wins.
+        line = out.decode("utf-8", "replace").strip().splitlines()[-1] if out.strip() else ""
         return line.split()[-1] if line else None
     except Exception:  # noqa: BLE001
         return None

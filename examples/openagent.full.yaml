@@ -93,6 +93,38 @@ memory:
   sessions:
     retention_days: 90                  # friendlier alias for curator.session_retention_days
 
+  # vault_path: ~/my-vault              # where the Markdown memory vault lives (default: <data-dir>/memories)
+
+  vault_reminder:
+    enabled: false                      # every Nth turn, inject a "save to the vault" checkpoint into the turn
+    every_n_turns: 6
+
+  semantic_search:
+    enabled: false                      # embed conversation turns for similarity recall (needs an OpenAI key)
+
+  # Code-enforced quality gate over the Markdown vault: atomic notes,
+  # complete frontmatter, dense real wikilinks, no orphans/broken links,
+  # one connected graph. Exposed to the agent as the ``vault-gate`` MCP and
+  # over REST (/api/vault/gate, /doctor, /stats, /derived, /index/sync).
+  vault:
+    enabled: true                       # the gate subsystem (index + tools + validate-on-write)
+    max_lines: 300                      # a note longer than this is flagged (atomicity)
+    min_outlinks: 3                     # a content note should link out to >= this many real notes
+    enforce_taxonomy: false             # nudge tags[0]==folder + channels-as-tags (advisory)
+    check_em_dash: false                # flag em dashes (—) everywhere, not just journal notes
+    strict: false                       # treat every issue as an error (the "0 errors" target)
+    validate_on_write: true             # REST note writes return quality warnings + keep the index current
+    git:
+      enabled: true                     # back the vault with a git repo; auto-commit every change (with provenance)
+      autocommit_seconds: 25            # sweep interval that captures edits made outside OpenAgent (Obsidian, external MCP); 0 disables
+      author_name: OpenAgent            # committer identity (no global git config needed)
+      author_email: agent@openagent.local
+    maintenance:
+      enabled: false                    # dream-mode pass: gate, auto-fix, regenerate derived, write a dream-log
+      interval_hours: 12
+      autofix: true                     # apply the mechanical fixes a script can make safely
+      regenerate_derived: true          # rewrite llms.txt + _showcase/showcase.md each pass
+
 # ── Quick commands ──────────────────────────────────────────────────
 # Bridges expand ``/<trigger>`` to the configured prompt before the
 # agent sees it. Triggers are case-insensitive. Anything after the

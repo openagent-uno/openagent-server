@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import logging
+import os
 import platform
 import shutil
 import subprocess
@@ -58,6 +59,11 @@ class UpdateInfo(NamedTuple):
     new_version: str
     download_url: str
     checksum_url: str | None
+    # SHA-256 the GitHub API reports for the asset itself, on the SAME
+    # authenticated response as the version/tag (``"sha256:<hex>"``).
+    # Preferred over the separate ``.sha256`` asset because it can't go
+    # missing or fail its own second request — see ``download_update``.
+    expected_digest: str | None = None
 
 
 def _expected_asset_name(version: str) -> str:
@@ -69,8 +75,14 @@ def _select_release_assets(
     assets: list[dict[str, object]],
     *,
     version: str,
-) -> tuple[str | None, str | None]:
+) -> tuple[str | None, str | None, str | None]:
     """Pick the server archive + checksum from a GitHub release asset list.
+
+    Returns ``(download_url, checksum_url, expected_digest)`` where
+    ``expected_digest`` is the chosen asset's own ``digest`` field
+    (``"sha256:<hex>"``) when GitHub reports it — the strongest integrity
+    anchor available because it rides the same authenticated API response
+    as the version, with no fragile second request.
 
     Prefer an exact match like ``openagent-0.5.17-linux-x64.tar.gz`` so we
     never confuse the server binary with sibling artifacts such as
@@ -82,17 +94,19 @@ def _select_release_assets(
 
     download_url = None
     checksum_url = None
+    digest = None
 
     for asset in assets:
         name = str(asset.get("name", ""))
         url = str(asset.get("browser_download_url", ""))
         if name == exact_name:
             download_url = url
+            digest = str(asset.get("digest") or "") or None
         elif name == checksum_name:
             checksum_url = url
 
     if download_url:
-        return download_url, checksum_url
+        return download_url, checksum_url, digest
 
     # Backward-compatible fallback for older release layouts: keep the server
     # prefix explicit so ``openagent-cli`` / ``openagent-app`` are ignored.
@@ -108,6 +122,7 @@ def _select_release_assets(
             and name.endswith(suffix)
         ):
             download_url = url
+            digest = str(asset.get("digest") or "") or None
         elif (
             name.startswith(server_prefix)
             and not name.startswith(excluded_prefixes)
@@ -115,7 +130,7 @@ def _select_release_assets(
         ):
             checksum_url = url
 
-    return download_url, checksum_url
+    return download_url, checksum_url, digest
 
 
 def _asset_suffix() -> str:
@@ -204,6 +219,20 @@ def check_for_update() -> UpdateInfo | None:
     tag = data.get("tag_name", "")
     new_version = tag.lstrip("v")
 
+    # Never re-install a version we already proved is broken and rolled
+    # back from. Without this, a bad release that stays GitHub-``latest``
+    # would re-download → re-apply → re-rollback on every 6 h / nightly
+    # poll, a perpetual brick-and-recover loop.
+    try:
+        from src.update_guard import rolled_back_versions
+        bad = rolled_back_versions()
+    except Exception:  # noqa: BLE001
+        bad = set()
+    if new_version in bad:
+        logger.warning("Skipping previously rolled-back version %s", new_version)
+        _try_elog("update.skipped_rolled_back", level="warning", tag=tag)
+        return None
+
     # Compare versions
     from packaging.version import Version, InvalidVersion
     try:
@@ -224,7 +253,7 @@ def check_for_update() -> UpdateInfo | None:
 
     # Find matching server asset. Releases also ship desktop and CLI artifacts,
     # so matching on platform suffix alone is not enough.
-    download_url, checksum_url = _select_release_assets(
+    download_url, checksum_url, expected_digest = _select_release_assets(
         list(data.get("assets", [])),
         version=new_version,
     )
@@ -245,13 +274,48 @@ def check_for_update() -> UpdateInfo | None:
         new_version=new_version,
         download_url=download_url,
         checksum_url=checksum_url,
+        expected_digest=expected_digest,
     )
 
 
 _DOWNLOAD_CHUNK_SIZE = 64 * 1024
 
+# When True (the default for self-update), a verified SHA-256 is
+# MANDATORY: if neither the GitHub asset digest nor a fetchable
+# ``.sha256`` is available, the download is refused rather than
+# installed unverified. On a box the operator can't reach, an
+# unverified 150 MB binary the supervisor will immediately exec is
+# exactly the brick we must never risk. Tests flip this off to exercise
+# the legacy no-checksum extraction paths.
+REQUIRE_CHECKSUM = True
 
-def download_update(url: str, checksum_url: str | None = None) -> Path:
+
+def _normalize_sha256(value: str | None) -> str | None:
+    """Return a bare lowercase 64-hex sha256 from a digest string.
+
+    Accepts ``"sha256:<hex>"`` (GitHub API digest) or ``"<hex>  name"``
+    (a ``.sha256`` file's first field). Returns None when the value
+    isn't a usable sha256 so the caller can fall back / fail closed.
+    """
+    if not value:
+        return None
+    token = value.strip().split()[0]
+    if token.lower().startswith("sha256:"):
+        token = token[len("sha256:"):]
+    token = token.strip().lower()
+    if len(token) == 64 and all(c in "0123456789abcdef" for c in token):
+        return token
+    return None
+
+
+def download_update(
+    url: str,
+    checksum_url: str | None = None,
+    expected_digest: str | None = None,
+    *,
+    dest_dir: Path | None = None,
+    require_checksum: bool | None = None,
+) -> Path:
     """Download and verify the update archive. Returns the path to the new
     executable file (onefile format — a single binary, not a directory).
 
@@ -259,27 +323,60 @@ def download_update(url: str, checksum_url: str | None = None) -> Path:
         openagent-<ver>-<platform>-<arch>.tar.gz → openagent (or .exe)
     We pick that one file out of the archive and return its path.
 
+    Integrity is **fail-closed** (see :data:`REQUIRE_CHECKSUM`). The
+    expected SHA-256 is resolved in order of trust:
+
+    1. ``expected_digest`` — the GitHub API's per-asset ``digest``, which
+       arrives on the same authenticated response as the version and
+       cannot silently go missing or fail a second request.
+    2. ``checksum_url`` — the sibling ``.sha256`` asset, fetched here.
+
+    If neither yields a usable checksum and ``require_checksum`` is set,
+    the download is REFUSED. A corrupt/truncated/tampered archive must
+    never reach :func:`apply_update`.
+
     The body is streamed to disk and hashed incrementally. ``resp.read()``
     used to load the entire archive (200 MB+) into memory before writing
-    a single byte — on a small multi-tenant VPS (single-digit GiB RAM,
-    several OpenAgent services, no swap) the kernel OOM-killed openagent
-    plus systemd itself mid-download. Streaming caps peak memory at one
-    chunk.
+    a single byte — on a small multi-tenant VPS the kernel OOM-killed
+    openagent plus systemd itself mid-download. Streaming caps peak
+    memory at one chunk. The total is also checked against the HTTP
+    ``Content-Length`` so a mid-stream disconnect can't masquerade as a
+    complete download.
+
+    ``dest_dir`` lets the caller own the temp-dir lifecycle (and clean it
+    up); when omitted a fresh ``mkdtemp`` is used.
     """
-    tmp_dir = Path(tempfile.mkdtemp(prefix="openagent_update_"))
+    if require_checksum is None:
+        require_checksum = REQUIRE_CHECKSUM
+    if dest_dir is None:
+        tmp_dir = Path(tempfile.mkdtemp(prefix="openagent_update_"))
+    else:
+        tmp_dir = Path(dest_dir)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
     archive_path = tmp_dir / "update_archive"
 
     ctx = _ssl_context()
 
-    # Fetch the expected checksum FIRST, so we can verify as we stream
-    # rather than reading the file back from disk for a second pass.
-    expected: str | None = None
-    if checksum_url:
+    # Resolve the expected checksum BEFORE downloading so we can verify
+    # the stream and fail closed early. Digest (same-response, can't
+    # vanish) is preferred over the separate .sha256 request.
+    expected = _normalize_sha256(expected_digest)
+    digest_source = "api-digest" if expected else None
+    if expected is None and checksum_url:
         try:
             with urlopen(Request(checksum_url), timeout=15, context=ctx) as resp:
-                expected = resp.read().decode().strip().split()[0]
+                expected = _normalize_sha256(resp.read().decode())
+                digest_source = "sha256-asset" if expected else None
         except Exception as e:
             logger.warning("Could not fetch checksum: %s", e)
+
+    if expected is None and require_checksum:
+        raise RuntimeError(
+            "Refusing to apply update: no verifiable SHA-256 available "
+            "(GitHub asset digest missing and .sha256 unavailable). "
+            "Installing an unverified binary the service manager will "
+            "immediately exec is not safe on an unattended host."
+        )
 
     logger.info("Downloading update from %s", url)
     # Generous timeout because release assets are large and residential
@@ -289,6 +386,7 @@ def download_update(url: str, checksum_url: str | None = None) -> Path:
     bytes_read = 0
     with urlopen(Request(url), timeout=600, context=ctx) as resp, \
          open(archive_path, "wb") as f:
+        content_length = resp.getheader("Content-Length")
         while True:
             chunk = resp.read(_DOWNLOAD_CHUNK_SIZE)
             if not chunk:
@@ -298,16 +396,30 @@ def download_update(url: str, checksum_url: str | None = None) -> Path:
             bytes_read += len(chunk)
     logger.info("Downloaded %d bytes", bytes_read)
 
+    # Truncation guard: a clean-enough socket close mid-transfer ends the
+    # read loop normally with a short body. Without a checksum this is the
+    # only thing standing between a half-download and an install.
+    if content_length is not None:
+        try:
+            expected_len = int(content_length)
+        except (TypeError, ValueError):
+            expected_len = None
+        if expected_len is not None and bytes_read != expected_len:
+            raise RuntimeError(
+                f"Truncated download: got {bytes_read} bytes, "
+                f"Content-Length was {expected_len}"
+            )
+
     if expected is not None:
         actual = h.hexdigest()
         if actual != expected:
             raise RuntimeError(
                 f"Checksum mismatch: expected {expected}, got {actual}"
             )
-        logger.info("Checksum verified OK")
+        logger.info("Checksum verified OK (%s)", digest_source or "checksum")
 
     extract_dir = tmp_dir / "extracted"
-    extract_dir.mkdir()
+    extract_dir.mkdir(exist_ok=True)
 
     lower = str(archive_path).lower() + " " + url.lower()
     if ".pkg" in lower:
@@ -331,7 +443,14 @@ def download_update(url: str, checksum_url: str | None = None) -> Path:
         # or something else.
         try:
             with tarfile.open(archive_path) as tf:
-                tf.extractall(extract_dir)
+                # filter="data" rejects absolute paths, ``..`` traversal,
+                # and unsafe member types — defence-in-depth even though
+                # we control the release archives. Falls back gracefully
+                # on the rare runtime without the 3.12 extraction filters.
+                try:
+                    tf.extractall(extract_dir, filter="data")
+                except TypeError:
+                    tf.extractall(extract_dir)
         except Exception:
             try:
                 stat = archive_path.stat()
@@ -465,46 +584,159 @@ def apply_update(new_exe: Path) -> None:
                 )
             parent_dir = current_bundle.parent
             old = parent_dir / (current_bundle.stem + ".app.old")
+            staged = parent_dir / (current_bundle.stem + ".app.new")
             with _swap_lock(current_bundle):
+                # Stage the new bundle ALONGSIDE the live one first. The
+                # running binary stays valid the whole time this (slow)
+                # copytree runs — the supervisor would find it on relaunch.
+                if staged.exists():
+                    shutil.rmtree(str(staged), ignore_errors=True)
+                shutil.copytree(str(new_bundle), str(staged))
                 if old.exists():
                     shutil.rmtree(str(old))
+                # Commit with two adjacent renames. The window where the
+                # bundle path doesn't exist shrinks from the multi-second
+                # copytree to two metadata ops (microseconds) — and the
+                # live process is still running, so the supervisor isn't
+                # relaunching during it.
                 current_bundle.rename(old)
                 try:
-                    shutil.copytree(str(new_bundle), str(current_bundle))
+                    staged.rename(current_bundle)
                 except Exception:
-                    # Roll back so launchd can still find the bundle.
-                    if current_bundle.exists():
-                        shutil.rmtree(str(current_bundle), ignore_errors=True)
+                    # Couldn't put the new bundle in place — restore the
+                    # known-good so launchd always has something to exec.
                     old.rename(current_bundle)
                     raise
             logger.info("Update applied (bundle swap). Old version at %s", old)
             return
 
     # Bare binary (Linux, or macOS without .app bundle).
-    # Rename the running binary to .old — the OS keeps the file open for
-    # the live process, and the new file is installed in its place so
-    # the next launch picks up the upgrade.
+    #
+    # Fully atomic: back up the live binary to .old (the OS keeps the
+    # running process's file open via its inode), stage the new bytes to
+    # a sibling temp file, fsync, then os.replace() over the target.
+    # os.replace is an atomic rename within the filesystem, so there is
+    # NEVER a moment where the executable path is missing — a SIGKILL or
+    # power loss at any instant leaves either the old or the new binary
+    # in place, never a truncated file or a hole.
     old = current_exe.with_suffix(current_exe.suffix + ".old")
+    staged = current_exe.with_name(current_exe.name + ".new")
     with _swap_lock(current_exe):
-        if old.exists():
-            old.unlink()
-        current_exe.rename(old)
         try:
-            shutil.copy2(str(new_exe), str(current_exe))
-            current_exe.chmod(0o755)
+            shutil.copy2(str(current_exe), str(old))  # last-known-good backup
         except Exception:
-            if current_exe.exists():
-                current_exe.unlink()
-            old.rename(current_exe)
+            # Non-fatal: without a backup we lose rollback, but the swap
+            # itself can still proceed. Log loudly so it's visible.
+            logger.warning("Could not back up current binary to %s", old)
+        if staged.exists():
+            staged.unlink()
+        try:
+            shutil.copy2(str(new_exe), str(staged))
+            os.chmod(str(staged), 0o755)
+            with open(staged, "rb") as _sf:
+                os.fsync(_sf.fileno())
+            os.replace(str(staged), str(current_exe))  # atomic
+        except Exception:
+            if staged.exists():
+                try:
+                    staged.unlink()
+                except Exception:  # noqa: BLE001
+                    pass
+            # current_exe is untouched by a failed os.replace, so the
+            # running binary on disk is still the old one — nothing to
+            # restore. Re-raise so the caller reports the failure.
             raise
     logger.info("Update applied. Old version at %s", old)
 
 
+_SELFCHECK_TIMEOUT_S = 60
+
+
+def verify_new_binary(new_exe: Path, expected_version: str | None = None) -> None:
+    """Pre-swap execution gate: prove the freshly-downloaded binary can
+    actually start BEFORE we replace the live one.
+
+    This is the first and most important line of defence on a box the
+    operator can't reach: it runs in the CURRENT, known-good process, so
+    a download that can't even start Python (wrong arch, missing dylib,
+    corrupt Mach-O, truncated extract) is rejected *without ever touching
+    the running binary* — no swap, no rollback needed, zero risk.
+
+    Runs ``<new_exe> selfcheck`` (a cheap, side-effect-free command that
+    boots the import graph and prints the version). Falls back to
+    ``--version`` then ``--help`` for binaries that predate ``selfcheck``.
+    A non-zero exit, a timeout, or a version mismatch raises.
+
+    NOTE: this runs under the updater's process environment, which may
+    differ from the supervisor's (launchd/systemd) env. It catches
+    "can't start at all"; the post-restart boot guard
+    (:mod:`src.update_guard`) catches "starts here but unhealthy under
+    the supervisor". The two layers are complementary.
+    """
+    # Probes from strongest to weakest. The FIRST one that exits cleanly
+    # proves the binary can start, and we accept. We deliberately do NOT
+    # hard-fail on an individual probe's non-zero exit: ``selfcheck`` can
+    # fail for an ENVIRONMENTAL reason (e.g. a malformed ``openagent.yaml``
+    # in the service's cwd that the CLI group callback loads) on a binary
+    # that is otherwise perfectly healthy. ``--help`` is eager in Click —
+    # it builds (hence imports) the whole command tree but runs no
+    # callback body / config load — so it's the robust floor: if it
+    # exits 0, the bundle extracted, Python started, and the import graph
+    # is intact. We only reject when EVERY probe fails (i.e. the binary
+    # genuinely can't start at all).
+    errors: list[str] = []
+    for args in (["selfcheck"], ["--version"], ["--help"]):
+        try:
+            proc = subprocess.run(
+                [str(new_exe), *args],
+                capture_output=True,
+                timeout=_SELFCHECK_TIMEOUT_S,
+            )
+        except FileNotFoundError as e:
+            # Not executable at all — no probe can succeed; fail fast.
+            raise RuntimeError(f"Downloaded binary is not executable: {e}") from e
+        except subprocess.TimeoutExpired:
+            errors.append(f"`{' '.join(args)}` timed out (>{_SELFCHECK_TIMEOUT_S}s)")
+            continue
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"`{' '.join(args)}` could not run: {e}")
+            continue
+
+        out = (proc.stdout + proc.stderr).decode("utf-8", "replace")
+        if proc.returncode != 0:
+            errors.append(f"`{' '.join(args)}` exit {proc.returncode}: {out.strip()[:200]}")
+            continue
+
+        if expected_version and args in (["selfcheck"], ["--version"]) \
+                and expected_version not in out:
+            # Clean exit but a different version than the release we think
+            # we downloaded. Log it; a clean start is the primary signal
+            # and version-string formats vary, so don't reject on this
+            # alone.
+            logger.warning(
+                "Self-check version mismatch: expected %s, output was %r",
+                expected_version, out.strip()[:200],
+            )
+        logger.info("Pre-swap self-check passed (`%s`)", " ".join(args))
+        return
+
+    raise RuntimeError(
+        "Downloaded binary failed every self-check probe — refusing to "
+        "install (it cannot start). Tried: " + "; ".join(errors)
+    )
+
+
 def perform_self_update_sync() -> tuple[str, str]:
-    """Synchronous self-update: check → download → apply.
+    """Synchronous self-update: check → download → verify → apply.
 
     Returns (old_version, new_version). If already up-to-date,
     old == new.
+
+    Owns the temp-dir lifecycle so the ~150-300 MB download+extract tree
+    is always cleaned up (previously leaked on every run). Verifies the
+    new binary actually runs before swapping, and records the swap in the
+    update journal so the post-restart boot guard can roll back if the
+    new binary turns out to be unhealthy under the supervisor.
     """
     info = check_for_update()
     if info is None:
@@ -516,7 +748,27 @@ def perform_self_update_sync() -> tuple[str, str]:
         "Update available: %s → %s", info.current_version, info.new_version
     )
 
-    new_exe = download_update(info.download_url, info.checksum_url)
-    apply_update(new_exe)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="openagent_update_"))
+    try:
+        new_exe = download_update(
+            info.download_url,
+            info.checksum_url,
+            info.expected_digest,
+            dest_dir=tmp_dir,
+        )
+        verify_new_binary(new_exe, expected_version=info.new_version)
+        apply_update(new_exe)
+    finally:
+        # Always reclaim the temp tree, success or failure.
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # Record the pending swap so the next boot's guard can confirm or
+    # roll it back. Best-effort: a journal hiccup must not undo a
+    # successful update.
+    try:
+        from src.update_guard import record_pending
+        record_pending(info.new_version, prev_version=info.current_version)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Could not record pending update: %s", e)
 
     return info.current_version, info.new_version

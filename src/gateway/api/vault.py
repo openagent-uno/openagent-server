@@ -28,15 +28,21 @@ def _sanitize(obj):
 
 
 def _parse_frontmatter(content: str) -> tuple[dict, str]:
+    # Find the frontmatter block by its closing ``---`` fence on its own line.
+    # (The old ``split("---", 2)`` truncated any note whose YAML value itself
+    # contained ``---``.)
     if content.startswith("---"):
-        parts = content.split("---", 2)
-        if len(parts) >= 3:
-            import yaml
-            try:
-                meta = yaml.safe_load(parts[1]) or {}
-            except Exception:
-                meta = {}
-            return _sanitize(meta), parts[2].strip()
+        lines = content.split("\n")
+        if lines and lines[0].strip() == "---":
+            for i in range(1, len(lines)):
+                if lines[i].strip() == "---":
+                    import yaml
+                    try:
+                        meta = yaml.safe_load("\n".join(lines[1:i])) or {}
+                    except Exception:
+                        meta = {}
+                    body = "\n".join(lines[i + 1:]).strip()
+                    return _sanitize(meta if isinstance(meta, dict) else {}), body
     return {}, content
 
 
@@ -86,6 +92,40 @@ def _resolve_vault(request) -> Path:
     return default_vault_path()
 
 
+def _service(request):
+    """The vault quality service for the gateway's vault (cached per root).
+
+    Resolves through ``_resolve_vault`` — the SAME path the REST CRUD
+    handlers use — so the index/gate and the file operations never target
+    different folders."""
+    from src.memory.vault.service import get_service
+    return get_service(_resolve_vault(request))
+
+
+def _safe_full(vault: Path, note_path: str) -> Path | None:
+    """Join ``note_path`` under ``vault`` and confirm it stays inside it.
+    Returns ``None`` for a path that escapes the vault (``../`` traversal,
+    absolute path, symlink-out), so handlers can reject it."""
+    try:
+        base = vault.resolve()
+        full = (vault / note_path).resolve()
+        full.relative_to(base)
+    except (ValueError, OSError):
+        return None
+    return full
+
+
+def _truthy(value: str | None, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _validate_on_write() -> bool:
+    import os
+    return _truthy(os.environ.get("OPENAGENT_VAULT_VALIDATE_ON_WRITE"), default=True)
+
+
 async def handle_list(request):
     from aiohttp import web
     vault = _resolve_vault(request)
@@ -94,6 +134,8 @@ async def handle_list(request):
 
     notes = []
     for md in sorted(vault.rglob("*.md")):
+        if not md.is_file():
+            continue  # a directory literally named "*.md"
         rel = str(md.relative_to(vault))
         content = md.read_text(errors="replace")
         meta, _ = _parse_frontmatter(content)
@@ -113,7 +155,9 @@ async def handle_read(request):
     from aiohttp import web
     vault = _resolve_vault(request)
     note_path = request.match_info["path"]
-    full = vault / note_path
+    full = _safe_full(vault, note_path)
+    if full is None:
+        return web.json_response({"error": "Invalid path"}, status=400)
     if not full.exists() or not full.is_file():
         return web.json_response({"error": "Not found"}, status=404)
 
@@ -133,44 +177,93 @@ async def handle_write(request):
     from aiohttp import web
     vault = _resolve_vault(request)
     note_path = request.match_info["path"]
-    full = vault / note_path
-    existed = full.exists()
-    full.parent.mkdir(parents=True, exist_ok=True)
-    data = await request.json()
-    full.write_text(data.get("content", ""))
+    full = _safe_full(vault, note_path)
+    if full is None:
+        return web.json_response({"error": "Invalid path"}, status=400)
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON body"}, status=400)
+    if not isinstance(data, dict):
+        return web.json_response({"error": "Body must be a JSON object"}, status=400)
+    content = data.get("content", "")
+    # Atomic write+index+validate+commit under the service's mutation lock so
+    # the change lands in history with its own precise provenance (never swept
+    # by the autocommit loop). The write is never rejected — notes are
+    # Markdown the user owns — but the response carries quality warnings.
+    warnings: list = []
+    commit = None
+    try:
+        from src.memory.vault.vault_origin import origin_from_request
+        result = await _service(request).write_note(
+            note_path, content, origin_from_request(request),
+            validate=_validate_on_write())
+        existed = result["existed"]
+        warnings = result["warnings"]
+        commit = result["commit"]
+    except Exception:  # noqa: BLE001 — never lose the note on a downstream error
+        existed = full.exists()
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text(content)
     gw = request.app.get("gateway")
     if gw is not None:
         await gw.broadcast_resource(
             "vault", "updated" if existed else "created", note_path,
         )
-    return web.json_response({"ok": True, "path": note_path})
+    return web.json_response(
+        {"ok": True, "path": note_path, "warnings": warnings, "commit": commit})
 
 
 async def handle_delete(request):
     from aiohttp import web
     vault = _resolve_vault(request)
     note_path = request.match_info["path"]
-    full = vault / note_path
+    full = _safe_full(vault, note_path)
+    if full is None:
+        return web.json_response({"error": "Invalid path"}, status=400)
     if full.exists():
-        full.unlink()
+        commit = None
+        try:
+            from src.memory.vault.vault_origin import origin_from_request
+            result = await _service(request).delete_note(
+                note_path, origin_from_request(request))
+            commit = result["commit"]
+        except Exception:  # noqa: BLE001 — ensure the file is gone regardless
+            if full.exists():
+                full.unlink()
         gw = request.app.get("gateway")
         if gw is not None:
             await gw.broadcast_resource("vault", "deleted", note_path)
-        return web.json_response({"ok": True})
+        return web.json_response({"ok": True, "commit": commit})
     return web.json_response({"error": "Not found"}, status=404)
 
 
 async def handle_search(request):
     from aiohttp import web
     vault = _resolve_vault(request)
-    query = (request.query.get("q") or "").lower().strip()
+    query = (request.query.get("q") or "").strip()
     if not query:
         return web.json_response({"results": []})
 
+    # Prefer the FTS5 index — O(log n) and scales to 100k+ notes. Fall back
+    # to a linear scan only if the index is unavailable for some reason.
+    try:
+        limit = int(request.query.get("limit", 50))
+    except (TypeError, ValueError):
+        limit = 50
+    try:
+        results = await _service(request).search(query, limit=limit)
+        return web.json_response({"results": results})
+    except Exception:  # noqa: BLE001 — degrade to the scan below
+        pass
+
+    ql = query.lower()
     results = []
     for md in vault.rglob("*.md"):
+        if not md.is_file():
+            continue
         content = md.read_text(errors="replace")
-        if query in content.lower() or query in md.stem.lower():
+        if ql in content.lower() or ql in md.stem.lower():
             meta, _ = _parse_frontmatter(content)
             results.append({
                 "path": str(md.relative_to(vault)),
@@ -196,6 +289,8 @@ async def handle_graph(request):
     note_data: dict[str, dict] = {}
 
     for md in vault.rglob("*.md"):
+        if not md.is_file():
+            continue
         rel = str(md.relative_to(vault))
         content = md.read_text(errors="replace")
         meta, _ = _parse_frontmatter(content)
@@ -223,3 +318,99 @@ async def handle_graph(request):
                 edges.append({"source": rel, "target": target})
 
     return web.json_response({"nodes": nodes, "edges": edges})
+
+
+# ── Quality subsystem endpoints ───────────────────────────────────────
+
+async def handle_gate(request):
+    """GET /api/vault/gate?strict=&limit= — run the quality gate and return
+    the structured report (violations grouped by rule + health stats)."""
+    from aiohttp import web
+    import dataclasses
+    svc = _service(request)
+    cfg = svc.config
+    if _truthy(request.query.get("strict")):
+        cfg = dataclasses.replace(cfg, strict=True)
+    try:
+        limit = int(request.query.get("limit", 500))
+    except (TypeError, ValueError):
+        limit = 500
+    rep = await svc.gate(config=cfg)
+    body = rep.to_dict()
+    if len(body["violations"]) > limit:
+        body["violations"] = body["violations"][:limit]
+        body["violations_truncated"] = True
+    return web.json_response(body)
+
+
+async def handle_doctor(request):
+    """POST /api/vault/doctor?apply= — mechanically fix what code can fix and
+    list the rest as suggestions. ``apply=false`` is a dry run."""
+    from aiohttp import web
+    apply = _truthy(request.query.get("apply"))
+    svc = _service(request)
+    result = await svc.doctor(apply=apply)
+    if apply and result["fix"]["files_changed"]:
+        gw = request.app.get("gateway")
+        if gw is not None:
+            await gw.broadcast_resource("vault", "changed")
+    return web.json_response(result)
+
+
+async def handle_index_sync(request):
+    """POST /api/vault/index/sync?force= — reconcile the index with disk."""
+    from aiohttp import web
+    force = _truthy(request.query.get("force"))
+    svc = _service(request)
+    return web.json_response(await svc.sync(force=force))
+
+
+async def handle_derived(request):
+    """POST /api/vault/derived — regenerate llms.txt + _showcase/showcase.md."""
+    from aiohttp import web
+    svc = _service(request)
+    res = await svc.regenerate_derived()
+    gw = request.app.get("gateway")
+    if gw is not None:
+        await gw.broadcast_resource("vault", "changed")
+    return web.json_response(res)
+
+
+async def handle_stats(request):
+    """GET /api/vault/stats — vault health summary."""
+    from aiohttp import web
+    return web.json_response(await _service(request).stats())
+
+
+async def handle_init(request):
+    """POST /api/vault/init — scaffold the folder system + canon + journal."""
+    from aiohttp import web
+    res = await _service(request).init_taxonomy()
+    gw = request.app.get("gateway")
+    if gw is not None and res.get("created"):
+        await gw.broadcast_resource("vault", "changed")
+    return web.json_response(res)
+
+
+async def handle_move(request):
+    """POST /api/vault/move {from, to} — move/rename a note or folder and
+    rewrite every inbound wikilink so nothing breaks."""
+    from aiohttp import web
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON body"}, status=400)
+    src = (body.get("from") or "").strip()
+    dst = (body.get("to") or "").strip()
+    if not src or not dst:
+        return web.json_response({"error": "from and to are required"}, status=400)
+    vault = _resolve_vault(request)
+    if _safe_full(vault, src) is None or _safe_full(vault, dst) is None:
+        return web.json_response({"error": "Invalid path"}, status=400)
+    result = await _service(request).move(src, dst)
+    if "error" in result:
+        return web.json_response(result, status=409)
+    gw = request.app.get("gateway")
+    if gw is not None:
+        await gw.broadcast_resource("vault", "changed")
+    return web.json_response(result)

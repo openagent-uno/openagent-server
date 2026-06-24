@@ -34,11 +34,21 @@ class _FakeHTTPResponse:
     the in-flight payload to assert the streaming bound is real.
     """
 
-    def __init__(self, payload: bytes, max_outstanding: int | None = None):
+    def __init__(self, payload: bytes, max_outstanding: int | None = None,
+                 content_length: int | None = None):
         self._payload = payload
         self._pos = 0
         self._max_outstanding = max_outstanding
         self.peak_outstanding = 0
+        # ``content_length`` lets a test exercise the truncation guard:
+        # None (default) → header absent → guard is skipped (back-compat
+        # with the streaming/checksum tests).
+        self._content_length = content_length
+
+    def getheader(self, name: str, default=None):
+        if name.lower() == "content-length" and self._content_length is not None:
+            return str(self._content_length)
+        return default
 
     def read(self, size: int | None = None) -> bytes:
         remaining = self._payload[self._pos:]
@@ -172,7 +182,12 @@ async def t_updater_rejects_cli_only_archive(ctx: TestContext) -> None:
         patch.object(updater, "urlopen", return_value=_FakeHTTPResponse(archive)),
     ):
         try:
-            updater.download_update("https://example.invalid/openagent-0.5.17-linux-x64.tar.gz")
+            # require_checksum=False to exercise the extraction/selection
+            # path; integrity fail-closed is covered by its own test.
+            updater.download_update(
+                "https://example.invalid/openagent-0.5.17-linux-x64.tar.gz",
+                require_checksum=False,
+            )
         except RuntimeError as exc:
             assert "did not contain the OpenAgent server executable" in str(exc)
         else:
@@ -215,7 +230,8 @@ async def t_updater_streaming_bound(ctx: TestContext) -> None:
         patch.object(updater, "urlopen", return_value=fake),
     ):
         out = updater.download_update(
-            "https://example.invalid/openagent-9.9.9-linux-x64.tar.gz"
+            "https://example.invalid/openagent-9.9.9-linux-x64.tar.gz",
+            require_checksum=False,
         )
 
     assert out.exists(), out
@@ -549,3 +565,274 @@ async def t_run_upgrade_normal_path(ctx: TestContext) -> None:
         "the binary is unchanged"
     )
     assert (old, new) == ("0.12.41", "0.12.41")
+
+
+# ── Bomb-proofing: fail-closed integrity, atomic swap, pre-swap gate ──
+
+
+def _gz_tar_with_openagent(content: bytes = b"new-binary") -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        info = tarfile.TarInfo("openagent")
+        info.size = len(content)
+        info.mode = 0o755
+        tf.addfile(info, io.BytesIO(content))
+    return buf.getvalue()
+
+
+@test("updater", "download_update is FAIL-CLOSED: refuses to install without a verified checksum")
+async def t_updater_fail_closed_no_checksum(ctx: TestContext) -> None:
+    """On an unreachable box, installing an unverified binary the
+    supervisor will immediately exec is the brick we must never risk.
+    With no digest and no .sha256, download_update must refuse BEFORE it
+    even downloads."""
+    import src.updater as updater
+
+    archive = _gz_tar_with_openagent()
+    with (
+        patch.object(updater, "_ssl_context", return_value=None),
+        patch.object(updater, "urlopen", return_value=_FakeHTTPResponse(archive)),
+    ):
+        try:
+            updater.download_update(
+                "https://example.invalid/openagent-9.9.9-linux-x64.tar.gz",
+                checksum_url=None,
+                expected_digest=None,
+            )  # require_checksum defaults to REQUIRE_CHECKSUM (True)
+        except RuntimeError as exc:
+            assert "no verifiable SHA-256" in str(exc), exc
+        else:
+            raise AssertionError("download_update must fail closed without a checksum")
+
+
+@test("updater", "download_update verifies the GitHub API asset digest (no second request)")
+async def t_updater_api_digest(ctx: TestContext) -> None:
+    """The per-asset ``digest`` rides the same authenticated response as
+    the version and can't go missing — it must be accepted as the
+    integrity anchor, and a mismatch must abort."""
+    import hashlib
+    import src.updater as updater
+
+    archive = _gz_tar_with_openagent(b"Z" * 1234)
+    good = "sha256:" + hashlib.sha256(archive).hexdigest()
+
+    # urlopen is called ONLY for the archive (no checksum fetch) — the
+    # digest came from the API response already.
+    with (
+        patch.object(updater, "_ssl_context", return_value=None),
+        patch.object(updater, "urlopen", return_value=_FakeHTTPResponse(archive)),
+    ):
+        out = updater.download_update(
+            "https://example.invalid/openagent-9.9.9-linux-x64.tar.gz",
+            expected_digest=good,
+        )
+    assert out.exists()
+
+    with (
+        patch.object(updater, "_ssl_context", return_value=None),
+        patch.object(updater, "urlopen", return_value=_FakeHTTPResponse(archive)),
+    ):
+        try:
+            updater.download_update(
+                "https://example.invalid/openagent-9.9.9-linux-x64.tar.gz",
+                expected_digest="sha256:" + "0" * 64,
+            )
+        except RuntimeError as exc:
+            assert "Checksum mismatch" in str(exc), exc
+        else:
+            raise AssertionError("a bad API digest must abort the install")
+
+
+@test("updater", "download_update rejects a truncated body via Content-Length")
+async def t_updater_truncation_guard(ctx: TestContext) -> None:
+    """A mid-stream disconnect ends the read loop cleanly with a short
+    body. When the server advertised a Content-Length, a size mismatch
+    must raise rather than install a half-download."""
+    import hashlib
+    import src.updater as updater
+
+    archive = _gz_tar_with_openagent(b"Q" * 5000)
+    digest = "sha256:" + hashlib.sha256(archive).hexdigest()
+    # Claim the body is 1 byte longer than what we actually serve.
+    fake = _FakeHTTPResponse(archive, content_length=len(archive) + 1)
+    with (
+        patch.object(updater, "_ssl_context", return_value=None),
+        patch.object(updater, "urlopen", return_value=fake),
+    ):
+        try:
+            updater.download_update(
+                "https://example.invalid/openagent-9.9.9-linux-x64.tar.gz",
+                expected_digest=digest,
+            )
+        except RuntimeError as exc:
+            assert "Truncated download" in str(exc), exc
+        else:
+            raise AssertionError("a short body vs Content-Length must abort")
+
+
+@test("updater", "apply_update bare swap is atomic: the executable path is never missing")
+async def t_apply_update_bare_atomic(ctx: TestContext) -> None:
+    """The new bare-binary swap backs up to .old then os.replace()s the
+    new bytes over the target — so a kill at any instant leaves either
+    the old or the new binary, never a hole. Verify the end state: target
+    is the new binary, .old holds the previous one, no .new leftover, and
+    the target was never unlinked (os.replace overwrites in place)."""
+    import tempfile
+    from pathlib import Path
+    import src.updater as updater
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        cur = tmp / "openagent"
+        cur.write_bytes(b"OLD")
+        cur.chmod(0o755)
+        new = tmp / "src" / "openagent"
+        new.parent.mkdir()
+        new.write_bytes(b"NEW")
+        new.chmod(0o755)
+
+        with (
+            patch("src._frozen.executable_path", return_value=cur),
+            patch("platform.system", return_value="Linux"),
+        ):
+            updater.apply_update(new)
+
+        assert cur.read_bytes() == b"NEW", "target must hold the new binary"
+        old = cur.with_suffix(cur.suffix + ".old")
+        assert old.exists() and old.read_bytes() == b"OLD", "previous binary kept as .old"
+        assert not (cur.with_name(cur.name + ".new")).exists(), "no staged leftover"
+        assert cur.stat().st_mode & 0o111, "new binary stays executable"
+
+
+@test("updater", "verify_new_binary accepts a runnable binary and rejects a broken one")
+async def t_verify_new_binary(ctx: TestContext) -> None:
+    """The pre-swap execution gate runs the downloaded binary's
+    ``selfcheck`` from the current process. A clean exit passes; a
+    non-zero exit (broken build / wrong arch surrogate) must raise so the
+    live binary is never touched."""
+    import os
+    import stat
+    import tempfile
+    from pathlib import Path
+    import src.updater as updater
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        good = tmp / "good"
+        good.write_text('#!/bin/sh\nif [ "$1" = "selfcheck" ]; then echo "9.9.9"; exit 0; fi\nexit 2\n')
+        good.chmod(0o755)
+        # Should not raise.
+        updater.verify_new_binary(good, expected_version="9.9.9")
+
+        bad = tmp / "bad"
+        bad.write_text('#!/bin/sh\nexit 1\n')
+        bad.chmod(0o755)
+        try:
+            updater.verify_new_binary(bad)
+        except RuntimeError as exc:
+            assert "self-check" in str(exc).lower() or "exit" in str(exc).lower(), exc
+        else:
+            raise AssertionError("a binary that fails selfcheck must be rejected")
+
+
+@test("updater", "perform_self_update_sync cleans up its temp dir and records the pending update")
+async def t_perform_self_update_cleans_temp(ctx: TestContext) -> None:
+    """The download+extract tree (~150-300 MB) must never leak, and a
+    successful swap must be journalled so the boot guard can roll back."""
+    import tempfile
+    from pathlib import Path
+    from unittest.mock import patch as _patch
+    import src.updater as updater
+
+    created = {}
+
+    real_mkdtemp = tempfile.mkdtemp
+
+    def tracking_mkdtemp(*a, **kw):
+        d = real_mkdtemp(*a, **kw)
+        if str(kw.get("prefix", "")).startswith("openagent_update_"):
+            created["dir"] = d
+        return d
+
+    info = updater.UpdateInfo(
+        current_version="1.0.0", new_version="1.1.0",
+        download_url="https://x/openagent-1.1.0-linux-x64.tar.gz",
+        checksum_url=None, expected_digest=None,
+    )
+    recorded = {}
+
+    fake_new_exe = Path(tempfile.mkdtemp()) / "openagent"
+    fake_new_exe.write_bytes(b"x")
+
+    with (
+        _patch.object(updater, "check_for_update", return_value=info),
+        _patch.object(updater, "download_update", return_value=fake_new_exe),
+        _patch.object(updater, "verify_new_binary", return_value=None),
+        _patch.object(updater, "apply_update", return_value=None),
+        _patch.object(tempfile, "mkdtemp", side_effect=tracking_mkdtemp),
+        _patch("src.update_guard.record_pending", side_effect=lambda *a, **k: recorded.update(a=a, k=k)),
+    ):
+        old, new = updater.perform_self_update_sync()
+
+    assert (old, new) == ("1.0.0", "1.1.0")
+    assert "dir" in created
+    assert not Path(created["dir"]).exists(), "perform_self_update_sync must rmtree its temp dir"
+    assert recorded.get("a", (None,))[0] == "1.1.0", "the pending update must be journalled"
+
+
+@test("updater", "check_for_update skips a version that was previously rolled back")
+async def t_updater_skips_rolled_back(ctx: TestContext) -> None:
+    """A bad release that stays GitHub-latest must not be re-installed on
+    every poll — the boot guard records rolled-back versions and
+    check_for_update honours them."""
+    import src
+    import src.updater as updater
+
+    payload = {
+        "tag_name": "v9.9.9",
+        "assets": [
+            {"name": "openagent-9.9.9-linux-x64.tar.gz",
+             "browser_download_url": "https://x/openagent-9.9.9-linux-x64.tar.gz",
+             "digest": "sha256:" + "a" * 64},
+            {"name": "openagent-9.9.9-linux-x64.tar.gz.sha256",
+             "browser_download_url": "https://x/openagent-9.9.9-linux-x64.tar.gz.sha256"},
+        ],
+    }
+    with (
+        patch.object(src, "__version__", "1.0.0"),
+        patch.object(updater, "_asset_suffix", return_value="linux-x64.tar.gz"),
+        patch.object(updater, "_ssl_context", return_value=None),
+        patch.object(updater, "urlopen",
+                     return_value=_FakeHTTPResponse(json.dumps(payload).encode())),
+        patch("src.update_guard.rolled_back_versions", return_value={"9.9.9"}),
+    ):
+        info = updater.check_for_update()
+    assert info is None, "a previously rolled-back version must be skipped"
+
+
+@test("updater", "check_for_update surfaces the GitHub asset digest in UpdateInfo")
+async def t_updater_captures_digest(ctx: TestContext) -> None:
+    import src
+    import src.updater as updater
+
+    payload = {
+        "tag_name": "v2.0.0",
+        "assets": [
+            {"name": "openagent-2.0.0-linux-x64.tar.gz",
+             "browser_download_url": "https://x/openagent-2.0.0-linux-x64.tar.gz",
+             "digest": "sha256:" + "b" * 64},
+            {"name": "openagent-2.0.0-linux-x64.tar.gz.sha256",
+             "browser_download_url": "https://x/openagent-2.0.0-linux-x64.tar.gz.sha256"},
+        ],
+    }
+    with (
+        patch.object(src, "__version__", "1.0.0"),
+        patch.object(updater, "_asset_suffix", return_value="linux-x64.tar.gz"),
+        patch.object(updater, "_ssl_context", return_value=None),
+        patch.object(updater, "urlopen",
+                     return_value=_FakeHTTPResponse(json.dumps(payload).encode())),
+        patch("src.update_guard.rolled_back_versions", return_value=set()),
+    ):
+        info = updater.check_for_update()
+    assert info is not None
+    assert info.expected_digest == "sha256:" + "b" * 64, info.expected_digest

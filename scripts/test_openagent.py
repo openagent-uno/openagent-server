@@ -245,6 +245,8 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_workflow_parallel_execution",
     "test_dream",
     "test_updater",
+    "test_update_guard",
+    "test_task_hooks",
     "test_bridges",
     # Spam coalescing end-to-end: real StreamSession against a slow
     # fake agent (every turn takes real time, mirroring LLM latency),
@@ -346,6 +348,10 @@ _TEST_MODULES: tuple[str, ...] = (
     #     memory-checkpoint prompt into the user turn every N turns
     #     (default off; opt-in via memory.vault_reminder.enabled).
     "test_vault_reminder",
+    # Vault quality subsystem: parser / incremental index / gate / doctor /
+    #     derived artifacts + a 3k-note scale test. Pure-unit (temp vaults,
+    #     no gateway), so it can run anywhere in the order.
+    "test_vault_gate",
 )
 
 

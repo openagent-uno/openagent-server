@@ -424,6 +424,15 @@ class Gateway:
             ("GET", "/api/vault/notes", vault.handle_list),
             ("GET", "/api/vault/graph", vault.handle_graph),
             ("GET", "/api/vault/search", vault.handle_search),
+            # Quality subsystem — static paths registered BEFORE the
+            # ``notes/{path:.+}`` wildcards so they are not shadowed.
+            ("GET", "/api/vault/gate", vault.handle_gate),
+            ("GET", "/api/vault/stats", vault.handle_stats),
+            ("POST", "/api/vault/doctor", vault.handle_doctor),
+            ("POST", "/api/vault/derived", vault.handle_derived),
+            ("POST", "/api/vault/move", vault.handle_move),
+            ("POST", "/api/vault/init", vault.handle_init),
+            ("POST", "/api/vault/index/sync", vault.handle_index_sync),
             ("GET", "/api/vault/notes/{path:.+}", vault.handle_read),
             ("PUT", "/api/vault/notes/{path:.+}", vault.handle_write),
             ("DELETE", "/api/vault/notes/{path:.+}", vault.handle_delete),
@@ -1056,13 +1065,31 @@ class Gateway:
             else:
                 text = f"Usage tracking available for {len(by_model)} model(s); monthly spend is ${spend:.4f}."
         elif name == "update":
-            result = control.perform_update(self)
+            # Run the (multi-minute, blocking) download+apply OFF the event
+            # loop — doing it inline froze the entire gateway (no health,
+            # no WS frames, no bridge polling) for the whole download. And
+            # schedule the restart so the new binary actually takes over;
+            # the old code swapped the binary but never restarted, so the
+            # stale code kept running ("update not reliable").
+            result = await asyncio.to_thread(control.perform_update, self)
             if not result["ok"]:
                 text = f"Update failed: {result['error']}"
             elif result["updated"]:
                 text = f"Updated: v{result['old']} → v{result['new']}. Restarting..."
             else:
                 text = f"Already up-to-date (v{result['version']})."
+            # Send the result to the client FIRST, then restart, so the
+            # confirmation isn't lost to the socket teardown.
+            elog("command.result", client_id=client_id, name=name, text=text)
+            await self._safe_ws_send_json(ws, {"type": P.COMMAND_RESULT, "text": text})
+            if result.get("ok") and result.get("updated"):
+                async def _delayed_update_restart():
+                    await asyncio.sleep(0.5)
+                    control.request_restart(self, source="ws_update")
+                asyncio.get_running_loop().create_task(
+                    _delayed_update_restart(), name="gateway:ws-update-restart"
+                )
+            return
         elif name == "restart":
             text = "Restarting..."
             control.request_restart(self, source="ws_command")

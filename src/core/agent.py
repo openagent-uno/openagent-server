@@ -1122,6 +1122,13 @@ class Agent:
                 await _status("Thinking...")
 
                 token = set_session_context(session_id)
+                # Record the active chat session so the vault autocommit can
+                # attribute out-of-band note writes (external vault MCP) to it.
+                try:
+                    from src.memory.vault.vault_origin import note_activity
+                    note_activity(kind="chat", session=session_id)
+                except Exception:  # noqa: BLE001
+                    pass
                 # ``delegate_task`` MCP routes through ``dispatcher.run_delegated``,
                 # which only ``ModelDispatcher`` (the canonical ``self.model``)
                 # implements — a per-turn ``TeamRouterProvider`` built by
@@ -1397,6 +1404,13 @@ class Agent:
                 await _status("Thinking...")
 
                 token = set_session_context(session_id)
+                # Record the active chat session so the vault autocommit can
+                # attribute out-of-band note writes (external vault MCP) to it.
+                try:
+                    from src.memory.vault.vault_origin import note_activity
+                    note_activity(kind="chat", session=session_id)
+                except Exception:  # noqa: BLE001
+                    pass
                 # See ``_run_inner`` above: delegation must route through the
                 # canonical ``ModelDispatcher`` (``self.model``), not the
                 # per-turn ``active_model`` which may be a ``TeamRouterProvider``

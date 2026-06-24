@@ -290,3 +290,93 @@ def install_docker() -> str:
         return install_docker_windows()
     raise RuntimeError(f"Unsupported platform for automatic Docker install: {pf}")
 
+
+# ── Git installer (the memory vault is a git repo) ──
+
+def install_git_linux() -> str:
+    mgr = detect_linux_pkg_manager()
+    if mgr is None:
+        raise RuntimeError("No supported package manager found; install git manually.")
+    is_root = hasattr(os, "geteuid") and os.geteuid() == 0
+    # ``sudo -n`` never prompts: it fails fast when no cached credential is
+    # available rather than blocking forever on a password prompt (the
+    # auto-installer must never hang a setup command). stdin is closed for
+    # the same reason. The caller (ensure_git) treats failure as "couldn't
+    # install" and degrades gracefully.
+    sudo = [] if is_root else ["sudo", "-n"]
+
+    def run(args: list[str], env=None) -> None:
+        r = subprocess.run(sudo + args, env=env, stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, timeout=300)
+        if r.returncode != 0:
+            err = (r.stderr or r.stdout or "").strip()
+            if not is_root and ("password" in err.lower() or "sudo" in err.lower()):
+                raise RuntimeError(
+                    "git install needs root. Re-run with sudo, or install git "
+                    "manually (e.g. `sudo " + mgr + " install git`).")
+            raise RuntimeError(f"git install failed: {err[:200]}")
+
+    if mgr == "apt":
+        env = os.environ.copy()
+        env["DEBIAN_FRONTEND"] = "noninteractive"
+        run(["apt-get", "update", "-q"], env=env)
+        run(["apt-get", "install", "-y", "-q", "git"], env=env)
+    elif mgr == "dnf":
+        run(["dnf", "install", "-y", "git"])
+    elif mgr == "pacman":
+        run(["pacman", "-S", "--noconfirm", "git"])
+    elif mgr == "zypper":
+        run(["zypper", "--non-interactive", "install", "git"])
+    elif mgr == "apk":
+        run(["apk", "add", "git"])
+    return "git installed."
+
+
+def install_git_macos() -> str:
+    if shutil.which("brew"):
+        _run(["brew", "install", "git"])
+        return "git installed via Homebrew."
+    # The bare ``git`` shim triggers the Xcode Command Line Tools installer.
+    subprocess.run(["xcode-select", "--install"], check=False)
+    raise RuntimeError(
+        "Homebrew not found. Triggered the Xcode Command Line Tools installer "
+        "(which provides git) — accept the dialog, then re-run setup."
+    )
+
+
+def install_git_windows() -> str:
+    if shutil.which("winget"):
+        _run([
+            "winget", "install", "--silent", "--accept-source-agreements",
+            "--accept-package-agreements", "Git.Git",
+        ])
+        return "git installed via winget."
+    raise RuntimeError("winget not found; install Git from https://git-scm.com/download/win")
+
+
+def install_git() -> str:
+    pf = current_platform()
+    if pf == "linux":
+        return install_git_linux()
+    if pf == "macos":
+        return install_git_macos()
+    if pf == "windows":
+        return install_git_windows()
+    raise RuntimeError(f"Unsupported platform for automatic git install: {pf}")
+
+
+def ensure_git() -> str | None:
+    """Return the path to a usable ``git``, installing it if missing and
+    possible. Best-effort: returns ``None`` (never raises) when git is not
+    present and cannot be installed automatically — the vault still works,
+    just without commit history."""
+    found = shutil.which("git")
+    if found:
+        return found
+    try:
+        logger.info("git not found — attempting automatic install for the vault repo")
+        install_git()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("automatic git install failed: %s", e)
+    return shutil.which("git")
+

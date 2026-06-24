@@ -202,8 +202,14 @@ def _build_linux_unit(agent_dir: Path | None = None) -> str:
         Description={label} - AI agent service
         After=network-online.target
         Wants=network-online.target
-        StartLimitIntervalSec=60
-        StartLimitBurst=5
+        # Never give up restarting. A crash-looping bad release is made
+        # self-healing by the self-update boot guard (src/update_guard),
+        # which rolls back to the previous binary after a few failed
+        # boots; for any other (often transient) cause we would rather
+        # keep retrying on a box the operator cannot reach than leave the
+        # unit dead and the agent permanently offline. RestartSec throttles
+        # the loop so this is cheap. Matches launchd KeepAlive=true.
+        StartLimitIntervalSec=0
 
         [Service]
         Type=simple
@@ -211,6 +217,8 @@ def _build_linux_unit(agent_dir: Path | None = None) -> str:
         WorkingDirectory={_get_working_dir(agent_dir)}
         Restart=always
         RestartSec=5
+        # Exit 75 is our "restart me to apply an update" code — treat it
+        # as success so it never trips failure accounting.
         SuccessExitStatus=75
 
         # Environment
@@ -327,6 +335,32 @@ def _macos_status(agent_dir: Path | None = None) -> str:
     return "Not running"
 
 
+def _macos_restart(agent_dir: Path | None = None) -> str:
+    """Restart the launchd job so a freshly-swapped binary takes over.
+
+    ``launchctl kickstart -k`` stops (if running) and (re)starts the
+    job in one atomic step. Falls back to unload+load if kickstart isn't
+    available (older macOS) or the job isn't loaded under this GUI domain.
+    """
+    svc_name, _, _ = _service_names(agent_dir)
+    target = f"gui/{os.getuid()}/{svc_name}"
+    r = subprocess.run(
+        ["launchctl", "kickstart", "-k", target],
+        capture_output=True, text=True,
+    )
+    if r.returncode == 0:
+        return f"launchctl kickstart -k {target}"
+    # Fallback: reload the plist.
+    path = _macos_plist_path(agent_dir)
+    if path.exists():
+        subprocess.run(["launchctl", "unload", str(path)], capture_output=True, check=False)
+        subprocess.run(["launchctl", "load", str(path)], check=True)
+        return f"reloaded {path}"
+    raise RuntimeError(
+        f"could not restart {svc_name}: {r.stderr.strip() or 'job not loaded'}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Linux  (systemd user service)
 # ---------------------------------------------------------------------------
@@ -377,6 +411,12 @@ def _linux_status(agent_dir: Path | None = None) -> str:
         capture_output=True, text=True,
     )
     return result.stdout.strip() if result.stdout else "Not running"
+
+
+def _linux_restart(agent_dir: Path | None = None) -> str:
+    _, _, unit_name = _service_names(agent_dir)
+    subprocess.run(["systemctl", "--user", "restart", unit_name], check=True)
+    return f"systemctl --user restart {unit_name}"
 
 
 # ---------------------------------------------------------------------------
@@ -443,6 +483,13 @@ def _windows_status(agent_dir: Path | None = None) -> str:
     return "Not installed"
 
 
+def _windows_restart(agent_dir: Path | None = None) -> str:
+    _, label, _ = _service_names(agent_dir)
+    subprocess.run(["schtasks", "/End", "/TN", label], capture_output=True, check=False)
+    subprocess.run(["schtasks", "/Run", "/TN", label], check=True)
+    return f"schtasks restart {label}"
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -453,6 +500,12 @@ _DISPATCH = {
     "Windows": (_windows_install, _windows_uninstall, _windows_status),
 }
 
+_RESTART_DISPATCH = {
+    "Darwin": _macos_restart,
+    "Linux": _linux_restart,
+    "Windows": _windows_restart,
+}
+
 
 def _get_handlers():
     system = platform.system()
@@ -460,6 +513,19 @@ def _get_handlers():
     if handlers is None:
         raise RuntimeError(f"Unsupported platform: {system}")
     return handlers
+
+
+def restart_service(agent_dir: Path | None = None) -> str:
+    """Restart the installed OpenAgent service. Returns a status message.
+
+    Used by ``openagent update`` to make a freshly-swapped binary take
+    over immediately (the running service is a separate process, so the
+    swap alone wouldn't pick it up)."""
+    system = platform.system()
+    fn = _RESTART_DISPATCH.get(system)
+    if fn is None:
+        raise RuntimeError(f"Unsupported platform: {system}")
+    return fn(agent_dir)
 
 
 def install_service(agent_dir: Path | None = None) -> str:

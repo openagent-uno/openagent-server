@@ -181,6 +181,17 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
         "adapter_module": "src.mcp.servers.tool_search.adapters",
         "runtime_toolkit_factory": "build_runtime_toolkit",
     },
+    "vault-gate": {
+        "in_process": True,
+        "adapter_module": "src.mcp.servers.vault_gate.adapters",
+        "runtime_toolkit_factory": "build_runtime_toolkit",
+        "description": (
+            "evaluate and repair your memory vault — run the quality gate "
+            "(orphans, broken links, over-long notes, duplicates, missing "
+            "frontmatter), mechanically fix what code can, validate a note "
+            "before writing it, search, and regenerate llms.txt / showcase"
+        ),
+    },
     "attachments": {
         "in_process": True,
         "adapter_module": "src.mcp.servers.attachments.adapters",
@@ -305,6 +316,7 @@ DEFAULT_MCPS: list[dict[str, Any]] = [
     {"builtin": "web-search", "_default": True},
     {"builtin": "shell", "_default": True},
     {"builtin": "tool-search", "_default": True},
+    {"builtin": "vault-gate", "_default": True},
     {"builtin": "attachments", "_default": True},
     {"builtin": "computer-control", "_default": True},
     {"builtin": "agent-in-chrome", "_default": True},

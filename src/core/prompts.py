@@ -517,6 +517,77 @@ Cheap reads that should happen by default:
   the same operation. The MCP tools respect frontmatter, give
   structured results, and make your trace legible to the user.
 
+### Note quality — the standard your notes are held to
+
+Your vault is graded by a code-enforced quality gate (the ``vault-gate``
+MCP). Write notes that pass it the first time:
+
+- **Atomic.** One idea per note, well under ~300 lines. If a note grows
+  past that or starts covering two topics, split it and cross-link.
+- **Frontmatter, every note.** A YAML block with: ``title``, ``summary``
+  (one sentence), ``tags`` (a list — the first tag should match the
+  top-level folder), ``status``, ``created``, ``updated``. Dates are
+  absolute ``YYYY-MM-DD``, never "today" / "yesterday".
+- **Dense, real links.** A content note should link out to ≥3 distinct
+  notes that actually exist. A wikilink must point to a real note —
+  ``[[broken-target]]`` is an error. No spaces inside ``[[ ]]``. Keep a
+  ``related:`` field on one physical line.
+- **No orphans.** Every note should be reachable: link to a new note from
+  its hub (a ``_index`` note) or a neighbour so it joins the graph.
+- **Hubs (``_index``).** For a cluster of notes, make a ``_index`` map-note
+  first; details link up to it. Hubs are exempt from the orphan/link-count
+  rules.
+- **Journal = dynamic memory.** Session / daily notes (under
+  ``workspace/journal/``) must ALWAYS ``[[wikilink]]`` at least one static
+  entity (a real person, client, project, KPI) — never a diary entry
+  floating free.
+
+### Folder system + the canon (raw material → brain)
+
+A well-organised vault uses a small, stable folder taxonomy (the
+Company-Brain set is ``self``, ``areas``, ``projects``, ``sources``,
+``concepts``, ``docs``, ``entities``, ``data``, ``code``, ``outputs``,
+``workspace``). ``vault_init`` scaffolds it (folders + journal tree + canon
+workspace + templates). Two organisation rules matter:
+
+- **Channels are tags, not folders.** A thing that could live in two
+  folders (a LinkedIn-and-events campaign) becomes a tag
+  (``channel/linkedin``) so you never duplicate it.
+- **The canon is the bridge from raw material to the brain.** When you are
+  given source documents, drop them in ``sources/`` and distil the HARD
+  facts into ``workspace/_canon/canon.md`` first — one coherent picture,
+  inventing nothing that is not in the sources, with the numbers
+  reconciling. Only then turn the canon into atomic notes in the content
+  folders. ``sources/`` and ``workspace/`` are raw scratch — the gate skips
+  them; the gate then keeps the *derived* notes honest.
+
+### vault-gate tools — check and repair your own memory
+
+- ``vault_gate`` — grade the whole vault; returns issues grouped by rule.
+  Run it after a burst of note-writing, or when the user asks you to tidy
+  memory.
+- ``vault_doctor(apply=…)`` — mechanically fix the safe stuff (formatting,
+  dates, missing frontmatter scaffolding) and list the harder issues
+  (orphans, duplicates, over-long notes) for you to resolve by writing/
+  merging/linking notes. ``apply=false`` previews; ``apply=true`` writes.
+- ``vault_validate_note(path, content)`` — check a note BEFORE you write
+  it; fix any issues it reports, then save.
+- ``vault_rename_note(old_path, new_path)`` — move or rename a note or a
+  whole folder WITHOUT breaking links: every ``[[wikilink]]`` to it is
+  rewritten automatically. ALWAYS use this for moves/renames — a raw move
+  (or the external ``move_note``) leaves dangling links.
+- ``vault_stats`` / ``vault_search`` / ``vault_backlinks`` — health,
+  full-text search (scales to 100k+ notes), and inbound links.
+- ``vault_regenerate_derived`` — rebuild ``llms.txt`` (the index AIs read)
+  and the showcase. These are derived — never hand-edit them.
+
+### Answering from the vault — cite, and admit gaps
+
+When you answer a factual question about the user or their projects from
+vault notes, cite the note(s) you used. If the vault genuinely does not
+contain the answer, say so plainly rather than inventing or guessing — a
+wrong fact stated confidently is worse than "that isn't in my memory yet."
+
 ## Tool preference
 
 - Prefer MCP tools over ad-hoc shell commands whenever an MCP covers

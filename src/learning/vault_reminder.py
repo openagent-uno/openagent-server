@@ -25,11 +25,13 @@ _REMINDER_TEMPLATE = (
     "conversation and SAVE to the memory vault (vault_write_note / "
     "vault_patch_note) anything relevant learned and not yet saved: "
     "preferences, decisions, facts, names, paths, gotchas, completed "
-    "tasks. Notes must be ATOMIC (one topic), STRUCTURED (frontmatter + "
-    "clear sections) and well-linked with [[wikilinks]] to existing "
+    "tasks. Notes must be ATOMIC (one topic), STRUCTURED (complete "
+    "frontmatter: title, summary, tags, status, created/updated as "
+    "YYYY-MM-DD) and well-linked with ≥3 real [[wikilinks]] to existing "
     "notes — search first with vault_search_notes to avoid duplicates "
-    "and to connect related notes. If there is nothing new to save, "
-    "ignore this reminder.]"
+    "and connect related notes, and never leave a broken link or an "
+    "orphan. If you wrote several notes, run vault_gate to check them. "
+    "If there is nothing new to save, ignore this reminder.]"
 )
 
 

@@ -367,6 +367,13 @@ class Scheduler:
                 await self.agent.refresh_registries()
             except Exception as e:  # noqa: BLE001
                 elog("scheduler.hot_reload_error", level="warning", error=str(e))
+            # Provenance for vault commits made during this scheduled run.
+            try:
+                from src.memory.vault.vault_origin import note_activity
+                note_activity(kind="scheduled_task", task=task["id"],
+                              run=run_id, session=session_id)
+            except Exception:  # noqa: BLE001
+                pass
             response = await self.agent.run(
                 message=task["prompt"],
                 user_id="scheduler",
@@ -626,6 +633,12 @@ class Scheduler:
             except Exception as e:  # noqa: BLE001
                 elog("scheduler.hot_reload_error", level="warning", error=str(e))
 
+            # Provenance for vault commits made during this workflow run.
+            try:
+                from src.memory.vault.vault_origin import note_activity
+                note_activity(kind="workflow", workflow=wf.get("id"), run=run_id)
+            except Exception:  # noqa: BLE001
+                pass
             executor = self._get_workflow_executor()
             final = await executor.run(
                 wf, trigger=trigger, inputs=inputs, run_id=run_id,
