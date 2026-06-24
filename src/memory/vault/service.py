@@ -174,11 +174,11 @@ class VaultService:
                 [rel], f"vault: delete {rel}", origin)
             return {"existed": existed, "commit": commit}
 
-    async def git_log(self, limit: int = 20) -> list[dict]:
+    async def git_log(self, limit: int = 20, path: str | None = None) -> list[dict]:
         g = await self._ensure_git()
         if not g:
             return []
-        return await asyncio.to_thread(g.log, limit)
+        return await asyncio.to_thread(g.log, limit, path)
 
     # ── reconcile + read ──────────────────────────────────────────────
 

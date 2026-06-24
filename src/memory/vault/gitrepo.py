@@ -236,17 +236,39 @@ class VaultGit:
         except Exception:  # noqa: BLE001
             return None
 
-    def log(self, limit: int = 20) -> list[dict]:
-        """Recent commits as ``{hash, subject}`` — for inspection / tests."""
+    def log(self, limit: int = 20, path: Optional[str] = None) -> list[dict]:
+        """Recent commits as ``{hash, subject, date, author, provenance}``.
+        With ``path``, only commits that touched that note/folder. The
+        provenance dict is parsed from the commit-message trailers (Origin,
+        Session, Workflow, Task, Tool, …)."""
         if not self.available or not self.is_repo():
             return []
         try:
-            r = self._git("log", f"-{limit}", "--pretty=format:%h\t%s")
-            out = []
-            for line in (r.stdout or "").splitlines():
-                if "\t" in line:
-                    h, s = line.split("\t", 1)
-                    out.append({"hash": h, "subject": s})
+            fmt = "--pretty=format:%h%x1f%s%x1f%cI%x1f%an%x1f%b%x1e"
+            args = ["log", f"-{max(1, limit)}", fmt]
+            if path:
+                args += ["--", path]
+            r = self._git(*args)
+            out: list[dict] = []
+            for rec in (r.stdout or "").split("\x1e"):
+                rec = rec.strip("\n")
+                if not rec.strip():
+                    continue
+                parts = rec.split("\x1f")
+                if len(parts) < 4:
+                    continue
+                h, subject, date, author = parts[0], parts[1], parts[2], parts[3]
+                body = parts[4] if len(parts) > 4 else ""
+                prov: dict[str, str] = {}
+                for line in body.splitlines():
+                    if ":" in line:
+                        k, v = line.split(":", 1)
+                        if k.strip() and v.strip():
+                            prov[k.strip().lower()] = v.strip()
+                out.append({
+                    "hash": h, "subject": subject, "date": date,
+                    "author": author, "provenance": prov,
+                })
             return out
         except Exception:  # noqa: BLE001
             return []

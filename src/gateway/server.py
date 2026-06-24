@@ -428,6 +428,7 @@ class Gateway:
             # ``notes/{path:.+}`` wildcards so they are not shadowed.
             ("GET", "/api/vault/gate", vault.handle_gate),
             ("GET", "/api/vault/stats", vault.handle_stats),
+            ("GET", "/api/vault/history", vault.handle_history),
             ("POST", "/api/vault/doctor", vault.handle_doctor),
             ("POST", "/api/vault/derived", vault.handle_derived),
             ("POST", "/api/vault/move", vault.handle_move),

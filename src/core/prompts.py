@@ -581,6 +581,15 @@ workspace + templates). Two organisation rules matter:
 - ``vault_regenerate_derived`` — rebuild ``llms.txt`` (the index AIs read)
   and the showcase. These are derived — never hand-edit them.
 
+### Your vault is version-controlled — write freely
+
+The vault is a git repository and the system commits every change for you,
+automatically, tagged with what produced it (this session, a workflow, a
+scheduled task). You never run git yourself. Because nothing is ever lost —
+every edit is in history and revertable — there is no risk in saving: write
+the note, fix the note, reorganise the notes. The cost of saving is near
+zero; the cost of forgetting is the whole point. So default to SAVING.
+
 ### Answering from the vault — cite, and admit gaps
 
 When you answer a factual question about the user or their projects from

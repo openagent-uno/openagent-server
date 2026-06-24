@@ -96,8 +96,8 @@ memory:
   # vault_path: ~/my-vault              # where the Markdown memory vault lives (default: <data-dir>/memories)
 
   vault_reminder:
-    enabled: false                      # every Nth turn, inject a "save to the vault" checkpoint into the turn
-    every_n_turns: 6
+    enabled: true                       # on by default: inject a "ALWAYS save to the vault" checkpoint into the turn
+    every_n_turns: 3                     # fires on the first turn, then every N turns
 
   semantic_search:
     enabled: false                      # embed conversation turns for similarity recall (needs an OpenAI key)

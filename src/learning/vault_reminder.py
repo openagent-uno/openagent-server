@@ -1,13 +1,13 @@
 """Per-session vault-save reminder injected into the user prompt.
 
-Every ``_every()`` user turns we prepend a short memory-checkpoint hint
-to the outbound user text, asking the agent to review the conversation
-and save anything relevant to the vault before replying. The reminder is
-pure prompt text — no model call, no network hop — so it costs nothing
-extra on the hot path.
+On the first user turn, and then every ``_every()`` turns, we prepend a
+short memory-checkpoint hint to the outbound user text telling the agent to
+ALWAYS save anything relevant to the memory vault before replying. The
+reminder is pure prompt text — no model call, no network hop — so it costs
+nothing extra on the hot path.
 
-Opt-in via ``memory.vault_reminder.enabled: true`` in ``openagent.yaml``
-(see ``core/server.py`` for the env mapping). Default off.
+On by default. Tune via ``memory.vault_reminder`` in ``openagent.yaml``
+(``enabled``, ``every_n_turns``); see ``core/server.py`` for the env mapping.
 """
 
 from __future__ import annotations
@@ -18,26 +18,28 @@ from typing import Any, Optional
 
 from src.core.logging import elog
 
-_DEFAULT_EVERY = 6
+_DEFAULT_EVERY = 3
 
 _REMINDER_TEMPLATE = (
-    "[Memory checkpoint — turn {n}: before replying, review this "
-    "conversation and SAVE to the memory vault (vault_write_note / "
-    "vault_patch_note) anything relevant learned and not yet saved: "
-    "preferences, decisions, facts, names, paths, gotchas, completed "
-    "tasks. Notes must be ATOMIC (one topic), STRUCTURED (complete "
-    "frontmatter: title, summary, tags, status, created/updated as "
-    "YYYY-MM-DD) and well-linked with ≥3 real [[wikilinks]] to existing "
-    "notes — search first with vault_search_notes to avoid duplicates "
-    "and connect related notes, and never leave a broken link or an "
-    "orphan. If you wrote several notes, run vault_gate to check them. "
-    "If there is nothing new to save, ignore this reminder.]"
+    "[Memory checkpoint (turn {n}) — ALWAYS save what matters. Before "
+    "replying, review this conversation and SAVE to the memory vault "
+    "(vault_write_note / vault_patch_note) EVERYTHING relevant that isn't "
+    "already there: preferences, decisions, facts, names, paths, deadlines, "
+    "gotchas, completed tasks. Saving is the DEFAULT — only skip when truly "
+    "nothing was learned this turn. Notes must be ATOMIC (one idea), "
+    "STRUCTURED (complete frontmatter: title, summary, tags, status, "
+    "created/updated as YYYY-MM-DD) and densely linked with >=3 real "
+    "[[wikilinks]] to existing notes — search first with vault_search_notes "
+    "to avoid duplicates and connect related notes; never leave a broken "
+    "link or an orphan. Every change is version-controlled automatically, so "
+    "write freely. After a burst of writes, run vault_gate to check them.]"
 )
 
 
 def _is_enabled() -> bool:
+    # On by default; opt out with memory.vault_reminder.enabled: false.
     return (
-        os.environ.get("OPENAGENT_VAULT_REMINDER_ENABLED", "0").strip().lower()
+        os.environ.get("OPENAGENT_VAULT_REMINDER_ENABLED", "1").strip().lower()
         in ("1", "true", "yes", "on")
     )
 
@@ -47,7 +49,7 @@ def _every() -> int:
         n = int(os.environ.get("OPENAGENT_VAULT_REMINDER_EVERY_N_TURNS", _DEFAULT_EVERY))
     except (TypeError, ValueError):
         return _DEFAULT_EVERY
-    return max(2, n)
+    return max(1, n)
 
 
 async def _bump_turn_count(db: Any, session_id: str) -> int:
@@ -100,7 +102,8 @@ async def maybe_render_reminder(db: Any, session_id: str) -> Optional[str]:
     except Exception as e:
         elog("vault_reminder.bump_error", session_id=session_id, error=str(e)[:200])
         return None
-    if new_count == 0 or new_count % _every() != 0:
+    # Fire on the very first turn, then on every Nth turn after.
+    if new_count == 0 or not (new_count == 1 or new_count % _every() == 0):
         return None
     # Update last_reminded_at.
     conn = getattr(db, "_conn", None)

@@ -382,6 +382,19 @@ async def handle_stats(request):
     return web.json_response(await _service(request).stats())
 
 
+async def handle_history(request):
+    """GET /api/vault/history?path=&limit= — the vault's git history with
+    provenance. ``path`` (optional) scopes it to one note/folder."""
+    from aiohttp import web
+    path = request.query.get("path") or None
+    try:
+        limit = int(request.query.get("limit", 50))
+    except (TypeError, ValueError):
+        limit = 50
+    commits = await _service(request).git_log(limit, path)
+    return web.json_response({"commits": commits, "path": path})
+
+
 async def handle_init(request):
     """POST /api/vault/init — scaffold the folder system + canon + journal."""
     from aiohttp import web
