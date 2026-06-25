@@ -189,29 +189,39 @@ async def handle_write(request):
     content = data.get("content", "")
     # Atomic write+index+validate+commit under the service's mutation lock so
     # the change lands in history with its own precise provenance (never swept
-    # by the autocommit loop). The write is never rejected — notes are
-    # Markdown the user owns — but the response carries quality warnings.
-    warnings: list = []
-    commit = None
+    # by the autocommit loop). With the quality gate on (default), mechanical
+    # issues are auto-fixed and a structurally-broken note is rejected with
+    # 422 + ``errors`` (nothing written); otherwise warnings ride along.
     try:
         from src.memory.vault.vault_origin import origin_from_request
         result = await _service(request).write_note(
             note_path, content, origin_from_request(request),
             validate=_validate_on_write())
-        existed = result["existed"]
-        warnings = result["warnings"]
-        commit = result["commit"]
     except Exception:  # noqa: BLE001 — never lose the note on a downstream error
         existed = full.exists()
         full.parent.mkdir(parents=True, exist_ok=True)
         full.write_text(content)
+        gw = request.app.get("gateway")
+        if gw is not None:
+            await gw.broadcast_resource(
+                "vault", "updated" if existed else "created", note_path)
+        return web.json_response(
+            {"ok": True, "path": note_path, "warnings": [], "commit": None})
+
+    if not result.get("ok", True):
+        # Rejected by the quality gate — nothing was written.
+        return web.json_response(
+            {"ok": False, "path": note_path, "blocked": True,
+             "errors": result.get("errors", []),
+             "warnings": result.get("warnings", [])}, status=422)
+
     gw = request.app.get("gateway")
     if gw is not None:
         await gw.broadcast_resource(
-            "vault", "updated" if existed else "created", note_path,
-        )
+            "vault", "updated" if result["existed"] else "created", note_path)
     return web.json_response(
-        {"ok": True, "path": note_path, "warnings": warnings, "commit": commit})
+        {"ok": True, "path": note_path, "warnings": result.get("warnings", []),
+         "applied": result.get("applied", []), "commit": result.get("commit")})
 
 
 async def handle_delete(request):

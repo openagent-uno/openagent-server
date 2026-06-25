@@ -5,7 +5,10 @@ import trash from 'trash';
 import { FrontmatterHandler } from './frontmatter.js';
 import { PathFilter } from './pathfilter.js';
 import { generateObsidianUri } from './uri.js';
-import { validateAndFix, validationEnabled } from './validate.js';
+import { validateAndFix, validationEnabled, type Violation } from './validate.js';
+
+/** What the quality gate did to a write the agent should hear about. */
+export interface WriteQuality { applied: string[]; warnings: Violation[]; }
 import type { ParsedNote, DirectoryListing, NoteWriteParams, DeleteNoteParams, DeleteResult, MoveNoteParams, MoveFileParams, MoveResult, BatchReadParams, BatchReadResult, UpdateFrontmatterParams, NoteInfo, TagManagementParams, TagManagementResult, PatchNoteParams, PatchNoteResult, VaultStats } from './types.js';
 
 /**
@@ -161,11 +164,19 @@ export class FileSystemService {
     fullPath: string,
     content: string,
     checkSize = false,
-  ): Promise<void> {
+  ): Promise<WriteQuality | null> {
     let toWrite = content;
+    let quality: WriteQuality | null = null;
     if (validationEnabled()) {
+      let result = null as ReturnType<typeof validateAndFix> | null;
       try {
-        const result = validateAndFix(relPath, content, { checkSize });
+        result = validateAndFix(relPath, content, { checkSize });
+      } catch {
+        // An unexpected validator fault must never lose a write — fall back
+        // to writing the content unvalidated.
+        result = null;
+      }
+      if (result) {
         if (!result.ok) {
           const lines = result.errors
             .map((v) => `  - [${v.rule}] ${v.message}`)
@@ -175,18 +186,14 @@ export class FileSystemService {
           );
         }
         toWrite = result.content;
-      } catch (error) {
-        // A thrown gate rejection (our Error) must propagate; only swallow
-        // unexpected validator faults so a bug can never lose a write.
-        if (error instanceof Error && error.message.startsWith('Note rejected')) {
-          throw error;
-        }
+        quality = { applied: result.applied, warnings: result.warnings };
       }
     }
     await writeFile(fullPath, toWrite, 'utf-8');
+    return quality;
   }
 
-  async writeNote(params: NoteWriteParams): Promise<void> {
+  async writeNote(params: NoteWriteParams): Promise<WriteQuality | null> {
     const { path, content, frontmatter, mode = 'overwrite' } = params;
     const fullPath = this.resolvePath(path);
 
@@ -257,7 +264,7 @@ export class FileSystemService {
       await mkdir(dirname(fullPath), { recursive: true });
       // Atomic-size is only enforced on a full write (creation / overwrite);
       // append / prepend are incremental edits to an existing note.
-      await this.writeNoteFile(path, fullPath, finalContent!, mode === 'overwrite');
+      return await this.writeNoteFile(path, fullPath, finalContent!, mode === 'overwrite');
     } catch (error) {
       throw classifyWriteError(error, path);
     }

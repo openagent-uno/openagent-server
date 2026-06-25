@@ -250,15 +250,22 @@ export function createServer(vaultPath: string, options: CreateServerOptions = {
 
         case "write_note": {
           const fm = parseFrontmatter(trimmedArgs.frontmatter);
-          await fileSystem.writeNote({
+          const quality = await fileSystem.writeNote({
             path: trimmedArgs.path,
             content: trimmedArgs.content,
             ...(fm !== undefined && { frontmatter: fm }),
             mode: trimmedArgs.mode || 'overwrite'
           });
-          return {
-            content: [{ type: "text", text: `Successfully wrote note: ${trimmedArgs.path} (mode: ${trimmedArgs.mode || 'overwrite'})` }]
-          };
+          let text = `Successfully wrote note: ${trimmedArgs.path} (mode: ${trimmedArgs.mode || 'overwrite'})`;
+          // Tell the agent what the quality gate auto-fixed and what still
+          // needs its judgement, so it can improve the note next.
+          if (quality && quality.applied.length > 0) {
+            text += `\nAuto-fixed: ${quality.applied.join('; ')}.`;
+          }
+          if (quality && quality.warnings.length > 0) {
+            text += `\nStill needs you: ${quality.warnings.map((w) => w.message).join('; ')}.`;
+          }
+          return { content: [{ type: "text", text }] };
         }
 
         case "patch_note": {

@@ -132,34 +132,101 @@ class VaultService:
         async with self._mutation_lock:
             return await asyncio.to_thread(g.commit_all, msg, trailers(o))
 
+    @staticmethod
+    def _enforce_writes() -> bool:
+        """Whether REST/service writes go through the quality gate (auto-fix +
+        block). Shares the flag the vendored vault MCP uses, default ON for
+        the in-process service so the app/CLI get the same enforcement as the
+        agent. Set OPENAGENT_VAULT_VALIDATE_WRITES=0 to fall back to the old
+        warn-only behaviour."""
+        return os.environ.get(
+            "OPENAGENT_VAULT_VALIDATE_WRITES", "1").strip().lower() in (
+            "1", "true", "yes", "on")
+
+    async def _enforce_write(self, rel: str, content: str,
+                             is_new: bool) -> tuple[str, list, list, list]:
+        """Auto-fix the mechanically-fixable issues and return any blocking
+        errors + warnings, mirroring the vendored vault MCP's write gate
+        (validate.ts). Pure CPU; runs in a thread. Returns
+        ``(fixed_content, errors, warnings, applied)``."""
+        import datetime
+        import yaml
+        from src.memory.vault.doctor import fix_note_content, _FIXABLE_RULES
+        from src.memory.vault.parser import split_frontmatter
+
+        def work() -> tuple[str, list, list, list]:
+            note = parse_note_text(rel, content, journal_root=self.journal_root)
+            today = datetime.date.today().isoformat()
+            fixed, applied = fix_note_content(
+                content, note, set(_FIXABLE_RULES), today)
+            errors: list = []
+            warnings: list = []
+            raw_fm, _ = split_frontmatter(fixed)
+            if raw_fm is not None and raw_fm.strip():
+                try:
+                    yaml.safe_load(raw_fm)
+                except Exception as e:  # noqa: BLE001
+                    errors.append({"rule": "frontmatter", "severity": "error",
+                                   "message": f"frontmatter is not valid YAML: {e}"})
+            note2 = parse_note_text(rel, fixed, journal_root=self.journal_root)
+            if is_new and note2.line_count > self.config.max_lines:
+                errors.append({
+                    "rule": "atomicity", "severity": "error",
+                    "message": (f"note is {note2.line_count} body lines "
+                                f"(> {self.config.max_lines}); split it into "
+                                "atomic notes, one idea each, and link them")})
+            if not note2.summary:
+                warnings.append({
+                    "rule": "frontmatter", "severity": "warn",
+                    "message": ("missing 'summary' — add a one-sentence "
+                                "summary so the note is self-describing")})
+            return fixed, errors, warnings, applied
+
+        return await asyncio.to_thread(work)
+
     async def write_note(self, rel_path: str, content: str,
                          origin: dict | None = None,
                          validate: bool = True) -> dict:
-        """Write a note, index it, optionally validate it, and commit it —
-        all atomically under the mutation lock so the change lands in history
-        with its own precise provenance. Returns ``{existed, warnings,
-        commit}``."""
+        """Write a note, index it, validate it, and commit it — all atomically
+        under the mutation lock so the change lands in history with its own
+        precise provenance. With the quality gate on (default), mechanical
+        issues are auto-fixed and a structurally-broken note is rejected
+        (``ok: False`` + ``errors``, nothing written). Returns ``{ok, existed,
+        warnings, applied, commit}`` or ``{ok: False, blocked, errors}``."""
         rel = rel_path.replace("\\", "/").lstrip("/")
         abs_path = self.vault_root / rel
         async with self._mutation_lock:
             existed = abs_path.exists()
+            warnings: list = []
+            applied: list = []
+
+            gated = validate and rel.lower().endswith(".md") and self._enforce_writes()
+            if gated:
+                try:
+                    content, errors, warnings, applied = await self._enforce_write(
+                        rel, content, is_new=not existed)
+                except Exception:  # noqa: BLE001 — a validator fault must never block
+                    errors = []
+                if errors:
+                    return {"ok": False, "blocked": True, "existed": existed,
+                            "errors": errors, "warnings": warnings}
 
             def _write() -> None:
                 abs_path.parent.mkdir(parents=True, exist_ok=True)
                 abs_path.write_text(content)
 
             await asyncio.to_thread(_write)  # critical: the note must land
-            warnings: list = []
             try:
                 await self.index_note(rel, content)
-                if validate and rel.lower().endswith(".md"):
+                if not gated and validate and rel.lower().endswith(".md"):
                     v = await self.validate_note(rel, content)
                     warnings = v.get("issues", [])
             except Exception:  # noqa: BLE001 — index/validate is best-effort
                 pass
             commit = await self.commit_paths(
                 [rel], f"vault: {'update' if existed else 'create'} {rel}", origin)
-            return {"existed": existed, "warnings": warnings, "commit": commit}
+            return {"ok": True, "existed": existed, "warnings": warnings,
+                    "applied": applied, "commit": commit}
 
     async def delete_note(self, rel_path: str, origin: dict | None = None) -> dict:
         """Delete a note, de-index it, and commit the removal atomically."""
