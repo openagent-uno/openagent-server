@@ -166,6 +166,26 @@ binaries = collect_dynamic_libs("iroh")
 
 mcps_dir = Path("src/mcp/servers")
 
+# The vendored vault MCP (src/mcp/servers/vault) must be built before it is
+# bundled. ``scripts/build-executable.sh`` and CI's "Build Node MCPs" step
+# build the other Node MCPs, but CI's workflow list can't always be updated
+# (workflow-scope push restrictions), so build the vault MCP here too —
+# idempotent, best-effort. If it fails, the MCP self-bootstraps at first
+# launch (see builtins.py::resolve_builtin_entry), so the build never breaks.
+import subprocess as _sp
+_vault_dir = mcps_dir / "vault"
+if _vault_dir.exists():
+    try:
+        if not (_vault_dir / "node_modules").exists():
+            print("openagent.spec: npm install (vault MCP)...")
+            _sp.run("npm install", cwd=str(_vault_dir), shell=True, check=True)
+        if not (_vault_dir / "dist").exists():
+            print("openagent.spec: npm run build (vault MCP)...")
+            _sp.run("npm run build", cwd=str(_vault_dir), shell=True, check=True)
+    except Exception as _e:  # noqa: BLE001 — runtime self-bootstrap is the fallback
+        print(f"openagent.spec: WARNING — vault MCP prebuild failed ({_e}); "
+              "it will self-build at first launch")
+
 datas = []
 if mcps_dir.exists():
     # Bundle every MCP EXCEPT computer-control. The Rust binary for

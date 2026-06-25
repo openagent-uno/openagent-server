@@ -242,6 +242,25 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
             "Slack, WhatsApp) when the user asks you to relay something"
         ),
     },
+    # The long-term memory vault. A vendored fork of @bitbonsai/mcpvault
+    # (src/mcp/servers/vault, see VENDORED.md) with an OpenAgent addition:
+    # every write is run through the vault quality gate (validate.ts) — it
+    # auto-fixes the mechanical issues (frontmatter scaffolding, dates,
+    # wikilink spacing, em dashes) and rejects structurally broken notes so
+    # the agent literally cannot save a messy one. The vault path arrives via
+    # OPENAGENT_VAULT_PATH (injected in resolve_default_entry).
+    "vault": {
+        "dir": "vault",
+        "command": ["node", "dist/server.js"],
+        "build": ["npm", "run", "build"],
+        "install": ["npm", "install"],
+        "env": {"OPENAGENT_VAULT_VALIDATE_WRITES": "1"},
+        "description": (
+            "the long-term memory vault — read, write, patch, search, "
+            "move, and tag your markdown notes. Every write is validated "
+            "and auto-corrected to the vault's quality standard"
+        ),
+    },
     "scheduler": {
         "dir": "scheduler",
         "command": ["python", "-m", "src.mcp.servers.scheduler.server"],
@@ -310,7 +329,7 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
 }
 
 DEFAULT_MCPS: list[dict[str, Any]] = [
-    {"name": "vault", "command": ["npx", "-y", "@bitbonsai/mcpvault@latest"], "args": [], "_default": True},
+    {"builtin": "vault", "_default": True},
     {"name": "filesystem", "command": ["npx", "-y", "@modelcontextprotocol/server-filesystem"], "args": [], "_default": True},
     {"builtin": "editor", "_default": True},
     {"builtin": "web-search", "_default": True},
@@ -685,6 +704,14 @@ def resolve_default_entry(entry: dict[str, Any], db_path: str | None = None) -> 
                 from src.core.paths import default_db_path
 
                 extra_env["OPENAGENT_DB_PATH"] = str(default_db_path())
+
+        # The vault MCP needs to know which folder is the vault. It reads
+        # OPENAGENT_VAULT_PATH (server.ts), so the subprocess lands on the
+        # same notes directory as the rest of OpenAgent instead of its CWD.
+        if entry["builtin"] == "vault" and "OPENAGENT_VAULT_PATH" not in extra_env:
+            from src.core.paths import default_vault_path
+
+            extra_env["OPENAGENT_VAULT_PATH"] = str(default_vault_path())
 
         try:
             return resolve_builtin_entry(entry["builtin"], env=extra_env or None)
