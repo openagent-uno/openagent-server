@@ -395,6 +395,66 @@ async def handle_history(request):
     return web.json_response({"commits": commits, "path": path})
 
 
+async def handle_commit(request):
+    """GET /api/vault/commit?hash= — the changes a single commit introduced
+    (metadata, the files it touched, and the unified diff)."""
+    from aiohttp import web
+    ref = (request.query.get("hash") or "").strip()
+    if not ref:
+        return web.json_response({"error": "hash is required"}, status=400)
+    detail = await _service(request).git_show(ref)
+    if detail is None:
+        return web.json_response({"error": "Unknown commit"}, status=404)
+    return web.json_response(detail)
+
+
+async def handle_restore(request):
+    """POST /api/vault/restore {hash} — non-destructively roll the vault back
+    to the state at a commit (adds a new commit; history is preserved)."""
+    from aiohttp import web
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON body"}, status=400)
+    ref = (body.get("hash") or "").strip()
+    if not ref:
+        return web.json_response({"error": "hash is required"}, status=400)
+    from src.memory.vault.vault_origin import origin_from_request
+    result = await _service(request).restore_to(ref, origin_from_request(request))
+    if "error" in result:
+        return web.json_response(result, status=409)
+    gw = request.app.get("gateway")
+    if gw is not None:
+        await gw.broadcast_resource("vault", "changed")
+    return web.json_response(result)
+
+
+async def handle_reset(request):
+    """POST /api/vault/reset {hash, confirm:true} — DESTRUCTIVELY make a
+    commit the latest, deleting every commit after it. Requires an explicit
+    ``confirm`` flag (the clients gate this behind a confirmation prompt)."""
+    from aiohttp import web
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON body"}, status=400)
+    ref = (body.get("hash") or "").strip()
+    if not ref:
+        return web.json_response({"error": "hash is required"}, status=400)
+    if body.get("confirm") is not True:
+        return web.json_response(
+            {"error": "This permanently deletes later commits — set "
+                      "\"confirm\": true to proceed."}, status=400)
+    from src.memory.vault.vault_origin import origin_from_request
+    result = await _service(request).reset_to(ref, origin_from_request(request))
+    if "error" in result:
+        return web.json_response(result, status=409)
+    gw = request.app.get("gateway")
+    if gw is not None:
+        await gw.broadcast_resource("vault", "changed")
+    return web.json_response(result)
+
+
 async def handle_init(request):
     """POST /api/vault/init — scaffold the folder system + canon + journal."""
     from aiohttp import web

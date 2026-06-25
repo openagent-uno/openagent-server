@@ -180,6 +180,54 @@ class VaultService:
             return []
         return await asyncio.to_thread(g.log, limit, path)
 
+    async def git_show(self, ref: str) -> dict | None:
+        """The changes a single commit introduced (files + unified diff)."""
+        g = await self._ensure_git()
+        if not g:
+            return None
+        return await asyncio.to_thread(g.show, ref)
+
+    async def restore_to(self, ref: str, origin: dict | None = None) -> dict:
+        """Non-destructively roll the vault back to the state at ``ref`` — a
+        NEW commit whose content matches it, so every later commit stays in
+        history and this is itself revertable. Pending edits are checkpointed
+        first (nothing is lost), and the index is rebuilt from disk after.
+        Returns ``{ok, commit, restored_from, changed}``."""
+        g = await self._ensure_git()
+        if not g:
+            return {"error": "git is disabled for this vault"}
+        from src.memory.vault.vault_origin import trailers
+        o = dict(origin or {})
+        o.setdefault("kind", "tool")
+        o["action"] = "restore"
+        o["restored_from"] = ref
+        async with self._mutation_lock:
+            if await asyncio.to_thread(g.has_pending):
+                await asyncio.to_thread(
+                    g.commit_all, "vault: checkpoint before restore",
+                    trailers({"kind": "system", "action": "pre-restore"}))
+            commit = await asyncio.to_thread(
+                g.restore_to, ref, f"vault: restore to {ref}", trailers(o))
+            idx = await self._ensure_index()
+            await asyncio.to_thread(idx.sync, True)
+        return {"ok": True, "commit": commit, "restored_from": ref,
+                "changed": commit is not None}
+
+    async def reset_to(self, ref: str, origin: dict | None = None) -> dict:
+        """DESTRUCTIVELY make ``ref`` the latest commit, deleting every commit
+        after it (only when ``ref`` is in the current history). The index is
+        rebuilt from disk after. Returns ``{ok, head, deleted}`` or
+        ``{error}``."""
+        g = await self._ensure_git()
+        if not g:
+            return {"error": "git is disabled for this vault"}
+        async with self._mutation_lock:
+            result = await asyncio.to_thread(g.reset_to, ref)
+            if result.get("ok"):
+                idx = await self._ensure_index()
+                await asyncio.to_thread(idx.sync, True)
+        return result
+
     # ── reconcile + read ──────────────────────────────────────────────
 
     async def sync(self, force: bool = False) -> dict:

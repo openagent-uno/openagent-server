@@ -743,6 +743,52 @@ async def t_vault_dream(ctx: TestContext) -> None:
         shutil.rmtree(d, ignore_errors=True)
 
 
+@test("vault_gate", "history: show diff + restore (non-destructive) + reset (destructive)")
+async def t_vault_history_ops(ctx: TestContext) -> None:
+    if not _has_git():
+        return  # git-backed history is a no-op without git
+    d, vault, idxp = _mkvault()
+    try:
+        (vault / "e").mkdir()
+        svc = VaultService(vault, index_path=idxp)
+        fm = "---\ntitle: {t}\nsummary: s\n---\n{b}\n"
+        await svc.write_note("e/a.md", fm.format(t="A", b="alpha"),
+                             origin={"kind": "chat", "session": "s1"})
+        await svc.write_note("e/b.md", fm.format(t="B", b="beta"),
+                             origin={"kind": "chat", "session": "s1"})
+        await svc.write_note("e/a.md", fm.format(t="A", b="EDITED"),
+                             origin={"kind": "chat", "session": "s1"})
+        log = await svc.git_log(20)
+        assert len(log) == 3, log
+        target = log[1]["hash"]  # state where a.md == 'alpha'
+
+        # show: files + diff + provenance
+        det = await svc.git_show(log[0]["hash"])
+        assert det and det["files"][0]["path"] == "e/a.md"
+        assert "EDITED" in det["diff"]
+        assert det["provenance"].get("session") == "s1"
+
+        # restore: non-destructive — a.md reverts, history grows
+        r = await svc.restore_to(target)
+        assert r["ok"] and r["changed"], r
+        assert (vault / "e" / "a.md").read_text().strip().endswith("alpha")
+        log2 = await svc.git_log(20)
+        assert len(log2) == 4, "restore must preserve history (+1 commit)"
+        assert log2[0]["provenance"].get("action") == "restore"
+
+        # reset: destructive — deletes commits after target
+        rr = await svc.reset_to(target)
+        assert rr.get("ok") and rr["deleted"] == 2, rr
+        assert len(await svc.git_log(20)) == 2
+
+        # ancestor guard: resetting forward to a now-unreachable commit fails
+        bad = await svc.reset_to(log[0]["hash"])
+        assert "error" in bad, bad
+        await svc.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 # ── scale ─────────────────────────────────────────────────────────────
 
 @test("vault_gate", "scale: 3000 notes index + gate fast; re-sync is incremental")

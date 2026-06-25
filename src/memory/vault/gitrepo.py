@@ -236,6 +236,16 @@ class VaultGit:
         except Exception:  # noqa: BLE001
             return None
 
+    @staticmethod
+    def _provenance(body: str) -> dict:
+        prov: dict[str, str] = {}
+        for line in (body or "").splitlines():
+            if ":" in line:
+                k, v = line.split(":", 1)
+                if k.strip() and v.strip():
+                    prov[k.strip().lower()] = v.strip()
+        return prov
+
     def log(self, limit: int = 20, path: Optional[str] = None) -> list[dict]:
         """Recent commits as ``{hash, subject, date, author, provenance}``.
         With ``path``, only commits that touched that note/folder. The
@@ -259,16 +269,115 @@ class VaultGit:
                     continue
                 h, subject, date, author = parts[0], parts[1], parts[2], parts[3]
                 body = parts[4] if len(parts) > 4 else ""
-                prov: dict[str, str] = {}
-                for line in body.splitlines():
-                    if ":" in line:
-                        k, v = line.split(":", 1)
-                        if k.strip() and v.strip():
-                            prov[k.strip().lower()] = v.strip()
                 out.append({
                     "hash": h, "subject": subject, "date": date,
-                    "author": author, "provenance": prov,
+                    "author": author, "provenance": self._provenance(body),
                 })
             return out
         except Exception:  # noqa: BLE001
             return []
+
+    def _commit_exists(self, ref: str) -> bool:
+        """True when ``ref`` resolves to a real commit in this repo."""
+        if not ref or any(c.isspace() for c in ref):
+            return False
+        r = self._git("rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
+        return r.returncode == 0 and bool((r.stdout or "").strip())
+
+    def show(self, ref: str, max_diff_lines: int = 600) -> Optional[dict]:
+        """The changes a single commit introduced: metadata, the list of
+        files (with status), and the unified diff (capped at
+        ``max_diff_lines`` so a huge commit can't blow up the response)."""
+        if not self.available or not self.is_repo() or not self._commit_exists(ref):
+            return None
+        try:
+            meta = self._git(
+                "show", "-s",
+                "--pretty=format:%H%x1f%h%x1f%s%x1f%cI%x1f%an%x1f%b", ref)
+            parts = (meta.stdout or "").split("\x1f")
+            if len(parts) < 5:
+                return None
+            full, short, subject, date, author = parts[:5]
+            body = parts[5] if len(parts) > 5 else ""
+            ns = self._git("show", "--name-status", "--pretty=format:", ref)
+            files: list[dict] = []
+            for line in (ns.stdout or "").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                bits = line.split("\t")
+                status = bits[0][:1]
+                fpath = bits[-1]
+                files.append({"status": status, "path": fpath})
+            patch = self._git("show", "--no-color", "--pretty=format:", ref)
+            lines = (patch.stdout or "").splitlines()
+            truncated = len(lines) > max_diff_lines
+            diff = "\n".join(lines[:max_diff_lines])
+            return {
+                "hash": short.strip(), "full_hash": full.strip(),
+                "subject": subject, "date": date, "author": author,
+                "provenance": self._provenance(body),
+                "files": files, "diff": diff, "diff_truncated": truncated,
+            }
+        except Exception:  # noqa: BLE001
+            return None
+
+    def restore_to(self, ref: str, summary: str,
+                   trailers: list[str]) -> Optional[str]:
+        """Non-destructively bring the working tree back to the state at
+        ``ref`` by committing a NEW commit whose content matches it. History
+        is fully preserved (every later commit stays reachable and this is
+        itself revertable). Returns the new short hash, or ``None`` when the
+        tree already matched ``ref`` (nothing to do) or on failure.
+
+        Assumes a clean tree — the caller commits any pending edits first so
+        ``reset --hard`` can't silently drop them."""
+        if not self.ensure_repo() or not self._commit_exists(ref):
+            return None
+        with self._lock:
+            try:
+                saved = (self._git("rev-parse", "HEAD").stdout or "").strip()
+                if not saved:
+                    return None
+                if self._git("reset", "--hard", ref).returncode != 0:
+                    return None
+                # Move the branch pointer back to the real tip; index +
+                # worktree stay at ``ref`` so the next commit records the
+                # difference as a forward-moving "restore".
+                self._git("reset", "--soft", saved)
+                if self._git("diff", "--cached", "--quiet").returncode == 0:
+                    return None  # already at that state
+                r = self._git("commit", "-m", self._message(summary, trailers))
+                if r.returncode != 0:
+                    # Best-effort recovery: re-point HEAD at the real tip.
+                    self._git("reset", "--hard", saved)
+                    return None
+                return self._head()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("vault git restore_to failed: %s", e)
+                return None
+
+    def reset_to(self, ref: str) -> dict:
+        """DESTRUCTIVELY make ``ref`` the latest commit, permanently deleting
+        every commit after it (``git reset --hard``). Only allowed when
+        ``ref`` is an ancestor of HEAD — you can roll the history back, never
+        rewrite a divergent line. Returns ``{ok, head, deleted}`` or
+        ``{error}``."""
+        if not self.ensure_repo():
+            return {"error": "git unavailable"}
+        if not self._commit_exists(ref):
+            return {"error": "unknown commit"}
+        with self._lock:
+            try:
+                if self._git("merge-base", "--is-ancestor", ref,
+                             "HEAD").returncode != 0:
+                    return {"error": "commit is not in the current history"}
+                cnt = (self._git("rev-list", "--count",
+                                 f"{ref}..HEAD").stdout or "0").strip()
+                if self._git("reset", "--hard", ref).returncode != 0:
+                    return {"error": "reset failed"}
+                return {"ok": True, "head": self._head(),
+                        "deleted": int(cnt or 0)}
+            except Exception as e:  # noqa: BLE001
+                logger.warning("vault git reset_to failed: %s", e)
+                return {"error": str(e)}
