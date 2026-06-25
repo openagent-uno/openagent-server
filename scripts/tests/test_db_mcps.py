@@ -105,3 +105,36 @@ async def t_schema_idempotent(ctx: TestContext) -> None:
             path.unlink()
         except FileNotFoundError:
             pass
+
+
+@test("db_mcps", "bootstrap migrates the legacy npx vault MCP to the vendored built-in")
+async def t_vault_migration(ctx: TestContext) -> None:
+    from src.memory.db import MemoryDB
+    from src.memory.bootstrap import ensure_builtin_mcps
+
+    db = MemoryDB(str(ctx.db_path))
+    await db.connect()
+    try:
+        # legacy seed: vault pinned to the upstream npx package
+        await db.upsert_mcp(
+            "vault", kind="default",
+            command=["npx", "-y", "@bitbonsai/mcpvault@latest"],
+            args=[], enabled=True, source="ensure-builtin")
+        await ensure_builtin_mcps(db)
+        v = await db.get_mcp("vault")
+        assert v["builtin_name"] == "vault", "vault not migrated to builtin"
+        assert not v["command"], "legacy command not cleared"
+        assert v["enabled"], "enabled flag lost in migration"
+        # idempotent
+        await ensure_builtin_mcps(db)
+        v2 = await db.get_mcp("vault")
+        assert v2["builtin_name"] == "vault" and not v2["command"]
+
+        # a user's custom vault MCP must NOT be migrated
+        await db.upsert_mcp("vault", kind="custom",
+                            command=["node", "/my/vault.js"], enabled=True)
+        await ensure_builtin_mcps(db)
+        cust = await db.get_mcp("vault")
+        assert not cust["builtin_name"] and "my/vault.js" in str(cust["command"])
+    finally:
+        await db.close()

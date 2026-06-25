@@ -40,7 +40,36 @@ async def ensure_builtin_mcps(db: MemoryDB) -> int:
     """
     from src.mcp.builtins import DEFAULT_MCPS
 
-    existing = {row["name"] for row in await db.list_mcps()}
+    rows = await db.list_mcps()
+
+    # Migration: early agents seeded the vault MCP as the upstream npx package
+    # (``@bitbonsai/mcpvault``), which has no write-time quality validation.
+    # It now ships as a vendored, validated built-in (src/mcp/servers/vault).
+    # Convert that one specific legacy row in place — matched by its npx
+    # command so a user's own custom vault MCP is never touched — preserving
+    # whether it was enabled. Built-in resolution then injects the validation
+    # env (see resolve_default_entry).
+    migrated = 0
+    for row in rows:
+        if row["name"] != "vault":
+            continue
+        builtin_name = row["builtin_name"] if "builtin_name" in row.keys() else None
+        command = row["command"] if "command" in row.keys() else None
+        if not builtin_name and command and "mcpvault" in str(command):
+            enabled = bool(row["enabled"]) if "enabled" in row.keys() else True
+            await db.upsert_mcp(
+                "vault",
+                kind="default",
+                builtin_name="vault",
+                enabled=enabled,
+                source="migrate-vendored-vault",
+            )
+            migrated += 1
+            logger.info("bootstrap: migrated the vault MCP to the vendored "
+                        "validated built-in (was npx @bitbonsai/mcpvault)")
+        break
+
+    existing = {row["name"] for row in (rows if not migrated else await db.list_mcps())}
     added = 0
     for entry in DEFAULT_MCPS:
         if "builtin" in entry:
