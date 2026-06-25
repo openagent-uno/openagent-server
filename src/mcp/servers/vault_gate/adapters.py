@@ -56,6 +56,15 @@ def build_runtime_toolkit() -> Any:
         """List the notes that link TO a note (its inbound links)."""
         return await handlers.vault_backlinks(path=path)
 
+    async def vault_dream() -> dict:
+        """Run a DREAM-MODE maintenance pass NOW: grade the vault, auto-fix
+        the mechanical issues, regenerate llms.txt + showcase, commit it, and
+        return open_suggestions — the harder issues (orphans, duplicates,
+        over-long notes, missing summaries, broken links) for YOU to resolve.
+        After it returns, fix those by writing/merging/linking notes, then run
+        vault_gate again to confirm the vault improved."""
+        return await handlers.vault_dream()
+
     async def vault_init() -> dict:
         """Scaffold the Company-Brain folder system: the eleven folders, the
         journal sub-tree, the canon workspace, and note/session/daily
@@ -70,8 +79,8 @@ def build_runtime_toolkit() -> Any:
     return Toolkit(
         name="vault-gate",
         tools=[
-            vault_gate, vault_doctor, vault_validate_note, vault_rename_note,
-            vault_init, vault_stats, vault_search, vault_backlinks,
-            vault_regenerate_derived,
+            vault_gate, vault_doctor, vault_dream, vault_validate_note,
+            vault_rename_note, vault_init, vault_stats, vault_search,
+            vault_backlinks, vault_regenerate_derived,
         ],
     )

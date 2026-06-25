@@ -570,6 +570,7 @@ workspace + templates). Two organisation rules matter:
   dates, missing frontmatter scaffolding) and list the harder issues
   (orphans, duplicates, over-long notes) for you to resolve by writing/
   merging/linking notes. ``apply=false`` previews; ``apply=true`` writes.
+- ``vault_dream`` — run a full DREAM-MODE maintenance pass now (see below).
 - ``vault_validate_note(path, content)`` — check a note BEFORE you write
   it; fix any issues it reports, then save.
 - ``vault_rename_note(old_path, new_path)`` — move or rename a note or a
@@ -580,6 +581,38 @@ workspace + templates). Two organisation rules matter:
   full-text search (scales to 100k+ notes), and inbound links.
 - ``vault_regenerate_derived`` — rebuild ``llms.txt`` (the index AIs read)
   and the showcase. These are derived — never hand-edit them.
+
+### Dream mode — keeping your memory healthy
+
+Dream mode is your memory-maintenance routine. A vault decays as it grows:
+notes pile up unlinked (orphans), duplicates accumulate, links break, notes
+sprawl, frontmatter goes missing. Dream mode is the antidote — it
+consolidates duplicates into one canonical note, links related notes
+together, prunes broken/stale cross-references, fixes structure, and
+regenerates the derived index. It normally runs on a schedule, but **when the
+user asks you to "run dream mode", "tidy/clean up my memory", or fix the
+vault, do it now**:
+
+1. Call ``vault_dream``. It grades the vault, mechanically auto-fixes what
+   code safely can (formatting, dates, scaffolding missing frontmatter),
+   regenerates ``llms.txt`` + the showcase, commits it, and returns
+   ``open_suggestions`` — the issues code CANNOT fix on its own.
+2. **Then do the real work — resolve those suggestions yourself.** This is the
+   part only you can do:
+   - **Orphans** → read the orphan note, find related notes
+     (``vault_search``), and add ``[[wikilinks]]`` both ways so it joins the
+     graph.
+   - **Duplicates** → merge them into a single canonical note (``patch_note``
+     to combine, then ``delete_note`` the redundant ones).
+   - **Missing summaries** → write a one-sentence ``summary`` in the
+     frontmatter (the doctor scaffolds every field except this one).
+   - **Over-long notes** → split into atomic notes, one idea each, cross-linked.
+   - **Broken links** → fix the target, create the missing note, or remove the link.
+3. Re-run ``vault_gate`` (or ``vault_dream``) to confirm the counts improved
+   — fewer orphans, fewer broken links, fewer islands. Repeat until healthy.
+
+Report what you consolidated, linked, and fixed. This is high-value work: a
+clean, densely-linked vault makes every future answer better.
 
 ### Your vault is version-controlled — write freely
 

@@ -712,6 +712,37 @@ async def t_git_disabled(ctx: TestContext) -> None:
             os.environ["OPENAGENT_VAULT_GIT_ENABLED"] = old
 
 
+@test("vault_gate", "dream: maintenance pass auto-fixes + returns suggestions + commits")
+async def t_vault_dream(ctx: TestContext) -> None:
+    import os
+    os.environ["OPENAGENT_VAULT_PATH"] = ""  # not used; service takes explicit root
+    d, vault, idxp = _mkvault()
+    try:
+        (vault / "e").mkdir()
+        svc = VaultService(vault, index_path=idxp)
+        await svc._ensure_git()  # existing repo so dream fixes are real commits
+        # a messy note: missing frontmatter + an orphan + a broken link
+        (vault / "e" / "messy.md").write_text("just notes about [[ghost]]\n")
+        res = await svc.maintenance(apply_fixes=True, regenerate=True)
+        commit = await svc.autocommit(origin={"kind": "dream", "tool": "vault_dream"})
+        # mechanical fixes applied (frontmatter scaffolded) + suggestions surfaced
+        assert res["files_changed"] >= 1, res
+        rules = {s["rule"] for s in res["open_suggestions"]}
+        assert "orphan" in rules or "broken_link" in rules, rules
+        # the fixes landed in git with dream provenance
+        if _has_git():
+            assert commit, "expected a dream commit"
+            import subprocess
+            body = subprocess.run(
+                ["git", "-C", str(vault), "log", "-1", "--pretty=%B", "-1"],
+                capture_output=True, text=True).stdout
+            assert "dream" in body.lower(), body
+        await svc.close()
+    finally:
+        os.environ.pop("OPENAGENT_VAULT_PATH", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
 # ── scale ─────────────────────────────────────────────────────────────
 
 @test("vault_gate", "scale: 3000 notes index + gate fast; re-sync is incremental")

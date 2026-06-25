@@ -121,6 +121,28 @@ async def vault_backlinks(path: str) -> dict:
     return {"path": path, "backlinks": links, "count": len(links)}
 
 
+async def vault_dream() -> dict:
+    """Run a DREAM-MODE maintenance pass over the memory vault NOW (the same
+    routine that normally runs on a schedule): grade every note, mechanically
+    auto-fix what code safely can (formatting, dates, scaffold missing
+    frontmatter), regenerate the derived llms.txt + showcase, and commit it
+    all. Returns ``before``/``after`` health, what was auto-fixed, and
+    ``open_suggestions`` — the HARDER issues that need YOUR judgement (orphans
+    to link, duplicates to merge, over-long notes to split, missing summaries
+    to write, broken links to fix). After this returns, RESOLVE those
+    suggestions by writing/merging/linking notes, then call vault_gate (or
+    vault_dream) again to confirm the vault improved."""
+    svc = get_service()
+    summary = await svc.maintenance(apply_fixes=True, regenerate=True)
+    try:
+        # Commit the mechanical fixes (the derived files were committed by the
+        # pass) with dream provenance.
+        await svc.autocommit(origin={**_origin("vault_dream"), "kind": "dream"})
+    except Exception:  # noqa: BLE001
+        pass
+    return summary
+
+
 async def vault_init() -> dict:
     """Scaffold the Company-Brain folder system in the vault: the eleven
     folders (self, areas, projects, sources, concepts, docs, entities, data,
