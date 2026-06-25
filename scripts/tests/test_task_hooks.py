@@ -4,7 +4,7 @@ Guards the refactor of ``AgentServer._install_task_hook`` (formerly
 ``_wrap_scheduler_run_task``), which previously composed a fresh closure
 on every call. Toggling a built-in task's config section at runtime
 re-synced its hook and stacked another wrapper each time, so
-``_do_auto_update`` (and dream/manager hooks) fired once per accumulated
+``_do_auto_update`` (and the dream hook) fired once per accumulated
 layer; the old wrapper also dropped the ``trigger`` kwarg.
 """
 from __future__ import annotations

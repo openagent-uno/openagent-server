@@ -106,7 +106,7 @@ class Gateway:
         # Per-section live-reaction hooks, populated by AgentServer when it
         # spins up the scheduler. ``config.handle_patch`` calls
         # ``on_config_change(section, patch)`` after writing the yaml so
-        # toggles (dream_mode, manager_review, auto_update) take effect
+        # toggles (dream_mode, auto_update) take effect
         # without a restart. Keyed by config section name.
         self._config_change_callbacks: dict[
             str, Callable[[dict], Awaitable[None]]
@@ -185,9 +185,9 @@ class Gateway:
     async def on_config_change(self, section: str, patch: dict) -> None:
         """Notify a registered side-effect that a yaml section changed.
 
-        ``AgentServer`` registers closures here for ``dream_mode``,
-        ``manager_review`` and ``auto_update`` so toggles flow straight
-        into the scheduler without a restart.
+        ``AgentServer`` registers closures here for ``dream_mode``
+        and ``auto_update`` so toggles flow straight into the scheduler
+        without a restart.
         """
         cb = self._config_change_callbacks.get(section)
         if cb is None:

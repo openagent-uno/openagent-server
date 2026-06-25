@@ -46,7 +46,7 @@ def _is_builtin(row: dict | None) -> bool:
 async def _reject_if_builtin(scheduler, task_id: str):
     """Return (row, error_response). row is None on error.
 
-    Built-in tasks (``dream-mode``, ``manager-review``, ``auto-update``)
+    Built-in tasks (``dream-mode``, ``auto-update``)
     are seeded by ``AgentServer`` and managed via ``/api/config/<section>``;
     the gateway pretends they don't exist for GET-by-id and returns 403
     for mutations. Centralised so any new handler added later inherits

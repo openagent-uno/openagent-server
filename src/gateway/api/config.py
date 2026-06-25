@@ -97,7 +97,7 @@ async def handle_patch(request):
     elog("config.update", section=section)
 
     # Sections with a registered live-reaction hook (dream_mode,
-    # manager_review, auto_update) take effect immediately — the
+    # auto_update) take effect immediately — the
     # AgentServer registered a closure that re-syncs the matching
     # scheduled-task row to the new state without a process restart.
     gw = request.app.get("gateway")

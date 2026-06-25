@@ -54,7 +54,6 @@ except Exception:  # noqa: BLE001 — best-effort, never block startup
 from src.core.builtin_tasks import (
     AUTO_UPDATE_TASK_NAME,
     DREAM_MODE_TASK_NAME,
-    MANAGER_REVIEW_TASK_NAME,
 )
 
 
@@ -70,16 +69,16 @@ def _compose_task_hook(hook, nxt):
     return _composed
 
 DREAM_MODE_PROMPT = """\
-You are running in Dream Mode — a nightly maintenance routine.
-Perform these tasks and write a concise audit log at the end.
+You are running in Dream Mode — OpenAgent's nightly self-maintenance
+routine. You run while the agent is otherwise idle. Work through both
+missions below in order, then write a single dream-log at the end. Be
+thorough but non-destructive: when in doubt, skip rather than delete,
+and log the uncertainty.
 
-1. **Clean temp files**: List and remove files in /tmp older than 24 hours.
-   Use `find /tmp -maxdepth 1 -type f -mtime +1 -delete` (or the OS
-   equivalent). Report how many files were removed and how much space
-   was freed.
+## Mission 1 — Evaluate and correct the memory vault
 
-2. **Curate the memory vault (via the mcpvault MCP — do NOT cat/grep
-   the .md files)**:
+Curate the memory vault via the mcpvault MCP — do NOT cat/grep the
+.md files directly.
    - Use `list_notes` and `search_notes` to survey the vault.
    - Identify notes that cover the same topic and **merge duplicates**
      into a single canonical note with `write_note` or `patch_note`,
@@ -95,61 +94,45 @@ Perform these tasks and write a concise audit log at the end.
      theme, make sure each one links to the others. Prefer
      `patch_note` to add links in place rather than rewriting whole
      notes.
-   - Update frontmatter `tags:` so related notes share consistent
-     tags and surface together in future searches.
-   Report what was merged, updated, cross-linked, or removed.
+   - **Reconcile contradictions**: when a newer note contradicts an
+     older one, fix or retire the stale entry rather than leaving both.
+   - Keep frontmatter `tags:` consistent so related notes share tags
+     and surface together in future searches.
 
-3. **System health check**:
-   - Disk usage (`df -h`) — warn if any partition is above 85%.
-   - Memory usage (`free -m` on Linux, `vm_stat` on macOS).
-   - Top 5 processes by CPU usage.
-   Report any anomalies or concerns.
+## Mission 2 — Analyze the last day of logs and fix what is broken
 
-4. **Log results**: Use `write_note` to save a concise summary under
-   `dream-logs/dream-log-YYYY-MM-DD.md` with frontmatter `type: dream-log`
-   and `date:` set to today, so there is an audit trail linkable from
-   other notes.
+Read OpenAgent's own event log for roughly the last 24 hours and find
+issues to fix. The log is a JSON-lines file `events.jsonl` in
+OpenAgent's logs directory (macOS:
+`~/Library/Application Support/OpenAgent/logs/`; Linux:
+`$XDG_DATA_HOME/OpenAgent/logs/` or `~/.local/share/OpenAgent/logs/`).
+If unsure of the path, locate it with
+`find ~ -name events.jsonl 2>/dev/null`, then read the recent tail
+(e.g. `tail -n 2000 <path>`).
 
-Be thorough but non-destructive. When in doubt, skip rather than
-delete, and always use mcpvault tools instead of raw filesystem access
-for anything under the memory vault.
-"""
+Look for problems and act on them:
+   - **Broken scheduled tasks**: tasks that errored or produced empty
+     output. Inspect them via the `scheduler` MCP
+     (`scheduler_list_scheduled_tasks`), confirm whether the prompt is
+     still accurate, and fix, reschedule, or retire the task.
+   - **Broken workflows**: workflow runs that failed or stalled.
+     Inspect via the `workflow-manager` MCP and repair the definition,
+     or clearly report the failure if you cannot fix it.
+   - **Recurring errors**: model-call failures, MCP errors, federation
+     or channel errors that repeat. Diagnose the cause, fix what is in
+     your power (a stale path, a misconfigured task), and log what
+     still needs a human.
 
-MANAGER_REVIEW_PROMPT = """\
-You are running a weekly Manager Review. Look at your own work as a
-project manager would look at their team's work and act on what you
-find. Do this silently and efficiently.
+## Log the dream
 
-1. **Review the memory vault**:
-   - Search for notes tagged ``pending-automation`` or ``followup``.
-     For each: is the pattern still active? If yes, propose or
-     schedule the automation now via ``scheduler`` or
-     ``workflow-manager``. If no, archive the note.
-   - List notes from the last 7 days. Identify duplicates, stubs
-     (<20 words with no links), or notes that contradict a newer
-     note. Merge, cross-link, or delete.
-   - Scan recent session transcripts / event log for "I'll
-     remember", "next time", "we decided" that never landed as a
-     note. Create the missing notes.
+Use `write_note` to save a concise summary under
+`dream-logs/dream-log-YYYY-MM-DD.md` with frontmatter `type: dream-log`
+and `date:` set to today. Record, per mission: what you
+merged/updated/cross-linked/removed in the vault, which log issues you
+found, what you fixed, and what still needs the user's decision.
 
-2. **Review scheduled tasks and workflows**:
-   - List all via ``scheduler_list_scheduled_tasks``. Has each fired
-     as expected? Is the prompt still accurate? Should any retire?
-   - Same question for workflows via the ``workflow-manager`` MCP.
-
-3. **Detect recurring work you haven't yet automated**:
-   - Review the last 7 days of activity. Any task run 3+ times with
-     minor variation? Create a scheduled task or workflow for it.
-
-4. **Log the review**: Write a concise receipt under
-   ``manager-reviews/review-YYYY-MM-DD.md`` with frontmatter
-   ``type: manager-review`` summarising what you changed, what you
-   noticed but didn't change (and why), and what the user should
-   decide next.
-
-Be non-destructive by default — when in doubt about deleting or
-disabling, leave it and log the uncertainty. Use the ``vault`` MCP
-for all vault access — never shell out.
+Use mcpvault tools for all vault access — never shell out for anything
+under the memory vault.
 """
 
 
@@ -969,8 +952,12 @@ class AgentServer:
             broadcast=self._scheduler_broadcast,
         )
 
+        # One-time cleanup: the retired ``manager-review`` built-in used
+        # to seed a row that the scheduler would keep firing from the DB.
+        # Drop any leftover row so it stops running after the upgrade.
+        await self._purge_retired_builtin_tasks()
+
         await self._sync_dream_mode(scheduler)
-        await self._sync_manager_review(scheduler)
         await self._sync_auto_update(scheduler)
 
         await scheduler.start()
@@ -983,6 +970,26 @@ class AgentServer:
             # /api/config/{section} re-syncs the underlying scheduled-task
             # row immediately (no restart).
             self._register_config_callbacks(scheduler)
+
+    # Built-in tasks that existed in an earlier release and must be
+    # removed from the DB on upgrade so the scheduler stops firing them.
+    _RETIRED_BUILTIN_TASK_NAMES: frozenset[str] = frozenset({"manager-review"})
+
+    async def _purge_retired_builtin_tasks(self) -> None:
+        """Delete leftover rows for built-in tasks that no longer exist.
+
+        ``_sync_*`` only touches tasks it still knows about, so a retired
+        built-in's row would otherwise linger — enabled — and the
+        scheduler would keep running its stored prompt on every boot."""
+        try:
+            tasks = await self.agent._db.get_tasks()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Could not purge retired built-in tasks: %s", e)
+            return
+        for task in tasks:
+            if task["name"] in self._RETIRED_BUILTIN_TASK_NAMES:
+                await self.agent._db.delete_task(task["id"])
+                elog("scheduler.retired_task_purged", name=task["name"])
 
     def _scheduler_broadcast(
         self, resource: str, action: str, id: str | None = None,
@@ -997,7 +1004,7 @@ class AgentServer:
 
     def _register_config_callbacks(self, scheduler) -> None:
         """Hook ``/api/config/{section}`` PATCH writes into live scheduler
-        re-sync for our three built-in tasks. Updates ``self.config`` in
+        re-sync for our built-in tasks. Updates ``self.config`` in
         place so subsequent reads see the new state."""
         gw = self._gateway
         if gw is None:
@@ -1008,18 +1015,12 @@ class AgentServer:
             await self._sync_dream_mode(scheduler)
             gw.broadcast_resource_sync("scheduled_task", "updated")
 
-        async def _review(patch: dict) -> None:
-            self.config["manager_review"] = patch or {}
-            await self._sync_manager_review(scheduler)
-            gw.broadcast_resource_sync("scheduled_task", "updated")
-
         async def _autoupdate(patch: dict) -> None:
             self.config["auto_update"] = patch or {}
             await self._sync_auto_update(scheduler)
             gw.broadcast_resource_sync("scheduled_task", "updated")
 
         gw._config_change_callbacks["dream_mode"] = _dream
-        gw._config_change_callbacks["manager_review"] = _review
         gw._config_change_callbacks["auto_update"] = _autoupdate
 
     async def _sync_scheduled_task(
@@ -1126,39 +1127,6 @@ class AgentServer:
 
             dream_hook = _dream_run
         self._install_task_hook(scheduler, DREAM_MODE_TASK_NAME, dream_hook)
-
-    async def _sync_manager_review(self, scheduler) -> None:
-        """Weekly self-review: agent audits its own work as a project manager.
-
-        Complements Dream Mode (nightly hygiene) with a forward-looking
-        pass: what should I schedule, what did I miss, what decisions
-        are pending? Ships enabled by default as a deliberate signal
-        that proactive self-review is core to OpenAgent.
-        """
-        review_cfg = self.config.get("manager_review", {})
-        enabled = review_cfg.get("enabled", True)
-        cron_expr = review_cfg.get("cron", "0 9 * * MON")
-
-        await self._sync_scheduled_task(
-            scheduler,
-            name=MANAGER_REVIEW_TASK_NAME,
-            enabled=enabled,
-            cron_expr=cron_expr,
-            prompt=MANAGER_REVIEW_PROMPT,
-        )
-
-        review_hook = None
-        if enabled:
-            async def _manager_review_run(task, _orig):
-                if task["name"] == MANAGER_REVIEW_TASK_NAME:
-                    elog("manager_review.start")
-                    await _orig(task)
-                    elog("manager_review.done")
-                else:
-                    await _orig(task)
-
-            review_hook = _manager_review_run
-        self._install_task_hook(scheduler, MANAGER_REVIEW_TASK_NAME, review_hook)
 
     async def _sync_auto_update(self, scheduler) -> None:
         update_cfg = self.config.get("auto_update", {})
