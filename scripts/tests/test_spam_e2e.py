@@ -72,7 +72,7 @@ class _SlowAgent:
         self._turn_ends: list[float] = []
 
     async def run_stream(self, *, message, user_id, session_id,
-                         attachments=None, on_status=None):
+                         attachments=None, on_status=None, author=None):
         loop = asyncio.get_running_loop()
         self._turn_starts.append(loop.time())
         self.calls.append({

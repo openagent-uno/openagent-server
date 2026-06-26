@@ -1,25 +1,38 @@
-"""Regression guard for issue #5: scheduled firings must start in a fresh session.
+"""Regression guard for issue #5: a scheduled firing must never inherit a
+prior firing's transcript.
 
-Before the fix, ``Scheduler.run_task`` called ``agent.release_session`` in
-its finally block. ``release_session`` disconnects the live Claude CLI
-subprocess but keeps the provider-native ``sdk_session_id`` on disk, so
-the next firing of the same task spawned a new subprocess with
-``--resume <uuid>`` and inherited the previous firing's transcript. Once
-that transcript crossed Claude's compaction threshold it would be summarised
-to something like *"all work already done, nothing outstanding"*, and every
-subsequent firing would silently exit without re-running the task prompt.
+Issue #5's root cause was that ``Scheduler.run_task`` *reused* one session id
+per task and ``release_session`` kept the provider-native resume id on disk —
+so the next firing resumed the previous one, and once that transcript crossed
+the compaction threshold it summarised to *"all work already done"* and every
+subsequent firing silently exited without re-running the prompt.
 
-The fix swaps ``release_session`` for ``forget_session``, which also drops
-the resume id so the next firing gets a blank conversation. This test
-pins that contract without spawning the real ``claude`` binary.
+The current fix removes the root cause structurally: each firing runs as a
+UNIQUE per-run child session (``scheduler:{task}:{run_id}``) via
+``core.child_session.run_child_session``, so there is no shared session to
+resume — the firing is durable (navigable + continuable, vision §7) and
+``release_session`` (not ``forget_session``) frees only the live runtime.
+
+A legacy safety hatch (``OPENAGENT_SCHEDULER_DURABLE_SESSIONS=0``) restores
+the old reused-session + ``forget_session`` behavior; the second test pins it.
+
+These tests run without spawning the real ``claude`` binary.
 """
 from __future__ import annotations
+
+import os
 
 from ._framework import TestContext, test
 
 
 class _SpyAgent:
-    """Minimal Agent stub that records which release method the scheduler called."""
+    """Minimal Agent stub recording how the scheduler drives + releases a run.
+
+    ``run`` mirrors the real signature ``run_child_session`` calls it with
+    (``model_override`` / ``author`` / ``on_status`` are passed through)."""
+
+    name = "spy"
+    model = None
 
     def __init__(self) -> None:
         self.run_calls: list[tuple[str, str]] = []
@@ -29,23 +42,23 @@ class _SpyAgent:
     async def refresh_registries(self) -> None:
         return None
 
-    async def run(self, *, message: str, user_id: str, session_id: str) -> str:
+    async def run(self, *, message: str, user_id: str, session_id: str,
+                  model_override=None, author=None, on_status=None) -> str:
         self.run_calls.append((session_id, message))
         return "ok"
 
     async def forget_session(self, session_id: str) -> None:
         self.forget_calls.append(session_id)
 
-    async def release_session(self, session_id: str) -> None:  # pragma: no cover
-        # Kept so a regression that restores the old call fails loudly
-        # via the assertion below rather than AttributeError-ing first.
+    async def release_session(self, session_id: str, *, model_override=None) -> None:
         self.release_calls.append(session_id)
 
 
-@test("scheduler_fresh_session", "run_task forgets session between firings (issue #5)")
-async def t_run_task_forgets_session(ctx: TestContext) -> None:
+@test("scheduler_fresh_session", "durable firings get unique per-run sessions (issue #5)")
+async def t_run_task_unique_sessions(ctx: TestContext) -> None:
     from src.core.scheduler import Scheduler
 
+    os.environ.pop("OPENAGENT_SCHEDULER_DURABLE_SESSIONS", None)  # default = durable
     agent = _SpyAgent()
     scheduler = Scheduler(db=None, agent=agent)  # type: ignore[arg-type]
 
@@ -53,36 +66,63 @@ async def t_run_task_forgets_session(ctx: TestContext) -> None:
     await scheduler.run_task(task)
     await scheduler.run_task(task)
 
-    expected_sid = "scheduler:daily-dev"
-    assert agent.run_calls == [
-        (expected_sid, "do the work"),
-        (expected_sid, "do the work"),
-    ], agent.run_calls
-    # The fix: forget_session is called between firings so the next run
-    # spawns a fresh Claude CLI subprocess without --resume.
-    assert agent.forget_calls == [expected_sid, expected_sid], agent.forget_calls
-    # Regression guard: release_session (which preserves resume state)
-    # must NOT be what the scheduler reaches for.
-    assert agent.release_calls == [], agent.release_calls
+    # Two firings → two DISTINCT per-run session ids, both under the task root,
+    # each seeded with the prompt. Distinctness is what removes the issue-#5
+    # resume/compaction bug (there is no shared session to inherit).
+    assert len(agent.run_calls) == 2, agent.run_calls
+    sids = [sid for sid, _ in agent.run_calls]
+    assert all(s.startswith("scheduler:daily-dev:") and s != "scheduler:daily-dev" for s in sids), sids
+    assert sids[0] != sids[1], sids
+    assert all(msg == "do the work" for _, msg in agent.run_calls), agent.run_calls
+    # Durable: the row is kept (release frees the runtime); it is NOT wiped.
+    assert agent.release_calls == sids, agent.release_calls
+    assert agent.forget_calls == [], agent.forget_calls
 
 
-class _RaisingAgent(_SpyAgent):
-    async def run(self, *, message: str, user_id: str, session_id: str) -> str:
-        self.run_calls.append((session_id, message))
-        raise RuntimeError("boom")
-
-
-@test("scheduler_fresh_session", "run_task forgets session even when the run raises")
-async def t_run_task_forgets_on_error(ctx: TestContext) -> None:
+@test("scheduler_fresh_session", "durable firing still releases when the run raises")
+async def t_run_task_releases_on_error(ctx: TestContext) -> None:
     from src.core.scheduler import Scheduler
+
+    os.environ.pop("OPENAGENT_SCHEDULER_DURABLE_SESSIONS", None)
+
+    class _RaisingAgent(_SpyAgent):
+        async def run(self, *, message: str, user_id: str, session_id: str,
+                      model_override=None, author=None, on_status=None) -> str:
+            self.run_calls.append((session_id, message))
+            raise RuntimeError("boom")
 
     agent = _RaisingAgent()
     scheduler = Scheduler(db=None, agent=agent)  # type: ignore[arg-type]
 
     task = {"id": "flaky", "name": "Flaky", "prompt": "try me"}
-    # run_task swallows exceptions from the agent run — the finally
-    # block must still wipe the resume state.
+    # run_task swallows agent-run exceptions; run_child_session's finally must
+    # still release the live runtime for the (durable) per-run session.
     await scheduler.run_task(task)
 
-    assert agent.forget_calls == ["scheduler:flaky"], agent.forget_calls
-    assert agent.release_calls == [], agent.release_calls
+    assert len(agent.run_calls) == 1, agent.run_calls
+    sid = agent.run_calls[0][0]
+    assert sid.startswith("scheduler:flaky:"), sid
+    assert agent.release_calls == [sid], agent.release_calls
+    assert agent.forget_calls == [], agent.forget_calls
+
+
+@test("scheduler_fresh_session", "legacy hatch reuses one session + forgets it")
+async def t_run_task_legacy_forget(ctx: TestContext) -> None:
+    from src.core.scheduler import Scheduler
+
+    os.environ["OPENAGENT_SCHEDULER_DURABLE_SESSIONS"] = "0"
+    try:
+        agent = _SpyAgent()
+        scheduler = Scheduler(db=None, agent=agent)  # type: ignore[arg-type]
+        task = {"id": "daily-dev", "name": "Daily Dev", "prompt": "do the work"}
+        await scheduler.run_task(task)
+        await scheduler.run_task(task)
+        # Legacy: one reused per-task id, forgotten between firings.
+        assert agent.run_calls == [
+            ("scheduler:daily-dev", "do the work"),
+            ("scheduler:daily-dev", "do the work"),
+        ], agent.run_calls
+        assert agent.forget_calls == ["scheduler:daily-dev", "scheduler:daily-dev"], agent.forget_calls
+        assert agent.release_calls == [], agent.release_calls
+    finally:
+        os.environ.pop("OPENAGENT_SCHEDULER_DURABLE_SESSIONS", None)

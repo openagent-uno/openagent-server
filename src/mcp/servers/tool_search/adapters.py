@@ -148,19 +148,41 @@ async def _call_tool_impl(
     pool: Any, server: str, tool: str, args: dict | None,
 ) -> Any:
     toolkit = pool.toolkit_by_name(server)
-    if toolkit is None:
-        raise ValueError(
-            f"MCP {server!r} is not loaded. Known MCPs: "
-            f"{sorted(pool._toolkit_by_name)}"
-        )
-    # Recover from connect-time stealth-fail before reporting "no such tool".
-    # See ``_ensure_functions_loaded`` for the rationale.
-    fns = await _ensure_functions_loaded(toolkit, server)
-    fn = fns.get(tool)
+    fn = None
+    if toolkit is not None:
+        # Recover from connect-time stealth-fail before reporting "no such
+        # tool". See ``_ensure_functions_loaded`` for the rationale.
+        fns = await _ensure_functions_loaded(toolkit, server)
+        fn = fns.get(tool)
+
     if fn is None:
-        avail = sorted(fns)
+        # The model picks the right tool NAME but often guesses the wrong
+        # server for a behind-tool-search tool (e.g. ``run_dream_mode`` lives
+        # in ``delegation`` but the model calls it on ``vault``). Resolve the
+        # tool by name across every loaded MCP so a correct name + wrong
+        # server still works, instead of a dead-end "no such tool" error.
+        for _name, _tk in pool._toolkit_by_name.items():
+            if _name == server:
+                continue
+            try:
+                _cand = (await _ensure_functions_loaded(_tk, _name)).get(tool)
+            except Exception:  # noqa: BLE001 — a flaky MCP must not block the search
+                _cand = None
+            if _cand is not None:
+                fn = _cand
+                server = _name  # for downstream error/log context
+                break
+
+    if fn is None:
+        if toolkit is None:
+            raise ValueError(
+                f"MCP {server!r} is not loaded, and no loaded MCP exposes a "
+                f"tool named {tool!r}. Known MCPs: {sorted(pool._toolkit_by_name)}"
+            )
+        avail = sorted(await _ensure_functions_loaded(toolkit, server))
         raise ValueError(
-            f"MCP {server!r} has no tool {tool!r}. Available: {avail}"
+            f"No loaded MCP has a tool named {tool!r}. "
+            f"MCP {server!r} exposes: {avail}"
         )
     if args is None:
         args = {}

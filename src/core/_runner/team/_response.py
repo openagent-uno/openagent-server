@@ -1565,6 +1565,15 @@ def _handle_model_response_chunk(
                         if index is not None:
                             if run_response.tools[index].child_run_id is not None:
                                 tool_execution.child_run_id = run_response.tools[index].child_run_id
+                            # Same as child_run_id: the completion event REPLACES
+                            # the stored tool below, so carry over the child
+                            # SESSION id that ``delegate_task_to_member`` stamped
+                            # (a member runs in its own child session). Without
+                            # this the navigable-card link is lost on every
+                            # delegate tool — both on the live wire AND in the
+                            # persisted run — so the chip never becomes a card.
+                            if run_response.tools[index].child_session_id is not None:
+                                tool_execution.child_session_id = run_response.tools[index].child_session_id
                             run_response.tools[index] = tool_execution
                 else:
                     run_response.tools = tool_executions_list

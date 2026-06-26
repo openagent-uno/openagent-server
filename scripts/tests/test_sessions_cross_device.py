@@ -57,6 +57,98 @@ async def t_match_by_handle(ctx: TestContext) -> None:
             pass
 
 
+@test("sessions_cross_device", "list_all_sessions hides delegation children when asked")
+async def t_exclude_delegation_children(ctx: TestContext) -> None:
+    """The flat history list (``GET /api/sessions``) passes
+    ``exclude_child_origins=('delegation',)`` so a delegated sub-agent never
+    shows in the sidebar — it's navigable only from its parent's transcript
+    card (which uses ``list_child_sessions``, unaffected). Chats and other
+    child origins (scheduler / workflow) stay visible. NULL-safe: a legacy
+    chat row with no ``origin`` is always kept."""
+    from src.memory.db import MemoryDB
+
+    tmp_db = ctx.db_path.with_name(f"xd-excl-{uuid.uuid4().hex[:8]}.db")
+    try:
+        db = MemoryDB(str(tmp_db))
+        await db.connect()
+        await db.upsert_session("chat-A", client_id="alice", title="Chat")  # no origin (legacy)
+        await db.upsert_session(
+            "chat-A::member::opus::ab12", client_id="alice", title="Sub",
+            parent_session_id="chat-A", origin="delegation", kind="opus",
+        )
+        await db.upsert_session(
+            "scheduler:t1:r1", client_id="alice", title="Sched",
+            parent_session_id="scheduler:t1", origin="scheduler", kind="t1",
+        )
+        full = {r["session_id"] for r in await db.list_all_sessions("alice", limit=50)}
+        hidden = {
+            r["session_id"]
+            for r in await db.list_all_sessions(
+                "alice", limit=50, exclude_child_origins=("delegation",),
+            )
+        }
+        # Default behaviour unchanged: the child is still inheritable/visible.
+        assert "chat-A::member::opus::ab12" in full, full
+        # With the exclusion the sub-agent is gone; chat + scheduler remain.
+        assert "chat-A::member::opus::ab12" not in hidden, hidden
+        assert {"chat-A", "scheduler:t1:r1"} <= hidden, hidden
+        # The parent's own card list still sees the child (different query).
+        child_ids = {c["session_id"] for c in await db.list_child_sessions("chat-A")}
+        assert "chat-A::member::opus::ab12" in child_ids, child_ids
+        await db.close()
+    finally:
+        try:
+            tmp_db.unlink()
+        except FileNotFoundError:
+            pass
+
+
+@test("sessions_cross_device", "flat list hides every spawned child origin")
+async def t_exclude_all_child_origins(ctx: TestContext) -> None:
+    """``GET /api/sessions`` now passes ``HIDDEN_CHILD_ORIGINS`` (delegation +
+    scheduler + workflow), so a scheduled firing and a workflow node are hidden
+    from the sidebar too — each navigable only from its run's execution screen.
+    Only chat sessions (and legacy no-origin rows) remain in the flat list."""
+    from src.memory.db import MemoryDB
+    from src.core.child_session import HIDDEN_CHILD_ORIGINS
+
+    tmp_db = ctx.db_path.with_name(f"xd-excl-all-{uuid.uuid4().hex[:8]}.db")
+    try:
+        db = MemoryDB(str(tmp_db))
+        await db.connect()
+        await db.upsert_session("chat-A", client_id="alice", title="Chat")  # legacy, no origin
+        await db.upsert_session("chat-B", client_id="alice", title="Chat 2", origin="chat")
+        await db.upsert_session(
+            "chat-A::member::opus::ab12", client_id="alice", title="Sub",
+            parent_session_id="chat-A", origin="delegation", kind="opus",
+        )
+        await db.upsert_session(
+            "scheduler:t1:r1", client_id="alice", title="Sched",
+            parent_session_id="scheduler:t1", origin="scheduler", kind="t1",
+        )
+        await db.upsert_session(
+            "workflow:wf1:run1:node1", client_id="alice", title="WF node",
+            parent_session_id="workflow:wf1:run1", origin="workflow", kind="wf1:node1",
+        )
+        visible = {
+            r["session_id"]
+            for r in await db.list_all_sessions(
+                "alice", limit=50, exclude_child_origins=HIDDEN_CHILD_ORIGINS,
+            )
+        }
+        # Only the chats survive the flat-list filter.
+        assert visible == {"chat-A", "chat-B"}, visible
+        # …but each hidden child is still reachable via its own queries:
+        assert {c["session_id"] for c in await db.list_child_sessions("scheduler:t1")} == {"scheduler:t1:r1"}
+        assert (await db.list_session_runs("workflow:wf1:run1:node1")) == []  # no runs yet, but row exists
+        await db.close()
+    finally:
+        try:
+            tmp_db.unlink()
+        except FileNotFoundError:
+            pass
+
+
 @test("sessions_cross_device", "legacy device-pubkey rows resolve via network_devices")
 async def t_legacy_pubkey_via_devices(ctx: TestContext) -> None:
     """A pre-fix row carries ``metadata.client_id = <pubkey_hex_B>``. The

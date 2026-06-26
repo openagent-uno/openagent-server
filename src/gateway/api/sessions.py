@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from aiohttp import web
 
 
+from src.core.child_session import HIDDEN_CHILD_ORIGINS  # noqa: E402
 from src.gateway.api._common import gateway_db as _db  # noqa: E402
 
 
@@ -55,8 +56,24 @@ async def handle_list(request):
         limit = 50
 
     gateway = request.app.get("gateway")
-    # DB-backed sessions (chat_sessions + sessions merged).
-    rows = await db.list_all_sessions(client_id, limit=limit)
+    # ``?parent=<sid>`` lists just the children a session spawned (delegated
+    # sub-agents, or the AI-node / firing sessions under a workflow-run /
+    # scheduled-task root) — powers the parent transcript's delegation cards
+    # and the run screen. Otherwise return the flat list, every row now
+    # carrying ``parent_session_id`` / ``origin`` / ``kind`` so the app can
+    # show an origin chip and a navigable breadcrumb.
+    parent = (request.query.get("parent") or "").strip()
+    if parent:
+        rows = await db.list_child_sessions(parent, limit=limit)
+    else:
+        # The flat history hides every spawned child session — delegated
+        # sub-agents, scheduled firings, and workflow nodes alike. Each is
+        # navigable only in context (a parent's transcript card; a run's
+        # execution screen), never as a standalone sidebar row. An explicit
+        # ``?parent=`` query still lists them for those in-context surfaces.
+        rows = await db.list_all_sessions(
+            client_id, limit=limit, exclude_child_origins=HIDDEN_CHILD_ORIGINS,
+        )
 
     # Enrich with RAM queue/busy state from SessionManager. RAM is
     # keyed by device pubkey (the WebSocket's client_id), not by
@@ -95,6 +112,15 @@ async def handle_delete(request):
     await db.delete_session_binding(session_id)
     await db.delete_sdk_session(session_id)
     await db.delete_session(session_id)
+
+    # Announce the removal so every connected client drops the row from its
+    # sidebar in realtime (a sub-agent pruned/deleted on one device vanishes on
+    # the others). Carries the id so the app removes exactly that row.
+    if gateway is not None:
+        try:
+            gateway.broadcast_session("deleted", session_id)
+        except Exception:
+            pass
 
     return web.json_response({
         "session_id": session_id,
@@ -155,6 +181,8 @@ def _expand_run_messages(
     parent_model: str | None = None,
     parent_images: list | None = None,
     is_member_run: bool = False,
+    parent_session_id: str | None = None,
+    child_by_run_id: dict[str, str] | None = None,
 ) -> list[dict]:
     """Expand ONE runtime run dict into the flat ``ChatMessage`` shape the
     universal app expects, mirroring the live-wire event ordering.
@@ -253,25 +281,16 @@ def _expand_run_messages(
                 tool_info = run_tools_by_id.get(str(tcall_id))
             if tool_info is None and tname:
                 tool_info = run_tools_by_name.get(str(tname))
-            entry: dict = {
-                "id": f"run-msg-{msg_counter[0]}",
-                "role": "tool",
-                "text": content,
-                "timestamp": timestamp,
-            }
-            if tool_info:
-                entry["toolInfo"] = tool_info
-            out.append(entry)
 
-            # If this tool result came from a delegate_task_to_member
-            # call, splice the matching member_responses entry inline.
-            # Match by args.member_id → tools[].child_run_id → next
-            # un-spliced member (in stored order, for legacy rows).
-            if (
+            # If this tool result came from a delegate_task_to_member call,
+            # resolve the matching member_responses entry. Match by
+            # args.member_id → tools[].child_run_id → next un-spliced member.
+            is_delegate = bool(
                 tool_info
                 and tool_info.get("tool_name") == "delegate_task_to_member"
-            ):
-                member_idx: int | None = None
+            )
+            member_idx: int | None = None
+            if is_delegate:
                 params = tool_info.get("tool_args") or {}
                 member_id_arg = (
                     str(params.get("member_id") or "")
@@ -297,14 +316,59 @@ def _expand_run_messages(
                         None,
                     )
 
-                if member_idx is not None:
-                    spliced_member_ids.add(member_idx)
+            # Did the member run as its OWN child session (a navigable row),
+            # or nested in this (team) session (legacy)?
+            #   1. Primary, deterministic: the parent delegate tool's
+            #      ``child_run_id`` maps to a child session (built above from
+            #      the child rows). Parallel-safe; independent of the team
+            #      run_response object identity.
+            #   2. Fallback (legacy rows): the member_response's session_id
+            #      differs from the parent.
+            child_member_sid = None
+            crid = tool_info.get("child_run_id") if tool_info else None
+            if crid and child_by_run_id:
+                child_member_sid = child_by_run_id.get(str(crid))
+            if child_member_sid is None and member_idx is not None:
+                mr_sid = members_by_index[member_idx].get("session_id")
+                if mr_sid and mr_sid != parent_session_id:
+                    child_member_sid = mr_sid
+            runs_as_child = bool(child_member_sid and child_member_sid != parent_session_id)
+
+            # In child-session mode the chip MUST carry child_session_id so the
+            # app renders a delegation card that deep-links into the member's
+            # own session. Rehydration is the source of truth here — the stored
+            # ToolExecution may not have captured the id (the live team-tool
+            # object and the persisted one can differ), so backfill it from the
+            # member_response. Copy the shared tool_info dict before mutating.
+            if runs_as_child and tool_info is not None and not tool_info.get("child_session_id"):
+                tool_info = {**tool_info, "child_session_id": child_member_sid}
+
+            entry: dict = {
+                "id": f"run-msg-{msg_counter[0]}",
+                "role": "tool",
+                "text": content,
+                "timestamp": timestamp,
+            }
+            if tool_info:
+                entry["toolInfo"] = tool_info
+            out.append(entry)
+
+            if is_delegate and member_idx is not None:
+                spliced_member_ids.add(member_idx)
+                # Legacy nested mode: splice the member transcript inline so
+                # the specialist's tool calls + content appear in-slot. In
+                # child-session mode we DON'T splice — the member's transcript
+                # lives in its own row; the parent shows only the card (the
+                # member_responses entry exists purely to carry the link).
+                if not runs_as_child:
                     out.extend(_expand_run_messages(
                         members_by_index[member_idx],
                         timestamp=timestamp,
                         msg_counter=msg_counter,
                         parent_model=run_model,
                         is_member_run=True,
+                        parent_session_id=parent_session_id,
+                        child_by_run_id=child_by_run_id,
                     ))
             continue
 
@@ -323,6 +387,13 @@ def _expand_run_messages(
             "text": content,
             "timestamp": timestamp,
         }
+        # Per-message authorship: a human handle/display (so the app shows the
+        # real sender instead of a generic "You", and multi-human sessions
+        # attribute correctly) or an agent-self seed (the delegated task /
+        # scheduled mission / workflow node prompt — rendered as a Mission
+        # block). Absent on legacy rows → app falls back to the role label.
+        if isinstance(m.get("author"), dict):
+            entry["author"] = m["author"]
         if role == "assistant":
             # Specialist (member) runs carry their own model id; fall
             # back to the leader's badge only when the member row
@@ -343,12 +414,19 @@ def _expand_run_messages(
     for idx, mr in enumerate(members_by_index):
         if idx in spliced_member_ids:
             continue
+        # A member that ran in its own child session is represented by its
+        # card (the delegate chip), not by inlining its transcript here.
+        mr_sid = mr.get("session_id")
+        if mr_sid and mr_sid != parent_session_id:
+            continue
         out.extend(_expand_run_messages(
             mr,
             timestamp=timestamp,
             msg_counter=msg_counter,
             parent_model=run_model,
             is_member_run=True,
+            parent_session_id=parent_session_id,
+            child_by_run_id=child_by_run_id,
         ))
 
     return out
@@ -380,6 +458,23 @@ async def handle_get_runs(request):
         limit = 20
 
     runs = await db.list_session_runs(session_id, limit=limit)
+
+    # Map each delegate-tool run_id → its child session id. A team-member
+    # delegation runs in its own child session (a navigable sub-agent row);
+    # its child session records the member ``child_run_id`` (= the parent
+    # delegate tool's ``child_run_id``). This bridge lets us stamp the parent
+    # chip's ``child_session_id`` deterministically — the runtime's team
+    # run_response the leader mutates is not the persisted one, so the tool's
+    # own field can't be relied on. Best-effort (no-op pre-child-session rows).
+    child_by_run_id: dict[str, str] = {}
+    try:
+        for c in await db.list_child_sessions(session_id):
+            crid = c.get("child_run_id")
+            if crid:
+                child_by_run_id[str(crid)] = c["session_id"]
+    except Exception:  # noqa: BLE001
+        child_by_run_id = {}
+
     messages: list[dict] = []
     msg_counter = [0]  # mutable counter shared across recursive expansions
     for run in reversed(runs):
@@ -387,6 +482,8 @@ async def handle_get_runs(request):
             run,
             timestamp=int(run.get("created_at", 0) or 0),
             msg_counter=msg_counter,
+            parent_session_id=session_id,
+            child_by_run_id=child_by_run_id,
         ))
     return web.json_response({
         "session_id": session_id,

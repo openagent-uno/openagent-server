@@ -157,6 +157,11 @@ _TEST_MODULES: tuple[str, ...] = (
     # (Friday's stuck Telegram turns; provider falls back to its own
     # generate() before control returns to Agent.run_stream).
     "test_runtime_stream",
+    # A delegated sub-agent streams into its OWN child session live (over the
+    # active turn's channel, tagged with the child session_id) — the emitter
+    # contextvar, member content/tool → child frame translation, and the
+    # mid-run delegate card-link (clickable while the sub-agent runs).
+    "test_child_live_stream",
     "test_behavior_contract",
     "test_mcp_manager_guards",
     "test_provider_manager",

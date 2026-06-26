@@ -47,29 +47,57 @@ _db_var: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar(
 _dispatcher_var: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar(
     "openagent_delegation_dispatcher", default=None,
 )
+# The live Agent driving the parent turn. ``delegate_task`` runs the
+# sub-agent through ``core.child_session.run_child_session`` (which needs the
+# Agent's full system prompt + tool set + ``run``), so the parent binds
+# itself here for the duration of the turn.
+_agent_var: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar(
+    "openagent_delegation_agent", default=None,
+)
+# The owner handle driving the parent turn (the authenticated human). Threaded
+# so a delegation's child session is stamped with the RIGHT owner even on a
+# session's very first turn — before the gateway's fire-and-forget owner stamp
+# on the parent row has committed (the race that hid sub-agent rows from the
+# sidebar). None for agent-self / automation runs; child_session falls back to
+# parent-row inheritance then the deployment's primary owner.
+_owner_handle_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "openagent_delegation_owner_handle", default=None,
+)
 
 
-def install_context(*, session_id, pool, db, dispatcher):
+def install_context(*, session_id, pool, db, dispatcher, agent=None, owner_handle=None):
     """Bind the per-run context that delegation handlers will read.
 
-    Returns four reset tokens; pass them back to :func:`reset_context`
+    Returns reset tokens; pass them back to :func:`reset_context`
     in the same order. The agent runtime wraps each turn in this binding
-    so the in-process MCP handler sees the right session.
+    so the in-process MCP handler sees the right session and Agent.
     """
     return (
         _session_id_var.set(session_id),
         _pool_var.set(pool),
         _db_var.set(db),
         _dispatcher_var.set(dispatcher),
+        _agent_var.set(agent),
+        _owner_handle_var.set(owner_handle),
     )
 
 
 def reset_context(tokens) -> None:
-    sid_tok, pool_tok, db_tok, disp_tok = tokens
+    sid_tok, pool_tok, db_tok, disp_tok, agent_tok, owner_tok = tokens
     _session_id_var.reset(sid_tok)
     _pool_var.reset(pool_tok)
     _db_var.reset(db_tok)
     _dispatcher_var.reset(disp_tok)
+    _agent_var.reset(agent_tok)
+    _owner_handle_var.reset(owner_tok)
+
+
+def current_parent_session_id() -> Optional[str]:
+    """The chat session driving the current turn (the session whose stream a
+    spawned child's card lives on). Set for the whole turn by the main agent's
+    ``install_context``; ``None`` in a headless / autonomous run with no chat
+    turn. Used by ``src.stream.card_link`` to target the in-flight card."""
+    return _session_id_var.get()
 
 
 async def delegate_task(model_id: str, task: str) -> dict[str, Any]:
@@ -86,11 +114,11 @@ async def delegate_task(model_id: str, task: str) -> dict[str, Any]:
         (failure message).
     """
     parent_session_id = _session_id_var.get()
-    pool = _pool_var.get()
     db = _db_var.get()
-    dispatcher = _dispatcher_var.get()
+    agent = _agent_var.get()
+    owner_handle = _owner_handle_var.get()
 
-    if dispatcher is None or db is None:
+    if agent is None or db is None:
         return {
             "status": "error",
             "model_id": model_id,
@@ -108,13 +136,24 @@ async def delegate_task(model_id: str, task: str) -> dict[str, Any]:
         task_preview=(task[:200] + "…") if len(task) > 200 else task,
     )
 
+    # Run the sub-agent as a FULL child session: its own durable row, the
+    # same two-layer framework+persona system prompt and full tool set as
+    # the parent (vision §15 — the old ``run_delegated`` path passed
+    # ``system=None`` and persisted nothing), linked back to the parent and
+    # surfaced as a clickable card in the leader's transcript.
+    from src.core.child_session import run_child_session
+
     try:
-        result = await dispatcher.run_delegated(
-            model_id=model_id,
-            task=task,
-            parent_session_id=parent_session_id,
-            pool=pool,
+        result = await run_child_session(
+            agent=agent,
             db=db,
+            parent_session_id=parent_session_id,
+            origin="delegation",
+            origin_ref={"model_id": model_id},
+            title=f"Sub-agent · {model_id}",
+            prompt=task,
+            owner_client_id=owner_handle,
+            model_id=model_id,
         )
     except Exception as e:  # noqa: BLE001
         elog(
@@ -134,9 +173,126 @@ async def delegate_task(model_id: str, task: str) -> dict[str, Any]:
         "subagent.complete",
         session_id=parent_session_id,
         delegated_to=model_id,
-        chars=len(result or ""),
+        child_session_id=result.session_id,
+        chars=len(result.text or ""),
     )
-    return {"status": "ok", "model_id": model_id, "answer": result}
+    # ``child_session_id`` lets the app render the delegation tool call as a
+    # card that deep-links into the sub-agent's full session (OpenCode-style).
+    return {
+        "status": "ok",
+        "model_id": model_id,
+        "answer": result.text,
+        "child_session_id": result.session_id,
+    }
+
+
+async def run_dream_mode() -> dict[str, Any]:
+    """Run a full DREAM-MODE memory-maintenance pass as a SEPARATE session.
+
+    Unlike ``vault_dream`` (which runs the maintenance INLINE in the current
+    chat), this spawns the real dream-mode routine as its own durable child
+    session — it appears in the sidebar as a scheduled run and as a clickable
+    card in this chat, exactly like the nightly automated firing. The agent's
+    full reasoning lives in that separate session, keeping this conversation
+    clean. Use this whenever the user asks you to "run dream mode".
+
+    Returns ``status`` plus the spawned ``child_session_id`` (the card target).
+    """
+    import time
+    import uuid as _uuid
+
+    parent_session_id = _session_id_var.get()
+    db = _db_var.get()
+    agent = _agent_var.get()
+    owner_handle = _owner_handle_var.get()
+
+    if agent is None or db is None:
+        return {
+            "status": "error",
+            "error": (
+                "run_dream_mode called outside an agent turn — the runtime "
+                "didn't install a delegation context."
+            ),
+        }
+
+    from src.core.builtin_tasks import DREAM_MODE_TASK_NAME
+    from src.core.child_session import mint_child_session_id, run_child_session
+    from src.core.identity_context import agent_author
+    from src.core.server import DREAM_MODE_PROMPT
+
+    run_id = _uuid.uuid4().hex[:8]
+    child_sid = mint_child_session_id(
+        "scheduler", {"task_id": DREAM_MODE_TASK_NAME, "run_id": run_id},
+    )
+
+    # Best-effort: record a task_runs row so the firing also surfaces in the
+    # task run-history screen. The FK needs the dream-mode scheduled_tasks row
+    # to exist (it's a framework builtin, present when dream mode is enabled);
+    # when absent we just skip the row — the child session alone already gives
+    # the in-chat card and the sidebar entry.
+    task_run_id: str | None = None
+    try:
+        tasks = await db.get_tasks()
+        dream_task = next(
+            (t for t in tasks if t.get("name") == DREAM_MODE_TASK_NAME), None,
+        )
+        if dream_task is not None:
+            task_run_id = await db.add_task_run(
+                task_id=dream_task["id"], trigger="manual",
+                run_id=run_id, session_id=child_sid,
+            )
+    except Exception as e:  # noqa: BLE001
+        logger.debug("run_dream_mode: task_run record skipped: %s", e)
+
+    elog("dream.manual_start", session_id=parent_session_id,
+         child_session_id=child_sid)
+
+    try:
+        result = await run_child_session(
+            agent=agent,
+            db=db,
+            parent_session_id=parent_session_id,
+            origin="scheduler",
+            origin_ref={"task_id": DREAM_MODE_TASK_NAME, "run_id": run_id},
+            title="Dream mode",
+            prompt=DREAM_MODE_PROMPT,
+            owner_client_id=owner_handle,
+            author=agent_author(
+                "Dream mode", agent_name=getattr(agent, "name", None),
+            ),
+        )
+    except Exception as e:  # noqa: BLE001
+        if task_run_id is not None:
+            try:
+                await db.update_task_run(
+                    task_run_id, status="failed",
+                    finished_at=time.time(), error=f"{type(e).__name__}: {e}",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        elog("dream.manual_error", level="error",
+             session_id=parent_session_id, error=str(e))
+        return {"status": "error", "error": f"{type(e).__name__}: {e}"}
+
+    if task_run_id is not None:
+        try:
+            await db.update_task_run(
+                task_run_id, status="success",
+                finished_at=time.time(), output=(result.text or "")[:2000],
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    elog("dream.manual_complete", session_id=parent_session_id,
+         child_session_id=result.session_id, chars=len(result.text or ""))
+    return {
+        "status": "ok",
+        "child_session_id": result.session_id,
+        "answer": (
+            "Dream mode is running as its own session — open the card above to "
+            "follow along as it works through the vault."
+        ),
+    }
 
 
 async def list_delegatable_models() -> dict[str, Any]:

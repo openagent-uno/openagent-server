@@ -221,7 +221,7 @@ class _FakeAgent:
         self._deltas = deltas
 
     async def run_stream(self, *, message, user_id, session_id,
-                         attachments=None, on_status=None):
+                         attachments=None, on_status=None, author=None):
         for d in self._deltas:
             yield {"kind": "delta", "text": d}
         yield {"kind": "done", "text": "".join(self._deltas)}
@@ -286,7 +286,7 @@ async def t_run_one_shot_unexpected_cancel_gets_terminal_frame(ctx: TestContext)
         db = None
 
         async def run_stream(self, *, message, user_id, session_id,
-                             attachments=None, on_status=None):
+                             attachments=None, on_status=None, author=None):
             raise asyncio.CancelledError()
             yield  # pragma: no cover - keeps this an async generator
 
@@ -532,7 +532,7 @@ async def t_dispatch_pcm_propagation(ctx: TestContext) -> None:
         db = None
 
         async def run_stream(self, *, message, user_id, session_id,
-                             attachments=None, on_status=None):
+                             attachments=None, on_status=None, author=None):
             yield {"kind": "done", "text": ""}
 
         def last_response_meta(self, sid):
@@ -596,7 +596,7 @@ class _RecordingAgent:
         self._idx = 0
 
     async def run_stream(self, *, message, user_id, session_id,
-                         attachments=None, on_status=None):
+                         attachments=None, on_status=None, author=None):
         self._idx += 1
         self.calls.append({
             "message": message,
@@ -1146,7 +1146,7 @@ async def t_cancel_suppresses_completion(ctx: TestContext) -> None:
             self.allow_finish = asyncio.Event()
 
         async def run_stream(self, *, message, user_id, session_id,
-                             attachments=None, on_status=None):
+                             attachments=None, on_status=None, author=None):
             self.calls += 1
             if self.calls == 1:
                 # Stream a delta then block until the test signals OR
@@ -1283,7 +1283,7 @@ async def t_slow_spawn_salvage(ctx: TestContext) -> None:
             self.calls = 0
 
         async def run_stream(self, *, message, user_id, session_id,
-                             attachments=None, on_status=None):
+                             attachments=None, on_status=None, author=None):
             self.calls += 1
             if self.calls == 1:
                 # Simulate a slow provider's subprocess spawn — agent has the
@@ -1357,7 +1357,7 @@ async def t_interrupt_during_spawn_no_salvage(ctx: TestContext) -> None:
             self.calls = 0
 
         async def run_stream(self, *, message, user_id, session_id,
-                             attachments=None, on_status=None):
+                             attachments=None, on_status=None, author=None):
             self.calls += 1
             if self.calls == 1:
                 await spawn_release.wait()
@@ -1742,6 +1742,36 @@ async def t_realtime_unrecoverable_callback(ctx: TestContext) -> None:
         await channel.close()
 
 
+@test("stream", "Gateway._broadcast_child_frame enqueues (non-blocking) instead of sending inline")
+async def t_child_frame_nonblocking(ctx: TestContext) -> None:
+    """A detached child run forwards deltas via ``_broadcast_child_frame`` from
+    inside the agent loop — it MUST only ``put_nowait`` onto the drain queue, so
+    a slow/stuck client can never backpressure (stall) the run. Here a Gateway
+    with a stub ``broadcast`` that would explode confirms the frame lands on the
+    queue and ``broadcast`` is never called inline."""
+    import asyncio
+    from src.gateway.server import Gateway
+
+    gw = Gateway.__new__(Gateway)
+    gw._child_frame_q = asyncio.Queue(maxsize=16)
+    called = []
+
+    async def _boom(payload):  # would be awaited if the path sent inline
+        called.append(payload)
+        raise AssertionError("broadcast must not run inline from the agent loop")
+
+    gw.broadcast = _boom  # type: ignore[assignment]
+
+    await gw._broadcast_child_frame({"kind": "delta", "session_id": "scheduler:t:r", "text": "hi"})
+    await gw._broadcast_child_frame({"kind": "turn_complete", "session_id": "scheduler:t:r"})
+
+    assert called == [], "broadcast was called inline (would stall the run)"
+    q = gw._child_frame_q
+    assert q.qsize() == 2, q.qsize()
+    assert q.get_nowait() == {"session_id": "scheduler:t:r", "type": "delta", "text": "hi"}
+    assert q.get_nowait() == {"session_id": "scheduler:t:r", "type": "turn_complete"}
+
+
 @test("stream", "Gateway._adopt_sessions_to_ws rebinds every channel for the client_id")
 async def t_gateway_adopt_sessions_to_ws(ctx: TestContext) -> None:
     """End-to-end check of the reconnect adoption path: sessions
@@ -1755,10 +1785,13 @@ async def t_gateway_adopt_sessions_to_ws(ctx: TestContext) -> None:
         name = "stub"
         db = None
 
+    from weakref import WeakKeyDictionary
     gw = Gateway.__new__(Gateway)
     gw.clients = {}
     gw._stream_sessions = {}
-    # _safe_ws_send_json is a staticmethod, no need to bind.
+    # _safe_ws_send_json is now an instance method that serialises sends with a
+    # per-socket lock — __new__ skips __init__, so seed the lock map.
+    gw._ws_send_locks = WeakKeyDictionary()
 
     class _FakeWS:
         def __init__(self, name):

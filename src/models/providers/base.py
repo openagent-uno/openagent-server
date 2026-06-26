@@ -2241,6 +2241,10 @@ class Model(ABC):
                     function_execution_result.audios = tool_result.audios
                 if tool_result.files:
                     function_execution_result.files = tool_result.files
+                # Lift the spawned child session id so the ToolExecution below
+                # carries it → the app renders a delegation card (OpenCode-style).
+                if tool_result.child_session_id:
+                    function_execution_result.child_session_id = tool_result.child_session_id
             else:
                 function_call_output = str(function_execution_result.result) if function_execution_result.result else ""
 
@@ -2282,6 +2286,7 @@ class Model(ABC):
                     result=str(function_call_result.content),
                     stop_after_tool_call=function_call_result.stop_after_tool_call,
                     metrics=tool_metrics,
+                    child_session_id=function_execution_result.child_session_id,
                 )
             ],
             event=ModelResponseEvent.tool_call_completed.value,
@@ -2459,6 +2464,12 @@ class Model(ABC):
         success: Union[bool, AgentRunException] = False
         result: FunctionExecutionResult = FunctionExecutionResult(status="failure")
 
+        # Bind this tool's id/name so a handler that spawns a child session can
+        # re-stream the in-flight chip carrying child_session_id (→ its card
+        # flips clickable mid-run). The dispatcher invokes inner tools in this
+        # same context, so a tool-search-wrapped spawn reads the OUTER chip.
+        from src.stream.card_link import set_active_tool_call, reset_active_tool_call
+        _tool_tok = set_active_tool_call(function_call.call_id, function_call.function.name)
         try:
             if (
                 iscoroutinefunction(function_call.function.entrypoint)
@@ -2483,6 +2494,8 @@ class Model(ABC):
             log_error(f"Error executing function {function_call.function.name}: {str(e)}")
             success = False
             raise e
+        finally:
+            reset_active_tool_call(_tool_tok)
 
         function_call_timer.stop()
         return success, function_call_timer, function_call, result
@@ -2904,6 +2917,10 @@ class Model(ABC):
                         function_execution_result.audios = tool_result.audios
                     if tool_result.files:
                         function_execution_result.files = tool_result.files
+                    # Lift the spawned child session id onto the ToolExecution
+                    # below so the app renders a delegation card.
+                    if tool_result.child_session_id:
+                        function_execution_result.child_session_id = tool_result.child_session_id
                 else:
                     function_call_output = str(function_call.result)
 
@@ -2945,6 +2962,7 @@ class Model(ABC):
                         result=str(function_call_result.content),
                         stop_after_tool_call=function_call_result.stop_after_tool_call,
                         metrics=tool_metrics,
+                        child_session_id=function_execution_result.child_session_id,
                     )
                 ],
                 event=ModelResponseEvent.tool_call_completed.value,

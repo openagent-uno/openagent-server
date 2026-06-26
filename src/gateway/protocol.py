@@ -66,11 +66,25 @@ typed messages stay silent but voice notes get spoken back.
 A ``resource_event`` tells subscribed clients (the desktop app's MCPs /
 Tasks / Workflows / Memory screens) that a server-side resource list
 changed and they should refetch. ``resource`` is one of ``"mcp"``,
-``"scheduled_task"``, ``"workflow"``, ``"vault"`` or ``"config"``;
-``action`` is one of ``"created"``, ``"updated"``, ``"deleted"``, or
-``"changed"`` (the coarse hint used when we know *something* in that
-namespace moved but not exactly what — e.g. an MCP-tool driven write
-from a chat turn). ``id`` is optional.
+``"scheduled_task"``, ``"workflow"``, ``"vault"``, ``"config"`` or
+``"session"``; ``action`` is one of ``"created"``, ``"updated"``,
+``"deleted"``, or ``"changed"`` (the coarse hint used when we know
+*something* in that namespace moved but not exactly what — e.g. an
+MCP-tool driven write from a chat turn). ``id`` is optional.
+
+``resource="session"`` fires when a child session is spawned (a delegated
+sub-agent, a scheduled-task firing, or a workflow AI-prompt node) so the
+client adds it to the flat session list and a parent transcript's
+delegation cards refresh live. ``id`` carries the new child ``session_id``;
+the client refetches ``GET /api/sessions`` to pick up its metadata.
+
+Per-message authorship: messages returned by ``GET /api/sessions/{id}/runs``
+may carry an optional ``author`` object — ``{"kind": "human"|"agent",
+"handle"?, "display"?}`` — distinguishing which human sent a message (so
+multi-user / bridge sessions attribute correctly) from an agent-self seed
+(a delegated task / scheduled mission / workflow node prompt). Inbound
+``text_final`` / legacy ``message`` frames may also carry ``author`` so a
+bridge can attribute each multiplexed user.
 """
 
 # Message type constants

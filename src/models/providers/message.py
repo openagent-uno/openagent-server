@@ -109,6 +109,14 @@ class Message(BaseModel):
     add_to_agent_memory: bool = True
     # This flag is enabled when a message is fetched from the agent's memory.
     from_history: bool = False
+    # Who authored this message — distinguishes humans from each other (a
+    # network handle, so multi-user/bridge sessions attribute per message)
+    # and humans from agent-self seed prompts (a delegated task, a scheduled
+    # mission, a workflow node prompt). Shape:
+    # ``{"kind": "human"|"agent", "handle"?: str, "display"?: str, "device_id"?: str}``.
+    # SERVER-ONLY: persisted into the runs JSON and surfaced to the app, but
+    # NEVER sent to a provider (it is not the OpenAI ``name`` field).
+    author: Optional[Dict[str, Any]] = None
     # Metrics for the message. Defaults to empty MessageMetrics; populated on assistant messages.
     metrics: MessageMetrics = Field(default_factory=MessageMetrics)
     # The references added to the message for RAG
@@ -299,6 +307,11 @@ class Message(BaseModel):
             "tool_calls": self.tool_calls,
             "redacted_reasoning_content": self.redacted_reasoning_content,
             "provider_data": self.provider_data,
+            # Server-only authorship. MUST be listed explicitly here —
+            # ``extra="allow"`` does NOT survive ``to_dict()``, and
+            # ``RunOutput.to_dict`` persists messages via ``m.to_dict()``,
+            # so omitting this key silently drops author from the runs JSON.
+            "author": self.author,
         }
         # Filter out None and empty collections
         message_dict = {

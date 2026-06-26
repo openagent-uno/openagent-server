@@ -21,7 +21,8 @@ the supported path — not an escape hatch.
 
 These tests pin:
 1. delegate_task succeeds end-to-end through ``executor.run`` (context
-   present → dispatcher.run_delegated is reached).
+   present → the sub-agent runs as a full child session via ``agent.run``,
+   which returns its ``child_session_id``).
 2. The same handler, called *without* the executor wrapper, still errors
    — proving the context (not the block plumbing) is what the fix adds.
 3. The context is torn down after the run (no contextvar leak).
@@ -67,19 +68,32 @@ class _StubDispatcher:
 
 
 class _DelegatingAgent:
-    """Agent stub exposing exactly what the executor reads to build the
-    delegation context: ``_mcp`` (pool), ``_db`` (catalog handle), and
-    ``model`` (the dispatcher with ``run_delegated``)."""
+    """Agent stub exposing what the executor reads to build the delegation
+    context (``_mcp`` pool, ``_db``, ``model``) AND what
+    ``run_child_session`` now drives a sub-agent through: ``run`` (a full
+    child-session turn — the vision §15 fix replaced the old system-less
+    ``dispatcher.run_delegated``) plus ``release_session``. Records each
+    ``run`` so the test can prove the delegation spawned a child session."""
+
+    name = "test-agent"
 
     def __init__(self, *, pool: Any, db: Any, model: Any) -> None:
         self._mcp = pool
         self._db = db
         self.model = model
+        self.runs: list[dict[str, Any]] = []
+
+    async def run(self, *, message, user_id="", session_id=None,
+                  model_override=None, author=None, on_status=None) -> str:
+        self.runs.append({
+            "message": message, "session_id": session_id, "author": author,
+        })
+        return f"sub-agent handled: {message}"
 
     async def forget_session(self, session_id: str) -> None:
         return None
 
-    async def release_session(self, session_id: str) -> None:
+    async def release_session(self, session_id: str, *, model_override=None) -> None:
         return None
 
 
@@ -150,15 +164,22 @@ async def t_delegate_task_succeeds_in_workflow(ctx: TestContext) -> None:
     inner = node["output"]["result"]
     assert inner["status"] == "ok", inner
     assert inner["answer"] == "sub-agent handled: Cover the support queue.", inner
+    # Delegation now spawns a full child session and hands its id back so the
+    # app can render a navigable card.
+    child_sid = inner["child_session_id"]
+    assert child_sid and "::sub::deepseek:v4-pro::" in child_sid, inner
 
-    # The context actually routed through to a real delegated run with
-    # the parent's pool + db + the workflow-scoped session id.
-    assert len(dispatcher.calls) == 1, dispatcher.calls
-    call = dispatcher.calls[0]
-    assert call["model_id"] == "deepseek:v4-pro", call
-    assert call["pool"] is pool, call
-    assert call["db"] is db, call
-    assert call["parent_session_id"] == "workflow:wf-support-coverage:" + final["id"], call
+    # The sub-agent ran as a real child-session turn (agent.run), seeded with
+    # the task as an agent-self authored first message — NOT the old
+    # system-less dispatcher.run_delegated path.
+    assert len(agent.runs) == 1, agent.runs
+    call = agent.runs[0]
+    assert call["message"] == "Cover the support queue.", call
+    assert call["session_id"] == child_sid, call
+    assert call["author"] and call["author"]["kind"] == "agent", call
+    assert call["session_id"].startswith(
+        "workflow:wf-support-coverage:" + final["id"] + "::sub::"
+    ), call
 
 
 @test(
@@ -198,8 +219,9 @@ async def t_context_reset_after_run(ctx: TestContext) -> None:
 
     # finally-block reset must have restored the module contextvars to
     # their unset default — otherwise a delegate_task in an unrelated
-    # context (or a later workflow) could inherit this run's dispatcher.
+    # context (or a later workflow) could inherit this run's agent/dispatcher.
     assert handlers._dispatcher_var.get() is None
     assert handlers._db_var.get() is None
     assert handlers._session_id_var.get() is None
     assert handlers._pool_var.get() is None
+    assert handlers._agent_var.get() is None

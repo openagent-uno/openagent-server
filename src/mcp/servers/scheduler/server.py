@@ -454,6 +454,102 @@ async def _await_task_runs_terminal(
         await asyncio.sleep(0.4)
 
 
+def _serialize_task_run(row: aiosqlite.Row) -> dict[str, Any]:
+    """Hydrate a ``task_runs`` row with ISO mirrors for its epoch columns —
+    matches the gateway's ``_serialize_run`` so callers see one shape."""
+    out = dict(row)
+    for key in ("started_at", "finished_at"):
+        epoch = out.get(key)
+        out[f"{key}_iso"] = _iso(epoch) if epoch else None
+    return out
+
+
+async def _poll_task_request(
+    conn: aiosqlite.Connection, request_id: str, *, timeout_s: float,
+) -> str:
+    """Wait for the main process to claim the request and attach a run_id."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        cursor = await conn.execute(
+            "SELECT run_id FROM task_run_requests WHERE id = ?", (request_id,),
+        )
+        row = await cursor.fetchone()
+        if row and row["run_id"]:
+            return row["run_id"]
+        await asyncio.sleep(0.25)
+    raise TimeoutError(
+        f"run-now request {request_id!r} was not picked up within "
+        f"{timeout_s:.0f}s — is the main OpenAgent process running?"
+    )
+
+
+@mcp.tool()
+async def run_scheduled_task_now(
+    task_id: str,
+    wait: bool = True,
+    timeout_s: int = 300,
+) -> dict[str, Any]:
+    """Run a scheduled task immediately, out of band from its cron schedule.
+
+    Fires the task's prompt right now. This does NOT touch the task's
+    schedule — its next cron run is unchanged — and the task does not need
+    to be enabled, so this also works to test or one-off a disabled task.
+
+    Use this when the user wants a scheduled task to happen "now" /
+    "right away" instead of waiting for its next tick. To change *when* it
+    recurs, edit ``cron_expression`` instead; to run something brand new
+    once, use ``create_one_shot_task``.
+
+    This subprocess has no in-process Scheduler, so it drops a request row
+    that the main OpenAgent process claims and executes within a couple of
+    seconds. With ``wait=True`` (default) it polls until the firing
+    finishes and returns the ``task_runs`` row (status / output preview /
+    timing); ``wait=False`` returns as soon as the run is assigned an id.
+    """
+    conn = await _get_conn()
+    full_id = await _resolve_task_id(conn, task_id)
+
+    cursor = await conn.execute(
+        "SELECT name FROM scheduled_tasks WHERE id = ?", (full_id,)
+    )
+    name_row = await cursor.fetchone()
+    name = name_row["name"] if name_row else ""
+
+    req_id = str(uuid.uuid4())
+    await conn.execute(
+        "INSERT INTO task_run_requests (id, task_id, trigger, created_at) "
+        "VALUES (?, ?, 'ai', ?)",
+        (req_id, full_id, time.time()),
+    )
+    await conn.commit()
+
+    # Wait for the main process to claim + attach a run_id (bounded so a
+    # dead main process surfaces a clear error instead of hanging).
+    run_id = await _poll_task_request(conn, req_id, timeout_s=min(timeout_s, 60))
+    if not wait:
+        return {
+            "task_id": full_id,
+            "name": name,
+            "run_id": run_id,
+            "status": "running",
+        }
+
+    # Then wait for the firing itself to finish.
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        cursor = await conn.execute(
+            "SELECT * FROM task_runs WHERE id = ?", (run_id,),
+        )
+        run_row = await cursor.fetchone()
+        if run_row and run_row["status"] != "running":
+            return _serialize_task_run(run_row)
+        await asyncio.sleep(0.5)
+    raise TimeoutError(
+        f"task run {run_id!r} did not finish within {timeout_s}s — it may "
+        "still be running; check list_scheduled_tasks / the run history."
+    )
+
+
 @mcp.tool()
 async def describe_cron(cron_expression: str, count: int = 3) -> dict[str, Any]:
     """Validate a cron expression and preview its next N fire times.

@@ -38,6 +38,7 @@ from src.stream.events import (
     OutAudioEnd,
     OutAudioStart,
     OutError,
+    OutSeedMessage,
     OutTextDelta,
     OutTextFinal,
     OutToolStatus,
@@ -67,6 +68,7 @@ SESSION_OPEN = "session_open"  # client → server stream open
 SESSION_CLOSE = "session_close"  # client → server stream close
 
 VIDEO_FRAME_OUT = "video_frame_out"  # server → client image frame
+SEED = "seed"  # server → client agent-self seed (child-session mission prompt)
 TURN_COMPLETE = "turn_complete"  # server → client batched-channel sentinel
 SESSION_COMPACTED = "session_compacted"  # server → client in-place compaction landed
 
@@ -119,6 +121,8 @@ def event_to_wire(evt: Event) -> dict[str, Any]:
         return {**base, "type": P.AUDIO_CHUNK, "data": _b64encode(evt.data)}
     if isinstance(evt, OutAudioEnd):
         return {**base, "type": P.AUDIO_END, "total_chunks": evt.total_chunks}
+    if isinstance(evt, OutSeedMessage):
+        return {**base, "type": SEED, "text": evt.text, "author": evt.author}
     if isinstance(evt, OutToolStatus):
         return {**base, "type": P.STATUS, "text": evt.text}
     if isinstance(evt, OutError):
@@ -231,6 +235,7 @@ def wire_to_event(frame: dict[str, Any]) -> Event | None:
             text=str(frame.get("text") or ""),
             source="user_typed",
             attachments=tuple(frame.get("attachments") or ()),
+            author=frame.get("author") if isinstance(frame.get("author"), dict) else None,
         )
 
     if t == TEXT_DELTA_IN:
@@ -245,6 +250,7 @@ def wire_to_event(frame: dict[str, Any]) -> Event | None:
             text=str(frame.get("text") or ""),
             source=frame.get("source") or "user_typed",
             attachments=tuple(frame.get("attachments") or ()),
+            author=frame.get("author") if isinstance(frame.get("author"), dict) else None,
         )
     if t == AUDIO_CHUNK_IN:
         return AudioChunk(

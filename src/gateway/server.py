@@ -14,6 +14,7 @@ import logging
 import os
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, TYPE_CHECKING
+from weakref import WeakKeyDictionary
 
 from src.gateway import protocol as P
 from src.gateway.commands import command_help_text
@@ -68,6 +69,22 @@ class Gateway:
         # websocket drops so a closed app never leaks live shells.
         self.terminals = TerminalManager()
         self.clients: dict[str, object] = {}  # client_id → WebSocketResponse
+        # Per-socket send lock: serialises EVERY write to a given WebSocket so
+        # concurrent producers can't interleave frames on the wire. Without it,
+        # broadcasting a child session's live deltas (the scheduler / workflow
+        # run-screen stream) while that socket's own chat channel is also
+        # streaming would race aiohttp's single writer. Keyed weakly so a
+        # dropped socket's lock is collected with it.
+        self._ws_send_locks: "WeakKeyDictionary[Any, asyncio.Lock]" = WeakKeyDictionary()
+        # Detached child-run live frames (scheduled firings / workflow nodes)
+        # are decoupled from the agent loop through this queue + a single drain
+        # pump: the run forwards each delta with a non-blocking ``put_nowait`` so
+        # a slow/stuck client can never apply backpressure that stalls the
+        # actual agent execution. The pump preserves frame order (single
+        # consumer) and drops on overflow (a reconcile backfills). Bound is
+        # generous — a chatty firing is a few thousand tokens.
+        self._child_frame_q: "asyncio.Queue[dict] | None" = None
+        self._child_frame_pump: asyncio.Task | None = None
         self._runner = None
         self._site: IrohSite | None = None
         # AgentSite handles the openagent/agent/1 ALPN — direct agent-to-agent
@@ -112,13 +129,21 @@ class Gateway:
             str, Callable[[dict], Awaitable[None]]
         ] = {}
 
-    @staticmethod
-    async def _safe_ws_send_json(ws, payload: dict) -> bool:
-        """Best-effort websocket send that tolerates closing transports."""
+    async def _safe_ws_send_json(self, ws, payload: dict) -> bool:
+        """Best-effort websocket send that tolerates closing transports.
+
+        Serialised per-socket (``_ws_send_locks``) so concurrent producers —
+        a session's channel pump and a broadcast of a child run's live deltas —
+        never interleave frames on aiohttp's single writer."""
         if ws is None or getattr(ws, "closed", False):
             return False
+        lock = self._ws_send_locks.get(ws)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._ws_send_locks[ws] = lock
         try:
-            await ws.send_json(payload)
+            async with lock:
+                await ws.send_json(payload)
             return True
         except Exception as e:
             if "closing transport" in str(e).lower():
@@ -237,9 +262,79 @@ class Gateway:
         self._network_state.iroh_node.register_handler(_Alpn.GATEWAY, _gateway_handler)
         self._network_state.iroh_node.register_handler(_Alpn.AGENT, _agent_handler)
 
+    def broadcast_session(self, action: str, session_id: str) -> None:
+        """Announce a session change (created/updated/deleted) to clients so
+        the flat session list / a parent's delegation cards refresh live.
+        Sync wrapper over ``broadcast_resource_sync`` for producers running
+        inside the event loop (the child-session spawn path)."""
+        self.broadcast_resource_sync("session", action, session_id)
+
+    def _on_child_session_created(self, session_id: str, info: dict) -> None:
+        """Listener registered with ``core.child_session`` — fires a
+        ``session`` resource_event when a child session is spawned so the app
+        can refresh live.
+
+        Hidden child origins (delegation sub-agents, scheduled firings,
+        workflow nodes — see ``HIDDEN_CHILD_ORIGINS``) are SKIPPED: they're
+        excluded from ``GET /api/sessions`` (each navigable only in context —
+        a parent's transcript card, a run's execution screen), so a ``created``
+        broadcast would only make clients refetch a list that can never contain
+        them. The run feed they DO appear in is driven by the separate
+        ``scheduled_task`` / ``workflow`` resource events, not this one."""
+        from src.core.child_session import HIDDEN_CHILD_ORIGINS
+        if (info or {}).get("origin") in HIDDEN_CHILD_ORIGINS:
+            return
+        self.broadcast_session("created", session_id)
+
+    async def _broadcast_child_frame(self, frame: dict) -> None:
+        """Broadcast sink for a DETACHED child run's live stream (a scheduled
+        firing / workflow node — see ``child_stream.set_child_broadcast_sink``).
+
+        Translates the child frame — via the shared ``child_frame_to_event`` +
+        ``event_to_wire`` builders the interactive turn already uses — to the
+        same ``delta`` / ``status`` / ``turn_complete`` wire shape, tagged with
+        the child sid. The actual fan-out is handed to the drain pump via a
+        NON-BLOCKING ``put_nowait`` so the agent run loop (which awaits this) is
+        never gated on a slow client's socket; the pump preserves order and the
+        bounded queue drops on overflow (a reconcile backfills)."""
+        from src.stream.child_stream import child_frame_to_event
+        from src.stream.wire import event_to_wire
+        evt = child_frame_to_event(frame)
+        if evt is None or self._child_frame_q is None:
+            return
+        try:
+            self._child_frame_q.put_nowait(event_to_wire(evt))
+        except asyncio.QueueFull:
+            logger.debug("child-frame queue full; dropping a %s frame", frame.get("kind"))
+
+    async def _child_frame_pump_loop(self) -> None:
+        """Single consumer: drain queued child-run frames and fan each out to
+        every client. Decoupled from the agent loop so per-client send latency
+        (or a stuck socket) never backpressures the run that produced them."""
+        assert self._child_frame_q is not None
+        while True:
+            payload = await self._child_frame_q.get()
+            try:
+                await self.broadcast(payload)
+            except Exception as e:  # noqa: BLE001 — one bad frame must not kill the pump
+                logger.debug("child-frame broadcast failed: %s", e)
+
     async def start(self) -> None:
         from aiohttp import web
         from aiohttp.web import middleware
+
+        # Surface freshly-spawned child sessions (delegations, scheduled
+        # firings, workflow nodes) to connected clients in real time, and stream
+        # a detached child run's live deltas to every client (its run screen).
+        try:
+            from src.core.child_session import set_child_session_listener
+            from src.stream.child_stream import set_child_broadcast_sink
+            set_child_session_listener(self._on_child_session_created)
+            self._child_frame_q = asyncio.Queue(maxsize=4096)
+            self._child_frame_pump = asyncio.create_task(self._child_frame_pump_loop())
+            set_child_broadcast_sink(self._broadcast_child_frame)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("child-session listener registration failed: %s", e)
 
         @middleware
         async def cors(request, handler):
@@ -367,6 +462,16 @@ class Gateway:
             except (asyncio.CancelledError, Exception):
                 pass
             self._system_broadcast_task = None
+        if self._child_frame_pump is not None:
+            from src.stream.child_stream import set_child_broadcast_sink
+            set_child_broadcast_sink(None)
+            self._child_frame_pump.cancel()
+            try:
+                await self._child_frame_pump
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._child_frame_pump = None
+            self._child_frame_q = None
         if self._site is not None:
             try:
                 await self._site.stop()
@@ -447,6 +552,8 @@ class Gateway:
             ("POST", "/api/scheduled-tasks", scheduled_tasks.handle_create),
             ("GET", "/api/scheduled-tasks/{id}", scheduled_tasks.handle_get),
             ("GET", "/api/scheduled-tasks/{id}/runs", scheduled_tasks.handle_runs_list),
+            ("POST", "/api/scheduled-tasks/{id}/run", scheduled_tasks.handle_run),
+            ("POST", "/api/scheduled-tasks/{id}/stop", scheduled_tasks.handle_stop),
             ("PATCH", "/api/scheduled-tasks/{id}", scheduled_tasks.handle_update),
             ("DELETE", "/api/scheduled-tasks/{id}", scheduled_tasks.handle_delete),
             # Workflow engine (n8n-style multi-block pipelines). Same
@@ -1361,6 +1468,7 @@ class Gateway:
                 language=language,
                 coalesce_window_ms=coalesce_window_ms,
                 speak_enabled=speak_enabled,
+                handle=handle,
             )
             # Install gateway hooks: pre-dispatch enforces the same
             # "no enabled models" + "history-mode binding" guards the

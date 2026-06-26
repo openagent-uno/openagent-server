@@ -19,6 +19,8 @@ overhead for users who never adopt workflows.
 from __future__ import annotations
 
 import asyncio
+import os
+import uuid
 from typing import Callable, TYPE_CHECKING
 
 import time
@@ -70,6 +72,21 @@ def _no_broadcast(resource: str, action: str, id: str | None = None) -> None:
 # in the agent's session history; ``task_runs.output`` is only a preview
 # for the dashboard's run list, so a chatty turn can't bloat the DB.
 _MAX_TASK_RUN_OUTPUT = 4000
+
+
+def _durable_child_sessions() -> bool:
+    """Whether a scheduled firing persists as a durable child session.
+
+    Default ON: each firing runs as a unique per-run session
+    (``scheduler:{task}:{run}``) that survives for navigation + follow-up,
+    via ``core.child_session.run_child_session``. The per-run uniqueness is
+    what removes the issue-#5 root cause (a *reused* session whose compacted
+    transcript made the next firing exit early), so persisting is safe.
+
+    Set ``OPENAGENT_SCHEDULER_DURABLE_SESSIONS=0`` to revert to the exact
+    legacy behavior (a reused ``scheduler:{task}`` session wiped via
+    ``forget_session`` after every fire) as a safety hatch."""
+    return os.environ.get("OPENAGENT_SCHEDULER_DURABLE_SESSIONS", "1").strip() not in ("0", "false", "no")
 
 
 class Scheduler:
@@ -225,13 +242,61 @@ class Scheduler:
     # finalized directly so the badge never sticks.
 
     async def _cancellation_loop(self) -> None:
-        """Drain ``status='cancelling'`` rows every CANCEL_CHECK_INTERVAL."""
+        """Fast cross-process signal loop, every CANCEL_CHECK_INTERVAL.
+
+        Drains the two cross-process hand-offs an out-of-process MCP
+        subprocess uses to reach the in-process runtime: ``status='cancelling'``
+        rows (a "completely stop" request) and ``task_run_requests`` rows (a
+        "run now" request). Kept off the heavy 30 s due-task scan so both feel
+        near-immediate."""
         while True:
             try:
                 await self._drain_cancellations()
             except Exception as e:  # noqa: BLE001
                 elog("scheduler.cancel_loop_error", level="error", error=str(e))
+            try:
+                await self._drain_task_run_requests()
+            except Exception as e:  # noqa: BLE001
+                elog("scheduler.run_request_loop_error", level="error", error=str(e))
             await asyncio.sleep(CANCEL_CHECK_INTERVAL)
+
+    async def _drain_task_run_requests(self) -> None:
+        """Claim and fire every pending on-demand "run now" request.
+
+        Each request fires its task immediately via ``run_task`` with
+        ``trigger`` carried from the request row, leaving the task's cron
+        schedule and enabled flag untouched. The firing is dispatched as its
+        own tracked ``asyncio.Task`` so a long run can't stall the drain."""
+        if self.db is None:
+            return
+        try:
+            requests = await self.db.claim_pending_task_requests(
+                limit=_CANCEL_SCAN_LIMIT,
+            )
+        except Exception as e:  # noqa: BLE001
+            elog("scheduler.task_request_claim_failed", level="warning",
+                 error=str(e) or type(e).__name__)
+            return
+        if len(requests) >= _CANCEL_SCAN_LIMIT:
+            elog("scheduler.task_request_scan_capped", level="warning",
+                 limit=_CANCEL_SCAN_LIMIT)
+        for req in requests:
+            task_id = req.get("task_id")
+            task = await self.db.get_task(task_id) if task_id else None
+            if task is None:
+                # FK cascade should prevent this, but guard anyway.
+                elog("scheduler.task_request_orphan", level="warning",
+                     request_id=req.get("id"), task_id=task_id)
+                continue
+            elog("scheduler.run_now", name=task.get("name"),
+                 request_id=req.get("id"))
+            self._spawn_workflow(
+                self.run_task(
+                    task,
+                    trigger=req.get("trigger") or "manual",
+                    request_id=req.get("id"),
+                )
+            )
 
     async def _drain_cancellations(self) -> None:
         """Act on every run flagged ``cancelling`` since the last drain."""
@@ -331,12 +396,33 @@ class Scheduler:
     def _unregister_run(self, registry: dict[str, asyncio.Task], run_id: str) -> None:
         registry.pop(run_id, None)
 
-    async def run_task(self, task: dict, *, trigger: str = "schedule") -> None:
+    async def run_task(
+        self, task: dict, *, trigger: str = "schedule", request_id: str | None = None,
+    ) -> None:
         """Execute a single task. Extension point: override or monkey-patch
         this to intercept specific tasks (e.g. auto-update, which uses a
-        direct pip subprocess instead of going through the agent)."""
+        direct pip subprocess instead of going through the agent).
+
+        Each firing runs as a durable per-run child session
+        (``scheduler:{task}:{run}``) — vision §7's "chat with the user's seat
+        empty": it appears in the owner's session list, can be opened to read
+        the agent's full reasoning, and accepts follow-up messages. The
+        per-run uniqueness (not a wiped, reused session) is what fixes
+        issue #5. Set ``OPENAGENT_SCHEDULER_DURABLE_SESSIONS=0`` to revert to
+        the legacy reused-session + ``forget_session`` behavior."""
         task_name = task["name"]
-        session_id = f"scheduler:{task['id']}"
+        durable = _durable_child_sessions()
+        # Per-run id (durable) so each firing is its own navigable session;
+        # legacy mode reuses one per-task id wiped after every fire.
+        run_id: str = str(uuid.uuid4())
+        # The durable per-run id MUST equal what ``run_child_session`` mints for
+        # the same origin_ref, so the ``task_runs.session_id`` link points at the
+        # real child row — mint it the one way instead of re-formatting by hand.
+        from src.core.child_session import mint_child_session_id
+        session_id = (
+            mint_child_session_id("scheduler", {"task_id": task["id"], "run_id": run_id})
+            if durable else f"scheduler:{task['id']}"
+        )
         elog("task.run", name=task_name)
         # Record this firing in ``task_runs`` so the dashboard can show a
         # per-task execution history (status / output preview / timing) —
@@ -344,17 +430,41 @@ class Scheduler:
         # logging must never stop the task from running, so the db touch
         # is guarded and skipped entirely when there's no db (e.g. a
         # Scheduler constructed with ``db=None`` in unit tests).
-        run_id: str | None = None
+        recorded = False
         if self.db is not None:
             try:
-                run_id = await self.db.add_task_run(task_id=task["id"], trigger=trigger)
+                await self.db.add_task_run(
+                    task_id=task["id"], trigger=trigger, run_id=run_id,
+                    session_id=session_id if durable else None,
+                )
+                recorded = True
             except Exception as e:  # noqa: BLE001
                 elog("task.run_record_failed", level="warning",
                      name=task_name, error=str(e))
+        # The id to finalize the ``task_runs`` row with — None when the row was
+        # never recorded (so ``_record_task_finish`` no-ops). ``run_id`` itself
+        # stays the real uuid for register/unregister + request linking.
+        finish_run_id = run_id if recorded else None
         # Once the run row exists, bind this firing's task so the
         # cancellation drain can hard-stop it on a "completely stop" request.
-        if run_id is not None:
+        if recorded:
             self._register_run(self._scheduled_run_tasks, run_id)
+            # Surface the in-flight firing to subscribed clients so the
+            # dashboard can flip the tile to "running" and offer a Stop
+            # control — for *every* firing (scheduled tick, run-now from the
+            # app, or run-now from the agent's MCP), not just app-initiated
+            # ones. The matching "no longer running" signal is the finish
+            # broadcast in ``_record_task_finish``.
+            self._broadcast("scheduled_task", "updated", task["id"])
+            # When this firing was kicked off by an out-of-process "run now"
+            # request, link the request to this run_id so the MCP tool's
+            # wait-poller can find the firing (mirrors the workflow path).
+            if request_id is not None:
+                try:
+                    await self.db.set_task_request_run_id(request_id, run_id)
+                except Exception as e:  # noqa: BLE001
+                    elog("task.run_request_link_failed", level="warning",
+                         name=task_name, error=str(e))
         try:
             # Pick up any providers/models the REST or MCP layer wrote
             # since the last tick. The gateway fires refresh_registries on
@@ -374,14 +484,44 @@ class Scheduler:
                               run=run_id, session=session_id)
             except Exception:  # noqa: BLE001
                 pass
-            response = await self.agent.run(
-                message=task["prompt"],
-                user_id="scheduler",
-                session_id=session_id,
-            )
+            if durable:
+                # A scheduled firing is the agent acting on a mission it gave
+                # itself: spawn a full child session under a per-task root,
+                # authored by the agent (so the app renders the prompt as a
+                # Mission block), owned by the agent's primary user so the
+                # row lands in their session list.
+                from src.core.child_session import run_child_session
+                from src.core.identity_context import agent_author
+                owner = None
+                if self.db is not None:
+                    try:
+                        owner = await self.db.primary_owner_handle()
+                    except Exception:  # noqa: BLE001
+                        owner = None
+                result = await run_child_session(
+                    agent=self.agent,
+                    db=self.db,
+                    parent_session_id=f"scheduler:{task['id']}",
+                    origin="scheduler",
+                    origin_ref={"task_id": task["id"], "run_id": run_id},
+                    title=task_name,
+                    prompt=task["prompt"],
+                    owner_client_id=owner,
+                    author=agent_author(task_name, agent_name=getattr(self.agent, "name", None)),
+                    # Stream the firing live so its run screen fills in
+                    # token-by-token like any interactive session.
+                    stream=True,
+                )
+                response = result.text
+            else:
+                response = await self.agent.run(
+                    message=task["prompt"],
+                    user_id="scheduler",
+                    session_id=session_id,
+                )
             elog("task.done", name=task_name, preview=str(response)[:100])
             await self._record_task_finish(
-                run_id, task, status="success", output=str(response),
+                finish_run_id, task, status="success", output=str(response),
             )
         except asyncio.CancelledError:
             # A stop request (or shutdown) cancelled this firing mid-turn.
@@ -392,29 +532,30 @@ class Scheduler:
             # the only place the cancelled firing gets recorded.
             elog("task.cancelled", name=task_name)
             await self._record_task_finish(
-                run_id, task, status="cancelled", error="Stopped by user",
+                finish_run_id, task, status="cancelled", error="Stopped by user",
             )
             raise
         except Exception as e:
             elog("task.error", level="error", name=task_name, error=str(e))
             await self._record_task_finish(
-                run_id, task, status="failed", error=str(e),
+                finish_run_id, task, status="failed", error=str(e),
             )
         finally:
-            if run_id is not None:
+            if recorded:
                 self._unregister_run(self._scheduled_run_tasks, run_id)
-            # Scheduled firings are fire-and-forget — each tick must run in
-            # a fresh session with no memory of prior firings. ``forget_session``
-            # wipes the provider-native resume id, so the next firing spawns
-            # a new Claude CLI subprocess without ``--resume``. Using
-            # ``release_session`` here caused the bug in issue #5: compaction
-            # of a resumed transcript would produce a summary like "all done,
-            # nothing outstanding", and the next firing would silently exit
-            # without ever re-running the task prompt.
-            try:
-                await self.agent.forget_session(session_id)
-            except Exception as e:
-                elog("scheduler.forget_failed", task=task_name, error=str(e))
+            if not durable:
+                # Legacy fire-and-forget: each tick reuses one per-task
+                # session, so ``forget_session`` wipes the provider-native
+                # resume id between firings (issue #5 — a resumed, compacted
+                # transcript would summarize to "all done" and the next
+                # firing would exit without re-running the prompt). The
+                # durable path avoids this structurally with per-run ids, so
+                # it keeps the row (``run_child_session`` already released
+                # the live runtime).
+                try:
+                    await self.agent.forget_session(session_id)
+                except Exception as e:
+                    elog("scheduler.forget_failed", task=task_name, error=str(e))
 
     async def _record_task_finish(
         self,
@@ -440,6 +581,15 @@ class Scheduler:
             await self.db.update_task_run(run_id, **updates)
             # Keep the per-task history bounded.
             await self.db.prune_task_runs(task["id"])
+            # Opt-in retention for the durable per-firing child sessions under
+            # this task's root. Default 0 = keep all (sessions stay navigable);
+            # operators set a cap if firings accumulate.
+            try:
+                keep = int(os.environ.get("OPENAGENT_SCHEDULER_KEEP_SESSIONS", "0"))
+            except (TypeError, ValueError):
+                keep = 0
+            if keep > 0:
+                await self.db.prune_child_sessions(f"scheduler:{task['id']}", keep=keep)
             self._broadcast("scheduled_task", "updated", task["id"])
         except Exception as e:  # noqa: BLE001
             elog("task.run_finish_failed", level="warning",

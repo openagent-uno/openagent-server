@@ -38,12 +38,14 @@ async def _get_or_create_session(
     gateway,
     client_id: str,
     session_id: str,
+    handle: str | None = None,
 ):
     """Return the cached StreamSession for this (client_id, session_id).
 
     Creates and starts a fresh one on first call. Serialised by
     ``_sessions_registry_lock`` so two concurrent first-calls don't
-    double-start the same session.
+    double-start the same session. ``handle`` (the authenticated user
+    identity) is recorded so per-message human authorship is captured.
     """
     from src.stream.session import StreamSession
 
@@ -57,6 +59,7 @@ async def _get_or_create_session(
                 session_id=session_id,
                 profile="batched",
                 speak_enabled=False,
+                handle=handle,
             )
             # Wire gateway hooks so MCP resource broadcasts and model
             # guards work the same as for WebSocket sessions.
@@ -125,7 +128,10 @@ async def handle_chat(request: web.Request) -> web.Response:
     session_id: str = (body.get("session_id") or "default").strip() or "default"
 
     # ── Get or create StreamSession ──────────────────────────────────────────
-    session, turn_lock = await _get_or_create_session(gateway, client_id, session_id)
+    session, turn_lock = await _get_or_create_session(
+        gateway, client_id, session_id,
+        handle=request.get("user_handle"),
+    )
 
     # ── Run one turn (serialised per session) ────────────────────────────────
     async with turn_lock:

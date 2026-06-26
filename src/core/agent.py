@@ -921,6 +921,7 @@ class Agent:
         attachments: list[dict] | None = None,
         on_status: StatusCallback | None = None,
         model_override: BaseModel | None = None,
+        author: dict | None = None,
     ) -> str:
         """Run the agent with a user message. Returns the final text response.
 
@@ -930,6 +931,10 @@ class Agent:
             on_status: Optional async callback for live status updates.
                 Called with status strings like "Thinking...", "Using shell_exec...", etc.
                 Channels use this to update a live status message.
+            author: Optional per-message author for this turn (a human handle,
+                or an agent-self seed for delegated/scheduled/workflow runs).
+                Stamped onto the user message and persisted in the runs JSON;
+                never sent to the model. See src.core.identity_context.
         """
         if not self.model:
             raise RuntimeError("No model configured. Set agent.model before calling run().")
@@ -955,7 +960,7 @@ class Agent:
                 model_class=type(model_override or self.model).__name__,
                 attachments=len(attachments or []),
             )
-            return await self._run_inner(message, attachments, _status, session_id=session_id, model_override=model_override)
+            return await self._run_inner(message, attachments, _status, session_id=session_id, model_override=model_override, author=author)
         except asyncio.CancelledError:
             # Shutdown or task-level cancellation is NOT a fatal error — it's
             # the runtime telling us to stop cleanly. Log it as such, tell the
@@ -993,6 +998,7 @@ class Agent:
         _status,
         session_id: str | None = None,
         model_override: BaseModel | None = None,
+        author: dict | None = None,
     ) -> str:
         """Run a single agent turn, continuing the session automatically when
         background shells complete during or shortly after it.
@@ -1063,6 +1069,9 @@ class Agent:
         from src.mcp.servers.delegation.handlers import (
             install_context as install_delegation_context,
             reset_context as reset_delegation_context,
+        )
+        from src.core.identity_context import (
+            install_author_context, reset_author_context, owner_handle_of,
         )
         from src.core.config import shell_settings
 
@@ -1146,7 +1155,13 @@ class Agent:
                     pool=self._mcp,
                     db=self._db,
                     dispatcher=delegation_dispatcher,
+                    agent=self,
+                    # Owner handle for any child session spawned this turn. Only
+                    # a human author carries one; agent-self / automation runs
+                    # resolve to None and child_session inherits from the parent row.
+                    owner_handle=owner_handle_of(author),
                 )
+                author_token = install_author_context(author)
                 try:
                     # ``files`` is forwarded native to the runtime's ``arun(files=...)``
                     # by NativeProvider / TeamRouterProvider. Only attach on
@@ -1169,6 +1184,7 @@ class Agent:
                 finally:
                     reset_session_context(token)
                     reset_delegation_context(delegation_tokens)
+                    reset_author_context(author_token)
 
                 last_response = response
 
@@ -1213,6 +1229,7 @@ class Agent:
         attachments: list[dict] | None = None,
         on_status: StatusCallback | None = None,
         model_override: BaseModel | None = None,
+        author: dict | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Streaming sibling of :meth:`run` for voice-mode replies.
 
@@ -1260,6 +1277,7 @@ class Agent:
             async for event in self._run_inner_stream(
                 message, attachments, _status,
                 session_id=session_id, model_override=model_override,
+                author=author,
             ):
                 yield event
         except asyncio.CancelledError:
@@ -1298,6 +1316,7 @@ class Agent:
         _status,
         session_id: str | None = None,
         model_override: BaseModel | None = None,
+        author: dict | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Streaming variant of :meth:`_run_inner`.
 
@@ -1343,6 +1362,9 @@ class Agent:
         from src.mcp.servers.delegation.handlers import (
             install_context as install_delegation_context,
             reset_context as reset_delegation_context,
+        )
+        from src.core.identity_context import (
+            install_author_context, reset_author_context, owner_handle_of,
         )
         from src.core.config import shell_settings
 
@@ -1425,7 +1447,13 @@ class Agent:
                     pool=self._mcp,
                     db=self._db,
                     dispatcher=delegation_dispatcher,
+                    agent=self,
+                    # Owner handle for any child session spawned this turn. Only
+                    # a human author carries one; agent-self / automation runs
+                    # resolve to None and child_session inherits from the parent row.
+                    owner_handle=owner_handle_of(author),
                 )
+                author_token = install_author_context(author)
                 try:
                     # Pass session_id and on_status so SmartRouter.stream
                     # can run the same classifier + binding logic that
@@ -1478,6 +1506,7 @@ class Agent:
                 finally:
                     reset_session_context(token)
                     reset_delegation_context(delegation_tokens)
+                    reset_author_context(author_token)
 
                 events = hub.drain(session_id)
                 if not events:

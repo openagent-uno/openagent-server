@@ -26,6 +26,7 @@ import json
 
 from src.channels.stt_base import BaseSTT, resolve_stt
 from src.channels.tts_base import BaseTTS, resolve_tts
+from src.core.identity_context import human_author
 from src.core.logging import elog
 from src.stream.events import (
     Attachment,
@@ -93,11 +94,18 @@ class StreamSession:
         language: str | None = None,
         coalesce_window_ms: int | None = None,
         speak_enabled: bool = True,
+        handle: str | None = None,
     ):
         self._agent = agent
         self._db = getattr(agent, "db", None)
         self.client_id = client_id
         self.session_id = session_id
+        # The authenticated user handle (stable across the user's devices;
+        # vision §11). Recorded as the per-message human author so the app
+        # shows real identity instead of a generic "You" and multi-human /
+        # bridge sessions attribute each message. ``None`` on handle-less
+        # deployments → author stays unset (today's generic rendering).
+        self.handle = handle
         self.profile = profile
         self.language = language
         # ``0`` disables coalescing (legacy preempt-on-each-message);
@@ -243,6 +251,7 @@ class StreamSession:
                 session_id=self.session_id,
                 attachments=attachments,
                 speak=speak,
+                author=human_author(self.handle, display=self.handle),
             )
         finally:
             self._extra_status_cb = None
@@ -587,6 +596,13 @@ class StreamSession:
         # comment for the salvage rationale.
         self._current_turn_msg = msg
         self._current_turn_started = False
+        # Prefer a per-message author carried on the inbound frame (a
+        # bridge multiplexing several humans onto one session sets it so
+        # each message attributes to the right person); fall back to the
+        # session-owner handle for the common single-user case.
+        turn_author = getattr(msg, "author", None) or human_author(
+            self.handle, display=self.handle,
+        )
         self._current_turn = asyncio.create_task(
             runner.run(
                 text,
@@ -594,6 +610,7 @@ class StreamSession:
                 session_id=self.session_id,
                 attachments=attachments or None,
                 speak=speak,
+                author=turn_author,
             ),
             name=f"stream-turn:{self.session_id}",
         )
@@ -782,6 +799,7 @@ class StreamTurnRunner:
         session_id: str,
         attachments: list[dict] | None = None,
         speak: bool = False,
+        author: dict | None = None,
     ) -> dict[str, Any]:
         sess = self._session
         publish = sess._publish
@@ -843,7 +861,29 @@ class StreamTurnRunner:
                 text=status_text,
             ))
 
+        # A spawned child session (a delegated sub-agent) runs inside this
+        # turn but is its OWN session to the app. Publish its deltas / tool
+        # frames onto THIS turn's outbound queue, tagged with the child's
+        # session_id — the app routes them to the child session exactly like
+        # any session's stream. Goes through the same serialized pump as the
+        # parent's own frames, so there's no concurrent-write race on the
+        # client socket. ``ev_sid`` falls back to the parent for safety.
+        async def child_emit(frame: dict[str, Any]) -> None:
+            # Map via the SAME builder the detached broadcast path uses
+            # (``gateway._broadcast_child_frame``) so the two never drift — this
+            # inline chain had already fallen behind (no ``response``/``seed``).
+            # ``ev_sid`` falls back to the parent for safety.
+            if not frame.get("session_id"):
+                frame = {**frame, "session_id": session_id}
+            evt = child_frame_to_event(frame, seq=sess.next_seq(), ts_ms=now_ms())
+            if evt is not None:
+                await publish(evt)
+
         speaker = asyncio.create_task(speaker_task()) if (speak and self._tts) else None
+        from src.stream.child_stream import (
+            child_frame_to_event, install_child_stream_emitter, reset_child_stream_emitter,
+        )
+        _child_emit_tok = install_child_stream_emitter(child_emit)
 
         try:
             try:
@@ -853,6 +893,7 @@ class StreamTurnRunner:
                     session_id=session_id,
                     attachments=attachments,
                     on_status=on_status,
+                    author=author,
                 ):
                     # Engagement signal — soonest reliable indicator
                     # the prompt reached the provider. Idempotent bool,
@@ -915,6 +956,7 @@ class StreamTurnRunner:
                     await text_q.put(None)
                 logger.warning("stream turn failed: %s", e)
         finally:
+            reset_child_stream_emitter(_child_emit_tok)
             if speaker is not None:
                 try:
                     await asyncio.wait_for(speaker, timeout=SPEAKER_DRAIN_TIMEOUT)

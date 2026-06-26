@@ -134,6 +134,12 @@ class TextFinal(Event):
     text: str = ""
     source: Literal["user_typed", "stt", "system"] = "user_typed"
     attachments: tuple[dict[str, Any], ...] = ()
+    # Optional per-message human author. A bridge multiplexing several
+    # users onto one session (Telegram/Discord) sets it so each message
+    # attributes to the right person; the app/CLI omit it and the session
+    # falls back to its owner handle. Shape mirrors
+    # ``identity_context.human_author``.
+    author: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -233,6 +239,24 @@ class OutVideoFrame(Event):
 
 
 @dataclass(frozen=True)
+class OutSeedMessage(Event):
+    """The agent-self seed that opens a spawned child session — the
+    task / mission / role prompt the agent gave itself (vision §15).
+
+    Streamed FIRST, before any delta, so a detached run's screen (a
+    scheduled firing, a workflow node) shows the Mission block at the top
+    *while it runs* — mirroring how an interactive chat optimistically shows
+    the user's just-typed message. Without it the seed only surfaces once the
+    run's canonical transcript is persisted at completion. ``author`` is the
+    agent-self author dict (``identity_context.agent_author``) so the app
+    renders a Mission/Role/Task block rather than a human "You" bubble.
+    """
+
+    text: str = ""
+    author: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
 class OutToolStatus(Event):
     """Tool progress hint ("Using bash...", "Read done", ...)."""
 
@@ -291,6 +315,7 @@ __all__ = [
     "OutAudioChunk",
     "OutAudioEnd",
     "OutVideoFrame",
+    "OutSeedMessage",
     "OutToolStatus",
     "OutError",
     "TurnComplete",

@@ -755,6 +755,9 @@ class FunctionExecutionResult(BaseModel):
     videos: Optional[List[Video]] = None
     audios: Optional[List[Audio]] = None
     files: Optional[List[File]] = None
+    # Child session id transferred from a ToolResult so the runner can stamp
+    # it on the emitted ToolExecution (delegation-card deep-link).
+    child_session_id: Optional[str] = None
 
 
 class FunctionCall(BaseModel):
@@ -1335,3 +1338,8 @@ class ToolResult(BaseModel):
     videos: Optional[List[Video]] = None
     audios: Optional[List[Audio]] = None
     files: Optional[List[File]] = None
+    # The durable child SESSION this tool spawned (delegation / dream / any
+    # tool that runs a full ``run_child_session``). Lifted onto the resulting
+    # ``ToolExecution.child_session_id`` (see providers/base.py) so the leader
+    # transcript renders a card that deep-links into the sub-agent's session.
+    child_session_id: Optional[str] = None

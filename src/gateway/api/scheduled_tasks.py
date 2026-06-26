@@ -20,6 +20,9 @@ thing is to reject writes rather than silently let rows drift.
 
 from __future__ import annotations
 
+import asyncio
+import time
+
 from src.core.builtin_tasks import BUILTIN_TASK_NAMES
 from src.core.logging import elog
 from src.memory.schedule import decorate_scheduled_task, epoch_to_iso
@@ -67,8 +70,14 @@ async def _reject_if_builtin(scheduler, task_id: str):
     return row, None
 
 
-def _serialize(row: dict) -> dict:
-    return decorate_scheduled_task(row)
+def _serialize(row: dict, *, running: bool = False) -> dict:
+    out = decorate_scheduled_task(row)
+    # Whether a firing of this task is in flight right now (``running`` or
+    # ``cancelling``). Drives the tile's Run-now ↔ Stop control. Defaults
+    # false so callers that don't pass it (e.g. create/update responses,
+    # which can't be mid-firing) keep the same shape.
+    out["running"] = running
+    return out
 
 
 def _serialize_run(row: dict) -> dict:
@@ -91,7 +100,12 @@ async def handle_list(request):
     enabled_only = request.query.get("enabled_only", "").lower() in ("1", "true", "yes")
     rows = await scheduler.db.get_tasks(enabled_only=enabled_only)
     rows = [r for r in rows if not _is_builtin(r)]
-    return web.json_response({"tasks": [_serialize(r) for r in rows]})
+    # One query for the whole list tells each tile whether a firing is in
+    # flight (so it can show a Stop control instead of Run now).
+    running = await scheduler.db.running_task_ids()
+    return web.json_response(
+        {"tasks": [_serialize(r, running=r["id"] in running) for r in rows]}
+    )
 
 
 async def handle_get(request):
@@ -107,7 +121,8 @@ async def handle_get(request):
         # Treat builtins as 404 on GET-by-id so callers can't enumerate
         # their existence — same behaviour as a non-existent id.
         return web.json_response({"error": f"Task {task_id!r} not found"}, status=404)
-    return web.json_response(_serialize(row))
+    running = await scheduler.db.running_task_ids()
+    return web.json_response(_serialize(row, running=row["id"] in running))
 
 
 async def handle_runs_list(request):
@@ -130,6 +145,164 @@ async def handle_runs_list(request):
     status = request.query.get("status") or None
     runs = await scheduler.db.list_task_runs(task_id, limit=limit, status=status)
     return web.json_response({"runs": [_serialize_run(r) for r in runs]})
+
+
+async def handle_run(request):
+    """POST /api/scheduled-tasks/{id}/run — fire a task now, out of band
+    from its cron schedule. Body: ``{wait, timeout_s}``.
+
+    Mirrors ``/api/workflows/{id}/run``: the gateway shares the scheduler's
+    process, so it fast-paths by spawning the firing directly through the
+    scheduler's bookkeeping (avoiding the ~2s request-drain tick the
+    out-of-process MCP path incurs). The firing leaves the task's schedule
+    and enabled flag untouched. When ``wait`` is true (default) it polls for
+    completion and returns the ``task_runs`` row; otherwise it returns
+    ``{run_id, status:'running'}`` once the run row exists.
+    """
+    from aiohttp import web
+
+    scheduler, err = _resolve_scheduler(request)
+    if err is not None:
+        return err
+
+    task_id = request.match_info["id"]
+    existing, reject = await _reject_if_builtin(scheduler, task_id)
+    if reject is not None:
+        return reject
+
+    try:
+        body = await request.json() if request.can_read_body else {}
+    except Exception:
+        body = {}
+    wait = body.get("wait", True)
+    timeout_s = int(body.get("timeout_s", 300))
+
+    # Fast path: spawn through the scheduler's tracked task set so concurrent
+    # API calls each get their own handle. ``run_task`` mints its own run_id
+    # and records the ``task_runs`` row.
+    try:
+        run_task = scheduler._spawn_workflow(
+            scheduler.run_task(existing, trigger="manual")
+        )
+    except AttributeError:
+        return web.json_response(
+            {"error": "Scheduler has no run runtime attached"}, status=503,
+        )
+
+    gw = request.app["gateway"]
+    elog("scheduled_task.run", id=task_id, name=existing.get("name", ""))
+    # Flip the tile into a running state on subscribed clients.
+    await gw.broadcast_resource("scheduled_task", "updated", task_id)
+
+    if not wait:
+        # Short-poll for the row ``run_task`` just opened so we can report
+        # its run_id without blocking on the whole firing.
+        deadline = time.monotonic() + 3
+        latest = None
+        while time.monotonic() < deadline:
+            runs = await scheduler.db.list_task_runs(task_id, limit=1)
+            if runs:
+                latest = runs[0]
+                break
+            await asyncio.sleep(0.05)
+        return web.json_response(
+            {"run_id": latest["id"] if latest else None, "status": "running"},
+            status=202,
+        )
+
+    # wait=True: run_task swallows task errors (records them on the row), so
+    # awaiting it resolves once the firing reaches a terminal state.
+    try:
+        await asyncio.wait_for(run_task, timeout=timeout_s)
+    except asyncio.TimeoutError:
+        return web.json_response(
+            {"error": f"task did not finish within {timeout_s}s"}, status=504,
+        )
+    runs = await scheduler.db.list_task_runs(task_id, limit=1)
+    if not runs:
+        return web.json_response({"error": "run did not produce a row"}, status=500)
+    # Run finished — re-broadcast so the tile flips the spinner off and the
+    # "last run" badge picks up the new status.
+    await gw.broadcast_resource("scheduled_task", "updated", task_id)
+    return web.json_response(_serialize_run(runs[0]))
+
+
+async def _await_task_runs_terminal(db, run_ids: list[str], *, timeout_s: int):
+    """Poll ``task_runs`` until each id leaves ``running`` / ``cancelling``,
+    or the deadline passes. The scheduler's cancellation drain is the writer;
+    a fresh read each pass sees its latest committed status. Returns
+    ``[{id, status}]`` for every requested id."""
+    deadline = time.monotonic() + max(1, timeout_s)
+    while True:
+        statuses: dict[str, str] = {}
+        for rid in run_ids:
+            row = await db.get_task_run(rid)
+            statuses[rid] = row["status"] if row else "unknown"
+        pending = [rid for rid in run_ids if statuses.get(rid) in ("running", "cancelling")]
+        if not pending or time.monotonic() >= deadline:
+            return [{"id": rid, "status": statuses.get(rid, "unknown")} for rid in run_ids]
+        await asyncio.sleep(0.4)
+
+
+async def handle_stop(request):
+    """POST /api/scheduled-tasks/{id}/stop — hard-stop the currently-running
+    firing(s) of a task. Body: ``{wait, timeout_s}``.
+
+    Flags each in-flight firing ``cancelling`` (the same DB-backed hand-off
+    the agent's ``stop_scheduled_task`` MCP tool uses); the scheduler cancels
+    them within ~2s — aborting the agent turn and any in-flight model call —
+    and records each run ``cancelled``. This stops the *current run* only; it
+    does not change the schedule. With ``wait`` true (default) it polls until
+    the firing(s) actually stop so the response reflects the real outcome.
+    """
+    from aiohttp import web
+
+    scheduler, err = _resolve_scheduler(request)
+    if err is not None:
+        return err
+
+    task_id = request.match_info["id"]
+    existing, reject = await _reject_if_builtin(scheduler, task_id)
+    if reject is not None:
+        return reject
+
+    try:
+        body = await request.json() if request.can_read_body else {}
+    except Exception:
+        body = {}
+    wait = body.get("wait", True)
+    timeout_s = int(body.get("timeout_s", 30))
+
+    flagged = await scheduler.db.flag_task_runs_cancelling(task_id)
+    gw = request.app["gateway"]
+    # Reflect the cancelling state on subscribed clients right away.
+    await gw.broadcast_resource("scheduled_task", "updated", task_id)
+
+    if not flagged:
+        return web.json_response({
+            "task_id": task_id,
+            "name": existing.get("name", ""),
+            "stopped": [],
+            "count": 0,
+            "runs": [],
+            "note": "No running firing to stop.",
+        })
+
+    elog("scheduled_task.stop", id=task_id, count=len(flagged))
+    if wait:
+        runs = await _await_task_runs_terminal(scheduler.db, flagged, timeout_s=timeout_s)
+        # Re-broadcast so the tile drops its running/cancelling state.
+        await gw.broadcast_resource("scheduled_task", "updated", task_id)
+    else:
+        runs = [{"id": rid, "status": "cancelling"} for rid in flagged]
+
+    return web.json_response({
+        "task_id": task_id,
+        "name": existing.get("name", ""),
+        "stopped": flagged,
+        "count": len(flagged),
+        "runs": runs,
+    })
 
 
 async def handle_create(request):

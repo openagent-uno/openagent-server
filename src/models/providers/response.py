@@ -37,6 +37,11 @@ class ToolExecution:
 
     # In the case where a tool call creates a run of an agent/team/workflow
     child_run_id: Optional[str] = None
+    # The durable child SESSION a delegation tool spawned (a team member now
+    # runs in its own session row, not nested in the team session). Lets the
+    # leader transcript render a card that deep-links into the sub-agent's
+    # full session. Serialized via ToolExecution.to_dict (see below).
+    child_session_id: Optional[str] = None
 
     # If True, the agent will stop executing after this tool call.
     stop_after_tool_call: bool = False
@@ -89,6 +94,7 @@ class ToolExecution:
             tool_call_error=data.get("tool_call_error"),
             result=data.get("result"),
             child_run_id=data.get("child_run_id"),
+            child_session_id=data.get("child_session_id"),
             stop_after_tool_call=data.get("stop_after_tool_call", False),
             requires_confirmation=data.get("requires_confirmation"),
             confirmed=data.get("confirmed"),

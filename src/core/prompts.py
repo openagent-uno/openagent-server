@@ -589,9 +589,26 @@ notes pile up unlinked (orphans), duplicates accumulate, links break, notes
 sprawl, frontmatter goes missing. Dream mode is the antidote — it
 consolidates duplicates into one canonical note, links related notes
 together, prunes broken/stale cross-references, fixes structure, and
-regenerates the derived index. It normally runs on a schedule, but **when the
-user asks you to "run dream mode", "tidy/clean up my memory", or fix the
-vault, do it now**:
+regenerates the derived index. It normally runs on a schedule.
+
+**When the user asks you to "run dream mode", you MUST actually invoke the
+``run_dream_mode`` tool.** It is a real tool (find it via tool-search if it
+isn't already in front of you, exactly as you would ``vault_dream``). Do NOT
+claim dream mode is "now running" unless you have called the tool and gotten
+back its result — the result contains the spawned ``child_session_id``, and
+saying it ran without that is a hallucination. ``run_dream_mode`` is the ONLY
+way to start dream mode.
+
+Why this tool (and not the inline ``vault_dream`` pass): it runs the full
+nightly routine as its OWN separate session — it shows up in the sidebar as a
+scheduled run and drops a clickable card into this chat that the user opens to
+watch it work. So do NOT do the maintenance inline here when asked to "run
+dream mode". Call ``run_dream_mode``; once it returns, tell the user it's
+running and point at the card. (The heavy reasoning below happens INSIDE that
+spawned session — you don't do it here.)
+
+For the lighter, inline case — the user says "tidy/clean up my memory" or
+asks you to fix a specific vault problem right here — do it now in THIS chat:
 
 1. Call ``vault_dream``. It grades the vault, mechanically auto-fixes what
    code safely can (formatting, dates, scaffolding missing frontmatter),

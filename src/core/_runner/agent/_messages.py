@@ -24,6 +24,7 @@ from src.stream.media import Audio, File, Image, Video
 from src.models.providers.message import Message, MessageReferences
 from src.models.providers.response import ModelResponse
 from src.core._run_state import RunContext
+from src.core.identity_context import current_author
 from src.core._run_state.agent import RunOutput
 from src.core._run_state.messages import RunMessages
 from src.memory.sessions import AgentSession
@@ -1349,6 +1350,14 @@ def get_run_messages(
 
     # Add user message to run_messages
     if user_message is not None:
+        # Stamp authorship from the current turn's bound author (the human
+        # handle, or an agent-self seed for delegated/scheduled/workflow
+        # runs) when the caller hasn't already set one. Server-only field;
+        # never sent to the provider. See src.core.identity_context.
+        if user_message.author is None:
+            _author = current_author()
+            if _author is not None:
+                user_message.author = _author
         run_messages.user_message = user_message
         run_messages.messages.append(user_message)
 
@@ -1554,6 +1563,12 @@ async def aget_run_messages(
 
     # Add user message to run_messages
     if user_message is not None:
+        # Stamp authorship from the current turn's bound author (see the
+        # sync get_run_messages above). Server-only; never sent to the model.
+        if user_message.author is None:
+            _author = current_author()
+            if _author is not None:
+                user_message.author = _author
         run_messages.user_message = user_message
         run_messages.messages.append(user_message)
 

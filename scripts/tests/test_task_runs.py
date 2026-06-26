@@ -175,20 +175,28 @@ async def t_cascade(ctx: TestContext) -> None:
 
 
 class _SpyAgent:
+    name = "spy"
+    model = None
+
     def __init__(self, *, raise_on_run: bool = False) -> None:
         self.raise_on_run = raise_on_run
         self.forget_calls: list[str] = []
+        self.release_calls: list[str] = []
 
     async def refresh_registries(self) -> None:
         return None
 
-    async def run(self, *, message: str, user_id: str, session_id: str) -> str:
+    async def run(self, *, message: str, user_id: str, session_id: str,
+                  model_override=None, author=None, on_status=None) -> str:
         if self.raise_on_run:
             raise RuntimeError("boom")
         return "the result"
 
     async def forget_session(self, session_id: str) -> None:
         self.forget_calls.append(session_id)
+
+    async def release_session(self, session_id: str, *, model_override=None) -> None:
+        self.release_calls.append(session_id)
 
 
 @test("task_runs", "run_task records a success run with the output preview")
@@ -241,8 +249,12 @@ async def t_scheduler_records_failure(ctx: TestContext) -> None:
         assert len(runs) == 1, runs
         assert runs[0]["status"] == "failed", runs[0]
         assert "boom" in (runs[0]["error"] or "")
-        # The session is still forgotten on the failure path.
-        assert agent.forget_calls == [f"scheduler:{task_id}"], agent.forget_calls
+        # Durable: the failing firing's per-run child session is RELEASED (row
+        # kept for inspection), not forgotten. The run row links to it.
+        assert agent.forget_calls == [], agent.forget_calls
+        assert len(agent.release_calls) == 1, agent.release_calls
+        assert agent.release_calls[0].startswith(f"scheduler:{task_id}:"), agent.release_calls
+        assert runs[0]["session_id"] == agent.release_calls[0], runs[0]
         await db.close()
     finally:
         try:
@@ -260,3 +272,202 @@ async def t_scheduler_no_db(ctx: TestContext) -> None:
     scheduler = Scheduler(db=None, agent=_SpyAgent())  # type: ignore[arg-type]
     await scheduler.run_task({"id": "x", "name": "X", "prompt": "p"})
     # No assertion beyond "did not raise" — the recording path is guarded.
+
+
+# ── Run-now (on-demand firing) ────────────────────────────────────────────
+
+
+@test("task_runs", "task run requests: claim is atomic + one-shot, links a run_id")
+async def t_run_request_db(ctx: TestContext) -> None:
+    from src.memory.db import MemoryDB
+
+    tmp_db = ctx.db_path.with_name(f"taskreq-db-{uuid.uuid4().hex[:8]}.db")
+    try:
+        db = MemoryDB(str(tmp_db))
+        await db.connect()
+        task_id = await db.add_task("T", "* * * * *", "p")
+
+        req = await db.enqueue_task_run_request(task_id=task_id, trigger="ai")
+        # First claim wins the row; a second claim sees nothing left.
+        claimed = await db.claim_pending_task_requests()
+        assert len(claimed) == 1 and claimed[0]["id"] == req, claimed
+        assert claimed[0]["trigger"] == "ai", claimed[0]
+        assert await db.claim_pending_task_requests() == [], "double-claim"
+
+        # The scheduler links the spawned run back so a waiter can find it.
+        await db.set_task_request_run_id(req, "run-123")
+        row = await db.get_task_run_request(req)
+        assert row is not None and row["run_id"] == "run-123", row
+
+        await db.close()
+    finally:
+        try:
+            tmp_db.unlink()
+        except FileNotFoundError:
+            pass
+
+
+@test("task_runs", "run request claim cascades away with its task")
+async def t_run_request_cascade(ctx: TestContext) -> None:
+    from src.memory.db import MemoryDB
+
+    tmp_db = ctx.db_path.with_name(f"taskreq-cascade-{uuid.uuid4().hex[:8]}.db")
+    try:
+        db = MemoryDB(str(tmp_db))
+        await db.connect()
+        task_id = await db.add_task("T", "* * * * *", "p")
+        req = await db.enqueue_task_run_request(task_id=task_id)
+
+        await db.delete_task(task_id)
+        # FK ON DELETE CASCADE drops the orphaned request too.
+        assert await db.get_task_run_request(req) is None
+        await db.close()
+    finally:
+        try:
+            tmp_db.unlink()
+        except FileNotFoundError:
+            pass
+
+
+@test("task_runs", "flag_task_runs_cancelling flags running firings, no-ops when idle")
+async def t_flag_cancelling(ctx: TestContext) -> None:
+    from src.memory.db import MemoryDB
+
+    tmp_db = ctx.db_path.with_name(f"taskstop-flag-{uuid.uuid4().hex[:8]}.db")
+    try:
+        db = MemoryDB(str(tmp_db))
+        await db.connect()
+        task_id = await db.add_task("T", "* * * * *", "p")
+
+        # Nothing running → empty, no error.
+        assert await db.flag_task_runs_cancelling(task_id) == []
+
+        running = await db.add_task_run(task_id=task_id)  # left 'running'
+        settled = await db.add_task_run(task_id=task_id)
+        await db.update_task_run(settled, status="success", finished_at=1.0)
+
+        flagged = await db.flag_task_runs_cancelling(task_id)
+        assert flagged == [running], flagged
+        assert (await db.get_task_run(running))["status"] == "cancelling"
+        # A settled run is untouched.
+        assert (await db.get_task_run(settled))["status"] == "success"
+
+        # Idempotent: re-flagging finds nothing still 'running'.
+        assert await db.flag_task_runs_cancelling(task_id) == []
+        await db.close()
+    finally:
+        try:
+            tmp_db.unlink()
+        except FileNotFoundError:
+            pass
+
+
+@test("task_runs", "running_task_ids reports tasks with an in-flight firing")
+async def t_running_ids(ctx: TestContext) -> None:
+    from src.memory.db import MemoryDB
+
+    tmp_db = ctx.db_path.with_name(f"taskstop-running-{uuid.uuid4().hex[:8]}.db")
+    try:
+        db = MemoryDB(str(tmp_db))
+        await db.connect()
+        a = await db.add_task("A", "* * * * *", "p")
+        b = await db.add_task("B", "* * * * *", "p")
+        c = await db.add_task("C", "* * * * *", "p")
+
+        run_a = await db.add_task_run(task_id=a)  # running
+        run_b = await db.add_task_run(task_id=b)
+        await db.update_task_run(run_b, status="cancelling")  # mid-stop, still in flight
+        run_c = await db.add_task_run(task_id=c)
+        await db.update_task_run(run_c, status="success", finished_at=1.0)  # done
+
+        ids = await db.running_task_ids()
+        assert ids == {a, b}, ids  # C finished → excluded
+        await db.close()
+    finally:
+        try:
+            tmp_db.unlink()
+        except FileNotFoundError:
+            pass
+
+
+@test("task_runs", "stop drain finalizes an orphan cancelling firing as cancelled")
+async def t_stop_orphan_drain(ctx: TestContext) -> None:
+    from src.core.scheduler import Scheduler
+    from src.memory.db import MemoryDB
+
+    tmp_db = ctx.db_path.with_name(f"taskstop-orphan-{uuid.uuid4().hex[:8]}.db")
+    try:
+        db = MemoryDB(str(tmp_db))
+        await db.connect()
+        task_id = await db.add_task("T", "* * * * *", "p")
+        run_id = await db.add_task_run(task_id=task_id)
+
+        # A stop request flags the row 'cancelling'. With no live asyncio task
+        # owning it (the firing already returned, or a prior-process crash),
+        # the scheduler's drain finalizes it directly to 'cancelled' so the UI
+        # never sits on a phantom cancelling badge.
+        flagged = await db.flag_task_runs_cancelling(task_id)
+        assert flagged == [run_id], flagged
+
+        scheduler = Scheduler(db=db, agent=_SpyAgent())  # type: ignore[arg-type]
+        await scheduler._drain_cancellations()
+
+        row = await db.get_task_run(run_id)
+        assert row["status"] == "cancelled", row
+        assert row["finished_at"] is not None
+        await db.close()
+    finally:
+        try:
+            tmp_db.unlink()
+        except FileNotFoundError:
+            pass
+
+
+@test("task_runs", "drain fires a disabled task, links the run, leaves the schedule alone")
+async def t_drain_run_request(ctx: TestContext) -> None:
+    import asyncio
+
+    from src.core.scheduler import Scheduler
+    from src.memory.db import MemoryDB
+
+    tmp_db = ctx.db_path.with_name(f"taskreq-drain-{uuid.uuid4().hex[:8]}.db")
+    try:
+        db = MemoryDB(str(tmp_db))
+        await db.connect()
+        # A DISABLED task: run-now must still fire it without re-enabling.
+        task_id = await db.add_task("Nightly", "0 3 * * *", "do the work")
+        await db.update_task(task_id, enabled=0)
+        before = await db.get_task(task_id)
+
+        req = await db.enqueue_task_run_request(task_id=task_id, trigger="manual")
+
+        scheduler = Scheduler(db=db, agent=_SpyAgent())  # type: ignore[arg-type]
+        await scheduler._drain_task_run_requests()
+        # The firing is dispatched as a background task; let it finish.
+        await asyncio.gather(*scheduler._workflow_tasks, return_exceptions=True)
+
+        # The request now points at a recorded, successful firing.
+        linked = await db.get_task_run_request(req)
+        assert linked is not None and linked["run_id"], linked
+        run = await db.get_task_run(linked["run_id"])
+        assert run is not None and run["status"] == "success", run
+        assert run["trigger"] == "manual", run
+        assert run["output"] == "the result", run
+
+        # The cron schedule + enabled flag are untouched by a run-now.
+        after = await db.get_task(task_id)
+        assert after["enabled"] == 0, "run-now must not enable the task"
+        assert after["next_run"] == before["next_run"], after
+        assert after["last_run"] == before["last_run"], after
+
+        # Claim is one-shot: a second drain finds nothing to fire.
+        scheduler._workflow_tasks.clear()
+        await scheduler._drain_task_run_requests()
+        assert not scheduler._workflow_tasks, "request fired twice"
+
+        await db.close()
+    finally:
+        try:
+            tmp_db.unlink()
+        except FileNotFoundError:
+            pass

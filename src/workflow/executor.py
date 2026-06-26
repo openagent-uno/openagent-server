@@ -284,6 +284,10 @@ class WorkflowExecutor:
                 # active model leaves dispatcher unset (the handler then
                 # errors cleanly instead of calling a missing method).
                 dispatcher=agent_model if hasattr(agent_model, "run_delegated") else None,
+                # ``delegate_task`` now spawns a full child session via the
+                # Agent, so a workflow ``mcp-tool`` block that delegates needs
+                # the live Agent bound, not just the dispatcher.
+                agent=self.agent,
             )
             try:
                 # Run-start re-validation with the live pool. The
@@ -592,6 +596,11 @@ class WorkflowExecutor:
         entry["status"] = "success"
         entry["finished_at"] = time.time()
         entry["output"] = output
+        # Surface the child session an ai-prompt node spawned as a first-class
+        # trace field so the run screen can render a card that deep-links into
+        # the node's full conversation.
+        if isinstance(output, dict) and output.get("child_session_id"):
+            entry["child_session_id"] = output["child_session_id"]
         ctx.nodes[node_id] = {"output": output, "status": "success"}
         await self._persist_trace(ctx)
         return taken
@@ -652,23 +661,24 @@ class WorkflowExecutor:
                 ctx.workflow_id, e,
             )
 
-        # Wipe any shared-policy ai-prompt session carried across this run.
-        # ephemeral nodes already forgot their own sessions at node-end;
-        # shared nodes only released (subprocess dropped, resume id kept)
-        # so consecutive nodes could chain thought. Now that the run is
-        # over, drop the resume id too so sdk_sessions doesn't grow
-        # unboundedly and a future run can't inherit transcript. No-op
-        # when the workflow had no shared nodes (the session never existed).
+        # Free (but KEEP) any shared-policy ai-prompt session carried across
+        # this run. ai-prompt nodes now run as durable child sessions via
+        # run_child_session, which already released each one — this is a
+        # belt-and-suspenders release of the shared sid so the runtime cache
+        # can't leak. We deliberately do NOT forget: the per-run id is unique
+        # (no future run can inherit it — the issue-#5 root cause is gone), so
+        # the session stays navigable and continuable. No-op for ephemeral-
+        # only runs (the shared sid was never used).
         shared_sid = f"workflow:{ctx.workflow_id}:{ctx.run_id}"
-        forget = getattr(self.agent, "forget_session", None)
-        if callable(forget):
-            maybe = forget(shared_sid)
+        release = getattr(self.agent, "release_session", None)
+        if callable(release):
+            maybe = release(shared_sid)
             if inspect.isawaitable(maybe):
                 try:
                     await maybe
                 except Exception:  # noqa: BLE001
                     logger.debug(
-                        "workflow shared forget_session failed for %s",
+                        "workflow shared release_session failed for %s",
                         shared_sid,
                     )
 
@@ -832,51 +842,64 @@ async def _h_ai_prompt(
     prompt = cfg.get("prompt")
     if not prompt:
         raise ValueError("ai-prompt: 'prompt' is required")
+
+    # Optional per-node ``system`` override (previously declared in the block
+    # spec but never wired). Layered ON TOP of the framework+persona prompt
+    # that every child session already carries — prepended to the seed as a
+    # marked preamble so a node can steer behavior without replacing the
+    # agent's identity.
+    system_override = cfg.get("system")
+    seed = str(prompt)
+    if system_override:
+        seed = f"[Workflow node instructions]\n{str(system_override).strip()}\n\n{seed}"
+
     policy = cfg.get("session_policy", "ephemeral")
-    session_id = (
-        f"workflow:{ctx.workflow_id}:{ctx.run_id}"
-        if policy == "shared"
-        else f"workflow:{ctx.workflow_id}:{ctx.run_id}:{node['id']}"
-    )
+    is_shared = policy == "shared"
+    node_id = node["id"]
+    label = node.get("label") or cfg.get("label") or "AI prompt"
     override_id = cfg.get("model_override")
-    override = None
-    if override_id:
-        smart = getattr(exe.agent, "model", None)
-        if smart is not None and hasattr(smart, "build_override_model"):
-            override = smart.build_override_model(override_id)
-        else:
-            logger.warning(
-                "ai-prompt: model_override=%r requested but active model "
-                "%r does not support overrides; using default",
-                override_id, type(smart).__name__,
-            )
-    try:
-        text = await exe.agent.run(
-            message=str(prompt),
-            user_id="workflow",
-            session_id=session_id,
-            model_override=override,
-        )
-    finally:
-        # ephemeral: each node owns a unique session_id never reused in
-        # this run — so forget now to wipe provider-native resume state
-        # (the runtime's history rows). Otherwise a re-run of the same
-        # workflow could inherit transcript through persisted resume ids
-        # (same bug class as scheduler issue #5).
-        # shared: every ai-prompt node in the run shares one session_id
-        # so successive nodes chain thought via the runtime's history;
-        # we only release it here. _finalize_run calls forget_session on
-        # the shared sid once the run is done.
-        method_name = "forget_session" if policy != "shared" else "release_session"
-        fn = getattr(exe.agent, method_name, None)
-        if callable(fn):
-            maybe = fn(session_id)
-            if inspect.isawaitable(maybe):
-                try:
-                    await maybe
-                except Exception:  # noqa: BLE001
-                    logger.debug("%s failed for %s", method_name, session_id)
-    return {"text": text}
+
+    # Run the node as a full child session: the same two-layer prompt + tools
+    # as a chat turn, its own durable row linked to the workflow run, so the
+    # user can open the node's full conversation from the run screen and send
+    # follow-up messages. ``ephemeral`` (default) gives each node its own
+    # per-run session (``workflow:{wf}:{run}:{node}`` — already unique per
+    # run, so keeping the durable row can't leak transcript into a re-run);
+    # ``shared`` runs every node on one ``workflow:{wf}:{run}`` session so
+    # successive nodes chain thought through the persisted history.
+    from src.core.child_session import run_child_session
+    from src.core.identity_context import agent_author
+
+    db = getattr(exe.agent, "_db", None) or exe.db
+    owner = None
+    if db is not None:
+        try:
+            owner = await db.primary_owner_handle()
+        except Exception:  # noqa: BLE001
+            owner = None
+
+    origin_ref: dict[str, Any] = {"workflow_id": ctx.workflow_id, "run_id": ctx.run_id}
+    if not is_shared:
+        origin_ref["node_id"] = node_id
+
+    result = await run_child_session(
+        agent=exe.agent,
+        db=db,
+        parent_session_id=None if is_shared else f"workflow:{ctx.workflow_id}:{ctx.run_id}",
+        origin="workflow",
+        origin_ref=origin_ref,
+        title=label,
+        prompt=seed,
+        owner_client_id=owner,
+        model_id=override_id,
+        author=agent_author(label, agent_name=getattr(exe.agent, "name", None)),
+        # Stream the node live so its inline transcript on the run screen fills
+        # in token-by-token like any interactive session.
+        stream=True,
+    )
+    # ``child_session_id`` is lifted onto the trace entry by ``_run_node`` so
+    # the run screen can deep-link a node to its full session.
+    return {"text": result.text, "child_session_id": result.session_id}
 
 
 async def _h_if(

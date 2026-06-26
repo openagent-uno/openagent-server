@@ -103,15 +103,18 @@ def _patch_install_capture(monkeypatch_target: str, captured: list[Any]):
     original_install = handlers.install_context
     original_reset = handlers.reset_context
 
-    def fake_install(*, session_id, pool, db, dispatcher):
+    def fake_install(*, session_id, pool, db, dispatcher, agent=None, owner_handle=None):
         captured.append({
             "session_id": session_id,
             "pool": pool,
             "db": db,
             "dispatcher": dispatcher,
+            "agent": agent,
+            "owner_handle": owner_handle,
         })
         return original_install(
             session_id=session_id, pool=pool, db=db, dispatcher=dispatcher,
+            agent=agent, owner_handle=owner_handle,
         )
 
     handlers.install_context = fake_install

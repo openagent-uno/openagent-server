@@ -34,8 +34,12 @@ class _FakeAgent:
     """Minimal agent: ``run`` blocks forever (so the drain has something
     live to cancel), the rest are no-ops the scheduler calls around it."""
 
+    name = "fake"
+    model = None
+
     def __init__(self) -> None:
         self.forgotten: list[str] = []
+        self.released: list[str] = []
 
     async def refresh_registries(self) -> None:
         return None
@@ -46,6 +50,9 @@ class _FakeAgent:
 
     async def forget_session(self, session_id: str) -> None:
         self.forgotten.append(session_id)
+
+    async def release_session(self, session_id: str, *, model_override=None) -> None:
+        self.released.append(session_id)
 
 
 class _SleepingExecutor:
@@ -262,8 +269,11 @@ async def t_scheduled_task_hard_stop(ctx: TestContext) -> None:
         row = await db.get_task_run(run_id)
         assert row["status"] == "cancelled", f"expected cancelled, got {row['status']!r}"
         assert row.get("finished_at"), "cancelled firing missing finished_at"
-        # The session is still forgotten on the way out (fresh-session invariant).
-        assert agent.forgotten, "cancelled firing should still forget its session"
+        # Durable: a cancelled firing's per-run child session is RELEASED on
+        # the way out (live runtime freed, row kept for inspection), not
+        # wiped — the per-run id is unique so there's nothing to inherit.
+        assert agent.released, "cancelled firing should release its child session"
+        assert not agent.forgotten, "durable cancelled firing must not forget its session"
         assert run_id not in sched._scheduled_run_tasks
     finally:
         if fire is not None and not fire.done():

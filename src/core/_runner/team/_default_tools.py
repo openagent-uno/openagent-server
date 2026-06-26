@@ -10,7 +10,210 @@ if TYPE_CHECKING:
 import asyncio
 import contextlib
 import json
+import os
+import uuid
 from copy import copy
+
+
+def _team_member_sessions_enabled() -> bool:
+    """Mirror of ``models.dispatcher._team_member_sessions_enabled`` (kept
+    local to avoid a dispatcher↔team import cycle). When ON, a delegated
+    team member runs in its OWN durable child session row rather than nested
+    in the team session, so it surfaces as a navigable card."""
+    return os.environ.get("OPENAGENT_TEAM_MEMBER_SESSIONS", "1").strip() not in ("0", "false", "no")
+
+
+def _member_run_session_id(team_session_id, member_agent) -> str:
+    """The session id a member delegation runs on: a unique per-delegation
+    child id (``{team}::member::{member}::{rand}``) when team-member sessions
+    are enabled, else the shared team session id (legacy nested behavior).
+    Unique per call so concurrent / repeated delegations never collide."""
+    if not team_session_id or not _team_member_sessions_enabled():
+        return team_session_id
+    mid = getattr(member_agent, "id", None) or getattr(member_agent, "name", None) or "member"
+    return f"{team_session_id}::member::{mid}::{uuid.uuid4().hex[:8]}"
+
+
+def _child_session_meta(team_session, member_agent, *, child_run_id=None) -> dict:
+    """Build a delegated member's child-session link metadata (parent /
+    origin / inherited owner, + optionally the member ``child_run_id`` bridge).
+    Shared by the at-START announce and the at-COMPLETION persist so the stub
+    and the final row never drift."""
+    meta = dict(getattr(member_agent, "metadata", None) or {})
+    meta.setdefault("parent_session_id", getattr(team_session, "session_id", None))
+    meta.setdefault("origin", "delegation")
+    if child_run_id:
+        meta["child_run_id"] = child_run_id
+    parent_meta = getattr(team_session, "metadata", None) or {}
+    if parent_meta.get("client_id") and not meta.get("client_id"):
+        meta["client_id"] = parent_meta.get("client_id")
+    return meta
+
+
+async def _upsert_member_child_row(member_agent, sid, meta, runs) -> None:
+    """Write the child ``sessions`` row via the lower-level ``aupsert_session``
+    (no ``team_id`` gate — the runner's ``asave_session`` would otherwise refuse
+    a member's own session). ``user_id`` stays the runtime sentinel; owner
+    visibility rides on ``metadata.client_id``."""
+    import time as _time
+
+    from src.core._runner.agent import _storage
+    from src.memory.sessions.agent import AgentSession
+
+    now = int(_time.time())
+    child = AgentSession(
+        session_id=sid,
+        agent_id=getattr(member_agent, "id", None) or getattr(member_agent, "name", None),
+        user_id=(getattr(runs[-1], "user_id", None) if runs else None) or "openagent",
+        metadata=meta,
+        runs=list(runs),
+        created_at=now,
+        updated_at=now,
+    )
+    await _storage.aupsert_session(member_agent, session=child)
+
+
+async def _announce_member_child_session(team_session, member_agent, member_session_id) -> None:
+    """Pre-create the child session row + announce it the MOMENT a delegation
+    starts — not when it finishes — so the sub-agent appears in the sidebar
+    immediately and its live token stream (emitted below) has a durable row to
+    land on while it works. Best-effort; never blocks delegation."""
+    try:
+        db = getattr(member_agent, "db", None)
+        if db is None or not member_session_id:
+            return
+        if member_session_id == getattr(team_session, "session_id", None):
+            return
+        if not _team_member_sessions_enabled():
+            return
+        meta = _child_session_meta(team_session, member_agent)
+        await _upsert_member_child_row(member_agent, member_session_id, meta, runs=[])
+        # Announce so connected clients add the sub-agent to the sidebar live.
+        try:
+            from src.core.child_session import _notify_created
+            _notify_created(member_session_id, {
+                "owner": meta.get("client_id"),
+                "origin": "delegation",
+                "parent_session_id": meta.get("parent_session_id"),
+                "title": meta.get("title"),
+            })
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception:  # noqa: BLE001 — announce is best-effort
+        pass
+
+
+async def _persist_member_child_session(team_session, member_agent, member_run) -> None:
+    """Persist a delegated member's run as its OWN durable child session row
+    once the run completes (overwriting the stub written at announce time with
+    the full transcript). Records the member ``run_id`` so the parent delegate
+    tool — which reliably carries the same value as ``child_run_id`` — links to
+    this child session deterministically at rehydration (the runtime's team
+    run_response object the leader mutates is NOT the one persisted, so the
+    tool's own ``child_session_id`` can't be trusted). Best-effort.
+    """
+    try:
+        db = getattr(member_agent, "db", None)
+        sid = getattr(member_run, "session_id", None)
+        if db is None or not sid or sid == getattr(team_session, "session_id", None):
+            return
+        if not _team_member_sessions_enabled():
+            return
+        meta = _child_session_meta(
+            team_session, member_agent, child_run_id=getattr(member_run, "run_id", None),
+        )
+        await _upsert_member_child_row(member_agent, sid, meta, runs=[member_run])
+    except Exception:  # noqa: BLE001 — persistence is best-effort
+        pass
+
+
+# Member run event classes (agent + nested-team variants), resolved once and
+# memoized — the team runner imports them lazily to avoid an import cycle.
+_member_event_types_cache: Optional[dict] = None
+
+
+def _member_event_types() -> dict:
+    global _member_event_types_cache
+    if _member_event_types_cache is None:
+        from src.core._run_state.agent import (
+            RunContentEvent as _AC, ToolCallCompletedEvent as _ACd,
+            ToolCallErrorEvent as _AE, ToolCallStartedEvent as _AS,
+        )
+        from src.core._run_state.team import (
+            RunContentEvent as _TC, ToolCallCompletedEvent as _TCd,
+            ToolCallErrorEvent as _TE, ToolCallStartedEvent as _TS,
+        )
+        _member_event_types_cache = {
+            "content": (_AC, _TC),
+            "tool_start": (_AS, _TS),
+            "tool_done": (_ACd, _TCd),
+            "tool_err": (_AE, _TE),
+        }
+    return _member_event_types_cache
+
+
+async def _emit_member_card_link(run_response, team_session, member_id, member_session_id) -> None:
+    """Stamp the child session id onto the leader's IN-PROGRESS delegate tool
+    and re-stream its status so the parent's delegation card becomes clickable
+    WHILE the sub-agent runs — otherwise the completed frame is the first
+    carrier of ``child_session_id`` and the card stays inert until the
+    sub-agent finishes. Best-effort."""
+    try:
+        parent_sid = getattr(team_session, "session_id", None)
+        if not member_session_id or member_session_id == parent_sid:
+            return
+        target = None
+        for t in (getattr(run_response, "tools", None) or []):
+            if (getattr(t, "tool_name", None) or "").lower() != "delegate_task_to_member":
+                continue
+            if getattr(t, "child_session_id", None):
+                continue  # already linked (a sibling delegation)
+            args = getattr(t, "tool_args", None) or {}
+            if member_id and args.get("member_id") and args.get("member_id") != member_id:
+                continue
+            target = t
+            break
+        if target is None:
+            return
+        target.child_session_id = member_session_id  # type: ignore[attr-defined]
+        from src.models._tool_status import tool_exec_to_wire_json
+        from src.stream.child_stream import emit_child_frame
+        encoded = tool_exec_to_wire_json(target, phase="started")
+        if encoded is not None:
+            await emit_child_frame(parent_sid, "status", text=encoded)
+    except Exception:  # noqa: BLE001 — card linkage is best-effort
+        pass
+
+
+async def _emit_member_event(member_session_id, event) -> None:
+    """Mirror ONE member run event onto the child session's OWN live stream
+    (tagged with the child ``session_id``) over the active turn's channel — so
+    navigating into a running sub-agent shows its work in real time, exactly
+    like any session. No-op when no streaming client drives the turn. The
+    PARENT stream suppresses these same events (dispatcher); this is where they
+    surface, on the child's channel."""
+    try:
+        if not member_session_id:
+            return
+        from src.stream.child_stream import current_child_stream_emitter, emit_child_frame
+        if current_child_stream_emitter() is None:
+            return
+        types = _member_event_types()
+        if isinstance(event, types["content"]):
+            content = getattr(event, "content", None)
+            if isinstance(content, str) and content:
+                await emit_child_frame(member_session_id, "delta", text=content)
+            return
+        if isinstance(event, types["tool_start"] + types["tool_done"] + types["tool_err"]):
+            from src.models._tool_status import tool_exec_to_wire_json
+            tool = getattr(event, "tool", None)
+            err = getattr(event, "error", None) if isinstance(event, types["tool_err"]) else None
+            phase = "started" if isinstance(event, types["tool_start"]) else None
+            encoded = tool_exec_to_wire_json(tool, phase=phase, error_text=err)
+            if encoded is not None:
+                await emit_child_frame(member_session_id, "status", text=encoded)
+    except Exception:  # noqa: BLE001 — child mirroring is best-effort
+        pass
 from typing import (
     Any,
     AsyncIterator,
@@ -494,6 +697,13 @@ def _get_delegate_task_function(
             for tool in run_response.tools:
                 if tool.tool_name and tool.tool_name.lower() == "delegate_task_to_member":
                     tool.child_run_id = member_agent_run_response.run_id  # type: ignore
+                    # When the member ran in its OWN session (id differs from
+                    # the team session), record it so the leader transcript can
+                    # render a card that deep-links into the sub-agent's full
+                    # session. No-op in legacy nested mode (same session id).
+                    member_sid = getattr(member_agent_run_response, "session_id", None)
+                    if member_sid and member_sid != session.session_id:
+                        tool.child_session_id = member_sid  # type: ignore
 
         # Update the team run context
         member_name = member_agent.name if member_agent.name else member_agent.id if member_agent.id else "Unknown"
@@ -525,8 +735,20 @@ def _get_delegate_task_function(
 
                 scrub_run_output_for_storage(member_agent, run_response=member_agent_run_response)  # type: ignore[arg-type]
 
-            # Add the member run to the team session
-            session.upsert_run(member_agent_run_response)
+            # Add the member run to the team session — but ONLY in legacy
+            # nested mode. When the member ran in its OWN child session row
+            # (id differs from the team session), persisting its full run into
+            # the TEAM session too would (a) duplicate the transcript and
+            # (b) surface the member's leader-authored task prompt as a
+            # top-level "user" message in the parent chat (the reported
+            # "my message shows the delegation prompt" bug). In child-session
+            # mode the member's transcript lives in its own row; the parent
+            # only needs the delegation card (child_session_id on the tool +
+            # the member_responses linkage used at rehydration).
+            _member_sid = getattr(member_agent_run_response, "session_id", None)
+            if not (_member_sid and _member_sid != session.session_id
+                    and _team_member_sessions_enabled()):
+                session.upsert_run(member_agent_run_response)
 
         # Update team session state
         merge_dictionaries(run_context.session_state, member_session_state_copy)  # type: ignore
@@ -559,13 +781,16 @@ def _get_delegate_task_function(
         use_agent_logger()
 
         member_session_state_copy = copy(run_context.session_state)
+        # A unique per-delegation session so the member runs as its own full
+        # child session (navigable card); falls back to the team session id
+        # when team-member sessions are disabled (legacy nested behavior).
+        member_session_id = _member_run_session_id(session.session_id, member_agent)
 
         if stream:
             member_agent_run_response_stream = member_agent.run(
                 input=member_agent_task if not history else history,
                 user_id=user_id,
-                # All members have the same session_id
-                session_id=session.session_id,
+                session_id=member_session_id,
                 session_state=member_session_state_copy,  # Send a copy to the agent
                 images=images,
                 videos=videos,
@@ -602,8 +827,7 @@ def _get_delegate_task_function(
             member_agent_run_response = member_agent.run(  # type: ignore
                 input=member_agent_task if not history else history,  # type: ignore
                 user_id=user_id,
-                # All members have the same session_id
-                session_id=session.session_id,
+                session_id=member_session_id,
                 session_state=member_session_state_copy,  # Send a copy to the agent
                 images=images,
                 videos=videos,
@@ -699,13 +923,44 @@ def _get_delegate_task_function(
         use_agent_logger()
 
         member_session_state_copy = copy(run_context.session_state)
+        # Unique per-delegation session → member runs as its own child session.
+        member_session_id = _member_run_session_id(session.session_id, member_agent)
+
+        # The member's seed message is the LEADER's task, not a human's words.
+        # The per-turn author contextvar carries the human handle (so the
+        # parent chat attributes the user correctly); a delegated member runs
+        # inside that same context, so without this override its task prompt
+        # would be stamped with the human's identity (the reported "my message
+        # shows the delegation prompt" bug). Override to an agent-self author so
+        # the child session renders the seed as a Mission block. Reset right
+        # after the member run (the HITL/synthesis code below stamps nothing).
+        _member_author_tok = None
+        if member_session_id and member_session_id != session.session_id and _team_member_sessions_enabled():
+            try:
+                from src.core.identity_context import agent_author, install_author_context
+                _member_author_tok = install_author_context(
+                    agent_author(
+                        f"Sub-agent · {getattr(member_agent, 'name', None) or member_id}",
+                        agent_name=getattr(member_agent, "name", None),
+                    )
+                )
+            except Exception:  # noqa: BLE001 — never block delegation on authorship
+                _member_author_tok = None
+
+        # A delegation IS a navigable sub-agent session. Create + announce it
+        # the moment it STARTS (so it appears in the sidebar and its live
+        # stream has a row to land on), and stamp + stream the child id onto
+        # the leader's in-progress delegate tool so the card is clickable
+        # immediately — both previously only happened at completion.
+        if member_session_id and member_session_id != session.session_id and _team_member_sessions_enabled():
+            await _announce_member_child_session(session, member_agent, member_session_id)
+            await _emit_member_card_link(run_response, session, member_id, member_session_id)
 
         if stream:
             member_agent_run_response_stream = member_agent.arun(  # type: ignore
                 input=member_agent_task if not history else history,
                 user_id=user_id,
-                # All members have the same session_id
-                session_id=session.session_id,
+                session_id=member_session_id,
                 session_state=member_session_state_copy,  # Send a copy to the agent
                 images=images,
                 videos=videos,
@@ -738,12 +993,17 @@ def _get_delegate_task_function(
                     member_agent_run_response_event, "parent_run_id", None
                 ) or (run_response.run_id if run_response is not None else None)
                 yield member_agent_run_response_event  # type: ignore
+
+                # Mirror the event onto the child session's own live stream so
+                # navigating into the running sub-agent shows it work in real
+                # time. The parent stream suppresses these (dispatcher); this
+                # surfaces them on the child's channel, tagged with its sid.
+                await _emit_member_event(member_session_id, member_agent_run_response_event)
         else:
             member_agent_run_response = await member_agent.arun(  # type: ignore
                 input=member_agent_task if not history else history,
                 user_id=user_id,
-                # All members have the same session_id
-                session_id=session.session_id,
+                session_id=member_session_id,
                 session_state=member_session_state_copy,  # Send a copy to the agent
                 images=images,
                 videos=videos,
@@ -760,6 +1020,41 @@ def _get_delegate_task_function(
                 else None,
             )
             check_if_run_cancelled(member_agent_run_response)  # type: ignore
+
+        # Pin the member RunOutput's session_id to the minted child id. The
+        # runtime can leave ``RunOutput.session_id`` pointing at the team
+        # session, which would (a) make ``_process`` skip the child_session_id
+        # card link and (b) mislabel the child row — so make it authoritative
+        # here for the persistence + linkage steps below.
+        if (member_agent_run_response is not None
+                and member_session_id and member_session_id != session.session_id):
+            try:
+                member_agent_run_response.session_id = member_session_id  # type: ignore
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Member run done — restore the human author context for the rest of
+        # the leader's turn (the HITL / synthesis code below stamps nothing).
+        if _member_author_tok is not None:
+            try:
+                from src.core.identity_context import reset_author_context
+                reset_author_context(_member_author_tok)
+            except Exception:  # noqa: BLE001
+                pass
+            _member_author_tok = None
+
+        # Persist the member run as its OWN durable child session row (the
+        # runner skips member-session saves, so we write it explicitly) — this
+        # is what makes the delegation a navigable sub-agent session + sidebar
+        # card rather than a dangling link.
+        if member_agent_run_response is not None and not member_agent_run_response.is_paused:
+            await _persist_member_child_session(session, member_agent, member_agent_run_response)
+            # Finalize the child's live stream: the now-persisted row is
+            # canonical, so tell the app the sub-agent's turn is done — it
+            # reconciles to that transcript and settles the streaming bubble.
+            if member_session_id and member_session_id != session.session_id:
+                from src.stream.child_stream import emit_child_frame
+                await emit_child_frame(member_session_id, "turn_complete")
 
         # Check if the member run is paused (HITL)
         if member_agent_run_response is not None and member_agent_run_response.is_paused:
@@ -829,12 +1124,13 @@ def _get_delegate_task_function(
             member_agent_task, history = _setup_delegate_task_to_member(member_agent=member_agent, task=task)
 
             member_session_state_copy = copy(run_context.session_state)
+            # Each broadcast member runs as its own child session.
+            member_session_id = _member_run_session_id(session.session_id, member_agent)
             if stream:
                 member_agent_run_response_stream = member_agent.run(
                     input=member_agent_task if not history else history,
                     user_id=user_id,
-                    # All members have the same session_id
-                    session_id=session.session_id,
+                    session_id=member_session_id,
                     session_state=member_session_state_copy,  # Send a copy to the agent
                     images=images,
                     videos=videos,
@@ -872,8 +1168,7 @@ def _get_delegate_task_function(
                 member_agent_run_response = member_agent.run(  # type: ignore
                     input=member_agent_task if not history else history,
                     user_id=user_id,
-                    # All members have the same session_id
-                    session_id=session.session_id,
+                    session_id=member_session_id,
                     session_state=member_session_state_copy,  # Send a copy to the agent
                     images=images,
                     videos=videos,
@@ -959,11 +1254,12 @@ def _get_delegate_task_function(
             async def stream_member(agent: Union[Agent, "Team"]) -> None:
                 member_agent_task, history = _setup_delegate_task_to_member(member_agent=agent, task=task)  # type: ignore
                 member_session_state_copy = copy(run_context.session_state)
+                member_session_id = _member_run_session_id(session.session_id, agent)
 
                 member_stream = agent.arun(  # type: ignore
                     input=member_agent_task if not history else history,
                     user_id=user_id,
-                    session_id=session.session_id,
+                    session_id=member_session_id,
                     session_state=member_session_state_copy,  # Send a copy to the agent
                     images=images,
                     videos=videos,
@@ -1056,12 +1352,12 @@ def _get_delegate_task_function(
                     member_agent_index=member_agent_index,
                 ) -> tuple[str, Optional[Union[Agent, "Team"]], Optional[Union[RunOutput, TeamRunOutput]]]:
                     member_session_state_copy = copy(run_context.session_state)
+                    member_session_id = _member_run_session_id(session.session_id, member_agent)
 
                     member_agent_run_response = await member_agent.arun(
                         input=member_agent_task if not history else history,
                         user_id=user_id,
-                        # All members have the same session_id
-                        session_id=session.session_id,
+                        session_id=member_session_id,
                         session_state=member_session_state_copy,  # Send a copy to the agent
                         images=images,
                         videos=videos,

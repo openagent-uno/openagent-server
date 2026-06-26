@@ -298,21 +298,28 @@ async def t_generate_no_models_returns_error(ctx: TestContext) -> None:
     assert "no model" in resp.content.lower(), resp.content
 
 
-@test("regression_v014", "_arun_runtime_stream forwards Team-module content events (no duplicate-run bug)")
+@test("regression_v014", "_arun_runtime_stream forwards leader content + suppresses member content (no duplicate-run bug)")
 async def t_stream_handles_team_events(ctx: TestContext) -> None:
-    """Regression for the prod bug where ``TeamRouterProvider.stream``
-    yielded zero deltas → ``agent.run_stream`` fired its
-    "no_deltas_yielded" fallback to ``generate()`` → the team ran the
-    whole turn AGAIN, persisting a duplicate row to ``sessions``
-    → the next user turn saw the orphan in history and the model
-    replied "I already answered above".
+    """Two intertwined contracts:
 
-    Root cause: ``src.core._run_state.team.RunContentEvent`` is a DISTINCT class
-    from ``src.core._run_state.agent.RunContentEvent``. The shared
-    ``_arun_runtime_stream`` helper must isinstance-check BOTH module
-    variants (plus ``IntermediateRunContentEvent`` for delegated
-    member content) so Team-mode deltas reach the WS pipe.
+    1. The original regression: ``TeamRouterProvider.stream`` must yield
+       deltas so ``agent.run_stream`` never fires its "no_deltas_yielded"
+       fallback to ``generate()`` (which re-ran the whole turn, persisted a
+       duplicate row, and made the model reply "I already answered above").
+       Root cause was that ``team.RunContentEvent`` is a DISTINCT class from
+       ``agent.RunContentEvent``; the helper must isinstance-check BOTH.
+
+    2. The newer child-session contract: a delegated member runs in its OWN
+       child session, so its content + nested tools are SUPPRESSED from the
+       PARENT live stream (they live in the child session, navigable via the
+       delegation card). Member events are identified by a session_id that
+       differs from the parent run, plus the team's relayed
+       ``IntermediateRunContentEvent``. The LEADER's content (parent
+       session_id) is still forwarded — which is what keeps contract #1 intact.
+       Legacy nested mode (flag off) forwards member content inline as before.
     """
+    import os
+
     from src.core._run_state.agent import RunContentEvent as AgentRCE
     from src.core._run_state.team import (
         IntermediateRunContentEvent as TeamIRCE,
@@ -326,25 +333,53 @@ async def t_stream_handles_team_events(ctx: TestContext) -> None:
 
     from src.models.dispatcher import _arun_runtime_stream
 
+    PARENT = "sess-x"
+    CHILD = "sess-x::member::opus::abcd1234"
+
+    async def _collect(runtime) -> list[str]:
+        out: list[str] = []
+        async for delta in _arun_runtime_stream(
+            runtime, prompt="x", session_id=PARENT, user_id="u",
+            on_status=None, error_event="test.stream_error",
+        ):
+            out.append(delta)
+        return out
+
     class _FakeTeamRuntime:
         def arun(self, prompt, *, session_id, user_id, stream, stream_events=False):
             async def _iter():
-                yield TeamRCE(content="hello ", run_id="r", session_id=session_id)
-                yield TeamIRCE(content="from ", run_id="r", session_id=session_id)
-                yield AgentRCE(content="opus", run_id="r", session_id=session_id)
+                yield TeamRCE(content="hello ", run_id="r", session_id=PARENT)       # leader
+                yield TeamIRCE(content="relay ", run_id="r", session_id=PARENT)      # member relay → suppressed
+                yield AgentRCE(content="member-text", run_id="rm", session_id=CHILD) # member own → suppressed
+                yield AgentRCE(content="opus", run_id="r", session_id=PARENT)        # leader → kept
             return _iter()
 
-    deltas: list[str] = []
-    async for delta in _arun_runtime_stream(
-        _FakeTeamRuntime(),
-        prompt="x",
-        session_id="sess-x",
-        user_id="u",
-        on_status=None,
-        error_event="test.stream_error",
-    ):
-        deltas.append(delta)
-    assert deltas == ["hello ", "from ", "opus"], deltas
+    # team-member-sessions ON (default): member content suppressed, leader kept.
+    os.environ.pop("OPENAGENT_TEAM_MEMBER_SESSIONS", None)
+    deltas = await _collect(_FakeTeamRuntime())
+    assert deltas == ["hello ", "opus"], deltas
+    assert deltas, "leader content must reach the pipe (else duplicate-run fallback)"
+
+    # Silent-leader safety net: a turn that produced ONLY member content still
+    # yields content (surfaced as a fallback), so the zero-delta → generate()
+    # → duplicate-child-session path never triggers.
+    class _SilentLeader:
+        def arun(self, prompt, *, session_id, user_id, stream, stream_events=False):
+            async def _iter():
+                yield AgentRCE(content="only ", run_id="rm", session_id=CHILD)
+                yield AgentRCE(content="member", run_id="rm", session_id=CHILD)
+            return _iter()
+
+    silent = await _collect(_SilentLeader())
+    assert "".join(silent) == "only member", silent
+
+    # Legacy nested mode (flag off): member content forwarded inline (old behavior).
+    os.environ["OPENAGENT_TEAM_MEMBER_SESSIONS"] = "0"
+    try:
+        legacy = await _collect(_FakeTeamRuntime())
+        assert legacy == ["hello ", "relay ", "member-text", "opus"], legacy
+    finally:
+        os.environ.pop("OPENAGENT_TEAM_MEMBER_SESSIONS", None)
 
 
 @test("regression_v014", "stream with no enabled models yields user-facing error")

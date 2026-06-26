@@ -932,6 +932,18 @@ def _get_run_messages(
     )
     # Add user message to run_messages
     if user_message is not None:
+        # Per-message authorship: stamp the human handle (or agent-self for a
+        # spawned team turn) so the team transcript attributes the sender like
+        # the single-agent path does (vision §16). The agent runner stamps the
+        # same way in src/core/_runner/agent/_messages.py.
+        if getattr(user_message, "author", None) is None:
+            try:
+                from src.core.identity_context import current_author
+                _a = current_author()
+                if _a is not None:
+                    user_message.author = _a
+            except Exception:  # noqa: BLE001
+                pass
         run_messages.user_message = user_message
         run_messages.messages.append(user_message)
 
@@ -1066,6 +1078,18 @@ async def _aget_run_messages(
     )
     # Add user message to run_messages
     if user_message is not None:
+        # Per-message authorship: stamp the human handle (or agent-self for a
+        # spawned team turn) so the team transcript attributes the sender like
+        # the single-agent path does (vision §16). The agent runner stamps the
+        # same way in src/core/_runner/agent/_messages.py.
+        if getattr(user_message, "author", None) is None:
+            try:
+                from src.core.identity_context import current_author
+                _a = current_author()
+                if _a is not None:
+                    user_message.author = _a
+            except Exception:  # noqa: BLE001
+                pass
         run_messages.user_message = user_message
         run_messages.messages.append(user_message)
 

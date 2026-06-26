@@ -28,6 +28,7 @@ and external callers.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable
@@ -142,6 +143,15 @@ def _build_role_blurb(entry: CatalogModel) -> str:
     """
     hint = (entry.tier_hint or "").strip()
     return hint or f"specialist using {entry.model_id}"
+
+
+def _team_member_sessions_enabled() -> bool:
+    """Whether a coordinate-team member delegation runs as its own durable
+    child session (navigable card) rather than nested in the team session.
+    Default ON (the chosen design); set
+    ``OPENAGENT_TEAM_MEMBER_SESSIONS=0`` to revert to the legacy nested
+    ``member_responses`` behavior."""
+    return os.environ.get("OPENAGENT_TEAM_MEMBER_SESSIONS", "1").strip() not in ("0", "false", "no")
 
 
 def _member_identifier(runtime_id: str) -> str:
@@ -354,11 +364,42 @@ async def _arun_runtime_stream(
             stream_kwargs["audio"] = audio
         if videos:
             stream_kwargs["videos"] = videos
+        member_sessions_on = _team_member_sessions_enabled()
+        yielded_content = False
+        suppressed_content: list[str] = []
         stream_iter = runtime.arun(prompt, **stream_kwargs)
         async for event in stream_iter:
+            # Suppress a delegated member's OWN content + nested tool events
+            # from the PARENT live stream when the member runs in its own child
+            # session. That work belongs to the child session (navigable via the
+            # delegation card) — streaming it into the parent floods the parent
+            # transcript with the sub-agent's reasoning + tool calls (the
+            # reported "mid messages"). A member event is identifiable by a
+            # session_id that differs from this (parent) run; the team also
+            # relays the member's text as ``IntermediateRunContentEvent``
+            # (parent session_id) — drop that too. Legacy nested mode
+            # (team-member-sessions off) keeps the old inline behavior so the
+            # live view still matches its rehydration.
+            if member_sessions_on:
+                ev_sid = getattr(event, "session_id", None)
+                is_member = (
+                    isinstance(event, _TeamIntermediateRunContentEvent)
+                    or (ev_sid is not None and session_id is not None and ev_sid != session_id)
+                )
+                if is_member:
+                    # Stash the member's text — the silent-leader fallback below
+                    # surfaces it ONLY if the leader emitted no synthesis of its
+                    # own, so a delegate-and-stop turn still yields content
+                    # rather than tripping run_stream's no-deltas fallback
+                    # (which would re-run the turn and spawn a DUPLICATE child).
+                    c = getattr(event, "content", None)
+                    if c:
+                        suppressed_content.append(c)
+                    continue
             if isinstance(event, content_event_types):
                 delta = event.content or ""
                 if delta:
+                    yielded_content = True
                     yield delta
             elif isinstance(event, tool_start_event_types):
                 tool = getattr(event, "tool", None)
@@ -374,6 +415,15 @@ async def _arun_runtime_stream(
                 tool = getattr(event, "tool", None)
                 err_text = getattr(event, "error", None)
                 await _emit_status(tool, error_text=err_text)
+
+        # Silent-leader safety net: a turn that delegated but whose leader
+        # emitted NO synthesis of its own would otherwise yield zero content
+        # (member text suppressed above) → run_stream's no-deltas fallback
+        # re-runs the whole turn via generate(), spawning a DUPLICATE child
+        # session. Surface the member's text in that (rare) case so the turn
+        # has content. The normal case (leader synthesises) never hits this.
+        if member_sessions_on and not yielded_content and suppressed_content:
+            yield "".join(suppressed_content)
     except Exception as e:  # noqa: BLE001
         elog(error_event, session_id=session_id, error=str(e))
         raise
@@ -523,6 +573,7 @@ class TeamRouterProvider(BaseModel):
         name: str,
         role: str | None,
         system: str | None = None,
+        db: Any = None,
     ) -> Any:
         """Construct a single api-based runtime ``Agent`` for ``entry``.
 
@@ -561,6 +612,13 @@ class TeamRouterProvider(BaseModel):
             role=role,
             system_message=system or None,
             markdown=False,
+            # When a db is supplied (members in team-member-session mode), the
+            # member persists its run to its OWN child session row — so a
+            # delegation surfaces as a navigable child session + card. The
+            # leader is built without a db (its turn persists via the Team's
+            # own db on the parent session). ``add_history_to_context`` stays
+            # False so a fresh per-delegation child id never loads stale state.
+            db=db,
         )
 
     def _build_agent_for(
@@ -570,6 +628,7 @@ class TeamRouterProvider(BaseModel):
         name: str,
         role: str | None,
         system: str | None = None,
+        db: Any = None,
     ) -> Any:
         """Build a runtime ``Agent`` for ``entry``.
 
@@ -578,7 +637,7 @@ class TeamRouterProvider(BaseModel):
         ``_build_api_agent_for``.
         """
         return self._build_api_agent_for(
-            entry, name=name, role=role, system=system,
+            entry, name=name, role=role, system=system, db=db,
         )
 
     def _ensure_runtime(self, session_id: str, system: str | None) -> Any:
@@ -652,6 +711,15 @@ class TeamRouterProvider(BaseModel):
         from src.memory.store.sqlite import SqliteDb
         from src.core._runner.team import Team, TeamMode
 
+        # The shared runtime DB. Built BEFORE the members so it can be handed
+        # to each one: in team-member-session mode a delegated member persists
+        # its run to its OWN child session row (a real, navigable session +
+        # sidebar card) rather than nested in the parent. The leader stays
+        # db-less — its turn is persisted via the Team's own db below.
+        db_path = _runtime_db_path(self._db)
+        team_db = SqliteDb(db_file=db_path) if db_path else None
+        member_db = team_db if _team_member_sessions_enabled() else None
+
         # Vision §15: every member must run with the framework prompt +
         # user persona injected as its own system_message — the Team's
         # ``instructions=`` only feed the coordinator (team.model), they
@@ -666,9 +734,30 @@ class TeamRouterProvider(BaseModel):
                 name=_member_identifier(e.runtime_id),
                 role=_build_role_blurb(e),
                 system=_compose_member_system(system, _build_role_blurb(e)),
+                db=member_db,
             )
             for e in members_catalog
         ]
+
+        # Stamp each member with child-session linkage so that when a
+        # delegation runs the member in its OWN session row (see
+        # ``delegate_task_to_member``), ``read_or_create_session`` carries
+        # this metadata onto the new row: the app then shows the member run
+        # as a delegation card under the team session. ``client_id`` (owner)
+        # is intentionally omitted — this sync build site can't resolve it;
+        # ``list_all_sessions`` instead inherits visibility from the parent
+        # team session (so the child still lands in the owner's list).
+        if _team_member_sessions_enabled():
+            for member, e in zip(members, members_catalog):
+                try:
+                    member.metadata = {
+                        "parent_session_id": session_id,
+                        "origin": "delegation",
+                        "kind": e.runtime_id,
+                        "title": f"Sub-agent · {e.runtime_id}",
+                    }
+                except Exception:  # noqa: BLE001 — never block team build on this
+                    pass
 
         # Record member_id → runtime_id so the per-turn delegation tool
         # call can be reflected back to the chat UI as the specialist's
@@ -679,8 +768,7 @@ class TeamRouterProvider(BaseModel):
             "leader": entry.runtime_id,
             **{_member_identifier(e.runtime_id): e.runtime_id for e in members_catalog},
         }
-        db_path = _runtime_db_path(self._db)
-        team_db = SqliteDb(db_file=db_path) if db_path else None
+        # ``team_db`` / ``db_path`` were built above (before the members).
         # Pass our OpenAgent system prompt as ``instructions`` — NOT as
         # ``system_message``. The runtime's get_system_message returns early
         # when system_message is set, skipping the <team_members> block
@@ -1322,39 +1410,27 @@ class ModelDispatcher(BaseModel):
         pool: Any,
         db: Any,
     ) -> str:
-        """Run ``task`` on ``model_id`` as a sub-agent of the parent turn.
+        """SUPERSEDED — delegation now spawns a full child session.
 
-        Used by the delegation MCP server to fulfil a leader's
-        ``delegate_task`` call. The sub-agent shares the parent's
-        session (so its trace lands in the same conversation) but
-        runs its own provider end-to-end — including MCP access.
+        This method used to run the sub-agent as a bare ``provider.generate``
+        with ``system=None`` (no framework/persona prompt — a vision §15
+        violation) on a synthetic, non-persisted ``{parent}::sub::{model}``
+        id. The delegation MCP (``mcp/servers/delegation/handlers.py``) now
+        routes ``delegate_task`` through ``core.child_session.run_child_session``
+        instead, so the sub-agent runs through the ordinary ``Agent.run``
+        path: full two-layer prompt, full tools, and a real durable session
+        row the user can navigate to and continue.
 
-        Returns the final assistant text. Raises if the target id is
-        not in the enabled catalog or the underlying provider errors.
+        The method is kept only so the ``hasattr(model, "run_delegated")``
+        dispatcher-selection guard (agent.py / workflow/executor.py) is
+        undisturbed; it should never be invoked. If it is, fail loudly
+        rather than silently re-introduce the §15 violation.
         """
-        known = {m.runtime_id for m in self._enabled_catalog()}
-        if model_id not in known:
-            raise ValueError(
-                f"model_id {model_id!r} is not enabled. Known ids: {sorted(known)}"
-            )
-
-        provider = self._get_team_provider(model_id)
-        if pool is not None and hasattr(provider, "set_mcp_pool"):
-            provider.set_mcp_pool(pool)
-        if db is not None and hasattr(provider, "set_db"):
-            provider.set_db(db)
-
-        delegated_session_id = (
-            f"{parent_session_id}::sub::{model_id}" if parent_session_id else None
+        raise NotImplementedError(
+            "ModelDispatcher.run_delegated is superseded by "
+            "core.child_session.run_child_session; delegation now spawns a "
+            "full child session via the Agent, not a system-less provider call."
         )
-
-        response = await provider.generate(
-            messages=[{"role": "user", "content": task}],
-            system=None,
-            on_status=None,
-            session_id=delegated_session_id,
-        )
-        return getattr(response, "content", "") or ""
 
     async def stream(
         self,

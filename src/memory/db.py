@@ -57,11 +57,34 @@ CREATE TABLE IF NOT EXISTS task_runs (
     started_at  REAL NOT NULL,
     finished_at REAL,
     output      TEXT,
-    error       TEXT
+    error       TEXT,
+    -- The durable child ``sessions`` row this firing ran as (per-run id
+    -- ``scheduler:{task_id}:{run_id}``). Lets the app open a past firing
+    -- as a full chat session. Added to existing DBs by
+    -- ``_migrate_task_runs_session_id``.
+    session_id  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_taskruns_task    ON task_runs(task_id);
 CREATE INDEX IF NOT EXISTS idx_taskruns_started ON task_runs(started_at);
 CREATE INDEX IF NOT EXISTS idx_taskruns_status  ON task_runs(status);
+
+-- On-demand "run now" requests for scheduled tasks. The scheduler MCP
+-- subprocess (and any other out-of-process caller) drops a row here to
+-- ask the main OpenAgent process to fire a task immediately, out of band
+-- from its cron schedule. The Scheduler claims these on its fast
+-- cross-process loop (~2s) and runs the task, linking the spawned
+-- ``task_runs`` row back via ``run_id`` so a waiting caller can poll for
+-- completion. The scheduled-task analogue of ``workflow_run_requests``;
+-- firing this way leaves the task's schedule (and enabled flag) untouched.
+CREATE TABLE IF NOT EXISTS task_run_requests (
+    id          TEXT PRIMARY KEY,
+    task_id     TEXT NOT NULL REFERENCES scheduled_tasks(id) ON DELETE CASCADE,
+    trigger     TEXT NOT NULL DEFAULT 'manual',
+    claimed_at  REAL,
+    run_id      TEXT,
+    created_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_taskreq_unclaimed ON task_run_requests(claimed_at);
 
 CREATE TABLE IF NOT EXISTS usage_log (
     id TEXT PRIMARY KEY,
@@ -748,6 +771,22 @@ class MemoryDB:
             )
             await self._conn.commit()
 
+        await self._migrate_task_runs_session_id()
+
+    async def _migrate_task_runs_session_id(self) -> None:
+        """v0.15: a scheduled-task firing now runs as a durable child
+        ``sessions`` row (``scheduler:{task_id}:{run_id}``). ``task_runs``
+        records which one so the app can open a past firing as a full chat
+        session. Old DBs predate the column; add it idempotently."""
+        assert self._conn is not None
+        cursor = await self._conn.execute("PRAGMA table_info(task_runs)")
+        cols = {row[1] for row in await cursor.fetchall()}
+        if "session_id" not in cols:
+            await self._conn.execute(
+                "ALTER TABLE task_runs ADD COLUMN session_id TEXT"
+            )
+            await self._conn.commit()
+
     async def _migrate_legacy_tables_to_sessions(self) -> None:
         """One-time: fold sdk_sessions + chat_sessions + chat_session_runs
         into the canonical ``sessions`` table, then drop them.
@@ -1355,14 +1394,15 @@ class MemoryDB:
         task_id: str,
         trigger: str = "schedule",
         run_id: str | None = None,
+        session_id: str | None = None,
     ) -> str:
         conn = await self._ensure_connected()
         rid = run_id or str(uuid.uuid4())
         await conn.execute(
             "INSERT INTO task_runs "
-            "(id, task_id, trigger, status, started_at) "
-            "VALUES (?, ?, ?, 'running', ?)",
-            (rid, task_id, trigger, time.time()),
+            "(id, task_id, trigger, status, started_at, session_id) "
+            "VALUES (?, ?, ?, 'running', ?, ?)",
+            (rid, task_id, trigger, time.time(), session_id),
         )
         await conn.commit()
         return rid
@@ -1377,7 +1417,7 @@ class MemoryDB:
         stop" request is suppressed and the orphan sweep / cancel handler
         records ``cancelled``.
         """
-        allowed = {"status", "finished_at", "output", "error"}
+        allowed = {"status", "finished_at", "output", "error", "session_id"}
         updates = {k: v for k, v in kwargs.items() if k in allowed}
         if not updates:
             return
@@ -1487,6 +1527,118 @@ class MemoryDB:
         )
         await conn.commit()
         return cursor.rowcount or 0
+
+    async def flag_task_runs_cancelling(self, task_id: str) -> list[str]:
+        """Flag every currently-``running`` firing of a task as ``cancelling``
+        and return the run ids flagged.
+
+        This is the same cross-process "completely stop" hand-off the
+        scheduler MCP's ``stop_scheduled_task`` writes: the scheduler's
+        cancellation drain turns the flag into a real hard stop within ~2s
+        (cancelling the agent turn) and finalizes the row as ``cancelled``.
+        Idempotent — the ``status='running'`` guard on the UPDATE avoids
+        clobbering a firing that finished between the SELECT and here, so a
+        double "stop" can't resurrect a settled run."""
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            "SELECT id FROM task_runs WHERE task_id = ? AND status = 'running'",
+            (task_id,),
+        )
+        ids = [r["id"] for r in await cursor.fetchall()]
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        await conn.execute(
+            f"UPDATE task_runs SET status = 'cancelling' "
+            f"WHERE id IN ({placeholders}) AND status = 'running'",
+            ids,
+        )
+        await conn.commit()
+        return ids
+
+    async def running_task_ids(self) -> set[str]:
+        """Set of task ids that have a firing in flight (``running`` or
+        ``cancelling``). Lets the dashboard light up a "running" badge and
+        offer a Stop control without an N+1 per-task run query."""
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            "SELECT DISTINCT task_id FROM task_runs "
+            "WHERE status IN ('running', 'cancelling')"
+        )
+        return {r["task_id"] for r in await cursor.fetchall()}
+
+    # ── Task Run Requests (on-demand "run now" hand-off) ──
+    #
+    # Mirrors ``workflow_run_requests``: an out-of-process caller (the
+    # scheduler MCP subprocess) can't reach the in-process Scheduler, so it
+    # enqueues a row here and the main process claims + fires it. The atomic
+    # claim guards against a request firing twice if two scheduler loops
+    # overlap.
+
+    async def enqueue_task_run_request(
+        self, *, task_id: str, trigger: str = "manual",
+    ) -> str:
+        conn = await self._ensure_connected()
+        req_id = str(uuid.uuid4())
+        await conn.execute(
+            "INSERT INTO task_run_requests "
+            "(id, task_id, trigger, created_at) VALUES (?, ?, ?, ?)",
+            (req_id, task_id, trigger, time.time()),
+        )
+        await conn.commit()
+        return req_id
+
+    async def claim_pending_task_requests(self, *, limit: int = 20) -> list[dict]:
+        """Atomically claim up to ``limit`` unclaimed run-now requests.
+
+        Same row-level ``WHERE claimed_at IS NULL`` guard as
+        ``claim_pending_workflow_requests`` — a concurrent claimer that
+        picked the same rows loses the race because its UPDATE filters out
+        already-claimed rows, so no request fires twice.
+        """
+        conn = await self._ensure_connected()
+        now = time.time()
+        cursor = await conn.execute(
+            "SELECT * FROM task_run_requests "
+            "WHERE claimed_at IS NULL ORDER BY created_at ASC LIMIT ?",
+            (int(limit),),
+        )
+        rows = await cursor.fetchall()
+        if not rows:
+            return []
+        ids = [row["id"] for row in rows]
+        placeholders = ",".join("?" for _ in ids)
+        await conn.execute(
+            f"UPDATE task_run_requests SET claimed_at = ? "
+            f"WHERE id IN ({placeholders}) AND claimed_at IS NULL",
+            [now, *ids],
+        )
+        await conn.commit()
+        cursor = await conn.execute(
+            f"SELECT * FROM task_run_requests "
+            f"WHERE id IN ({placeholders}) AND claimed_at = ? "
+            f"ORDER BY created_at ASC",
+            [*ids, now],
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def set_task_request_run_id(self, request_id: str, run_id: str) -> None:
+        """Link a claimed request to the ``task_runs`` row it spawned so the
+        MCP tool's ``wait`` poller can find the firing."""
+        conn = await self._ensure_connected()
+        await conn.execute(
+            "UPDATE task_run_requests SET run_id = ? WHERE id = ?",
+            (run_id, request_id),
+        )
+        await conn.commit()
+
+    async def get_task_run_request(self, request_id: str) -> dict | None:
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            "SELECT * FROM task_run_requests WHERE id = ?", (request_id,),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
 
     # ── Workflow Tasks ──
 
@@ -3062,6 +3214,7 @@ class MemoryDB:
         client_id: str | None = None,
         *,
         limit: int = 50,
+        exclude_child_origins: tuple[str, ...] = (),
     ) -> list[dict]:
         """Return every session in ``sessions``, ordered by
         ``updated_at`` descending. Metadata columns (client_id, title,
@@ -3085,39 +3238,150 @@ class MemoryDB:
         ``serialize_session_json_fields`` path produces.
         """
         conn = await self._ensure_connected()
+        # Optionally drop child sessions of a given origin (the flat history
+        # list hides ``delegation`` sub-agents — they're navigable only from
+        # their parent's transcript card, never the sidebar). NULL-safe so
+        # legacy chat rows (no ``origin``) are always kept. The parent's own
+        # cards use ``list_child_sessions`` instead, which is unaffected.
+        origin_expr = "json_extract(json_extract(metadata, '$'), '$.origin')"
+        excl_clause = ""
+        excl_params: list = []
+        if exclude_child_origins:
+            ph = ",".join("?" * len(exclude_child_origins))
+            excl_clause = f" AND ({origin_expr} IS NULL OR {origin_expr} NOT IN ({ph}))"
+            excl_params = list(exclude_child_origins)
         if client_id:
             legacy_pubkeys = await self._pubkeys_for_handle(client_id)
             candidates = [client_id, *sorted(legacy_pubkeys)]
             placeholders = ",".join("?" * len(candidates))
+            # A row matches if it's owned by the handle directly, OR if its
+            # ``parent_session_id`` points at a row the handle owns. The
+            # second clause is the owner-inheritance fallback for child
+            # sessions whose owner couldn't be stamped at spawn time — most
+            # importantly coordinate-team members, spawned from a sync build
+            # site that can't resolve the handle — so they still surface in
+            # the right user's flat list, nested logically under their parent.
             cursor = await conn.execute(
                 f"SELECT session_id, metadata, created_at, updated_at "
                 f"FROM sessions "
-                f"WHERE json_extract(json_extract(metadata, '$'), '$.client_id') "
-                f"  IN ({placeholders}) "
+                f"WHERE (json_extract(json_extract(metadata, '$'), '$.client_id') IN ({placeholders}) "
+                f"   OR json_extract(json_extract(metadata, '$'), '$.parent_session_id') IN ("
+                f"        SELECT session_id FROM sessions "
+                f"        WHERE json_extract(json_extract(metadata, '$'), '$.client_id') IN ({placeholders})"
+                f"   )){excl_clause} "
                 f"ORDER BY updated_at DESC LIMIT ?",
-                (*candidates, int(limit)),
+                (*candidates, *candidates, *excl_params, int(limit)),
             )
         else:
             cursor = await conn.execute(
-                "SELECT session_id, metadata, created_at, updated_at "
-                "FROM sessions "
-                "ORDER BY updated_at DESC LIMIT ?",
-                (int(limit),),
+                f"SELECT session_id, metadata, created_at, updated_at "
+                f"FROM sessions "
+                f"WHERE 1=1{excl_clause} "
+                f"ORDER BY updated_at DESC LIMIT ?",
+                (*excl_params, int(limit)),
             )
         results: list[dict] = []
         for row in await cursor.fetchall():
             sid = row[0]
             meta = self._parse_metadata(row[1])
-            results.append({
-                "session_id": sid,
-                "client_id": meta.get("client_id", ""),
-                "title": meta.get("title"),
-                "model": meta.get("model"),
-                "framework": meta.get("framework") or FRAMEWORK_API_BASED,
-                "created_at": row[2],
-                "last_active_at": row[3],
-            })
+            results.append(self._session_row_to_summary(sid, meta, row[2], row[3]))
         return results
+
+    @staticmethod
+    def _session_row_to_summary(
+        sid: str, meta: dict, created_at, updated_at,
+    ) -> dict:
+        """Shape one ``sessions`` row's metadata into the summary dict the
+        gateway returns to the app. Shared by ``list_all_sessions`` and
+        ``list_child_sessions`` so both surface the same fields, including
+        the child-linkage (``parent_session_id`` / ``origin`` / ``kind``)
+        the app uses for origin chips and the parent breadcrumb."""
+        return {
+            "session_id": sid,
+            "client_id": meta.get("client_id", ""),
+            "title": meta.get("title"),
+            "model": meta.get("model"),
+            "framework": meta.get("framework") or FRAMEWORK_API_BASED,
+            "parent_session_id": meta.get("parent_session_id"),
+            "origin": meta.get("origin") or "chat",
+            "kind": meta.get("kind"),
+            # The delegate-tool run_id this child corresponds to (team-member
+            # child sessions only). Lets the parent transcript link a
+            # delegate_task_to_member chip to its child session deterministically.
+            "child_run_id": meta.get("child_run_id"),
+            "created_at": created_at,
+            "last_active_at": updated_at,
+        }
+
+    async def list_child_sessions(
+        self,
+        parent_session_id: str,
+        *,
+        limit: int = 200,
+    ) -> list[dict]:
+        """Return the sessions spawned by ``parent_session_id`` (delegated
+        sub-agents, scheduled-task firings under a task root, or workflow
+        AI-prompt nodes under a run root), ordered by ``updated_at`` desc.
+
+        Powers the parent transcript's delegation cards and the ``?parent=``
+        gateway query. Filters on ``metadata.parent_session_id`` with the
+        same two-level ``json_extract`` form ``list_all_sessions`` uses so
+        it matches both proper JSON-object rows and the double-encoded form
+        the runtime's ``serialize_session_json_fields`` path produces."""
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            "SELECT session_id, metadata, created_at, updated_at "
+            "FROM sessions "
+            "WHERE json_extract(json_extract(metadata, '$'), '$.parent_session_id') = ? "
+            "ORDER BY updated_at DESC LIMIT ?",
+            (parent_session_id, int(limit)),
+        )
+        return [
+            self._session_row_to_summary(row[0], self._parse_metadata(row[1]), row[2], row[3])
+            for row in await cursor.fetchall()
+        ]
+
+    async def prune_child_sessions(self, parent_session_id: str, *, keep: int) -> int:
+        """Delete the oldest child sessions of ``parent_session_id`` beyond the
+        most recent ``keep``. Opt-in retention for automation parents (a
+        scheduled-task root, a workflow root) that would otherwise accumulate
+        a firing/run session forever. ``keep <= 0`` is a no-op — child
+        sessions are durable and navigable by default (vision §4/§16); this
+        only trims when an operator sets a cap. Returns the number deleted."""
+        if keep is None or keep <= 0:
+            return 0
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            "SELECT session_id FROM sessions "
+            "WHERE json_extract(json_extract(metadata, '$'), '$.parent_session_id') = ? "
+            "ORDER BY updated_at DESC",
+            (parent_session_id,),
+        )
+        sids = [r[0] for r in await cursor.fetchall()]
+        stale = sids[keep:]
+        for sid in stale:
+            await conn.execute("DELETE FROM sessions WHERE session_id = ?", (sid,))
+        if stale:
+            await conn.commit()
+        return len(stale)
+
+    async def primary_owner_handle(self) -> str | None:
+        """The agent's primary owner handle — the earliest active network
+        user. Used as the owner for automation child sessions (scheduled-task
+        firings, workflow nodes) that have no human parent, so those rows land
+        in the owner's flat session list. Returns None on a handle-less /
+        coordinator-less deployment (the rows then stay sidebar-hidden, which
+        is the correct fallback rather than leaking to a wrong user)."""
+        conn = await self._ensure_connected()
+        try:
+            cursor = await conn.execute(
+                "SELECT handle FROM network_users WHERE status = 'active' "
+                "ORDER BY created_at ASC LIMIT 1"
+            )
+            row = await cursor.fetchone()
+        except Exception:
+            return None
+        return row[0] if row else None
 
     async def _pubkeys_for_handle(self, handle: str) -> set[str]:
         """Return every device pubkey (lowercase hex) bound to ``handle``.
@@ -3159,6 +3423,9 @@ class MemoryDB:
         model: str | None = None,
         framework: str | None = None,
         device_id: str | None = None,
+        parent_session_id: str | None = None,
+        origin: str | None = None,
+        kind: str | None = None,
     ) -> None:
         """Create or update the ``sessions`` row, merging the display
         metadata into the ``metadata`` JSON column.
@@ -3169,6 +3436,15 @@ class MemoryDB:
         ``device_id`` (when set) records which device first opened the
         session, so per-device routing (sticky-device retries, WS
         reconnect) still works.
+
+        ``parent_session_id`` / ``origin`` / ``kind`` link a *child*
+        session (a delegated sub-agent, a scheduled-task firing, or a
+        workflow AI-prompt node) back to its parent and tag what spawned
+        it. ``origin`` is one of ``chat | delegation | scheduler |
+        workflow``; ``kind`` is the fine label (the delegated model id, a
+        task id, ``workflow:node`` …). These are pure metadata, surfaced
+        by ``list_all_sessions`` so the app can render an origin chip and
+        a navigable parent breadcrumb — they never touch ``user_id``.
 
         **The gateway is metadata-only on this table — it must NOT write
         ``user_id``.** That column is owned exclusively by the runtime,
@@ -3203,6 +3479,12 @@ class MemoryDB:
             meta["model"] = model
         if framework:
             meta["framework"] = framework
+        if parent_session_id:
+            meta["parent_session_id"] = parent_session_id
+        if origin:
+            meta["origin"] = origin
+        if kind:
+            meta["kind"] = kind
 
         if existing:
             # Metadata-only update — never touch ``user_id`` (runtime-owned).
