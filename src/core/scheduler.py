@@ -730,7 +730,9 @@ class Scheduler:
         if self._workflow_executor is None:
             from src.workflow.executor import WorkflowExecutor
 
-            self._workflow_executor = WorkflowExecutor(self.agent, self.db)
+            self._workflow_executor = WorkflowExecutor(
+                self.agent, self.db, broadcast=self._broadcast,
+            )
         return self._workflow_executor
 
     async def _run_workflow(

@@ -7,6 +7,7 @@ import contextlib
 import logging
 import shutil
 import tempfile
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -80,7 +81,7 @@ _MEDIA_GROUP_FLUSH_DELAY = 1.0
 
 class _TypingAnimator:
     """Drives a continuous Telegram ``ChatAction.TYPING`` while a turn is
-    in flight. Replaces the ``⏳ Thinking...`` status reply used elsewhere
+    in flight. Replaces the ``Thinking...`` status reply used elsewhere
     in this bridge so the user sees the platform's native typing dot —
     matching the UX of Hermes / the Telegram bot SDK examples.
 
@@ -225,8 +226,8 @@ class TelegramBridge(BaseBridge):
     def __init__(self, token: str, allowed_users: list[str] | None = None,
                  gateway_url: str = "ws://localhost:8765/ws", gateway_token: str | None = None,
                  personality: str | None = None, streaming: bool = False,
-                 allowed_chats: list[int] | None = None):
-        super().__init__(gateway_url, gateway_token, personality=personality)
+                 allowed_chats: list[int] | None = None, live: bool = True):
+        super().__init__(gateway_url, gateway_token, personality=personality, live=live)
         self.token = token
         # Group/supergroup chats the bot is allowed to listen in. ``None``
         # = listen anywhere it's added (still gated by @mention / reply
@@ -1127,7 +1128,7 @@ class TelegramBridge(BaseBridge):
 
     async def post_status(self, msg, text: str):
         # Surface the agent's in-flight state as Telegram's native typing
-        # action (matches Hermes' UX) instead of a "⏳ Thinking..." reply
+        # action (matches Hermes' UX) instead of a "Thinking..." reply
         # message. The animator self-refreshes every 4s — Telegram clears
         # the typing indicator after ~5s of silence, so the loop period
         # has to undercut that. ``update_status`` becomes a no-op since

@@ -24,10 +24,6 @@ logger = logging.getLogger(__name__)
 # WhatsApp message size limit (Green API allows up to 65 536 chars; keep
 # generous headroom for our own framing).
 WHATSAPP_MSG_LIMIT = 4096
-# Throttle: at most one progress message every N seconds, to avoid
-# spamming the user (WhatsApp can't edit messages, so each status is a
-# brand-new chat bubble).
-WA_STATUS_THROTTLE_SECS = 8
 
 
 class WhatsAppBridge(BaseBridge):
@@ -44,17 +40,13 @@ class WhatsAppBridge(BaseBridge):
         gateway_url: str = "ws://localhost:8765/ws",
         gateway_token: str | None = None,
         personality: str | None = None,
+        live: bool = True,
     ):
-        super().__init__(gateway_url, gateway_token, personality=personality)
+        super().__init__(gateway_url, gateway_token, personality=personality, live=live)
         self.instance_id = instance_id
         self.api_token = api_token
         self.allowed_users = set(str(u) for u in allowed_users) if allowed_users else None
         self._greenapi = None
-        # Per-chat throttle for status updates: WhatsApp can't edit, so
-        # every progress ping is a brand-new bubble. We dedupe identical
-        # lines and wait ``WA_STATUS_THROTTLE_SECS`` between distinct
-        # updates so the user doesn't see a wall of "Using bash…" pings.
-        self._status_throttle: dict[str, dict] = {}
 
     async def _run(self) -> None:
         try:
@@ -175,39 +167,15 @@ class WhatsAppBridge(BaseBridge):
 
     # ── Platform primitives (consumed by BaseBridge.dispatch_turn) ──
     #
-    # WhatsApp's HTTP API can't edit messages — every "update" would be
-    # a new chat bubble. ``post_status`` posts the initial line and
-    # seeds the per-chat throttle so ``update_status`` only re-posts
-    # when the line CHANGES and at least ``WA_STATUS_THROTTLE_SECS``
-    # have passed since the last ping. ``clear_status`` wipes the
-    # throttle slot (the visible "Thinking…" stays in chat — there's
-    # no API to remove it).
+    # The Green API exposes no typing/presence primitive, so there is no
+    # native "is writing" flag to set — and we no longer post a
+    # ``Thinking…`` placeholder. The live step messages (each tool call
+    # + answer span, BaseBridge.dispatch_turn live mode) are the progress
+    # affordance instead. ``post_status``/``update_status``/``clear_status``
+    # are therefore no-ops (the latter two inherit the BaseBridge default).
 
     async def post_status(self, chat_id, text: str):
-        await self._send_text(chat_id, f"⏳ {text}")
-        # Seed text for dedup but ``ts=0`` so the FIRST tool-status
-        # update isn't throttled by the initial "Thinking…" post — the
-        # original closure kept ``ts=0`` for the same reason. Without
-        # this, the user wouldn't see ``Using bash…`` until 8 s after
-        # the bot started thinking.
-        self._status_throttle[chat_id] = {"text": text, "ts": 0.0}
-        return chat_id
-
-    async def update_status(self, chat_id, text: str) -> None:
-        last = self._status_throttle.get(chat_id) or {"text": "", "ts": 0.0}
-        now = asyncio.get_event_loop().time()
-        if text == last["text"]:
-            return
-        if now - last["ts"] < WA_STATUS_THROTTLE_SECS:
-            return
-        self._status_throttle[chat_id] = {"text": text, "ts": now}
-        try:
-            await self._send_text(chat_id, f"⏳ {text}")
-        except Exception:
-            pass
-
-    async def clear_status(self, chat_id) -> None:
-        self._status_throttle.pop(chat_id, None)
+        return None
 
     async def send_text_chunk(self, chat_id, chunk: str) -> None:
         await self._send_text(chat_id, markdown_to_whatsapp(chunk))

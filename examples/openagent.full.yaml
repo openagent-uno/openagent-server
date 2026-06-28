@@ -27,11 +27,19 @@ network:
 # ``personality`` accepts a preset name (casual, technical, teacher,
 # kawaii, pirate, noir, philosopher) OR a free-form string treated as
 # the literal persona directive.
+#
+# ``live`` (default true) makes the bridge narrate the turn in-chat:
+# each tool call and each span of the answer is posted as its own
+# message while the "is writing" indicator stays lit — the Hermes-style
+# feed. Set ``live: false`` per channel (or ``OPENAGENT_CHANNEL_LIVE=0``
+# globally) to fall back to a single final reply per turn. Voice-note
+# turns always use the single-reply path regardless of this setting.
 channels:
   telegram:
     token: "${TELEGRAM_BOT_TOKEN}"     # or hard-code; env wins if both set
     allowed_users: []                  # list of Telegram user_ids ("12345"); empty = open
     personality: casual
+    live: true                         # narrate tool calls + answer as separate messages
 
   discord:
     token: "${DISCORD_BOT_TOKEN}"

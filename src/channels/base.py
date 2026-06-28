@@ -70,6 +70,35 @@ def parse_status_event(raw: str) -> Optional[ToolStatusEvent]:
     return None
 
 
+def is_reasoning_status(raw: str) -> bool:
+    """True for a plain "agent is thinking" UI string (``"Thinking..."``,
+    ``"Loading context..."``), False for anything that is structured data.
+
+    Used by the turn runner to split the ``on_status`` stream: a plain
+    thinking string becomes the typed ``OutReasoning(active=True)`` flag
+    (the client renders its own indicator), while tool-execution JSON and
+    structured envelopes like ``{"kind":"session.compacted"}`` keep flowing
+    as ``OutToolStatus`` because they carry real data the client renders.
+
+    The test is deliberately structural rather than a hardcoded string set,
+    so a new plain status added upstream is classified correctly without a
+    second edit here: it's reasoning iff it is non-empty, is not a parsed
+    tool event, and is not a JSON object/array.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return False
+    if parse_status_event(text) is not None:
+        return False  # tool execution event
+    if text[:1] in "{[":
+        try:
+            json.loads(text)
+            return False  # structured JSON envelope (e.g. session.compacted)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+    return True
+
+
 @dataclass
 class Attachment:
     """A file/image/voice attachment."""

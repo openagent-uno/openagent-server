@@ -1032,21 +1032,19 @@ async def t_telegram_gateway_lost_stops_app(ctx: TestContext) -> None:
     assert calls == ["updater.stop", "app.stop", "app.shutdown"], calls
 
 
-# ── WhatsApp status-throttle tests ────────────────────────────────────
+# ── No-placeholder "is writing" model ─────────────────────────────────
 #
-# WhatsApp can't edit messages — every ``update_status`` call would be a
-# brand-new chat bubble. The bridge dedupes identical lines and enforces
-# a minimum gap between distinct lines. That throttle dict was moved
-# from a per-call closure to a per-instance dict keyed by chat_id; the
-# tests below pin all three invariants so a regression doesn't drown
-# WhatsApp users in "Using bash…" pings.
+# The "⏳ Thinking…" placeholder message is gone on every channel. The
+# working state is the native typing indicator where the platform has one
+# (Telegram, Discord) and the live step messages everywhere else. The
+# server emits a boolean reasoning flag, never a UI string. These tests
+# pin that no bridge posts a "⏳"-prefixed status bubble anymore.
 
 def _fresh_whatsapp_bridge():
     from src.bridges.whatsapp import WhatsAppBridge
 
     bridge = WhatsAppBridge.__new__(WhatsAppBridge)
     bridge.name = "whatsapp"
-    bridge._status_throttle = {}
     bridge._greenapi = None  # never used — we stub _send_text below
     sent: list[tuple[str, str]] = []
 
@@ -1057,80 +1055,109 @@ def _fresh_whatsapp_bridge():
     return bridge, sent
 
 
-@test("bridges", "whatsapp: status throttle dedupes identical consecutive lines")
-async def t_whatsapp_throttle_dedupes_identical(ctx: TestContext) -> None:
-    """An agent can fire the same tool-status string back-to-back
-    (e.g., two ``Using bash...`` pings as it batches sub-commands).
-    The throttle must drop the second one — otherwise WhatsApp users
-    see redundant bubbles."""
+@test("bridges", "whatsapp: post_status posts NO placeholder and status primitives are no-ops")
+async def t_whatsapp_no_placeholder(ctx: TestContext) -> None:
+    """Green API has no typing primitive, so WhatsApp relies on live step
+    messages — it must never post a ``⏳ Thinking…`` bubble. post_status
+    returns None and update_status/clear_status are inert."""
     bridge, sent = _fresh_whatsapp_bridge()
     chat = "1234@c.us"
 
-    await bridge.post_status(chat, "Thinking...")  # seeds throttle
-    sent.clear()
-
+    handle = await bridge.post_status(chat, "Thinking...")
+    assert handle is None, handle
     await bridge.update_status(chat, "Using bash...")
-    await bridge.update_status(chat, "Using bash...")  # dedupe
-    await bridge.update_status(chat, "Using bash...")  # dedupe
+    await bridge.clear_status(chat)
 
-    assert sent == [(chat, "⏳ Using bash...")], (
-        f"identical lines must dedupe; got {sent}"
-    )
+    assert sent == [], f"WhatsApp must not post any status bubble; got {sent}"
+    # The dead throttle machinery is gone.
+    from src.bridges import whatsapp as wa_mod
+    assert not hasattr(wa_mod, "WA_STATUS_THROTTLE_SECS"), "throttle const should be removed"
+    assert not hasattr(bridge, "_status_throttle"), "throttle dict should be removed"
 
 
-@test("bridges", "whatsapp: status throttle enforces minimum gap between distinct lines")
-async def t_whatsapp_throttle_enforces_gap(ctx: TestContext) -> None:
-    """Distinct status lines arriving inside ``WA_STATUS_THROTTLE_SECS``
-    are dropped. Without this, a fast tool-loop would fire one bubble
-    per tool call."""
+@test("bridges", "discord: post_status starts native typing (no placeholder), clear stops it")
+async def t_discord_native_typing(ctx: TestContext) -> None:
+    """Discord uses the native ``channel.typing()`` indicator via a
+    keepalive animator instead of a ``⏳ Thinking…`` message. post_status
+    must NOT call channel.send; clear_status stops the animator."""
     import asyncio
-    from src.bridges.whatsapp import WA_STATUS_THROTTLE_SECS
+    from src.bridges.discord import DiscordBridge
 
-    bridge, sent = _fresh_whatsapp_bridge()
-    chat = "1234@c.us"
-    await bridge.post_status(chat, "Thinking...")
-    sent.clear()
+    bridge = DiscordBridge.__new__(DiscordBridge)
+    bridge.name = "discord"
 
-    # Same instant: second distinct line is throttled.
-    await bridge.update_status(chat, "Using read_file...")
-    await bridge.update_status(chat, "Using bash...")
-    assert len(sent) == 1, f"throttle must drop the second line; got {sent}"
+    sends: list[str] = []
+    typing_open = asyncio.Event()
+    typing_closed = asyncio.Event()
 
-    # Forge the timestamp BEYOND the throttle window so the next
-    # distinct line gets through (avoids a real 8 s sleep in tests).
-    bridge._status_throttle[chat]["ts"] -= WA_STATUS_THROTTLE_SECS + 1
-    await bridge.update_status(chat, "Using web_search...")
-    assert len(sent) == 2, f"line beyond gap must pass; got {sent}"
+    class _FakeTyping:
+        async def __aenter__(self):
+            typing_open.set()
+            return self
+        async def __aexit__(self, *exc):
+            typing_closed.set()
+            return False
+
+    class _FakeChannel:
+        def typing(self):
+            return _FakeTyping()
+        async def send(self, *_a, **_k):
+            sends.append("send")
+
+    ch = _FakeChannel()
+    animator = await bridge.post_status(ch, "Thinking...")
+    assert animator is not None, "discord post_status should return a typing animator"
+    await asyncio.wait_for(typing_open.wait(), timeout=1.0)
+    assert sends == [], f"discord must NOT post a placeholder message; got {sends}"
+
+    # update_status is a no-op (no placeholder to edit).
+    await bridge.update_status(animator, "Using bash...")
+    assert sends == [], sends
+
+    await bridge.clear_status(animator)
+    await asyncio.wait_for(typing_closed.wait(), timeout=1.0)
 
 
-@test("bridges", "whatsapp: status throttle is per-chat (no cross-chat leak) and cleared on clear_status")
-async def t_whatsapp_throttle_per_chat_isolation(ctx: TestContext) -> None:
-    """Two concurrent WhatsApp users share one bridge instance. Their
-    throttle state must NOT leak — chat A's recent ``Using bash...``
-    cannot suppress chat B's first ``Using bash...``."""
-    bridge, sent = _fresh_whatsapp_bridge()
-    a, b = "alice@c.us", "bob@c.us"
+@test("bridges", "slack: post_status is a no-op (no placeholder, no typing primitive)")
+async def t_slack_no_placeholder(ctx: TestContext) -> None:
+    from src.bridges.slack import SlackBridge
 
-    await bridge.post_status(a, "Thinking...")
-    await bridge.post_status(b, "Thinking...")
-    sent.clear()
+    bridge = SlackBridge.__new__(SlackBridge)
+    bridge.name = "slack"
 
-    await bridge.update_status(a, "Using bash...")
-    # If state leaked, this would be deduped against alice's entry.
-    await bridge.update_status(b, "Using bash...")
-    targets = sorted(c for c, _ in sent)
-    assert targets == [a, b], (
-        f"per-chat throttle leaked across chats; got {sent}"
-    )
+    posted: list = []
 
-    # clear_status pops the slot so a new burst starts fresh.
-    assert a in bridge._status_throttle
-    await bridge.clear_status(a)
-    assert a not in bridge._status_throttle, (
-        f"clear_status must pop throttle entry; got {bridge._status_throttle}"
-    )
-    # The other chat's slot is untouched.
-    assert b in bridge._status_throttle
+    class _FakeClient:
+        async def chat_postMessage(self, **kw):
+            posted.append(kw)
+            return {"ts": "1"}
+
+    class _Target:
+        client = _FakeClient()
+        channel = "C1"
+        user = "U1"
+
+    handle = await bridge.post_status(_Target(), "Thinking...")
+    assert handle is None, handle
+    assert posted == [], f"slack must not post a placeholder; got {posted}"
+
+
+@test("bridges", "no bridge module emits a ⏳ placeholder string")
+async def t_no_hourglass_placeholder_anywhere(ctx: TestContext) -> None:
+    """Grep guard: the '⏳' placeholder glyph must not reappear in any
+    bridge source. The working state is native typing / live step
+    messages / the server's boolean reasoning flag — never a bubble."""
+    import inspect
+    import src.bridges.telegram as tg
+    import src.bridges.discord as dc
+    import src.bridges.whatsapp as wa
+    import src.bridges.slack as sl
+    import src.bridges.base as base
+
+    for label, mod in (("telegram", tg), ("discord", dc), ("whatsapp", wa),
+                        ("slack", sl), ("base", base)):
+        src = inspect.getsource(mod)
+        assert "⏳" not in src, f"{label} bridge still references the ⏳ placeholder"
 
 
 # ── on_status callback lifecycle ──────────────────────────────────────
@@ -1462,6 +1489,10 @@ async def t_dispatch_turn_post_status_raises(ctx: TestContext) -> None:
 
     bridge = _Stub.__new__(_Stub)
     bridge.name = "stub"
+    # This test pins the NON-live status path (on_status → update_status,
+    # which no-ops when post_status returned no handle). Live mode posts
+    # tool lines as their own messages and is covered separately below.
+    bridge._live = False
 
     async def _fake_send_message(text, session_id, *, on_status=None, **kwargs):
         # Trigger on_status to confirm it's safely no-op when no handle.
@@ -1581,3 +1612,309 @@ async def t_gateway_ws_drop_orphan_cleanup(ctx: TestContext) -> None:
     # All cached state cleaned.
     assert sid not in fb._real._stream_pending
     assert sid not in fb._real._stream_opened
+
+
+# ── Live-message mode (Hermes-style in-chat narration) ────────────────
+#
+# In live mode every tool invocation and every span of assistant
+# narration is posted as its OWN chat message while the turn runs, in
+# addition to the platform "is writing" indicator — instead of a single
+# final reply. The tests below pin: the per-tool / per-segment posting,
+# the no-duplication contract (the final reply only carries the still-
+# unposted tail), the voice opt-out, and the config threading. Live mode
+# is the default; ``channels.<name>.live: false`` / ``OPENAGENT_CHANNEL_LIVE``
+# turn it off.
+
+@test("bridges", "format_tool_message: invocation + error get a line, done/plain do not")
+async def t_format_tool_message(ctx: TestContext) -> None:
+    from src.bridges.base import format_tool_message
+    # running (no result yet) → invocation line
+    assert format_tool_message(
+        '{"tool_name":"bash","tool_call_error":false}'
+    ) == "🔧 Using `bash`"
+    # done (result present) → no message (avoids 2 bubbles per tool)
+    assert format_tool_message(
+        '{"tool_name":"bash","tool_call_error":false,"result":"ok"}'
+    ) is None
+    # error → failure line carrying the message
+    assert format_tool_message(
+        '{"tool_name":"bash","tool_call_error":true,"result":"boom"}'
+    ) == "⚠️ `bash` failed: boom"
+    # plain status + the compaction envelope → no message
+    assert format_tool_message("Thinking...") is None
+    assert format_tool_message(
+        '{"kind":"session.compacted","summary_chars":10,"kept_runs_count":2}'
+    ) is None
+
+
+@test("bridges", "live flag threads from each bridge constructor to BaseBridge")
+async def t_live_flag_threads(ctx: TestContext) -> None:
+    from src.bridges.telegram import TelegramBridge
+    from src.bridges.discord import DiscordBridge
+    from src.bridges.whatsapp import WhatsAppBridge
+    from src.bridges.slack import SlackBridge
+
+    # Default is ON.
+    assert TelegramBridge(token="x")._live is True
+    # Explicit opt-out threads through super().__init__.
+    assert TelegramBridge(token="x", live=False)._live is False
+    assert DiscordBridge(token="x", allowed_users=["1"], live=False)._live is False
+    assert WhatsAppBridge(instance_id="i", api_token="t", live=False)._live is False
+    assert SlackBridge(bot_token="b", app_token="a", live=False)._live is False
+
+
+@test("bridges", "live mode posts each tool call + narration span as its own message (no dup)")
+async def t_live_mode_streams_segments(ctx: TestContext) -> None:
+    """End-to-end through the real ``send_message`` + gateway-frame
+    router. We feed an ordered stream — narration, a tool running/done
+    pair, more narration, the final RESPONSE, turn_complete — exactly as
+    the gateway would, and assert the chat sees:
+
+        1. the narration that preceded the tool,
+        2. the tool-usage line,
+        3. ONLY the still-unposted tail as the final answer.
+
+    The final reply must NOT re-send text already streamed."""
+    import asyncio
+    from src.bridges.base import BaseBridge
+
+    posted: list[str] = []
+
+    class _Stub(BaseBridge):
+        name = "livestub"
+        message_limit = 4096
+
+        async def post_status(self, target, text):
+            return "writing-indicator"  # the "is writing" flag stays lit
+
+        async def clear_status(self, handle):
+            pass
+
+        async def send_text_chunk(self, target, chunk):
+            posted.append(chunk)
+
+        async def send_attachment(self, target, att):
+            pass
+
+    bridge = _Stub()
+    bridge._ws = object()  # bypass the not-connected guard
+
+    sent: list[dict] = []
+
+    async def _capture(payload):
+        sent.append(payload)
+
+    bridge._send_gateway_json = _capture  # type: ignore[method-assign]
+    sid = "sid:live"
+
+    async def feed():
+        # Wait for send_message to register the owner collector.
+        for _ in range(500):
+            if sid in bridge._stream_pending:
+                break
+            await asyncio.sleep(0.001)
+        else:
+            raise AssertionError("collector never appeared")
+        frame = bridge._handle_gateway_frame
+        await frame({"type": "delta", "session_id": sid,
+                     "text": "Let me check the weather. "})
+        await frame({"type": "status", "session_id": sid,
+                     "text": '{"tool_name":"bash","tool_call_error":false}'})
+        await frame({"type": "status", "session_id": sid,
+                     "text": '{"tool_name":"bash","tool_call_error":false,"result":"sunny"}'})
+        await frame({"type": "delta", "session_id": sid, "text": "It is sunny."})
+        await frame({"type": "response", "session_id": sid,
+                     "text": "Let me check the weather. It is sunny.",
+                     "model": None})
+        await frame({"type": "turn_complete", "session_id": sid})
+
+    await asyncio.gather(
+        bridge.dispatch_turn("target", sid, "weather?"),
+        feed(),
+    )
+
+    assert posted == [
+        "Let me check the weather.",   # narration flushed before the tool
+        "🔧 Using `bash`",             # the tool invocation line
+        "It is sunny.",                # ONLY the unposted tail (no dup)
+    ], posted
+
+
+@test("bridges", "live mode: plain (tool-free) turn posts a single final reply, no dup")
+async def t_live_mode_no_tools_single_reply(ctx: TestContext) -> None:
+    """When the agent uses no tools there is nothing to narrate
+    mid-turn, so live mode must collapse to exactly one reply message —
+    never the empty-segment + duplicate the naive implementation would
+    produce."""
+    import asyncio
+    from src.bridges.base import BaseBridge
+
+    posted: list[str] = []
+
+    class _Stub(BaseBridge):
+        name = "livestub"
+        message_limit = 4096
+
+        async def post_status(self, target, text):
+            return "h"
+
+        async def clear_status(self, handle):
+            pass
+
+        async def send_text_chunk(self, target, chunk):
+            posted.append(chunk)
+
+        async def send_attachment(self, target, att):
+            pass
+
+    bridge = _Stub()
+    bridge._ws = object()
+
+    async def _capture(payload):
+        return None
+
+    bridge._send_gateway_json = _capture  # type: ignore[method-assign]
+    sid = "sid:notool"
+
+    async def feed():
+        for _ in range(500):
+            if sid in bridge._stream_pending:
+                break
+            await asyncio.sleep(0.001)
+        else:
+            raise AssertionError("collector never appeared")
+        frame = bridge._handle_gateway_frame
+        await frame({"type": "delta", "session_id": sid, "text": "Just the answer."})
+        await frame({"type": "response", "session_id": sid,
+                     "text": "Just the answer.", "model": None})
+        await frame({"type": "turn_complete", "session_id": sid})
+
+    await asyncio.gather(
+        bridge.dispatch_turn("target", sid, "hi"),
+        feed(),
+    )
+    assert posted == ["Just the answer."], posted
+
+
+@test("bridges", "live mode surfaces a failed tool as its own ⚠️ message")
+async def t_live_mode_tool_error_message(ctx: TestContext) -> None:
+    from src.bridges.base import BaseBridge
+
+    posted: list[str] = []
+
+    class _Stub(BaseBridge):
+        name = "livestub"
+        message_limit = 4096
+
+        async def post_status(self, target, text):
+            return None
+
+        async def send_text_chunk(self, target, chunk):
+            posted.append(chunk)
+
+        async def send_attachment(self, target, att):
+            pass
+
+    bridge = _Stub.__new__(_Stub)
+    bridge.name = "livestub"
+    bridge._live = True
+    bridge._stream_pending = {}
+
+    async def _fake_send(text, session_id, *, on_status=None, on_delta=None, **kwargs):
+        if on_status:
+            # running, then error
+            await on_status('{"tool_name":"web_search","tool_call_error":false}')
+            await on_status('{"tool_name":"web_search","tool_call_error":true,"result":"429 rate limited"}')
+        return {"type": "response", "text": "Sorry, search failed.",
+                "accumulated": "Sorry, search failed.", "model": None,
+                "attachments": [], "target": None}
+
+    bridge.send_message = _fake_send  # type: ignore[method-assign]
+    await bridge.dispatch_turn("target", "sid:err", "search please")
+
+    assert posted == [
+        "🔧 Using `web_search`",
+        "⚠️ `web_search` failed: 429 rate limited",
+        "Sorry, search failed.",
+    ], posted
+
+
+@test("bridges", "live mode is OFF for voice turns — no per-tool bubbles, just the reply")
+async def t_live_mode_off_for_voice(ctx: TestContext) -> None:
+    """A voice-note user wants the spoken reply, not a wall of
+    intermediate text. ``voice_detected`` forces the non-live path even
+    when ``_live`` is on; tool calls must NOT each become a message."""
+    from src.bridges.base import BaseBridge
+
+    posted: list[str] = []
+
+    class _Stub(BaseBridge):
+        name = "livestub"
+        message_limit = 4096
+
+        async def post_status(self, target, text):
+            return None
+
+        async def send_text_chunk(self, target, chunk):
+            posted.append(chunk)
+
+        async def send_attachment(self, target, att):
+            pass
+
+    bridge = _Stub.__new__(_Stub)
+    bridge.name = "livestub"
+    bridge._live = True
+
+    async def _fake_send(text, session_id, *, on_status=None, on_delta=None, **kwargs):
+        if on_status:
+            await on_status('{"tool_name":"bash","tool_call_error":false}')
+        return {"type": "response", "text": "Spoken answer.",
+                "accumulated": "Spoken answer.", "model": None,
+                "attachments": [], "target": None}
+
+    async def _no_voice(text):
+        return None  # skip real TTS; just exercise the non-live text path
+
+    bridge.send_message = _fake_send  # type: ignore[method-assign]
+    bridge.synthesise_audio_attachment = _no_voice  # type: ignore[method-assign]
+
+    await bridge.dispatch_turn("target", "sid:voice", "hi", voice_detected=True)
+    # No "🔧 Using `bash`" bubble — only the final reply.
+    assert posted == ["Spoken answer."], posted
+
+
+@test("bridges", "live mode appends the model footer to the final answer span")
+async def t_live_mode_model_footer(ctx: TestContext) -> None:
+    from src.bridges.base import BaseBridge
+
+    posted: list[str] = []
+
+    class _Stub(BaseBridge):
+        name = "livestub"
+        message_limit = 4096
+
+        async def post_status(self, target, text):
+            return None
+
+        async def send_text_chunk(self, target, chunk):
+            posted.append(chunk)
+
+        async def send_attachment(self, target, att):
+            pass
+
+    bridge = _Stub.__new__(_Stub)
+    bridge.name = "livestub"
+    bridge._live = True
+    bridge._stream_pending = {}
+
+    async def _fake_send(text, session_id, *, on_status=None, on_delta=None, **kwargs):
+        if on_status:
+            await on_status('{"tool_name":"bash","tool_call_error":false}')
+        return {"type": "response", "text": "Done.",
+                "accumulated": "Done.", "model": "claude-opus-4-8",
+                "attachments": [], "target": None}
+
+    bridge.send_message = _fake_send  # type: ignore[method-assign]
+    await bridge.dispatch_turn("target", "sid:footer", "go")
+    assert posted[0] == "🔧 Using `bash`", posted
+    assert posted[-1] == "Done.\n\nModel: claude-opus-4-8", posted

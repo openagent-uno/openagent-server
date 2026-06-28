@@ -28,6 +28,42 @@ logger = logging.getLogger(__name__)
 DISCORD_MSG_LIMIT = 2000
 
 
+class _DiscordTypingAnimator:
+    """Keeps Discord's native "Bot is typing…" indicator lit for the whole
+    turn — the in-chat equivalent of Telegram's ``ChatAction.TYPING``
+    animator, so the agent never has to post a ``Thinking…`` placeholder.
+
+    ``channel.typing()`` is an async context manager that re-triggers the
+    indicator on Discord's ~10 s cadence while the block is open, so we
+    just hold it open on a background task until ``stop()`` is called.
+    """
+
+    def __init__(self, channel) -> None:
+        self._channel = channel
+        self._stop = asyncio.Event()
+        self._task: asyncio.Task | None = None
+
+    async def start(self) -> None:
+        async def _loop() -> None:
+            try:
+                async with self._channel.typing():
+                    await self._stop.wait()
+            except Exception as e:  # noqa: BLE001
+                # Missing permission / deleted channel / network blip —
+                # the typing dot is best-effort; the reply still lands.
+                logger.debug("discord typing indicator failed: %s", e)
+        self._task = asyncio.create_task(_loop())
+
+    async def stop(self) -> None:
+        self._stop.set()
+        if self._task is not None:
+            try:
+                await asyncio.wait_for(self._task, timeout=1.0)
+            except (asyncio.TimeoutError, Exception):
+                pass
+            self._task = None
+
+
 class DiscordBridge(BaseBridge):
     name = "discord"
     message_limit = DISCORD_MSG_LIMIT
@@ -42,8 +78,9 @@ class DiscordBridge(BaseBridge):
         gateway_url: str = "ws://localhost:8765/ws",
         gateway_token: str | None = None,
         personality: str | None = None,
+        live: bool = True,
     ):
-        super().__init__(gateway_url, gateway_token, personality=personality)
+        super().__init__(gateway_url, gateway_token, personality=personality, live=live)
         self.token = token
         self.allowed_users = set(str(u) for u in allowed_users)
         self.allowed_guilds = set(str(g) for g in (allowed_guilds or []))
@@ -210,20 +247,27 @@ class DiscordBridge(BaseBridge):
     # ── Platform primitives (consumed by BaseBridge.dispatch_turn) ──
 
     async def post_status(self, channel, text: str):
+        # Native "is writing" indicator instead of a "Thinking…"
+        # message. Tool calls + answer spans surface as live step messages
+        # (BaseBridge.dispatch_turn live mode); the typing dot covers the
+        # gap before the first one lands.
         try:
-            return await channel.send(f"⏳ {text}")
+            animator = _DiscordTypingAnimator(channel)
+            await animator.start()
+            return animator
         except Exception:
             return None
 
-    async def update_status(self, status_msg, text: str) -> None:
-        try:
-            await status_msg.edit(content=f"⏳ {text}")
-        except Exception:
-            pass
+    async def update_status(self, animator, text: str) -> None:
+        # No-op: the native typing indicator + live step messages replace
+        # the old edited "…" placeholder.
+        return None
 
-    async def clear_status(self, status_msg) -> None:
+    async def clear_status(self, animator) -> None:
+        if animator is None:
+            return
         try:
-            await status_msg.delete()
+            await animator.stop()
         except Exception:
             pass
 

@@ -162,6 +162,7 @@ _TEST_MODULES: tuple[str, ...] = (
     # contextvar, member content/tool → child frame translation, and the
     # mid-run delegate card-link (clickable while the sub-agent runs).
     "test_child_live_stream",
+    "test_workflow_live_stream",
     "test_behavior_contract",
     "test_mcp_manager_guards",
     "test_provider_manager",

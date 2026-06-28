@@ -69,12 +69,34 @@ class StreamCollector(BatchedReply):
     # while the turn is still in flight.
     _delta_buffer: str = ""
 
+    @property
+    def accumulated_text(self) -> str:
+        """The raw token stream accumulated so far this turn.
+
+        This is the ordered concatenation of every ``OutTextDelta`` —
+        ``fold_outbound_event`` appends to it synchronously as each delta
+        frame is decoded, so it is always current/ordered even though the
+        per-delta ``on_delta`` callbacks fire as detached tasks. Live-mode
+        bridges read it to flush the narration that preceded a tool call
+        (see ``BaseBridge.dispatch_turn``). Unlike ``text`` it still
+        carries any ``[IMAGE:/path]`` / ``[FILE:/path]`` markers — the
+        server strips those from the final ``OutTextFinal.text`` but not
+        from the deltas.
+        """
+        return self._delta_buffer or ""
+
     def to_legacy_reply(self) -> dict:
         """Render the answer-response dict shape bridge / CLI callers expect."""
         base = {
             "model": self.model,
             "attachments": self.attachments,
             "target": self.latest_target,
+            # Raw accumulated delta stream for live-mode bridges that
+            # posted text incrementally during the turn and only need the
+            # still-unposted tail at the end. ``None`` would be wrong here
+            # (callers slice it); empty string is the right "nothing
+            # streamed" sentinel.
+            "accumulated": self.accumulated_text,
         }
         if self.errored:
             return {

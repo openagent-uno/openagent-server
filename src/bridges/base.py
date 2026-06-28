@@ -167,6 +167,68 @@ def format_tool_status(raw: str) -> str:
     return f"✓ {evt.tool} done"
 
 
+def format_tool_message(raw: str) -> str | None:
+    """Render a tool-status event as a STANDALONE chat message for live
+    mode (vs ``format_tool_status`` which feeds an editable status line).
+
+    Returns ``None`` for events that should NOT get their own message so
+    the chat isn't flooded:
+
+    * non-tool statuses (``"Thinking..."``, ``"Loading context..."``,
+      the ``session.compacted`` envelope) — ``parse_status_event`` yields
+      ``None`` for these,
+    * tool *completion* pings — the runtime emits a (running, done) pair
+      per tool; we surface the invocation and any failure, but a "done"
+      bubble for every tool would double the message count.
+
+    Mirrors the Hermes UX of narrating each tool call in-chat.
+    """
+    from src.channels.base import parse_status_event
+    evt = parse_status_event(raw)
+    if evt is None:
+        return None
+    if evt.status == "running":
+        return f"🔧 Using `{evt.tool}`"
+    if evt.status == "error":
+        return f"⚠️ `{evt.tool}` failed: {evt.error or 'unknown error'}"
+    return None  # "done" — skip; the invocation line already landed
+
+
+class _LiveProgress:
+    """Per-turn bookkeeping for live-message mode.
+
+    In live mode ``dispatch_turn`` posts each tool invocation and each
+    span of assistant narration as its own chat message *as the turn
+    unfolds* — instead of one final reply — while the platform "is
+    writing" indicator stays lit (vision §9: a channel translates the
+    agent's outbound stream into platform-native messages).
+
+    Created fresh per ``dispatch_turn`` and captured by that turn's
+    ``on_status`` / ``on_delta`` closures, so concurrent turns on the
+    same bridge instance never share state. Text is tracked by character
+    offset into the collector's raw accumulated delta stream
+    (``StreamCollector.accumulated_text``) — that stream only ever grows
+    and is updated in frame order, so a simple high-water mark is enough
+    to know what is still unposted.
+    """
+
+    __slots__ = ("posted_chars", "posted_any", "latest")
+
+    def __init__(self) -> None:
+        # High-water mark: chars of the raw accumulated stream already
+        # posted as messages.
+        self.posted_chars = 0
+        # Whether ANY live message (tool line or narration) was posted.
+        # Gates the end-of-turn path: if nothing streamed, fall back to
+        # the normal single-reply render so error/empty turns behave
+        # exactly as before.
+        self.posted_any = False
+        # Most recent accumulated text seen via ``on_delta`` — a fallback
+        # source when the collector can't be read (it shouldn't normally
+        # happen mid-turn, but the on_delta value is always safe).
+        self.latest = ""
+
+
 class BaseBridge:
     """Abstract base for platform bridges.
 
@@ -191,11 +253,22 @@ class BaseBridge:
     # resolved from the ``personality`` config arg.
     _personality_directive: str | None = None
 
+    # Live-message mode: post each tool invocation and each span of
+    # assistant narration as its own chat message while the turn runs,
+    # in addition to the "is writing" indicator (Hermes-style). Class
+    # default ``True`` so it is the out-of-the-box behaviour and so the
+    # attribute is present even on bridges built via ``__new__`` (tests);
+    # ``__init__`` overrides it from the ``live`` config arg. Disable per
+    # channel with ``channels.<name>.live: false`` or globally with
+    # ``OPENAGENT_CHANNEL_LIVE=0``.
+    _live: bool = True
+
     def __init__(
         self,
         gateway_url: str = "ws://localhost:8765/ws",
         gateway_token: str | None = None,
         personality: str | None = None,
+        live: bool = True,
     ):
         self.gateway_url = gateway_url
         self.gateway_token = gateway_token
@@ -203,6 +276,7 @@ class BaseBridge:
         # ``None`` means no overlay. Wired into ``dispatch_turn`` so every
         # user message picks it up automatically.
         self._personality_directive = resolve_personality_directive(personality)
+        self._live = bool(live)
         self._ws = None
         self._ws_session = None  # aiohttp.ClientSession — must be closed
         self._http_session = None  # cached aiohttp.ClientSession for TTS/STT
@@ -583,22 +657,27 @@ class BaseBridge:
     # every bridge MUST override.
 
     async def post_status(self, target, text: str):
-        """Post the initial "Thinking..." status. Return an opaque
-        handle (anything the bridge wants — message object, chat_id, …)
-        that ``update_status`` / ``clear_status`` will receive back, or
-        ``None`` if the bridge has no status surface."""
+        """Start the platform's native "is writing" indicator for the turn.
+
+        Telegram/Discord override this to light the native typing dot
+        (kept alive on a background task for the turn's duration) and
+        return a handle that ``clear_status`` stops. Platforms with no
+        typing primitive (Slack, WhatsApp) return ``None`` and rely on the
+        live step messages instead. We deliberately do NOT post a
+        ``Thinking…`` placeholder message — the server's reasoning state
+        is a boolean flag, not a chat bubble. ``text`` is a legacy hint and
+        is ignored by typing-based bridges."""
         return None
 
     async def update_status(self, handle, text: str) -> None:
-        """Update the in-flight status with a new line (e.g. "Using bash…").
-        Default: no-op (bridges with no edit API can override to
-        post a throttled new message instead)."""
+        """Deprecated no-op. Tool progress is surfaced as live step
+        messages (see ``dispatch_turn`` live mode) and the working state
+        as the native typing indicator — there is no placeholder to edit."""
         return None
 
     async def clear_status(self, handle) -> None:
-        """Remove the status indicator once the turn is done. Default:
-        no-op (WhatsApp can't delete messages, so the throttled status
-        line just stays in the chat)."""
+        """Stop the native typing indicator started by ``post_status``.
+        Default no-op for platforms that had no indicator to start."""
         return None
 
     async def stream_text(self, handle, text: str) -> None:
@@ -654,7 +733,57 @@ class BaseBridge:
             logger.debug("%s: post_status failed: %s", self.name, e)
             status_handle = None
 
+        # Live-message mode posts tool calls + narration as separate
+        # chat messages as the turn unfolds. Disabled for voice turns:
+        # a voice-note user wants the spoken reply, not a wall of
+        # intermediate text bubbles (the spoken answer still lands via
+        # the normal final-reply path below).
+        live_active = self._live and not voice_detected
+        live = _LiveProgress() if live_active else None
+
+        async def _live_flush_text(accumulated: str) -> None:
+            """Post the span of narration produced since the last flush.
+
+            ``accumulated`` is the raw delta stream so far; we post the
+            slice past our high-water mark, advancing the mark even when
+            the slice is marker/whitespace-only so it is never re-posted.
+            """
+            if live is None or not accumulated:
+                return
+            if len(accumulated) <= live.posted_chars:
+                return
+            segment = accumulated[live.posted_chars:]
+            live.posted_chars = len(accumulated)
+            # Strip [IMAGE:]/[FILE:]/… markers from the visible text. We
+            # don't send the parsed attachments mid-stream — they're
+            # handled once at the end (matches the non-live path).
+            seg_clean, _atts = parse_response_markers(segment)
+            if seg_clean.strip():
+                try:
+                    await self.send_response_text(target, seg_clean)
+                    live.posted_any = True
+                except Exception:
+                    pass
+
         async def on_status(raw: str) -> None:
+            if live is not None:
+                # Flush narration that preceded this tool call, then post
+                # the tool-usage line as its own message. Read the raw
+                # accumulated text straight off the collector so it is in
+                # frame order (the on_delta callbacks are detached and may
+                # lag); fall back to the latest on_delta value otherwise.
+                pending = getattr(self, "_stream_pending", None)
+                coll = pending.get(session_id) if pending else None
+                accumulated = coll.accumulated_text if coll is not None else live.latest
+                await _live_flush_text(accumulated)
+                line = format_tool_message(raw)
+                if line:
+                    try:
+                        await self.send_text_chunk(target, line)
+                        live.posted_any = True
+                    except Exception:
+                        pass
+                return
             if status_handle is None:
                 return
             try:
@@ -663,6 +792,14 @@ class BaseBridge:
                 pass
 
         async def on_delta(running_text: str) -> None:
+            if live is not None:
+                # Keep the latest accumulated text as a fallback for
+                # ``on_status`` / the end-of-turn flush. Don't post here —
+                # narration is flushed at tool boundaries and at the end
+                # so each message is a coherent span, not a token fragment.
+                if running_text and len(running_text) > len(live.latest):
+                    live.latest = running_text
+                return
             if status_handle is None or not running_text:
                 return
             try:
@@ -813,20 +950,41 @@ class BaseBridge:
         # collector; the owner's reply now reads back the latest.
         post_target = response.get("target") or target
 
-        response_text = response.get("text", "") or ""
-        response_text = await self.maybe_prepend_voice_reply(response_text, voice_detected)
+        if live is not None and live.posted_any:
+            # Live mode already streamed the tool calls + narration as
+            # their own messages. Post ONLY the still-unposted tail (the
+            # final answer) so nothing is duplicated. ``accumulated`` is
+            # the raw delta stream; ``posted_chars`` is how much of it we
+            # already sent. Voice mirroring is off in live mode, and
+            # agent-emitted attachment markers are dropped here exactly as
+            # the non-live path drops them — only the visible text shows.
+            accumulated = response.get("accumulated")
+            if accumulated is None:
+                remainder_raw = response.get("text", "") or ""
+            elif live.posted_chars < len(accumulated):
+                remainder_raw = accumulated[live.posted_chars:]
+            else:
+                remainder_raw = ""
+            clean, _atts = parse_response_markers(remainder_raw)
+            clean = clean.strip()
+            if clean:
+                clean = self.append_model_feedback(clean, response.get("model"))
+                await self.send_response_text(post_target, clean)
+        else:
+            response_text = response.get("text", "") or ""
+            response_text = await self.maybe_prepend_voice_reply(response_text, voice_detected)
 
-        clean, attachments = parse_response_markers(response_text)
-        for att in attachments:
-            try:
-                await self.send_attachment(post_target, att)
-            except Exception as e:  # noqa: BLE001
-                logger.error("%s attachment send error: %s", self.name, e)
-            finally:
-                self._cleanup_owned_temp_artifact(att.path)
+            clean, attachments = parse_response_markers(response_text)
+            for att in attachments:
+                try:
+                    await self.send_attachment(post_target, att)
+                except Exception as e:  # noqa: BLE001
+                    logger.error("%s attachment send error: %s", self.name, e)
+                finally:
+                    self._cleanup_owned_temp_artifact(att.path)
 
-        clean = self.append_model_feedback(clean, response.get("model"))
-        await self.send_response_text(post_target, clean)
+            clean = self.append_model_feedback(clean, response.get("model"))
+            await self.send_response_text(post_target, clean)
 
         # Fire turn_end hook if registered. Fire-and-forget; never
         # blocks the response path. ``response_chars`` is a coarse

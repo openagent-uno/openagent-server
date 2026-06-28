@@ -99,6 +99,12 @@ MESSAGE = "message"
 COMMAND = "command"
 COMMAND_RESULT = "command_result"
 STATUS = "status"
+# Agent reasoning/thinking state (server→client), a boolean flag — NOT a
+# UI string. ``{"type":"reasoning","active":true|false,"session_id":...}``.
+# Clients render their own affordance (native typing / spinner / animated
+# component); the server never dictates the "Thinking..." copy. The actual
+# wire (de)serialisation lives in ``src/stream/wire.py``.
+REASONING = "reasoning"
 # Streaming token frame for text-mode replies (server→client). Emitted
 # by ``StreamSession`` while the LLM streams; the trailing ``response``
 # is the canonical record. See module docstring.

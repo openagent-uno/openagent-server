@@ -30,8 +30,8 @@ from ._framework import TestContext, test
 async def t_wire_round_trip(ctx: TestContext) -> None:
     from src.stream.events import (
         AudioChunk, Interrupt, OutAudioChunk, OutAudioEnd, OutAudioStart,
-        OutTextDelta, OutTextFinal, OutToolStatus, OutVideoFrame, SessionOpen,
-        TextDelta, TextFinal, TurnComplete, VideoFrame,
+        OutReasoning, OutTextDelta, OutTextFinal, OutToolStatus, OutVideoFrame,
+        SessionOpen, TextDelta, TextFinal, TurnComplete, VideoFrame,
     )
     from src.stream.events import OutError
     from src.stream.wire import event_to_wire, wire_to_event
@@ -43,6 +43,8 @@ async def t_wire_round_trip(ctx: TestContext) -> None:
         OutAudioChunk(session_id="s", seq=4, ts_ms=40, data=b"\x00\x01"),
         OutAudioEnd(session_id="s", seq=5, ts_ms=50, total_chunks=1),
         OutToolStatus(session_id="s", seq=6, ts_ms=60, text="Using bash"),
+        OutReasoning(session_id="s", seq=16, ts_ms=160, active=True),
+        OutReasoning(session_id="s", seq=17, ts_ms=170, active=False),
         OutVideoFrame(session_id="s", seq=7, ts_ms=70, stream="webcam",
                       image_bytes=b"jpgbytes", width=320, height=240),
         TurnComplete(session_id="s", seq=8, ts_ms=80),
@@ -255,6 +257,113 @@ async def t_run_one_shot(ctx: TestContext) -> None:
     assert finals[-1].model == "fake-model"
     assert completes, "expected a TurnComplete event"
     assert isinstance(out[-1], TurnComplete), f"TurnComplete must be last; got {out[-1]!r}"
+
+
+# ── Reasoning flag (server emits a boolean, never a "Thinking…" string) ─
+
+class _StatusAgent:
+    """Fake agent that drives ``on_status`` with a scripted sequence
+    (plain thinking strings + tool JSON) then yields deltas, so we can
+    pin how ``StreamTurnRunner`` translates statuses into the typed
+    reasoning flag vs. tool-status frames."""
+
+    name = "statusy"
+    db = None
+
+    def __init__(self, script, deltas):
+        self._script = script   # list of on_status strings, in order
+        self._deltas = deltas
+
+    async def run_stream(self, *, message, user_id, session_id,
+                         attachments=None, on_status=None, author=None):
+        for s in self._script:
+            if on_status:
+                await on_status(s)
+        for d in self._deltas:
+            yield {"kind": "delta", "text": d}
+        yield {"kind": "done", "text": "".join(self._deltas)}
+
+    def last_response_meta(self, session_id: str) -> dict:
+        return {"model": "fake-model"}
+
+
+async def _drain(sess):
+    out = []
+    while not sess.outbound.empty():
+        out.append(sess.outbound.get_nowait())
+    return out
+
+
+@test("stream", "plain 'Thinking…' status becomes OutReasoning(true/false), never an OutToolStatus string")
+async def t_reasoning_translation(ctx: TestContext) -> None:
+    from src.stream.events import OutReasoning, OutToolStatus, OutTextDelta
+    from src.stream.session import StreamSession
+
+    # Loading→Thinking (UI strings) then a tool (data) then the answer.
+    agent = _StatusAgent(
+        script=[
+            "Loading context...",
+            "Thinking...",
+            '{"tool_name":"bash","tool_call_error":false}',
+        ],
+        deltas=["the ", "answer"],
+    )
+    sess = StreamSession(agent, client_id="c", session_id="s")
+    await sess.run_one_shot("hi", speak=False)
+    out = await _drain(sess)
+
+    reasoning = [e for e in out if isinstance(e, OutReasoning)]
+    tools = [e for e in out if isinstance(e, OutToolStatus)]
+
+    # Exactly one true then one false — the two plain strings collapse to a
+    # single active=True; the tool start flips it back to active=False.
+    assert [e.active for e in reasoning] == [True, False], reasoning
+    # The plain UI strings NEVER leak onto the wire as tool-status text.
+    assert all(t.text not in ("Thinking...", "Loading context...") for t in tools), tools
+    # The tool JSON DID survive as data.
+    assert any('"tool_name"' in t.text for t in tools), tools
+    # Reasoning(true) precedes the first delta; reasoning(false) precedes it too.
+    first_delta_idx = next(i for i, e in enumerate(out) if isinstance(e, OutTextDelta))
+    true_idx = out.index(reasoning[0])
+    false_idx = out.index(reasoning[1])
+    assert true_idx < false_idx < first_delta_idx, (true_idx, false_idx, first_delta_idx)
+
+
+@test("stream", "tool-free turn: reasoning ends on the first delta")
+async def t_reasoning_ends_on_first_delta(ctx: TestContext) -> None:
+    from src.stream.events import OutReasoning, OutTextDelta
+    from src.stream.session import StreamSession
+
+    agent = _StatusAgent(script=["Thinking..."], deltas=["hello"])
+    sess = StreamSession(agent, client_id="c", session_id="s")
+    await sess.run_one_shot("hi", speak=False)
+    out = await _drain(sess)
+
+    reasoning = [e for e in out if isinstance(e, OutReasoning)]
+    assert [e.active for e in reasoning] == [True, False], reasoning
+    # active=False lands immediately before the first visible token.
+    false_idx = out.index(reasoning[1])
+    first_delta_idx = next(i for i, e in enumerate(out) if isinstance(e, OutTextDelta))
+    assert false_idx < first_delta_idx, (false_idx, first_delta_idx)
+
+
+@test("stream", "tool-only / empty turn still terminates reasoning at turn end")
+async def t_reasoning_safety_net_on_empty(ctx: TestContext) -> None:
+    from src.stream.events import OutReasoning, TurnComplete
+    from src.stream.session import StreamSession
+
+    # Thinking fires but the model yields no deltas (tool-only / empty).
+    agent = _StatusAgent(script=["Thinking..."], deltas=[])
+    sess = StreamSession(agent, client_id="c", session_id="s")
+    await sess.run_one_shot("hi", speak=False)
+    out = await _drain(sess)
+
+    reasoning = [e for e in out if isinstance(e, OutReasoning)]
+    assert [e.active for e in reasoning] == [True, False], reasoning
+    # The closing active=False precedes TurnComplete (safety-net path).
+    false_idx = out.index(reasoning[-1])
+    tc_idx = next(i for i, e in enumerate(out) if isinstance(e, TurnComplete))
+    assert false_idx < tc_idx, (false_idx, tc_idx)
 
 
 @test("stream", "StreamSession.run_one_shot never ships an empty final response")

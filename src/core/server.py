@@ -378,6 +378,19 @@ def _build_agent(config: dict) -> Agent:
     )
 
 
+def _channel_live_default() -> bool:
+    """Default for live-message mode when a channel config omits ``live``.
+
+    Reads ``OPENAGENT_CHANNEL_LIVE`` so an operator can flip the
+    fleet-wide default without editing every ``openagent.yaml``. Defaults
+    to ON — the Hermes-style "narrate each tool call + answer span as its
+    own message" behaviour is the intended out-of-the-box experience.
+    """
+    return os.environ.get("OPENAGENT_CHANNEL_LIVE", "1").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
 def _build_bridges(config: dict, per_bridge_url: dict[str, str]) -> list:
     """Build platform bridges from config. Each connects to the Gateway via WS.
 
@@ -406,6 +419,13 @@ def _build_bridges(config: dict, per_bridge_url: dict[str, str]) -> list:
         # inside BaseBridge — here we just plumb the raw string through.
         personality = cfg.get("personality")
 
+        # Live-message mode: post each tool call + narration span as its
+        # own chat message while the turn runs (Hermes-style), alongside
+        # the "is writing" indicator. On by default; opt out per channel
+        # with ``channels.<name>.live: false`` or globally with the
+        # ``OPENAGENT_CHANNEL_LIVE`` env var.
+        live = bool(cfg.get("live", _channel_live_default()))
+
         if name == "telegram":
             from src.bridges.telegram import TelegramBridge
             token = cfg.get("token") or os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -420,6 +440,7 @@ def _build_bridges(config: dict, per_bridge_url: dict[str, str]) -> list:
                 personality=personality,
                 streaming=bool(cfg.get("streaming", False)),
                 allowed_chats=cfg.get("allowed_chats"),
+                live=live,
             ))
 
         elif name == "discord":
@@ -441,6 +462,7 @@ def _build_bridges(config: dict, per_bridge_url: dict[str, str]) -> list:
                 gateway_url=gateway_url,
                 gateway_token=None,
                 personality=personality,
+                live=live,
             ))
 
         elif name == "whatsapp":
@@ -457,6 +479,7 @@ def _build_bridges(config: dict, per_bridge_url: dict[str, str]) -> list:
                 gateway_url=gateway_url,
                 gateway_token=None,
                 personality=personality,
+                live=live,
             ))
 
         elif name == "slack":
@@ -474,6 +497,7 @@ def _build_bridges(config: dict, per_bridge_url: dict[str, str]) -> list:
                 gateway_url=gateway_url,
                 gateway_token=None,
                 personality=personality,
+                live=live,
             ))
 
         else:

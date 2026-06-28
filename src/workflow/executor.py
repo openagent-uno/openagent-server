@@ -138,9 +138,17 @@ class WorkflowExecutor:
     per main process is enough — per-run state lives in ``_RunCtx``.
     """
 
-    def __init__(self, agent: Any, db: MemoryDB):
+    def __init__(self, agent: Any, db: MemoryDB, broadcast: Any = None):
         self.agent = agent
         self.db = db
+        # Optional resource-broadcast hook — the Scheduler passes the gateway's
+        # ``broadcast_resource_sync``. Lets a run surface in the app's Recent
+        # feed live: emitted when the run row opens (``running``) and again when
+        # it finalizes, exactly as ``Scheduler.run_task`` announces scheduled
+        # firings. Without it an AI-/manually-triggered run-now never appears in
+        # the feed until it finishes and the sidebar is remounted. No-op in
+        # tests / headless runs (no gateway attached).
+        self._broadcast = broadcast or (lambda *a, **k: None)
         self._gates: dict[str, _ConcurrencyGate] = {}
         self._gates_lock = asyncio.Lock()
         self._trace_lock = asyncio.Lock()
@@ -240,6 +248,9 @@ class WorkflowExecutor:
                 inputs=inputs or {},
                 run_id=run_id,
             )
+            # Announce the freshly-opened run so the app's Recent feed flips it
+            # to "running" live (the feed refreshes on ``workflow`` events).
+            self._broadcast("workflow", "updated", workflow_id)
             ctx = _RunCtx(
                 run_id=run_id,
                 workflow_id=workflow_id,
@@ -327,6 +338,10 @@ class WorkflowExecutor:
                 )
             finally:
                 reset_delegation_context(delegation_tokens)
+
+            # Run finalized (success/failed) — re-announce so the feed updates
+            # the status dot and the row leaves the "running" state.
+            self._broadcast("workflow", "updated", workflow_id)
 
             final = await self.db.get_workflow_run(run_id)
             if final is None:

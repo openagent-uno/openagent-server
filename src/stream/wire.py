@@ -38,6 +38,7 @@ from src.stream.events import (
     OutAudioEnd,
     OutAudioStart,
     OutError,
+    OutReasoning,
     OutSeedMessage,
     OutTextDelta,
     OutTextFinal,
@@ -71,6 +72,7 @@ VIDEO_FRAME_OUT = "video_frame_out"  # server → client image frame
 SEED = "seed"  # server → client agent-self seed (child-session mission prompt)
 TURN_COMPLETE = "turn_complete"  # server → client batched-channel sentinel
 SESSION_COMPACTED = "session_compacted"  # server → client in-place compaction landed
+REASONING = "reasoning"  # server → client agent thinking-state flag (boolean)
 
 
 def _b64encode(data: bytes) -> str:
@@ -125,6 +127,8 @@ def event_to_wire(evt: Event) -> dict[str, Any]:
         return {**base, "type": SEED, "text": evt.text, "author": evt.author}
     if isinstance(evt, OutToolStatus):
         return {**base, "type": P.STATUS, "text": evt.text}
+    if isinstance(evt, OutReasoning):
+        return {**base, "type": REASONING, "active": evt.active}
     if isinstance(evt, OutError):
         return {**base, "type": P.ERROR, "text": evt.text}
     if isinstance(evt, OutVideoFrame):
@@ -359,6 +363,11 @@ def wire_to_event(frame: dict[str, Any]) -> Event | None:
             session_id=sid, seq=seq, ts_ms=ts,
             text=str(frame.get("text") or ""),
         )
+    if t == REASONING:
+        return OutReasoning(
+            session_id=sid, seq=seq, ts_ms=ts,
+            active=bool(frame.get("active", False)),
+        )
     if t == P.ERROR:
         return OutError(
             session_id=sid, seq=seq, ts_ms=ts,
@@ -393,4 +402,5 @@ __all__ = [
     "SESSION_CLOSE",
     "VIDEO_FRAME_OUT",
     "TURN_COMPLETE",
+    "REASONING",
 ]

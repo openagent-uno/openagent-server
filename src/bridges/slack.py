@@ -7,9 +7,10 @@ self-hosted agent because the bot doesn't need a public HTTP endpoint
 — it dials out to Slack's gateway and receives events over WebSocket.
 
 Status indicator: Slack doesn't expose a typing primitive to bots
-(unlike Telegram's chat.sendChatAction), so ``post_status`` posts a
-real placeholder message and ``update_status`` / ``clear_status`` edit
-or delete it. That's the same fallback Discord and WhatsApp use.
+(unlike Telegram's chat.sendChatAction / Discord's typing()), so there
+is no "is writing" flag to set and ``post_status`` is a no-op — the live
+step messages (each tool call + answer span) are the progress affordance
+instead. We no longer post a ``Thinking…`` placeholder.
 
 Auth needs TWO tokens:
   - ``bot_token`` (``xoxb-...``) — HTTP API auth, set as bot OAuth scope
@@ -54,8 +55,9 @@ class SlackBridge(BaseBridge):
         gateway_url: str = "ws://localhost:8765/ws",
         gateway_token: str | None = None,
         personality: str | None = None,
+        live: bool = True,
     ):
-        super().__init__(gateway_url, gateway_token, personality=personality)
+        super().__init__(gateway_url, gateway_token, personality=personality, live=live)
         self.bot_token = bot_token
         self.app_token = app_token
         self.allowed_users = (
@@ -151,9 +153,19 @@ class SlackBridge(BaseBridge):
             elog("bridge.error", name="slack", error=str(e)[:200])
             raise
 
+    async def stop(self) -> None:
+        # Close the slack-bolt socket-mode connection + aiohttp session
+        # BEFORE the BaseBridge teardown cancels the ``_run`` task — the
+        # base ``stop()`` never knew about the platform handler, so without
+        # this the socket-mode websocket and its session leaked on every
+        # shutdown / config reload (``_shutdown_platform`` was dead code).
+        self._should_stop = True
+        await self._shutdown_platform()
+        await super().stop()
+
     async def _shutdown_platform(self) -> None:
-        # Called by BaseBridge.stop() — close the socket mode connection
-        # cleanly so the websocket doesn't leak.
+        # Close the socket mode connection cleanly so the websocket and its
+        # aiohttp session don't leak. Invoked from ``stop()`` above.
         if self._socket_handler is not None:
             with contextlib.suppress(Exception):
                 await self._socket_handler.close_async()
@@ -166,40 +178,16 @@ class SlackBridge(BaseBridge):
     # ── Platform primitives consumed by BaseBridge.dispatch_turn ──
 
     async def post_status(self, target, text: str):
-        # Slack has no native typing indicator for bots; post a real
-        # placeholder we can edit/delete. Returns the message handle so
-        # update / clear can address it.
-        try:
-            resp = await target.client.chat_postMessage(
-                channel=target.channel, text=f"⏳ {text}"
-            )
-            return _SlackStatusHandle(
-                client=target.client, channel=target.channel, ts=resp["ts"]
-            )
-        except Exception:
-            return None
+        # Slack exposes no native bot typing indicator, so there is no
+        # "is writing" flag to set and we deliberately do NOT post a
+        # "Thinking…" placeholder message. The live step messages (each
+        # tool call + answer span, BaseBridge.dispatch_turn live mode)
+        # are the progress affordance instead. Returns None — nothing to
+        # update or clear.
+        return None
 
-    async def update_status(self, status_handle, text: str) -> None:
-        if status_handle is None:
-            return
-        try:
-            await status_handle.client.chat_update(
-                channel=status_handle.channel,
-                ts=status_handle.ts,
-                text=f"⏳ {text}",
-            )
-        except Exception:
-            pass
-
-    async def clear_status(self, status_handle) -> None:
-        if status_handle is None:
-            return
-        try:
-            await status_handle.client.chat_delete(
-                channel=status_handle.channel, ts=status_handle.ts
-            )
-        except Exception:
-            pass
+    # update_status / clear_status inherit the BaseBridge no-op defaults:
+    # there is no placeholder to edit or delete.
 
     async def send_text_chunk(self, target, chunk: str) -> None:
         # Slack mrkdwn is close enough to plain markdown that the
@@ -246,15 +234,3 @@ class _SlackTarget:
         self.client = client
         self.channel = channel
         self.user = user
-
-
-class _SlackStatusHandle:
-    """Opaque handle returned by ``post_status`` so ``update_status`` /
-    ``clear_status`` can edit / delete that exact message later."""
-
-    __slots__ = ("client", "channel", "ts")
-
-    def __init__(self, client, channel: str, ts: str):
-        self.client = client
-        self.channel = channel
-        self.ts = ts

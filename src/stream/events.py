@@ -264,6 +264,28 @@ class OutToolStatus(Event):
 
 
 @dataclass(frozen=True)
+class OutReasoning(Event):
+    """Agent reasoning/thinking state — a pure boolean, NOT a UI string.
+
+    The server used to push ``"Thinking..."`` / ``"Loading context..."``
+    as ``OutToolStatus`` text, forcing every client to render the server's
+    chosen copy. That's a UI decision the server has no business making.
+    Instead it now emits this typed flag and each client renders its own
+    affordance: the native "is writing" indicator or live step messages on
+    a channel, an animated spinner in the CLI, a custom animated component
+    in the app.
+
+    ``active=True`` — the model is working with no visible output yet.
+    ``active=False`` — visible output has started, or the turn ended.
+    Several may fire per turn (think → tool → think → answer). Clients
+    should also clear the state on the turn's terminal frame as a safety
+    net in case an explicit ``active=False`` is dropped.
+    """
+
+    active: bool = False
+
+
+@dataclass(frozen=True)
 class OutError(Event):
     """Inline soft error. Channel-batched callers may merge with text."""
 
@@ -317,6 +339,7 @@ __all__ = [
     "OutVideoFrame",
     "OutSeedMessage",
     "OutToolStatus",
+    "OutReasoning",
     "OutError",
     "TurnComplete",
     "SessionCompacted",

@@ -24,6 +24,7 @@ from typing import Any, Awaitable, Callable
 
 import json
 
+from src.channels.base import is_reasoning_status
 from src.channels.stt_base import BaseSTT, resolve_stt
 from src.channels.tts_base import BaseTTS, resolve_tts
 from src.core.identity_context import human_author
@@ -37,6 +38,7 @@ from src.stream.events import (
     OutAudioEnd,
     OutAudioStart,
     OutError,
+    OutReasoning,
     OutTextDelta,
     OutTextFinal,
     OutToolStatus,
@@ -810,6 +812,12 @@ class StreamTurnRunner:
         cancelled = False
         cancel_reason: str | None = None
         spoken_tools: set[str] = set()
+        # Tracks whether we've published OutReasoning(active=True) without a
+        # matching active=False yet. The agent's "Thinking..."/"Loading
+        # context..." statuses become this boolean flag; anything that ends
+        # the thinking phase (a tool starting, the first text token, turn
+        # end) flips it back via ``_end_reasoning``.
+        reasoning_active = False
 
         text_q: asyncio.Queue[str | None] = asyncio.Queue()
 
@@ -853,7 +861,37 @@ class StreamTurnRunner:
             except Exception as e:  # noqa: BLE001
                 logger.warning("stream speaker task error: %s", e)
 
+        async def _end_reasoning() -> None:
+            """Publish ``OutReasoning(active=False)`` once, if active."""
+            nonlocal reasoning_active
+            if reasoning_active:
+                reasoning_active = False
+                await publish(OutReasoning(
+                    session_id=session_id,
+                    seq=sess.next_seq(),
+                    ts_ms=now_ms(),
+                    active=False,
+                ))
+
         async def on_status(status_text: str) -> None:
+            # Plain "Thinking..."/"Loading context..." → the boolean
+            # reasoning flag (the client renders its own indicator; the
+            # server does not ship a "Thinking..." UI string). Tool JSON
+            # and structured envelopes stay as OutToolStatus — real data.
+            nonlocal reasoning_active
+            if is_reasoning_status(status_text):
+                if not reasoning_active:
+                    reasoning_active = True
+                    await publish(OutReasoning(
+                        session_id=session_id,
+                        seq=sess.next_seq(),
+                        ts_ms=now_ms(),
+                        active=True,
+                    ))
+                return
+            # A tool (or other structured update) is the visible activity
+            # now, so the thinking phase is over until the next "Thinking..."
+            await _end_reasoning()
             await publish(OutToolStatus(
                 session_id=session_id,
                 seq=sess.next_seq(),
@@ -904,6 +942,8 @@ class StreamTurnRunner:
                         delta = event.get("text") or ""
                         if not delta:
                             continue
+                        # Visible output has started — reasoning is over.
+                        await _end_reasoning()
                         accumulated.append(delta)
                         # Tee for ``commit_partial_assistant`` on barge-in.
                         sess._partial_assistant.append(delta)
@@ -1002,6 +1042,14 @@ class StreamTurnRunner:
             except Exception as e:  # noqa: BLE001
                 logger.debug("last_response_meta failed: %s", e)
 
+            # Safety net: clear reasoning before the terminal frames in case
+            # the turn produced no deltas (tool-only / empty / errored turn)
+            # so the active flag never got flipped off above. Skipped when
+            # terminal frames are being suppressed for a barge-in — there
+            # the follow-up turn keeps the "thinking" state alive across the
+            # gap, exactly like the suppressed OutTextFinal/TurnComplete.
+            if not sess._suppress_runner_completion:
+                await _end_reasoning()
             await publish(OutTextFinal(
                 session_id=session_id,
                 seq=sess.next_seq(),
