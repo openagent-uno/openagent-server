@@ -334,7 +334,18 @@ def update(ctx, yes: bool, no_restart: bool) -> None:
     it up). Use ``--no-restart`` to stage the swap and let the service
     pick it up on its next restart.
     """
+    # Preload EVERYTHING needed for the post-swap report + restart *before*
+    # ``run_upgrade`` replaces the running executable on disk. In a onefile
+    # (PyInstaller) build, modules not yet imported are read on demand from
+    # the embedded archive mmap'd out of the executable file; once that file
+    # is swapped, those reads return corrupt bytes and raise
+    # ``zlib.error: incorrect header check``. This bit ``restart_service``
+    # (imported here, after the swap) and — more subtly — Rich's lazy
+    # ``rich._unicode_data`` cell-width table, which loads the first time it
+    # measures a non-ASCII char (e.g. the old ``→`` in the success line and
+    # crashed the command *after* the swap had already landed).
     from src.core.server import get_installed_version, run_upgrade
+    from src.setup.installer import restart_service
 
     current = get_installed_version()
     console.print(f"Current version: [bold]{current}[/bold]")
@@ -347,27 +358,30 @@ def update(ctx, yes: bool, no_restart: bool) -> None:
         console.print(f"[red]Update failed:[/red] {exc}")
         raise SystemExit(1)
 
+    # ── Past this point the on-disk executable has been replaced. Emit only
+    # plain ASCII via ``click.echo`` — no Rich markup (its width measurement
+    # would trigger the lazy ``rich._unicode_data`` load against the stale
+    # archive) and no further lazy imports. The swap has already succeeded,
+    # so a cosmetic print must never be able to crash the command. ──
     if old == new:
-        console.print(f"[green]Already up-to-date[/green] (v{old}).")
+        click.echo(f"Already up-to-date (v{old}).")
         return
 
-    console.print(f"[green]Installed[/green] v{old} → v{new}.")
+    click.echo(f"Installed v{old} -> v{new}.")
 
     if no_restart:
-        console.print("[dim]Service not restarted (--no-restart); it will pick up "
-                      "the new binary on its next restart.[/dim]")
+        click.echo("Service not restarted (--no-restart); it will pick up "
+                   "the new binary on its next restart.")
         return
 
     # Bounce the installed service so the new binary takes over now.
     try:
-        from src.setup.installer import restart_service
-        active_dir = paths.get_agent_dir()
-        msg = restart_service(active_dir)
-        console.print(f"[green]Restarted:[/green] {msg}")
+        msg = restart_service(paths.get_agent_dir())
+        click.echo(f"Restarted: {msg}")
     except Exception as exc:  # noqa: BLE001
-        console.print(
-            f"[yellow]Update installed but could not auto-restart the service "
-            f"({exc}).[/yellow] Restart it manually to load v{new}."
+        click.echo(
+            f"Update installed but could not auto-restart the service "
+            f"({exc}). Restart it manually to load v{new}."
         )
 
 
