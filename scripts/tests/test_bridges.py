@@ -45,10 +45,10 @@ async def t_bridge_base(ctx: TestContext) -> None:
     # render the per-tool status pings the bridges show during a turn.
     assert format_tool_status("Thinking...") == "Thinking..."
     # runtime-native wire shape: tool_name present, tool_call_error false,
-    # no result yet → derives status "running" → "Using bash..." line.
+    # no result yet → derives status "running" → friendly "Running command".
     assert format_tool_status(
         '{"tool_name":"bash","tool_call_error":false}'
-    ) == "Using bash..."
+    ) == "Running command"
 
 
 @test("bridges", "BaseBridge treats listener exit as a reconnect signal")
@@ -1628,10 +1628,10 @@ async def t_gateway_ws_drop_orphan_cleanup(ctx: TestContext) -> None:
 @test("bridges", "format_tool_message: invocation + error get a line, done/plain do not")
 async def t_format_tool_message(ctx: TestContext) -> None:
     from src.bridges.base import format_tool_message
-    # running (no result yet) → invocation line
+    # running (no result yet) → friendly invocation line
     assert format_tool_message(
         '{"tool_name":"bash","tool_call_error":false}'
-    ) == "🔧 Using `bash`"
+    ) == "🔧 Running command"
     # done (result present) → no message (avoids 2 bubbles per tool)
     assert format_tool_message(
         '{"tool_name":"bash","tool_call_error":false,"result":"ok"}'
@@ -1639,12 +1639,70 @@ async def t_format_tool_message(ctx: TestContext) -> None:
     # error → failure line carrying the message
     assert format_tool_message(
         '{"tool_name":"bash","tool_call_error":true,"result":"boom"}'
-    ) == "⚠️ `bash` failed: boom"
+    ) == "⚠️ Running command failed: boom"
     # plain status + the compaction envelope → no message
     assert format_tool_message("Thinking...") is None
     assert format_tool_message(
         '{"kind":"session.compacted","summary_chars":10,"kept_runs_count":2}'
     ) is None
+
+
+@test("bridges", "friendly memory verbs + dispatcher unwrapping in channel labels")
+async def t_friendly_memory_labels(ctx: TestContext) -> None:
+    import json
+    from src.bridges.base import format_tool_message, format_tool_status
+    from src.channels.base import parse_status_event
+    from src.channels.tool_labels import tool_label
+
+    # Direct (upfront-prefixed) vault write → "Memorizing" + note title.
+    assert format_tool_message(
+        '{"tool_name":"vault_write_note","tool_call_error":false,'
+        '"tool_args":{"path":"Casa Garda/Brain.md","content":"x"}}'
+    ) == "🧠 Memorizing — Brain"
+
+    # Deferred dispatch: tool_search_call_tool(server=vault, tool=read_note)
+    # must unwrap to the inner tool → "Recalling".
+    dispatched_read = json.dumps({
+        "tool_name": "tool_search_call_tool",
+        "tool_call_error": False,
+        "tool_args": {
+            "server": "vault",
+            "tool": "read_note",
+            "args": {"path": "project_viki_ops.md"},
+        },
+    })
+    evt = parse_status_event(dispatched_read)
+    assert evt is not None and evt.tool == "read_note" and evt.server == "vault"
+    assert format_tool_message(dispatched_read) == "📖 Recalling — project_viki_ops"
+    assert format_tool_status(dispatched_read) == "Recalling project_viki_ops"
+
+    # Search has no single note → verb + quoted query, no note title.
+    dispatched_search = json.dumps({
+        "tool_name": "tool_search_call_tool",
+        "tool_call_error": False,
+        "tool_args": {
+            "server": "vault",
+            "tool": "search_notes",
+            "args": {"query": "casa garda"},
+        },
+    })
+    assert format_tool_message(dispatched_search) == "🔍 Searching memory — “casa garda”"
+
+    # vault-gate maintenance op (prefixed name) → "Memory maintenance".
+    title, detail, _emoji = tool_label(parse_status_event(json.dumps({
+        "tool_name": "tool_search_call_tool",
+        "tool_call_error": False,
+        "tool_args": {"server": "vault-gate", "tool": "vault_dream", "args": {}},
+    })))
+    assert title == "Memory maintenance" and detail is None
+
+    # Non-memory MCP tool via dispatcher → Title-Case + server suffix.
+    unknown = json.dumps({
+        "tool_name": "tool_search_call_tool",
+        "tool_call_error": False,
+        "tool_args": {"server": "spotify", "tool": "play_track", "args": {}},
+    })
+    assert format_tool_message(unknown) == "🔧 Play Track · Spotify"
 
 
 @test("bridges", "live flag threads from each bridge constructor to BaseBridge")
@@ -1735,7 +1793,7 @@ async def t_live_mode_streams_segments(ctx: TestContext) -> None:
 
     assert posted == [
         "Let me check the weather.",   # narration flushed before the tool
-        "🔧 Using `bash`",             # the tool invocation line
+        "🔧 Running command",          # the tool invocation line (friendly)
         "It is sunny.",                # ONLY the unposted tail (no dup)
     ], posted
 
@@ -1833,8 +1891,8 @@ async def t_live_mode_tool_error_message(ctx: TestContext) -> None:
     await bridge.dispatch_turn("target", "sid:err", "search please")
 
     assert posted == [
-        "🔧 Using `web_search`",
-        "⚠️ `web_search` failed: 429 rate limited",
+        "🌐 Searching the web",
+        "⚠️ Searching the web failed: 429 rate limited",
         "Sorry, search failed.",
     ], posted
 
@@ -1879,7 +1937,7 @@ async def t_live_mode_off_for_voice(ctx: TestContext) -> None:
     bridge.synthesise_audio_attachment = _no_voice  # type: ignore[method-assign]
 
     await bridge.dispatch_turn("target", "sid:voice", "hi", voice_detected=True)
-    # No "🔧 Using `bash`" bubble — only the final reply.
+    # No "🔧 Running command" bubble — only the final reply.
     assert posted == ["Spoken answer."], posted
 
 
@@ -1916,5 +1974,5 @@ async def t_live_mode_model_footer(ctx: TestContext) -> None:
 
     bridge.send_message = _fake_send  # type: ignore[method-assign]
     await bridge.dispatch_turn("target", "sid:footer", "go")
-    assert posted[0] == "🔧 Using `bash`", posted
+    assert posted[0] == "🔧 Running command", posted
     assert posted[-1] == "Done.\n\nModel: claude-opus-4-8", posted

@@ -154,17 +154,17 @@ def format_tool_status(raw: str) -> str:
     "tool_call_error": false, "result": ...}``; phase is derived from
     the bool + ``result`` presence. Plain strings like ``"Thinking..."``
     pass through unchanged.
+
+    Tool labels are FRIENDLY — memory-vault ops read "Recalling Brain" /
+    "Memorizing Brain", a shell call reads "Running command", etc. (see
+    :mod:`src.channels.tool_labels`, the twin of the app's tool chips).
     """
     from src.channels.base import parse_status_event
+    from src.channels.tool_labels import status_line
     evt = parse_status_event(raw)
     if evt is None:
         return raw
-    if evt.status == "running":
-        return f"Using {evt.tool}..."
-    if evt.status == "error":
-        return f"✗ {evt.tool} failed: {evt.error or 'unknown error'}"
-    # done / anything else
-    return f"✓ {evt.tool} done"
+    return status_line(evt)
 
 
 def format_tool_message(raw: str) -> str | None:
@@ -181,16 +181,18 @@ def format_tool_message(raw: str) -> str | None:
       per tool; we surface the invocation and any failure, but a "done"
       bubble for every tool would double the message count.
 
-    Mirrors the Hermes UX of narrating each tool call in-chat.
+    The line is FRIENDLY and on-brand — "🧠 Memorizing — Brain",
+    "📖 Recalling — Brain", "🔧 Running command" — mirroring the app's
+    tool chips (see :mod:`src.channels.tool_labels`). Mirrors the Hermes
+    UX of narrating each tool call in-chat.
     """
     from src.channels.base import parse_status_event
+    from src.channels.tool_labels import message_line
     evt = parse_status_event(raw)
     if evt is None:
         return None
-    if evt.status == "running":
-        return f"🔧 Using `{evt.tool}`"
-    if evt.status == "error":
-        return f"⚠️ `{evt.tool}` failed: {evt.error or 'unknown error'}"
+    if evt.status in ("running", "error"):
+        return message_line(evt)
     return None  # "done" — skip; the invocation line already landed
 
 

@@ -27,10 +27,22 @@ class ToolStatusEvent:
     ``result`` present → done, otherwise → running. This dataclass
     normalises both shapes so callers can branch on ``status`` without
     re-parsing.
+
+    ``tool`` is the REAL tool: when the agent reaches a tool through the
+    deferred-tool dispatcher (``tool_search_call_tool({server, tool, args})``
+    — see :mod:`src.mcp.servers.tool_search`), ``parse_status_event`` unwraps
+    it so ``tool`` is the inner tool, ``server`` its MCP, and ``tool_args``
+    the inner args. This mirrors the app's ``effectiveTool`` so the friendly
+    channel labels (:mod:`src.channels.tool_labels`) match the app's chips.
     """
     tool: str
     status: str  # "running" / "done" / "error"
     error: str | None = None
+    tool_args: dict | None = None
+    server: str | None = None  # MCP server when reached via the dispatcher
+
+
+_TOOL_SEARCH_DISPATCHER = "tool_search_call_tool"
 
 
 def parse_status_event(raw: str) -> Optional[ToolStatusEvent]:
@@ -53,10 +65,26 @@ def parse_status_event(raw: str) -> Optional[ToolStatusEvent]:
             err_text: str | None = None
             if is_err and parsed.get("result") is not None:
                 err_text = str(parsed["result"])
+            tool_name = str(parsed["tool_name"])
+            raw_args = parsed.get("tool_args")
+            tool_args = raw_args if isinstance(raw_args, dict) else None
+            server: str | None = None
+            # Unwrap the deferred-tool dispatcher so the real tool surfaces —
+            # exactly like the app's ``effectiveTool``.
+            if tool_name == _TOOL_SEARCH_DISPATCHER and tool_args:
+                inner = tool_args.get("tool")
+                if isinstance(inner, str) and inner:
+                    srv = tool_args.get("server")
+                    server = srv if isinstance(srv, str) else None
+                    inner_args = tool_args.get("args")
+                    tool_args = inner_args if isinstance(inner_args, dict) else {}
+                    tool_name = inner
             return ToolStatusEvent(
-                tool=str(parsed["tool_name"]),
+                tool=tool_name,
                 status=status,
                 error=err_text,
+                tool_args=tool_args,
+                server=server,
             )
     except (json.JSONDecodeError, ValueError, TypeError):
         pass
