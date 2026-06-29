@@ -326,6 +326,18 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
             "faster, or better-scoped for the work"
         ),
     },
+    "agent-bridge": {
+        "dir": "agent_bridge",
+        "command": ["python", "-m", "src.mcp.servers.agent_bridge.server"],
+        "python": True,
+        "description": (
+            "consult a PEER OpenAgent agent over the native Iroh "
+            "federation — exposes ask_<peer>_agent / ask_peer_agent / "
+            "list_federated_agents for every network this agent has "
+            "joined. Use to delegate a question to a federated agent's "
+            "own memory vault, MCPs, and tools"
+        ),
+    },
 }
 
 DEFAULT_MCPS: list[dict[str, Any]] = [
@@ -345,6 +357,7 @@ DEFAULT_MCPS: list[dict[str, Any]] = [
     {"builtin": "model-manager", "_default": True},
     {"builtin": "workflow-manager", "_default": True},
     {"builtin": "delegation", "_default": True},
+    {"builtin": "agent-bridge", "_default": True},
 ]
 
 
@@ -697,6 +710,7 @@ def resolve_default_entry(entry: dict[str, Any], db_path: str | None = None) -> 
         # file).
         if entry["builtin"] in (
             "scheduler", "mcp-manager", "model-manager", "workflow-manager",
+            "agent-bridge",
         ):
             if db_path:
                 extra_env["OPENAGENT_DB_PATH"] = os.path.abspath(db_path)
@@ -704,6 +718,16 @@ def resolve_default_entry(entry: dict[str, Any], db_path: str | None = None) -> 
                 from src.core.paths import default_db_path
 
                 extra_env["OPENAGENT_DB_PATH"] = str(default_db_path())
+
+        # agent-bridge relays peer chat through the local gateway loopback,
+        # so it needs the HTTP listener's port + token (+ host) to reach
+        # ``/api/peers/{id}/chat``. These live in the main process env
+        # (set by the deployment / serve flags); pass them through.
+        if entry["builtin"] == "agent-bridge":
+            for _var in ("OPENAGENT_HTTP_PORT", "OPENAGENT_HTTP_TOKEN", "OPENAGENT_HTTP_HOST"):
+                _val = os.environ.get(_var)
+                if _val:
+                    extra_env.setdefault(_var, _val)
 
         # The vault MCP needs to know which folder is the vault. It reads
         # OPENAGENT_VAULT_PATH (server.ts), so the subprocess lands on the
