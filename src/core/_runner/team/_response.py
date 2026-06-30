@@ -1368,6 +1368,10 @@ def _handle_model_response_chunk(
                     run_response.content_type = content_type
                 elif isinstance(model_response_event.content, str):
                     full_model_response.content = (full_model_response.content or "") + model_response_event.content
+                    # Mirror the partial onto run_response as it streams (like
+                    # reasoning_content below) so a stop mid-generation keeps
+                    # what was produced — the cancel path persists run_response.
+                    run_response.content = full_model_response.content
                 should_yield = True
 
             # Process reasoning content

@@ -192,6 +192,8 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_gateway",
     # 5. HTTP surface + WS + files/images (need gateway)
     "test_sessions",
+    # Chat-session delete: cascade to sub-agent children + chat-only guard
+    "test_session_delete",
     "test_upload",
     "test_usage",
     "test_models",

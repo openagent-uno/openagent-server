@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 import uuid
+from collections import deque
 from typing import Any
 
 import aiosqlite
@@ -21,6 +23,8 @@ from src.models.catalog import (
     SUPPORTED_FRAMEWORKS,
 )
 
+
+logger = logging.getLogger(__name__)
 
 VALID_MCP_KINDS = ("builtin", "custom", "default")
 # Alias kept for the ``from src.memory.db import VALID_FRAMEWORKS``
@@ -3529,9 +3533,126 @@ class MemoryDB:
             "title": meta.get("title"),
             "model": meta.get("model"),
             "framework": meta.get("framework") or FRAMEWORK_API_BASED,
+            # The child-linkage metadata, so a caller can tell a manual chat
+            # (``origin == "chat"``/absent, no parent) from a spawned child
+            # (delegation sub-agent, scheduled firing, workflow node) without a
+            # second query. Mirrors ``_session_row_to_summary``.
+            "parent_session_id": meta.get("parent_session_id"),
+            "origin": meta.get("origin") or "chat",
+            "kind": meta.get("kind"),
             "created_at": row[2],
             "last_active_at": row[3],
         }
+
+    async def is_session_owned_by(
+        self, session_id: str, handle: str, *, row: dict[str, Any] | None = None,
+    ) -> bool:
+        """Whether ``handle`` owns ``session_id``.
+
+        Ownership is ``metadata.client_id`` being the handle directly, or a
+        device pubkey bound to that handle — the SAME soft-fallback
+        ``list_all_sessions`` uses, so a session a user can SEE in their list
+        is exactly one they can delete. Used to authorise a destructive delete
+        in multi-user / federated deploys. Returns False when the row is gone
+        or carries no owner (the caller decides how to treat ambiguity).
+
+        Pass ``row`` to reuse an already-fetched session row and skip the
+        redundant ``get_session`` read (the delete path has it in hand)."""
+        if not handle:
+            return False
+        if row is None:
+            row = await self.get_session(session_id)
+        if not row:
+            return False
+        owner = row.get("client_id") or ""
+        if not owner:
+            return False
+        if owner == handle:
+            return True
+        return owner in await self._pubkeys_for_handle(handle)
+
+    async def list_descendant_sessions(
+        self,
+        session_id: str,
+        *,
+        max_total: int = 5000,
+    ) -> list[str]:
+        """Every session spawned (transitively) by ``session_id``.
+
+        Walks ``metadata.parent_session_id`` breadth-first so a manual chat's
+        delegated sub-agents, *their* sub-agents (delegation nests to any
+        depth, vision §4), and any in-chat ``run dream mode`` firing whose
+        parent is the chat itself are all collected. The root is excluded.
+
+        Used to cascade a chat-session delete to its whole sub-agent lineage.
+        Genuine scheduled-task / workflow run sessions are never reached: their
+        ``parent_session_id`` points at a *synthetic* root (``scheduler:<task>``
+        / ``workflow:<wf>:<run>``), never at a real chat session id — so a chat
+        delete can only ever sweep what that chat actually spawned. A
+        ``seen`` set guards against pathological cycles; ``max_total`` bounds a
+        runaway fan-out.
+        """
+        conn = await self._ensure_connected()
+        collected: list[str] = []
+        seen: set[str] = {session_id}
+        queue: deque[str] = deque([session_id])
+        while queue and len(collected) < max_total:
+            parent = queue.popleft()
+            cursor = await conn.execute(
+                "SELECT session_id FROM sessions "
+                # Double ``json_extract`` — the inner ``$`` normalises rows whose
+                # metadata the runtime double-encoded (a JSON string of the dict)
+                # so this matches BOTH shapes, exactly like ``list_child_sessions``
+                # / ``list_all_sessions``. A single extract returns NULL for the
+                # double-encoded form and would silently leave delegation
+                # sub-agents orphaned after a chat delete.
+                "WHERE json_extract(json_extract(metadata, '$'), '$.parent_session_id') = ?",
+                (parent,),
+            )
+            for (child_sid,) in await cursor.fetchall():
+                if child_sid in seen:
+                    continue
+                seen.add(child_sid)
+                collected.append(child_sid)
+                queue.append(child_sid)
+        return collected
+
+    # Per-session satellite tables that carry a ``session_id`` but have no
+    # ON DELETE CASCADE (they are plain TEXT columns, not FKs). They hold data
+    # *derived* from a conversation, so they must be cleared when the session
+    # is permanently deleted — most importantly ``conversation_embeddings``, or
+    # a deleted chat would keep resurfacing through memory-search.
+    _SESSION_SATELLITE_TABLES: tuple[str, ...] = (
+        "pinned_sessions",
+        "conversation_embeddings",
+        "user_profiles",
+        "vault_save_reminders",
+    )
+
+    async def purge_session(self, session_id: str) -> None:
+        """Permanently delete a session row and all of its derived per-session
+        data, in a single transaction.
+
+        The ``sessions`` row holds the whole transcript (in its ``runs`` JSON),
+        so deleting it removes the history; the satellite deletes then clear the
+        derived records that would otherwise be orphaned (no FK cascade exists).
+        Idempotent — safe to call for an id whose row is already gone (e.g. the
+        runtime ``forget_session`` ran first) and tolerant of older DB shapes
+        where a satellite table is absent. Child sessions are handled by the
+        caller via :meth:`list_descendant_sessions`."""
+        conn = await self._ensure_connected()
+        await conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+        for table in self._SESSION_SATELLITE_TABLES:
+            try:
+                await conn.execute(
+                    f"DELETE FROM {table} WHERE session_id = ?", (session_id,)
+                )
+            except Exception as e:  # noqa: BLE001 — missing table / shape drift
+                logger.debug(
+                    "purge_session: %s cleanup failed for %s: %s",
+                    table, session_id, e,
+                )
+        await conn.commit()
 
     # ── Session runs (the runtime SqliteDb owns writes) ──
     #

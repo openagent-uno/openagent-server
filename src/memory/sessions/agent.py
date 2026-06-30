@@ -112,7 +112,12 @@ class AgentSession:
 
     def upsert_run(self, run: RunOutput):
         """Adds a RunOutput, together with some calculated data, to the runs list."""
+        # Promote a stopped (CANCELLED) run so its turn survives history.
+        from src.memory.sessions._synth import promote_interrupted_run
+
+        promote_interrupted_run(run)
         messages = run.messages
+
         for m in messages or []:
             if m.metrics is not None and hasattr(m.metrics, "timer"):
                 m.metrics.timer = None

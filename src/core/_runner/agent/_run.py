@@ -624,7 +624,7 @@ def _run(
                 return run_response
             except RunCancelledException as e:
                 log_info(f"Run {run_response.run_id} was cancelled")
-                run_response.content = str(e)
+                run_response.content = run_response.content or str(e)
                 run_response.status = RunStatus.cancelled
 
                 # Cleanup and store the run response and session
@@ -660,7 +660,7 @@ def _run(
             except KeyboardInterrupt:
                 run_response = cast(RunOutput, run_response)
                 run_response.status = RunStatus.cancelled
-                run_response.content = "Operation cancelled by user"
+                run_response.content = run_response.content or "Operation cancelled by user"
                 return run_response
 
             except Exception as e:
@@ -1111,7 +1111,7 @@ def _run_stream(
             except RunCancelledException as e:
                 # Handle run cancellation during streaming
                 log_info(f"Run {run_response.run_id} was cancelled during streaming")
-                run_response.content = str(e)
+                run_response.content = run_response.content or str(e)
                 run_response.status = RunStatus.cancelled
                 yield handle_event(
                     create_run_cancelled_event(from_run_response=run_response, reason=str(e)),
@@ -1719,7 +1719,7 @@ async def _arun(
             except RunCancelledException as e:
                 # Handle run cancellation
                 log_info(f"Run {run_response.run_id} was cancelled")
-                run_response.content = str(e)
+                run_response.content = run_response.content or str(e)
                 run_response.status = RunStatus.cancelled
 
                 # Cleanup and store the run response and session
@@ -1756,7 +1756,7 @@ async def _arun(
             except KeyboardInterrupt:
                 run_response = cast(RunOutput, run_response)
                 run_response.status = RunStatus.cancelled
-                run_response.content = "Operation cancelled by user"
+                run_response.content = run_response.content or "Operation cancelled by user"
                 return run_response
             except Exception as e:
                 # Check if this is the last attempt
@@ -3206,7 +3206,7 @@ def _continue_run(
                 # Handle run cancellation during async streaming
                 log_info(f"Run {run_response.run_id} was cancelled")
                 run_response.status = RunStatus.cancelled
-                run_response.content = str(e)
+                run_response.content = run_response.content or str(e)
 
                 # Cleanup and store the run response and session
                 cleanup_and_store(
@@ -3232,7 +3232,7 @@ def _continue_run(
             except KeyboardInterrupt:
                 run_response = cast(RunOutput, run_response)
                 run_response.status = RunStatus.cancelled
-                run_response.content = "Operation cancelled by user"
+                run_response.content = run_response.content or "Operation cancelled by user"
                 return run_response
 
             except Exception as e:
@@ -3471,7 +3471,7 @@ def _continue_run_stream(
                 # Handle run cancellation during async streaming
                 log_info(f"Run {run_response.run_id} was cancelled during streaming")
                 run_response.status = RunStatus.cancelled
-                run_response.content = str(e)
+                run_response.content = run_response.content or str(e)
 
                 # Yield the cancellation event
                 yield handle_event(  # type: ignore
@@ -4160,7 +4160,7 @@ async def _acontinue_run(
                 # Handle run cancellation
                 log_info(f"Run {run_response.run_id if run_response else run_id} was cancelled")
                 run_response.status = RunStatus.cancelled
-                run_response.content = str(e)
+                run_response.content = run_response.content or str(e)
 
                 # Cleanup and store the run response and session
                 if agent_session is not None:
@@ -4197,7 +4197,7 @@ async def _acontinue_run(
             except KeyboardInterrupt:
                 run_response = cast(RunOutput, run_response)
                 run_response.status = RunStatus.cancelled
-                run_response.content = "Operation cancelled by user"
+                run_response.content = run_response.content or "Operation cancelled by user"
                 return run_response
             except Exception as e:
                 run_response = cast(RunOutput, run_response)

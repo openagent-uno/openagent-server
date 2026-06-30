@@ -121,6 +121,10 @@ class _Harness:
         server.sessions = self.sessions
         server.agent = self.agent
         server.clients = {}
+        # The real registry that holds live chat turns. ``__init__`` sets
+        # this; tests building the Gateway via ``__new__`` must too, since
+        # ``/stop`` now routes through it (``_interrupt_stream_sessions``).
+        server._stream_sessions = {}
         server._safe_ws_send_json = self._capture
         self.server = server
         self.ws = _FakeWS()
@@ -324,3 +328,188 @@ async def t_clear_no_sessions(ctx: TestContext) -> None:
     assert "forgot" not in text.lower(), text
     assert "fresh session" in text.lower(), text
     assert h.agent.model.forgotten == []
+
+
+# ── /stop against a REAL live StreamSession turn ───────────────────────
+#
+# The tests above hand-inject ``current_task`` onto the SessionManager —
+# the slot the live stream path never populates — so they proved only
+# that ``stop_current`` cancels a task you give it, NOT that ``/stop``
+# stops a running chat turn. These drive the ACTUAL registry: a real
+# ``StreamSession`` with a model that is genuinely mid-stream, attached
+# to ``gateway._stream_sessions`` exactly as ``_handle_stream_frame``
+# does, then assert the command cancels it end to end.
+
+
+class _EngagedAgent:
+    """``run_stream`` yields one delta (engages the turn) then blocks
+    forever — so a turn is genuinely streaming when we try to stop it.
+
+    ``engaged`` fires once the first token is yielded (the StreamSession
+    flips ``_current_turn_started`` here too); ``cancelled`` fires when
+    the asyncio cancellation actually reaches the model loop. A working
+    stop must set ``cancelled``; a no-op stop never will.
+    """
+
+    name = "engaged"
+    db = None
+
+    def __init__(self) -> None:
+        self.engaged = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    async def run_stream(self, *, message, user_id, session_id,
+                         attachments=None, on_status=None, author=None):
+        yield {"kind": "delta", "text": "thinking…"}
+        self.engaged.set()
+        try:
+            await asyncio.sleep(30)  # never completes on its own
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+        yield {"kind": "done", "text": ""}  # pragma: no cover — unreachable
+
+    def last_response_meta(self, _sid):
+        return {"model": "engaged"}
+
+    async def request_cancel(self, _sid):
+        # No cooperative cancel in this mock → barge-in falls back to the
+        # hard asyncio cancel, which this fake honours via ``self.cancelled``.
+        return False
+
+
+async def _poll(condition, *, timeout: float = 3.0, step: float = 0.01) -> bool:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if condition():
+            return True
+        await asyncio.sleep(step)
+    return False
+
+
+async def _attach_live_turn(h: "_Harness", client: str, raw_sid: str):
+    """Attach a real StreamSession to the gateway and fire one engaged turn.
+
+    Returns ``(session, agent, sid)``. ``coalesce_window_ms=0`` dispatches
+    the turn immediately (no debounce wait) so the turn is in flight by the
+    time the agent engages.
+    """
+    from src.stream.session import StreamSession
+    from src.stream.channel import RealtimeChannel
+    from src.stream.events import TextFinal, now_ms
+    from src.gateway.server import _StreamHolder
+
+    sid = h.sessions.get_or_create_session(client, raw_sid)
+    agent = _EngagedAgent()
+    sess = StreamSession(
+        agent, client_id=client, session_id=sid, coalesce_window_ms=0,
+    )
+
+    async def _null(_db):
+        return None
+
+    await sess.start(stt_factory=_null, tts_factory=_null)
+    # A RealtimeChannel draining the outbound queue onto a capture list —
+    # mirrors how a real connection consumes frames, so the queue can't
+    # fill and the runner's terminal-frame publish never blocks.
+    sent: list = []
+
+    async def _send_wire(payload) -> bool:
+        sent.append(payload)
+        return True
+
+    channel = RealtimeChannel(sess, _send_wire)
+    await channel.start()
+    h.server._stream_sessions[(client, sid)] = _StreamHolder(
+        session=sess, channel=channel,
+    )
+
+    await sess.push_in(TextFinal(
+        session_id=sid, seq=1, ts_ms=now_ms(), text="hi", source="user_typed",
+    ))
+    await asyncio.wait_for(agent.engaged.wait(), timeout=3.0)
+    return sess, agent, sid, channel, sent
+
+
+@test("gateway_commands", "/stop cancels a LIVE StreamSession turn end-to-end (the real path)")
+async def t_stop_cancels_live_stream_turn(ctx: TestContext) -> None:
+    h = _Harness()
+    client = "device:abc"
+    sess, agent, sid, channel, sent = await _attach_live_turn(h, client, "app:tab1")
+    try:
+        assert sess.has_active_turn(), "turn should be in flight after engage"
+
+        # The exact wire path the app/CLI/bridges take: a COMMAND 'stop'.
+        text = await h.run_command(client, "stop", session_id=sid)
+
+        # Cancellation must reach the model loop — the whole point.
+        reached = await _poll(lambda: agent.cancelled.is_set())
+        assert reached, "/stop did not cancel the running model loop"
+        assert "Stopped" in text, f"expected 'Stopped', got: {text!r}"
+
+        # The live turn slot must free.
+        freed = await _poll(lambda: not sess.has_active_turn())
+        assert freed, "turn still active after /stop"
+
+        # A terminal turn_complete must reach the client so the UI un-sticks.
+        saw_complete = await _poll(
+            lambda: any(p.get("type") == "turn_complete" for p in sent),
+        )
+        assert saw_complete, (
+            f"no turn_complete frame after /stop; frames={[p.get('type') for p in sent]}"
+        )
+    finally:
+        await channel.close()
+
+
+@test("gateway_commands", "/stop on an idle StreamSession reports 'Nothing running.'")
+async def t_stop_idle_stream_session(ctx: TestContext) -> None:
+    """A /stop with a live session attached but no turn running must not
+    claim it stopped something — guards against a false-positive 'Stopped'.
+    """
+    h = _Harness()
+    client = "device:idle"
+    sess, agent, sid, channel, sent = await _attach_live_turn(h, client, "app:tab1")
+    try:
+        # Let the engaged turn be cancelled first so the session goes idle.
+        await h.run_command(client, "stop", session_id=sid)
+        await _poll(lambda: not sess.has_active_turn())
+        # Second /stop — nothing is running now.
+        text = await h.run_command(client, "stop", session_id=sid)
+        assert "Nothing running" in text, f"expected idle report, got: {text!r}"
+    finally:
+        await channel.close()
+
+
+@test("gateway_commands", "/clear cancels a running StreamSession turn AND forgets the session")
+async def t_clear_stops_live_turn(ctx: TestContext) -> None:
+    """A wipe issued mid-turn must halt the live turn (else a stale reply
+    interleaves into the fresh session) and forget prior context.
+    """
+    h = _Harness(known_ids=["app:tab1"])
+    client = "device:abc"
+    sess, agent, sid, channel, sent = await _attach_live_turn(h, client, "app:tab1")
+    try:
+        text = await h.run_command(client, "clear", session_id=sid)
+        reached = await _poll(lambda: agent.cancelled.is_set())
+        assert reached, "/clear did not cancel the running turn"
+        assert "fresh session" in text.lower(), text
+        assert h.agent.model.forgotten == [sid], h.agent.model.forgotten
+    finally:
+        await channel.close()
+
+
+@test("gateway_commands", "/status reports Busy while a StreamSession turn runs")
+async def t_status_reflects_live_turn(ctx: TestContext) -> None:
+    """Before the fix, /status read the always-idle SessionManager and
+    said 'Idle' mid-turn. It must reflect the StreamSession registry.
+    """
+    h = _Harness()
+    client = "device:abc"
+    sess, agent, sid, channel, sent = await _attach_live_turn(h, client, "app:tab1")
+    try:
+        text = await h.run_command(client, "status", session_id=sid)
+        assert "Busy" in text, f"expected Busy mid-turn, got: {text!r}"
+    finally:
+        await channel.close()

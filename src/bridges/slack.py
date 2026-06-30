@@ -141,6 +141,39 @@ class SlackBridge(BaseBridge):
                 logger.exception("slack dispatch failed: %s", e)
                 elog("bridge.error", name="slack", session_id=session_id, error=str(e)[:200])
 
+        # Native Slack slash commands, delivered over socket mode (no
+        # public request URL needed). Mirrors Telegram's bot commands and
+        # Discord's app commands: /stop cancels the issuing user's running
+        # turn, /clear|/new|/reset wipe + restart it, /status reports
+        # state — all scoped to ``sl:<user_id>`` so one user's command
+        # can't touch another's conversation. Slack only delivers these
+        # once the user adds them under the app's Features → Slash Commands
+        # (socket mode then routes them here). Without that registration
+        # Slack swallows ``/stop`` as an "unknown command" and never hands
+        # it to the bot — which is why the previous text-only handler could
+        # not implement stop on Slack.
+        from src.gateway.commands import BOT_COMMANDS
+
+        def _make_slash_handler(command_name: str):
+            async def _handler(ack, command, respond):  # noqa: ANN001
+                await ack()
+                uid = str(command.get("user_id") or "")
+                if not self._is_authorized(uid):
+                    await respond("Unauthorized.")
+                    return
+                try:
+                    result = await self.send_command(
+                        command_name, session_id=f"sl:{uid}",
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("slack /%s failed: %s", command_name, e)
+                    result = f"/{command_name} failed."
+                await respond(result or f"/{command_name} done.")
+            return _handler
+
+        for _cmd_name, _ in BOT_COMMANDS:
+            app.command(f"/{_cmd_name}")(_make_slash_handler(_cmd_name))
+
         # Socket mode handler — long-lived; cancellation comes from
         # BaseBridge.stop() which sets _should_stop and cancels the
         # listener task.

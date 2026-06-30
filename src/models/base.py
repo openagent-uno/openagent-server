@@ -134,18 +134,61 @@ class BaseModel(ABC):
         """
         await self.close_session(session_id)
 
-    async def commit_partial_assistant(self, session_id: str, text: str) -> None:
-        """Persist a synthesized assistant turn after barge-in.
+    async def request_cancel(self, session_id: str) -> bool:
+        """Cooperatively cancel the session's in-flight run, if supported.
 
-        Called by ``StreamSession._cancel_active_turn`` when the user
-        interrupts a reply mid-flight. Provider-managed models (Claude
-        SDK) translate this into a control-request interrupt so the
-        SDK's session log records what was emitted up to the cut. Platform-
-        managed models (API-based) inject a synthetic run into their session
-        store so the next turn sees coherent history. Default no-op for
-        caller-managed models (no hidden history state to maintain).
+        Runtime-backed models (agno) override this to mark the run in the
+        cancellation registry so it is persisted with its partial messages.
+        Default: not supported — the caller falls back to a hard cancel.
         """
-        return None
+        return False
+
+    # ── cooperative-cancel run tracking ──────────────────────────────
+    # Runtime-backed providers (single-model NativeProvider, team
+    # TeamRouterProvider) stream through agno and must remember the agno
+    # ``run_id`` of the in-flight turn so a barge-in can cooperatively cancel
+    # THAT run (letting agno persist its partial messages) instead of a raw
+    # ``task.cancel()`` that poisons the coroutine before any checkpoint. The
+    # tracking map + helpers live here so both paths share one implementation.
+
+    @property
+    def _run_ids(self) -> dict[str, str]:
+        """Per-session in-flight agno run_id (lazily created, base-owned)."""
+        store = self.__dict__.get("_run_ids_store")
+        if store is None:
+            store = {}
+            self.__dict__["_run_ids_store"] = store
+        return store
+
+    def _track_run_id(self, session_id: str | None, run_id: str | None) -> None:
+        """Record the in-flight agno run_id for a session — first event wins."""
+        if run_id:
+            self._run_ids.setdefault(session_id or "default", run_id)
+
+    def _clear_run_id(self, session_id: str | None) -> None:
+        """Forget the in-flight run_id once a session's stream has drained."""
+        self._run_ids.pop(session_id or "default", None)
+
+    async def _coop_cancel(self, session_id: str | None) -> bool:
+        """Cooperatively cancel the session's tracked run via the registry.
+
+        Returns True if a run was registered for cancellation; False if none
+        is in flight (the caller should then hard-cancel).
+        """
+        sid = session_id or "default"
+        run_id = self._run_ids.get(sid)
+        if not run_id:
+            return False
+        try:
+            from src.core._run_state.cancel import acancel_run
+            from src.core.logging import elog
+
+            ok = bool(await acancel_run(run_id))
+            if ok:
+                elog("runtime.coop_cancel", session_id=sid, run_id=run_id)
+            return ok
+        except Exception:  # noqa: BLE001
+            return False
 
     def known_session_ids(self) -> list[str]:
         """Return every session_id the provider currently has resume state for.

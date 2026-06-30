@@ -1987,3 +1987,88 @@ async def t_realtime_rebind_preserves_order(ctx: TestContext) -> None:
         assert deltas_text == "abc", deltas_text
     finally:
         await channel.close()
+
+
+# ── Barge-in must not stall on the TTS speaker drain ──────────────────
+
+
+@test("stream", "barge-in cancels promptly even with a slow TTS speaker (no 20s drain stall)")
+async def t_barge_in_no_speaker_drain_stall(ctx: TestContext) -> None:
+    """A voice/stop barge-in must cancel the live turn promptly even while
+    TTS is mid-stream.
+
+    The runner's ``speaker_task`` is a sibling that is NOT cancelled by the
+    turn task's own cancellation. The old finally awaited
+    ``wait_for(speaker, SPEAKER_DRAIN_TIMEOUT=20s)`` on EVERY exit, so a
+    barge-in mid-TTS blocked ``_cancel_active_turn`` — which runs inside the
+    single dispatch loop under ``_dispatch_lock`` — for up to 20s, going
+    deaf to the next utterance/interrupt. The fix cancels the speaker
+    immediately on a cancelled turn. Pin it: the cancel must complete in
+    well under the drain timeout.
+    """
+    from src.channels.tts_base import BaseTTS
+    from src.stream.events import Interrupt, TextFinal, now_ms
+
+    speaker_cancelled = asyncio.Event()
+
+    class _BlockingTTS(BaseTTS):
+        @property
+        def audio_format(self):
+            return "mp3", "audio/mpeg"
+
+        @property
+        def voice_id(self):
+            return "blocking"
+
+        async def synthesize_full(self, text, *, language=None):
+            return b""
+
+        async def synthesize_stream(self, text_chunks, *, language=None):
+            # Drain the text the runner pipes in, then simulate a long
+            # TTS tail. Before the fix this 30s sleep was awaited by the
+            # cancel path (capped at the 20s drain timeout).
+            try:
+                async for _ in text_chunks:
+                    pass
+                await asyncio.sleep(30)
+                yield b"audio"  # pragma: no cover — unreachable
+            except asyncio.CancelledError:
+                speaker_cancelled.set()
+                raise
+
+    async def _tts_factory(_db):
+        return _BlockingTTS()
+
+    async def _null(_db):
+        return None
+
+    agent = _RecordingAgent(block_first=True)
+    sess = _make_session(agent, coalesce_window_ms=0, speak_enabled=True)
+    await sess.start(stt_factory=_null, tts_factory=_tts_factory)
+    try:
+        # Fire a turn; it engages (yields a delta) and blocks, while the
+        # speaker_task is spun up and parked on its 30s tail.
+        await sess.push_in(TextFinal(
+            session_id="s", seq=1, ts_ms=now_ms(), text="hi", source="user_typed",
+        ))
+        engaged = await _wait_for(lambda: sess._current_turn_started, timeout=3.0)
+        assert engaged, "turn never engaged"
+
+        # Barge-in. Time how long until the turn slot frees.
+        loop = asyncio.get_running_loop()
+        t0 = loop.time()
+        await sess.push_in(Interrupt(
+            session_id="s", seq=2, ts_ms=now_ms(), reason="user_speech",
+        ))
+        freed = await _wait_for(lambda: not sess.has_active_turn(), timeout=5.0)
+        elapsed = loop.time() - t0
+        assert freed, "turn still active 5s after barge-in — drain stall regressed"
+        assert elapsed < 3.0, (
+            f"barge-in took {elapsed:.2f}s — the speaker-drain stall (up to 20s) "
+            f"appears to have regressed"
+        )
+        # And the speaker itself was cancelled, not left to drain.
+        was_cancelled = await _wait_for(lambda: speaker_cancelled.is_set(), timeout=2.0)
+        assert was_cancelled, "speaker task was not cancelled on barge-in"
+    finally:
+        await sess.close()

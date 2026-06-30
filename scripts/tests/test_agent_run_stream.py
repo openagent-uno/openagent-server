@@ -250,42 +250,69 @@ class _DeferredCancellationPoisoningModel(_FakeModel):
         )
 
 
-@test("agent_run_stream", "empty-stream fallback recovers from cancellation-poisoned provider stream")
-async def t_fallback_recovers_poisoned_cancel(_ctx: TestContext) -> None:
+@test("agent_run_stream", "barge-in (cancel during a zero-delta stream) propagates — no silent generate() recovery")
+async def t_barge_in_propagates_not_recovered(_ctx: TestContext) -> None:
+    """A pending cancellation on the turn task is ALWAYS a barge-in:
+    only ``StreamSession._cancel_active_turn`` (a user interrupt / a new
+    message preempting the turn) and session teardown ever cancel it.
+
+    When the provider's stream swallows that ``CancelledError`` and
+    returns with zero deltas, ``run_stream`` must RE-RAISE it — not
+    ``uncancel()`` + run a full ``generate()`` to completion. The old
+    recovery defeated barge-in and, because the runner's caller awaits the
+    task under the session dispatch lock, blocked the whole session for the
+    duration of that recovered generate — so after a quick burst of
+    messages the agent stopped responding. Pin the corrected contract:
+    the cancellation propagates and ``generate()`` never runs.
+
+    The run is wrapped in its own task (exactly like production, where the
+    turn lives in ``StreamSession._current_turn``) so the model's
+    self-cancel poisons THAT task and not the test's task.
+    """
+    import asyncio
+
     model = _CancellationPoisoningModel(
         deltas=[],
-        generate_text="Recovered after poisoned cancel",
+        generate_text="SHOULD NOT RUN — barge-in must win",
     )
     agent = _make_agent(model)
 
-    events = await _drive(agent, "hi", session_id="sess-poison")
+    turn = asyncio.ensure_future(_drive(agent, "hi", session_id="sess-poison"))
+    raised = False
+    try:
+        await turn
+    except asyncio.CancelledError:
+        raised = True
 
-    deltas = [e for e in events if e.get("kind") == "delta"]
-    done = [e for e in events if e.get("kind") == "done"]
-
+    assert raised, "barge-in CancelledError must propagate out of run_stream"
     assert model.stream_calls == 1, model.stream_calls
-    assert model.generate_calls == 1, model.generate_calls
-    assert deltas and deltas[0]["text"] == "Recovered after poisoned cancel", deltas
-    assert done and done[0]["text"] == "Recovered after poisoned cancel", done
+    assert model.generate_calls == 0, (
+        f"generate() must NOT run when the turn was cancelled (calls={model.generate_calls})"
+    )
 
 
-@test("agent_run_stream", "fallback child task survives a deferred stray cancel")
-async def t_fallback_survives_deferred_cancel(_ctx: TestContext) -> None:
+@test("agent_run_stream", "barge-in with a deferred stray cancel still propagates (no recovery)")
+async def t_barge_in_deferred_propagates(_ctx: TestContext) -> None:
+    """Same contract when the provider also schedules a second stray
+    cancel for the next tick: the barge-in still wins; no generate()."""
+    import asyncio
+
     model = _DeferredCancellationPoisoningModel(
         deltas=[],
-        generate_text="Recovered after deferred cancel",
+        generate_text="SHOULD NOT RUN",
     )
     agent = _make_agent(model)
 
-    events = await _drive(agent, "hi", session_id="sess-deferred-poison")
+    turn = asyncio.ensure_future(_drive(agent, "hi", session_id="sess-deferred-poison"))
+    raised = False
+    try:
+        await turn
+    except asyncio.CancelledError:
+        raised = True
 
-    deltas = [e for e in events if e.get("kind") == "delta"]
-    done = [e for e in events if e.get("kind") == "done"]
-
+    assert raised, "deferred barge-in cancel must propagate"
     assert model.stream_calls == 1, model.stream_calls
-    assert model.generate_calls == 1, model.generate_calls
-    assert deltas and deltas[0]["text"] == "Recovered after deferred cancel", deltas
-    assert done and done[0]["text"] == "Recovered after deferred cancel", done
+    assert model.generate_calls == 0, model.generate_calls
 
 
 @test("agent_run_stream", "fallback response populates last_response_meta()")
@@ -492,3 +519,98 @@ async def t_streaming_meta_uses_effective_model_id(_ctx: TestContext) -> None:
     assert meta.get("model") == "provider-y/streaming-model", (
         f"streaming-only path must surface the active model id: {meta}"
     )
+
+
+# ── StreamSession integration: rapid messages must not freeze ─────────
+
+
+async def _poll_until(cond, *, timeout: float = 5.0, step: float = 0.01) -> bool:
+    import asyncio
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if cond():
+            return True
+        await asyncio.sleep(step)
+    return False
+
+
+@test("agent_run_stream", "rapid messages don't freeze the StreamSession when a provider swallows the barge-in cancel")
+async def t_burst_no_freeze_on_swallowed_cancel(_ctx: TestContext) -> None:
+    """The reported production bug: sending messages back-to-back made the
+    agent stop responding. Root cause — a barge-in cancel that the provider
+    swallowed got 'recovered' into a full generate() that blocked the
+    session's dispatch loop (held under _dispatch_lock). With the fix the
+    barge-in propagates, the merged turn dispatches, and the agent keeps
+    answering.
+
+    Drives a REAL Agent (so the real run_stream fix is exercised) inside a
+    StreamSession with a model whose first stream blocks then swallows the
+    barge-in yielding zero deltas, and answers normally on the merged turn.
+    """
+    import asyncio
+    from src.stream.session import StreamSession
+    from src.stream.events import TextFinal, OutTextFinal, now_ms
+
+    class _SwallowModel(_FakeModel):
+        async def stream(
+            self, messages, system=None, tools=None,
+            session_id=None, on_status=None,
+        ):
+            self.stream_calls += 1
+            if self.stream_calls == 1:
+                # First turn: block before any delta, then SWALLOW the
+                # barge-in cancel (zero deltas) — the misbehaving provider.
+                try:
+                    await asyncio.sleep(30)
+                except asyncio.CancelledError:
+                    return
+                yield "unreachable"  # pragma: no cover
+            else:
+                yield "Ecco la risposta al tuo ultimo messaggio."
+
+    model = _SwallowModel(deltas=[], generate_text="FALLBACK — must not run")
+    agent = _make_agent(model)
+    sess = StreamSession(agent, client_id="c", session_id="s", coalesce_window_ms=50)
+
+    async def _null(_db):
+        return None
+
+    await sess.start(stt_factory=_null, tts_factory=_null)
+    try:
+        await sess.push_in(TextFinal(
+            session_id="s", seq=1, ts_ms=now_ms(), text="primo", source="user_typed",
+        ))
+        assert await _poll_until(lambda: model.stream_calls >= 1, timeout=3.0), (
+            "first turn never reached the model stream"
+        )
+        # Second message mid-flight → barge-in. With the bug this freezes
+        # the dispatch loop for the duration of a recovered generate().
+        await sess.push_in(TextFinal(
+            session_id="s", seq=2, ts_ms=now_ms(), text="secondo", source="user_typed",
+        ))
+
+        # A real OutTextFinal for the merged turn must arrive promptly.
+        got: str | None = None
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 5.0
+        while loop.time() < deadline:
+            try:
+                evt = await asyncio.wait_for(sess.outbound.get(), timeout=0.2)
+            except asyncio.TimeoutError:
+                continue
+            if isinstance(evt, OutTextFinal) and evt.text:
+                got = evt.text
+                break
+
+        assert got is not None, "no response within 5s — the session froze after a burst"
+        assert "ultimo messaggio" in got.lower(), got
+        assert model.generate_calls == 0, (
+            f"the fallback generate() ran — barge-in was recovered, not honoured "
+            f"(calls={model.generate_calls})"
+        )
+        assert model.stream_calls >= 2, (
+            f"the merged turn never streamed (stream_calls={model.stream_calls})"
+        )
+    finally:
+        await sess.close()

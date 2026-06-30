@@ -87,8 +87,50 @@ async def handle_list(request):
     return web.json_response({"sessions": rows})
 
 
+async def _teardown_session(gateway, db, sid: str) -> None:
+    """Remove one session id everywhere: live RAM, the runtime, the persisted
+    row + its derived satellites, then announce the removal. Best-effort per
+    layer so one failure never strands the others (and a cascade never aborts
+    half-way). Shared by the single-delete and the child-cascade so both tear a
+    session down identically."""
+    if gateway is not None:
+        # RAM: find whichever live client owns this session and drop it.
+        for client_id in list(gateway.sessions._clients.keys()):
+            try:
+                await gateway.sessions.delete_session(client_id, sid)
+            except Exception:
+                pass
+        try:
+            await gateway.agent.forget_session(sid)
+        except Exception:
+            pass
+    # Persisted cleanup — covers the row + per-session satellites even when
+    # RAM is already gone. ``purge_session`` is idempotent.
+    try:
+        await db.purge_session(sid)
+    except Exception:
+        pass
+    # Announce so every connected client drops the row from its sidebar live
+    # (a session deleted on one device vanishes on the others).
+    if gateway is not None:
+        try:
+            gateway.broadcast_session("deleted", sid)
+        except Exception:
+            pass
+
+
 async def handle_delete(request):
-    """DELETE /api/sessions/{session_id} — forget a session and its history."""
+    """DELETE /api/sessions/{session_id} — delete a chat session and its
+    history, cascading to the sub-agent child sessions it spawned.
+
+    Only a *top-level manual chat* is deletable here: a row with
+    ``origin == "chat"`` (or no origin, for legacy rows) and no
+    ``parent_session_id``. Scheduled-task and workflow run sessions — and the
+    sub-agent children themselves — are not directly deletable; they are
+    managed in the context that owns them (the scheduled-task / workflow
+    screens, or the parent chat). Deleting the chat cascades to every session
+    it spawned (delegated sub-agents at any depth, plus any in-chat
+    ``run dream mode`` firing), so no orphan child is left behind."""
     from aiohttp import web
 
     db = _db(request)
@@ -100,31 +142,53 @@ async def handle_delete(request):
         return web.json_response({"error": "session_id is required"}, status=400)
 
     gateway = request.app.get("gateway")
-    if gateway is not None:
-        # Clean up RAM (find which client owns this session).
-        for client_id in list(gateway.sessions._clients.keys()):
-            await gateway.sessions.delete_session(client_id, session_id)
-        try:
-            await gateway.agent.forget_session(session_id)
-        except Exception:
-            pass
-    # Persisted cleanup — covers DB rows even when RAM is gone.
-    await db.delete_session_binding(session_id)
-    await db.delete_sdk_session(session_id)
-    await db.delete_session(session_id)
 
-    # Announce the removal so every connected client drops the row from its
-    # sidebar in realtime (a sub-agent pruned/deleted on one device vanishes on
-    # the others). Carries the id so the app removes exactly that row.
-    if gateway is not None:
-        try:
-            gateway.broadcast_session("deleted", session_id)
-        except Exception:
-            pass
+    row = await db.get_session(session_id)
+
+    # Authz: in a multi-user / federated deploy one user must not be able to
+    # delete (and now cascade-purge) another's chat by guessing its id. Enforce
+    # only when we can resolve BOTH a caller handle and a stamped owner — a
+    # trusted-proxy / single-owner / legacy un-owned row has no handle or no
+    # owner to compare and falls through unchanged (matching the prior
+    # behaviour and the sibling list/runs endpoints). A non-owner gets 404 so
+    # the endpoint never confirms the id exists.
+    caller = request.get("user_handle") or request.get("client_id")
+    if row is not None and caller and (row.get("client_id") or ""):
+        if not await db.is_session_owned_by(session_id, caller, row=row):
+            return web.json_response({"error": "session not found"}, status=404)
+
+    # Guard: refuse to delete a run / sub-agent session. A missing row means a
+    # never-persisted RAM-only chat (or one already gone) — fall through and
+    # tear it down anyway, so a delete from the client always converges.
+    if row is not None:
+        origin = row.get("origin") or "chat"
+        if origin != "chat" or row.get("parent_session_id"):
+            return web.json_response(
+                {
+                    "error": (
+                        "Only top-level chat sessions can be deleted. "
+                        "Sub-agent, scheduled-run and workflow sessions are "
+                        "managed from the context that spawned them."
+                    ),
+                    "origin": origin,
+                },
+                status=403,
+            )
+
+    # Collect the whole sub-agent lineage spawned by this chat, then tear down
+    # children first and the parent last.
+    descendants = await db.list_descendant_sessions(session_id)
+    for child_sid in descendants:
+        await _teardown_session(gateway, db, child_sid)
+    await _teardown_session(gateway, db, session_id)
 
     return web.json_response({
         "session_id": session_id,
         "deleted": True,
+        # The full set removed (parent + cascaded sub-agents) so a client can
+        # prune every affected row and report an accurate count.
+        "deleted_session_ids": [session_id, *descendants],
+        "deleted_count": 1 + len(descendants),
     })
 
 
@@ -523,11 +587,14 @@ async def handle_get(request):
     if db is None:
         return web.json_response({"error": "memory DB not available"}, status=500)
     session_id = request.match_info["session_id"]
-    side = await db.get_session_binding(session_id)
     pin = await db.get_session_pin(session_id)
     return web.json_response({
         "session_id": session_id,
-        "side": side,
+        # ``side`` was the legacy per-session framework lock; the v0.14
+        # ``session_bindings`` → ``pinned_sessions`` migration dropped it (and
+        # the ``get_session_binding`` method with it). Kept as a null in the
+        # response so the field's shape stays stable for any old client.
+        "side": None,
         "runtime_id": pin,
     })
 

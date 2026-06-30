@@ -105,6 +105,10 @@ class TeamSession:
 
     def upsert_run(self, run_response: Union[TeamRunOutput, RunOutput]):
         """Adds a RunOutput, together with some calculated data, to the runs list."""
+        # Promote a stopped (CANCELLED) run so its turn survives history.
+        from src.memory.sessions._synth import promote_interrupted_run
+
+        promote_interrupted_run(run_response)
         messages = run_response.messages
 
         # Clear message timer before storage

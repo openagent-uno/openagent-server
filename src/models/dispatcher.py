@@ -266,6 +266,7 @@ async def _arun_runtime_stream(
     on_status: Callable[[str], Awaitable[None]] | None,
     error_event: str,
     on_delegate: Callable[[str], None] | None = None,
+    on_run_id: Callable[[str], None] | None = None,
     files: list[Any] | None = None,
     images: list[Any] | None = None,
     audio: list[Any] | None = None,
@@ -369,6 +370,13 @@ async def _arun_runtime_stream(
         suppressed_content: list[str] = []
         stream_iter = runtime.arun(prompt, **stream_kwargs)
         async for event in stream_iter:
+            # Capture the agno run_id (first event wins) so a barge-in can
+            # cooperatively cancel THIS run and let the runner persist it.
+            if on_run_id is not None:
+                rid = getattr(event, "run_id", None)
+                if rid:
+                    on_run_id(rid)
+                    on_run_id = None
             # Suppress a delegated member's OWN content + nested tool events
             # from the PARENT live stream when the member runs in its own child
             # session. That work belongs to the child session (navigable via the
@@ -496,6 +504,9 @@ class TeamRouterProvider(BaseModel):
         # prefers this over the entry pick so the chat badge shows the
         # specialist that actually wrote the response, not the leader.
         self._last_delegation_by_session: dict[str, str] = {}
+        # In-flight agno run_id per session is tracked by ``BaseModel`` (see
+        # ``_track_run_id`` / ``_coop_cancel``); the TEAM path captures it via
+        # the ``on_run_id`` callback wired into ``_arun_runtime_stream``.
 
     @property
     def model(self) -> str | None:
@@ -547,6 +558,7 @@ class TeamRouterProvider(BaseModel):
         self._session_system_key.clear()
         self._session_member_map.clear()
         self._last_delegation_by_session.clear()
+        self._run_ids.clear()
 
     # ── catalog → runtime objects ─────────────────────────────────────
 
@@ -841,17 +853,25 @@ class TeamRouterProvider(BaseModel):
         self._session_system_key.pop(session_id, None)
         self._session_member_map.pop(session_id, None)
         self._last_delegation_by_session.pop(session_id, None)
+        self._clear_run_id(session_id)
 
-    async def commit_partial_assistant(self, session_id: str, text: str) -> None:
-        # Falls through to the underlying provider if it's an NativeProvider
-        # (single-model deployment); Teams don't expose this surface.
-        runtime = self._session_runtime.get(session_id)
-        fn = getattr(runtime, "commit_partial_assistant", None) if runtime else None
+    async def request_cancel(self, session_id: str) -> bool:
+        # Cooperative cancel so the runner persists the interrupted run. The
+        # TEAM path streams through ``_arun_runtime_stream`` (run_id captured
+        # here); the single-model path streams through the NativeProvider
+        # runtime (run_id captured there). Try the team-captured id first,
+        # else forward to the runtime.
+        sid = session_id or "default"
+        if await self._coop_cancel(session_id):
+            return True
+        runtime = self._session_runtime.get(sid)
+        fn = getattr(runtime, "request_cancel", None) if runtime else None
         if callable(fn):
             try:
-                await fn(session_id, text)
+                return bool(await fn(session_id))
             except Exception as e:  # noqa: BLE001
-                logger.debug("TeamRouterProvider.commit_partial_assistant: %s", e)
+                logger.debug("TeamRouterProvider.request_cancel: %s", e)
+        return False
 
     async def cleanup_idle(self) -> None:
         await self._fan_out_runtimes("cleanup_idle")
@@ -998,17 +1018,21 @@ class TeamRouterProvider(BaseModel):
         # runtime can always read/write the row regardless of which
         # handle (if any) the gateway bound to the session.
         user_id = RUNTIME_SESSION_USER_ID
-        async for delta in _arun_runtime_stream(
-            runtime,
-            prompt=_last_user_prompt(messages),
-            session_id=sid,
-            user_id=user_id,
-            on_status=on_status,
-            error_event="team_router.stream_error",
-            on_delegate=lambda mid: self._record_delegation(sid, mid),
-            files=files, images=images, audio=audio, videos=videos,
-        ):
-            yield delta
+        try:
+            async for delta in _arun_runtime_stream(
+                runtime,
+                prompt=_last_user_prompt(messages),
+                session_id=sid,
+                user_id=user_id,
+                on_status=on_status,
+                error_event="team_router.stream_error",
+                on_delegate=lambda mid: self._record_delegation(sid, mid),
+                on_run_id=lambda rid: self._track_run_id(sid, rid),
+                files=files, images=images, audio=audio, videos=videos,
+            ):
+                yield delta
+        finally:
+            self._clear_run_id(sid)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -1138,24 +1162,24 @@ class ModelDispatcher(BaseModel):
                 logger.debug("delete_sdk_session %s: %s", session_id, e)
         await self._fan_out_async("forget_session", session_id)
 
-    async def commit_partial_assistant(self, session_id: str, text: str) -> None:
-        """Best-effort barge-in commit. Targets only the provider that
-        handled this session, not every cached provider — fanning out
-        to every provider per barge-in does N redundant sqlite reads
-        for sessions they don't know about.
+    async def request_cancel(self, session_id: str) -> bool:
+        """Cooperatively cancel the session's in-flight runtime run so the
+        runner persists it (and ``upsert_run`` backfills the interrupted turn
+        into history) rather than leaving a poisoned RUNNING shell. Targets
+        only the provider that handled the session. Returns True if a run was
+        registered for cancellation.
         """
-        if not session_id or not text:
-            return
+        if not session_id:
+            return False
         provider = self._provider_for_session(session_id)
-        if provider is None:
-            return
-        fn = getattr(provider, "commit_partial_assistant", None)
+        fn = getattr(provider, "request_cancel", None) if provider else None
         if not callable(fn):
-            return
+            return False
         try:
-            await fn(session_id, text)
+            return bool(await fn(session_id))
         except Exception as e:  # noqa: BLE001
-            logger.debug("team provider commit_partial: %s", e)
+            logger.debug("team provider request_cancel: %s", e)
+            return False
 
     def _provider_for_session(self, session_id: str) -> BaseModel | None:
         """Return the TeamRouterProvider that handled ``session_id``,

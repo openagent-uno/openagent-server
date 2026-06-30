@@ -1,25 +1,37 @@
 """Bootstrap — DEFAULT_MCPS seeding into the ``mcps`` table.
 
-Regression test for the bug where ``ensure_builtin_mcps`` only iterated
-``BUILTIN_MCP_SPECS`` and never seeded the ``npx``-based defaults
-(``vault``, ``filesystem``). Fresh ``--agent-dir`` installs came up
-without the vault MCP, the agent reported "il vault MCP non è
-disponibile in questa installazione", and memory writes leaked to the
-filesystem instead of the OpenAgent vault.
+Regression test for the bug where ``ensure_builtin_mcps`` failed to seed
+the memory defaults (``vault``, ``filesystem``). Fresh ``--agent-dir``
+installs came up without the vault MCP, the agent reported "il vault MCP
+non è disponibile in questa installazione", and memory writes leaked to
+the filesystem instead of the OpenAgent vault.
+
+``vault`` is a vendored node builtin (``src/mcp/servers/vault``, run as
+``node dist/server.js`` and seeded by ``builtin_name``); ``filesystem``
+is an ``npx`` default. Both must land in the ``mcps`` table on a fresh DB
+and surface as real, executable specs through ``MCPPool.from_db``.
 """
 from __future__ import annotations
 
+import uuid
 from unittest.mock import patch
 
 from ._framework import TestContext, test
 
 
-@test("bootstrap", "ensure_builtin_mcps seeds vault + filesystem (npx defaults)")
-async def t_seeds_npx_defaults(ctx: TestContext) -> None:
+def _fresh_db_path(ctx: TestContext) -> str:
+    """A unique, never-seeded DB path so a ``fresh DB`` assertion holds
+    regardless of suite ordering — ``ctx.db_path`` is shared and another
+    test may already have bootstrapped it (``added`` would then be 0)."""
+    return str(ctx.db_path.with_name(f"seed-{uuid.uuid4().hex[:8]}.db"))
+
+
+@test("bootstrap", "ensure_builtin_mcps seeds vault (node builtin) + filesystem (npx)")
+async def t_seeds_memory_defaults(ctx: TestContext) -> None:
     from src.memory.bootstrap import ensure_builtin_mcps
     from src.memory.db import MemoryDB
 
-    db = MemoryDB(str(ctx.db_path))
+    db = MemoryDB(_fresh_db_path(ctx))
     await db.connect()
     try:
         added = await ensure_builtin_mcps(db)
@@ -28,20 +40,27 @@ async def t_seeds_npx_defaults(ctx: TestContext) -> None:
         rows = await db.list_mcps()
         names = {row["name"] for row in rows}
 
-        # The two npx-based defaults that were missing before the fix.
+        # The two memory defaults that were missing before the fix.
         assert "vault" in names, (
             "vault MCP must be seeded so memory writes route through "
             "vault_* tools (not raw filesystem)"
         )
         assert "filesystem" in names, "filesystem MCP must be seeded"
 
-        # Vault row shape: command + args, no builtin_name.
+        # Vault is the vendored node builtin: seeded by ``builtin_name`` and
+        # resolved to ``node dist/server.js`` at runtime (BUILTIN_MCP_SPECS),
+        # so the row stores no command of its own.
         vault = next(r for r in rows if r["name"] == "vault")
-        assert vault["command"], "vault row must store the npx argv"
-        assert vault["command"][0] == "npx"
-        assert not vault.get("builtin_name"), "vault is not a python builtin"
+        assert vault.get("builtin_name") == "vault", "vault seeds as a builtin"
+        assert not vault["command"], "builtin vault resolves its command at runtime"
         assert vault["enabled"] is True
         assert vault["kind"] == "default"
+
+        # Filesystem stays an npx default: a concrete argv on the row.
+        filesystem = next(r for r in rows if r["name"] == "filesystem")
+        assert filesystem["command"], "filesystem row must store the npx argv"
+        assert filesystem["command"][0] == "npx"
+        assert not filesystem.get("builtin_name"), "filesystem is not a builtin"
     finally:
         await db.close()
 
@@ -52,7 +71,7 @@ async def t_seeds_every_default(ctx: TestContext) -> None:
     from src.memory.bootstrap import ensure_builtin_mcps
     from src.memory.db import MemoryDB
 
-    db = MemoryDB(str(ctx.db_path))
+    db = MemoryDB(_fresh_db_path(ctx))
     await db.connect()
     try:
         await ensure_builtin_mcps(db)
@@ -74,7 +93,7 @@ async def t_idempotent(ctx: TestContext) -> None:
     from src.memory.bootstrap import ensure_builtin_mcps
     from src.memory.db import MemoryDB
 
-    db = MemoryDB(str(ctx.db_path))
+    db = MemoryDB(_fresh_db_path(ctx))
     await db.connect()
     try:
         await ensure_builtin_mcps(db)
@@ -98,11 +117,12 @@ async def t_pool_loads_vault(ctx: TestContext) -> None:
     from src.memory.bootstrap import ensure_builtin_mcps
     from src.memory.db import MemoryDB
 
-    db = MemoryDB(str(ctx.db_path))
+    db_path = _fresh_db_path(ctx)
+    db = MemoryDB(db_path)
     await db.connect()
     try:
         await ensure_builtin_mcps(db)
-        pool = await MCPPool.from_db(db, db_path=str(ctx.db_path))
+        pool = await MCPPool.from_db(db, db_path=db_path)
         names = {spec.name for spec in pool.specs}
         assert "vault" in names, (
             "vault must surface as a real MCPPool spec after "
@@ -112,9 +132,11 @@ async def t_pool_loads_vault(ctx: TestContext) -> None:
         vault = next(s for s in pool.specs if s.name == "vault")
         assert vault.is_stdio, "vault is a stdio MCP, not http/sse"
         assert vault.command, "vault spec must carry an argv"
-        # ``_normalise_spec`` resolves the head to absolute. ``npx`` should
-        # have been turned into something like /…/.nvm/…/npx.
-        assert vault.command[0].endswith("npx") or vault.command[0] == "npx"
+        # The vendored node builtin resolves to ``node dist/server.js``.
+        # ``_normalise_spec`` resolves the head to an absolute node path and
+        # the script to the vendored server under src/mcp/servers/vault.
+        assert vault.command[0].endswith("node") or vault.command[0] == "node"
+        assert vault.command[-1].endswith("vault/dist/server.js")
     finally:
         await db.close()
 
@@ -186,7 +208,6 @@ async def t_migrate_agno_sessions_renamed(ctx: TestContext) -> None:
     Idempotent — running connect() twice is a no-op for the rename.
     """
     import sqlite3
-    import uuid
     from src.memory.db import MemoryDB
 
     tmp_db = ctx.db_path.with_name(f"rename-{uuid.uuid4().hex[:8]}.db")
@@ -306,7 +327,6 @@ async def t_migrate_agno_sessions_both_present(ctx: TestContext) -> None:
     drop. We only assert that connect() doesn't blow up and both tables
     survive."""
     import sqlite3
-    import uuid
     from src.memory.db import MemoryDB
 
     tmp_db = ctx.db_path.with_name(f"both-{uuid.uuid4().hex[:8]}.db")

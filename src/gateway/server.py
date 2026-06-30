@@ -1125,13 +1125,23 @@ class Gateway:
             # /new, /reset, /clear: full wipe — stop anything running, drop
             # the queue, AND forget provider-native resume state. Scoped to
             # ``session_id`` when given; falls back to client-wide wipe
-            # otherwise.
+            # otherwise. ``_interrupt_stream_sessions`` cancels the LIVE
+            # StreamSession turn (the real registry); ``sm.stop_current``
+            # is kept for the legacy/REST path. Without the former a turn
+            # streaming into the session survives the wipe and can
+            # interleave a stale reply into the fresh conversation.
             if session_id:
-                stopped = sm.stop_current(client_id, session_id=session_id)
+                stream_stopped = await self._interrupt_stream_sessions(
+                    client_id, session_id, reason="manual",
+                )
+                stopped = sm.stop_current(client_id, session_id=session_id) or stream_stopped
                 cleared = sm.clear_queue_for_session(client_id, session_id)
                 forgotten = await self._forget_one_session(session_id)
             else:
-                stopped = sm.stop_current(client_id)
+                stream_stopped = await self._interrupt_stream_sessions(
+                    client_id, reason="manual",
+                )
+                stopped = sm.stop_current(client_id) or stream_stopped
                 cleared = sm.clear_queue(client_id)
                 forgotten = await self._forget_all_client_sessions(client_id)
             fresh_sid = sm.create_session(client_id, handle=handle)
@@ -1145,11 +1155,22 @@ class Gateway:
             parts.append(f"fresh session: {fresh_sid[-8:]}")
             text = ". ".join(p.capitalize() if i == 0 else p for i, p in enumerate(parts)) + "."
         elif name == "stop":
+            # Cancel the LIVE StreamSession turn (the registry that runs
+            # chat turns). The legacy ``sm.stop_current`` is OR'd in for the
+            # REST/legacy path but is a no-op for stream traffic — its
+            # queue/worker is never populated on this path, which is why
+            # ``/stop`` silently did nothing before.
             if session_id:
-                stopped = sm.stop_current(client_id, session_id=session_id)
+                stream_stopped = await self._interrupt_stream_sessions(
+                    client_id, session_id, reason="manual",
+                )
+                stopped = sm.stop_current(client_id, session_id=session_id) or stream_stopped
                 cleared = sm.clear_queue_for_session(client_id, session_id)
             else:
-                stopped = sm.stop_current(client_id)
+                stream_stopped = await self._interrupt_stream_sessions(
+                    client_id, reason="manual",
+                )
+                stopped = sm.stop_current(client_id) or stream_stopped
                 cleared = sm.clear_queue(client_id)
             parts = []
             if stopped:
@@ -1158,7 +1179,9 @@ class Gateway:
                 parts.append(f"cleared {cleared} queued message{'s' if cleared != 1 else ''}")
             text = ". ".join(parts) + "." if parts else "Nothing running."
         elif name == "status":
-            busy = sm.is_busy(client_id)
+            # Reflect the registry that actually runs turns (StreamSession),
+            # not the always-idle SessionManager queue.
+            busy = self._client_has_active_stream_turn(client_id) or sm.is_busy(client_id)
             depth = sm.queue_depth(client_id)
             sessions = sm.list_sessions(client_id)
             text = f"{'Busy' if busy else 'Idle'} | Queue: {depth} | Sessions: {len(sessions)}"
@@ -1517,6 +1540,67 @@ class Gateway:
             return
         for key in [k for k in self._stream_sessions if k[0] == client_id]:
             await self._close_stream_session(key)
+
+    async def _interrupt_stream_sessions(
+        self, client_id: str, session_id: str | None = None, *, reason: str = "manual",
+    ) -> bool:
+        """Cancel the live turn(s) for a client by injecting an ``Interrupt``.
+
+        This is the bridge between the COMMAND surface (``/stop``,
+        ``/new``, ``/clear``, ``/reset``) and the registry that actually
+        holds running turns. Chat turns run as
+        ``StreamSession._current_turn`` inside ``self._stream_sessions``;
+        the legacy :class:`SessionManager` the command handler historically
+        cancelled never owns that task (its queue/worker is unused on the
+        stream path), so ``sm.stop_current`` was a no-op for real traffic.
+
+        We push an ``Interrupt`` event so the cancel runs through the
+        session's own ``_dispatch`` → ``_cancel_active_turn`` path — under
+        the dispatch lock, with partial-commit and terminal frames, exactly
+        like a barge-in — instead of reaching into session internals here.
+
+        ``session_id`` scopes to one conversation (app tab / bridge user);
+        omitting it interrupts every live session for the client (admin
+        shutdown / single-session ws clients). Returns True iff at least
+        one targeted session had a turn in flight or a burst buffered, so
+        the caller can report "Stopped" vs "Nothing running."
+        """
+        from src.stream.events import Interrupt, now_ms
+
+        if session_id is not None:
+            keys = [(client_id, session_id)]
+        else:
+            keys = [k for k in self._stream_sessions if k[0] == client_id]
+        stopped_any = False
+        for key in keys:
+            holder = self._stream_sessions.get(key)
+            if holder is None:
+                continue
+            session = holder.session
+            if session.has_active_turn():
+                stopped_any = True
+            try:
+                await session.push_in(Interrupt(
+                    session_id=key[1],
+                    seq=session.next_seq(),
+                    ts_ms=now_ms(),
+                    reason=reason,  # type: ignore[arg-type]
+                ))
+            except Exception as e:  # noqa: BLE001 — best-effort stop
+                logger.debug("interrupt push failed for %s: %s", key, e)
+        return stopped_any
+
+    def _client_has_active_stream_turn(self, client_id: str) -> bool:
+        """True iff a live StreamSession turn is running for the client.
+
+        Used so ``/status`` and ``is_busy`` reflect the registry that
+        actually runs turns instead of the always-idle SessionManager.
+        """
+        return any(
+            holder.session.has_active_turn()
+            for key, holder in self._stream_sessions.items()
+            if key[0] == client_id
+        )
 
     def _adopt_sessions_to_ws(self, client_id: str, ws) -> None:
         """Rebind every live channel for ``client_id`` onto ``ws``.

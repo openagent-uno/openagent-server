@@ -561,29 +561,27 @@ class Agent:
                     pass
         return list(sids)
 
-    async def commit_partial_assistant(
-        self, session_id: str, text: str
-    ) -> None:
-        """Persist a partial assistant reply after barge-in.
+    async def request_cancel(self, session_id: str) -> bool:
+        """Cooperatively cancel the in-flight run for ``session_id``.
 
-        Called by ``StreamSession._cancel_active_turn`` when the user
-        interrupts a turn mid-flight. Forwards to ``self.model`` so the
-        bound provider can either issue a clean interrupt control-request
-        or inject a synthetic run into its history store. Best-effort:
-        provider failures log and swallow.
+        Forwards to ``self.model`` (runtime providers register the run in
+        agno's cancellation registry so it persists with partial messages).
+        Returns True if a run was registered for cancellation; False if the
+        model can't cooperatively cancel (caller hard-cancels instead).
         """
-        if not session_id or not text or self.model is None:
-            return
-        commit = getattr(self.model, "commit_partial_assistant", None)
-        if not callable(commit):
-            return
+        if not session_id or self.model is None:
+            return False
+        fn = getattr(self.model, "request_cancel", None)
+        if not callable(fn):
+            return False
         try:
-            await commit(session_id, text)
+            return bool(await fn(session_id))
         except Exception as e:  # noqa: BLE001 — best-effort
             logger.debug(
-                "commit_partial_assistant on %s failed: %s",
+                "request_cancel on %s failed: %s",
                 type(self.model).__name__, e,
             )
+            return False
 
     async def forget_session(
         self,
@@ -1378,7 +1376,6 @@ class Agent:
         current_input = message
         accumulated: list[str] = []
         iter_count = 0
-        stream_finished_cleanly = False
 
         pending = hub.drain(session_id)
         if pending:
@@ -1502,7 +1499,6 @@ class Agent:
                             continue
                         accumulated.append(delta)
                         yield {"kind": "delta", "text": delta}
-                    stream_finished_cleanly = True
                 finally:
                     reset_session_context(token)
                     reset_delegation_context(delegation_tokens)
@@ -1535,33 +1531,47 @@ class Agent:
             # chat) would surface a confusing "(no output)" message
             # while ``Agent.run()`` worked fine for the same prompt.
             if not accumulated:
+                # A pending cancellation here is ALWAYS a barge-in. The
+                # only code that calls ``cancel()`` on this turn's task is
+                # ``StreamSession._cancel_active_turn`` (a user interrupt /
+                # a new message preempting the turn) and session teardown —
+                # nothing else increments ``task.cancelling()``. When the
+                # provider's stream swallows that ``CancelledError``
+                # internally and returns "cleanly" with zero deltas, the
+                # task is left cancellation-poisoned (``cancelling() > 0``)
+                # but the stream looks empty.
+                #
+                # The old behaviour ``uncancel()``-ed that poison and ran a
+                # full ``generate()`` to completion. That defeated the
+                # barge-in AND — because the runner's caller is blocked on
+                # ``await task`` while holding the session's dispatch lock —
+                # froze the whole session for the duration of the recovered
+                # generate. After a quick burst of messages each preempt
+                # stacked another blocking generate and the agent stopped
+                # responding entirely. Honour the interrupt instead: let the
+                # cancellation propagate promptly so the caller can dispatch
+                # the next (merged) turn.
+                task = asyncio.current_task()
+                if (
+                    task is not None
+                    and hasattr(task, "cancelling")
+                    and task.cancelling() > 0
+                ):
+                    elog(
+                        "agent.run_stream.barge_in",
+                        session_id=session_id,
+                        pending_cancels=task.cancelling(),
+                    )
+                    raise asyncio.CancelledError()
+
+                # Genuine empty stream (tool-only / empty completion, no
+                # cancel pending): fall back to a one-shot ``generate()`` so
+                # the caller doesn't surface a confusing "(no output)".
                 elog(
                     "agent.run_stream.fallback_to_generate",
                     session_id=session_id,
                     reason="no_deltas_yielded",
                 )
-                # Some provider streaming stacks return "normally" after
-                # swallowing an inner CancelledError, leaving the caller task
-                # cancellation-poisoned. The next await then raises
-                # CancelledError immediately and the empty-stream fallback
-                # never gets a chance to recover. Only clear that poisoned
-                # state after the stream loop itself finished cleanly.
-                task = asyncio.current_task()
-                if (
-                    stream_finished_cleanly
-                    and task is not None
-                    and hasattr(task, "uncancel")
-                    and task.cancelling()
-                ):
-                    pending_cancels = task.cancelling()
-                    while task.cancelling():
-                        task.uncancel()
-                    elog(
-                        "agent.run_stream.recovered_cancel",
-                        session_id=session_id,
-                        pending_cancels=pending_cancels,
-                        phase="post_stream_empty_fallback",
-                    )
                 try:
                     generate_kwargs: dict[str, Any] = {
                         "system": system,
@@ -1585,29 +1595,14 @@ class Agent:
                         ),
                         name=f"generate-fallback:{session_id or 'default'}",
                     )
-                    while True:
-                        try:
-                            fallback_response = await asyncio.shield(fallback_task)
-                            break
-                        except asyncio.CancelledError:
-                            if fallback_task.done():
-                                raise
-                            task = asyncio.current_task()
-                            if task is None or not hasattr(task, "uncancel"):
-                                fallback_task.cancel()
-                                raise
-                            pending_cancels = task.cancelling()
-                            if pending_cancels <= 0:
-                                fallback_task.cancel()
-                                raise
-                            while task.cancelling():
-                                task.uncancel()
-                            elog(
-                                "agent.run_stream.recovered_cancel",
-                                session_id=session_id,
-                                pending_cancels=pending_cancels,
-                                phase="await_generate_fallback",
-                            )
+                    try:
+                        fallback_response = await fallback_task
+                    except asyncio.CancelledError:
+                        # A barge-in arriving during the fallback generate
+                        # must stop it too — cancel the child and propagate
+                        # rather than running it to completion.
+                        fallback_task.cancel()
+                        raise
                     _emit_tool_call_summary(
                         fallback_response,
                         session_id=session_id,

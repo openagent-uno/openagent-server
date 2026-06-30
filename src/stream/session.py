@@ -56,6 +56,18 @@ logger = logging.getLogger(__name__)
 
 VIDEO_RING_SIZE = 8
 SPEAKER_DRAIN_TIMEOUT = 20.0
+# Upper bound on how long a barge-in waits for the cancelled turn to
+# actually finish before detaching it. With a runner that honours
+# cancellation this is never hit; it only guards against a provider that
+# swallows the cancel — so one misbehaving model can't freeze the session.
+BARGE_IN_DRAIN_TIMEOUT = 5.0
+# How long to let a COOPERATIVELY-cancelled runtime turn finish on its own
+# before falling back to a hard ``task.cancel()``. Cooperative cancel lets the
+# runtime (agno) reach its next checkpoint, persist the interrupted run with
+# its partial messages, and exit cleanly — so the next turn keeps context. For
+# a streaming turn the next checkpoint is sub-second; this only bounds the wait
+# when the model is parked in a long non-streaming call.
+COOP_CANCEL_DRAIN_TIMEOUT = 4.0
 _EMPTY_TURN_FALLBACK_TEXT = (
     "(No text response — the agent finished without producing any output. "
     "Please retry, and check the model/provider logs if this keeps happening.)"
@@ -133,6 +145,10 @@ class StreamSession:
         self._stt_pump_task: asyncio.Task | None = None
         self._dispatch_task: asyncio.Task | None = None
         self._current_turn: asyncio.Task | None = None
+        # Turns whose cancellation a misbehaving provider swallowed: held
+        # here so they finish in the background without a "Task was
+        # destroyed but it is pending" warning, and don't block barge-in.
+        self._detached_turns: set[asyncio.Task] = set()
 
         self._video_buffers: dict[str, deque[VideoFrame]] = defaultdict(
             lambda: deque(maxlen=VIDEO_RING_SIZE)
@@ -151,9 +167,6 @@ class StreamSession:
         # "Thinking…" indicator alive across a barge-in until the
         # follow-up turn lands.
         self._suppress_runner_completion: bool = False
-        # Deltas of the in-flight assistant turn. Read by
-        # ``_cancel_active_turn`` for ``commit_partial_assistant``.
-        self._partial_assistant: list[str] = []
         # ``_current_turn_msg`` is the TextFinal that triggered the
         # in-flight turn; the runner flips ``_current_turn_started`` on
         # the FIRST event from ``agent.run_stream`` (the engagement
@@ -288,6 +301,20 @@ class StreamSession:
     async def push_in(self, evt: Event) -> None:
         """Append an inbound event for the dispatch loop to handle."""
         await self.inbound.put(evt)
+
+    def has_active_turn(self) -> bool:
+        """True iff a turn is running or a burst is buffered to dispatch.
+
+        The gateway consults this so a COMMAND ``stop`` / lifecycle wipe
+        can report honestly ("Stopped" vs "Nothing running.") and decide
+        whether injecting an :class:`Interrupt` into this live session is
+        worthwhile. A turn buffered in ``_pending_burst`` but not yet
+        dispatched still counts — a ``stop`` issued inside the coalesce
+        window must drop it, otherwise the merged turn would still fire.
+        """
+        if self._current_turn is not None and not self._current_turn.done():
+            return True
+        return bool(self._pending_burst)
 
     def next_seq(self) -> int:
         self._seq += 1
@@ -580,8 +607,6 @@ class StreamSession:
         if not text and not attachments:
             return
 
-        self._partial_assistant = []
-
         # Mirror modality: voice in → voice out regardless of the
         # session toggle. Merged bursts inherit the last message's
         # source (see ``_merge_burst``).
@@ -675,10 +700,6 @@ class StreamSession:
         if task is None or task.done():
             return
         elog("stream.barge_in", session_id=self.session_id, reason=reason)
-        # Snapshot BEFORE cancelling — otherwise the runner can append
-        # one more delta between read and cancel.
-        partial = "".join(self._partial_assistant).strip()
-        self._partial_assistant = []
         # Salvage: re-buffer the input if the agent hasn't engaged yet
         # (typed-burst drain race — merged turn was just scheduled but
         # the runner hasn't reached ``run_stream``). Interrupt/close
@@ -695,36 +716,62 @@ class StreamSession:
         if suppress_completion:
             self._suppress_runner_completion = True
         self._active_cancel_reason = reason
-        # Cancel BEFORE any provider control-request — otherwise the
-        # provider's reader might be parked behind a full receive
-        # channel and ``client.interrupt()``'s ack can't land,
-        # burning a 60 s timeout and freezing the dispatch loop.
-        task.cancel()
-        try:
-            await task
-        except (asyncio.CancelledError, Exception):
-            pass
-        finally:
-            self._current_turn = None
-            self._current_turn_msg = None
-            self._current_turn_started = False
-            self._active_cancel_reason = None
-            if suppress_completion:
-                self._suppress_runner_completion = False
+        # ROOT of the "stop then continue loses all context" bug: a raw asyncio
+        # ``task.cancel()`` poisons the runner coroutine before it reaches a
+        # cancellation checkpoint, so the run is abandoned at ``status=RUNNING``
+        # with no messages and never persisted. The runner only records an
+        # interrupted turn through its COOPERATIVE cancel path. So ask the
+        # runtime to cancel cooperatively and let the turn finish on its own —
+        # the runner then persists the run and ``upsert_run`` backfills the
+        # user's question into history, so "continua" keeps context. Only if
+        # cooperative cancel is unavailable or stalls do we hard-cancel.
+        # ``salvage`` (typed-burst merge) skips this — that path wants instant
+        # preemption and re-merges the input forward.
+        cancelled_cleanly = False
+        if salvaged_msg is None:
+            try:
+                if await self._agent.request_cancel(self.session_id):
+                    await asyncio.wait_for(
+                        asyncio.shield(task), timeout=COOP_CANCEL_DRAIN_TIMEOUT
+                    )
+                    cancelled_cleanly = True
+                    elog(
+                        "stream.barge_in.coop_drained",
+                        session_id=self.session_id, reason=reason,
+                    )
+            except (asyncio.CancelledError, Exception):
+                # request_cancel unavailable, the drain timed out, or it
+                # failed — fall through to the hard cancel below.
+                pass
+        if not cancelled_cleanly and not task.done():
+            # Hard cancel fallback. A well-behaved runner honours it in
+            # milliseconds. If a provider swallows it and keeps generating, do
+            # NOT block the dispatch loop (this runs under ``_dispatch_lock``)
+            # — detach the task and move on so the next turn can dispatch.
+            # ``_suppress_runner_completion`` keeps late zombie frames off the
+            # wire.
+            task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=BARGE_IN_DRAIN_TIMEOUT)
+            except asyncio.TimeoutError:
+                elog(
+                    "stream.barge_in.drain_timeout",
+                    level="warning",
+                    session_id=self.session_id,
+                    reason=reason,
+                )
+                self._detached_turns.add(task)
+                task.add_done_callback(self._detached_turns.discard)
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._current_turn = None
+        self._current_turn_msg = None
+        self._current_turn_started = False
+        self._active_cancel_reason = None
+        if suppress_completion:
+            self._suppress_runner_completion = False
         if salvaged_msg is not None:
             self._pending_burst.insert(0, salvaged_msg)
-        # Persist the partial so history reads as
-        # ``user → assistant(partial) → user`` not two adjacent users.
-        if partial:
-            commit = getattr(self._agent, "commit_partial_assistant", None)
-            if callable(commit):
-                try:
-                    await commit(self.session_id, partial)
-                except Exception as e:  # noqa: BLE001
-                    logger.warning(
-                        "commit_partial_assistant failed (%s): %s",
-                        self.session_id, e,
-                    )
 
     def _snapshot_video_frames(self) -> list[dict[str, Any]]:
         """Persist the latest frame per stream as image attachments.
@@ -945,8 +992,6 @@ class StreamTurnRunner:
                         # Visible output has started — reasoning is over.
                         await _end_reasoning()
                         accumulated.append(delta)
-                        # Tee for ``commit_partial_assistant`` on barge-in.
-                        sess._partial_assistant.append(delta)
                         await publish(OutTextDelta(
                             session_id=session_id,
                             seq=sess.next_seq(),
@@ -998,14 +1043,30 @@ class StreamTurnRunner:
         finally:
             reset_child_stream_emitter(_child_emit_tok)
             if speaker is not None:
-                try:
-                    await asyncio.wait_for(speaker, timeout=SPEAKER_DRAIN_TIMEOUT)
-                except asyncio.TimeoutError:
+                if cancelled:
+                    # Barge-in / stop: do NOT drain the TTS tail. The
+                    # speaker is a sibling task that is not cancelled by
+                    # the runner's own cancellation, so awaiting its full
+                    # drain here (up to SPEAKER_DRAIN_TIMEOUT) blocks
+                    # ``_cancel_active_turn``'s ``await task`` — and that
+                    # runs inside the single dispatch loop holding
+                    # ``_dispatch_lock``, so a voice barge-in mid-TTS would
+                    # freeze the whole inbound pipeline (no next utterance,
+                    # no follow-up interrupt) for up to 20s. Cancel it now.
                     speaker.cancel()
-                except (asyncio.CancelledError, Exception) as e:
-                    if isinstance(e, asyncio.CancelledError):
-                        raise
-                    logger.debug("speaker cleanup error: %s", e)
+                    try:
+                        await speaker
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                else:
+                    try:
+                        await asyncio.wait_for(speaker, timeout=SPEAKER_DRAIN_TIMEOUT)
+                    except asyncio.TimeoutError:
+                        speaker.cancel()
+                    except (asyncio.CancelledError, Exception) as e:
+                        if isinstance(e, asyncio.CancelledError):
+                            raise
+                        logger.debug("speaker cleanup error: %s", e)
 
             if audio_started:
                 await publish(OutAudioEnd(
@@ -1018,7 +1079,13 @@ class StreamTurnRunner:
             full_text = "".join(accumulated)
             if not full_text and stream_error is not None:
                 full_text = f"Error: {stream_error}"
-            elif not full_text and cancelled and cancel_reason is None:
+            elif not full_text and cancelled:
+                # Any cancel — an explicit user stop (reason set) or an
+                # unexpected provider-side cancel (reason None) — reads as
+                # "interrupted", not "the agent produced nothing". The
+                # reason is always set for a user Interrupt (wire.py), so
+                # gating on ``cancel_reason is None`` showed the wrong
+                # "No text response" copy for a deliberate early stop.
                 full_text = _CANCELLED_TURN_FALLBACK_TEXT
             elif not full_text:
                 full_text = _EMPTY_TURN_FALLBACK_TEXT

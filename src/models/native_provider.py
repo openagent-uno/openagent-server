@@ -508,6 +508,9 @@ class NativeProvider(BaseModel):
         # ``_evict_oldest``.
         self._agno_agents: OrderedDict[str, Any] = OrderedDict()
         self._agno_teams: OrderedDict[str, Any] = OrderedDict()
+        # In-flight agno run_id per session is tracked by ``BaseModel`` (see
+        # ``_track_run_id`` / ``_coop_cancel``) so the single-model and team
+        # paths share one cooperative-cancel implementation.
         # Memoised provider-config row for this model. Resolved once at
         # construction because the providers_config can't change for a
         # given NativeProvider instance (rebuild_routing rebuilds the
@@ -715,85 +718,22 @@ class NativeProvider(BaseModel):
         self._ensured_db_path = path
         return path
 
-    async def commit_partial_assistant(self, session_id: str, text: str) -> None:
-        """Append a synthetic assistant run to the runtime's session row.
+    async def request_cancel(self, session_id: str) -> bool:
+        """Cooperatively cancel the in-flight agno run for ``session_id``.
 
-        After barge-in, the in-flight runtime run is cancelled mid-stream and
-        nothing has been committed to the sessions table's runs column. We
-        append a synthetic ``RunOutput`` with ``status=cancelled`` carrying
-        the partial assistant text, so the next turn (which reads the session
-        via ``add_history_to_context=True``) sees ``user → assistant
-        (interrupted) → user`` rather than two adjacent user turns.
+        Marks the run in the runner's global cancellation registry so it
+        raises ``RunCancelledException`` at its next checkpoint, sets
+        ``status=cancelled``, and persists the run via ``upsert_run`` — which
+        backfills the user's question into ``messages`` (see
+        ``synth_interrupted_messages``) so the interrupted turn survives in
+        history. It's the difference from a raw asyncio ``task.cancel()``,
+        which poisons the coroutine before any checkpoint, leaving a
+        ``status=RUNNING`` shell that's never persisted — losing the turn.
 
-        Best-effort: missing session row, schema mismatch, or import
-        errors all degrade silently — barge-in must succeed even when
-        history persistence fails.
+        Returns True if a run was registered for cancellation; False if none
+        is in flight for the session (the caller should then hard-cancel).
         """
-        if not session_id or not text:
-            return
-        try:
-            from src.memory.store.sqlite import SqliteDb
-            from src.memory.store.base import SessionType
-            from src.memory.sessions.agent import AgentSession
-            from src.core._run_state.agent import RunOutput
-            from src.core._run_state.base import RunStatus
-            from src.models.providers.message import Message
-        except ImportError as e:
-            logger.debug("runtime commit_partial_assistant: import failed: %s", e)
-            return
-
-        db_path = self._runtime_db_path()
-
-        def _commit_sync() -> None:
-            # Sync helper: the runtime's SqliteDb is sync end-to-end. Run on a
-            # worker thread so barge-in doesn't stall the event loop.
-            try:
-                db = SqliteDb(db_file=db_path)
-            except Exception as e:  # noqa: BLE001
-                logger.debug("runtime commit_partial_assistant: SqliteDb init failed: %s", e)
-                return
-
-            try:
-                session = db.get_session(
-                    session_id=session_id,
-                    session_type=SessionType.AGENT,
-                    deserialize=True,
-                )
-            except Exception as e:  # noqa: BLE001
-                logger.debug("runtime commit_partial_assistant: get_session %s: %s", session_id, e)
-                return
-
-            if not isinstance(session, AgentSession):
-                return
-
-            import time as _time
-            # ``agent_id`` is REQUIRED on the run dict — the runtime's
-            # ``AgentSession.from_dict`` filters out any run that lacks both
-            # ``agent_id`` and ``team_id`` when deserialising. Without it,
-            # our synth run round-trips through SqliteDb and silently
-            # disappears on the next read.
-            run = RunOutput(
-                run_id=f"interrupted-{int(_time.time() * 1000)}",
-                agent_id=session.agent_id,
-                session_id=session_id,
-                user_id=session.user_id,
-                content=text,
-                messages=[Message(role="assistant", content=text)],
-                status=RunStatus.cancelled,
-            )
-            try:
-                session.upsert_run(run)
-            except Exception as e:  # noqa: BLE001
-                logger.debug("runtime commit_partial_assistant: upsert_run failed: %s", e)
-                return
-            try:
-                db.upsert_session(session, deserialize=False)
-                elog("runtime.barge_in_commit", session_id=session_id, chars=len(text))
-            except Exception as e:  # noqa: BLE001
-                logger.debug("runtime commit_partial_assistant: upsert_session failed: %s", e)
-
-        import asyncio as _asyncio
-        await _asyncio.to_thread(_commit_sync)
+        return await self._coop_cancel(session_id)
 
     def _runtime_parts(self) -> tuple[str, str]:
         return split_runtime_id(self.model)
@@ -1587,6 +1527,9 @@ class NativeProvider(BaseModel):
             try:
                 emitted = 0
                 async for event in stream:
+                    # Capture the agno run_id (first event wins) so a barge-in
+                    # can cooperatively cancel THIS run and let agno persist it.
+                    self._track_run_id(sid, getattr(event, "run_id", None))
                     if isinstance(event, content_types):
                         text = getattr(event, "content", None) or ""
                         if text:
@@ -1621,6 +1564,7 @@ class NativeProvider(BaseModel):
                                 error_text=getattr(event, "error", None),
                             )
             finally:
+                self._clear_run_id(sid)
                 aclose = getattr(stream, "aclose", None)
                 if aclose is not None:
                     try:
