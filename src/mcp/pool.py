@@ -1472,6 +1472,23 @@ class MCPPool:
                 out[spec.name] = description.strip()
         return out
 
+    def server_tool_names(self) -> dict[str, list[str]]:
+        """``{server_name: [registered tool keys]}`` for every connected MCP.
+
+        Feeds the catalog summary (:func:`render_catalog_summary`) so the
+        model can copy an exact key like ``vault_write_note`` instead of
+        guessing — and mis-prefixing — it. The renderer inlines keys only
+        for a small allowlist of high-traffic builtins; this returns them
+        all and lets the renderer decide.
+        """
+        out: dict[str, list[str]] = {}
+        for name, toolkit in self._toolkit_by_name.items():
+            fns = dict(getattr(toolkit, "functions", {}) or {})
+            fns.update(getattr(toolkit, "async_functions", {}) or {})
+            if fns:
+                out[name] = sorted(fns)
+        return out
+
     def render_catalog_summary(self) -> str:
         """Cached markdown block listing every connected MCP server.
 
@@ -1502,7 +1519,9 @@ class MCPPool:
         # duck-typed test fallback can't drift apart.
         from src.core.prompts import _render_catalog_summary_lines
 
-        return _render_catalog_summary_lines(summary, self.server_descriptions())
+        return _render_catalog_summary_lines(
+            summary, self.server_descriptions(), self.server_tool_names()
+        )
 
     def dormant_servers(self) -> list[str]:
         return sorted(name for name, count in self._tool_counts.items() if count == 0)

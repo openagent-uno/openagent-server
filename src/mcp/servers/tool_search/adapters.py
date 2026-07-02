@@ -2,16 +2,17 @@
 
 This MCP gives the model a uniform, provider-agnostic way to discover
 and invoke any tool from any other connected MCP. It exists because
-deployments with many MCPs accumulate hundreds of tools; LLM providers
-cap how many tools they accept per request (OpenAI: 128, Claude Code
-"standard" mode: ~200), so above-budget tools get silently dropped
-from the upfront tool list. Without a recovery channel the model
-plain doesn't see those tools — the symptom this MCP is here to fix.
+deployments with many MCPs accumulate hundreds of tools that would
+blow past any provider's per-request tool cap and bloat every prompt.
 
-The companion logic in ``openagent.models.runtime.wire_model_runtime``
-trims above-budget MCPs from the upfront list and relies on the four
-tools below (``list_servers`` / ``list_tools`` / ``describe_tool`` /
-``call_tool``) to recover them on demand.
+Since the v0.14 defer-all rewrite ``openagent.models.runtime.wire_model_runtime``
+puts ONLY this MCP in the model's upfront tool list — every other
+capability is reached through the four tools below (``list_servers`` /
+``list_tools`` / ``describe_tool`` / ``call_tool``), regardless of tool
+count. Because the model never sees the real tools upfront, it guesses
+their registered keys and mis-prefixes them; ``_candidate_names`` /
+``_resolve_tool`` absorb those mechanical slips so a near-miss key still
+dispatches instead of burning a turn.
 
 Both factories accept a ``pool`` kwarg so the adapter can navigate
 the live ``MCPPool``. The pool is injected by ``MCPPool.connect_all``
@@ -22,6 +23,7 @@ it; existing in-process adapters that don't take ``pool`` (e.g.
 from __future__ import annotations
 
 import asyncio
+import difflib
 import inspect
 import json
 from typing import Any
@@ -57,6 +59,66 @@ def _functions_dict(toolkit: Any) -> dict[str, Any]:
     out = dict(getattr(toolkit, "functions", {}) or {})
     out.update(getattr(toolkit, "async_functions", {}) or {})
     return out
+
+
+def _safe_prefix(name: str) -> str:
+    """Mirror of ``MCPPool._safe_prefix`` / ``workflow.validate._safe_prefix``:
+    the runtime keys subprocess tools as ``<safe_prefix>_<tool>`` with every
+    non-alphanumeric char in the server name mapped to ``_``. The bare↔prefixed
+    repair below MUST use this, not the raw server name — otherwise a
+    hyphenated server (``vault-gate`` → key prefix ``vault_gate_``,
+    ``web-search`` → ``web_search_``) never resolves.
+    """
+    return "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in name)
+
+
+def _candidate_names(server: str, tool: str) -> list[str]:
+    """Deterministic variants of the ``tool`` argument, in priority order.
+
+    Registered tool keys are inconsistent: subprocess MCPs are prefixed
+    ``<safe_prefix>_<name>`` (``vault_write_note``, ``web_search_fetch``)
+    while in-process ones keep the bare function name (``shell_exec``,
+    ``delegate_task``). The model, generalising from the prefixed case,
+    makes three mechanical mistakes when it guesses the key. We normalise
+    each one to the real key WITHOUT fuzzy matching, so we only ever
+    resolve to a name the model literally typed a variant of — never a
+    *different* tool:
+
+      * correct already          — ``vault_write_note``
+      * server prefix omitted     — ``write_note``            → ``vault_write_note``
+      * server prefix doubled     — ``shell_shell_exec``      → ``shell_exec``
+                                    ``vault_gate_vault_gate`` → ``vault_gate``
+
+    Exact match is tried first so a redundant-prefix strip can never
+    shadow a genuinely-distinct tool that happens to share the leaf.
+    """
+    out: list[str] = []
+
+    def add(name: str) -> None:
+        if name and name not in out:
+            out.append(name)
+
+    add(tool)
+    if server:
+        # Keys use the SAFE-prefixed server name, so ``vault-gate`` →
+        # ``vault_gate_``. Mirror that here (see _safe_prefix).
+        pfx = f"{_safe_prefix(server)}_"
+        add(f"{pfx}{tool}")          # bare leaf → add the server prefix
+        if tool.startswith(pfx):
+            add(tool[len(pfx):])     # doubled prefix → drop one copy
+    return out
+
+
+def _did_you_mean(name: str, available: list[str]) -> str:
+    """A ``" Did you mean: [...]?"`` suffix for a failed lookup, or ``""``.
+
+    Used only to enrich the *error* — never to auto-invoke — so a
+    hallucinated leaf (``vault_list_notes`` when the real tool is
+    ``vault_list_directory``) is corrected on the model's next turn
+    instead of silently dispatching to the wrong tool.
+    """
+    close = difflib.get_close_matches(name, available, n=3, cutoff=0.5)
+    return f" Did you mean: {close}?" if close else ""
 
 
 # Lazy-recovery timeout for ``call_tool``. Lower than the connect-time
@@ -131,11 +193,17 @@ def _describe_tool_impl(pool: Any, server: str, tool: str) -> dict[str, Any]:
     toolkit = pool.toolkit_by_name(server)
     if toolkit is None:
         raise ValueError(f"MCP {server!r} is not loaded.")
-    fn = _functions_dict(toolkit).get(tool)
+    fns = _functions_dict(toolkit)
+    fn = None
+    for cand in _candidate_names(server or "", tool):
+        if cand in fns:
+            fn, tool = fns[cand], cand  # report the resolved key back
+            break
     if fn is None:
-        avail = sorted(_functions_dict(toolkit))
+        avail = sorted(fns)
         raise ValueError(
-            f"MCP {server!r} has no tool {tool!r}. Available: {avail}"
+            f"MCP {server!r} has no tool {tool!r}. Available: {avail}."
+            + _did_you_mean(tool, avail)
         )
     return {
         "name": tool,
@@ -144,36 +212,55 @@ def _describe_tool_impl(pool: Any, server: str, tool: str) -> dict[str, Any]:
     }
 
 
-async def _call_tool_impl(
-    pool: Any, server: str, tool: str, args: dict | None,
-) -> Any:
-    toolkit = pool.toolkit_by_name(server)
-    fn = None
+async def _resolve_tool(
+    pool: Any, server: str, tool: str,
+) -> tuple[Any, str | None]:
+    """Locate the callable for ``(server, tool)``, tolerating the model's
+    mechanical naming slips. Returns ``(fn, resolved_server)`` or
+    ``(None, None)``.
+
+    Resolution order — most-specific first so a normalised variant can
+    never shadow an exact hit:
+
+      1. every :func:`_candidate_names` variant against the NAMED server
+         (the model usually gets the server right and the key slightly
+         wrong — a missing or doubled prefix);
+      2. the same variants across every OTHER loaded MCP — covers the
+         "right key, wrong server" slip (e.g. ``run_dream_mode`` lives in
+         ``delegation`` but the model calls it on ``vault``).
+    """
+    cands = _candidate_names(server or "", tool)
+
+    toolkit = pool.toolkit_by_name(server) if server else None
     if toolkit is not None:
         # Recover from connect-time stealth-fail before reporting "no such
         # tool". See ``_ensure_functions_loaded`` for the rationale.
         fns = await _ensure_functions_loaded(toolkit, server)
-        fn = fns.get(tool)
+        for cand in cands:
+            if cand in fns:
+                return fns[cand], server
+
+    for _name, _tk in pool._toolkit_by_name.items():
+        if _name == server:
+            continue
+        try:
+            _fns = await _ensure_functions_loaded(_tk, _name)
+        except Exception:  # noqa: BLE001 — a flaky MCP must not block the search
+            continue
+        for cand in cands:
+            if cand in _fns:
+                return _fns[cand], _name
+
+    return None, None
+
+
+async def _call_tool_impl(
+    pool: Any, server: str, tool: str, args: dict | None,
+) -> Any:
+    fn, _resolved_server = await _resolve_tool(pool, server, tool)
 
     if fn is None:
-        # The model picks the right tool NAME but often guesses the wrong
-        # server for a behind-tool-search tool (e.g. ``run_dream_mode`` lives
-        # in ``delegation`` but the model calls it on ``vault``). Resolve the
-        # tool by name across every loaded MCP so a correct name + wrong
-        # server still works, instead of a dead-end "no such tool" error.
-        for _name, _tk in pool._toolkit_by_name.items():
-            if _name == server:
-                continue
-            try:
-                _cand = (await _ensure_functions_loaded(_tk, _name)).get(tool)
-            except Exception:  # noqa: BLE001 — a flaky MCP must not block the search
-                _cand = None
-            if _cand is not None:
-                fn = _cand
-                server = _name  # for downstream error/log context
-                break
-
-    if fn is None:
+        toolkit = pool.toolkit_by_name(server) if server else None
         if toolkit is None:
             raise ValueError(
                 f"MCP {server!r} is not loaded, and no loaded MCP exposes a "
@@ -182,7 +269,7 @@ async def _call_tool_impl(
         avail = sorted(await _ensure_functions_loaded(toolkit, server))
         raise ValueError(
             f"No loaded MCP has a tool named {tool!r}. "
-            f"MCP {server!r} exposes: {avail}"
+            f"MCP {server!r} exposes: {avail}." + _did_you_mean(tool, avail)
         )
     if args is None:
         args = {}

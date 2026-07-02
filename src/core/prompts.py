@@ -162,12 +162,29 @@ Your directly-callable function list is INTENTIONALLY MINIMAL:
 
 That is the full set. Every other capability — vault, shell, web, the
 delegation MCP, the builtin management MCPs below, third-party MCPs —
-lives BEHIND ``tool_search_call_tool``. Do NOT attempt to call
-``vault_write_note``, ``shell_shell_exec``, or ``delegate_task``
-directly; those names exist only as arguments to
-``tool_search_call_tool(server="vault", tool="write_note", args=…)``,
-``…server="delegation", tool="delegate_task"…``, and so on. A direct
-call yields ``Function X not found`` and burns a turn.
+lives BEHIND ``tool_search_call_tool``. Do NOT emit any of those as a
+top-level tool call: a direct ``vault_write_note`` or ``shell_exec``
+call yields ``Function X not found`` and burns a turn. Reach them
+through the wrapper.
+
+**The ``tool`` argument is the tool's REGISTERED KEY, and the key
+almost always carries the server name as a prefix.** Copy it verbatim —
+do not re-prefix it, do not strip it:
+
+  * vault note-writer  → ``tool_search_call_tool(server="vault", tool="vault_write_note", args=…)``
+  * shell runner       → ``tool_search_call_tool(server="shell", tool="shell_exec", args=…)``
+  * scheduler lister   → ``tool_search_call_tool(server="scheduler", tool="scheduler_list_scheduled_tasks", args=…)``
+
+Two slips waste a turn — avoid them:
+  * Do NOT double the prefix. The shell runner is ``shell_exec``, never
+    ``shell_shell_exec``.
+  * Do NOT invent the leaf. It is ``vault_list_directory``, not the
+    plausible-sounding ``vault_list_notes``. When you are not certain of
+    the exact key, call ``tool_search_list_tools(server)`` FIRST and copy
+    a key from its output.
+
+The resolver forgives a missing or doubled server prefix, but a wrong
+leaf still fails — so when in doubt, list first, guess never.
 
 When the user asks "which MCPs do you have?", "what can you do?", or
 any similar inventory question, call ``tool_search_list_servers`` and
@@ -732,9 +749,27 @@ is in the tool calls you make, not the words you say.
 """
 
 
+# Builtin, high-traffic MCPs whose EXACT tool keys we inline into the
+# catalog so the model copies a key verbatim instead of guessing (and
+# mis-prefixing) it — vision §"deferred tools" sanctions surfacing a
+# handful of high-traffic builtin tools up front. Third-party MCPs and
+# the browser MCP are omitted (unbounded / very large tool counts); the
+# model discovers those on demand via ``tool_search_list_tools``.
+_INLINE_TOOL_KEYS_SERVERS = frozenset({
+    "vault", "vault-gate", "shell", "scheduler", "editor",
+    "workflow-manager", "mcp-manager", "model-manager", "delegation",
+    "web-search", "attachments", "messaging", "memory-search",
+    "agent-bridge", "media-gen", "computer-control", "env",
+})
+# Per-server cap so a large MCP can't bloat the every-turn prompt; beyond
+# it the model falls back to ``list_tools``.
+_INLINE_TOOL_KEYS_CAP = 24
+
+
 def _render_catalog_summary_lines(
     summary: dict[str, int],
     descriptions: dict[str, str],
+    tool_names: dict[str, list[str]] | None = None,
 ) -> str:
     """Render the markdown bullet list for the MCP catalog summary.
 
@@ -796,6 +831,18 @@ def _render_catalog_summary_lines(
             else:
                 lines.append(f"- ``{name}`` ({count} tools).")
 
+        # Inline the exact registered keys for high-traffic builtins so the
+        # model copies one verbatim instead of guessing (and mis-prefixing)
+        # it. ``tool-search`` is skipped — its four keys are already spelled
+        # out in the framework prompt's tool section above.
+        if tool_names and name in _INLINE_TOOL_KEYS_SERVERS:
+            keys = tool_names.get(name) or []
+            if keys:
+                shown = keys[:_INLINE_TOOL_KEYS_CAP]
+                more = len(keys) - len(shown)
+                suffix = f", … (+{more} more — use list_tools)" if more > 0 else ""
+                lines.append(f"    tools: {', '.join(shown)}{suffix}")
+
     return "\n".join(lines)
 
 
@@ -835,4 +882,12 @@ def build_mcp_catalog_summary(pool) -> str:
     except Exception:
         descriptions = {}
 
-    return _render_catalog_summary_lines(summary, descriptions)
+    tool_names: dict[str, list[str]] = {}
+    try:
+        getter = getattr(pool, "server_tool_names", None)
+        if callable(getter):
+            tool_names = getter() or {}
+    except Exception:
+        tool_names = {}
+
+    return _render_catalog_summary_lines(summary, descriptions, tool_names)
