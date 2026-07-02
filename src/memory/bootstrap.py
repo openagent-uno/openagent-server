@@ -69,6 +69,23 @@ async def ensure_builtin_mcps(db: MemoryDB) -> int:
                         "validated built-in (was npx @bitbonsai/mcpvault)")
         break
 
+    # Migration: the subprocess ``agent-bridge`` shim is replaced by the
+    # in-process ``agent-federation`` builtin (same tools, no /api/peers
+    # relay). Rename any persisted agent-bridge row to agent-federation,
+    # preserving its enabled flag, and drop the stale row.
+    for row in rows:
+        if row["name"] == "agent-bridge":
+            enabled = bool(row["enabled"]) if "enabled" in row.keys() else True
+            await db.upsert_mcp(
+                "agent-federation", kind="default",
+                builtin_name="agent-federation", enabled=enabled,
+                source="migrate-agent-federation",
+            )
+            await db.delete_mcp("agent-bridge")
+            migrated += 1
+            logger.info("bootstrap: migrated agent-bridge -> agent-federation MCP row")
+            break
+
     existing = {row["name"] for row in (rows if not migrated else await db.list_mcps())}
     added = 0
     for entry in DEFAULT_MCPS:

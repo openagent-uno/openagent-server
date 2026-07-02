@@ -126,6 +126,11 @@ def make_auth_middleware(state: NetworkAuthState):
         if current_is_authenticated_agent():
             import hashlib as _hashlib
             peer_id = current_peer_node_id() or "unknown-agent"
+            # Phase-0 security: record every first-contact agent node_id so the
+            # allowlist can be built/audited and unexpected dialers spotted.
+            # (Enforcement is a documented opt-in fast-follow; today the
+            # agent-ALPN endpoint trusts any node that can dial it.)
+            elog("agent.contact", level="info", node_id=peer_id, path=request.path)
             # Derive a stable synthetic device_pubkey from the peer's node_id.
             # sha256 gives us a deterministic 32-byte key that's unique per
             # peer without requiring the coordinator.

@@ -59,7 +59,7 @@ _DEFAULT_MCP_PRIORITY: tuple[str, ...] = (
     "filesystem",   # read/list paths
     "web-search",   # quick lookup
     "scheduler",    # cron / reminders
-    "agent-bridge", # consult federated peer agents — keep discoverable
+    "agent-federation", # consult federated peer agents — keep discoverable
 )
 
 

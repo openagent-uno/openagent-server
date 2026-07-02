@@ -619,11 +619,6 @@ def mcp_server_cmd(name: str):
         from src.mcp.servers.memory_search.server import main as memory_search_main
         memory_search_main()
         return
-    if name == "agent-bridge":
-        from src.mcp.servers.agent_bridge.server import main as agent_bridge_main
-        agent_bridge_main()
-        return
-
     click.echo(f"Unknown MCP server: {name}", err=True)
     raise SystemExit(1)
 

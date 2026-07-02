@@ -111,6 +111,13 @@ hiddenimports = [
     # src.models.providers.* which native_provider.py loads dynamically
     # via importlib.import_module. No external agno collect is needed.
     *collect_submodules("src"),
+    # openagent-mcp: the in-process agent-federation builtin
+    # (src/mcp/servers/agent_federation) imports the standalone openagent-mcp
+    # package — oa_agent_client (Iroh agent-ALPN wire core) + openagent_mcp
+    # (tool layer). They're separate top-level packages, so
+    # collect_submodules("src") doesn't reach them — bundle them explicitly.
+    *collect_submodules("openagent_mcp"),
+    *collect_submodules("oa_agent_client"),
     # groq Python SDK: imported at module level by
     # src.models.providers.groq.groq — must be bundled.
     *collect_submodules("groq"),

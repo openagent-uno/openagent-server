@@ -759,7 +759,7 @@ _INLINE_TOOL_KEYS_SERVERS = frozenset({
     "vault", "vault-gate", "shell", "scheduler", "editor",
     "workflow-manager", "mcp-manager", "model-manager", "delegation",
     "web-search", "attachments", "messaging", "memory-search",
-    "agent-bridge", "media-gen", "computer-control", "env",
+    "agent-federation", "media-gen", "computer-control", "env",
 })
 # Per-server cap so a large MCP can't bloat the every-turn prompt; beyond
 # it the model falls back to ``list_tools``.

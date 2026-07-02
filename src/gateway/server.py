@@ -262,6 +262,12 @@ class Gateway:
         self._network_state.iroh_node.register_handler(_Alpn.GATEWAY, _gateway_handler)
         self._network_state.iroh_node.register_handler(_Alpn.AGENT, _agent_handler)
 
+        # Bind the running node + DB into the in-process agent-federation
+        # builtin so its ask_agent / list_agents tools can dial peers on this
+        # node (no second identity, no /api/peers relay).
+        from src.mcp.servers.agent_federation.handlers import set_agent_runtime
+        set_agent_runtime(self._network_state.iroh_node, getattr(self.agent, "_db", None))
+
     def broadcast_session(self, action: str, session_id: str) -> None:
         """Announce a session change (created/updated/deleted) to clients so
         the flat session list / a parent's delegation cards refresh live.
@@ -648,7 +654,6 @@ class Gateway:
             ("POST", "/api/peers",                          peers_api.handle_create),
             ("DELETE", "/api/peers/{network_id}",           peers_api.handle_delete),
             ("POST", "/api/peers/{network_id}/refresh",     peers_api.handle_refresh),
-            ("POST", "/api/peers/{network_id}/chat",        peers_api.handle_peer_chat),
             ("GET",  "/api/peers/{network_id}/agents",      peers_api.handle_list_agents),
             # Network directory + invitations (coordinator-only; member
             # agents 404 here — the client should ask the coordinator).

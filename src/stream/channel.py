@@ -186,6 +186,18 @@ class BatchedChannel:
         source: str = "user_typed",
     ) -> BatchedReply:
         """Push one user message and drain the outbound stream once."""
+        # Discard any frames a prior turn left un-drained (e.g. one that
+        # exceeded the caller's timeout and finished AFTER we returned). The
+        # turn runs as a separate task on the same per-session outbound queue;
+        # without this drain, THIS turn would read the PREVIOUS turn's reply
+        # (a permanent one-off desync). Safe: run_one_shot is serialised per
+        # session and only runs when no turn is in flight.
+        _ob = self._session.outbound
+        while not _ob.empty():
+            try:
+                _ob.get_nowait()
+            except asyncio.QueueEmpty:
+                break
         sid = self._session.session_id
         msg = TextFinal(
             session_id=sid,
