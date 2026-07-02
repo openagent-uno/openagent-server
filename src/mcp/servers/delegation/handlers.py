@@ -219,6 +219,7 @@ async def run_dream_mode() -> dict[str, Any]:
     from src.core.child_session import mint_child_session_id, run_child_session
     from src.core.identity_context import agent_author
     from src.core.server import DREAM_MODE_PROMPT
+    from src.stream.resource_events import emit_resource_event
 
     run_id = _uuid.uuid4().hex[:8]
     child_sid = mint_child_session_id(
@@ -231,16 +232,38 @@ async def run_dream_mode() -> dict[str, Any]:
     # when absent we just skip the row — the child session alone already gives
     # the in-chat card and the sidebar entry.
     task_run_id: str | None = None
+    dream_task_id: str | None = None
     try:
         tasks = await db.get_tasks()
         dream_task = next(
             (t for t in tasks if t.get("name") == DREAM_MODE_TASK_NAME), None,
         )
+        if dream_task is None:
+            # Self-heal: dream mode is "toggleable but not removable" (vision
+            # §12), but the row is only seeded when the feature has been enabled
+            # at least once. Create it DISABLED so a manual firing always has a
+            # ``scheduled_tasks`` row to record its ``task_runs`` history on —
+            # otherwise the run never surfaces in the app's "Recent" feed.
+            # Disabled means the scheduler never auto-fires it.
+            try:
+                new_id = await db.add_task(
+                    DREAM_MODE_TASK_NAME, "0 3 * * *", DREAM_MODE_PROMPT,
+                )
+                await db.update_task(new_id, enabled=0, next_run=None)
+                dream_task = await db.get_task(new_id)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("run_dream_mode: dream-mode row self-heal failed: %s", e)
         if dream_task is not None:
+            dream_task_id = dream_task["id"]
             task_run_id = await db.add_task_run(
-                task_id=dream_task["id"], trigger="manual",
+                task_id=dream_task_id, trigger="manual",
                 run_id=run_id, session_id=child_sid,
             )
+            # Flip the "Recent" feed live the moment the firing opens — the
+            # same ``scheduled_task`` resource event the cron path broadcasts
+            # from ``Scheduler.run_task``, so a manual run shows up in the
+            # sidebar exactly like a nightly one (not only on the next reload).
+            emit_resource_event("scheduled_task", "updated", dream_task_id)
     except Exception as e:  # noqa: BLE001
         logger.debug("run_dream_mode: task_run record skipped: %s", e)
 
@@ -260,6 +283,12 @@ async def run_dream_mode() -> dict[str, Any]:
             author=agent_author(
                 "Dream mode", agent_name=getattr(agent, "name", None),
             ),
+            # Stream the firing live so its card / run screen fills in
+            # token-by-token, exactly like the nightly cron firing
+            # (``scheduler.run_task`` also passes ``stream=True``). Without
+            # this the child ran through the non-streaming ``agent.run``
+            # branch and its transcript only appeared once fully finished.
+            stream=True,
         )
     except Exception as e:  # noqa: BLE001
         if task_run_id is not None:
@@ -270,6 +299,8 @@ async def run_dream_mode() -> dict[str, Any]:
                 )
             except Exception:  # noqa: BLE001
                 pass
+            # Flip the feed's run status off "running".
+            emit_resource_event("scheduled_task", "updated", dream_task_id)
         elog("dream.manual_error", level="error",
              session_id=parent_session_id, error=str(e))
         return {"status": "error", "error": f"{type(e).__name__}: {e}"}
@@ -282,6 +313,8 @@ async def run_dream_mode() -> dict[str, Any]:
             )
         except Exception:  # noqa: BLE001
             pass
+        # Re-broadcast so the feed picks up the terminal status.
+        emit_resource_event("scheduled_task", "updated", dream_task_id)
 
     elog("dream.manual_complete", session_id=parent_session_id,
          child_session_id=result.session_id, chars=len(result.text or ""))

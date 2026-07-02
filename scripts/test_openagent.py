@@ -252,6 +252,7 @@ _TEST_MODULES: tuple[str, ...] = (
     # asserts the per-workflow lock keeps SAME-workflow runs ordered.
     "test_workflow_parallel_execution",
     "test_dream",
+    "test_dream_surfacing",
     "test_updater",
     "test_update_guard",
     "test_task_hooks",

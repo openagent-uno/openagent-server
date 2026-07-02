@@ -51,9 +51,9 @@ async def _reject_if_builtin(scheduler, task_id: str):
 
     Built-in tasks (``dream-mode``, ``auto-update``)
     are seeded by ``AgentServer`` and managed via ``/api/config/<section>``;
-    the gateway pretends they don't exist for GET-by-id and returns 403
-    for mutations. Centralised so any new handler added later inherits
-    the policy without drift.
+    the gateway serves them read-only (list opt-in, get-by-id, run history)
+    but returns 403 for every mutation. Centralised so any new handler added
+    later inherits the policy without drift.
     """
     from aiohttp import web
 
@@ -98,8 +98,17 @@ async def handle_list(request):
         return err
 
     enabled_only = request.query.get("enabled_only", "").lower() in ("1", "true", "yes")
+    # Built-in tasks (``dream-mode``, ``auto-update``) are hidden from the
+    # default list — they're managed via ``/api/config/<section>``, not this
+    # CRUD surface, so the Scheduled-tasks management screen stays clean. The
+    # sidebar's "Recent" activity feed opts in with ``?include_builtin=1`` so a
+    # dream-mode firing surfaces there like any other scheduled run — its runs
+    # are recorded in the same run history (vision §7/§12). Opt-in exposes
+    # READ only; mutations still 403 via ``_reject_if_builtin``.
+    include_builtin = request.query.get("include_builtin", "").lower() in ("1", "true", "yes")
     rows = await scheduler.db.get_tasks(enabled_only=enabled_only)
-    rows = [r for r in rows if not _is_builtin(r)]
+    if not include_builtin:
+        rows = [r for r in rows if not _is_builtin(r)]
     # One query for the whole list tells each tile whether a firing is in
     # flight (so it can show a Stop control instead of Run now).
     running = await scheduler.db.running_task_ids()
@@ -117,10 +126,11 @@ async def handle_get(request):
 
     task_id = request.match_info["id"]
     row = await scheduler.db.get_task(task_id)
-    if row is None or _is_builtin(row):
-        # Treat builtins as 404 on GET-by-id so callers can't enumerate
-        # their existence — same behaviour as a non-existent id.
+    if row is None:
         return web.json_response({"error": f"Task {task_id!r} not found"}, status=404)
+    # Built-ins are READABLE by id — the activity feed's run screen and the
+    # run-history title fetch resolve them here — but stay non-editable
+    # (mutations 403 via ``_reject_if_builtin``).
     running = await scheduler.db.running_task_ids()
     return web.json_response(_serialize(row, running=row["id"] in running))
 
@@ -137,9 +147,11 @@ async def handle_runs_list(request):
 
     task_id = request.match_info["id"]
     row = await scheduler.db.get_task(task_id)
-    if row is None or _is_builtin(row):
-        # Treat builtins as 404 here too — same as handle_get.
+    if row is None:
         return web.json_response({"error": f"Task {task_id!r} not found"}, status=404)
+    # A built-in's run history is readable — dream-mode firings are recorded in
+    # ``task_runs`` like any scheduled run, and the sidebar feed / run screen
+    # read them here. Only the schedule itself is non-editable.
 
     limit = int(request.query.get("limit", 20))
     status = request.query.get("status") or None

@@ -1050,17 +1050,31 @@ class AgentServer:
     async def _sync_scheduled_task(
         self, scheduler, *, name: str, enabled: bool, cron_expr: str, prompt: str,
     ) -> None:
-        """Ensure a built-in scheduled task matches the desired state."""
+        """Ensure a built-in scheduled task matches the desired state.
+
+        The row is ALWAYS seeded (created disabled if missing) even when the
+        feature is off: a built-in is "toggleable but not removable" (vision
+        §12), and — load-bearing here — a manual firing (``run_dream_mode``, the
+        Run-now API) needs an existing ``scheduled_tasks`` row to hang its
+        ``task_runs`` history off, so it surfaces in the app's "Recent" feed.
+        Seeding it disabled never makes the scheduler fire it (``get_due_tasks``
+        skips disabled rows); the enable branch below flips it on when config
+        wants it.
+        """
         tasks = await self.agent._db.get_tasks()
         existing = next((t for t in tasks if t["name"] == name), None)
 
-        if enabled:
-            if existing is None:
-                await scheduler.add_task(
-                    name=name, cron_expression=cron_expr, prompt=prompt,
-                )
-                return
+        if existing is None:
+            new_id = await scheduler.add_task(
+                name=name, cron_expression=cron_expr, prompt=prompt,
+            )
+            # ``add_task`` creates the row enabled with a future next_run; park
+            # it disabled so a disabled built-in never fires on a cron the user
+            # didn't set. The enable branch re-arms it if config is on.
+            await self.agent._db.update_task(new_id, enabled=0, next_run=None)
+            existing = await self.agent._db.get_task(new_id)
 
+        if enabled:
             updates = {}
             if existing["cron_expression"] != cron_expr:
                 updates["cron_expression"] = cron_expr
@@ -1072,7 +1086,7 @@ class AgentServer:
                 await scheduler.enable_task(existing["id"])
             elif "cron_expression" in updates:
                 await scheduler.reschedule_task(existing["id"])
-        elif existing is not None and existing["enabled"]:
+        elif existing["enabled"]:
             await scheduler.disable_task(existing["id"])
 
     @staticmethod

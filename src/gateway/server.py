@@ -329,10 +329,15 @@ class Gateway:
         try:
             from src.core.child_session import set_child_session_listener
             from src.stream.child_stream import set_child_broadcast_sink
+            from src.stream.resource_events import set_resource_event_sink
             set_child_session_listener(self._on_child_session_created)
             self._child_frame_q = asyncio.Queue(maxsize=4096)
             self._child_frame_pump = asyncio.create_task(self._child_frame_pump_loop())
             set_child_broadcast_sink(self._broadcast_child_frame)
+            # In-process producers with no gateway handle (e.g. the
+            # ``run_dream_mode`` MCP tool) emit resource events through this so
+            # a manual firing refreshes the "Recent" feed like a cron one.
+            set_resource_event_sink(self.broadcast_resource_sync)
         except Exception as e:  # noqa: BLE001
             logger.debug("child-session listener registration failed: %s", e)
 
@@ -464,7 +469,9 @@ class Gateway:
             self._system_broadcast_task = None
         if self._child_frame_pump is not None:
             from src.stream.child_stream import set_child_broadcast_sink
+            from src.stream.resource_events import set_resource_event_sink
             set_child_broadcast_sink(None)
+            set_resource_event_sink(None)
             self._child_frame_pump.cancel()
             try:
                 await self._child_frame_pump
