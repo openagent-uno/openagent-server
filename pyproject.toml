@@ -11,7 +11,11 @@ requires-python = ">=3.11"
 license = "MIT"
 
 dependencies = [
-    "mcp>=1.0.0",
+    # ``[cli]`` pulls in typer: recent ``mcp`` releases import it from a
+    # submodule that ``collect_submodules("mcp")`` walks at PyInstaller build
+    # time, so without typer the frozen build aborts with
+    # "typer is required. Install with 'pip install mcp[cli]'".
+    "mcp[cli]>=1.0.0",
     "click>=8.1.0",
     "rich>=13.0.0",
     "pyyaml>=6.0",
