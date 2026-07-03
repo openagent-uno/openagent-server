@@ -429,7 +429,13 @@ async function downloadChromium(onProgress) {
       for (const f of fs.readdirSync(src)) fs.renameSync(path.join(src, f), path.join(CHROMIUM_DIR, f));
       fs.rmSync(src, { recursive: true, force: true });
     }
-    try { fs.chmodSync(cachedChromiumBinary(), 0o755); } catch {}
+    // Chromium ships several helper executables (chrome, chrome_crashpad_handler,
+    // chrome-sandbox, nacl_helper). unzip drops the exec bit — restore it on
+    // every extensionless file in the root, or chrome aborts spawning them.
+    for (const f of fs.readdirSync(CHROMIUM_DIR)) {
+      const full = path.join(CHROMIUM_DIR, f);
+      try { if (fs.statSync(full).isFile() && !path.extname(f)) fs.chmodSync(full, 0o755); } catch {}
+    }
   } else if (SYSTEM === "win32") {
     spawnSync("tar", ["-xf", zipPath, "-C", CHROMIUM_DIR], { stdio: "ignore" });
     const src = path.join(CHROMIUM_DIR, "chrome-win");
