@@ -193,6 +193,18 @@ if _vault_dir.exists():
         print(f"openagent.spec: WARNING — vault MCP prebuild failed ({_e}); "
               "it will self-build at first launch")
 
+# agent-in-chrome (the CDP browser MCP) needs its Node deps (ws, MCP SDK, zod)
+# bundled. CI's release.yml "Build Node MCPs" loop doesn't cover its host/ dir,
+# so install here — idempotent, best-effort; the MCP self-bootstraps at first
+# launch (resolve_builtin_entry) if this is skipped.
+_aic_dir = mcps_dir / "agent-in-chrome" / "host"
+if _aic_dir.exists() and not (_aic_dir / "node_modules").exists():
+    try:
+        print("openagent.spec: npm install (agent-in-chrome/host)...")
+        _sp.run("npm install", cwd=str(_aic_dir), shell=True, check=True)
+    except Exception as _e:  # noqa: BLE001 — runtime self-bootstrap is the fallback
+        print(f"openagent.spec: WARNING — agent-in-chrome npm install failed ({_e})")
+
 datas = []
 if mcps_dir.exists():
     # Bundle every MCP EXCEPT computer-control. The Rust binary for

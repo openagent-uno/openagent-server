@@ -35,6 +35,54 @@ function tabGroupExtensionDir() {
   return isFile(path.join(dir, "manifest.json")) ? dir : null;
 }
 
+// Agent-installed extensions live here, one unpacked extension per subdirectory
+// (named by its Web Store id). They persist across runs and are loaded at every
+// launch, so e.g. a VPN/proxy extension stays installed + configured.
+const MANAGED_EXTENSIONS_DIR = path.join(HOME, ".openagent", "chrome-extensions");
+
+export function listManagedExtensions() {
+  let entries;
+  try { entries = fs.readdirSync(MANAGED_EXTENSIONS_DIR, { withFileTypes: true }); }
+  catch { return []; }
+  const out = [];
+  for (const d of entries) {
+    if (!d.isDirectory()) continue;
+    const dir = path.join(MANAGED_EXTENSIONS_DIR, d.name);
+    const manifest = path.join(dir, "manifest.json");
+    if (!isFile(manifest)) continue;
+    let name = d.name;
+    try { name = resolveExtName(dir, JSON.parse(fs.readFileSync(manifest, "utf-8"))); } catch {}
+    out.push({ id: d.name, dir, name });
+  }
+  return out;
+}
+
+// Resolve a possibly-localized manifest "name" (e.g. "__MSG_extName__").
+function resolveExtName(dir, manifest) {
+  let name = manifest.name || "";
+  const m = /^__MSG_(.+)__$/.exec(name);
+  if (!m) return name;
+  const locale = (manifest.default_locale || "en");
+  for (const loc of [locale, "en", "en_US"]) {
+    try {
+      const msgs = JSON.parse(fs.readFileSync(path.join(dir, "_locales", loc, "messages.json"), "utf-8"));
+      const entry = msgs[m[1]] || msgs[m[1].toLowerCase()];
+      if (entry && entry.message) return entry.message;
+    } catch {}
+  }
+  return name;
+}
+
+// Every extension dir to load at launch: the builtin tab-group (always) plus
+// every agent-installed managed extension.
+function extensionLoadDirs() {
+  const dirs = [];
+  const tg = tabGroupExtensionDir();
+  if (tg) dirs.push(tg);
+  for (const e of listManagedExtensions()) dirs.push(e.dir);
+  return dirs;
+}
+
 export const CDP_PORT = Number(process.env.OPENAGENT_CHROME_CDP_PORT || 18800);
 export const VIEWPORT = { width: 1280, height: 800 };
 
@@ -140,6 +188,14 @@ export async function getWsEndpoint(port = CDP_PORT) {
   return null;
 }
 
+// Running browser version (e.g. "146.0.7680.164") from its CDP /json/version,
+// used to fetch a store extension build compatible with the actual browser.
+export async function getBrowserVersion(port = CDP_PORT) {
+  const info = await httpGetJson(`http://127.0.0.1:${port}/json/version`);
+  const m = /[\/ ](\d+\.\d+\.\d+\.\d+)/.exec(info?.Browser || "");
+  return m ? m[1] : null;
+}
+
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 // ── Launch flags ──────────────────────────────────────────────────────────
@@ -168,12 +224,25 @@ function launchArgs(binary, profile, port) {
     // in containers/VPSes, and /dev/shm is frequently tiny on servers.
     args.push("--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu");
   }
-  // Cosmetic tab-group extension (best-effort; ignored by browsers that block
-  // --load-extension). Automation is CDP-only and unaffected either way.
-  const ext = tabGroupExtensionDir();
-  if (ext) {
-    args.push(`--load-extension=${ext}`);
-    args.push(`--disable-extensions-except=${ext}`);
+  // Optional egress proxy for page traffic (e.g. a VPN provider's SOCKS5/HTTP
+  // endpoint), so the browser exits from a chosen IP/country while the rest of
+  // the host is untouched. Value is a Chrome --proxy-server string, e.g.
+  // "socks5://127.0.0.1:1080" or "http://proxy.example:8080". Loopback is always
+  // bypassed so the CDP endpoint and localhost pages stay direct.
+  // NB: Chromium cannot authenticate to a SOCKS5 proxy directly — front an
+  // authenticated upstream with a local no-auth shim and point this at it.
+  const proxy = (process.env.OPENAGENT_CHROME_PROXY || "").trim();
+  if (proxy) {
+    args.push(`--proxy-server=${proxy}`);
+    args.push("--proxy-bypass-list=127.0.0.1;localhost;[::1]");
+  }
+  // Builtin cosmetic tab-group extension + any agent-installed extensions
+  // (best-effort; ignored by browsers that block --load-extension). Automation
+  // is CDP-only and unaffected either way.
+  const extDirs = extensionLoadDirs();
+  if (extDirs.length) {
+    args.push(`--load-extension=${extDirs.join(",")}`);
+    args.push(`--disable-extensions-except=${extDirs.join(",")}`);
   }
   args.push("about:blank");
   return args;
@@ -375,4 +444,89 @@ async function downloadChromium(onProgress) {
   if (!isFile(bin)) throw new Error("Chromium download completed but the binary is missing");
   log("Chromium downloaded to", bin);
   return bin;
+}
+
+// ── Extension management (install/remove from the Chrome Web Store) ─────────
+function unzipTo(zipPath, destDir) {
+  fs.rmSync(destDir, { recursive: true, force: true });
+  fs.mkdirSync(destDir, { recursive: true });
+  let r;
+  if (SYSTEM === "win32") r = spawnSync("tar", ["-xf", zipPath, "-C", destDir], { stdio: "ignore" });
+  else r = spawnSync("unzip", ["-o", "-q", zipPath, "-d", destDir], { stdio: "ignore" });
+  if ((r.status !== 0 && r.status !== 1) || !isFile(path.join(destDir, "manifest.json"))) {
+    // unzip exit 1 = warnings (e.g. _metadata) but files extracted; only fail if
+    // the manifest is missing.
+    if (!isFile(path.join(destDir, "manifest.json"))) {
+      throw new Error("could not unpack extension (is 'unzip' installed?)");
+    }
+  }
+}
+
+// A .crx is a small header followed by a plain ZIP. Strip the header, unzip.
+function unpackCrx(crxPath, destDir) {
+  const buf = fs.readFileSync(crxPath);
+  if (buf.subarray(0, 4).toString("latin1") !== "Cr24") throw new Error("not a CRX file");
+  const version = buf.readUInt32LE(4);
+  let zipStart;
+  if (version === 3) {
+    zipStart = 12 + buf.readUInt32LE(8);
+  } else if (version === 2) {
+    zipStart = 16 + buf.readUInt32LE(8) + buf.readUInt32LE(12);
+  } else {
+    throw new Error(`unsupported CRX version ${version}`);
+  }
+  const zipPath = crxPath + ".zip";
+  fs.writeFileSync(zipPath, buf.subarray(zipStart));
+  try { unzipTo(zipPath, destDir); } finally { try { fs.rmSync(zipPath, { force: true }); } catch {} }
+}
+
+const STORE_ID_RE = /^[a-p]{32}$/;
+
+/**
+ * Install a browser extension into the managed dir. `source` is either a Chrome
+ * Web Store extension ID (32 chars a–p) or a path to an already-unpacked
+ * extension directory. Returns { id, dir, name }. Does NOT reload the browser —
+ * the caller applies it (extensions load at launch).
+ */
+export async function installExtension(source, prodversion) {
+  fs.mkdirSync(MANAGED_EXTENSIONS_DIR, { recursive: true });
+  source = String(source || "").trim();
+  // Ask the store for a build matching the running browser; a high default
+  // otherwise fetches the latest. (Too LOW a version → the store 204s.)
+  const pv = prodversion || "9999.0.0.0";
+
+  // Local unpacked directory.
+  if (source.includes(path.sep) && isFile(path.join(source, "manifest.json"))) {
+    const manifest = JSON.parse(fs.readFileSync(path.join(source, "manifest.json"), "utf-8"));
+    const id = "local-" + path.basename(source.replace(/\/+$/, ""));
+    const dest = path.join(MANAGED_EXTENSIONS_DIR, id);
+    fs.rmSync(dest, { recursive: true, force: true });
+    fs.cpSync(source, dest, { recursive: true });
+    return { id, dir: dest, name: resolveExtName(dest, manifest) };
+  }
+
+  if (!STORE_ID_RE.test(source)) {
+    throw new Error("Provide a 32-character Chrome Web Store extension ID (a–p) or a path to an unpacked extension.");
+  }
+  const id = source;
+  const url =
+    "https://clients2.google.com/service/update2/crx?response=redirect&acceptformat=crx2,crx3" +
+    `&prodversion=${pv}&x=id%3D${id}%26installsource%3Dondemand%26uc`;
+  const crxPath = path.join(MANAGED_EXTENSIONS_DIR, id + ".crx");
+  await downloadTo(url, crxPath);
+  const destDir = path.join(MANAGED_EXTENSIONS_DIR, id);
+  try { unpackCrx(crxPath, destDir); } finally { try { fs.rmSync(crxPath, { force: true }); } catch {} }
+  let name = id;
+  try { name = resolveExtName(destDir, JSON.parse(fs.readFileSync(path.join(destDir, "manifest.json"), "utf-8"))); } catch {}
+  log(`installed extension ${name} (${id})`);
+  return { id, dir: destDir, name };
+}
+
+export function removeManagedExtension(id) {
+  const dir = path.join(MANAGED_EXTENSIONS_DIR, String(id));
+  // Guard against path traversal and only touch the managed dir.
+  if (path.dirname(dir) !== MANAGED_EXTENSIONS_DIR || !fs.existsSync(dir)) return false;
+  fs.rmSync(dir, { recursive: true, force: true });
+  log(`removed extension ${id}`);
+  return true;
 }

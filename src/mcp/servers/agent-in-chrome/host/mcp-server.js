@@ -20,7 +20,10 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { CDPConnection } from "./cdp.js";
-import { ensureBrowser, VIEWPORT, CDP_PORT } from "./browser.js";
+import {
+  ensureBrowser, VIEWPORT, CDP_PORT,
+  installExtension, removeManagedExtension, listManagedExtensions, getBrowserVersion,
+} from "./browser.js";
 import { PAGE_SCRIPT } from "./page-script.js";
 
 const MAX_BUFFER = 1000;
@@ -262,6 +265,28 @@ class BrowserController {
     const keys = [...this.screenshots.keys()];
     while (keys.length > 10) this.screenshots.delete(keys.shift());
     return { base64: data, imageId };
+  }
+
+  // Tear down the owned browser and relaunch it — used to apply an extension
+  // change (extensions only load at launch).
+  async relaunch() {
+    try { if (this.cdp && !this.cdp.closed) await this.cdp.send("Browser.close"); } catch {}
+    try { if (this.cdp) this.cdp.close(); } catch {}
+    if (this.ownsBrowser && this.browserPid) {
+      try { process.kill(-this.browserPid, "SIGTERM"); } catch {
+        try { process.kill(this.browserPid, "SIGTERM"); } catch {}
+      }
+    }
+    this.cdp = null;
+    this.ownsBrowser = false;
+    this.browserPid = null;
+    this.sessions.clear();
+    this.console.clear();
+    this.network.clear();
+    this.intByTarget.clear();
+    this.targetById.clear();
+    await sleep(1200); // let the CDP port + profile lock release
+    await this.ensure();
   }
 
   async shutdown() {
@@ -624,6 +649,34 @@ const tools = {
       try { fs.rmSync(tmp, { force: true }); } catch {}
     }
   },
+
+  async list_extensions() {
+    const managed = listManagedExtensions();
+    let out = "Browser extensions:\n  • [builtin] OpenAgent Tab Group — always on, not removable\n";
+    if (managed.length === 0) out += "  (no agent-installed extensions yet)\n";
+    for (const e of managed) out += `  • ${e.name} — id: ${e.id}\n`;
+    out += "\nInstall one with install_extension using its Chrome Web Store ID (the 32-char id in the store URL).";
+    return text(out);
+  },
+
+  async install_extension(args) {
+    const pv = await getBrowserVersion().catch(() => null);
+    const { id, dir, name } = await installExtension(args.source, pv);
+    await controller.relaunch();
+    return text(
+      `Installed "${name}" (id: ${id}) and restarted the browser to load it.\n` +
+      `Tab IDs changed — call tabs_context_mcp again before other actions.\n` +
+      `If it needs a login or country/config (e.g. a VPN extension), open it and sign in once; ` +
+      `the setting persists in the profile across restarts.`,
+    );
+  },
+
+  async remove_extension(args) {
+    const ok = removeManagedExtension(args.id);
+    if (!ok) return text(`No agent-installed extension with id "${args.id}" (builtins can't be removed here).`);
+    await controller.relaunch();
+    return text(`Removed extension ${args.id} and restarted the browser. Call tabs_context_mcp again.`);
+  },
 };
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -786,6 +839,27 @@ server.tool(
     filename: z.string().optional().describe('Filename (default "image.png").'),
   },
   (a) => callTool("upload_image", a),
+);
+
+server.tool(
+  "list_extensions",
+  "List the browser extensions installed in the agent's browser (builtin + agent-installed).",
+  {},
+  (a) => callTool("list_extensions", a),
+);
+
+server.tool(
+  "install_extension",
+  "Install a Chromium extension into the agent's browser from its Chrome Web Store ID (the 32-char id in the store URL), or a path to an unpacked extension. It persists across restarts and loads on every launch. Use for capabilities like a VPN/proxy extension — after installing, open it and sign in / pick options once. Restarts the browser to apply.",
+  { source: z.string().describe("Chrome Web Store extension ID (32 chars a–p) or a path to an unpacked extension directory.") },
+  (a) => callTool("install_extension", a),
+);
+
+server.tool(
+  "remove_extension",
+  "Remove an agent-installed extension by its id (from list_extensions). Builtins can't be removed. Restarts the browser to apply.",
+  { id: z.string().describe("Extension id to remove.") },
+  (a) => callTool("remove_extension", a),
 );
 
 // ── Lifecycle ───────────────────────────────────────────────────────────────

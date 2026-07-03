@@ -47,13 +47,29 @@ same surface the extension wrapped, minus every failure mode above.
 
 - `OPENAGENT_CHROME_BINARY` — explicit browser executable path.
 - `OPENAGENT_CHROME_CDP_PORT` — CDP remote-debugging port (default `18800`).
+- `OPENAGENT_CHROME_PROXY` — egress proxy for page traffic, a Chrome
+  `--proxy-server` string (e.g. `socks5://127.0.0.1:1080`). Loopback is always
+  bypassed. NB: Chromium can't authenticate to SOCKS5 directly — front an
+  authenticated upstream with a local no-auth shim, or use a proxy *extension*
+  (see below) that handles its own auth.
+
+## Extensions
+
+The agent's browser always loads the builtin cosmetic tab-group extension, plus
+any extensions the agent installs, from a persistent managed dir
+(`~/.openagent/chrome-extensions/<id>/`). Tools: `install_extension` (Chrome Web
+Store id or an unpacked path), `remove_extension`, `list_extensions`. Installing
+a VPN/proxy *extension* (e.g. NordVPN) is the clean way to route the browser
+through a chosen country: it handles its own proxy auth and persists its login
+in the profile — no system VPN, no shim. Builtins can't be removed.
 
 ## Tools
 
 `tabs_context_mcp`, `tabs_create_mcp`, `navigate`, `computer` (click/type/key/
 scroll/screenshot/drag/hover/zoom), `find`, `read_page`, `get_page_text`,
 `form_input`, `javascript_tool`, `read_console_messages`,
-`read_network_requests`, `resize_window`, `upload_image`.
+`read_network_requests`, `resize_window`, `upload_image`,
+`install_extension`, `remove_extension`, `list_extensions`.
 
 Token discipline: prefer `find` + `read_page` + `get_page_text` (structured,
 cheap) to locate and read; take a `computer` screenshot only when you need to
