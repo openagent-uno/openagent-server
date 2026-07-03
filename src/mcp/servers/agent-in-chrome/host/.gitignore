@@ -1,5 +1,3 @@
 node_modules/
 package-lock.json
-.agent-chrome.pid
-launch-*.sh
-launch-*.bat
+_*.mjs

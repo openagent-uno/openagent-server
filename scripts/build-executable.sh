@@ -35,7 +35,7 @@ bash "$SCRIPT_DIR/build-computer-control.sh"
 # ── Step 2b: Build Node.js MCPs ──
 echo "→ Building built-in Node MCPs..."
 
-NODE_MCPS=(shell web-search editor chrome-devtools messaging vault)
+NODE_MCPS=(shell web-search editor agent-in-chrome/host messaging vault)
 for mcp in "${NODE_MCPS[@]}"; do
     mcp_dir="src/mcp/servers/$mcp"
     if [ ! -d "$mcp_dir" ]; then

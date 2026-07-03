@@ -1,404 +1,657 @@
 #!/usr/bin/env node
-
-// MCP Server for OpenAgent in Chrome extension.
-// Started by OpenAgent via stdio MCP transport.
 //
-// Operates in one of two modes:
-// - PRIMARY: Owns the TCP port, accepts native host + client connections
-// - CLIENT: Port already taken by another session, connects as a client
+// MCP server: OpenAgent in Chrome.
 //
-// Multiple OpenAgent sessions can share one browser extension.
+// Drives a dedicated Chrome/Chromium/Brave/Edge browser purely over the Chrome
+// DevTools Protocol (CDP). There is no browser extension, no native-messaging
+// host, and no HTTP bridge — one WebSocket to the browser, flattened sessions
+// per tab. The browser launches lazily on the first browser tool call (never at
+// server startup) into an isolated, persistent profile so logins survive across
+// runs.
 //
-// Adapted from open-claude-in-chrome (MIT license) by Sebastian Sosa / Noemica.
+// The pool spawns ONE instance of this server, shared by every OpenAgent
+// session, so there is no multi-process broker to coordinate.
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import net from "node:net";
-import http from "node:http";
+import { z } from "zod";
+import os from "node:os";
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
-import { spawn } from "node:child_process";
-import { z } from "zod";
 
-const DEFAULT_PORT = 18765;
+import { CDPConnection } from "./cdp.js";
+import { ensureBrowser, VIEWPORT, CDP_PORT } from "./browser.js";
+import { PAGE_SCRIPT } from "./page-script.js";
 
-function getPort() {
-  const configPath = path.join(os.homedir(), ".config", "openagent-in-chrome", "config.json");
-  try {
-    const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-    return config.port || DEFAULT_PORT;
-  } catch {
-    return DEFAULT_PORT;
+const MAX_BUFFER = 1000;
+
+function log(...a) {
+  process.stderr.write("[agent-in-chrome] " + a.join(" ") + "\n");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Browser controller — owns the CDP connection, tabs, and per-tab buffers.
+// ───────────────────────────────────────────────────────────────────────────
+class BrowserController {
+  constructor() {
+    this.cdp = null;
+    this.ownsBrowser = false;
+    this.browserPid = null;
+    this._ensuring = null;
+
+    this.nextTabId = 1;
+    this.intByTarget = new Map(); // targetId -> int
+    this.targetById = new Map(); // int -> targetId
+    this.sessions = new Map(); // targetId -> { sessionId, injected, netEnabled }
+    this.console = new Map(); // targetId -> [msg]
+    this.network = new Map(); // targetId -> [req]
+    this.screenshots = new Map(); // imageId -> base64
   }
-}
 
-const TCP_PORT = getPort();
-
-let mode = "primary";
-let nativeHostSocket = null;
-const pendingRequests = new Map();
-let requestIdCounter = 0;
-const clientSockets = new Map();
-let clientIdCounter = 0;
-const clientRequestMap = new Map();
-let primarySocket = null;
-let clientBuffer = Buffer.alloc(0);
-
-// Path to the Python auto-launch script (same directory as this file's parent)
-import { fileURLToPath } from "node:url";
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const LAUNCH_SCRIPT = path.join(__dirname, "..", "auto-install-extension.py");
-const PYTHON = process.env.PYTHON || "python3";
-
-let autoLaunchInProgress = false;
-
-function autoLaunchBrowser() {
-  if (autoLaunchInProgress) return;
-  autoLaunchInProgress = true;
-  process.stderr.write("Auto-launching browser...\n");
-  const child = spawn(PYTHON, [LAUNCH_SCRIPT], {
-    stdio: ["ignore", "pipe", "pipe"],
-    detached: true,
-  });
-  child.on("close", () => { autoLaunchInProgress = false; });
-  child.stderr.on("data", (d) => process.stderr.write(d));
-}
-
-const pidfilePath = path.join(os.tmpdir(), `openagent-in-chrome-mcp-${TCP_PORT}.pid`);
-
-function writePidfile() {
-  try { fs.writeFileSync(pidfilePath, String(process.pid)); } catch {}
-}
-
-function cleanupPidfile() {
-  try {
-    const content = fs.readFileSync(pidfilePath, "utf-8").trim();
-    if (content === String(process.pid)) fs.unlinkSync(pidfilePath);
-  } catch {}
-}
-
-function shutdown() {
-  if (mode === "primary") cleanupPidfile();
-  if (nativeHostSocket && !nativeHostSocket.destroyed) nativeHostSocket.destroy();
-  if (primarySocket && !primarySocket.destroyed) primarySocket.destroy();
-  for (const [, sock] of clientSockets) {
-    if (!sock.destroyed) sock.destroy();
-  }
-  for (const [, { reject, timer }] of pendingRequests) {
-    clearTimeout(timer);
-    reject(new Error("Server shutting down"));
-  }
-  pendingRequests.clear();
-  if (mode === "primary") tcpServer.close();
-  process.exit(0);
-}
-
-process.on("SIGTERM", shutdown);
-process.on("SIGINT", shutdown);
-process.on("SIGHUP", shutdown);
-process.stdin.on("end", shutdown);
-process.stdin.resume();
-
-function handleResponse(msg) {
-  if (msg.id && clientRequestMap.has(msg.id)) {
-    const { clientId, originalId } = clientRequestMap.get(msg.id);
-    clientRequestMap.delete(msg.id);
-    const clientSocket = clientSockets.get(clientId);
-    if (clientSocket && !clientSocket.destroyed) {
-      const fwd = JSON.stringify({ ...msg, id: originalId }) + "\n";
-      clientSocket.write(fwd);
+  // Lazy: launch/connect on first use; concurrent callers await one promise.
+  async ensure(onProgress) {
+    if (this.cdp && !this.cdp.closed) return;
+    if (this._ensuring) return this._ensuring;
+    this._ensuring = (async () => {
+      const { wsUrl, ownsBrowser, pid } = await ensureBrowser({ onProgress });
+      const cdp = new CDPConnection(wsUrl);
+      await cdp.connect();
+      cdp.onClose(() => {
+        log("browser CDP connection closed");
+        this.cdp = null;
+        this.sessions.clear();
+      });
+      this.cdp = cdp;
+      this.ownsBrowser = ownsBrowser;
+      this.browserPid = pid;
+      await cdp.send("Target.setDiscoverTargets", { discover: true });
+      cdp.on("Target.targetCreated", (p) => this._onTargetCreated(p.targetInfo));
+      cdp.on("Target.targetDestroyed", (p) => this._onTargetDestroyed(p.targetId));
+      // A tab that closes or crashes detaches its session — drop it so the next
+      // tool call re-attaches cleanly instead of using a dead sessionId.
+      cdp.on("Target.detachedFromTarget", (p) => {
+        for (const [tid, s] of this.sessions) {
+          if (s.sessionId === p.sessionId) this.sessions.delete(tid);
+        }
+      });
+      await this.syncTargets();
+      log("controller ready");
+    })();
+    try {
+      await this._ensuring;
+    } finally {
+      this._ensuring = null;
     }
-    return;
   }
 
-  if (msg.id && pendingRequests.has(msg.id)) {
-    const { resolve, reject, timer } = pendingRequests.get(msg.id);
-    clearTimeout(timer);
-    pendingRequests.delete(msg.id);
-    if (msg.type === "tool_error") {
-      reject(new Error(msg.error || "Tool execution failed"));
+  _isPage(info) {
+    return info && info.type === "page" && !String(info.url || "").startsWith("devtools://");
+  }
+
+  _intForTarget(targetId) {
+    let n = this.intByTarget.get(targetId);
+    if (n === undefined) {
+      n = this.nextTabId++;
+      this.intByTarget.set(targetId, n);
+      this.targetById.set(n, targetId);
+    }
+    return n;
+  }
+
+  _onTargetCreated(info) {
+    if (this._isPage(info)) this._intForTarget(info.targetId);
+  }
+
+  _onTargetDestroyed(targetId) {
+    const n = this.intByTarget.get(targetId);
+    if (n !== undefined) {
+      this.targetById.delete(n);
+      this.intByTarget.delete(targetId);
+    }
+    this.sessions.delete(targetId);
+    this.console.delete(targetId);
+    this.network.delete(targetId);
+  }
+
+  async syncTargets() {
+    const { targetInfos } = await this.cdp.send("Target.getTargets");
+    const alivePages = new Set();
+    for (const info of targetInfos) {
+      if (this._isPage(info)) {
+        alivePages.add(info.targetId);
+        this._intForTarget(info.targetId);
+      }
+    }
+    // Prune ints whose targets are gone.
+    for (const [tid, n] of [...this.intByTarget]) {
+      if (!alivePages.has(tid)) {
+        this.targetById.delete(n);
+        this.intByTarget.delete(tid);
+        this.sessions.delete(tid);
+      }
+    }
+    return targetInfos;
+  }
+
+  async listTabs() {
+    const infos = await this.syncTargets();
+    const byId = new Map(infos.map((i) => [i.targetId, i]));
+    const tabs = [];
+    for (const [tid, n] of this.intByTarget) {
+      const info = byId.get(tid);
+      if (info) tabs.push({ tabId: n, title: info.title || "Untitled", url: info.url || "" });
+    }
+    tabs.sort((a, b) => a.tabId - b.tabId);
+    return tabs;
+  }
+
+  targetForTab(tabId) {
+    return this.targetById.get(Number(tabId)) || null;
+  }
+
+  async ensureAttached(tabId) {
+    const targetId = this.targetForTab(tabId);
+    if (!targetId) {
+      await this.syncTargets();
+      if (!this.targetForTab(tabId)) throw new Error(`Tab ${tabId} does not exist. Call tabs_context_mcp first.`);
+    }
+    const tid = this.targetForTab(tabId);
+    let sess = this.sessions.get(tid);
+    if (sess && sess.sessionId) return sess;
+
+    const { sessionId } = await this.cdp.send("Target.attachToTarget", { targetId: tid, flatten: true });
+    sess = { sessionId, injected: false, netEnabled: false };
+    this.sessions.set(tid, sess);
+
+    await this.cdp.send("Page.enable", {}, sessionId);
+    await this.cdp.send("Runtime.enable", {}, sessionId);
+    await this.cdp.send("Log.enable", {}, sessionId).catch(() => {});
+    await this.cdp.send("Emulation.setDeviceMetricsOverride", {
+      width: VIEWPORT.width, height: VIEWPORT.height, deviceScaleFactor: 1, mobile: false,
+    }, sessionId).catch(() => {});
+    await this.cdp.send("Page.addScriptToEvaluateOnNewDocument", { source: PAGE_SCRIPT }, sessionId).catch(() => {});
+
+    // Console capture (survives across navigations, capped).
+    const pushConsole = (level, text, url) => {
+      const arr = this.console.get(tid) || [];
+      arr.push({ level, text, url: url || "", timestamp: Date.now() });
+      if (arr.length > MAX_BUFFER) arr.splice(0, arr.length - MAX_BUFFER);
+      this.console.set(tid, arr);
+    };
+    this.cdp.on("Runtime.consoleAPICalled", (p) => {
+      const text = (p.args || []).map((a) => (a.value !== undefined ? a.value : a.description) ?? "").join(" ");
+      pushConsole(p.type || "log", text, p.stackTrace?.callFrames?.[0]?.url);
+    }, sessionId);
+    this.cdp.on("Log.entryAdded", (p) => {
+      if (p.entry) pushConsole(p.entry.level || "info", p.entry.text || "", p.entry.url);
+    }, sessionId);
+
+    // Reset the ref map / clear network on a real (main-frame) navigation.
+    this.cdp.on("Page.frameNavigated", (p) => {
+      if (p.frame && !p.frame.parentId) {
+        this.network.set(tid, []);
+        sess.injected = false;
+      }
+    }, sessionId);
+
+    await this.injectPageScript(sess);
+    return sess;
+  }
+
+  async send(method, params, sess) {
+    return this.cdp.send(method, params, sess.sessionId);
+  }
+
+  async evaluate(sess, expression, { returnByValue = true, awaitPromise = true, userGesture = false } = {}) {
+    const res = await this.send("Runtime.evaluate", {
+      expression, returnByValue, awaitPromise, userGesture,
+    }, sess);
+    return res;
+  }
+
+  async injectPageScript(sess) {
+    // addScriptToEvaluateOnNewDocument covers future documents; make sure the
+    // CURRENT document has the helper too.
+    try {
+      const check = await this.evaluate(sess, "typeof window.__openagentChrome !== 'undefined'");
+      if (!(check.result && check.result.value)) {
+        await this.evaluate(sess, PAGE_SCRIPT, { returnByValue: false });
+      }
+      sess.injected = true;
+    } catch {
+      /* page may be mid-navigation; next call retries */
+    }
+  }
+
+  // Call a window.__openagentChrome.<fn>(...) safely, re-injecting if needed.
+  async callPageFn(sess, jsExpr) {
+    await this.injectPageScript(sess);
+    const res = await this.evaluate(sess, jsExpr, { returnByValue: true });
+    if (res.exceptionDetails) {
+      throw new Error(res.exceptionDetails.text || "page function error");
+    }
+    return res.result ? res.result.value : undefined;
+  }
+
+  async enableNetwork(sess, tid) {
+    if (sess.netEnabled) return;
+    sess.netEnabled = true;
+    await this.send("Network.enable", {}, sess).catch(() => {});
+    const push = (entry) => {
+      const arr = this.network.get(tid) || [];
+      arr.push(entry);
+      if (arr.length > MAX_BUFFER) arr.splice(0, arr.length - MAX_BUFFER);
+      this.network.set(tid, arr);
+    };
+    this.cdp.on("Network.requestWillBeSent", (p) => {
+      if (p.request) push({ url: p.request.url, method: p.request.method, status: 0, type: p.type || "Other", timestamp: Date.now() });
+    }, sess.sessionId);
+    this.cdp.on("Network.responseReceived", (p) => {
+      if (p.response) push({ url: p.response.url, method: "", status: p.response.status, statusText: p.response.statusText, type: p.type || "Other", mimeType: p.response.mimeType, timestamp: Date.now() });
+    }, sess.sessionId);
+  }
+
+  async screenshot(sess) {
+    const shoot = (quality) => this.send("Page.captureScreenshot", {
+      format: "jpeg", quality, optimizeForSpeed: true, captureBeyondViewport: false,
+    }, sess);
+    let { data } = await shoot(55);
+    if (data.length > 500000) ({ data } = await shoot(30));
+    const imageId = `screenshot_${Date.now()}_${Math.floor(this.nextTabId)}`;
+    this.screenshots.set(imageId, data);
+    const keys = [...this.screenshots.keys()];
+    while (keys.length > 10) this.screenshots.delete(keys.shift());
+    return { base64: data, imageId };
+  }
+
+  async shutdown() {
+    try {
+      if (this.cdp) this.cdp.close();
+    } catch {}
+    // Only kill the browser if THIS process launched it (never a reused one).
+    // Kill the whole detached process group (negative pid) so an xvfb-run
+    // wrapper + Chrome + helpers all go down together.
+    if (this.ownsBrowser && this.browserPid) {
+      try { process.kill(-this.browserPid, "SIGTERM"); } catch {
+        try { process.kill(this.browserPid, "SIGTERM"); } catch {}
+      }
+    }
+  }
+}
+
+const controller = new BrowserController();
+
+// ── CDP input helpers ──────────────────────────────────────────────────────
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+const KEY_MAP = {
+  enter: "Enter", return: "Enter", tab: "Tab", escape: "Escape", esc: "Escape",
+  backspace: "Backspace", delete: "Delete", space: " ", " ": " ",
+  arrowup: "ArrowUp", arrowdown: "ArrowDown", arrowleft: "ArrowLeft", arrowright: "ArrowRight",
+  up: "ArrowUp", down: "ArrowDown", left: "ArrowLeft", right: "ArrowRight",
+  home: "Home", end: "End", pageup: "PageUp", pagedown: "PageDown",
+  f1: "F1", f2: "F2", f3: "F3", f4: "F4", f5: "F5", f6: "F6",
+  f7: "F7", f8: "F8", f9: "F9", f10: "F10", f11: "F11", f12: "F12",
+};
+
+function parseKeyCombo(keyStr) {
+  const parts = keyStr.split("+").map((p) => p.trim().toLowerCase());
+  let modifiers = 0;
+  let key = "";
+  for (const part of parts) {
+    if (part === "ctrl" || part === "control") modifiers |= 2;
+    else if (part === "alt") modifiers |= 1;
+    else if (part === "shift") modifiers |= 8;
+    else if (["meta", "cmd", "command", "win", "windows"].includes(part)) modifiers |= 4;
+    else key = KEY_MAP[part] || part;
+  }
+  return { key, modifiers };
+}
+
+function parseModifierString(modStr) {
+  if (!modStr) return 0;
+  let modifiers = 0;
+  for (const part of modStr.split("+").map((p) => p.trim().toLowerCase())) {
+    if (part === "ctrl" || part === "control") modifiers |= 2;
+    else if (part === "alt") modifiers |= 1;
+    else if (part === "shift") modifiers |= 8;
+    else if (["meta", "cmd", "command", "win", "windows"].includes(part)) modifiers |= 4;
+  }
+  return modifiers;
+}
+
+async function dispatchMouse(sess, type, x, y, opts = {}) {
+  await controller.send("Input.dispatchMouseEvent", {
+    type, x, y,
+    button: opts.button || "left",
+    buttons: opts.buttons || 0,
+    clickCount: opts.clickCount || (type === "mousePressed" || type === "mouseReleased" ? 1 : 0),
+    modifiers: opts.modifiers || 0,
+  }, sess);
+}
+
+async function mouseClick(sess, x, y, opts = {}) {
+  const button = opts.button || "left";
+  const clickCount = opts.clickCount || 1;
+  const modifiers = opts.modifiers || 0;
+  const buttons = button === "right" ? 2 : 1;
+  await dispatchMouse(sess, "mouseMoved", x, y, { modifiers });
+  await sleep(30);
+  await dispatchMouse(sess, "mousePressed", x, y, { button, clickCount, modifiers, buttons });
+  await sleep(30);
+  await dispatchMouse(sess, "mouseReleased", x, y, { button, clickCount, modifiers, buttons });
+}
+
+async function waitForLoad(sess, timeout = 15000) {
+  return controller.cdp.once("Page.loadEventFired", { sessionId: sess.sessionId, timeout });
+}
+
+// ── Result helpers ──────────────────────────────────────────────────────────
+function text(t) { return { content: [{ type: "text", text: t }] }; }
+function textImage(t, base64) {
+  return { content: [{ type: "text", text: t }, { type: "image", data: base64, mimeType: "image/jpeg" }] };
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Tool implementations
+// ───────────────────────────────────────────────────────────────────────────
+const tools = {
+  async tabs_context_mcp(args) {
+    let tabs = await controller.listTabs();
+    if (tabs.length === 0 && args.createIfEmpty) {
+      await controller.cdp.send("Target.createTarget", { url: "about:blank" });
+      await sleep(150);
+      tabs = await controller.listTabs();
+    }
+    if (tabs.length === 0) return text("No tabs open. Call again with createIfEmpty: true to open one.");
+    let out = "Tab Context:\n- Available tabs:\n";
+    for (const t of tabs) out += `  • tabId ${t.tabId}: "${t.title}" (${t.url})\n`;
+    return { content: [{ type: "text", text: JSON.stringify({ availableTabs: tabs }) + "\n\n" + out }] };
+  },
+
+  async tabs_create_mcp() {
+    const { targetId } = await controller.cdp.send("Target.createTarget", { url: "about:blank" });
+    const tabId = controller._intForTarget(targetId);
+    const tabs = await controller.listTabs();
+    let out = `Created new tab. Tab ID: ${tabId}\n\nTab Context:\n- Available tabs:\n`;
+    for (const t of tabs) out += `  • tabId ${t.tabId}: "${t.title}" (${t.url})\n`;
+    return text(out);
+  },
+
+  async navigate(args) {
+    const { url, tabId } = args;
+    const sess = await controller.ensureAttached(tabId);
+
+    if (url === "back" || url === "forward") {
+      const hist = await controller.send("Page.getNavigationHistory", {}, sess);
+      const idx = hist.currentIndex + (url === "back" ? -1 : 1);
+      if (idx < 0 || idx >= hist.entries.length) return text(`Cannot go ${url}: no ${url} history.`);
+      const entryId = hist.entries[idx].id;
+      const p = waitForLoad(sess, 12000);
+      await controller.send("Page.navigateToHistoryEntry", { entryId }, sess);
+      await p;
     } else {
-      resolve(msg.result);
+      let target = url;
+      if (!/^https?:\/\//i.test(target) && !/^(about|chrome|edge|brave):/i.test(target)) {
+        target = "https://" + target.replace(/^[a-z]{1,6}:\/+/i, "");
+      }
+      try { new URL(target); } catch { return text(`Invalid URL: "${url}".`); }
+      const p = waitForLoad(sess, 15000);
+      const nav = await controller.send("Page.navigate", { url: target }, sess);
+      if (nav.errorText && nav.errorText !== "net::ERR_ABORTED") {
+        return text(`Navigation to ${target} failed: ${nav.errorText}`);
+      }
+      await p;
     }
-  }
-}
+    await sleep(200);
+    const tabs = await controller.listTabs();
+    const me = tabs.find((t) => t.tabId === Number(tabId));
+    const pages = tabs.map((t, i) => `${i + 1}: ${t.url}${t.tabId === Number(tabId) ? " [selected]" : ""}`).join("\n");
+    return text(`Navigated to ${me ? me.url : target}.\n## Pages\n${pages}`);
+  },
 
-function processLine(line) {
-  if (!line) return;
-  try {
-    const msg = JSON.parse(line);
-    if (msg.type === "heartbeat") return;
-    handleResponse(msg);
-  } catch {}
-}
+  async computer(args) {
+    const { action, tabId } = args;
+    const sess = await controller.ensureAttached(tabId);
+    // Bring the tab to front so screenshots reflect what a viewer sees.
+    await controller.send("Target.activateTarget", { targetId: controller.targetForTab(tabId) }).catch(() => {});
 
-const tcpServer = net.createServer((socket) => {
-  let classified = false;
-  let earlyBuffer = Buffer.alloc(0);
-
-  const classifyTimeout = setTimeout(() => {
-    if (!classified) {
-      classified = true;
-      setupNativeHostConnection(socket, earlyBuffer);
+    let coordinate = args.coordinate;
+    if (args.ref && !coordinate) {
+      const c = await controller.callPageFn(sess, `window.__openagentChrome.getRefCoordinates(${JSON.stringify(args.ref)})`);
+      if (!c) return text(`Could not resolve ref "${args.ref}" to coordinates.`);
+      coordinate = [c.x, c.y];
     }
-  }, 500);
+    const modifiers = parseModifierString(args.modifiers);
 
-  socket.on("data", function onEarlyData(chunk) {
-    if (classified) return;
-    earlyBuffer = Buffer.concat([earlyBuffer, chunk]);
-    const newlineIdx = earlyBuffer.indexOf(10);
-    if (newlineIdx === -1) return;
+    switch (action) {
+      case "screenshot": {
+        const { base64, imageId } = await controller.screenshot(sess);
+        return textImage(`Captured screenshot (${VIEWPORT.width}x${VIEWPORT.height}, jpeg) - ID: ${imageId}`, base64);
+      }
+      case "left_click":
+      case "right_click":
+      case "double_click":
+      case "triple_click": {
+        if (!coordinate) return text(`coordinate (or ref) is required for ${action}`);
+        const map = { left_click: {}, right_click: { button: "right" }, double_click: { clickCount: 2 }, triple_click: { clickCount: 3 } };
+        await mouseClick(sess, coordinate[0], coordinate[1], { ...map[action], modifiers });
+        return text(`${action.replace("_", " ")} at (${coordinate[0]}, ${coordinate[1]})`);
+      }
+      case "hover": {
+        if (!coordinate) return text("coordinate is required for hover");
+        await dispatchMouse(sess, "mouseMoved", coordinate[0], coordinate[1], { modifiers });
+        await sleep(150);
+        return text(`Hovered at (${coordinate[0]}, ${coordinate[1]})`);
+      }
+      case "type": {
+        if (!args.text) return text("text is required for type");
+        await controller.send("Input.insertText", { text: args.text }, sess);
+        return text(`Typed "${args.text.slice(0, 60)}${args.text.length > 60 ? "…" : ""}"`);
+      }
+      case "key": {
+        if (!args.text) return text("text is required for key");
+        const repeat = Math.min(args.repeat || 1, 100);
+        const keys = args.text.split(" ").filter(Boolean);
+        for (let r = 0; r < repeat; r++) {
+          for (const keyStr of keys) {
+            const { key, modifiers: keyMod } = parseKeyCombo(keyStr);
+            const isChar = key.length === 1;
+            const common = {
+              key, modifiers: keyMod,
+              code: isChar ? (/[a-z]/i.test(key) ? `Key${key.toUpperCase()}` : key) : key,
+              windowsVirtualKeyCode: isChar ? key.toUpperCase().charCodeAt(0) : undefined,
+            };
+            await controller.send("Input.dispatchKeyEvent", { type: "keyDown", text: isChar && !keyMod ? key : undefined, ...common }, sess);
+            await controller.send("Input.dispatchKeyEvent", { type: "keyUp", ...common }, sess);
+            await sleep(20);
+          }
+        }
+        return text(`Pressed key(s): ${args.text}${repeat > 1 ? ` x${repeat}` : ""}`);
+      }
+      case "scroll": {
+        if (!coordinate) return text("coordinate is required for scroll");
+        const dir = args.scroll_direction || "down";
+        const amount = Math.min(args.scroll_amount || 3, 10);
+        const deltaX = dir === "left" ? -amount * 100 : dir === "right" ? amount * 100 : 0;
+        const deltaY = dir === "up" ? -amount * 100 : dir === "down" ? amount * 100 : 0;
+        await controller.send("Input.dispatchMouseEvent", { type: "mouseWheel", x: coordinate[0], y: coordinate[1], deltaX, deltaY, modifiers }, sess);
+        await sleep(300);
+        const { base64 } = await controller.screenshot(sess);
+        return textImage(`Scrolled ${dir} by ${amount} at (${coordinate[0]}, ${coordinate[1]})`, base64);
+      }
+      case "scroll_to": {
+        if (args.ref) await controller.callPageFn(sess, `window.__openagentChrome.scrollToRef(${JSON.stringify(args.ref)})`);
+        else if (coordinate) await controller.evaluate(sess, `window.scrollTo(${coordinate[0]}, ${coordinate[1]})`);
+        else return text("coordinate or ref is required for scroll_to");
+        await sleep(250);
+        return text("Scrolled to target.");
+      }
+      case "wait": {
+        const d = Math.min(args.duration || 1, 30);
+        await sleep(d * 1000);
+        return text(`Waited ${d}s`);
+      }
+      case "left_click_drag": {
+        if (!args.start_coordinate || !coordinate) return text("start_coordinate and coordinate are required for left_click_drag");
+        const [sx, sy] = args.start_coordinate;
+        const [ex, ey] = coordinate;
+        await dispatchMouse(sess, "mouseMoved", sx, sy, { modifiers });
+        await sleep(30);
+        await dispatchMouse(sess, "mousePressed", sx, sy, { button: "left", modifiers, buttons: 1, clickCount: 1 });
+        for (let i = 1; i <= 10; i++) {
+          await dispatchMouse(sess, "mouseMoved", sx + ((ex - sx) * i) / 10, sy + ((ey - sy) * i) / 10, { modifiers, buttons: 1 });
+          await sleep(16);
+        }
+        await dispatchMouse(sess, "mouseReleased", ex, ey, { button: "left", modifiers, buttons: 1, clickCount: 1 });
+        return text(`Dragged from (${sx}, ${sy}) to (${ex}, ${ey})`);
+      }
+      case "zoom": {
+        if (!args.region || args.region.length !== 4) return text("region [x0,y0,x1,y1] is required for zoom");
+        const [x0, y0, x1, y1] = args.region;
+        const clip = { x: x0, y: y0, width: Math.max(1, x1 - x0), height: Math.max(1, y1 - y0), scale: 2 };
+        const { data } = await controller.send("Page.captureScreenshot", { format: "jpeg", quality: 80, clip }, sess);
+        return textImage(`Zoom region [${args.region.join(", ")}]`, data);
+      }
+      default:
+        return text(`Unknown computer action: ${action}`);
+    }
+  },
 
-    const firstLine = earlyBuffer.subarray(0, newlineIdx).toString("utf-8").trim();
+  async read_page(args) {
+    const sess = await controller.ensureAttached(args.tabId);
+    const opts = { filter: args.filter, depth: args.depth, max_chars: args.max_chars, ref_id: args.ref_id };
+    let tree = await controller.callPageFn(sess, `window.__openagentChrome.generateAccessibilityTree(${JSON.stringify(opts)})`);
+    if (typeof tree !== "string") tree = "Error: could not generate accessibility tree";
+    const vp = await controller.evaluate(sess, "window.innerWidth + 'x' + window.innerHeight");
+    if (vp.result && vp.result.value) tree += `\n\nViewport: ${vp.result.value}`;
+    return text(tree);
+  },
+
+  async get_page_text(args) {
+    const sess = await controller.ensureAttached(args.tabId);
+    const raw = await controller.callPageFn(sess, "window.__openagentChrome.getPageText()");
     try {
-      const firstMsg = JSON.parse(firstLine);
-      if (firstMsg.type === "client_hello") {
-        classified = true;
-        clearTimeout(classifyTimeout);
-        socket.removeListener("data", onEarlyData);
-        setupClientConnection(socket, earlyBuffer.subarray(newlineIdx + 1));
-        return;
-      }
-    } catch {}
-
-    classified = true;
-    clearTimeout(classifyTimeout);
-    socket.removeListener("data", onEarlyData);
-    setupNativeHostConnection(socket, earlyBuffer);
-  });
-});
-
-function setupNativeHostConnection(socket, initialBuffer) {
-  if (nativeHostSocket && !nativeHostSocket.destroyed) {
-    socket.end(JSON.stringify({ type: "error", error: "Another browser profile is already connected." }) + "\n");
-    socket.destroy();
-    return;
-  }
-
-  nativeHostSocket = socket;
-  let buffer = initialBuffer;
-
-  let idx;
-  while ((idx = buffer.indexOf(10)) !== -1) {
-    processLine(buffer.subarray(0, idx).toString("utf-8").trim());
-    buffer = buffer.subarray(idx + 1);
-  }
-
-  socket.on("data", (chunk) => {
-    buffer = Buffer.concat([buffer, chunk]);
-    let newlineIdx;
-    while ((newlineIdx = buffer.indexOf(10)) !== -1) {
-      processLine(buffer.subarray(0, newlineIdx).toString("utf-8").trim());
-      buffer = buffer.subarray(newlineIdx + 1);
+      const d = JSON.parse(raw);
+      return text(`Title: ${d.title}\nURL: ${d.url}\nSource: <${d.sourceTag}>\n\n${d.text}`);
+    } catch {
+      return text(String(raw || "Error: could not extract page text"));
     }
-  });
+  },
 
-  socket.on("error", () => { nativeHostSocket = null; });
+  async find(args) {
+    const sess = await controller.ensureAttached(args.tabId);
+    const results = (await controller.callPageFn(sess, `window.__openagentChrome.findElements(${JSON.stringify(args.query)})`)) || [];
+    if (results.length === 0) return text(`No elements found matching "${args.query}"`);
+    let out = `Found ${results.length} element(s) matching "${args.query}":\n\n`;
+    for (const r of results) out += `[${r.ref}] ${r.role} "${r.name}" at (${r.coordinates[0]}, ${r.coordinates[1]})\n`;
+    return text(out);
+  },
 
-  socket.on("close", () => {
-    if (nativeHostSocket === socket) nativeHostSocket = null;
-    if (pendingRequests.size > 0) {
-      setTimeout(() => {
-        if (nativeHostSocket && !nativeHostSocket.destroyed) {
-          for (const [id, entry] of pendingRequests) {
-            if (entry.resent) continue;
-            entry.resent = true;
-            nativeHostSocket.write(JSON.stringify({ id, type: "tool_request", tool: entry.tool, args: entry.args }) + "\n");
-          }
-        } else {
-          for (const [, { reject, timer }] of pendingRequests) {
-            clearTimeout(timer);
-            reject(new Error("Native host disconnected"));
-          }
-          pendingRequests.clear();
-        }
-      }, 5000);
+  async form_input(args) {
+    const sess = await controller.ensureAttached(args.tabId);
+    const result = await controller.callPageFn(
+      sess,
+      `window.__openagentChrome.setFormValue(${JSON.stringify(args.ref)}, ${JSON.stringify(args.value)})`,
+    );
+    if (result && result.error) return text(`Error: ${result.error}`);
+    return text(`Set ${args.ref} to "${args.value}". ${JSON.stringify(result)}`);
+  },
+
+  async javascript_tool(args) {
+    const sess = await controller.ensureAttached(args.tabId);
+    const res = await controller.evaluate(sess, args.text, { returnByValue: true, awaitPromise: true, userGesture: true });
+    if (res.exceptionDetails) return text(`Error: ${res.exceptionDetails.text || JSON.stringify(res.exceptionDetails)}`);
+    const val = res.result;
+    if (!val || val.type === "undefined") return text("undefined");
+    return text(val.value !== undefined ? JSON.stringify(val.value) : val.description || String(val));
+  },
+
+  async read_console_messages(args) {
+    const tid = controller.targetForTab(args.tabId);
+    await controller.ensureAttached(args.tabId);
+    let msgs = (controller.console.get(tid) || []).slice();
+    if (args.onlyErrors) msgs = msgs.filter((m) => ["error", "exception", "severe"].includes((m.level || "").toLowerCase()));
+    if (args.pattern) {
+      let re; try { re = new RegExp(args.pattern, "i"); } catch { re = null; }
+      msgs = msgs.filter((m) => (re ? re.test(m.text) || re.test(m.level) : m.text.includes(args.pattern)));
     }
-  });
-}
+    msgs = msgs.slice(-(args.limit || 100));
+    if (args.clear) controller.console.set(tid, []);
+    if (msgs.length === 0) return text("No console messages matching the criteria.");
+    return text(`Console messages (${msgs.length}):\n` + msgs.map((m) => `[${m.level}] ${m.text}${m.url ? ` (${m.url})` : ""}`).join("\n"));
+  },
 
-function setupClientConnection(socket, initialBuffer) {
-  const clientId = String(++clientIdCounter);
-  clientSockets.set(clientId, socket);
-  process.stderr.write(`Client MCP server connected (client ${clientId})\n`);
+  async read_network_requests(args) {
+    const tid = controller.targetForTab(args.tabId);
+    const sess = await controller.ensureAttached(args.tabId);
+    await controller.enableNetwork(sess, tid);
+    let reqs = (controller.network.get(tid) || []).slice();
+    if (args.urlPattern) reqs = reqs.filter((r) => r.url.includes(args.urlPattern));
+    reqs = reqs.slice(-(args.limit || 100));
+    if (args.clear) controller.network.set(tid, []);
+    if (reqs.length === 0) return text("No network requests captured yet (they are recorded from the moment this tool is first called on a tab).");
+    return text(`Network requests (${reqs.length}):\n` + reqs.map((r) => `${r.method || ""} ${r.url} ${r.status ? `→ ${r.status}` : "(pending)"}${r.mimeType ? ` [${r.mimeType}]` : ""}`.trim()).join("\n"));
+  },
 
-  socket.write(JSON.stringify({ type: "client_ack", clientId }) + "\n");
-
-  let buffer = initialBuffer;
-
-  function processClientData() {
-    let idx;
-    while ((idx = buffer.indexOf(10)) !== -1) {
-      const line = buffer.subarray(0, idx).toString("utf-8").trim();
-      buffer = buffer.subarray(idx + 1);
-      if (!line) continue;
-      try {
-        const msg = JSON.parse(line);
-        if (msg.type === "tool_request" && msg.id) {
-          const prefixedId = `c${clientId}_${msg.id}`;
-          clientRequestMap.set(prefixedId, { clientId, originalId: msg.id });
-
-          if (!nativeHostSocket || nativeHostSocket.destroyed) {
-            socket.write(JSON.stringify({ id: msg.id, type: "tool_error", error: "Browser extension is not connected." }) + "\n");
-            clientRequestMap.delete(prefixedId);
-          } else {
-            nativeHostSocket.write(JSON.stringify({ ...msg, id: prefixedId }) + "\n");
-          }
-        }
-      } catch {}
+  async resize_window(args) {
+    const sess = await controller.ensureAttached(args.tabId);
+    const { windowId } = await controller.send("Browser.getWindowForTarget", { targetId: controller.targetForTab(args.tabId) }, sess).catch(() => ({}));
+    if (windowId !== undefined) {
+      await controller.cdp.send("Browser.setWindowBounds", { windowId, bounds: { width: args.width, height: args.height } }).catch(() => {});
     }
-  }
+    await controller.send("Emulation.setDeviceMetricsOverride", { width: args.width, height: args.height, deviceScaleFactor: 1, mobile: false }, sess).catch(() => {});
+    return text(`Resized window to ${args.width}x${args.height}`);
+  },
 
-  processClientData();
+  async upload_image(args) {
+    const sess = await controller.ensureAttached(args.tabId);
+    const base64 = controller.screenshots.get(args.imageId);
+    if (!base64) return text(`Image ${args.imageId} not found. Take a screenshot first.`);
+    if (!args.ref) return text("A file-input `ref` is required. Use read_page/find to get the file input's ref, then call upload_image with it.");
 
-  socket.on("data", (chunk) => {
-    buffer = Buffer.concat([buffer, chunk]);
-    processClientData();
-  });
-
-  socket.on("error", () => {});
-  socket.on("close", () => {
-    clientSockets.delete(clientId);
-    for (const [prefixedId, info] of clientRequestMap) {
-      if (info.clientId === clientId) clientRequestMap.delete(prefixedId);
-    }
-    process.stderr.write(`Client MCP server disconnected (client ${clientId})\n`);
-  });
-}
-
-function startClientMode() {
-  mode = "client";
-  process.stderr.write(`Port ${TCP_PORT} in use. Connecting as client to primary MCP server...\n`);
-
-  function connect() {
-    primarySocket = net.createConnection(TCP_PORT, "127.0.0.1", () => {
-      process.stderr.write(`Connected to primary MCP server on :${TCP_PORT}\n`);
-      primarySocket.write(JSON.stringify({ type: "client_hello" }) + "\n");
-    });
-
-    primarySocket.on("data", (chunk) => {
-      clientBuffer = Buffer.concat([clientBuffer, chunk]);
-      let idx;
-      while ((idx = clientBuffer.indexOf(10)) !== -1) {
-        const line = clientBuffer.subarray(0, idx).toString("utf-8").trim();
-        clientBuffer = clientBuffer.subarray(idx + 1);
-        if (!line) continue;
-        try {
-          const msg = JSON.parse(line);
-          if (msg.type === "client_ack") continue;
-          if (msg.type === "error") {
-            process.stderr.write(`Primary server error: ${msg.error}\n`);
-            continue;
-          }
-          if (msg.id && pendingRequests.has(msg.id)) {
-            const { resolve, reject, timer } = pendingRequests.get(msg.id);
-            clearTimeout(timer);
-            pendingRequests.delete(msg.id);
-            if (msg.type === "tool_error") {
-              reject(new Error(msg.error || "Tool execution failed"));
-            } else {
-              resolve(msg.result);
-            }
-          }
-        } catch {}
-      }
-    });
-
-    primarySocket.on("error", (err) => {
-      process.stderr.write(`Client connection error: ${err.message}\n`);
-    });
-
-    primarySocket.on("close", () => {
-      primarySocket = null;
-      for (const [, { reject, timer }] of pendingRequests) {
-        clearTimeout(timer);
-        reject(new Error("Primary MCP server disconnected"));
-      }
-      pendingRequests.clear();
-      setTimeout(connect, 2000);
-    });
-  }
-
-  connect();
-}
-
-async function start() {
-  const pidfiles = [
-    pidfilePath,
-    path.join(os.tmpdir(), `unblocked-chrome-mcp-${TCP_PORT}.pid`),
-  ];
-  for (const pf of pidfiles) {
+    const tmp = path.join(os.tmpdir(), `openagent-upload-${Date.now()}-${args.filename || "image.png"}`);
+    fs.writeFileSync(tmp, Buffer.from(base64, "base64"));
     try {
-      const oldPid = parseInt(fs.readFileSync(pf, "utf-8").trim(), 10);
-      if (oldPid && oldPid !== process.pid) {
-        try {
-          process.kill(oldPid, 0);
-        } catch {
-          try { fs.unlinkSync(pf); } catch {}
-        }
-      }
-    } catch {}
-  }
+      const objRes = await controller.evaluate(sess, `window.__openagentChrome.resolveRef(${JSON.stringify(args.ref)})`, { returnByValue: false });
+      const objectId = objRes.result && objRes.result.objectId;
+      if (!objectId) return text(`Could not resolve ref "${args.ref}" to an element.`);
+      await controller.send("DOM.setFileInputFiles", { files: [tmp], objectId }, sess);
+      return text(`Uploaded ${args.filename || "image.png"} to ${args.ref}.`);
+    } catch (e) {
+      return text(`Upload failed: ${e.message}. The ref must point to an <input type="file"> element.`);
+    } finally {
+      try { fs.rmSync(tmp, { force: true }); } catch {}
+    }
+  },
+};
 
-  return new Promise((resolve) => {
-    tcpServer.once("error", (err) => {
-      if (err.code === "EADDRINUSE") {
-        startClientMode();
-        resolve();
-      } else {
-        process.stderr.write(`TCP server error: ${err.message}\n`);
-        process.exit(1);
-      }
-    });
-
-    tcpServer.listen(TCP_PORT, "127.0.0.1", () => {
-      mode = "primary";
-      writePidfile();
-      process.stderr.write(`Primary MCP server listening on :${TCP_PORT}\n`);
-      resolve();
-    });
-  });
-}
-
-await start();
-
-function textResult(text) {
-  return { content: [{ type: "text", text }] };
-}
-
-async function callTool(toolName, args) {
+// ───────────────────────────────────────────────────────────────────────────
+// MCP wiring
+// ───────────────────────────────────────────────────────────────────────────
+async function callTool(name, args) {
   try {
-    const result = await sendToExtension(toolName, args);
-    if (typeof result === "string") return textResult(result);
-    if (result && result.content) return result;
-    return textResult(JSON.stringify(result, null, 2));
+    await controller.ensure();
+    const handler = tools[name];
+    if (!handler) return text(`Unknown tool: ${name}`);
+    return await handler(args || {});
   } catch (err) {
-    return textResult(`Error: ${err.message}`);
+    return text(`Error: ${err.message}`);
   }
 }
 
-const server = new McpServer({
-  name: "agent-in-chrome",
-  version: "1.0.0",
-});
+const server = new McpServer({ name: "agent-in-chrome", version: "2.0.0" });
 
-// Pre-validation arg coercion
+// Coerce stringly-typed args (some clients send numbers/arrays as strings).
 {
-  const origSetRequestHandler = server.server.setRequestHandler.bind(server.server);
-  server.server.setRequestHandler = function(schema, handler) {
-    return origSetRequestHandler(schema, async (request, extra) => {
-      const args = request?.params?.arguments;
-      if (args) {
-        if (typeof args.tabId === "string") args.tabId = Number(args.tabId);
-        if (typeof args.coordinate === "string") {
-          try { args.coordinate = JSON.parse(args.coordinate); } catch {}
-        }
-        if (typeof args.start_coordinate === "string") {
-          try { args.start_coordinate = JSON.parse(args.start_coordinate); } catch {}
-        }
-        if (typeof args.region === "string") {
-          try { args.region = JSON.parse(args.region); } catch {}
+  const orig = server.server.setRequestHandler.bind(server.server);
+  server.server.setRequestHandler = function (schema, handler) {
+    return orig(schema, async (request, extra) => {
+      const a = request?.params?.arguments;
+      if (a) {
+        if (typeof a.tabId === "string" && a.tabId.trim() !== "") a.tabId = Number(a.tabId);
+        for (const k of ["coordinate", "start_coordinate", "region"]) {
+          if (typeof a[k] === "string") { try { a[k] = JSON.parse(a[k]); } catch {} }
         }
       }
       return handler(request, extra);
@@ -406,332 +659,148 @@ const server = new McpServer({
   };
 }
 
-// 1. tabs_context_mcp
+const n = z.number();
+const tabIdParam = z.number().describe("Tab ID from tabs_context_mcp. Call tabs_context_mcp first if you don't have one.");
+
 server.tool(
   "tabs_context_mcp",
-  "Get context information about the current MCP tab group. Returns all tab IDs inside the group if it exists. CRITICAL: You must get the context at least once before using other browser automation tools so you know what tabs exist. Each new conversation should create its own new tab (using tabs_create_mcp) rather than reusing existing tabs, unless the user explicitly asks to use an existing tab.",
-  { createIfEmpty: z.boolean().optional().describe("Creates a new MCP tab group if none exists, creates a new Window with a new tab group containing an empty tab (which can be used for this conversation). If a MCP tab group already exists, this parameter has no effect.") },
-  async (args) => callTool("tabs_context_mcp", args)
+  "List the browser tabs available to you. Call this once before any other browser tool so you know what tabs exist. Each new task should open its own tab with tabs_create_mcp unless told to reuse one.",
+  { createIfEmpty: z.boolean().optional().describe("Open a fresh blank tab if none exist.") },
+  (a) => callTool("tabs_context_mcp", a),
 );
 
-// 2. tabs_create_mcp
 server.tool(
   "tabs_create_mcp",
-  "Creates a new empty tab in the MCP tab group. CRITICAL: You must get the context using tabs_context_mcp at least once before using other browser automation tools so you know what tabs exist.",
+  "Open a new blank tab and return its tab ID.",
   {},
-  async (args) => callTool("tabs_create_mcp", args)
+  (a) => callTool("tabs_create_mcp", a),
 );
 
-// 3. navigate
 server.tool(
   "navigate",
-  'Navigate to a URL, or go forward/back in browser history. If you don\'t have a valid tab ID, use tabs_context_mcp first to get available tabs.',
-  {
-    url: z.string().describe('The URL to navigate to. Can be provided with or without protocol (defaults to https://). Use "forward" to go forward in history or "back" to go back in history.'),
-    tabId: z.number().describe("Tab ID to navigate. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
-  },
-  async (args) => callTool("navigate", args)
+  "Navigate a tab to a URL (protocol optional, defaults to https), or pass \"back\"/\"forward\" for history. Waits for the page to load.",
+  { url: z.string().describe('URL, or "back"/"forward".'), tabId: tabIdParam },
+  (a) => callTool("navigate", a),
 );
 
-// 4. computer
 server.tool(
   "computer",
-  "Use a mouse and keyboard to interact with a web browser, and take screenshots. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.\n* Whenever you intend to click on an element like an icon, you should consult a screenshot to determine the coordinates of the element before moving the cursor.\n* If you tried clicking on a program or link but it failed to load, even after waiting, try adjusting your click location so that the tip of the cursor visually falls on the element that you want to click.\n* Make sure to click any buttons, links, icons, etc with the cursor tip in the center of the element. Don't click boxes on their edges unless asked.",
+  "Mouse/keyboard/screenshot control of a tab. Prefer find + read_page (structured, cheap) to locate elements; only screenshot when you need to see pixels. Click at the center of the target. Coordinates are viewport pixels from a screenshot.",
   {
-    action: z.enum([
-      "left_click", "right_click", "double_click", "triple_click",
-      "type", "screenshot", "wait", "scroll", "key",
-      "left_click_drag", "zoom", "scroll_to", "hover"
-    ]).describe('The action to perform:\n* `left_click`: Click the left mouse button at the specified coordinates.\n* `right_click`: Click the right mouse button at the specified coordinates to open context menus.\n* `double_click`: Double-click the left mouse button at the specified coordinates.\n* `triple_click`: Triple-click the left mouse button at the specified coordinates.\n* `type`: Type a string of text.\n* `screenshot`: Take a screenshot of the screen.\n* `wait`: Wait for a specified number of seconds.\n* `scroll`: Scroll up, down, left, or right at the specified coordinates.\n* `key`: Press a specific keyboard key.\n* `left_click_drag`: Drag from start_coordinate to coordinate.\n* `zoom`: Take a screenshot of a specific region for closer inspection.\n* `scroll_to`: Scroll an element into view using its element reference ID from read_page or find tools.\n* `hover`: Move the mouse cursor to the specified coordinates or element without clicking. Useful for revealing tooltips, dropdown menus, or triggering hover states.'),
-    tabId: z.number().describe("Tab ID to execute the action on. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
-    coordinate: z.array(z.number()).min(2).max(2).optional().describe("(x, y): The x (pixels from the left edge) and y (pixels from the top edge) coordinates. Required for `left_click`, `right_click`, `double_click`, `triple_click`, and `scroll`. For `left_click_drag`, this is the end position."),
-    duration: z.number().min(0).max(30).optional().describe("The number of seconds to wait. Required for `wait`. Maximum 30 seconds."),
-    modifiers: z.string().optional().describe('Modifier keys for click actions. Supports: "ctrl", "shift", "alt", "cmd" (or "meta"), "win" (or "windows"). Can be combined with "+" (e.g., "ctrl+shift", "cmd+alt"). Optional.'),
-    ref: z.string().optional().describe('Element reference ID from read_page or find tools (e.g., "ref_1", "ref_2"). Required for `scroll_to` action. Can be used as alternative to `coordinate` for click actions.'),
-    region: z.array(z.number()).min(4).max(4).optional().describe("(x0, y0, x1, y1): The rectangular region to capture for `zoom`. Coordinates define a rectangle from top-left (x0, y0) to bottom-right (x1, y1) in pixels from the viewport origin. Required for `zoom` action. Useful for inspecting small UI elements like icons, buttons, or text."),
-    repeat: z.number().min(1).max(100).optional().describe("Number of times to repeat the key sequence. Only applicable for `key` action. Must be a positive integer between 1 and 100. Default is 1. Useful for navigation tasks like pressing arrow keys multiple times."),
-    scroll_direction: z.enum(["up", "down", "left", "right"]).optional().describe("The direction to scroll. Required for `scroll`."),
-    scroll_amount: z.number().min(1).max(10).optional().describe("The number of scroll wheel ticks. Optional for `scroll`, defaults to 3."),
-    start_coordinate: z.array(z.number()).min(2).max(2).optional().describe("(x, y): The starting coordinates for `left_click_drag`."),
-    text: z.string().optional().describe('The text to type (for `type` action) or the key(s) to press (for `key` action). For `key` action: Provide space-separated keys (e.g., "Backspace Backspace Delete"). Supports keyboard shortcuts using the platform\'s modifier key (use "cmd" on Mac, "ctrl" on Windows/Linux, e.g., "cmd+a" or "ctrl+a" for select all).'),
+    action: z.enum(["left_click", "right_click", "double_click", "triple_click", "type", "screenshot", "wait", "scroll", "key", "left_click_drag", "zoom", "scroll_to", "hover"]).describe("The action to perform."),
+    tabId: tabIdParam,
+    coordinate: z.array(n).min(2).max(2).optional().describe("(x, y) target. For left_click_drag this is the end point."),
+    duration: n.min(0).max(30).optional().describe("Seconds to wait (wait action)."),
+    modifiers: z.string().optional().describe('Modifier keys, e.g. "ctrl", "cmd+shift".'),
+    ref: z.string().optional().describe("Element ref from find/read_page (alternative to coordinate)."),
+    region: z.array(n).min(4).max(4).optional().describe("(x0,y0,x1,y1) region for zoom."),
+    repeat: n.min(1).max(100).optional().describe("Repeat count for key."),
+    scroll_direction: z.enum(["up", "down", "left", "right"]).optional().describe("Direction for scroll."),
+    scroll_amount: n.min(1).max(10).optional().describe("Scroll ticks (default 3)."),
+    start_coordinate: z.array(n).min(2).max(2).optional().describe("(x, y) start for left_click_drag."),
+    text: z.string().optional().describe('Text to type, or space-separated keys for the key action (e.g. "Enter", "cmd+a").'),
   },
-  async (args) => callTool("computer", args)
+  (a) => callTool("computer", a),
 );
 
-// 5. find
 server.tool(
   "find",
-  'Find elements on the page using natural language. Can search for elements by their purpose (e.g., "search bar", "login button") or by text content (e.g., "organic mango product"). Returns up to 20 matching elements with references that can be used with other tools. If more than 20 matches exist, you\'ll be notified to use a more specific query. If you don\'t have a valid tab ID, use tabs_context_mcp first to get available tabs.',
-  {
-    query: z.string().describe('Natural language description of what to find (e.g., "search bar", "add to cart button", "product title containing organic")'),
-    tabId: z.number().describe("Tab ID to search in. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
-  },
-  async (args) => callTool("find", args)
+  'Find elements by natural-language description or visible text (e.g. "search box", "log in button", "post title containing cats"). Returns up to 20 matches with refs usable by computer/form_input. The cheapest way to locate something — prefer it over screenshots.',
+  { query: z.string().describe("What to find."), tabId: tabIdParam },
+  (a) => callTool("find", a),
 );
 
-// 6. form_input
 server.tool(
   "form_input",
-  "Set values in form elements using element reference ID from the read_page tool. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
-  {
-    ref: z.string().describe('Element reference ID from the read_page tool (e.g., "ref_1", "ref_2")'),
-    value: z.union([z.string(), z.boolean(), z.number()]).describe("The value to set. For checkboxes use boolean, for selects use option value or text, for other inputs use appropriate string/number"),
-    tabId: z.number().describe("Tab ID to set form value in. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
-  },
-  async (args) => callTool("form_input", args)
+  "Set the value of a form field by its ref (from find/read_page). Booleans toggle checkboxes; strings fill text inputs and select options.",
+  { ref: z.string().describe("Element ref."), value: z.union([z.string(), z.boolean(), z.number()]).describe("Value to set."), tabId: tabIdParam },
+  (a) => callTool("form_input", a),
 );
 
-// 7. get_page_text
 server.tool(
   "get_page_text",
-  "Extract raw text content from the page, prioritizing article content. Ideal for reading articles, blog posts, or other text-heavy pages. Returns plain text without HTML formatting. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
-  {
-    tabId: z.number().describe("Tab ID to extract text from. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
-  },
-  async (args) => callTool("get_page_text", args)
+  "Extract the main readable text of the page (article/body), stripped of markup. Ideal for reading posts, comments, and articles cheaply.",
+  { tabId: tabIdParam },
+  (a) => callTool("get_page_text", a),
 );
 
-// 8. gif_creator
-server.tool(
-  "gif_creator",
-  "Manage GIF recording and export for browser automation sessions. Control when to start/stop recording browser actions (clicks, scrolls, navigation), then export as an animated GIF with visual overlays (click indicators, action labels, progress bar, watermark). All operations are scoped to the tab's group. When starting recording, take a screenshot immediately after to capture the initial state as the first frame. When stopping recording, take a screenshot immediately before to capture the final state as the last frame. For export, either provide 'coordinate' to drag/drop upload to a page element, or set 'download: true' to download the GIF.",
-  {
-    action: z.enum(["start_recording", "stop_recording", "export", "clear"]).describe("Action to perform: 'start_recording' (begin capturing), 'stop_recording' (stop capturing but keep frames), 'export' (generate and export GIF), 'clear' (discard frames)"),
-    tabId: z.number().describe("Tab ID to identify which tab group this operation applies to"),
-    download: z.boolean().optional().describe("Always set this to true for the 'export' action only. This causes the gif to be downloaded in the browser."),
-    filename: z.string().optional().describe("Optional filename for exported GIF (default: 'recording-[timestamp].gif'). For 'export' action only."),
-    options: z.object({
-      showClickIndicators: z.boolean().optional().describe("Show orange circles at click locations (default: true)"),
-      showDragPaths: z.boolean().optional().describe("Show red arrows for drag actions (default: true)"),
-      showActionLabels: z.boolean().optional().describe("Show black labels describing actions (default: true)"),
-      showProgressBar: z.boolean().optional().describe("Show orange progress bar at bottom (default: true)"),
-      showWatermark: z.boolean().optional().describe("Show Claude logo watermark (default: true)"),
-      quality: z.number().optional().describe("GIF compression quality, 1-30 (lower = better quality, slower encoding). Default: 10"),
-    }).optional().describe("Optional GIF enhancement options for 'export' action. Properties: showClickIndicators (bool), showDragPaths (bool), showActionLabels (bool), showProgressBar (bool), showWatermark (bool), quality (number 1-30). All default to true except quality (default: 10)."),
-  },
-  async (args) => callTool("gif_creator", args)
-);
-
-// 9. javascript_tool
-server.tool(
-  "javascript_tool",
-  "Execute JavaScript code in the context of the current page. The code runs in the page's context and can interact with the DOM, window object, and page variables. Returns the result of the last expression or any thrown errors. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
-  {
-    action: z.literal("javascript_exec").describe("Must be set to 'javascript_exec'"),
-    text: z.string().describe("The JavaScript code to execute. The code will be evaluated in the page context. The result of the last expression will be returned automatically. Do NOT use 'return' statements - just write the expression you want to evaluate (e.g., 'window.myData.value' not 'return window.myData.value'). You can access and modify the DOM, call page functions, and interact with page variables."),
-    tabId: z.number().describe("Tab ID to execute the code in. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
-  },
-  async (args) => callTool("javascript_tool", args)
-);
-
-// 10. read_console_messages
-server.tool(
-  "read_console_messages",
-  "Read browser console messages (console.log, console.error, console.warn, etc.) from a specific tab. Useful for debugging JavaScript errors, viewing application logs, or understanding what's happening in the browser console. Returns console messages from the current domain only. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs. IMPORTANT: Always provide a pattern to filter messages - without a pattern, you may get too many irrelevant messages.",
-  {
-    tabId: z.number().describe("Tab ID to read console messages from. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
-    pattern: z.string().optional().describe("Regex pattern to filter console messages. Only messages matching this pattern will be returned (e.g., 'error|warning' to find errors and warnings, 'MyApp' to filter app-specific logs). You should always provide a pattern to avoid getting too many irrelevant messages."),
-    limit: z.number().optional().describe("Maximum number of messages to return. Defaults to 100. Increase only if you need more results."),
-    onlyErrors: z.boolean().optional().describe("If true, only return error and exception messages. Default is false (return all message types)."),
-    clear: z.boolean().optional().describe("If true, clear the console messages after reading to avoid duplicates on subsequent calls. Default is false."),
-  },
-  async (args) => callTool("read_console_messages", args)
-);
-
-// 11. read_network_requests
-server.tool(
-  "read_network_requests",
-  "Read HTTP network requests (XHR, Fetch, documents, images, etc.) from a specific tab. Useful for debugging API calls, monitoring network activity, or understanding what requests a page is making. Returns all network requests made by the current page, including cross-origin requests. Requests are automatically cleared when the page navigates to a different domain. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
-  {
-    tabId: z.number().describe("Tab ID to read network requests from. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
-    urlPattern: z.string().optional().describe("Optional URL pattern to filter requests. Only requests whose URL contains this string will be returned (e.g., '/api/' to filter API calls, 'example.com' to filter by domain)."),
-    limit: z.number().optional().describe("Maximum number of requests to return. Defaults to 100. Increase only if you need more results."),
-    clear: z.boolean().optional().describe("If true, clear the network requests after reading to avoid duplicates on subsequent calls. Default is false."),
-  },
-  async (args) => callTool("read_network_requests", args)
-);
-
-// 12. read_page
 server.tool(
   "read_page",
-  "Get an accessibility tree representation of elements on the page. By default returns all elements including non-visible ones. Output is limited to 50000 characters by default. If the output exceeds this limit, you will receive an error asking you to specify a smaller depth or focus on a specific element using ref_id. Optionally filter for only interactive elements. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
+  "Accessibility-tree view of the page with element refs. Use filter:\"interactive\" for just buttons/links/inputs. Output is capped; narrow with depth or ref_id if it truncates.",
   {
-    tabId: z.number().describe("Tab ID to read from. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
-    filter: z.enum(["interactive", "all"]).optional().describe('Filter elements: "interactive" for buttons/links/inputs only, "all" for all elements including non-visible ones (default: all elements)'),
-    depth: z.number().optional().describe("Maximum depth of the tree to traverse (default: 15). Use a smaller depth if output is too large."),
-    ref_id: z.string().optional().describe("Reference ID of a parent element to read. Will return the specified element and all its children. Use this to focus on a specific part of the page when output is too large."),
-    max_chars: z.number().optional().describe("Maximum characters for output (default: 50000). Set to a higher value if your client can handle large outputs."),
+    tabId: tabIdParam,
+    filter: z.enum(["interactive", "all"]).optional().describe('"interactive" or "all" (default).'),
+    depth: n.optional().describe("Max tree depth (default 15)."),
+    ref_id: z.string().optional().describe("Read only this element's subtree."),
+    max_chars: n.optional().describe("Output cap (default 50000)."),
   },
-  async (args) => callTool("read_page", args)
+  (a) => callTool("read_page", a),
 );
 
-// 13. resize_window
+server.tool(
+  "javascript_tool",
+  "Evaluate a JavaScript expression in the page and return its value. Write an expression (no `return`); promises are awaited.",
+  { action: z.literal("javascript_exec").describe("Must be 'javascript_exec'."), text: z.string().describe("Expression to evaluate."), tabId: tabIdParam },
+  (a) => callTool("javascript_tool", a),
+);
+
+server.tool(
+  "read_console_messages",
+  "Read captured console output for a tab. Always pass a pattern to avoid noise.",
+  {
+    tabId: tabIdParam,
+    pattern: z.string().optional().describe("Regex filter."),
+    limit: n.optional().describe("Max messages (default 100)."),
+    onlyErrors: z.boolean().optional().describe("Only errors/exceptions."),
+    clear: z.boolean().optional().describe("Clear the buffer after reading."),
+  },
+  (a) => callTool("read_console_messages", a),
+);
+
+server.tool(
+  "read_network_requests",
+  "Read HTTP requests captured for a tab (recorded from the first time this tool is called on that tab).",
+  {
+    tabId: tabIdParam,
+    urlPattern: z.string().optional().describe("Substring URL filter."),
+    limit: n.optional().describe("Max requests (default 100)."),
+    clear: z.boolean().optional().describe("Clear the buffer after reading."),
+  },
+  (a) => callTool("read_network_requests", a),
+);
+
 server.tool(
   "resize_window",
-  "Resize the current browser window to specified dimensions. Useful for testing responsive designs or setting up specific screen sizes. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
-  {
-    width: z.number().describe("Target window width in pixels"),
-    height: z.number().describe("Target window height in pixels"),
-    tabId: z.number().describe("Tab ID to get the window for. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
-  },
-  async (args) => callTool("resize_window", args)
+  "Resize the browser window / viewport.",
+  { width: n.describe("Width px."), height: n.describe("Height px."), tabId: tabIdParam },
+  (a) => callTool("resize_window", a),
 );
 
-// 14. shortcuts_list
-server.tool(
-  "shortcuts_list",
-  "List all available shortcuts and workflows (shortcuts and workflows are interchangeable). Returns shortcuts with their commands, descriptions, and whether they are workflows. Use shortcuts_execute to run a shortcut or workflow.",
-  {
-    tabId: z.number().describe("Tab ID to list shortcuts from. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
-  },
-  async (args) => callTool("shortcuts_list", args)
-);
-
-// 15. shortcuts_execute
-server.tool(
-  "shortcuts_execute",
-  "Execute a shortcut or workflow by running it in a new sidepanel window using the current tab (shortcuts and workflows are interchangeable). Use shortcuts_list first to see available shortcuts. This starts the execution and returns immediately - it does not wait for completion.",
-  {
-    tabId: z.number().describe("Tab ID to execute the shortcut on. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
-    shortcutId: z.string().optional().describe("The ID of the shortcut to execute"),
-    command: z.string().optional().describe("The command name of the shortcut to execute (e.g., 'debug', 'summarize'). Do not include the leading slash."),
-  },
-  async (args) => callTool("shortcuts_execute", args)
-);
-
-// 16. switch_browser
-server.tool(
-  "switch_browser",
-  "Switch which Chrome browser is used for browser automation. Call this when the user wants to connect to a different Chrome browser. Broadcasts a connection request to all Chrome browsers with the extension installed - the user clicks 'Connect' in the desired browser.",
-  {},
-  async (args) => callTool("switch_browser", args)
-);
-
-// 17. update_plan
-server.tool(
-  "update_plan",
-  "Present a plan to the user for approval before taking actions. The user will see the domains you intend to visit and your approach. Once approved, you can proceed with actions on the approved domains without additional permission prompts.",
-  {
-    domains: z.array(z.string()).describe("List of domains you will visit (e.g., ['github.com', 'stackoverflow.com']). These domains will be approved for the session when the user accepts the plan."),
-    approach: z.array(z.string()).describe("High-level description of what you will do. Focus on outcomes and key actions, not implementation details. Be concise - aim for 3-7 items."),
-  },
-  async (args) => callTool("update_plan", args)
-);
-
-// 18. upload_image
 server.tool(
   "upload_image",
-  "Upload a previously captured screenshot or user-uploaded image to a file input or drag & drop target. Supports two approaches: (1) ref - for targeting specific elements, especially hidden file inputs, (2) coordinate - for drag & drop to visible locations like Google Docs. Provide either ref or coordinate, not both.",
+  "Upload a previously captured screenshot to a file input identified by its ref.",
   {
-    imageId: z.string().describe("ID of a previously captured screenshot (from the computer tool's screenshot action) or a user-uploaded image"),
-    tabId: z.number().describe("Tab ID where the target element is located. This is where the image will be uploaded to."),
-    ref: z.string().optional().describe('Element reference ID from read_page or find tools (e.g., "ref_1", "ref_2"). Use this for file inputs (especially hidden ones) or specific elements. Provide either ref or coordinate, not both.'),
-    coordinate: z.array(z.number()).optional().describe("Viewport coordinates [x, y] for drag & drop to a visible location. Use this for drag & drop targets like Google Docs. Provide either ref or coordinate, not both."),
-    filename: z.string().optional().describe('Optional filename for the uploaded file (default: "image.png")'),
+    imageId: z.string().describe("Screenshot ID from computer's screenshot action."),
+    tabId: tabIdParam,
+    ref: z.string().optional().describe("Ref of the <input type=file> element."),
+    filename: z.string().optional().describe('Filename (default "image.png").'),
   },
-  async (args) => callTool("upload_image", args)
+  (a) => callTool("upload_image", a),
 );
 
-// ── HTTP bridge ─────────────────────────────────────────────────────
-// Extension polls for tool requests via GET /pending and POSTs results
-// to /result.  This bypasses native messaging entirely.
-const HTTP_PORT = TCP_PORT + 1;
-const pendingHttpRequests = new Map(); // id -> { resolve, reject, timer }
-
-const httpServer = http.createServer(async (req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-
-  if (req.method === "OPTIONS") {
-    res.writeHead(200); res.end(); return;
-  }
-
-  // Extension polls for pending work
-  if (req.method === "GET" && req.url === "/pending") {
-    // Take the oldest pending request
-    if (pendingHttpRequests.size === 0) {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ pending: false }));
-      return;
-    }
-    const [id, entry] = pendingHttpRequests.entries().next().value;
-    pendingHttpRequests.delete(id);
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ pending: true, id, tool: entry.tool, args: entry.args }));
-    return;
-  }
-
-  // Extension posts a result
-  if (req.method === "POST" && req.url === "/result") {
-    try {
-      const body = await readBody(req);
-      const { id, result, error } = JSON.parse(body);
-      const entry = pendingRequests.get(id);
-      if (entry) {
-        clearTimeout(entry.timer);
-        pendingRequests.delete(id);
-        if (error) entry.reject(new Error(error));
-        else entry.resolve(result);
-      }
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true }));
-    } catch (e) {
-      res.writeHead(400);
-      res.end(JSON.stringify({ ok: false, error: e.message }));
-    }
-    return;
-  }
-
-  res.writeHead(404); res.end("not found");
-});
-
-httpServer.listen(HTTP_PORT, "127.0.0.1", () => {
-  process.stderr.write(`HTTP bridge listening on :${HTTP_PORT}\n`);
-});
-
-function readBody(req) {
-  return new Promise((resolve) => {
-    let data = "";
-    req.on("data", (chunk) => (data += chunk));
-    req.on("end", () => resolve(data));
-  });
+// ── Lifecycle ───────────────────────────────────────────────────────────────
+let shuttingDown = false;
+async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  await controller.shutdown();
+  process.exit(0);
 }
-
-// Modified sendToExtension: tries native host first, falls back to
-// HTTP polling queue for the extension to pick up.
-function sendToExtension(tool, args) {
-  return new Promise((resolve, reject) => {
-    const id = String(++requestIdCounter);
-    const timer = setTimeout(() => {
-      pendingRequests.delete(id);
-      pendingHttpRequests.delete(id);
-      reject(new Error("Tool request timed out after 60s"));
-    }, 60000);
-    pendingRequests.set(id, { resolve, reject, timer, tool, args, resent: false });
-
-    if (mode === "primary") {
-      if (nativeHostSocket && !nativeHostSocket.destroyed) {
-        // Native host connected — fast path
-        nativeHostSocket.write(JSON.stringify({ id, type: "tool_request", tool, args }) + "\n");
-        return;
-      }
-
-      // No native host. Queue for HTTP polling by extension.
-      autoLaunchBrowser();
-      pendingHttpRequests.set(id, { tool, args });
-      return;
-    }
-
-    if (!primarySocket || primarySocket.destroyed) {
-      clearTimeout(timer);
-      pendingRequests.delete(id);
-      reject(new Error("Lost connection to primary MCP server."));
-      return;
-    }
-    primarySocket.write(JSON.stringify({ id, type: "tool_request", tool, args }) + "\n");
-  });
-}
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
+process.on("SIGHUP", shutdown);
+process.stdin.on("close", shutdown);
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
+log("MCP server ready (browser launches lazily on first tool call)");

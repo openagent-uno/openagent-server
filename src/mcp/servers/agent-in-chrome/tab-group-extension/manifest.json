@@ -1,0 +1,8 @@
+{
+  "manifest_version": 3,
+  "name": "OpenAgent Tab Group",
+  "version": "1.0.0",
+  "description": "Cosmetic only: collects OpenAgent's tabs into a labelled 'OpenAgent' tab group so it's visible which tabs the agent is driving. No automation — all browser control is done over CDP, independent of this extension.",
+  "permissions": ["tabs", "tabGroups"],
+  "background": { "service_worker": "background.js" }
+}

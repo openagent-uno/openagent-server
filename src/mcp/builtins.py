@@ -457,128 +457,6 @@ def _find_node_binary() -> str | None:
     return shutil.which("node")
 
 
-def _resolve_subprocess_python() -> str | None:
-    """Return an executable suitable for running a bundled ``*.py`` script.
-
-    In a PyInstaller frozen bundle ``sys.executable`` is the openagent CLI
-    binary, not a Python interpreter — handing it a ``.py`` path makes
-    Click parse the path as a subcommand and surface a misleading
-    "No such command" error. Fall back to a system Python in that case.
-    Returns ``None`` if the bundle is frozen and no system Python is on
-    PATH, signalling that the caller should skip the subprocess.
-    """
-    if not is_frozen():
-        return sys.executable
-    for name in ("python3", "python"):
-        found = shutil.which(name)
-        if found:
-            return found
-    return None
-
-
-def _run_agent_in_chrome_auto_setup(base_dir: Path) -> None:
-    """Run the idempotent auto-setup for agent-in-chrome.
-
-    Two phases (both safe to run on every startup):
-
-    1. **Native messaging** — installs native messaging host manifests for
-       all detected Chromium browsers (auto-setup.sh / auto-setup.ps1).
-
-    2. **Extension installation** — modifies each browser's Preferences
-       file to permanently install the unpacked extension so the user
-       never has to touch ``chrome://extensions``.  If a browser is
-       running, it is gracefully closed before Preferences are modified
-       and then relaunched (one-time, only when the extension isn't
-       already present).
-    """
-    # --- Phase 1: native messaging manifests ---------------------------
-    if platform.system() == "Windows":
-        script = base_dir / "auto-setup.ps1"
-        if not script.exists():
-            logger.warning("agent-in-chrome: auto-setup.ps1 not found at %s", script)
-        else:
-            try:
-                subprocess.run(
-                    ["powershell", "-ExecutionPolicy", "Bypass", "-File", str(script)],
-                    cwd=str(base_dir),
-                    check=False,
-                    capture_output=True,
-                    timeout=30,
-                )
-            except subprocess.TimeoutExpired:
-                logger.warning("agent-in-chrome: native messaging setup timed out")
-            except Exception as exc:
-                logger.warning("agent-in-chrome: native messaging setup failed: %s", exc)
-    else:
-        script = base_dir / "auto-setup.sh"
-        if not script.exists():
-            logger.warning("agent-in-chrome: auto-setup.sh not found at %s", script)
-        else:
-            if not os.access(script, os.X_OK):
-                script.chmod(0o755)
-            try:
-                subprocess.run(
-                    ["bash", str(script)],
-                    cwd=str(base_dir),
-                    check=False,
-                    capture_output=True,
-                    timeout=30,
-                )
-            except subprocess.TimeoutExpired:
-                logger.warning("agent-in-chrome: native messaging setup timed out")
-            except Exception as exc:
-                logger.warning("agent-in-chrome: native messaging setup failed: %s", exc)
-
-    # --- Phase 2: launch dedicated Chrome with extension pre-loaded ---
-    # Uses --load-extension with an isolated profile so the user's main
-    # browser is untouched.  No file modification — Chrome's own flag
-    # loads the extension.  On subsequent starts this is a no-op when
-    # the dedicated Chrome is already running.
-    #
-    # The first run downloads ~150 MB of Chromium, which may take a
-    # while over slow or relayed connections.  A long timeout + a
-    # background thread keeps the bootstrap loop from blocking other
-    # MCP servers while the download completes.
-    launcher = base_dir / "auto-install-extension.py"
-    if not launcher.exists():
-        logger.warning("agent-in-chrome: auto-install-extension.py not found at %s", launcher)
-        return
-
-    python_exe = _resolve_subprocess_python()
-    if python_exe is None:
-        logger.warning(
-            "agent-in-chrome: skipping Chromium auto-install — no system python3 "
-            "found on PATH (frozen bundle cannot use itself as a Python interpreter)"
-        )
-        return
-
-    import threading
-
-    def _launch_chrome_worker() -> None:
-        try:
-            proc = subprocess.run(
-                [python_exe, str(launcher)],
-                cwd=str(base_dir),
-                check=False,
-                capture_output=True,
-                timeout=180,       # 3 min for ~150 MB download over slow links
-            )
-            if proc.stdout:
-                for line in proc.stdout.decode(errors="replace").splitlines():
-                    if line.strip():
-                        logger.info("agent-in-chrome: %s", line.strip())
-            if proc.stderr:
-                for line in proc.stderr.decode(errors="replace").splitlines():
-                    if line.strip():
-                        logger.warning("agent-in-chrome: %s", line.strip())
-        except subprocess.TimeoutExpired:
-            logger.warning("agent-in-chrome: Chrome launch timed out (180 s)")
-        except Exception as exc:
-            logger.warning("agent-in-chrome: Chrome launch failed: %s", exc)
-
-    threading.Thread(target=_launch_chrome_worker, name="agent-in-chrome-setup", daemon=True).start()
-
-
 def resolve_builtin_entry(name: str, env: dict[str, str] | None = None) -> dict[str, Any]:
     """Resolve a built-in MCP by name into MCPTools kwargs."""
     if name not in BUILTIN_MCP_SPECS:
@@ -645,12 +523,9 @@ def resolve_builtin_entry(name: str, env: dict[str, str] | None = None) -> dict[
             logger.info("Building built-in MCP '%s'...", name)
             subprocess.run(spec["build"], cwd=mcp_dir, check=True, capture_output=True)
 
-        # Auto-setup native messaging for agent-in-chrome (idempotent).
-        # This installs native messaging host manifests for all detected
-        # Chromium browsers and creates launch wrappers so the user doesn't
-        # need to manually load the extension or run install scripts.
-        if name == "agent-in-chrome":
-            _run_agent_in_chrome_auto_setup(mcp_dir.parent)
+        # agent-in-chrome launches its dedicated browser lazily, on the
+        # first browser tool call (see host/mcp-server.js) — never at server
+        # startup. Nothing to auto-set-up here.
 
     cmd_list = list(spec["command"])
     if is_python and cmd_list and cmd_list[0] in ("python3", "python"):
