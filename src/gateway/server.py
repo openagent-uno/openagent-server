@@ -1035,6 +1035,7 @@ class Gateway:
                 elif t == P.COMMAND:
                     cmd_name = data.get("name", "")
                     cmd_sid = data.get("session_id")
+                    cmd_arg = data.get("arg") or None
                     elog(
                         "command.received",
                         client_id=client_id,
@@ -1044,6 +1045,7 @@ class Gateway:
                     await self._handle_command(
                         ws, client_id, cmd_name, cmd_sid,
                         handle=cert.handle,
+                        arg=cmd_arg,
                     )
 
                 # Stream protocol — typed event frames. Every text/voice/
@@ -1121,7 +1123,7 @@ class Gateway:
 
     async def _handle_command(
         self, ws, client_id: str, name: str, session_id: str | None = None,
-        *, handle: str | None = None,
+        *, handle: str | None = None, arg: str | None = None,
     ) -> None:
         """Dispatch a WS command.
 
@@ -1241,6 +1243,86 @@ class Gateway:
             control.request_restart(self, source="ws_command")
         elif name == "help":
             text = command_help_text()
+        elif name == "compact":
+            if not session_id:
+                text = "No active session to compact."
+            else:
+                try:
+                    from src.core.compaction import compact as _compact
+                    result = await _compact(
+                        session_id,
+                        self.agent.model,
+                        self.agent,
+                    )
+                    if result is None:
+                        text = "Nothing to compact — conversation is already short."
+                    else:
+                        folded = result.get("folded_runs", 0)
+                        kept = result.get("kept_runs", 0)
+                        chars = result.get("summary_chars", 0)
+                        text = (
+                            f"Compacted conversation history: folded {folded} older turn"
+                            f"{'s' if folded != 1 else ''} into a recap "
+                            f"({chars:,} chars), kept {kept} recent turn"
+                            f"{'s' if kept != 1 else ''}."
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    text = f"Compaction failed: {exc}"
+        elif name == "model":
+            if not session_id:
+                text = "No active session — cannot read or change model pin."
+            else:
+                db = getattr(self.agent, "memory_db", None)
+                if db is None:
+                    text = "Memory DB not available."
+                elif arg is None or arg.strip() == "":
+                    # List configured models + current pin
+                    try:
+                        models = await db.list_models(enabled_only=True)
+                        current_pin = await db.get_session_pin(session_id)
+                        if not models:
+                            text = "No models configured."
+                        else:
+                            lines = ["Configured models (enabled):"]
+                            for m in models:
+                                rid = m.get("runtime_id") or ""
+                                disp = m.get("display_name") or m.get("model") or rid
+                                pin_marker = " ← active" if rid == current_pin else ""
+                                lines.append(f"  • {rid}  ({disp}){pin_marker}")
+                            if not current_pin:
+                                lines.append("Current: SmartRouter default (no pin)")
+                            lines.append("Usage: /model <runtime_id> | /model default")
+                            text = "\n".join(lines)
+                    except Exception as exc:  # noqa: BLE001
+                        text = f"Failed to list models: {exc}"
+                elif arg.strip().lower() in ("default", "none", "reset"):
+                    try:
+                        await db.unpin_session_model(session_id)
+                        text = "Model pin cleared — SmartRouter will pick the best model."
+                    except Exception as exc:  # noqa: BLE001
+                        text = f"Failed to clear model pin: {exc}"
+                else:
+                    runtime_id = arg.strip()
+                    try:
+                        model_row = await db.get_model_by_runtime_id(runtime_id)
+                        if model_row is None:
+                            # Invalid — list valid options
+                            models = await db.list_models(enabled_only=True)
+                            valid = [m.get("runtime_id") or "" for m in models if m.get("runtime_id")]
+                            text = (
+                                f"Unknown model {runtime_id!r}. "
+                                f"Valid options: {', '.join(valid) or '(none configured)'}"
+                            )
+                        elif not model_row.get("enabled"):
+                            text = f"Model {runtime_id!r} is disabled — enable it first."
+                        else:
+                            await db.pin_session_model(session_id, runtime_id)
+                            disp = model_row.get("display_name") or model_row.get("model") or runtime_id
+                            text = f"Switched to {disp} ({runtime_id}) for this session."
+                    except ValueError as exc:
+                        text = f"Cannot pin model: {exc}"
+                    except Exception as exc:  # noqa: BLE001
+                        text = f"Failed to switch model: {exc}"
         else:
             text = f"Unknown command: {name}"
         elog("command.result", client_id=client_id, name=name, text=text)

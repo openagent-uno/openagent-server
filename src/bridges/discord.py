@@ -104,8 +104,11 @@ class DiscordBridge(BaseBridge):
         # ── Register slash commands ──
 
         def _make_command_handler(command_name: str):
-            async def _handler(interaction: discord.Interaction) -> None:
-                await self._handle_slash(interaction, command_name)
+            async def _handler(
+                interaction: discord.Interaction,
+                arg: str | None = None,
+            ) -> None:
+                await self._handle_slash(interaction, command_name, arg=arg)
 
             _handler.__name__ = f"_cmd_{command_name.replace('-', '_')}"
             return _handler
@@ -287,17 +290,17 @@ class DiscordBridge(BaseBridge):
         except Exception as e:  # noqa: BLE001
             logger.error("Discord file send error: %s", e)
 
-    async def _handle_slash(self, interaction, cmd: str) -> None:
+    async def _handle_slash(self, interaction, cmd: str, *, arg: str | None = None) -> None:
         """Handle a Discord slash command via the Gateway."""
         uid = str(interaction.user.id)
         if uid not in self.allowed_users:
             await interaction.response.send_message("Unauthorized.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
-        # Scope /stop, /clear, /new, /reset to THIS user's session so a
-        # command from user A doesn't wipe user B's conversation on the
-        # same bot.
-        result = await self.send_command(cmd, session_id=f"dc:{uid}")
+        # Scope /stop, /clear, /new, /reset, /compact, /model to THIS user's
+        # session so a command from user A doesn't wipe user B's conversation.
+        # Forward any inline argument (e.g. /model gpt-4o) via the arg field.
+        result = await self.send_command(cmd, session_id=f"dc:{uid}", arg=arg or None)
         await interaction.followup.send(result, ephemeral=True)
 
     async def stop(self) -> None:

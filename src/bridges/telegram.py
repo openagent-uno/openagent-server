@@ -625,7 +625,10 @@ class TelegramBridge(BaseBridge):
             return
         # Scope scope-sensitive commands to just the user who issued them.
         # Other users on the same bot keep their own conversations.
-        result = await self.send_command(cmd, session_id=f"tg:{user_id}")
+        # Forward any inline argument (e.g. /model gpt-4o) via the arg field.
+        raw_args = getattr(context, "args", None) or []
+        cmd_arg = " ".join(raw_args) if raw_args else None
+        result = await self.send_command(cmd, session_id=f"tg:{user_id}", arg=cmd_arg)
         await self.send_response_text(update.message, result)
 
     async def _on_export(self, update, context) -> None:

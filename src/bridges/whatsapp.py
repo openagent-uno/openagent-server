@@ -108,7 +108,12 @@ class WhatsAppBridge(BaseBridge):
                     # Scope scope-sensitive commands to this user's
                     # session so one WhatsApp contact's /clear doesn't
                     # wipe another's conversation on the same bot.
-                    result = await self.send_command(cmd, session_id=f"wa:{user_id}")
+                    # Forward any inline argument (e.g. /model gpt-4o).
+                    wa_parts = text.strip()[1:].split(None, 1)
+                    wa_arg = wa_parts[1] if len(wa_parts) > 1 else None
+                    result = await self.send_command(
+                        cmd, session_id=f"wa:{user_id}", arg=wa_arg,
+                    )
                     await self._send_text(chat_id, result)
                 return
         elif msg_type in ("audioMessage", "voiceMessage"):

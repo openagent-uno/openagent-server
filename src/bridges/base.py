@@ -1254,15 +1254,20 @@ class BaseBridge:
             return text
         return f"{voice_marker}\n{text}"
 
-    async def send_command(self, name: str, session_id: str | None = None) -> str:
+    async def send_command(
+        self, name: str, session_id: str | None = None, arg: str | None = None,
+    ) -> str:
         """Send a command and wait for the result.
 
         ``session_id`` is forwarded to the gateway so scope-sensitive
-        commands (``stop``, ``clear``, ``new``, ``reset``) can be limited to
-        the specific bridge user who issued them. Bridges that multiplex
-        many users onto a single ``client_id`` (telegram, discord) MUST
-        pass the user's session_id here; otherwise a ``/clear`` from one
-        user wipes everyone else's conversation.
+        commands (``stop``, ``clear``, ``new``, ``reset``, ``compact``,
+        ``model``) can be limited to the specific bridge user who issued
+        them. Bridges that multiplex many users onto a single ``client_id``
+        (telegram, discord) MUST pass the user's session_id here; otherwise
+        a ``/clear`` from one user wipes everyone else's conversation.
+
+        ``arg`` is an optional positional argument forwarded verbatim to the
+        gateway (e.g. the runtime_id for ``/model <id>``).
         """
         async with self._command_lock:
             future: asyncio.Future = asyncio.get_running_loop().create_future()
@@ -1270,6 +1275,8 @@ class BaseBridge:
             payload: dict = {"type": P.COMMAND, "name": name}
             if session_id is not None:
                 payload["session_id"] = session_id
+            if arg is not None:
+                payload["arg"] = arg
             try:
                 await self._send_gateway_json(payload)
             except Exception:

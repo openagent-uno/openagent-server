@@ -25,6 +25,8 @@ COMMAND_SPECS = (
     GatewayCommandSpec("update", "Check for updates and install", "check for updates and install"),
     GatewayCommandSpec("restart", "Restart OpenAgent", "restart OpenAgent"),
     GatewayCommandSpec("help", "Show available commands", "show this help message"),
+    GatewayCommandSpec("compact", "Summarize & compress the conversation to free up context", "fold older turns into a recap to free context"),
+    GatewayCommandSpec("model", "Switch the model for this conversation", "list configured models or switch: /model <id>"),
 )
 
 COMMAND_MAP = {spec.name: spec for spec in COMMAND_SPECS}

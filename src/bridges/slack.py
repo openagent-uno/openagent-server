@@ -162,8 +162,11 @@ class SlackBridge(BaseBridge):
                     await respond("Unauthorized.")
                     return
                 try:
+                    # Slack puts any text after the command name in
+                    # command["text"] (e.g. "/model gpt-4o" → "gpt-4o").
+                    slack_arg = (command.get("text") or "").strip() or None
                     result = await self.send_command(
-                        command_name, session_id=f"sl:{uid}",
+                        command_name, session_id=f"sl:{uid}", arg=slack_arg,
                     )
                 except Exception as e:  # noqa: BLE001
                     logger.warning("slack /%s failed: %s", command_name, e)

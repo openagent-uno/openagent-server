@@ -513,3 +513,158 @@ async def t_status_reflects_live_turn(ctx: TestContext) -> None:
         assert "Busy" in text, f"expected Busy mid-turn, got: {text!r}"
     finally:
         await channel.close()
+
+
+# ── /compact ────────────────────────────────────────────────────────────
+
+
+@test("gateway_commands", "/compact without session_id returns error")
+async def t_compact_no_session(ctx: TestContext) -> None:
+    h = _Harness()
+    text = await h.run_command("device:x", "compact", session_id=None)
+    assert "no active session" in text.lower(), text
+
+
+@test("gateway_commands", "/compact with session_id returns 'nothing to compact' when history is short")
+async def t_compact_short_history(ctx: TestContext) -> None:
+    """The real compact() bails out when there are too few runs to fold.
+    With a fresh test session there are zero stored runs, so compact()
+    returns None and we expect the 'nothing to compact' message.
+    """
+    import tempfile, os
+    from src.gateway.server import Gateway
+    from src.gateway.sessions import SessionManager
+
+    # Build a real MemoryDB in a temp dir so compact() can resolve a db_path.
+    with tempfile.TemporaryDirectory() as tmp:
+        from src.memory.db import MemoryDB
+        db_path = os.path.join(tmp, "test.db")
+        db = MemoryDB(db_path)
+        await db.connect()
+
+        class _AgentWithDB:
+            name = "test"
+            _db = db
+            _initialized = True
+
+            @property
+            def memory_db(self):
+                return self._db
+
+            @property
+            def model(self):
+                return None
+
+            def known_model_session_ids(self):
+                return []
+
+            async def forget_session(self, sid):
+                pass
+
+        server = Gateway.__new__(Gateway)
+        server.sessions = SessionManager(agent_name="test")
+        server.agent = _AgentWithDB()
+        server.clients = {}
+        server._stream_sessions = {}
+        captured: list[str] = []
+
+        async def _capture(_ws, payload):
+            if payload.get("type") == "command_result":
+                captured.append(payload.get("text", ""))
+
+        server._safe_ws_send_json = _capture
+
+        class _WS:
+            pass
+
+        sid = server.sessions.get_or_create_session("device:t", "u1")
+        await server._handle_command(_WS(), "device:t", "compact", sid)
+        assert captured, "no command_result sent"
+        text = captured[0]
+        # compact() returns None when there are too few runs — we expect the
+        # friendly 'nothing to compact' message.
+        assert "nothing to compact" in text.lower() or "compacted" in text.lower(), text
+        await db.close()
+
+
+# ── /model ─────────────────────────────────────────────────────────────
+
+
+@test("gateway_commands", "/model without session_id returns error")
+async def t_model_no_session(ctx: TestContext) -> None:
+    h = _Harness()
+    text = await h.run_command("device:x", "model", session_id=None)
+    assert "no active session" in text.lower(), text
+
+
+@test("gateway_commands", "/model without session_id returns error (arg path)")
+async def t_model_no_session_with_arg(ctx: TestContext) -> None:
+    """Passing an arg without a session_id should still return the same error."""
+    h = _Harness()
+    # The _Harness.run_command doesn't thread arg through; call the server
+    # directly.
+    from src.gateway.server import Gateway
+    from src.gateway.sessions import SessionManager
+
+    server = Gateway.__new__(Gateway)
+    server.sessions = SessionManager(agent_name="test")
+    server.agent = h.agent
+    server.clients = {}
+    server._stream_sessions = {}
+    captured: list[str] = []
+
+    async def _capture(_ws, payload):
+        if payload.get("type") == "command_result":
+            captured.append(payload.get("text", ""))
+
+    server._safe_ws_send_json = _capture
+
+    class _WS:
+        pass
+
+    await server._handle_command(_WS(), "device:x", "model", None, arg="openai:gpt-4o")
+    assert captured, "no command_result sent"
+    assert "no active session" in captured[0].lower(), captured[0]
+
+
+@test("gateway_commands", "/model with session_id but no db returns error")
+async def t_model_no_db(ctx: TestContext) -> None:
+    """When memory_db is None (agent has no DB), /model must fail gracefully."""
+    from src.gateway.server import Gateway
+    from src.gateway.sessions import SessionManager
+
+    class _AgentNoDB:
+        name = "test"
+        _initialized = True
+        model = None
+
+        @property
+        def memory_db(self):
+            return None
+
+        def known_model_session_ids(self):
+            return []
+
+        async def forget_session(self, sid):
+            pass
+
+    server = Gateway.__new__(Gateway)
+    server.sessions = SessionManager(agent_name="test")
+    server.agent = _AgentNoDB()
+    server.clients = {}
+    server._stream_sessions = {}
+    captured: list[str] = []
+
+    async def _capture(_ws, payload):
+        if payload.get("type") == "command_result":
+            captured.append(payload.get("text", ""))
+
+    server._safe_ws_send_json = _capture
+
+    class _WS:
+        pass
+
+    sid = server.sessions.get_or_create_session("device:t", "u1")
+    await server._handle_command(_WS(), "device:t", "model", sid)
+    assert captured, "no command_result sent"
+    assert "not available" in captured[0].lower() or "memory db" in captured[0].lower(), captured[0]
