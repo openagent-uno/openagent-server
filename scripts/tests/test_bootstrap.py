@@ -113,9 +113,20 @@ async def t_pool_loads_vault(ctx: TestContext) -> None:
     write a row that ``_specs_from_db`` then rejects (e.g. missing command
     after column-shape changes), and the agent would still come up
     without the vault MCP — exactly the bug we're fixing."""
+    import os
+
     from src.mcp.pool import MCPPool
     from src.memory.bootstrap import ensure_builtin_mcps
     from src.memory.db import MemoryDB
+
+    # Never let spec resolution shell out to ``cargo build --release`` for a
+    # native MCP here: a cold build of e.g. computer-control -> wayland-sys
+    # on a bare CI runner burns ~60s before failing, blowing this test's
+    # timeout even though the vault spec (a node builtin) has nothing to do
+    # with it. The build-from-source fallback is a dev-machine convenience;
+    # the CI binary is pre-staged or genuinely absent either way.
+    _prev_skip = os.environ.get("OPENAGENT_SKIP_NATIVE_BUILD")
+    os.environ["OPENAGENT_SKIP_NATIVE_BUILD"] = "1"
 
     db_path = _fresh_db_path(ctx)
     db = MemoryDB(db_path)
@@ -139,6 +150,10 @@ async def t_pool_loads_vault(ctx: TestContext) -> None:
         assert vault.command[-1].endswith("vault/dist/server.js")
     finally:
         await db.close()
+        if _prev_skip is None:
+            os.environ.pop("OPENAGENT_SKIP_NATIVE_BUILD", None)
+        else:
+            os.environ["OPENAGENT_SKIP_NATIVE_BUILD"] = _prev_skip
 
 
 # NOTE: the old ``_resolve_subprocess_python falls back to system python

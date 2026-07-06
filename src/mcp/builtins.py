@@ -129,8 +129,18 @@ def _resolve_native_binary(name: str) -> str:
         return str(path)
 
     # 3. Build from source (dev-machine fallback only).
+    #
+    # SKIP in CI / test runs. A cold ``cargo build --release`` of a native
+    # MCP (e.g. computer-control -> enigo -> wayland-sys/xkbcommon on Linux)
+    # can burn ~60s before it even fails on a bare runner that lacks the
+    # system libs. That is non-fatal (we ``raise FileNotFoundError`` and the
+    # caller skips the optional MCP), but the wall-clock cost alone blows
+    # per-test timeouts (see t_pool_loads_vault). In CI the native binary is
+    # always pre-staged (step 2) or genuinely absent, so building from source
+    # buys nothing — short-circuit straight to the not-found path.
+    _skip_native_build = os.environ.get("OPENAGENT_SKIP_NATIVE_BUILD") or os.environ.get("CI")
     cargo_toml = BUILTIN_MCPS_DIR / name / "Cargo.toml"
-    if cargo_toml.exists() and command_exists("cargo"):
+    if not _skip_native_build and cargo_toml.exists() and command_exists("cargo"):
         logger.info("Native MCP '%s' binary missing — building from source...", name)
         # Non-fatal: the crate can pull system libs (e.g. enigo -> wayland /
         # xkbcommon on Linux) that a bare CI runner or minimal host lacks. A
