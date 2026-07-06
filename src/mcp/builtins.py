@@ -132,11 +132,30 @@ def _resolve_native_binary(name: str) -> str:
     cargo_toml = BUILTIN_MCPS_DIR / name / "Cargo.toml"
     if cargo_toml.exists() and command_exists("cargo"):
         logger.info("Native MCP '%s' binary missing — building from source...", name)
-        subprocess.run(
+        # Non-fatal: the crate can pull system libs (e.g. enigo -> wayland /
+        # xkbcommon on Linux) that a bare CI runner or minimal host lacks. A
+        # failed native build must NOT abort bootstrap / the whole test suite
+        # — we just skip this optional MCP, exactly like the other fallbacks.
+        proc = subprocess.run(
             ["cargo", "build", "--release"],
             cwd=BUILTIN_MCPS_DIR / name,
-            check=True,
+            check=False,
+            capture_output=True,
+            text=True,
         )
+        if proc.returncode != 0:
+            # Raise the same signal as a genuinely-absent binary so the
+            # caller (resolve_builtin_entry -> pool/bootstrap) skips this
+            # optional MCP gracefully instead of getting a ``[None]`` argv.
+            logger.warning(
+                "Native MCP '%s' build failed (skipping this optional MCP): %s",
+                name,
+                (proc.stderr or "").strip()[-500:],
+            )
+            raise FileNotFoundError(
+                f"Native MCP '{name}' build failed; skipping. "
+                f"stderr tail: {(proc.stderr or '').strip()[-300:]}"
+            )
         built = BUILTIN_MCPS_DIR / name / "target" / "release" / bin_name
         if built.exists():
             path.parent.mkdir(parents=True, exist_ok=True)
