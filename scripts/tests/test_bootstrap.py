@@ -141,39 +141,13 @@ async def t_pool_loads_vault(ctx: TestContext) -> None:
         await db.close()
 
 
-@test("bootstrap", "_resolve_subprocess_python falls back to system python when frozen")
-async def t_resolve_subprocess_python_frozen(ctx: TestContext) -> None:
-    """In a frozen bundle ``sys.executable`` is the openagent Click CLI,
-    not a Python interpreter — calling it with a ``.py`` path makes Click
-    emit a misleading ``No such command`` error. ``_resolve_subprocess_python``
-    must look up a system python instead so the Chromium auto-install
-    subprocess actually runs Python."""
-    import src.mcp.builtins as builtins_mod
-
-    with patch.object(builtins_mod, "is_frozen", return_value=False):
-        # Non-frozen: must hand back the running interpreter unchanged.
-        import sys as _sys
-        assert builtins_mod._resolve_subprocess_python() == _sys.executable
-
-    with patch.object(builtins_mod, "is_frozen", return_value=True):
-        # Frozen + python on PATH: must hand back the system python,
-        # never ``sys.executable`` (which would be the openagent binary).
-        with patch.object(
-            builtins_mod.shutil, "which",
-            side_effect=lambda name: "/usr/bin/python3" if name == "python3" else None,
-        ):
-            resolved = builtins_mod._resolve_subprocess_python()
-            assert resolved == "/usr/bin/python3", (
-                f"frozen mode must use system python3, got {resolved!r}"
-            )
-
-        # Frozen + no system python: returns None so caller can skip cleanly
-        # instead of feeding the .py path to Click as a subcommand.
-        with patch.object(builtins_mod.shutil, "which", return_value=None):
-            resolved = builtins_mod._resolve_subprocess_python()
-            assert resolved is None, (
-                f"frozen mode with no system python must return None, got {resolved!r}"
-            )
+# NOTE: the old ``_resolve_subprocess_python falls back to system python
+# when frozen`` test was removed in v0.14.30. Commit d777046 rewrote
+# agent-in-chrome on pure CDP and DELETED ``builtins._resolve_subprocess_python``
+# (there is no longer a Python subprocess for Chromium auto-install), so the
+# test referenced a non-existent attribute and raised AttributeError on CI.
+# The frozen-vs-system interpreter choice now lives inline in
+# ``builtins`` where it builds ``cmd_list`` ([sys.executable, "_mcp-server", name]).
 
 
 @test("bootstrap", "ensure_builtin_mcps does not reset disabled rows")
