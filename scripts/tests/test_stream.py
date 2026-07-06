@@ -423,27 +423,30 @@ async def t_batched_channel(ctx: TestContext) -> None:
     from src.stream.channel import BatchedChannel
     from src.stream.session import StreamSession
 
+    async def _null(_db):
+        return None
+
     agent = _FakeAgent(["foo ", "bar"])
     sess = StreamSession(agent, client_id="c", session_id="s")
+    # Start the dispatch loop so ``BatchedChannel.run_one_shot`` drives the
+    # turn end-to-end through the real inbound -> dispatch -> outbound path,
+    # exactly like a bridge does in production. Drive it through the channel
+    # ALONE — do NOT also call ``sess.run_one_shot`` concurrently. The old
+    # test raced the channel's startup drain against a manual direct-path
+    # turn: if the manual turn published its frames (incl. TurnComplete)
+    # before the channel reached its drain-then-consume loop, the drain ate
+    # the reply and ``run_one_shot`` blocked until the 5s timeout. Ordering
+    # was environment-dependent (green on macOS, red on the ubuntu CI runner).
+    await sess.start(stt_factory=_null, tts_factory=_null)
     channel = BatchedChannel(sess)
 
-    async def driver():
-        return await channel.run_one_shot("ping")
-
-    async def runner():
-        # Drive the runner directly — the channel pushes a TextFinal,
-        # then we run_one_shot to make the assistant reply land in
-        # outbound; BatchedChannel drains it.
-        await sess.run_one_shot("ping", speak=False)
-
-    # Push the user message via the channel, run_one_shot in parallel.
-    drain = asyncio.create_task(driver())
-    await runner()
-    reply = await asyncio.wait_for(drain, timeout=5.0)
+    reply = await asyncio.wait_for(channel.run_one_shot("ping"), timeout=5.0)
 
     assert reply.text == "foo bar", reply
     assert reply.audio_bytes is None
     assert reply.model == "fake-model"
+
+    await sess.close()
 
 
 @test("stream", "wire codec drops binary payloads losslessly via base64")
