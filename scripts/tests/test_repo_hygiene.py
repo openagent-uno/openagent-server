@@ -176,6 +176,14 @@ _SMOKE_IMPORT_SKIP: frozenset[str] = frozenset({
     "src.cli",
     # Frozen-build runtime helper; some branches assume sys.frozen.
     "src._frozen",
+    # agent-federation adapters/backend import external packages that
+    # ship with the separate ``openagent-mcp`` repo (``openagent_mcp``,
+    # ``oa_agent_client``), NOT declared as server dependencies. They
+    # resolve only when that sibling package is installed at runtime; in
+    # a clean venv / CI they raise ModuleNotFoundError, which is expected
+    # and harmless (the federation MCP simply isn't available there).
+    "src.mcp.servers.agent_federation.adapters",
+    "src.mcp.servers.agent_federation.backend",
 })
 
 
