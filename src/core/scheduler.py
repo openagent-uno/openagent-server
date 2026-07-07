@@ -507,6 +507,11 @@ class Scheduler:
                     title=task_name,
                     prompt=task["prompt"],
                     owner_client_id=owner,
+                    # Optional per-task model pin: run the firing on the model
+                    # the task was configured with. NULL falls back to the
+                    # agent's default/router pick inside run_child_session,
+                    # exactly like a chat turn with no session pin.
+                    model_id=task.get("model") or None,
                     author=agent_author(task_name, agent_name=getattr(self.agent, "name", None)),
                     # Stream the firing live so its run screen fills in
                     # token-by-token like any interactive session.
@@ -827,10 +832,16 @@ class Scheduler:
 
     # ── Task management helpers ──
 
-    async def add_task(self, name: str, cron_expression: str, prompt: str) -> str:
-        """Add a new scheduled task."""
+    async def add_task(
+        self, name: str, cron_expression: str, prompt: str, model: str | None = None,
+    ) -> str:
+        """Add a new scheduled task. ``model`` is an optional runtime_id the
+        firing runs on (NULL = the agent's default/router model)."""
         now = time.time()
-        return await self.db.add_task(name, cron_expression, prompt, self._next_run(cron_expression, now))
+        return await self.db.add_task(
+            name, cron_expression, prompt,
+            self._next_run(cron_expression, now), model=model,
+        )
 
     async def list_tasks(self) -> list[dict]:
         return await self.db.get_tasks()

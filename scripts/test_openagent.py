@@ -217,6 +217,10 @@ _TEST_MODULES: tuple[str, ...] = (
     # Scheduler recording each firing's status/output preview, mirroring
     # workflow_runs. Backs GET /api/scheduled-tasks/{id}/runs.
     "test_task_runs",
+    # Optional per-run model selection: scheduled_tasks.model column (DB
+    # round-trip + idempotent ALTER migration) and delegate_task's now-optional
+    # model_id (omit → default/router model; pass one → override threaded in).
+    "test_scheduled_task_model",
     # Workflow ai-prompt must forget/release at the right moment (same
     # bug class as scheduler issue #5 but for workflows).
     "test_workflow_forgets_session",

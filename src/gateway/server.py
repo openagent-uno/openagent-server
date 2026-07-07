@@ -20,7 +20,7 @@ from src.gateway import protocol as P
 from src.gateway.commands import command_help_text
 from src.gateway.sessions import SessionManager
 from src.gateway.terminals import TerminalManager
-from src.gateway.api import vault, config, health, logs, control, usage, providers, models, scheduled_tasks, workflow_tasks, mcps, marketplace, sessions as sessions_api, system as system_api, network as network_api, chat as chat_api, terminals as terminals_api
+from src.gateway.api import vault, config, health, logs, control, usage, providers, models, scheduled_tasks, workflow_tasks, mcps, marketplace, sessions as sessions_api, system as system_api, network as network_api, chat as chat_api, terminals as terminals_api, commands as commands_api
 from src.network import peers as peers_api
 from src.network.auth.middleware import make_auth_middleware
 from src.network.transport.aiohttp_iroh_site import IrohSite
@@ -32,6 +32,24 @@ if TYPE_CHECKING:
 from src.core.logging import elog
 
 logger = logging.getLogger(__name__)
+
+
+# Explicit Content-Type fallback for the media/doc types the agent attaches via
+# ``send_file_to_user``. Used by ``/api/files`` when the stdlib ``mimetypes``
+# guess is empty (slim containers often ship no ``/etc/mime.types``), so inline
+# ``<img>``/``<video>``/``<audio>`` still get a playable type. Mirrors the
+# extension sets in ``src.mcp.servers.attachments.adapters``.
+_ATTACHMENT_MIME_FALLBACK: dict[str, str] = {
+    "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif",
+    "webp": "image/webp", "bmp": "image/bmp", "heic": "image/heic", "tiff": "image/tiff",
+    "svg": "image/svg+xml",
+    "mp4": "video/mp4", "mov": "video/quicktime", "avi": "video/x-msvideo",
+    "mkv": "video/x-matroska", "webm": "video/webm", "m4v": "video/x-m4v",
+    "mp3": "audio/mpeg", "wav": "audio/wav", "m4a": "audio/mp4", "ogg": "audio/ogg",
+    "oga": "audio/ogg", "opus": "audio/opus", "flac": "audio/flac", "aac": "audio/aac",
+    "pdf": "application/pdf", "txt": "text/plain", "md": "text/markdown",
+    "csv": "text/csv", "json": "application/json", "html": "text/html", "htm": "text/html",
+}
 
 
 @dataclass
@@ -611,6 +629,8 @@ class Gateway:
             ("DELETE", r"/api/models/{id:\d+}", models.handle_delete_db),
             ("POST", r"/api/models/{id:\d+}/enable", models.handle_enable_db),
             ("POST", r"/api/models/{id:\d+}/disable", models.handle_disable_db),
+            # Introspectable slash-command registry (for client autocomplete).
+            ("GET", "/api/commands", commands_api.handle_list),
             # DB-backed MCP registry.
             ("GET", "/api/mcps", mcps.handle_list),
             ("POST", "/api/mcps", mcps.handle_create),
@@ -916,6 +936,7 @@ class Gateway:
         """
         from aiohttp import web
         import os
+        import mimetypes
 
         # Auth is enforced by ``make_auth_middleware`` for every
         # ``/api/*`` route — by the time the handler runs the cert is
@@ -932,14 +953,71 @@ class Gateway:
         if not os.path.isfile(real):
             return web.Response(status=404, text="not found")
 
-        # Let aiohttp pick the Content-Type from the extension and stream
-        # the file from disk instead of buffering the whole thing in RAM.
-        # Expose a sensible Content-Disposition so browsers download with
-        # the original filename rather than a random hash.
-        filename = os.path.basename(real)
-        return web.FileResponse(
-            real,
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        # IMPORTANT: do NOT use ``web.FileResponse`` here. The gateway serves
+        # HTTP over a custom asyncio transport (``IrohSite`` → QUIC), which has
+        # no real socket, so ``FileResponse``'s zero-copy ``sendfile`` path is
+        # unavailable and its fallback interacts badly with our fire-and-forget
+        # ``IrohStreamWriter`` — the client got 200 + Content-Length but ZERO
+        # body bytes ("transfer closed with N bytes remaining"), i.e. a blank
+        # image in the app and broken downloads, both locally and (always) for
+        # remote clients which reach the gateway exclusively over this
+        # transport. Reading the bytes and returning them as a plain
+        # ``web.Response`` uses the exact same write+drain path as every JSON
+        # response (which works), so the body is delivered in full. See
+        # ``IrohStreamWriter._drain_then_finish`` for the transport-side flush.
+        # Size cap: the whole body is buffered here AND again by the
+        # fire-and-forget Iroh writer, so an unbounded read can OOM the gateway
+        # (which also serves every WS stream). Streaming wouldn't help — the
+        # transport has no working backpressure, so it buffers each chunk
+        # anyway. Reject oversized files instead. Configurable; 0 disables.
+        try:
+            max_mb = int(os.environ.get("OPENAGENT_MAX_ATTACHMENT_MB", "256") or "256")
+        except ValueError:
+            max_mb = 256
+        try:
+            size = os.path.getsize(real)
+        except OSError:
+            return web.Response(status=404, text="not found")
+        if max_mb > 0 and size > max_mb * 1024 * 1024:
+            return web.Response(status=413, text=f"file too large ({size} bytes; cap {max_mb} MB)")
+
+        try:
+            with open(real, "rb") as fh:
+                data = fh.read()
+        except MemoryError:
+            return web.Response(status=503, text="file too large to serve")
+        except OSError:
+            return web.Response(status=404, text="not found")
+
+        # Content-Type: prefer the stdlib guess, but fall back to an explicit
+        # map for the media/doc types we attach. A slim container may ship no
+        # ``/etc/mime.types``, and ``application/octet-stream`` would stop
+        # ``<video>``/``<audio>`` from playing inline in the app.
+        ctype = mimetypes.guess_type(real)[0]
+        if not ctype:
+            ext = os.path.splitext(real)[1].lower().lstrip(".")
+            ctype = _ATTACHMENT_MIME_FALLBACK.get(ext, "application/octet-stream")
+
+        # Sanitize the filename for the header so a crafted name can't inject
+        # CR/LF or break out of the quoted value; the exact UTF-8 name still
+        # rides in ``filename*`` (RFC 5987).
+        from urllib.parse import quote as _urlquote
+        raw_name = os.path.basename(real)
+        safe_name = raw_name.replace("\\", "_").replace('"', "").replace("\r", "").replace("\n", "")
+        # ``?inline=1`` lets a client embed the file for preview (e.g. a PDF in
+        # an <iframe>) instead of forcing a download; default stays
+        # ``attachment``. Inline media (<img>/<video>/<audio>) ignores it anyway.
+        disposition = "inline" if request.query.get("inline") in ("1", "true") else "attachment"
+        content_disposition = (
+            f"{disposition}; filename=\"{safe_name}\"; filename*=UTF-8''{_urlquote(raw_name)}"
+        )
+        return web.Response(
+            body=data,
+            content_type=ctype,
+            headers={
+                "Content-Disposition": content_disposition,
+                "Cache-Control": "private, max-age=60",
+            },
         )
 
     # ── WebSocket ──
@@ -1135,6 +1213,11 @@ class Gateway:
         one user/tab wipes everyone else on the same ``client_id``.
         """
         sm = self.sessions
+        # Optional structured picker attached to the command_result so thin
+        # bridges (telegram/discord/whatsapp/slack) can render buttons /
+        # select menus instead of asking the user to type an id. Additive:
+        # clients that don't know the field just show ``text``.
+        picker: dict | None = None
         if name in ("new", "reset", "clear"):
             # /new, /reset, /clear: full wipe — stop anything running, drop
             # the queue, AND forget provider-native resume state. Scoped to
@@ -1249,23 +1332,54 @@ class Gateway:
             else:
                 try:
                     from src.core.compaction import compact as _compact
+                    from src.channels.base import parse_compaction_status
+                    from src.stream.events import SessionCompacted
+                    from src.stream.events import now_ms as _compact_now_ms
+                    from src.stream.wire import event_to_wire as _compact_e2w
+
+                    async def _compact_status(raw: str, _sid=session_id, _ws=ws) -> None:
+                        # Same envelope the turn runner lifts into a typed
+                        # SessionCompacted frame — emit it here too so a
+                        # manual /compact draws the identical compaction
+                        # card (app) / step line as an automatic fold. The
+                        # verbose command_result below still lands as the
+                        # authoritative confirmation for text-only clients.
+                        comp = parse_compaction_status(raw)
+                        if comp is None:
+                            return
+                        await self._safe_ws_send_json(_ws, _compact_e2w(SessionCompacted(
+                            session_id=_sid,
+                            ts_ms=_compact_now_ms(),
+                            phase=comp["phase"],
+                            folded_runs=comp["folded_runs"],
+                            kept_runs_count=comp["kept_runs_count"],
+                            summary_chars=comp["summary_chars"],
+                            tokens_before=comp["tokens_before"],
+                            tokens_after=comp["tokens_after"],
+                        )))
+
+                    # keep=0 → Claude-Code-style manual compaction: fold the
+                    # WHOLE conversation into one recap and continue from it,
+                    # rather than only folding turns older than the automatic
+                    # keep window (which no-ops on short chats). The automatic
+                    # context-pressure path keeps its default keep window.
                     result = await _compact(
                         session_id,
                         self.agent.model,
                         self.agent,
+                        on_status=_compact_status,
+                        keep=0,
                     )
                     if result is None:
-                        text = "Nothing to compact — conversation is already short."
+                        text = "Nothing to compact — the conversation is empty or already compacted."
                     else:
-                        folded = result.get("folded_runs", 0)
-                        kept = result.get("kept_runs", 0)
-                        chars = result.get("summary_chars", 0)
-                        text = (
-                            f"Compacted conversation history: folded {folded} older turn"
-                            f"{'s' if folded != 1 else ''} into a recap "
-                            f"({chars:,} chars), kept {kept} recent turn"
-                            f"{'s' if kept != 1 else ''}."
-                        )
+                        # Concise outcome only. The channels want just the
+                        # start + end of the fold, not a recap of it — and the
+                        # desktop app already draws the detailed card from the
+                        # session_compacted frames emitted above. A verbose
+                        # "folded N turns into a recap (X chars)…" line here
+                        # would be exactly the full transcript we're avoiding.
+                        text = "Compacted conversation."
                 except Exception as exc:  # noqa: BLE001
                     text = f"Compaction failed: {exc}"
         elif name == "model":
@@ -1276,29 +1390,61 @@ class Gateway:
                 if db is None:
                     text = "Memory DB not available."
                 elif arg is None or arg.strip() == "":
-                    # List configured models + current pin
+                    # List configured models + current pin. Use the *enriched*
+                    # query: ``list_models`` returns raw ``models`` rows that
+                    # carry neither ``runtime_id`` (derived from provider+model)
+                    # nor ``provider_name`` (on the providers table), so every
+                    # entry would fail the ``if not rid`` guard below and the
+                    # picker would show only "Auto". ``kind='llm'`` also drops
+                    # TTS/STT rows that share the table.
                     try:
-                        models = await db.list_models(enabled_only=True)
+                        models = await db.list_models_enriched(
+                            enabled_only=True, kind="llm",
+                        )
                         current_pin = await db.get_session_pin(session_id)
                         if not models:
                             text = "No models configured."
                         else:
                             lines = ["Configured models (enabled):"]
+                            options = []
                             for m in models:
                                 rid = m.get("runtime_id") or ""
+                                if not rid:
+                                    continue
                                 disp = m.get("display_name") or m.get("model") or rid
-                                pin_marker = " ← active" if rid == current_pin else ""
+                                provider = m.get("provider_name") or ""
+                                is_active = rid == current_pin
+                                pin_marker = " ← active" if is_active else ""
                                 lines.append(f"  • {rid}  ({disp}){pin_marker}")
+                                options.append({
+                                    "label": disp,
+                                    "value": rid,
+                                    "subtitle": provider or rid,
+                                    "active": is_active,
+                                })
                             if not current_pin:
-                                lines.append("Current: SmartRouter default (no pin)")
+                                lines.append("Current: Auto (no pin)")
                             lines.append("Usage: /model <runtime_id> | /model default")
                             text = "\n".join(lines)
+                            # Structured picker for bridges that can render a
+                            # keyboard/select. Add an explicit "Auto" option
+                            # that clears the pin (maps to /model default).
+                            picker_options = [{
+                                "label": "Auto",
+                                "value": "default",
+                                "active": not current_pin,
+                            }] + options
+                            picker = {
+                                "command": "model",
+                                "prompt": "Pick a model for this conversation:",
+                                "options": picker_options,
+                            }
                     except Exception as exc:  # noqa: BLE001
                         text = f"Failed to list models: {exc}"
                 elif arg.strip().lower() in ("default", "none", "reset"):
                     try:
                         await db.unpin_session_model(session_id)
-                        text = "Model pin cleared — SmartRouter will pick the best model."
+                        text = "Model pin cleared — back to Auto (best model picked automatically)."
                     except Exception as exc:  # noqa: BLE001
                         text = f"Failed to clear model pin: {exc}"
                 else:
@@ -1326,7 +1472,10 @@ class Gateway:
         else:
             text = f"Unknown command: {name}"
         elog("command.result", client_id=client_id, name=name, text=text)
-        await self._safe_ws_send_json(ws, {"type": P.COMMAND_RESULT, "text": text})
+        result_frame: dict = {"type": P.COMMAND_RESULT, "text": text}
+        if picker is not None:
+            result_frame["picker"] = picker
+        await self._safe_ws_send_json(ws, result_frame)
 
     # Prefix used by each bridge when naming its per-user session ids.
     # Used ONLY for the legacy, unscoped fallback path of /clear (no

@@ -173,6 +173,8 @@ async def handle_list_db(request: web.Request) -> web.Response:
       - ``provider_id`` (int) — filter to a single provider row
       - ``framework`` (``api-based``) — filter by framework
       - ``enabled_only`` (bool) — skip disabled model rows
+      - ``kind`` (``llm``|``tts``|``stt``) — filter by model kind (e.g. the
+        chat model picker asks for ``llm`` only)
 
     When Piper is importable AND no kind='tts' row exists yet, a
     synthetic local-Piper TTS row is appended so the Voice tab knows
@@ -193,11 +195,13 @@ async def handle_list_db(request: web.Request) -> web.Response:
         except ValueError:
             return _web.json_response({"error": "invalid provider_id"}, status=400)
     enabled_only = request.query.get("enabled_only", "").lower() in ("1", "true", "yes")
+    kind = request.query.get("kind") or None
 
     rows = await db.list_models_enriched(
         enabled_only=enabled_only,
         framework=framework,
         provider_id=provider_id,
+        kind=kind,
     )
     shaped = [_shape_model(r) for r in rows]
 
@@ -210,6 +214,7 @@ async def handle_list_db(request: web.Request) -> web.Response:
     if (
         provider_id is None
         and framework is None
+        and kind in (None, "tts")
         and tts_local.is_available()
         and not any(m.get("kind") == "tts" for m in shaped)
     ):

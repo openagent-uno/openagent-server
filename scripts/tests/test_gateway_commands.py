@@ -129,10 +129,12 @@ class _Harness:
         self.server = server
         self.ws = _FakeWS()
         self._last_result_text: str | None = None
+        self._last_frame: dict[str, Any] | None = None
 
     async def _capture(self, _ws, payload: dict[str, Any]) -> None:
         if payload.get("type") == "command_result":
             self._last_result_text = payload.get("text")
+            self._last_frame = payload
 
     async def run_command(
         self, client_id: str, name: str, session_id: str | None = None
@@ -668,3 +670,104 @@ async def t_model_no_db(ctx: TestContext) -> None:
     await server._handle_command(_WS(), "device:t", "model", sid)
     assert captured, "no command_result sent"
     assert "not available" in captured[0].lower() or "memory db" in captured[0].lower(), captured[0]
+
+
+@test("gateway_commands", "/model with no arg emits a structured picker + text fallback")
+async def t_model_picker(ctx: TestContext) -> None:
+    """The no-arg /model result carries a ``picker`` (options with the pin
+    marked ``active`` + an Auto/default option) AND the plain-text list, so
+    thin bridges render buttons while everything else degrades to text.
+
+    Regression (2026-07-07): the handler used ``list_models`` — raw ``models``
+    rows that carry neither ``runtime_id`` (derived from provider+model) nor
+    ``provider_name`` (it lives on the providers table). Every model then
+    failed the ``if not rid`` guard, so the picker showed ONLY "Auto" (users
+    on Telegram saw no configured models). Seed a REAL ``MemoryDB`` with raw
+    rows so the enriched query is exercised end-to-end; a fake returning
+    pre-baked ``runtime_id`` would mask exactly this bug.
+    """
+    from src.gateway.server import Gateway
+    from src.gateway.sessions import SessionManager
+    from src.memory.db import MemoryDB
+
+    db = MemoryDB(str(ctx.db_path))
+    await db.connect()
+    try:
+        # Two providers + one enabled llm model each. runtime_id is derived
+        # (``<provider>:<model>``), never stored on the raw row.
+        ap = await db.upsert_provider(name="anthropic", framework="api-based", api_key="k")
+        op = await db.upsert_provider(name="openai", framework="api-based", api_key="k")
+        await db.upsert_model(provider_id=ap, model="claude-opus-4-8", display_name="Opus 4.8")
+        await db.upsert_model(provider_id=op, model="gpt-4o", display_name="GPT-4o")
+        # A TTS row shares the table — it must NOT leak into the llm picker.
+        tp = await db.upsert_provider(name="eleven", framework="api-based", api_key="k", kind="tts")
+        await db.upsert_model(provider_id=tp, model="tts-1", display_name="Voice", kind="tts")
+
+        server = Gateway.__new__(Gateway)
+        server.sessions = SessionManager(agent_name="test")
+
+        class _AgentDB:
+            name = "test"
+            _initialized = True
+            model = None
+            memory_db = db
+
+        server.agent = _AgentDB()
+        server.clients = {}
+        server._stream_sessions = {}
+        captured: list[dict] = []
+
+        async def _capture(_ws, payload):
+            if payload.get("type") == "command_result":
+                captured.append(payload)
+
+        server._safe_ws_send_json = _capture
+
+        class _WS:
+            pass
+
+        sid = server.sessions.get_or_create_session("device:t", "u1")
+        # Pin one model so we can assert the picker reflects the active pin.
+        await db.pin_session_model(sid, "openai:gpt-4o")
+
+        await server._handle_command(_WS(), "device:t", "model", sid)
+        assert captured, "no command_result sent"
+        payload = captured[0]
+        assert "picker" in payload, payload
+        picker = payload["picker"]
+        assert picker["command"] == "model", picker
+        values = [o["value"] for o in picker["options"]]
+        assert "default" in values, values  # Auto/clear-pin option
+        assert "anthropic:claude-opus-4-8" in values, values
+        assert "openai:gpt-4o" in values, values
+        assert "eleven:tts-1" not in values, values  # TTS row excluded
+        active = [o["value"] for o in picker["options"] if o.get("active")]
+        assert active == ["openai:gpt-4o"], active  # reflects the current pin
+        assert "openai:gpt-4o" in payload["text"], payload["text"]  # text fallback
+        # The "hide SmartRouter" ask: no SmartRouter wording leaks to users.
+        assert "SmartRouter" not in payload["text"], payload["text"]
+        auto = next(o for o in picker["options"] if o["value"] == "default")
+        assert "SmartRouter" not in (auto.get("subtitle") or ""), auto
+        assert "SmartRouter" not in auto["label"], auto
+    finally:
+        await db.close()
+
+
+@test("gateway_commands", "GET /api/commands exposes specs incl. model.arg_source")
+async def t_commands_api(ctx: TestContext) -> None:
+    import json
+    from src.gateway.commands import COMMAND_MAP
+    from src.gateway.api.commands import handle_list
+
+    assert COMMAND_MAP["model"].arg_source == "models", COMMAND_MAP["model"]
+    assert COMMAND_MAP["stop"].arg_source is None, COMMAND_MAP["stop"]
+
+    class _Req:  # handle_list ignores the request object
+        pass
+
+    resp = await handle_list(_Req())
+    body = json.loads(resp.body.decode())
+    cmds = {c["name"]: c for c in body["commands"]}
+    assert cmds["model"]["arg_source"] == "models", cmds["model"]
+    assert cmds["stop"]["arg_source"] is None, cmds["stop"]
+    assert cmds["model"]["description"], cmds["model"]

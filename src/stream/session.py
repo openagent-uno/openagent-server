@@ -24,7 +24,7 @@ from typing import Any, Awaitable, Callable
 
 import json
 
-from src.channels.base import is_reasoning_status
+from src.channels.base import is_reasoning_status, parse_compaction_status
 from src.channels.stt_base import BaseSTT, resolve_stt
 from src.channels.tts_base import BaseTTS, resolve_tts
 from src.core.identity_context import human_author
@@ -43,6 +43,7 @@ from src.stream.events import (
     OutTextFinal,
     OutToolStatus,
     SessionClose,
+    SessionCompacted,
     SessionOpen,
     TextDelta,
     TextFinal,
@@ -926,6 +927,26 @@ class StreamTurnRunner:
             # server does not ship a "Thinking..." UI string). Tool JSON
             # and structured envelopes stay as OutToolStatus — real data.
             nonlocal reasoning_active
+            # Session compaction (vision §2) rides the on_status channel as
+            # a structured envelope, not tool JSON. Lift it into its own
+            # typed frame so clients draw a compaction affordance instead
+            # of leaking the raw JSON into a status line. Compaction is
+            # visible activity, so it also ends any pending reasoning span.
+            comp = parse_compaction_status(status_text)
+            if comp is not None:
+                await _end_reasoning()
+                await publish(SessionCompacted(
+                    session_id=session_id,
+                    seq=sess.next_seq(),
+                    ts_ms=now_ms(),
+                    phase=comp["phase"],
+                    folded_runs=comp["folded_runs"],
+                    kept_runs_count=comp["kept_runs_count"],
+                    summary_chars=comp["summary_chars"],
+                    tokens_before=comp["tokens_before"],
+                    tokens_after=comp["tokens_after"],
+                ))
+                return
             if is_reasoning_status(status_text):
                 if not reasoning_active:
                     reasoning_active = True

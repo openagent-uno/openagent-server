@@ -41,6 +41,11 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
     enabled INTEGER NOT NULL DEFAULT 1,
     last_run REAL,
     next_run REAL,
+    -- Optional per-task model override (a runtime_id such as
+    -- ``anthropic:claude-opus-4-8``). NULL → the firing runs on the agent's
+    -- default/router model, exactly like a chat turn with no session pin.
+    -- Added by ``_migrate_scheduled_tasks_model_column`` on old DBs.
+    model TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -776,6 +781,21 @@ class MemoryDB:
             await self._conn.commit()
 
         await self._migrate_task_runs_session_id()
+        await self._migrate_scheduled_tasks_model_column()
+
+    async def _migrate_scheduled_tasks_model_column(self) -> None:
+        """A scheduled task can now pin an optional per-task model (a
+        runtime_id). The firing runs its child session on that model instead
+        of the agent's default/router pick. Old DBs predate the column; add
+        it idempotently (NULL = use the default model)."""
+        assert self._conn is not None
+        cursor = await self._conn.execute("PRAGMA table_info(scheduled_tasks)")
+        cols = {row[1] for row in await cursor.fetchall()}
+        if "model" not in cols:
+            await self._conn.execute(
+                "ALTER TABLE scheduled_tasks ADD COLUMN model TEXT"
+            )
+            await self._conn.commit()
 
     async def _migrate_task_runs_session_id(self) -> None:
         """v0.15: a scheduled-task firing now runs as a durable child
@@ -1327,14 +1347,21 @@ class MemoryDB:
 
     # ── Scheduled Tasks ──
 
-    async def add_task(self, name: str, cron_expression: str, prompt: str, next_run: float | None = None) -> str:
+    async def add_task(
+        self,
+        name: str,
+        cron_expression: str,
+        prompt: str,
+        next_run: float | None = None,
+        model: str | None = None,
+    ) -> str:
         conn = await self._ensure_connected()
         task_id = str(uuid.uuid4())
         now = time.time()
         await conn.execute(
-            "INSERT INTO scheduled_tasks (id, name, cron_expression, prompt, enabled, next_run, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
-            (task_id, name, cron_expression, prompt, next_run or now, now, now),
+            "INSERT INTO scheduled_tasks (id, name, cron_expression, prompt, enabled, next_run, model, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)",
+            (task_id, name, cron_expression, prompt, next_run or now, model or None, now, now),
         )
         await conn.commit()
         return task_id
@@ -1356,7 +1383,7 @@ class MemoryDB:
 
     async def update_task(self, task_id: str, **kwargs: Any) -> None:
         conn = await self._ensure_connected()
-        allowed = {"name", "cron_expression", "prompt", "enabled", "last_run", "next_run"}
+        allowed = {"name", "cron_expression", "prompt", "enabled", "last_run", "next_run", "model"}
         updates = {k: v for k, v in kwargs.items() if k in allowed}
         if not updates:
             return

@@ -146,8 +146,12 @@ def event_to_wire(evt: Event) -> dict[str, Any]:
         return {
             **base,
             "type": SESSION_COMPACTED,
+            "phase": evt.phase,
             "summary_chars": evt.summary_chars,
             "kept_runs_count": evt.kept_runs_count,
+            "folded_runs": evt.folded_runs,
+            "tokens_before": evt.tokens_before,
+            "tokens_after": evt.tokens_after,
         }
 
     # Inbound types — included for completeness (e.g. tests that
@@ -383,6 +387,16 @@ def wire_to_event(frame: dict[str, Any]) -> Event | None:
         )
     if t == TURN_COMPLETE:
         return TurnComplete(session_id=sid, seq=seq, ts_ms=ts)
+    if t == SESSION_COMPACTED:
+        return SessionCompacted(
+            session_id=sid, seq=seq, ts_ms=ts,
+            phase=str(frame.get("phase") or "done"),
+            summary_chars=int(frame.get("summary_chars") or 0),
+            kept_runs_count=int(frame.get("kept_runs_count") or 0),
+            folded_runs=int(frame.get("folded_runs") or 0),
+            tokens_before=int(frame.get("tokens_before") or 0),
+            tokens_after=int(frame.get("tokens_after") or 0),
+        )
 
     logger.debug("wire_to_event: unknown type %r", t)
     return None
@@ -402,5 +416,6 @@ __all__ = [
     "SESSION_CLOSE",
     "VIDEO_FRAME_OUT",
     "TURN_COMPLETE",
+    "SESSION_COMPACTED",
     "REASONING",
 ]

@@ -28,6 +28,62 @@ logger = logging.getLogger(__name__)
 DISCORD_MSG_LIMIT = 2000
 
 
+def _build_picker_view(bridge, uid: str, picker: dict):
+    """Build a Discord Select-menu ``View`` for a structured command picker
+    (e.g. the /model chooser). Returns ``None`` when discord.ui is
+    unavailable or there are no renderable options — the caller then falls
+    back to the plain-text option list.
+
+    Discord dispatches component interactions straight to the View, so the
+    Select's own ``callback`` re-issues the command with the chosen value;
+    no global interaction handler is needed.
+    """
+    try:
+        import discord
+    except Exception:
+        return None
+    command = str(picker.get("command") or "")
+    raw = picker.get("options") or []
+    if not command or not raw:
+        return None
+    options = []
+    for opt in raw[:25]:  # Discord Select hard cap of 25 options
+        value = str(opt.get("value") or "")
+        if not value:
+            continue
+        label = str(opt.get("label") or value)[:100]
+        desc = (str(opt.get("subtitle") or "")[:100]) or None
+        options.append(discord.SelectOption(
+            label=label, value=value[:100], description=desc,
+            default=bool(opt.get("active")),
+        ))
+    if not options:
+        return None
+
+    class _PickerSelect(discord.ui.Select):
+        def __init__(self) -> None:
+            super().__init__(
+                placeholder=str(picker.get("prompt") or "Choose…")[:150],
+                min_values=1, max_values=1, options=options,
+            )
+
+        async def callback(self, interaction) -> None:  # noqa: ANN001
+            value = self.values[0]
+            result = await bridge.send_command(
+                command, session_id=f"dc:{uid}", arg=value,
+            )
+            try:
+                await interaction.response.edit_message(
+                    content=result or "Done.", view=None,
+                )
+            except Exception:
+                pass
+
+    view = discord.ui.View(timeout=300)
+    view.add_item(_PickerSelect())
+    return view
+
+
 class _DiscordTypingAnimator:
     """Keeps Discord's native "Bot is typing…" indicator lit for the whole
     turn — the in-chat equivalent of Telegram's ``ChatAction.TYPING``
@@ -280,6 +336,23 @@ class DiscordBridge(BaseBridge):
         except Exception as e:  # noqa: BLE001
             logger.error("Discord text send error: %s", e)
 
+    async def post_compaction_notice(self, channel):
+        # In-place compaction (vision §2): Discord supports message edits,
+        # so post one bubble and flip it in place rather than posting a
+        # "Compacting…"/"Compacted" pair (see resolve_compaction_notice).
+        try:
+            return await channel.send("🗜 *Compacting conversation…*")
+        except Exception:
+            return None
+
+    async def resolve_compaction_notice(self, channel, handle, text, *, ok):
+        if handle is None:
+            return await super().resolve_compaction_notice(channel, handle, text, ok=ok)
+        try:
+            await handle.edit(content=text)
+        except Exception:
+            pass
+
     async def send_attachment(self, channel, att) -> None:
         import discord as _dc
         p = Path(att.path)
@@ -300,8 +373,15 @@ class DiscordBridge(BaseBridge):
         # Scope /stop, /clear, /new, /reset, /compact, /model to THIS user's
         # session so a command from user A doesn't wipe user B's conversation.
         # Forward any inline argument (e.g. /model gpt-4o) via the arg field.
-        result = await self.send_command(cmd, session_id=f"dc:{uid}", arg=arg or None)
-        await interaction.followup.send(result, ephemeral=True)
+        result = await self.send_command_full(cmd, session_id=f"dc:{uid}", arg=arg or None)
+        picker = result.get("picker") if isinstance(result, dict) else None
+        if isinstance(picker, dict) and picker.get("options"):
+            view = _build_picker_view(self, uid, picker)
+            if view is not None:
+                prompt = str(picker.get("prompt") or "Choose:")
+                await interaction.followup.send(prompt, view=view, ephemeral=True)
+                return
+        await interaction.followup.send(result.get("text", ""), ephemeral=True)
 
     async def stop(self) -> None:
         self._should_stop = True

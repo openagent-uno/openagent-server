@@ -381,3 +381,319 @@ async def t_session_compacted_wire_roundtrip(_ctx: TestContext) -> None:
     assert wire["seq"] == 42
     assert wire["summary_chars"] == 350
     assert wire["kept_runs_count"] == 4
+
+
+# ── 6. Live status plumbing: running → done envelopes ──────────────────
+
+
+@test("compaction", "compact emits running→done status envelopes with stats")
+async def t_compact_status_envelopes(ctx: TestContext) -> None:
+    """``compact`` must fire a ``phase=running`` hint BEFORE the summariser
+    round-trip and a ``phase=done`` hint after, carrying the run/token
+    stats — that's what lets a client show "Compacting conversation" →
+    "Compacted conversation" instead of unexplained latency. The same
+    stats must persist in the recap row's metadata so a reopened session
+    rebuilds the identical card.
+    """
+    from src.core.compaction import compact
+    from src.channels.base import parse_compaction_status
+
+    os.environ.pop("OPENAGENT_COMPACTION_ENABLED", None)
+    os.environ["OPENAGENT_COMPACTION_KEEP_RUNS"] = "2"
+
+    db_path = str(ctx.test_dir / "compact-status.db")
+    runs = [
+        {"run_id": f"r-{i}", "content": f"run-{i}-text " * 5,
+         "messages": [{"role": "assistant", "content": f"run-{i}-text " * 5}]}
+        for i in range(5)
+    ]
+    _make_session_row(db_path, "sid", runs)
+    model = _FakeModel(summary="Recap of the earlier turns.")
+    agent = _FakeAgent(db_path, model)
+
+    seen: list[dict] = []
+
+    async def on_status(raw: str) -> None:
+        # compact() must only ever push compaction envelopes through
+        # on_status — never a bare tool line — so parsing must succeed.
+        parsed = parse_compaction_status(raw)
+        assert parsed is not None, raw
+        seen.append(parsed)
+
+    result = await compact("sid", model, agent, on_status=on_status)
+    assert result is not None
+
+    assert [p["phase"] for p in seen] == ["running", "done"], seen
+    running, done = seen
+    assert running["folded_runs"] == 3, running
+    assert running["kept_runs_count"] == 2, running
+    assert running["tokens_before"] > 0, running
+    assert done["folded_runs"] == 3, done
+    assert done["summary_chars"] == len("Recap of the earlier turns."), done
+    assert done["tokens_after"] > 0, done
+
+    # The returned dict exposes the token stats too (manual /compact reads it).
+    assert result["tokens_before"] == running["tokens_before"], result
+    assert result["tokens_after"] == done["tokens_after"], result
+
+    # Recap metadata persists every stat for reopen/reconcile parity.
+    saved = _read_runs(db_path, "sid")
+    meta = saved[0]["metadata"]
+    assert meta["compaction"] is True, meta
+    assert meta["folded_runs"] == 3, meta
+    assert meta["kept_runs_count"] == 2, meta
+    assert meta["tokens_before"] == running["tokens_before"], meta
+    assert meta["tokens_after"] == done["tokens_after"], meta
+    assert meta["summary_chars"] == done["summary_chars"], meta
+
+
+@test("compaction", "compact emits running→error when the summary is empty")
+async def t_compact_status_error(ctx: TestContext) -> None:
+    """An empty summary aborts the fold — but only AFTER we've announced
+    ``running``. The terminal ``error`` hint must fire so a client that
+    showed "Compacting…" doesn't hang on it. The runs stay untouched.
+    """
+    from src.core.compaction import compact
+    from src.channels.base import parse_compaction_status
+
+    os.environ.pop("OPENAGENT_COMPACTION_ENABLED", None)
+    os.environ["OPENAGENT_COMPACTION_KEEP_RUNS"] = "2"
+
+    db_path = str(ctx.test_dir / "compact-status-err.db")
+    runs = [{"run_id": f"r-{i}", "content": f"c{i} " * 5} for i in range(5)]
+    _make_session_row(db_path, "sid", runs)
+    model = _FakeModel(summary="")  # empty recap → skip the fold
+    agent = _FakeAgent(db_path, model)
+
+    phases: list[str] = []
+
+    async def on_status(raw: str) -> None:
+        parsed = parse_compaction_status(raw)
+        if parsed is not None:
+            phases.append(parsed["phase"])
+
+    result = await compact("sid", model, agent, on_status=on_status)
+    assert result is None
+    assert phases == ["running", "error"], phases
+    # Nothing folded — the row is byte-identical.
+    assert len(_read_runs(db_path, "sid")) == 5
+
+
+@test("compaction", "parse_compaction_status normalises phase + stats")
+async def t_parse_compaction_status(_ctx: TestContext) -> None:
+    """The shared envelope parser is the seam the turn runner and the
+    bridges rely on. It must coerce stats to ints, default a missing
+    phase to ``done`` (legacy pre-phase envelopes), and reject anything
+    that isn't a compaction envelope.
+    """
+    from src.channels.base import parse_compaction_status
+
+    full = parse_compaction_status(json.dumps({
+        "kind": "session.compacted", "phase": "done",
+        "folded_runs": 3, "kept_runs_count": 2, "summary_chars": 120,
+        "tokens_before": 900, "tokens_after": 60,
+    }))
+    assert full == {
+        "phase": "done", "folded_runs": 3, "kept_runs_count": 2,
+        "summary_chars": 120, "tokens_before": 900, "tokens_after": 60,
+    }, full
+
+    # Legacy envelope without a phase → treated as done.
+    legacy = parse_compaction_status(json.dumps({
+        "kind": "session.compacted", "summary_chars": 5, "kept_runs_count": 4,
+    }))
+    assert legacy["phase"] == "done", legacy
+    assert legacy["kept_runs_count"] == 4, legacy
+
+    assert parse_compaction_status(json.dumps({
+        "kind": "session.compacted", "phase": "running",
+    }))["phase"] == "running"
+    # Unknown phase coerces to done rather than leaking through.
+    assert parse_compaction_status(json.dumps({
+        "kind": "session.compacted", "phase": "weird",
+    }))["phase"] == "done"
+
+    # Non-envelopes → None (a tool event, a plain status, empty, other kind).
+    assert parse_compaction_status(json.dumps({"tool_name": "bash"})) is None
+    assert parse_compaction_status("Thinking...") is None
+    assert parse_compaction_status("") is None
+    assert parse_compaction_status(json.dumps({"kind": "other"})) is None
+
+
+@test("compaction", "SessionCompacted round-trips phase + token stats")
+async def t_session_compacted_full_roundtrip(_ctx: TestContext) -> None:
+    """The extended SessionCompacted fields (phase + folded_runs + token
+    counts) must survive both directions of the wire codec — the CLI and
+    bridge listeners parse the frame back via ``wire_to_event``.
+    """
+    from src.stream.events import SessionCompacted
+    from src.stream.wire import event_to_wire, wire_to_event, SESSION_COMPACTED
+
+    evt = SessionCompacted(
+        session_id="sid", seq=7, ts_ms=999,
+        phase="done", folded_runs=5, kept_runs_count=3,
+        summary_chars=420, tokens_before=1800, tokens_after=90,
+    )
+    wire = event_to_wire(evt)
+    assert wire["type"] == SESSION_COMPACTED, wire
+    assert wire["phase"] == "done", wire
+    assert wire["folded_runs"] == 5, wire
+    assert wire["tokens_before"] == 1800, wire
+    assert wire["tokens_after"] == 90, wire
+
+    back = wire_to_event(wire)
+    assert isinstance(back, SessionCompacted), back
+    assert back.phase == "done"
+    assert back.folded_runs == 5
+    assert back.kept_runs_count == 3
+    assert back.summary_chars == 420
+    assert back.tokens_before == 1800
+    assert back.tokens_after == 90
+
+    # A running frame (partial stats) round-trips too.
+    r = wire_to_event(event_to_wire(SessionCompacted(
+        session_id="s", phase="running", folded_runs=2, tokens_before=500,
+    )))
+    assert r.phase == "running", r
+    assert r.folded_runs == 2, r
+    assert r.tokens_before == 500, r
+
+
+@test("compaction", "recap run rehydrates as a compaction message")
+async def t_recap_rehydrates_as_compaction(_ctx: TestContext) -> None:
+    """On reopen/reconcile the recap run must surface as a ``compaction``
+    message (the same card the live frame draws) — NOT as a bare
+    assistant bubble leaking the recap paragraph. Exercises the gateway's
+    ``_expand_run_messages`` directly.
+    """
+    from src.gateway.api.sessions import _expand_run_messages
+
+    recap = {
+        "run_id": "compaction-1",
+        "content": "Recap paragraph.",
+        "messages": [
+            {"role": "system", "content": "[compacted session recap]"},
+            {"role": "assistant", "content": "Recap paragraph."},
+        ],
+        "metadata": {
+            "compaction": True, "folded_runs": 3, "kept_runs_count": 2,
+            "summary_chars": 16, "tokens_before": 900, "tokens_after": 40,
+        },
+    }
+    out = _expand_run_messages(recap, timestamp=123, msg_counter=[0])
+    # Exactly one message, and it's the compaction card — the assistant
+    # summary must NOT also render as a bubble.
+    assert len(out) == 1, out
+    m = out[0]
+    assert m["role"] == "compaction", m
+    comp = m["compaction"]
+    assert comp["phase"] == "done", comp
+    assert comp["folded_runs"] == 3, comp
+    assert comp["kept_runs_count"] == 2, comp
+    assert comp["summary_chars"] == 16, comp
+    assert comp["tokens_before"] == 900, comp
+    assert comp["tokens_after"] == 40, comp
+
+
+@test("compaction", "manual /compact on a short conversation emits a no-op feedback frame")
+async def t_compact_noop_emits_feedback(ctx: TestContext) -> None:
+    """A hand-typed /compact on a conversation too short to fold must still
+    tell the UI something happened — the app reads the typed frame, not the
+    command_result, so a silent early-return leaves the command looking
+    broken. ``compact`` emits a terminal ``done`` frame with
+    ``folded_runs=0`` (rendered as "Already compact — nothing to fold")
+    while still doing no summariser work.
+    """
+    from src.core.compaction import compact
+    from src.channels.base import parse_compaction_status
+
+    os.environ.pop("OPENAGENT_COMPACTION_ENABLED", None)
+    os.environ["OPENAGENT_COMPACTION_KEEP_RUNS"] = "4"
+
+    db_path = str(ctx.test_dir / "compact-noop-feedback.db")
+    _make_session_row(db_path, "sid", [
+        {"run_id": f"r-{i}", "content": f"c{i}"} for i in range(2)
+    ])
+    model = _FakeModel()
+    agent = _FakeAgent(db_path, model)
+
+    seen: list[dict] = []
+
+    async def on_status(raw: str) -> None:
+        parsed = parse_compaction_status(raw)
+        if parsed is not None:
+            seen.append(parsed)
+
+    result = await compact("sid", model, agent, on_status=on_status)
+    assert result is None
+    # No summariser round-trip — there was nothing to fold.
+    assert len(model.generate_calls) == 0, model.generate_calls
+    # But exactly one terminal feedback frame lands: done, zero folded.
+    assert len(seen) == 1, seen
+    assert seen[0]["phase"] == "done", seen
+    assert seen[0]["folded_runs"] == 0, seen
+    assert seen[0]["kept_runs_count"] == 2, seen
+
+
+# ── 7. Claude-Code-style manual /compact (keep=0 folds everything) ─────
+
+
+@test("compaction", "manual /compact (keep=0) folds the WHOLE conversation")
+async def t_compact_keep_zero_folds_all(ctx: TestContext) -> None:
+    """The manual /compact command passes ``keep=0`` so it behaves like
+    Claude Code: it folds the entire conversation into one recap and keeps
+    nothing verbatim, even when the chat is far shorter than the automatic
+    keep window (which would otherwise no-op).
+    """
+    from src.core.compaction import compact
+
+    os.environ.pop("OPENAGENT_COMPACTION_ENABLED", None)
+    # A keep window that WOULD no-op the automatic path on 2 runs...
+    os.environ["OPENAGENT_COMPACTION_KEEP_RUNS"] = "4"
+
+    db_path = str(ctx.test_dir / "compact-keep0.db")
+    runs = [
+        {"run_id": f"r-{i}", "content": f"turn-{i} text " * 5,
+         "messages": [{"role": "assistant", "content": f"turn-{i} text " * 5}]}
+        for i in range(2)
+    ]
+    _make_session_row(db_path, "sid", runs)
+    model = _FakeModel(summary="Whole-conversation recap.")
+    agent = _FakeAgent(db_path, model)
+
+    # ...but keep=0 folds them anyway.
+    result = await compact("sid", model, agent, keep=0)
+    assert result is not None, "keep=0 must fold even a short conversation"
+    assert result["folded_runs"] == 2, result
+    assert result["kept_runs"] == 0, result
+
+    # The session is now JUST the recap — nothing kept verbatim.
+    saved = _read_runs(db_path, "sid")
+    assert len(saved) == 1, saved
+    assert saved[0]["metadata"]["compaction"] is True, saved
+    assert "Whole-conversation recap" in (saved[0]["content"] or ""), saved
+
+
+@test("compaction", "manual /compact (keep=0) no-ops when only a recap remains")
+async def t_compact_keep_zero_noop_on_recap(ctx: TestContext) -> None:
+    """Folding an already-compacted session (only a recap run) into another
+    recap gains nothing, so keep=0 must no-op rather than loop — otherwise
+    a repeated /compact would summarise the summary forever.
+    """
+    from src.core.compaction import compact
+
+    os.environ.pop("OPENAGENT_COMPACTION_ENABLED", None)
+
+    db_path = str(ctx.test_dir / "compact-keep0-recap.db")
+    _make_session_row(db_path, "sid", [
+        {"run_id": "compaction-1", "content": "existing recap",
+         "metadata": {"compaction": True, "folded_runs": 3}},
+    ])
+    model = _FakeModel()
+    agent = _FakeAgent(db_path, model)
+
+    result = await compact("sid", model, agent, keep=0)
+    assert result is None, "folding a lone recap into a recap must no-op"
+    assert len(model.generate_calls) == 0, model.generate_calls
+    saved = _read_runs(db_path, "sid")
+    assert len(saved) == 1 and saved[0]["run_id"] == "compaction-1", saved

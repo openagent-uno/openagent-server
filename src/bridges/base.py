@@ -25,7 +25,7 @@ from src.gateway import protocol as P
 from src.core.logging import elog
 from src.stream.collector import StreamCollector, fold_outbound_event
 from src.stream.events import SessionOpen, TextFinal, now_ms
-from src.stream.wire import event_to_wire, wire_to_event
+from src.stream.wire import SESSION_COMPACTED, event_to_wire, wire_to_event
 
 logger = logging.getLogger(__name__)
 
@@ -174,9 +174,10 @@ def format_tool_message(raw: str) -> str | None:
     Returns ``None`` for events that should NOT get their own message so
     the chat isn't flooded:
 
-    * non-tool statuses (``"Thinking..."``, ``"Loading context..."``,
-      the ``session.compacted`` envelope) — ``parse_status_event`` yields
-      ``None`` for these,
+    * non-tool statuses (``"Thinking..."``, ``"Loading context..."``) —
+      ``parse_status_event`` yields ``None`` for these. (Session compaction
+      no longer arrives here at all — it rides its own ``session_compacted``
+      frame into ``dispatch_turn``'s ``on_compaction`` notice.)
     * tool *completion* pings — the runtime emits a (running, done) pair
       per tool; we surface the invocation and any failure, but a "done"
       bubble for every tool would double the message count.
@@ -523,6 +524,20 @@ class BaseBridge:
                     pass
             return
 
+        if t == SESSION_COMPACTED:
+            # In-place compaction progress (vision §2). Route the raw frame
+            # to the collector's compaction sink so ``dispatch_turn`` can
+            # post the "Compacting conversation" → "Compacted conversation"
+            # notice. Not part of the folded reply, so it never touches
+            # ``fold_outbound_event`` / the ``done`` latch.
+            cb = collector.on_compaction if collector is not None else None
+            if cb is not None:
+                try:
+                    await cb(data)
+                except Exception:
+                    pass
+            return
+
         if t == P.COMMAND_RESULT:
             if self._command_future and not self._command_future.done():
                 self._command_future.set_result(data)
@@ -553,6 +568,7 @@ class BaseBridge:
         target: Any = None,
         on_status: Callable[[str], Awaitable[None]] | None = None,
         on_delta: Callable[[str], Awaitable[None]] | None = None,
+        on_compaction: Callable[[dict], Awaitable[None]] | None = None,
         input_was_voice: bool = False,
         source: str = "user_typed",
     ) -> dict:
@@ -602,6 +618,7 @@ class BaseBridge:
             collector = StreamCollector()
             collector.on_status = on_status
             collector.on_delta = on_delta
+            collector.on_compaction = on_compaction
             self._stream_pending[session_id] = collector
         else:
             collector = existing
@@ -690,6 +707,72 @@ class BaseBridge:
         text. ``text`` is always the *full accumulated* response so
         far — the bridge doesn't have to maintain its own buffer."""
         return None
+
+    async def post_compaction_notice(self, target):
+        """Post the "Compacting conversation" start notice and return a
+        handle the terminal edit can target — or ``None``.
+
+        In-place compaction (vision §2) runs a summariser round-trip that
+        can take a couple of seconds; this notice explains the pause and
+        is the "start" half of the start→outcome pair the user sees.
+        Bridges with a message-edit API (Telegram, Discord) override to
+        post an editable message and RETURN it, so ``resolve_compaction_notice``
+        flips that same bubble to "Compacted conversation" (one
+        self-updating message). The default posts a plain start message
+        and returns ``None`` — a bridge with no edit API (WhatsApp, Slack)
+        then shows the start and the outcome as two short messages.
+        """
+        try:
+            await self.send_text_chunk(target, "🗜 Compacting conversation")
+        except Exception:
+            pass
+        return None
+
+    async def resolve_compaction_notice(
+        self, target, handle, text: str, *, ok: bool,
+    ) -> None:
+        """Resolve the compaction notice started by ``post_compaction_notice``.
+
+        ``handle`` is whatever that method returned. Edit-capable bridges
+        override to rewrite the handle's bubble to ``text`` (the outcome).
+        The default covers the no-handle case (no edit API): on success it
+        posts ``text`` ("Compacted conversation") as the second of the two
+        messages; on a skipped fold (``ok=False``) it stays silent — the
+        start line already landed and an internal no-op needs no epilogue.
+        """
+        if handle is not None:
+            return  # edit-capable bridges override; the base can't edit
+        if ok:
+            try:
+                await self.send_text_chunk(target, text)
+            except Exception:
+                pass
+
+    async def run_compact_command(self, target, session_id: str) -> None:
+        """Run ``/compact`` with a start→outcome notice on the channel.
+
+        A slash command doesn't flow through a turn collector, so the
+        ``session_compacted`` frames the gateway emits during the fold are
+        dropped here (they still drive the desktop app's card). We post our
+        own notice around the command instead — "Compacting conversation"
+        up front, then the concise outcome once it lands — so a manual
+        ``/compact`` reads exactly like the automatic path. Callers use
+        this in place of the generic ``send_command`` + ``deliver_command_result``
+        for the ``compact`` command.
+        """
+        try:
+            handle = await self.post_compaction_notice(target)
+        except Exception:
+            handle = None
+        result = (await self.send_command("compact", session_id=session_id) or "").strip()
+        # The gateway returns a concise "Compacted conversation." on success,
+        # or an informative line ("Nothing to compact …" / "Compaction
+        # failed …") otherwise — surface whichever it is as the outcome.
+        label = f"🗜 {result}" if result else "🗜 Compacted conversation"
+        try:
+            await self.resolve_compaction_notice(target, handle, label, ok=True)
+        except Exception:
+            pass
 
     async def ack_follower(self, target) -> None:
         """Acknowledge a follow-up message that arrived while a turn
@@ -809,6 +892,37 @@ class BaseBridge:
             except Exception:
                 pass
 
+        # In-place compaction (vision §2) posts its own lifecycle notice —
+        # a distinct meaningful event, so it fires in both live and
+        # non-live modes (unlike tool spam). The ``running`` frame opens
+        # "Compacting conversation" and stashes the editable handle; the
+        # terminal frame flips it to "Compacted conversation" (or resolves
+        # a skipped fold). Voice turns opt out — a voice-note user wants
+        # the spoken reply, not a text bubble. Deliberately does NOT touch
+        # ``live.posted_any``: the notice is orthogonal to reply narration,
+        # and marking it posted would suppress the end-of-turn reply render.
+        compaction_handle: dict = {"h": None}
+
+        async def on_compaction(data: dict) -> None:
+            if voice_detected:
+                return
+            phase = str(data.get("phase") or "done")
+            if phase == "running":
+                try:
+                    compaction_handle["h"] = await self.post_compaction_notice(target)
+                except Exception:
+                    compaction_handle["h"] = None
+                return
+            ok = phase != "error"
+            label = "🗜 Compacted conversation" if ok else "🗜 Compaction skipped"
+            try:
+                await self.resolve_compaction_notice(
+                    target, compaction_handle["h"], label, ok=ok,
+                )
+            except Exception:
+                pass
+            compaction_handle["h"] = None
+
         # Quick-command expansion runs FIRST so personality + skill
         # overlays act on the expanded prompt, not the bare ``/recap``.
         try:
@@ -881,6 +995,7 @@ class BaseBridge:
                 target=target,
                 on_status=on_status,
                 on_delta=on_delta,
+                on_compaction=on_compaction,
                 # Voice notes bypass the typed-burst coalescence window
                 # for instant barge-in (StreamSession STT-bypass path).
                 source="stt" if voice_detected else "user_typed",
@@ -1254,10 +1369,16 @@ class BaseBridge:
             return text
         return f"{voice_marker}\n{text}"
 
-    async def send_command(
+    async def send_command_full(
         self, name: str, session_id: str | None = None, arg: str | None = None,
-    ) -> str:
-        """Send a command and wait for the result.
+    ) -> dict:
+        """Send a command and wait for the full ``command_result`` dict.
+
+        Same wire round-trip as :meth:`send_command` but returns the whole
+        result frame — including an optional ``picker`` (see the protocol
+        docstring) that bridges with a button/select primitive render as an
+        interactive model chooser. Callers that only need the text should
+        use :meth:`send_command`.
 
         ``session_id`` is forwarded to the gateway so scope-sensitive
         commands (``stop``, ``clear``, ``new``, ``reset``, ``compact``,
@@ -1288,7 +1409,49 @@ class BaseBridge:
             finally:
                 if self._command_future is future:
                     self._command_future = None
-            return result.get("text", "")
+            return result if isinstance(result, dict) else {"text": str(result)}
+
+    async def send_command(
+        self, name: str, session_id: str | None = None, arg: str | None = None,
+    ) -> str:
+        """Send a command and wait for the result text.
+
+        Thin wrapper over :meth:`send_command_full` for callers that don't
+        render a picker (the common case: destructive-command confirms,
+        ``/model <id>`` switches, ``/help``, etc.).
+        """
+        result = await self.send_command_full(name, session_id=session_id, arg=arg)
+        return result.get("text", "")
+
+    async def render_picker(self, target, picker: dict) -> bool:
+        """Render a structured command picker (``command_result.picker``)
+        as native interactive UI (inline keyboard / select menu).
+
+        Returns ``True`` when the platform rendered an interactive picker,
+        ``False`` when it can't — in which case :meth:`deliver_command_result`
+        falls back to the plain-text option list. Default is ``False`` (no
+        button primitive). Telegram, Discord, WhatsApp and Slack override.
+        """
+        return False
+
+    async def deliver_command_result(self, target, result: dict) -> None:
+        """Send a command result to ``target``, preferring an interactive
+        picker when one is present and the platform can render it.
+
+        Command handlers call this instead of ``send_response_text`` so the
+        model chooser (and any future pickable command) shows buttons where
+        possible and degrades to the text list everywhere else.
+        """
+        if not isinstance(result, dict):
+            return await self.send_response_text(target, str(result))
+        picker = result.get("picker")
+        if isinstance(picker, dict) and picker.get("options"):
+            try:
+                if await self.render_picker(target, picker):
+                    return
+            except Exception as e:  # noqa: BLE001
+                logger.warning("%s render_picker error: %s", self.name, e)
+        await self.send_response_text(target, result.get("text", ""))
 
     async def _run(self) -> None:
         """Platform-specific polling loop. Override in subclass."""

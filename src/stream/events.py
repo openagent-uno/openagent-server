@@ -304,21 +304,39 @@ class TurnComplete(Event):
 
 @dataclass(frozen=True)
 class SessionCompacted(Event):
-    """In-place context compaction landed for this session.
+    """In-place context compaction is starting or landed for this session.
 
-    Emitted by :func:`openagent.core.compaction.compact` right after the
-    oldest runs have been folded into a recap run and the session row has
-    been rewritten on disk. Lets the desktop UI render a "Compacted
-    earlier turns" affordance without forcing the user to restart — see
-    vision §2 (Streams: "the session compacts in place").
+    Emitted by :func:`openagent.core.compaction.compact` around the fold
+    of the oldest runs into a recap run — vision §2 (Streams: "the
+    session compacts in place"). Every client renders its own affordance:
+    the desktop app shows a tool-style compaction card, the CLI a dim
+    step line, the bridges a "Compacting conversation" → "Compacted
+    conversation" message. Because the summarisation LLM call takes a
+    couple of seconds, the event fires TWICE per compaction — once with
+    ``phase="running"`` before the fold and once with ``phase="done"``
+    after — so clients can show progress rather than just latency. A rare
+    third ``phase="error"`` resolves the notice when the summary comes
+    back empty (compaction was skipped; the reactive context-overflow
+    fallback still backstops it).
 
-    ``summary_chars`` is the length of the recap paragraph the model
-    produced; ``kept_runs_count`` is how many recent runs survived the
-    rewrite verbatim (the recap plus the last N untouched runs).
+    Field meanings (all best-effort, zero when unknown):
+
+    * ``phase`` — ``"running"`` (fold starting), ``"done"`` (fold landed),
+      or ``"error"`` (fold skipped after it was announced).
+    * ``folded_runs`` — how many older runs were folded into the recap.
+    * ``kept_runs_count`` — how many recent runs survived verbatim.
+    * ``summary_chars`` — length of the recap paragraph the model produced.
+    * ``tokens_before`` — estimated tokens of the folded runs.
+    * ``tokens_after`` — estimated tokens of the recap that replaced them.
+      ``tokens_before - tokens_after`` is roughly the context freed.
     """
 
+    phase: str = "done"
     summary_chars: int = 0
     kept_runs_count: int = 0
+    folded_runs: int = 0
+    tokens_before: int = 0
+    tokens_after: int = 0
 
 
 __all__ = [

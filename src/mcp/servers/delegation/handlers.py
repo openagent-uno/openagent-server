@@ -100,19 +100,28 @@ def current_parent_session_id() -> Optional[str]:
     return _session_id_var.get()
 
 
-async def delegate_task(model_id: str, task: str) -> dict[str, Any]:
-    """Run ``task`` on the model named by ``model_id`` and return the answer.
+async def delegate_task(task: str, model_id: str | None = None) -> dict[str, Any]:
+    """Run ``task`` as a sub-agent (its own child session) and return the answer.
 
     Args:
-        model_id: runtime id of a model registered in the catalog, e.g.
-            ``"anthropic:claude-3-5-sonnet-20240620"``, ``"openai:gpt-4o"``.
-        task: the prompt to send the delegated model.
+        task: the prompt to hand the sub-agent.
+        model_id: OPTIONAL runtime id of a model registered in the catalog,
+            e.g. ``"anthropic:claude-opus-4-8"``, ``"openai:gpt-4o"``. Pick a
+            model when you want this part of the work handled by a specific
+            one (its scope matches the task, or you want a second opinion from
+            a different model). OMIT it to run the sub-agent on this session's
+            default/router model — a fresh, independent child session that
+            still decomposes work off your own transcript. Call
+            ``list_delegatable_models`` first if you want to choose by scope.
 
     Returns:
         A dict with ``status`` (``"ok"`` / ``"error"``), the delegated
-        ``model_id``, and either ``answer`` (final text) or ``error``
-        (failure message).
+        ``model_id`` (may be null when the default model was used), and either
+        ``answer`` (final text) or ``error`` (failure message).
     """
+    # Normalise an empty/whitespace model_id to None so callers that pass ""
+    # get the default-model behaviour rather than a bogus-id error.
+    model_id = (model_id or "").strip() or None
     parent_session_id = _session_id_var.get()
     db = _db_var.get()
     agent = _agent_var.get()
@@ -150,7 +159,7 @@ async def delegate_task(model_id: str, task: str) -> dict[str, Any]:
             parent_session_id=parent_session_id,
             origin="delegation",
             origin_ref={"model_id": model_id},
-            title=f"Sub-agent · {model_id}",
+            title=f"Sub-agent · {model_id}" if model_id else "Sub-agent",
             prompt=task,
             owner_client_id=owner_handle,
             model_id=model_id,

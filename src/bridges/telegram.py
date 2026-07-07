@@ -628,8 +628,14 @@ class TelegramBridge(BaseBridge):
         # Forward any inline argument (e.g. /model gpt-4o) via the arg field.
         raw_args = getattr(context, "args", None) or []
         cmd_arg = " ".join(raw_args) if raw_args else None
-        result = await self.send_command(cmd, session_id=f"tg:{user_id}", arg=cmd_arg)
-        await self.send_response_text(update.message, result)
+        if cmd == "compact":
+            # Show "Compacting conversation" → "Compacted conversation"
+            # inline (edited in place), matching the automatic path — the
+            # command has no turn collector to carry the compaction notice.
+            await self.run_compact_command(update.message, f"tg:{user_id}")
+            return
+        result = await self.send_command_full(cmd, session_id=f"tg:{user_id}", arg=cmd_arg)
+        await self.deliver_command_result(update.message, result)
 
     async def _on_export(self, update, context) -> None:
         """``/export`` — bundle the user's profile + skills + recent
@@ -815,6 +821,22 @@ class TelegramBridge(BaseBridge):
                 )
             except Exception:
                 pass
+            return
+        if data.startswith("cmd:"):
+            # Format: cmd:<command>:<value> — a pick from a structured
+            # command picker (e.g. the /model chooser). Re-issue the
+            # command with the chosen value as its argument and show the
+            # result in place of the keyboard.
+            _, _, rest = data.partition(":")
+            command, _, value = rest.partition(":")
+            if command and value:
+                result = await self.send_command(
+                    command, session_id=f"tg:{user_id}", arg=value,
+                )
+                try:
+                    await cb.edit_message_text(result or "Fatto.")
+                except Exception:
+                    pass
             return
         if data.startswith("choice:"):
             # Format: choice:<turn_id>:<value> — the value is what we
@@ -1182,6 +1204,70 @@ class TelegramBridge(BaseBridge):
             # Older clients / unsupported chat types just don't render
             # the reaction — non-fatal.
             pass
+
+    async def post_compaction_notice(self, msg):
+        # In-place compaction (vision §2): post an editable bubble that
+        # ``resolve_compaction_notice`` flips to "Compacted conversation"
+        # once the fold lands. Telegram supports message edits, so this is
+        # a single self-updating message, not a "Compacting…"/"Compacted"
+        # pair. The copy is fixed, HTML-safe (no ``<``/``&`` beyond the
+        # ``<i>`` we add), so it's sent as literal HTML — not routed
+        # through the markdown converter, which is for model output.
+        try:
+            return await msg.reply_text(
+                "🗜 <i>Compacting conversation…</i>",
+                parse_mode="HTML", disable_web_page_preview=True,
+            )
+        except Exception:
+            return None
+
+    async def resolve_compaction_notice(self, msg, handle, text, *, ok):
+        if handle is None:
+            return await super().resolve_compaction_notice(msg, handle, text, ok=ok)
+        try:
+            await handle.edit_text(
+                text, parse_mode="HTML", disable_web_page_preview=True,
+            )
+        except Exception:
+            # Edit can fail (message deleted, too old, identical content) —
+            # non-fatal; the fold still happened server-side.
+            pass
+
+    async def render_picker(self, msg, picker: dict) -> bool:
+        # Render a structured command picker (e.g. /model) as an inline
+        # keyboard. Each button carries ``cmd:<command>:<value>`` which
+        # ``_on_callback`` re-issues as the command. One button per row so
+        # the model label + provider subtitle stay readable on mobile.
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        command = str(picker.get("command") or "")
+        options = picker.get("options") or []
+        if not command or not options:
+            return False
+        rows: list[list] = []
+        for opt in options:
+            value = str(opt.get("value") or "")
+            if not value:
+                continue
+            label = str(opt.get("label") or value)
+            if opt.get("active"):
+                label = f"✓ {label}"
+            subtitle = str(opt.get("subtitle") or "")
+            if subtitle:
+                label = f"{label} · {subtitle}"
+            cb_data = f"cmd:{command}:{value}"
+            # Telegram caps callback_data at 64 bytes; skip anything longer
+            # (the text list in the command_result still covers it).
+            if len(cb_data.encode("utf-8")) > 64:
+                continue
+            rows.append([InlineKeyboardButton(label[:64], callback_data=cb_data)])
+        if not rows:
+            return False
+        prompt = str(picker.get("prompt") or "Scegli:")
+        try:
+            await msg.reply_text(prompt, reply_markup=InlineKeyboardMarkup(rows))
+            return True
+        except Exception:
+            return False
 
     async def send_choice_buttons(self, msg, options: list[str]) -> None:
         # Render the picker as a reply to ``msg`` so the buttons sit

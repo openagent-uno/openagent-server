@@ -46,7 +46,7 @@ Server → Client::
     {"type": "audio_end",      "session_id": "...", "total_chunks": N}
     {"type": "turn_complete",  "session_id": "..."}
     {"type": "error",          "text": "..."}
-    {"type": "command_result", "text": "..."}
+    {"type": "command_result", "text": "...", "picker"?: {...}}
     {"type": "pong"}
     {"type": "resource_event", "resource": "...", "action": "...", "id": "..."}
     {"type": "system_snapshot", "snapshot": {host, cpu, memory, swap, disks, network, processes, timestamp}}
@@ -62,6 +62,22 @@ The mirror-modality rule on the server side: ``text_final`` with
 ``source="stt"`` always speaks the reply when TTS is configured, even
 when the session was opened with ``speak=false``. That way chat-tab
 typed messages stay silent but voice notes get spoken back.
+
+A ``command_result`` may carry an optional ``picker`` when the command
+offers a list to choose from (today only ``/model`` with no argument). The
+shape is::
+
+    {"command": "model",
+     "prompt": "Pick a model for this conversation:",
+     "options": [{"label": "...", "value": "<runtime_id>",
+                  "subtitle"?: "...", "active"?: true|false}, ...]}
+
+``text`` always fully describes the result on its own, so clients that
+don't understand ``picker`` degrade gracefully. Thin bridges render the
+options as native buttons / select menus; on selection they re-issue the
+command with ``arg=<value>`` (a ``value`` of ``"default"`` clears the pin).
+Rich clients (desktop app, CLI) ignore this and build their own picker
+from ``GET /api/models`` + ``GET /api/commands`` (``arg_source``).
 
 A ``resource_event`` tells subscribed clients (the desktop app's MCPs /
 Tasks / Workflows / Memory screens) that a server-side resource list

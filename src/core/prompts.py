@@ -86,10 +86,13 @@ Two delegation paths exist depending on how you're running:
      the ``delegation`` MCP server:
 
        ``tool_search_call_tool(server="delegation", tool="list_delegatable_models", args={})``
-       ``tool_search_call_tool(server="delegation", tool="delegate_task", args={"model_id": "<runtime_id>", "task": "<full prompt>"})``
+       ``tool_search_call_tool(server="delegation", tool="delegate_task", args={"task": "<full prompt>", "model_id": "<runtime_id>"})``
 
      Agents not running as a team leader can use this to reach a model
-     that isn't in their team.
+     that isn't in their team. ``model_id`` is OPTIONAL: pass one to route
+     the sub-task to a specific model (pick by scope), or omit it to spawn
+     the sub-agent on your own default/router model — a fresh child session
+     that decomposes the work without you having to choose a model.
 
 **Hard rule.** For any user prompt that is more than a one-line
 acknowledgement or a trivial confirmation, decompose and delegate.
@@ -139,9 +142,11 @@ concatenate raw sub-agent outputs or echo "specialist X said …".
 **How to delegate.**
 - Team-leader path: use the member's exact `id` from
   ``<team_members>`` (NOT the friendly name, NOT a guess).
-- Universal path: call ``list_delegatable_models`` first to get the
-  exact ``runtime_id`` strings, then pass one of them to
-  ``delegate_task``. Pass each sub-task's full description — goal,
+- Universal path: to target a specific model, call
+  ``list_delegatable_models`` first to get the exact ``runtime_id``
+  strings, then pass one as ``model_id`` to ``delegate_task``; to just
+  fan out on your default model, call ``delegate_task`` with only
+  ``task``. Either way pass each sub-task's full description — goal,
   context, what a good result looks like; don't narrow or reinterpret
   the user's intent.
 

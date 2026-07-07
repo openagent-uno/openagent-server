@@ -46,6 +46,7 @@ _ALLOWED_UPDATE_COLUMNS = {
     "enabled",
     "last_run",
     "next_run",
+    "model",
 }
 
 
@@ -168,6 +169,7 @@ async def create_scheduled_task(
     name: str,
     cron_expression: str,
     prompt: str,
+    model: str | None = None,
 ) -> dict[str, Any]:
     """Create a new recurring task.
 
@@ -178,6 +180,10 @@ async def create_scheduled_task(
 
     Use this ONLY for repeating schedules. If the user wants something
     to happen once, use create_one_shot_task instead.
+
+    ``model`` (optional) pins the firing to a specific model — a runtime_id
+    such as 'anthropic:claude-opus-4-8'. Omit it to run the task on the
+    agent's default/router model, like a normal chat turn.
     """
     if not name or not name.strip():
         raise ValueError("name is required")
@@ -192,9 +198,9 @@ async def create_scheduled_task(
 
     await conn.execute(
         "INSERT INTO scheduled_tasks "
-        "(id, name, cron_expression, prompt, enabled, next_run, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
-        (task_id, name, cron_expression, prompt, nr, now, now),
+        "(id, name, cron_expression, prompt, enabled, next_run, model, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)",
+        (task_id, name, cron_expression, prompt, nr, (model or None), now, now),
     )
     await conn.commit()
 
@@ -211,6 +217,7 @@ async def create_one_shot_task(
     prompt: str,
     delay_seconds: int | None = None,
     run_at_iso: str | None = None,
+    model: str | None = None,
 ) -> dict[str, Any]:
     """Create a task that runs exactly once.
 
@@ -220,6 +227,9 @@ async def create_one_shot_task(
     Pass exactly one of:
       - delay_seconds: seconds from now
       - run_at_iso: absolute local timestamp like 2026-04-14T09:30:00
+
+    ``model`` (optional) pins the firing to a specific model (a runtime_id);
+    omit to use the agent's default/router model.
     """
     if not name or not name.strip():
         raise ValueError("name is required")
@@ -246,9 +256,9 @@ async def create_one_shot_task(
     cron_expression = build_one_shot_expression(run_at)
     await conn.execute(
         "INSERT INTO scheduled_tasks "
-        "(id, name, cron_expression, prompt, enabled, next_run, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
-        (task_id, name, cron_expression, prompt, run_at, now, now),
+        "(id, name, cron_expression, prompt, enabled, next_run, model, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)",
+        (task_id, name, cron_expression, prompt, run_at, (model or None), now, now),
     )
     await conn.commit()
 
@@ -266,12 +276,16 @@ async def update_scheduled_task(
     cron_expression: str | None = None,
     prompt: str | None = None,
     enabled: bool | None = None,
+    model: str | None = None,
 ) -> dict[str, Any]:
     """Partially update a scheduled task.
 
     Only the fields you pass are changed. Changing cron_expression also
     recomputes next_run so the Scheduler loop picks up the new cadence
     on its next tick.
+
+    ``model`` sets the per-task model pin (a runtime_id). Pass an empty
+    string to clear it so the task reverts to the default/router model.
     """
     conn = await _get_conn()
     full_id = await _resolve_task_id(conn, task_id)
@@ -285,6 +299,9 @@ async def update_scheduled_task(
         if not prompt.strip():
             raise ValueError("prompt cannot be empty")
         updates["prompt"] = prompt
+    if model is not None:
+        # Empty string clears the pin (→ default model); any other value sets it.
+        updates["model"] = model.strip() or None
     if cron_expression is not None:
         _validate_cron(cron_expression)
         updates["cron_expression"] = cron_expression
@@ -305,7 +322,7 @@ async def update_scheduled_task(
     if not updates:
         raise ValueError(
             "No fields to update. Pass at least one of: name, "
-            "cron_expression, prompt, enabled."
+            "cron_expression, prompt, enabled, model."
         )
 
     # Drop unknown columns as a safety net.

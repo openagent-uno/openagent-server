@@ -42,6 +42,50 @@ logger = logging.getLogger(__name__)
 SLACK_MSG_LIMIT = 3500
 
 
+def _build_picker_blocks(picker: dict | None) -> list | None:
+    """Build Block Kit blocks with a ``static_select`` for a structured
+    command picker (e.g. the /model chooser). Returns ``None`` when there
+    are no renderable options — the caller then falls back to plain text.
+
+    Each option's value encodes ``<command>::<runtime_id>`` so the shared
+    ``oa_cmd_pick`` action handler can re-issue the right command. Slack
+    caps a select at 100 options and each value/label at 75 chars.
+    """
+    if not isinstance(picker, dict):
+        return None
+    command = str(picker.get("command") or "")
+    raw = picker.get("options") or []
+    if not command or not raw:
+        return None
+    options = []
+    for opt in raw[:100]:
+        value = str(opt.get("value") or "")
+        if not value:
+            continue
+        encoded = f"{command}::{value}"
+        if len(encoded) > 75:  # Slack option value hard cap
+            continue
+        label = str(opt.get("label") or value)
+        if opt.get("active"):
+            label = f"✓ {label}"
+        options.append({
+            "text": {"type": "plain_text", "text": label[:75]},
+            "value": encoded,
+        })
+    if not options:
+        return None
+    prompt = str(picker.get("prompt") or "Choose:")
+    return [
+        {"type": "section", "text": {"type": "mrkdwn", "text": prompt}},
+        {"type": "actions", "elements": [{
+            "type": "static_select",
+            "action_id": "oa_cmd_pick",
+            "placeholder": {"type": "plain_text", "text": "Select…"},
+            "options": options,
+        }]},
+    ]
+
+
 class SlackBridge(BaseBridge):
     name = "slack"
     message_limit = SLACK_MSG_LIMIT
@@ -165,17 +209,50 @@ class SlackBridge(BaseBridge):
                     # Slack puts any text after the command name in
                     # command["text"] (e.g. "/model gpt-4o" → "gpt-4o").
                     slack_arg = (command.get("text") or "").strip() or None
-                    result = await self.send_command(
+                    result = await self.send_command_full(
                         command_name, session_id=f"sl:{uid}", arg=slack_arg,
                     )
                 except Exception as e:  # noqa: BLE001
                     logger.warning("slack /%s failed: %s", command_name, e)
-                    result = f"/{command_name} failed."
-                await respond(result or f"/{command_name} done.")
+                    await respond(f"/{command_name} failed.")
+                    return
+                picker = result.get("picker") if isinstance(result, dict) else None
+                blocks = _build_picker_blocks(picker) if isinstance(picker, dict) else None
+                if blocks:
+                    await respond(text=str(picker.get("prompt") or "Choose:"), blocks=blocks)
+                else:
+                    await respond(result.get("text", "") or f"/{command_name} done.")
             return _handler
 
         for _cmd_name, _ in BOT_COMMANDS:
             app.command(f"/{_cmd_name}")(_make_slash_handler(_cmd_name))
+
+        # Block Kit picker selection (e.g. /model). The static_select's
+        # value encodes ``<command>::<runtime_id>``; re-issue the command
+        # and replace the picker message with the result. Registered once
+        # for the shared action_id used by ``_build_picker_blocks``.
+        @app.action("oa_cmd_pick")  # type: ignore[misc]
+        async def _on_pick(ack, body, respond):  # noqa: ANN001
+            await ack()
+            uid = str((body.get("user") or {}).get("id") or "")
+            if not self._is_authorized(uid):
+                return
+            try:
+                selected = body["actions"][0]["selected_option"]["value"]
+            except (KeyError, IndexError, TypeError):
+                return
+            command, _, value = selected.partition("::")
+            if not command or not value:
+                return
+            try:
+                result = await self.send_command(
+                    command, session_id=f"sl:{uid}", arg=value,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("slack picker /%s failed: %s", command, e)
+                result = f"/{command} failed."
+            with contextlib.suppress(Exception):
+                await respond(text=result or "Done.", replace_original=True)
 
         # Socket mode handler — long-lived; cancellation comes from
         # BaseBridge.stop() which sets _should_stop and cancels the

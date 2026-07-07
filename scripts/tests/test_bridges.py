@@ -1976,3 +1976,136 @@ async def t_live_mode_model_footer(ctx: TestContext) -> None:
     await bridge.dispatch_turn("target", "sid:footer", "go")
     assert posted[0] == "🔧 Running command", posted
     assert posted[-1] == "Done.\n\nModel: claude-opus-4-8", posted
+
+
+@test("bridges", "deliver_command_result renders picker natively, else falls back to text")
+async def t_deliver_command_result(ctx: TestContext) -> None:
+    """A bridge that overrides ``render_picker`` (returns True) shows the
+    interactive picker and skips the text; a bridge without one degrades to
+    the ``text`` option list. Non-picker results always send text."""
+    from src.bridges.base import BaseBridge
+
+    picker = {
+        "command": "model",
+        "prompt": "Pick a model:",
+        "options": [
+            {"label": "Auto", "value": "default", "active": True},
+            {"label": "Opus", "value": "anthropic:claude-opus-4-8"},
+        ],
+    }
+    result = {"type": "command_result", "text": "text list of models", "picker": picker}
+
+    # 1) Bridge WITHOUT a render_picker override → text fallback.
+    text_chunks: list[str] = []
+
+    class _TextOnly(BaseBridge):
+        name = "textonly"
+        message_limit = 4096
+
+        async def send_text_chunk(self, target, chunk):
+            text_chunks.append(chunk)
+
+        async def send_attachment(self, target, att):
+            pass
+
+    plain = _TextOnly.__new__(_TextOnly)
+    plain.name = "textonly"
+    await plain.deliver_command_result("target", result)
+    assert text_chunks == ["text list of models"], text_chunks
+
+    # 2) Bridge WITH a render_picker override → native picker, no text.
+    rendered: list[dict] = []
+    native_chunks: list[str] = []
+
+    class _Native(BaseBridge):
+        name = "native"
+        message_limit = 4096
+
+        async def send_text_chunk(self, target, chunk):
+            native_chunks.append(chunk)
+
+        async def send_attachment(self, target, att):
+            pass
+
+        async def render_picker(self, target, pk):
+            rendered.append(pk)
+            return True
+
+    native = _Native.__new__(_Native)
+    native.name = "native"
+    await native.deliver_command_result("target", result)
+    assert rendered == [picker], rendered
+    assert native_chunks == [], native_chunks  # native path skips the text
+
+    # 3) A result with NO picker always sends text, even on a picker-capable bridge.
+    native_chunks.clear()
+    rendered.clear()
+    await native.deliver_command_result("target", {"type": "command_result", "text": "just text"})
+    assert native_chunks == ["just text"], native_chunks
+    assert rendered == [], rendered
+
+
+@test("bridges", "run_compact_command posts start then outcome (no-edit path)")
+async def t_run_compact_command_no_edit(ctx: TestContext) -> None:
+    """A manual /compact on an edit-less bridge (WhatsApp/Slack) shows the
+    start and the outcome as two short messages, in order, wrapping the
+    concise gateway command result — no verbose recap line."""
+    from src.bridges.base import BaseBridge
+
+    class _Stub(BaseBridge):
+        def __init__(self) -> None:  # noqa: D401 — skip WS connect
+            self.name = "stub"
+            self.sent: list[str] = []
+
+        async def send_text_chunk(self, target, chunk: str) -> None:  # noqa: ANN001
+            self.sent.append(chunk)
+
+        async def send_command(self, name, session_id=None, arg=None) -> str:  # noqa: ANN001
+            assert name == "compact", name
+            assert session_id == "s1", session_id
+            self.sent.append(f"__cmd:{name}")
+            return "Compacted conversation."
+
+    b = _Stub()
+    await b.run_compact_command(target="chat1", session_id="s1")
+    # start notice → the command ran → the outcome, strictly in order.
+    assert b.sent == [
+        "🗜 Compacting conversation",
+        "__cmd:compact",
+        "🗜 Compacted conversation.",
+    ], b.sent
+
+
+@test("bridges", "run_compact_command edits one bubble when the bridge can edit")
+async def t_run_compact_command_edit(ctx: TestContext) -> None:
+    """On an edit-capable bridge (Telegram/Discord) the outcome edits the
+    same 'Compacting…' bubble in place — one self-updating message, no
+    second send."""
+    from src.bridges.base import BaseBridge
+
+    class _EditStub(BaseBridge):
+        def __init__(self) -> None:
+            self.name = "editstub"
+            self.events: list = []
+
+        async def send_text_chunk(self, target, chunk: str) -> None:  # noqa: ANN001
+            self.events.append(("send", chunk))
+
+        async def send_command(self, name, session_id=None, arg=None) -> str:  # noqa: ANN001
+            return "Compacted conversation."
+
+        async def post_compaction_notice(self, target):  # noqa: ANN001
+            self.events.append(("post", target))
+            return {"bubble": 1}  # a truthy editable handle
+
+        async def resolve_compaction_notice(self, target, handle, text, *, ok):  # noqa: ANN001
+            self.events.append(("edit", handle, text, ok))
+
+    b = _EditStub()
+    await b.run_compact_command(target="chat1", session_id="s1")
+    assert b.events == [
+        ("post", "chat1"),
+        ("edit", {"bubble": 1}, "🗜 Compacted conversation.", True),
+    ], b.events
+    # The outcome edits the start bubble — it is NOT a fresh send_text_chunk.
+    assert all(e[0] != "send" for e in b.events), b.events

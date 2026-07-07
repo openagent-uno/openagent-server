@@ -104,9 +104,14 @@ def is_reasoning_status(raw: str) -> bool:
 
     Used by the turn runner to split the ``on_status`` stream: a plain
     thinking string becomes the typed ``OutReasoning(active=True)`` flag
-    (the client renders its own indicator), while tool-execution JSON and
-    structured envelopes like ``{"kind":"session.compacted"}`` keep flowing
-    as ``OutToolStatus`` because they carry real data the client renders.
+    (the client renders its own indicator), while tool-execution JSON
+    keeps flowing as ``OutToolStatus`` because it carries real data the
+    client renders. The ``{"kind":"session.compacted"}`` envelope is
+    lifted out even earlier — the turn runner checks
+    :func:`parse_compaction_status` first and emits a typed
+    ``SessionCompacted`` frame — so it never reaches this classifier;
+    were it to, the JSON-object guard below would (harmlessly) treat it
+    as non-reasoning too.
 
     The test is deliberately structural rather than a hardcoded string set,
     so a new plain status added upstream is classified correctly without a
@@ -125,6 +130,46 @@ def is_reasoning_status(raw: str) -> bool:
         except (json.JSONDecodeError, ValueError, TypeError):
             pass
     return True
+
+
+def parse_compaction_status(raw: str) -> dict | None:
+    """Parse a session-compaction status envelope, or return ``None``.
+
+    ``src.core.compaction.compact`` fires its progress hints through the
+    same ``on_status`` channel every tool uses, as a JSON envelope tagged
+    ``{"kind": "session.compacted", "phase": ...}``. The turn runner and
+    the bridges call this to lift that envelope out of the tool-status
+    stream and render it as a first-class compaction affordance (vision
+    §2) instead of leaking the raw JSON into a "Using ..." line.
+
+    Returns the payload dict with a normalised ``phase`` in
+    ``{"running", "done", "error"}`` (legacy envelopes without a phase read
+    as ``"done"`` — the pre-phase behaviour was a single fire-after-fold),
+    the integer stat fields coerced to ``int``, or ``None`` when *raw* is
+    not a compaction envelope.
+    """
+    text = (raw or "").strip()
+    if not text or text[:1] != "{":
+        return None
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return None
+    if not isinstance(parsed, dict) or parsed.get("kind") != "session.compacted":
+        return None
+    phase = parsed.get("phase")
+    if phase not in ("running", "done", "error"):
+        phase = "done"
+    out: dict = {"phase": phase}
+    for key in (
+        "folded_runs", "kept_runs_count", "summary_chars",
+        "tokens_before", "tokens_after",
+    ):
+        try:
+            out[key] = int(parsed.get(key) or 0)
+        except (TypeError, ValueError):
+            out[key] = 0
+    return out
 
 
 @dataclass

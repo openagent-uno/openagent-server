@@ -26,8 +26,8 @@ def build_runtime_toolkit() -> Any:
     from src.mcp._runtime.function import ToolResult
     from src.mcp._runtime.toolkit import Toolkit
 
-    async def delegate_task(model_id: str, task: str):
-        result = await handlers.delegate_task(model_id=model_id, task=task)
+    async def delegate_task(task: str, model_id: str | None = None):
+        result = await handlers.delegate_task(task=task, model_id=model_id)
         # Return a structured ToolResult so the runner can lift
         # ``child_session_id`` onto the ToolExecution (→ delegation card).
         # The model still sees the JSON text via ``content``.

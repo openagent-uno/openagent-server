@@ -34,6 +34,13 @@ logger = logging.getLogger(__name__)
 
 READ_CHUNK = 64 * 1024  # large enough to keep up with WS frames; small enough for prompt cancellation
 
+# Backstop for the finish-path drain (see ``IrohStreamWriter._drain_for_finish``).
+# A peer that stops reading mid-transfer must not pin a closing stream forever.
+# Healthy transfers — even slow ones — finish well under this; a genuinely dead
+# peer is usually unblocked earlier by iroh's QUIC idle timeout erroring
+# ``write_all``. This bound is a last-resort leak guard, not the primary path.
+_FINISH_DRAIN_TIMEOUT_S = 120.0
+
 
 class _FakeTransport:
     """Minimal asyncio.Transport surface that aiohttp pokes at."""
@@ -122,6 +129,14 @@ class IrohStreamWriter:
         # a single asyncio.Lock so concurrent ``write`` calls from the
         # same writer don't interleave on the wire.
         self._write_lock = asyncio.Lock()
+        # In-flight ``write()`` tasks. ``drain()`` / the finish path gather
+        # these so a closing stream waits for EVERY scheduled write — even
+        # ones not yet started — before finishing (otherwise the response
+        # body is truncated; see ``drain``).
+        self._pending: set[asyncio.Task] = set()
+        # Strong reference to the deferred close→finish task so the loop can't
+        # GC it mid-flight ("Task was destroyed but it is pending").
+        self._finish_task: asyncio.Task | None = None
 
     @property
     def transport(self) -> _FakeTransport:
@@ -152,7 +167,12 @@ class IrohStreamWriter:
         # writes concurrently from different tasks (rare for HTTP/1.1
         # but possible for WS pings on a misconfigured peer), they
         # serialise here rather than racing on the Iroh stream.
-        loop.create_task(self._write_async(data))
+        task = loop.create_task(self._write_async(data))
+        # Register the in-flight write so ``drain()`` can await it even
+        # before it has acquired ``_write_lock`` (a just-scheduled write
+        # hasn't started yet, so the lock alone wouldn't wait for it).
+        self._pending.add(task)
+        task.add_done_callback(self._pending.discard)
 
     def writelines(self, data) -> None:
         for d in data:
@@ -167,14 +187,46 @@ class IrohStreamWriter:
                 self._closed = True
 
     async def drain(self) -> None:
-        # The lock acts as the drain barrier: once we acquire-release
-        # it, any prior ``write`` has finished writing to Iroh.
-        async with self._write_lock:
-            return
+        # Await every scheduled write to complete, in-flight or not-yet-
+        # started. ``_write_lock`` still guarantees on-wire ordering; gathering
+        # the task objects guarantees completeness — a write that was
+        # ``create_task``'d but hasn't run yet is still awaited here, so the
+        # finish path can't race ahead of it and truncate the response.
+        pending = [t for t in self._pending if not t.done()]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    async def _drain_for_finish(self) -> None:
+        # Bounded drain used ONLY on the close/write_eof path. Identical intent
+        # to ``drain()`` (flush the body before finishing the stream) but with a
+        # last-resort timeout so a peer that stops reading can't pin the close
+        # forever. Uses ``asyncio.wait`` (NOT ``wait_for``/``gather``) so a
+        # timeout does NOT cancel the in-flight writes — cancelling them would
+        # re-introduce the very truncation this drain exists to prevent. On the
+        # rare timeout we finish best-effort; healthy transfers never hit it.
+        pending = [t for t in self._pending if not t.done()]
+        if pending:
+            done, still = await asyncio.wait(pending, timeout=_FINISH_DRAIN_TIMEOUT_S)
+            if still:
+                logger.warning(
+                    "iroh writer: %d write(s) still pending after %.0fs — "
+                    "finishing stream anyway to avoid a hang",
+                    len(still), _FINISH_DRAIN_TIMEOUT_S,
+                )
 
     async def write_eof(self) -> None:
         if self._closed:
             return
+        # Mark closed up front so a racing ``close()`` doesn't double-finish;
+        # already-scheduled ``_write_async`` tasks don't check this flag, so
+        # they still flush.
+        self._closed = True
+        # Drain in-flight writes BEFORE finishing the stream. ``write()`` is
+        # fire-and-forget; finishing without draining would close the Iroh
+        # send stream while body-write tasks are still pending, truncating the
+        # response — exactly what made ``web.FileResponse`` (and any large
+        # body) deliver its headers but zero body bytes.
+        await self._drain_for_finish()
         try:
             # iroh-py exposes ``finish()`` on SendStream to mark a clean
             # half-close. Older versions used ``close()`` — try both.
@@ -183,11 +235,14 @@ class IrohStreamWriter:
                 await finish()
         except Exception as e:  # noqa: BLE001
             logger.debug("iroh send finish failed: %s", e)
-        self._closed = True
 
     def close(self) -> None:
-        # Sync close: aiohttp calls this on shutdown. Fire-and-forget
-        # the async finish; the Iroh stream tolerates the hang-up.
+        # Sync close: aiohttp calls this after each response / on shutdown.
+        # We must NOT finish the Iroh send stream until every scheduled
+        # ``write()`` has flushed, or the tail of the response is cut off
+        # (the FileResponse / large-body truncation bug). So drain-then-finish
+        # runs on the loop; ``_closed`` blocks new writes immediately while the
+        # already-queued ones (which don't check the flag) still complete.
         if self._closed:
             return
         self._closed = True
@@ -196,9 +251,19 @@ class IrohStreamWriter:
             loop = asyncio.get_event_loop()
         except RuntimeError:
             return
-        finish = getattr(self._send, "finish", None) or getattr(self._send, "close", None)
-        if finish is not None:
-            loop.create_task(finish())
+        # Keep a strong ref so the loop doesn't GC this task before it finishes.
+        self._finish_task = loop.create_task(self._drain_then_finish())
+
+    async def _drain_then_finish(self) -> None:
+        """Wait (bounded) for all scheduled ``write()`` tasks to reach the wire,
+        then cleanly finish the Iroh send stream."""
+        try:
+            await self._drain_for_finish()
+            finish = getattr(self._send, "finish", None) or getattr(self._send, "close", None)
+            if finish is not None:
+                await finish()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("iroh send finish failed: %s", e)
 
     async def wait_closed(self) -> None:
         # Nothing to wait on — ``close()`` already scheduled the finish.

@@ -64,6 +64,11 @@ class StreamCollector(BatchedReply):
     # need to maintain their own buffer — the same string that would
     # arrive as ``OutTextFinal`` if the turn ended right now.
     on_delta: Callable[[str], Awaitable[None]] | None = None
+    # Compaction-progress callback (vision §2 in-place compaction). The
+    # WS listener routes ``session_compacted`` frames here so a bridge can
+    # post a "Compacting conversation" → "Compacted conversation" notice
+    # as the fold runs. Receives the raw frame dict (``phase`` + stats).
+    on_compaction: Callable[[dict], Awaitable[None]] | None = None
     # Rolling text buffer used by the delta path; ``OutTextFinal``
     # overwrites it with the canonical reply, so this is only meaningful
     # while the turn is still in flight.

@@ -333,6 +333,8 @@ async def handle_create(request):
     name = (body.get("name") or "").strip()
     cron_expression = (body.get("cron_expression") or "").strip()
     prompt = (body.get("prompt") or "").strip()
+    # Optional per-task model pin (a runtime_id). Empty/absent → default model.
+    model = (body.get("model") or "").strip() or None
 
     if not name:
         return web.json_response({"error": "name is required"}, status=400)
@@ -352,7 +354,7 @@ async def handle_create(request):
             status=400,
         )
 
-    task_id = await scheduler.add_task(name, cron_expression, prompt)
+    task_id = await scheduler.add_task(name, cron_expression, prompt, model=model)
 
     # add_task enables by default; honour an explicit enabled=false.
     if body.get("enabled") is False:
@@ -398,6 +400,11 @@ async def handle_update(request):
             return web.json_response({"error": "prompt cannot be empty"}, status=400)
         updates["prompt"] = prompt
 
+    if "model" in body:
+        # Optional per-task model pin. An explicit empty string / null clears
+        # it (firing reverts to the default/router model); a runtime_id sets it.
+        updates["model"] = (body["model"] or "").strip() or None
+
     if "cron_expression" in body:
         cron_expression = (body["cron_expression"] or "").strip()
         if not cron_expression:
@@ -417,7 +424,7 @@ async def handle_update(request):
 
     if not updates and enabled_change is None:
         return web.json_response(
-            {"error": "No fields to update. Pass name, cron_expression, prompt, or enabled."},
+            {"error": "No fields to update. Pass name, cron_expression, prompt, model, or enabled."},
             status=400,
         )
 

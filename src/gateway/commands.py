@@ -12,6 +12,14 @@ class GatewayCommandSpec:
     help_text: str
     menu_visible: bool = True
     help_visible: bool = True
+    # When set, the command's positional argument is chosen from a named,
+    # server-known list rather than typed free-hand. Clients read this
+    # (via ``GET /api/commands``) to render a picker instead of a text
+    # field. Today the only source is ``"models"`` (enabled LLM models);
+    # ``None`` means a plain free-text / no argument. Keeping it a string
+    # rather than an enum lets new pickable sources appear without a
+    # client redeploy.
+    arg_source: str | None = None
 
 
 COMMAND_SPECS = (
@@ -26,7 +34,7 @@ COMMAND_SPECS = (
     GatewayCommandSpec("restart", "Restart OpenAgent", "restart OpenAgent"),
     GatewayCommandSpec("help", "Show available commands", "show this help message"),
     GatewayCommandSpec("compact", "Summarize & compress the conversation to free up context", "fold older turns into a recap to free context"),
-    GatewayCommandSpec("model", "Switch the model for this conversation", "list configured models or switch: /model <id>"),
+    GatewayCommandSpec("model", "Switch the model for this conversation", "list configured models or switch: /model <id>", arg_source="models"),
 )
 
 COMMAND_MAP = {spec.name: spec for spec in COMMAND_SPECS}

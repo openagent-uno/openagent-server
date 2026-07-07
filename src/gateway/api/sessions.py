@@ -270,6 +270,35 @@ def _expand_run_messages(
     if run_status in ("cancelled", "canceled"):
         return out
 
+    # In-session compaction recap (vision §2). ``src.core.compaction``
+    # folds the oldest runs into a single recap run tagged
+    # ``metadata.compaction``. Surface it as a ``compaction`` message —
+    # the same tool-style card the live ``session_compacted`` frame draws
+    # — instead of letting the recap paragraph render as a bare assistant
+    # bubble. The stats persisted alongside the recap let the reopened
+    # transcript rebuild the identical card. This is a terminal shape for
+    # the run: it has no user/tool/assistant messages worth expanding.
+    meta = run.get("metadata")
+    if isinstance(meta, dict) and meta.get("compaction"):
+        msg_counter[0] += 1
+        out.append({
+            "id": f"run-msg-{msg_counter[0]}",
+            "role": "compaction",
+            "text": "",
+            "timestamp": timestamp,
+            "compaction": {
+                "phase": "done",
+                "folded_runs": int(meta.get("folded_runs") or 0),
+                "kept_runs_count": int(meta.get("kept_runs_count") or 0),
+                "summary_chars": int(
+                    meta.get("summary_chars") or len(run.get("content") or "")
+                ),
+                "tokens_before": int(meta.get("tokens_before") or 0),
+                "tokens_after": int(meta.get("tokens_after") or 0),
+            },
+        })
+        return out
+
     run_tools = run.get("tools") or []
     run_tools_by_id, run_tools_by_name = _build_run_tool_index(run_tools)
 
@@ -464,10 +493,37 @@ def _expand_run_messages(
             # lacks one (very old rows, or external-agent shims).
             if run_model:
                 entry["model"] = run_model
-            atts = _attachments_from_images(images_for_assistant)
+            # Agent-attached files ride as ``[IMAGE:/p]`` / ``[VIDEO:/p]`` /
+            # ``[VOICE:/p]`` / ``[FILE:/p]`` markers embedded in the STORED
+            # assistant text — from the attachments MCP's ``send_file_to_user``
+            # or auto-emitted for natively generated images. The live turn
+            # strips them via ``parse_response_markers`` before the wire
+            # ``response`` frame (stream/session.py); rehydration must do the
+            # same, else a reopened — or, because the app reconciles the
+            # transcript from this endpoint after every ``turn_complete``, even
+            # a live — session shows the raw markers as literal text and loses
+            # every non-image attachment (only ``run["images"]`` survived).
+            atts: list[dict] = []
+            if isinstance(content, str) and content:
+                from src.channels.base import parse_response_markers
+
+                clean, marker_atts = parse_response_markers(content)
+                entry["text"] = clean
+                atts = [
+                    {"type": a.type, "path": a.path, "filename": a.filename}
+                    for a in marker_atts
+                ]
+            # Merge the runtime-image attachments, deduped by path so a
+            # generated image present BOTH as a ``run["images"]`` entry and as an
+            # inline ``[IMAGE:/p]`` marker isn't attached twice.
+            seen_paths = {a["path"] for a in atts}
+            for a in _attachments_from_images(images_for_assistant):
+                if a["path"] not in seen_paths:
+                    atts.append(a)
+                    seen_paths.add(a["path"])
             if atts:
                 entry["attachments"] = atts
-                images_for_assistant = []  # only emit once per run
+            images_for_assistant = []  # only emit once per run
         out.append(entry)
 
     # Any member_responses that weren't spliced inline (e.g. the

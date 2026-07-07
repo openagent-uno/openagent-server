@@ -25,10 +25,17 @@ The flow per turn, called from ``Agent._run_inner`` *before* the next
    identifiable on inspection and so a future compaction pass doesn't
    try to re-summarise an already-compacted span.
 
-3. A :class:`stream.events.SessionCompacted` event is published if the
-   active stream session is in reach, plus a structured
-   ``runtime.compaction`` row in ``events.jsonl`` so debugging and
-   metrics queries both have a stable trail.
+3. Progress is announced through the ``on_status`` hook as a
+   ``{"kind": "session.compacted", "phase": ...}`` envelope — once with
+   ``phase="running"`` before the (slow) summariser call and once with
+   ``phase="done"`` after the rewrite lands (or ``phase="error"`` if the
+   summary came back empty). The turn runner
+   (:mod:`src.stream.session`) lifts that envelope into a typed
+   :class:`stream.events.SessionCompacted` frame, so the desktop app
+   draws a compaction card, the CLI a step line, and the bridges a
+   "Compacting conversation" → "Compacted conversation" message. A
+   structured ``runtime.compaction`` row also lands in ``events.jsonl``
+   so debugging and metrics queries have a stable trail.
 
 The reactive ``ContextWindowExceededError`` fallback in
 ``src.models.providers.fallback`` stays — it's the safety net for the
@@ -413,15 +420,19 @@ async def _summarize_runs(
     transcript = "\n\n".join(transcript_parts)
 
     system_prompt = (
-        "You are summarizing earlier turns of an ongoing conversation. "
-        "Preserve the user's stated goals, decisions made, file paths "
-        "mentioned, identifiers, and any open questions. Drop tool-call "
-        "mechanics and rephrasing. Output one paragraph."
+        "You are compacting an ongoing conversation into a recap that "
+        "REPLACES it — a future assistant will see only this recap and must "
+        "continue seamlessly, as if it had read the whole thread. Capture: "
+        "the user's goals and explicit requests; key decisions and their "
+        "rationale; files, paths, identifiers, and commands mentioned; what "
+        "was done and its outcome; the current state; and any open or "
+        "pending tasks. Be thorough but compact — drop tool-call mechanics "
+        "and verbatim rephrasing, keep the substance."
     )
     user_prompt = (
-        "Summarize the following earlier turns into one paragraph that a "
-        "future assistant can read to continue the conversation without "
-        "loss of important context:\n\n" + transcript
+        "Compact the following conversation into a recap a future assistant "
+        "can read to continue it without loss of important context:\n\n"
+        + transcript
     )
 
     summariser = _pick_summary_model(agent, fallback=model)
@@ -467,49 +478,130 @@ def _pick_summary_model(agent: Any, *, fallback: Any) -> Any:
     return fallback
 
 
+async def _emit_compaction_status(
+    on_status: Any | None, session_id: str, fields: dict[str, Any],
+) -> None:
+    """Fire one ``session.compacted`` envelope down the *on_status* channel.
+
+    The envelope rides the same hook tool progress uses; the turn runner
+    (``src.stream.session``) and the bridges lift it out with
+    ``channels.base.parse_compaction_status`` and render a first-class
+    compaction affordance instead of a raw status line. Best-effort: a UI
+    hint must never crash the turn, so a failing callback is logged and
+    swallowed.
+    """
+    if on_status is None:
+        return
+    try:
+        await on_status(json.dumps({"kind": "session.compacted", **fields}))
+    except Exception as exc:  # noqa: BLE001 — UI hint is best-effort
+        elog(
+            "runtime.compaction.status_failed",
+            level="warning",
+            session_id=session_id,
+            error=str(exc) or type(exc).__name__,
+        )
+
+
 async def compact(
     session_id: str, model: Any, agent: Any,
-    *, on_status: Any | None = None,
+    *, on_status: Any | None = None, keep: int | None = None,
 ) -> dict[str, Any] | None:
-    """Fold the oldest runs of *session_id* into a single recap run.
+    """Fold older runs of *session_id* into a single recap run.
 
     Reads the stored runs, summarises everything older than the last
-    ``OPENAGENT_COMPACTION_KEEP_RUNS`` (default 4), and writes
-    ``[recap_run] + last_N_runs`` back to ``sessions.runs``. The
-    recap run is tagged with ``metadata={"compaction": True}`` so it's
-    identifiable on inspection and so future compaction passes can
-    detect "this was already compacted" without re-parsing.
+    *keep* runs, and writes ``[recap_run] + last_keep_runs`` back to
+    ``sessions.runs``. The recap run is tagged with
+    ``metadata={"compaction": True}`` so it's identifiable on inspection
+    and so future passes can detect "already compacted" without re-parsing.
+
+    *keep* controls how many recent runs survive verbatim:
+
+    * ``None`` (the default, used by the AUTOMATIC context-pressure path)
+      → ``OPENAGENT_COMPACTION_KEEP_RUNS`` (default 4). Keeps a floor of
+      recent turns intact while folding the older span.
+    * ``0`` (the MANUAL ``/compact`` command, Claude-Code style) → fold
+      the ENTIRE conversation into one recap and keep nothing verbatim;
+      the conversation continues from the summary alone. This is why a
+      hand-typed ``/compact`` compacts even a short chat, instead of
+      no-opping until the conversation exceeds the keep window.
 
     Emits ``runtime.compaction.done`` (success) or
-    ``runtime.compaction.skipped`` (no-op) to ``events.jsonl``. Also
-    invokes *on_status* with a SessionCompacted-style JSON envelope so
-    StreamSession turns the call into an ``OutToolStatus`` frame on the
-    outbound bus — that's what the desktop UI reads to render
-    "Compacted earlier turns" inline with the active reply.
+    ``runtime.compaction.skipped`` (no-op) to ``events.jsonl`` and fires
+    the ``session.compacted`` progress envelope through *on_status* (see
+    :func:`_emit_compaction_status`).
 
     Returns a dict summarising the rewrite when one occurred, ``None``
-    when nothing changed. Idempotent in the no-op direction: calling
-    with too few runs simply returns ``None`` after the early bail.
+    when nothing changed. No-ops (and idempotently returns ``None`` +
+    emits a terminal feedback frame) when there is nothing real to fold —
+    an empty session, or one whose only foldable content is an existing
+    recap.
     """
     if not _flag_enabled() or not session_id:
         return None
     db_path = _resolve_db_path(agent)
     if not db_path:
         return None
-    keep = _keep_runs()
+    keep_n = _keep_runs() if keep is None else max(0, int(keep))
     runs = _load_runs(db_path, session_id)
-    if len(runs) <= keep:
+
+    # Split into the span to fold and the recent turns to keep verbatim.
+    # ``keep_n == 0`` (manual /compact) folds everything; slicing with
+    # ``runs[:-0]`` would wrongly yield ``[]``, so branch explicitly.
+    if keep_n > 0:
+        old_runs = runs[:-keep_n]
+        kept = runs[-keep_n:]
+    else:
+        old_runs = list(runs)
+        kept = []
+
+    # Nothing worth folding? No old runs at all (automatic path below the
+    # keep window), or the only thing older than the window is an
+    # already-compacted recap (folding a recap into a recap gains
+    # nothing). Emit a terminal ``done`` frame with ``folded_runs=0`` so a
+    # manual /compact still shows feedback ("Already compact — nothing to
+    # fold") instead of silence — the app reads the frame, not the command
+    # result.
+    real_old = [
+        r for r in old_runs
+        if not (isinstance(r, dict) and (r.get("metadata") or {}).get("compaction"))
+    ]
+    if not real_old:
         elog(
             "runtime.compaction.skipped",
             session_id=session_id,
-            reason="below_keep_window",
+            reason="nothing_to_fold",
             runs=len(runs),
-            keep=keep,
+            keep=keep_n,
         )
+        await _emit_compaction_status(on_status, session_id, {
+            "phase": "done",
+            "folded_runs": 0,
+            "kept_runs_count": len(kept),
+        })
         return None
 
-    old_runs = runs[:-keep]
-    kept = runs[-keep:]
+    # Measure the folded span up front so both the live "Compacting…"
+    # hint and the persisted recap metadata can report how much context
+    # the fold frees (``tokens_before − tokens_after``). Same estimation
+    # path ``should_compact`` used to decide we were over the threshold.
+    model_id = _resolve_model_id(model)
+    tokens_before = sum(
+        _estimate_text_tokens(_extract_run_text(r), model_id) for r in old_runs
+    )
+
+    # Announce the fold BEFORE the summariser round-trip. That call is a
+    # full model generate() (a couple of seconds), so this ``running``
+    # hint is the only thing that lets a client show "Compacting
+    # conversation" instead of unexplained latency. The matching
+    # ``done``/``error`` hint below always resolves it — a client that
+    # showed a spinner never gets stranded on it.
+    await _emit_compaction_status(on_status, session_id, {
+        "phase": "running",
+        "folded_runs": len(old_runs),
+        "kept_runs_count": len(kept),
+        "tokens_before": tokens_before,
+    })
 
     summary = await _summarize_runs(old_runs, model, agent)
     if not summary:
@@ -519,7 +611,13 @@ async def compact(
             reason="empty_summary",
             runs=len(runs),
         )
+        # We already told the client we were compacting; resolve that
+        # notice so a spinner doesn't hang on "Compacting…" forever. The
+        # reactive ContextWindowExceeded fallback still backstops the turn.
+        await _emit_compaction_status(on_status, session_id, {"phase": "error"})
         return None
+
+    tokens_after = _estimate_text_tokens(summary, model_id)
 
     recap_run: dict[str, Any] = {
         "run_id": f"compaction-{int(time.time())}",
@@ -530,7 +628,19 @@ async def compact(
             {"role": "system", "content": "[compacted session recap]"},
             {"role": "assistant", "content": summary},
         ],
-        "metadata": {"compaction": True, "folded_runs": len(old_runs)},
+        # Persist the same stats the live "done" hint carries so a
+        # reopened / reconciled session rebuilds the identical compaction
+        # card from the recap row (see gateway.api.sessions
+        # ``_expand_run_messages``) — the boundary marker survives, it's
+        # not a live-only affordance.
+        "metadata": {
+            "compaction": True,
+            "folded_runs": len(old_runs),
+            "kept_runs_count": len(kept),
+            "summary_chars": len(summary),
+            "tokens_before": tokens_before,
+            "tokens_after": tokens_after,
+        },
         "created_at": int(time.time()),
     }
     new_runs = [recap_run, *kept]
@@ -542,34 +652,29 @@ async def compact(
         folded_runs=len(old_runs),
         kept_runs=len(kept),
         summary_chars=len(summary),
+        tokens_before=tokens_before,
+        tokens_after=tokens_after,
     )
 
-    # Tell the UI. The on_status hook is the same channel as tool
-    # progress (``OutToolStatus`` on the outbound bus); a JSON envelope
-    # with ``kind="session.compacted"`` keeps the existing wire codec
-    # happy without inventing a new frame type at this layer. The
-    # SessionCompacted dataclass in src.stream.events is the typed shape
-    # bridges use when they hand the same payload upstream.
-    if on_status is not None:
-        try:
-            payload = json.dumps({
-                "kind": "session.compacted",
-                "summary_chars": len(summary),
-                "kept_runs_count": len(kept),
-            })
-            await on_status(payload)
-        except Exception as exc:  # noqa: BLE001 — UI hint is best-effort
-            elog(
-                "runtime.compaction.status_failed",
-                level="warning",
-                session_id=session_id,
-                error=str(exc) or type(exc).__name__,
-            )
+    # Tell the UI the fold landed. The turn runner turns this envelope
+    # into a typed ``SessionCompacted`` wire frame; the desktop app
+    # renders a tool-style compaction card, the CLI a step line, and the
+    # bridges flip "Compacting conversation" → "Compacted conversation".
+    await _emit_compaction_status(on_status, session_id, {
+        "phase": "done",
+        "folded_runs": len(old_runs),
+        "kept_runs_count": len(kept),
+        "summary_chars": len(summary),
+        "tokens_before": tokens_before,
+        "tokens_after": tokens_after,
+    })
 
     return {
         "folded_runs": len(old_runs),
         "kept_runs": len(kept),
         "summary_chars": len(summary),
+        "tokens_before": tokens_before,
+        "tokens_after": tokens_after,
     }
 
 

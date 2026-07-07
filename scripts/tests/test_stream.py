@@ -366,6 +366,42 @@ async def t_reasoning_safety_net_on_empty(ctx: TestContext) -> None:
     assert false_idx < tc_idx, (false_idx, tc_idx)
 
 
+@test("stream", "session.compacted envelope becomes typed SessionCompacted frames, not tool JSON")
+async def t_compaction_translation(ctx: TestContext) -> None:
+    """The turn runner must lift a ``session.compacted`` on_status envelope
+    into typed ``SessionCompacted`` frames (running → done) and NEVER let
+    the raw JSON leak onto the wire as an ``OutToolStatus`` string — that
+    raw-JSON leak was the "displayed poorly" bug this feature fixes.
+    """
+    import json as _json
+    from src.stream.events import SessionCompacted, OutToolStatus
+    from src.stream.session import StreamSession
+
+    running = _json.dumps({
+        "kind": "session.compacted", "phase": "running",
+        "folded_runs": 3, "kept_runs_count": 2, "tokens_before": 900,
+    })
+    done = _json.dumps({
+        "kind": "session.compacted", "phase": "done",
+        "folded_runs": 3, "kept_runs_count": 2, "summary_chars": 120,
+        "tokens_before": 900, "tokens_after": 60,
+    })
+    agent = _StatusAgent(script=[running, done], deltas=["ok"])
+    sess = StreamSession(agent, client_id="c", session_id="s")
+    await sess.run_one_shot("hi", speak=False)
+    out = await _drain(sess)
+
+    comp = [e for e in out if isinstance(e, SessionCompacted)]
+    assert [c.phase for c in comp] == ["running", "done"], comp
+    assert comp[0].folded_runs == 3, comp[0]
+    assert comp[0].tokens_before == 900, comp[0]
+    assert comp[1].summary_chars == 120, comp[1]
+    assert comp[1].tokens_after == 60, comp[1]
+    # The raw envelope never ships as tool-status text.
+    tools = [e for e in out if isinstance(e, OutToolStatus)]
+    assert all("session.compacted" not in t.text for t in tools), tools
+
+
 @test("stream", "StreamSession.run_one_shot never ships an empty final response")
 async def t_run_one_shot_empty_reply_gets_fallback(ctx: TestContext) -> None:
     from src.stream.events import OutTextFinal

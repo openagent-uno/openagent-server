@@ -111,10 +111,22 @@ class WhatsAppBridge(BaseBridge):
                     # Forward any inline argument (e.g. /model gpt-4o).
                     wa_parts = text.strip()[1:].split(None, 1)
                     wa_arg = wa_parts[1] if len(wa_parts) > 1 else None
-                    result = await self.send_command(
+                    if cmd == "compact":
+                        # "Compacting conversation" → "Compacted conversation"
+                        # as two short messages (WhatsApp has no edit API),
+                        # matching the automatic path — the command has no turn
+                        # collector to carry the compaction notice.
+                        await self.run_compact_command(chat_id, f"wa:{user_id}")
+                        return
+                    result = await self.send_command_full(
                         cmd, session_id=f"wa:{user_id}", arg=wa_arg,
                     )
-                    await self._send_text(chat_id, result)
+                    # WhatsApp (Green API) has no reliable interactive
+                    # button/list primitive, so ``render_picker`` is not
+                    # overridden — ``deliver_command_result`` degrades to
+                    # the text option list, which now enumerates every
+                    # configured model with its id for easy copy/switch.
+                    await self.deliver_command_result(chat_id, result)
                 return
         elif msg_type in ("audioMessage", "voiceMessage"):
             file_data = msg_data.get("fileMessageData", {})
