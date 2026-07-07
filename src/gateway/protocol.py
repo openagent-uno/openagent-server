@@ -46,7 +46,8 @@ Server → Client::
     {"type": "audio_end",      "session_id": "...", "total_chunks": N}
     {"type": "turn_complete",  "session_id": "..."}
     {"type": "error",          "text": "..."}
-    {"type": "command_result", "text": "...", "picker"?: {...}}
+    {"type": "command_result", "text": "...", "picker"?: {...}, "context"?: {...}}
+    {"type": "context_report", "session_id": "...", "report": {...}}
     {"type": "pong"}
     {"type": "resource_event", "resource": "...", "action": "...", "id": "..."}
     {"type": "system_snapshot", "snapshot": {host, cpu, memory, swap, disks, network, processes, timestamp}}
@@ -78,6 +79,17 @@ options as native buttons / select menus; on selection they re-issue the
 command with ``arg=<value>`` (a ``value`` of ``"default"`` clears the pin).
 Rich clients (desktop app, CLI) ignore this and build their own picker
 from ``GET /api/models`` + ``GET /api/commands`` (``arg_source``).
+
+A ``command_result`` for ``/context`` additionally carries an optional
+``context`` object — the Claude-Code-style context-window composition for
+the conversation (``src.core.context_report.build_context_report``): model,
+``context_window``, per-section token counts/percentages, and cumulative
+cost. Like ``picker`` it is purely additive: ``text`` already renders the
+same breakdown as a fenced monospace block, so text-only bridges ignore
+``context`` and degrade gracefully, while rich clients draw the panel from
+it. The same payload is pushed unsolicited after each turn as a standalone
+``context_report`` frame (so an always-visible panel updates in realtime)
+and is served by ``GET /api/sessions/{id}/context`` for the initial paint.
 
 A ``resource_event`` tells subscribed clients (the desktop app's MCPs /
 Tasks / Workflows / Memory screens) that a server-side resource list

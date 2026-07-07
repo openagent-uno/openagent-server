@@ -652,6 +652,7 @@ class Gateway:
             ("DELETE", "/api/sessions/{session_id}", sessions_api.handle_delete),
             ("PATCH", "/api/sessions/{session_id}", sessions_api.handle_patch_metadata),
             ("GET", "/api/sessions/{session_id}/runs", sessions_api.handle_get_runs),
+            ("GET", "/api/sessions/{session_id}/context", sessions_api.handle_get_context),
             ("POST", "/api/update", control.handle_update),
             ("POST", "/api/restart", control.handle_restart),
             # Cross-platform host telemetry (psutil-backed). Live
@@ -1218,6 +1219,10 @@ class Gateway:
         # select menus instead of asking the user to type an id. Additive:
         # clients that don't know the field just show ``text``.
         picker: dict | None = None
+        # Structured, additive command_result extension (like ``picker``):
+        # carries the /context breakdown for rich clients while text-only
+        # channels render ``text``. Unknown to bridges, so it's ignored there.
+        context_payload: dict | None = None
         if name in ("new", "reset", "clear"):
             # /new, /reset, /clear: full wipe — stop anything running, drop
             # the queue, AND forget provider-native resume state. Scoped to
@@ -1295,6 +1300,27 @@ class Gateway:
                 text = f"Usage: ${spend:.4f} / ${float(budget):.4f} this month across {len(by_model)} model(s)."
             else:
                 text = f"Usage tracking available for {len(by_model)} model(s); monthly spend is ${spend:.4f}."
+        elif name == "context":
+            # Per-conversation context-window composition (Claude-Code
+            # /context). Text form renders on every channel; the structured
+            # ``context`` payload lets rich clients (app/CLI) draw the panel.
+            if not session_id:
+                text = "No active session to inspect."
+            else:
+                try:
+                    from src.core.context_report import (
+                        build_context_report,
+                        format_context_report_text,
+                    )
+
+                    report = build_context_report(self.agent, session_id)
+                    if report is None:
+                        text = "No context to report for this session yet."
+                    else:
+                        text = format_context_report_text(report)
+                        context_payload = report
+                except Exception as exc:  # noqa: BLE001
+                    text = f"Could not read context: {exc}"
         elif name == "update":
             # Run the (multi-minute, blocking) download+apply OFF the event
             # loop — doing it inline froze the entire gateway (no health,
@@ -1475,6 +1501,8 @@ class Gateway:
         result_frame: dict = {"type": P.COMMAND_RESULT, "text": text}
         if picker is not None:
             result_frame["picker"] = picker
+        if context_payload is not None:
+            result_frame["context"] = context_payload
         await self._safe_ws_send_json(ws, result_frame)
 
     # Prefix used by each bridge when naming its per-user session ids.

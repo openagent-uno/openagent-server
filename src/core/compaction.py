@@ -228,6 +228,20 @@ def _resolve_max_context(model: Any) -> int:
         val = getattr(model, attr, None)
         if isinstance(val, (int, float)) and val > 0:
             return int(val)
+    # No provider attribute set — consult the shared catalog (OpenRouter's
+    # live ``context_length``) so compaction and the /context panel agree
+    # on the denominator. Only trust a real catalog hit; the catalog's own
+    # fallback is the same 200k we return below, so a miss changes nothing.
+    model_id = _resolve_model_id(model)
+    if model_id:
+        try:
+            from src.models.catalog import get_model_context_window
+
+            window, source = get_model_context_window(model_id)
+            if source == "openrouter" and window > 0:
+                return int(window)
+        except Exception:  # noqa: BLE001 — never let a lookup block a turn
+            pass
     return _FALLBACK_MAX_CONTEXT
 
 

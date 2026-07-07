@@ -45,6 +45,7 @@ from src.stream.events import (
     OutToolStatus,
     OutVideoFrame,
     SessionClose,
+    ContextReport,
     SessionCompacted,
     SessionOpen,
     TextDelta,
@@ -72,6 +73,7 @@ VIDEO_FRAME_OUT = "video_frame_out"  # server → client image frame
 SEED = "seed"  # server → client agent-self seed (child-session mission prompt)
 TURN_COMPLETE = "turn_complete"  # server → client batched-channel sentinel
 SESSION_COMPACTED = "session_compacted"  # server → client in-place compaction landed
+CONTEXT_REPORT = "context_report"  # server → client context-window composition (live /context)
 REASONING = "reasoning"  # server → client agent thinking-state flag (boolean)
 
 
@@ -153,6 +155,8 @@ def event_to_wire(evt: Event) -> dict[str, Any]:
             "tokens_before": evt.tokens_before,
             "tokens_after": evt.tokens_after,
         }
+    if isinstance(evt, ContextReport):
+        return {**base, "type": CONTEXT_REPORT, "report": evt.report}
 
     # Inbound types — included for completeness (e.g. tests that
     # round-trip both directions). Servers don't usually emit these.
@@ -397,6 +401,12 @@ def wire_to_event(frame: dict[str, Any]) -> Event | None:
             tokens_before=int(frame.get("tokens_before") or 0),
             tokens_after=int(frame.get("tokens_after") or 0),
         )
+    if t == CONTEXT_REPORT:
+        rep = frame.get("report")
+        return ContextReport(
+            session_id=sid, seq=seq, ts_ms=ts,
+            report=rep if isinstance(rep, dict) else {},
+        )
 
     logger.debug("wire_to_event: unknown type %r", t)
     return None
@@ -417,5 +427,6 @@ __all__ = [
     "VIDEO_FRAME_OUT",
     "TURN_COMPLETE",
     "SESSION_COMPACTED",
+    "CONTEXT_REPORT",
     "REASONING",
 ]

@@ -35,6 +35,7 @@ from src.stream.events import (
     Event,
     Interrupt,
     OutAudioChunk,
+    ContextReport,
     OutAudioEnd,
     OutAudioStart,
     OutError,
@@ -1151,6 +1152,24 @@ class StreamTurnRunner:
                 seq=sess.next_seq(),
                 ts_ms=now_ms(),
             ))
+
+            # Push the fresh context-window composition so a client's
+            # always-visible /context panel updates in realtime as the
+            # conversation grows. Best-effort — measurement must never
+            # break a turn, and text-only channels simply ignore the frame.
+            try:
+                from src.core.context_report import build_context_report
+
+                report = build_context_report(self._agent, session_id)
+                if report is not None:
+                    await publish(ContextReport(
+                        session_id=session_id,
+                        seq=sess.next_seq(),
+                        ts_ms=now_ms(),
+                        report=report,
+                    ))
+            except Exception as e:  # noqa: BLE001
+                logger.debug("context_report emit failed: %s", e)
 
             elog(
                 "stream.turn.end",

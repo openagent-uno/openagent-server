@@ -100,6 +100,11 @@ _TEST_MODULES: tuple[str, ...] = (
     # threshold check, the rewrite shape, the run-loop call site, the
     # feature flag, and the wire-codec round trip for SessionCompacted.
     "test_compaction",
+    # Per-session context-window composition behind /context — the
+    # sectioned breakdown (system/tools/messages/summary/free), the
+    # catalog context-window lookup + 200k fallback, and the
+    # ContextReport wire round-trip. Pure-unit; synthetic DB + fake agent.
+    "test_context_report",
     # DELTA frame plumbing for the unified streaming path (web chat +
     # bridges). Pure-unit; relies on the BaseBridge dispatch logic.
     "test_streaming",

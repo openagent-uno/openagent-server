@@ -30,6 +30,7 @@ COMMAND_SPECS = (
     GatewayCommandSpec("status", "Show agent status and queue", "show agent status and queue depth"),
     GatewayCommandSpec("queue", "Show pending messages", "show pending messages", menu_visible=False),
     GatewayCommandSpec("usage", "Show current usage and budget", "show current usage and budget"),
+    GatewayCommandSpec("context", "Show context window usage for this conversation", "token/cost breakdown of the current context by section"),
     GatewayCommandSpec("update", "Check for updates and install", "check for updates and install"),
     GatewayCommandSpec("restart", "Restart OpenAgent", "restart OpenAgent"),
     GatewayCommandSpec("help", "Show available commands", "show this help message"),

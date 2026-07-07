@@ -339,6 +339,21 @@ class SessionCompacted(Event):
     tokens_after: int = 0
 
 
+@dataclass(frozen=True)
+class ContextReport(Event):
+    """Realtime context-window composition for this session.
+
+    Emitted after each turn completes so a client's always-visible context
+    panel (Claude-Code ``/context``) updates live as the conversation grows.
+    ``report`` is the JSON payload produced by
+    :func:`src.core.context_report.build_context_report` — the same shape the
+    ``GET /api/sessions/{id}/context`` endpoint and the ``/context`` command's
+    structured ``context`` field carry, so every surface shares one contract.
+    """
+
+    report: dict = field(default_factory=dict)
+
+
 __all__ = [
     "Event",
     "SessionOpen",
@@ -361,5 +376,6 @@ __all__ = [
     "OutError",
     "TurnComplete",
     "SessionCompacted",
+    "ContextReport",
     "now_ms",
 ]

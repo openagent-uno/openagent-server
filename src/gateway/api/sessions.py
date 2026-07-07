@@ -552,6 +552,38 @@ def _expand_run_messages(
     return out
 
 
+async def handle_get_context(request):
+    """GET /api/sessions/{session_id}/context — context-window composition.
+
+    Returns the Claude-Code-style breakdown (:mod:`src.core.context_report`):
+    per-section token counts + percentages, the model's context window, and
+    cumulative session cost. Used for the app's context panel initial paint /
+    reconcile, the CLI ``/context`` table, and any client polling. Works for
+    live chat, sub-agent, scheduled-firing, and workflow AI-node sessions
+    alike (all are rows in the ``sessions`` table keyed by ``session_id``).
+    """
+    from aiohttp import web
+
+    gateway = request.app.get("gateway")
+    agent = getattr(gateway, "agent", None) if gateway else None
+    if agent is None:
+        return web.json_response({"error": "agent not available"}, status=500)
+
+    session_id = request.match_info["session_id"]
+    try:
+        from src.core.context_report import build_context_report
+
+        report = build_context_report(agent, session_id)
+    except Exception as exc:  # noqa: BLE001
+        return web.json_response({"error": str(exc)}, status=500)
+
+    if report is None:
+        # No DB-backed session (yet) — return an empty-but-valid shape so
+        # the client renders "no data" rather than erroring.
+        return web.json_response({"session_id": session_id, "sections": [], "context_window": 0})
+    return web.json_response(report)
+
+
 async def handle_get_runs(request):
     """GET /api/sessions/{session_id}/runs — turn history as flat messages.
 

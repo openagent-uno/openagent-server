@@ -469,6 +469,34 @@ def get_model_pricing(model_ref: str, providers_config: dict | None = None) -> d
     return {"input_cost_per_million": 0.0, "output_cost_per_million": 0.0}
 
 
+# Fallback context window used when a model is absent from OpenRouter's
+# catalog (local / sub-proxy / self-hosted ids). Kept identical to
+# ``compaction._FALLBACK_MAX_CONTEXT`` so the /context gauge and the
+# compaction trigger agree on the denominator for unknown models.
+_FALLBACK_CONTEXT_WINDOW = 200_000
+
+
+def get_model_context_window(
+    model_ref: str, providers_config: dict | None = None
+) -> tuple[int, str]:
+    """Return ``(context_window_tokens, source)`` for a model.
+
+    ``source`` is ``"openrouter"`` when the size came from OpenRouter's
+    live catalog (which already carries a ``context_length`` per model,
+    see :func:`_openrouter_context_length_lookup`), or ``"fallback"``
+    when the model isn't in the catalog and we assume
+    ``_FALLBACK_CONTEXT_WINDOW``. Never raises — mirrors
+    :func:`get_model_pricing` so any configured provider resolves.
+    """
+    runtime_id = normalize_runtime_model_id(model_ref, providers_config)
+    online = _openrouter_context_length_lookup(runtime_id)
+    if online:
+        return online, "openrouter"
+    # Cache miss — prime for next time, same as the pricing path.
+    _maybe_prime_openrouter_cache()
+    return _FALLBACK_CONTEXT_WINDOW, "fallback"
+
+
 def _maybe_prime_openrouter_cache() -> None:
     """Schedule a background fetch of OpenRouter's catalog if cache is cold.
 
@@ -584,6 +612,47 @@ def _openrouter_pricing_lookup(runtime_id: str) -> dict[str, float] | None:
         "input_cost_per_million": input_cost,
         "output_cost_per_million": output_cost,
     }
+
+
+def _openrouter_context_length_lookup(runtime_id: str) -> int | None:
+    """Look up the context-window size for ``runtime_id`` in OpenRouter's cache.
+
+    Mirrors :func:`_openrouter_pricing_lookup` exactly — same index, same
+    reverse vendor map, no network — but reads the ``context_length``
+    field (falling back to ``top_provider.context_length``) that the
+    catalog fetch already carries and that pricing ignores. Returns
+    ``None`` on cache miss or when the model isn't in OpenRouter.
+    """
+    try:
+        from src.models import discovery
+    except ImportError:
+        return None
+    cache = getattr(discovery, "_OPENROUTER_CACHE", None)
+    if not cache or ":" not in runtime_id:
+        return None
+    provider, bare = runtime_id.split(":", 1)
+    reverse_map = _get_reverse_vendor_map(discovery)
+    want_prefix = reverse_map.get(provider)
+    if not want_prefix:
+        return None
+    target = f"{want_prefix}/{bare}"
+    entry = _get_openrouter_index(cache).get(target)
+    if entry is None:
+        return None
+    candidates = [
+        entry.get("context_length"),
+        (entry.get("top_provider") or {}).get("context_length")
+        if isinstance(entry.get("top_provider"), dict)
+        else None,
+    ]
+    for candidate in candidates:
+        try:
+            val = int(candidate)
+        except (TypeError, ValueError):
+            continue
+        if val > 0:
+            return val
+    return None
 
 
 def _log_pricing(model_ref: str, runtime_id: str, source: str, input_cpm: float, output_cpm: float) -> None:
