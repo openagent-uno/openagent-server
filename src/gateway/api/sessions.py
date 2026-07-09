@@ -94,6 +94,17 @@ async def _teardown_session(gateway, db, sid: str) -> None:
     half-way). Shared by the single-delete and the child-cascade so both tear a
     session down identically."""
     if gateway is not None:
+        # Live stream sessions are now server-owned and may outlive the
+        # WebSocket that started them. A delete is an explicit lifecycle event,
+        # so close any matching live session before purging the durable row.
+        for key in [
+            k for k in list(getattr(gateway, "_stream_sessions", {}))
+            if len(k) > 1 and k[1] == sid
+        ]:
+            try:
+                await gateway._close_stream_session(key)
+            except Exception:
+                pass
         # RAM: find whichever live client owns this session and drop it.
         for client_id in list(gateway.sessions._clients.keys()):
             try:

@@ -41,6 +41,7 @@ Server → Client::
     {"type": "status",         "text": "...",  "session_id": "..."}
     {"type": "delta",          "text": "...",  "session_id": "..."}
     {"type": "response",       "text": "...",  "session_id": "...", "attachments": [...], "model": "..."}
+    {"type": "live_state",     "session_id": "...", "active": true, "frames": [...]}
     {"type": "audio_start",    "session_id": "...", "format": "mp3", "voice_id": "...", "mime": "audio/mpeg"}
     {"type": "audio_chunk",    "session_id": "...", "seq": N, "data": "<base64>"}
     {"type": "audio_end",      "session_id": "...", "total_chunks": N}
@@ -63,6 +64,13 @@ The mirror-modality rule on the server side: ``text_final`` with
 ``source="stt"`` always speaks the reply when TTS is configured, even
 when the session was opened with ``speak=false``. That way chat-tab
 typed messages stay silent but voice notes get spoken back.
+
+When a client reattaches while a turn is still running, the gateway may
+send ``live_state`` snapshots. ``frames`` is an ordered replay of ordinary
+stream frames (``text_final`` / ``seed`` / ``status`` / ``delta`` /
+``response`` / …) for the not-yet-persisted transcript tail. Clients should
+replace their live tail from this snapshot, then continue processing normal
+frames. Completed turns are still hydrated from ``GET /api/sessions/{id}/runs``.
 
 A ``command_result`` may carry an optional ``picker`` when the command
 offers a list to choose from (today only ``/model`` with no argument). The

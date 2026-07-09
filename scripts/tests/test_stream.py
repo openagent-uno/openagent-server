@@ -1901,7 +1901,9 @@ async def t_child_frame_nonblocking(ctx: TestContext) -> None:
     from src.gateway.server import Gateway
 
     gw = Gateway.__new__(Gateway)
+    gw.agent = type("_Agent", (), {"memory_db": None})()
     gw._child_frame_q = asyncio.Queue(maxsize=16)
+    gw._live_replays = {}
     called = []
 
     async def _boom(payload):  # would be awaited if the path sent inline
@@ -1937,6 +1939,7 @@ async def t_gateway_adopt_sessions_to_ws(ctx: TestContext) -> None:
     gw = Gateway.__new__(Gateway)
     gw.clients = {}
     gw._stream_sessions = {}
+    gw._live_replays = {}
     # _safe_ws_send_json is now an instance method that serialises sends with a
     # per-socket lock — __new__ skips __init__, so seed the lock map.
     gw._ws_send_locks = WeakKeyDictionary()
@@ -1971,16 +1974,105 @@ async def t_gateway_adopt_sessions_to_ws(ctx: TestContext) -> None:
     gw._stream_sessions[("alice", "sb")] = _StreamHolder(session=sess_b, channel=ch_b)
     gw._stream_sessions[("bob",   "sc")] = _StreamHolder(session=sess_c, channel=ch_c)
 
-    # Adopt only Alice's sessions onto ws_new.
-    gw._adopt_sessions_to_ws("alice", ws_new)
+    try:
+        # Adopt only Alice's sessions onto ws_new.
+        await gw._adopt_sessions_to_ws("alice", ws_new)
 
-    # Alice's channels now hit ws_new; Bob's still hit ws_old.
-    await ch_a._send({"type": "ping", "tag": "a"})
-    await ch_b._send({"type": "ping", "tag": "b"})
-    await ch_c._send({"type": "ping", "tag": "c"})
+        # Alice's channels now hit ws_new; Bob's still hit ws_old.
+        await ch_a._send({"type": "ping", "tag": "a"})
+        await ch_b._send({"type": "ping", "tag": "b"})
+        await ch_c._send({"type": "ping", "tag": "c"})
 
-    assert [p["tag"] for p in ws_new.sent] == ["a", "b"], ws_new.sent
-    assert [p["tag"] for p in ws_old.sent] == ["c"], ws_old.sent
+        assert [p["tag"] for p in ws_new.sent] == ["a", "b"], ws_new.sent
+        assert [p["tag"] for p in ws_old.sent] == ["c"], ws_old.sent
+    finally:
+        await ch_a.close()
+        await ch_b.close()
+        await ch_c.close()
+
+
+@test("stream", "Gateway live_state rehydrates an active turn for the same owner")
+async def t_gateway_live_state_rehydrates_active_turn(ctx: TestContext) -> None:
+    """Closing the app must not make an in-flight turn invisible. The gateway
+    keeps a replay tail and sends it back to the same authenticated owner when
+    a fresh websocket attaches."""
+    from weakref import WeakKeyDictionary
+    from src.gateway.server import Gateway
+
+    gw = Gateway.__new__(Gateway)
+    gw.agent = type("_Agent", (), {"memory_db": None})()
+    gw._live_replays = {}
+    gw._ws_send_locks = WeakKeyDictionary()
+
+    class _FakeWS:
+        closed = False
+        def __init__(self):
+            self.sent: list[dict] = []
+        async def send_json(self, payload):
+            self.sent.append(payload)
+
+    ws = _FakeWS()
+    gw._record_live_input(
+        "s1",
+        {"type": "text_final", "session_id": "s1", "text": "hello"},
+        owner="alice",
+    )
+    gw._record_live_output(
+        "s1",
+        {"type": "delta", "session_id": "s1", "text": "he"},
+        owner="alice",
+    )
+    gw._record_live_output(
+        "s1",
+        {"type": "delta", "session_id": "s1", "text": "llo"},
+        owner="alice",
+    )
+
+    await gw._send_live_snapshots(ws, client_id="device-1", handle="alice")
+
+    assert len(ws.sent) == 1, ws.sent
+    payload = ws.sent[0]
+    assert payload["type"] == "live_state"
+    assert payload["session_id"] == "s1"
+    assert payload["active"] is True
+    assert payload["frames"] == [
+        {"type": "text_final", "session_id": "s1", "text": "hello"},
+        {"type": "delta", "session_id": "s1", "text": "hello"},
+    ]
+
+
+@test("stream", "Gateway live_state is owner-scoped")
+async def t_gateway_live_state_is_owner_scoped(ctx: TestContext) -> None:
+    """A replay without a resolved owner must not be treated as a broadcast.
+    Child runs resolve ownership best-effort; until they do, reconnects should
+    skip the snapshot instead of leaking it to another authenticated handle."""
+    from weakref import WeakKeyDictionary
+    from src.gateway.server import Gateway
+
+    class _DB:
+        async def get_session(self, _session_id):
+            return None
+
+    gw = Gateway.__new__(Gateway)
+    gw.agent = type("_Agent", (), {"memory_db": _DB()})()
+    gw._live_replays = {}
+    gw._ws_send_locks = WeakKeyDictionary()
+    gw._record_live_output(
+        "scheduler:t:r",
+        {"type": "delta", "session_id": "scheduler:t:r", "text": "secret"},
+        owner=None,
+    )
+
+    class _FakeWS:
+        closed = False
+        def __init__(self):
+            self.sent: list[dict] = []
+        async def send_json(self, payload):
+            self.sent.append(payload)
+
+    ws = _FakeWS()
+    await gw._send_live_snapshots(ws, client_id="device-2", handle="bob")
+    assert ws.sent == []
 
 
 @test("stream", "RealtimeChannel.rebind preserves frame ordering across the swap")

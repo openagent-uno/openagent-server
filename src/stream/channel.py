@@ -93,11 +93,13 @@ class RealtimeChannel:
         session: StreamSession,
         send_wire: Callable[[dict], Awaitable[bool]],
         *,
+        on_outbound: Callable[[dict], None] | None = None,
         on_unrecoverable: Callable[[], Awaitable[None]] | None = None,
     ):
         self._session = session
         self._send = send_wire
         self._pump_task: asyncio.Task | None = None
+        self._on_outbound = on_outbound
         self._on_unrecoverable = on_unrecoverable
 
     def rebind(self, send_wire: Callable[[dict], Awaitable[bool]]) -> None:
@@ -110,7 +112,7 @@ class RealtimeChannel:
         self._send = send_wire
 
     async def start(self) -> None:
-        if self._pump_task is None:
+        if self._pump_task is None or self._pump_task.done():
             self._pump_task = asyncio.create_task(
                 self._pump_outbound(),
                 name=f"realtime-out:{self._session.session_id}",
@@ -132,6 +134,11 @@ class RealtimeChannel:
                 except TypeError as e:
                     logger.debug("realtime: drop unwireable event: %s", e)
                     continue
+                if self._on_outbound is not None:
+                    try:
+                        self._on_outbound(payload)
+                    except Exception as e:  # noqa: BLE001
+                        logger.debug("realtime: outbound observer raised: %s", e)
                 deadline = time.monotonic() + self.UNRECOVERABLE_AFTER_S
                 while True:
                     try:

@@ -12,7 +12,8 @@ import base64
 import json
 import logging
 import os
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, TYPE_CHECKING
 from weakref import WeakKeyDictionary
 
@@ -54,10 +55,80 @@ _ATTACHMENT_MIME_FALLBACK: dict[str, str] = {
 
 @dataclass
 class _StreamHolder:
-    """A live stream session attached to a client WS."""
+    """A server-owned stream session with a rebindable client transport."""
 
     session: "StreamSession"
     channel: "RealtimeChannel"
+
+
+_LIVE_REPLAY_FRAME_TYPES: set[str] = {
+    P.TEXT_FINAL_IN,
+    P.STATUS,
+    P.REASONING,
+    P.DELTA,
+    P.RESPONSE,
+    P.ERROR,
+    P.TURN_COMPLETE,
+    "seed",
+    "session_compacted",
+    "context_report",
+}
+
+
+@dataclass
+class _LiveReplay:
+    """In-memory replay for the not-yet-persisted tail of one live session.
+
+    The database remains the source of truth for completed turns. This object
+    only covers the gap while a run is still streaming and therefore has no
+    canonical ``sessions.runs`` row for the app to hydrate from.
+    """
+
+    session_id: str
+    owner: str | None = None
+    frames: list[dict[str, Any]] = field(default_factory=list)
+    active: bool = True
+    updated_at: float = field(default_factory=time.time)
+
+    MAX_FRAMES = 512
+
+    def start(self, frame: dict[str, Any], *, owner: str | None = None) -> None:
+        if owner:
+            self.owner = owner
+        self.frames = [dict(frame)]
+        self.active = True
+        self.updated_at = time.time()
+
+    def append(self, frame: dict[str, Any], *, owner: str | None = None) -> None:
+        if owner and not self.owner:
+            self.owner = owner
+        t = frame.get("type")
+        if t not in _LIVE_REPLAY_FRAME_TYPES:
+            return
+        self.updated_at = time.time()
+        if t == P.DELTA and self.frames and self.frames[-1].get("type") == P.DELTA:
+            self.frames[-1] = {
+                **self.frames[-1],
+                "text": f"{self.frames[-1].get('text') or ''}{frame.get('text') or ''}",
+            }
+        else:
+            self.frames.append(dict(frame))
+        if len(self.frames) > self.MAX_FRAMES:
+            # Keep the first frame (usually the user/seed message) and trim the
+            # oldest middle frames. Adjacent deltas coalesce, so overflow is
+            # mostly a pathological tool/status burst.
+            self.frames = [self.frames[0], *self.frames[-(self.MAX_FRAMES - 1):]]
+        if t == P.TURN_COMPLETE:
+            self.active = False
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "type": "live_state",
+            "session_id": self.session_id,
+            "active": self.active,
+            "frames": [dict(f) for f in self.frames],
+            "updated_at": self.updated_at,
+        }
 
 
 class Gateway:
@@ -115,10 +186,16 @@ class Gateway:
         # externally-attached sites).
         self._tcp_site = None
 
-        # Per (client_id, session_id) StreamSession + RealtimeChannel
-        # pair. Created on demand from inbound stream frames; closed on
-        # ``session_close`` or WS drop.
+        # Per (owner, session_id) StreamSession + RealtimeChannel pair.
+        # Created on demand from inbound stream frames. These are server-owned:
+        # a WS drop detaches the transport, while ``session_close`` / delete /
+        # gateway shutdown explicitly close the session.
         self._stream_sessions: dict[tuple[str, str], _StreamHolder] = {}
+        # Server-owned live transcript tails, keyed by session_id. A client can
+        # close and later reattach while a turn is still running; completed
+        # turns are deliberately not kept here because ``sessions.runs`` is the
+        # authoritative persisted history.
+        self._live_replays: dict[str, _LiveReplay] = {}
 
         # Cross-platform host-telemetry sampler (psutil). Filled in by
         # ``start()``; the /api/system handler and the broadcast loop
@@ -204,6 +281,88 @@ class Gateway:
         if id is not None:
             payload["id"] = id
         await self.broadcast(payload)
+
+    @staticmethod
+    def _live_owner(client_id: str | None, handle: str | None = None) -> str | None:
+        """Stable owner key for a live replay.
+
+        Prefer the human handle (cross-device within one network). Fall back to
+        the device pubkey for handle-less/local deployments.
+        """
+        return (handle or client_id or "").strip() or None
+
+    def _record_live_input(
+        self, session_id: str, frame: dict[str, Any], *, owner: str | None,
+    ) -> None:
+        """Start/replace the replay tail for a newly-dispatched user turn."""
+        if not session_id or frame.get("type") != P.TEXT_FINAL_IN:
+            return
+        replay = self._live_replays.get(session_id)
+        if replay is None:
+            replay = _LiveReplay(session_id=session_id, owner=owner)
+            self._live_replays[session_id] = replay
+        replay.start(frame, owner=owner)
+
+    def _record_live_output(
+        self, session_id: str, frame: dict[str, Any], *, owner: str | None = None,
+    ) -> None:
+        """Append one outbound frame to a session's live replay.
+
+        ``turn_complete`` ends the replay immediately; a reconnect after that
+        should hydrate from the DB, whose run write has landed by then.
+        """
+        if not session_id or frame.get("type") not in _LIVE_REPLAY_FRAME_TYPES:
+            return
+        replay = self._live_replays.get(session_id)
+        if replay is None:
+            replay = _LiveReplay(session_id=session_id, owner=owner)
+            self._live_replays[session_id] = replay
+        replay.append(frame, owner=owner)
+        if not replay.active:
+            self._live_replays.pop(session_id, None)
+
+    async def _lookup_live_owner(self, session_id: str) -> str | None:
+        """Best-effort owner lookup for detached scheduler/workflow sessions."""
+        replay = self._live_replays.get(session_id)
+        if replay is not None and replay.owner:
+            return replay.owner
+        db = getattr(self.agent, "memory_db", None)
+        if db is None:
+            return None
+        try:
+            row = await db.get_session(session_id)
+        except Exception:  # noqa: BLE001
+            return None
+        owner = (row or {}).get("client_id")
+        return str(owner) if owner else None
+
+    async def _send_live_snapshots(
+        self, ws, *, client_id: str | None, handle: str | None,
+    ) -> None:
+        """Send active live tails to a just-attached client.
+
+        This is the explicit rehydration path for closing/reopening the app
+        mid-generation. It also covers scheduled-task and workflow run screens,
+        because their detached child sessions record through the same replay
+        registry.
+        """
+        owner = self._live_owner(client_id, handle)
+        if not owner:
+            return
+        stale: list[str] = []
+        for sid, replay in list(self._live_replays.items()):
+            if not replay.active or not replay.frames:
+                stale.append(sid)
+                continue
+            if not replay.owner:
+                resolved = await self._lookup_live_owner(sid)
+                if resolved:
+                    replay.owner = resolved
+            if replay.owner != owner:
+                continue
+            await self._safe_ws_send_json(ws, replay.snapshot())
+        for sid in stale:
+            self._live_replays.pop(sid, None)
 
     def broadcast_resource_sync(
         self,
@@ -326,8 +485,17 @@ class Gateway:
         evt = child_frame_to_event(frame)
         if evt is None or self._child_frame_q is None:
             return
+        sid = getattr(evt, "session_id", None) or frame.get("session_id") or ""
+        payload = event_to_wire(evt)
+        owner = None
+        if sid and (
+            sid not in self._live_replays
+            or not self._live_replays[sid].owner
+        ):
+            owner = await self._lookup_live_owner(sid)
+        self._record_live_output(sid, payload, owner=owner)
         try:
-            self._child_frame_q.put_nowait(event_to_wire(evt))
+            self._child_frame_q.put_nowait(payload)
         except asyncio.QueueFull:
             logger.debug("child-frame queue full; dropping a %s frame", frame.get("kind"))
 
@@ -518,6 +686,9 @@ class Gateway:
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
+        for key in list(self._stream_sessions):
+            await self._close_stream_session(key)
+        self._live_replays.clear()
         self.clients.clear()
 
     async def _system_broadcast_loop(self) -> None:
@@ -1057,8 +1228,8 @@ class Gateway:
         request["user_handle"] = cert.handle
         old_ws = self.clients.get(client_id)
         self.clients[client_id] = ws
+        await self._adopt_sessions_to_ws(client_id, ws, handle=cert.handle)
         if old_ws is not None and old_ws is not ws:
-            self._adopt_sessions_to_ws(client_id, ws)
             elog("gateway.client_reconnect", client_id=client_id)
             if not getattr(old_ws, "closed", True):
                 try:
@@ -1085,6 +1256,9 @@ class Gateway:
             "network": self._network_state.network_name,
             "network_id": cert.network_id,
         })
+        await self._send_live_snapshots(
+            ws, client_id=client_id, handle=cert.handle,
+        )
 
         frames_seen = 0
         last_msg_type: str | None = None
@@ -1183,10 +1357,9 @@ class Gateway:
             if client_id and self.clients.get(client_id) is ws:
                 del self.clients[client_id]
                 elog("gateway.client_disconnect", client_id=client_id)
-                # Tear down any stream sessions belonging to this client
-                # so the agent's per-session resources (runtime session
-                # rows) get a clean release.
-                await self._close_stream_sessions_for(client_id)
+                # Stream sessions are server-owned: closing the app only
+                # detaches the transport. Any active turn keeps running and
+                # rehydrates through live_state on the next attachment.
                 # And kill any PTYs this client opened — a closed app or
                 # dropped link must not leave shells running on the host.
                 try:
@@ -1236,14 +1409,14 @@ class Gateway:
             # interleave a stale reply into the fresh conversation.
             if session_id:
                 stream_stopped = await self._interrupt_stream_sessions(
-                    client_id, session_id, reason="manual",
+                    client_id, session_id, reason="manual", handle=handle,
                 )
                 stopped = sm.stop_current(client_id, session_id=session_id) or stream_stopped
                 cleared = sm.clear_queue_for_session(client_id, session_id)
                 forgotten = await self._forget_one_session(session_id)
             else:
                 stream_stopped = await self._interrupt_stream_sessions(
-                    client_id, reason="manual",
+                    client_id, reason="manual", handle=handle,
                 )
                 stopped = sm.stop_current(client_id) or stream_stopped
                 cleared = sm.clear_queue(client_id)
@@ -1266,13 +1439,13 @@ class Gateway:
             # ``/stop`` silently did nothing before.
             if session_id:
                 stream_stopped = await self._interrupt_stream_sessions(
-                    client_id, session_id, reason="manual",
+                    client_id, session_id, reason="manual", handle=handle,
                 )
                 stopped = sm.stop_current(client_id, session_id=session_id) or stream_stopped
                 cleared = sm.clear_queue_for_session(client_id, session_id)
             else:
                 stream_stopped = await self._interrupt_stream_sessions(
-                    client_id, reason="manual",
+                    client_id, reason="manual", handle=handle,
                 )
                 stopped = sm.stop_current(client_id) or stream_stopped
                 cleared = sm.clear_queue(client_id)
@@ -1285,7 +1458,7 @@ class Gateway:
         elif name == "status":
             # Reflect the registry that actually runs turns (StreamSession),
             # not the always-idle SessionManager queue.
-            busy = self._client_has_active_stream_turn(client_id) or sm.is_busy(client_id)
+            busy = self._client_has_active_stream_turn(client_id, handle=handle) or sm.is_busy(client_id)
             depth = sm.queue_depth(client_id)
             sessions = sm.list_sessions(client_id)
             text = f"{'Busy' if busy else 'Idle'} | Queue: {depth} | Sessions: {len(sessions)}"
@@ -1721,8 +1894,8 @@ class Gateway:
         matching :class:`StreamSession`.
 
         Sessions are created on demand on the first frame for a given
-        ``(client_id, session_id)`` pair. ``session_close`` (or the
-        client WS dropping) tears them down.
+        ``(owner, session_id)`` pair. ``session_close`` tears them down;
+        a client WS drop only detaches the transport.
 
         ``handle`` is the authenticated user identity (same across
         their devices) and is recorded as the session owner so the
@@ -1730,8 +1903,8 @@ class Gateway:
         """
         from src.stream.session import StreamSession
         from src.stream.channel import RealtimeChannel
-        from src.stream.wire import wire_to_event
-        from src.stream.events import SessionClose, SessionOpen
+        from src.stream.wire import event_to_wire, wire_to_event
+        from src.stream.events import SessionClose, SessionOpen, TextFinal
 
         session_id = (frame.get("session_id") or "default").strip() or "default"
         sid = self.sessions.get_or_create_session(
@@ -1748,7 +1921,8 @@ class Gateway:
                     model_runtime.set_session_handle(sid, handle)
             except Exception:  # noqa: BLE001
                 pass
-        key = (client_id, sid)
+        owner = self._live_owner(client_id, handle)
+        key = (owner or client_id, sid)
         evt = wire_to_event(frame)
         if evt is None:
             return
@@ -1756,6 +1930,9 @@ class Gateway:
         if isinstance(evt, SessionClose):
             await self._close_stream_session(key)
             return
+
+        if isinstance(evt, TextFinal):
+            self._record_live_input(sid, event_to_wire(evt), owner=owner)
 
         holder = self._stream_sessions.get(key)
         if holder is None:
@@ -1797,6 +1974,10 @@ class Gateway:
             channel = RealtimeChannel(
                 session,
                 lambda payload, _ws=ws: self._safe_ws_send_json(_ws, payload),
+                on_outbound=(
+                    lambda payload, _sid=sid, _owner=owner:
+                        self._record_live_output(_sid, payload, owner=_owner)
+                ),
                 on_unrecoverable=self._make_unrecoverable_callback(key),
             )
             await channel.start()
@@ -1808,8 +1989,16 @@ class Gateway:
                 session_id=sid,
                 profile=profile,
             )
+        else:
+            holder.channel.rebind(
+                lambda payload, _ws=ws: self._safe_ws_send_json(_ws, payload),
+            )
+            await holder.channel.start()
 
         if isinstance(evt, SessionOpen):
+            await self._send_live_snapshots(
+                ws, client_id=client_id, handle=handle,
+            )
             return  # session already created above; SessionOpen is metadata-only
 
         await holder.session.push_in(evt)
@@ -1819,20 +2008,19 @@ class Gateway:
         holder = self._stream_sessions.pop(key, None)
         if holder is None:
             return
+        self._live_replays.pop(key[1], None)
         try:
             await holder.channel.close()
         except Exception as e:  # noqa: BLE001
             logger.debug("stream session close failed: %s", e)
 
-    async def _close_stream_sessions_for(self, client_id: str | None) -> None:
-        """Close any stream sessions belonging to a disconnecting client."""
-        if not client_id:
-            return
-        for key in [k for k in self._stream_sessions if k[0] == client_id]:
-            await self._close_stream_session(key)
-
     async def _interrupt_stream_sessions(
-        self, client_id: str, session_id: str | None = None, *, reason: str = "manual",
+        self,
+        client_id: str,
+        session_id: str | None = None,
+        *,
+        reason: str = "manual",
+        handle: str | None = None,
     ) -> bool:
         """Cancel the live turn(s) for a client by injecting an ``Interrupt``.
 
@@ -1857,10 +2045,14 @@ class Gateway:
         """
         from src.stream.events import Interrupt, now_ms
 
+        owner = self._live_owner(client_id, handle)
+        owner_keys = {client_id}
+        if owner:
+            owner_keys.add(owner)
         if session_id is not None:
-            keys = [(client_id, session_id)]
+            keys = [(k, session_id) for k in owner_keys]
         else:
-            keys = [k for k in self._stream_sessions if k[0] == client_id]
+            keys = [k for k in self._stream_sessions if k[0] in owner_keys]
         stopped_any = False
         for key in keys:
             holder = self._stream_sessions.get(key)
@@ -1880,19 +2072,27 @@ class Gateway:
                 logger.debug("interrupt push failed for %s: %s", key, e)
         return stopped_any
 
-    def _client_has_active_stream_turn(self, client_id: str) -> bool:
+    def _client_has_active_stream_turn(
+        self, client_id: str, *, handle: str | None = None,
+    ) -> bool:
         """True iff a live StreamSession turn is running for the client.
 
         Used so ``/status`` and ``is_busy`` reflect the registry that
         actually runs turns instead of the always-idle SessionManager.
         """
+        owner = self._live_owner(client_id, handle)
+        owner_keys = {client_id}
+        if owner:
+            owner_keys.add(owner)
         return any(
             holder.session.has_active_turn()
             for key, holder in self._stream_sessions.items()
-            if key[0] == client_id
+            if key[0] in owner_keys
         )
 
-    def _adopt_sessions_to_ws(self, client_id: str, ws) -> None:
+    async def _adopt_sessions_to_ws(
+        self, client_id: str, ws, *, handle: str | None = None,
+    ) -> None:
         """Rebind every live channel for ``client_id`` onto ``ws``.
 
         Called from the AUTH path when a previous ws under the same
@@ -1901,12 +2101,17 @@ class Gateway:
         dead transport completes delivery as soon as we swap the send
         callable.
         """
+        owner = self._live_owner(client_id, handle)
+        owner_keys = {client_id}
+        if owner:
+            owner_keys.add(owner)
         for key, holder in self._stream_sessions.items():
-            if key[0] != client_id:
+            if key[0] not in owner_keys:
                 continue
             holder.channel.rebind(
                 lambda payload, _ws=ws: self._safe_ws_send_json(_ws, payload),
             )
+            await holder.channel.start()
 
     def _make_unrecoverable_callback(self, key: tuple[str, str]):
         """Build the ``on_unrecoverable`` callback for a channel.
@@ -1922,6 +2127,13 @@ class Gateway:
                 client_id=key[0],
                 session_id=key[1],
             )
+            holder = self._stream_sessions.get(key)
+            if holder is not None and holder.session.has_active_turn():
+                # The transport may be gone for longer than the channel retry
+                # window, but the server-owned turn must keep running. The live
+                # replay registry is now the reattachment path; a later
+                # ``_adopt_sessions_to_ws`` restarts this channel pump.
+                return
             await self._close_stream_session(key)
         return _on_unrecoverable
 
@@ -2002,4 +2214,3 @@ class Gateway:
                     logger.debug("broadcast_resource(%s) failed: %s", r, outcome)
 
         return _post_turn
-
