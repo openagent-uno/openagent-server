@@ -947,6 +947,24 @@ class StreamTurnRunner:
                     tokens_before=comp["tokens_before"],
                     tokens_after=comp["tokens_after"],
                 ))
+                # After the compaction "done" frame lands, push a fresh
+                # ContextReport so the always-visible context panel updates
+                # immediately — before the turn completes — showing the
+                # freed space. Best-effort: measurement must never block
+                # the status handler.
+                if comp["phase"] == "done":
+                    try:
+                        from src.core.context_report import build_context_report
+                        report = build_context_report(self._agent, session_id)
+                        if report is not None:
+                            await publish(ContextReport(
+                                session_id=session_id,
+                                seq=sess.next_seq(),
+                                ts_ms=now_ms(),
+                                report=report,
+                            ))
+                    except Exception:  # noqa: BLE001
+                        pass
                 return
             if is_reasoning_status(status_text):
                 if not reasoning_active:

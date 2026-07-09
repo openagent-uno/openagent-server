@@ -639,7 +639,7 @@ async def compact(
         "content": summary,
         "content_type": "str",
         "messages": [
-            {"role": "system", "content": "[compacted session recap]"},
+            {"role": "user", "content": "[Previous conversation was compacted into this summary. Continue helping the user as if you had read the full conversation — all key context, decisions, and pending tasks are captured below.]"},
             {"role": "assistant", "content": summary},
         ],
         # Persist the same stats the live "done" hint carries so a

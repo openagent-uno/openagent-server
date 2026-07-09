@@ -1406,6 +1406,23 @@ class Gateway:
                         # "folded N turns into a recap (X chars)…" line here
                         # would be exactly the full transcript we're avoiding.
                         text = "Compacted conversation."
+                        # Push a fresh ContextReport so the always-visible
+                        # context panel updates immediately after manual
+                        # compaction, without the user having to switch
+                        # sessions and come back.
+                        try:
+                            from src.core.context_report import build_context_report
+                            from src.stream.events import ContextReport as _CR
+
+                            report = build_context_report(self.agent, session_id)
+                            if report is not None:
+                                await self._safe_ws_send_json(ws, _compact_e2w(_CR(
+                                    session_id=session_id,
+                                    ts_ms=_compact_now_ms(),
+                                    report=report,
+                                )))
+                        except Exception:  # noqa: BLE001 — best-effort UI hint
+                            pass
                 except Exception as exc:  # noqa: BLE001
                     text = f"Compaction failed: {exc}"
         elif name == "model":
