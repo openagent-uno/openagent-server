@@ -627,6 +627,12 @@ class AgentServer:
         self._stop_event = asyncio.Event()
         elog("server.start", agent=self.agent.name)
 
+        # 0. Apply anyio cancel-scope guard BEFORE any MCP operations.
+        #    anyio#695: _deliver_cancellation can spin forever when
+        #    MCP SDK tasks don't respond to CancelledError.
+        from src.network.transport.anyio_cancel_guard import _patch_deliver_cancellation
+        _patch_deliver_cancellation()
+
         # 1. Agent (connects MCPs, opens DB)
         await self.agent.initialize()
 
