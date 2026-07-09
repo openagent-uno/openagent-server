@@ -312,6 +312,11 @@ class VaultService:
         idx = await self._ensure_index()
         return await asyncio.to_thread(idx.search, query, limit)
 
+    async def search_files(self, query: str, limit: int = 50) -> list[dict]:
+        """Search note file names/paths only."""
+        idx = await self._ensure_index()
+        return await asyncio.to_thread(idx.search_files, query, limit)
+
     async def backlinks(self, rel_path: str) -> list[str]:
         idx = await self._ensure_index()
         return await asyncio.to_thread(idx.backlinks, rel_path)

@@ -195,12 +195,17 @@ def cmd_mv(old_path, new_path, vault_path):
 @click.argument("query")
 @click.option("--vault", "vault_path", default=None, help="Vault path override.")
 @click.option("--limit", default=20, show_default=True, type=int)
-def cmd_search(query, vault_path, limit):
-    """Full-text search the vault."""
+@click.option("--files-only", is_flag=True, help="Search only file names/paths, not content.")
+def cmd_search(query, vault_path, limit, files_only):
+    """Search the vault — full-text by default, or file names only with --files-only."""
     async def _run():
         svc = _service(vault_path)
-        res = await svc.search(query, limit=limit)
+        if files_only:
+            res = await svc.search_files(query, limit=limit)
+        else:
+            res = await svc.search(query, limit=limit)
         await svc.close()
         return res
     for r in asyncio.run(_run()):
-        click.echo(f"{r['path']}  —  {r.get('title','')}")
+        tags = f" [{', '.join(r['tags'])}]" if r.get("tags") else ""
+        click.echo(f"{r['path']}  —  {r.get('title','')}{tags}")

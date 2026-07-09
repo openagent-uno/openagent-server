@@ -516,6 +516,29 @@ class VaultIndex:
             groups.setdefault(find(p), []).append(p)
         return sorted(groups.values(), key=len, reverse=True)
 
+    def search_files(self, query: str, limit: int = 50) -> list[dict]:
+        """Search note file names/paths only. Queries the ``path`` and
+        ``stem_lower`` columns of the ``notes`` table with a case-insensitive
+        substring match. Returns ``{path, title, tags}`` for each match."""
+        q = (query or "").strip().lower()
+        if not q:
+            return []
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT path, title, tags_json FROM notes "
+                "WHERE lower(path) LIKE ? OR lower(stem) LIKE ? "
+                "ORDER BY path LIMIT ?",
+                (f"%{q}%", f"%{q}%", limit),
+            )
+            return [
+                {
+                    "path": r["path"],
+                    "title": r["title"],
+                    "tags": json.loads(r["tags_json"] or "[]"),
+                }
+                for r in cur.fetchall()
+            ]
+
     def search(self, query: str, limit: int = 25) -> list[dict]:
         """FTS5 full-text search over title/summary/body. Falls back to a
         LIKE scan when the query has no FTS-tokenizable terms."""

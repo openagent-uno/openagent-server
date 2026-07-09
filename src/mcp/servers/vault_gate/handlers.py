@@ -106,12 +106,60 @@ async def vault_stats() -> dict:
     return await svc.stats()
 
 
-async def vault_search(query: str, limit: int = 20) -> dict:
-    """Full-text search the vault (FTS5 over title/summary/body). Scales to
-    hundreds of thousands of notes. Returns matching notes with a snippet."""
+async def vault_search(query: str, limit: int = 20,
+                      search_type: str = "content",
+                      file_path: str | None = None) -> dict:
+    """Search the vault. ``search_type`` controls what is searched:
+
+    - ``"content"`` (default) — full-text search over title/summary/body (FTS5).
+    - ``"filename"`` — search only note file names/paths.
+    - ``"regex"`` — requires ``file_path``; searches within ONE note's content
+      using Python regex. Returns line/column positions for each match.
+
+    For ``search_type="regex"``, set ``file_path`` to the vault-relative path
+    of the note (e.g. ``"projects/my-project/notes.md"``) and ``query`` to
+    the regex pattern."""
     svc = get_service()
+    if search_type == "filename":
+        results = await svc.search_files(query, limit=limit)
+        return {"query": query, "count": len(results), "results": results,
+                "search_type": "filename"}
+    if search_type == "regex":
+        import re as _re
+        if not file_path:
+            return {"error": "file_path is required for regex search",
+                    "count": 0, "results": []}
+        vault_root = svc.vault_root
+        full = vault_root / file_path.lstrip("/")
+        try:
+            full = full.resolve()
+            full.relative_to(vault_root.resolve())
+        except (ValueError, OSError):
+            return {"error": "Invalid or forbidden path", "count": 0, "results": []}
+        if not full.exists() or not full.is_file():
+            return {"error": "File not found", "count": 0, "results": []}
+        try:
+            content = full.read_text(errors="replace")
+        except OSError as exc:
+            return {"error": str(exc), "count": 0, "results": []}
+        try:
+            pattern = _re.compile(query)
+        except _re.error as exc:
+            return {"error": f"Invalid regex: {exc}", "count": 0, "results": []}
+        matches = []
+        for lineno, line in enumerate(content.split("\n"), start=1):
+            for m in pattern.finditer(line):
+                matches.append({
+                    "line": lineno,
+                    "col": m.start() + 1,
+                    "text": line,
+                })
+        return {"query": query, "count": len(matches), "results": matches,
+                "search_type": "regex", "file_path": file_path}
+    # Default: full-text content search
     results = await svc.search(query, limit=limit)
-    return {"query": query, "count": len(results), "results": results}
+    return {"query": query, "count": len(results), "results": results,
+            "search_type": "content"}
 
 
 async def vault_backlinks(path: str) -> dict:

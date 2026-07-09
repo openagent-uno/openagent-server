@@ -560,6 +560,8 @@ class Gateway:
             ("GET", "/api/vault/notes", vault.handle_list),
             ("GET", "/api/vault/graph", vault.handle_graph),
             ("GET", "/api/vault/search", vault.handle_search),
+            ("GET", "/api/vault/search/files", vault.handle_search_files),
+            ("GET", "/api/vault/search/in-file", vault.handle_search_in_file),
             # Quality subsystem — static paths registered BEFORE the
             # ``notes/{path:.+}`` wildcards so they are not shadowed.
             ("GET", "/api/vault/gate", vault.handle_gate),

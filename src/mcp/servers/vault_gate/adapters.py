@@ -47,10 +47,23 @@ def build_runtime_toolkit() -> Any:
         connected components, notes per folder."""
         return await handlers.vault_stats()
 
-    async def vault_search(query: str, limit: int = 20) -> dict:
-        """Full-text search the vault (scales to 100k+ notes). Returns
-        matching notes with a snippet."""
-        return await handlers.vault_search(query=query, limit=limit)
+    async def vault_search(query: str, limit: int = 20,
+                           search_type: str = "content",
+                           file_path: str | None = None) -> dict:
+        """Search the vault. ``search_type`` controls what is searched:
+
+        - ``"content"`` (default) — full-text search over title/summary/body (FTS5).
+        - ``"filename"`` — search only note file names/paths.
+        - ``"regex"`` — requires ``file_path``; searches within ONE note's content
+          using Python regex. Returns line/column positions for each match.
+
+        For ``search_type="regex"``, set ``file_path`` to the vault-relative path
+        of the note (e.g. ``"projects/my-project/notes.md"``) and ``query`` to
+        the regex pattern."""
+        return await handlers.vault_search(
+            query=query, limit=limit,
+            search_type=search_type, file_path=file_path,
+        )
 
     async def vault_backlinks(path: str) -> dict:
         """List the notes that link TO a note (its inbound links)."""

@@ -248,6 +248,93 @@ async def handle_delete(request):
     return web.json_response({"error": "Not found"}, status=404)
 
 
+async def handle_search_files(request):
+    """GET /api/vault/search/files?q=&limit=50
+
+    Search only note file names/paths (not content). Uses simple case-insensitive
+    substring matching against the note path/stem in the FTS5 index.
+    """
+    from aiohttp import web
+    query = (request.query.get("q") or "").strip()
+    if not query:
+        return web.json_response({"results": []})
+    try:
+        limit = int(request.query.get("limit", 50))
+    except (TypeError, ValueError):
+        limit = 50
+    try:
+        results = await _service(request).search_files(query, limit=limit)
+        return web.json_response({"results": results})
+    except Exception:
+        return web.json_response({"results": []})
+
+
+async def handle_search_in_file(request):
+    """GET /api/vault/search/in-file?path=&q=&regex=false
+
+    Search for ``q`` within a specific note's content. When ``regex=true``,
+    treat ``q`` as a Python regex pattern. Returns line/column positions and
+    the matching line text. Reads the file from disk.
+    """
+    from aiohttp import web
+    import re as _re
+
+    vault = _resolve_vault(request)
+    note_path = (request.query.get("path") or "").strip()
+    query = (request.query.get("q") or "")
+    is_regex = _truthy(request.query.get("regex"))
+
+    if not note_path:
+        return web.json_response({"error": "path is required"}, status=400)
+    if not query:
+        return web.json_response({"error": "q is required"}, status=400)
+
+    full = _safe_full(vault, note_path)
+    if full is None:
+        return web.json_response({"error": "Invalid path"}, status=400)
+    if not full.exists() or not full.is_file():
+        return web.json_response({"error": "Not found"}, status=404)
+
+    try:
+        content = full.read_text(errors="replace")
+    except OSError as exc:
+        return web.json_response({"error": str(exc)}, status=500)
+
+    matches = []
+    lines = content.split("\n")
+
+    if is_regex:
+        try:
+            pattern = _re.compile(query)
+        except _re.error as exc:
+            return web.json_response({"error": f"Invalid regex: {exc}"}, status=400)
+        for lineno, line in enumerate(lines, start=1):
+            for m in pattern.finditer(line):
+                matches.append({
+                    "line": lineno,
+                    "col": m.start() + 1,
+                    "text": line,
+                })
+    else:
+        ql = query.lower()
+        for lineno, line in enumerate(lines, start=1):
+            idx = line.lower().find(ql)
+            if idx != -1:
+                matches.append({
+                    "line": lineno,
+                    "col": idx + 1,
+                    "text": line,
+                })
+
+    return web.json_response({
+        "path": note_path,
+        "query": query,
+        "regex": is_regex,
+        "matches": matches,
+        "count": len(matches),
+    })
+
+
 async def handle_search(request):
     from aiohttp import web
     vault = _resolve_vault(request)
