@@ -154,20 +154,29 @@ class CoordinatorService:
             peer_node_id = str(raw) if raw is not None else "unknown"
         except Exception:
             pass
+        _tasks: set[asyncio.Task] = set()
         try:
             while True:
                 try:
                     bi = await connection.accept_bi()
                 except Exception:
-                    return
+                    break
                 if bi is None:
-                    return
-                asyncio.create_task(
+                    break
+                task = asyncio.create_task(
                     self._handle_one_rpc(bi.send(), bi.recv(), peer_node_id),
                     name=f"coord-rpc-{peer_node_id[:8]}",
                 )
+                _tasks.add(task)
+                task.add_done_callback(_tasks.discard)
         except asyncio.CancelledError:
             raise
+        finally:
+            for t in list(_tasks):
+                if not t.done():
+                    t.cancel()
+            if _tasks:
+                await asyncio.gather(*_tasks, return_exceptions=True)
 
     async def _handle_one_rpc(self, send_stream, recv_stream, peer_node_id: str) -> None:
         request: object | None = None

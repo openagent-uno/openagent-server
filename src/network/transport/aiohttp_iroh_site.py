@@ -77,6 +77,9 @@ def current_is_authenticated_agent() -> bool:
 
 CERT_LEN_BYTES = 4
 MAX_CERT_LEN = 16 * 1024  # generous bound; a real cert is ~500 bytes
+# Per-stream timeout: a peer that connects but never sends a complete HTTP
+# request must not hold a task forever. Covers cert read + full request.
+_STREAM_TIMEOUT = 120.0
 
 
 class IrohSite(web.BaseSite):
@@ -128,25 +131,34 @@ class IrohSite(web.BaseSite):
         except Exception:
             pass
 
+        _tasks: set[asyncio.Task] = set()
         try:
             while True:
                 try:
                     bi = await connection.accept_bi()
                 except Exception as e:  # noqa: BLE001
                     logger.debug("iroh-gw: connection ended: %s", e)
-                    return
+                    break
                 if bi is None:
-                    return
+                    break
                 send_stream = bi.send()
                 recv_stream = bi.recv()
                 # Spawn per-stream task so a slow request doesn't block
                 # other streams on this same connection.
-                asyncio.create_task(
+                task = asyncio.create_task(
                     self._handle_one_stream(peer_node_id, send_stream, recv_stream),
                     name=f"iroh-gw-stream-{peer_node_id[:8]}",
                 )
+                _tasks.add(task)
+                task.add_done_callback(_tasks.discard)
         except asyncio.CancelledError:
             raise
+        finally:
+            for t in list(_tasks):
+                if not t.done():
+                    t.cancel()
+            if _tasks:
+                await asyncio.gather(*_tasks, return_exceptions=True)
 
     async def _handle_one_stream(
         self,
@@ -155,6 +167,23 @@ class IrohSite(web.BaseSite):
         recv_stream: object,
     ) -> None:
         """Handle one bi-stream: cert prefix → HTTP/1 dispatch → response."""
+        try:
+            await asyncio.wait_for(
+                self._handle_one_stream_inner(peer_node_id, send_stream, recv_stream),
+                timeout=_STREAM_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.debug("iroh-gw: stream timed out after %.0fs from %s", _STREAM_TIMEOUT, peer_node_id[:16])
+        except asyncio.CancelledError:
+            raise
+
+    async def _handle_one_stream_inner(
+        self,
+        peer_node_id: str,
+        send_stream: object,
+        recv_stream: object,
+    ) -> None:
+        """Inner handler: cert prefix → HTTP/1 dispatch → response (called under timeout)."""
         # ── Strip the cert prefix ──
         try:
             length_bytes = await _read_exact(recv_stream, CERT_LEN_BYTES)

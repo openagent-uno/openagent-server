@@ -82,23 +82,32 @@ class AgentSite(web.BaseSite):
             pass
 
         logger.debug("iroh-agent: inbound connection from %s", peer_node_id[:16])
+        _tasks: set[asyncio.Task] = set()
         try:
             while True:
                 try:
                     bi = await connection.accept_bi()
                 except Exception as e:  # noqa: BLE001
                     logger.debug("iroh-agent: connection ended from %s: %s", peer_node_id[:16], e)
-                    return
+                    break
                 if bi is None:
-                    return
+                    break
                 send_stream = bi.send()
                 recv_stream = bi.recv()
-                asyncio.create_task(
+                task = asyncio.create_task(
                     self._handle_one_stream(peer_node_id, send_stream, recv_stream),
                     name=f"iroh-agent-stream-{peer_node_id[:8]}",
                 )
+                _tasks.add(task)
+                task.add_done_callback(_tasks.discard)
         except asyncio.CancelledError:
             raise
+        finally:
+            for t in list(_tasks):
+                if not t.done():
+                    t.cancel()
+            if _tasks:
+                await asyncio.gather(*_tasks, return_exceptions=True)
 
     async def _handle_one_stream(
         self,
