@@ -1584,32 +1584,80 @@ async def t_dispatch_turn_chunk_raise_continues(ctx: TestContext) -> None:
 
 # ── Gateway WS drop with in-flight collectors ────────────────────────
 
-@test("bridges", "gateway WS drop resolves in-flight collectors with errored=True")
-async def t_gateway_ws_drop_orphan_cleanup(ctx: TestContext) -> None:
-    """A dropped WebSocket (gateway crash, network blip) calls
-    ``_resolve_orphaned_futures``, which must mark every in-flight
-    collector as errored and set ``done`` so the awaiter unblocks
-    instead of hanging forever. Without this, every spam-burst owner
-    would deadlock the bridge handler when the gateway hiccups."""
+@test("bridges", "gateway WS drop keeps in-flight collectors through reconnect grace")
+async def t_gateway_ws_drop_waits_for_reconnect(ctx: TestContext) -> None:
+    """A transient bridge->gateway WS drop must not become a chat error.
+
+    The gateway owns StreamSessions across reconnects and rebinds their
+    outbound channel to the new WS, so the bridge keeps the collector alive
+    during a short grace window. Pre-fix, this resolved the collector with
+    ``Gateway connection lost`` immediately and Telegram users saw an error
+    even though the run was still alive server-side.
+    """
+    import asyncio
+
     fb = _FakeBridge()
     sid = "s-drop"
 
-    async def trigger_drop_after_owner_appears():
+    async def trigger_drop_then_recover():
         for _ in range(500):
-            if sid in fb._real._stream_pending:
-                fb._real._resolve_orphaned_futures("Gateway connection lost")
+            col = fb._real._stream_pending.get(sid)
+            if col is not None:
+                fb._real._schedule_gateway_loss_cleanup(
+                    "Gateway connection lost",
+                    fb._real._gateway_generation,
+                )
+                await asyncio.sleep(0)
+                assert not col.done.is_set(), "transient drop errored the turn"
+                fb._real._gateway_generation += 1
+                fb._real._cancel_gateway_loss_cleanup()
+                col.text = "recovered reply"
+                col.done.set()
                 return
             await asyncio.sleep(0.001)
         raise AssertionError("collector never appeared")
 
-    import asyncio
     result, _ = await asyncio.gather(
         fb.send("hello", sid),
-        trigger_drop_after_owner_appears(),
+        trigger_drop_then_recover(),
     )
+    assert result["type"] == "response", result
+    assert result["text"] == "recovered reply", result
+    assert sid not in fb._real._stream_pending
+
+
+@test("bridges", "gateway WS drop grace eventually errors if reconnect never arrives")
+async def t_gateway_ws_drop_grace_expires(ctx: TestContext) -> None:
+    """If reconnect never happens, the bridge still unblocks the waiter."""
+    import asyncio
+    import src.bridges.base as bridge_mod
+
+    old_grace = bridge_mod.BRIDGE_GATEWAY_LOSS_GRACE_SECONDS
+    bridge_mod.BRIDGE_GATEWAY_LOSS_GRACE_SECONDS = 0.001
+    try:
+        fb = _FakeBridge()
+        sid = "s-drop-timeout"
+
+        async def trigger_drop_after_owner_appears():
+            for _ in range(500):
+                if sid in fb._real._stream_pending:
+                    fb._real._schedule_gateway_loss_cleanup(
+                        "Gateway connection lost",
+                        fb._real._gateway_generation,
+                    )
+                    return
+                await asyncio.sleep(0.001)
+            raise AssertionError("collector never appeared")
+
+        result, _ = await asyncio.gather(
+            fb.send("hello", sid),
+            trigger_drop_after_owner_appears(),
+        )
+    finally:
+        bridge_mod.BRIDGE_GATEWAY_LOSS_GRACE_SECONDS = old_grace
+
     assert result["type"] == "error", result
     assert result["text"] == "Gateway connection lost", result
-    # All cached state cleaned.
     assert sid not in fb._real._stream_pending
     assert sid not in fb._real._stream_opened
 

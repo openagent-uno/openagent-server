@@ -32,6 +32,16 @@ logger = logging.getLogger(__name__)
 # Retry cooldown between bridge crashes.
 BRIDGE_RETRY_SECONDS = 30
 
+# Keep the bridge -> gateway WebSocket warm through NAT / tunnel idle windows.
+BRIDGE_WS_HEARTBEAT_SECONDS = 30
+
+# A gateway reconnect is usually sub-second and the gateway owns live
+# StreamSessions across WS drops. Do not surface a transport error to the chat
+# unless the bridge fails to reattach within this window.
+BRIDGE_GATEWAY_LOSS_GRACE_SECONDS = float(
+    os.environ.get("OPENAGENT_BRIDGE_GATEWAY_LOSS_GRACE_SECONDS", "55")
+)
+
 # Single shared fallback message when STT can't transcribe an inbound
 # voice note. Forks per bridge had cosmetically-different copy
 # ("Voice message not transcribed.", "Voice not transcribed.", etc.) —
@@ -286,6 +296,8 @@ class BaseBridge:
         self._listener_task: asyncio.Task | None = None
         self._should_stop = False
         self._gateway_lost = asyncio.Event()
+        self._gateway_generation = 0
+        self._gateway_loss_cleanup_task: asyncio.Task | None = None
         self._command_future: asyncio.Future | None = None
         self._command_lock = asyncio.Lock()
         # NOTE: there is no ``_delta_callbacks`` field. Bridges run in
@@ -295,8 +307,8 @@ class BaseBridge:
         # editing it can subclass and tap the WS directly; we don't
         # carry dead infrastructure for a hypothetical caller.
         # ``_stream_opened`` tracks which session_ids have already
-        # been ``session_open``'d on the current WS — wiped on reconnect
-        # since the gateway tears down server-side sessions on WS drop.
+        # been ``session_open``'d on the current WS. Reconnects clear this
+        # cache so future turns re-send the idempotent SessionOpen frame.
         # ``_stream_pending`` maps session_id → in-flight collector;
         # the listener writes events into it via ``fold_outbound_event``,
         # ``send_message`` awaits ``collector.done``. The tool-status
@@ -340,6 +352,7 @@ class BaseBridge:
     async def stop(self) -> None:
         elog("bridge.stop", name=self.name)
         self._should_stop = True
+        self._cancel_gateway_loss_cleanup()
         if self._listener_task and not self._listener_task.done():
             self._listener_task.cancel()
             try:
@@ -347,6 +360,7 @@ class BaseBridge:
             except (asyncio.CancelledError, Exception):
                 pass
             self._listener_task = None
+        self._resolve_orphaned_futures("Bridge stopped")
         if self._ws:
             await self._ws.close()
             self._ws = None
@@ -404,6 +418,37 @@ class BaseBridge:
             self._command_future.set_result({"type": "error", "text": reason})
         self._command_future = None
 
+    def _cancel_gateway_loss_cleanup(self) -> None:
+        task = self._gateway_loss_cleanup_task
+        self._gateway_loss_cleanup_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _schedule_gateway_loss_cleanup(self, reason: str, generation: int) -> None:
+        """Fail pending bridge waits only if reconnect does not arrive soon."""
+        self._cancel_gateway_loss_cleanup()
+        if not self._stream_pending and self._command_future is None:
+            return
+
+        async def _cleanup() -> None:
+            try:
+                await asyncio.sleep(max(0.0, BRIDGE_GATEWAY_LOSS_GRACE_SECONDS))
+                if self._should_stop or self._gateway_generation != generation:
+                    return
+                elog(
+                    "bridge.gateway_loss_grace_expired",
+                    level="warning",
+                    name=self.name,
+                    pending_streams=len(self._stream_pending),
+                )
+                self._resolve_orphaned_futures(reason)
+            except asyncio.CancelledError:
+                return
+
+        self._gateway_loss_cleanup_task = asyncio.create_task(
+            _cleanup(), name=f"{self.name}:gateway-loss-cleanup"
+        )
+
     async def _send_gateway_json(self, payload: dict) -> None:
         """Write to the gateway websocket, tolerating reconnect races."""
         if self._ws is None or getattr(self._ws, "closed", False):
@@ -427,11 +472,10 @@ class BaseBridge:
         """Connect to the Gateway WebSocket and authenticate."""
         import aiohttp
 
-        # Clean up stale state from any previous connection — the
-        # gateway tears down the server-side StreamSessions on the WS
-        # drop, so any cached "we already opened it" bookkeeping in
-        # ``_resolve_orphaned_futures`` is also wiped.
-        self._resolve_orphaned_futures("Reconnecting to gateway")
+        # SessionOpen is idempotent on the gateway. Clear the bridge-side cache
+        # on every new WS so future turns reannounce their session metadata, but
+        # keep in-flight collectors alive while the gateway rebinds them.
+        self._stream_opened.clear()
 
         # Close any previous session/ws from a prior connection attempt
         if self._ws:
@@ -443,7 +487,10 @@ class BaseBridge:
 
         session = aiohttp.ClientSession()
         self._ws_session = session
-        self._ws = await session.ws_connect(self.gateway_url)
+        self._ws = await session.ws_connect(
+            self.gateway_url,
+            heartbeat=BRIDGE_WS_HEARTBEAT_SECONDS,
+        )
 
         # Authenticate
         auth_msg = {"type": P.AUTH, "token": self.gateway_token or "", "client_id": f"bridge:{self.name}"}
@@ -459,6 +506,8 @@ class BaseBridge:
         self._listener_task = asyncio.create_task(
             self._listen_gateway(), name=f"{self.name}:gw-listener"
         )
+        self._gateway_generation += 1
+        self._cancel_gateway_loss_cleanup()
 
     async def _listen_gateway(self) -> None:
         """Listen for Gateway responses and dispatch to pending collectors."""
@@ -493,13 +542,19 @@ class BaseBridge:
             )
         finally:
             elog("bridge.listener_exit", name=self.name, exit_kind=exit_kind)
-            self._resolve_orphaned_futures("Gateway connection lost")
+            generation = self._gateway_generation
             if not self._should_stop:
+                self._schedule_gateway_loss_cleanup(
+                    "Gateway connection lost",
+                    generation,
+                )
                 self._gateway_lost.set()
                 try:
                     await self._on_gateway_lost()
                 except Exception as e:  # noqa: BLE001
                     logger.warning("%s gateway-loss hook failed: %s", self.name, e)
+            else:
+                self._resolve_orphaned_futures("Bridge stopped")
 
     async def _handle_gateway_frame(self, data: dict) -> None:
         """Route a single decoded WS frame.
