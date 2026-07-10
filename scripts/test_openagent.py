@@ -348,6 +348,9 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_sessions_parallel_execution",
     # 10. MCPPool resilience — one bad MCP mustn't sink the whole pool
     "test_mcp_pool_resilience",
+    # AnyIO cancellation guard — pins the MCP spin-loop mitigation to an
+    # external counter so it never mutates CancelScope objects used by HTTPX.
+    "test_anyio_cancel_guard",
     # MCPPool spec.headers forwarding — regression guard for the
     # auth-gated remote MCP (mixout) 401 → ClosedResourceError chain.
     "test_mcp_pool_headers",
