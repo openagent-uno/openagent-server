@@ -2091,6 +2091,7 @@ async def t_gateway_live_state_drops_completed_stream_turn(ctx: TestContext) -> 
     terminal frames but the run completed and persisted, reconnect must hydrate
     from the DB rather than resurrect a permanent live/reasoning state."""
     from weakref import WeakKeyDictionary
+    from src.gateway.sessions import SessionManager
     from src.gateway.server import Gateway, _StreamHolder
 
     gw = Gateway.__new__(Gateway)
@@ -2098,6 +2099,7 @@ async def t_gateway_live_state_drops_completed_stream_turn(ctx: TestContext) -> 
     gw._live_replays = {}
     gw._stream_sessions = {}
     gw._ws_send_locks = WeakKeyDictionary()
+    gw.sessions = SessionManager(agent_name="test")
 
     class _DoneSession:
         def has_active_turn(self):
@@ -2202,7 +2204,10 @@ async def t_gateway_live_state_drops_db_terminal_despite_active_holder(ctx: Test
     db.runs = [{
         "status": "COMPLETED",
         "created_at": gw._live_replays["s1"].started_at + 1,
-        "input": {"input_content": "hello"},
+        # Real runtime rows may carry a coalesced/transformed input that does
+        # not exactly equal the first replay text_final. The timestamped
+        # terminal run is still authoritative for this session turn.
+        "input": {"input_content": "hello\n\nsecond burst message"},
         "content": "done",
     }]
 
@@ -2212,6 +2217,183 @@ async def t_gateway_live_state_drops_db_terminal_despite_active_holder(ctx: Test
     assert "s1" not in gw._live_replays
     assert ("alice", "s1") not in gw._stream_sessions
     assert channel.closed is True
+
+
+@test("stream", "Gateway keeps live replay when newer terminal run is unrelated")
+async def t_gateway_live_state_ignores_unrelated_terminal_run(ctx: TestContext) -> None:
+    """A delayed terminal write from a previous/cancelled turn must not close
+    a fresh live replay just because its timestamp lands after the new input."""
+    from weakref import WeakKeyDictionary
+    from src.gateway.server import Gateway, _StreamHolder
+
+    class _DB:
+        def __init__(self):
+            self.runs: list[dict] = []
+
+        async def list_session_runs(self, _session_id, *, limit=20):
+            return self.runs[:limit]
+
+    db = _DB()
+    gw = Gateway.__new__(Gateway)
+    gw.agent = type("_Agent", (), {"memory_db": db})()
+    gw._live_replays = {}
+    gw._stream_sessions = {}
+    gw._ws_send_locks = WeakKeyDictionary()
+
+    class _StillActiveSession:
+        def has_active_turn(self):
+            return True
+
+    class _Channel:
+        def __init__(self):
+            self.closed = False
+        async def close(self):
+            self.closed = True
+
+    channel = _Channel()
+    gw._stream_sessions[("alice", "s1")] = _StreamHolder(
+        session=_StillActiveSession(),
+        channel=channel,
+    )
+
+    class _FakeWS:
+        closed = False
+        def __init__(self):
+            self.sent: list[dict] = []
+        async def send_json(self, payload):
+            self.sent.append(payload)
+
+    ws = _FakeWS()
+    gw._record_live_input(
+        "s1",
+        {"type": "text_final", "session_id": "s1", "text": "new live question"},
+        owner="alice",
+    )
+    gw._record_live_output(
+        "s1",
+        {"type": "reasoning", "session_id": "s1", "active": True},
+        owner="alice",
+    )
+    db.runs = [{
+        "status": "COMPLETED",
+        "created_at": gw._live_replays["s1"].started_at + 1,
+        "input": {"input_content": "old cancelled question"},
+        "content": "old answer",
+    }]
+
+    await gw._send_live_snapshots(ws, client_id="device-1", handle="alice")
+
+    assert len(ws.sent) == 1, ws.sent
+    assert ws.sent[0]["type"] == "live_state"
+    assert "s1" in gw._live_replays
+    assert ("alice", "s1") in gw._stream_sessions
+    assert channel.closed is False
+
+
+@test("stream", "Gateway reattach retires stale holder before stale frame flush")
+async def t_gateway_adopt_retires_db_terminal_before_rebind_flush(ctx: TestContext) -> None:
+    """Regression for close/reopen mid-generation: the channel pump can be
+    retrying an old ``reasoning active=true`` frame on the dead websocket while
+    the run has already completed in the DB. Reattach must retire the holder
+    before ``rebind`` gives that stale frame a fresh transport."""
+    from weakref import WeakKeyDictionary
+    from src.gateway.sessions import SessionManager
+    from src.gateway.server import Gateway, _StreamHolder
+    from src.stream.channel import RealtimeChannel
+    from src.stream.events import OutReasoning, now_ms
+    from src.stream.session import StreamSession
+
+    class _DB:
+        def __init__(self):
+            self.runs: list[dict] = []
+
+        async def list_session_runs(self, _session_id, *, limit=20):
+            return self.runs[:limit]
+
+    db = _DB()
+    gw = Gateway.__new__(Gateway)
+    gw.agent = type("_Agent", (), {"memory_db": db})()
+    gw._live_replays = {}
+    gw._stream_sessions = {}
+    gw._ws_send_locks = WeakKeyDictionary()
+    gw.sessions = SessionManager(agent_name="test")
+
+    sess = StreamSession(_FakeAgent([]), client_id="device-1", session_id="s1")
+    # Keep has_active_turn() true even though the persisted run below says the
+    # turn has already completed, mirroring the stale holder race.
+    sleeper = asyncio.create_task(asyncio.sleep(60))
+    sess._current_turn = sleeper
+
+    stuck_payloads: list[dict] = []
+
+    async def dead_send(payload: dict) -> bool:
+        stuck_payloads.append(payload)
+        return False
+
+    channel = RealtimeChannel(sess, dead_send)
+    gw._stream_sessions[("alice", "s1")] = _StreamHolder(
+        session=sess,
+        channel=channel,
+    )
+    gw._record_live_input(
+        "s1",
+        {"type": "text_final", "session_id": "s1", "text": "hello"},
+        owner="alice",
+    )
+    sess.outbound.put_nowait(OutReasoning(
+        session_id="s1",
+        seq=1,
+        ts_ms=now_ms(),
+        active=True,
+    ))
+    await channel.start()
+    await _wait_for(lambda: len(stuck_payloads) >= 1, timeout=2.0)
+
+    db.runs = [{
+        "status": "COMPLETED",
+        "created_at": gw._live_replays["s1"].started_at + 1,
+        "input": {"input_content": "hello"},
+        "content": "done",
+    }]
+
+    class _FreshWS:
+        closed = False
+        def __init__(self):
+            self.sent: list[dict] = []
+        async def send_json(self, payload):
+            self.sent.append(payload)
+
+    fresh_ws = _FreshWS()
+    try:
+        await gw._adopt_sessions_to_ws("device-1", fresh_ws, handle="alice")
+        await asyncio.sleep(0.05)
+        live = await gw.active_live_session_ids(client_id="device-1", handle="alice")
+        await gw._handle_stream_frame(
+            fresh_ws,
+            "device-1",
+            {
+                "type": "session_open",
+                "session_id": "s2",
+                "profile": "batched",
+                "client_kind": "webapp-chat",
+                "speak": False,
+            },
+            handle="alice",
+        )
+        await asyncio.sleep(0.05)
+    finally:
+        sleeper.cancel()
+        try:
+            await sleeper
+        except asyncio.CancelledError:
+            pass
+
+    assert fresh_ws.sent == [], fresh_ws.sent
+    assert live == set()
+    assert ("alice", "s1") not in gw._stream_sessions
+    assert "s1" not in gw._live_replays
+    assert ("alice", "s2") in gw._stream_sessions
+    assert channel._pump_task is None or channel._pump_task.done()
 
 
 @test("stream", "RealtimeChannel.rebind preserves frame ordering across the swap")

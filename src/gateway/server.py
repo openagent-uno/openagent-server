@@ -389,6 +389,24 @@ class Gateway:
                 return piece
         return ""
 
+    @staticmethod
+    def _run_input_matches_replay(run_text: str, replay_text: str) -> bool:
+        if not run_text or not replay_text:
+            return False
+        if run_text == replay_text:
+            return True
+        run_norm = " ".join(run_text.split())
+        replay_norm = " ".join(replay_text.split())
+        return bool(
+            run_norm
+            and replay_norm
+            and (
+                run_norm == replay_norm
+                or replay_norm in run_norm
+                or run_norm in replay_norm
+            )
+        )
+
     async def _stream_turn_persisted_terminal(
         self, session_id: str, replay: _LiveReplay,
     ) -> bool:
@@ -425,19 +443,45 @@ class Gateway:
             "INTERRUPTED",
         }
         # Runtime run timestamps are second-granularity and can be recorded a
-        # beat before/after the inbound frame, so allow a tiny same-turn skew
-        # but avoid matching an older identical prompt from much earlier.
+        # beat before/after the inbound frame, so allow a tiny same-turn skew.
+        # Coalescing can make the persisted input a superset of the first
+        # replay text; exact equality is too strict, but a clearly different
+        # terminal row must not close a fresh live turn after a barge-in.
         earliest_same_turn = replay.started_at - 5
         for run in runs:
             if not isinstance(run, dict):
                 continue
             if self._run_status(run) not in terminal_statuses:
                 continue
-            if self._run_input_text(run) != replay_text:
+            run_text = self._run_input_text(run)
+            if not self._run_input_matches_replay(run_text, replay_text):
                 continue
             run_ts = self._run_timestamp(run)
-            if run_ts is not None and run_ts < earliest_same_turn:
+            if run_ts is not None:
+                if run_ts >= earliest_same_turn:
+                    return True
                 continue
+            if run_text == replay_text:
+                return True
+        return False
+
+    async def _stream_holder_is_stale_for_attach(
+        self, key: tuple[str, str], holder: _StreamHolder,
+    ) -> bool:
+        """True when a reconnect should retire a holder before rebinding it.
+
+        Rebinding first is dangerous: a ``RealtimeChannel`` may be stuck
+        retrying an old ``reasoning active=true`` frame from a dead websocket.
+        If the DB already has the terminal run, flushing that stale frame to
+        the fresh app resurrects a completed turn as live before
+        ``_send_live_snapshots`` gets a chance to prune it.
+        """
+        replay = self._live_replays.get(key[1])
+        if replay is None:
+            return False
+        if await self._stream_turn_persisted_terminal(key[1], replay):
+            return True
+        if self._replay_is_stream_turn(replay) and not holder.session.has_active_turn():
             return True
         return False
 
@@ -2153,10 +2197,16 @@ class Gateway:
             await self._close_stream_session(key)
             return
 
+        holder = self._stream_sessions.get(key)
+        if holder is not None and await self._stream_holder_is_stale_for_attach(
+            key, holder,
+        ):
+            await self._close_stream_session(key)
+            holder = None
+
         if isinstance(evt, TextFinal):
             self._record_live_input(sid, event_to_wire(evt), owner=owner)
 
-        holder = self._stream_sessions.get(key)
         if holder is None:
             language: str | None = None
             profile = "realtime"
@@ -2327,8 +2377,11 @@ class Gateway:
         owner_keys = {client_id}
         if owner:
             owner_keys.add(owner)
-        for key, holder in self._stream_sessions.items():
+        for key, holder in list(self._stream_sessions.items()):
             if key[0] not in owner_keys:
+                continue
+            if await self._stream_holder_is_stale_for_attach(key, holder):
+                await self._close_stream_session(key)
                 continue
             holder.channel.rebind(
                 lambda payload, _ws=ws: self._safe_ws_send_json(_ws, payload),
