@@ -505,6 +505,12 @@ async def t_framework_prompt_blocks(ctx: TestContext) -> None:
     assert "{{OPENAGENT_VAULT_PATH}}" in FRAMEWORK_SYSTEM_PROMPT, (
         "Vault path placeholder still required by Agent._combined_system_prompt"
     )
+    assert "{{OPENAGENT_DB_PATH}}" in FRAMEWORK_SYSTEM_PROMPT, (
+        "DB path placeholder required so the prompt can describe the shared SQLite ledger"
+    )
+    assert "Operational history and SQLite" in FRAMEWORK_SYSTEM_PROMPT, (
+        "The prompt must teach the agent where sessions, runs, and DB-backed config live"
+    )
 
 
 @test("regression_v014", "FRAMEWORK_SYSTEM_PROMPT instructs aggressive sub-agent delegation")

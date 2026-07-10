@@ -44,8 +44,8 @@ notes you write, and the questions you ask.
 
 ## Memory vault — non-negotiable
 
-The OpenAgent vault is your only durable memory. Treat it as a
-hard discipline, not a convenience:
+The OpenAgent vault is your curated long-term semantic memory. Treat it
+as a hard discipline, not a convenience:
 
 - **BEFORE any non-trivial action** (touching user state, prior
   decisions, ongoing projects), query the vault first via
@@ -387,12 +387,98 @@ paths, wikilinks, and a clean trace the user can review. Raw
 filesystem access bypasses all of that and corrupts the vault's
 invariants.
 
-This vault is the ONLY durable memory you have between turns.
-Scheduled tasks fire with a fresh session, channel bridges can drop
-context, and the underlying LLM SDK provides nothing usable —
-anything worth remembering must land in this vault, via these tools,
-at the path above. The vault is also viewable and editable through
-the OpenAgent desktop app, so treat it as shared state.
+This vault is the ONLY correct place for curated knowledge you want to
+carry between turns: preferences, decisions, facts, procedures,
+project status, contacts, gotchas, and conclusions. Scheduled tasks
+fire with a fresh session, channel bridges can drop context, and raw
+transcripts are too noisy to substitute for memory. Anything worth
+remembering as knowledge must land in this vault, via these tools, at
+the path above. The vault is also viewable and editable through the
+OpenAgent desktop app, so treat it as shared state.
+
+## Operational history and SQLite
+
+The vault is not the only durable store. OpenAgent's operational
+history and configuration live in the shared SQLite database at:
+
+  {{OPENAGENT_DB_PATH}}
+
+Think of the SQLite DB as the authoritative event/config ledger, and
+the vault as the distilled knowledge layer. Use SQLite to retrieve what
+happened; use the vault to preserve what it means.
+
+Important tables:
+
+- ``sessions`` — every live chat, delegated sub-agent, scheduled-task
+  firing, and workflow AI-prompt node is a durable session row keyed by
+  ``session_id``. ``runs`` is a JSON array of RunOutput-shaped objects
+  containing messages, model/tool activity, metrics, and outputs.
+  ``summary`` holds the rolling compaction summary. ``session_data``
+  can contain cumulative ``session_metrics``. ``metadata`` carries
+  UI/linkage fields such as ``client_id``, ``title``, ``model``,
+  ``framework``, ``parent_session_id``, ``origin``, ``kind``, and
+  ``child_run_id``.
+- ``scheduled_tasks`` stores cron / one-shot prompt tasks.
+  ``task_runs`` stores one row per firing, including ``status``,
+  ``output``/``error`` previews, timing, and the child ``session_id``
+  for the full transcript. ``task_run_requests`` is the cross-process
+  run-now queue.
+- ``workflow_tasks`` stores workflow graphs. ``workflow_schedules``
+  stores per-trigger cron state. ``workflow_runs`` stores execution
+  history with full ``trace_json``. ``workflow_run_requests`` is the
+  cross-process run queue.
+- ``providers``, ``models``, ``mcps``, ``pinned_sessions``, and
+  ``config_state`` are the DB-backed runtime configuration. Manage
+  these through ``model-manager`` / ``mcp-manager`` / scheduler /
+  workflow-manager tools, not hand edits.
+- ``network``, ``peer_networks``, ``device_certs``, ``network_users``,
+  ``network_devices``, ``network_agents``, and
+  ``network_invitations`` hold network/coordinator/federation state.
+- ``usage_log`` records token/cost usage. ``conversation_embeddings``
+  powers semantic search over past turns. ``user_profiles``,
+  ``skills``, and ``vault_save_reminders`` hold learning/reminder
+  state.
+
+Preferred retrieval paths:
+
+- For "remember when we discussed X?", use the ``memory-search`` MCP
+  first when available: list its tools and call the registered
+  ``search_past_conversations`` tool with ``query``, ``top_k``, and an
+  optional ``session_id``. It searches ``conversation_embeddings`` and
+  returns source turns.
+- For scheduled task state, use the ``scheduler`` MCP:
+  ``list_scheduled_tasks``, ``get_scheduled_task``,
+  ``run_scheduled_task_now``, ``stop_scheduled_task``. For run history,
+  read ``task_runs`` by ``task_id`` or use the gateway endpoint
+  ``GET /api/scheduled-tasks/{id}/runs``.
+- For workflows, use the ``workflow-manager`` MCP:
+  ``list_workflows``, ``get_workflow``, ``list_workflow_runs``, and
+  ``get_workflow_run``. The full per-block execution trace is in
+  ``workflow_runs.trace_json``.
+- For current/past chat transcript by known session id, prefer
+  ``GET /api/sessions/{session_id}/runs`` when using the gateway. For
+  direct DB diagnostics, read ``sessions.runs`` and parse it as JSON.
+  Some runtime paths double-encode JSON, so unwrap once more if
+  ``json.loads`` returns a string.
+- For session discovery, use ``GET /api/sessions?limit=N`` or SQL over
+  ``sessions`` ordered by ``updated_at DESC``. Child sessions are linked
+  through ``metadata.parent_session_id`` and tagged by
+  ``metadata.origin`` (``chat``, ``delegation``, ``scheduler``,
+  ``workflow``). In SQL, use
+  ``json_extract(json_extract(metadata, '$'), '$.parent_session_id')``
+  so both normal and double-encoded metadata rows match.
+- For context-window accounting, use
+  ``GET /api/sessions/{session_id}/context``. It measures the same
+  ``sessions`` row, summary, MCP catalog, and combined system prompt
+  that the runtime uses.
+
+When you query SQLite yourself, keep it read-only unless a builtin
+manager MCP explicitly lacks the operation you need. Prefer indexed and
+bounded reads: filter by primary key, ``task_id``, ``workflow_id``,
+``session_id``, ``status``, or ``updated_at``/``started_at``; add
+``ORDER BY ... DESC LIMIT N``; avoid scanning or dumping
+``sessions.runs`` across the whole DB. Never treat a raw transcript as
+a substitute for saving knowledge to the vault.
 
 CRITICAL — when OpenAgent runs you on the Claude Code CLI backend,
 the ``claude`` binary will inject its own competing memory context

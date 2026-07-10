@@ -1675,15 +1675,30 @@ class Agent:
             return str(Path(cfg_path).expanduser().resolve())
         return str(default_vault_path())
 
+    def _resolve_db_path(self) -> str:
+        """Return the SQLite DB path backing runtime state for this agent."""
+        from pathlib import Path
+        from src.core.paths import default_db_path
+
+        cfg_path = (
+            (self.config or {}).get("memory", {}).get("db_path")
+        )
+        if cfg_path:
+            return str(Path(cfg_path).expanduser().resolve())
+        db_path = getattr(self._db, "db_path", None)
+        if db_path:
+            return str(Path(str(db_path)).expanduser().resolve())
+        return str(default_db_path())
+
     def _combined_system_prompt(self, session_id: str | None = None) -> str:
         """Concatenate the framework prompt with the user's project-specific one.
 
-        Substitutes ``{{OPENAGENT_VAULT_PATH}}`` in the framework prompt
-        with the resolved on-disk path so the agent sees the exact folder
-        it must use as memory (and can compare against any rogue path a
-        wrapper SDK might inject). Per-agent because each agent runs in
-        its own process with its own ``--agent-dir`` (and optional
-        ``memory.vault_path`` YAML override).
+        Substitutes ``{{OPENAGENT_VAULT_PATH}}`` and
+        ``{{OPENAGENT_DB_PATH}}`` in the framework prompt with the
+        resolved on-disk paths so the agent sees the exact vault and
+        SQLite stores for this deployment. Per-agent because each agent
+        runs in its own process with its own ``--agent-dir`` (and
+        optional ``memory.*_path`` YAML overrides).
 
         When ``session_id`` is provided we append a ``<session-id>`` tag
         so the LLM can learn its own id and pass it to tools that
@@ -1694,6 +1709,8 @@ class Agent:
         """
         framework = FRAMEWORK_SYSTEM_PROMPT.replace(
             "{{OPENAGENT_VAULT_PATH}}", self._resolve_vault_path()
+        ).replace(
+            "{{OPENAGENT_DB_PATH}}", self._resolve_db_path()
         ).replace(
             "{{MCP_CATALOG_SUMMARY}}",
             build_mcp_catalog_summary(self._mcp),
