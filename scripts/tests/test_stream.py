@@ -2002,7 +2002,16 @@ async def t_gateway_live_state_rehydrates_active_turn(ctx: TestContext) -> None:
     gw = Gateway.__new__(Gateway)
     gw.agent = type("_Agent", (), {"memory_db": None})()
     gw._live_replays = {}
+    gw._stream_sessions = {}
     gw._ws_send_locks = WeakKeyDictionary()
+
+    class _ActiveSession:
+        def has_active_turn(self):
+            return True
+
+    gw._stream_sessions[("alice", "s1")] = type("_Holder", (), {
+        "session": _ActiveSession(),
+    })()
 
     class _FakeWS:
         closed = False
@@ -2073,6 +2082,64 @@ async def t_gateway_live_state_is_owner_scoped(ctx: TestContext) -> None:
     ws = _FakeWS()
     await gw._send_live_snapshots(ws, client_id="device-2", handle="bob")
     assert ws.sent == []
+
+
+@test("stream", "Gateway drops stale completed stream-turn live_state")
+async def t_gateway_live_state_drops_completed_stream_turn(ctx: TestContext) -> None:
+    """A chat turn replay that started with ``text_final`` is only valid while
+    its StreamSession still has an active turn. If the transport pump missed the
+    terminal frames but the run completed and persisted, reconnect must hydrate
+    from the DB rather than resurrect a permanent live/reasoning state."""
+    from weakref import WeakKeyDictionary
+    from src.gateway.server import Gateway, _StreamHolder
+
+    gw = Gateway.__new__(Gateway)
+    gw.agent = type("_Agent", (), {"memory_db": None})()
+    gw._live_replays = {}
+    gw._stream_sessions = {}
+    gw._ws_send_locks = WeakKeyDictionary()
+
+    class _DoneSession:
+        def has_active_turn(self):
+            return False
+
+    class _Channel:
+        def __init__(self):
+            self.closed = False
+        async def close(self):
+            self.closed = True
+
+    channel = _Channel()
+    gw._stream_sessions[("alice", "s1")] = _StreamHolder(
+        session=_DoneSession(),
+        channel=channel,
+    )
+
+    class _FakeWS:
+        closed = False
+        def __init__(self):
+            self.sent: list[dict] = []
+        async def send_json(self, payload):
+            self.sent.append(payload)
+
+    ws = _FakeWS()
+    gw._record_live_input(
+        "s1",
+        {"type": "text_final", "session_id": "s1", "text": "hello"},
+        owner="alice",
+    )
+    gw._record_live_output(
+        "s1",
+        {"type": "delta", "session_id": "s1", "text": "hello"},
+        owner="alice",
+    )
+
+    await gw._send_live_snapshots(ws, client_id="device-1", handle="alice")
+
+    assert ws.sent == []
+    assert "s1" not in gw._live_replays
+    assert ("alice", "s1") not in gw._stream_sessions
+    assert channel.closed is True
 
 
 @test("stream", "RealtimeChannel.rebind preserves frame ordering across the swap")

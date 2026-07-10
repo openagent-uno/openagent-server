@@ -321,6 +321,74 @@ class Gateway:
         if not replay.active:
             self._live_replays.pop(session_id, None)
 
+    @staticmethod
+    def _replay_is_stream_turn(replay: _LiveReplay) -> bool:
+        """True for app/CLI chat turns that should have a StreamSession owner.
+
+        Detached scheduler/workflow/sub-agent streams may start with a seed,
+        status, or delta frame and have no entry in ``_stream_sessions``. A
+        normal interactive turn always starts with the inbound ``text_final``
+        frame recorded by ``_record_live_input``.
+        """
+        return bool(replay.frames) and replay.frames[0].get("type") == P.TEXT_FINAL_IN
+
+    def _owner_keys(
+        self, *, client_id: str | None, handle: str | None, owner: str | None = None,
+    ) -> set[str]:
+        keys = {k for k in (client_id, handle, owner) if k}
+        live_owner = self._live_owner(client_id, handle)
+        if live_owner:
+            keys.add(live_owner)
+        return keys
+
+    def _stream_holder_for_replay(
+        self, session_id: str, owner_keys: set[str],
+    ) -> tuple[tuple[str, str], _StreamHolder] | None:
+        for key, holder in self._stream_sessions.items():
+            if key[1] == session_id and key[0] in owner_keys:
+                return key, holder
+        return None
+
+    async def active_live_session_ids(
+        self, *, client_id: str | None, handle: str | None,
+    ) -> set[str]:
+        """Return session ids that genuinely still have live work.
+
+        Used by REST hydration so the app can distinguish an in-flight turn
+        from a stale client-side spinner. For chat turns, the stream registry is
+        authoritative; for detached child runs, the replay's active flag is.
+        """
+        owner = self._live_owner(client_id, handle)
+        owner_keys = self._owner_keys(client_id=client_id, handle=handle, owner=owner)
+        if not owner_keys:
+            return set()
+
+        live: set[str] = set()
+        for key, holder in self._stream_sessions.items():
+            if key[0] in owner_keys and holder.session.has_active_turn():
+                live.add(key[1])
+
+        for sid, replay in list(self._live_replays.items()):
+            if not replay.active or not replay.frames:
+                continue
+            if not replay.owner:
+                resolved = await self._lookup_live_owner(sid)
+                if resolved:
+                    replay.owner = resolved
+            if replay.owner not in owner_keys:
+                continue
+            if self._replay_is_stream_turn(replay):
+                holder_entry = self._stream_holder_for_replay(
+                    sid, self._owner_keys(
+                        client_id=client_id, handle=handle, owner=replay.owner,
+                    ),
+                )
+                if holder_entry is not None and holder_entry[1].session.has_active_turn():
+                    live.add(sid)
+                continue
+            live.add(sid)
+        return live
+
     async def _lookup_live_owner(self, session_id: str) -> str | None:
         """Best-effort owner lookup for detached scheduler/workflow sessions."""
         replay = self._live_replays.get(session_id)
@@ -349,7 +417,9 @@ class Gateway:
         owner = self._live_owner(client_id, handle)
         if not owner:
             return
+        owner_keys = self._owner_keys(client_id=client_id, handle=handle, owner=owner)
         stale: list[str] = []
+        stale_stream_keys: list[tuple[str, str]] = []
         for sid, replay in list(self._live_replays.items()):
             if not replay.active or not replay.frames:
                 stale.append(sid)
@@ -358,11 +428,36 @@ class Gateway:
                 resolved = await self._lookup_live_owner(sid)
                 if resolved:
                     replay.owner = resolved
-            if replay.owner != owner:
+            if replay.owner not in owner_keys:
                 continue
+            if self._replay_is_stream_turn(replay):
+                holder_entry = self._stream_holder_for_replay(
+                    sid,
+                    self._owner_keys(
+                        client_id=client_id,
+                        handle=handle,
+                        owner=replay.owner,
+                    ),
+                )
+                if (
+                    holder_entry is None
+                    or not holder_entry[1].session.has_active_turn()
+                ):
+                    # The canonical run has finished (or the StreamSession was
+                    # explicitly closed) but the replay never observed its
+                    # terminal frame, usually because the transport pump hit
+                    # the unrecoverable window while the server-owned turn kept
+                    # running. Do not rehydrate this as live forever; the DB is
+                    # now source of truth.
+                    stale.append(sid)
+                    if holder_entry is not None:
+                        stale_stream_keys.append(holder_entry[0])
+                    continue
             await self._safe_ws_send_json(ws, replay.snapshot())
         for sid in stale:
             self._live_replays.pop(sid, None)
+        for key in stale_stream_keys:
+            await self._close_stream_session(key)
 
     def broadcast_resource_sync(
         self,

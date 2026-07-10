@@ -75,15 +75,22 @@ async def handle_list(request):
             client_id, limit=limit, exclude_child_origins=HIDDEN_CHILD_ORIGINS,
         )
 
-    # Enrich with RAM queue/busy state from SessionManager. RAM is
-    # keyed by device pubkey (the WebSocket's client_id), not by
-    # handle, so we look up using the device pubkey when available.
+    # Enrich with true live-turn state from the stream registry. The legacy
+    # SessionManager's RAM list only means "session metadata is attached", not
+    # "a turn is running"; using it here would make completed sessions look
+    # live forever after reconnect.
     device_client_id = request.get("client_id")
+    live_sids: set[str] = set()
     if gateway is not None and device_client_id:
-        ram_sids = set(gateway.sessions.list_sessions(device_client_id))
+        try:
+            live_sids.update(await gateway.active_live_session_ids(
+                client_id=device_client_id,
+                handle=request.get("user_handle"),
+            ))
+        except Exception:
+            pass
         for r in rows:
-            if r["session_id"] in ram_sids:
-                r["_live"] = True
+            r["_live"] = r["session_id"] in live_sids
     return web.json_response({"sessions": rows})
 
 

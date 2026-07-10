@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import time as _time
 import uuid
+from types import SimpleNamespace
 
 from ._framework import TestContext, test
 
@@ -141,6 +142,58 @@ async def t_exclude_all_child_origins(ctx: TestContext) -> None:
         # …but each hidden child is still reachable via its own queries:
         assert {c["session_id"] for c in await db.list_child_sessions("scheduler:t1")} == {"scheduler:t1:r1"}
         assert (await db.list_session_runs("workflow:wf1:run1:node1")) == []  # no runs yet, but row exists
+        await db.close()
+    finally:
+        try:
+            tmp_db.unlink()
+        except FileNotFoundError:
+            pass
+
+
+@test("sessions_cross_device", "GET /api/sessions marks only genuinely active live sessions")
+async def t_rest_sessions_live_flag_uses_gateway_active_state(ctx: TestContext) -> None:
+    """The app uses ``_live: false`` to clear stale local processing/reasoning
+    flags. The REST list must therefore consult the gateway's real stream-turn
+    state, not legacy attached-session RAM."""
+    import json
+    from aiohttp.test_utils import make_mocked_request
+    from src.gateway.api.sessions import handle_list
+    from src.memory.db import MemoryDB
+
+    tmp_db = ctx.db_path.with_name(f"xd-live-{uuid.uuid4().hex[:8]}.db")
+    try:
+        db = MemoryDB(str(tmp_db))
+        await db.connect()
+        sid_live = f"live-{uuid.uuid4().hex[:8]}"
+        sid_done = f"done-{uuid.uuid4().hex[:8]}"
+        await db.upsert_session(sid_live, client_id="alice", title="Live")
+        await db.upsert_session(sid_done, client_id="alice", title="Done")
+
+        class _Gateway:
+            def __init__(self):
+                self.agent = SimpleNamespace(memory_db=db)
+                self.calls: list[tuple[str | None, str | None]] = []
+
+            async def active_live_session_ids(self, *, client_id, handle):
+                self.calls.append((client_id, handle))
+                return {sid_live}
+
+        gateway = _Gateway()
+        req = make_mocked_request(
+            "GET",
+            "/api/sessions",
+            app={"gateway": gateway},
+        )
+        req["client_id"] = "device-pubkey"
+        req["user_handle"] = "alice"
+
+        resp = await handle_list(req)
+        data = json.loads(resp.text)
+        live_by_id = {row["session_id"]: row.get("_live") for row in data["sessions"]}
+
+        assert gateway.calls == [("device-pubkey", "alice")]
+        assert live_by_id[sid_live] is True, live_by_id
+        assert live_by_id[sid_done] is False, live_by_id
         await db.close()
     finally:
         try:
