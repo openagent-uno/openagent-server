@@ -44,6 +44,7 @@ import psutil  # noqa: F401 — cross-platform host telemetry (api/system.py)
 import iroh  # noqa: F401 — P2P transport (src.network.iroh_node) — Rust FFI dylib must be bundled
 import pydantic  # noqa: F401 — runtime calls importlib.metadata.version("pydantic")
 import email_validator  # noqa: F401 — pydantic.EmailStr validation calls version("email-validator")
+import telegram  # noqa: F401 — Telegram bridge is a first-class production channel
 
 block_cipher = None
 

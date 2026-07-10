@@ -94,6 +94,10 @@ dependencies = [
     # extra; promote to core since the network layer cannot work
     # without it.
     "aiohttp>=3.9",
+    # Telegram is a first-class channel in production OpenAgent deployments.
+    # Keep the SDK in the base install so source-style runtime installs cannot
+    # replace a bundled binary with an entry point that lacks the bridge deps.
+    "python-telegram-bot>=21.0",
     # email-validator: pydantic.EmailStr defers to it at runtime, and
     # openagent.spec imports it at build time so PyInstaller can bundle
     # the .dist-info metadata that ``importlib.metadata.version`` needs.
@@ -104,7 +108,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-telegram = ["python-telegram-bot>=21.0"]
+# Kept as a compatibility alias for installers that still request
+# ``openagent-framework[telegram]``.
+telegram = []
 discord = ["discord.py>=2.3.0"]
 whatsapp = ["whatsapp-api-client-python>=0.0.46"]
 slack = ["slack-bolt>=1.20.0", "slack-sdk>=3.30.0"]
@@ -115,7 +121,6 @@ slack = ["slack-bolt>=1.20.0", "slack-sdk>=3.30.0"]
 voice = []
 websocket = ["aiohttp>=3.9"]
 all = [
-    "python-telegram-bot>=21.0",
     "discord.py>=2.3.0",
     "whatsapp-api-client-python>=0.0.46",
     "slack-bolt>=1.20.0",
