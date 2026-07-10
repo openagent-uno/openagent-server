@@ -2290,6 +2290,82 @@ async def t_gateway_live_state_ignores_unrelated_terminal_run(ctx: TestContext) 
     assert channel.closed is False
 
 
+@test("stream", "Gateway terminal follow-up frames do not resurrect live replay")
+async def t_gateway_context_report_after_turn_complete_stays_settled(ctx: TestContext) -> None:
+    """The runner publishes context_report after turn_complete. That passive
+    frame must not create a new active replay, or the next new-chat
+    session_open will rehydrate the previous completed chat as live."""
+    from weakref import WeakKeyDictionary
+    from src.gateway.sessions import SessionManager
+    from src.gateway.server import Gateway
+
+    gw = Gateway.__new__(Gateway)
+    gw.agent = type("_Agent", (), {"memory_db": None})()
+    gw._live_replays = {}
+    gw._stream_sessions = {}
+    gw._ws_send_locks = WeakKeyDictionary()
+    gw.sessions = SessionManager(agent_name="test")
+
+    gw._record_live_input(
+        "old",
+        {"type": "text_final", "session_id": "old", "text": "old prompt"},
+        owner="alice",
+    )
+    gw._record_live_output(
+        "old",
+        {"type": "reasoning", "session_id": "old", "active": True},
+        owner="alice",
+    )
+    gw._record_live_output(
+        "old",
+        {"type": "response", "session_id": "old", "text": "old answer"},
+        owner="alice",
+    )
+    gw._record_live_output(
+        "old",
+        {"type": "turn_complete", "session_id": "old"},
+        owner="alice",
+    )
+    assert "old" not in gw._live_replays
+
+    gw._record_live_output(
+        "old",
+        {
+            "type": "context_report",
+            "session_id": "old",
+            "report": {"used_tokens": 10, "max_tokens": 100},
+        },
+        owner="alice",
+    )
+    assert "old" not in gw._live_replays
+
+    class _FakeWS:
+        closed = False
+        def __init__(self):
+            self.sent: list[dict] = []
+        async def send_json(self, payload):
+            self.sent.append(payload)
+
+    ws = _FakeWS()
+    await gw._handle_stream_frame(
+        ws,
+        "device-1",
+        {
+            "type": "session_open",
+            "session_id": "new",
+            "profile": "batched",
+            "client_kind": "webapp-chat",
+            "speak": False,
+        },
+        handle="alice",
+    )
+
+    assert all(
+        frame.get("session_id") != "old" for frame in ws.sent
+    ), ws.sent
+    assert "old" not in gw._live_replays
+
+
 @test("stream", "Gateway reattach retires stale holder before stale frame flush")
 async def t_gateway_adopt_retires_db_terminal_before_rebind_flush(ctx: TestContext) -> None:
     """Regression for close/reopen mid-generation: the channel pump can be

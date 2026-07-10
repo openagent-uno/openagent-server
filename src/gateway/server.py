@@ -319,6 +319,16 @@ class Gateway:
             return
         replay = self._live_replays.get(session_id)
         if replay is None:
+            # Do not resurrect a completed chat turn from terminal/passive
+            # follow-up frames. The runner emits ``context_report`` after
+            # ``turn_complete``; treating that as a fresh active replay makes
+            # the next session_open re-mark the old chat as live forever.
+            t = frame.get("type")
+            if (
+                t in {P.TURN_COMPLETE, P.RESPONSE, P.ERROR, "context_report"}
+                or t == P.REASONING
+            ):
+                return
             replay = _LiveReplay(session_id=session_id, owner=owner)
             self._live_replays[session_id] = replay
         replay.append(frame, owner=owner)
