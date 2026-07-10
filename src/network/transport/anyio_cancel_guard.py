@@ -16,12 +16,14 @@ Refs:
 from __future__ import annotations
 
 import logging
+import weakref
 
 logger = logging.getLogger(__name__)
 
 _MAX_ITERATIONS = 200
 
 _original_deliver = None
+_cancel_iterations: "weakref.WeakKeyDictionary[object, int]" = weakref.WeakKeyDictionary()
 
 
 def _patch_deliver_cancellation() -> bool:
@@ -40,8 +42,8 @@ def _patch_deliver_cancellation() -> bool:
     _original_deliver = _CancelScope._deliver_cancellation  # type: ignore[attr-defined]
 
     def _patched_deliver(self, origin):
-        iteration = getattr(origin, "_oa_cancel_iter", 0) + 1
-        origin._oa_cancel_iter = iteration  # type: ignore[attr-defined]
+        iteration = _cancel_iterations.get(origin, 0) + 1
+        _cancel_iterations[origin] = iteration
         if iteration > _MAX_ITERATIONS:
             logger.warning(
                 "anyio cancel delivery exceeded %d iterations on scope %r — "
@@ -55,8 +57,12 @@ def _patch_deliver_cancellation() -> bool:
             if hasattr(origin, "_cancel_handle") and origin._cancel_handle is not None:
                 origin._cancel_handle.cancel()
                 origin._cancel_handle = None
+            _cancel_iterations.pop(origin, None)
             return False
-        return _original_deliver(self, origin)
+        should_retry = _original_deliver(self, origin)
+        if origin is self and not should_retry:
+            _cancel_iterations.pop(origin, None)
+        return should_retry
 
     _CancelScope._deliver_cancellation = _patched_deliver  # type: ignore[attr-defined]
     logger.info("anyio_cancel_guard: patched _deliver_cancellation (max %d iterations)", _MAX_ITERATIONS)
@@ -74,4 +80,5 @@ def _unpatch_deliver_cancellation() -> bool:
         return False
     _CancelScope._deliver_cancellation = _original_deliver  # type: ignore[attr-defined]
     _original_deliver = None
+    _cancel_iterations.clear()
     return True
