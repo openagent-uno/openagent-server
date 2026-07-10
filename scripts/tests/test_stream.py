@@ -2142,6 +2142,78 @@ async def t_gateway_live_state_drops_completed_stream_turn(ctx: TestContext) -> 
     assert channel.closed is True
 
 
+@test("stream", "Gateway prefers persisted terminal run over active stale holder")
+async def t_gateway_live_state_drops_db_terminal_despite_active_holder(ctx: TestContext) -> None:
+    """A websocket can die while ``RealtimeChannel`` is retrying an early
+    frame. The agent turn may then finish and persist while the in-memory
+    stream holder still looks active. Reconnect must trust the persisted run
+    and avoid resurrecting the replay as an endless live/reasoning turn."""
+    from weakref import WeakKeyDictionary
+    from src.gateway.server import Gateway, _StreamHolder
+
+    class _DB:
+        def __init__(self):
+            self.runs: list[dict] = []
+
+        async def list_session_runs(self, _session_id, *, limit=20):
+            return self.runs[:limit]
+
+    db = _DB()
+    gw = Gateway.__new__(Gateway)
+    gw.agent = type("_Agent", (), {"memory_db": db})()
+    gw._live_replays = {}
+    gw._stream_sessions = {}
+    gw._ws_send_locks = WeakKeyDictionary()
+
+    class _StillLooksActiveSession:
+        def has_active_turn(self):
+            return True
+
+    class _Channel:
+        def __init__(self):
+            self.closed = False
+        async def close(self):
+            self.closed = True
+
+    channel = _Channel()
+    gw._stream_sessions[("alice", "s1")] = _StreamHolder(
+        session=_StillLooksActiveSession(),
+        channel=channel,
+    )
+
+    class _FakeWS:
+        closed = False
+        def __init__(self):
+            self.sent: list[dict] = []
+        async def send_json(self, payload):
+            self.sent.append(payload)
+
+    ws = _FakeWS()
+    gw._record_live_input(
+        "s1",
+        {"type": "text_final", "session_id": "s1", "text": "hello"},
+        owner="alice",
+    )
+    gw._record_live_output(
+        "s1",
+        {"type": "reasoning", "session_id": "s1", "active": True},
+        owner="alice",
+    )
+    db.runs = [{
+        "status": "COMPLETED",
+        "created_at": gw._live_replays["s1"].started_at + 1,
+        "input": {"input_content": "hello"},
+        "content": "done",
+    }]
+
+    await gw._send_live_snapshots(ws, client_id="device-1", handle="alice")
+
+    assert ws.sent == []
+    assert "s1" not in gw._live_replays
+    assert ("alice", "s1") not in gw._stream_sessions
+    assert channel.closed is True
+
+
 @test("stream", "RealtimeChannel.rebind preserves frame ordering across the swap")
 async def t_realtime_rebind_preserves_order(ctx: TestContext) -> None:
     """A rebind during an in-flight pump iteration must not lose or

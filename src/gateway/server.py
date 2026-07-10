@@ -88,6 +88,7 @@ class _LiveReplay:
     owner: str | None = None
     frames: list[dict[str, Any]] = field(default_factory=list)
     active: bool = True
+    started_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
     MAX_FRAMES = 512
@@ -97,7 +98,9 @@ class _LiveReplay:
             self.owner = owner
         self.frames = [dict(frame)]
         self.active = True
-        self.updated_at = time.time()
+        now = time.time()
+        self.started_at = now
+        self.updated_at = now
 
     def append(self, frame: dict[str, Any], *, owner: str | None = None) -> None:
         if owner and not self.owner:
@@ -127,6 +130,7 @@ class _LiveReplay:
             "session_id": self.session_id,
             "active": self.active,
             "frames": [dict(f) for f in self.frames],
+            "started_at": self.started_at,
             "updated_at": self.updated_at,
         }
 
@@ -332,6 +336,111 @@ class Gateway:
         """
         return bool(replay.frames) and replay.frames[0].get("type") == P.TEXT_FINAL_IN
 
+    @staticmethod
+    def _replay_input_text(replay: _LiveReplay) -> str:
+        if not replay.frames:
+            return ""
+        text = replay.frames[0].get("text")
+        return text.strip() if isinstance(text, str) else ""
+
+    @staticmethod
+    def _run_status(run: dict[str, Any]) -> str:
+        raw = run.get("status") or run.get("run_status") or run.get("state") or ""
+        value = getattr(raw, "value", raw)
+        return str(value or "").strip().upper()
+
+    @staticmethod
+    def _run_timestamp(run: dict[str, Any]) -> float | None:
+        raw = run.get("created_at") or run.get("updated_at") or run.get("started_at")
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _run_input_text(run: dict[str, Any]) -> str:
+        def _text(value: Any) -> str:
+            if isinstance(value, str):
+                return value.strip()
+            if isinstance(value, list):
+                parts: list[str] = []
+                for item in value:
+                    piece = _text(item)
+                    if piece:
+                        parts.append(piece)
+                return "\n".join(parts).strip()
+            if isinstance(value, dict):
+                for key in (
+                    "input_content",
+                    "content",
+                    "text",
+                    "message",
+                    "prompt",
+                    "value",
+                ):
+                    piece = _text(value.get(key))
+                    if piece:
+                        return piece
+            return ""
+
+        for key in ("input", "input_content", "message", "prompt"):
+            piece = _text(run.get(key))
+            if piece:
+                return piece
+        return ""
+
+    async def _stream_turn_persisted_terminal(
+        self, session_id: str, replay: _LiveReplay,
+    ) -> bool:
+        """Whether a chat replay is already represented by a terminal DB run.
+
+        A dead websocket can leave ``RealtimeChannel`` retrying an old frame
+        while the server-owned ``StreamSession`` finishes and persists the run.
+        In that window ``has_active_turn()`` can lag behind the durable truth;
+        reconnect must prefer the DB or the app rehydrates a permanent
+        reasoning/live tail.
+        """
+        if not self._replay_is_stream_turn(replay):
+            return False
+        replay_text = self._replay_input_text(replay)
+        if not replay_text:
+            return False
+
+        db = getattr(self.agent, "memory_db", None)
+        if db is None or not hasattr(db, "list_session_runs"):
+            return False
+        try:
+            runs = await db.list_session_runs(session_id, limit=100)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("live replay DB check failed for %s: %s", session_id, e)
+            return False
+
+        terminal_statuses = {
+            "COMPLETED",
+            "COMPLETE",
+            "FAILED",
+            "ERROR",
+            "CANCELLED",
+            "CANCELED",
+            "INTERRUPTED",
+        }
+        # Runtime run timestamps are second-granularity and can be recorded a
+        # beat before/after the inbound frame, so allow a tiny same-turn skew
+        # but avoid matching an older identical prompt from much earlier.
+        earliest_same_turn = replay.started_at - 5
+        for run in runs:
+            if not isinstance(run, dict):
+                continue
+            if self._run_status(run) not in terminal_statuses:
+                continue
+            if self._run_input_text(run) != replay_text:
+                continue
+            run_ts = self._run_timestamp(run)
+            if run_ts is not None and run_ts < earliest_same_turn:
+                continue
+            return True
+        return False
+
     def _owner_keys(
         self, *, client_id: str | None, handle: str | None, owner: str | None = None,
     ) -> set[str]:
@@ -364,9 +473,16 @@ class Gateway:
             return set()
 
         live: set[str] = set()
-        for key, holder in self._stream_sessions.items():
-            if key[0] in owner_keys and holder.session.has_active_turn():
-                live.add(key[1])
+        for key, holder in list(self._stream_sessions.items()):
+            if key[0] not in owner_keys or not holder.session.has_active_turn():
+                continue
+            replay = self._live_replays.get(key[1])
+            if replay is not None and await self._stream_turn_persisted_terminal(
+                key[1], replay,
+            ):
+                await self._close_stream_session(key)
+                continue
+            live.add(key[1])
 
         for sid, replay in list(self._live_replays.items()):
             if not replay.active or not replay.frames:
@@ -383,6 +499,12 @@ class Gateway:
                         client_id=client_id, handle=handle, owner=replay.owner,
                     ),
                 )
+                if await self._stream_turn_persisted_terminal(sid, replay):
+                    if holder_entry is not None:
+                        await self._close_stream_session(holder_entry[0])
+                    else:
+                        self._live_replays.pop(sid, None)
+                    continue
                 if holder_entry is not None and holder_entry[1].session.has_active_turn():
                     live.add(sid)
                 continue
@@ -439,6 +561,11 @@ class Gateway:
                         owner=replay.owner,
                     ),
                 )
+                if await self._stream_turn_persisted_terminal(sid, replay):
+                    stale.append(sid)
+                    if holder_entry is not None:
+                        stale_stream_keys.append(holder_entry[0])
+                    continue
                 if (
                     holder_entry is None
                     or not holder_entry[1].session.has_active_turn()
