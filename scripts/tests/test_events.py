@@ -36,6 +36,8 @@ async def t_event_db_roundtrip(ctx: TestContext) -> None:
             secret_enc=enc, secret_hint=hint, event_type="github",
             prompt_template="Push by {{payload.pusher.name}}",
             input_schema=[{"name": "pusher", "path": "pusher.name"}],
+            session_binding_enabled=True,
+            session_binding_path="repository.id",
         )
         # A public read never returns the encrypted secret.
         pub = await db.get_event(eid)
@@ -43,6 +45,8 @@ async def t_event_db_roundtrip(ctx: TestContext) -> None:
         assert pub["secret_hint"] == hint
         assert pub["input_schema"][0]["name"] == "pusher"
         assert pub["enabled"] is True
+        assert pub["session_binding_enabled"] is True
+        assert pub["session_binding_path"] == "repository.id"
         # The private read (webhook-auth path) does — and it decrypts back.
         priv = await db.get_event(eid, include_secret=True)
         assert decrypt_secret(priv["secret_enc"], db_path=str(ctx.db_path)) == clear
@@ -340,6 +344,75 @@ async def t_dispatch_prompt(ctx: TestContext) -> None:
         # The child session is event-origin and therefore hidden as a standalone
         # row (surfaced via the delivery, not double-listed under chats).
         assert "event" in HIDDEN_CHILD_ORIGINS
+    finally:
+        await db.close()
+
+
+@test("events", "prompt action can bind a payload id to one internal event run session")
+async def t_dispatch_prompt_session_binding(ctx: TestContext) -> None:
+    import os
+    from src.memory.db import MemoryDB
+    from src.core.scheduler import Scheduler
+    from src.core.event_dispatcher import dispatch_event
+    from src.core.event_secret import make_secret_material
+
+    os.environ.pop("OPENAGENT_SCHEDULER_DURABLE_SESSIONS", None)
+    db = MemoryDB(str(ctx.db_path))
+    await db.connect()
+    try:
+        agent = _SpyAgent()
+        scheduler = Scheduler(db=db, agent=agent)  # type: ignore[arg-type]
+        clear, enc, hint = make_secret_material(db_path=str(ctx.db_path))
+        eid = await db.add_event(
+            name="Ticket", action_kind="prompt", slug="ticket-bound",
+            secret_enc=enc, secret_hint=hint,
+            prompt_template="Handle ticket {{payload.ticket.id}}",
+            session_binding_enabled=True,
+            session_binding_path="ticket.id",
+        )
+        ev = await db.get_event(eid)
+
+        async def fire(payload: dict) -> str:
+            did = await db.add_event_delivery(event_id=eid, payload=payload)
+            result = await dispatch_event(
+                agent=agent, db=db, scheduler=scheduler, event=ev,
+                payload=payload, delivery_id=did, source="webhook",
+            )
+            row = await db.get_event_delivery(did)
+            assert row["session_id"] == result["session_id"], row
+            return result["session_id"]
+
+        sid1 = await fire({"ticket": {"id": "T-1", "body": "first"}})
+        sid2 = await fire({"ticket": {"id": "T-1", "body": "follow-up"}})
+        sid3 = await fire({"ticket": {"id": "T-2", "body": "other"}})
+        assert sid1 == sid2, (sid1, sid2)
+        assert sid3 != sid1, (sid1, sid3)
+        binding = await db.get_event_session_binding(eid, "T-1")
+        assert binding and binding["session_id"] == sid1, binding
+
+        # Binding disabled keeps the old one-delivery/one-session behaviour,
+        # even if the same payload id appears repeatedly.
+        eid2 = await db.add_event(
+            name="Ticket unbound", action_kind="prompt", slug="ticket-unbound",
+            secret_enc=enc, secret_hint=hint,
+            prompt_template="Handle {{payload.ticket.id}}",
+            session_binding_enabled=False,
+            session_binding_path="ticket.id",
+        )
+        ev2 = await db.get_event(eid2)
+
+        async def fire_unbound() -> str:
+            payload = {"ticket": {"id": "T-1"}}
+            did = await db.add_event_delivery(event_id=eid2, payload=payload)
+            result = await dispatch_event(
+                agent=agent, db=db, scheduler=scheduler, event=ev2,
+                payload=payload, delivery_id=did, source="webhook",
+            )
+            return result["session_id"]
+
+        sid4 = await fire_unbound()
+        sid5 = await fire_unbound()
+        assert sid4 != sid5, (sid4, sid5)
     finally:
         await db.close()
 

@@ -57,10 +57,40 @@ async def _get_conn() -> aiosqlite.Connection:
             await conn.execute("PRAGMA busy_timeout = 10000")
             await conn.execute("PRAGMA journal_mode=WAL")
             await conn.executescript(SCHEMA_SQL)
+            await _ensure_event_session_binding_schema(conn)
             await conn.commit()
             _conn = conn
             logger.info("events-manager MCP connected to %s", path)
         return _conn
+
+
+async def _ensure_event_session_binding_schema(conn: aiosqlite.Connection) -> None:
+    """Subset of MemoryDB's migration needed by this direct-SQL MCP server."""
+    cursor = await conn.execute("PRAGMA table_info(events)")
+    cols = {row[1] for row in await cursor.fetchall()}
+    if "session_binding_enabled" not in cols:
+        await conn.execute(
+            "ALTER TABLE events ADD COLUMN "
+            "session_binding_enabled INTEGER NOT NULL DEFAULT 0"
+        )
+    if "session_binding_path" not in cols:
+        await conn.execute("ALTER TABLE events ADD COLUMN session_binding_path TEXT")
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS event_session_bindings (
+            event_id     TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+            binding_key  TEXT NOT NULL,
+            session_id   TEXT NOT NULL,
+            created_at   REAL NOT NULL,
+            updated_at   REAL NOT NULL,
+            PRIMARY KEY (event_id, binding_key)
+        )
+        """
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ev_session_bindings_session "
+        "ON event_session_bindings(session_id)"
+    )
 
 
 def _public_event(row: aiosqlite.Row) -> dict[str, Any]:
@@ -73,6 +103,7 @@ def _public_event(row: aiosqlite.Row) -> dict[str, Any]:
     except (TypeError, ValueError):
         d["input_schema"] = []
     d["enabled"] = bool(d.get("enabled"))
+    d["session_binding_enabled"] = bool(d.get("session_binding_enabled"))
     d["webhook_path"] = f"/hooks/{d.get('slug')}"
     return d
 
@@ -100,6 +131,20 @@ async def _unique_slug(conn: aiosqlite.Connection, name: str, desired: str | Non
         if await cur.fetchone() is None:
             return candidate
     return f"{slug}-{uuid.uuid4().hex[:6]}"
+
+
+async def _current_session_binding(
+    conn: aiosqlite.Connection, event_id: str,
+) -> tuple[bool, str | None]:
+    cur = await conn.execute(
+        "SELECT session_binding_enabled, session_binding_path "
+        "FROM events WHERE id = ?",
+        (event_id,),
+    )
+    row = await cur.fetchone()
+    if not row:
+        return False, None
+    return bool(row[0]), (row[1] or None)
 
 
 # ── FastMCP server ──
@@ -149,6 +194,8 @@ async def create_event(
     description: str | None = None,
     input_schema: list | None = None,
     model: str | None = None,
+    session_binding_enabled: bool = False,
+    session_binding_path: str | None = None,
     enabled: bool = True,
 ) -> dict[str, Any]:
     """Create a webhook event and return it WITH its one-time clear secret.
@@ -165,6 +212,11 @@ async def create_event(
         input_schema: optional list of {name,type,required,description,path}
             field descriptors documenting the expected payload.
         model: optional model runtime_id to pin the run to.
+        session_binding_enabled: when true, prompt-event deliveries with the
+            same payload field value reuse the same internal OpenAgent event
+            run session.
+        session_binding_path: dot-path in the payload to use as the binding
+            key, e.g. "id" or "ticket.id". Required when binding is enabled.
         enabled: whether the event accepts deliveries immediately.
 
     Returns the event plus ``secret`` (the clear per-event secret) — shown
@@ -178,6 +230,9 @@ async def create_event(
         raise ValueError(f"action_ref is required for action_kind={action_kind}")
     if action_kind == "prompt" and not (prompt_template and prompt_template.strip()):
         raise ValueError("prompt_template is required for action_kind='prompt'")
+    binding_path = (session_binding_path or "").strip() or None
+    if session_binding_enabled and not binding_path:
+        raise ValueError("session_binding_path is required when session binding is enabled")
 
     conn = await _get_conn()
 
@@ -209,12 +264,14 @@ async def create_event(
         "INSERT INTO events "
         "(id, name, slug, description, type, enabled, secret_enc, secret_hint, "
         " input_schema_json, action_kind, action_ref, prompt_template, model, "
+        " session_binding_enabled, session_binding_path, "
         " rate_limit_per_min, max_payload_bytes, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 60, 262144, ?, ?)",
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 60, 262144, ?, ?)",
         (
             event_id, name, slug, description or None, type, 1 if enabled else 0,
             secret_enc, hint, json.dumps(input_schema or []), action_kind,
-            action_ref or None, prompt_template or None, model or None, now, now,
+            action_ref or None, prompt_template or None, model or None,
+            1 if session_binding_enabled else 0, binding_path, now, now,
         ),
     )
     await conn.commit()
@@ -236,6 +293,8 @@ async def update_event(
     action_ref: str | None = None,
     prompt_template: str | None = None,
     model: str | None = None,
+    session_binding_enabled: bool | None = None,
+    session_binding_path: str | None = None,
 ) -> dict[str, Any]:
     """Update an event's fields (only the ones you pass). Returns the event."""
     conn = await _get_conn()
@@ -261,6 +320,24 @@ async def update_event(
         sets["prompt_template"] = prompt_template or None
     if model is not None:
         sets["model"] = model or None
+    if session_binding_enabled is not None or session_binding_path is not None:
+        current_enabled, current_path = await _current_session_binding(conn, eid)
+        effective_enabled = (
+            bool(session_binding_enabled)
+            if session_binding_enabled is not None
+            else current_enabled
+        )
+        effective_path = (
+            session_binding_path.strip()
+            if session_binding_path is not None
+            else current_path
+        ) or None
+        if effective_enabled and not effective_path:
+            raise ValueError("session_binding_path is required when session binding is enabled")
+        if session_binding_enabled is not None:
+            sets["session_binding_enabled"] = 1 if session_binding_enabled else 0
+        if session_binding_path is not None:
+            sets["session_binding_path"] = effective_path
     if not sets:
         raise ValueError("no fields to update")
     sets["updated_at"] = time.time()

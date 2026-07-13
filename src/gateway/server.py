@@ -740,12 +740,13 @@ class Gateway:
         can refresh live.
 
         Hidden child origins (delegation sub-agents, scheduled firings,
-        workflow nodes — see ``HIDDEN_CHILD_ORIGINS``) are SKIPPED: they're
+        workflow nodes, event-prompt sessions — see ``HIDDEN_CHILD_ORIGINS``)
+        are SKIPPED: they're
         excluded from ``GET /api/sessions`` (each navigable only in context —
         a parent's transcript card, a run's execution screen), so a ``created``
         broadcast would only make clients refetch a list that can never contain
         them. The run feed they DO appear in is driven by the separate
-        ``scheduled_task`` / ``workflow`` resource events, not this one."""
+        ``scheduled_task`` / ``workflow`` / ``event`` resource events, not this one."""
         from src.core.child_session import HIDDEN_CHILD_ORIGINS
         if (info or {}).get("origin") in HIDDEN_CHILD_ORIGINS:
             return

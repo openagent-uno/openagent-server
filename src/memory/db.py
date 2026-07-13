@@ -589,6 +589,13 @@ CREATE TABLE IF NOT EXISTS events (
     -- Optional per-event model pin (a runtime_id), same semantics as
     -- ``scheduled_tasks.model``: NULL → the agent's default/router pick.
     model              TEXT,
+    -- Optional prompt-event session binding. When enabled, the dispatcher
+    -- reads ``session_binding_path`` from the payload and maps that external
+    -- value to one durable OpenAgent child session id in
+    -- ``event_session_bindings``. Disabled preserves the default:
+    -- one fresh event run session per delivery.
+    session_binding_enabled INTEGER NOT NULL DEFAULT 0,
+    session_binding_path    TEXT,
     -- Guardrails (the webhook is the first cert-less inbound surface, and
     -- every delivery is a paid LLM run): requests over the cap are 413'd,
     -- more than ``rate_limit_per_min`` deliveries in a rolling minute are
@@ -601,6 +608,20 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_slug    ON events(slug);
 CREATE INDEX IF NOT EXISTS idx_events_enabled ON events(enabled);
+
+-- Stable map from an event-specific external object id (extracted from the
+-- payload) to OpenAgent's internal event-run child session id. The payload id
+-- is never used as a session id; it only looks up the internal one.
+CREATE TABLE IF NOT EXISTS event_session_bindings (
+    event_id     TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+    binding_key  TEXT NOT NULL,
+    session_id   TEXT NOT NULL,
+    created_at   REAL NOT NULL,
+    updated_at   REAL NOT NULL,
+    PRIMARY KEY (event_id, binding_key)
+);
+CREATE INDEX IF NOT EXISTS idx_ev_session_bindings_session
+    ON event_session_bindings(session_id);
 
 -- Per-firing history for events AND the cross-process run queue, unified
 -- in one table (what ``task_runs`` + ``task_run_requests`` are for tasks).
@@ -869,6 +890,7 @@ class MemoryDB:
 
         await self._migrate_task_runs_session_id()
         await self._migrate_scheduled_tasks_model_column()
+        await self._migrate_events_session_binding()
 
     async def _migrate_scheduled_tasks_model_column(self) -> None:
         """A scheduled task can now pin an optional per-task model (a
@@ -883,6 +905,44 @@ class MemoryDB:
                 "ALTER TABLE scheduled_tasks ADD COLUMN model TEXT"
             )
             await self._conn.commit()
+
+    async def _migrate_events_session_binding(self) -> None:
+        """Prompt events can optionally bind a payload field (usually an
+        external object id) to one durable OpenAgent event-run session.
+
+        Old DBs predate both columns and the lookup table; add them
+        idempotently. ``session_binding_enabled=0`` preserves the old
+        one-delivery/one-session behaviour.
+        """
+        assert self._conn is not None
+        cursor = await self._conn.execute("PRAGMA table_info(events)")
+        cols = {row[1] for row in await cursor.fetchall()}
+        if "session_binding_enabled" not in cols:
+            await self._conn.execute(
+                "ALTER TABLE events ADD COLUMN "
+                "session_binding_enabled INTEGER NOT NULL DEFAULT 0"
+            )
+        if "session_binding_path" not in cols:
+            await self._conn.execute(
+                "ALTER TABLE events ADD COLUMN session_binding_path TEXT"
+            )
+        await self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS event_session_bindings (
+                event_id     TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+                binding_key  TEXT NOT NULL,
+                session_id   TEXT NOT NULL,
+                created_at   REAL NOT NULL,
+                updated_at   REAL NOT NULL,
+                PRIMARY KEY (event_id, binding_key)
+            )
+            """
+        )
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ev_session_bindings_session "
+            "ON event_session_bindings(session_id)"
+        )
+        await self._conn.commit()
 
     async def _migrate_task_runs_session_id(self) -> None:
         """v0.15: a scheduled-task firing now runs as a durable child
@@ -1778,6 +1838,7 @@ class MemoryDB:
         except (TypeError, ValueError):
             d["input_schema"] = []
         d["enabled"] = bool(d.get("enabled"))
+        d["session_binding_enabled"] = bool(d.get("session_binding_enabled"))
         if not include_secret:
             d.pop("secret_enc", None)
         return d
@@ -1796,6 +1857,8 @@ class MemoryDB:
         action_ref: str | None = None,
         prompt_template: str | None = None,
         model: str | None = None,
+        session_binding_enabled: bool = False,
+        session_binding_path: str | None = None,
         rate_limit_per_min: int = 60,
         max_payload_bytes: int = 262144,
         enabled: bool = True,
@@ -1807,13 +1870,16 @@ class MemoryDB:
             "INSERT INTO events "
             "(id, name, slug, description, type, enabled, secret_enc, "
             " secret_hint, input_schema_json, action_kind, action_ref, prompt_template, "
-            " model, rate_limit_per_min, max_payload_bytes, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " model, session_binding_enabled, session_binding_path, "
+            " rate_limit_per_min, max_payload_bytes, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 event_id, name, slug, description or None, event_type,
                 1 if enabled else 0, secret_enc, secret_hint,
                 json.dumps(input_schema or []), action_kind, action_ref or None,
                 prompt_template or None, model or None,
+                1 if session_binding_enabled else 0,
+                (session_binding_path or "").strip() or None,
                 int(rate_limit_per_min), int(max_payload_bytes), now, now,
             ),
         )
@@ -1853,6 +1919,7 @@ class MemoryDB:
             "name", "slug", "description", "type", "enabled", "action_kind",
             "action_ref", "prompt_template", "model", "rate_limit_per_min",
             "max_payload_bytes", "last_triggered_at",
+            "session_binding_enabled", "session_binding_path",
             # Secret rotation goes through ``rotate_event_secret``; these are
             # accepted here too so that path can reuse the same UPDATE.
             "secret_enc", "secret_hint",
@@ -1861,8 +1928,10 @@ class MemoryDB:
         for k, v in kwargs.items():
             if k not in allowed:
                 continue
-            if k == "enabled":
+            if k in ("enabled", "session_binding_enabled"):
                 v = 1 if v else 0
+            if k == "session_binding_path":
+                v = (str(v).strip() if v is not None else "") or None
             updates[k] = v
         # ``input_schema`` is passed as a list and serialised here.
         if "input_schema" in kwargs:
@@ -1892,6 +1961,57 @@ class MemoryDB:
         # ON DELETE CASCADE clears event_deliveries.
         await conn.execute("DELETE FROM events WHERE id = ?", (event_id,))
         await conn.commit()
+
+    async def get_event_session_binding(
+        self, event_id: str, binding_key: str,
+    ) -> dict | None:
+        """Return the stored payload-key → internal session binding, if any."""
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            "SELECT * FROM event_session_bindings "
+            "WHERE event_id = ? AND binding_key = ?",
+            (event_id, binding_key),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def get_or_create_event_session_binding(
+        self,
+        event_id: str,
+        binding_key: str,
+        *,
+        candidate_session_id: str,
+    ) -> tuple[str, bool]:
+        """Resolve a payload binding to an OpenAgent session id.
+
+        If the ``(event_id, binding_key)`` pair is new, ``candidate_session_id``
+        is inserted. If another delivery wins the race first, return the
+        already-stored session id instead. The external binding key is never
+        used as a session id.
+        """
+        conn = await self._ensure_connected()
+        now = time.time()
+        cursor = await conn.execute(
+            """
+            INSERT OR IGNORE INTO event_session_bindings
+                (event_id, binding_key, session_id, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (event_id, binding_key, candidate_session_id, now, now),
+        )
+        created = bool(cursor.rowcount)
+        await conn.execute(
+            "UPDATE event_session_bindings SET updated_at = ? "
+            "WHERE event_id = ? AND binding_key = ?",
+            (now, event_id, binding_key),
+        )
+        await conn.commit()
+        row = await self.get_event_session_binding(event_id, binding_key)
+        if not row:
+            # Defensive fallback; INSERT OR IGNORE + SELECT should make this
+            # unreachable unless the row was concurrently deleted.
+            return candidate_session_id, created
+        return str(row["session_id"]), created
 
     async def count_recent_deliveries(self, event_id: str, *, window_s: float = 60.0) -> int:
         """Deliveries for an event started within the last ``window_s`` seconds.

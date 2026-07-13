@@ -190,6 +190,7 @@ async def run_child_session(
     author: Optional[dict[str, Any]] = None,
     on_status: Any = None,
     stream: bool = False,
+    session_id: Optional[str] = None,
 ) -> ChildSessionResult:
     """Spawn ``prompt`` as a full durable child session and return its result.
 
@@ -212,6 +213,10 @@ async def run_child_session(
         author: optional author override for the seed message; defaults to an
             agent-self author labelled with ``title``.
         on_status: optional status callback forwarded to ``Agent.run``.
+        session_id: optional durable child session id to reuse. Omit for the
+            normal one-spawn/one-session path; pass an existing OpenAgent
+            session id when a caller intentionally injects another turn into a
+            durable child transcript (event payload binding).
         stream: when True, drive ``Agent.run_stream`` and forward each content
             delta / tool status as a child-tagged frame (``emit_child_frame``),
             so a DETACHED run (a scheduled firing, a workflow node) streams live
@@ -225,7 +230,7 @@ async def run_child_session(
     if parent_session_id and "parent_session_id" not in origin_ref:
         origin_ref = {**origin_ref, "parent_session_id": parent_session_id}
 
-    child_sid = mint_child_session_id(origin, origin_ref)
+    child_sid = session_id or mint_child_session_id(origin, origin_ref)
 
     # Resolve the owner handle so the row lands in the right flat list. An
     # explicit owner wins (scheduler / workflow have no human parent); else

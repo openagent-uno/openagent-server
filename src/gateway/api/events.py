@@ -116,6 +116,21 @@ def _validate_action(body) -> tuple[str, str | None, str | None, str | None]:
     return action_kind, action_ref, prompt_template, None
 
 
+def _validate_session_binding(body) -> tuple[bool | None, str | None, str | None]:
+    """Return (enabled?, path?, error) for optional event-session binding."""
+    enabled = None
+    if "session_binding_enabled" in body:
+        enabled = bool(body.get("session_binding_enabled"))
+    raw_path = body.get("session_binding_path")
+    path = (str(raw_path).strip() if raw_path is not None else "") or None
+    effective_enabled = bool(enabled)
+    if enabled is None and raw_path is not None:
+        effective_enabled = bool(body.get("session_binding_enabled", False))
+    if effective_enabled and not path:
+        return enabled, path, "session_binding_path is required when session binding is enabled"
+    return enabled, path, None
+
+
 async def handle_create(request):
     from aiohttp import web
     db, err = _require_db(request)
@@ -137,6 +152,9 @@ async def handle_create(request):
     action_kind, action_ref, prompt_template, verr = _validate_action(body)
     if verr:
         return web.json_response({"error": verr}, status=400)
+    binding_enabled, binding_path, berr = _validate_session_binding(body)
+    if berr:
+        return web.json_response({"error": berr}, status=400)
 
     # Referenced workflow / task must exist so a broken binding can't be saved.
     if action_kind == "workflow" and await db.get_workflow(action_ref) is None:
@@ -159,6 +177,8 @@ async def handle_create(request):
         action_ref=action_ref,
         prompt_template=prompt_template,
         model=(body.get("model") or "").strip() or None,
+        session_binding_enabled=bool(binding_enabled),
+        session_binding_path=binding_path,
         rate_limit_per_min=int(body.get("rate_limit_per_min", 60)),
         max_payload_bytes=int(body.get("max_payload_bytes", 262144)),
         enabled=bool(body.get("enabled", True)),
@@ -197,6 +217,22 @@ async def handle_update(request):
         updates["enabled"] = bool(body["enabled"])
     if "input_schema" in body:
         updates["input_schema"] = body["input_schema"] or []
+    if any(k in body for k in ("session_binding_enabled", "session_binding_path")):
+        merged_binding = {
+            "session_binding_enabled": body.get(
+                "session_binding_enabled",
+                existing.get("session_binding_enabled"),
+            ),
+            "session_binding_path": body.get(
+                "session_binding_path",
+                existing.get("session_binding_path"),
+            ),
+        }
+        binding_enabled, binding_path, berr = _validate_session_binding(merged_binding)
+        if berr:
+            return web.json_response({"error": berr}, status=400)
+        updates["session_binding_enabled"] = bool(binding_enabled)
+        updates["session_binding_path"] = binding_path
     for key in ("rate_limit_per_min", "max_payload_bytes"):
         if key in body:
             try:
