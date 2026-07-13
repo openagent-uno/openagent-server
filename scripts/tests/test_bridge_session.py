@@ -346,3 +346,32 @@ async def t_bridge_rejects_bad_name(ctx: TestContext) -> None:
         except ValueError:
             continue
         raise AssertionError(f"BridgeSession({bad!r}) should have raised ValueError")
+
+
+@test("bridge_session", "IrohSite stream lifetime is not capped by handshake timeout")
+async def t_iroh_site_stream_lifetime_not_capped(ctx: TestContext) -> None:
+    import src.network.transport.aiohttp_iroh_site as iroh_site
+
+    completed = asyncio.Event()
+
+    class _FakeSite:
+        async def _handle_one_stream_inner(self, peer_node_id, send_stream, recv_stream) -> None:
+            await asyncio.sleep(0.02)
+            completed.set()
+
+    old_timeout = iroh_site._STREAM_TIMEOUT
+    iroh_site._STREAM_TIMEOUT = 0.001
+    try:
+        await iroh_site.IrohSite._handle_one_stream(
+            _FakeSite(),
+            "peer-node-id",
+            object(),
+            object(),
+        )
+    finally:
+        iroh_site._STREAM_TIMEOUT = old_timeout
+
+    assert completed.is_set(), (
+        "IrohSite must not apply the handshake timeout to the full stream; "
+        "WebSocket upgrades are long-lived"
+    )

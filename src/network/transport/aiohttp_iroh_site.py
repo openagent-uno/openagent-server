@@ -77,8 +77,9 @@ def current_is_authenticated_agent() -> bool:
 
 CERT_LEN_BYTES = 4
 MAX_CERT_LEN = 16 * 1024  # generous bound; a real cert is ~500 bytes
-# Per-stream timeout: a peer that connects but never sends a complete HTTP
-# request must not hold a task forever. Covers cert read + full request.
+# Handshake timeout: a peer that connects but never sends the cert prefix
+# must not hold a task forever. Do not wrap the whole stream with this
+# value: upgraded WebSockets are expected to stay open beyond it.
 _STREAM_TIMEOUT = 120.0
 
 
@@ -168,12 +169,13 @@ class IrohSite(web.BaseSite):
     ) -> None:
         """Handle one bi-stream: cert prefix → HTTP/1 dispatch → response."""
         try:
-            await asyncio.wait_for(
-                self._handle_one_stream_inner(peer_node_id, send_stream, recv_stream),
-                timeout=_STREAM_TIMEOUT,
-            )
+            await self._handle_one_stream_inner(peer_node_id, send_stream, recv_stream)
         except asyncio.TimeoutError:
-            logger.debug("iroh-gw: stream timed out after %.0fs from %s", _STREAM_TIMEOUT, peer_node_id[:16])
+            logger.debug(
+                "iroh-gw: stream handshake timed out after %.0fs from %s",
+                _STREAM_TIMEOUT,
+                peer_node_id[:16],
+            )
         except asyncio.CancelledError:
             raise
 
@@ -183,10 +185,14 @@ class IrohSite(web.BaseSite):
         send_stream: object,
         recv_stream: object,
     ) -> None:
-        """Inner handler: cert prefix → HTTP/1 dispatch → response (called under timeout)."""
+        """Inner handler: cert prefix → HTTP/1 dispatch → response."""
         # ── Strip the cert prefix ──
         try:
-            length_bytes = await _read_exact(recv_stream, CERT_LEN_BYTES)
+            length_bytes = await _read_exact(
+                recv_stream,
+                CERT_LEN_BYTES,
+                timeout=_STREAM_TIMEOUT,
+            )
         except _StreamClosed:
             return
         cert_len = int.from_bytes(length_bytes, "big")
@@ -199,7 +205,11 @@ class IrohSite(web.BaseSite):
         cert_wire: bytes | None = None
         if cert_len > 0:
             try:
-                cert_wire = await _read_exact(recv_stream, cert_len)
+                cert_wire = await _read_exact(
+                    recv_stream,
+                    cert_len,
+                    timeout=_STREAM_TIMEOUT,
+                )
             except _StreamClosed:
                 return
 
@@ -348,13 +358,19 @@ class _StreamClosed(Exception):
     """The Iroh stream was closed before we read all expected bytes."""
 
 
-async def _read_exact(stream: object, n: int) -> bytes:
+async def _read_exact(stream: object, n: int, *, timeout: float | None = None) -> bytes:
     """Read exactly *n* bytes off an Iroh recv stream or raise."""
     out = bytearray()
     while len(out) < n:
         try:
-            chunk = await stream.read(n - len(out))
+            read_coro = stream.read(n - len(out))
+            if timeout is None:
+                chunk = await read_coro
+            else:
+                chunk = await asyncio.wait_for(read_coro, timeout=timeout)
         except Exception as e:  # noqa: BLE001
+            if isinstance(e, asyncio.TimeoutError):
+                raise
             raise _StreamClosed(str(e)) from e
         if not chunk:
             raise _StreamClosed("eof before frame complete")
