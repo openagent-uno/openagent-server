@@ -12,6 +12,9 @@ from src.models.catalog import (
 )
 
 
+_UNSET = object()
+
+
 # ── Defer-all MCP wiring (v0.14+) ───────────────────────────────────
 #
 # Every LLM gets ONLY the ``tool-search`` MCP up front. Its four meta-
@@ -34,8 +37,9 @@ def wire_model_runtime(
     *,
     db: Any = None,
     mcp_pool: Any = None,
+    fallback_config: Any = _UNSET,
 ) -> BaseModel:
-    """Attach runtime dependencies (DB, MCP pool) to a model.
+    """Attach runtime dependencies (DB, MCP pool, fallback config) to a model.
 
     Wires only the ``tool-search`` MCP into the model's upfront tool
     list. Every other MCP connected in ``mcp_pool`` stays reachable
@@ -56,6 +60,10 @@ def wire_model_runtime(
         set_mcp_pool = getattr(model, "set_mcp_pool", None)
         if callable(set_mcp_pool):
             set_mcp_pool(mcp_pool)
+    if fallback_config is not _UNSET:
+        set_fallback_config = getattr(model, "set_fallback_config", None)
+        if callable(set_fallback_config):
+            set_fallback_config(fallback_config)
     return model
 
 

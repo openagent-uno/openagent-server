@@ -359,11 +359,13 @@ class Agent:
         mcp_pool: MCPPool | None = None,
         memory: MemoryDB | str | None = None,
         config: dict | None = None,
+        fallback_config: Any | None = None,
     ):
         self.name = name
         self.model = model
         self.system_prompt = system_prompt
         self.config = config or {}
+        self.fallback_config = fallback_config
 
         # MCPPool — owns the lifecycle of all MCP servers for the process.
         # Pass an empty pool if not provided so dormant detection / system
@@ -435,7 +437,12 @@ class Agent:
         if model is None:
             return
         self._register_runtime_model(model)
-        wire_model_runtime(model, db=self._db, mcp_pool=self._mcp)
+        wire_model_runtime(
+            model,
+            db=self._db,
+            mcp_pool=self._mcp,
+            fallback_config=self.fallback_config,
+        )
 
     def _acquire_model_slot(self, model: BaseModel | None) -> BaseModel | None:
         """Increment the in-flight counter for *model*. Returns *model* unchanged."""

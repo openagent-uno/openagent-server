@@ -494,6 +494,7 @@ class NativeProvider(BaseModel):
         self._base_url = base_url
         self._db_path = db_path
         self._history_runs = history_runs
+        self._fallback_config: Any = None
         # Pre-connected MCPTools instances supplied by MCPPool. Shared
         # across all NativeProvider instances under the same ModelDispatcher
         # so we don't spawn duplicate MCP server processes per entry model.
@@ -545,6 +546,13 @@ class NativeProvider(BaseModel):
         self._mcp_toolkits = list(toolkits)
         self._compatible_cache = None
         # Force agent/team rebuild so the new tool list is picked up.
+        self._agno_agents.clear()
+        self._agno_teams.clear()
+
+    def set_fallback_config(self, fallback_config: Any) -> None:
+        if fallback_config is self._fallback_config:
+            return
+        self._fallback_config = fallback_config
         self._agno_agents.clear()
         self._agno_teams.clear()
 
@@ -955,6 +963,7 @@ class NativeProvider(BaseModel):
         agent_tools: list[Any] = list(compatible_toolkits)
         agent = RuntimeAgent(
             model=self._build_runtime_model(),
+            fallback_config=self._fallback_config,
             db=SqliteDb(db_file=str(db_path)),
             tools=agent_tools,
             system_message=sys_key or None,
@@ -1055,6 +1064,7 @@ class NativeProvider(BaseModel):
             )
             member = RuntimeAgent(
                 model=self._build_runtime_model(),
+                fallback_config=self._fallback_config,
                 tools=list(toolkits),
                 system_message=member_system,
                 name=f"{family}_specialist",
@@ -1075,6 +1085,7 @@ class NativeProvider(BaseModel):
                 members=members,
                 mode=TeamMode.route,
                 model=self._build_runtime_model(),
+                fallback_config=self._fallback_config,
                 db=SqliteDb(db_file=str(db_path)),
                 tools=leader_tools,
                 system_message=sys_key,

@@ -487,6 +487,7 @@ class TeamRouterProvider(BaseModel):
         self._providers_config = providers_config if providers_config is not None else []
         self._db: Any = None
         self._mcp_pool: Any = None
+        self._fallback_config: Any = None
         self._history_runs = history_runs
         self._session_runtime: dict[str, Any] = {}  # session_id → Team or fallback
         # session_id → stable hash of the system prompt the cached runtime
@@ -524,6 +525,12 @@ class TeamRouterProvider(BaseModel):
         if pool is self._mcp_pool:
             return
         self._mcp_pool = pool
+        self._invalidate_session_cache()
+
+    def set_fallback_config(self, fallback_config: Any) -> None:
+        if fallback_config is self._fallback_config:
+            return
+        self._fallback_config = fallback_config
         self._invalidate_session_cache()
 
     def set_session_handle(self, session_id: str, handle: str | None) -> None:
@@ -610,6 +617,7 @@ class TeamRouterProvider(BaseModel):
             providers_config=self._providers_config,
             db_path=_runtime_db_path(self._db),
         )
+        provider.set_fallback_config(self._fallback_config)
         member_toolkits: list[Any] = []
         if self._mcp_pool is not None:
             member_toolkits = list(self._mcp_pool.runtime_toolkits_tool_search_only())
@@ -623,6 +631,7 @@ class TeamRouterProvider(BaseModel):
             tools=member_toolkits or None,
             role=role,
             system_message=system or None,
+            fallback_config=self._fallback_config,
             markdown=False,
             # When a db is supplied (members in team-member-session mode), the
             # member persists its run to its OWN child session row — so a
@@ -697,6 +706,7 @@ class TeamRouterProvider(BaseModel):
                 providers_config=self._providers_config,
                 db_path=_runtime_db_path(self._db),
             )
+            provider.set_fallback_config(self._fallback_config)
             if self._mcp_pool is not None:
                 provider.set_mcp_toolkits(self._mcp_pool.runtime_toolkits_tool_search_only())
             if self._db is not None:
@@ -801,6 +811,7 @@ class TeamRouterProvider(BaseModel):
             db=team_db,
             tools=team_tools,
             instructions=[system] if system else None,
+            fallback_config=self._fallback_config,
             add_member_tools_to_context=True,
             add_history_to_context=True,
             num_history_runs=self._history_runs,
@@ -1086,6 +1097,7 @@ class ModelDispatcher(BaseModel):
         self._budget: BudgetTracker | None = None
         self._db: Any = None
         self._mcp_pool: Any = None
+        self._fallback_config: Any = None
 
         # Per-entry-model TeamRouterProvider. The provider's session
         # cache picks up where this one leaves off, so reusing a single
@@ -1125,6 +1137,11 @@ class ModelDispatcher(BaseModel):
         self._mcp_pool = pool
         for provider in self._team_providers.values():
             wire_model_runtime(provider, mcp_pool=pool)
+
+    def set_fallback_config(self, fallback_config: Any) -> None:
+        self._fallback_config = fallback_config
+        for provider in self._team_providers.values():
+            wire_model_runtime(provider, fallback_config=fallback_config)
 
     def set_session_handle(self, session_id: str, handle: str | None) -> None:
         """Bind a user handle to ``session_id`` across every cached
@@ -1284,7 +1301,12 @@ class ModelDispatcher(BaseModel):
                 entry_runtime_id=entry_runtime_id,
                 providers_config=self._providers_config,
             )
-            wire_model_runtime(provider, db=self._db, mcp_pool=self._mcp_pool)
+            wire_model_runtime(
+                provider,
+                db=self._db,
+                mcp_pool=self._mcp_pool,
+                fallback_config=self._fallback_config,
+            )
             self._team_providers[entry_runtime_id] = provider
         return self._team_providers[entry_runtime_id]
 
