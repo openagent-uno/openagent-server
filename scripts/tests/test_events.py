@@ -125,6 +125,60 @@ async def t_webhook_auth_github(ctx: TestContext) -> None:
         await db.close()
 
 
+@test("events", "replio HMAC verifies and dedupes on the retry-stable delivery id")
+async def t_webhook_auth_replio(ctx: TestContext) -> None:
+    from src.memory.db import MemoryDB
+    from src.core.event_secret import make_secret_material
+    from src.gateway.webhook_auth import authenticate, WebhookAuthError, extract_external_id
+
+    db = MemoryDB(str(ctx.db_path))
+    await db.connect()
+    try:
+        clear, enc, hint = make_secret_material(db_path=str(ctx.db_path))
+        eid = await db.add_event(
+            name="support", action_kind="prompt", slug="support",
+            secret_enc=enc, secret_hint=hint, event_type="replio", prompt_template="x",
+        )
+        ev = await db.get_event(eid, include_secret=True)
+        body = b'{"thread_id":"9624291b","subject":"premium not working"}'
+        good = "sha256=" + hmac.new(clear.encode(), body, hashlib.sha256).hexdigest()
+        headers = {
+            "X-Replio-Event": "thread.created",
+            "X-Replio-Signature": good,
+            "X-Replio-Delivery-Id": "dlv-1",
+            "X-Replio-Attempt": "1",
+        }
+        authenticate(event=ev, raw_body=body, headers=headers, db_path=str(ctx.db_path))
+
+        # Replio holds the delivery id stable across its retries, so attempt 2
+        # of the same delivery de-dupes to the same key — the customer cannot
+        # be answered twice because a POST timed out.
+        retry = dict(headers, **{"X-Replio-Attempt": "2"})
+        authenticate(event=ev, raw_body=body, headers=retry, db_path=str(ctx.db_path))
+        assert extract_external_id(event=ev, headers=headers, payload={}) == "dlv-1"
+        assert extract_external_id(event=ev, headers=retry, payload={}) == "dlv-1"
+
+        # The signature header is type-specific: GitHub's does not authenticate
+        # a Replio event, even when the HMAC itself is correct.
+        try:
+            authenticate(event=ev, raw_body=body,
+                         headers={"X-Hub-Signature-256": good},
+                         db_path=str(ctx.db_path))
+            raise AssertionError("wrong signature header should have been rejected")
+        except WebhookAuthError:
+            pass
+
+        # Body integrity: same signature, different body.
+        try:
+            authenticate(event=ev, raw_body=b'{"thread_id":"other"}',
+                         headers=headers, db_path=str(ctx.db_path))
+            raise AssertionError("tampered body should have been rejected")
+        except WebhookAuthError:
+            pass
+    finally:
+        await db.close()
+
+
 @test("events", "generic type verifies the bearer secret")
 async def t_webhook_auth_generic(ctx: TestContext) -> None:
     from src.memory.db import MemoryDB
