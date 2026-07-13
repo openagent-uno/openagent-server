@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import os
 from collections import deque
 from typing import (
     TYPE_CHECKING,
+    Any,
     AsyncIterator,
     Callable,
     Dict,
@@ -41,6 +43,33 @@ from src.core._runner.utils.events import (
     handle_event,
 )
 from src.core._runner.utils.log import log_debug, log_warning
+
+
+# Hard ceiling on a SINGLE tool result before it enters the model context.
+# One unbounded tool output can single-handedly exceed the context window —
+# e.g. an MCP call returning a whole email thread with its re-quoted history
+# was measured at ~1.7 MB (~480k tokens) — and in-session compaction cannot
+# fold a single oversized message (it folds whole turns, not message bodies).
+# We keep the head and a small tail with a marker in between, so the run
+# survives and the model can narrow its next query instead of the whole call
+# failing with a non-retryable context-length error.
+_MAX_TOOL_RESULT_CHARS = int(os.environ.get("OPENAGENT_MAX_TOOL_RESULT_CHARS", "100000"))
+
+
+def _cap_tool_result(result: Any) -> Any:
+    """Truncate an oversized string tool result; pass anything else through."""
+    limit = _MAX_TOOL_RESULT_CHARS
+    if limit <= 0 or not isinstance(result, str) or len(result) <= limit:
+        return result
+    head = int(limit * 0.85)
+    tail = max(0, limit - head)
+    dropped = len(result) - head - tail
+    marker = (
+        f"\n\n[... {dropped} characters truncated by OpenAgent: this single tool "
+        f"result exceeded {limit} chars and would overflow the model context. "
+        f"Narrow the query, request fewer items, or fetch specifics. ...]\n\n"
+    )
+    return result[:head] + marker + (result[-tail:] if tail else "")
 
 
 def raise_if_async_tools(agent: Agent) -> None:
@@ -680,7 +709,7 @@ def run_tool(
 
             if call_result.event == ModelResponseEvent.tool_call_completed.value and call_result.tool_executions:
                 tool_execution = call_result.tool_executions[0]
-                tool.result = tool_execution.result
+                tool.result = _cap_tool_result(tool_execution.result)
                 tool.tool_call_error = tool_execution.tool_call_error
                 if stream_events:
                     if team_mode:
@@ -794,7 +823,7 @@ async def arun_tool(
                         )
             if call_result.event == ModelResponseEvent.tool_call_completed.value and call_result.tool_executions:
                 tool_execution = call_result.tool_executions[0]
-                tool.result = tool_execution.result
+                tool.result = _cap_tool_result(tool_execution.result)
                 tool.tool_call_error = tool_execution.tool_call_error
                 if stream_events:
                     if team_mode:
