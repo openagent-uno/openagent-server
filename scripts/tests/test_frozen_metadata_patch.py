@@ -1,4 +1,4 @@
-"""Regression guard for the frozen-bundle importlib.metadata fix.
+"""Regression guards for frozen-bundle runtime patches.
 
 Production runtime ``Team`` runs were dying with::
 
@@ -16,7 +16,10 @@ falling back to ``module.__version__`` when the dist-info lookup raises.
 from __future__ import annotations
 
 import importlib.metadata
+import os
 import sys
+import types
+from pathlib import Path
 
 from ._framework import TestContext, test
 
@@ -57,6 +60,13 @@ def _reset_patch_state() -> None:
     from src import _frozen
 
     _frozen._METADATA_PATCHED = False
+
+
+def _restore_env(name: str, value: str | None) -> None:
+    if value is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = value
 
 
 @test("frozen_metadata_patch", "version() falls back to module.__version__ for pydantic when dist-info is missing")
@@ -165,3 +175,77 @@ async def t_noop_when_not_frozen(ctx: TestContext) -> None:
         importlib.metadata.version = orig_version  # type: ignore[assignment]
         _reset_patch_state()
         _restore_frozen(*prior)
+
+
+@test("frozen_ssl_patch", "SSL_CERT_FILE points at stable certifi copy outside _MEI")
+async def t_ssl_cert_copied_outside_mei(ctx: TestContext) -> None:
+    from src import _frozen
+    from src.core import paths
+
+    source_dir = ctx.test_dir / "_MEIsource" / "certifi"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    source = source_dir / "cacert.pem"
+    source.write_text("FAKE CERT\n")
+
+    fake_certifi = types.SimpleNamespace(where=lambda: str(source))
+    prior_certifi = sys.modules.get("certifi")
+    prior_ssl = os.environ.get("SSL_CERT_FILE")
+    prior_cache = os.environ.get("OPENAGENT_SSL_CERT_CACHE_DIR")
+    prior_agent_dir = paths.get_agent_dir()
+    prior_frozen = _force_frozen(True)
+    try:
+        sys.modules["certifi"] = fake_certifi  # type: ignore[assignment]
+        os.environ.pop("SSL_CERT_FILE", None)
+        os.environ.pop("OPENAGENT_SSL_CERT_CACHE_DIR", None)
+        paths.set_agent_dir(ctx.test_dir / "agent")
+
+        _frozen.patch_ssl_for_frozen()
+
+        configured = Path(os.environ["SSL_CERT_FILE"])
+        expected = paths.data_dir() / ".runtime" / "certifi-cacert.pem"
+        assert configured == expected
+        assert configured.read_text() == "FAKE CERT\n"
+        assert "_MEI" not in str(configured), configured
+    finally:
+        if prior_certifi is None:
+            sys.modules.pop("certifi", None)
+        else:
+            sys.modules["certifi"] = prior_certifi
+        _restore_env("SSL_CERT_FILE", prior_ssl)
+        _restore_env("OPENAGENT_SSL_CERT_CACHE_DIR", prior_cache)
+        paths.set_agent_dir(prior_agent_dir)
+        _restore_frozen(*prior_frozen)
+
+
+@test("frozen_ssl_patch", "missing inherited SSL_CERT_FILE falls back to cached cert")
+async def t_missing_ssl_cert_file_uses_cached_copy(ctx: TestContext) -> None:
+    from src import _frozen
+
+    cache_dir = ctx.test_dir / "stable-cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cached = cache_dir / "certifi-cacert.pem"
+    cached.write_text("CACHED CERT\n")
+
+    missing_source = ctx.test_dir / "_MEIgone" / "certifi" / "cacert.pem"
+    fake_certifi = types.SimpleNamespace(where=lambda: str(missing_source))
+    prior_certifi = sys.modules.get("certifi")
+    prior_ssl = os.environ.get("SSL_CERT_FILE")
+    prior_cache = os.environ.get("OPENAGENT_SSL_CERT_CACHE_DIR")
+    prior_frozen = _force_frozen(True)
+    try:
+        sys.modules["certifi"] = fake_certifi  # type: ignore[assignment]
+        os.environ["SSL_CERT_FILE"] = str(missing_source)
+        os.environ["OPENAGENT_SSL_CERT_CACHE_DIR"] = str(cache_dir)
+
+        _frozen.patch_ssl_for_frozen()
+
+        assert os.environ["SSL_CERT_FILE"] == str(cached)
+        assert Path(os.environ["SSL_CERT_FILE"]).read_text() == "CACHED CERT\n"
+    finally:
+        if prior_certifi is None:
+            sys.modules.pop("certifi", None)
+        else:
+            sys.modules["certifi"] = prior_certifi
+        _restore_env("SSL_CERT_FILE", prior_ssl)
+        _restore_env("OPENAGENT_SSL_CERT_CACHE_DIR", prior_cache)
+        _restore_frozen(*prior_frozen)

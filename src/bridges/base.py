@@ -32,6 +32,19 @@ logger = logging.getLogger(__name__)
 # Retry cooldown between bridge crashes.
 BRIDGE_RETRY_SECONDS = 30
 
+# Retry cooldown for bridge -> gateway reconnect storms. A healthy gateway
+# reconnect is fast, but a persistent close loop must not rebuild the platform
+# SDK app several times per second forever.
+BRIDGE_GATEWAY_RECONNECT_BASE_SECONDS = float(
+    os.environ.get("OPENAGENT_BRIDGE_GATEWAY_RECONNECT_BASE_SECONDS", "1")
+)
+BRIDGE_GATEWAY_RECONNECT_MAX_SECONDS = float(
+    os.environ.get("OPENAGENT_BRIDGE_GATEWAY_RECONNECT_MAX_SECONDS", "60")
+)
+BRIDGE_GATEWAY_RECONNECT_STABLE_SECONDS = float(
+    os.environ.get("OPENAGENT_BRIDGE_GATEWAY_RECONNECT_STABLE_SECONDS", "60")
+)
+
 # Keep the bridge -> gateway WebSocket warm through NAT / tunnel idle windows.
 BRIDGE_WS_HEARTBEAT_SECONDS = 30
 
@@ -326,24 +339,59 @@ class BaseBridge:
     async def start(self) -> None:
         """Connect to Gateway and start the platform polling loop with retry."""
         self._should_stop = False
+        gateway_loss_streak = 0
         elog("bridge.start", name=self.name)
         while not self._should_stop:
             try:
                 self._gateway_lost.clear()
+                loop = asyncio.get_running_loop()
+                connected_at = loop.time()
                 await self._connect_gateway()
                 await self._run()
                 if self._should_stop:
                     break
                 if self._gateway_lost.is_set():
-                    elog("bridge.reconnect", name=self.name, reason="gateway_lost")
+                    uptime = max(0.0, loop.time() - connected_at)
+                    if uptime >= BRIDGE_GATEWAY_RECONNECT_STABLE_SECONDS:
+                        gateway_loss_streak = 0
+                    gateway_loss_streak += 1
+                    retry_in = self._gateway_reconnect_delay(gateway_loss_streak)
+                    elog(
+                        "bridge.reconnect",
+                        name=self.name,
+                        reason="gateway_lost",
+                        streak=gateway_loss_streak,
+                        uptime_s=round(uptime, 3),
+                        retry_in=retry_in,
+                    )
+                    if retry_in > 0:
+                        await asyncio.sleep(retry_in)
                     continue
+                gateway_loss_streak = 0
+                elog(
+                    "bridge.platform_exit",
+                    level="warning",
+                    name=self.name,
+                    retry_in=BRIDGE_RETRY_SECONDS,
+                )
+                await asyncio.sleep(BRIDGE_RETRY_SECONDS)
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 if self._should_stop:
                     break
+                gateway_loss_streak = 0
                 elog("bridge.error", level="error", name=self.name, error=str(e), retry_in=BRIDGE_RETRY_SECONDS)
                 await asyncio.sleep(BRIDGE_RETRY_SECONDS)
+
+    @staticmethod
+    def _gateway_reconnect_delay(streak: int) -> float:
+        """Exponential backoff for repeated gateway-lost reconnects."""
+        if streak <= 0:
+            return 0.0
+        base = max(0.0, BRIDGE_GATEWAY_RECONNECT_BASE_SECONDS)
+        cap = max(base, BRIDGE_GATEWAY_RECONNECT_MAX_SECONDS)
+        return min(cap, base * (2 ** max(0, streak - 1)))
 
     async def _on_gateway_lost(self) -> None:
         """Platform hook fired when the gateway WS listener exits."""

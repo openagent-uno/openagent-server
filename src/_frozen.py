@@ -21,9 +21,49 @@ def is_frozen() -> bool:
     return getattr(sys, "frozen", False)
 
 
+def _stable_ssl_cert_cache_dir() -> Path:
+    """Return a writable cache dir outside PyInstaller's ``_MEI`` tree."""
+    override = os.environ.get("OPENAGENT_SSL_CERT_CACHE_DIR")
+    if override:
+        return Path(override).expanduser()
+    try:
+        from src.core import paths
+
+        return paths.data_dir() / ".runtime"
+    except Exception:
+        xdg = os.environ.get("XDG_CACHE_HOME")
+        base = Path(xdg).expanduser() if xdg else Path.home() / ".cache"
+        return base / "openagent"
+
+
+def _cached_ssl_cert_path() -> Path:
+    return _stable_ssl_cert_cache_dir() / "certifi-cacert.pem"
+
+
+def _copy_ssl_cert_to_stable_cache(source: Path) -> Path | None:
+    """Copy certifi's CA bundle out of ``_MEI`` and return the stable path."""
+    if not source.is_file():
+        cached = _cached_ssl_cert_path()
+        return cached if cached.is_file() else None
+
+    dest = _cached_ssl_cert_path()
+    tmp = dest.with_name(f".{dest.name}.{os.getpid()}.tmp")
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, tmp)
+        os.replace(tmp, dest)
+        return dest
+    except OSError:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        return source if source.is_file() else None
+
+
 def patch_ssl_for_frozen() -> None:
-    """Point Python's SSL at certifi's CA bundle inside the PyInstaller
-    extraction tree.
+    """Point Python's SSL at a stable copy of certifi's CA bundle.
 
     Without this, any library that uses Python's default
     ``ssl.create_default_context()`` (aiohttp → discord.py,
@@ -32,15 +72,18 @@ def patch_ssl_for_frozen() -> None:
         ssl.SSLCertVerificationError: [SSL: CERTIFICATE_VERIFY_FAILED]
         certificate verify failed: unable to get local issuer certificate
 
-    because OpenSSL's compiled-in CA path doesn't exist inside
-    ``$TMPDIR/_MEI_xxxxx``. Setting ``SSL_CERT_FILE`` at process
-    start — before any bridge or MCP opens an HTTPS connection — makes
-    every downstream consumer inherit the right CA bundle.
+    because OpenSSL's compiled-in CA path doesn't exist in the frozen
+    runtime. Setting ``SSL_CERT_FILE`` at process start — before any
+    bridge or MCP opens an HTTPS connection — makes every downstream
+    consumer inherit the right CA bundle.
 
-    ``python-telegram-bot`` isn't affected because it uses ``httpx``
-    which imports certifi internally. ``aiohttp`` (used by discord.py)
-    does NOT — it relies on the system CA store, which is missing
-    inside PyInstaller.
+    The bundled certifi file originally lives under PyInstaller's
+    disposable ``$TMPDIR/_MEI_xxxxx`` extraction tree. Long-running
+    container agents may run cleanup jobs that delete old temp dirs while
+    the process is still alive; if ``SSL_CERT_FILE`` keeps pointing into
+    that deleted tree, later model calls and Telegram polling fail with
+    ``FileNotFoundError`` while creating SSL contexts. Copy the CA bundle
+    into a stable cache outside ``_MEI`` and point SSL there instead.
 
     Libraries like ``litellm`` (OpenAI SDK, Anthropic SDK) also benefit:
     they use ``httpx`` too, but having ``SSL_CERT_FILE`` set is a
@@ -52,13 +95,16 @@ def patch_ssl_for_frozen() -> None:
     """
     if not is_frozen():
         return
-    if os.environ.get("SSL_CERT_FILE"):
-        return  # caller already set it — don't override
+    configured = os.environ.get("SSL_CERT_FILE")
+    if configured and Path(configured).is_file():
+        return  # caller already set a live CA bundle — don't override
     try:
         import certifi
-        ca = certifi.where()
-        if os.path.isfile(ca):
-            os.environ["SSL_CERT_FILE"] = ca
+
+        ca = Path(certifi.where())
+        stable = _copy_ssl_cert_to_stable_cache(ca)
+        if stable is not None and stable.is_file():
+            os.environ["SSL_CERT_FILE"] = str(stable)
     except ImportError:
         pass
 

@@ -258,6 +258,11 @@ class TelegramBridge(BaseBridge):
         # the same ``/restart`` Update came right back from
         # ``getUpdates`` — crash loop.
         self._last_update_id: int = 0
+        # Bot command menu registration is idempotent but Telegram rate-limits
+        # it aggressively. A reconnect storm must not call set_my_commands on
+        # every SDK rebuild; remember success and respect RetryAfter.
+        self._commands_menu_set: bool = False
+        self._commands_next_attempt_at: float = 0.0
         # Bounded set of recently-seen update_ids used by ``_is_fresh_update``
         # to reject Telegram redeliveries. The deque enforces the size cap
         # while the set gives O(1) membership; they're kept in lockstep.
@@ -274,7 +279,6 @@ class TelegramBridge(BaseBridge):
         return self.allowed_users is None or uid in self.allowed_users
 
     async def _run(self) -> None:
-        from telegram import BotCommand
         from telegram.ext import (
             ApplicationBuilder, CallbackQueryHandler, CommandHandler,
             MessageHandler, filters,
@@ -317,17 +321,51 @@ class TelegramBridge(BaseBridge):
         await self._app.start()
 
         # Set bot menu commands so they appear in Telegram's "/" picker
-        try:
-            await self._app.bot.set_my_commands([
-                BotCommand(cmd, desc) for cmd, desc in BOT_COMMANDS
-            ])
-            logger.info("Telegram bot commands menu set (%d commands)", len(BOT_COMMANDS))
-        except Exception as e:
-            logger.warning("Failed to set bot commands: %s", e)
+        await self._maybe_set_bot_commands_menu()
 
         await self._app.updater.start_polling()
         while not self._should_stop and not self._gateway_lost.is_set():
             await asyncio.sleep(1)
+
+    async def _maybe_set_bot_commands_menu(self) -> None:
+        """Best-effort Telegram "/" menu registration with rate-limit memory."""
+        if self._app is None:
+            return
+        now = time.monotonic()
+        if self._commands_menu_set or now < self._commands_next_attempt_at:
+            return
+        from telegram import BotCommand
+        try:
+            from telegram.error import RetryAfter
+        except Exception:  # pragma: no cover - SDK compatibility fallback
+            RetryAfter = ()  # type: ignore[assignment]
+        try:
+            await self._app.bot.set_my_commands([
+                BotCommand(cmd, desc) for cmd, desc in BOT_COMMANDS
+            ])
+            self._commands_menu_set = True
+            self._commands_next_attempt_at = 0.0
+            logger.info("Telegram bot commands menu set (%d commands)", len(BOT_COMMANDS))
+        except RetryAfter as e:  # type: ignore[misc]
+            retry_after = float(getattr(e, "retry_after", 900) or 900)
+            self._commands_next_attempt_at = now + max(retry_after, 60.0)
+            logger.warning("Failed to set bot commands: retry after %.0fs", retry_after)
+            elog(
+                "bridge.telegram.commands_rate_limited",
+                level="warning",
+                retry_after_s=retry_after,
+            )
+        except Exception as e:
+            # Transient network/auth failures should be visible, but retrying
+            # the menu endpoint on every bridge reconnect just creates noise.
+            self._commands_next_attempt_at = now + 300.0
+            logger.warning("Failed to set bot commands: %s", e)
+            elog(
+                "bridge.telegram.commands_menu_error",
+                level="warning",
+                error=str(e) or type(e).__name__,
+                retry_in=300,
+            )
 
     def _track_update_id(self, update) -> None:
         """Record the highest update_id we've processed so we can ACK it on stop."""

@@ -81,6 +81,28 @@ async def t_bridge_listener_exit_marks_gateway_lost(ctx: TestContext) -> None:
     await asyncio.wait_for(bridge.hook_called.wait(), timeout=0.1)
 
 
+@test("bridges", "BaseBridge backs off repeated gateway reconnects")
+async def t_bridge_gateway_reconnect_delay_caps(ctx: TestContext) -> None:
+    import src.bridges.base as bridge_mod
+    from src.bridges.base import BaseBridge
+
+    old_base = bridge_mod.BRIDGE_GATEWAY_RECONNECT_BASE_SECONDS
+    old_max = bridge_mod.BRIDGE_GATEWAY_RECONNECT_MAX_SECONDS
+    try:
+        bridge_mod.BRIDGE_GATEWAY_RECONNECT_BASE_SECONDS = 2.0
+        bridge_mod.BRIDGE_GATEWAY_RECONNECT_MAX_SECONDS = 10.0
+
+        assert BaseBridge._gateway_reconnect_delay(0) == 0.0
+        assert BaseBridge._gateway_reconnect_delay(1) == 2.0
+        assert BaseBridge._gateway_reconnect_delay(2) == 4.0
+        assert BaseBridge._gateway_reconnect_delay(3) == 8.0
+        assert BaseBridge._gateway_reconnect_delay(4) == 10.0
+        assert BaseBridge._gateway_reconnect_delay(20) == 10.0
+    finally:
+        bridge_mod.BRIDGE_GATEWAY_RECONNECT_BASE_SECONDS = old_base
+        bridge_mod.BRIDGE_GATEWAY_RECONNECT_MAX_SECONDS = old_max
+
+
 class _FakeBridge:
     """Subclass stand-in that skips the WS connect. Used for the
     send_message tests — we drive the in-flight ``_StreamCollector``
@@ -859,6 +881,52 @@ def _fresh_telegram_bridge():
     bridge._stream_opened = set()
     bridge._stream_pending = {}
     return bridge
+
+
+@test("bridges", "telegram command menu respects RetryAfter")
+async def t_telegram_commands_menu_retry_after(ctx: TestContext) -> None:
+    import sys
+    import time
+    import types
+
+    bridge = _fresh_telegram_bridge()
+    calls = 0
+
+    class _RetryAfter(Exception):
+        def __init__(self, retry_after: int) -> None:
+            super().__init__(f"retry after {retry_after}")
+            self.retry_after = retry_after
+
+    class _FakeBot:
+        async def set_my_commands(self, commands):
+            nonlocal calls
+            calls += 1
+            assert commands, "menu registration should pass BotCommand entries"
+            raise _RetryAfter(123)
+
+    bridge._app = types.SimpleNamespace(bot=_FakeBot())
+
+    fake_tg = types.ModuleType("telegram")
+    fake_tg.BotCommand = lambda cmd, desc: (cmd, desc)  # type: ignore[attr-defined]
+    fake_err = types.ModuleType("telegram.error")
+    fake_err.RetryAfter = _RetryAfter  # type: ignore[attr-defined]
+
+    saved = {k: sys.modules.get(k) for k in ("telegram", "telegram.error")}
+    sys.modules["telegram"] = fake_tg
+    sys.modules["telegram.error"] = fake_err
+    try:
+        await bridge._maybe_set_bot_commands_menu()
+        await bridge._maybe_set_bot_commands_menu()
+    finally:
+        for k, v in saved.items():
+            if v is not None:
+                sys.modules[k] = v
+            else:
+                sys.modules.pop(k, None)
+
+    assert calls == 1, "RetryAfter must suppress immediate menu retries"
+    assert bridge._commands_next_attempt_at > time.monotonic() + 100
+    assert not bridge._commands_menu_set
 
 
 @test("bridges", "telegram bridge rejects duplicate update_id (replay defense)")
