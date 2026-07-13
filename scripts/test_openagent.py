@@ -54,6 +54,7 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_serve_singleton",
     "test_cli_cleanup",
     "test_tool_result_cap",
+    "test_model_fallback",
     # importlib.metadata fallback for frozen bundles — defense in depth
     # against the runtime Team-run crash when pydantic dist-info goes missing
     # under sys._MEIPASS.

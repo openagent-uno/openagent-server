@@ -368,6 +368,27 @@ def _build_agent(config: dict) -> Agent:
     # the pool is online so providers see the full toolkit list.
     wire_model_runtime(model, db=db)
 
+    # Model fallback — when the primary provider (e.g. Claude via the local
+    # proxy) rate-limits, times out, or errors, degrade the turn to a
+    # secondary provider instead of failing the whole run. Configured under
+    # ``fallback:`` in the agent yaml, e.g.
+    #   fallback:
+    #     on_rate_limit: ["deepseek:deepseek-v4-pro"]
+    #     on_error:      ["deepseek:deepseek-v4-pro"]
+    # Strings resolve to Model instances in ``Agent.initialize`` via
+    # ``FallbackConfig.resolve_models()`` against the DB provider catalog; an
+    # unresolvable entry is skipped, so a bad config degrades to "no fallback"
+    # (today's behaviour) rather than crashing the agent.
+    fallback_raw = config.get("fallback") or {}
+    fallback_config = None
+    if fallback_raw:
+        from src.models.providers.fallback import FallbackConfig
+        fallback_config = FallbackConfig(
+            on_error=list(fallback_raw.get("on_error") or []),
+            on_rate_limit=list(fallback_raw.get("on_rate_limit") or []),
+            on_context_overflow=list(fallback_raw.get("on_context_overflow") or []),
+        )
+
     return Agent(
         name=config.get("name", "openagent"),
         model=model,
@@ -375,6 +396,7 @@ def _build_agent(config: dict) -> Agent:
         mcp_pool=None,
         memory=db,
         config=config,  # channels / memory / name only — providers/models/mcps live in the DB
+        fallback_config=fallback_config,
     )
 
 
