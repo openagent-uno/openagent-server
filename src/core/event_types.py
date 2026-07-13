@@ -83,22 +83,6 @@ EVENT_TYPES: dict[str, dict[str, Any]] = {
         "external_id_header": "X-Slack-Retry-Num",
         "docs": "Slack app → Basic Information → Signing Secret = <secret>",
     },
-    "replio": {
-        "label": "Replio",
-        "description": (
-            "Replio support platform. Verifies X-Replio-Signature (HMAC-SHA256 "
-            "of the raw body with the secret) and dedupes on X-Replio-Delivery-Id. "
-            "Replio keeps that id stable across its four retries, so a delivery "
-            "it re-sends after a timeout cannot run the event — or answer a "
-            "customer — twice. Use the same secret as the Replio webhook."
-        ),
-        "signature": "hmac_sha256",
-        "signature_header": "X-Replio-Signature",
-        "signature_prefix": "sha256=",
-        "external_id_header": "X-Replio-Delivery-Id",
-        "event_name_header": "X-Replio-Event",
-        "docs": "Replio → Webhooks → new webhook, Secret = <secret>",
-    },
 }
 
 DEFAULT_TYPE = "generic"

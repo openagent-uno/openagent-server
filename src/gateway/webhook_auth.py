@@ -8,10 +8,10 @@ Two layers, in order:
 1. **Secret** — every event carries a per-event secret (salted-hash stored).
    The caller presents it in ``X-OpenAgent-Event-Secret`` or
    ``Authorization: Bearer``. This is the baseline for ``type=generic``.
-2. **Signature** — provider presets (github/stripe/slack/replio/generic-hmac)
-   ALSO verify an HMAC over the *raw* body (and, for timestamped schemes, a
-   replay window). A real provider satisfies this automatically; it means a
-   leaked secret alone is not enough to forge a body.
+2. **Signature** — provider presets (github/stripe/slack/generic-hmac) ALSO
+   verify an HMAC over the *raw* body (and, for timestamped schemes, a replay
+   window). A real provider satisfies this automatically; it means a leaked
+   secret alone is not enough to forge a body.
 
 All comparisons are constant-time. Failures return a reason string that is
 logged (never the secret) and mapped to an identical 401 by the caller, so a

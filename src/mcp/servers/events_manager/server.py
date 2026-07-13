@@ -161,8 +161,7 @@ async def create_event(
         prompt_template: for action_kind='prompt', the prompt to run — may
             reference the payload with {{payload.field}}.
         type: webhook preset ('generic', 'generic-hmac', 'github', 'stripe',
-            'slack', 'replio'). Controls signature verification + delivery
-            de-dupe.
+            'slack'). Controls signature verification + delivery de-dupe.
         input_schema: optional list of {name,type,required,description,path}
             field descriptors documenting the expected payload.
         model: optional model runtime_id to pin the run to.

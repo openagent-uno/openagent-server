@@ -560,7 +560,9 @@ CREATE INDEX IF NOT EXISTS idx_vault_reminders_updated ON vault_save_reminders(u
 -- ``slug`` is the public path segment: ``POST /hooks/{slug}`` on the
 -- dedicated webhook listener. ``type`` is the provider preset that decides
 -- how the request is authenticated and how a de-dupe id is extracted
--- (generic | generic-hmac | github | stripe | slack | replio). ``action_kind``
+-- (generic | generic-hmac | github | stripe | slack). The per-event secret
+-- is NEVER stored in clear: only a salted sha256 (``secret_hash`` +
+-- ``secret_salt``) plus a 4-char ``secret_hint`` for the UI. ``action_kind``
 -- is one of ``workflow`` | ``scheduled_task`` | ``prompt``; ``action_ref``
 -- points at the workflow/task id (NULL for ``prompt``, which carries a
 -- ``prompt_template`` rendered against the delivery payload instead).
