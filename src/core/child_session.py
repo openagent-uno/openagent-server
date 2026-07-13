@@ -47,11 +47,12 @@ logger = logging.getLogger(__name__)
 # Child origins that are NOT surfaced as standalone rows in the flat session
 # list / sidebar. Each is navigable only from where it was spawned — a
 # delegation from its parent transcript's card, a scheduled firing / workflow
-# node from its run's execution screen — so listing it separately would just
-# duplicate a row the user already reaches in context. Shared by the gateway's
+# node from its run's execution screen, an event-prompt session from its
+# delivery in the Events feed — so listing it separately would just duplicate
+# a row the user already reaches in context. Shared by the gateway's
 # ``GET /api/sessions`` filter and its child-session-created broadcast skip so
 # the two never drift. ``chat`` is the only origin that lists normally.
-HIDDEN_CHILD_ORIGINS: tuple[str, ...] = ("delegation", "scheduler", "workflow")
+HIDDEN_CHILD_ORIGINS: tuple[str, ...] = ("delegation", "scheduler", "workflow", "event")
 
 
 # Total concurrent child runs across the whole agent. The real backpressure
@@ -150,6 +151,10 @@ def mint_child_session_id(origin: str, origin_ref: dict[str, Any]) -> str:
         run = origin_ref.get("run_id") or "run"
         node = origin_ref.get("node_id")
         return f"workflow:{wf}:{run}:{node}" if node else f"workflow:{wf}:{run}"
+    if origin == "event":
+        ev = origin_ref.get("event_id") or "event"
+        delivery = origin_ref.get("delivery_id") or uuid.uuid4().hex[:8]
+        return f"event:{ev}:{delivery}"
     # Unknown origin — still produce a unique, namespaced id.
     return f"{origin}:{uuid.uuid4().hex}"
 
@@ -166,6 +171,8 @@ def _kind_label(origin: str, origin_ref: dict[str, Any], model_id: Optional[str]
         wf = origin_ref.get("workflow_id")
         node = origin_ref.get("node_id")
         return f"{wf}:{node}" if (wf and node) else wf
+    if origin == "event":
+        return origin_ref.get("event_id")
     return None
 
 

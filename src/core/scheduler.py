@@ -297,6 +297,10 @@ class Scheduler:
                 await self._drain_task_run_requests()
             except Exception as e:  # noqa: BLE001
                 elog("scheduler.run_request_loop_error", level="error", error=str(e))
+            try:
+                await self._drain_event_deliveries()
+            except Exception as e:  # noqa: BLE001
+                elog("scheduler.event_delivery_loop_error", level="error", error=str(e))
             await asyncio.sleep(CANCEL_CHECK_INTERVAL)
 
     async def _drain_task_run_requests(self) -> None:
@@ -334,6 +338,47 @@ class Scheduler:
                     task,
                     trigger=req.get("trigger") or "manual",
                     request_id=req.get("id"),
+                )
+            )
+
+    async def _drain_event_deliveries(self) -> None:
+        """Claim and dispatch every unclaimed event delivery.
+
+        The ``events-manager`` MCP subprocess cannot reach the in-process
+        runtime, so ``trigger_event`` inserts an ``event_deliveries`` row with
+        ``claimed_at IS NULL``; this drain claims it (atomically) and runs the
+        bound action via the shared ``dispatch_event``. The webhook listener
+        and the REST trigger dispatch in-process and never hit this path (they
+        create their rows already ``claimed``)."""
+        if self.db is None:
+            return
+        try:
+            deliveries = await self.db.claim_pending_event_deliveries(
+                limit=_CANCEL_SCAN_LIMIT,
+            )
+        except Exception as e:  # noqa: BLE001
+            elog("scheduler.event_claim_failed", level="warning",
+                 error=str(e) or type(e).__name__)
+            return
+        if not deliveries:
+            return
+        from src.core.event_dispatcher import dispatch_event
+        for dl in deliveries:
+            event = await self.db.get_event(dl.get("event_id"))
+            if event is None:
+                elog("scheduler.event_delivery_orphan", level="warning",
+                     delivery_id=dl.get("id"), event_id=dl.get("event_id"))
+                continue
+            try:
+                payload = json.loads(dl.get("payload_json") or "{}")
+            except (TypeError, ValueError):
+                payload = {}
+            self._spawn_workflow(
+                dispatch_event(
+                    agent=self.agent, db=self.db, scheduler=self,
+                    event=event, payload=payload,
+                    delivery_id=dl["id"], source=dl.get("source") or "agent",
+                    broadcast=self._broadcast,
                 )
             )
 
@@ -437,6 +482,7 @@ class Scheduler:
 
     async def run_task(
         self, task: dict, *, trigger: str = "schedule", request_id: str | None = None,
+        context: dict | None = None,
     ) -> None:
         """Execute a single task. Extension point: override or monkey-patch
         this to intercept specific tasks (e.g. auto-update, which uses a
@@ -448,8 +494,20 @@ class Scheduler:
         the agent's full reasoning, and accepts follow-up messages. The
         per-run uniqueness (not a wiped, reused session) is what fixes
         issue #5. Set ``OPENAGENT_SCHEDULER_DURABLE_SESSIONS=0`` to revert to
-        the legacy reused-session + ``forget_session`` behavior."""
+        the legacy reused-session + ``forget_session`` behavior.
+
+        ``context`` (optional) is an untrusted payload appended to the task
+        prompt — used by the webhook Events channel to feed a delivery's data
+        into a scheduled-task action. It is wrapped in a size-capped,
+        clearly-delimited "data, not instructions" block. No existing caller
+        passes it, so scheduled/manual firings are unchanged."""
         task_name = task["name"]
+        # Build the effective prompt: the task prompt, plus (for event-driven
+        # firings) an injection-guarded block carrying the delivery payload.
+        effective_prompt = task["prompt"]
+        if context:
+            from src.core.event_dispatcher import render_payload_block
+            effective_prompt = effective_prompt + render_payload_block(context)
         durable = _durable_child_sessions()
         # Per-run id (durable) so each firing is its own navigable session;
         # legacy mode reuses one per-task id wiped after every fire.
@@ -544,7 +602,7 @@ class Scheduler:
                     origin="scheduler",
                     origin_ref={"task_id": task["id"], "run_id": run_id},
                     title=task_name,
-                    prompt=task["prompt"],
+                    prompt=effective_prompt,
                     owner_client_id=owner,
                     # Optional per-task model pin: run the firing on the model
                     # the task was configured with. NULL falls back to the
@@ -562,7 +620,7 @@ class Scheduler:
                 )
             else:
                 response = await self.agent.run(
-                    message=task["prompt"],
+                    message=effective_prompt,
                     user_id="scheduler",
                     session_id=session_id,
                 )
@@ -860,6 +918,7 @@ class Scheduler:
         inputs: dict | None = None,
         request_id: str | None = None,
         entry_node_id: str | None = None,
+        run_id: str | None = None,
     ) -> None:
         """Execute a workflow. Mirrors ``run_task``: catches exceptions,
         refreshes registries, and — when this run came from a request
@@ -869,11 +928,15 @@ class Scheduler:
         ``entry_node_id`` restricts the walk's entry set to a specific
         node, used by the scheduler when a workflow has multiple
         ``trigger-schedule`` blocks and only one of them fired this tick.
+
+        ``run_id`` may be supplied so a caller (the event dispatcher) can
+        link the produced run to its own record deterministically; when
+        None a fresh id is minted, matching the previous behaviour.
         """
         import uuid
 
         wf_name = wf.get("name")
-        run_id = str(uuid.uuid4())
+        run_id = run_id or str(uuid.uuid4())
         elog(
             "workflow.run", name=wf_name, run_id=run_id,
             trigger=trigger, request_id=request_id,

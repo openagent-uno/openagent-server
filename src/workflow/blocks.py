@@ -130,6 +130,26 @@ BLOCK_CATALOG: dict[str, BlockSpec] = {
         target_handles=(),
         output_shape="the inputs object the AI passed",
     ),
+    "trigger-event": BlockSpec(
+        type="trigger-event",
+        category="triggers",
+        description=(
+            "Entry point fired by a webhook Event bound to this workflow "
+            "(action_kind='workflow'). The event's delivery payload arrives as "
+            "the workflow inputs — reach it in downstream blocks with "
+            "{{inputs.<field>}}. The binding lives on the Event (managed in the "
+            "Events screen / events-manager MCP), not here; this block just "
+            "marks the workflow as event-driven so it shows the 'event' badge."
+        ),
+        config_schema={
+            "event": _field(
+                "string",
+                description="Optional event id or slug this workflow is triggered by (documentation only).",
+            ),
+        },
+        target_handles=(),
+        output_shape="the event payload object",
+    ),
 
     # ── MCP tool call ──
     "mcp-tool": BlockSpec(

@@ -85,6 +85,7 @@ _CANCELLED_TURN_FALLBACK_TEXT = (
 _MCP_PREFIX_TO_RESOURCE: tuple[tuple[str, str], ...] = (
     ("scheduler", "scheduled_task"),
     ("workflow_manager", "workflow"),
+    ("events_manager", "event"),
     ("mcp_manager", "mcp"),
     ("vault", "vault"),
 )

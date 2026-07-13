@@ -757,6 +757,15 @@ async def _h_trigger_ai(
     return dict(ctx.inputs)
 
 
+async def _h_trigger_event(
+    exe: WorkflowExecutor, node: dict, cfg: dict, ctx: _RunCtx,
+) -> dict[str, Any]:
+    # A webhook Event fires this workflow with the delivery payload as inputs.
+    # Same shape as trigger-manual: emit the inputs so downstream blocks reach
+    # them via {{inputs.<field>}} / {{nodes.<id>.output.<field>}}.
+    return dict(ctx.inputs)
+
+
 async def _h_trigger_schedule(
     exe: WorkflowExecutor, node: dict, cfg: dict, ctx: _RunCtx,
 ) -> dict[str, Any]:
@@ -1079,6 +1088,7 @@ _HANDLERS: dict[str, Callable[..., Awaitable[Any]]] = {
     "trigger-manual": _h_trigger_manual,
     "trigger-schedule": _h_trigger_schedule,
     "trigger-ai": _h_trigger_ai,
+    "trigger-event": _h_trigger_event,
     "set-variable": _h_set_variable,
     "mcp-tool": _h_mcp_tool,
     "ai-prompt": _h_ai_prompt,

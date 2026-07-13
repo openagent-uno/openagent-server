@@ -407,6 +407,11 @@ def _build_bridges(config: dict, per_bridge_url: dict[str, str]) -> list:
     for name, cfg in channels_config.items():
         if name == "websocket":
             continue  # legacy, ignored — gateway is now Iroh-bound
+        if name == "webhook":
+            # Not a WS-client bridge: the webhook is an INBOUND HTTP listener
+            # owned by the Gateway (see Gateway._maybe_start_webhook_listener).
+            # Skip it here so it never looks for a per-bridge loopback URL.
+            continue
 
         gateway_url = per_bridge_url.get(name)
         if gateway_url is None:
@@ -654,6 +659,11 @@ class AgentServer:
                     reaped_tasks = await db.reap_orphan_task_runs()
                     if reaped_tasks:
                         elog("task.orphan_reaped", count=reaped_tasks)
+                # And webhook event deliveries left mid-flight by a crash.
+                if hasattr(db, "reap_orphan_event_deliveries"):
+                    reaped_ev = await db.reap_orphan_event_deliveries()
+                    if reaped_ev:
+                        elog("event.orphan_reaped", count=reaped_ev)
         except Exception as e:  # noqa: BLE001
             logger.warning("orphan workflow_run reap failed: %s", e)
 

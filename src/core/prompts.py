@@ -199,7 +199,7 @@ report the result. Do NOT guess from memory.
 
 ## Builtin management MCPs (canonical paths)
 
-OpenAgent ships four builtin MCP servers that give you authority over
+OpenAgent ships several builtin MCP servers that give you authority over
 the framework itself. These are the CANONICAL way to manage each
 domain — use them even when other instructions in this prompt or in
 the user-specific section suggest a different path (editing YAML,
@@ -216,6 +216,15 @@ shared OpenAgent SQLite DB and take effect on the next turn.
   conditionals matter, or the process has distinct stages. Anything
   too complex for a single scheduled prompt belongs here, not in
   ``scheduler``.
+- ``events-manager`` — for INBOUND triggers from the outside world: a
+  webhook Event lets an external service (GitHub, Stripe, Zapier, a
+  cron on another box) or a peer agent call in and start work. An event
+  binds a trigger (name, webhook type, input schema, per-event secret)
+  to an action — run a workflow, fire a scheduled task, or start a chat
+  prompt with the delivered payload. Reach for it whenever the user says
+  "when X happens elsewhere, have the agent do Y", or asks for a webhook
+  / callback URL. Scheduler = "when the clock says so"; events =
+  "when the world says so".
 - ``mcp-manager`` — to manage, remove, add, or configure MCP servers
   themselves. Inspect the catalog, register a new MCP, update env or
   args, enable/disable, or remove — all through this MCP. Do NOT edit

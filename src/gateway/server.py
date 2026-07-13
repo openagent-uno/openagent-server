@@ -21,7 +21,7 @@ from src.gateway import protocol as P
 from src.gateway.commands import command_help_text
 from src.gateway.sessions import SessionManager
 from src.gateway.terminals import TerminalManager
-from src.gateway.api import vault, config, health, logs, control, usage, providers, models, scheduled_tasks, workflow_tasks, mcps, marketplace, sessions as sessions_api, system as system_api, network as network_api, chat as chat_api, terminals as terminals_api, commands as commands_api
+from src.gateway.api import vault, config, health, logs, control, usage, providers, models, scheduled_tasks, workflow_tasks, mcps, marketplace, sessions as sessions_api, system as system_api, network as network_api, chat as chat_api, terminals as terminals_api, commands as commands_api, events as events_api
 from src.network import peers as peers_api
 from src.network.auth.middleware import make_auth_middleware
 from src.network.transport.aiohttp_iroh_site import IrohSite
@@ -189,6 +189,12 @@ class Gateway:
         # can tear it down explicitly (the runner cleanup doesn't track
         # externally-attached sites).
         self._tcp_site = None
+        # Optional dedicated webhook listener (the ``webhook`` channel). A
+        # SEPARATE aiohttp Application on its own TCP port serving ONLY
+        # ``/hooks/*`` — never ``/api/*`` — so the external-facing surface
+        # can't leak the gateway API. Built from ``channels.webhook`` config;
+        # None when disabled. See ``gateway/webhook_site.py``.
+        self._webhook_site = None
 
         # Per (owner, session_id) StreamSession + RealtimeChannel pair.
         # Created on demand from inbound stream frames. These are server-owned:
@@ -912,6 +918,12 @@ class Gateway:
                 "<set>" if http_token_raw else "",
             )
 
+        # Dedicated webhook listener (the ``webhook`` channel). A separate
+        # aiohttp Application on its own port, serving ONLY ``/hooks/*`` — the
+        # gateway API is structurally absent from it. Built from
+        # ``channels.webhook`` in the resolved config; skipped when disabled.
+        await self._maybe_start_webhook_listener()
+
         # Spin up host telemetry. Broadcast loop primes psutil's CPU
         # baseline on first tick, then emits one ``system_snapshot``
         # every ``BROADCAST_INTERVAL_S`` seconds — but only when at
@@ -922,7 +934,41 @@ class Gateway:
             self._system_broadcast_loop(), name="gateway-system-broadcast"
         )
 
+    async def _maybe_start_webhook_listener(self) -> None:
+        """Start the dedicated webhook listener if ``channels.webhook.enabled``.
+
+        Loads the resolved config (env vars expanded) from ``config_path``.
+        Failure to start is logged but never fatal — the rest of the gateway
+        (Iroh, /api) comes up regardless, so a bad webhook port can't take the
+        agent down."""
+        from src.gateway.webhook_site import WebhookSite
+        try:
+            from src.core.config import load_config
+            cfg = load_config(self.config_path) if self.config_path else load_config()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("webhook: config load failed: %s", e)
+            return
+        wh_cfg = WebhookSite.config_from(cfg)
+        if wh_cfg is None:
+            return
+        site = WebhookSite(self)
+        try:
+            await site.start(wh_cfg)
+            self._webhook_site = site
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("webhook listener failed to start on %s:%s",
+                             wh_cfg.get("host"), wh_cfg.get("port"))
+            elog("gateway.webhook_listener.error",
+                 level="error", host=wh_cfg.get("host"), port=wh_cfg.get("port"),
+                 error=str(exc))
+
     async def stop(self) -> None:
+        if self._webhook_site is not None:
+            try:
+                await self._webhook_site.stop()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("webhook site stop failed: %s", e)
+            self._webhook_site = None
         await self.sessions.shutdown()
         try:
             await self.terminals.close_all()
@@ -1051,6 +1097,19 @@ class Gateway:
             ("GET", "/api/workflow-block-types", workflow_tasks.handle_block_types),
             ("GET", "/api/mcp-tools", workflow_tasks.handle_mcp_tools),
             ("GET", "/api/cron/describe", workflow_tasks.handle_cron_describe),
+            # Events (webhook channel). CRUD + delivery history + an
+            # authenticated in-network trigger. Static paths BEFORE the
+            # ``{id}`` wildcards so ``/api/event-types`` isn't shadowed.
+            ("GET", "/api/event-types", events_api.handle_types),
+            ("GET", "/api/event-deliveries/{id}", events_api.handle_delivery_get),
+            ("GET", "/api/events", events_api.handle_list),
+            ("POST", "/api/events", events_api.handle_create),
+            ("GET", "/api/events/{id}", events_api.handle_get),
+            ("PATCH", "/api/events/{id}", events_api.handle_update),
+            ("DELETE", "/api/events/{id}", events_api.handle_delete),
+            ("POST", "/api/events/{id}/rotate-secret", events_api.handle_rotate_secret),
+            ("POST", "/api/events/{id}/trigger", events_api.handle_trigger),
+            ("GET", "/api/events/{id}/deliveries", events_api.handle_deliveries_list),
             ("GET", "/api/logs", logs.handle_get),
             ("DELETE", "/api/logs", logs.handle_delete),
             ("GET", "/api/usage", usage.handle_get),

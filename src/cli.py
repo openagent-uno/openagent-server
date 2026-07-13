@@ -611,6 +611,10 @@ def mcp_server_cmd(name: str):
         from src.mcp.servers.workflow_manager.server import main as workflow_manager_main
         workflow_manager_main()
         return
+    if name == "events-manager":
+        from src.mcp.servers.events_manager.server import main as events_manager_main
+        events_manager_main()
+        return
     if name == "media-gen":
         from src.mcp.servers.media_gen.server import main as media_gen_main
         media_gen_main()

@@ -547,6 +547,93 @@ CREATE TABLE IF NOT EXISTS vault_save_reminders (
     updated_at      REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_vault_reminders_updated ON vault_save_reminders(updated_at);
+
+-- ── Events (webhook channel) ──
+--
+-- An ``event`` is a first-class inbound trigger (vision §9 "one agent,
+-- many doorways"): an external service (or an Iroh peer) hits the webhook
+-- and the agent runs a bound action — an existing workflow, a scheduled
+-- task, or a fresh chat-prompt session. It is the inbound analogue of the
+-- outbound bridges (Telegram/Discord/…): those dial *out* to a platform,
+-- an event lets a platform reach *in*.
+--
+-- ``slug`` is the public path segment: ``POST /hooks/{slug}`` on the
+-- dedicated webhook listener. ``type`` is the provider preset that decides
+-- how the request is authenticated and how a de-dupe id is extracted
+-- (generic | generic-hmac | github | stripe | slack). The per-event secret
+-- is NEVER stored in clear: only a salted sha256 (``secret_hash`` +
+-- ``secret_salt``) plus a 4-char ``secret_hint`` for the UI. ``action_kind``
+-- is one of ``workflow`` | ``scheduled_task`` | ``prompt``; ``action_ref``
+-- points at the workflow/task id (NULL for ``prompt``, which carries a
+-- ``prompt_template`` rendered against the delivery payload instead).
+CREATE TABLE IF NOT EXISTS events (
+    id                 TEXT PRIMARY KEY,
+    name               TEXT NOT NULL,
+    slug               TEXT NOT NULL UNIQUE,
+    description        TEXT,
+    type               TEXT NOT NULL DEFAULT 'generic',
+    enabled            INTEGER NOT NULL DEFAULT 1,
+    -- The per-event secret, ENCRYPTED at rest (see src.core.event_secret).
+    -- Encryption not hashing, because provider HMAC verification needs the
+    -- key in clear. Only ``secret_hint`` (last 4 chars) is unencrypted.
+    secret_enc         TEXT NOT NULL,
+    secret_hint        TEXT,
+    -- User-friendly input schema: a JSON array of
+    -- ``[{name,type,required,description,path}]`` where ``path`` is the
+    -- dot-path into the payload. Drives delivery validation and the
+    -- ``{{payload.x}}`` / workflow-inputs surface.
+    input_schema_json  TEXT NOT NULL DEFAULT '[]',
+    action_kind        TEXT NOT NULL,
+    action_ref         TEXT,
+    prompt_template    TEXT,
+    -- Optional per-event model pin (a runtime_id), same semantics as
+    -- ``scheduled_tasks.model``: NULL → the agent's default/router pick.
+    model              TEXT,
+    -- Guardrails (the webhook is the first cert-less inbound surface, and
+    -- every delivery is a paid LLM run): requests over the cap are 413'd,
+    -- more than ``rate_limit_per_min`` deliveries in a rolling minute are
+    -- 429'd.
+    rate_limit_per_min INTEGER NOT NULL DEFAULT 60,
+    max_payload_bytes  INTEGER NOT NULL DEFAULT 262144,
+    last_triggered_at  REAL,
+    created_at         REAL NOT NULL,
+    updated_at         REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_events_slug    ON events(slug);
+CREATE INDEX IF NOT EXISTS idx_events_enabled ON events(enabled);
+
+-- Per-firing history for events AND the cross-process run queue, unified
+-- in one table (what ``task_runs`` + ``task_run_requests`` are for tasks).
+-- A row created by an out-of-process caller (the ``events-manager`` MCP)
+-- is born with ``claimed_at IS NULL`` and is claimed by the Scheduler's
+-- fast (~2s) loop, exactly like ``task_run_requests``. ``source`` records
+-- the doorway: ``webhook`` (external HTTP), ``peer`` (Iroh device-cert /
+-- agent ALPN via ``/api/events/{id}/trigger``), ``manual`` (app/CLI Test),
+-- ``agent`` (the MCP tool). ``external_id`` is the provider delivery id
+-- (``X-GitHub-Delivery`` / Stripe event id) used to make redelivery
+-- idempotent. Exactly one of ``session_id`` / ``workflow_run_id`` /
+-- ``task_run_id`` links the produced unit of work.
+CREATE TABLE IF NOT EXISTS event_deliveries (
+    id               TEXT PRIMARY KEY,
+    event_id         TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+    source           TEXT NOT NULL DEFAULT 'webhook',
+    external_id      TEXT,
+    status           TEXT NOT NULL,
+    payload_json     TEXT NOT NULL DEFAULT '{}',
+    started_at       REAL NOT NULL,
+    finished_at      REAL,
+    output           TEXT,
+    error            TEXT,
+    session_id       TEXT,
+    workflow_run_id  TEXT,
+    task_run_id      TEXT,
+    claimed_at       REAL
+);
+CREATE INDEX IF NOT EXISTS idx_evdel_event     ON event_deliveries(event_id);
+CREATE INDEX IF NOT EXISTS idx_evdel_started   ON event_deliveries(started_at);
+CREATE INDEX IF NOT EXISTS idx_evdel_status    ON event_deliveries(status);
+CREATE INDEX IF NOT EXISTS idx_evdel_external  ON event_deliveries(event_id, external_id);
+CREATE INDEX IF NOT EXISTS idx_evdel_unclaimed ON event_deliveries(claimed_at);
 """
 
 
@@ -1670,6 +1757,291 @@ class MemoryDB:
         )
         row = await cursor.fetchone()
         return dict(row) if row else None
+
+    # ── Events (webhook channel) ──
+    #
+    # An event is an inbound trigger bound to an action (workflow / task /
+    # prompt). CRUD mirrors ``scheduled_tasks``; the secret is hashed via
+    # ``src.core.event_secret`` and is NEVER returned by a read — callers get
+    # ``secret_hint`` only. ``event_deliveries`` is both the run history and
+    # the cross-process queue (see ``claim_pending_event_deliveries``).
+
+    @staticmethod
+    def _row_to_event(row: aiosqlite.Row, *, include_secret: bool = False) -> dict:
+        """Hydrate an event row. ``input_schema_json`` is parsed into a list;
+        ``enabled`` becomes a real bool. The encrypted secret is dropped unless
+        ``include_secret`` (only the webhook-auth path sets it)."""
+        d = dict(row)
+        raw = d.pop("input_schema_json", None) or "[]"
+        try:
+            d["input_schema"] = json.loads(raw)
+        except (TypeError, ValueError):
+            d["input_schema"] = []
+        d["enabled"] = bool(d.get("enabled"))
+        if not include_secret:
+            d.pop("secret_enc", None)
+        return d
+
+    async def add_event(
+        self,
+        *,
+        name: str,
+        action_kind: str,
+        slug: str,
+        secret_enc: str,
+        secret_hint: str | None = None,
+        event_type: str = "generic",
+        description: str | None = None,
+        input_schema: list | None = None,
+        action_ref: str | None = None,
+        prompt_template: str | None = None,
+        model: str | None = None,
+        rate_limit_per_min: int = 60,
+        max_payload_bytes: int = 262144,
+        enabled: bool = True,
+    ) -> str:
+        conn = await self._ensure_connected()
+        event_id = str(uuid.uuid4())
+        now = time.time()
+        await conn.execute(
+            "INSERT INTO events "
+            "(id, name, slug, description, type, enabled, secret_enc, "
+            " secret_hint, input_schema_json, action_kind, action_ref, prompt_template, "
+            " model, rate_limit_per_min, max_payload_bytes, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                event_id, name, slug, description or None, event_type,
+                1 if enabled else 0, secret_enc, secret_hint,
+                json.dumps(input_schema or []), action_kind, action_ref or None,
+                prompt_template or None, model or None,
+                int(rate_limit_per_min), int(max_payload_bytes), now, now,
+            ),
+        )
+        await conn.commit()
+        return event_id
+
+    async def list_events(self, *, enabled_only: bool = False) -> list[dict]:
+        conn = await self._ensure_connected()
+        if enabled_only:
+            cursor = await conn.execute(
+                "SELECT * FROM events WHERE enabled = 1 ORDER BY created_at DESC"
+            )
+        else:
+            cursor = await conn.execute("SELECT * FROM events ORDER BY created_at DESC")
+        return [self._row_to_event(r) for r in await cursor.fetchall()]
+
+    async def get_event(self, event_id: str, *, include_secret: bool = False) -> dict | None:
+        conn = await self._ensure_connected()
+        cursor = await conn.execute("SELECT * FROM events WHERE id = ?", (event_id,))
+        row = await cursor.fetchone()
+        return self._row_to_event(row, include_secret=include_secret) if row else None
+
+    async def get_event_by_slug(self, slug: str, *, include_secret: bool = False) -> dict | None:
+        conn = await self._ensure_connected()
+        cursor = await conn.execute("SELECT * FROM events WHERE slug = ?", (slug,))
+        row = await cursor.fetchone()
+        return self._row_to_event(row, include_secret=include_secret) if row else None
+
+    async def slug_exists(self, slug: str) -> bool:
+        conn = await self._ensure_connected()
+        cursor = await conn.execute("SELECT 1 FROM events WHERE slug = ?", (slug,))
+        return (await cursor.fetchone()) is not None
+
+    async def update_event(self, event_id: str, **kwargs: Any) -> None:
+        conn = await self._ensure_connected()
+        allowed = {
+            "name", "slug", "description", "type", "enabled", "action_kind",
+            "action_ref", "prompt_template", "model", "rate_limit_per_min",
+            "max_payload_bytes", "last_triggered_at",
+            # Secret rotation goes through ``rotate_event_secret``; these are
+            # accepted here too so that path can reuse the same UPDATE.
+            "secret_enc", "secret_hint",
+        }
+        updates: dict[str, Any] = {}
+        for k, v in kwargs.items():
+            if k not in allowed:
+                continue
+            if k == "enabled":
+                v = 1 if v else 0
+            updates[k] = v
+        # ``input_schema`` is passed as a list and serialised here.
+        if "input_schema" in kwargs:
+            updates["input_schema_json"] = json.dumps(kwargs["input_schema"] or [])
+        if not updates:
+            return
+        updates["updated_at"] = time.time()
+        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        await conn.execute(
+            f"UPDATE events SET {set_clause} WHERE id = ?",
+            list(updates.values()) + [event_id],
+        )
+        await conn.commit()
+
+    async def rotate_event_secret(
+        self, event_id: str, *, secret_enc: str, secret_hint: str,
+    ) -> None:
+        """Replace an event's secret. The old secret is invalidated the moment
+        this commits (no grace window) — the clear value is generated by the
+        caller and returned to the user once."""
+        await self.update_event(
+            event_id, secret_enc=secret_enc, secret_hint=secret_hint,
+        )
+
+    async def delete_event(self, event_id: str) -> None:
+        conn = await self._ensure_connected()
+        # ON DELETE CASCADE clears event_deliveries.
+        await conn.execute("DELETE FROM events WHERE id = ?", (event_id,))
+        await conn.commit()
+
+    async def count_recent_deliveries(self, event_id: str, *, window_s: float = 60.0) -> int:
+        """Deliveries for an event started within the last ``window_s`` seconds.
+        Backstop for the in-memory rate limiter (survives a restart / covers
+        multiple listener processes sharing one DB)."""
+        conn = await self._ensure_connected()
+        cutoff = time.time() - window_s
+        cursor = await conn.execute(
+            "SELECT COUNT(*) AS n FROM event_deliveries "
+            "WHERE event_id = ? AND started_at >= ?",
+            (event_id, cutoff),
+        )
+        row = await cursor.fetchone()
+        return int(row["n"]) if row else 0
+
+    # ── Event Deliveries (history + cross-process run queue) ──
+
+    async def add_event_delivery(
+        self,
+        *,
+        event_id: str,
+        source: str = "webhook",
+        external_id: str | None = None,
+        payload: dict | None = None,
+        status: str = "received",
+        delivery_id: str | None = None,
+        claimed: bool = True,
+    ) -> str:
+        """Open a delivery row. ``claimed=False`` leaves ``claimed_at`` NULL so
+        the Scheduler's drain picks it up (the out-of-process MCP path);
+        in-process callers pass ``claimed=True`` (the default) since they
+        dispatch it themselves."""
+        conn = await self._ensure_connected()
+        did = delivery_id or str(uuid.uuid4())
+        now = time.time()
+        await conn.execute(
+            "INSERT INTO event_deliveries "
+            "(id, event_id, source, external_id, status, payload_json, started_at, claimed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                did, event_id, source, external_id, status,
+                json.dumps(payload or {}), now, (now if claimed else None),
+            ),
+        )
+        # Stamp last_triggered_at so the events list can show recency.
+        await conn.execute(
+            "UPDATE events SET last_triggered_at = ? WHERE id = ?", (now, event_id),
+        )
+        await conn.commit()
+        return did
+
+    async def update_event_delivery(self, delivery_id: str, **kwargs: Any) -> None:
+        allowed = {
+            "status", "finished_at", "output", "error",
+            "session_id", "workflow_run_id", "task_run_id",
+        }
+        updates = {k: v for k, v in kwargs.items() if k in allowed}
+        if not updates:
+            return
+        conn = await self._ensure_connected()
+        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        await conn.execute(
+            f"UPDATE event_deliveries SET {set_clause} WHERE id = ?",
+            list(updates.values()) + [delivery_id],
+        )
+        await conn.commit()
+
+    async def get_event_delivery(self, delivery_id: str) -> dict | None:
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            "SELECT * FROM event_deliveries WHERE id = ?", (delivery_id,),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def list_event_deliveries(
+        self, event_id: str, *, limit: int = 20,
+    ) -> list[dict]:
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            "SELECT * FROM event_deliveries WHERE event_id = ? "
+            "ORDER BY started_at DESC LIMIT ?",
+            (event_id, int(limit)),
+        )
+        return [dict(r) for r in await cursor.fetchall()]
+
+    async def find_delivery_by_external_id(
+        self, event_id: str, external_id: str,
+    ) -> dict | None:
+        """Idempotency check: has this provider delivery id already been
+        recorded for this event? Used to dedupe webhook redeliveries."""
+        if not external_id:
+            return None
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            "SELECT * FROM event_deliveries "
+            "WHERE event_id = ? AND external_id = ? LIMIT 1",
+            (event_id, external_id),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def claim_pending_event_deliveries(self, *, limit: int = 20) -> list[dict]:
+        """Atomically claim up to ``limit`` unclaimed deliveries (those the
+        events-manager MCP enqueued out-of-process). Same ``WHERE claimed_at
+        IS NULL`` race guard as ``claim_pending_task_requests``."""
+        conn = await self._ensure_connected()
+        now = time.time()
+        cursor = await conn.execute(
+            "SELECT * FROM event_deliveries "
+            "WHERE claimed_at IS NULL ORDER BY started_at ASC LIMIT ?",
+            (int(limit),),
+        )
+        rows = await cursor.fetchall()
+        if not rows:
+            return []
+        ids = [row["id"] for row in rows]
+        placeholders = ",".join("?" for _ in ids)
+        await conn.execute(
+            f"UPDATE event_deliveries SET claimed_at = ? "
+            f"WHERE id IN ({placeholders}) AND claimed_at IS NULL",
+            [now, *ids],
+        )
+        await conn.commit()
+        cursor = await conn.execute(
+            f"SELECT * FROM event_deliveries "
+            f"WHERE id IN ({placeholders}) AND claimed_at = ? "
+            f"ORDER BY started_at ASC",
+            [*ids, now],
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def reap_orphan_event_deliveries(self) -> int:
+        """Mark every delivery still ``received`` / ``running`` as ``failed`` —
+        the events analogue of ``reap_orphan_task_runs``. Called from
+        ``AgentServer.start()`` so a delivery that was in flight when the
+        process died doesn't hang forever as ``running``."""
+        conn = await self._ensure_connected()
+        now = time.time()
+        cursor = await conn.execute(
+            "UPDATE event_deliveries "
+            "SET status='failed', finished_at=?, "
+            "    error=COALESCE(error,'') || "
+            "          CASE WHEN error IS NULL OR error='' THEN '' ELSE ' | ' END || "
+            "          'reaped: orphan from prior process' "
+            "WHERE status IN ('received','running') AND claimed_at IS NOT NULL",
+            (now,),
+        )
+        await conn.commit()
+        return cursor.rowcount or 0
 
     # ── Workflow Tasks ──
 

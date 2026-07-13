@@ -227,6 +227,10 @@ _TEST_MODULES: tuple[str, ...] = (
     # round-trip + idempotent ALTER migration) and delegate_task's now-optional
     # model_id (omit → default/router model; pass one → override threaded in).
     "test_scheduled_task_model",
+    # Webhook Events channel: DB + secret hygiene, webhook auth (github HMAC /
+    # generic bearer), listener isolation (/hooks yes, /api never), the three
+    # dispatch action kinds, and resource-event surfacing.
+    "test_events",
     # Workflow ai-prompt must forget/release at the right moment (same
     # bug class as scheduler issue #5 but for workflows).
     "test_workflow_forgets_session",

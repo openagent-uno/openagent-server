@@ -327,6 +327,18 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
             "ad-hoc sub-agent delegation"
         ),
     },
+    "events-manager": {
+        "dir": "events_manager",
+        "command": ["python", "-m", "src.mcp.servers.events_manager.server"],
+        "python": True,
+        "description": (
+            "create, list, update, and remove webhook events, and fire one on "
+            "demand. An event is an inbound trigger (a name, a webhook type, an "
+            "input schema, a per-event secret) bound to an action — run a "
+            "workflow, a scheduled task, or a chat prompt — when an external "
+            "service (or a peer) calls it"
+        ),
+    },
     "media-gen": {
         "dir": "media_gen",
         "command": ["python", "-m", "src.mcp.servers.media_gen.server"],
@@ -385,6 +397,7 @@ DEFAULT_MCPS: list[dict[str, Any]] = [
     {"builtin": "mcp-manager", "_default": True},
     {"builtin": "model-manager", "_default": True},
     {"builtin": "workflow-manager", "_default": True},
+    {"builtin": "events-manager", "_default": True},
     {"builtin": "delegation", "_default": True},
     {"builtin": "agent-federation", "_default": True},
 ]
@@ -606,14 +619,16 @@ def resolve_default_entry(entry: dict[str, Any], db_path: str | None = None) -> 
             return None
 
         extra_env: dict[str, str] = dict(entry.get("env") or {})
-        # The scheduler, mcp-manager, model-manager and workflow-manager
-        # all speak to the shared OpenAgent SQLite DB. Inject
+        # The scheduler, mcp-manager, model-manager, workflow-manager and
+        # events-manager all speak to the shared OpenAgent SQLite DB. Inject
         # OPENAGENT_DB_PATH so they land on the same file as the main
         # process (otherwise they'd fall back to ``./openagent.db`` in
         # each subprocess CWD and every write would go to a different
-        # file).
+        # file). events-manager ALSO needs it to resolve the events.key
+        # encryption file that sits next to the DB.
         if entry["builtin"] in (
             "scheduler", "mcp-manager", "model-manager", "workflow-manager",
+            "events-manager",
         ):
             if db_path:
                 extra_env["OPENAGENT_DB_PATH"] = os.path.abspath(db_path)
