@@ -7,6 +7,70 @@ from src.core._runner.utils.log import log_debug, log_error
 T = TypeVar("T")
 
 
+def _escape_control_chars_in_quoted_strings(arguments: str) -> str:
+    repaired: list[str] = []
+    in_string = False
+    quote_char = ""
+    escaped = False
+
+    for char in arguments:
+        if in_string:
+            if escaped:
+                repaired.append(char)
+                escaped = False
+                continue
+            if char == "\\":
+                repaired.append(char)
+                escaped = True
+                continue
+            if char == quote_char:
+                repaired.append(char)
+                in_string = False
+                quote_char = ""
+                continue
+            if char == "\n":
+                repaired.append("\\n")
+                continue
+            if char == "\r":
+                repaired.append("\\r")
+                continue
+            if char == "\t":
+                repaired.append("\\t")
+                continue
+            if ord(char) < 0x20:
+                repaired.append(json.dumps(char)[1:-1])
+                continue
+            repaired.append(char)
+            continue
+
+        repaired.append(char)
+        if char in ("'", '"'):
+            in_string = True
+            quote_char = char
+
+    return "".join(repaired)
+
+
+def _decode_function_arguments(arguments: str) -> Any:
+    try:
+        return json.loads(arguments)
+    except Exception as json_error:
+        try:
+            import ast
+
+            return ast.literal_eval(arguments)
+        except Exception:
+            repaired = _escape_control_chars_in_quoted_strings(arguments)
+            if repaired == arguments:
+                raise json_error
+            try:
+                return json.loads(repaired)
+            except Exception:
+                import ast
+
+                return ast.literal_eval(repaired)
+
+
 def get_function_call(
     name: str,
     arguments: Optional[str] = None,
@@ -28,12 +92,7 @@ def get_function_call(
         function_call.call_id = call_id
     if arguments is not None and arguments != "":
         try:
-            try:
-                _arguments = json.loads(arguments)
-            except Exception:
-                import ast
-
-                _arguments = ast.literal_eval(arguments)
+            _arguments = _decode_function_arguments(arguments)
         except Exception as e:
             log_error(f"Unable to decode function arguments:\n{arguments}\nError: {str(e)}")
             function_call.error = (

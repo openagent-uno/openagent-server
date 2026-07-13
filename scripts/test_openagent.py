@@ -59,6 +59,7 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_catalog",
     "test_channels",
     "test_formatting",
+    "test_function_arguments",
     "test_tts_chunker",
     # Local Piper TTS fallback — pure-unit, no fixtures. The legacy
     # ``TurnRunner`` it used to be paired with is gone (every text/voice
