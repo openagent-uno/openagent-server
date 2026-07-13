@@ -1668,7 +1668,7 @@ wheels = [
 
 [[package]]
 name = "openagent-framework"
-version = "0.14.35"
+version = "0.14.45"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
@@ -1692,6 +1692,7 @@ dependencies = [
     { name = "packaging" },
     { name = "piper-tts" },
     { name = "psutil" },
+    { name = "python-telegram-bot" },
     { name = "pyyaml" },
     { name = "rich" },
     { name = "sqlalchemy" },
@@ -1704,7 +1705,6 @@ all = [
     { name = "aiohttp" },
     { name = "discord-py" },
     { name = "openagent-mcp" },
-    { name = "python-telegram-bot" },
     { name = "slack-bolt" },
     { name = "slack-sdk" },
     { name = "whatsapp-api-client-python" },
@@ -1715,9 +1715,6 @@ discord = [
 slack = [
     { name = "slack-bolt" },
     { name = "slack-sdk" },
-]
-telegram = [
-    { name = "python-telegram-bot" },
 ]
 websocket = [
     { name = "aiohttp" },
@@ -1754,8 +1751,7 @@ requires-dist = [
     { name = "packaging", specifier = ">=21.0" },
     { name = "piper-tts", specifier = ">=1.3.0" },
     { name = "psutil", specifier = ">=5.9.0" },
-    { name = "python-telegram-bot", marker = "extra == 'all'", specifier = ">=21.0" },
-    { name = "python-telegram-bot", marker = "extra == 'telegram'", specifier = ">=21.0" },
+    { name = "python-telegram-bot", specifier = ">=21.0" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "rich", specifier = ">=13.0.0" },
     { name = "slack-bolt", marker = "extra == 'all'", specifier = ">=1.20.0" },

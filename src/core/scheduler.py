@@ -19,6 +19,7 @@ overhead for users who never adopt workflows.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import uuid
 from typing import Callable, TYPE_CHECKING
@@ -72,6 +73,44 @@ def _no_broadcast(resource: str, action: str, id: str | None = None) -> None:
 # in the agent's session history; ``task_runs.output`` is only a preview
 # for the dashboard's run list, so a chatty turn can't bloat the DB.
 _MAX_TASK_RUN_OUTPUT = 4000
+
+_CHILD_FAILURE_STATUSES = {"ERROR", "FAILED"}
+_CHILD_CANCELLED_STATUSES = {"CANCELLED"}
+_CHILD_INCOMPLETE_STATUSES = {"PAUSED", "PENDING", "RUNNING"}
+
+
+def _status_name(status: object) -> str:
+    """Normalize runtime RunStatus enum/string values from session JSON."""
+    value = getattr(status, "value", status)
+    return str(value or "").upper()
+
+
+def _string_preview(value: object) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value.strip() or None
+    try:
+        return json.dumps(value, ensure_ascii=False)[:_MAX_TASK_RUN_OUTPUT]
+    except Exception:  # noqa: BLE001
+        return str(value)[:_MAX_TASK_RUN_OUTPUT]
+
+
+def _child_run_error_preview(run: dict, *, fallback: str) -> str:
+    """Best-effort human error preview from a stored child-session run."""
+    content = _string_preview(run.get("content"))
+    if content:
+        return content
+    events = run.get("events")
+    if isinstance(events, list):
+        for event in reversed(events):
+            if not isinstance(event, dict):
+                continue
+            for key in ("error", "message", "content", "text"):
+                preview = _string_preview(event.get(key))
+                if preview:
+                    return preview
+    return fallback
 
 
 def _durable_child_sessions() -> bool:
@@ -518,16 +557,37 @@ class Scheduler:
                     stream=True,
                 )
                 response = result.text
+                child_issue = await self._child_session_terminal_issue(
+                    result.session_id,
+                )
             else:
                 response = await self.agent.run(
                     message=task["prompt"],
                     user_id="scheduler",
                     session_id=session_id,
                 )
+                child_issue = None
             elog("task.done", name=task_name, preview=str(response)[:100])
-            await self._record_task_finish(
-                finish_run_id, task, status="success", output=str(response),
-            )
+            if child_issue is not None:
+                final_status, final_error = child_issue
+                elog(
+                    "task.child_run_not_successful",
+                    level="warning",
+                    name=task_name,
+                    status=final_status,
+                    error=final_error[:200],
+                )
+                await self._record_task_finish(
+                    finish_run_id,
+                    task,
+                    status=final_status,
+                    output=str(response),
+                    error=final_error,
+                )
+            else:
+                await self._record_task_finish(
+                    finish_run_id, task, status="success", output=str(response),
+                )
         except asyncio.CancelledError:
             # A stop request (or shutdown) cancelled this firing mid-turn.
             # Finalize the task_runs row as ``cancelled`` — not ``failed`` —
@@ -561,6 +621,58 @@ class Scheduler:
                     await self.agent.forget_session(session_id)
                 except Exception as e:
                     elog("scheduler.forget_failed", task=task_name, error=str(e))
+
+    async def _child_session_terminal_issue(
+        self,
+        session_id: str,
+    ) -> tuple[str, str] | None:
+        """Return a task_runs terminal override from child-session metadata.
+
+        ``Agent.run`` and ``Agent.run_stream`` intentionally convert provider
+        exceptions into chat-renderable text. The durable child session still
+        persists the runtime run with ``status='ERROR'`` / ``'CANCELLED'``;
+        scheduled-task history must honor that lower-level truth instead of
+        marking the wrapper call as a success.
+        """
+        if self.db is None:
+            return None
+        try:
+            runs = await self.db.list_session_runs(session_id, limit=1)
+        except Exception as e:  # noqa: BLE001
+            elog(
+                "task.child_run_status_read_failed",
+                level="warning",
+                session_id=session_id,
+                error=str(e) or type(e).__name__,
+            )
+            return None
+        if not runs:
+            return None
+
+        latest = runs[0]
+        status = _status_name(latest.get("status"))
+        if status in _CHILD_FAILURE_STATUSES:
+            return (
+                "failed",
+                _child_run_error_preview(
+                    latest,
+                    fallback=f"Child session {session_id} ended with runtime status {status}",
+                ),
+            )
+        if status in _CHILD_CANCELLED_STATUSES:
+            return (
+                "cancelled",
+                _child_run_error_preview(
+                    latest,
+                    fallback=f"Child session {session_id} ended with runtime status {status}",
+                ),
+            )
+        if status in _CHILD_INCOMPLETE_STATUSES:
+            return (
+                "failed",
+                f"Child session {session_id} ended without a completed runtime run: {status}",
+            )
+        return None
 
     async def _record_task_finish(
         self,

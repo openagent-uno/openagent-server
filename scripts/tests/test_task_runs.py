@@ -10,6 +10,8 @@ the DB layer and the recording path without spawning the real agent.
 """
 from __future__ import annotations
 
+import json
+import time
 import uuid
 
 from ._framework import TestContext, test
@@ -255,6 +257,63 @@ async def t_scheduler_records_failure(ctx: TestContext) -> None:
         assert len(agent.release_calls) == 1, agent.release_calls
         assert agent.release_calls[0].startswith(f"scheduler:{task_id}:"), agent.release_calls
         assert runs[0]["session_id"] == agent.release_calls[0], runs[0]
+        await db.close()
+    finally:
+        try:
+            tmp_db.unlink()
+        except FileNotFoundError:
+            pass
+
+
+@test("task_runs", "run_task fails when the durable child session stores runtime ERROR")
+async def t_scheduler_records_child_runtime_error(ctx: TestContext) -> None:
+    from src.core.scheduler import Scheduler
+    from src.memory.db import MemoryDB
+
+    tmp_db = ctx.db_path.with_name(f"taskruns-child-error-{uuid.uuid4().hex[:8]}.db")
+    try:
+        db = MemoryDB(str(tmp_db))
+        await db.connect()
+        task_id = await db.add_task("Provider Broken", "* * * * *", "try me")
+        task = await db.get_task(task_id)
+
+        class _RuntimeErrorAgent(_SpyAgent):
+            def __init__(self) -> None:
+                super().__init__()
+                self.db = db
+
+            async def run(self, *, message: str, user_id: str, session_id: str,
+                          model_override=None, author=None, on_status=None) -> str:
+                self.run_calls = getattr(self, "run_calls", [])
+                self.run_calls.append((session_id, message))
+                conn = await db._ensure_connected()
+                await conn.execute(
+                    "UPDATE sessions SET runs = ?, updated_at = ? WHERE session_id = ?",
+                    (
+                        json.dumps([
+                            {
+                                "run_id": "runtime-run",
+                                "status": "ERROR",
+                                "content": "[Errno 2] No such file or directory",
+                            }
+                        ]),
+                        time.time(),
+                        session_id,
+                    ),
+                )
+                await conn.commit()
+                return "[Errno 2] No such file or directory"
+
+        scheduler = Scheduler(db=db, agent=_RuntimeErrorAgent())  # type: ignore[arg-type]
+        await scheduler.run_task(task)
+
+        runs = await db.list_task_runs(task_id)
+        assert len(runs) == 1, runs
+        run = runs[0]
+        assert run["status"] == "failed", run
+        assert "[Errno 2]" in (run["error"] or ""), run
+        assert "[Errno 2]" in (run["output"] or ""), run
+        assert run["session_id"] and run["session_id"].startswith(f"scheduler:{task_id}:")
         await db.close()
     finally:
         try:
