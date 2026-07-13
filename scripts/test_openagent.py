@@ -28,7 +28,8 @@ from pathlib import Path
 # Silence noisy third-party loggers; test output is already explicit.
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
 for noisy in ("openagent", "src.mcp", "src.models", "openai", "httpx",
-              "httpcore", "asyncio", "openagent.mcp.client", "openagent.mcp.pool"):
+              "httpcore", "asyncio", "aiosqlite", "hpack", "urllib3",
+              "websockets", "openagent.mcp.client", "openagent.mcp.pool"):
     logging.getLogger(noisy).setLevel(logging.ERROR)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -52,6 +53,7 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_setup",
     "test_serve_singleton",
     "test_cli_cleanup",
+    "test_tool_result_cap",
     # importlib.metadata fallback for frozen bundles — defense in depth
     # against the runtime Team-run crash when pydantic dist-info goes missing
     # under sys._MEIPASS.

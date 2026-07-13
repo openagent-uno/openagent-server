@@ -73,6 +73,15 @@ def setup_logging(verbose: bool = False) -> None:
     root.setLevel(logging.DEBUG)
     root.addHandler(console)
 
+    # Chatty third-party loggers emit at DEBUG/INFO and drown real output —
+    # aiosqlite logs every SQL statement it executes, which buries the signal
+    # in schema dumps. Root runs at DEBUG (so events.jsonl captures every
+    # level), so we gate these at their own logger level: a record below
+    # WARNING is dropped at the source and never reaches any handler.
+    for _noisy in ("aiosqlite", "httpx", "httpcore", "hpack", "urllib3",
+                   "asyncio", "websockets", "telegram", "PIL"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
+
     events = logging.getLogger(EVENT_LOGGER)
     events.setLevel(logging.DEBUG)  # events.jsonl captures every level
     _reopen_event_file(target)

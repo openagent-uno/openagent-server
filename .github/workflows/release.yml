@@ -10,6 +10,29 @@ permissions:
   id-token: write
 
 jobs:
+  # Gate the whole release on the end-to-end suite: no executable is built
+  # and nothing is published unless the tests pass on the tagged commit.
+  test:
+    name: end-to-end test suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Create venv + install package
+        run: |
+          uv venv
+          uv pip install -e .
+      - name: Run end-to-end suite
+        run: bash scripts/test_openagent.sh
+
   computer-control-binary:
     strategy:
       fail-fast: false
@@ -88,7 +111,7 @@ jobs:
           path: src/mcp/servers/computer-control/target/${{ matrix.target }}/release/openagent-computer-control${{ matrix.ext }}
 
   executable:
-    needs: computer-control-binary
+    needs: [test, computer-control-binary]
     strategy:
       fail-fast: false
       matrix:
