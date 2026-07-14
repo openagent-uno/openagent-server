@@ -8,6 +8,8 @@ act, etc. The user's config is expected to stay short and
 project-specific (identity, key facts, pointers to memory).
 """
 
+import os
+
 FRAMEWORK_SYSTEM_PROMPT = """\
 You are running inside OpenAgent, a persistent LLM agent framework with
 long-term memory, scheduled tasks, workflows, inbound events, and
@@ -877,6 +879,22 @@ _INLINE_TOOL_KEYS_SERVERS = frozenset({
 _INLINE_TOOL_KEYS_CAP = 24
 
 
+def _operator_inline_servers() -> frozenset[str]:
+    """Server names the OPERATOR opted into full tool-key inlining, read from
+    the ``OPENAGENT_INLINE_TOOL_KEYS_SERVERS`` env var (comma-separated).
+
+    ``_INLINE_TOOL_KEYS_SERVERS`` above is OpenAgent's built-in allowlist —
+    small, high-traffic builtins that ship with the framework. A deployment
+    that connects its OWN high-traffic MCP (an org/domain MCP whose exact tool
+    keys the model must copy verbatim rather than guess) lists it here from its
+    own config, so OpenAgent never hardcodes a tenant's server name. These are
+    operator-vetted, so the renderer inlines ALL their names with no per-server
+    cap — a left-out key is exactly what the model would otherwise hallucinate.
+    """
+    raw = os.environ.get("OPENAGENT_INLINE_TOOL_KEYS_SERVERS", "")
+    return frozenset(s.strip() for s in raw.split(",") if s.strip())
+
+
 def _render_catalog_summary_lines(
     summary: dict[str, int],
     descriptions: dict[str, str],
@@ -919,6 +937,7 @@ def _render_catalog_summary_lines(
         ),
     }
 
+    operator_servers = _operator_inline_servers()
     lines: list[str] = []
     for name in ordered:
         count = summary[name]
@@ -942,15 +961,21 @@ def _render_catalog_summary_lines(
             else:
                 lines.append(f"- ``{name}`` ({count} tools).")
 
-        # Inline the exact registered keys for high-traffic builtins so the
-        # model copies one verbatim instead of guessing (and mis-prefixing)
-        # it. ``tool-search`` is skipped — its four keys are already spelled
-        # out in the framework prompt's tool section above.
-        if tool_names and name in _INLINE_TOOL_KEYS_SERVERS:
+        # Inline the exact registered keys so the model copies one verbatim
+        # instead of guessing (and mis-prefixing) it. Two sources: OpenAgent's
+        # built-in high-traffic allowlist (capped at _INLINE_TOOL_KEYS_CAP), and
+        # any server the operator opted in via env — org/domain MCPs, inlined in
+        # FULL (no cap) since a left-out key is what the model would hallucinate.
+        # ``tool-search`` is skipped — its four keys are already spelled out in
+        # the framework prompt's tool section above.
+        if tool_names and (name in _INLINE_TOOL_KEYS_SERVERS or name in operator_servers):
             keys = tool_names.get(name) or []
             if keys:
-                shown = keys[:_INLINE_TOOL_KEYS_CAP]
-                more = len(keys) - len(shown)
+                if name in operator_servers:
+                    shown, more = keys, 0  # operator-vetted → surface every key
+                else:
+                    shown = keys[:_INLINE_TOOL_KEYS_CAP]
+                    more = len(keys) - len(shown)
                 suffix = f", … (+{more} more — use list_tools)" if more > 0 else ""
                 lines.append(f"    tools: {', '.join(shown)}{suffix}")
 

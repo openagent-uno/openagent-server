@@ -181,6 +181,8 @@ _TEST_MODULES: tuple[str, ...] = (
     # MCP marketplace — pure schema-mapping unit tests, plus one REST
     # shape check that skips when no gateway fixture is wired.
     "test_marketplace",
+    # Catalog tool-key inlining (pure renderer — no pool/network needed).
+    "test_catalog_inline",
     # 2. MCP pool — sets ctx.extras["pool"] for everything below
     "test_pool",
     # MCPPool.from_db + reload — runs right after test_pool so it inherits
