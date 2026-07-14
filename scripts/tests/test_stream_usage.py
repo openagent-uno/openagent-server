@@ -62,30 +62,53 @@ async def t_metrics_shapes(_ctx: TestContext) -> None:
     assert metrics_to_tokens(_Broken()) == (0, 0)  # a bad metrics object costs a log line, not a turn
 
 
+async def _usage_rows(db, session_id: str) -> list[dict]:
+    conn = await db._ensure_connected()
+    cursor = await conn.execute(
+        "SELECT model, input_tokens, output_tokens FROM usage_log WHERE session_id = ?",
+        (session_id,),
+    )
+    return [dict(r) for r in await cursor.fetchall()]
+
+
+def _stub_provider(monkeypatched_runtime):
+    """A TeamRouterProvider whose runtime streams two deltas and reports the
+    run's tokens through the sink, exactly as the runtime's RunCompletedEvent
+    does."""
+    from src.models.base import BaseModel
+    from src.models import stream_usage
+
+    class _Runtime(BaseModel):
+        async def generate(self, *a, **k):  # pragma: no cover — stream test
+            raise NotImplementedError
+
+        async def stream(self, messages, **kwargs):
+            yield "hel"
+            yield "lo"
+            stream_usage.record(input_tokens=12_000, output_tokens=300)
+
+    return _Runtime
+
+
 @test("stream_usage", "a streamed turn lands in usage_log")
 async def t_streamed_turn_is_billed(ctx: TestContext) -> None:
-    """End-to-end on the dispatcher: stream a turn, then read the ledger."""
+    """End-to-end through the dispatcher: stream a turn, then read the ledger."""
     from src.memory.db import MemoryDB
-    from src.models import stream_usage
     from src.models.budget import BudgetTracker
-    from src.models.dispatcher import ModelDispatcher, RoutingDecision
+    from src.models.dispatcher import ModelDispatcher, RoutingDecision, TeamRouterProvider
 
     db = MemoryDB(str(ctx.db_path))
     await db.connect()
     try:
-        class _Provider:
-            """Stands in for TeamRouterProvider: streams deltas and reports its
-            run's tokens through the sink, exactly as the runtime's
-            RunCompletedEvent does."""
-
-            async def stream(self, messages, **kwargs):
-                yield "hel"
-                yield "lo"
-                stream_usage.record(input_tokens=12_000, output_tokens=300)
+        provider = TeamRouterProvider(
+            entry_runtime_id="local:claude-sonnet-4-6",
+            budget=BudgetTracker(db, 0.0),
+        )
+        provider._ensure_runtime = lambda sid, system: _stub_provider(None)()
 
         dispatcher = ModelDispatcher.__new__(ModelDispatcher)
         dispatcher._budget = BudgetTracker(db, 0.0)
-        dispatcher._get_team_provider = lambda rid: _Provider()
+        dispatcher._get_team_provider = lambda rid: provider
         dispatcher._remember_pick = lambda sid, rid: None
 
         async def _resolve(_sid):
@@ -96,7 +119,7 @@ async def t_streamed_turn_is_billed(ctx: TestContext) -> None:
 
         dispatcher._resolve_entry_model = _resolve
 
-        sid = f"event:{int(time.time() * 1000)}"
+        sid = f"chat:{int(time.time() * 1000)}"
         chunks = [
             c async for c in dispatcher.stream(
                 [{"role": "user", "content": "hi"}], session_id=sid,
@@ -104,19 +127,56 @@ async def t_streamed_turn_is_billed(ctx: TestContext) -> None:
         ]
         assert "".join(chunks) == "hello"
 
-        conn = await db._ensure_connected()
-        cursor = await conn.execute(
-            "SELECT model, input_tokens, output_tokens FROM usage_log "
-            "WHERE session_id = ?",
-            (sid,),
-        )
-        rows = [dict(r) for r in await cursor.fetchall()]
+        rows = await _usage_rows(db, sid)
         assert len(rows) == 1, (
             f"a streamed turn must produce exactly one usage row, got {rows}"
         )
-        row = rows[0]
-        assert row["input_tokens"] == 12_000
-        assert row["output_tokens"] == 300
-        assert row["model"] == "local:claude-sonnet-4-6"
+        assert rows[0]["input_tokens"] == 12_000
+        assert rows[0]["output_tokens"] == 300
+        assert rows[0]["model"] == "local:claude-sonnet-4-6"
+    finally:
+        await db.close()
+
+
+@test("stream_usage", "a MODEL-PINNED run is billed too (it skips the dispatcher)")
+async def t_pinned_run_is_billed(ctx: TestContext) -> None:
+    """The one that actually cost money.
+
+    An Events delivery, a scheduled task with a `model`, a workflow ai-prompt
+    override — all pin a model, and a pinned run is handed the provider straight
+    from `build_override_model`: it never calls ModelDispatcher.stream at all.
+    With accounting living on the dispatcher, the ENTIRE Replio webhook lane was
+    unbilled — usage_log held zero rows while it burned 412M input tokens.
+    Accounting lives on the provider now, so this path bills like any other.
+    """
+    from src.memory.db import MemoryDB
+    from src.models.budget import BudgetTracker
+    from src.models.dispatcher import TeamRouterProvider
+
+    db = MemoryDB(str(ctx.db_path))
+    await db.connect()
+    try:
+        provider = TeamRouterProvider(
+            entry_runtime_id="local:claude-sonnet-4-6",
+            budget=BudgetTracker(db, 0.0),
+        )
+        provider._ensure_runtime = lambda sid, system: _stub_provider(None)()
+
+        sid = f"event:{int(time.time() * 1000)}"
+        # Exactly what a pinned run does: talk to the provider directly.
+        chunks = [
+            c async for c in provider.stream(
+                [{"role": "user", "content": "hi"}], session_id=sid,
+            )
+        ]
+        assert "".join(chunks) == "hello"
+
+        rows = await _usage_rows(db, sid)
+        assert len(rows) == 1, (
+            "a model-pinned run must be billed — this is the hole the Replio "
+            f"webhook lane fell through; got {rows}"
+        )
+        assert rows[0]["input_tokens"] == 12_000
+        assert rows[0]["model"] == "local:claude-sonnet-4-6"
     finally:
         await db.close()

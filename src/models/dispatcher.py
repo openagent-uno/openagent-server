@@ -503,6 +503,7 @@ class TeamRouterProvider(BaseModel):
         providers_config: Any = None,
         *,
         history_runs: int = FULL_SESSION_HISTORY_RUNS,
+        budget: Any = None,
     ):
         self._entry_runtime_id = entry_runtime_id
         self._providers_config = providers_config if providers_config is not None else []
@@ -510,6 +511,14 @@ class TeamRouterProvider(BaseModel):
         self._mcp_pool: Any = None
         self._fallback_config: Any = None
         self._history_runs = history_runs
+        # Cost telemetry lives HERE, not in ModelDispatcher, because not every
+        # run goes through the dispatcher: a model-PINNED run (an Events
+        # delivery, a scheduled task with a `model`, a workflow ai-prompt
+        # override) is handed this provider directly by
+        # ``ModelDispatcher.build_override_model`` and never touches the
+        # dispatcher's generate/stream. That is why usage_log held zero rows
+        # for the entire Replio webhook lane while it burned 412M input tokens.
+        self._budget = budget
         self._session_runtime: dict[str, Any] = {}  # session_id → Team or fallback
         # session_id → stable hash of the system prompt the cached runtime
         # was built with; used to invalidate when the system prompt
@@ -962,6 +971,52 @@ class TeamRouterProvider(BaseModel):
             runtime_id=runtime_id,
         )
 
+    # ── cost telemetry ────────────────────────────────────────────────
+
+    async def record_cost(
+        self,
+        *,
+        input_tokens: int,
+        output_tokens: int,
+        session_id: str | None,
+    ) -> None:
+        """Write one call into ``usage_log`` — the canonical cost ledger.
+
+        Every path that runs a model reaches this provider: the dispatcher's
+        routed turns, AND the model-pinned ones that skip the dispatcher
+        entirely. Accounting therefore belongs here, or it does not cover the
+        traffic that turned out to be the expensive kind.
+        """
+        if not self._budget:
+            return
+        if not input_tokens and not output_tokens:
+            return
+        runtime_id = self._entry_runtime_id
+        cost = BudgetTracker.compute_cost(runtime_id, input_tokens, output_tokens)
+        try:
+            await self._budget.record(
+                model=runtime_id,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cost=cost,
+                session_id=session_id,
+            )
+            elog(
+                "router.cost_recorded",
+                session_id=session_id,
+                model=runtime_id,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cost_usd=cost,
+            )
+        except Exception as e:  # noqa: BLE001
+            elog(
+                "router.cost_record_error",
+                session_id=session_id,
+                model=runtime_id,
+                error=str(e),
+            )
+
     # ── turn ──────────────────────────────────────────────────────────
 
     async def generate(
@@ -981,7 +1036,7 @@ class TeamRouterProvider(BaseModel):
         runtime = self._ensure_runtime(sid, system)
         # Plain-NativeProvider single-model path: forward the full args.
         if isinstance(runtime, BaseModel):
-            return await runtime.generate(
+            resp = await runtime.generate(
                 messages=messages,
                 system=system,
                 tools=tools,
@@ -990,6 +1045,12 @@ class TeamRouterProvider(BaseModel):
                 model_override=model_override,
                 files=files, images=images, audio=audio, videos=videos,
             )
+            await self.record_cost(
+                input_tokens=resp.input_tokens,
+                output_tokens=resp.output_tokens,
+                session_id=session_id,
+            )
+            return resp
 
         # Runtime Team path. Translate to the Team's run signature.
         # Clear the previous turn's delegation memo so this turn's badge
@@ -1002,7 +1063,7 @@ class TeamRouterProvider(BaseModel):
         # runtime can always read/write the row regardless of which
         # handle (if any) the gateway bound to the session.
         user_id = RUNTIME_SESSION_USER_ID
-        return await _arun_runtime_collect(
+        resp = await _arun_runtime_collect(
             runtime,
             prompt=_last_user_prompt(messages),
             session_id=sid,
@@ -1012,6 +1073,12 @@ class TeamRouterProvider(BaseModel):
             on_delegate=lambda mid: self._record_delegation(sid, mid),
             files=files, images=images, audio=audio, videos=videos,
         )
+        await self.record_cost(
+            input_tokens=resp.input_tokens,
+            output_tokens=resp.output_tokens,
+            session_id=session_id,
+        )
+        return resp
 
     async def stream(
         self,
@@ -1028,43 +1095,55 @@ class TeamRouterProvider(BaseModel):
     ) -> AsyncIterator[str]:
         sid = session_id or "default"
         runtime = self._ensure_runtime(sid, system)
-        if isinstance(runtime, BaseModel):
-            async for delta in runtime.stream(
-                messages,
-                system=system,
-                tools=tools,
-                on_status=on_status,
-                session_id=sid,
-                model_override=model_override,
-                files=files, images=images, audio=audio, videos=videos,
-            ):
-                yield delta
-            return
-
-        # Runtime Team streaming. Clear the previous turn's delegation memo
-        # so a non-delegating turn falls back to the leader's badge
-        # instead of staying pinned to the last specialist.
-        self._last_delegation_by_session.pop(sid, None)
-        # Stable sessions-row owner for every surface (see catalog.py);
-        # tenancy is carried by ``session_id``, not this column, so the
-        # runtime can always read/write the row regardless of which
-        # handle (if any) the gateway bound to the session.
-        user_id = RUNTIME_SESSION_USER_ID
+        # Collect the streamed run's tokens. Whatever ends the stream —
+        # completion, an error, a barge-in cancel — what was already spent
+        # gets billed: an abandoned turn still cost its input tokens.
+        sink, sink_token = stream_usage.open_sink()
         try:
-            async for delta in _arun_runtime_stream(
-                runtime,
-                prompt=_last_user_prompt(messages),
-                session_id=sid,
-                user_id=user_id,
-                on_status=on_status,
-                error_event="team_router.stream_error",
-                on_delegate=lambda mid: self._record_delegation(sid, mid),
-                on_run_id=lambda rid: self._track_run_id(sid, rid),
-                files=files, images=images, audio=audio, videos=videos,
-            ):
-                yield delta
+            if isinstance(runtime, BaseModel):
+                async for delta in runtime.stream(
+                    messages,
+                    system=system,
+                    tools=tools,
+                    on_status=on_status,
+                    session_id=sid,
+                    model_override=model_override,
+                    files=files, images=images, audio=audio, videos=videos,
+                ):
+                    yield delta
+                return
+
+            # Runtime Team streaming. Clear the previous turn's delegation memo
+            # so a non-delegating turn falls back to the leader's badge
+            # instead of staying pinned to the last specialist.
+            self._last_delegation_by_session.pop(sid, None)
+            # Stable sessions-row owner for every surface (see catalog.py);
+            # tenancy is carried by ``session_id``, not this column, so the
+            # runtime can always read/write the row regardless of which
+            # handle (if any) the gateway bound to the session.
+            user_id = RUNTIME_SESSION_USER_ID
+            try:
+                async for delta in _arun_runtime_stream(
+                    runtime,
+                    prompt=_last_user_prompt(messages),
+                    session_id=sid,
+                    user_id=user_id,
+                    on_status=on_status,
+                    error_event="team_router.stream_error",
+                    on_delegate=lambda mid: self._record_delegation(sid, mid),
+                    on_run_id=lambda rid: self._track_run_id(sid, rid),
+                    files=files, images=images, audio=audio, videos=videos,
+                ):
+                    yield delta
+            finally:
+                self._clear_run_id(sid)
         finally:
-            self._clear_run_id(sid)
+            stream_usage.close_sink(sink_token)
+            await self.record_cost(
+                input_tokens=sink.get("input_tokens", 0),
+                output_tokens=sink.get("output_tokens", 0),
+                session_id=session_id,
+            )
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -1153,6 +1232,9 @@ class ModelDispatcher(BaseModel):
         self._budget = BudgetTracker(db, 0.0)
         for provider in self._team_providers.values():
             wire_model_runtime(provider, db=db)
+            # A provider built before the db arrived would otherwise bill into
+            # the void for the rest of the process's life.
+            provider._budget = self._budget
 
     def set_mcp_pool(self, pool: Any) -> None:
         self._mcp_pool = pool
@@ -1321,6 +1403,11 @@ class ModelDispatcher(BaseModel):
             provider = TeamRouterProvider(
                 entry_runtime_id=entry_runtime_id,
                 providers_config=self._providers_config,
+                # The provider bills, not the dispatcher: a model-pinned run
+                # (Events delivery, scheduled task, workflow override) gets this
+                # object straight from build_override_model and never touches
+                # the dispatcher at all.
+                budget=self._budget,
             )
             wire_model_runtime(
                 provider,
@@ -1435,61 +1522,13 @@ class ModelDispatcher(BaseModel):
             files=files, images=images, audio=audio, videos=videos,
         )
 
-        # Cost telemetry: api-based runs go through the BudgetTracker.
-        await self._record_cost(
-            runtime_id=runtime_id,
-            input_tokens=resp.input_tokens,
-            output_tokens=resp.output_tokens,
-            session_id=session_id,
-        )
+        # Cost telemetry is recorded by the provider (TeamRouterProvider
+        # .record_cost) — it is the one object EVERY path reaches, including
+        # the model-pinned runs that bypass this dispatcher entirely.
 
         if not resp.model:
             resp.model = runtime_id
         return resp
-
-    async def _record_cost(
-        self,
-        *,
-        runtime_id: str,
-        input_tokens: int,
-        output_tokens: int,
-        session_id: str | None,
-    ) -> None:
-        """Write one call into ``usage_log`` — the canonical cost ledger.
-
-        Shared by ``generate`` and ``stream``. It used to live inline in
-        ``generate`` only, which is why the entire streaming path (chat, the
-        bridges, scheduled tasks, webhook events) never produced a single
-        usage row.
-        """
-        if not self._budget:
-            return
-        if not input_tokens and not output_tokens:
-            return
-        cost = BudgetTracker.compute_cost(runtime_id, input_tokens, output_tokens)
-        try:
-            await self._budget.record(
-                model=runtime_id,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                cost=cost,
-                session_id=session_id,
-            )
-            elog(
-                "router.cost_recorded",
-                session_id=session_id,
-                model=runtime_id,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                cost_usd=cost,
-            )
-        except Exception as e:  # noqa: BLE001
-            elog(
-                "router.cost_record_error",
-                session_id=session_id,
-                model=runtime_id,
-                error=str(e),
-            )
 
     async def run_delegated(
         self,
@@ -1553,27 +1592,15 @@ class ModelDispatcher(BaseModel):
             model=runtime_id,
         )
 
+        # The provider opens its own usage sink and bills the turn — see
+        # TeamRouterProvider.stream / .record_cost.
         provider = self._get_team_provider(runtime_id)
-        # Collect the streamed run's tokens and record them like generate()
-        # does. Whatever happens to the stream — completion, an error, a
-        # barge-in cancel — whatever was already spent gets billed: an
-        # abandoned turn still cost the provider's input tokens.
-        sink, token = stream_usage.open_sink()
-        try:
-            async for chunk in provider.stream(
-                messages, system=system, tools=tools,
-                on_status=on_status, session_id=session_id,
-                files=files, images=images, audio=audio, videos=videos,
-            ):
-                yield chunk
-        finally:
-            stream_usage.close_sink(token)
-            await self._record_cost(
-                runtime_id=runtime_id,
-                input_tokens=sink.get("input_tokens", 0),
-                output_tokens=sink.get("output_tokens", 0),
-                session_id=session_id,
-            )
+        async for chunk in provider.stream(
+            messages, system=system, tools=tools,
+            on_status=on_status, session_id=session_id,
+            files=files, images=images, audio=audio, videos=videos,
+        ):
+            yield chunk
 
 
 # Transitional alias so existing imports keep working until the
