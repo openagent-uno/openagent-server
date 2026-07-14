@@ -332,21 +332,30 @@ async def _dispatch_prompt(*, agent, db, event, payload, delivery_id, source, on
     except Exception as e:  # noqa: BLE001
         logger.debug("event delivery session link failed for %s: %s", delivery_id, e)
 
+    # A ``dry_run: true`` payload makes the whole turn a dry-run: every MCP tool
+    # call it makes is stamped with dry-run meta so the server captures/rejects
+    # writes instead of executing them (see src.core.dry_run). Scoped to this
+    # turn only.
+    from src.core.dry_run import dry_run_scope
+
+    is_dry = bool((payload or {}).get("dry_run"))
+
     async def _run_bound_turn():
-        return await run_child_session(
-            agent=agent,
-            db=db,
-            parent_session_id=f"event:{event['id']}",
-            origin="event",
-            origin_ref=origin_ref,
-            title=event.get("name", "Event"),
-            prompt=prompt,
-            owner_client_id=owner,
-            model_id=event.get("model") or None,
-            author=agent_author(event.get("name", "Event"), agent_name=getattr(agent, "name", None)),
-            stream=True,
-            session_id=session_id,
-        )
+        with dry_run_scope(is_dry):
+            return await run_child_session(
+                agent=agent,
+                db=db,
+                parent_session_id=f"event:{event['id']}",
+                origin="event",
+                origin_ref=origin_ref,
+                title=event.get("name", "Event"),
+                prompt=prompt,
+                owner_client_id=owner,
+                model_id=event.get("model") or None,
+                author=agent_author(event.get("name", "Event"), agent_name=getattr(agent, "name", None)),
+                stream=True,
+                session_id=session_id,
+            )
 
     if bound:
         async with _bound_session_lock(session_id):

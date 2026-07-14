@@ -76,8 +76,15 @@ def get_entrypoint_for_tool(
             except Exception as e:
                 log_exception(e)
 
+            # Stamp dry-run meta when the current run is a dry-run so the MCP
+            # server captures/rejects writes instead of executing them. None on
+            # a live run (identical to not passing meta at all).
+            from src.core.dry_run import call_meta
+
             log_debug(f"Calling MCP Tool '{tool_name}' with args: {kwargs}")
-            result: CallToolResult = await active_session.call_tool(tool_name, kwargs)  # type: ignore
+            result: CallToolResult = await active_session.call_tool(
+                tool_name, kwargs, meta=call_meta()
+            )  # type: ignore
 
             # Return an error if the tool call failed
             if result.isError:

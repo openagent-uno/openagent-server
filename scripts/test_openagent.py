@@ -183,6 +183,8 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_marketplace",
     # Catalog tool-key inlining (pure renderer — no pool/network needed).
     "test_catalog_inline",
+    # Dry-run meta propagation (ContextVar scope + MCP call-site stamping).
+    "test_dry_run",
     # 2. MCP pool — sets ctx.extras["pool"] for everything below
     "test_pool",
     # MCPPool.from_db + reload — runs right after test_pool so it inherits
