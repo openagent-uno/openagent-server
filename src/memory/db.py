@@ -217,15 +217,19 @@ CREATE INDEX IF NOT EXISTS idx_providers_name ON providers(name);
 -- deleting a provider cascades to wipe its models (ON DELETE CASCADE).
 --
 -- ``model`` is the bare vendor id (e.g. ``gpt-4o-mini``, ``claude-opus-4-7``).
--- The canonical ``runtime_id`` used in logs / session pins / classifier
--- responses is DERIVED at read time from the provider row's (name,
+-- The canonical ``runtime_id`` used in logs / session pins / entry-model
+-- resolution is DERIVED at read time from the provider row's (name,
 -- framework) pair — no longer stored here.
 --
--- ``tier_hint`` absorbs the old ``notes`` column: free-form classifier
--- guidance (``"vision, 200k context, best for code"``, ``"cheap and fast"``).
+-- ``tier_hint`` absorbs the old ``notes`` column: the model's free-form
+-- scope (``"vision, 200k context, best for code"``, ``"cheap and fast"``).
+-- It is live text, not a note to operators — ``_build_role_blurb`` turns
+-- it into the ``role`` the team leader reads when picking who to
+-- delegate to.
 --
 -- ``kind`` partitions the row by capability:
---   ``llm`` — text generation (the SmartRouter / classifier picks one).
+--   ``llm`` — text generation (the dispatcher resolves one as the turn's
+--     entry model; the rest join its team as members).
 --   ``tts`` — speech synthesis. ``metadata.voice_id`` carries the voice.
 --   ``stt`` — speech-to-text.
 -- LLM rows route via the provider's framework (``api-based`` builds
@@ -265,7 +269,7 @@ CREATE TABLE IF NOT EXISTS config_state (
 );
 
 -- Per-session model pin. Optional explicit user/agent choice of a
--- specific runtime_id for a session; SmartRouter honours this pin
+-- specific runtime_id for a session; the dispatcher honours this pin
 -- before falling back to first-enabled. ``runtime_id`` is a human-
 -- readable label (e.g. ``anthropic:claude-opus-4-7``)
 -- derived from the provider + model rows at pin time; it's not a FK
@@ -481,11 +485,29 @@ CREATE TABLE IF NOT EXISTS network_invitations (
 );
 CREATE INDEX IF NOT EXISTS idx_invitations_expires ON network_invitations(expires_at);
 
--- ── Learning tables ────────────────────────────────────────────────
--- ``user_profiles`` accumulates a JSON summary of who the user is per
--- session (preferences, ongoing projects, communication style). Flushed
--- every N turns by ``src.learning.user_profile`` and injected back as
--- system context at session resume so the bot doesn't restart cold.
+-- ── Learning tables (DORMANT — no writer, empty everywhere) ────────
+-- Both tables below are empty on every deployment and always have been.
+-- Their only writers were ``src.learning.user_profile`` / ``.skills``,
+-- whose flush + detector hooks had zero callers; both modules were
+-- deleted in v0.15.11 for being a second, opaque memory system
+-- competing with the vault (§5 wants long-term memory as readable
+-- Markdown, not SQLite blobs) — ``src/learning/__init__.py`` carries the
+-- full argument. Do not re-point these at a new writer; that data is a
+-- vault note.
+--
+-- They are KEPT rather than dropped because dropping is all cost and no
+-- gain: it buys a 15th ``_migrate_*`` to delete tables that never held a
+-- row, and edits to the readers that still name them
+-- (``bridges/telegram.py``'s ``/export``, ``purge_session``'s
+-- ``_SESSION_SATELLITE_TABLES``). Both readers are already try/except'd
+-- and degrade to empty payloads, and ``CREATE TABLE IF NOT EXISTS``
+-- costs one no-op per boot. Retiring them wants one owner for the schema
+-- AND those readers, in one pass.
+--
+-- ``user_profiles`` was *meant* to accumulate a JSON summary of who the
+-- user is per session (preferences, ongoing projects, communication
+-- style), flushed every N turns and injected back as system context at
+-- resume so the bot didn't restart cold. It never was: nothing writes it.
 -- Hermes equivalent: ``memory.user_profile_enabled``.
 CREATE TABLE IF NOT EXISTS user_profiles (
     session_id      TEXT PRIMARY KEY,
@@ -497,11 +519,14 @@ CREATE TABLE IF NOT EXISTS user_profiles (
 );
 CREATE INDEX IF NOT EXISTS idx_user_profiles_updated ON user_profiles(updated_at);
 
--- ``skills`` stores reusable how-tos the AI distils from recurring
--- request patterns. ``signature_hash`` is a stable hash of the
--- normalised trigger so the pattern detector can dedup. ``markdown``
--- holds the actual playbook text the matcher injects at turn start
--- when relevance hits a threshold. Hermes equivalent: skills + curator.
+-- ``skills`` was *meant* to store reusable how-tos distilled from
+-- recurring request patterns: ``signature_hash`` a stable hash of the
+-- normalised trigger so the detector could dedup, ``markdown`` the
+-- playbook text a matcher would inject at turn start once relevance hit
+-- a threshold. Neither exists any more — the detector that would have
+-- written this and the matcher that would have read it are both deleted,
+-- so the columns below describe an intent, not a behaviour.
+-- Hermes equivalent: skills + curator.
 CREATE TABLE IF NOT EXISTS skills (
     id              TEXT PRIMARY KEY,
     name            TEXT NOT NULL,
@@ -3399,7 +3424,7 @@ class MemoryDB:
     ) -> list[dict]:
         """Build the NativeProvider-consumable providers_config from the DB.
 
-        Produces the flat list shape SmartRouter / NativeProvider consume:
+        Produces the flat list shape ModelDispatcher / NativeProvider consume:
         one entry per (name, framework) pair, each carrying its nested
         ``models`` list. Used by :meth:`Agent._hydrate_providers_from_db`
         (``enabled_only=True``) and by the smoke-test endpoints that
@@ -3596,14 +3621,18 @@ class MemoryDB:
         await conn.commit()
 
     async def set_model_is_classifier(self, model_id: int, flag: bool) -> None:
-        """Toggle the classifier flag on ``model_id``.
+        """Toggle the ``is_classifier`` flag on ``model_id``.
+
+        Despite the column name this arms no classifier: it is the
+        user's persistent "default team leader" hint, read as step 2 of
+        ``ModelDispatcher._resolve_entry_model`` (session pin → flagged
+        row → first enabled). See ``models.catalog.CatalogModel``.
 
         Multiple rows are allowed to carry the flag simultaneously —
         this is a narrow UPDATE that only touches ``model_id``. The
-        SmartRouter resolver picks the first flagged row it sees
-        (deterministic catalog order), so having several flagged rows
-        is effectively a pool of "eligible classifiers" where the
-        first one wins each turn.
+        resolver takes the first flagged row it sees in deterministic
+        catalog order, so with several flagged rows the first simply
+        wins and the others are inert.
         """
         conn = await self._ensure_connected()
         await conn.execute(
@@ -3659,10 +3688,13 @@ class MemoryDB:
     async def get_session_pin(self, session_id: str) -> str | None:
         """Return the pinned ``runtime_id`` for ``session_id``, or ``None``.
 
-        When non-null, SmartRouter dispatches this session straight to
-        ``runtime_id`` without falling back to the catalog's
-        first-enabled. Pinned sessions ignore budget degradation too —
-        an explicit user choice wins.
+        When non-null, the dispatcher makes ``runtime_id`` the session's
+        entry model directly, skipping the ``is_classifier`` default-leader
+        flag and the first-enabled fallback. Pinned sessions ignore budget
+        degradation too — an explicit user choice wins. The one exception
+        is a pin to a model that is no longer enabled:
+        ``_resolve_entry_model`` auto-heals it (drops the pin, logs
+        ``router.pin_auto_heal``) rather than failing the turn.
         """
         conn = await self._ensure_connected()
         cursor = await conn.execute(
@@ -3701,8 +3733,9 @@ class MemoryDB:
     async def unpin_session_model(self, session_id: str) -> None:
         """Drop the per-session model pin.
 
-        SmartRouter resumes using the catalog's first-enabled model on
-        the next turn.
+        On the next turn the session resumes normal entry-model
+        resolution: the ``is_classifier``-flagged default leader if one
+        is set, else the catalog's first-enabled model.
         """
         conn = await self._ensure_connected()
         await conn.execute(

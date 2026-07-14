@@ -147,9 +147,18 @@ async def _run_hook(event_name: str, command: str, payload: dict[str, Any]) -> N
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()
+            # ``hook_event``, not ``event``: ``elog(event, level, ...)`` takes
+            # the event name as its first positional, so ``event=`` here binds
+            # it twice -> ``TypeError: got multiple values for argument
+            # 'event'``. All three calls in this function had that bug, which
+            # meant hooks ran but never logged — and the failure was invisible
+            # *because* the logging call was the thing raising. Worse, the
+            # ``except`` below repeated the mistake, so the TypeError from the
+            # success-path ``hooks.fired`` re-raised inside the handler and
+            # escaped as an unretrieved task exception.
             elog(
                 "hooks.timeout",
-                event=event_name,
+                hook_event=event_name,
                 command=command[:120],
                 timeout_s=_HOOK_TIMEOUT_S,
             )
@@ -158,14 +167,14 @@ async def _run_hook(event_name: str, command: str, payload: dict[str, Any]) -> N
         out = (stdout or b"").decode("utf-8", errors="replace")[:_HOOK_OUTPUT_BYTES]
         elog(
             "hooks.fired",
-            event=event_name,
+            hook_event=event_name,
             command=command[:120],
             exit_code=proc.returncode,
             elapsed_s=elapsed,
             output=out,
         )
     except Exception as e:  # noqa: BLE001
-        elog("hooks.error", event=event_name, error=str(e)[:200])
+        elog("hooks.error", hook_event=event_name, error=str(e)[:200])
 
 
 def fire(event_name: str, **payload: Any) -> None:
@@ -182,7 +191,7 @@ def fire(event_name: str, **payload: Any) -> None:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         # Called from a non-async context — log and skip.
-        elog("hooks.skipped", event=event_name, reason="no_event_loop")
+        elog("hooks.skipped", hook_event=event_name, reason="no_event_loop")
         return
     loop.create_task(_run_hook(event_name, cmd, payload))
 

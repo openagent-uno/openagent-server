@@ -150,7 +150,7 @@ async def delegate_task(task: str, model_id: str | None = None) -> dict[str, Any
     # the parent (vision §15 — the old ``run_delegated`` path passed
     # ``system=None`` and persisted nothing), linked back to the parent and
     # surfaced as a clickable card in the leader's transcript.
-    from src.core.child_session import run_child_session
+    from src.core.child_session import DelegationDepthExceeded, run_child_session
 
     try:
         result = await run_child_session(
@@ -164,6 +164,19 @@ async def delegate_task(task: str, model_id: str | None = None) -> dict[str, Any
             owner_client_id=owner_handle,
             model_id=model_id,
         )
+    except DelegationDepthExceeded as e:
+        # Structural limit, not a fault: hand the model a plain explanation it
+        # can act on (do the work here) instead of an exception string that
+        # reads like a crash and invites a retry. The retry is the thing we are
+        # trying to stop — a runaway chain that re-delegates on every failure is
+        # exactly the shape that used to saturate the pool. ``run_child_session``
+        # already elog'd the lineage, so this stays quiet.
+        return {
+            "status": "error",
+            "model_id": model_id,
+            "error": str(e),
+            "depth_limit_reached": True,
+        }
     except Exception as e:  # noqa: BLE001
         elog(
             "subagent.error",

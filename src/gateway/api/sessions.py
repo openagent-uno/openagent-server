@@ -4,10 +4,11 @@
 ``GET /api/sessions/{session_id}/model`` — current pin, side binding,
     and resolved runtime_id.
 ``PUT /api/sessions/{session_id}/model`` body ``{"runtime_id": "..."}`` —
-    pin the session to a specific model. Subsequent turns on that session
-    skip SmartRouter's classifier and dispatch straight to that model.
-``DELETE /api/sessions/{session_id}/model`` — unpin. Session returns
-    to normal SmartRouter routing.
+    pin the session to a specific model. Subsequent turns make that model
+    the entry model directly, skipping the dispatcher's default-leader
+    flag and first-enabled fallback.
+``DELETE /api/sessions/{session_id}/model`` — unpin. Session returns to
+    normal entry-model resolution (default-leader flag → first enabled).
 ``DELETE /api/sessions/{session_id}`` — delete a session and its history.
 ``GET /api/sessions/{session_id}/runs`` — turn history for a session.
 """

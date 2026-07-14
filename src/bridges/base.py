@@ -426,10 +426,16 @@ class BaseBridge:
             self._learning_conn = None
 
     async def _get_learning_db_shim(self):
-        """Return a duck-typed DB shim for the learning helpers, opening
+        """Return a duck-typed DB shim over the agent's SQLite file, opening
         the aiosqlite connection on first use and reusing it thereafter.
-        Returns ``None`` when the connection can't be opened — callers
-        treat that as "skill matcher unavailable, fall through cleanly".
+        Returns ``None`` when the connection can't be opened — callers treat
+        that as "unavailable, fall through cleanly".
+
+        Sole remaining caller is Telegram's ``/export``. It was originally
+        opened for the bridge-side skill matcher, which is gone (see the note
+        in ``_send_and_reply``); the export's own reads of ``user_profiles`` /
+        ``skills`` now hit tables with no writer and return empty payloads —
+        as they have since those tables were introduced.
         """
         if self._learning_conn is not None:
             return _DBShim(self._learning_conn)
@@ -1057,40 +1063,22 @@ class BaseBridge:
                 f"[Persona for this reply: {self._personality_directive}]\n\n"
                 f"{outbound_text}"
             )
-        # Auto-skills matcher — pulls the top relevant how-tos for the
-        # current user text and prepends them. Bridge-side so the LLM
-        # roundtrip costs nothing extra; the matcher is a cheap
-        # heuristic (no Groq call on the hot path). No-op when the
-        # feature is off or no skill scores high enough. The connection
-        # is cached at the bridge instance (see ``_get_learning_db_shim``)
-        # so we don't pay the SQLite open/close per turn.
-        if os.environ.get("OPENAGENT_SKILLS_ENABLED", "0").strip().lower() in (
-            "1", "true", "yes", "on",
-        ):
-            try:
-                from src.learning.skills import render_skills_for_system_prompt as _sk_render
-                shim = await self._get_learning_db_shim()
-                if shim is not None:
-                    skill_block = await _sk_render(shim, text)
-                    if skill_block:
-                        outbound_text = f"{skill_block}\n\n{outbound_text}"
-            except Exception:
-                # Never let learning shrapnel block a user turn.
-                pass
-
-        if os.environ.get("OPENAGENT_VAULT_REMINDER_ENABLED", "0").strip().lower() in (
-            "1", "true", "yes", "on",
-        ):
-            try:
-                from src.learning.vault_reminder import maybe_render_reminder as _vr_render
-                _vr_shim = await self._get_learning_db_shim()
-                if _vr_shim is not None:
-                    _reminder = await _vr_render(_vr_shim, session_id)
-                    if _reminder:
-                        outbound_text = f"{_reminder}\n\n{outbound_text}"
-            except Exception:
-                # Never let reminder logic block a user turn.
-                pass
+        # NOTE: the vault-save reminder and the auto-skills matcher used to be
+        # injected here, bridge-side. Both are gone from this path:
+        #
+        #  • The reminder now hooks ``core/agent.py``'s ``_run_inner`` /
+        #    ``_run_inner_stream``, which EVERY origin funnels through — chat,
+        #    scheduler, delegation, workflow, events. Injecting it here meant
+        #    only bridge-mediated conversations could ever get it, so a
+        #    desktop/gateway-only install got no nudge at all. Vision §15: "no
+        #    reduced or alternate baseline for non-interactive execution
+        #    paths". This path's copy also re-implemented the enabled check
+        #    with the wrong default, which is what kept the feature off
+        #    everywhere; see ``learning/vault_reminder.py``.
+        #  • The skills matcher is deleted outright — it read a table nothing
+        #    could write (its Groq-hardcoded detector had zero callers), and a
+        #    markdown how-to belongs in the vault, not an opaque parallel
+        #    store. See ``learning/__init__.py``.
 
         try:
             response = await self.send_message(

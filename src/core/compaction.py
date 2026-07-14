@@ -100,6 +100,30 @@ _FALLBACK_MAX_CONTEXT = 200_000
 # tokens of history is a lot of conversation; what it is not is 786k.
 _MAX_HISTORY_TOKENS = 150_000
 
+# Runtime id (``<provider>:<model>``) of a cheap model to summarise with,
+# instead of whatever model the user is talking to. Unset = use the primary.
+#
+# Why an env var, and NOT the ``is_classifier`` DB flag this module's docstring
+# used to promise: ``is_classifier`` does not mean "cheap". It is read by
+# ``dispatcher._resolve_entry_model`` as the user's persistent "default team
+# leader" hint — the model ENTRY turns route to (per-session pin →
+# is_classifier → first enabled). On a typical setup that is the user's *best*
+# model, not their cheapest, so wiring compaction to it would summarise on the
+# premium model exactly when the point was to stop doing that. It would also
+# couple two unrelated subsystems: flipping the flag to move the team leader
+# would silently move the summariser too.
+#
+# ``tier_hint`` is the other candidate and is also the wrong thing to switch
+# on. It is free-form prose ("fast and cheap general-purpose chat"), and
+# vision §3 is explicit: "Scopes over hardcoded routing. A model's role is a
+# sentence the router reads, not a switch statement in code." Grepping
+# /cheap|mini|fast/ over that sentence is the switch statement it forbids, and
+# it would mis-fire on the first user who writes "not for cheap work".
+#
+# So: explicit config, in the same env-driven shape as every other tunable
+# above. The operator names the model; we never guess one.
+_SUMMARY_MODEL_ENV = "OPENAGENT_COMPACTION_MODEL"
+
 
 def _cost_ceiling() -> int:
     raw = os.environ.get("OPENAGENT_COMPACTION_MAX_HISTORY_TOKENS", "").strip()
@@ -217,7 +241,7 @@ def _resolve_model_id(model: Any) -> str | None:
 
     Providers expose this under a handful of attributes — ``self.model``
     (NativeProvider), ``effective_model_id(session_id)``
-    (SmartRouter), ``id`` (runtime Model wrapper). We try them in order and
+    (ModelDispatcher), ``id`` (runtime Model wrapper). We try them in order and
     accept the first stringy result. Returns ``None`` when nothing
     sticks; callers use that to fall back to the generic ``gpt-4o``
     tokenizer.
@@ -508,21 +532,74 @@ async def _summarize_runs(
 
 
 def _pick_summary_model(agent: Any, *, fallback: Any) -> Any:
-    """Return the cheapest classifier-flagged model, else *fallback*.
+    """Return the configured cheap summariser model, else *fallback*.
 
-    Looks for a ``is_classifier=True`` row in the agent's hydrated
-    providers config. When one exists we'd ideally instantiate it as a
-    standalone ``NativeProvider``; for now the simpler shape is to use
-    the agent's primary model directly — it already has working
-    credentials, MCP wiring, and a session pool. The hook stays here so
-    the cheap-model branch can be wired up without disturbing callers
-    when the dispatcher gains a public classifier accessor.
+    Compaction is the one place OpenAgent knowingly ships up to
+    ``_cost_ceiling()`` (150k) tokens of transcript into a model to get a few
+    hundred tokens of prose back. Doing that on the primary means paying the
+    user's premium reasoning model — the one they picked for the actual
+    conversation — to do a summarisation job a cheap model does fine. Worse,
+    it scales with exactly the sessions we already flagged as expensive: the
+    long ones.
+
+    Set ``OPENAGENT_COMPACTION_MODEL=<provider>:<model>`` (e.g.
+    ``anthropic:claude-haiku-4-5``) to point that work at a cheap row. See
+    ``_SUMMARY_MODEL_ENV`` above for why this is explicit config rather than
+    an inference over ``is_classifier`` or ``tier_hint``.
+
+    Resolution is strict but never fatal: the id must match an enabled,
+    api-based row in the agent's hydrated providers config, and anything
+    unresolvable logs and falls back to *fallback*. A compaction that
+    summarises expensively is a cost bug; a compaction that raises is a broken
+    chat — and this function is called on the turn's critical path.
+
+    The summariser is deliberately built WITHOUT MCP toolkits: it takes one
+    prompt and returns prose, so tool schemas would be pure token overhead on
+    the very call we are trying to make cheap.
     """
-    # Future: probe agent._providers_config for an enabled classifier
-    # row and build a transient NativeProvider against it. Today we
-    # delegate to the same model the user is talking to — cheaper than
-    # any cross-provider roundtrip and zero extra config to maintain.
-    return fallback
+    configured = os.environ.get(_SUMMARY_MODEL_ENV, "").strip()
+    if not configured:
+        return fallback
+    try:
+        from src.models.catalog import FRAMEWORK_API_BASED, iter_configured_models
+        from src.models.native_provider import NativeProvider
+
+        providers_config = getattr(agent, "_providers_config", None) or []
+        match = next(
+            (
+                entry
+                for entry in iter_configured_models(providers_config)
+                if entry.runtime_id == configured
+                and not entry.disabled
+                and entry.framework == FRAMEWORK_API_BASED
+            ),
+            None,
+        )
+        if match is None:
+            elog(
+                "runtime.compaction.summary_model_unresolved",
+                level="warning",
+                configured=configured,
+                reason="no_enabled_api_based_row",
+            )
+            return fallback
+        db_path = getattr(getattr(agent, "_db", None), "db_path", None)
+        summariser = NativeProvider(
+            model=match.runtime_id,
+            providers_config=providers_config,
+            db_path=str(db_path) if db_path else None,
+        )
+        elog("runtime.compaction.summary_model", model=match.runtime_id)
+        return summariser
+    except Exception as exc:  # noqa: BLE001 — a cost win must never break a turn
+        elog(
+            "runtime.compaction.summary_model_failed",
+            level="warning",
+            configured=configured,
+            error_type=type(exc).__name__,
+            error=str(exc) or repr(exc),
+        )
+        return fallback
 
 
 async def _emit_compaction_status(

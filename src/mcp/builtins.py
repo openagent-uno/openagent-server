@@ -230,6 +230,23 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
             "screenshots, images, pasted text, uploads from the chat UI"
         ),
     },
+    # In-process on purpose: the log path comes from ``paths.log_dir()``,
+    # which resolves against the live agent dir set by ``set_agent_dir``. A
+    # subprocess would re-resolve it from platform defaults and read a
+    # DIFFERENT agent's log — the bug that forced OPENAGENT_DB_PATH injection
+    # for the scheduler / model-manager subprocess MCPs (resolve_default_entry).
+    "logs": {
+        "in_process": True,
+        "adapter_module": "src.mcp.servers.logs.adapters",
+        "runtime_toolkit_factory": "build_runtime_toolkit",
+        "description": (
+            "query your own unified event log — search past events by "
+            "name, time window, session, or error; summarise what went "
+            "wrong and what it cost; read the events surrounding a "
+            "failure. Reach for it to diagnose your own behaviour "
+            "instead of tailing events.jsonl through the shell"
+        ),
+    },
     "web-search": {
         "dir": "web-search",
         "command": ["node", "dist/index.js"],
@@ -343,8 +360,14 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
         "dir": "media_gen",
         "command": ["python", "-m", "src.mcp.servers.media_gen.server"],
         "python": True,
+        # Was "images, audio, or video" — but the server only ever registered
+        # generate_image (OpenAI) and generate_video (Fal); there is no audio
+        # tool. tool-search surfaces this text as the MCP's one-line pitch, so
+        # the phantom capability was an invitation for the model to burn a
+        # turn calling a tool that does not exist. Speech synthesis is not
+        # missing from OpenAgent — it lives in the TTS path, not in an MCP.
         "description": (
-            "generate images, audio, or video via configured providers"
+            "generate images or video via configured providers"
         ),
     },
     "memory-search": {
@@ -390,6 +413,14 @@ DEFAULT_MCPS: list[dict[str, Any]] = [
     {"builtin": "tool-search", "_default": True},
     {"builtin": "vault-gate", "_default": True},
     {"builtin": "attachments", "_default": True},
+    # On by default: §14 makes reading the log a first-class agent capability,
+    # and every other introspection surface (scheduler, workflow-manager,
+    # events-manager, mcp-manager, model-manager) is already here. It is
+    # ~free to ship — in-process (no subprocess, no Node, no DB), and since
+    # the v0.14 defer-all rewrite only tool-search is in the upfront tool
+    # list, so three more tools cost 0 prompt tokens until actually used.
+    # Dream mode's log-triage mission also depends on it being present.
+    {"builtin": "logs", "_default": True},
     {"builtin": "computer-control", "_default": True},
     {"builtin": "agent-in-chrome", "_default": True},
     {"builtin": "messaging", "_default": True},

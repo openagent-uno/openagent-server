@@ -161,10 +161,36 @@ def clear(older_than_days: float | None = None) -> None:
 
 
 class _JsonlFormatter(logging.Formatter):
+    """Render one event as a single JSON line: ``{ts, event, level, **data}``.
+
+    ``level`` is written from ``record.levelname`` because for a long time it
+    was not: every :func:`elog` call dutifully passed ``level=`` (144 call
+    sites), the value reached the stdlib record, and this formatter then
+    dropped it on the floor. The result was a log where severity existed
+    everywhere except the place you read it — measured at **0 of 5365 entries
+    carrying a level** on a real agent. Anything asking "what went wrong?"
+    (the logs MCP, dream mode, a human with ``jq``) had to *infer* severity
+    from an ``error`` field or an error-ish event name, which over-reports
+    recovered failures and cannot see a level-only warning at all.
+
+    Key order is ``{when, what, how-bad, details}``. ``level`` sits before
+    ``**event_data`` purely for readability — a ``level`` key in
+    ``event_data`` is unreachable, so no order can shadow it: ``elog``
+    declares ``level`` as a named parameter, so ``elog("x", level="error")``
+    binds the parameter and ``**data`` gets ``{}``. Pinned by
+    ``test_logs_mcp``'s schema tripwire.
+
+    NOTE (latent, not fixed here — no call site does it today): ``ts`` has no
+    such protection. It is NOT a named parameter of ``elog``, so
+    ``elog("x", ts=123)`` lands in ``**data`` and silently overwrites the real
+    ``record.created`` timestamp, because ``**event_data`` is splatted last.
+    """
+
     def format(self, record: logging.LogRecord) -> str:
         entry: dict[str, Any] = {
             "ts": record.created,
             "event": record.getMessage(),
+            "level": record.levelname.lower(),
             **getattr(record, "event_data", {}),
         }
         if record.exc_info:

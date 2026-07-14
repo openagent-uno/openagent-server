@@ -77,9 +77,9 @@ and log the uncertainty.
 
 ## Mission 1 — Evaluate and correct the memory vault
 
-Curate the memory vault via the mcpvault MCP — do NOT cat/grep the
+Curate the memory vault via the `vault` MCP — do NOT cat/grep the
 .md files directly.
-   - Use `list_notes` and `search_notes` to survey the vault.
+   - Use `list_directory` and `search_notes` to survey the vault.
    - Identify notes that cover the same topic and **merge duplicates**
      into a single canonical note with `write_note` or `patch_note`,
      then `delete_note` the redundant ones.
@@ -102,13 +102,24 @@ Curate the memory vault via the mcpvault MCP — do NOT cat/grep the
 ## Mission 2 — Analyze the last day of logs and fix what is broken
 
 Read OpenAgent's own event log for roughly the last 24 hours and find
-issues to fix. The log is a JSON-lines file `events.jsonl` in
-OpenAgent's logs directory (macOS:
-`~/Library/Application Support/OpenAgent/logs/`; Linux:
-`$XDG_DATA_HOME/OpenAgent/logs/` or `~/.local/share/OpenAgent/logs/`).
-If unsure of the path, locate it with
-`find ~ -name events.jsonl 2>/dev/null`, then read the recent tail
-(e.g. `tail -n 2000 <path>`).
+issues to fix. Use the `logs` MCP — never `find`/`tail` over
+`events.jsonl` by hand. It resolves the log path itself, so there is no
+OS-specific path to guess, and it summarises the *whole* window instead
+of whatever fits in a tail:
+
+   - `logs_summary(since="24h")` — start here. One call: totals, the
+     top failing events, and sample lines.
+   - `logs_query(event=..., errors_only=true, since="24h")` — drill
+     into one failing event.
+   - `logs_context(ts=...)` — read the lines around a failure. The
+     error says *what* broke; the lines before it say *why*.
+
+Note `error_like` mixes two schemas. Entries written since the severity
+fix carry a real level and are authoritative; older entries predate it,
+so their severity is guessed from the event name and can over-report
+failures that actually recovered. `logs_summary` reports the split and
+says which case this log is in — when a verdict is a guess, confirm it
+from the event's own payload before acting on it.
 
 Look for problems and act on them:
    - **Broken scheduled tasks**: tasks that errored or produced empty
@@ -131,8 +142,8 @@ and `date:` set to today. Record, per mission: what you
 merged/updated/cross-linked/removed in the vault, which log issues you
 found, what you fixed, and what still needs the user's decision.
 
-Use mcpvault tools for all vault access — never shell out for anything
-under the memory vault.
+Use the `vault` MCP's tools for all vault access — never shell out for
+anything under the memory vault.
 """
 
 
@@ -205,26 +216,23 @@ def _build_agent(config: dict) -> Agent:
             pass
 
     memory_cfg = config.get("memory", {})
-    # Learning toggles — mapped to env vars so the post-turn hooks in
-    # ``src.learning`` can read them without plumbing the agent config
-    # through every callsite. Default off across the board.
-    _up_cfg = (memory_cfg.get("user_profile") or {})
-    if "enabled" in _up_cfg:
-        os.environ["OPENAGENT_USER_PROFILE_ENABLED"] = (
-            "1" if bool(_up_cfg["enabled"]) else "0"
-        )
-    if "flush_every_n_turns" in _up_cfg:
-        try:
-            os.environ["OPENAGENT_USER_PROFILE_FLUSH_EVERY"] = str(
-                int(_up_cfg["flush_every_n_turns"])
-            )
-        except (TypeError, ValueError):
-            pass
-    _sk_cfg = (memory_cfg.get("skills") or {})
-    if "enabled" in _sk_cfg:
-        os.environ["OPENAGENT_SKILLS_ENABLED"] = (
-            "1" if bool(_sk_cfg["enabled"]) else "0"
-        )
+    # Learning toggles — mapped to env vars so the loops in ``src.learning``
+    # can read them without plumbing the agent config through every callsite.
+    #
+    # ``memory.user_profile`` / ``memory.skills`` are no longer read: both
+    # subsystems were deleted in v0.15.11 (opaque parallel memory stores
+    # competing with the vault, with Groq-hardcoded writers that had zero
+    # callers — see ``learning/__init__.py``). A stale block for either in an
+    # existing ``openagent.yaml`` is inert rather than an error, which is the
+    # same way every other retired key degrades here.
+    #
+    # ``memory.learning_model`` names the model the background loops use for
+    # their optional AI step (currently dream-mode's fix suggestions), as
+    # ``<provider>:<model>``. Unset → those steps no-op and keep their
+    # mechanical half. It is explicit config rather than an inference over the
+    # catalog for the reasons in ``learning/_model.py``.
+    if memory_cfg.get("learning_model"):
+        os.environ["OPENAGENT_LEARNING_MODEL"] = str(memory_cfg["learning_model"]).strip()
     _ss_cfg = (memory_cfg.get("semantic_search") or {})
     if "enabled" in _ss_cfg:
         os.environ["OPENAGENT_SEMANTIC_SEARCH"] = (
@@ -552,7 +560,7 @@ class AgentServer:
 
         self._bridge_tasks: list[asyncio.Task] = []
         self._bridges: list = []
-        # Curator task — periodic prune of stale skills + user_profiles.
+        # Curator task — periodic prune of dormant sessions + DB backups.
         # Created in ``start()`` only when the feature is enabled; ``None``
         # otherwise so ``stop()`` can short-circuit cleanly.
         self._curator_task: asyncio.Task | None = None
@@ -732,7 +740,7 @@ class AgentServer:
                 bridge.start(), name=f"bridge:{bridge.name}"
             ))
 
-        # 5. Curator — periodic prune of stale skills/user_profiles.
+        # 5. Curator — periodic prune of dormant sessions + rolling DB backups.
         # No-op when ``memory.curator.enabled`` is false.
         # ``self.agent._db`` is the live MemoryDB (the Agent exposes no
         # ``.memory`` attribute — that was a long-standing typo that left

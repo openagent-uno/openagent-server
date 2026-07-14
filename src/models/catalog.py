@@ -140,8 +140,22 @@ class CatalogModel:
     provider_id: int = 0
     # DB-level marker (mirror of ``models.is_classifier``) kept on the
     # catalog row so model_manager surfaces the flag in /api/models
-    # responses. No router currently consumes this — SmartRouter was
-    # retired in v0.14 in favour of the runtime's Team-based routing.
+    # responses.
+    #
+    # Despite the name, this is NOT a "pick a model per turn" classifier
+    # flag: the classifier-LLM router (``SmartRouter``) was retired in
+    # v0.14 (``e8f5d68``) in favour of the runtime's Team-based routing,
+    # and no per-turn classifier call survives it.
+    #
+    # It IS consumed, though — do not believe otherwise. It is the
+    # user's persistent *default team leader* hint, read by
+    # ``ModelDispatcher._resolve_entry_model`` as the second step of
+    # ``per-session pin -> is_classifier -> first enabled``. The flagged
+    # model becomes the entry model, i.e. the Team leader that routes to
+    # the other enabled models as members. Flag a cheap model here and it
+    # answers trivia itself while delegating the hard turns — which is
+    # what the retired classifier router was for, minus the extra
+    # round-trip.
     is_classifier: bool = False
 
 

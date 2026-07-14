@@ -1,25 +1,25 @@
-"""Background maintenance for the learning tables.
+"""Background housekeeping for the agent's SQLite database.
 
-Periodically prunes / archives stale entries so the bot's "memory" stays
-relevant instead of growing forever:
+Two jobs, both cheap and both on the same loop:
 
-  • ``skills``: rows whose ``last_used_at`` is older than
-    ``skill_stale_days`` AND ``usage_count`` is zero get deleted —
-    these are saves the matcher never confirmed as useful, so they were
-    likely noise from the detector. Rows older than
-    ``skill_archive_days`` (since ``last_used_at`` or ``updated_at``)
-    are deleted regardless: the matcher would never surface them
-    anyway, and keeping them inflates the matcher's candidate set.
+  • ``sessions``: rows whose ``updated_at`` is older than
+    ``session_retention_days`` get deleted. ``updated_at`` is bumped every
+    turn, so a row that hasn't moved in that long is a conversation the user
+    has clearly abandoned.
 
-  • ``user_profiles``: rows whose ``last_flushed_at`` is older than
-    ``profile_archive_days`` get deleted. The user has likely abandoned
-    that session_id; the next inbound message will recreate a fresh
-    profile on first flush.
+  • Backups: a ``VACUUM INTO`` snapshot of the whole DB every
+    ``backup_interval_hours``, retaining the newest ``backup_keep``.
+
+It used to also prune ``skills`` and ``user_profiles``. Those subsystems were
+deleted in v0.15.11 and nothing writes either table any more (nothing ever
+did — both writers had zero callers), so pruning them was deleting from
+permanently-empty tables. Dropping the tables themselves needs a migration in
+``memory/db.py``; see ``learning/__init__.py``.
 
 The curator runs as a single long-lived ``asyncio.Task`` started by
-``core/server.AgentServer``. It sleeps ``interval_hours`` between
-passes, so the steady-state CPU cost is one ``DELETE WHERE`` query per
-hour — negligible next to the rest of the server.
+``core/server.AgentServer``. It sleeps ``interval_hours`` between passes, so
+the steady-state cost is one ``DELETE WHERE`` per interval — negligible next
+to the rest of the server.
 
 Off by default. Enable via ``memory.curator.enabled: true`` in
 ``openagent.yaml``.
@@ -39,9 +39,6 @@ _DAY_SECONDS = 86400.0
 
 _DEFAULTS = {
     "interval_hours": 6,
-    "skill_stale_days": 14,
-    "skill_archive_days": 90,
-    "profile_archive_days": 90,
     "session_retention_days": 90,
     # Backup knobs — separate cadence (daily, by default) from the
     # prune interval. ``backup_keep`` is "how many snapshots to retain
@@ -73,65 +70,15 @@ async def run_once(db: Any) -> dict[str, int]:
     """
     conn = getattr(db, "_conn", None)
     if conn is None:
-        return {"skills_unused_pruned": 0, "skills_archived": 0, "profiles_archived": 0}
+        return {"sessions_pruned": 0}
     now = time.time()
-    skill_stale_cutoff = now - _DAY_SECONDS * _int_env(
-        "OPENAGENT_CURATOR_SKILL_STALE_DAYS", _DEFAULTS["skill_stale_days"]
-    )
-    skill_archive_cutoff = now - _DAY_SECONDS * _int_env(
-        "OPENAGENT_CURATOR_SKILL_ARCHIVE_DAYS", _DEFAULTS["skill_archive_days"]
-    )
-    profile_archive_cutoff = now - _DAY_SECONDS * _int_env(
-        "OPENAGENT_CURATOR_PROFILE_ARCHIVE_DAYS", _DEFAULTS["profile_archive_days"]
-    )
-
     session_retention_cutoff = now - _DAY_SECONDS * _int_env(
         "OPENAGENT_CURATOR_SESSION_RETENTION_DAYS", _DEFAULTS["session_retention_days"]
     )
 
-    counts = {
-        "skills_unused_pruned": 0,
-        "skills_archived": 0,
-        "profiles_archived": 0,
-        "sessions_pruned": 0,
-    }
+    counts = {"sessions_pruned": 0}
 
     try:
-        # Prune unused skills past the stale cutoff. ``last_used_at``
-        # being NULL falls under ``COALESCE(last_used_at, updated_at)``
-        # so newly-created saves with no usage yet are also age-checked.
-        cur = await conn.execute(
-            "DELETE FROM skills "
-            "WHERE usage_count <= 0 "
-            "  AND COALESCE(last_used_at, updated_at) < ?",
-            (skill_stale_cutoff,),
-        )
-        counts["skills_unused_pruned"] = cur.rowcount or 0
-        await cur.close()
-
-        # Archive (delete) any skill older than the archive cutoff
-        # regardless of usage — the matcher would not surface it again
-        # anyway after that horizon.
-        cur = await conn.execute(
-            "DELETE FROM skills "
-            "WHERE COALESCE(last_used_at, updated_at) < ?",
-            (skill_archive_cutoff,),
-        )
-        counts["skills_archived"] = cur.rowcount or 0
-        await cur.close()
-
-        # Prune profile rows that haven't been flushed in a long time.
-        # ``last_flushed_at`` can be NULL when the row was bumped but
-        # never reached the flush threshold — fall back to updated_at
-        # so those rows still age out cleanly.
-        cur = await conn.execute(
-            "DELETE FROM user_profiles "
-            "WHERE COALESCE(last_flushed_at, updated_at) < ?",
-            (profile_archive_cutoff,),
-        )
-        counts["profiles_archived"] = cur.rowcount or 0
-        await cur.close()
-
         # Prune dormant the runtime sessions. ``updated_at`` is bumped on every
         # turn, so a row that hasn't moved in retention_days is a
         # session the user has clearly abandoned. ``sessions``
@@ -151,13 +98,7 @@ async def run_once(db: Any) -> dict[str, int]:
         elog("curator.run_error", error=str(e)[:200])
         return counts
 
-    elog(
-        "curator.run",
-        skills_unused_pruned=counts["skills_unused_pruned"],
-        skills_archived=counts["skills_archived"],
-        profiles_archived=counts["profiles_archived"],
-        sessions_pruned=counts["sessions_pruned"],
-    )
+    elog("curator.run", sessions_pruned=counts["sessions_pruned"])
     return counts
 
 

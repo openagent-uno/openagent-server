@@ -12,8 +12,9 @@ Concretely:
 
   - ``NativeProvider`` consumes ``pool.runtime_toolkits`` — a list of runtime
     ``MCPTools`` instances that the pool owns and connects once. Multiple
-    ``NativeProvider`` tiers (under ``SmartRouter``) share the same toolkit
-    list, so we don't spawn N copies of each MCP server process.
+    ``NativeProvider`` instances (the team members under
+    ``ModelDispatcher``) share the same toolkit list, so we don't spawn N
+    copies of each MCP server process.
 
 The pool also exposes ``server_summary()`` and ``dormant_servers()`` so the
 Agent can inject runtime MCP state into the system prompt (e.g. "messaging
@@ -508,8 +509,8 @@ class MCPPool:
 
     Connect once at agent startup; close at shutdown. Both providers read
     from the same pool so we don't spawn duplicate MCP server processes
-    across SmartRouter tiers (the old ``MCPRegistry`` did the same; this
-    keeps that property).
+    across the dispatcher's team members (the old ``MCPRegistry`` did the
+    same; this keeps that property).
     """
 
     def __init__(self, specs: list[_ServerSpec]):

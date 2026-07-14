@@ -55,7 +55,7 @@ def wire_model_runtime(
         set_mcp_toolkits = getattr(model, "set_mcp_toolkits", None)
         if callable(set_mcp_toolkits):
             set_mcp_toolkits(mcp_pool.runtime_toolkits_tool_search_only())
-        # SmartRouter holds the pool itself so it can re-wire newly
+        # ModelDispatcher holds the pool itself so it can re-wire newly
         # constructed per-session providers as they're lazily built.
         set_mcp_pool = getattr(model, "set_mcp_pool", None)
         if callable(set_mcp_pool):
@@ -97,14 +97,14 @@ def create_model_from_spec(
 def create_model_from_config(config: dict) -> BaseModel:
     """Instantiate the active model from the resolved OpenAgent config.
 
-    Always returns a SmartRouter — SmartRouter is the single top-level
-    runtime and dispatches each session to the native API provider
-    internally (see ``openagent.models.smart_router``). The ``providers`` / ``models``
-    SQLite tables are the sole source of truth for the catalog;
-    SmartRouter starts empty and gets its routing populated by
-    ``Agent.initialize`` (and every hot-reload tick) via
-    ``rebuild_routing``. The yaml is never consulted for provider or
-    model state.
+    Always returns a ``ModelDispatcher`` — it is the single top-level
+    runtime and dispatches each session through its entry model's
+    ``TeamRouterProvider`` internally (see ``src.models.dispatcher``).
+    The ``providers`` / ``models`` SQLite tables are the sole source of
+    truth for the catalog; the dispatcher starts empty and gets its
+    routing populated by ``Agent.initialize`` (and every hot-reload
+    tick) via ``rebuild_routing``. The yaml is never consulted for
+    provider or model state.
     """
     del config  # catalog comes from the DB, not yaml
     return create_model_from_spec("smart", providers_config=[])

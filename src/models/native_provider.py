@@ -438,7 +438,61 @@ PROVIDER_ENV_VARS = {
     "qwen": "DASHSCOPE_API_KEY",
 }
 RUNTIME_PROVIDER_CLASSES: dict[str, tuple[str, str, dict[str, Any]]] = {
-    "anthropic": ("src.models.providers.anthropic", "Claude", {}),
+    # Anthropic prompt caching is ON here, hardcoded, on purpose.
+    #
+    # This dict's 3rd element (``extra_kwargs``) is the ONLY channel that
+    # reaches a provider constructor — ``_load_runtime_model_class`` reads it
+    # and ``build_runtime_model`` splats it into ``_construct_model``. Model-row
+    # metadata never becomes provider kwargs, so there is no per-model config
+    # escape hatch to defer to. Leaving this ``{}`` did not mean "operator
+    # decides"; it meant nobody could turn caching on at all, and Claude's own
+    # defaults (cache_system_prompt=False, cache_tools=False) meant every
+    # Anthropic call paid full price for a byte-identical prefix.
+    #
+    # What that cost: each call re-sends the ~12k-token FRAMEWORK_SYSTEM_PROMPT
+    # (src/core/prompts.py) + the user persona + every tool schema. And a turn
+    # is not one call — it is one call per tool-use iteration (3.3 average, 13
+    # worst case; see ``_MAX_HISTORY_TOKENS`` in src/core/compaction.py), times
+    # every surface: chat, sub-agent, workflow AI block, cron firing.
+    # ``src/core/metrics.py`` has read ``cache_read_tokens`` in ~9 places since
+    # it was written — against a counter that was structurally always zero.
+    #
+    # Why NOT ``extended_cache_time`` (1h): the flags collide, and the local
+    # validator will not save us. Anthropic renders tools → system → messages,
+    # and ``Claude._apply_cache_tools`` hardcodes the tool breakpoint to a bare
+    # ``{"type": "ephemeral"}`` — always 5m; it never consults
+    # extended_cache_time. Turning 1h on would place a 1h *system* block after
+    # a 5m *tool* block, which is precisely the ordering Anthropic rejects.
+    # ``_validate_cache_ttl_order`` only ever inspects the system array (it is
+    # called from ``_build_system``, which never sees ``tools``), so it cannot
+    # catch that combination — the first symptom would be a 400 on live
+    # traffic. Uniform 5m/5m cannot trip the rule from any direction, and it
+    # breaks even sooner anyway: 1.25x write + 0.1x read beats 2x uncached at
+    # the 2nd call, where a 1h write (2x) needs a 3rd.
+    #
+    # Breakpoint budget: Anthropic allows 4 per request. We spend 2 — the last
+    # tool (cache_tools) and the agent-built system block (cache_system_prompt).
+    # The other 2 stay free for ``system_prompt_blocks``, which is user-supplied
+    # and which OpenAgent itself never sets.
+    #
+    # Interaction with compaction: ``compact()`` rewrites ``sessions.runs`` in
+    # place, so the replayed transcript changes and any cache over it dies.
+    # That is expected and cheap — Anthropic's invalidation is tiered, and a
+    # messages-only change leaves the tools+system entries intact. The
+    # expensive, stable prefix survives compaction; only the suffix re-bills.
+    # (Note the transcript is not cached by these two flags in the first place:
+    # the only ``cache_control`` placements on this path are the system blocks
+    # and the last tool.)
+    #
+    # No other provider needs anything here: OpenAI — and the OpenAILike fleet
+    # below — caches prefixes implicitly and server-side, with no request-side
+    # opt-in and no breakpoints to place. Anthropic is the only provider on this
+    # path where caching is something the caller must explicitly ask for.
+    "anthropic": (
+        "src.models.providers.anthropic",
+        "Claude",
+        {"cache_system_prompt": True, "cache_tools": True},
+    ),
     "openai": ("src.models.providers.openai", "OpenAIChat", {}),
     "google": ("src.models.providers.google", "Gemini", {}),
     "groq": ("src.models.providers.groq", "Groq", {}),

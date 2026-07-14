@@ -4,9 +4,10 @@ This module is the single top-level model layer wired into the Agent.
 It owns two complementary responsibilities, colocated for clarity:
 
 - :class:`ModelDispatcher` — picks the entry runtime_id for each
-  session (pin → first-enabled) and routes the turn through the
-  matching :class:`TeamRouterProvider`. Also drives lifecycle
-  (cleanup_idle, shutdown, close/forget_session) and budget telemetry.
+  session (pin → default-leader flag → first-enabled) and routes the
+  turn through the matching :class:`TeamRouterProvider`. Also drives
+  lifecycle (cleanup_idle, shutdown, close/forget_session) and budget
+  telemetry.
 
 - :class:`TeamRouterProvider` — for one entry runtime_id, builds a
   runtime ``Team(mode=coordinate)`` per session whose leader is that entry
@@ -20,9 +21,13 @@ It owns two complementary responsibilities, colocated for clarity:
 History is unified in the runtime's sessions SqliteDb, so there's no
 need to lock a session to one framework once it's been served.
 
-``SmartRouter`` (the pre-rename name) stays available as an alias at
-the bottom of this module for transitional compatibility with tests
-and external callers.
+``SmartRouter`` was this class's pre-v0.14 name, kept as a transitional
+alias after ``e8f5d68``. The alias is gone: its callers are cleaned up
+and §10 makes the dispatcher internal, so there is no compatibility
+surface to hold it open. Note the rename outlived the *behaviour* it
+described — the per-turn classifier LLM call it named was retired in
+the same commit, so a "SmartRouter" sighting in prose is usually
+describing something that no longer happens.
 """
 
 from __future__ import annotations
@@ -1162,18 +1167,25 @@ class RoutingDecision:
 class ModelDispatcher(BaseModel):
     """Single dispatcher routing every turn through a TeamRouterProvider.
 
-    Resolves the entry runtime_id for a session (pin → first-enabled),
-    holds one cached :class:`TeamRouterProvider` per entry runtime_id,
-    forwards lifecycle hooks (cleanup_idle, shutdown, close/forget
-    session) and records cost telemetry against the api-based path.
+    Resolves the entry runtime_id for a session (pin → default-leader
+    flag → first-enabled), holds one cached :class:`TeamRouterProvider`
+    per entry runtime_id, forwards lifecycle hooks (cleanup_idle,
+    shutdown, close/forget session) and records cost telemetry against
+    the api-based path.
 
-    Entry-model resolution (no classifier LLM call):
+    Entry-model resolution — a deterministic lookup, no classifier LLM
+    call (see :meth:`_resolve_entry_model`):
 
       1. **Per-session pin** (``models.pin_session``) — if the user or
          the agent itself has chosen a specific runtime_id for this
-         session, dispatch directly.
-      2. **First enabled** — fresh sessions with no pin pick the first
-         enabled model in catalog order.
+         session, dispatch directly. A pin to a now-disabled model is
+         auto-healed rather than failing the turn.
+      2. **Default-leader flag** — the first row flagged
+         ``is_classifier`` in catalog order. The column name is a
+         leftover from the retired classifier router; it means "lead
+         the team by default" (see ``catalog.CatalogModel``).
+      3. **First enabled** — fresh sessions with neither pin nor flag
+         pick the first enabled model in catalog order.
 
     History is unified in the runtime's sessions SqliteDb across
     every framework, so there's no longer a need to lock a session to
@@ -1601,11 +1613,3 @@ class ModelDispatcher(BaseModel):
             files=files, images=images, audio=audio, videos=videos,
         ):
             yield chunk
-
-
-# Transitional alias so existing imports keep working until the
-# follow-up pass cleans up callers (tests + src). Tests reference
-# ``SmartRouter`` directly; the runtime entry point in
-# ``runtime.create_model_from_spec`` uses ``ModelDispatcher`` after
-# the rename.
-SmartRouter = ModelDispatcher

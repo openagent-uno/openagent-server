@@ -200,8 +200,8 @@ BLOCK_CATALOG: dict[str, BlockSpec] = {
         category="ai",
         description=(
             "Run a prompt through the OpenAgent AI (same agent.run path as "
-            "scheduled tasks). Optionally pin a specific model via "
-            "model_override to bypass the SmartRouter."
+            "scheduled tasks). Optionally pin the turn's entry model via "
+            "model_override."
         ),
         config_schema={
             "prompt": _field(
@@ -216,8 +216,11 @@ BLOCK_CATALOG: dict[str, BlockSpec] = {
                 "string",
                 description=(
                     "runtime_id such as 'openai:gpt-4o-mini' or "
-                    "'anthropic:claude-opus-4-7'. When set, "
-                    "bypasses the SmartRouter and dispatches directly."
+                    "'anthropic:claude-opus-4-7'. When set, this model "
+                    "becomes the block's entry model instead of the "
+                    "resolved default. It still leads the team and may "
+                    "delegate to other enabled models — this pins where "
+                    "the turn starts, not that one model answers alone."
                 ),
             ),
             "session_policy": _field(

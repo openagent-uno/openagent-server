@@ -5,7 +5,7 @@ undo them:
 
   - Phase 1: runtime bump (inlined Agent/Team import paths).
   - Phase 2: Framework rename (agno/litellm → api-based) + legacy aliases.
-  - Phase 4: SmartRouter classifier removed; TeamRouterProvider built
+  - Phase 4: the classifier LLM call removed; TeamRouterProvider built
     on first dispatch.
   - Phase 5: db.py SDK metadata helpers deleted; back-compat shims left.
   - Phase 6a: All MCPs deferred behind tool-search; only the
@@ -197,16 +197,19 @@ async def t_upsert_provider_legacy_compat(ctx: TestContext) -> None:
             pass
 
 
-# ── Phase 4: SmartRouter → TeamRouterProvider ────────────────────────
+# ── Phase 4: ModelDispatcher → TeamRouterProvider ────────────────────
 
 
-@test("regression_v014", "SmartRouter dispatches api-based entries through TeamRouterProvider")
+@test("regression_v014", "ModelDispatcher dispatches api-based entries through TeamRouterProvider")
 async def t_smart_router_uses_team(ctx: TestContext) -> None:
     """The api-based path must build a TeamRouterProvider, not a raw
     NativeProvider. The team router is what gives sessions their
     sub-agent / specialist-delegation behaviour.
+
+    Was written against the ``SmartRouter`` alias, which is gone as of
+    the e8f5d68 follow-up pass — ``ModelDispatcher`` is the only name.
     """
-    from src.models.dispatcher import SmartRouter
+    from src.models.dispatcher import ModelDispatcher
     from src.models.dispatcher import TeamRouterProvider
 
     providers = [
@@ -214,9 +217,100 @@ async def t_smart_router_uses_team(ctx: TestContext) -> None:
          "api_key": "sk-x", "enabled": True,
          "models": [{"id": 10, "model": "gpt-4o-mini", "enabled": True}]},
     ]
-    router = SmartRouter(providers_config=providers)
+    router = ModelDispatcher(providers_config=providers)
     provider = router._get_team_provider("openai:gpt-4o-mini")
     assert isinstance(provider, TeamRouterProvider), type(provider).__name__
+
+
+@test("regression_v014", "the SmartRouter alias stays deleted")
+async def t_smart_router_alias_deleted(ctx: TestContext) -> None:
+    """``SmartRouter = ModelDispatcher`` was the transitional alias left
+    by e8f5d68. The follow-up pass removed it — one name, not two.
+
+    AST-based on purpose: this asserts the alias is not re-introduced as
+    *code* (an import, a binding, an ``__all__`` entry) and deliberately
+    ignores prose. Comments are still free to say "SmartRouter" when
+    describing the retired name — several correctly do.
+    """
+    import ast
+
+    src_root = Path(__file__).resolve().parents[2] / "src"
+    offenders: list[str] = []
+
+    for path in sorted(src_root.rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        except SyntaxError:  # not ours to police here
+            continue
+        rel = path.relative_to(src_root.parent)
+        for node in ast.walk(tree):
+            # `from x import SmartRouter` / `import SmartRouter`
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    if alias.name.split(".")[-1] == "SmartRouter" or alias.asname == "SmartRouter":
+                        offenders.append(f"{rel}:{node.lineno} imports SmartRouter")
+            elif isinstance(node, ast.Assign):
+                targets = [t for t in node.targets if isinstance(t, ast.Name)]
+                # `SmartRouter = ...` (the alias itself)
+                for target in targets:
+                    if target.id == "SmartRouter":
+                        offenders.append(f"{rel}:{node.lineno} binds SmartRouter")
+                # `__all__ = [..., "SmartRouter", ...]` — re-exporting the
+                # name is the part that would make it an API promise again.
+                # Scoped to __all__ so an honest "SmartRouter is gone"
+                # message in a string stays legal.
+                if any(t.id == "__all__" for t in targets):
+                    for sub in ast.walk(node.value):
+                        if isinstance(sub, ast.Constant) and sub.value == "SmartRouter":
+                            offenders.append(f"{rel}:{node.lineno} re-exports SmartRouter in __all__")
+
+    assert not offenders, (
+        "The SmartRouter alias must stay deleted — ModelDispatcher is the "
+        "only name for this class:\n  " + "\n  ".join(offenders)
+    )
+
+
+@test("regression_v014", "_resolve_entry_model stays a lookup — no classifier LLM call")
+async def t_entry_resolution_makes_no_llm_call(ctx: TestContext) -> None:
+    """The per-turn classifier call retired in e8f5d68 must not creep back.
+
+    Entry resolution is a deterministic DB + catalog lookup (pin →
+    is_classifier flag → first enabled). It must not build a provider or
+    reach a model to decide. This is the behavioural twin of the "no
+    classifier call" claims now spread across src/ docstrings and the
+    model_manager tool descriptions: re-add an inference step here and
+    all of them become false at once, so fail loudly instead.
+    """
+    from src.models.dispatcher import ModelDispatcher
+
+    providers = [
+        {"id": 1, "name": "openai", "framework": "api-based",
+         "api_key": "sk-x", "enabled": True,
+         "models": [
+             {"id": 10, "model": "gpt-4o-mini", "enabled": True},
+             {"id": 11, "model": "gpt-4o", "enabled": True},
+         ]},
+    ]
+    dispatcher = ModelDispatcher(providers_config=providers)
+
+    def _boom(*_a: Any, **_kw: Any) -> Any:
+        raise AssertionError(
+            "_resolve_entry_model reached for a provider. Entry resolution "
+            "must be a lookup, not an inference — the classifier LLM call "
+            "is retired (e8f5d68)."
+        )
+
+    dispatcher._get_team_provider = _boom  # type: ignore[assignment]
+
+    first = await dispatcher._resolve_entry_model("sess-no-classifier")
+    second = await dispatcher._resolve_entry_model("sess-no-classifier")
+
+    # A classifier would be free to answer differently on identical input;
+    # a lookup cannot.
+    assert first == second, f"resolution is not deterministic: {first} != {second}"
+    assert first.reason in {
+        "session_pin", "router_flag", "first_enabled", "no_enabled_model",
+    }, f"unexpected resolution reason {first.reason!r} — a new inference path?"
 
 
 @test("regression_v014", "_resolve_entry_model picks is_classifier-flagged model over first enabled")

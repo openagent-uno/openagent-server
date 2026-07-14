@@ -8,6 +8,27 @@ nothing extra on the hot path.
 
 On by default. Tune via ``memory.vault_reminder`` in ``openagent.yaml``
 (``enabled``, ``every_n_turns``); see ``core/server.py`` for the env mapping.
+
+TWO RULES THIS MODULE LEARNED THE HARD WAY
+------------------------------------------
+1. **Only ``maybe_render_reminder`` gates the feature.** It is documented as
+   safe to call unconditionally and early-exits when disabled. Until v0.15.11
+   the sole call site (``bridges/base.py``) ALSO checked
+   ``OPENAGENT_VAULT_REMINDER_ENABLED`` inline — but defaulted it to ``"0"``
+   while this module defaults to ``"1"``. The call site's default won, so a
+   feature documented as on-by-default here, and in
+   ``guide/vault-quality.md``, was off on every deployment that had not
+   explicitly opted *in*. Never re-implement the check at a call site: the
+   default must live in exactly one place, and that place is ``_is_enabled``.
+2. **It is wired on the shared run path, not per-channel.** It used to live in
+   the bridge send path, so only Telegram/Discord/Slack/WhatsApp turns could
+   ever see it — a desktop or gateway-only install got no nudge at all, and
+   neither did any scheduled task, sub-agent, workflow AI block, or event run.
+   Vision §15: "There is no reduced or alternate baseline for non-interactive
+   execution paths — the agent is the same agent wherever it runs." §7 says
+   the same of the scheduler ("chat with the user's seat empty… writes any
+   results back to the vault"). It now hooks ``core/agent.py``'s
+   ``_run_inner`` / ``_run_inner_stream``, which every origin funnels through.
 """
 
 from __future__ import annotations

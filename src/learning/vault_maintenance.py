@@ -16,7 +16,8 @@ vault half of that. On its interval it:
 
 Independent of the curator loop and opt-in via
 ``memory.vault.maintenance.enabled`` (default off). Everything degrades
-gracefully: no model key → no AI suggestions, just the mechanical pass.
+gracefully: no ``OPENAGENT_LEARNING_MODEL`` configured → no AI suggestions,
+just the mechanical pass (steps 1-4 + 6).
 """
 from __future__ import annotations
 
@@ -86,16 +87,22 @@ async def run_once(db: Any = None) -> dict:
 
 
 async def _ai_suggestions(db: Any, summary: dict) -> Optional[str]:
-    """Ask a cheap model to propose concrete fixes for the issues code could
-    not fix. Best-effort: returns ``None`` offline or without a key."""
+    """Ask the configured learning model to propose concrete fixes for the
+    issues code could not fix. Best-effort: returns ``None`` when no learning
+    model is configured, so the pass still lands its mechanical half.
+
+    Until v0.15.11 this called a hardcoded Groq client, which meant dream mode
+    — "toggleable but not removable" per §12 — could only ever reach its AI
+    half on deployments that happened to hold a ``GROQ_API_KEY``. An agent
+    running purely local models silently got the mechanical pass forever. That
+    is the "structurally required cloud service" §17 rules out. Model choice
+    now comes from ``OPENAGENT_LEARNING_MODEL``; see ``_model.py`` for why it
+    is explicit config rather than an inference over the catalog.
+    """
     if db is None:
         return None
     suggestions = summary.get("open_suggestions") or []
     if not suggestions:
-        return None
-    try:
-        from src.learning import _groq
-    except Exception:
         return None
     lines = [
         f"- [{s['rule']}] {s['path']}: {s['message']}"
@@ -110,13 +117,11 @@ async def _ai_suggestions(db: Any, summary: dict) -> Optional[str]:
         "an over-long note). Be terse — one line per issue.\n\n"
         + "\n".join(lines)
     )
-    try:
-        return await _groq.complete(
-            db=db, prompt=prompt, log_event="vault_maintenance.ai",
-            timeout_s=25.0, max_tokens=900,
-        )
-    except Exception:
-        return None
+    from src.learning._model import complete as _complete
+
+    return await _complete(
+        db=db, prompt=prompt, log_event="vault_maintenance.ai", timeout_s=25.0,
+    )
 
 
 async def _write_dream_log(svc, summary: dict, ai_note: Optional[str]) -> None:

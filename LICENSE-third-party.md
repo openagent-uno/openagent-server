@@ -5,7 +5,7 @@ OpenAgent ships its own self-contained LLM execution runtime under
 `src/memory/store/`, `src/models/providers/`, `src/mcp/_runtime/`, and
 `src/stream/media.py`. The implementation of this runtime was originally
 derived from the **Agno** framework (https://github.com/agno-agi/agno),
-which is distributed under the **Mozilla Public License 2.0**.
+which is distributed under the **Apache License 2.0**.
 
 The code has since been substantially restructured, renamed, and trimmed
 for use in OpenAgent — unused subsystems (knowledge bases, vector DBs,

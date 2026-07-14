@@ -3,7 +3,7 @@
 Exposes the ``providers`` + ``models`` tables over MCP so the agent
 can inspect and edit its own LLM catalog at runtime. Writes land
 directly in SQLite; the gateway polls ``MAX(updated_at)`` per message
-and rebuilds SmartRouter's providers_config — so additions take effect
+and rebuilds the dispatcher's providers_config — so additions take effect
 on the next turn without a process restart.
 
 Vocabulary:
@@ -14,7 +14,8 @@ Vocabulary:
     by ``add_model`` / ``list_models``. Used by
     ``enable_model`` / ``disable_model`` / ``remove_model``.
   - **runtime_id**: composite string like ``anthropic:claude-opus-4-7``
-    — derived at read time, used for session pins and classifier output.
+    — derived at read time, used for session pins and entry-model
+    resolution.
 
 Transport: stdio. Storage: the shared OpenAgent SQLite DB via
 ``OPENAGENT_DB_PATH`` (set by MCPPool at launch).
@@ -287,14 +288,18 @@ async def add_model(
       framework is inherited — no separate ``framework`` argument.
     - ``model`` is the bare vendor id (``gpt-4o-mini``,
       ``claude-sonnet-4-6``, ``glm-5``, …).
-    - ``tier_hint`` (optional, free-form) is a soft hint to the
-      classifier describing the model's strengths: ``"vision"``,
-      ``"200k context"``, ``"best for code"``, ``"fast + cheap"``, etc.
-      The classifier treats it as advice and overrides freely.
-    - ``is_classifier`` (optional) marks this row as an eligible
-      SmartRouter classifier. Multiple rows can carry the flag; the
-      router picks the first flagged row it sees each turn, so the
-      flag effectively opts a model into the "classifier pool".
+    - ``tier_hint`` (optional, free-form) is this model's *scope*: a
+      natural-language sentence describing what it is good at
+      (``"vision"``, ``"200k context"``, ``"best for code"``, ``"fast +
+      cheap"``). It is not inert metadata — when this model joins a
+      turn's team it becomes the model's ``role``, and it is the text
+      the team leader reads to decide what to delegate here. A row
+      with no hint falls back to a generic "specialist using <model>".
+    - ``is_classifier`` (optional) is misnamed: no per-turn classifier
+      call exists. It marks this row as the default **entry model** —
+      the team leader. Entry resolution per turn is: session pin →
+      first flagged row in catalog order → first enabled. Multiple
+      rows may carry the flag; the first in catalog order wins.
 
     Pricing is resolved live from OpenRouter on every billing event,
     so there is no cost field to set here. Returns the enriched row.
@@ -321,12 +326,12 @@ async def update_model(
 ) -> dict[str, Any]:
     """Partially update a model row (only fields you pass are changed).
 
-    Pass ``is_classifier=True`` to opt this row into the SmartRouter
-    classifier pool, ``False`` to remove it; omit to leave the flag
-    intact. Multiple rows may carry the flag — the router picks the
-    first flagged row per turn, so the pool acts as "eligible
-    classifiers" ordered by the catalog's deterministic order
-    (provider name, framework, model).
+    Pass ``is_classifier=True`` to make this row the default entry
+    model (the team leader), ``False`` to clear it; omit to leave the
+    flag intact. Despite the name it selects no per-turn classifier —
+    it is a persistent "lead by default" hint. Multiple rows may carry
+    the flag; the first in the catalog's deterministic order (provider
+    name, framework, model) wins.
 
     Pricing isn't editable — it's resolved live on every billing event.
     """
@@ -352,13 +357,15 @@ async def update_model(
 
 @mcp.tool()
 async def set_classifier_model(model_id: int) -> dict[str, Any]:
-    """Opt one model into the SmartRouter classifier pool.
+    """Mark one model as the default entry model (the team leader).
 
     Idempotent narrow UPDATE — this row's ``is_classifier`` flag flips
-    to 1, other rows are untouched. Multiple rows can carry the flag
-    at once; the router picks the first flagged row in catalog order
-    each turn. To remove a row from the pool, call
-    ``update_model(model_id, is_classifier=False)``.
+    to 1, other rows are untouched. Despite the column name this opts
+    the row into no classifier call: it is the persistent "lead the
+    team by default" hint, read as step 2 of entry resolution (session
+    pin → flagged row → first enabled). Multiple rows can carry the
+    flag at once; the first in catalog order wins. To clear a row,
+    call ``update_model(model_id, is_classifier=False)``.
 
     The flag is honoured on the next message (hot-reload loop picks up
     ``models.updated_at``).
@@ -457,8 +464,11 @@ async def pin_session(session_id: str, runtime_id: str) -> dict[str, Any]:
 async def unpin_session(session_id: str) -> dict[str, Any]:
     """Clear the per-session model pin on ``session_id``.
 
-    The session returns to normal SmartRouter routing (classifier →
-    tier → model) on the next turn.
+    On the next turn the session falls back to normal entry-model
+    resolution: the ``is_classifier``-flagged default leader, else the
+    first enabled model in catalog order. No classifier call is
+    involved — the entry model leads the turn's team and delegates to
+    the other enabled models as it sees fit.
     """
     session_id = (session_id or "").strip()
     if not session_id:

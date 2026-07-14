@@ -2487,7 +2487,7 @@ class Gateway:
 
         Mirrors the per-turn checks the legacy MESSAGE handler did:
         hot-reload registries, refuse the turn if no models are
-        enabled, then bind the session's history mode for SmartRouter.
+        enabled, then bind the session's history mode for the dispatcher.
         Returns a non-None error string to reject the turn — the
         StreamSession publishes ``OutError`` + ``TurnComplete`` so the
         client gets a clean error frame.
@@ -2508,7 +2508,7 @@ class Gateway:
                     "the agent to add an openai/anthropic/google model."
                 )
 
-            # SmartRouter handles per-session binding internally; it
+            # ModelDispatcher handles per-session binding internally; it
             # reports ``history_mode = None`` so this is a no-op for
             # the common case. Direct-provider models (legacy/test
             # paths) get the SessionManager pre-bind enforcement.

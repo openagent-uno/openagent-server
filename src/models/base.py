@@ -103,7 +103,7 @@ class BaseModel(ABC):
         to synthesize one and needs to know which model to credit.
 
         Default reads ``self.model`` (set by the API-based runtime).
-        SmartRouter overrides because it picks per-session and a single
+        ModelDispatcher overrides because it picks per-session and a single
         instance attribute can't capture which routed model handled the
         latest turn. ``None`` is acceptable — the chat UI just hides the
         model badge instead of crashing.

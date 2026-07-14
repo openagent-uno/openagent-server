@@ -317,6 +317,45 @@ def _emit_tool_call_summary(
     )
 
 
+async def _with_vault_reminder(db: Any, session_id: str | None, text: str) -> str:
+    """Prepend the periodic memory-checkpoint nudge to a turn's input.
+
+    Hooked here — on the shared run path — rather than in any one channel,
+    because this is where chat, delegation, the scheduler, workflow AI blocks
+    and event runs all converge (every origin reaches the model through
+    ``Agent.run`` / ``run_stream``; see ``core/child_session.py``). It used to
+    live in ``bridges/base.py``, which meant a desktop or gateway-only install
+    got no nudge at all and no automated run ever did. Vision §15: "There is
+    no reduced or alternate baseline for non-interactive execution paths — the
+    agent is the same agent wherever it runs"; §7 says a scheduled task
+    "writes any results back to the vault… exactly as it would for a turn the
+    user typed in person".
+
+    Deliberately unconditional: ``maybe_render_reminder`` owns the enabled
+    check and the cadence, and returns ``None`` when off or when this turn
+    isn't a checkpoint. Re-checking the flag here is what broke the feature
+    last time — see ``learning/vault_reminder.py``.
+
+    Never raises: a memory nudge must not be able to fail a turn.
+    """
+    if db is None or not session_id:
+        return text
+    try:
+        from src.learning.vault_reminder import maybe_render_reminder
+
+        reminder = await maybe_render_reminder(db, session_id)
+    except Exception as exc:  # noqa: BLE001
+        elog(
+            "vault_reminder.hook_error",
+            level="warning",
+            session_id=session_id,
+            error_type=type(exc).__name__,
+            error=str(exc) or repr(exc),
+        )
+        return text
+    return f"{reminder}\n\n{text}" if reminder else text
+
+
 # Status callback type: async def on_status(status: str) -> None
 StatusCallback = Callable[[str], Awaitable[None]]
 
@@ -652,13 +691,13 @@ class Agent:
                 # Existing rows — including disabled ones — are untouched.
                 await ensure_builtin_mcps(self._db)
                 # Provider keys and the model catalog are DB-backed. Pull
-                # the rows into ``self._providers_config`` so SmartRouter
+                # the rows into ``self._providers_config`` so ModelDispatcher
                 # / NativeProvider see the materialised view.
                 await self._hydrate_providers_from_db()
                 self._providers_last_updated = await self._db.providers_max_updated()
                 self._models_last_updated = await self._db.models_max_updated()
                 # Hand the freshly-hydrated list to every live runtime
-                # model. SmartRouter was constructed with an empty
+                # model. ModelDispatcher was constructed with an empty
                 # providers_config; without this push it would keep that
                 # empty reference until the first hot-reload tick — which
                 # only fires on gateway messages, so scheduler turns that
@@ -784,7 +823,7 @@ class Agent:
         models are enabled. Returns ``(reloaded_anything, enabled_models)``.
 
         Provider edits (``api_key``, ``base_url``) invalidate the cached
-        ``providers_config`` dict that SmartRouter hands to NativeProvider
+        ``providers_config`` dict that ModelDispatcher hands to NativeProvider
         — without this hook, adding a key would require a restart.
         """
         if self._db is None:
@@ -851,7 +890,7 @@ class Agent:
         """Pull provider + model rows from the DB into ``self._providers_config``.
 
         The DB is the source of truth for provider keys AND the model
-        catalog. SmartRouter / NativeProvider consume the v0.12 flat-list
+        catalog. ModelDispatcher / NativeProvider consume the v0.12 flat-list
         shape — each entry already carries its ``framework`` and its
         nested ``models`` list. Delegates the SQL materialisation to
         MemoryDB so
@@ -1087,7 +1126,10 @@ class Agent:
 
         active_model = self._acquire_model_slot(model_override or self.model)
 
-        current_input = message
+        # Applied to the first input only: the autoloop's shell-reminder
+        # re-entries below reassign ``current_input``, so a long tool-driven
+        # turn doesn't re-pay the nudge on every iteration.
+        current_input = await _with_vault_reminder(self._db, session_id, message)
         last_response = None
         iter_count = 0
 
@@ -1380,7 +1422,8 @@ class Agent:
 
         active_model = self._acquire_model_slot(model_override or self.model)
 
-        current_input = message
+        # Streaming twin of the reminder hook in ``_run_inner`` — see there.
+        current_input = await _with_vault_reminder(self._db, session_id, message)
         accumulated: list[str] = []
         iter_count = 0
 
@@ -1459,13 +1502,16 @@ class Agent:
                 )
                 author_token = install_author_context(author)
                 try:
-                    # Pass session_id and on_status so SmartRouter.stream
-                    # can run the same classifier + binding logic that
-                    # ``generate`` uses. Without these, voice turns would
-                    # route to "first enabled api-based model" instead of the
-                    # session's bound side, which 403'd on users whose
-                    # first api-based model was an OpenAI model their key
-                    # couldn't access.
+                    # Pass session_id and on_status so ``ModelDispatcher.stream``
+                    # can run the same entry-model resolution that ``generate``
+                    # uses: per-session pin -> ``is_classifier``-flagged model ->
+                    # first enabled. (No classifier LLM call is involved despite
+                    # the flag's name — see ``models/catalog.py``.) The pin lives
+                    # in ``pinned_sessions``, so without ``session_id`` there is
+                    # nothing to look it up by and voice turns fell through to
+                    # "first enabled api-based model" instead of the session's
+                    # pinned one — which 403'd on users whose first api-based
+                    # model was an OpenAI model their key couldn't access.
                     #
                     # Introspect once instead of try/except TypeError around
                     # the iteration body — a catch-all TypeError swallows
@@ -1638,12 +1684,12 @@ class Agent:
         # Prefer the real ModelResponse from the generate() fallback so
         # last_response_meta() has accurate model + usage. Otherwise
         # synthesize a minimal stand-in from the accumulated text and
-        # the *effective* model id — for SmartRouter this is the
+        # the *effective* model id — for ModelDispatcher this is the
         # runtime actually picked for the session, not a generic
         # instance attribute. ``getattr(active_model, "model_name",
         # None)`` (the previous code) returned ``None`` for every
         # provider in tree (NativeProvider exposes ``self.model``;
-        # SmartRouter exposes neither), which silently dropped the
+        # ModelDispatcher exposes neither), which silently dropped the
         # model badge from the chat UI after the streaming migration.
         # ``effective_model_id`` is the provider-aware accessor.
         if fallback_response is not None:

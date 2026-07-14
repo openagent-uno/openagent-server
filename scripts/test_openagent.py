@@ -54,8 +54,22 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_serve_singleton",
     "test_cli_cleanup",
     "test_tool_result_cap",
+    # In-process `logs` MCP: structured query over the agent's own
+    # events.jsonl (vision §14). Pure-unit — synthetic logs in a temp
+    # agent dir, no pool/gateway.
+    "test_logs_mcp",
+    "test_delegation_depth",
     "test_stream_usage",
     "test_model_fallback",
+    # Every tool name the framework / dream prompts hand the model must
+    # resolve to a real MCP registration. Pure-unit: introspects the
+    # adapters + parses the vendored vault server; no Node, no subprocess.
+    "test_prompt_tool_names",
+    # Cost-control regressions: Anthropic prompt caching stays wired on in
+    # RUNTIME_PROVIDER_CLASSES (the only channel that reaches the provider
+    # constructor), the 5m/5m TTL order stays un-trippable, and compaction
+    # summarises on the configured cheap model. Pure-unit; no live calls.
+    "test_model_cost",
     # importlib.metadata fallback for frozen bundles — defense in depth
     # against the runtime Team-run crash when pydantic dist-info goes missing
     # under sys._MEIPASS.
@@ -278,6 +292,7 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_updater",
     "test_update_guard",
     "test_task_hooks",
+    "test_shell_hooks",
     "test_bridges",
     # Spam coalescing end-to-end: real StreamSession against a slow
     # fake agent (every turn takes real time, mirroring LLM latency),
@@ -382,6 +397,10 @@ _TEST_MODULES: tuple[str, ...] = (
     #     memory-checkpoint prompt into the user turn every N turns
     #     (default off; opt-in via memory.vault_reminder.enabled).
     "test_vault_reminder",
+    # Learning hooks WIRING (as opposed to the module above): the reminder
+    #     reaches every origin via the shared Agent run path, no call site
+    #     re-implements its enabled flag, and src/learning pins no vendor SDK.
+    "test_learning_wiring",
     # Vault quality subsystem: parser / incremental index / gate / doctor /
     #     derived artifacts + a 3k-note scale test. Pure-unit (temp vaults,
     #     no gateway), so it can run anywhere in the order.
