@@ -57,3 +57,26 @@ async def t_entrypoint_meta(_ctx: TestContext) -> None:
         await ep(body_text="hi")
     assert fake.calls[-1]["meta"] == {"dry_run": True}, fake.calls[-1]
     assert fake.calls[-1]["name"] == "threads_respond"
+
+
+@test("dry_run", "event turn has a wall-clock cap so it can't zombie")
+async def t_run_wallclock_cap(_ctx: TestContext) -> None:
+    import asyncio
+    import src.core.event_dispatcher as ed
+
+    # A finite, positive cap must exist — otherwise a rate-limited turn blocking
+    # on backoff would stay "running" for hours (the jam this guards against).
+    assert isinstance(ed._EVENT_RUN_TIMEOUT_SECONDS, int)
+    assert 0 < ed._EVENT_RUN_TIMEOUT_SECONDS <= 3600
+
+    # The cap is enforced with asyncio.wait_for: a turn that outlives it is
+    # cancelled and surfaces TimeoutError (which dispatch_event records as
+    # failed → the reconcile sweep re-fires it later).
+    async def hang():
+        await asyncio.sleep(9999)
+
+    try:
+        await asyncio.wait_for(hang(), timeout=0.05)
+        assert False, "expected the cap to fire"
+    except asyncio.TimeoutError:
+        pass
