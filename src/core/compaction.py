@@ -85,6 +85,33 @@ _DEFAULT_KEEP_RUNS = 4
 # we hit this constant.
 _FALLBACK_MAX_CONTEXT = 200_000
 
+# A COST ceiling on the history we let a session carry, independent of how much
+# the model could technically swallow.
+#
+# The threshold below is a fraction of the model's context window, which is the
+# right denominator for "will this overflow?" and the wrong one for "what will
+# this cost?". A 1M-context model licenses ~786k tokens of accumulated history —
+# and history is not paid once. The agentic loop re-sends the whole context on
+# every step (3.3 on average, 13 at worst), and a session bound to a long-lived
+# external thread replays it on every delivery. On 2026-07-13 that turned single
+# support threads into 16M-input-token sessions.
+#
+# So we compact on whichever comes first: the model's window, or this. 150k
+# tokens of history is a lot of conversation; what it is not is 786k.
+_MAX_HISTORY_TOKENS = 150_000
+
+
+def _cost_ceiling() -> int:
+    raw = os.environ.get("OPENAGENT_COMPACTION_MAX_HISTORY_TOKENS", "").strip()
+    if raw:
+        try:
+            val = int(raw)
+            if val > 0:
+                return val
+        except ValueError:
+            pass
+    return _MAX_HISTORY_TOKENS
+
 
 def _flag_enabled() -> bool:
     """Honour OPENAGENT_COMPACTION_ENABLED — default ON.
@@ -391,9 +418,13 @@ def should_compact(session_id: str | None, model: Any, *, agent: Any) -> bool:
     for run in runs:
         cumulative += _estimate_text_tokens(_extract_run_text(run), model_id)
 
+    # Compact on whichever bites first: the model's context window (so we never
+    # overflow) or the cost ceiling (so a 1M-window model can't quietly carry
+    # 786k tokens of history into every step of every turn).
     max_context = _resolve_max_context(model)
     threshold = _threshold()
-    breached = cumulative > int(max_context * threshold)
+    budget = min(int(max_context * threshold), _cost_ceiling())
+    breached = cumulative > budget
     if breached:
         elog(
             "runtime.compaction.threshold_breached",
@@ -402,6 +433,8 @@ def should_compact(session_id: str | None, model: Any, *, agent: Any) -> bool:
             cumulative_tokens=cumulative,
             max_context=max_context,
             threshold=threshold,
+            budget=budget,
+            capped_by="cost_ceiling" if budget < int(max_context * threshold) else "context_window",
             runs=len(runs),
         )
     return breached

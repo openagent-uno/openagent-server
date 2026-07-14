@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from collections import deque
 from typing import (
     TYPE_CHECKING,
@@ -45,31 +44,13 @@ from src.core._runner.utils.events import (
 from src.core._runner.utils.log import log_debug, log_warning
 
 
-# Hard ceiling on a SINGLE tool result before it enters the model context.
-# One unbounded tool output can single-handedly exceed the context window —
-# e.g. an MCP call returning a whole email thread with its re-quoted history
-# was measured at ~1.7 MB (~480k tokens) — and in-session compaction cannot
-# fold a single oversized message (it folds whole turns, not message bodies).
-# We keep the head and a small tail with a marker in between, so the run
-# survives and the model can narrow its next query instead of the whole call
-# failing with a non-retryable context-length error.
-_MAX_TOOL_RESULT_CHARS = int(os.environ.get("OPENAGENT_MAX_TOOL_RESULT_CHARS", "100000"))
-
-
-def _cap_tool_result(result: Any) -> Any:
-    """Truncate an oversized string tool result; pass anything else through."""
-    limit = _MAX_TOOL_RESULT_CHARS
-    if limit <= 0 or not isinstance(result, str) or len(result) <= limit:
-        return result
-    head = int(limit * 0.85)
-    tail = max(0, limit - head)
-    dropped = len(result) - head - tail
-    marker = (
-        f"\n\n[... {dropped} characters truncated by OpenAgent: this single tool "
-        f"result exceeded {limit} chars and would overflow the model context. "
-        f"Narrow the query, request fewer items, or fetch specifics. ...]\n\n"
-    )
-    return result[:head] + marker + (result[-tail:] if tail else "")
+# The ceiling on a single tool result lives in src/core/tool_output.py, because
+# it has to be applied where the result becomes a message for the MODEL
+# (Model.create_function_call_result) — not only here, on the record the UI
+# renders. Capping only this one is what let a 642 KB vault note reach the
+# context on every step of every run. We still cap the display record: the run
+# history is persisted, and a 1.7 MB tool result has no business in it either.
+from src.core.tool_output import cap_tool_output as _cap_tool_result  # noqa: E402
 
 
 def raise_if_async_tools(agent: Agent) -> None:

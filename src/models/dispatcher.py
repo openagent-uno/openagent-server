@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 from src.core.logging import elog
+from src.models import stream_usage
 from src.models.base import BaseModel, ModelResponse
 from src.models.budget import BudgetTracker
 from src.models.catalog import (
@@ -303,6 +304,7 @@ async def _arun_runtime_stream(
     sometimes as text response".
     """
     from src.core._run_state.agent import (
+        RunCompletedEvent as _AgentRunCompletedEvent,
         RunContentEvent as _AgentRunContentEvent,
         ToolCallCompletedEvent as _AgentToolCallCompletedEvent,
         ToolCallErrorEvent as _AgentToolCallErrorEvent,
@@ -310,12 +312,19 @@ async def _arun_runtime_stream(
     )
     from src.core._run_state.team import (
         IntermediateRunContentEvent as _TeamIntermediateRunContentEvent,
+        RunCompletedEvent as _TeamRunCompletedEvent,
         RunContentEvent as _TeamRunContentEvent,
         ToolCallCompletedEvent as _TeamToolCallCompletedEvent,
         ToolCallErrorEvent as _TeamToolCallErrorEvent,
         ToolCallStartedEvent as _TeamToolCallStartedEvent,
     )
+    from src.models import stream_usage
     from src.models._tool_status import emit_tool_status
+
+    run_completed_event_types = (
+        _AgentRunCompletedEvent,
+        _TeamRunCompletedEvent,
+    )
 
     content_event_types = (
         _AgentRunContentEvent,
@@ -377,6 +386,18 @@ async def _arun_runtime_stream(
                 if rid:
                     on_run_id(rid)
                     on_run_id = None
+            # Token accounting. The streaming path used to record NOTHING, so a
+            # streamed turn — which is every turn that matters — never reached
+            # usage_log. Take the metrics off the PARENT run's completion event
+            # only: a delegated member's run belongs to its own child session
+            # and reports there. (src/models/stream_usage.py)
+            if isinstance(event, run_completed_event_types):
+                ev_sid = getattr(event, "session_id", None)
+                if ev_sid is None or ev_sid == session_id:
+                    inp, out = stream_usage.metrics_to_tokens(
+                        getattr(event, "metrics", None)
+                    )
+                    stream_usage.record(input_tokens=inp, output_tokens=out)
             # Suppress a delegated member's OWN content + nested tool events
             # from the PARENT live stream when the member runs in its own child
             # session. That work belongs to the child session (navigable via the
@@ -1415,37 +1436,60 @@ class ModelDispatcher(BaseModel):
         )
 
         # Cost telemetry: api-based runs go through the BudgetTracker.
-        if self._budget:
-            cost = BudgetTracker.compute_cost(
-                runtime_id, resp.input_tokens, resp.output_tokens,
-            )
-            try:
-                await self._budget.record(
-                    model=runtime_id,
-                    input_tokens=resp.input_tokens,
-                    output_tokens=resp.output_tokens,
-                    cost=cost,
-                    session_id=session_id,
-                )
-                elog(
-                    "router.cost_recorded",
-                    session_id=session_id,
-                    model=runtime_id,
-                    input_tokens=resp.input_tokens,
-                    output_tokens=resp.output_tokens,
-                    cost_usd=cost,
-                )
-            except Exception as e:  # noqa: BLE001
-                elog(
-                    "router.cost_record_error",
-                    session_id=session_id,
-                    model=runtime_id,
-                    error=str(e),
-                )
+        await self._record_cost(
+            runtime_id=runtime_id,
+            input_tokens=resp.input_tokens,
+            output_tokens=resp.output_tokens,
+            session_id=session_id,
+        )
 
         if not resp.model:
             resp.model = runtime_id
         return resp
+
+    async def _record_cost(
+        self,
+        *,
+        runtime_id: str,
+        input_tokens: int,
+        output_tokens: int,
+        session_id: str | None,
+    ) -> None:
+        """Write one call into ``usage_log`` — the canonical cost ledger.
+
+        Shared by ``generate`` and ``stream``. It used to live inline in
+        ``generate`` only, which is why the entire streaming path (chat, the
+        bridges, scheduled tasks, webhook events) never produced a single
+        usage row.
+        """
+        if not self._budget:
+            return
+        if not input_tokens and not output_tokens:
+            return
+        cost = BudgetTracker.compute_cost(runtime_id, input_tokens, output_tokens)
+        try:
+            await self._budget.record(
+                model=runtime_id,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cost=cost,
+                session_id=session_id,
+            )
+            elog(
+                "router.cost_recorded",
+                session_id=session_id,
+                model=runtime_id,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cost_usd=cost,
+            )
+        except Exception as e:  # noqa: BLE001
+            elog(
+                "router.cost_record_error",
+                session_id=session_id,
+                model=runtime_id,
+                error=str(e),
+            )
 
     async def run_delegated(
         self,
@@ -1510,12 +1554,26 @@ class ModelDispatcher(BaseModel):
         )
 
         provider = self._get_team_provider(runtime_id)
-        async for chunk in provider.stream(
-            messages, system=system, tools=tools,
-            on_status=on_status, session_id=session_id,
-            files=files, images=images, audio=audio, videos=videos,
-        ):
-            yield chunk
+        # Collect the streamed run's tokens and record them like generate()
+        # does. Whatever happens to the stream — completion, an error, a
+        # barge-in cancel — whatever was already spent gets billed: an
+        # abandoned turn still cost the provider's input tokens.
+        sink, token = stream_usage.open_sink()
+        try:
+            async for chunk in provider.stream(
+                messages, system=system, tools=tools,
+                on_status=on_status, session_id=session_id,
+                files=files, images=images, audio=audio, videos=videos,
+            ):
+                yield chunk
+        finally:
+            stream_usage.close_sink(token)
+            await self._record_cost(
+                runtime_id=runtime_id,
+                input_tokens=sink.get("input_tokens", 0),
+                output_tokens=sink.get("output_tokens", 0),
+                session_id=session_id,
+            )
 
 
 # Transitional alias so existing imports keep working until the

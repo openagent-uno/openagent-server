@@ -697,3 +697,48 @@ async def t_compact_keep_zero_noop_on_recap(ctx: TestContext) -> None:
     assert len(model.generate_calls) == 0, model.generate_calls
     saved = _read_runs(db_path, "sid")
     assert len(saved) == 1 and saved[0]["run_id"] == "compaction-1", saved
+
+
+# ── 6. the cost ceiling: a huge context window must not license a huge bill ──
+
+
+@test("compaction", "the cost ceiling compacts a 1M-window model long before its window")
+async def t_cost_ceiling_bites_before_the_window(ctx: TestContext) -> None:
+    """The regression behind the 2026-07-13 burn.
+
+    The threshold is a fraction of the MODEL's context window, which answers
+    "will this overflow?" and not "what will this cost?". On a 1M-token model
+    that licensed ~786k tokens of accumulated history — and history is re-sent
+    on every step of the agentic loop and every delivery bound to the session.
+    Sessions reached 16M input tokens for one support thread.
+
+    So compaction now trips on whichever comes first: the window, or the cost
+    ceiling. Same session, same model: unbounded ceiling → no compaction;
+    realistic ceiling → compaction.
+    """
+    from src.core.compaction import should_compact
+
+    os.environ.pop("OPENAGENT_COMPACTION_ENABLED", None)
+    os.environ["OPENAGENT_COMPACTION_THRESHOLD"] = "0.75"
+    os.environ["OPENAGENT_COMPACTION_KEEP_RUNS"] = "2"
+
+    db_path = str(ctx.test_dir / "compact-ceiling.db")
+    # ~10k tokens of history: nowhere near 75% of a 1M window (750k), but well
+    # past a 5k-token cost ceiling.
+    long_text = "the quick brown fox jumps over the lazy dog " * 400
+    _make_session_row(db_path, "sid", [
+        {"content": long_text, "messages": [{"role": "assistant", "content": long_text}]}
+        for _ in range(6)
+    ])
+    agent = _FakeAgent(db_path, _FakeModel(max_context=1_000_000))
+
+    try:
+        # A 1M-token model's own window would never trip on this history.
+        os.environ["OPENAGENT_COMPACTION_MAX_HISTORY_TOKENS"] = "10000000"
+        assert should_compact("sid", agent.model, agent=agent) is False
+
+        # With a realistic ceiling, the same session compacts.
+        os.environ["OPENAGENT_COMPACTION_MAX_HISTORY_TOKENS"] = "5000"
+        assert should_compact("sid", agent.model, agent=agent) is True
+    finally:
+        os.environ.pop("OPENAGENT_COMPACTION_MAX_HISTORY_TOKENS", None)

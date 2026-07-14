@@ -2097,9 +2097,14 @@ class Model(ABC):
             audios = function_execution_result.audios
             files = function_execution_result.files
 
+        # Cap the result HERE, not at the display record: this is the message
+        # every provider hands back to the model, and it is re-sent on every
+        # following step of the turn. See src/core/tool_output.py.
+        from src.core.tool_output import cap_tool_output
+
         return Message(
             role=self.tool_message_role,
-            content=output if success else function_call.error,
+            content=cap_tool_output(output) if success else function_call.error,
             tool_call_id=function_call.call_id,
             tool_name=function_call.function.name,
             tool_args=function_call.arguments,

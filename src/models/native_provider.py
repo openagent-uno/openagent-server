@@ -31,7 +31,7 @@ import os
 import re
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 
 from src.core.logging import elog
 from src.models.base import BaseModel, ModelResponse
@@ -54,6 +54,28 @@ from src.models.catalog import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Backstop on how many tools ONE run may call before the runtime stops handing
+# it more. Not a budget for normal work — real turns measured 3.3 tool calls on
+# average, 13 at the worst — but a ceiling on the pathological one: the loop
+# re-sends the ENTIRE context on every step, so an agent that keeps calling
+# tools pays for its whole history again each time. Past the limit the runtime
+# returns "tool call limit reached" instead of executing, and the model has to
+# answer with what it has. Tune with OPENAGENT_MAX_TOOL_CALLS_PER_RUN.
+_DEFAULT_MAX_TOOL_CALLS_PER_RUN = 60
+
+
+def _max_tool_calls_per_run() -> Optional[int]:
+    raw = os.environ.get("OPENAGENT_MAX_TOOL_CALLS_PER_RUN", "").strip()
+    if not raw:
+        return _DEFAULT_MAX_TOOL_CALLS_PER_RUN
+    try:
+        val = int(raw)
+    except ValueError:
+        return _DEFAULT_MAX_TOOL_CALLS_PER_RUN
+    # 0 / negative = explicitly unbounded, for an operator who knows why.
+    return val if val > 0 else None
 
 
 # Per-coroutine sink for runtime ERROR log capture. The previous
@@ -176,6 +198,7 @@ def _agno_event_types() -> dict[str, tuple]:
     omitted on runtime builds that don't ship the team module.
     """
     from src.core._run_state.agent import (
+        RunCompletedEvent as AgentRunCompletedEvent,
         RunContentEvent as AgentRunContentEvent,
         ToolCallStartedEvent as AgentToolCallStartedEvent,
         ToolCallCompletedEvent as AgentToolCallCompletedEvent,
@@ -185,8 +208,10 @@ def _agno_event_types() -> dict[str, tuple]:
     tool_started: tuple = (AgentToolCallStartedEvent,)
     tool_completed: tuple = (AgentToolCallCompletedEvent,)
     tool_error: tuple = (AgentToolCallErrorEvent,)
+    run_completed: tuple = (AgentRunCompletedEvent,)
     try:
         from src.core._run_state.team import (
+            RunCompletedEvent as TeamRunCompletedEvent,
             RunContentEvent as TeamRunContentEvent,
             ToolCallStartedEvent as TeamToolCallStartedEvent,
             ToolCallCompletedEvent as TeamToolCallCompletedEvent,
@@ -199,11 +224,13 @@ def _agno_event_types() -> dict[str, tuple]:
         tool_started = (AgentToolCallStartedEvent, TeamToolCallStartedEvent)
         tool_completed = (AgentToolCallCompletedEvent, TeamToolCallCompletedEvent)
         tool_error = (AgentToolCallErrorEvent, TeamToolCallErrorEvent)
+        run_completed = (AgentRunCompletedEvent, TeamRunCompletedEvent)
     return {
         "content": content,
         "tool_started": tool_started,
         "tool_completed": tool_completed,
         "tool_error": tool_error,
+        "run_completed": run_completed,
     }
 
 
@@ -983,6 +1010,10 @@ class NativeProvider(BaseModel):
             # user-scoped persistence. Keeping it off avoids the legacy agno_memories
             # table creation and keeps all state in the sessions table.
             enable_agentic_memory=False,
+            # Backstop against a run that never stops calling tools: every step
+            # re-sends the whole context, so an unbounded loop pays for the
+            # history again on each one.
+            tool_call_limit=_max_tool_calls_per_run(),
             markdown=False,
         )
         self._agno_agents[sys_key] = agent
@@ -1069,6 +1100,7 @@ class NativeProvider(BaseModel):
                 system_message=member_system,
                 name=f"{family}_specialist",
                 role=member_role,
+                tool_call_limit=_max_tool_calls_per_run(),
                 markdown=False,
             )
             members.append(member)
@@ -1100,6 +1132,7 @@ class NativeProvider(BaseModel):
                 enable_session_summaries=True,
                 add_session_summary_to_context=True,
                 enable_agentic_memory=False,
+                tool_call_limit=_max_tool_calls_per_run(),
                 markdown=False,
             )
         except Exception as exc:
@@ -1520,6 +1553,7 @@ class NativeProvider(BaseModel):
         tool_started_types = event_types["tool_started"]
         tool_completed_types = event_types["tool_completed"]
         tool_error_types = event_types["tool_error"]
+        run_completed_types = event_types["run_completed"]
 
         try:
             stream_kwargs: dict[str, Any] = {
@@ -1574,6 +1608,18 @@ class NativeProvider(BaseModel):
                                 on_status, getattr(event, "tool", None),
                                 error_text=getattr(event, "error", None),
                             )
+                    elif isinstance(event, run_completed_types):
+                        # The streamed run's tokens. Without this the whole
+                        # streaming path is invisible to usage_log — see
+                        # src/models/stream_usage.py.
+                        from src.models import stream_usage
+
+                        inp, out = stream_usage.metrics_to_tokens(
+                            getattr(event, "metrics", None)
+                        )
+                        stream_usage.record(
+                            input_tokens=inp, output_tokens=out, model=self.model,
+                        )
             finally:
                 self._clear_run_id(sid)
                 aclose = getattr(stream, "aclose", None)
