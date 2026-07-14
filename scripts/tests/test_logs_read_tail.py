@@ -212,6 +212,58 @@ async def t_contract_edges(ctx: TestContext) -> None:
         assert len(got) == 1 and got[0]["event"] == "only.one", got
 
 
+@test("logs_read_tail", "a non-object JSON line is skipped — the ONE deliberate divergence")
+async def t_non_object_lines(ctx: TestContext) -> None:
+    """The single place the new ``read_tail`` does not match the old one, on
+    purpose, because the old behaviour was indefensible in both directions:
+
+      * unfiltered, it returned the bare scalar/list from a function annotated
+        ``list[dict[str, Any]]`` — and ``GET /api/logs`` JSON-serialised it
+        straight out to the app;
+      * with ``event_filter`` set, it called ``.get`` on that non-dict and
+        raised ``AttributeError`` — a 500 on the endpoint.
+
+    Both are pinned here so the divergence stays a decision someone made rather
+    than something that quietly happened. Nothing writes such a line —
+    ``_JsonlFormatter`` always emits an object — so this is reachable only via
+    a corrupt/hand-edited log, which is precisely when not crashing matters.
+    """
+    from src.core.logging import read_tail
+
+    with _agent_dir(ctx, "nonobject") as log_dir_:
+        path = _write(
+            log_dir_,
+            '{"ts": 1.0, "event": "real.entry"}\n'
+            "123\n"
+            '["a", "b"]\n'
+            '"just a string"\n',
+        )
+
+        got = read_tail(lines=10)
+        assert got == [{"ts": 1.0, "event": "real.entry"}], (
+            f"non-object lines must be treated as corrupt, not returned: {got}"
+        )
+        assert all(isinstance(e, dict) for e in got), got
+
+        # The old implementation's actual behaviour, for the record.
+        old = _read_tail_before(path, lines=10)
+        assert 123 in old, (
+            "the oracle no longer reproduces the old non-dict leak — if the "
+            "old behaviour changed, this divergence needs re-stating"
+        )
+        raised = False
+        try:
+            _read_tail_before(path, lines=10, event_filter="real.")
+        except AttributeError:
+            raised = True
+        assert raised, "the old implementation used to crash here; it no longer does?"
+
+        # The new one just filters, on the same corrupt file.
+        assert read_tail(lines=10, event_filter="real.") == [
+            {"ts": 1.0, "event": "real.entry"},
+        ]
+
+
 @test("logs_read_tail", "read_tail spans block boundaries exactly (no dropped/merged lines)")
 async def t_block_boundaries(ctx: TestContext) -> None:
     """The reverse reader stitches 64 KB blocks back together; an off-by-one at

@@ -414,20 +414,23 @@ the things a schema dump will NOT tell you:
 - ``task_runs`` holds one row per firing, with the child ``session_id``
   for the full transcript. ``workflow_runs.trace_json`` holds the full
   per-block trace.
-- ``conversation_embeddings`` is only written when turn-indexing is
-  enabled — see the ``memory-search`` warning below.
-
 Preferred retrieval paths:
 
-- For "remember when we discussed X?", start with the vault
-  (``vault_search_notes``) and ``sessions`` — those are always
-  populated. The ``memory-search`` MCP's ``search_past_conversations``
-  tool takes ``query``, ``top_k``, and an optional ``session_id``, but
-  its index is opt-in and off by default, so on most deployments it is
-  EMPTY and returns nothing. An empty result means "this deployment
-  isn't indexing turns" — NOT "we never discussed it". Never report it
-  to the user as a memory failure, and never stop there: fall back to
-  the vault and ``sessions``.
+- For "remember when we discussed X?", you have two complementary
+  sources. The vault (``vault_search_notes``) holds what you
+  deliberately LEARNED; ``search_past_conversations`` (the
+  ``memory-search`` MCP) searches what was literally SAID, across every
+  stored session. Try the vault first for facts, decisions and
+  preferences; use memory-search for the raw transcript. It takes
+  ``query``, ``limit``, ``offset`` and an optional ``session_id``, and
+  is always on — FTS5 over ``sessions.runs``, needing no key and no
+  provider. It matches WORDS, NOT MEANING: "launch deadline" will not
+  find "the ship date we agreed", so retry with the user's likely
+  wording before concluding anything. It covers user and assistant
+  messages only — not tool output (use ``logs``), attachments, or text
+  folded away by compaction. An empty result means THOSE WORDS are
+  absent, not that the topic is; check the ``index`` field in the reply
+  and never report a miss to the user as "we never discussed it".
 - To diagnose your OWN behaviour ("what went wrong yesterday?", "why
   did that task fail?", "what is slow?"), use the ``logs`` MCP over the
   unified event log rather than hand-rolling SQL.

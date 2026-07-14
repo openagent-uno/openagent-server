@@ -426,6 +426,22 @@ DEFAULT_MCPS: list[dict[str, Any]] = [
     # list, so three more tools cost 0 prompt tokens until actually used.
     # Dream mode's log-triage mission also depends on it being present.
     {"builtin": "logs", "_default": True},
+    # On by default as of the FTS rewrite. It was opt-in while it was an
+    # OpenAI-pinned embedding index whose only writer had zero callers — i.e.
+    # it could never return a row, and enabling it bought nothing. It is now
+    # FTS5 over ``sessions.runs`` (``src/memory/transcript_index.py``): no key,
+    # no provider, no vendor, and a rebuildable cache rather than a store.
+    #
+    # It has to be default-on because ``prompts.py`` tells the model this tool
+    # exists and when to reach for it. A described tool that isn't registered
+    # is the same defect as a prompt naming a tool that doesn't exist — the
+    # model burns a turn on "Function not found" and learns nothing.
+    #
+    # Cost is one more Python subprocess at boot, the sixth of an identical
+    # kind (scheduler, mcp-manager, model-manager, workflow-manager,
+    # events-manager). Making it in-process would make this free and is the
+    # better end state; it is not worth blocking the capability on.
+    {"builtin": "memory-search", "_default": True},
     {"builtin": "computer-control", "_default": True},
     {"builtin": "agent-in-chrome", "_default": True},
     {"builtin": "messaging", "_default": True},

@@ -55,6 +55,7 @@ from src.core.builtin_tasks import (
     AUTO_UPDATE_TASK_NAME,
     DREAM_MODE_TASK_NAME,
 )
+from src.memory.schedule import default_timezone_name
 
 
 def _compose_task_hook(hook, nxt):
@@ -228,6 +229,32 @@ def _build_agent(config: dict) -> Agent:
     # ``guardrails``/``compression`` block in an existing ``openagent.yaml`` is
     # inert rather than an error, the same way every other retired key degrades
     # here.
+    # ``scheduler.timezone`` — the zone new scheduled tasks are created in.
+    # Exported before the MCP pool spawns, because the ``scheduler`` MCP runs
+    # as a subprocess and writes task rows itself; it can only see the default
+    # through the environment it inherits.
+    #
+    # Crons evaluate in **UTC**, not host-local: ``next_run_for_expression``
+    # hands croniter a float, which croniter resolves via
+    # ``fromtimestamp(ts, tz=utc)``. So an untagged ``0 9 * * *`` is 09:00 UTC
+    # on every machine, which is why operators end up hand-converting
+    # (``23 11 * * 1-5 UTC ~= 13:23 Europe/Rome``) and why DST silently moves
+    # their briefings twice a year.
+    #
+    # This default is materialised into each new row at creation time and is
+    # NEVER resolved for existing NULL-timezone rows at fire time. That is the
+    # whole safety property: setting it re-aims nothing that already exists —
+    # every hand-converted cron on every deployment keeps firing at exactly the
+    # instant it fires today.
+    _sched_cfg = config.get("scheduler") or {}
+    if _sched_cfg.get("timezone"):
+        from src.memory.schedule import DEFAULT_TZ_ENV, validate_timezone
+
+        _tz = str(_sched_cfg["timezone"]).strip()
+        # Fail at boot on a bad zone rather than at 3am on the first firing.
+        validate_timezone(_tz)
+        os.environ[DEFAULT_TZ_ENV] = _tz
+
     safety_config = config.get("safety") or {}
     _approvals_cfg = (safety_config.get("approvals") or {})
     if "enabled" in _approvals_cfg:
@@ -275,11 +302,13 @@ def _build_agent(config: dict) -> Agent:
     # catalog for the reasons in ``learning/_model.py``.
     if memory_cfg.get("learning_model"):
         os.environ["OPENAGENT_LEARNING_MODEL"] = str(memory_cfg["learning_model"]).strip()
-    _ss_cfg = (memory_cfg.get("semantic_search") or {})
-    if "enabled" in _ss_cfg:
-        os.environ["OPENAGENT_SEMANTIC_SEARCH"] = (
-            "1" if bool(_ss_cfg["enabled"]) else "0"
-        )
+    # ``memory.semantic_search`` is no longer read. The subsystem it gated was
+    # an OpenAI-pinned embedding index whose only writer had zero callers, so
+    # it could never return a row on any deployment; ``search_past_conversations``
+    # is now FTS5 over ``sessions.runs`` (``src/memory/transcript_index.py``),
+    # needs no key and no provider, and has nothing to gate. Exporting a
+    # write-only env var is how the five ``OPENAGENT_SAFETY_*`` vars sat here
+    # for months describing protection that never fired — one is enough.
     _cur_cfg = (memory_cfg.get("curator") or {})
     if "enabled" in _cur_cfg:
         os.environ["OPENAGENT_CURATOR_ENABLED"] = (
@@ -1137,6 +1166,7 @@ class AgentServer:
 
     async def _sync_scheduled_task(
         self, scheduler, *, name: str, enabled: bool, cron_expr: str, prompt: str,
+        timezone: str | None = None,
     ) -> None:
         """Ensure a built-in scheduled task matches the desired state.
 
@@ -1155,6 +1185,7 @@ class AgentServer:
         if existing is None:
             new_id = await scheduler.add_task(
                 name=name, cron_expression=cron_expr, prompt=prompt,
+                timezone=timezone,
             )
             # ``add_task`` creates the row enabled with a future next_run; park
             # it disabled so a disabled built-in never fires on a cron the user
@@ -1231,12 +1262,25 @@ class AgentServer:
             minute = int(parts[1]) if len(parts) > 1 else 0
             cron_expr = f"{minute} {hour} * * *"
 
+        # ``time: "3:00"`` reads as a wall-clock hour, and a user setting it
+        # means "while I'm asleep" (§12: dreaming runs while the agent is
+        # otherwise idle). But an untagged cron evaluates in UTC, so on a
+        # Europe/Rome operator's k8s box "3:00" has always fired at 05:00 local
+        # in summer — inside the working day, competing with the user-facing
+        # work §12 says it must not compete with.
+        #
+        # ``dream_mode.timezone`` names the zone; absent, it inherits
+        # ``scheduler.timezone``; absent both, it stays UTC — the behaviour
+        # every existing deployment has today, so nothing moves on upgrade.
+        dream_tz = dream_cfg.get("timezone") or default_timezone_name()
+
         await self._sync_scheduled_task(
             scheduler,
             name=DREAM_MODE_TASK_NAME,
             enabled=enabled,
             cron_expr=cron_expr,
             prompt=DREAM_MODE_PROMPT,
+            timezone=dream_tz,
         )
 
         dream_hook = None

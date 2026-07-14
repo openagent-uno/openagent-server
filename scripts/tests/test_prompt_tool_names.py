@@ -192,6 +192,10 @@ _NON_TOOL_TOKENS: frozenset[str] = frozenset({
     "model_id", "runtime_id", "top_k", "session_binding_path", "task",
     "query", "path", "tool", "marker", "shell_id", "open_suggestions",
     "child_session_id", "id",
+    # ``search_past_conversations`` params, and the ``index`` field of its
+    # reply — the prompt names that field because an empty result must be
+    # read as "those words are absent", never as "we never discussed it".
+    "limit", "offset", "index",
     # ``error_like`` is a RESULT FIELD of the logs MCP, not a tool.
     # DREAM_MODE_PROMPT names it to warn that severity is inferred rather
     # than authoritative (log entries carry no level field), so the flag
