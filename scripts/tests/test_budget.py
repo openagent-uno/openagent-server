@@ -1,8 +1,8 @@
 """BudgetTracker tests.
 
-The SmartRouter budget-exhausted gate is gone with the yaml knob; the
-BudgetTracker itself is still wired inside SmartRouter to record usage
-(``record`` path) so these tests cover the class in isolation.
+The budget-exhausted gate is gone with the yaml knob; the
+BudgetTracker itself is still wired inside ``ModelDispatcher`` to record
+usage (``record`` path) so these tests cover the class in isolation.
 """
 from __future__ import annotations
 

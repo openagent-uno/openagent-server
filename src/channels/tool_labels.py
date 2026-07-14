@@ -2,10 +2,17 @@
 
 Channels (Telegram, WhatsApp, Discord, Slack) narrate the agent's tool use
 as chat messages and typing-status lines (see ``BaseBridge.dispatch_turn``).
-Raw tool names — ``vault_write_note``, ``shell_shell_exec``, or the
+Raw tool names — ``vault_write_note``, ``shell_exec``, or the
 dispatcher-unwrapped ``read_note`` — are an implementation detail. This module
 turns them into human verbs, with first-class copy for memory-vault operations
 ("Recalling", "Memorizing", "Forgetting", …).
+
+An op named here that no server registers is dead weight; a registered op
+missing from here leaks a raw name into a user's chat. Both had happened
+(``list_notes`` / ``get_backlinks`` were labelled but do not exist, while
+``list_directory``, ``move_file`` and ``get_notes_info`` were real and
+unlabelled) — so ``scripts/tests/test_tool_labels.py`` now checks this
+table against the live MCP registrations rather than trusting it.
 
 It is the Python twin of the universal app's ``toolDisplay`` (the app's
 ``common/types.ts``): a tool call reads the same on a phone channel as it does
@@ -39,13 +46,26 @@ _MEMORY_VERBS: dict[str, tuple[str, str]] = {
     "rename_note": ("Renaming memory", "🔀"),
     "search_notes": ("Searching memory", "🔍"),
     "search": ("Searching memory", "🔍"),
-    "list_notes": ("Browsing memory", "🗂️"),
+    # ``list_directory`` is the real vault browsing leaf. It was missing
+    # while a ``list_notes`` entry sat here for a tool that has never
+    # existed — so every dream-mode run (whose prompt opens with
+    # "use `list_directory` and `search_notes` to survey the vault")
+    # narrated a raw tool name to the user's channel. Ops are checked
+    # against the live registrations by ``test_tool_labels``.
+    "list_directory": ("Browsing memory", "🗂️"),
     "list_all_tags": ("Memory tags", "🏷️"),
     "manage_tags": ("Tagging memory", "🏷️"),
-    "get_backlinks": ("Tracing memory links", "🔗"),
+    "get_notes_info": ("Checking memory", "🔎"),
+    "move_file": ("Reorganizing memory", "🔀"),
+    # ``backlinks`` is the bare op of ``vault_backlinks`` (vault-gate, an
+    # in-process toolkit, so no server prefix). ``get_backlinks`` never
+    # existed on either server.
     "backlinks": ("Tracing memory links", "🔗"),
     "get_vault_stats": ("Memory stats", "📊"),
     "stats": ("Memory stats", "📊"),
+    # Recall attribution: which notes preceded runs that went well.
+    # Reading it is the agent weighing its own memory, not browsing it.
+    "recall_stats": ("Weighing memory", "⚖️"),
     "gate": ("Auditing memory", "🛡️"),
     "doctor": ("Healing memory", "🩺"),
     "dream": ("Memory maintenance", "🌙"),

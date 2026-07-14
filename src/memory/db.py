@@ -46,6 +46,16 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
     -- default/router model, exactly like a chat turn with no session pin.
     -- Added by ``_migrate_scheduled_tasks_model_column`` on old DBs.
     model TEXT,
+    -- IANA timezone the cron expression is read in (e.g. 'Europe/Rome').
+    -- NULL → UTC, which is how every cron already behaved (croniter reads a
+    -- float epoch as UTC), so upgrading moves nothing. It is never
+    -- backfilled: existing rows hold expressions the operator already
+    -- hand-converted to UTC ("23 11 * * 1-5 UTC ≈ 13:23 Europe/Rome"), and
+    -- re-reading those under an agent-wide default would shift every
+    -- production cron at once. Set per task to opt in; see
+    -- ``src/memory/schedule.py`` for the DST rules that follow from it.
+    -- Added by ``_migrate_scheduled_tasks_timezone_column`` on old DBs.
+    timezone TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -94,6 +104,47 @@ CREATE TABLE IF NOT EXISTS task_run_requests (
     created_at  REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_taskreq_unclaimed ON task_run_requests(claimed_at);
+
+-- One row per (run, vault note recalled). The join that lets the vault be a
+-- policy instead of a diary: which notes the agent READ before a run, and how
+-- that run ended. Written by ``TeamRouterProvider`` next to ``record_cost``
+-- (see src/core/vault_recall.py); read by ``vault-gate``'s
+-- ``vault_recall_stats``.
+--
+-- WHY A TABLE AND NOT NOTE FRONTMATTER: the vault is Markdown, git-backed and
+-- human-editable (§5). These counters are machine-generated and change on
+-- every turn — writing them into frontmatter would rewrite notes the user did
+-- not touch, churn the vault's git history, and hand dream mode (§12) a moving
+-- target while it tries to consolidate. Scores are ABOUT notes, not part of
+-- them, exactly as ``usage_log`` is about model calls and lives here.
+--
+-- WHY RAW ROWS AND NOT AGGREGATED COUNTERS: what counts as a good outcome is a
+-- v1 guess (see ``vault_recall.OUTCOME_*``) and WILL be refined. Per-note
+-- counters would bake today's definition in permanently and need a migration
+-- plus a backfill to change it; raw rows can simply be re-scored. Cheap, too:
+-- the production log's 697 streamed turns over two months would be a few
+-- thousand rows.
+--
+-- ``cost`` is stored, not joined from ``usage_log`` at read time: that ledger
+-- is keyed by ``session_id``, and a session has MANY turns, so a join would
+-- attribute a whole session's spend to every note any turn in it read. This
+-- column is the same ``BudgetTracker.compute_cost`` value ``usage_log`` gets,
+-- captured per run.
+CREATE TABLE IF NOT EXISTS vault_recall_outcomes (
+    id           TEXT PRIMARY KEY,
+    timestamp    REAL NOT NULL,
+    session_id   TEXT,
+    note_path    TEXT NOT NULL,
+    -- The vault read tool that surfaced the note (vault_read_note, …).
+    tool         TEXT NOT NULL,
+    -- 'ok' | 'errored' | 'cancelled'. 'cancelled' is a barge-in and is NEVER
+    -- scored — kept only so the recall count stays honest. See SCORABLE.
+    outcome      TEXT NOT NULL,
+    model        TEXT,
+    cost         REAL NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_vault_recall_note ON vault_recall_outcomes(note_path);
+CREATE INDEX IF NOT EXISTS idx_vault_recall_ts   ON vault_recall_outcomes(timestamp);
 
 CREATE TABLE IF NOT EXISTS usage_log (
     id TEXT PRIMARY KEY,
@@ -915,6 +966,7 @@ class MemoryDB:
 
         await self._migrate_task_runs_session_id()
         await self._migrate_scheduled_tasks_model_column()
+        await self._migrate_scheduled_tasks_timezone_column()
         await self._migrate_events_session_binding()
 
     async def _migrate_scheduled_tasks_model_column(self) -> None:
@@ -928,6 +980,24 @@ class MemoryDB:
         if "model" not in cols:
             await self._conn.execute(
                 "ALTER TABLE scheduled_tasks ADD COLUMN model TEXT"
+            )
+            await self._conn.commit()
+
+    async def _migrate_scheduled_tasks_timezone_column(self) -> None:
+        """A scheduled task can now name the IANA timezone its cron is read
+        in. Old DBs predate the column; add it idempotently.
+
+        Deliberately no backfill. Every row already in a production DB holds
+        an expression whose hour the operator converted to UTC by hand;
+        stamping a real timezone on it would re-read that hour and shift the
+        task. NULL keeps the UTC behaviour those rows were written against,
+        and an operator opts a task in by editing it."""
+        assert self._conn is not None
+        cursor = await self._conn.execute("PRAGMA table_info(scheduled_tasks)")
+        cols = {row[1] for row in await cursor.fetchall()}
+        if "timezone" not in cols:
+            await self._conn.execute(
+                "ALTER TABLE scheduled_tasks ADD COLUMN timezone TEXT"
             )
             await self._conn.commit()
 
@@ -1526,14 +1596,23 @@ class MemoryDB:
         prompt: str,
         next_run: float | None = None,
         model: str | None = None,
+        timezone: str | None = None,
     ) -> str:
+        """``timezone`` is an IANA name the cron is read in; None = UTC (the
+        pre-timezone behaviour). Validated here so a typo can't reach the
+        scheduler loop, where it would surface only as a task that mysteriously
+        stopped advancing."""
+        from src.memory.schedule import validate_timezone
+
+        validate_timezone(timezone)
         conn = await self._ensure_connected()
         task_id = str(uuid.uuid4())
         now = time.time()
         await conn.execute(
-            "INSERT INTO scheduled_tasks (id, name, cron_expression, prompt, enabled, next_run, model, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)",
-            (task_id, name, cron_expression, prompt, next_run or now, model or None, now, now),
+            "INSERT INTO scheduled_tasks (id, name, cron_expression, prompt, enabled, next_run, model, timezone, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?)",
+            (task_id, name, cron_expression, prompt, next_run or now, model or None,
+             (timezone or None), now, now),
         )
         await conn.commit()
         return task_id
@@ -1555,10 +1634,22 @@ class MemoryDB:
 
     async def update_task(self, task_id: str, **kwargs: Any) -> None:
         conn = await self._ensure_connected()
-        allowed = {"name", "cron_expression", "prompt", "enabled", "last_run", "next_run", "model"}
+        allowed = {
+            "name", "cron_expression", "prompt", "enabled", "last_run",
+            "next_run", "model", "timezone",
+        }
         updates = {k: v for k, v in kwargs.items() if k in allowed}
         if not updates:
             return
+        if "timezone" in updates:
+            from src.memory.schedule import validate_timezone
+
+            # Reject at the write. A bad zone that lands in the row makes
+            # every next_run recompute raise inside the scheduler tick, which
+            # logs but leaves next_run in the past — the task then re-fires
+            # every 30 s instead of failing visibly.
+            validate_timezone(updates["timezone"])
+            updates["timezone"] = updates["timezone"] or None
         updates["updated_at"] = time.time()
         set_clause = ", ".join(f"{k} = ?" for k in updates)
         values = list(updates.values()) + [task_id]
@@ -2851,6 +2942,91 @@ class MemoryDB:
         except (TypeError, ValueError):
             d["inputs"] = {}
         return d
+
+    # ── Vault recall attribution ──
+
+    async def record_vault_recall(
+        self,
+        *,
+        session_id: str | None,
+        note_path: str,
+        tool: str,
+        outcome: str,
+        model: str | None = None,
+        cost: float = 0.0,
+    ) -> str:
+        """Record that a run recalled ``note_path`` and ended in ``outcome``.
+
+        One row per (run, note). See ``src/core/vault_recall.py`` for what the
+        outcomes mean and why ``cancelled`` is recorded but never scored.
+        """
+        conn = await self._ensure_connected()
+        row_id = str(uuid.uuid4())
+        await conn.execute(
+            "INSERT INTO vault_recall_outcomes "
+            "(id, timestamp, session_id, note_path, tool, outcome, model, cost) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (row_id, time.time(), session_id, note_path, tool, outcome, model, cost),
+        )
+        await conn.commit()
+        return row_id
+
+    async def get_vault_recall_stats(
+        self,
+        *,
+        since: float | None = None,
+        limit: int = 50,
+        note_path: str | None = None,
+    ) -> list[dict]:
+        """Per-note recall counts grouped by outcome, most-recalled first.
+
+        Returns raw counts — ``ok``/``errored``/``cancelled`` — and leaves the
+        judgement to the caller. Deliberately does NOT return a single quality
+        score: a run that read a note and finished proves the run finished, not
+        that the note helped (nothing here observes whether the answer was any
+        good). Aggregation happens at read time so the outcome definition can
+        change without a migration or a backfill.
+        """
+        conn = await self._ensure_connected()
+        where: list[str] = []
+        params: list[Any] = []
+        if since is not None:
+            where.append("timestamp >= ?")
+            params.append(since)
+        if note_path:
+            where.append("note_path = ?")
+            params.append(note_path)
+        clause = f"WHERE {' AND '.join(where)}" if where else ""
+        params.append(int(limit))
+        sql = f"""
+            SELECT note_path,
+                   COUNT(*)                                   AS recalls,
+                   SUM(outcome = 'ok')                        AS ok,
+                   SUM(outcome = 'errored')                   AS errored,
+                   SUM(outcome = 'cancelled')                 AS cancelled,
+                   SUM(cost)                                  AS cost,
+                   MAX(timestamp)                             AS last_recalled
+            FROM vault_recall_outcomes
+            {clause}
+            GROUP BY note_path
+            ORDER BY recalls DESC, last_recalled DESC
+            LIMIT ?
+        """
+        rows = await (await conn.execute(sql, tuple(params))).fetchall()
+        out: list[dict] = []
+        for r in rows:
+            d = dict(r)
+            ok = int(d.get("ok") or 0)
+            errored = int(d.get("errored") or 0)
+            # The denominator EXCLUDES barge-ins by construction, not by a
+            # filter a caller has to remember. On the production log all 294
+            # errored runs were also cancelled; counting those as failures
+            # teaches that users interrupting is a defect (§2 says it is not).
+            scorable = ok + errored
+            d["scorable"] = scorable
+            d["ok_rate"] = round(ok / scorable, 3) if scorable else None
+            out.append(d)
+        return out
 
     # ── Usage Tracking ──
 

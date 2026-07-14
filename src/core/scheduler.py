@@ -165,8 +165,21 @@ class Scheduler:
         self._workflow_run_tasks: dict[str, asyncio.Task] = {}
         self._scheduled_run_tasks: dict[str, asyncio.Task] = {}
 
-    def _next_run(self, cron_expression: str, base: float | None = None) -> float:
-        return next_run_for_expression(cron_expression, base)
+    def _next_run(
+        self,
+        cron_expression: str,
+        base: float | None = None,
+        timezone: str | None = None,
+    ) -> float:
+        return next_run_for_expression(cron_expression, base, timezone)
+
+    @staticmethod
+    def _task_tz(task: dict) -> str | None:
+        """The zone a task's cron is read in; None = UTC (the default).
+
+        ``.get`` rather than ``[]`` so a row read before the timezone
+        migration ran (or a hand-built dict in a test) still schedules."""
+        return task.get("timezone") or None
 
     async def start(self) -> None:
         """Start the scheduler background loop."""
@@ -226,7 +239,12 @@ class Scheduler:
                     if task.get("last_run"):
                         await self.db.update_task(task["id"], enabled=0, next_run=None)
                     continue
-                await self.db.update_task(task["id"], next_run=self._next_run(task["cron_expression"], now))
+                await self.db.update_task(
+                    task["id"],
+                    next_run=self._next_run(
+                        task["cron_expression"], now, self._task_tz(task),
+                    ),
+                )
             except ValueError as e:
                 elog("scheduler.invalid_cron", level="error", task=task["name"], error=str(e))
 
@@ -798,7 +816,9 @@ class Scheduler:
                     await self.db.update_task(
                         task["id"],
                         last_run=now,
-                        next_run=self._next_run(task["cron_expression"], now),
+                        next_run=self._next_run(
+                            task["cron_expression"], now, self._task_tz(task),
+                        ),
                     )
                 self._broadcast("scheduled_task", "updated", task["id"])
             except ValueError as e:
@@ -1008,14 +1028,26 @@ class Scheduler:
     # ── Task management helpers ──
 
     async def add_task(
-        self, name: str, cron_expression: str, prompt: str, model: str | None = None,
+        self,
+        name: str,
+        cron_expression: str,
+        prompt: str,
+        model: str | None = None,
+        timezone: str | None = None,
     ) -> str:
         """Add a new scheduled task. ``model`` is an optional runtime_id the
-        firing runs on (NULL = the agent's default/router model)."""
+        firing runs on (NULL = the agent's default/router model).
+
+        ``timezone`` is an optional IANA name the cron is read in; NULL keeps
+        the UTC behaviour every pre-existing task was written against.
+        Callers that want the agent-wide default resolve it before
+        calling — it is materialised into the row here, not re-resolved at
+        fire time (see ``src/memory/schedule.py``)."""
         now = time.time()
         return await self.db.add_task(
             name, cron_expression, prompt,
-            self._next_run(cron_expression, now), model=model,
+            self._next_run(cron_expression, now, timezone), model=model,
+            timezone=timezone,
         )
 
     async def list_tasks(self) -> list[dict]:
@@ -1031,7 +1063,11 @@ class Scheduler:
         now = time.time()
         task = await self.db.get_task(task_id)
         if task:
-            updates = {"next_run": self._next_run(task["cron_expression"], now)}
+            updates = {
+                "next_run": self._next_run(
+                    task["cron_expression"], now, self._task_tz(task),
+                ),
+            }
             if enabled is not None:
                 updates["enabled"] = enabled
             await self.db.update_task(task_id, **updates)

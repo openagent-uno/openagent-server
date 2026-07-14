@@ -76,6 +76,17 @@ async def shell_exec(
     """
     if not command or not command.strip():
         raise ValueError("command must be a non-empty string")
+    # Blocklist gate (``safety.approvals`` in openagent.yaml). Off by default:
+    # when the stanza is absent or false this returns before matching anything,
+    # so every command runs exactly as it did pre-gate. Placed here rather than
+    # in an adapter because both providers and both the foreground and
+    # background paths funnel through this one function — a gate on the adapter
+    # would miss `run_in_background=True` callers that reach the handler
+    # directly. Only `command` is matched: `stdin` is data for whatever the
+    # command spawns, and matching it would flag a file whose *contents*
+    # mention `rm -rf /`. See src/core/safety.py for what this does not cover.
+    from src.core.safety import check_command_allowed
+    check_command_allowed(command)
     if session_id is None:
         # Fall back to the contextvar set by the provider adapter.
         from src.mcp.servers.shell.adapters import current_session_id

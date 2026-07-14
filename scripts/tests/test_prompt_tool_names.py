@@ -84,14 +84,19 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parent.parent.parent
 
 
-def _registered_tool_keys() -> tuple[set[str], list[str]]:
-    """Return ``(every registered tool key, notes)`` built from the real
-    sources: in-process adapter toolkits, the Python MCP servers' FastMCP
-    registries, and the vendored vault server's TypeScript source.
+def _registered_keys_by_server() -> tuple[dict[str, set[str]], list[str]]:
+    """Return ``({server_name: {registered tool keys}}, notes)`` built from
+    the real sources: in-process adapter toolkits, the Python MCP servers'
+    FastMCP registries, and the vendored vault server's TypeScript source.
+
+    Keyed by server (rather than flattened) because two different contracts
+    read it: "every name the prompt says must exist somewhere" wants the
+    union, while "the catalog must inline every key of THIS server" needs
+    to know which server a key belongs to.
     """
     from src.mcp.builtins import BUILTIN_MCP_SPECS, BUILTIN_MCPS_DIR
 
-    keys: set[str] = set(_RUNTIME_TOOLS)
+    by_server: dict[str, set[str]] = {}
     notes: list[str] = []
 
     for name, spec in BUILTIN_MCP_SPECS.items():
@@ -117,7 +122,7 @@ def _registered_tool_keys() -> tuple[set[str], list[str]]:
                 continue
             fns = dict(getattr(toolkit, "functions", {}) or {})
             fns.update(getattr(toolkit, "async_functions", {}) or {})
-            keys |= set(fns)
+            by_server[name] = set(fns)
             continue
 
         # 2. Python subprocess MCPs go through the pool's prefixing.
@@ -129,7 +134,7 @@ def _registered_tool_keys() -> tuple[set[str], list[str]]:
                 notes.append(f"{name}: not introspectable ({type(exc).__name__})")
                 continue
             pfx = _safe_prefix(name) + "_"
-            keys |= {pfx + t.name for t in registry}
+            by_server[name] = {pfx + t.name for t in registry}
 
     # 3. Vendored Node vault server — parse its ListTools handler.
     for name, rel in _NODE_TOOL_SOURCES.items():
@@ -138,8 +143,19 @@ def _registered_tool_keys() -> tuple[set[str], list[str]]:
             notes.append(f"{name}: source missing at {src}")
             continue
         pfx = _safe_prefix(name) + "_"
-        keys |= {pfx + t for t in _TS_TOOL_NAME.findall(src.read_text())}
+        by_server[name] = {pfx + t for t in _TS_TOOL_NAME.findall(src.read_text())}
 
+    return by_server, notes
+
+
+def _registered_tool_keys() -> tuple[set[str], list[str]]:
+    """Return ``(every registered tool key, notes)`` — the flat union of
+    :func:`_registered_keys_by_server` plus the runtime-injected tools.
+    """
+    by_server, notes = _registered_keys_by_server()
+    keys: set[str] = set(_RUNTIME_TOOLS)
+    for server_keys in by_server.values():
+        keys |= server_keys
     return keys, notes
 
 
@@ -171,6 +187,7 @@ _NON_TOOL_TOKENS: frozenset[str] = frozenset({
     "started_at", "workflow_id", "json_extract",
     # -- MCP SERVER names (not tools) --
     "vault", "scheduler", "delegation", "attachments", "workflow", "chat",
+    "logs",
     # -- tool PARAMETERS / result fields --
     "model_id", "runtime_id", "top_k", "session_binding_path", "task",
     "query", "path", "tool", "marker", "shell_id", "open_suggestions",
@@ -315,29 +332,73 @@ async def t_dream_prompt_tools_exist(_ctx: TestContext) -> None:
     _assert_prompt_tools_exist(DREAM_MODE_PROMPT, "DREAM_MODE_PROMPT")
 
 
-@test("prompt_tool_names", "the vault tool list matches the vault MCP exactly")
-async def t_vault_tool_list_is_complete(_ctx: TestContext) -> None:
-    """The prompt hardcodes the vault's tool surface. Pin it to the real
-    registration so the list can't silently drift again — it is the exact
-    list that carried ``list_notes`` and ``get_backlinks``.
+@test("prompt_tool_names", "the runtime catalog delivers every hardcoded-list key verbatim")
+async def t_inlined_tool_lists_are_complete(_ctx: TestContext) -> None:
+    """The contract this test has always defended: **the model can only
+    copy a key it has seen** — so every registered key of the servers whose
+    tools the prompt used to enumerate must still reach the prompt verbatim.
+
+    It used to defend that by pinning a HAND-WRITTEN list in
+    FRAMEWORK_SYSTEM_PROMPT against the real registration. Those lists are
+    gone, because they were duplicating a fact the runtime already injects:
+    ``_render_catalog_summary_lines`` builds the catalog from the LIVE pool
+    and substitutes it at ``{{MCP_CATALOG_SUMMARY}}`` on every run, spelling
+    out the exact keys of every allowlisted server. Hand-copying a runtime
+    fact into prose is precisely how ``list_notes`` and ``get_backlinks``
+    drifted in — the duplication WAS the defect.
+
+    So the assertion moves to the delivery mechanism rather than being
+    dropped, and it is stricter than the substring check it replaces: each
+    server must be on the inline allowlist, must fit under the truncation
+    cap, and must actually render every one of its keys. Remove ``vault``
+    from the allowlist, or let the vault MCP grow past the cap, and the
+    model stops seeing the keys — this fails, exactly as it would have
+    before.
     """
-    from src.core.prompts import FRAMEWORK_SYSTEM_PROMPT
-
-    keys, _ = _registered_tool_keys()
-    vault_keys = {k for k in keys if k.startswith("vault_")}
-    # vault-gate's tools are also ``vault_*``; keep only the vault MCP's.
-    from src.mcp.builtins import BUILTIN_MCPS_DIR, BUILTIN_MCP_SPECS
-
-    src = BUILTIN_MCPS_DIR / BUILTIN_MCP_SPECS["vault"]["dir"] / "src/createServer.ts"
-    real = {"vault_" + t for t in _TS_TOOL_NAME.findall(src.read_text())}
-    assert len(real) == 15, f"vault MCP tool count changed: {len(real)} — {sorted(real)}"
-    assert real <= vault_keys
-
-    missing = sorted(k for k in real if k not in FRAMEWORK_SYSTEM_PROMPT)
-    assert not missing, (
-        "FRAMEWORK_SYSTEM_PROMPT's vault tool list omits registered "
-        f"tool(s): {missing}. The model can only copy a key it has seen."
+    from src.core.prompts import (
+        _INLINE_TOOL_KEYS_CAP,
+        _INLINE_TOOL_KEYS_SERVERS,
+        _render_catalog_summary_lines,
     )
+
+    by_server, notes = _registered_keys_by_server()
+
+    # NOTE: deliberately no exact tool-COUNT pin here, unlike the version
+    # of this test that guarded the hand-written list. That pin existed so
+    # a newly-registered tool couldn't be silently missing from the prose;
+    # with the prose list gone the catalog picks a new tool up on its own,
+    # and hand-maintaining a number here would re-introduce exactly the
+    # class of drift this change removes. (Proof it would have: vault-gate
+    # gained ``vault_recall_stats`` while this very change was being made —
+    # the catalog surfaced it automatically.) The cap assertion below is
+    # the real guard: it fires when growth would start truncating keys.
+    for server in ("vault", "vault-gate", "shell"):
+        real = by_server.get(server) or set()
+        assert len(real) >= 5, (
+            f"{server}: only {len(real)} keys discovered — introspection "
+            f"looks broken, so the rest of this test would pass vacuously "
+            f"(notes: {notes})"
+        )
+        assert server in _INLINE_TOOL_KEYS_SERVERS, (
+            f"{server!r} dropped off _INLINE_TOOL_KEYS_SERVERS. The prompt no "
+            f"longer hardcodes its tool list, so the catalog is the ONLY place "
+            f"the model sees these keys — it would be left guessing them."
+        )
+        assert len(real) <= _INLINE_TOOL_KEYS_CAP, (
+            f"{server} has {len(real)} tools, over the _INLINE_TOOL_KEYS_CAP "
+            f"of {_INLINE_TOOL_KEYS_CAP} — the catalog would truncate the list "
+            f"and the model would only see the first {_INLINE_TOOL_KEYS_CAP}."
+        )
+
+        # Render exactly as the runtime does, and demand every key back.
+        rendered = _render_catalog_summary_lines(
+            {server: len(real)}, {}, {server: sorted(real)}
+        )
+        missing = sorted(k for k in real if k not in rendered)
+        assert not missing, (
+            f"the rendered MCP catalog omits registered {server} tool(s): "
+            f"{missing}. The model can only copy a key it has seen."
+        )
 
 
 @test("prompt_tool_names", "the counter-example keys are still genuinely wrong")

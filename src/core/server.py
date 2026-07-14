@@ -134,13 +134,39 @@ Look for problems and act on them:
      your power (a stale path, a misconfigured task), and log what
      still needs a human.
 
+## Mission 3 — Notice what should be automated, and say so
+
+You are expected to be proactive: surface the patterns you notice
+rather than waiting to be asked. You already have the week in front of
+you from Mission 2, so use it.
+
+   - **Recurring work**: widen to `logs_summary(since="7d")`. Did the
+     same kind of task run three or more times with only minor
+     variation? That is a scheduled task or a workflow that doesn't
+     exist yet. Propose it concretely — the exact prompt and cron, or
+     the block outline — via the `scheduler` / `workflow-manager` MCPs.
+   - **Promises that never landed**: search the vault for notes tagged
+     `pending-automation` or `followup`. For each, decide: is the
+     pattern still live? Then schedule it now. Is it dead? Then archive
+     the note. A followup note that survives untouched for months is a
+     decision nobody made.
+   - **Things you said you'd remember**: skim the recent sessions for
+     "I'll remember that", "next time", "we decided" that never became
+     a note. Write the missing notes.
+
+Propose, don't impose. Creating a scheduled task that spends money on
+the user's behalf every night is a decision they should make — write
+what you would automate and why into the dream-log, and create it only
+when the pattern is unambiguous and cheap.
+
 ## Log the dream
 
 Use `write_note` to save a concise summary under
 `dream-logs/dream-log-YYYY-MM-DD.md` with frontmatter `type: dream-log`
 and `date:` set to today. Record, per mission: what you
 merged/updated/cross-linked/removed in the vault, which log issues you
-found, what you fixed, and what still needs the user's decision.
+found, what you fixed, what you would automate and why, and what still
+needs the user's decision.
 
 Use the `vault` MCP's tools for all vault access — never shell out for
 anything under the memory vault.
@@ -179,16 +205,30 @@ def _build_agent(config: dict) -> Agent:
         if sl.get("app_token"):
             os.environ["SLACK_APP_TOKEN"] = sl["app_token"]
 
-    # Safety toggles — read from ``safety.*`` and export as env vars so the
-    # SDK options builder + the per-turn guardrail tracker can read them
-    # without plumbing the agent config object through every callsite.
-    # Defaults preserve current behaviour: guardrails ON, approvals OFF.
+    # Safety toggles — read from ``safety.*`` and exported as env vars so the
+    # blocklist can read them without plumbing the agent config object through
+    # every callsite. Default preserves current behaviour: approvals OFF.
+    #
+    # ``safety.approvals`` is the only stanza here that does anything, and as
+    # of this change it finally does. It is enforced by
+    # ``src.core.safety.check_command_allowed`` at the ``shell_exec`` callsite
+    # (``src/mcp/servers/shell/handlers.py``) — read that module's header for
+    # what the blocklist covers and, importantly, what it does not.
+    #
+    # ``safety.guardrails`` and ``safety.compression`` are no longer read.
+    # Both were parsed here into ``OPENAGENT_SAFETY_GUARDRAILS`` /
+    # ``OPENAGENT_SAFETY_COMPRESSION{,_THRESHOLD_TOKENS}``, which *nothing
+    # anywhere read* — they described the retired Claude-SDK turn loop ("abort
+    # SDK turn on 5 same-tool failures", "drop SDK client at threshold") and
+    # died with it in ``e8f5d68`` without anyone noticing the config had gone
+    # inert. Exporting a safety-shaped env var that has no reader is worse than
+    # exporting nothing: it greps like a live mitigation. Session compaction is
+    # a real, shipped feature — it is simply configured elsewhere, via
+    # ``OPENAGENT_COMPACTION_*`` (see ``src/core/compaction.py``). A stale
+    # ``guardrails``/``compression`` block in an existing ``openagent.yaml`` is
+    # inert rather than an error, the same way every other retired key degrades
+    # here.
     safety_config = config.get("safety") or {}
-    _guardrails_cfg = (safety_config.get("guardrails") or {})
-    if "enabled" in _guardrails_cfg:
-        os.environ["OPENAGENT_SAFETY_GUARDRAILS"] = (
-            "1" if bool(_guardrails_cfg["enabled"]) else "0"
-        )
     _approvals_cfg = (safety_config.get("approvals") or {})
     if "enabled" in _approvals_cfg:
         os.environ["OPENAGENT_SAFETY_APPROVALS"] = (
@@ -202,18 +242,20 @@ def _build_agent(config: dict) -> Agent:
             )
         elif isinstance(extras, str):
             os.environ["OPENAGENT_SAFETY_BLOCK_EXTRA_PATTERNS"] = extras
-    _compression_cfg = (safety_config.get("compression") or {})
-    if "enabled" in _compression_cfg:
-        os.environ["OPENAGENT_SAFETY_COMPRESSION"] = (
-            "1" if bool(_compression_cfg["enabled"]) else "0"
-        )
-    if "threshold_tokens" in _compression_cfg:
-        try:
-            os.environ["OPENAGENT_SAFETY_COMPRESSION_THRESHOLD_TOKENS"] = str(
-                int(_compression_cfg["threshold_tokens"])
+    # ``allow_patterns`` exempts a command from the block list, and is what
+    # makes the whole stanza usable rather than theoretical. ``git push
+    # --force`` is blocked by default, but an autonomous agent that owns its
+    # own branch force-pushes it every run by design — without an exception
+    # such an operator must choose between "blocklist off entirely" and
+    # "break my agent", and will pick off. See ``src.core.safety._compile_allow``.
+    if _approvals_cfg.get("allow_patterns"):
+        allows = _approvals_cfg["allow_patterns"]
+        if isinstance(allows, (list, tuple)):
+            os.environ["OPENAGENT_SAFETY_ALLOW_PATTERNS"] = ",".join(
+                str(p) for p in allows
             )
-        except (TypeError, ValueError):
-            pass
+        elif isinstance(allows, str):
+            os.environ["OPENAGENT_SAFETY_ALLOW_PATTERNS"] = allows
 
     memory_cfg = config.get("memory", {})
     # Learning toggles — mapped to env vars so the loops in ``src.learning``

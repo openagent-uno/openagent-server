@@ -72,32 +72,58 @@ channels:
     port: 8899
     public_url: "https://hooks.example.com"   # optional; shown in the UI
 
-# ── Safety toggles ──────────────────────────────────────────────────
-# Three independent guardrails. All default off (or as noted) so the
-# server behaves like the pre-safety build until a stanza is added.
+# ── Safety ──────────────────────────────────────────────────────────
+# One toggle, off by default. It is a blocklist, NOT an approval prompt:
+# a matching command is refused outright and the model is told why — no
+# human is asked, because a scheduled task firing at 3am has nobody to
+# ask. ("approvals" is the historical key name; it is kept so existing
+# configs keep working.)
+#
+# Scope — this covers the ``shell_exec`` tool ONLY. The editor MCP and
+# any registered filesystem MCP are NOT gated and can still delete or
+# overwrite anything they can reach. It is also a regex over the command
+# text, so it stops a mistake (`rm -rf /` typed literally) and not an
+# adversary (base64, a variable, a heredoc, or a script file all slip
+# past). Treat it as a seatbelt, not a sandbox.
+#
+# Leave it off unless you know your agent doesn't do the things below by
+# design — the Lyra agent, for one, force-pushes its own branch on every
+# run and would break instantly with this on.
 safety:
-  guardrails:
-    enabled: true                       # DEFAULT — abort SDK turn on 5 same-tool failures
-                                        # or 5 identical error responses
   approvals:
-    enabled: false                      # block destructive shell / git push --force / etc.
-    block_extra_patterns:               # additional regex fragments
+    enabled: false                      # DEFAULT — off; every command runs unchecked
+    # When true, shell_exec refuses a command matching any of these
+    # built-in patterns (case-insensitive, substring):
+    #   rm -rf /…            sudo rm            dd if=
+    #   mkfs…                > /dev/sd[a-z]     chmod [-R] NNN /…
+    #   git push --force|-f  git reset --hard HEAD|origin
+    #   kubectl delete       docker rm -f|rmi -f|system prune -a
+    #   drop database|table  shutdown|reboot    halt|poweroff
+    # Extend that list with your own regex fragments:
+    block_extra_patterns:
       - "\\bterraform\\s+destroy\\b"
-  compression:
-    enabled: false                      # summarise recent turns + drop SDK client at threshold
-    threshold_tokens: 80000             # cumulative input_tokens before trigger
+    # …and carve exceptions out of it. An allow pattern WINS over a block
+    # pattern, so this is how you keep the list on for an agent that
+    # legitimately does one thing on it. Without this the stanza is
+    # all-or-nothing, and an agent that force-pushes its own branch every
+    # run (as the Lyra agent does) forces you to disable every other
+    # protection to keep working — so you would, and then none of this
+    # would be on at all.
+    #
+    # Be specific. ``git push --force`` as an allow pattern re-permits it
+    # everywhere; scope it to the branch the agent owns instead:
+    # allow_patterns:
+    #   - "git push --force[a-z-]* origin lyra-agent/"
 
 # ── Memory & learning ───────────────────────────────────────────────
-# All three subsections are independent — you can run user_profile
-# without skills, skills without user_profile, curator regardless.
+# Every subsection is independent.
+#
+# ``user_profile`` and ``skills`` used to be documented here. Both were
+# deleted in v0.15.11 (opaque parallel memory stores competing with the
+# vault) and neither key is read any more — they are listed here only so
+# you don't go looking for them. A leftover block for either in your
+# openagent.yaml is inert, not an error.
 memory:
-  user_profile:
-    enabled: false                      # every Nth turn, flush a JSON "who is the user" summary
-    flush_every_n_turns: 10
-
-  skills:
-    enabled: false                      # detect + save reusable how-tos; matcher injects on relevant turns
-
   curator:
     enabled: false                      # background prune of stale skills/profiles + DB backup
     interval_hours: 6

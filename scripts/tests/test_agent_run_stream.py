@@ -504,7 +504,7 @@ async def t_streaming_meta_uses_effective_model_id(_ctx: TestContext) -> None:
     # ``None`` for every real provider in tree, so the chat bubble
     # never showed which model produced the reply. The fix routes
     # through ``BaseModel.effective_model_id`` (default reads
-    # ``self.model``; SmartRouter overrides for per-session picks).
+    # ``self.model``; ModelDispatcher overrides for per-session picks).
     model = _FakeModel(
         deltas=["streamed", " reply"],
         model_name="provider-y/streaming-model",

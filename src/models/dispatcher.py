@@ -38,6 +38,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable
 
+from src.core import vault_recall
 from src.core.logging import elog
 from src.models import stream_usage
 from src.models.base import BaseModel, ModelResponse
@@ -247,6 +248,7 @@ async def _arun_runtime_collect(
         name = getattr(tc, "tool_name", None)
         if name:
             tools_used.append(str(name))
+        vault_recall.record_tool(name, getattr(tc, "tool_args", None))
         if on_delegate is not None:
             member_id = _extract_delegated_member_id(tc)
             if member_id:
@@ -444,6 +446,14 @@ async def _arun_runtime_stream(
                 await _emit_status(tool, phase="started")
             elif isinstance(event, tool_complete_event_types):
                 tool = getattr(event, "tool", None)
+                # Vault recall on the TEAM streaming path. A delegated member
+                # reading a note counts: it is the same vault (§4 — a child
+                # session "shares the parent's world"), and the note informed
+                # the turn the parent will be judged on.
+                vault_recall.record_tool(
+                    getattr(tool, "tool_name", None),
+                    getattr(tool, "tool_args", None),
+                )
                 await _emit_status(tool)
             elif isinstance(event, tool_error_event_types):
                 tool = getattr(event, "tool", None)
@@ -978,6 +988,59 @@ class TeamRouterProvider(BaseModel):
 
     # ── cost telemetry ────────────────────────────────────────────────
 
+    async def record_vault_recalls(
+        self,
+        *,
+        sink: dict | None,
+        session_id: str | None,
+        outcome: str,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+    ) -> None:
+        """Attribute this run's outcome to every vault note it recalled.
+
+        Lives HERE, beside ``record_cost``, for the same reason that one does:
+        not every run goes through ``ModelDispatcher``. A model-PINNED run —
+        an Events delivery, a scheduled task with a ``model``, a workflow
+        ai-prompt override — is handed this provider directly by
+        ``build_override_model``. Those are precisely the unattended runs (§7)
+        whose notes we most want scored, and hanging this off the dispatcher
+        would have made every one of them invisible — the exact shape of the
+        bug that left usage_log empty while the webhook lane burned 412M
+        input tokens.
+
+        Never raises: attribution runs in a ``finally`` that may already be
+        unwinding a barge-in.
+        """
+        try:
+            cost = BudgetTracker.compute_cost(
+                self._entry_runtime_id, input_tokens, output_tokens,
+            )
+            written = await vault_recall.flush(
+                self._db,
+                sink=sink,
+                session_id=session_id,
+                outcome=outcome,
+                model=self._entry_runtime_id,
+                cost=cost,
+            )
+            if written:
+                elog(
+                    "vault.recall_attributed",
+                    session_id=session_id,
+                    model=self._entry_runtime_id,
+                    outcome=outcome,
+                    notes=written,
+                    cost_usd=cost,
+                )
+        except Exception as e:  # noqa: BLE001
+            elog(
+                "vault.recall_attribute_error",
+                level="warning",
+                session_id=session_id,
+                error=str(e),
+            )
+
     async def record_cost(
         self,
         *,
@@ -1039,51 +1102,68 @@ class TeamRouterProvider(BaseModel):
     ) -> ModelResponse:
         sid = session_id or "default"
         runtime = self._ensure_runtime(sid, system)
-        # Plain-NativeProvider single-model path: forward the full args.
-        if isinstance(runtime, BaseModel):
-            resp = await runtime.generate(
-                messages=messages,
-                system=system,
-                tools=tools,
-                on_status=on_status,
-                session_id=sid,
-                model_override=model_override,
-                files=files, images=images, audio=audio, videos=videos,
-            )
+        # Same sink + outcome pairing as ``stream`` below. ``generate`` is the
+        # model-PINNED lane (an Events delivery, a scheduled task with a
+        # ``model``, a workflow ai-prompt override), so skipping it here would
+        # drop attribution for exactly the unattended runs §7 cares about —
+        # the ones with the user's seat empty, where a note that misleads has
+        # nobody watching to notice.
+        recall_sink, recall_token = vault_recall.open_sink()
+        outcome = vault_recall.OUTCOME_OK
+        in_tokens = out_tokens = 0
+        try:
+            # Plain-NativeProvider single-model path: forward the full args.
+            if isinstance(runtime, BaseModel):
+                resp = await runtime.generate(
+                    messages=messages,
+                    system=system,
+                    tools=tools,
+                    on_status=on_status,
+                    session_id=sid,
+                    model_override=model_override,
+                    files=files, images=images, audio=audio, videos=videos,
+                )
+            else:
+                # Runtime Team path. Translate to the Team's run signature.
+                # Clear the previous turn's delegation memo so this turn's badge
+                # falls back to the leader when no delegate_task_to_member fires —
+                # otherwise the model attribution stays pinned to whichever
+                # specialist handled the LAST delegation indefinitely.
+                self._last_delegation_by_session.pop(sid, None)
+                # Stable sessions-row owner for every surface (see catalog.py);
+                # tenancy is carried by ``session_id``, not this column, so the
+                # runtime can always read/write the row regardless of which
+                # handle (if any) the gateway bound to the session.
+                user_id = RUNTIME_SESSION_USER_ID
+                resp = await _arun_runtime_collect(
+                    runtime,
+                    prompt=_last_user_prompt(messages),
+                    session_id=sid,
+                    user_id=user_id,
+                    error_event="team_router.generate_error",
+                    entry_runtime_id=self._entry_runtime_id,
+                    on_delegate=lambda mid: self._record_delegation(sid, mid),
+                    files=files, images=images, audio=audio, videos=videos,
+                )
+            in_tokens, out_tokens = resp.input_tokens, resp.output_tokens
             await self.record_cost(
                 input_tokens=resp.input_tokens,
                 output_tokens=resp.output_tokens,
                 session_id=session_id,
             )
             return resp
-
-        # Runtime Team path. Translate to the Team's run signature.
-        # Clear the previous turn's delegation memo so this turn's badge
-        # falls back to the leader when no delegate_task_to_member fires —
-        # otherwise the model attribution stays pinned to whichever
-        # specialist handled the LAST delegation indefinitely.
-        self._last_delegation_by_session.pop(sid, None)
-        # Stable sessions-row owner for every surface (see catalog.py);
-        # tenancy is carried by ``session_id``, not this column, so the
-        # runtime can always read/write the row regardless of which
-        # handle (if any) the gateway bound to the session.
-        user_id = RUNTIME_SESSION_USER_ID
-        resp = await _arun_runtime_collect(
-            runtime,
-            prompt=_last_user_prompt(messages),
-            session_id=sid,
-            user_id=user_id,
-            error_event="team_router.generate_error",
-            entry_runtime_id=self._entry_runtime_id,
-            on_delegate=lambda mid: self._record_delegation(sid, mid),
-            files=files, images=images, audio=audio, videos=videos,
-        )
-        await self.record_cost(
-            input_tokens=resp.input_tokens,
-            output_tokens=resp.output_tokens,
-            session_id=session_id,
-        )
-        return resp
+        except BaseException as exc:
+            outcome = vault_recall.outcome_for_exception(exc)
+            raise
+        finally:
+            vault_recall.close_sink(recall_token)
+            await self.record_vault_recalls(
+                sink=recall_sink,
+                session_id=session_id,
+                outcome=outcome,
+                input_tokens=in_tokens,
+                output_tokens=out_tokens,
+            )
 
     async def stream(
         self,
@@ -1104,6 +1184,14 @@ class TeamRouterProvider(BaseModel):
         # completion, an error, a barge-in cancel — what was already spent
         # gets billed: an abandoned turn still cost its input tokens.
         sink, sink_token = stream_usage.open_sink()
+        # Which vault notes this turn reads, so the outcome below can be
+        # attributed to them. Opened next to the usage sink because they are
+        # flushed together and share a lifetime.
+        recall_sink, recall_token = vault_recall.open_sink()
+        # How the turn ended, from the exception (if any) that unwinds this
+        # generator. Assume OK and let the handlers below correct it: a
+        # generator that runs to completion never raises at all.
+        outcome = vault_recall.OUTCOME_OK
         try:
             if isinstance(runtime, BaseModel):
                 async for delta in runtime.stream(
@@ -1142,12 +1230,29 @@ class TeamRouterProvider(BaseModel):
                     yield delta
             finally:
                 self._clear_run_id(sid)
+        except BaseException as exc:
+            # One handler, and the precedence (cancel BEFORE error) lives in
+            # ``outcome_for_exception`` rather than in the clause order here —
+            # a barge-in arrives as CancelledError, and booking it as a
+            # failure is the mistake that would teach the agent to treat users
+            # interrupting as a defect (§2). Re-raised unchanged: this is a
+            # bystander, not a handler.
+            outcome = vault_recall.outcome_for_exception(exc)
+            raise
         finally:
             stream_usage.close_sink(sink_token)
+            vault_recall.close_sink(recall_token)
             await self.record_cost(
                 input_tokens=sink.get("input_tokens", 0),
                 output_tokens=sink.get("output_tokens", 0),
                 session_id=session_id,
+            )
+            await self.record_vault_recalls(
+                sink=recall_sink,
+                session_id=session_id,
+                outcome=outcome,
+                input_tokens=sink.get("input_tokens", 0),
+                output_tokens=sink.get("output_tokens", 0),
             )
 
 

@@ -272,15 +272,32 @@ _VAULT_WRITE_TOOLS = frozenset({
     "vault_manage_tags",
 })
 
+# Every name here MUST be a live tool key — ``test_vault_recall`` asserts it
+# against the real registrations, because this set has already rotted once.
+# ``vault_list_notes`` and ``vault_get_backlinks`` sat here from the day it
+# shipped and matched NOTHING: the browse leaf is ``vault_list_directory`` and
+# the backlinks tool is ``vault_backlinks``. So ``vault_reads`` undercounted
+# for its whole life, missing the two tools the agent browses the vault with.
+#
+# The trap is that two servers spell their keys differently: ``vault`` is a
+# Node SUBPROCESS, so the pool prefixes its keys (``vault_read_note``), while
+# ``vault-gate`` is IN-PROCESS, so its keys are the bare python function names
+# (``vault_backlinks`` — not ``vault_gate_backlinks``). Guessing from the
+# server name is what produced the phantoms.
 _VAULT_READ_TOOLS = frozenset({
+    # ``vault`` (Node subprocess → prefixed keys)
     "vault_read_note",
     "vault_read_multiple_notes",
     "vault_search_notes",
-    "vault_list_notes",
+    "vault_list_directory",
     "vault_get_frontmatter",
+    "vault_get_notes_info",
     "vault_list_all_tags",
     "vault_get_vault_stats",
-    "vault_get_backlinks",
+    # ``vault-gate`` (in-process → bare function-name keys)
+    "vault_backlinks",
+    "vault_search",
+    "vault_stats",
 })
 
 
@@ -289,9 +306,25 @@ def _emit_tool_call_summary(
 ) -> None:
     """Log per-iteration tool call breakdown to events.jsonl.
 
-    Used to measure how often the agent actually writes to the vault, so
-    prompt tweaks can be evaluated against a numeric baseline. Best-effort:
-    silently no-ops when the provider didn't populate ``tool_names_called``.
+    Best-effort: silently no-ops when the provider didn't populate
+    ``tool_names_called``.
+
+    DO NOT TRUST THESE COUNTS AS A VAULT BASELINE. This was written to measure
+    how often the agent writes to the vault, and it has never once measured it:
+    the production log holds ZERO ``agent.turn.tool_calls`` entries across
+    11,360 events (2026-05-18 → 2026-07-14). ``tool_names_called`` is only
+    populated by the NON-streaming providers, and production streams —
+    ``runtime.generate`` fired 11 times in that window against 697 streamed
+    turns. So this covers ~2% of traffic, and a prompt tweak "evaluated"
+    against it would be evaluated against noise. Same defect class as the one
+    ``src/models/stream_usage.py`` was written to fix.
+
+    Fixing it here is not possible from inside this function: the streaming
+    loop (``_run_inner_stream``) has no ``ModelResponse`` to hand it, only
+    deltas. Vault-recall attribution therefore hooks the tool executions
+    themselves, on both paths — see ``src/core/vault_recall.py``. This hook is
+    left as-is because it is the only per-ITERATION tool breakdown there is,
+    and it is honest about non-streamed runs.
     """
     tool_names = list(getattr(response, "tool_names_called", None) or [])
     if not tool_names:
@@ -1759,6 +1792,18 @@ class Agent:
         ``model-manager.pin_session(session_id=..., runtime_id=...)``.
         The tag is stripped of whitespace and comes last so project
         prompts read cleanly above it.
+
+        Its position is now load-bearing for cost, not just readability.
+        ``Claude._build_system`` splits this string at the tag and emits the
+        tag as an uncached trailing block, so everything above it is a
+        byte-identical prefix across every session on the box and the ~10.8k
+        framework prompt is cached once rather than once per session. Moving
+        the tag, or appending anything after it, silently makes the cached
+        prefix per-session again — a quiet ~1.25x-write-per-session
+        regression with no test-visible symptom other than the bill.
+        ``src/models/native_provider.py`` and ``src/models/dispatcher.py``
+        also match this tag (to key their Agent caches), so its shape is a
+        contract, not a formatting choice.
         """
         framework = FRAMEWORK_SYSTEM_PROMPT.replace(
             "{{OPENAGENT_VAULT_PATH}}", self._resolve_vault_path()

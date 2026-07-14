@@ -59,7 +59,9 @@ def build_test_config(user_config_path: Path) -> tuple[dict, Path, Path]:
     """Create ``/tmp/openagent-test-<uuid>/`` with a minimal ``openagent.yaml``.
 
     The generated config:
-      - uses SmartRouter so classifier + tier routing runs in one config;
+      - routes through ModelDispatcher, so entry-model resolution and
+        Team delegation both run under one config (no classifier call —
+        that router was retired in v0.14);
       - merges providers from BOTH the user's ``providers:`` YAML block
         (legacy path) AND the sibling ``openagent.db`` (current source
         of truth) so live tests can hit real APIs without forcing users

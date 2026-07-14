@@ -1,4 +1,4 @@
-"""SmartRouter live tests — cost tracking + entry-model resolution.
+"""ModelDispatcher live tests — cost tracking + entry-model resolution.
 
 The first test confirms that a real call lands a non-zero cost row in
 the ``usage_log`` table (the bug that kicked off the whole MCP refactor).

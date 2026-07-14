@@ -1,30 +1,31 @@
-"""Bounded reverse reader + predicates over ``events.jsonl``.
+"""Diagnosis predicates over ``events.jsonl``, on the shared reverse reader.
 
-WHY THIS MODULE EXISTS (and does not live in ``src/core/logging.py``)
---------------------------------------------------------------------
-``src.core.logging`` owns the write path and exposes exactly two read
-primitives: ``read_tail(lines, event_filter)`` and ``clear(older_than_days)``.
-``read_tail`` is structurally unusable for this MCP for two reasons:
+WHAT LIVES HERE (and what moved)
+--------------------------------
+The reverse block reader this MCP was built on now lives in
+``src.core.logging`` — the module that owns the log's *format* — and is shared
+with ``read_tail`` / ``GET /api/logs``. That was always the right home (the
+original version of this docstring said so and deferred it); the endpoint was
+still slurping the whole file on the gateway's event loop, so the move landed
+with that fix rather than leaving a second reader of one format behind to
+drift.
 
-1. **It slurps.** ``read_text().splitlines()`` materialises the *entire* file
-   plus a list of every line before it filters anything. events.jsonl is
-   trimmed to ~6 days by dream mode, not to a size — a chatty agent's log is
-   unbounded within that window (measured 728 KB / 5365 lines on a light
-   install). This MCP runs **in-process**, inside the same event loop that
-   serves live WebSocket streams, so a multi-MB blocking slurp is a stall the
-   user hears in a voice turn.
-2. **Prefix-only.** It filters on ``event`` prefix and nothing else. Every
-   question §14 poses needs a time window, and two of them need severity or a
-   correlation id.
+What stays here is this MCP's **policy**, which is not the format's business:
 
-So we scan **backwards in fixed blocks from EOF** and stop as soon as the
-caller's window is satisfied — the log is append-only and every question is
-"recent first", so the newest bytes are the only ones worth touching.
+1. **A scan cap.** :data:`_MAX_SCAN_BYTES` is applied by
+   :func:`iter_entries_reverse` below, NOT by the core primitive, which is
+   unbounded by default. This asymmetry is deliberate: a model-driven query
+   with a rare filter must not walk 50 MB on the event loop, but ``read_tail``
+   must stay unbounded or a prefix matching only ancient entries would quietly
+   return fewer rows than it used to.
+2. **Severity inference.** :func:`classify` / :func:`looks_like_error` are a
+   judgement call about what "went wrong" means, tuned to this repo's event
+   names — a diagnosis stance, not a fact about the file.
+3. **Token bounds.** :func:`truncate_value` / :func:`compact_entry` shape
+   entries for a model's context window.
 
-The right long-term home for this is ``logging.py`` itself (a generator
-primitive shared with ``src/gateway/api/logs.py``, which today calls the same
-slurping ``read_tail``). That file is out of scope for this change; see the
-handover notes rather than duplicating the reader there later.
+Why backwards at all: the log is append-only and every §14 question is "recent
+first", so the newest bytes are the only ones worth touching.
 
 A MIXED-SCHEMA LOG (the important one)
 --------------------------------------
@@ -57,15 +58,21 @@ import json
 import os
 import re
 from collections.abc import Iterator
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-# Read backwards in blocks rather than lines: one 64 KB pread beats thousands
-# of syscalls, and it is comfortably larger than the longest line observed in
-# a real log (1105 bytes), so a single block almost always closes a partial
-# line rather than carrying it across iterations.
-_BLOCK_BYTES = 64 * 1024
+# The format's own reader, shared with ``read_tail`` / ``GET /api/logs``.
+# Re-exported unchanged so this module stays the single import site for the
+# MCP's handlers (and so ``reader.iso`` / ``reader.ScanStats`` keep resolving).
+from src.core.logging import (  # noqa: F401
+    _BLOCK_BYTES,
+    ScanStats,
+    events_path,
+    iso,
+    iter_events_reverse,
+    iter_lines_reverse,
+)
 
 # Hard ceiling on how much of the tail any single call may touch. This is the
 # *token* guard's twin: capping returned rows alone would still let a query
@@ -109,20 +116,6 @@ COST_EVENT = "runtime.cost_mirrored"
 
 _REL_TIME_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhdw])\s*$", re.IGNORECASE)
 _REL_UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
-
-
-def events_path() -> Path:
-    """Absolute path of the live ``events.jsonl``.
-
-    Resolved through :func:`src.core.paths.log_dir` — the same call
-    ``logging.setup_logging`` uses to place the file — so this MCP always
-    reads the log of the agent it is running inside, whatever ``--agent-dir``
-    said. This is the single piece of file *location* logic we reuse rather
-    than re-derive.
-    """
-    from src.core.paths import log_dir
-
-    return log_dir() / "events.jsonl"
 
 
 def parse_time(value: Any, *, now: float | None = None) -> float | None:
@@ -185,130 +178,22 @@ def _now() -> float:
     return time.time()
 
 
-def iso(ts: Any) -> str | None:
-    """Render an epoch ``ts`` as a UTC ISO string, or ``None`` if unusable.
-
-    Raw epoch floats are unreadable to a model reasoning about "yesterday";
-    every row and window we return carries the ISO form alongside the float
-    (the float stays because ``logs_context`` anchors on it).
-    """
-    if not isinstance(ts, (int, float)) or isinstance(ts, bool):
-        return None
-    try:
-        return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat(timespec="seconds")
-    except (OverflowError, OSError, ValueError):
-        return None
-
-
-def iter_lines_reverse(
-    path: Path, *, max_bytes: int = _MAX_SCAN_BYTES,
-) -> Iterator[tuple[bytes, int]]:
-    """Yield raw lines newest-first, reading fixed blocks backwards from EOF.
-
-    Yields ``(line, bytes_scanned_so_far)`` so callers can report how much of
-    the log a bound actually covered. Stops at ``max_bytes``.
-
-    The first line of a block is held back as ``carry`` because a block
-    boundary almost always lands mid-line; it is only emitted once we reach
-    byte 0 and know it is whole. If we stop early on ``max_bytes`` the carry
-    is a *truncated* line and is dropped rather than handed out as a corrupt
-    entry — the scan bound must not manufacture parse errors.
-    """
-    try:
-        with path.open("rb") as fh:
-            fh.seek(0, os.SEEK_END)
-            pos = fh.tell()
-            scanned = 0
-            carry = b""
-            while pos > 0 and scanned < max_bytes:
-                read_size = min(_BLOCK_BYTES, pos, max_bytes - scanned)
-                pos -= read_size
-                fh.seek(pos)
-                block = fh.read(read_size)
-                scanned += read_size
-                parts = (block + carry).split(b"\n")
-                carry = parts[0]
-                for part in reversed(parts[1:]):
-                    if part.strip():
-                        yield part, scanned
-            if pos == 0 and carry.strip():
-                yield carry, scanned
-    except FileNotFoundError:
-        return
-    except OSError:
-        # A log that cannot be opened (permissions, a directory in its place)
-        # must degrade to "no entries", never take down the caller's turn.
-        return
-
-
-class ScanStats:
-    """How much ground a scan covered — attached to every tool result.
-
-    Without this the model cannot tell "there were no errors yesterday" from
-    "I stopped scanning before yesterday", which are opposite conclusions.
-    """
-
-    __slots__ = ("lines", "bytes", "corrupt", "hit_scan_cap", "oldest_ts")
-
-    def __init__(self) -> None:
-        self.lines = 0
-        self.bytes = 0
-        self.corrupt = 0
-        self.hit_scan_cap = False
-        self.oldest_ts: float | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "lines_scanned": self.lines,
-            "bytes_scanned": self.bytes,
-            "corrupt_lines_skipped": self.corrupt,
-            "hit_scan_cap": self.hit_scan_cap,
-            "oldest_entry_scanned": iso(self.oldest_ts),
-        }
-
-
 def iter_entries_reverse(
     *, since: float | None = None, max_bytes: int = _MAX_SCAN_BYTES,
     stats: ScanStats | None = None, path: Path | None = None,
 ) -> Iterator[dict[str, Any]]:
-    """Yield parsed entries newest-first, stopping at ``since``.
+    """This MCP's capped view of :func:`src.core.logging.iter_events_reverse`.
 
-    ``since`` is the real optimisation: the log is append-only and therefore
-    ts-ordered, so the first entry older than the window means every remaining
-    byte is older too and we stop reading immediately. "What went wrong in the
-    last hour?" touches ~an hour of bytes, not the whole file.
-
-    Corrupt lines are counted and skipped, never raised: a half-written line
-    at the tail (the process was killed mid-``write``) is normal for an
-    append-only log and must not break a diagnosis query — the exact moment
-    you most want to read the log is right after a crash.
+    The *only* difference from the core primitive is the default: the scan cap
+    is applied here and nowhere else. Core defaults to unbounded because
+    ``read_tail`` must be able to reach an ancient prefix match; this MCP
+    defaults to capped because a model can ask for a filter that matches
+    nothing and would otherwise walk the whole log on the event loop. Callers
+    that genuinely want the whole file pass ``max_bytes`` explicitly.
     """
-    st = stats if stats is not None else ScanStats()
-    p = path if path is not None else events_path()
-
-    for raw, scanned in iter_lines_reverse(p, max_bytes=max_bytes):
-        st.bytes = scanned
-        st.lines += 1
-        try:
-            entry = json.loads(raw)
-        except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
-            st.corrupt += 1
-            continue
-        if not isinstance(entry, dict):
-            st.corrupt += 1
-            continue
-
-        ts = entry.get("ts")
-        if isinstance(ts, (int, float)) and not isinstance(ts, bool):
-            st.oldest_ts = float(ts)
-            if since is not None and ts < since:
-                return
-        yield entry
-
-    # Distinguish "read the whole file" from "stopped at the cap": only the
-    # latter means older matches may exist beyond what we looked at.
-    if st.bytes >= max_bytes:
-        st.hit_scan_cap = True
+    return iter_events_reverse(
+        since=since, max_bytes=max_bytes, stats=stats, path=path,
+    )
 
 
 def entry_level(entry: dict[str, Any]) -> str | None:

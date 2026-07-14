@@ -189,9 +189,10 @@ async def t_is_classifier_roundtrip(ctx: TestContext) -> None:
 
     ``set_model_is_classifier`` is a narrow UPDATE on a single row; it
     does NOT clear the flag on other rows. Multiple rows can be flagged
-    simultaneously, forming a "classifier pool". The SmartRouter
-    resolver then picks the first flagged entry in deterministic
-    catalog order (see test_smart_router_hybrid).
+    simultaneously. Despite the flag's name no classifier runs:
+    ``ModelDispatcher._resolve_entry_model`` picks the FIRST flagged
+    entry in deterministic catalog order and the rest act as a fallback
+    chain, taking over only when an earlier one is disabled.
     """
     from src.memory.db import MemoryDB
 

@@ -30,10 +30,13 @@ from src.memory.db import SCHEMA_SQL
 from src.memory.schedule import (
     build_one_shot_expression,
     decorate_scheduled_task,
+    default_timezone_name,
     epoch_to_iso,
     is_one_shot_expression,
     next_run_for_expression,
+    resolve_timezone,
     validate_schedule_expression,
+    validate_timezone,
 )
 import time
 
@@ -47,6 +50,7 @@ _ALLOWED_UPDATE_COLUMNS = {
     "last_run",
     "next_run",
     "model",
+    "timezone",
 }
 
 
@@ -90,16 +94,30 @@ def _row_to_dict(row: aiosqlite.Row) -> dict[str, Any]:
     return decorate_scheduled_task(row)
 
 
-def _iso(epoch: float) -> str:
-    return epoch_to_iso(epoch)
+def _iso(epoch: float, timezone: str | None = None) -> str:
+    return epoch_to_iso(epoch, timezone)
 
 
-def _validate_cron(expr: str) -> None:
-    validate_schedule_expression(expr)
+def _validate_cron(expr: str, timezone: str | None = None) -> None:
+    validate_schedule_expression(expr, timezone)
 
 
-def _next_run(expr: str, base: float | None = None) -> float:
-    return next_run_for_expression(expr, base)
+def _next_run(expr: str, base: float | None = None, timezone: str | None = None) -> float:
+    return next_run_for_expression(expr, base, timezone)
+
+
+def _resolve_new_task_tz(timezone: str | None) -> str | None:
+    """Zone to stamp on a task the agent is creating right now.
+
+    An explicit argument wins; otherwise the agent-wide default. Absent
+    both, None — UTC, i.e. what this tool did before timezones
+    existed. Validated here so a hallucinated zone ("Europe/Roma") comes
+    back to the model as a tool error it can correct, rather than silently
+    scheduling against the wrong clock."""
+    if timezone is not None and str(timezone).strip():
+        validate_timezone(timezone)
+        return str(timezone).strip()
+    return default_timezone_name()
 
 
 async def _resolve_task_id(conn: aiosqlite.Connection, task_id: str) -> str:
@@ -170,13 +188,14 @@ async def create_scheduled_task(
     cron_expression: str,
     prompt: str,
     model: str | None = None,
+    timezone: str | None = None,
 ) -> dict[str, Any]:
     """Create a new recurring task.
 
     The prompt will be fed to the agent on every cron tick. Cron is a
     standard 5-field expression (minute hour day month weekday), e.g.
-    '0 9 * * *' for every day at 09:00 server time. Use the
-    describe_cron tool first if you are unsure the expression is valid.
+    '0 9 * * *' for every day at 09:00. Use the describe_cron tool first
+    if you are unsure the expression is valid.
 
     Use this ONLY for repeating schedules. If the user wants something
     to happen once, use create_one_shot_task instead.
@@ -184,23 +203,32 @@ async def create_scheduled_task(
     ``model`` (optional) pins the firing to a specific model — a runtime_id
     such as 'anthropic:claude-opus-4-8'. Omit it to run the task on the
     agent's default/router model, like a normal chat turn.
+
+    ``timezone`` (optional) is the IANA zone the cron is read in, e.g.
+    'Europe/Rome'. Pass it whenever the user states a time of day — write
+    the hour they said and name their zone ('0 9 * * *' + 'Europe/Rome'),
+    do NOT convert the hour to UTC yourself: a converted hour is silently
+    wrong for half the year, because it cannot follow daylight-saving.
+    Omitted, the task uses the agent's configured default zone, or UTC if
+    none is set.
     """
     if not name or not name.strip():
         raise ValueError("name is required")
     if not prompt or not prompt.strip():
         raise ValueError("prompt is required")
-    _validate_cron(cron_expression)
+    tz = _resolve_new_task_tz(timezone)
+    _validate_cron(cron_expression, tz)
 
     conn = await _get_conn()
     task_id = str(uuid.uuid4())
     now = time.time()
-    nr = _next_run(cron_expression, now)
+    nr = _next_run(cron_expression, now, tz)
 
     await conn.execute(
         "INSERT INTO scheduled_tasks "
-        "(id, name, cron_expression, prompt, enabled, next_run, model, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)",
-        (task_id, name, cron_expression, prompt, nr, (model or None), now, now),
+        "(id, name, cron_expression, prompt, enabled, next_run, model, timezone, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?)",
+        (task_id, name, cron_expression, prompt, nr, (model or None), tz, now, now),
     )
     await conn.commit()
 
@@ -218,6 +246,7 @@ async def create_one_shot_task(
     delay_seconds: int | None = None,
     run_at_iso: str | None = None,
     model: str | None = None,
+    timezone: str | None = None,
 ) -> dict[str, Any]:
     """Create a task that runs exactly once.
 
@@ -226,10 +255,17 @@ async def create_one_shot_task(
 
     Pass exactly one of:
       - delay_seconds: seconds from now
-      - run_at_iso: absolute local timestamp like 2026-04-14T09:30:00
+      - run_at_iso: absolute timestamp like 2026-04-14T09:30:00
 
     ``model`` (optional) pins the firing to a specific model (a runtime_id);
     omit to use the agent's default/router model.
+
+    ``timezone`` (optional, IANA e.g. 'Europe/Rome') says which clock a
+    *bare* run_at_iso is read on. It is only a way to read the input: the
+    firing instant is stored as an absolute epoch and never re-interpreted
+    afterwards. An offset already in run_at_iso ('2026-04-14T09:30:00+02:00')
+    wins outright, and delay_seconds is relative to now, so neither is
+    affected by this argument.
     """
     if not name or not name.strip():
         raise ValueError("name is required")
@@ -238,6 +274,7 @@ async def create_one_shot_task(
     if (delay_seconds is None) == (run_at_iso is None):
         raise ValueError("Pass exactly one of delay_seconds or run_at_iso")
 
+    tz = _resolve_new_task_tz(timezone)
     now = time.time()
     if delay_seconds is not None:
         run_at = now + max(1, int(delay_seconds))
@@ -245,9 +282,17 @@ async def create_one_shot_task(
         import datetime as _dt
 
         try:
-            run_at = _dt.datetime.fromisoformat(str(run_at_iso)).timestamp()
+            parsed = _dt.datetime.fromisoformat(str(run_at_iso))
         except ValueError as exc:
             raise ValueError(f"Invalid run_at_iso value: {run_at_iso!r}") from exc
+        if parsed.tzinfo is None:
+            # "09:30" is a wall-clock reading and needs a clock. Prefer the
+            # named/default zone; fall back to the host's, which is what a
+            # bare fromisoformat().timestamp() meant before timezones existed.
+            zone = resolve_timezone(tz)
+            if zone is not None:
+                parsed = parsed.replace(tzinfo=zone)
+        run_at = parsed.timestamp()
     if run_at <= now:
         raise ValueError("One-shot task must be scheduled in the future")
 
@@ -256,9 +301,9 @@ async def create_one_shot_task(
     cron_expression = build_one_shot_expression(run_at)
     await conn.execute(
         "INSERT INTO scheduled_tasks "
-        "(id, name, cron_expression, prompt, enabled, next_run, model, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)",
-        (task_id, name, cron_expression, prompt, run_at, (model or None), now, now),
+        "(id, name, cron_expression, prompt, enabled, next_run, model, timezone, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?)",
+        (task_id, name, cron_expression, prompt, run_at, (model or None), tz, now, now),
     )
     await conn.commit()
 
@@ -277,6 +322,7 @@ async def update_scheduled_task(
     prompt: str | None = None,
     enabled: bool | None = None,
     model: str | None = None,
+    timezone: str | None = None,
 ) -> dict[str, Any]:
     """Partially update a scheduled task.
 
@@ -286,6 +332,12 @@ async def update_scheduled_task(
 
     ``model`` sets the per-task model pin (a runtime_id). Pass an empty
     string to clear it so the task reverts to the default/router model.
+
+    ``timezone`` sets the IANA zone the cron is read in (e.g.
+    'Europe/Rome'); pass an empty string to clear it back to the server's
+    own clock. This moves when the task fires — the same expression under
+    a new zone is a different instant — so only set it when the user is
+    telling you which clock they meant.
     """
     conn = await _get_conn()
     full_id = await _resolve_task_id(conn, task_id)
@@ -302,27 +354,49 @@ async def update_scheduled_task(
     if model is not None:
         # Empty string clears the pin (→ default model); any other value sets it.
         updates["model"] = model.strip() or None
+
+    # The stored row is the baseline for anything the caller didn't pass —
+    # a cron edit must keep the task's existing zone, and a zone edit must
+    # re-read the task's existing cron.
+    cursor = await conn.execute(
+        "SELECT cron_expression, timezone FROM scheduled_tasks WHERE id = ?",
+        (full_id,),
+    )
+    current = await cursor.fetchone()
+    current_cron = current[0] if current else None
+    effective_tz = current[1] if current else None
+
+    if timezone is not None:
+        # Empty string clears the zone (→ the UTC default); any other sets it.
+        effective_tz = timezone.strip() or None
+        validate_timezone(effective_tz)
+        updates["timezone"] = effective_tz
+
     if cron_expression is not None:
-        _validate_cron(cron_expression)
+        _validate_cron(cron_expression, effective_tz)
         updates["cron_expression"] = cron_expression
-        updates["next_run"] = _next_run(cron_expression)
+
+    # Recompute next_run whenever the *meaning* of the schedule changed.
+    # A zone edit alone changes it just as much as a cron edit does — the
+    # same expression on a different clock is a different instant — so
+    # skipping this would leave the task firing on the old zone until its
+    # next tick happened to rewrite next_run.
+    reschedule_cron = cron_expression if cron_expression is not None else current_cron
+    if (cron_expression is not None or timezone is not None) and reschedule_cron:
+        updates["next_run"] = _next_run(reschedule_cron, None, effective_tz)
     if enabled is not None:
         updates["enabled"] = 1 if enabled else 0
         # Re-arming an enabled task: make sure next_run points at the
         # next cron tick so it doesn't fire immediately on stale data.
-        if enabled:
-            cursor = await conn.execute(
-                "SELECT cron_expression FROM scheduled_tasks WHERE id = ?",
-                (full_id,),
+        if enabled and reschedule_cron:
+            updates.setdefault(
+                "next_run", _next_run(reschedule_cron, None, effective_tz),
             )
-            row = await cursor.fetchone()
-            if row:
-                updates.setdefault("next_run", _next_run(row[0]))
 
     if not updates:
         raise ValueError(
             "No fields to update. Pass at least one of: name, "
-            "cron_expression, prompt, enabled, model."
+            "cron_expression, prompt, enabled, model, timezone."
         )
 
     # Drop unknown columns as a safety net.
@@ -568,23 +642,43 @@ async def run_scheduled_task_now(
 
 
 @mcp.tool()
-async def describe_cron(cron_expression: str, count: int = 3) -> dict[str, Any]:
+async def describe_cron(
+    cron_expression: str,
+    count: int = 3,
+    timezone: str | None = None,
+) -> dict[str, Any]:
     """Validate a cron expression and preview its next N fire times.
 
     Use this before create_scheduled_task when you are unsure the cron
     string is valid or want to double-check the cadence matches the
     user's intent.
+
+    ``timezone`` (optional, IANA e.g. 'Europe/Rome') previews the
+    expression on that clock — pass the same value you intend to give
+    create_scheduled_task. Omitted, it previews the agent's default zone,
+    or UTC if none is configured. The returned ``iso``
+    times are rendered on the previewed clock, and the preview walks the
+    real scheduler, so daylight-saving is reflected here exactly as it
+    will be when the task fires.
     """
-    _validate_cron(cron_expression)
+    tz = _resolve_new_task_tz(timezone)
+    _validate_cron(cron_expression, tz)
     count = max(1, min(count, 20))
+    # Step the same function the Scheduler steps, rather than a private
+    # croniter walk: a preview that doesn't share the DST rules is a
+    # preview that lies exactly when it matters. (The old private walk
+    # never ran at all — croniter was not imported in this module.)
     base = time.time()
-    it = croniter(cron_expression, base)
     upcoming: list[dict[str, Any]] = []
     for _ in range(count):
-        nxt = it.get_next(float)
-        upcoming.append({"epoch": nxt, "iso": _iso(nxt)})
+        nxt = _next_run(cron_expression, base, tz)
+        upcoming.append({"epoch": nxt, "iso": _iso(nxt, tz)})
+        if is_one_shot_expression(cron_expression):
+            break  # fires once; stepping past it would loop on one instant
+        base = nxt
     return {
         "cron_expression": cron_expression,
+        "timezone": tz,
         "valid": True,
         "upcoming": upcoming,
     }

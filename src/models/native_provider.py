@@ -33,6 +33,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 
+from src.core import vault_recall
 from src.core.logging import elog
 from src.models.base import BaseModel, ModelResponse
 from src.models.catalog import (
@@ -375,6 +376,26 @@ def _extract_tool_names_from_agno_response(response: Any) -> list[str]:
         if name:
             names.append(str(name))
     return names
+
+
+def _tool_name_args(entry: Any) -> tuple[Any, Any]:
+    """Pull ``(tool_name, tool_args)`` off a runtime ``ToolExecution``.
+
+    Handles both the object and the dict shape for the same reason
+    ``_extract_tool_names_from_agno_response`` does: the runtime has changed
+    this object before, and a shape we fail to read must cost a counter, not
+    a turn.
+    """
+    if isinstance(entry, dict):
+        return entry.get("tool_name"), entry.get("tool_args")
+    return getattr(entry, "tool_name", None), getattr(entry, "tool_args", None)
+
+
+def _record_vault_recalls(response: Any) -> None:
+    """Book every vault note this non-streamed run read into the recall sink."""
+    for entry in getattr(response, "tools", None) or []:
+        name, args = _tool_name_args(entry)
+        vault_recall.record_tool(name, args)
 
 
 def _summarize_provider_errors(errs: list[str]) -> str:
@@ -1518,6 +1539,7 @@ class NativeProvider(BaseModel):
             stop_reason=stop_reason or "stop",
         )
         tool_names_called = _extract_tool_names_from_agno_response(response)
+        _record_vault_recalls(response)
         return ModelResponse(
             content=content,
             tool_names_called=tool_names_called,
@@ -1648,6 +1670,13 @@ class NativeProvider(BaseModel):
                             )
                     elif isinstance(event, tool_completed_types):
                         tool_exec = getattr(event, "tool", None)
+                        # Book a vault recall HERE, on completion, not on
+                        # ``tool_started``/``tool_error``: a read that failed
+                        # never put the note in front of the model, so it is
+                        # not a recall. This is the branch that fires in
+                        # production — the non-streaming path above ran 11
+                        # times against 697 streamed turns.
+                        vault_recall.record_tool(*_tool_name_args(tool_exec))
                         if on_status is not None:
                             await self._emit_agno_tool_status(
                                 on_status, tool_exec,

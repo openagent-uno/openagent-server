@@ -319,7 +319,11 @@ async def handle_stop(request):
 
 async def handle_create(request):
     from aiohttp import web
-    from src.memory.schedule import validate_schedule_expression
+    from src.memory.schedule import (
+        default_timezone_name,
+        validate_schedule_expression,
+        validate_timezone,
+    )
 
     scheduler, err = _resolve_scheduler(request)
     if err is not None:
@@ -343,8 +347,20 @@ async def handle_create(request):
     if not prompt:
         return web.json_response({"error": "prompt is required"}, status=400)
 
+    # Optional IANA zone the cron is read in. Absent → the agent-wide
+    # default; absent there too → UTC, i.e. the behaviour every task created
+    # before this field existed still has.
     try:
-        validate_schedule_expression(cron_expression)
+        if "timezone" in body:
+            timezone = (body.get("timezone") or "").strip() or None
+            validate_timezone(timezone)
+        else:
+            timezone = default_timezone_name()
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+
+    try:
+        validate_schedule_expression(cron_expression, timezone)
     except ValueError as exc:
         return web.json_response({"error": str(exc)}, status=400)
 
@@ -354,7 +370,9 @@ async def handle_create(request):
             status=400,
         )
 
-    task_id = await scheduler.add_task(name, cron_expression, prompt, model=model)
+    task_id = await scheduler.add_task(
+        name, cron_expression, prompt, model=model, timezone=timezone,
+    )
 
     # add_task enables by default; honour an explicit enabled=false.
     if body.get("enabled") is False:
@@ -369,7 +387,7 @@ async def handle_create(request):
 
 async def handle_update(request):
     from aiohttp import web
-    from src.memory.schedule import validate_schedule_expression
+    from src.memory.schedule import validate_schedule_expression, validate_timezone
 
     scheduler, err = _resolve_scheduler(request)
     if err is not None:
@@ -405,6 +423,22 @@ async def handle_update(request):
         # it (firing reverts to the default/router model); a runtime_id sets it.
         updates["model"] = (body["model"] or "").strip() or None
 
+    # Fall back to the task's stored zone so a cron edit keeps the zone and
+    # a zone edit re-reads the stored cron.
+    effective_tz = existing.get("timezone") or None
+    if "timezone" in body:
+        # Explicit null / "" clears the zone back to the UTC default; an IANA
+        # name sets it.
+        effective_tz = (body["timezone"] or "").strip() or None
+        try:
+            validate_timezone(effective_tz)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        updates["timezone"] = effective_tz
+        # A zone change relocates every future fire, so it needs the same
+        # next_run recompute a cron change gets.
+        cron_changed = True
+
     if "cron_expression" in body:
         cron_expression = (body["cron_expression"] or "").strip()
         if not cron_expression:
@@ -412,7 +446,7 @@ async def handle_update(request):
                 {"error": "cron_expression cannot be empty"}, status=400
             )
         try:
-            validate_schedule_expression(cron_expression)
+            validate_schedule_expression(cron_expression, effective_tz)
         except ValueError as exc:
             return web.json_response({"error": str(exc)}, status=400)
         updates["cron_expression"] = cron_expression
@@ -424,7 +458,7 @@ async def handle_update(request):
 
     if not updates and enabled_change is None:
         return web.json_response(
-            {"error": "No fields to update. Pass name, cron_expression, prompt, model, or enabled."},
+            {"error": "No fields to update. Pass name, cron_expression, prompt, model, timezone, or enabled."},
             status=400,
         )
 

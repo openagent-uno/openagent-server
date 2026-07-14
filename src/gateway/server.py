@@ -1092,6 +1092,10 @@ class Gateway:
             ("PATCH", "/api/workflows/{id}", workflow_tasks.handle_update),
             ("DELETE", "/api/workflows/{id}", workflow_tasks.handle_delete),
             ("POST", "/api/workflows/{id}/run", workflow_tasks.handle_run),
+            # Start and stop are a pair. This route was missing while
+            # /run shipped, so the app could kick off a workflow it had no
+            # way to stop — stopping existed only as an agent-facing MCP tool.
+            ("POST", "/api/workflows/{id}/stop", workflow_tasks.handle_stop),
             ("GET", "/api/workflows/{id}/runs", workflow_tasks.handle_runs_list),
             ("GET", "/api/workflows/{id}/stats", workflow_tasks.handle_stats),
             ("GET", "/api/workflow-runs/{run_id}", workflow_tasks.handle_run_get),

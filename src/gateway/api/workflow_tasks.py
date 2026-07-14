@@ -9,6 +9,7 @@ Endpoints:
     PATCH  /api/workflows/{id}                  partial update
     DELETE /api/workflows/{id}                  delete + cascade runs
     POST   /api/workflows/{id}/run              body: {inputs, wait}
+    POST   /api/workflows/{id}/stop             body: {run_id, wait}
     GET    /api/workflows/{id}/runs             run history (newest first)
     GET    /api/workflow-runs/{run_id}          fetch one run + trace
     GET    /api/workflow-block-types            static catalog for the UI
@@ -485,6 +486,101 @@ async def handle_run(request):
         "workflow", "updated", existing["id"],
     )
     return web.json_response(_decorate_run(runs[0]))
+
+
+async def handle_stop(request):
+    """POST /api/workflows/{id}/stop — hard-stop in-flight run(s) of a
+    workflow. Body: ``{run_id, wait, timeout_s}``.
+
+    The app could start a workflow it had no way to stop: ``/run`` has always
+    been here, and stopping was reachable only through the agent-facing
+    ``stop_workflow`` MCP tool — so a user watching a runaway run had to ask
+    the agent to kill it. The machinery was all present (the scheduler's
+    cancellation drain handles workflow runs already); this is the missing
+    door on the gateway, which §10 says is the *only* public surface.
+
+    Flags each in-flight run ``cancelling`` — the same DB-backed hand-off the
+    MCP tool writes, via one shared helper — and the scheduler cancels the
+    executor mid-DAG within ~2s, aborting any in-flight AI block, then records
+    each run ``cancelled``. Deliberately mirrors ``/api/scheduled-tasks/{id}
+    /stop`` in status codes and response shape (the app treats the two as the
+    same gesture), with one addition the scheduled-task side has no use for:
+    ``run_id``, because a workflow may legitimately have several concurrent
+    runs and the run screen stops the one it is showing.
+
+    Stopping a run does NOT stop the workflow from firing again — that is
+    ``enabled: false`` or removing its trigger-schedule block.
+    """
+    from aiohttp import web
+
+    from src.workflow.cancel import await_runs_terminal, flag_workflow_runs_cancelling
+
+    scheduler, err = _resolve_scheduler(request)
+    if err is not None:
+        return err
+
+    existing = await _find_workflow(scheduler, request.match_info["id"])
+    if existing is None:
+        return web.json_response(
+            {"error": f"Workflow {request.match_info['id']!r} not found"},
+            status=404,
+        )
+
+    try:
+        body = await request.json() if request.can_read_body else {}
+    except Exception:
+        body = {}
+    run_id = (body.get("run_id") or "").strip() or None
+    wait = body.get("wait", True)
+    timeout_s = int(body.get("timeout_s", 30))
+
+    # The gateway shares a process with the scheduler, so it writes the flag
+    # straight to the DB (as the scheduled-task endpoint does) rather than
+    # going through the MCP's request queue. The raw connection is needed for
+    # the compare-and-set the public partial-update helper cannot express —
+    # see ``flag_workflow_runs_cancelling`` for why that guard is load-bearing.
+    conn = await scheduler.db._ensure_connected()
+    flagged = await flag_workflow_runs_cancelling(
+        conn, workflow_id=existing["id"], run_id=run_id,
+    )
+    gw = request.app["gateway"]
+    # Reflect the cancelling state on subscribed clients right away.
+    await gw.broadcast_resource("workflow", "updated", existing["id"])
+
+    if not flagged:
+        # Not an error: the run finished on its own, was already stopped, or
+        # the run_id names a run of some other workflow. The app polls this
+        # endpoint from a Stop button that may well be a frame stale, so a
+        # 404/409 here would surface as a scary dialog for a benign race —
+        # same call the scheduled-task endpoint makes.
+        return web.json_response({
+            "workflow_id": existing["id"],
+            "name": existing.get("name", ""),
+            "stopped": [],
+            "count": 0,
+            "runs": [],
+            "note": (
+                "No running run to stop"
+                + (f" (run_id {run_id!r})" if run_id else "")
+                + "."
+            ),
+        })
+
+    elog("workflow.stop", id=existing["id"], count=len(flagged))
+    if wait:
+        runs = await await_runs_terminal(conn, flagged, timeout_s=timeout_s)
+        # Re-broadcast so the screen drops its running/cancelling state.
+        await gw.broadcast_resource("workflow", "updated", existing["id"])
+    else:
+        runs = [{"id": rid, "status": "cancelling"} for rid in flagged]
+
+    return web.json_response({
+        "workflow_id": existing["id"],
+        "name": existing.get("name", ""),
+        "stopped": flagged,
+        "count": len(flagged),
+        "runs": runs,
+    })
 
 
 async def handle_runs_list(request):

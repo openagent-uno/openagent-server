@@ -1,8 +1,9 @@
 import json
+import re
 from collections.abc import AsyncIterator
 from dataclasses import asdict, dataclass
 from os import getenv
-from typing import Any, Callable, Dict, List, Literal, NoReturn, Optional, Type, Union
+from typing import Any, Callable, Dict, List, Literal, NoReturn, Optional, Tuple, Type, Union
 
 import httpx
 from pydantic import BaseModel, ValidationError
@@ -67,6 +68,36 @@ except ImportError as e:
     raise ImportError(
         "`anthropic` not installed or missing beta components. Please install with `pip install anthropic`"
     ) from e
+
+
+# Anthropic allows at most 4 ``cache_control`` breakpoints per request; a 5th
+# is a hard 400. Every breakpoint this class places is counted against this cap
+# before it is placed — see ``_apply_cache_messages``.
+_MAX_CACHE_BREAKPOINTS = 4
+
+# The ``<session-id>`` tag the orchestrator appends to the framework system
+# prompt (``src.core.agent.Agent._combined_system_prompt``). It is the ONLY
+# per-session bytes in an otherwise deployment-wide prompt, so it decides
+# whether the ~10.8k framework prefix is cached once per box or once per
+# session. ``_split_session_id_tag`` moves it past the breakpoint.
+#
+# Duplicated from ``src.models.native_provider`` / ``src.models.dispatcher``,
+# which strip the same tag to key their Agent caches. Three copies of one
+# regex is a wart; the tag is a stable orchestrator↔provider contract, so
+# they have not drifted. Consolidate if a fourth appears.
+_SESSION_ID_TAG_RE = re.compile(r"\n*<session-id>[^<]*</session-id>\s*$")
+
+
+def _split_session_id_tag(system_message: str) -> Tuple[str, str]:
+    """Split a system prompt into its cacheable body and the ``<session-id>`` tail.
+
+    Returns ``(body, tag)``. ``tag`` is ``""`` when there is no tag, in which
+    case ``body`` is the input unchanged and callers behave exactly as before.
+    """
+    match = _SESSION_ID_TAG_RE.search(system_message)
+    if not match:
+        return system_message, ""
+    return system_message[: match.start()], match.group(0).strip()
 
 
 class SystemPromptBlock(BaseModel):
@@ -138,6 +169,16 @@ class Claude(Model):
     cache_system_prompt: Optional[bool] = False
     extended_cache_time: Optional[bool] = False
     cache_tools: bool = False
+    # Roll a cache breakpoint along the end of the transcript so a long
+    # conversation is re-read at 0.1x instead of re-billed at 1.0x on every
+    # call. Defaults ON, unlike its siblings above, because there is no config
+    # channel that reaches this constructor (RUNTIME_PROVIDER_CLASSES's
+    # extra_kwargs is the only one, and it is not ours to extend) — the flag
+    # exists as an off-switch, not an opt-in. Safe as a default because
+    # ``_apply_cache_messages`` refuses to place the breakpoint unless some
+    # other breakpoint already exists: it extends a cached prefix, it never
+    # starts one, so a caller with caching off is unaffected.
+    cache_messages: bool = True
     # Optional multi-block system prompt with per-block cache control.
     # Appended after the agent-built system message in the Anthropic ``system``
     # array. See SystemPromptBlock for cache/ttl semantics. May be a list, or a
@@ -468,6 +509,7 @@ class Claude(Model):
                 "cache_system_prompt": self.cache_system_prompt,
                 "extended_cache_time": self.extended_cache_time,
                 "cache_tools": self.cache_tools,
+                "cache_messages": self.cache_messages,
                 "betas": self.betas,
             }
         )
@@ -602,6 +644,106 @@ class Claude(Model):
         if self.cache_tools and "tools" in request_kwargs and request_kwargs["tools"]:
             request_kwargs["tools"][-1]["cache_control"] = {"type": "ephemeral"}
 
+    @staticmethod
+    def _count_cache_breakpoints(request_kwargs: Dict[str, Any]) -> int:
+        """Count ``cache_control`` breakpoints already placed on tools + system.
+
+        Anthropic renders tools → system → messages, so these are every
+        breakpoint that precedes the transcript. Messages are not counted:
+        nothing in this repo writes ``cache_control`` into a stored message,
+        and ``_apply_cache_messages`` copies rather than mutates precisely so
+        that stays true.
+        """
+        spent = 0
+        for entry in (request_kwargs.get("tools") or []) + (request_kwargs.get("system") or []):
+            if isinstance(entry, dict) and entry.get("cache_control"):
+                spent += 1
+        return spent
+
+    def _apply_cache_messages(self, chat_messages: List[Dict[str, Any]], request_kwargs: Dict[str, Any]) -> None:
+        """Roll a 5m breakpoint onto the last block of the last message.
+
+        WHY this is the single largest cost lever here: ``num_history_runs`` is
+        ``FULL_SESSION_HISTORY_RUNS`` (src/models/catalog.py), so every call
+        replays the WHOLE stored transcript — bounded only by compaction, i.e.
+        up to ~150k tokens. And a turn is not one call: it is one per tool-use
+        iteration (3.3 avg, 13 worst case). Without a breakpoint here, the
+        system+tools cache covers ~11k tokens while the ~150k transcript behind
+        it is re-billed at full price on every one of those calls.
+
+        WHY the end of the transcript is a *stable* prefix boundary despite the
+        transcript growing every turn: history is append-only, so the bytes
+        before this breakpoint never change. On the next call the transcript has
+        grown by one iteration (measured: 3 blocks — assistant[text, tool_use] +
+        user[tool_result]); the new breakpoint's 20-block lookback finds the
+        entry this call wrote, reads the whole prefix at 0.1x, and writes only
+        the delta at 1.25x. So it hits on call #2 — the break-even point — and
+        every call after.
+
+        Two events rewrite the prefix and cost exactly one re-write, not a
+        permanent miss:
+          * compaction (src/core/compaction.py) rewrites ``sessions.runs`` as
+            ``[recap] + last_N``; the next call re-writes a much *smaller*
+            transcript and resumes hitting. Note it does not touch tools or
+            system, so those breakpoints survive it untouched.
+          * ``compress_tool_results`` flipping on mid-session rewrites tool
+            result bodies. Same one-off cost.
+
+        The breakpoint yields to explicit config: it is only placed when at
+        least one breakpoint already exists (so we extend a cached prefix
+        rather than starting one the caller never asked for) and when doing so
+        stays inside Anthropic's cap of 4, which user-supplied
+        ``system_prompt_blocks`` are entitled to spend first.
+
+        KNOWN LIMIT: a single call that appends >20 content blocks (~10 parallel
+        tool calls in one iteration) outruns the lookback window and misses for
+        that call. It self-heals on the next one. Not defended against, because
+        the measured shape is 3 blocks per iteration.
+        """
+        if not self.cache_messages or not chat_messages:
+            return
+        # 0 spent => caching is off for this request; don't start a cache the
+        # caller didn't ask for (a write with no read is a 1.25x loss).
+        # >= _MAX spent => no room; a 5th breakpoint is a hard 400.
+        spent = self._count_cache_breakpoints(request_kwargs)
+        if not 0 < spent < _MAX_CACHE_BREAKPOINTS:
+            return
+
+        last_message = chat_messages[-1]
+        content = last_message.get("content")
+        if not isinstance(content, list) or not content:
+            return
+
+        block = content[-1]
+        if isinstance(block, dict):
+            if block.get("cache_control"):
+                return
+            cached_block: Dict[str, Any] = {**block, "cache_control": {"type": "ephemeral"}}
+        else:
+            # Assistant turns carry pydantic blocks (TextBlock/ToolUseBlock/...)
+            # which have no cache_control field. Only reachable on prefill-capable
+            # models; 4.6+ append a trailing user turn so the last block is a dict.
+            model_dump = getattr(block, "model_dump", None)
+            if not callable(model_dump):
+                return
+            try:
+                cached_block = model_dump(exclude_none=True)
+            except Exception as e:
+                log_warning(f"Skipping message cache breakpoint, could not serialize {type(block).__name__}: {e}")
+                return
+            if not isinstance(cached_block, dict) or not cached_block.get("type"):
+                return
+            cached_block["cache_control"] = {"type": "ephemeral"}
+
+        # Copy, never mutate. ``format_messages`` hands back the *same* list and
+        # dict objects it got from the caller's Message.content (verified), so an
+        # in-place write would persist cache_control into stored history — and
+        # every replayed turn would then contribute another breakpoint until the
+        # request blew the cap of 4 and started 400ing.
+        new_content = list(content)
+        new_content[-1] = cached_block
+        chat_messages[-1] = {**last_message, "content": new_content}
+
     def _build_system(self, system_message: str) -> List[Dict[str, Any]]:
         """Assemble the Anthropic ``system`` array.
 
@@ -611,6 +753,29 @@ class Claude(Model):
         Anthropic's prefix-cache semantics: stable content first, dynamic
         per-request content later.
 
+        The agent-built message is split at its trailing ``<session-id>`` tag,
+        which is emitted as its own UNCACHED block after the breakpoint. That
+        tag is the only per-session bytes in the prompt, and because the
+        breakpoint sat at the end of the whole string, it used to make the
+        ~10.8k framework prompt a per-session cache entry: every session paid
+        the 1.25x write and shared nothing with any other session. That is
+        worst for the webhook-driven customer-care agents (Replio), where every
+        event delivery can create a fresh single-call session — one that pays a
+        write it never reads back, making caching strictly *more* expensive than
+        not caching. With the tag past the breakpoint the framework prefix is
+        byte-identical across every session on the box, so it is written once
+        and read by every session thereafter, including on the first call of a
+        brand-new one.
+
+        The tag is kept in ``system`` (rather than moved into the user message)
+        because ``src/core/prompts.py`` tells the model the id arrives "at the
+        end of this system prompt", and ``model_manager_pin_session`` depends on
+        the model reading it from there. Splitting the block keeps that contract
+        byte-for-byte — the model still sees the same text in the same place —
+        while a move would silently break a prompt this file cannot edit. The
+        ~15 uncached tokens it costs per call are reimbursed from the next call
+        on, when the message breakpoint's prefix swallows them.
+
         Used by both ``_prepare_request_kwargs`` and ``count_tokens`` so the
         two paths cannot diverge.
 
@@ -619,13 +784,17 @@ class Claude(Model):
         """
         blocks: List[Dict[str, Any]] = []
         if system_message:
-            blocks.extend(
-                build_system_blocks(
-                    system_message,
-                    cache_system_prompt=bool(self.cache_system_prompt),
-                    extended_cache_time=bool(self.extended_cache_time),
+            cacheable, session_id_tag = _split_session_id_tag(system_message)
+            if cacheable:
+                blocks.extend(
+                    build_system_blocks(
+                        cacheable,
+                        cache_system_prompt=bool(self.cache_system_prompt),
+                        extended_cache_time=bool(self.extended_cache_time),
+                    )
                 )
-            )
+            if session_id_tag:
+                blocks.append({"text": session_id_tag, "type": "text"})
         user_blocks = self.system_prompt_blocks() if callable(self.system_prompt_blocks) else self.system_prompt_blocks
         if user_blocks:
             blocks.extend(
@@ -746,6 +915,7 @@ class Claude(Model):
             request_kwargs = self._prepare_request_kwargs(
                 system_message, tools=tools, response_format=response_format, messages=messages
             )
+            self._apply_cache_messages(chat_messages, request_kwargs)
 
             if self._has_beta_features(response_format=response_format, tools=tools):
                 assistant_message.metrics.start_timer()
@@ -806,6 +976,7 @@ class Claude(Model):
         request_kwargs = self._prepare_request_kwargs(
             system_message, tools=tools, response_format=response_format, messages=messages
         )
+        self._apply_cache_messages(chat_messages, request_kwargs)
 
         try:
             # Beta features
@@ -857,6 +1028,7 @@ class Claude(Model):
             request_kwargs = self._prepare_request_kwargs(
                 system_message, tools=tools, response_format=response_format, messages=messages
             )
+            self._apply_cache_messages(chat_messages, request_kwargs)
 
             # Beta features
             if self._has_beta_features(response_format=response_format, tools=tools):
@@ -916,6 +1088,7 @@ class Claude(Model):
             request_kwargs = self._prepare_request_kwargs(
                 system_message, tools=tools, response_format=response_format, messages=messages
             )
+            self._apply_cache_messages(chat_messages, request_kwargs)
 
             if self._has_beta_features(response_format=response_format, tools=tools):
                 assistant_message.metrics.start_timer()

@@ -58,8 +58,22 @@ _TEST_MODULES: tuple[str, ...] = (
     # events.jsonl (vision §14). Pure-unit — synthetic logs in a temp
     # agent dir, no pool/gateway.
     "test_logs_mcp",
+    # ``read_tail`` on the reverse reader shared with the logs MCP, plus
+    # ``GET /api/logs`` offloading the blocking read off the event loop.
+    # Pure-unit; sits next to test_logs_mcp because they pin two halves of
+    # one reader.
+    "test_logs_read_tail",
+    # FTS5 transcript index + the memory-search MCP that reads it: proves
+    # `search_past_conversations` returns a real hit (its embedding-based
+    # predecessor never could), and that purge / compaction rewrites do not
+    # resurface. Pure-unit — temp DBs, real MemoryDB, no pool/gateway.
+    "test_transcript_index",
     "test_delegation_depth",
     "test_stream_usage",
+    # Vault recall attribution (note → run → outcome). Drives the REAL
+    # TeamRouterProvider.stream path with genuine runtime events; pure-unit
+    # otherwise (temp DB, fake runtime, no pool/gateway).
+    "test_vault_recall",
     "test_model_fallback",
     # Every tool name the framework / dream prompts hand the model must
     # resolve to a real MCP registration. Pure-unit: introspects the
@@ -163,7 +177,7 @@ _TEST_MODULES: tuple[str, ...] = (
     # tier_hint/description, and the single-agent fallback.
     "test_team_router",
     # Regression lock-down for the v0.14 runtime-consolidation refactor.
-    # Covers framework collapse, SmartRouter classifier removal, db.py
+    # Covers framework collapse, classifier-router removal, db.py
     # helper deletion, defer-all MCP wiring, system prompt placeholders,
     # curator wiring, signal handler hardening, and the tqdm/multiprocessing
     # semaphore leak. The end-to-end subprocess test spawns ``python -m
@@ -239,6 +253,12 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_files",
     # 6. Misc standalone
     "test_cron",
+    # Timezone-aware schedules: the no-timezone default must stay
+    # byte-identical to the pre-timezone behaviour (every deployed cron was
+    # hand-converted to the host clock), while a tz-tagged cron holds its
+    # wall-clock hour across both Europe/Rome DST transitions — firing once
+    # on the skipped hour and once, not twice, on the repeated one.
+    "test_cron_timezone",
     # Issue #5 regression — scheduler must start each firing in a fresh session.
     "test_scheduler_fresh_session",
     # Scheduled-task execution history (task_runs) — DB layer + the
@@ -293,6 +313,7 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_update_guard",
     "test_task_hooks",
     "test_shell_hooks",
+    "test_tool_labels",
     "test_bridges",
     # Spam coalescing end-to-end: real StreamSession against a slow
     # fake agent (every turn takes real time, mirroring LLM latency),
@@ -353,6 +374,11 @@ _TEST_MODULES: tuple[str, ...] = (
     # hard-cancels the in-flight task and finalizes it ``cancelled`` (plus
     # the orphan sweep for stale flags). Pins both MCP stop tools too.
     "test_run_cancellation",
+    # The REST half of that stop: POST /api/workflows/{id}/stop, the route
+    # that was missing while /run shipped (so the app could start a workflow
+    # it could not stop). Runs after test_run_cancellation because it pins the
+    # same drain from the gateway's side.
+    "test_workflow_stop",
     # HTTP 402 / Insufficient Balance from any provider rewrites to a
     # billing-hint message naming the provider — surfaces the actual
     # config issue instead of looking like a transient provider blip.
@@ -367,6 +393,9 @@ _TEST_MODULES: tuple[str, ...] = (
     # drops emit a diagnostic event.
     "test_discord_bridge_receive",
     "test_shell",
+    # The safety.approvals blocklist, driven through the shell_exec callsite.
+    # Runs right after test_shell since it shares the ShellHub fixture reset.
+    "test_safety",
     # 9. Gateway /stop, /clear, /new command semantics
     "test_gateway_commands",
     # SessionManager must run sessions in parallel on one client

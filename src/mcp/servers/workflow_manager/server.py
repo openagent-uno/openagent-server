@@ -34,6 +34,10 @@ from src.workflow import (
     validate_graph,
 )
 from src.workflow.blocks import get_block_spec
+from src.workflow.cancel import (
+    await_runs_terminal as _await_runs_terminal,
+    flag_workflow_runs_cancelling,
+)
 from src.workflow.examples import (
     get_workflow_example as _get_workflow_example,
     list_workflow_examples as _list_workflow_examples,
@@ -980,21 +984,14 @@ async def stop_workflow(
     row = await _resolve_workflow(conn, id_or_name)
     workflow_id = row["id"]
 
-    # Snapshot exactly which running runs we're flagging, so we can report
-    # them and (optionally) poll those specific ids.
-    if run_id:
-        cursor = await conn.execute(
-            "SELECT id FROM workflow_runs "
-            "WHERE id = ? AND workflow_id = ? AND status = 'running'",
-            (run_id, workflow_id),
-        )
-    else:
-        cursor = await conn.execute(
-            "SELECT id FROM workflow_runs "
-            "WHERE workflow_id = ? AND status = 'running'",
-            (workflow_id,),
-        )
-    target_ids = [r["id"] for r in await cursor.fetchall()]
+    # Flag + snapshot in one shared step. The gateway's
+    # ``POST /api/workflows/{id}/stop`` writes the identical flag through the
+    # same helper — two requesters, one hand-off, so the ``status='running'``
+    # compare-and-set that keeps a settled run from being resurrected cannot
+    # drift between them.
+    target_ids = await flag_workflow_runs_cancelling(
+        conn, workflow_id=workflow_id, run_id=run_id,
+    )
 
     if not target_ids:
         return {
@@ -1009,16 +1006,6 @@ async def stop_workflow(
                 + "."
             ),
         }
-
-    # The ``status='running'`` guard keeps the transition idempotent and
-    # avoids clobbering a run that finished between the SELECT and here.
-    placeholders = ",".join("?" for _ in target_ids)
-    await conn.execute(
-        f"UPDATE workflow_runs SET status = 'cancelling' "
-        f"WHERE id IN ({placeholders}) AND status = 'running'",
-        target_ids,
-    )
-    await conn.commit()
 
     if wait:
         runs = await _await_runs_terminal(conn, target_ids, timeout_s=timeout_s)
@@ -1036,37 +1023,6 @@ async def stop_workflow(
             "cancels them within ~2s."
         ),
     }
-
-
-async def _await_runs_terminal(
-    conn: aiosqlite.Connection,
-    run_ids: list[str],
-    *,
-    timeout_s: int,
-) -> list[dict[str, Any]]:
-    """Poll ``workflow_runs`` until each run id leaves ``running`` /
-    ``cancelling``, or the deadline passes. The main process is the writer
-    (cross-process, WAL); a fresh SELECT each pass sees its latest committed
-    status — exactly how ``run_workflow``'s wait-poller observes completion.
-    Returns ``[{id, status}]`` with the latest status for every requested id."""
-    deadline = time.monotonic() + max(1, timeout_s)
-    placeholders = ",".join("?" for _ in run_ids)
-    while True:
-        cursor = await conn.execute(
-            f"SELECT id, status FROM workflow_runs WHERE id IN ({placeholders})",
-            run_ids,
-        )
-        statuses = {r["id"]: r["status"] for r in await cursor.fetchall()}
-        pending = [
-            rid for rid in run_ids
-            if statuses.get(rid) in ("running", "cancelling")
-        ]
-        if not pending or time.monotonic() >= deadline:
-            return [
-                {"id": rid, "status": statuses.get(rid, "unknown")}
-                for rid in run_ids
-            ]
-        await asyncio.sleep(0.4)
 
 
 # ── entrypoint ───────────────────────────────────────────────────────

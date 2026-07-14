@@ -147,16 +147,21 @@ async def t_learning_model_degrades(ctx: TestContext) -> None:
 # awaiting deletion rather than repair. Every entry here is a live §17
 # violation; the list must only ever shrink.
 #
-# semantic_search: embeds via OpenAI's text-embedding-3-small and scans with a
-#   brute-force Python cosine loop. Recommended for deletion along with the
-#   memory-search MCP that is its only reader — the table it writes has never
-#   had a writer wired, and §5 rules out a "hidden vector store" as the shape
-#   of the agent's memory in the first place. Deleting it needs the
-#   registration pulled from src/mcp/builtins.py + src/cli.py and the mention
-#   dropped from src/core/prompts.py, which are owned elsewhere; until then it
-#   stays put, opt-in and off by default, and the prompt already tells the
-#   model to treat it as empty.
-_KNOWN_VENDOR_PINNED = {"semantic_search.py"}
+# IT IS NOW EMPTY, AND THAT IS THE POINT (v0.15.12). Its last entry was
+# ``semantic_search.py`` — OpenAI ``text-embedding-3-small`` embeddings behind
+# a brute-force Python cosine loop. It was deleted rather than repaired: its
+# writer had zero callers on every deployment that ever existed, so the
+# ``conversation_embeddings`` table it read could never hold a row, and §5
+# rules out a hidden vector store as the shape of memory regardless. The
+# capability it claimed was real, so it was rebuilt without a vendor —
+# ``src/memory/transcript_index.py``, FTS5 over ``sessions.runs``, which is
+# data that was already on disk. See that module for the full argument.
+#
+# The mechanism is kept rather than deleted with its last entry, because the
+# ratchet is the valuable part: ``t_known_vendor_allowlist_is_real`` below now
+# asserts the set is EMPTY, so re-introducing an exemption is a deliberate,
+# reviewable edit to this line and not a quiet append.
+_KNOWN_VENDOR_PINNED: set[str] = set()
 
 _BANNED_IMPORTS = {"groq", "openai"}
 _BANNED_NAMES = {"AsyncGroq", "AsyncOpenAI", "OpenAI", "Groq"}
@@ -215,11 +220,19 @@ async def t_no_hardcoded_provider(ctx: TestContext) -> None:
     )
 
 
-@test("learning_wiring", "the known vendor-pinned allowlist stays accurate")
+@test("learning_wiring", "the known vendor-pinned allowlist stays accurate + empty")
 async def t_known_vendor_allowlist_is_real(ctx: TestContext) -> None:
     """An allowlist that outlives what it excuses is how a violation becomes
-    permanent. Fail once ``semantic_search.py`` is gone (or repaired) so the
-    entry — and this test — get removed with it.
+    permanent. Two ratchet teeth, both live:
+
+    1. Every entry must still exist AND still pin a vendor — so an exemption
+       cannot outlive the file it excuses, or survive that file's repair.
+       (Vacuous while the set is empty; it re-arms the moment anyone adds one.)
+    2. The set must be EMPTY. It reached zero when ``semantic_search.py`` was
+       deleted in v0.15.12 and §17 now holds across all of ``src/learning``
+       with no exceptions. This assert is what keeps tooth 1 from being
+       vacuously green forever: adding an entry back fails here and forces
+       the author to state why in this file.
     """
     for name in _KNOWN_VENDOR_PINNED:
         path = _SRC / "learning" / name
@@ -230,3 +243,10 @@ async def t_known_vendor_allowlist_is_real(ctx: TestContext) -> None:
         assert "AsyncOpenAI" in path.read_text(encoding="utf-8", errors="ignore"), (
             f"{name} no longer pins a vendor — drop it from _KNOWN_VENDOR_PINNED."
         )
+
+    assert _KNOWN_VENDOR_PINNED == set(), (
+        "A new §17 exemption was added to _KNOWN_VENDOR_PINNED. The list went "
+        "to zero in v0.15.12 and is meant to stay there: a vendor-pinned "
+        f"learning module is a bug, not a state to record. Got: "
+        f"{sorted(_KNOWN_VENDOR_PINNED)}"
+    )

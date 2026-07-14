@@ -1,7 +1,7 @@
 """Contract tests — pin the behavioral invariants of the model/router system.
 
 These tests are the living specification for how OpenAgent's model
-catalog + SmartRouter + session pin are supposed to behave.
+catalog + ModelDispatcher + session pin are supposed to behave.
 Together they cover:
 
   1. Models live ONLY in the ``models`` DB table (not in yaml).
@@ -13,8 +13,14 @@ Together they cover:
   4. ``runtime_id`` (``openai:gpt-4o-mini``) is the 2-part
      ``provider:model`` form, derived at read time, not stored in any
      table.
-  5. SmartRouter resolves the per-session entry model (pin →
-     first-enabled); per-turn delegation lives inside the Team.
+  5. ``ModelDispatcher`` resolves the per-session entry model by pure
+     lookup — per-session pin -> the ``is_classifier``-flagged model ->
+     first enabled in catalog order. No classifier LLM call is involved;
+     ``is_classifier`` is the user's persistent "default team leader"
+     hint, not a per-turn classification (the classifier router was
+     retired in v0.14, and this line used to omit the flag entirely).
+     Per-turn delegation lives inside the Team, whose leader routes to
+     members by their free-form ``tier_hint``.
   6. Per-session pin survives across turns and restarts (rows in
      ``pinned_sessions``).
   7. The ``model-manager`` MCP + REST + CLI can add / remove / edit

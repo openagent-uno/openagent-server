@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from src.mcp.servers.vault_gate import handlers
+from src.mcp.servers.vault_gate import handlers, recall
 
 
 def build_runtime_toolkit() -> Any:
@@ -89,11 +89,27 @@ def build_runtime_toolkit() -> Any:
         These are derived files — never edit them by hand."""
         return await handlers.vault_regenerate_derived()
 
+    async def vault_recall_stats(limit: int = 20, since_days: int | None = 30,
+                                 note_path: str | None = None) -> dict:
+        """Which notes you actually READ, and how those runs ended. Per note:
+        recalls, ok, errored, cancelled_excluded (barge-ins — never scored),
+        and ok_rate over the scorable runs only.
+
+        This is ASSOCIATION, NOT CAUSATION: ok_rate only says a run that read
+        the note finished without raising — not that the note helped, and a
+        run that read ten notes credits all ten. Use it to decide what to
+        re-read or re-check, and during a dream pass to see which notes are
+        load-bearing (often recalled) vs never recalled at all. Never use it
+        alone as grounds to delete a note. Ignore rows with a low 'scorable'."""
+        return await recall.vault_recall_stats(
+            limit=limit, since_days=since_days, note_path=note_path,
+        )
+
     return Toolkit(
         name="vault-gate",
         tools=[
             vault_gate, vault_doctor, vault_dream, vault_validate_note,
             vault_rename_note, vault_init, vault_stats, vault_search,
-            vault_backlinks, vault_regenerate_derived,
+            vault_backlinks, vault_regenerate_derived, vault_recall_stats,
         ],
     )

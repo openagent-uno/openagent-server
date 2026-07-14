@@ -374,10 +374,15 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
         "dir": "memory_search",
         "command": ["python", "-m", "src.mcp.servers.memory_search.server"],
         "python": True,
+        # Says "full-text" rather than the old "semantic": tool-search shows
+        # this line as the MCP's one-line pitch, and the model picks tools off
+        # it. It matches words, not meaning — promising semantics would send
+        # the model here with a paraphrase and let the miss read as "never
+        # discussed". Same failure the phantom "audio" claim on media-gen had.
         "description": (
-            "semantic search across past conversations. Complements "
-            "vault: vault is your editable notes, this is everything "
-            "you've already said"
+            "full-text search over what was SAID in past conversations. "
+            "Complements vault: vault is your curated notes, this is the "
+            "raw transcript. Matches words, not meaning"
         ),
     },
     "delegation": {
