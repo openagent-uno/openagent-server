@@ -73,3 +73,74 @@ async def t_no_manager_review(ctx: TestContext) -> None:
     assert not hasattr(bt, "MANAGER_REVIEW_TASK_NAME")
     assert "manager-review" not in bt.BUILTIN_TASK_NAMES
     assert "manager_review" not in bt.CONFIG_SECTION_BY_TASK.values()
+
+
+@test("dream", "Mission 1 consumes the recall score (the loop is closed)")
+async def t_dream_consumes_recall(ctx: TestContext) -> None:
+    """The measurement is worthless until something acts on it.
+
+    ``vault_recall_stats`` records which notes a run read and how the run
+    ended. Shipped on its own, that is a LEDGER — the vault is still a
+    diary, just one with bookkeeping attached. It only becomes a policy
+    when a consumer changes behaviour because of the number.
+
+    Dream mode's Mission 1 is that consumer: it already curates the vault,
+    it costs nothing per-turn (nightly only), and ``vault_dream`` and
+    ``vault_recall_stats`` sit on the same toolkit. If this assertion goes
+    red, the loop has been quietly re-opened and the scoring subsystem is
+    back to writing rows nobody reads.
+    """
+    from src.core.server import DREAM_MODE_PROMPT
+
+    assert "vault_recall_stats" in DREAM_MODE_PROMPT, (
+        "nothing consumes the recall score — vault_recall_stats writes rows "
+        "and no prompt tells any agent to read them. That is a ledger, not "
+        "a policy."
+    )
+    # It must lead the mission, not be an afterthought buried under the
+    # generic checks — its whole value is deciding WHERE to spend the pass.
+    idx_recall = DREAM_MODE_PROMPT.index("vault_recall_stats")
+    idx_survey = DREAM_MODE_PROMPT.index("list_directory")
+    assert idx_recall < idx_survey, (
+        "the recall score must be read BEFORE the alphabetical survey — "
+        "reading it afterwards wastes the pass it was meant to direct."
+    )
+
+
+@test("dream", "Mission 1 refuses to let a number condemn a note")
+async def t_dream_recall_is_not_a_verdict(ctx: TestContext) -> None:
+    """The failure mode that makes outcome scoring actively harmful.
+
+    A run that reads six notes and fails credits all six. Left unqualified,
+    a nightly agent holding both ``vault_recall_stats`` and ``delete_note``
+    will eventually delete a good note for the crime of being cited during
+    a hard task — and the vault silently loses its most-used entries first,
+    because they are the ones present when anything goes wrong.
+
+    The tool's own payload carries this caveat; the prompt must repeat it
+    where the agent is actually holding the delete tool.
+    """
+    import re
+
+    from src.core.server import DREAM_MODE_PROMPT
+
+    # Collapse the prompt's hard wrapping before matching. A prose guard that
+    # breaks when a paragraph reflows holds the wording hostage to its line
+    # width and teaches the next person to delete it — which is how the
+    # original "events.jsonl in lower" check ended up passing on a sentence
+    # that FORBADE reading events.jsonl.
+    lower = re.sub(r"\s+", " ", DREAM_MODE_PROMPT).lower()
+    assert "association, not causation" in lower, (
+        "Mission 1 reads ok_rate without stating it is association, not "
+        "causation — the agent will read a low number as a bad note."
+    )
+    assert "never delete a note for a bad number alone" in lower, (
+        "Mission 1 gives the agent a score and a delete tool without "
+        "forbidding the obvious wrong move."
+    )
+    # An empty table must read as "no evidence yet", not "no value" — every
+    # deployment starts empty, so this is the FIRST state it will be in.
+    assert "no evidence yet" in lower, (
+        "Mission 1 does not say what an empty stats table means. It is empty "
+        "on every fresh deployment, so that is the state it meets first."
+    )

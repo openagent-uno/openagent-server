@@ -196,6 +196,11 @@ _NON_TOOL_TOKENS: frozenset[str] = frozenset({
     # reply — the prompt names that field because an empty result must be
     # read as "those words are absent", never as "we never discussed it".
     "limit", "offset", "index",
+    # ``ok_rate`` is a RESULT FIELD of vault_recall_stats. DREAM_MODE_PROMPT
+    # names it repeatedly and on purpose: the number points at a note to
+    # READ, it is not a verdict on it (association, not causation), and the
+    # prompt has to say so where the agent will act on it.
+    "ok_rate",
     # ``error_like`` is a RESULT FIELD of the logs MCP, not a tool.
     # DREAM_MODE_PROMPT names it to warn that severity is inferred rather
     # than authoritative (log entries carry no level field), so the flag

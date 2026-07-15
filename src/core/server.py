@@ -80,6 +80,32 @@ and log the uncertainty.
 
 Curate the memory vault via the `vault` MCP — do NOT cat/grep the
 .md files directly.
+
+**Start with `vault_recall_stats`.** It tells you which notes were
+actually read during real runs and how those runs ended, so you spend
+this pass on the notes that carry weight instead of walking the vault
+alphabetically. Read its `caveat` and believe it: `ok_rate` is
+ASSOCIATION, NOT CAUSATION. A run that read six notes and failed credits
+all six; a low `ok_rate` is evidence about a note, never a verdict on it.
+
+Use it to decide **where to look**, then judge the note on its content:
+   - **Read often, low `ok_rate`** — look here first. Open the note and
+     ask why: is it stale, ambiguous, contradicted elsewhere, or missing
+     the caveat that would have prevented the failure? Fix what you can
+     verify. If the note reads fine, leave it and say so in the log —
+     the correlation may be the task's difficulty, not the note.
+   - **Read often, high `ok_rate`** — this note is load-bearing. Do not
+     merge it away casually, and make sure it is well cross-linked so it
+     keeps getting found.
+   - **Never read** — a candidate for the orphan/duplicate checks below,
+     NOT a reason to delete on its own. A note can be correct, niche,
+     and simply not needed yet.
+   - **Absent from the stats entirely** — the table only fills as runs
+     happen, so on a fresh deployment it is empty. That means "no
+     evidence yet", not "no value". Fall back to the checks below.
+
+Never delete a note for a bad number alone. The stats point; you read.
+
    - Use `list_directory` and `search_notes` to survey the vault.
    - Identify notes that cover the same topic and **merge duplicates**
      into a single canonical note with `write_note` or `patch_note`,
@@ -168,6 +194,12 @@ and `date:` set to today. Record, per mission: what you
 merged/updated/cross-linked/removed in the vault, which log issues you
 found, what you fixed, what you would automate and why, and what still
 needs the user's decision.
+
+Include the recall findings explicitly: which notes `vault_recall_stats`
+sent you to, what you concluded when you actually read them, and — this
+one matters — which ones you examined and found FINE despite a low
+`ok_rate`. Without that, the next run re-investigates the same note
+forever and the number slowly reads as guilt rather than as a pointer.
 
 Use the `vault` MCP's tools for all vault access — never shell out for
 anything under the memory vault.
