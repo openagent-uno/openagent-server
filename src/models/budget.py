@@ -63,12 +63,22 @@ class BudgetTracker:
         }
 
     @staticmethod
-    def compute_cost(model: str, input_tokens: int, output_tokens: int) -> float:
-        """Compute cost using OpenAgent's live pricing catalog."""
+    def compute_cost(
+        model: str,
+        input_tokens: int,
+        output_tokens: int,
+        cache_read_tokens: int = 0,
+    ) -> float:
+        """Compute cost using OpenAgent's live pricing catalog.
+
+        ``cache_read_tokens`` (a subset of ``input_tokens``) is billed at the
+        cheap prefix-cache-read rate; 0 reproduces the old flat pricing.
+        """
         from src.models.catalog import compute_cost
 
         return compute_cost(
             model_ref=model,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cache_read_tokens=cache_read_tokens,
         )

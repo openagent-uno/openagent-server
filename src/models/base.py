@@ -23,6 +23,9 @@ class ModelResponse:
     tool_names_called: list[str] = field(default_factory=list)
     input_tokens: int = 0
     output_tokens: int = 0
+    # Server-side prefix-cache reads, a subset of ``input_tokens`` billed at the
+    # cheap cache-read rate (DeepSeek prompt_cache_hit / OpenAI cached_tokens).
+    cache_read_tokens: int = 0
     stop_reason: str | None = None
     model: str | None = None
 

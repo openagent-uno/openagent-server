@@ -197,6 +197,52 @@ def _extract_delegated_member_id(tool_call: Any) -> str | None:
     return None
 
 
+def _run_metrics_cache_read(metrics: Any) -> int:
+    """Server-side prefix-cache reads for a whole run, robust to the runtime.
+
+    The top-level ``RunMetrics.cache_read_tokens`` is populated by
+    ``accumulate_model_metrics`` — but a scrubbed/rebuilt ``run_output.metrics``
+    can carry the aggregated ``input_tokens`` while dropping the top-level
+    cache-read counter (observed on the Team path). The per-model ``details``
+    breakdown keeps a ``ModelMetrics`` per (provider, id) that DOES carry
+    ``cache_read_tokens``, so we prefer the top-level value and fall back to
+    summing ``details`` — never under-count the discount that keeps the DeepSeek
+    ledger honest. Returns 0 when nothing is available (a non-caching model).
+    """
+    if metrics is None:
+        return 0
+    top = int(getattr(metrics, "cache_read_tokens", 0) or 0)
+    if top > 0:
+        return top
+    total = 0
+    try:
+        for entries in (getattr(metrics, "details", None) or {}).values():
+            for mm in entries or []:
+                total += int(getattr(mm, "cache_read_tokens", 0) or 0)
+    except Exception:  # noqa: BLE001 — accounting must never break a turn
+        return top
+    return total
+
+
+def _messages_cache_read(run_output: Any) -> int:
+    """Sum server-side cache-read tokens off a run's assistant messages.
+
+    The per-message ``MessageMetrics`` reliably carry ``cache_read_tokens``
+    (``_get_metrics`` sets them), and unlike the top-level ``run_output.metrics``
+    the message list survives intact — so this is the in-context capture the
+    ContextVar sink couldn't do (the runtime runs model calls off-thread). Walks
+    ``run_output.messages``; returns 0 when absent or unreadable.
+    """
+    total = 0
+    try:
+        for m in getattr(run_output, "messages", None) or []:
+            mm = getattr(m, "metrics", None)
+            total += int(getattr(mm, "cache_read_tokens", 0) or 0)
+    except Exception:  # noqa: BLE001 — accounting must never break a turn
+        return 0
+    return total
+
+
 async def _arun_runtime_collect(
     runtime: Any,
     *,
@@ -238,11 +284,18 @@ async def _arun_runtime_collect(
         arun_kwargs["audio"] = audio
     if videos:
         arun_kwargs["videos"] = videos
+    from src.core.metrics import (
+        open_turn_cache_read, close_turn_cache_read, read_turn_cache_read,
+    )
+    _cr_token = open_turn_cache_read()
     try:
         run_output = await runtime.arun(prompt, **arun_kwargs)
     except Exception as e:  # noqa: BLE001
         elog(error_event, session_id=session_id, error=str(e))
         raise
+    finally:
+        turn_cache_read = read_turn_cache_read()
+        close_turn_cache_read(_cr_token)
     content = str(getattr(run_output, "content", "") or "")
     tools_used: list[str] = []
     for tc in getattr(run_output, "tools", None) or []:
@@ -257,11 +310,23 @@ async def _arun_runtime_collect(
     metrics = getattr(run_output, "metrics", None)
     input_tokens = int(getattr(metrics, "input_tokens", 0) or 0) if metrics else 0
     output_tokens = int(getattr(metrics, "output_tokens", 0) or 0) if metrics else 0
+    # Server-side cache-read, best-effort from whatever the runtime surfaces:
+    # the per-turn sink, the top-level/details run metrics, or the messages.
+    # Clamp to the prompt so a mismatch never bills a negative miss. When none
+    # of them carry it (the Team non-stream path drops cache_read from
+    # run_output — see docs/known-issues), this is 0 and cost stays flat, i.e.
+    # CONSERVATIVE: the budget over-counts, never under-counts. See the
+    # cache-aware pricing in compute_cost.
+    cache_read_tokens = min(
+        max(turn_cache_read, _run_metrics_cache_read(metrics),
+            _messages_cache_read(run_output)), input_tokens,
+    )
     return ModelResponse(
         content=content,
         tool_names_called=tools_used,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
+        cache_read_tokens=cache_read_tokens,
         model=entry_runtime_id,
     )
 
@@ -402,10 +467,11 @@ async def _arun_runtime_stream(
             if isinstance(event, run_completed_event_types):
                 ev_sid = getattr(event, "session_id", None)
                 if ev_sid is None or ev_sid == session_id:
-                    inp, out = stream_usage.metrics_to_tokens(
-                        getattr(event, "metrics", None)
-                    )
-                    stream_usage.record(input_tokens=inp, output_tokens=out)
+                    _ev_metrics = getattr(event, "metrics", None)
+                    inp, out = stream_usage.metrics_to_tokens(_ev_metrics)
+                    cr = stream_usage.metrics_to_cache_read(_ev_metrics)
+                    stream_usage.record(
+                        input_tokens=inp, output_tokens=out, cache_read_tokens=cr)
             # Suppress a delegated member's OWN content + nested tool events
             # from the PARENT live stream when the member runs in its own child
             # session. That work belongs to the child session (navigable via the
@@ -1055,6 +1121,7 @@ class TeamRouterProvider(BaseModel):
         input_tokens: int,
         output_tokens: int,
         session_id: str | None,
+        cache_read_tokens: int = 0,
     ) -> None:
         """Write one call into ``usage_log`` — the canonical cost ledger.
 
@@ -1062,13 +1129,20 @@ class TeamRouterProvider(BaseModel):
         routed turns, AND the model-pinned ones that skip the dispatcher
         entirely. Accounting therefore belongs here, or it does not cover the
         traffic that turned out to be the expensive kind.
+
+        ``cache_read_tokens`` (a subset of ``input_tokens``) is priced at the
+        cheap prefix-cache-read rate, so the budget ledger reflects the REAL
+        spend — a tool-loop turn that re-sends a cached prefix is no longer
+        over-charged ~10x, which was silently shrinking the DeepSeek daily cap.
         """
         if not self._budget:
             return
         if not input_tokens and not output_tokens:
             return
         runtime_id = self._entry_runtime_id
-        cost = BudgetTracker.compute_cost(runtime_id, input_tokens, output_tokens)
+        cost = BudgetTracker.compute_cost(
+            runtime_id, input_tokens, output_tokens, cache_read_tokens,
+        )
         try:
             await self._budget.record(
                 model=runtime_id,
@@ -1163,6 +1237,7 @@ class TeamRouterProvider(BaseModel):
             await self.record_cost(
                 input_tokens=resp.input_tokens,
                 output_tokens=resp.output_tokens,
+                cache_read_tokens=resp.cache_read_tokens,
                 session_id=session_id,
             )
             return resp
@@ -1259,6 +1334,7 @@ class TeamRouterProvider(BaseModel):
             await self.record_cost(
                 input_tokens=sink.get("input_tokens", 0),
                 output_tokens=sink.get("output_tokens", 0),
+                cache_read_tokens=sink.get("cache_read_tokens", 0),
                 session_id=session_id,
             )
             await self.record_vault_recalls(

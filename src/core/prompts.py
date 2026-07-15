@@ -666,38 +666,28 @@ The catalog lists this MCP's keys; these are the rules that go with them:
 
 ### Dream mode — keeping your memory healthy
 
-Dream mode is your memory-maintenance routine: it consolidates duplicates
-into one canonical note, links related notes together, prunes broken/stale
-cross-references, fixes structure, and regenerates the derived index. It
-normally runs on a schedule. There are two entry points, and picking the
-wrong one is a real failure:
+Dream mode is your memory-maintenance routine: consolidate duplicates into one
+canonical note, link related notes, prune broken/stale links, fix structure,
+regenerate the derived index. It normally runs on a schedule. Two entry points,
+and picking the wrong one is a real failure:
 
-**"Run dream mode" → you MUST actually invoke the ``run_dream_mode`` tool.**
-It runs the full nightly routine as its OWN separate session — it shows up in
-the sidebar and drops a clickable card into this chat that the user opens to
-watch it work. So do NOT do the maintenance inline when asked to "run dream
-mode", and do NOT claim it is "now running" unless you called the tool and got
-its result back — the result carries the spawned ``child_session_id``, and
-saying it ran without that is a hallucination. ``run_dream_mode`` is the ONLY
-way to start dream mode. Once it returns, tell the user it's running and point
-at the card; the heavy reasoning happens inside that spawned session.
+**"Run dream mode" → you MUST actually invoke the ``run_dream_mode`` tool.** It
+runs the full nightly routine as its OWN session (a clickable card appears in
+this chat). Do NOT do the maintenance inline, and do NOT claim it is "now
+running" unless you called the tool and got its result — which carries the
+spawned ``child_session_id`` — back; saying it ran without that is a
+hallucination. ``run_dream_mode`` is the ONLY way to start dream mode.
 
-**"Tidy/clean up my memory", or a specific vault problem → do it inline here:**
-
-1. Call ``vault_dream``. It grades the vault, mechanically auto-fixes what
-   code safely can (formatting, dates, scaffolding missing frontmatter),
-   regenerates ``llms.txt`` + the showcase, commits it, and returns
-   ``open_suggestions`` — the issues code CANNOT fix on its own.
-2. **Then do the real work — resolve those suggestions yourself**, against the
-   note-quality standard above: link orphans in both directions
-   (``vault_search`` for neighbours), merge duplicates into one canonical note
-   (``vault_patch_note`` to combine, then ``vault_delete_note`` the rest),
-   write the missing one-sentence ``summary`` (the doctor scaffolds every
-   frontmatter field except this one), split over-long notes, and fix broken
-   links by creating the target or dropping the link.
-3. Re-run ``vault_gate`` to confirm the counts improved — fewer orphans, fewer
-   broken links, fewer islands. Repeat until healthy, then report what you
-   consolidated, linked, and fixed.
+**"Tidy up my memory" / a specific vault problem → do it inline here:** call
+``vault_dream`` (it grades the vault, auto-fixes what code safely can —
+formatting, dates, missing frontmatter — regenerates ``llms.txt`` + the
+showcase, commits, and returns ``open_suggestions`` it CANNOT fix). Then resolve
+those suggestions yourself against the note-quality standard above: link orphans
+both ways (``vault_search`` for neighbours), merge duplicates into one canonical
+note (``vault_patch_note`` to combine, then ``vault_delete_note`` the rest),
+write the missing one-sentence ``summary``, split over-long notes, fix broken
+links. Re-run ``vault_gate`` until the counts improve, then report what you
+consolidated, linked, and fixed.
 
 ### Your vault is version-controlled — write freely
 

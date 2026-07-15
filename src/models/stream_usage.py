@@ -33,7 +33,9 @@ _SINK: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
 
 def open_sink() -> tuple[dict, contextvars.Token]:
     """Start collecting usage for one streamed call."""
-    sink: dict[str, Any] = {"input_tokens": 0, "output_tokens": 0, "model": None}
+    sink: dict[str, Any] = {
+        "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "model": None,
+    }
     return sink, _SINK.set(sink)
 
 
@@ -42,12 +44,18 @@ def close_sink(token: contextvars.Token) -> None:
 
 
 def record(
-    *, input_tokens: int, output_tokens: int, model: str | None = None
+    *,
+    input_tokens: int,
+    output_tokens: int,
+    model: str | None = None,
+    cache_read_tokens: int = 0,
 ) -> None:
     """Add one streamed run's tokens to the sink, if one is open.
 
     A no-op when nothing is collecting — a provider streamed outside the
     dispatcher (a test, a direct call) must not blow up on accounting.
+    ``cache_read_tokens`` (a subset of ``input_tokens``) lets the streamed
+    ledger price a re-sent, server-cached prefix at the cheap cache-read rate.
     """
     sink = _SINK.get()
     if sink is None:
@@ -55,6 +63,7 @@ def record(
     try:
         sink["input_tokens"] += int(input_tokens or 0)
         sink["output_tokens"] += int(output_tokens or 0)
+        sink["cache_read_tokens"] = sink.get("cache_read_tokens", 0) + int(cache_read_tokens or 0)
     except (TypeError, ValueError):
         return
     if model and not sink.get("model"):
@@ -101,3 +110,35 @@ def metrics_to_tokens(metrics: Any) -> tuple[int, int]:
         _pick("input_tokens", "prompt_tokens", "input"),
         _pick("output_tokens", "completion_tokens", "output"),
     )
+
+
+def metrics_to_cache_read(metrics: Any) -> int:
+    """Pull server-side prefix-cache read tokens out of a ``RunMetrics`` object.
+
+    Separate from :func:`metrics_to_tokens` so that function's ``(input, output)``
+    return stays stable. Returns 0 when absent (a non-caching model / older
+    metrics shape), which makes cost accounting fall back to flat pricing.
+    """
+    if metrics is None:
+        return 0
+    if isinstance(metrics, dict):
+        data: Any = metrics
+    else:
+        dump = getattr(metrics, "model_dump", None) or getattr(metrics, "dict", None)
+        if callable(dump):
+            try:
+                data = dump()
+            except Exception:  # noqa: BLE001
+                data = {}
+        else:
+            data = {k: getattr(metrics, k, None)
+                    for k in ("cache_read_tokens", "cached_tokens")}
+    for name in ("cache_read_tokens", "cached_tokens", "cache_read"):
+        val = data.get(name) if isinstance(data, dict) else None
+        if val is None:
+            continue
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            continue
+    return 0

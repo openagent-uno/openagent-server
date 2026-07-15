@@ -961,6 +961,17 @@ class AgentServer:
         except Exception as e:  # noqa: BLE001
             elog("budget.warm_error", level="warning", error=str(e))
 
+        # 1.2. Warm the OpenRouter pricing cache so ``compute_cost`` is accurate
+        #      from the FIRST billed call, not the second. Without this the first
+        #      DeepSeek call of each boot logs ``$0`` (cold cache) and a cost cap
+        #      undercounts it — a per-boot blind spot in the brake. Awaited here
+        #      (never fatal) so the price is hot before any turn or scheduled fire.
+        try:
+            from src.models.catalog import warm_pricing_cache
+            await warm_pricing_cache()
+        except Exception as e:  # noqa: BLE001 — pricing warm must never block boot
+            elog("catalog.pricing_warm_error", level="warning", error=str(e))
+
         # 1.5. Reap any ``workflow_runs`` still in ``running`` state —
         #      they're zombies from the prior process that we have no
         #      way to resume. Without this, the UI shows them spinning

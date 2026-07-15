@@ -1567,6 +1567,14 @@ class NativeProvider(BaseModel):
 
         input_tokens = self._extract_metric(metrics_dict, "input_tokens", "prompt_tokens", "input")
         output_tokens = self._extract_metric(metrics_dict, "output_tokens", "completion_tokens", "output")
+        # Server-side prefix-cache reads (DeepSeek prompt_cache_hit / OpenAI
+        # prompt_tokens_details.cached_tokens). Captured by ``_get_metrics``
+        # into ``cache_read_tokens``; included IN ``input_tokens`` above, priced
+        # at the cheap cache-read rate by ``compute_cost``. Absent → 0 → old flat
+        # cost. This is why a 135k-token tool-loop turn (mostly re-sent, cached
+        # prefix) was over-billed ~10x before.
+        cache_read_tokens = self._extract_metric(
+            metrics_dict, "cache_read_tokens", "cached_tokens", "cache_read")
         stop_reason = metrics_dict.get("stop_reason")
 
         # Compute cost from OpenAgent's catalog and mirror it back into the runtime's
@@ -1575,6 +1583,7 @@ class NativeProvider(BaseModel):
             metrics_obj=metrics_obj,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cache_read_tokens=cache_read_tokens,
             session_id=sid,
         )
 
@@ -1593,6 +1602,7 @@ class NativeProvider(BaseModel):
             tool_names_called=tool_names_called,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cache_read_tokens=cache_read_tokens,
             stop_reason=stop_reason or "stop",
             model=self.model,
         )
@@ -1745,11 +1755,12 @@ class NativeProvider(BaseModel):
                         # src/models/stream_usage.py.
                         from src.models import stream_usage
 
-                        inp, out = stream_usage.metrics_to_tokens(
-                            getattr(event, "metrics", None)
-                        )
+                        _ev_metrics = getattr(event, "metrics", None)
+                        inp, out = stream_usage.metrics_to_tokens(_ev_metrics)
+                        cr = stream_usage.metrics_to_cache_read(_ev_metrics)
                         stream_usage.record(
                             input_tokens=inp, output_tokens=out, model=self.model,
+                            cache_read_tokens=cr,
                         )
             finally:
                 self._clear_run_id(sid)
@@ -1810,6 +1821,7 @@ class NativeProvider(BaseModel):
         input_tokens: int,
         output_tokens: int,
         session_id: str,
+        cache_read_tokens: int = 0,
     ) -> float:
         """Compute cost from OpenAgent's catalog and write it onto the runtime's metrics.
 
@@ -1827,6 +1839,7 @@ class NativeProvider(BaseModel):
             model_ref=self.model,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cache_read_tokens=cache_read_tokens,
         )
 
         if input_tokens == 0 and output_tokens == 0:

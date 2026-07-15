@@ -480,7 +480,11 @@ def get_model_pricing(model_ref: str, providers_config: dict | None = None) -> d
 
     # 2. Nothing — log so ops can alert on persistently-zero entries.
     _log_pricing(model_ref, runtime_id, "missing", 0.0, 0.0)
-    return {"input_cost_per_million": 0.0, "output_cost_per_million": 0.0}
+    return {
+        "input_cost_per_million": 0.0,
+        "output_cost_per_million": 0.0,
+        "input_cache_read_per_million": 0.0,
+    }
 
 
 # Fallback context window used when a model is absent from OpenRouter's
@@ -544,6 +548,32 @@ def _maybe_prime_openrouter_cache() -> None:
                 pass
 
     loop.create_task(_prime())
+
+
+async def warm_pricing_cache() -> bool:
+    """Await the OpenRouter catalog fetch so pricing is hot BEFORE the first
+    turn — closes the cold-start blind spot where the first billed call of each
+    boot logs ``$0`` (``get_model_pricing`` returns zero on a cache miss and only
+    fires a background prime). Called from the server boot warm path next to the
+    budget-guard warm, so a spend cap counts from call #1 instead of call #2.
+
+    Idempotent (``_fetch_openrouter_catalog`` no-ops when the cache is fresh) and
+    never fatal: on any network/HTTP error it logs and returns False, leaving the
+    existing lazy-prime fallback intact. Returns True when the cache is warm.
+    """
+    try:
+        from src.models import discovery
+    except ImportError:
+        return False
+    try:
+        entries = await discovery._fetch_openrouter_catalog()
+        return bool(entries)
+    except Exception as e:  # noqa: BLE001 — pricing warm must never block boot
+        try:
+            elog("catalog.pricing_warm_error", level="warning", error=str(e))
+        except Exception:
+            pass
+        return False
 
 
 # Cached reverse map of OpenAgent provider name → OpenRouter vendor prefix.
@@ -618,6 +648,12 @@ def _openrouter_pricing_lookup(runtime_id: str) -> dict[str, float] | None:
     try:
         input_cost = float(pricing.get("prompt") or 0.0) * 1_000_000
         output_cost = float(pricing.get("completion") or 0.0) * 1_000_000
+        # Cached-prefix read price. DeepSeek (and others) prefix-cache
+        # server-side and bill a re-sent prefix at a fraction of ``prompt``
+        # (deepseek-v4-pro: $0.0036/M cache-read vs $0.435/M miss — ~120x).
+        # Absent/None → 0.0, and compute_cost then falls back to the full
+        # input price, so a model without a cache-read price is unchanged.
+        cache_read_cost = float(pricing.get("input_cache_read") or 0.0) * 1_000_000
     except (TypeError, ValueError):
         return None
     if input_cost <= 0 and output_cost <= 0:
@@ -625,6 +661,7 @@ def _openrouter_pricing_lookup(runtime_id: str) -> dict[str, float] | None:
     return {
         "input_cost_per_million": input_cost,
         "output_cost_per_million": output_cost,
+        "input_cache_read_per_million": cache_read_cost,
     }
 
 
@@ -695,9 +732,33 @@ def _log_pricing(model_ref: str, runtime_id: str, source: str, input_cpm: float,
         pass
 
 
-def compute_cost(model_ref: str, input_tokens: int, output_tokens: int) -> float:
+def compute_cost(
+    model_ref: str,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int = 0,
+) -> float:
+    """Cost in USD for one call.
+
+    ``input_tokens`` is the FULL prompt count (it includes ``cache_read_tokens``
+    — that is how DeepSeek/OpenAI report ``prompt_tokens``). When a provider
+    prefix-caches server-side, the re-sent prefix is billed at
+    ``input_cache_read_per_million`` (a fraction of the miss price), so we split
+    the prompt into miss + cache-read and price each. ``cache_read_tokens=0``
+    (the default, and any model without a cache-read price) reproduces the old
+    flat ``input × price + output × price`` exactly — a zero cache-read price
+    falls back to the full input price, so a non-caching model is unchanged.
+    """
     pricing = get_model_pricing(model_ref)
+    in_tok = max(0, input_tokens)
+    cache_read = min(max(0, cache_read_tokens), in_tok)  # can't exceed the prompt
+    miss_tok = in_tok - cache_read
+    in_price = pricing["input_cost_per_million"]
+    # A zero/absent cache-read price means "unknown" → bill cache reads at the
+    # full input price (conservative: over-, never under-count the brake).
+    cache_price = pricing.get("input_cache_read_per_million") or in_price
     return (
-        (pricing["input_cost_per_million"] * max(0, input_tokens)) / 1_000_000
+        (in_price * miss_tok) / 1_000_000
+        + (cache_price * cache_read) / 1_000_000
         + (pricing["output_cost_per_million"] * max(0, output_tokens)) / 1_000_000
     )

@@ -1,3 +1,4 @@
+import contextvars
 from dataclasses import asdict, dataclass
 from dataclasses import fields as dc_fields
 from enum import Enum
@@ -5,6 +6,51 @@ from time import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from src.core._runner.utils.timer import Timer
+
+
+# ── Per-turn cache-read capture ────────────────────────────────────────
+# The runtime aggregates ``cache_read_tokens`` correctly per model call (see
+# ``accumulate_model_metrics``), but the ``run_output.metrics`` that
+# ``ModelDispatcher`` reads back can be a scrubbed/rebuilt object that keeps the
+# summed ``input_tokens`` while dropping the top-level AND per-model cache-read
+# counters. So the ONE reliable place to capture the server-side prefix-cache
+# reads is right here, as they are accumulated. A ContextVar sink (same pattern
+# as ``stream_usage``) lets the dispatcher open it for a turn and read the true
+# total for cost — a re-sent, cached prefix is billed at the cheap rate instead
+# of being over-charged ~10x, which was silently shrinking the DeepSeek cap.
+_TURN_CACHE_READ: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
+    "openagent_turn_cache_read", default=None
+)
+
+
+def open_turn_cache_read() -> contextvars.Token:
+    """Start capturing this turn's cache-read tokens."""
+    return _TURN_CACHE_READ.set({"cache_read": 0})
+
+
+def close_turn_cache_read(token: contextvars.Token) -> None:
+    try:
+        _TURN_CACHE_READ.reset(token)
+    except (ValueError, LookupError):
+        pass
+
+
+def _add_turn_cache_read(n: int) -> None:
+    """Fold one model call's cache-read count into the open sink (a no-op when
+    nothing is capturing — a bare runtime call must never break on accounting)."""
+    sink = _TURN_CACHE_READ.get()
+    if sink is None:
+        return
+    try:
+        sink["cache_read"] += int(n or 0)
+    except (TypeError, ValueError):
+        pass
+
+
+def read_turn_cache_read() -> int:
+    """Total cache-read tokens captured this turn (0 when no sink is open)."""
+    sink = _TURN_CACHE_READ.get()
+    return int(sink.get("cache_read", 0)) if sink else 0
 
 
 class ModelType(str, Enum):
@@ -665,6 +711,10 @@ def accumulate_model_metrics(
     cache_read_tokens = usage.cache_read_tokens or 0
     cache_write_tokens = usage.cache_write_tokens or 0
     reasoning_tokens = usage.reasoning_tokens or 0
+
+    # Capture the cache-read into the per-turn sink (if one is open) — the only
+    # place it survives reliably, since run_output.metrics can drop it downstream.
+    _add_turn_cache_read(cache_read_tokens)
 
     model_id = model.id
     model_provider = model.get_provider()

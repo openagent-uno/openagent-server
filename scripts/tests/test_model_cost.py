@@ -918,3 +918,145 @@ async def t_thinking_reaches_the_built_model(ctx: TestContext) -> None:
     # Off by default: the built model has no thinking when the env is unset.
     off = _build("anthropic:claude-opus-4-8")
     assert not getattr(off, "thinking", None)
+
+
+@test("model_cost", "warm_pricing_cache awaits the fetch so the first billed call is costed")
+async def t_warm_pricing_cache_populates(ctx: TestContext) -> None:
+    """The cold-start blind spot: ``get_model_pricing`` returns $0 on a cache
+    miss and only fires a background prime, so the FIRST DeepSeek call of each
+    boot logs $0 and a cost cap undercounts it. ``warm_pricing_cache`` awaits
+    the catalog fetch at boot to close that gap — prove it drives the fetch."""
+    from src.models import catalog, discovery
+
+    called = {"n": 0}
+    orig = discovery._fetch_openrouter_catalog
+
+    async def _fake():
+        called["n"] += 1
+        return [{"id": "deepseek/deepseek-chat", "pricing": {"prompt": "0.0000003"}}]
+
+    discovery._fetch_openrouter_catalog = _fake
+    try:
+        ok = await catalog.warm_pricing_cache()
+        assert ok is True, "warm_pricing_cache returned False on a healthy fetch"
+        assert called["n"] == 1, "warm_pricing_cache did not await the catalog fetch"
+    finally:
+        discovery._fetch_openrouter_catalog = orig
+
+
+@test("model_cost", "warm_pricing_cache is non-fatal — a fetch error never blocks boot")
+async def t_warm_pricing_cache_non_fatal(ctx: TestContext) -> None:
+    """Pricing is a convenience, not a boot dependency: if OpenRouter is down
+    the agent must still come up. ``warm_pricing_cache`` swallows the error and
+    returns False, leaving the existing lazy-prime fallback intact."""
+    from src.models import catalog, discovery
+
+    orig = discovery._fetch_openrouter_catalog
+
+    async def _boom():
+        raise RuntimeError("openrouter unreachable")
+
+    discovery._fetch_openrouter_catalog = _boom
+    try:
+        ok = await catalog.warm_pricing_cache()
+        assert ok is False, "a fetch error should yield False, not raise"
+    finally:
+        discovery._fetch_openrouter_catalog = orig
+
+
+@test("model_cost", "compute_cost prices server-cached prefix reads at the cheap rate")
+async def t_compute_cost_cache_aware(ctx: TestContext) -> None:
+    """A tool-loop turn re-sends a big prefix that DeepSeek serves from its
+    server-side cache — billed ~120x cheaper than a miss. The cost ledger must
+    split the prompt into miss + cache-read, or it over-charges ~10x and the
+    daily DeepSeek cap silently shrinks. Also: cache_read=0 must reproduce the
+    old flat cost exactly (a non-caching model is unchanged)."""
+    from src.models import catalog
+
+    orig = catalog.get_model_pricing
+    # deepseek-v4-pro's real OpenRouter numbers ($/million).
+    catalog.get_model_pricing = lambda ref, *a, **k: {
+        "input_cost_per_million": 0.435,
+        "output_cost_per_million": 0.870,
+        "input_cache_read_per_million": 0.003625,
+    }
+    try:
+        IN, OUT, CACHE = 136_000, 2_000, 122_000
+        flat = catalog.compute_cost("deepseek:deepseek-v4-pro", IN, OUT)          # cache-blind
+        cached = catalog.compute_cost("deepseek:deepseek-v4-pro", IN, OUT, CACHE)  # cache-aware
+
+        # cache_read=0 is byte-identical to the pre-change flat formula.
+        expect_flat = (0.435 * IN + 0.870 * OUT) / 1_000_000
+        assert abs(flat - expect_flat) < 1e-12, f"flat path changed: {flat} != {expect_flat}"
+
+        # cache-aware: miss billed full, the 122k cached tokens billed cheap.
+        expect_cached = (0.435 * (IN - CACHE) + 0.003625 * CACHE + 0.870 * OUT) / 1_000_000
+        assert abs(cached - expect_cached) < 1e-12, f"cache pricing wrong: {cached} != {expect_cached}"
+
+        # The whole point: the cached turn costs a fraction of the blind one.
+        assert cached < flat * 0.25, (
+            f"cache discount not applied: cached ${cached:.5f} vs flat ${flat:.5f}")
+
+        # A cache-read count exceeding the prompt is clamped (never negative miss).
+        clamped = catalog.compute_cost("deepseek:deepseek-v4-pro", 100, 0, 999)
+        assert clamped >= 0 and abs(clamped - (0.003625 * 100) / 1_000_000) < 1e-12
+    finally:
+        catalog.get_model_pricing = orig
+
+
+@test("model_cost", "get_model_pricing surfaces the OpenRouter cache-read price")
+async def t_pricing_exposes_cache_read(ctx: TestContext) -> None:
+    """``_openrouter_pricing_lookup`` must read OpenRouter's ``input_cache_read``
+    into the returned dict, else compute_cost has no cheap rate to apply."""
+    from src.models import catalog, discovery
+
+    # Prime the OpenRouter cache with a fake deepseek entry carrying a cache price.
+    import time as _t
+    fake = [{"id": "deepseek/deepseek-v4-pro", "pricing": {
+        "prompt": "0.000000435", "completion": "0.00000087",
+        "input_cache_read": "0.000000003625"}}]
+    saved = getattr(discovery, "_OPENROUTER_CACHE", None)
+    discovery._OPENROUTER_CACHE = (_t.time() + 1e6, fake)  # far-future ts = never stale
+    catalog._OPENROUTER_INDEX = None  # bust the id index so it rebuilds over `fake`
+    try:
+        p = catalog._openrouter_pricing_lookup("deepseek:deepseek-v4-pro")
+        assert p is not None, "pricing lookup returned None for a primed entry"
+        assert abs(p["input_cache_read_per_million"] - 0.003625) < 1e-9, (
+            f"cache-read price not surfaced: {p.get('input_cache_read_per_million')}")
+    finally:
+        discovery._OPENROUTER_CACHE = saved
+        catalog._OPENROUTER_INDEX = None
+
+
+@test("model_cost", "the cache-read count is wired end-to-end from response to cost")
+async def t_cache_read_wired_through(ctx: TestContext) -> None:
+    """The bug that made the cache discount silently not apply: the count was
+    captured but never set on the returned ``ModelResponse`` (single-model path)
+    nor accepted by ``record_cost``. Guard both wiring points so a refactor that
+    drops either re-opens the ~10x over-charge on DeepSeek tool loops."""
+    import inspect
+    from src.models.base import ModelResponse
+    from src.models.dispatcher import TeamRouterProvider
+    from src.models.budget import BudgetTracker
+
+    # 1. The response object carries the field (the single-model path sets it).
+    r = ModelResponse(input_tokens=1000, cache_read_tokens=900)
+    assert r.cache_read_tokens == 900, "ModelResponse dropped cache_read_tokens"
+
+    # 2. record_cost accepts and forwards cache_read_tokens.
+    sig = inspect.signature(TeamRouterProvider.record_cost)
+    assert "cache_read_tokens" in sig.parameters, (
+        "record_cost lost its cache_read_tokens parameter — the ledger goes flat")
+
+    # 3. BudgetTracker.compute_cost accepts it and applies a discount when priced.
+    from src.models import catalog
+    orig = catalog.get_model_pricing
+    catalog.get_model_pricing = lambda ref, *a, **k: {
+        "input_cost_per_million": 0.435, "output_cost_per_million": 0.87,
+        "input_cache_read_per_million": 0.003625}
+    try:
+        flat = BudgetTracker.compute_cost("deepseek:deepseek-v4-pro", 100000, 500)
+        cached = BudgetTracker.compute_cost("deepseek:deepseek-v4-pro", 100000, 500, 95000)
+        assert cached < flat * 0.2, f"cache_read not discounted through BudgetTracker: {cached} vs {flat}"
+    finally:
+        catalog.get_model_pricing = orig

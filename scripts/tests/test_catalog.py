@@ -29,7 +29,11 @@ async def t_pricing_missing(ctx: TestContext) -> None:
     try:
         discovery._OPENROUTER_CACHE = (time.time(), [])  # empty catalog
         p = get_model_pricing("openai:gpt-unknown-model")
-        assert p == {"input_cost_per_million": 0.0, "output_cost_per_million": 0.0}
+        assert p == {
+            "input_cost_per_million": 0.0,
+            "output_cost_per_million": 0.0,
+            "input_cache_read_per_million": 0.0,
+        }
         assert compute_cost("openai:gpt-unknown-model", 10_000, 5_000) == 0.0
     finally:
         discovery._OPENROUTER_CACHE = prev
