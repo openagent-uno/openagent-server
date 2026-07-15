@@ -806,3 +806,115 @@ async def t_pick_summary_model_ignores_is_classifier(ctx: TestContext) -> None:
         )
     finally:
         _set_env("OPENAGENT_COMPACTION_MODEL", previous)
+
+
+# ── Extended thinking wiring ───────────────────────────────────────────
+#
+# ``model.extended_thinking_tokens`` was a write-only env var — set from yaml
+# by ``core/server.py``, read by nobody — a config that documented a feature it
+# did not deliver, the same dead-knob shape as the retired ``safety.*`` vars.
+# Now ``native_provider._thinking_kwarg`` carries it to the Anthropic provider,
+# gated per model. The gate is the load-bearing part: measured 2026-07-15,
+# Haiku 4.5 returns HTTP 400 for a thinking budget through the subscription
+# proxy, and Haiku is the cheap routing model that fires most often.
+
+@test("model_cost", "extended thinking reaches Opus/Sonnet, skips Haiku")
+async def t_thinking_gate_per_model(ctx: TestContext) -> None:
+    from src.models.native_provider import _thinking_kwarg
+
+    _set_env("OPENAGENT_EXTENDED_THINKING_TOKENS", "4096")
+    try:
+        for model in ("claude-opus-4-8", "claude-sonnet-4-6"):
+            got = _thinking_kwarg("anthropic", model)
+            assert got == {"thinking": {"type": "enabled", "budget_tokens": 4096}}, (
+                f"{model} should get the thinking budget, got {got!r}"
+            )
+        for model in ("claude-haiku-4-5", "claude-haiku-4-5-20251001",
+                      "claude-3-5-haiku-latest"):
+            assert _thinking_kwarg("anthropic", model) == {}, (
+                f"{model} must be SKIPPED — Haiku 4.5 returns HTTP 400 for a "
+                "thinking budget, and it is the routing model that fires most."
+            )
+        # Non-Anthropic providers never get an Anthropic-only field.
+        for prov in ("openai", "groq", "google"):
+            assert _thinking_kwarg(prov, "any-model") == {}
+    finally:
+        _set_env("OPENAGENT_EXTENDED_THINKING_TOKENS", None)
+
+
+@test("model_cost", "thinking is off by default and below Anthropic's floor")
+async def t_thinking_defaults_off(ctx: TestContext) -> None:
+    from src.models.native_provider import _thinking_kwarg
+
+    _set_env("OPENAGENT_EXTENDED_THINKING_TOKENS", None)
+    assert _thinking_kwarg("anthropic", "claude-opus-4-8") == {}, (
+        "unset must mean off — the pre-wiring behaviour, so nothing changes on "
+        "upgrade for a deployment that doesn't opt in"
+    )
+    # Anthropic ignores a budget below 1024, so we treat it as off rather than
+    # send a request that engages nothing.
+    _set_env("OPENAGENT_EXTENDED_THINKING_TOKENS", "512")
+    try:
+        assert _thinking_kwarg("anthropic", "claude-opus-4-8") == {}
+    finally:
+        _set_env("OPENAGENT_EXTENDED_THINKING_TOKENS", None)
+    # Garbage never crashes a model build.
+    _set_env("OPENAGENT_EXTENDED_THINKING_TOKENS", "not-a-number")
+    try:
+        assert _thinking_kwarg("anthropic", "claude-opus-4-8") == {}
+    finally:
+        _set_env("OPENAGENT_EXTENDED_THINKING_TOKENS", None)
+
+
+@test("model_cost", "supports_extended_thinking gates the whole Haiku family")
+async def t_supports_thinking_family(ctx: TestContext) -> None:
+    """Gate on the family, not a hand-listed set that trails a generation
+    behind — the exact drift-by-hand pattern this session keeps deleting.
+    NON_THINKING_MODELS only lists Haiku 3/3.5, but no Haiku supports it."""
+    from src.models.providers.anthropic import Claude
+
+    assert Claude.supports_extended_thinking("claude-opus-4-8")
+    assert Claude.supports_extended_thinking("claude-sonnet-4-6")
+    # Every Haiku, including future ones the exact-id set will not list.
+    for m in ("claude-3-haiku-20240307", "claude-3-5-haiku-latest",
+              "claude-haiku-4-5", "claude-haiku-5-something-future"):
+        assert not Claude.supports_extended_thinking(m), m
+
+
+@test("model_cost", "build_runtime_model actually PASSES thinking to the model")
+async def t_thinking_reaches_the_built_model(ctx: TestContext) -> None:
+    """The junction, not the helper. ``_thinking_kwarg`` returning the right
+    dict is worthless if ``build_runtime_model`` doesn't splat it into the
+    constructor — which is exactly the write-only failure this fixes. Build a
+    real Anthropic model through the real path and read ``.thinking`` off it.
+    """
+    from src.models.native_provider import NativeProvider
+
+    def _build(runtime_id: str):
+        p = NativeProvider.__new__(NativeProvider)
+        p.model = runtime_id
+        p._resolved_api_key = lambda: "sk-test"
+        p._resolved_base_url = lambda: None
+        return p.build_runtime_model()
+
+    _set_env("OPENAGENT_EXTENDED_THINKING_TOKENS", "4096")
+    try:
+        opus = _build("anthropic:claude-opus-4-8")
+        assert getattr(opus, "thinking", None) == {
+            "type": "enabled", "budget_tokens": 4096
+        }, (
+            "build_runtime_model did not pass thinking to the Anthropic model "
+            f"— got {getattr(opus, 'thinking', None)!r}. The wiring is broken "
+            "and the env var is write-only again."
+        )
+        haiku = _build("anthropic:claude-haiku-4-5")
+        assert not getattr(haiku, "thinking", None), (
+            "Haiku was built WITH thinking — it returns HTTP 400 for a budget "
+            "and would break every routing turn."
+        )
+    finally:
+        _set_env("OPENAGENT_EXTENDED_THINKING_TOKENS", None)
+
+    # Off by default: the built model has no thinking when the env is unset.
+    off = _build("anthropic:claude-opus-4-8")
+    assert not getattr(off, "thinking", None)

@@ -458,6 +458,50 @@ PROVIDER_ENV_VARS = {
     "moonshot": "MOONSHOT_API_KEY",
     "qwen": "DASHSCOPE_API_KEY",
 }
+def _thinking_kwarg(provider_name: str, model_id: str) -> dict[str, Any]:
+    """The ``thinking=`` kwarg for a model build, or ``{}``.
+
+    Wires ``model.extended_thinking_tokens`` (yaml -> ``OPENAGENT_EXTENDED_THINKING_TOKENS``,
+    set in ``core/server.py``) through to the Anthropic provider's ``thinking``
+    field, which is the one channel that reaches it. Before this the env var was
+    write-only — set from yaml, read by nobody — a config that documented a
+    feature it did not deliver, the same dead-knob shape as the retired
+    ``safety.*`` vars.
+
+    Two gates, both load-bearing:
+
+    * **Anthropic only.** ``thinking`` is an Anthropic request field; other
+      providers' constructors do not accept it. (``_construct_model`` would
+      filter it out anyway, but not emitting it keeps the intent legible.)
+    * **Only models that support it.** ``Claude.supports_extended_thinking``
+      excludes the Haiku family. Measured 2026-07-15: Haiku 4.5 returns HTTP
+      400 through the subscription proxy when handed a thinking budget. An
+      unsupported model is SKIPPED, not injected-and-crashed — the Haiku tier
+      is the cheap routing model that fires most often, so a 400 there is the
+      worst place to guess wrong. Opus/Sonnet get the budget; Haiku silently
+      runs without it.
+
+    Anthropic requires a budget >= 1024 to engage the feature; below that it is
+    a no-op, so anything smaller is treated as off rather than sent.
+    """
+    if provider_name != "anthropic":
+        return {}
+    raw = (os.environ.get("OPENAGENT_EXTENDED_THINKING_TOKENS") or "").strip()
+    if not raw:
+        return {}
+    try:
+        budget = int(raw)
+    except (TypeError, ValueError):
+        return {}
+    if budget < 1024:
+        return {}
+    from src.models.providers.anthropic import Claude
+
+    if not Claude.supports_extended_thinking(model_id):
+        return {}
+    return {"thinking": {"type": "enabled", "budget_tokens": budget}}
+
+
 RUNTIME_PROVIDER_CLASSES: dict[str, tuple[str, str, dict[str, Any]]] = {
     # Anthropic prompt caching is ON here, hardcoded, on purpose.
     #
@@ -1008,6 +1052,10 @@ class NativeProvider(BaseModel):
         base_url = self._resolved_base_url()
         model_class, extra_kwargs = self._load_runtime_model_class(provider_name)
         if model_class is not None:
+            extra_kwargs = {
+                **extra_kwargs,
+                **_thinking_kwarg(provider_name, model_id),
+            }
             return self._construct_model(
                 model_class,
                 id=model_id,

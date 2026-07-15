@@ -196,6 +196,19 @@ safety:
     # allow_patterns:
     #   - "git push --force[a-z-]* origin lyra-agent/"
 
+# ── Model runtime ───────────────────────────────────────────────────
+# Which LLMs the agent uses lives in the DB (the Models screen / model-manager
+# MCP), not here. This block is for runtime knobs that apply across models.
+model:
+  # Extended thinking budget, in tokens. Engages Anthropic's extended
+  # thinking on the models that support it — Opus and Sonnet. It is SKIPPED
+  # for the Haiku tier, which does not support it (Haiku 4.5 returns HTTP 400
+  # for a thinking budget), so setting this fleet-wide is safe: your cheap
+  # routing model keeps working, your reasoning models gain the budget.
+  # Anthropic ignores a budget below 1024, so anything smaller reads as off.
+  # Omit the key to leave thinking off everywhere.
+  extended_thinking_tokens: 0            # e.g. 4096; 0 / unset = off
+
 # ── Memory & learning ───────────────────────────────────────────────
 # Every subsection is independent.
 #

@@ -139,6 +139,30 @@ class Claude(Model):
         "claude-3-5-haiku-latest",
     }
 
+    @classmethod
+    def supports_extended_thinking(cls, model_id: str) -> bool:
+        """Whether ``model_id`` can take an extended-thinking budget.
+
+        The exact ``NON_THINKING_MODELS`` set only lists Haiku 3/3.5, but NO
+        Haiku generation has supported extended thinking — measured 2026-07-15,
+        Haiku 4.5 (``claude-haiku-4-5``) returns HTTP 400 "adaptive thinking is
+        not supported on this model" through the subscription proxy. The class
+        comment's "all future models support thinking" is wrong for the Haiku
+        tier specifically, so gate on the family, not a hand-listed set that
+        will always trail a generation behind. Conservative on purpose: the
+        Haiku tier is the cheap routing model that fires most often, so a 400
+        there is the most expensive place to guess wrong. If a future Haiku
+        gains thinking, drop it from here with evidence rather than injecting
+        blind.
+        """
+        m = (model_id or "").lower()
+        if m in cls.NON_THINKING_MODELS:
+            return False
+        # Any Haiku, any generation: "...haiku..." in the id.
+        if "haiku" in m:
+            return False
+        return True
+
     # Model prefixes that do NOT support native structured outputs.
     # This is a closed set — all new Claude models support structured outputs.
     NON_STRUCTURED_OUTPUT_PREFIXES = (
