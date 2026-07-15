@@ -506,3 +506,103 @@ async def t_dispatch_emits_resource_event(ctx: TestContext) -> None:
     finally:
         set_resource_event_sink(None)
         await db.close()
+
+
+@test("events", "a barge-in cancellation is recorded as cancelled, not failed")
+async def t_event_cancel_not_failed(ctx: TestContext) -> None:
+    """The bug that poisoned the log the agent reads to diagnose itself.
+
+    A cancelled delivery — most often a barge-in, where a newer delivery for
+    the same bound session supersedes the one in flight (vision §2 calls this
+    first-class) — used to be caught by the generic ``except`` and written as
+    ``event.failed`` with ``error=str(e)``. ``str(CancelledError())`` is the
+    EMPTY STRING, so a live agent's log filled with
+    ``event.failed level=error error=""``: an error record that could not say
+    what went wrong, because nothing had. Measured: 230 of 230 ``errored=True``
+    entries were also ``cancelled=True``, and the recall scorer had to exclude
+    them by construction or it would learn that users interrupting is a defect.
+    """
+    import asyncio
+
+    import src.core.event_dispatcher as ed
+
+    recorded: dict = {}
+
+    class _Db:
+        async def update_event_delivery(self, delivery_id, **kw):
+            recorded.update(kw)
+
+    async def _boom(**_kw):
+        raise asyncio.CancelledError()
+
+    logged: list = []
+    orig_wf, orig_elog = ed._dispatch_workflow, ed.elog
+    ed._dispatch_workflow = _boom
+    ed.elog = lambda event, **kw: logged.append((event, kw))
+    try:
+        event = {"id": "e1", "action_kind": "workflow", "name": "wf"}
+        try:
+            await ed.dispatch_event(
+                agent=None, db=_Db(), scheduler=None,
+                event=event, payload={}, delivery_id="d1",
+            )
+        except asyncio.CancelledError:
+            pass  # must re-raise — swallowing it breaks cooperative cancel
+        else:
+            raise AssertionError("dispatch_event swallowed the CancelledError")
+    finally:
+        ed._dispatch_workflow, ed.elog = orig_wf, orig_elog
+
+    assert recorded.get("status") == "cancelled", (
+        f"a barge-in was recorded as {recorded.get('status')!r}, not "
+        "'cancelled' — an interrupt is not a fault."
+    )
+    assert recorded.get("error") is None, (
+        f"a cancelled delivery carries an error: {recorded.get('error')!r}. "
+        "It should be None — there was no error."
+    )
+    events = [e for e, _ in logged]
+    assert "event.cancelled" in events and "event.failed" not in events, (
+        f"expected event.cancelled (not event.failed); logged {events}"
+    )
+    # And it must be info, not error — that is the whole point.
+    lvl = dict(next(kw for e, kw in logged if e == "event.cancelled"))
+    assert lvl.get("level") == "info"
+
+
+@test("events", "a real failure never logs an empty error string")
+async def t_event_real_failure_has_message(ctx: TestContext) -> None:
+    """The other half: a genuine exception whose ``str()`` is blank must not be
+    indistinguishable from the cancellation bug. It gets the type name."""
+    import src.core.event_dispatcher as ed
+
+    class _Blank(Exception):
+        def __str__(self): return ""
+
+    recorded: dict = {}
+
+    class _Db:
+        async def update_event_delivery(self, delivery_id, **kw):
+            recorded.update(kw)
+
+    async def _boom(**_kw):
+        raise _Blank()
+
+    orig_wf, orig_elog = ed._dispatch_workflow, ed.elog
+    ed._dispatch_workflow = _boom
+    ed.elog = lambda event, **kw: None
+    try:
+        try:
+            await ed.dispatch_event(agent=None, db=_Db(), scheduler=None,
+                                    event={"id": "e", "action_kind": "workflow"},
+                                    payload={}, delivery_id="d")
+        except _Blank:
+            pass
+    finally:
+        ed._dispatch_workflow, ed.elog = orig_wf, orig_elog
+
+    assert recorded.get("status") == "failed"
+    assert recorded.get("error"), "a failed delivery logged an empty error"
+    assert "_Blank" in recorded["error"], (
+        f"expected the exception type in the error, got {recorded['error']!r}"
+    )

@@ -16,6 +16,28 @@ from src.models.runtime import wire_model_runtime
 
 from src.core.logging import elog
 
+
+def _now_local():
+    """Current wall-clock time in the agent's configured timezone.
+
+    Uses ``scheduler.timezone`` when set (so the date the agent records matches
+    the operator's day, not the container's UTC), falling back to host local
+    time. Imported lazily to keep this module's import graph light and to
+    avoid a cycle through the scheduler package at load time.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from src.memory.schedule import default_timezone_name
+
+    tz = default_timezone_name()
+    if tz:
+        try:
+            return datetime.now(ZoneInfo(tz))
+        except Exception:  # noqa: BLE001 — a bad tz name must never break a turn
+            pass
+    return datetime.now()
+
 logger = logging.getLogger(__name__)
 
 _FROZEN_RUNTIME_PRELOADS = (
@@ -1823,6 +1845,28 @@ class Agent:
                 + "\n\n── User-specific identity and project context ──\n\n"
                 + user
             )
+
+        # Tell the agent what day it is. Without this it does not know: the
+        # prompt asks it for "absolute date" note fields and deadlines, and the
+        # model fills them from its training cutoff — a live dream-log came out
+        # dated 2025 while the agent ran in 2026. Every note's ``created:``,
+        # every ``dream-log-YYYY-MM-DD.md`` filename, every "<date>: symptom"
+        # receipt was a guess.
+        #
+        # This lands INSIDE the cached prefix, and that is fine — the date is
+        # the same for every session on a given day, so the prefix stays
+        # byte-identical fleet-wide and caches once PER DAY per box. The cost is
+        # one ~10.8k-token prefix rewrite at each midnight boundary, then reads
+        # all day: negligible. That is a different thing from the per-SESSION
+        # invalidation the ``<session-id>`` split guards against — there, every
+        # new session would pay the write. A daily date does not; a per-turn
+        # value (a clock time, the session id) would, which is why only the
+        # date goes here and the time-of-day is deliberately omitted.
+        _now = _now_local()
+        combined += (
+            f"\n\nThe current date is {_now:%Y-%m-%d} ({_now:%A}). Use it for "
+            "any absolute date you record — never guess the year from memory."
+        )
         if session_id:
             combined += f"\n\n<session-id>{session_id}</session-id>"
         return combined

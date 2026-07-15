@@ -228,12 +228,49 @@ async def dispatch_event(
             )
         else:
             raise EventDispatchError(f"unknown action_kind {action_kind!r}")
+    except asyncio.CancelledError:
+        # A cancelled delivery is NOT a failure, and calling it one poisons
+        # the log the agent reads to diagnose itself.
+        #
+        # The common cause is a barge-in: a newer delivery for the same bound
+        # session supersedes the one in flight (§8.5 session binding), which
+        # vision §2 calls first-class behaviour — "interrupt and barge-in are
+        # first-class behaviors, not afterthoughts". The old code caught it
+        # here, logged ``level="error"``, and stamped ``error=str(e)`` — and
+        # ``str(CancelledError())`` is the EMPTY STRING, so the log filled with
+        # `event.failed level=error error=""`: an error record that cannot say
+        # what went wrong, because nothing did.
+        #
+        # Measured cost of that lie: on a live agent, 11 of these in one window
+        # on a single hot Replio thread, and 230 of 230 `errored=True` entries
+        # across the whole log were also `cancelled=True` — every one an
+        # interrupt. Dream mode had to spend a `logs_context` round-trip
+        # reasoning its way to "this is a barge-in, not a genuine failure",
+        # and the recall scorer has to exclude them by construction or it
+        # learns that users interrupting is a defect.
+        #
+        # Recorded as its own terminal state so it stays visible and countable
+        # — the delivery did stop — without being counted as a fault. Re-raised
+        # bare: swallowing a CancelledError breaks cooperative cancellation.
+        elog("event.cancelled", level="info", id=event_id, delivery=delivery_id)
+        await db.update_event_delivery(
+            delivery_id,
+            status="cancelled",
+            error=None,
+            finished_at=_now(),
+        )
+        _emit()
+        raise
     except Exception as e:  # noqa: BLE001
-        elog("event.failed", level="error", id=event_id, delivery=delivery_id, error=str(e))
+        # A genuine failure must never arrive with an empty message — that was
+        # the shape of the cancellation bug above, and it is indistinguishable
+        # from a real exception whose ``str()`` happens to be blank.
+        detail = str(e) or f"{type(e).__name__} (no message)"
+        elog("event.failed", level="error", id=event_id, delivery=delivery_id, error=detail)
         await db.update_event_delivery(
             delivery_id,
             status="failed",
-            error=str(e)[:2000],
+            error=detail[:2000],
             finished_at=_now(),
         )
         _emit()

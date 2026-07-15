@@ -84,6 +84,7 @@ _TEST_MODULES: tuple[str, ...] = (
     # constructor), the 5m/5m TTL order stays un-trippable, and compaction
     # summarises on the configured cheap model. Pure-unit; no live calls.
     "test_model_cost",
+    "test_prompt_date",
     # importlib.metadata fallback for frozen bundles — defense in depth
     # against the runtime Team-run crash when pydantic dist-info goes missing
     # under sys._MEIPASS.
