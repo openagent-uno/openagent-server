@@ -8,6 +8,7 @@ if TYPE_CHECKING:
     from src.core._runner.team.team import Team
 
 import json
+import os
 from collections import ChainMap
 from typing import (
     Any,
@@ -50,6 +51,25 @@ from src.core._runner.utils.team import (
     get_member_id,
 )
 from src.core._runner.utils.timer import Timer
+
+
+def _member_tools_cap() -> int:
+    """Cap on how many of a member's tool names are inlined into the team
+    leader's system message.
+
+    A single MCP (e.g. BillingBear) can register ~280 tools; listing every
+    name re-ships ~14k chars into every turn of every team run — and the
+    leader routes by member role/description, not by copying an exact tool
+    key, while the member keeps ALL its tools at runtime regardless. So a
+    capped sample + the total count is enough for delegation; anything beyond
+    the cap the member reaches via tool-search. Members with fewer tools than
+    the cap are listed in full (unchanged behaviour). Tunable via
+    ``OPENAGENT_MEMBER_TOOLS_CAP`` (0 disables the listing entirely)."""
+    raw = os.environ.get("OPENAGENT_MEMBER_TOOLS_CAP", "40")
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 40
 
 
 def _get_tool_names(member: Any, async_mode: bool = False) -> List[str]:
@@ -106,7 +126,16 @@ def get_members_system_message_content(
             if team.add_member_tools_to_context:
                 tool_names = _get_tool_names(member, async_mode=async_mode)
                 if tool_names:
-                    content += f"{pad}  Tools: {', '.join(tool_names)}\n"
+                    cap = _member_tools_cap()
+                    if cap and len(tool_names) > cap:
+                        shown = tool_names[:cap]
+                        content += (
+                            f"{pad}  Tools ({len(tool_names)} available; the member "
+                            f"has all of them, use tool-search for any not listed): "
+                            f"{', '.join(shown)}, … (+{len(tool_names) - cap} more)\n"
+                        )
+                    elif cap:
+                        content += f"{pad}  Tools: {', '.join(tool_names)}\n"
             content += f"{pad}</member>\n"
 
     return content
