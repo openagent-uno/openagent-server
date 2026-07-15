@@ -24,6 +24,7 @@ import json
 import time
 import uuid
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 from aiohttp import streams
 from aiohttp.test_utils import make_mocked_request
@@ -115,7 +116,18 @@ def _make_request(scheduler, *, method: str = "POST", path: str = "/x",
     kwargs: dict = {"match_info": match_info or {}, "app": {"gateway": gw}}
     if body is not None:
         raw = json.dumps(body).encode()
-        protocol = SimpleNamespace(_reading_paused=False)
+        # ``Mock``, not ``SimpleNamespace``: StreamReader calls back into its
+        # protocol (``resume_reading``/``pause_reading``) from paths whose
+        # guards move between aiohttp releases, and the signature moves too —
+        # 3.13 calls ``resume_reading()``, later versions
+        # ``resume_reading(resume_parser=False)``. A SimpleNamespace carrying
+        # only ``_reading_paused`` satisfied 3.13 and blew up with
+        # ``AttributeError: no attribute 'resume_reading'`` on CI, which
+        # resolves ``aiohttp>=3.9`` to the latest because there is no lock in
+        # ``uv pip install -e .``. Mock absorbs whatever the library calls,
+        # with whatever signature; ``_reading_paused`` stays an explicit False
+        # because it is read as a flag, and a bare Mock attribute is truthy.
+        protocol = Mock(_reading_paused=False)
         stream = streams.StreamReader(
             protocol, limit=2 ** 16, loop=asyncio.get_running_loop(),
         )
