@@ -459,3 +459,70 @@ async def t_autofix_byte_parity(ctx: TestContext) -> None:
     assert not diffs, (
         f"{len(diffs)} fixture(s): the two auto-fixers produce DIFFERENT bytes "
         "for the same input:\n" + "\n".join(diffs))
+
+
+@test("vault_gate", "the gateway reads frontmatter through the one parser")
+async def t_gateway_uses_the_one_parser(ctx: TestContext) -> None:
+    """The fourth frontmatter parser, and the last one.
+
+    ``gateway/api/vault.py`` had its own fence scan + bare ``yaml.safe_load``
+    + ``except Exception: meta = {}``. That last line meant a note whose YAML
+    the stock loader dislikes rendered in the app and over REST with EVERY
+    field blank — no title, no tags, no related — with no way for the reader
+    to tell "empty note" from "unreadable note". The same silent degrade
+    gray-matter does on the Node side, reproduced in Python.
+
+    It also disagreed with the gate on real notes: stock ``safe_load`` raises
+    on ``created: 2024-13-04`` (PyYAML's timestamp resolver rejects month 13
+    in an otherwise syntactically perfect document), so one bad date blanked
+    the whole note — while ``_FrontmatterLoader`` reads it and lets
+    ``date_format`` report the date, which is the rule that names it.
+    """
+    from src.gateway.api.vault import _parse_frontmatter
+
+    # A note the OLD parser blanked completely.
+    meta, body = _parse_frontmatter(
+        '---\ntitle: "Bug report"\ntags: [x]\ncreated: 2024-13-04\n---\n# Body\n'
+    )
+    assert meta.get("title") == "Bug report", (
+        "the gateway blanked a note over a bad date. It must read frontmatter "
+        "through parser.load_frontmatter_yaml — the documented single answer "
+        "to 'is this valid YAML?', which the gate, the doctor and "
+        "_enforce_write already ask."
+    )
+    assert meta.get("tags") == ["x"]
+    assert "# Body" in body
+
+    # Ordinary notes still round-trip, quotes stripped.
+    meta, _ = _parse_frontmatter(
+        '---\ntitle: "A note"\ntags: [a, b]\ncreated: "2026-07-10"\n---\n# B\n'
+    )
+    assert meta["title"] == "A note" and meta["tags"] == ["a", "b"]
+    assert meta["created"] == "2026-07-10"
+
+    # No frontmatter at all is not an error.
+    meta, body = _parse_frontmatter("# Just a body\n")
+    assert meta == {} and "Just a body" in body
+
+    # And the module must not grow its own parser back. Parsed with ``ast``,
+    # not grepped: the function's docstring EXPLAINS the removed
+    # ``yaml.safe_load`` at length, and a text scan reads that tombstone as the
+    # crime it describes. (It did — this assertion failed on its own docstring
+    # first, which is the same way two other guards in this suite shipped
+    # vacuous.)
+    import ast
+    import inspect
+
+    import src.gateway.api.vault as gv
+
+    tree = ast.parse(inspect.getsource(gv._parse_frontmatter))
+    calls = {
+        f"{ast.unparse(n.func)}"
+        for n in ast.walk(tree) if isinstance(n, ast.Call)
+    }
+    banned = {c for c in calls if "safe_load" in c or c.endswith("yaml.load")}
+    assert not banned, (
+        f"gateway/api/vault.py parses YAML itself again ({sorted(banned)}). "
+        "There is one answer to what a note's frontmatter says — "
+        "parser.load_frontmatter_yaml — and this file asks it."
+    )

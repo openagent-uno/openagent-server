@@ -26,22 +26,46 @@ def _sanitize(obj):
 
 
 def _parse_frontmatter(content: str) -> tuple[dict, str]:
-    # Find the frontmatter block by its closing ``---`` fence on its own line.
-    # (The old ``split("---", 2)`` truncated any note whose YAML value itself
-    # contained ``---``.)
-    if content.startswith("---"):
-        lines = content.split("\n")
-        if lines and lines[0].strip() == "---":
-            for i in range(1, len(lines)):
-                if lines[i].strip() == "---":
-                    import yaml
-                    try:
-                        meta = yaml.safe_load("\n".join(lines[1:i])) or {}
-                    except Exception:
-                        meta = {}
-                    body = "\n".join(lines[i + 1:]).strip()
-                    return _sanitize(meta if isinstance(meta, dict) else {}), body
-    return {}, content
+    """Read a note's frontmatter the same way the rest of the vault does.
+
+    This used to be a FOURTH independent frontmatter parser: its own fence
+    scan, a bare ``yaml.safe_load``, and ``except Exception: meta = {}``. That
+    last line is the whole problem — a note whose YAML is malformed rendered in
+    the app and over REST with **every field blank** (no title, no tags, no
+    related) and the reader had no way to tell "this note is empty" from "we
+    could not read this note". Exactly the silent degrade gray-matter does on
+    the Node side, reproduced in Python.
+
+    It also disagreed with the gate on real notes: stock ``safe_load`` raises on
+    ``created: 2024-13-04`` (PyYAML's timestamp resolver rejects month 13 in an
+    otherwise perfect document), so the whole note went blank over one bad date
+    — while ``_FrontmatterLoader`` drops that resolver and reads it, leaving the
+    ``date_format`` rule to report the date, which is the rule that names it.
+
+    ``parser.load_frontmatter_yaml`` is documented as "THE single answer to 'is
+    this frontmatter valid YAML?'" and is already what the gate, the doctor's
+    repair guard and ``_enforce_write`` ask. This was the one caller that
+    didn't. Now there is one parser and one answer.
+    """
+    from src.memory.vault.parser import (
+        FrontmatterSyntaxError,
+        load_frontmatter_yaml,
+        split_frontmatter,
+    )
+
+    raw_fm, body = split_frontmatter(content)
+    if raw_fm is None:
+        return {}, content
+    try:
+        meta = load_frontmatter_yaml(raw_fm)
+    except FrontmatterSyntaxError:
+        # Genuinely unparseable even by the tolerant loader. Still degrade to
+        # an empty mapping — the clients type these fields and call array ops
+        # on them — but do not pretend it parsed: the body is returned intact
+        # so the note is readable, and the gate's ``frontmatter_yaml`` rule is
+        # what reports it as broken.
+        meta = {}
+    return _sanitize(meta), body.strip()
 
 
 def _tags_list(meta: dict) -> list[str]:
