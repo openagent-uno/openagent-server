@@ -526,3 +526,77 @@ async def t_gateway_uses_the_one_parser(ctx: TestContext) -> None:
         "There is one answer to what a note's frontmatter says — "
         "parser.load_frontmatter_yaml — and this file asks it."
     )
+
+
+@test("vault_gate", "a wrongly-stamped index still rebuilds (the production state)")
+async def t_schema_bump_drops_stale_tables(ctx: TestContext) -> None:
+    """The upgrade path no test covered, because every test starts clean.
+
+    ``_ensure_vault_meta`` wipes the index when the schema version moves —
+    "a stale cache is worse than a cold one". But it EMPTIED ``notes`` and
+    ``links`` while only DROPPING ``notes_fts``, and ``CREATE TABLE IF NOT
+    EXISTS`` is a no-op against a table that already exists. So the old
+    columns survived the wipe, the recreate did nothing — **and the branch
+    stamped the new version anyway**.
+
+    That made the damage self-perpetuating: the stamp said v3 while the shape
+    was v2, so the branch never fired again. Observed on a live agent — the
+    table still carried ``related_multiline``, had no ``frontmatter_valid``,
+    and ``meta.schema`` read '3'. Every sync died with
+
+        sqlite3.OperationalError: table notes has no column named frontmatter_valid
+
+    taking ``vault stats``/``gate``/``doctor`` with it, and dream mode would
+    have hit it on the first nightly pass.
+
+    This reproduces that exact state: real v2 columns, stamped with a version
+    that is no longer current. Fixing the DROP alone would not save it — only
+    re-entering the branch does, which is what the version bump is for.
+    """
+    import sqlite3
+    import tempfile
+    from pathlib import Path
+
+    from src.memory.vault import index as index_mod
+    from src.memory.vault.index import VaultIndex
+
+    tmp = Path(tempfile.mkdtemp())
+    vault = tmp / "memories"
+    (vault / "sub").mkdir(parents=True)
+    (vault / "sub" / "n.md").write_text(
+        '---\ntitle: "N"\nsummary: "s"\ntags: [t]\nstatus: active\n'
+        'created: 2026-01-01\nupdated: 2026-01-01\n---\n# N\n'
+    )
+    idx_path = tmp / "index.db"
+
+    # The real pre-fix shape: current _SCHEMA with frontmatter_valid swapped
+    # back to the column it replaced. Derived from _SCHEMA rather than
+    # hand-written, so it cannot drift away from what an older build produced.
+    old_schema = index_mod._SCHEMA.replace(
+        "frontmatter_valid INTEGER DEFAULT 1", "related_multiline INTEGER"
+    )
+    con = sqlite3.connect(idx_path)
+    con.executescript(old_schema)
+    con.execute("INSERT OR REPLACE INTO meta VALUES('vault_root', ?)",
+                (str(vault.resolve()),))
+    # Stamped with a version that is NOT current — exactly the production state.
+    con.execute("INSERT OR REPLACE INTO meta VALUES('schema', '3')")
+    con.commit()
+    cols_before = {r[1] for r in con.execute("PRAGMA table_info(notes)")}
+    con.close()
+    assert "related_multiline" in cols_before and "frontmatter_valid" not in cols_before
+
+    index = VaultIndex(vault, idx_path)
+    index.sync()          # died here on the real agent
+    index.close()
+
+    con = sqlite3.connect(idx_path)
+    cols = {r[1] for r in con.execute("PRAGMA table_info(notes)")}
+    n = con.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+    con.close()
+    assert "frontmatter_valid" in cols, (
+        "the bump left the OLD notes table in place — CREATE TABLE IF NOT "
+        "EXISTS does not add a column. DROP the tables, do not empty them."
+    )
+    assert "related_multiline" not in cols
+    assert n == 1, "the vault did not re-index after the rebuild"

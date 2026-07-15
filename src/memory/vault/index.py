@@ -41,7 +41,19 @@ from src.memory.vault.parser import link_key, parse_note_text
 # Bumped to 3: ``related_multiline`` -> ``frontmatter_valid`` (the old
 # column fed a rule deleted in 89c7379). The index is a pure cache, so a
 # version bump just re-parses the markdown that was always the truth.
-_SCHEMA_VERSION = "3"
+# Bumped to 4 to force a rebuild of every index v3 left corrupt.
+#
+# v3 changed the ``notes`` table, but ``_ensure_vault_meta`` only EMPTIED it
+# (``CREATE TABLE IF NOT EXISTS`` is a no-op against an existing table) and
+# then stamped ``schema=3`` anyway — so the shape stayed v2, the stamp said
+# v3, and the branch never fired again. Self-perpetuating: on a real agent
+# the table still had ``related_multiline`` and no ``frontmatter_valid``
+# while claiming to be current, and every sync died with
+# "table notes has no column named frontmatter_valid".
+#
+# Fixing the DROP is necessary but not sufficient — a wrongly-stamped index
+# would never re-enter the branch to be fixed. The bump is what re-enters it.
+_SCHEMA_VERSION = "4"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -217,14 +229,33 @@ class VaultIndex:
             meta = {r["key"]: r["value"] for r in cur.fetchall()}
             root = str(self.vault_root.resolve())
             if meta.get("vault_root") != root or meta.get("schema") != _SCHEMA_VERSION:
-                # DROP, not DELETE: a schema bump can change the FTS table's
-                # column COUNT (v2 added ``stem``), and ``CREATE VIRTUAL
-                # TABLE IF NOT EXISTS`` will happily leave an old 4-column
-                # table in place — every insert would then fail with "table
-                # notes_fts has 4 columns but 5 values were supplied" on a
-                # vault that had merely been indexed by an older build.
+                # DROP every table the schema owns, not DELETE FROM them.
+                #
+                # ``CREATE [VIRTUAL] TABLE IF NOT EXISTS`` is a no-op against
+                # an existing table, so emptying one leaves its OLD COLUMNS in
+                # place and the recreate below silently does nothing. Then
+                # every insert fails on the shape:
+                #
+                #   v2 added ``stem`` to notes_fts  -> "table notes_fts has 4
+                #     columns but 5 values were supplied"
+                #   v3 added ``frontmatter_valid`` to notes -> "table notes has
+                #     no column named frontmatter_valid"
+                #
+                # This code already knew that — and dropped only ``notes_fts``,
+                # while ``notes`` and ``links`` were merely emptied. v3 changed
+                # ``notes``, so every vault indexed by an older build broke on
+                # its first sync: ``vault stats``/``gate``/``doctor`` all died,
+                # and dream mode would have hit it on its first nightly pass.
+                # Caught on a live production agent, not in the suite, because
+                # a test starts from an empty file and never has an old table
+                # to leave behind.
+                #
+                # ``meta`` is deliberately NOT dropped: it carries the
+                # vault_root/schema keys this very branch reads to decide.
                 self._conn.executescript(
-                    "DELETE FROM notes; DELETE FROM links; DROP TABLE IF EXISTS notes_fts;"
+                    "DROP TABLE IF EXISTS notes_fts;"
+                    "DROP TABLE IF EXISTS links;"
+                    "DROP TABLE IF EXISTS notes;"
                 )
                 self._conn.executescript(_SCHEMA)
                 self._conn.execute(
