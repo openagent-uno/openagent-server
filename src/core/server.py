@@ -1357,11 +1357,20 @@ class AgentServer:
                 updates["cron_expression"] = cron_expr
             if existing["prompt"] != prompt:
                 updates["prompt"] = prompt
+            # Sync the timezone too. It used to be passed only to ``add_task``
+            # (create), so a task that already existed — every built-in, since
+            # they are seeded disabled on first boot — could NEVER gain a
+            # timezone from config: setting ``dream_mode.timezone`` did nothing,
+            # and "3:00" kept firing at 03:00 UTC (05:00 Rome in summer). The
+            # column changing needs a reschedule so ``next_run`` is recomputed
+            # in the new zone, same as a cron change.
+            if timezone is not None and (existing.get("timezone") or None) != timezone:
+                updates["timezone"] = timezone
             if updates:
                 await self.agent._db.update_task(existing["id"], **updates)
             if not existing["enabled"]:
                 await scheduler.enable_task(existing["id"])
-            elif "cron_expression" in updates:
+            elif "cron_expression" in updates or "timezone" in updates:
                 await scheduler.reschedule_task(existing["id"])
         elif existing["enabled"]:
             await scheduler.disable_task(existing["id"])

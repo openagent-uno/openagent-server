@@ -762,3 +762,121 @@ async def t_default_tz_env(_ctx: TestContext) -> None:
         os.environ.pop(DEFAULT_TZ_ENV, None)
         if prior is not None:
             os.environ[DEFAULT_TZ_ENV] = prior
+
+
+@test("cron_timezone", "syncing an EXISTING task updates its timezone (prod bug)")
+async def t_sync_updates_existing_timezone(ctx: TestContext) -> None:
+    """The bug that made ``dream_mode.timezone`` do nothing on a live agent.
+
+    ``_sync_scheduled_task`` passed ``timezone`` only to ``add_task`` (create).
+    Every built-in is seeded DISABLED on first boot, so by the time an operator
+    sets ``dream_mode.enabled: true`` + ``timezone: Europe/Rome`` the row
+    already exists — and the update path only ever synced cron + prompt, never
+    the timezone. Result: ``timezone`` stayed NULL, "3:00" fired at 03:00 UTC
+    (05:00 Rome in summer), and setting the config key changed nothing. Both
+    production agents had to have the column patched by hand.
+
+    Drives the real ``AgentServer._sync_scheduled_task`` against a fake db +
+    scheduler, so it pins the method's logic, not a reimplementation.
+    """
+    from src.core.server import AgentServer
+
+    # Fake db holding one existing, enabled, timezone-less task.
+    class _Db:
+        def __init__(self):
+            self.task = {
+                "id": "t1", "name": "dream-mode",
+                "cron_expression": "0 3 * * *", "prompt": "P",
+                "enabled": 1, "timezone": None,
+            }
+            self.updates = []
+
+        async def get_tasks(self):
+            return [dict(self.task)]
+
+        async def update_task(self, task_id, **kw):
+            self.updates.append(kw)
+            self.task.update(kw)
+
+    class _Sched:
+        def __init__(self):
+            self.rescheduled = []
+
+        async def add_task(self, **kw):
+            return "new"
+
+        async def enable_task(self, tid):
+            pass
+
+        async def disable_task(self, tid):
+            pass
+
+        async def reschedule_task(self, tid, **kw):
+            self.rescheduled.append(tid)
+
+    server = AgentServer.__new__(AgentServer)
+    server.agent = type("A", (), {})()
+    server.agent._db = _Db()
+    sched = _Sched()
+
+    await server._sync_scheduled_task(
+        sched, name="dream-mode", enabled=True,
+        cron_expr="0 3 * * *", prompt="P", timezone="Europe/Rome",
+    )
+
+    tz_updates = [u for u in server.agent._db.updates if "timezone" in u]
+    assert tz_updates and tz_updates[0]["timezone"] == "Europe/Rome", (
+        "an existing task's timezone was not synced from config — setting "
+        f"dream_mode.timezone did nothing. updates: {server.agent._db.updates}"
+    )
+    assert sched.rescheduled == ["t1"], (
+        "the timezone changed but next_run was not recomputed — it would keep "
+        "firing at the old (UTC) instant until the next cron change."
+    )
+
+
+@test("cron_timezone", "syncing does NOT rewrite a timezone that already matches")
+async def t_sync_timezone_idempotent(ctx: TestContext) -> None:
+    """No spurious update/reschedule when the config already matches the DB —
+    a needless reschedule on every boot would move next_run around for nothing.
+    """
+    from src.core.server import AgentServer
+
+    class _Db:
+        def __init__(self):
+            self.task = {
+                "id": "t1", "name": "dream-mode", "cron_expression": "0 3 * * *",
+                "prompt": "P", "enabled": 1, "timezone": "Europe/Rome",
+            }
+            self.updates = []
+
+        async def get_tasks(self):
+            return [dict(self.task)]
+
+        async def update_task(self, task_id, **kw):
+            self.updates.append(kw)
+
+    class _Sched:
+        def __init__(self):
+            self.rescheduled = []
+
+        async def enable_task(self, tid):
+            pass
+
+        async def disable_task(self, tid):
+            pass
+
+        async def reschedule_task(self, tid, **kw):
+            self.rescheduled.append(tid)
+
+    server = AgentServer.__new__(AgentServer)
+    server.agent = type("A", (), {})()
+    server.agent._db = _Db()
+    sched = _Sched()
+
+    await server._sync_scheduled_task(
+        sched, name="dream-mode", enabled=True,
+        cron_expr="0 3 * * *", prompt="P", timezone="Europe/Rome",
+    )
+    assert not server.agent._db.updates, f"spurious update: {server.agent._db.updates}"
+    assert not sched.rescheduled, "rescheduled with nothing changed"
