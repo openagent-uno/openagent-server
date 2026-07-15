@@ -309,6 +309,12 @@ class VaultService:
         return await asyncio.to_thread(idx.stats)
 
     async def search(self, query: str, limit: int = 25) -> list[dict]:
+        """Ranked full-text search over filename/title/summary/body.
+
+        Bare words are OR'd and ranked; ``+term`` / ``"phrase"`` require and
+        ``-term`` excludes. See ``VaultIndex._fts_query`` for why OR is the
+        default rather than the stricter-looking every-term match.
+        """
         idx = await self._ensure_index()
         return await asyncio.to_thread(idx.search, query, limit)
 

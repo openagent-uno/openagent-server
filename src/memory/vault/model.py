@@ -58,8 +58,8 @@ RULES: dict[str, Rule] = {
              "the graph should be a single connected component, not islands"),
         Rule("filename", "Filename convention", SEVERITY_INFO, False,
              "filenames should be unique across the vault and domain-prefixed"),
-        Rule("wikilink_format", "Wikilink / related formatting", SEVERITY_WARN, True,
-             "related on one physical line; no spaces inside [[ ]]"),
+        Rule("wikilink_format", "Wikilink formatting", SEVERITY_WARN, True,
+             "no spaces inside [[ ]]"),
         Rule("date_format", "Date format", SEVERITY_INFO, True,
              "created / updated must be absolute YYYY-MM-DD dates"),
         Rule("taxonomy", "Folder taxonomy", SEVERITY_INFO, False,
@@ -105,6 +105,11 @@ class Note:
     is_index: bool = False            # _index hub note (exempt from orphan/min_links)
     is_journal: bool = False          # under the journal root
     # Lint signals captured at parse time so the gate/doctor needn't re-derive:
+    # Parsed and stored by index.py, but NO rule reads it any more: the
+    # "related on one line" requirement it fed was deleted (see gate.py R8 /
+    # doctor.py) once it turned out to demand invalid YAML. Kept only because
+    # ``index.py`` binds the column; it and the ``related_multiline`` column
+    # should be dropped together by that file's owner.
     related_multiline: bool = False   # `related:` value spanned >1 physical line
     spaced_wikilinks: list[str] = field(default_factory=list)  # `[[ a ]]` style
     missing_frontmatter_fields: list[str] = field(default_factory=list)

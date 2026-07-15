@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -34,7 +35,10 @@ from typing import Iterator, Optional
 from src.memory.vault.model import Note
 from src.memory.vault.parser import link_key, parse_note_text
 
-_SCHEMA_VERSION = "1"
+# Bumped to 2 when ``stem`` joined notes_fts: the FTS table's COLUMN COUNT
+# changed, so an index built by an older build cannot be reused — see
+# ``_ensure_vault_meta``, which drops it rather than clearing it.
+_SCHEMA_VERSION = "2"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -83,10 +87,37 @@ CREATE TABLE IF NOT EXISTS links (
 CREATE INDEX IF NOT EXISTS idx_links_src      ON links(src);
 CREATE INDEX IF NOT EXISTS idx_links_resolved ON links(resolved);
 
+-- ``stem`` is indexed alongside the prose because a note's FILENAME is the
+-- most deliberate label a human puts on it, and search used to throw it
+-- away. On the real vault the query "premium not active playbook" could not
+-- reach premium-not-active-playbook.md at ANY rank: its title is "Rule 1b —
+-- Premium Not Active / Not Verifiable", so "playbook" lived only in the
+-- filename. Column ORDER is load-bearing — ``search`` addresses body by
+-- index for snippet() and weights all five for bm25().
 CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
-    path UNINDEXED, title, summary, body, tokenize='unicode61'
+    path UNINDEXED, stem, title, summary, body, tokenize='unicode61'
 );
 """
+
+# bm25 column weights, in notes_fts column order: path (UNINDEXED, never
+# matches), stem, title, summary, body. Flat weighting is why the vault's
+# canonical notes were unreachable: 1,210 of the owner's 2,116 notes are
+# auto-written support-triage receipts that mention "premium" or "google
+# play" in passing, and short repetitive notes are exactly what flat bm25
+# rewards — so the receipts buried the one note that was ABOUT the topic.
+# Title outranks the stem because the stem is usually a slug OF the title
+# (counting both at full weight would double-count the same signal), and
+# body stays at 1 as the long-tail floor. Measured: title-shaped recall
+# went from MRR 0.746 to 0.967, and the numbers sit on a broad plateau
+# (stem 4-10, title 6-10, summary 3-5 all score within 0.05), so these are
+# a sane point in a flat region rather than a fit to the query set.
+_BM25_WEIGHTS = (0.0, 5.0, 10.0, 5.0, 1.0)
+
+# Tokens of context returned around a hit. Was 12, which often could not
+# span the matched terms plus enough words to tell two notes apart — so the
+# agent spent a ``read_note`` round-trip per candidate just to find out
+# which one it wanted. 32 is still small next to a note.
+_SNIPPET_TOKENS = 32
 
 # Directory names never descended into during a walk. ``_showcase`` holds a
 # derived artifact (regenerated from the index), so indexing it would be
@@ -108,6 +139,14 @@ class SyncStats:
 
     def to_dict(self) -> dict:
         return self.__dict__.copy()
+
+
+def _stem_text(stem: str) -> str:
+    """A filename as searchable words: ``premium-not-active-playbook`` ->
+    ``premium not active playbook``. The unicode61 tokenizer already splits
+    on hyphens, but doing it here keeps the indexed text readable and covers
+    the underscore/dot separators the vault also uses."""
+    return re.sub(r"[-_./]+", " ", stem or "").strip()
 
 
 def _row_to_note(row: sqlite3.Row) -> Note:
@@ -156,6 +195,7 @@ class VaultIndex:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(_SCHEMA)
         self._ensure_vault_meta()
+        self._configure_rank()
 
     # ── lifecycle ─────────────────────────────────────────────────────
 
@@ -174,9 +214,16 @@ class VaultIndex:
             meta = {r["key"]: r["value"] for r in cur.fetchall()}
             root = str(self.vault_root.resolve())
             if meta.get("vault_root") != root or meta.get("schema") != _SCHEMA_VERSION:
+                # DROP, not DELETE: a schema bump can change the FTS table's
+                # column COUNT (v2 added ``stem``), and ``CREATE VIRTUAL
+                # TABLE IF NOT EXISTS`` will happily leave an old 4-column
+                # table in place — every insert would then fail with "table
+                # notes_fts has 4 columns but 5 values were supplied" on a
+                # vault that had merely been indexed by an older build.
                 self._conn.executescript(
-                    "DELETE FROM notes; DELETE FROM links; DELETE FROM notes_fts;"
+                    "DELETE FROM notes; DELETE FROM links; DROP TABLE IF EXISTS notes_fts;"
                 )
+                self._conn.executescript(_SCHEMA)
                 self._conn.execute(
                     "INSERT OR REPLACE INTO meta(key, value) VALUES('vault_root', ?)",
                     (root,),
@@ -186,6 +233,32 @@ class VaultIndex:
                     (_SCHEMA_VERSION,),
                 )
                 self._conn.commit()
+
+    def _configure_rank(self) -> None:
+        """Make ``ORDER BY rank`` mean the WEIGHTED bm25 for this table.
+
+        Not a style choice — it is 4x faster than the identical
+        ``ORDER BY bm25(notes_fts, ...)`` expression (p50 2.3ms vs 9.6ms on
+        the real 2,116-note vault, byte-identical result lists). Only the
+        ``rank`` keyword lets FTS5 use its internal top-k path; an explicit
+        bm25() call in the ORDER BY is an opaque expression, so every
+        matching row is scored and sorted — and an OR-of-prefixes query
+        matches a LOT of rows.
+
+        Re-applied on every open rather than once at creation: the config is
+        persisted INSIDE the FTS table, so a weights change in this file
+        would otherwise be silently ignored on an already-built index. If it
+        ever fails to apply, ``ORDER BY rank`` quietly falls back to
+        UNWEIGHTED bm25 — the exact ranking bug this all fixes — so the
+        failure is loud here instead.
+        """
+        weights = ", ".join(str(w) for w in _BM25_WEIGHTS)
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO notes_fts(notes_fts, rank) VALUES('rank', ?)",
+                (f"bm25({weights})",),
+            )
+            self._conn.commit()
 
     # ── walk + sync ───────────────────────────────────────────────────
 
@@ -314,8 +387,8 @@ class VaultIndex:
         )
         self._conn.execute("DELETE FROM notes_fts WHERE path = ?", (note.path,))
         self._conn.execute(
-            "INSERT INTO notes_fts(path, title, summary, body) VALUES (?,?,?,?)",
-            (note.path, note.title, note.summary, fts_body),
+            "INSERT INTO notes_fts(path, stem, title, summary, body) VALUES (?,?,?,?,?)",
+            (note.path, _stem_text(note.stem), note.title, note.summary, fts_body),
         )
 
     def _delete(self, rel: str) -> None:
@@ -540,16 +613,21 @@ class VaultIndex:
             ]
 
     def search(self, query: str, limit: int = 25) -> list[dict]:
-        """FTS5 full-text search over title/summary/body. Falls back to a
-        LIKE scan when the query has no FTS-tokenizable terms."""
+        """Full-text search over stem/title/summary/body, best first.
+
+        Supports ``"exact phrase"``, ``+required`` and ``-excluded`` terms;
+        bare words are OR'd and ranked. See :func:`_fts_query` for why OR is
+        the default and precision lives in the ranking.
+        """
         q = (query or "").strip()
         if not q:
             return []
         with self._lock:
             try:
+                # ``rank`` here is the WEIGHTED bm25 — see _configure_rank.
                 cur = self._conn.execute(
                     "SELECT n.path, n.title, n.tags_json, "
-                    "       snippet(notes_fts, 3, '[', ']', '…', 12) AS snip "
+                    f"       snippet(notes_fts, 4, '[', ']', '…', {_SNIPPET_TOKENS}) AS snip "
                     "FROM notes_fts f JOIN notes n ON n.path = f.path "
                     "WHERE notes_fts MATCH ? ORDER BY rank LIMIT ?",
                     (_fts_query(q), limit),
@@ -633,12 +711,125 @@ class VaultIndex:
         }
 
 
+# Dropped from a BARE (non-required) term list before matching. English
+# only, and deliberately short: the vault is half Italian, and a word we
+# drop is a word the agent cannot search for. These are the fillers an
+# agent's own phrasing adds ("how do I get to the k8s credentials"), which
+# match almost every note and so drown the real terms in the bm25 score.
+# Measured on the real vault: dropping them lifted natural-language MRR
+# from 0.531 to 0.643 and left title/body-fact recall untouched.
+_STOPWORDS = frozenset("""
+a an the and or of to in on at is are was were for from by with this that it
+be been do does did how what why when where which who i me my we our you your
+can could should would get got there here about into over under not no if then
+""".split())
+
+# FTS5 operators the agent may type as bare words. ``AND`` is honoured
+# (``premium AND google`` plainly means both) rather than searched
+# literally, which is what the old builder did: it lower-cased and
+# prefix-matched every token, so the AND itself became the term ``and*``.
+_CONNECTIVE_AND = "AND"
+_CONNECTIVE_OR = "OR"
+
+_QUERY_TOKEN = re.compile(r'([+-]?)(?:"([^"]*)"|(\S+))')
+_TERM_CHARS = re.compile(r"[\w]+")
+
+
+def _quote(term: str) -> str:
+    """Wrap a term as an FTS5 string literal, doubling any embedded quote.
+
+    This is the whole safety story, and why the builder no longer has to
+    throw the user's syntax away to stay safe: a quoted FTS5 string is
+    matched as literal text, so an apostrophe, a stray ``*``, a bare
+    ``NEAR(`` or a reserved word inside it cannot become syntax. The old
+    builder stripped punctuation with ``re.findall`` for the same reason
+    and paid for it by also stripping every operator the agent meant.
+    """
+    return '"' + term.replace('"', '""') + '"'
+
+
 def _fts_query(q: str) -> str:
-    """Turn a freeform query into a safe FTS5 MATCH expression: each
-    alphanumeric term becomes a prefix match, joined by OR. Avoids syntax
-    errors from punctuation the user typed."""
-    import re
-    terms = re.findall(r"[\w]+", q.lower())
-    if not terms:
+    """Build a safe FTS5 MATCH expression from a freeform query.
+
+    The grammar the agent gets, and why each piece is here:
+
+    * bare words       -> OR'd prefix matches (the DEFAULT).
+    * ``"a phrase"``   -> required, matched as an exact phrase.
+    * ``+term``        -> required (AND).
+    * ``-term``        -> excluded (NOT).
+    * ``AND`` / ``OR`` -> make every bare term required / explicitly optional.
+
+    OR is the default because it MEASURED best, which is not the intuition:
+    requiring every term looks more precise and scores better on queries
+    shaped like a note's title (MRR 1.000 vs 0.967 on the real vault), but
+    it collapses on the queries an agent actually writes — a full sentence
+    like "how do I notarize the macos desktop app" scored 0.031 against OR's
+    0.643, hit@1 of 0/8. The reason is not that AND finds too little: it is
+    that AND finds the WRONG thing and so never looks wrong. Some long
+    receipt happens to contain every word of the sentence, the result set is
+    non-empty, and no "widen when empty" fallback can rescue it. Precision
+    therefore comes from RANKING (bm25 weights + the indexed stem), not from
+    filtering, and the agent that genuinely needs "both of these" asks for it
+    with ``+`` or quotes.
+    """
+    required: list[str] = []
+    optional: list[str] = []
+    excluded: list[str] = []
+    all_required = False
+    saw_operator = False
+
+    for sign, phrase, word in _QUERY_TOKEN.findall(q or ""):
+        if phrase is not None and phrase != "":
+            # A quoted phrase: keep the whole span, terms and all.
+            terms = _TERM_CHARS.findall(phrase.lower())
+            if not terms:
+                continue
+            saw_operator = True
+            expr = _quote(" ".join(terms))
+            (excluded if sign == "-" else required).append(expr)
+            continue
+        if not word:
+            continue
+        if not sign and word in (_CONNECTIVE_AND, _CONNECTIVE_OR):
+            saw_operator = True
+            all_required = all_required or word == _CONNECTIVE_AND
+            continue
+        terms = _TERM_CHARS.findall(word.lower())
+        if not terms:
+            continue
+        # A token like ``com.lyramusic`` is several FTS terms; keep it
+        # together as a phrase so it stays one unit.
+        expr = _quote(" ".join(terms)) + ("*" if len(terms) == 1 else "")
+        if sign == "-":
+            saw_operator = True
+            excluded.append(expr)
+        elif sign == "+":
+            saw_operator = True
+            required.append(expr)
+        else:
+            optional.append(expr)
+
+    if all_required:
+        required, optional = required + optional, []
+
+    # Filler words only ever drown the real terms; but never let them be the
+    # reason a query matches nothing (a search for "the who" is legitimate).
+    if optional and not required:
+        kept = [e for e in optional
+                if e.strip('"*').split()[0] not in _STOPWORDS]
+        if kept:
+            optional = kept
+
+    parts = list(required)
+    if optional:
+        parts.append("(" + " OR ".join(optional) + ")"
+                     if len(optional) > 1 else optional[0])
+    if not parts:
+        # Nothing searchable (pure punctuation, or only an exclusion) —
+        # the caller falls back to a LIKE scan over title/stem.
         raise ValueError("no terms")
-    return " OR ".join(f"{t}*" for t in terms)
+
+    expr = " AND ".join(parts)
+    if excluded:
+        expr = f"({expr}) NOT ({' OR '.join(excluded)})"
+    return expr

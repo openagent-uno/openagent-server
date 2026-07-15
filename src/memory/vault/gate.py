@@ -114,11 +114,17 @@ def run_gate(index: VaultIndex, config: GateConfig | None = None) -> GateReport:
                             "related note so it joins the graph")
 
         # R8 wikilink / related formatting
-        if n.related_multiline:
-            emit("wikilink_format", n.path,
-                 "`related:` spans multiple lines — keep it on one physical "
-                 "line, comma-separated", fixable=True,
-                 suggestion="collapse the related list onto a single line")
+        #
+        # This rule USED TO also fire on ``n.related_multiline``, demanding a
+        # block-style ``related:`` list be collapsed onto one comma-separated
+        # line. That requirement is deleted, not relaxed: ``related: [[a]],
+        # [[b]]`` is not valid YAML, our own vault MCP's gray-matter reader
+        # throws on it (and silently degrades the note to ``frontmatter: {}``),
+        # ``write_note`` rejects it, and Obsidian Properties — which §5 says
+        # the vault must render in — are strict YAML. The multi-line list the
+        # rule flagged is the *correct* form. See ``doctor.py`` where
+        # ``_collapse_related`` was removed for the measured damage (13 -> 21
+        # permanent ``date_format`` violations on the owner's real vault).
         if n.spaced_wikilinks:
             sample = ", ".join(n.spaced_wikilinks[:3])
             emit("wikilink_format", n.path,

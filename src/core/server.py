@@ -81,7 +81,29 @@ and log the uncertainty.
 Curate the memory vault via the `vault` MCP — do NOT cat/grep the
 .md files directly.
 
-**Start with `vault_recall_stats`.** It tells you which notes were
+**First, run the mechanical pass: `vault_dream()`.** One call does
+sync → gate → doctor (auto-fix) → regenerate derived. It is
+deterministic, offline, and it will not touch a judgement call — so
+there is no reason to skip it and no reason to hand-do any of it. It
+returns the violations code could NOT fix, which is your actual work
+list for this mission. Everything below is about those.
+
+Do not spend the pass re-deciding what the doctor already fixed. If you
+want the detail: `vault_gate()` grades, `vault_doctor(apply=False)`
+previews. `vault_regenerate_derived()` rebuilds `llms.txt` and the
+showcase — `vault_dream()` already did it.
+
+**Then `vault_contradiction_candidates()`.** Vision §5 requires
+contradictions to be "flagged and reconciled rather than silently
+overwritten" — this is the flagging half, and reconciling is your job.
+It is candidate generation, not detection: code matched opposing wording
+about a shared subject and never read either note, so expect roughly
+half to be false positives. Read BOTH notes in full, then fix or retire
+whichever is genuinely stale. An empty result is not proof the vault
+agrees with itself — it only sees explicitly deprecated/forbidden
+wording. Never delete on this signal alone.
+
+**Then `vault_recall_stats`.** It tells you which notes were
 actually read during real runs and how those runs ended, so you spend
 this pass on the notes that carry weight instead of walking the vault
 alphabetically. Read its `caveat` and believe it: `ok_rate` is

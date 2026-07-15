@@ -109,12 +109,38 @@ async def vault_stats() -> dict:
 async def vault_search(query: str, limit: int = 20,
                       search_type: str = "content",
                       file_path: str | None = None) -> dict:
-    """Search the vault. ``search_type`` controls what is searched:
+    """Search the vault. This is the DEFAULT way to consult memory: it runs
+    over an incremental full-text index, so it stays sub-10ms on a vault of
+    thousands of notes instead of re-reading every file from disk.
 
-    - ``"content"`` (default) — full-text search over title/summary/body (FTS5).
+    ``search_type`` controls what is searched:
+
+    - ``"content"`` (default) — full-text over filename/title/summary/body,
+      best match first.
     - ``"filename"`` — search only note file names/paths.
     - ``"regex"`` — requires ``file_path``; searches within ONE note's content
       using Python regex. Returns line/column positions for each match.
+
+    Query language for ``search_type="content"``:
+
+    - Plain words are OR'd and RANKED — ask in natural words and read the
+      top hits. A note's filename and title count for more than a passing
+      mention in a body, which is what floats the note that is ABOUT your
+      topic above the many that merely mention it. Do NOT pre-narrow out of
+      caution: requiring every word measurably finds the WRONG note on
+      question-shaped queries.
+    - ``+term`` requires a term, ``"exact phrase"`` requires a phrase, and
+      ``-term`` excludes one. Reach for these when plain words return a
+      topic instead of the fact you need.
+    - Punctuation is safe to type; it is never interpreted as syntax.
+
+    Frontmatter (including ``tags``) is NOT in this index — use the vault
+    MCP's ``search_notes`` with ``searchFrontmatter``/``pathPrefix`` for
+    those, and ``list_all_tags`` to enumerate tags.
+
+    Each result carries a ``snippet`` with the matched terms in ``[]``; it is
+    sized to let you pick between hits WITHOUT opening each one — read it
+    before reaching for ``vault_read_note``.
 
     For ``search_type="regex"``, set ``file_path`` to the vault-relative path
     of the note (e.g. ``"projects/my-project/notes.md"``) and ``query`` to

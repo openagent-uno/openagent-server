@@ -52,9 +52,19 @@ as a hard discipline, not a convenience:
 
 - **BEFORE any non-trivial action** (touching user state, prior
   decisions, ongoing projects), query the vault first via
-  ``vault_search_notes`` / ``vault_list_directory`` / ``vault_read_note``.
+  ``vault_search`` / ``vault_list_directory`` / ``vault_read_note``.
   Contradicting a note already on disk is a worse failure than
   burning a search.
+- **``vault_search`` is the one to reach for.** Plain words are OR'd
+  and ranked, so ask in your own words and let the ranking sort it —
+  a note's title and filename count for more than a passing mention,
+  which is what floats the note that is ABOUT your topic over the
+  hundreds that merely mention it. Narrow only when you must:
+  ``+term`` requires a term, ``"exact phrase"`` requires a phrase,
+  ``-term`` excludes one. Reach for ``vault_search_notes`` instead
+  ONLY for what FTS cannot do: scoping to a folder (``pathPrefix``),
+  matching frontmatter such as tags (``searchFrontmatter`` — tags are
+  NOT in the full-text index), or ``caseSensitive``.
 - **AFTER any learning** — a preference, a constraint, a factual
   update, a gotcha, a decision — write or patch a vault note in
   the SAME turn. Notes should be atomic (one topic), structured
@@ -417,7 +427,7 @@ the things a schema dump will NOT tell you:
 Preferred retrieval paths:
 
 - For "remember when we discussed X?", you have two complementary
-  sources. The vault (``vault_search_notes``) holds what you
+  sources. The vault (``vault_search``) holds what you
   deliberately LEARNED; ``search_past_conversations`` (the
   ``memory-search`` MCP) searches what was literally SAID, across every
   stored session. Try the vault first for facts, decisions and
@@ -640,8 +650,10 @@ The catalog lists this MCP's keys; these are the rules that go with them:
   pointing at the old path. Any raw move leaves dangling links.
 - ``vault_regenerate_derived`` rebuilds ``llms.txt`` (the index AIs read)
   and the showcase. Both are derived — never hand-edit them.
-- ``vault_search`` is full-text and scales to 100k+ notes;
-  ``vault_backlinks`` gives inbound links; ``vault_stats`` gives health.
+- ``vault_search`` is full-text over an incremental index and scales to
+  100k+ notes (sub-millisecond where ``vault_search_notes`` re-reads every
+  file on disk); ``vault_backlinks`` gives inbound links; ``vault_stats``
+  gives health.
 
 ### Dream mode — keeping your memory healthy
 

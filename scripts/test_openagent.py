@@ -314,6 +314,10 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_task_hooks",
     "test_shell_hooks",
     "test_tool_labels",
+    # Leader system message must not re-ship every member tool name each
+    # turn (BillingBear alone registers ~280). Pure-unit — imports
+    # ``_runner.team._messages`` directly, no pool/gateway.
+    "test_member_tools_cap",
     "test_bridges",
     # Spam coalescing end-to-end: real StreamSession against a slow
     # fake agent (every turn takes real time, mirroring LLM latency),
@@ -434,6 +438,15 @@ _TEST_MODULES: tuple[str, ...] = (
     #     derived artifacts + a 3k-note scale test. Pure-unit (temp vaults,
     #     no gateway), so it can run anywhere in the order.
     "test_vault_gate",
+    # Vault SEARCH — the query language + ranking that decide whether the
+    #     agent finds the right note (vision §5). Sits after test_vault_gate
+    #     because it shares its shape: pure-unit over throwaway temp vaults.
+    "test_vault_search",
+    # Vault CONTRADICTION candidates — the flagging half of vision §5
+    #     ("flagged and reconciled rather than silently overwritten"). Pure-unit
+    #     over throwaway temp vaults, like the two above; weighted toward false
+    #     positives, because dream mode holds delete_note.
+    "test_vault_contradiction",
 )
 
 

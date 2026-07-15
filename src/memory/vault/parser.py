@@ -68,6 +68,29 @@ def split_frontmatter(content: str) -> tuple[str | None, str]:
 _FM_KEY_RE = re.compile(r"^([A-Za-z0-9_][A-Za-z0-9_-]*):\s*(.*)$")
 
 
+def _unquote(val: str) -> str:
+    """Strip ONE layer of matching surrounding quotes, the way YAML does.
+
+    Load-bearing: the loose parser is the fallback for frontmatter
+    ``yaml.safe_load`` rejects, so for any such note it — not YAML — is what
+    the gate reads. It used to hand back scalars with their quotes still
+    attached while the strict path stripped them, so the two parsers
+    disagreed about the *value* of a field, not just about how to reach it.
+    Every one of the 13 ``date_format`` violations on the owner's real
+    2,116-note vault was this and nothing else: ``updated: '2026-06-02'`` —
+    a perfectly good ISO date — read as ``"'2026-06-02'"``, failing
+    ``gate._is_valid_iso``. The doctor could never clear them either, since
+    ``_coerce_date`` *does* strip quotes, sees a valid date, and returns
+    "already good". A 100%-false-positive rule that advertised ``fixable``
+    and could not be fixed. Quote handling now matches YAML, so the strict
+    and loose paths agree on a value.
+    """
+    v = val.strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+        return v[1:-1]
+    return v
+
+
 def _loose_frontmatter(raw_fm: str) -> dict:
     """Best-effort line-based frontmatter parse for when ``yaml.safe_load``
     fails — which it does on the Company-Brain ``related: [[a]], [[b]]``
@@ -95,7 +118,9 @@ def _loose_frontmatter(raw_fm: str) -> dict:
             continue
         key, val = m.group(1), m.group(2).strip()
         current_key = key
-        meta[key] = val if val else []
+        # ``_unquote`` mirrors what the block-list branch above already did
+        # (``.strip("\"'")``) — the scalar branch was the odd one out.
+        meta[key] = _unquote(val) if val else []
     return meta
 
 

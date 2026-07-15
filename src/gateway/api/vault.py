@@ -10,10 +10,8 @@ GET  /api/vault/search?q=...    → full-text search
 
 from __future__ import annotations
 
-import re
+import asyncio
 from pathlib import Path
-
-_WIKILINK_RE = re.compile(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]")
 
 
 def _sanitize(obj):
@@ -63,25 +61,17 @@ def _tags_list(meta: dict) -> list[str]:
 
 
 def _scan_wikilinks(content: str) -> list[str]:
-    return _WIKILINK_RE.findall(content)
+    """Raw wikilink targets in ``content``, in order.
 
-
-def _link_key(s: str) -> str:
-    """Normalize a wikilink target — or a note's vault-relative path — to
-    a comparison key: lowercased, no surrounding slashes, no ``.md``
-    suffix, and with any ``#heading`` / ``^block`` anchor dropped.
-
-    Vault notes link each other by folder-relative path
-    (``[[infra/scheduled-jobs]]``) far more than by bare name; keying the
-    graph lookup on the bare filename stem alone dropped ~70% of edges.
+    Delegates to the vault parser. This module used to carry its OWN
+    ``_WIKILINK_RE`` and ``_link_key`` — a second implementation of
+    ``[[target|alias]]`` semantics kept in agreement with
+    ``memory/vault/parser.py`` by convention alone. It drifted (see
+    ``handle_graph``); the local regex was missing the parser's ``\\n`` guard
+    and matched across line breaks. There is now one wikilink parser.
     """
-    k = s.lower().strip().lstrip("/")
-    k = k.split("#", 1)[0].split("^", 1)[0].strip()
-    if k.startswith("./"):
-        k = k[2:]
-    if k.endswith(".md"):
-        k = k[:-3]
-    return k
+    from src.memory.vault.parser import extract_wikilinks
+    return [target for target, _spaced in extract_wikilinks(content)]
 
 
 def _resolve_vault(request) -> Path:
@@ -370,50 +360,68 @@ async def handle_search(request):
     return web.json_response({"results": results})
 
 
-async def handle_graph(request):
-    from aiohttp import web
-    vault = _resolve_vault(request)
-    if not vault.exists():
-        return web.json_response({"nodes": [], "edges": []})
+def _graph_from_index(idx) -> tuple[list[dict], list[dict]]:
+    """Build ``(nodes, edges)`` from the index. Sync — the caller threads it.
 
-    nodes, edges = [], []
-    # Resolve wikilinks by folder path AND by bare note name: notes link
-    # each other both ways — ``[[infra/scheduled-jobs]]`` (path) and
-    # ``[[scheduled-jobs]]`` (bare). ``path_map`` is the exact match;
-    # ``stem_map`` is the last-segment fallback for bare links.
-    path_map: dict[str, str] = {}
-    stem_map: dict[str, str] = {}
-    note_data: dict[str, dict] = {}
-
-    for md in vault.rglob("*.md"):
-        if not md.is_file():
-            continue
-        rel = str(md.relative_to(vault))
-        content = md.read_text(errors="replace")
-        meta, _ = _parse_frontmatter(content)
-        path_map[_link_key(rel)] = rel
-        stem_map.setdefault(md.stem.lower(), rel)
-        note_data[rel] = {"meta": meta, "links": _scan_wikilinks(content)}
-
-    for rel, data in note_data.items():
-        meta = data["meta"]
+    Every link decision here is DELEGATED to the index (``note.outlinks`` from
+    the one parser, ``idx.resolve_link`` for the one two-tier path-then-stem
+    resolution). Nothing about wikilink syntax is re-decided in the gateway.
+    """
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    for note in idx.all_notes():
         nodes.append({
-            "id": rel,
-            "label": meta.get("title", Path(rel).stem),
-            "tags": _tags_list(meta),
-            "type": meta.get("type", ""),
+            "id": note.path,
+            "label": note.title or note.stem,
+            "tags": note.tags,
         })
         # Dedup per source: a note that mentions the same target several
         # times must not stack duplicate edges (they skew the force
         # layout's degree-based sizing/colour).
         seen: set[str] = set()
-        for link in data["links"]:
-            key = _link_key(link)
-            target = path_map.get(key) or stem_map.get(key.rsplit("/", 1)[-1])
-            if target and target != rel and target not in seen:
+        for raw in note.outlinks:
+            target = idx.resolve_link(raw)
+            if target and target != note.path and target not in seen:
                 seen.add(target)
-                edges.append({"source": rel, "target": target})
+                edges.append({"source": note.path, "target": target})
+    return nodes, edges
 
+
+async def handle_graph(request):
+    """GET /api/vault/graph — {nodes, edges}, served FROM THE VAULT INDEX.
+
+    This endpoint used to do its own ``rglob`` + frontmatter parse + wikilink
+    scan + two-tier link resolution, hand-kept "in agreement" with
+    ``memory/vault/parser.py`` + ``index.py``. They were not in agreement.
+    Measured against the owner's real 2,116-note vault, the two disagreed on:
+
+    * **1 node** — ``_showcase/showcase.md``. The index prunes ``_showcase``,
+      ``.git``, ``.obsidian``, ``node_modules`` … (``index._PRUNE_DIRS``); the
+      raw ``rglob`` here walked straight into them, so the graph drew a
+      derived artifact as if it were memory.
+    * **11 edges pointing at the WRONG note.** Both sides fall back to a
+      bare-stem match, but the index breaks ties deterministically
+      (``ORDER BY path``) while ``rglob`` order is whatever the filesystem
+      says. With ``anti-fabrication.md`` existing twice (and ``_index.md``
+      sixteen times, ``dev-coverage.md`` three times), ``[[anti-fabrication]]``
+      resolved to ``esound/…`` in the picture the user was shown and to
+      ``_inherited-from-lyra/…`` in the graph the gate validated.
+    * **wikilink syntax** — the local regex had no ``\\n`` guard, so it matched
+      ``[[foo`` / newline / ``bar]]`` across a line break; the parser's does not.
+
+    Serving from the index deletes all three classes at once: one walk, one
+    parser, one resolver. The index is also the cheaper source (a few SQL
+    queries beat re-reading 2,116 files on every graph refresh).
+    """
+    from aiohttp import web
+    vault = _resolve_vault(request)
+    if not vault.exists():
+        return web.json_response({"nodes": [], "edges": []})
+
+    svc = _service(request)
+    idx = await svc._ensure_index()
+    await asyncio.to_thread(idx.sync, False)
+    nodes, edges = await asyncio.to_thread(_graph_from_index, idx)
     return web.json_response({"nodes": nodes, "edges": edges})
 
 

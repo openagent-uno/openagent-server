@@ -144,3 +144,71 @@ async def t_dream_recall_is_not_a_verdict(ctx: TestContext) -> None:
         "Mission 1 does not say what an empty stats table means. It is empty "
         "on every fresh deployment, so that is the state it meets first."
     )
+
+
+@test("dream", "Mission 1 runs the mechanical pass it has tools for")
+async def t_dream_runs_mechanical_pass(ctx: TestContext) -> None:
+    """The gap that left every fixable violation unfixed.
+
+    The vault quality system is deliberately split: code does the
+    deterministic half (sync, gate, doctor's mechanical fixes, derived
+    artifacts) and the AI does the judgement calls. Dream mode is where
+    that split is supposed to meet — but its prompt named `vault_dream`,
+    `vault_gate`, `vault_doctor` and `vault_regenerate_derived` ZERO
+    times each, so it only ever did the AI half.
+
+    The mechanical half then ran nowhere by default: the only other
+    caller is `learning/vault_maintenance.py`'s background loop, which
+    is off unless `memory.vault.maintenance.enabled` is set. Measured
+    consequence on a real 2,116-note vault: 38 `wikilink_format` and 24
+    `frontmatter` violations, every one of them mechanically fixable,
+    none of them fixed — and `llms.txt` / the showcase never regenerated.
+    """
+    from src.core.server import DREAM_MODE_PROMPT
+
+    assert "vault_dream" in DREAM_MODE_PROMPT, (
+        "Mission 1 never runs the mechanical pass. `vault_dream()` is one "
+        "call for sync+gate+doctor+derive; without it dream mode does the "
+        "judgement half of a system whose other half then runs nowhere."
+    )
+    # It must come before the AI curation, not after: its output IS the
+    # work list, and re-deciding what the doctor already fixed wastes the pass.
+    i_dream = DREAM_MODE_PROMPT.index("vault_dream")
+    for later in ("vault_recall_stats", "merge duplicates"):
+        assert i_dream < DREAM_MODE_PROMPT.index(later), (
+            f"vault_dream() must run before {later!r} — its result is the "
+            "work list for everything after it."
+        )
+
+
+@test("dream", "Mission 1 flags contradictions, and won't act on the flag alone")
+async def t_dream_flags_contradictions(ctx: TestContext) -> None:
+    """Vision §5: contradictions are "flagged and reconciled rather than
+    silently overwritten". Nothing did the flagging — the only detection
+    in the codebase was byte-identical and same-title duplicates, so two
+    notes disagreeing about a fact in different words were invisible, and
+    the agent answered confidently from whichever it happened to read.
+
+    The generator is deliberately a CANDIDATE generator: it matches
+    opposing wording about a shared subject without reading either note,
+    and measured ~4 real out of 7 on a real vault. So the prompt must
+    carry the false-positive rate to the place the agent acts, exactly as
+    it must for `ok_rate` — the agent holds `delete_note` here too.
+    """
+    import re
+
+    from src.core.server import DREAM_MODE_PROMPT
+
+    lower = re.sub(r"\s+", " ", DREAM_MODE_PROMPT).lower()
+    assert "vault_contradiction_candidates" in DREAM_MODE_PROMPT, (
+        "nothing consumes the contradiction generator — vision §5's "
+        "flagging half exists and no prompt calls it."
+    )
+    assert "false positives" in lower, (
+        "Mission 1 hands the agent contradiction candidates without saying "
+        "roughly half are wrong; it will treat them as findings."
+    )
+    assert "never delete on this signal alone" in lower, (
+        "the agent holds delete_note and a signal that is ~50% wrong, with "
+        "nothing forbidding the obvious wrong move."
+    )

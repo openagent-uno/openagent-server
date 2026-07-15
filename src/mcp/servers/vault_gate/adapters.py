@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from src.mcp.servers.vault_gate import handlers, recall
+from src.mcp.servers.vault_gate import contradictions, handlers, recall
 
 
 def build_runtime_toolkit() -> Any:
@@ -105,11 +105,31 @@ def build_runtime_toolkit() -> Any:
             limit=limit, since_days=since_days, note_path=note_path,
         )
 
+    async def vault_contradiction_candidates(limit: int = 20,
+                                             sync: bool = True) -> dict:
+        """Note pairs that LOOK like they disagree about one technical subject.
+
+        Vision §5 requires contradictions to be "flagged and reconciled rather
+        than silently overwritten"; nothing did the flagging. This is CANDIDATE
+        GENERATION, NOT DETECTION — code matched opposing wording (one note
+        calls a subject deprecated/forbidden/absent, another uses it
+        affirmatively) about a shared identifier. It never read either note.
+
+        Expect roughly half to be false positives. Read BOTH notes in full
+        before touching anything, then reconcile by correcting or retiring
+        whichever is actually stale. Absence of candidates is NOT proof the
+        vault is consistent — a contradiction phrased any other way is
+        invisible here. NEVER delete a note on this signal alone."""
+        return await contradictions.vault_contradiction_candidates(
+            limit=limit, sync=sync,
+        )
+
     return Toolkit(
         name="vault-gate",
         tools=[
             vault_gate, vault_doctor, vault_dream, vault_validate_note,
             vault_rename_note, vault_init, vault_stats, vault_search,
             vault_backlinks, vault_regenerate_derived, vault_recall_stats,
+            vault_contradiction_candidates,
         ],
     )

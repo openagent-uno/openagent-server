@@ -58,62 +58,53 @@ class FixResult:
 # ── pure string transforms ────────────────────────────────────────────
 
 def _strip_wikilink_spaces(text: str) -> tuple[str, bool]:
+    """Strip whitespace from inside ``[[ ]]`` — target AND alias.
+
+    The alias used to be left alone, so ``[[ a | b ]]`` became ``[[a| b ]]``:
+    tidy enough that the gate stopped flagging it (its spaced-wikilink signal
+    only looks at the target), but still visibly spaced in Obsidian. The
+    vendored Node write gate (``validate.ts``, which is what the AGENT's
+    ``vault_write_note`` runs) has always stripped both, so the same note
+    landed with different bytes depending on whether it arrived via the MCP or
+    via REST/CLI. Strip both, and the two writers agree.
+    """
     def repl(m: re.Match) -> str:
         inner = m.group(1)
         if "|" in inner:
             target, alias = inner.split("|", 1)
-            return f"[[{target.strip()}|{alias}]]"
+            return f"[[{target.strip()}|{alias.strip()}]]"
         return f"[[{inner.strip()}]]"
     new = _WIKILINK_BRACED.sub(repl, text)
     return new, new != text
 
 
-def _collapse_related(raw_fm: str) -> tuple[str, bool]:
-    """Collapse a block-style ``related:`` list onto one comma-separated
-    line, preserving EVERY item exactly as written — wikilinks and any
-    plain-text entries alike. (An earlier version rebuilt the line from
-    wikilinks only, which silently deleted non-``[[...]]`` entries.)"""
-    lines = raw_fm.split("\n")
-    out: list[str] = []
-    i = 0
-    changed = False
-    while i < len(lines):
-        m = re.match(r"^(\s*)related:\s*(.*)$", lines[i])
-        if not m:
-            out.append(lines[i])
-            i += 1
-            continue
-        indent, inline_val = m.group(1), m.group(2).strip()
-        items = [s.strip() for s in inline_val.split(",") if s.strip()] if inline_val else []
-        j = i + 1
-        block: list[str] = []
-        while j < len(lines):
-            nxt = lines[j]
-            if nxt.strip() == "":
-                break
-            if nxt[:1] in (" ", "\t") or nxt.lstrip().startswith("- "):
-                block.append(nxt)
-                j += 1
-            else:
-                break
-        for bl in block:
-            t = bl.strip()
-            if t.startswith("- "):
-                t = t[2:].strip()
-            t = t.strip().strip("\"'").strip()
-            if t:
-                items.append(t)
-        # dedup, preserve order, keep plain-text + wikilink items verbatim
-        seen: set[str] = set()
-        uniq = [x for x in items if not (x in seen or seen.add(x))]
-        if block:
-            out.append(f"{indent}related: " + ", ".join(uniq))
-            changed = True
-            i = j
-        else:
-            out.append(lines[i])
-            i += 1
-    return "\n".join(out), changed
+# ``_collapse_related`` USED TO LIVE HERE. It rewrote a block-style
+# ``related:`` list onto one comma-separated line — ``related: [[a]], [[b]]``
+# — because that is the form the Company-Brain tutorial writes. It is deleted
+# because that form is not valid YAML, and the "fix" was net-destructive:
+#
+#   1. ``[[a]], [[b]]`` is not a YAML flow sequence, so collapsing a VALID
+#      block list made the note's frontmatter unparseable.
+#   2. Parsing then fell through to ``parser._loose_frontmatter``, whose
+#      values used to keep their quotes -> a bogus ``date_format`` violation
+#      on every ``updated: '2026-06-02'`` in the file.
+#   3. Measured on the owner's real 2,116-note vault: one ``doctor --apply``
+#      pass took ``wikilink_format`` 38 -> 0 but drove ``date_format``
+#      13 -> 21, and a second pass never cleared them. The doctor was
+#      manufacturing permanent violations it advertised as fixable.
+#   4. The form is unreadable by our OWN vault MCP: ``frontmatter.ts`` parses
+#      notes with gray-matter, which THROWS on it and then silently returns
+#      ``frontmatter: {}``. 50 notes in the real vault are already in this
+#      shape, and the agent reading one via ``vault_read_note`` sees no
+#      title, no tags, no related, and the raw ``---`` block leaking into the
+#      body. Obsidian's Properties are strict YAML too, so the form also
+#      breaks the §5 "renders like Obsidian" promise.
+#   5. ``VaultService.write_note`` rejects it outright ("frontmatter is not
+#      valid YAML"), so the doctor's own canonical output could not be
+#      written back through the service that grades it.
+#
+# The quoted block list is correct on every axis that matters: valid YAML,
+# Obsidian-native, and what gray-matter round-trips. There is nothing to fix.
 
 
 def _fmt_if_valid(y: int, mo: int, d: int) -> str | None:
@@ -210,10 +201,6 @@ def fix_note_content(content: str, note: Note, rules: set[str],
         fm, body = nfm, nbody
         if c1 or c2:
             applied.append("stripped spaces inside [[ ]]")
-        nfm2, c3 = _collapse_related(fm)
-        if c3:
-            fm = nfm2
-            applied.append("collapsed related onto one line")
 
     if "date_format" in rules:
         nfm, c = _normalize_dates(fm)

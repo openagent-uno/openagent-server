@@ -8,6 +8,7 @@ gate stay fast and that a no-change re-sync touches nothing.
 """
 from __future__ import annotations
 
+import asyncio
 import shutil
 import tempfile
 import time
@@ -16,7 +17,7 @@ from pathlib import Path
 from ._framework import TestContext, TestSkip, test
 
 from src.memory.vault.doctor import (
-    _coerce_date, _collapse_related, apply_mechanical_fixes, fix_note_content,
+    _coerce_date, apply_mechanical_fixes, fix_note_content,
 )
 from src.memory.vault.derived import generate_llms_txt, generate_showcase
 from src.memory.vault.gate import _is_valid_iso, run_gate
@@ -33,6 +34,13 @@ def _mkvault() -> tuple[Path, Path, Path]:
     vault = d / "vault"
     vault.mkdir()
     return d, vault, d / "index.db"
+
+
+def _service_for(vault: Path, idxp: Path) -> VaultService:
+    """The gateway resolves its service via ``get_service(vault_root)``; use
+    the same cached instance so the test reads the index the endpoint built."""
+    from src.memory.vault.service import get_service
+    return get_service(vault)
 
 
 def _note(summary_ok: bool = True, links: list[str] | None = None,
@@ -251,7 +259,10 @@ A [[ hub ]] link.
         fixed = (vault / "e" / "msg.md").read_text()
         assert "created: 2026-06-09" in fixed
         assert "[[ hub ]]" not in fixed and "[[hub]]" in fixed
-        assert "related: [[hub]]" in fixed  # collapsed to one line
+        # The block-style ``related:`` list must survive UNTOUCHED. The doctor
+        # used to collapse it onto ``related: [[hub]]``, which is not valid
+        # YAML — see the round-trip test below.
+        assert 'related:\n  - "[[hub]]"' in fixed, fixed
         assert "status: active" in fixed  # scaffolded
         # fewer or equal frontmatter/date/format violations after
         after = res["after"]
@@ -265,19 +276,149 @@ A [[ hub ]] link.
         shutil.rmtree(d, ignore_errors=True)
 
 
-@test("vault_gate", "doctor: collapsing related preserves non-wikilink items (no data loss)")
-async def t_doctor_related_no_data_loss(ctx: TestContext) -> None:
-    # Regression: a block-style related: with plain-text entries must keep them.
-    fm = ('title: X\nrelated:\n  - "[[hub]]"\n  - acme-corp\n'
-          '  - Ask Jane about headcount\n')
-    collapsed, changed = _collapse_related(fm)
-    assert changed
-    line = [l for l in collapsed.split("\n") if l.startswith("related:")][0]
-    assert "[[hub]]" in line
-    assert "acme-corp" in line, line
-    assert "Ask Jane about headcount" in line, line
-    # nothing silently dropped
-    assert line.count(",") == 2, line
+@test("vault_gate", "doctor: fixed frontmatter still parses as strict YAML")
+async def t_doctor_output_is_valid_yaml(ctx: TestContext) -> None:
+    """The invariant the doctor violated for real.
+
+    ``_collapse_related`` rewrote a VALID block-style ``related:`` list into
+    ``related: [[a]], [[b]]`` — not a YAML flow sequence. On the owner's real
+    2,116-note vault one ``doctor --apply`` pass drove ``date_format`` 13 ->
+    21 and never converged, because the broken frontmatter fell through to the
+    loose parser. gray-matter (our own vault MCP's reader) and Obsidian
+    Properties are both strict YAML, so this also made the note unreadable.
+    Whatever the doctor writes must survive ``yaml.safe_load``.
+    """
+    import yaml
+    from src.memory.vault.parser import split_frontmatter
+
+    src = ('---\ntitle: X\nsummary: s\ntags: [e]\nstatus: active\n'
+           'created: 2026-06-09\nupdated: 2026-06-09\n'
+           'related:\n  - "[[hub]]"\n  - acme-corp\n---\n'
+           'A [[ hub ]] link.\n')
+    note = parse_note_text("e/x.md", src)
+    fixed, applied = fix_note_content(
+        src, note, {"wikilink_format", "date_format", "frontmatter", "em_dash"},
+        "2026-06-09")
+    assert "stripped spaces inside [[ ]]" in applied, applied
+
+    raw_fm, _ = split_frontmatter(fixed)
+    meta = yaml.safe_load(raw_fm)   # must NOT raise
+    assert isinstance(meta, dict), meta
+    # and the related list is preserved verbatim, wikilinks + plain text alike
+    assert meta["related"] == ["[[hub]]", "acme-corp"], meta["related"]
+
+
+@test("vault_gate", "parser: loose and strict frontmatter agree on values")
+async def t_loose_strict_parity(ctx: TestContext) -> None:
+    """The two frontmatter parsers are a twin — pin them to each other.
+
+    ``_loose_frontmatter`` is the fallback whenever ``yaml.safe_load`` fails,
+    so for those notes IT is what the gate reads. It used to keep surrounding
+    quotes while YAML stripped them, so the two disagreed about a field's
+    *value*: every one of the 13 ``date_format`` violations on the owner's
+    real vault was a good ISO date read as ``"'2026-06-02'"``.
+    """
+    import yaml
+    from src.memory.vault.parser import _loose_frontmatter
+
+    for raw_fm in (
+        "title: X\nupdated: '2026-06-02'\ncreated: 2026-06-29\n",
+        'title: "Quoted Title"\nstatus: "active"\n',
+        "title: it's fine\nstatus: active\n",     # inner apostrophe, unquoted
+        'summary: "a: colon inside"\n',
+    ):
+        strict = yaml.safe_load(raw_fm)
+        loose = _loose_frontmatter(raw_fm)
+        for key, want in strict.items():
+            if not isinstance(want, str):
+                continue  # dates/lists: shape differs by design, values below
+            assert loose.get(key) == want, (
+                f"loose/strict disagree on {key!r} in {raw_fm!r}: "
+                f"loose={loose.get(key)!r} strict={want!r}")
+
+
+@test("vault_gate", "gate: a quoted ISO date is not a date_format violation")
+async def t_quoted_date_is_valid(ctx: TestContext) -> None:
+    """100% of the real vault's date_format violations were this.
+
+    The note's YAML is broken by an unquoted ``:`` in the title, so the loose
+    parser handles it. ``updated: '2026-06-02'`` is a perfectly good date and
+    must not be flagged — especially since the doctor could never fix it
+    (``_coerce_date`` strips the quotes, sees a valid date, reports
+    "already good"), making it a permanent violation advertised as fixable.
+    """
+    d, vault, idxp = _mkvault()
+    try:
+        (vault / "e").mkdir()
+        (vault / "e" / "x.md").write_text(
+            "---\ntitle: Bug: skip advances wrongly\nsummary: s\ntags: [e]\n"
+            "status: active\ncreated: 2026-06-29\nupdated: '2026-06-02'\n---\n"
+            "Body [[hub]].\n")
+        idx = VaultIndex(vault, idxp)
+        idx.sync(force=True)
+        rep = run_gate(idx, GateConfig())
+        dates = [v for v in rep.violations if v.rule == "date_format"]
+        assert not dates, [v.message for v in dates]
+        idx.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@test("vault_gate", "doctor: --apply never increases any rule's violation count")
+async def t_doctor_never_regresses(ctx: TestContext) -> None:
+    """The acceptance invariant: a fixer must not manufacture violations.
+
+    Measured on the owner's real 2,116-note vault, ``doctor --apply`` used to
+    take ``wikilink_format`` 38 -> 0 but drive ``date_format`` 13 -> 21, and a
+    second pass never cleared them — the doctor was creating permanent
+    violations it advertised as fixable.
+
+    ``e/a.md`` is the exact shape that regressed (cf. the real
+    ``esound/procedures/clickup-audit-workflow.md``), and all three of its
+    properties are load-bearing: its frontmatter is VALID YAML to start with,
+    its ``related:`` is a block list (so the old doctor would collapse it and
+    thereby invalidate that YAML), and its dates are QUOTED (so the loose
+    parser it then fell through to reported them as malformed). Drop any one
+    and the note stays clean through the old code — which is exactly how the
+    first draft of this test passed against the defect it was written to
+    catch.
+    """
+    d, vault, idxp = _mkvault()
+    try:
+        (vault / "e").mkdir()
+        (vault / "e" / "hub.md").write_text(_note(links=["a", "b"], title="Hub"))
+        (vault / "e" / "a.md").write_text(
+            '---\ntitle: A\nsummary: s\ntags: [e]\nstatus: active\n'
+            "created: '2026-06-29'\nupdated: '2026-06-02'\n"
+            'related:\n  - "[[hub]]"\n  - plain-text-entry\n'
+            '---\nBody [[ hub ]] here.\n')
+        (vault / "e" / "b.md").write_text(
+            '---\ntitle: B: a colon needs the loose parser\nsummary: s\n'
+            'tags: [e]\nstatus: active\n'
+            "created: 2026/06/09\nupdated: '2026-06-09'\n"
+            'related:\n  - "[[hub]]"\n---\nBody [[hub]].\n')
+        from collections import Counter
+
+        def _counts(rep) -> dict[str, int]:
+            return dict(Counter(v.rule for v in rep.violations))
+
+        svc = VaultService(vault, index_path=idxp)
+        before = _counts(await svc.gate())
+        await svc.doctor(apply=True)
+        after = _counts(await svc.gate(sync=True))
+
+        grew = {r: (before.get(r, 0), after.get(r, 0))
+                for r in set(before) | set(after)
+                if after.get(r, 0) > before.get(r, 0)}
+        assert not grew, f"doctor --apply INCREASED violations: {grew}"
+
+        # ...and it converges: a second pass changes nothing further.
+        await svc.doctor(apply=True)
+        third = _counts(await svc.gate(sync=True))
+        assert third == after, f"doctor is not idempotent: {after} -> {third}"
+        await svc.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 @test("vault_gate", "doctor: dates are coerced safely (no month-13) and gate validates ranges")
@@ -386,6 +527,70 @@ async def t_rest_path_traversal(ctx: TestContext) -> None:
                                       body={"content": "x"}))
         assert w.status == 400, w.status
         assert not (d / "escaped.md").exists()
+        from src.memory.vault.service import close_all
+        await close_all()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@test("vault_gate", "rest: the graph endpoint and the gate resolve links identically")
+async def t_graph_matches_index(ctx: TestContext) -> None:
+    """``/api/vault/graph`` must draw the graph the gate validates.
+
+    It used to do its own rglob + wikilink scan + link resolution alongside
+    ``parser.py``/``index.py``. On the owner's real 2,116-note vault the two
+    disagreed on 1 node and 11 edges: the endpoint walked into ``_showcase``
+    (which the index prunes), and it broke bare-stem ties in filesystem order
+    where the index breaks them by ``ORDER BY path`` — so ``[[dup]]`` pointed
+    at a different note in the picture than in the gate. Both shapes are here.
+    """
+    import json as _json
+    import src.gateway.api.vault as V
+
+    d, vault, idxp = _mkvault()
+
+    class _GW:
+        def __init__(self, vp): self.vault_path = str(vp)
+
+    class _App(dict):
+        pass
+
+    class _Req:
+        def __init__(self, app):
+            self.app = app; self.match_info = {}; self.query = {}
+
+    try:
+        (vault / "aaa").mkdir()
+        (vault / "zzz").mkdir()
+        (vault / "_showcase").mkdir()
+        # A stem collision: two notes named dup.md. A bare [[dup]] must
+        # resolve the SAME way here as in the gate (alphabetically-first path).
+        (vault / "aaa" / "dup.md").write_text(_note(links=[], title="Dup A"))
+        (vault / "zzz" / "dup.md").write_text(_note(links=[], title="Dup Z"))
+        (vault / "aaa" / "src.md").write_text(_note(links=["dup"], title="Src"))
+        # A derived artifact the index prunes — it must not become a node.
+        (vault / "_showcase" / "showcase.md").write_text(
+            _note(links=["dup"], title="Showcase"))
+
+        app = _App(); app["gateway"] = _GW(vault)
+        resp = await V.handle_graph(_Req(app))
+        graph = _json.loads(resp.body.decode())
+        node_ids = {n["id"] for n in graph["nodes"]}
+        edges = {(e["source"], e["target"]) for e in graph["edges"]}
+
+        # 1. the pruned derived artifact is not in the graph
+        assert not any(n.startswith("_showcase/") for n in node_ids), sorted(node_ids)
+
+        # 2. the graph's node set is exactly the index's
+        svc = _service_for(vault, idxp)
+        idx = await svc._ensure_index()
+        await asyncio.to_thread(idx.sync, False)
+        assert node_ids == {n.path for n in idx.all_notes()}, node_ids
+
+        # 3. the collision resolves the same way the index resolves it
+        assert ("aaa/src.md", idx.resolve_link("dup")) in edges, edges
+        assert idx.resolve_link("dup") == "aaa/dup.md", idx.resolve_link("dup")
+
         from src.memory.vault.service import close_all
         await close_all()
     finally:

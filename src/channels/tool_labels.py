@@ -66,6 +66,10 @@ _MEMORY_VERBS: dict[str, tuple[str, str]] = {
     # Recall attribution: which notes preceded runs that went well.
     # Reading it is the agent weighing its own memory, not browsing it.
     "recall_stats": ("Weighing memory", "⚖️"),
+    # Notes that look like they disagree with each other (vision §5's
+    # "flagged and reconciled"). Candidates, not findings — hence
+    # "checking", not "fixing".
+    "contradiction_candidates": ("Checking memory for conflicts", "⚡"),
     "gate": ("Auditing memory", "🛡️"),
     "doctor": ("Healing memory", "🩺"),
     "dream": ("Memory maintenance", "🌙"),
