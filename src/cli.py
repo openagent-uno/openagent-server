@@ -615,6 +615,10 @@ def mcp_server_cmd(name: str):
         from src.mcp.servers.events_manager.server import main as events_manager_main
         events_manager_main()
         return
+    if name == "budget-manager":
+        from src.mcp.servers.budget_manager.server import main as budget_manager_main
+        budget_manager_main()
+        return
     if name == "media-gen":
         from src.mcp.servers.media_gen.server import main as media_gen_main
         media_gen_main()

@@ -39,6 +39,7 @@ from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 from src.core import vault_recall
+from src.core.budget_guard import BudgetGuard
 from src.core.logging import elog
 from src.models import stream_usage
 from src.models.base import BaseModel, ModelResponse
@@ -519,6 +520,7 @@ class TeamRouterProvider(BaseModel):
         *,
         history_runs: int = FULL_SESSION_HISTORY_RUNS,
         budget: Any = None,
+        budget_guard: Any = None,
     ):
         self._entry_runtime_id = entry_runtime_id
         self._providers_config = providers_config if providers_config is not None else []
@@ -526,6 +528,12 @@ class TeamRouterProvider(BaseModel):
         self._mcp_pool: Any = None
         self._fallback_config: Any = None
         self._history_runs = history_runs
+        # The dispatcher's BudgetGuard, shared so ``record_cost`` can nudge a
+        # refresh the moment new spend lands — the over-cap scope drops out of
+        # routing on the next turn, not one TTL later. None on a model-pinned
+        # run built via ``build_override_model`` (no dispatcher), which is fine:
+        # the guard still refreshes on its TTL from the live dispatcher.
+        self._budget_guard = budget_guard
         # Cost telemetry lives HERE, not in ModelDispatcher, because not every
         # run goes through the dispatcher: a model-PINNED run (an Events
         # delivery, a scheduled task with a `model`, a workflow ai-prompt
@@ -1069,6 +1077,12 @@ class TeamRouterProvider(BaseModel):
                 cost=cost,
                 session_id=session_id,
             )
+            # New spend just landed — refresh the budget snapshot so an
+            # over-cap scope is excluded from routing on the NEXT turn rather
+            # than one TTL later. Non-blocking (schedules a background task) and
+            # a no-op when no guard is wired (a pinned run) or no loop is live.
+            if self._budget_guard is not None:
+                self._budget_guard.schedule_refresh()
             elog(
                 "router.cost_recorded",
                 session_id=session_id,
@@ -1312,6 +1326,13 @@ class ModelDispatcher(BaseModel):
         self._providers_config = providers_config
 
         self._budget: BudgetTracker | None = None
+        # The budget enforcement gate. Created in ``set_db`` (needs the DB) and
+        # consulted synchronously by ``_enabled_catalog`` to drop over-cap
+        # scopes from routing. None until then → off, byte-identical to before.
+        self._budget_guard: BudgetGuard | None = None
+        # yaml ``budgets:`` seed rules, stashed by ``set_budget_seed`` before the
+        # guard exists and handed over in ``set_db``.
+        self._budget_seed: Any = None
         self._db: Any = None
         self._mcp_pool: Any = None
         self._fallback_config: Any = None
@@ -1347,11 +1368,29 @@ class ModelDispatcher(BaseModel):
     def set_db(self, db: Any) -> None:
         self._db = db
         self._budget = BudgetTracker(db, 0.0)
+        self._budget_guard = BudgetGuard(db)
+        if self._budget_seed is not None:
+            self._budget_guard.set_seed_rules(self._budget_seed)
         for provider in self._team_providers.values():
             wire_model_runtime(provider, db=db)
             # A provider built before the db arrived would otherwise bill into
             # the void for the rest of the process's life.
             provider._budget = self._budget
+            provider._budget_guard = self._budget_guard
+
+    def set_budget_seed(self, rules: Any) -> None:
+        """Hand the yaml ``budgets:`` block to the guard so it seeds those rules
+        (additively, only-if-absent) at its first refresh. Called from
+        ``_build_agent`` after the DB is wired. No rules → nothing seeded."""
+        self._budget_seed = rules
+        if self._budget_guard is not None:
+            self._budget_guard.set_seed_rules(rules)
+
+    @property
+    def budget_guard(self) -> BudgetGuard | None:
+        """The live BudgetGuard, for the gateway (warm at boot, nudge on write)
+        and tests. None before ``set_db``."""
+        return self._budget_guard
 
     def set_mcp_pool(self, pool: Any) -> None:
         self._mcp_pool = pool
@@ -1485,13 +1524,32 @@ class ModelDispatcher(BaseModel):
 
     # ── dispatch plumbing ───────────────────────────────────────────
 
-    def _enabled_catalog(self) -> list[CatalogModel]:
+    def _configured_enabled_catalog(self) -> list[CatalogModel]:
+        """Every non-disabled configured model, BEFORE the budget gate.
+
+        This is the set a session pin is validated against for *existence*
+        (is the model still configured at all?). The budget gate is a
+        separate, *temporary* concern layered on top in ``_enabled_catalog``:
+        an over-cap model still exists and must not be auto-unpinned.
+        """
         out: list[CatalogModel] = []
         for entry in iter_configured_models(self._providers_config):
             if entry.disabled:
                 continue
             out.append(entry)
         return out
+
+    def _enabled_catalog(self) -> list[CatalogModel]:
+        out = self._configured_enabled_catalog()
+        # Budget gate: drop any scope currently over its cap. A pure, cached,
+        # allocation-cheap set test (no I/O on this sync hot path). Returns
+        # ``out`` untouched when no rule is tripped — so a deployment with no
+        # budgets configured is byte-identical to before — and NEVER empties the
+        # catalog (a cap must not take the agent fully offline).
+        guard = self._budget_guard
+        if guard is None:
+            return out
+        return guard.filter_catalog(out)
 
     def build_override_model(self, runtime_id: str) -> BaseModel:
         """Construct a BaseModel bound to a specific runtime_id.
@@ -1525,6 +1583,7 @@ class ModelDispatcher(BaseModel):
                 # object straight from build_override_model and never touches
                 # the dispatcher at all.
                 budget=self._budget,
+                budget_guard=self._budget_guard,
             )
             wire_model_runtime(
                 provider,
@@ -1553,8 +1612,13 @@ class ModelDispatcher(BaseModel):
                 logger.debug("get_session_pin failed for %s: %s", session_id, e)
                 pinned_id = None
             if pinned_id:
-                enabled_ids = {entry.runtime_id for entry in self._enabled_catalog()}
-                if pinned_id not in enabled_ids:
+                configured_ids = {
+                    entry.runtime_id for entry in self._configured_enabled_catalog()
+                }
+                if pinned_id not in configured_ids:
+                    # Genuinely gone (deleted / disabled in config). Auto-heal by
+                    # unpinning so the session doesn't keep asking for a model
+                    # that no longer exists.
                     elog(
                         "router.pin_auto_heal",
                         session_id=session_id,
@@ -1566,6 +1630,23 @@ class ModelDispatcher(BaseModel):
                     except Exception as e:  # noqa: BLE001
                         logger.debug("unpin_session_model failed for %s: %s", session_id, e)
                     pinned_id = None
+                else:
+                    enabled_ids = {
+                        entry.runtime_id for entry in self._enabled_catalog()
+                    }
+                    if pinned_id not in enabled_ids:
+                        # Enabled but budget-excluded THIS window. Route elsewhere
+                        # for this turn only — do NOT unpin: the cap is temporary
+                        # and the pin must be honoured again once the window rolls
+                        # over. Unpinning here would turn one over-cap moment into
+                        # a permanent loss of the user's model choice.
+                        elog(
+                            "router.pin_budget_bypass",
+                            session_id=session_id,
+                            pinned_model=pinned_id,
+                            reason="over_budget",
+                        )
+                        pinned_id = None
             if pinned_id:
                 return RoutingDecision(
                     reason="session_pin",

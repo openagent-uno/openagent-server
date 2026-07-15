@@ -442,13 +442,42 @@ def _build_agent(config: dict) -> Agent:
     # ``src/core/compaction.py``'s ``_SUMMARY_MODEL_ENV``. A stale
     # ``learning_model`` key in an existing ``openagent.yaml`` is inert rather
     # than an error, the same way every other retired key degrades here.
-    # ``memory.semantic_search`` is no longer read. The subsystem it gated was
-    # an OpenAI-pinned embedding index whose only writer had zero callers, so
-    # it could never return a row on any deployment; ``search_past_conversations``
-    # is now FTS5 over ``sessions.runs`` (``src/memory/transcript_index.py``),
-    # needs no key and no provider, and has nothing to gate. Exporting a
-    # write-only env var is how the five ``OPENAGENT_SAFETY_*`` vars sat here
-    # for months describing protection that never fired — one is enough.
+    # ``memory.semantic_search`` (the OLD key) is still not read: the subsystem
+    # it gated was an OpenAI-pinned embedding index whose only writer had zero
+    # callers, so it could never return a row on any deployment. What replaces
+    # it is NOT that — it is a REBUILDABLE CACHE done right (§5/§17):
+    # ``src/memory/semantic_index.py`` embeds the vault + sessions through ANY
+    # OpenAI-compatible endpoint the operator NAMES (local Ollama by default,
+    # $0 and offline), degrades to nothing when unset, and is a cache beside the
+    # FTS caches, not a hidden store. These keys are all READ by that module and
+    # by the auto-recall hook (``core/agent.py``), so none is write-only.
+    #
+    # NOTE: these are exported into the PARENT ``os.environ`` and so reach the
+    # IN-PROCESS auto-recall hook. The memory-search MCP *subprocess* does not
+    # inherit them (the SDK spawns it with only get_default_environment() +
+    # PYTHONPATH); forwarding them to that spec is a one-line change in the
+    # pool/builtins layer, owned elsewhere — see semantic_recall's docstring.
+    if memory_cfg.get("embedding_model"):
+        os.environ["OPENAGENT_EMBEDDING_MODEL"] = str(memory_cfg["embedding_model"]).strip()
+    if memory_cfg.get("embedding_base_url"):
+        os.environ["OPENAGENT_EMBEDDING_BASE_URL"] = str(memory_cfg["embedding_base_url"]).strip()
+    if memory_cfg.get("embedding_api_key"):
+        os.environ["OPENAGENT_EMBEDDING_API_KEY"] = str(memory_cfg["embedding_api_key"]).strip()
+    _ar_cfg = (memory_cfg.get("auto_recall") or {})
+    if "enabled" in _ar_cfg:
+        os.environ["OPENAGENT_AUTO_RECALL_ENABLED"] = "1" if bool(_ar_cfg["enabled"]) else "0"
+    for _k, _env in (
+        ("min_score",   "OPENAGENT_AUTO_RECALL_MIN_SCORE"),
+        ("top_k",       "OPENAGENT_AUTO_RECALL_TOP_K"),
+        ("max_tokens",  "OPENAGENT_AUTO_RECALL_MAX_TOKENS"),
+        ("warm_budget", "OPENAGENT_AUTO_RECALL_WARM_BUDGET"),
+        ("timeout",     "OPENAGENT_AUTO_RECALL_TIMEOUT"),
+    ):
+        if _k in _ar_cfg:
+            try:
+                os.environ[_env] = str(_ar_cfg[_k])
+            except (TypeError, ValueError):
+                pass
     _cur_cfg = (memory_cfg.get("curator") or {})
     if "enabled" in _cur_cfg:
         os.environ["OPENAGENT_CURATOR_ENABLED"] = (
@@ -628,6 +657,22 @@ def _build_agent(config: dict) -> Agent:
             on_rate_limit=list(fallback_raw.get("on_rate_limit") or []),
             on_context_overflow=list(fallback_raw.get("on_context_overflow") or []),
         )
+
+    # ── budgets: per-scope spend caps (off by default) ──
+    # Hand the yaml ``budgets:`` list to the dispatcher's BudgetGuard, which
+    # seeds the rules additively (only-if-absent, so an app edit is never
+    # clobbered on reboot) and enforces them by excluding an over-cap scope from
+    # routing. With no ``budgets:`` block this hands over nothing and the guard
+    # stays inert — behaviour is byte-identical to a build without it. Rules are
+    # DB-backed and editable at runtime via ``/api/budgets`` + the
+    # ``budget-manager`` MCP; the yaml is just the boot-time floor, exactly like
+    # ``DEFAULT_MCPS``. Unlike the safety/scheduler stanzas this seeds a DB
+    # table rather than exporting an env var, because a spend cap must be
+    # editable from the app without a redeploy.
+    _set_budget_seed = getattr(model, "set_budget_seed", None)
+    if callable(_set_budget_seed):
+        budgets_cfg = config.get("budgets")
+        _set_budget_seed(budgets_cfg if isinstance(budgets_cfg, list) else None)
 
     return Agent(
         name=config.get("name", "openagent"),
@@ -902,6 +947,19 @@ class AgentServer:
 
         # 1. Agent (connects MCPs, opens DB)
         await self.agent.initialize()
+
+        # 1.1. Budget guard: seed any yaml ``budgets:`` rules and prime the
+        #      over-cap snapshot so the very first turn already routes around a
+        #      capped scope (the operator's $100 DeepSeek brake must be armed at
+        #      boot, not one turn late). Off by default: with no rules the guard
+        #      finds nothing and changes nothing. Never fatal — a budget must
+        #      never block the agent from coming up.
+        try:
+            _guard = getattr(getattr(self.agent, "model", None), "budget_guard", None)
+            if _guard is not None:
+                await _guard.warm()
+        except Exception as e:  # noqa: BLE001
+            elog("budget.warm_error", level="warning", error=str(e))
 
         # 1.5. Reap any ``workflow_runs`` still in ``running`` state —
         #      they're zombies from the prior process that we have no

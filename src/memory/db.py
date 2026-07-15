@@ -159,6 +159,81 @@ CREATE TABLE IF NOT EXISTS usage_log (
 CREATE INDEX IF NOT EXISTS idx_usage_year_month ON usage_log(year_month);
 CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON usage_log(timestamp);
 
+-- Budget rules — per-scope spend caps that the router enforces by EXCLUDING
+-- an over-cap scope from the enabled catalog for the rest of the window (it
+-- never hard-stops a turn; the agent keeps working on whatever stays enabled).
+-- First-class and editable everywhere the other automation objects are (yaml
+-- seed + REST ``/api/budgets`` + the ``budget-manager`` MCP), exactly like
+-- ``events`` / ``models`` / ``mcps``.
+--
+-- WHY A TABLE (not a yaml-only knob): the operator just put $100 of PAYG on
+-- DeepSeek, which is disabled precisely because nothing read a budget before a
+-- call. ``BudgetTracker`` only RECORDS cost to ``usage_log``; a dispatcher gate
+-- that would have stopped a runaway was removed with a yaml knob. A DB table is
+-- what makes a rule editable from the app at 3am without a redeploy — the same
+-- reason models/events/mcps are DB-backed and not config.
+--
+-- ``scope_kind`` + ``scope_value`` name what the rule meters, WITHOUT
+-- overloading one string (a provider literally named "global", or one whose
+-- name contains a colon, must not collide with a model runtime_id):
+--   ``global``   → ALL spend, every model/provider (``scope_value`` = '').
+--   ``provider`` → every model of a provider (``scope_value`` = provider name,
+--                  e.g. 'deepseek'; the spend query does ``model LIKE 'deepseek:%'``
+--                  since runtime_ids are ``provider:model``).
+--   ``model``    → one runtime_id (``scope_value`` = 'deepseek:deepseek-v4-pro').
+--   ``task``     → one scheduled task's whole run tree (``scope_value`` = task
+--                  name; ``session_id LIKE 'scheduler:<task>:%'``). A task is a
+--                  CALLER, not a routing target — excluding a model can't "stop
+--                  a task" — so ``task`` is REPORTED (usage view) but NOT
+--                  enforced by the router gate; its enforcement (scheduler skip
+--                  + mid-run cancel) is phase 2. Stored/validated now so that
+--                  arrives without a migration.
+-- The router gate acts only on ``scope_kind IN (global, provider, model)``.
+--
+-- ``metric``: ``cost_usd`` sums ``usage_log.cost``; ``tokens`` sums
+-- ``input_tokens + output_tokens``. Both exist because token costs differ per
+-- model (a token cap is model-agnostic where a dollar cap is not) AND because
+-- ``compute_cost`` logs 0 when OpenRouter pricing is unavailable — a token
+-- budget is the robust fallback when dollar pricing is uncertain.
+--
+-- ``window``: ``hour`` / ``day`` / ``month`` are calendar windows (boundaries
+-- computed in the agent's timezone, see ``src/core/budget_guard.py``).
+-- ``per_run`` has no calendar boundary and applies only to task/run enforcement
+-- (phase 2); like ``task`` it is accepted + stored now to avoid a later ALTER,
+-- but the router gate ignores it.
+--
+-- ``scope_value`` is NOT NULL DEFAULT '' (not NULL) so the UNIQUE below also
+-- pins one global rule per (metric, window) — SQLite treats NULLs as distinct,
+-- which would let two identical global caps coexist.
+--
+-- ``source`` mirrors the marketplace/mcps marker: 'yaml' rows are seeded
+-- additively and only-if-absent (see ``seed_budget``), so an operator who edits
+-- a rule in the app is never clobbered on the next boot; 'user'/'agent' rows
+-- come from REST / the MCP.
+CREATE TABLE IF NOT EXISTS budgets (
+    id                    TEXT PRIMARY KEY,
+    scope_kind            TEXT NOT NULL DEFAULT 'model'
+                              CHECK (scope_kind IN ('global','provider','model','task')),
+    scope_value           TEXT NOT NULL DEFAULT '',
+    metric                TEXT NOT NULL DEFAULT 'cost_usd'
+                              CHECK (metric IN ('cost_usd','tokens')),
+    window                TEXT NOT NULL DEFAULT 'day'
+                              CHECK (window IN ('hour','day','month','per_run')),
+    amount                REAL NOT NULL,
+    -- JSON array of fractions in (0,1) at which to emit a ``budget.alert``
+    -- event (the 1.0 cap event always fires and is implicit). Default [0.5,0.9].
+    alert_thresholds_json TEXT NOT NULL DEFAULT '[0.5,0.9]',
+    -- Optional outbound webhook fired once per threshold crossing (in addition
+    -- to the structured event the logs MCP already sees).
+    webhook_url           TEXT,
+    enabled               INTEGER NOT NULL DEFAULT 1,
+    source                TEXT NOT NULL DEFAULT 'user',
+    created_at            REAL NOT NULL,
+    updated_at            REAL NOT NULL,
+    UNIQUE(scope_kind, scope_value, metric, window)
+);
+CREATE INDEX IF NOT EXISTS idx_budgets_enabled ON budgets(enabled);
+
 -- Canonical session table — every chat conversation lives here.
 -- Sessions are written natively by the inlined ``SqliteDb`` (which
 -- creates this table on first use via its own ORM).
@@ -3084,6 +3159,218 @@ class MemoryDB:
             by_model[r["model"]] = round(r["total_cost"], 6)
             total += r["total_cost"]
         return {"total": round(total, 6), "by_model": by_model}
+
+    # ── Budgets ──
+    #
+    # CRUD mirrors the events accessors above. The enforcement gate lives in
+    # ``src/core/budget_guard.py``; this layer is pure storage + the windowed
+    # spend aggregation over ``usage_log`` that both the gate and the REST/MCP
+    # usage view read. Keep cost provenance single: spend is summed from the
+    # same ``usage_log.cost`` that ``BudgetTracker.compute_cost`` writes — there
+    # is no second cost path here.
+
+    # Values the router gate acts on. ``task`` / ``per_run`` are stored and
+    # reported but never enforced here (phase 2 — scheduler skip + mid-run
+    # cancel). Kept as literals, not imported, so the memory layer stays free
+    # of a dependency on the guard module.
+    _ENFORCED_SCOPE_KINDS = ("global", "provider", "model")
+    _ENFORCED_WINDOWS = ("hour", "day", "month")
+
+    @staticmethod
+    def _row_to_budget(row: aiosqlite.Row) -> dict:
+        """Hydrate a budget row: parse ``alert_thresholds_json`` into a list of
+        floats and coerce ``enabled`` to a real bool."""
+        d = dict(row)
+        raw = d.pop("alert_thresholds_json", None) or "[]"
+        try:
+            parsed = json.loads(raw)
+            d["alert_thresholds"] = [float(x) for x in parsed] if isinstance(parsed, list) else []
+        except (TypeError, ValueError):
+            d["alert_thresholds"] = []
+        d["enabled"] = bool(d.get("enabled"))
+        return d
+
+    async def add_budget(
+        self,
+        *,
+        scope_kind: str,
+        scope_value: str = "",
+        metric: str = "cost_usd",
+        window: str = "day",
+        amount: float,
+        alert_thresholds: list[float] | None = None,
+        webhook_url: str | None = None,
+        enabled: bool = True,
+        source: str = "user",
+    ) -> str:
+        """Insert a budget rule and return its id.
+
+        Raises ``sqlite3.IntegrityError`` on a duplicate
+        (scope_kind, scope_value, metric, window) — the REST layer maps that to
+        409. ``global`` normalises ``scope_value`` to '' so the UNIQUE holds.
+        """
+        conn = await self._ensure_connected()
+        budget_id = str(uuid.uuid4())
+        now = time.time()
+        sv = "" if scope_kind == "global" else (scope_value or "").strip()
+        thresholds = alert_thresholds if alert_thresholds is not None else [0.5, 0.9]
+        await conn.execute(
+            "INSERT INTO budgets "
+            "(id, scope_kind, scope_value, metric, window, amount, "
+            " alert_thresholds_json, webhook_url, enabled, source, "
+            " created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                budget_id, scope_kind, sv, metric, window, float(amount),
+                json.dumps([float(t) for t in thresholds]),
+                (webhook_url or "").strip() or None,
+                1 if enabled else 0, source, now, now,
+            ),
+        )
+        await conn.commit()
+        return budget_id
+
+    async def seed_budget(
+        self,
+        *,
+        scope_kind: str,
+        scope_value: str = "",
+        metric: str = "cost_usd",
+        window: str = "day",
+        amount: float,
+        alert_thresholds: list[float] | None = None,
+        webhook_url: str | None = None,
+        enabled: bool = True,
+    ) -> bool:
+        """Seed a yaml rule additively — INSERT only if no row already owns the
+        same (scope_kind, scope_value, metric, window). Returns True if a row was
+        inserted, False if one already existed (operator's edit preserved).
+
+        This is the reconcile contract, identical to ``ensure_builtin_mcps``:
+        yaml is a floor, never a clobber. An operator who tweaks the amount in
+        the app keeps that tweak across reboots; one who deletes a yaml-seeded
+        rule gets it back on the next boot (the rule is declared in config).
+        """
+        conn = await self._ensure_connected()
+        sv = "" if scope_kind == "global" else (scope_value or "").strip()
+        cursor = await conn.execute(
+            "SELECT 1 FROM budgets WHERE scope_kind = ? AND scope_value = ? "
+            "AND metric = ? AND window = ?",
+            (scope_kind, sv, metric, window),
+        )
+        if await cursor.fetchone() is not None:
+            return False
+        await self.add_budget(
+            scope_kind=scope_kind, scope_value=sv, metric=metric, window=window,
+            amount=amount, alert_thresholds=alert_thresholds,
+            webhook_url=webhook_url, enabled=enabled, source="yaml",
+        )
+        return True
+
+    async def list_budgets(self, *, enabled_only: bool = False) -> list[dict]:
+        conn = await self._ensure_connected()
+        if enabled_only:
+            cursor = await conn.execute(
+                "SELECT * FROM budgets WHERE enabled = 1 ORDER BY created_at ASC"
+            )
+        else:
+            cursor = await conn.execute("SELECT * FROM budgets ORDER BY created_at ASC")
+        return [self._row_to_budget(r) for r in await cursor.fetchall()]
+
+    async def get_budget(self, budget_id: str) -> dict | None:
+        conn = await self._ensure_connected()
+        cursor = await conn.execute("SELECT * FROM budgets WHERE id = ?", (budget_id,))
+        row = await cursor.fetchone()
+        return self._row_to_budget(row) if row else None
+
+    async def update_budget(self, budget_id: str, **kwargs: Any) -> None:
+        conn = await self._ensure_connected()
+        allowed = {
+            "scope_kind", "scope_value", "metric", "window", "amount",
+            "webhook_url", "enabled",
+        }
+        updates: dict[str, Any] = {}
+        for k, v in kwargs.items():
+            if k not in allowed:
+                continue
+            if k == "enabled":
+                v = 1 if v else 0
+            if k == "amount":
+                v = float(v)
+            if k == "webhook_url":
+                v = (str(v).strip() if v is not None else "") or None
+            updates[k] = v
+        if "alert_thresholds" in kwargs and kwargs["alert_thresholds"] is not None:
+            updates["alert_thresholds_json"] = json.dumps(
+                [float(t) for t in kwargs["alert_thresholds"]]
+            )
+        # Keep the global invariant: '' for a global scope so the UNIQUE holds.
+        if updates.get("scope_kind") == "global":
+            updates["scope_value"] = ""
+        if not updates:
+            return
+        updates["updated_at"] = time.time()
+        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        await conn.execute(
+            f"UPDATE budgets SET {set_clause} WHERE id = ?",
+            list(updates.values()) + [budget_id],
+        )
+        await conn.commit()
+
+    async def delete_budget(self, budget_id: str) -> None:
+        conn = await self._ensure_connected()
+        await conn.execute("DELETE FROM budgets WHERE id = ?", (budget_id,))
+        await conn.commit()
+
+    async def get_scope_spend(
+        self,
+        *,
+        scope_kind: str,
+        scope_value: str,
+        metric: str,
+        since_epoch: float,
+    ) -> float:
+        """Sum spend for one budget scope since ``since_epoch`` (inclusive).
+
+        The window boundary is computed by the caller in the agent's timezone
+        (``budget_guard.window_start_epoch``) and passed as an epoch, so this
+        stays a pure aggregation and the timezone logic has one home.
+
+        - ``metric='cost_usd'`` sums ``cost``; ``metric='tokens'`` sums
+          ``input_tokens + output_tokens``.
+        - Scope filter:
+            global   → no model/session filter (the whole window).
+            provider → ``model LIKE '<value>:%'`` (runtime_ids are provider:model).
+            model    → ``model = '<value>'``.
+            task     → ``session_id LIKE 'scheduler:<value>:%'`` (a task run tree;
+                       sub-agent child sessions namespace UNDER the parent, so a
+                       prefix match captures the whole tree). Reporting only.
+        """
+        conn = await self._ensure_connected()
+        metric_expr = (
+            "COALESCE(SUM(input_tokens + output_tokens), 0)"
+            if metric == "tokens"
+            else "COALESCE(SUM(cost), 0)"
+        )
+        params: list[Any] = [since_epoch]
+        if scope_kind == "global":
+            scope_clause = ""
+        elif scope_kind == "provider":
+            scope_clause = " AND model LIKE ?"
+            params.append(f"{scope_value}:%")
+        elif scope_kind == "task":
+            scope_clause = " AND session_id LIKE ?"
+            params.append(f"scheduler:{scope_value}:%")
+        else:  # model
+            scope_clause = " AND model = ?"
+            params.append(scope_value)
+        cursor = await conn.execute(
+            f"SELECT {metric_expr} FROM usage_log "
+            f"WHERE timestamp >= ?{scope_clause}",
+            params,
+        )
+        row = await cursor.fetchone()
+        return float(row[0]) if row and row[0] is not None else 0.0
 
     # ── Session store (sessions) ──
     #

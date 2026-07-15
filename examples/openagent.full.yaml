@@ -209,6 +209,65 @@ model:
   # Omit the key to leave thinking off everywhere.
   extended_thinking_tokens: 0            # e.g. 4096; 0 / unset = off
 
+# ── Budgets ─────────────────────────────────────────────────────────
+# Per-scope spend caps, so a metered API (DeepSeek's pay-as-you-go, an OpenAI
+# key) can't run away with your balance. At the cap the scope is EXCLUDED FROM
+# ROUTING — that model quietly drops out of the enabled catalog for the rest of
+# the window and the agent keeps working on whatever stays enabled (Claude via a
+# subscription proxy is $0 marginal cost). The bot never stops; it stops
+# *spending on that model*. The exclusion lifts automatically when the window
+# rolls over. It NEVER leaves you with zero enabled models — if a cap would take
+# the agent fully offline it is not enforced, and that is logged.
+#
+# OFF BY DEFAULT: omit this whole block and nothing changes. Rules seeded here
+# are a floor, imported additively on boot; editing a rule in the app (Budgets
+# screen), over ``PUT /api/budgets``, or via the ``budget-manager`` MCP is NOT
+# clobbered on the next boot. Deleting a yaml-seeded rule brings it back next
+# boot (it is declared here) — remove it from yaml to retire it for good.
+#
+# Each rule:
+#   scope_kind: global | provider | model | task
+#   scope:      provider name ('deepseek'), a model runtime_id
+#               ('deepseek:deepseek-v4-pro'), or the task name (scope_kind:task).
+#               Omit for scope_kind: global. (Inferred when scope_kind is left
+#               out: a colon → model, empty → global, otherwise provider.)
+#   metric:     cost_usd (dollars) | tokens (input+output). Use tokens when
+#               dollar pricing is uncertain — a token cap is model-agnostic.
+#   window:     hour | day | month  (calendar windows in scheduler.timezone)
+#   amount:     the cap (dollars or tokens per the metric)
+#   alert_thresholds: fractions to alert at, default [0.5, 0.9]; 100% always
+#               alerts. Each crossing emits a ``budget.alert`` event (the logs
+#               MCP sees it) once per threshold per window.
+#   webhook_url: optional URL POSTed on each threshold crossing.
+#   enabled:    true/false
+#
+# NOTE: scope_kind 'task' and window 'per_run' are accepted and REPORTED in the
+# usage view but not yet enforced by the router (task/run enforcement is a
+# separate, planned hook — a task is a caller, not a routing target).
+budgets:
+  # The operator's first concrete rule: DeepSeek, $10/day, alert at 50% and 90%,
+  # excluded at 100% for the rest of the day.
+  - scope_kind: provider
+    scope: deepseek
+    metric: cost_usd
+    window: day
+    amount: 10.00
+    alert_thresholds: [0.5, 0.9]
+    enabled: true
+  # Examples of the other levels (leave commented unless you want them):
+  # - scope_kind: global          # a total daily token ceiling across all models
+  #   metric: tokens
+  #   window: day
+  #   amount: 5000000
+  #   enabled: true
+  # - scope_kind: model           # cap one specific model in dollars per month
+  #   scope: openai:gpt-4o
+  #   metric: cost_usd
+  #   window: month
+  #   amount: 50.00
+  #   webhook_url: https://hooks.example.com/budget
+  #   enabled: true
+
 # ── Memory & learning ───────────────────────────────────────────────
 # Every subsection is independent.
 #
@@ -239,6 +298,37 @@ memory:
 
   semantic_search:
     enabled: false                      # embed conversation turns for similarity recall (needs an OpenAI key)
+
+  # Semantic recall (meaning-based memory over vault notes + past sessions).
+  # Keyword search matches WORDS: "launch deadline" can't find "the ship date
+  # we agreed", so the agent answers "no record" while the note exists. This
+  # layer closes that gap with embeddings. OFF by default and fully inert until
+  # ``embedding_model`` is set — an unset config is byte-identical to the
+  # keyword-only behaviour that shipped before.
+  #
+  # The index is a REBUILDABLE CACHE (its own SQLite file, keyed to the DB);
+  # the Markdown vault stays the single source of truth. Provider-agnostic:
+  # any OpenAI-compatible /embeddings endpoint (§17). The recommended default
+  # is LOCAL — $0, private, offline — via Ollama:
+  #   embedding_model: local:nomic-embed-text
+  #   embedding_base_url: http://localhost:11434/v1   # (ollama pull nomic-embed-text)
+  # Hosted alternative: openai:text-embedding-3-small with the key below or on
+  # the openai provider row.
+  # embedding_model: local:nomic-embed-text   # "<provider>:<model>"; unset => layer inert
+  # embedding_base_url: http://localhost:11434/v1  # the ONLY channel that reaches the memory-search subprocess
+  # embedding_api_key: ""                     # optional; a local server needs none
+
+  # Automatic recall: before each turn, silently retrieve the top matches and
+  # inject a bounded, VERIFY-FRAMED reminder (never asserted as fact — the agent
+  # is told to confirm with vault_read_note). Prepended to the USER message, so
+  # it never busts the cached system prefix. Needs ``embedding_model`` set.
+  auto_recall:
+    enabled: false                      # inject matches into the turn automatically
+    min_score: 0.75                     # similarity floor; a weak match injects nothing (model-specific — tune it)
+    top_k: 3                            # max hits injected
+    max_tokens: 400                     # hard char cap on the injected block (chars ≈ tokens×4)
+    warm_budget: 128                    # max notes/sessions embedded per background sync pass
+    timeout: 4                          # seconds; a slow/unreachable endpoint degrades to no injection, never blocks the turn
 
   # Code-enforced quality gate over the Markdown vault: atomic notes,
   # complete frontmatter, dense real wikilinks, no orphans/broken links,

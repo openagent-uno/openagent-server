@@ -356,6 +356,18 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
             "service (or a peer) calls it"
         ),
     },
+    "budget-manager": {
+        "dir": "budget_manager",
+        "command": ["python", "-m", "src.mcp.servers.budget_manager.server"],
+        "python": True,
+        "description": (
+            "inspect and adjust your own spend caps — list budgets, read "
+            "current spend vs limit (before doing expensive work), and "
+            "create/update/remove a per-model, per-provider, or global "
+            "dollar/token cap over an hour/day/month window. A tripped cap "
+            "routes you AROUND that model, it never stops you"
+        ),
+    },
     "media-gen": {
         "dir": "media_gen",
         "command": ["python", "-m", "src.mcp.servers.media_gen.server"],
@@ -450,6 +462,12 @@ DEFAULT_MCPS: list[dict[str, Any]] = [
     {"builtin": "model-manager", "_default": True},
     {"builtin": "workflow-manager", "_default": True},
     {"builtin": "events-manager", "_default": True},
+    # On by default: a spend cap the agent can't see is one it can't reason
+    # about. In-line with §15 (the agent knows its own levers) and free until
+    # used — one more Python subprocess of the same kind as the others, and
+    # tool schemas are deferred so it costs 0 prompt tokens until the agent
+    # queries its budget.
+    {"builtin": "budget-manager", "_default": True},
     {"builtin": "delegation", "_default": True},
     {"builtin": "agent-federation", "_default": True},
 ]
@@ -680,7 +698,7 @@ def resolve_default_entry(entry: dict[str, Any], db_path: str | None = None) -> 
         # encryption file that sits next to the DB.
         if entry["builtin"] in (
             "scheduler", "mcp-manager", "model-manager", "workflow-manager",
-            "events-manager",
+            "events-manager", "budget-manager", "memory-search",
         ):
             if db_path:
                 extra_env["OPENAGENT_DB_PATH"] = os.path.abspath(db_path)
@@ -692,10 +710,28 @@ def resolve_default_entry(entry: dict[str, Any], db_path: str | None = None) -> 
         # The vault MCP needs to know which folder is the vault. It reads
         # OPENAGENT_VAULT_PATH (server.ts), so the subprocess lands on the
         # same notes directory as the rest of OpenAgent instead of its CWD.
-        if entry["builtin"] == "vault" and "OPENAGENT_VAULT_PATH" not in extra_env:
+        # memory-search reads the same folder for its semantic index over
+        # notes, so it gets OPENAGENT_VAULT_PATH too.
+        if entry["builtin"] in ("vault", "memory-search") and "OPENAGENT_VAULT_PATH" not in extra_env:
             from src.core.paths import default_vault_path
 
             extra_env["OPENAGENT_VAULT_PATH"] = str(default_vault_path())
+
+        # memory-search's semantic_recall tool builds an embedder from the
+        # providers config the operator named (OPENAGENT_EMBEDDING_MODEL, etc.).
+        # The MCP SDK spawns the subprocess with a minimal env, so these do NOT
+        # inherit automatically — forward them when the operator set them.
+        # Unset upstream => nothing forwarded => the tool degrades to inert and
+        # reports {active:false} rather than half-working. See semantic_index.py.
+        if entry["builtin"] == "memory-search":
+            for _var in (
+                "OPENAGENT_EMBEDDING_MODEL",
+                "OPENAGENT_EMBEDDING_BASE_URL",
+                "OPENAGENT_EMBEDDING_API_KEY",
+            ):
+                _val = os.environ.get(_var)
+                if _val and _var not in extra_env:
+                    extra_env[_var] = _val
 
         try:
             return resolve_builtin_entry(entry["builtin"], env=extra_env or None)

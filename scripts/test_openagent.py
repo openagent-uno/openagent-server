@@ -68,6 +68,12 @@ _TEST_MODULES: tuple[str, ...] = (
     # predecessor never could), and that purge / compaction rewrites do not
     # resurface. Pure-unit — temp DBs, real MemoryDB, no pool/gateway.
     "test_transcript_index",
+    # Semantic recall: the embedding-cache index (Layer A) over vault + sessions
+    # and the auto-recall hook (Layer B). Proves off-by-default, inert-without-
+    # a-model, semantic-beats-keyword on a paraphrase, thresholded injection,
+    # cache-safety, and purge propagation. Deterministic fake embedder — no
+    # network. Pure-unit; sits by test_transcript_index (its keyword sibling).
+    "test_semantic_recall",
     "test_delegation_depth",
     "test_stream_usage",
     # Vault recall attribution (note → run → outcome). Drives the REAL
@@ -236,6 +242,12 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_router",
     "test_mcp",
     "test_budget",
+    # Budget enforcement gate — the sync ``_enabled_catalog`` filter fed by the
+    # async-refreshed BudgetGuard snapshot. Pure-unit: throwaway DB + the REAL
+    # ModelDispatcher; drives the junction (entry resolution routes around a
+    # blocked scope), never-empty, window rollover, alert de-dupe, usage view,
+    # and yaml seed reconcile.
+    "test_budget_guard",
     # 4. Gateway — sets ctx.extras["gateway_port"]/gateway/agent
     "test_gateway",
     # 5. HTTP surface + WS + files/images (need gateway)

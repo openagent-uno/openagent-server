@@ -441,6 +441,15 @@ Preferred retrieval paths:
   folded away by compaction. An empty result means THOSE WORDS are
   absent, not that the topic is; check the ``index`` field in the reply
   and never report a miss to the user as "we never discussed it".
+- ``semantic_recall`` (the ``memory-search`` MCP) is the MEANING-based
+  complement: it ranks notes AND past sessions by embedding similarity,
+  so it can find "the ship date we agreed" from "launch deadline" when
+  keyword search cannot. Reach for it when your natural wording differs
+  from how a note was written; keep ``vault_search`` /
+  ``search_past_conversations`` as the first stop for exact terms and
+  body facts (keyword wins there, semantic wins on paraphrase — use
+  both). It needs an embedding model configured; when none is, it says
+  so and you fall back to keyword recall, which always works.
 - To diagnose your OWN behaviour ("what went wrong yesterday?", "why
   did that task fail?", "what is slow?"), use the ``logs`` MCP over the
   unified event log rather than hand-rolling SQL.

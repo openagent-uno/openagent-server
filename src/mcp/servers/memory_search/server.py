@@ -58,12 +58,60 @@ _MAX_RESULT_CHARS = 12_000
 _index: Any = None
 _index_lock: Optional[asyncio.Lock] = None
 
+# Semantic index singleton (separate from the FTS transcript index above). Built
+# on first ``semantic_recall`` call, INERT when no embedding model is resolved.
+_sem_index: Any = None
+_sem_lock: Optional[asyncio.Lock] = None
+
 
 def _db_path() -> str:
     """Resolve the agent DB path the way every other in-tree MCP subprocess
     does — env var first (injected by ``MCPPool`` at spawn), then a relative
     fallback so the module still runs when invoked directly."""
     return os.environ.get("OPENAGENT_DB_PATH", "./openagent.db")
+
+
+def _vault_path() -> Optional[str]:
+    """Resolve the vault root the semantic index should embed notes from.
+    ``OPENAGENT_VAULT_PATH`` (set by the parent for the vault MCP) first, then
+    the packaged default. Returns ``None`` only if resolution raises — the
+    index then covers sessions alone."""
+    override = os.environ.get("OPENAGENT_VAULT_PATH")
+    if override:
+        return override
+    try:
+        from src.core.paths import default_vault_path
+        return str(default_vault_path())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _get_semantic_index() -> Any:
+    """Lazily open the semantic index, resolving the embedder from env.
+
+    NOTE ON PLUMBING (reported to the maintainer): a Python MCP subprocess does
+    NOT inherit arbitrary ``OPENAGENT_*`` env from the parent — the SDK spawns
+    it with ``get_default_environment()`` + only the spec's env (PYTHONPATH). So
+    ``OPENAGENT_EMBEDDING_MODEL`` reaches this process ONLY if the memory-search
+    spec forwards it (a one-line change in ``mcp/builtins.py`` /
+    ``mcp/pool.py``, which are owned elsewhere). Until then this tool resolves
+    to INERT here and returns a clear "not configured" reply — the in-process
+    auto-recall hook (``core/agent.py``) is the fully-wired path today.
+    """
+    global _sem_index, _sem_lock
+    if _sem_lock is None:
+        _sem_lock = asyncio.Lock()
+    async with _sem_lock:
+        if _sem_index is None:
+            from src.memory.semantic_index import SemanticIndex, resolve_embedder
+
+            embedder = resolve_embedder()  # subprocess: env-only, no providers_config
+            override = os.environ.get("OPENAGENT_SEMANTIC_INDEX_PATH") or None
+            _sem_index = await asyncio.to_thread(
+                SemanticIndex, _db_path(),
+                vault_root=_vault_path(), index_path=override, embedder=embedder,
+            )
+        return _sem_index
 
 
 async def _get_index() -> Any:
@@ -216,6 +264,80 @@ async def search_past_conversations(
     if hints:
         out["hint"] = " ".join(hints)
     return out
+
+
+@mcp.tool()
+async def semantic_recall(
+    query: str,
+    scope: str = "all",
+    limit: int = _DEFAULT_LIMIT,
+) -> dict[str, Any]:
+    """Semantic (meaning-based) recall over your notes AND past sessions.
+
+    The COMPLEMENT to keyword search, not a replacement. ``search_past_conversations``
+    and ``vault_search`` match WORDS — great for exact terms, body facts and
+    known phrasings. This matches MEANING — great for natural-language questions
+    where the wording differs from the note: "has this customer complained
+    before?" finds a note titled "Acme — refund dispute" that shares no words
+    with the query. Measured: keyword wins for exact-term/body-fact queries,
+    semantic wins for paraphrased/natural-language ones — so reach for BOTH and
+    prefer keyword first for an exact term.
+
+    Ranks by cosine similarity of embeddings. Requires an embedding model
+    (``OPENAGENT_EMBEDDING_MODEL``, e.g. a local ``local:nomic-embed-text`` on
+    Ollama). WITHOUT one this returns ``{ok: false, active: false}`` and you
+    should fall back to ``search_past_conversations`` / ``vault_search`` — a
+    self-hosted agent with no embedder still has full keyword recall.
+
+    Args:
+        query: A natural-language description of what you're looking for.
+        scope: ``"all"`` (default), ``"vault"`` (notes only), or
+            ``"sessions"`` (past conversations only).
+        limit: Max hits (default 5, hard cap 25).
+
+    Returns ``{ok, active, hits, index}``. Each hit is ``{kind, score, …}`` —
+    ``kind: "note"`` carries ``path``/``title``; ``kind: "session"`` carries
+    ``session_id``/``title``. ``score`` is cosine similarity (0..1); a low score
+    is a weak lead to VERIFY, not a fact. An empty ``hits`` over an ``active``
+    index with warming complete means no note or session is semantically close —
+    not that the topic was never discussed; check ``vault_search`` too.
+    """
+    if not query or not query.strip():
+        return {"ok": False, "hits": [], "hint": "empty query"}
+    if scope not in ("all", "vault", "sessions"):
+        scope = "all"
+    n_limit = _clamp(limit, _DEFAULT_LIMIT, 1, _MAX_LIMIT)
+
+    try:
+        index = await _get_semantic_index()
+        if not index.active:
+            return {
+                "ok": False,
+                "active": False,
+                "hits": [],
+                "hint": (
+                    "No embedding model configured for semantic recall "
+                    "(OPENAGENT_EMBEDDING_MODEL is unset, or not forwarded to "
+                    "this MCP subprocess). Use search_past_conversations or "
+                    "vault_search — keyword recall is always available."
+                ),
+            }
+        # Warm bounded, then search. Both legs off the event loop.
+        await asyncio.to_thread(index.sync)
+        hits = await asyncio.to_thread(
+            index.search, query, scope=scope, limit=n_limit, min_score=0.0)
+        totals = await asyncio.to_thread(index.stats)
+    except Exception as e:  # noqa: BLE001 — a recall miss must not fail a turn
+        logger.exception("semantic_recall failed")
+        return {"ok": False, "hits": [], "hint": f"error: {e}"}
+
+    return {
+        "ok": True,
+        "active": True,
+        "hits": hits,
+        "index": {"notes": totals["notes"], "sessions": totals["sessions"],
+                  "model": totals["model"]},
+    }
 
 
 def main() -> None:

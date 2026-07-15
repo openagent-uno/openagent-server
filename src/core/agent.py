@@ -6,6 +6,8 @@ import asyncio
 import importlib
 import inspect
 import logging
+import os
+import threading
 from typing import Any, AsyncIterator, Callable, Awaitable
 
 from src.models.base import BaseModel, ModelResponse
@@ -409,6 +411,199 @@ async def _with_vault_reminder(db: Any, session_id: str | None, text: str) -> st
         )
         return text
     return f"{reminder}\n\n{text}" if reminder else text
+
+
+# ── Auto-recall: semantic memory surfaced before a turn ───────────────
+#
+# This is Layer B — "recall automatici". Before a turn we run a cheap semantic
+# search (``src/memory/semantic_index.py``) over the user's message and surface
+# the top hits so the agent sees possibly-relevant notes/sessions it would
+# otherwise have to think to go look for. It is also the single most dangerous
+# change in this area, so it is built SAFE, not naive:
+#
+#   * OFF BY DEFAULT and INERT WITHOUT AN EMBEDDING MODEL. With no
+#     ``OPENAGENT_EMBEDDING_MODEL`` the embedder resolves to ``None`` and this
+#     returns the turn text byte-identical — retrieval falls back to FTS,
+#     exactly as before the semantic layer existed (§17).
+#   * THRESHOLDED. Only hits at/above ``min_score`` are surfaced; a weak match
+#     injects NOTHING. The real eSound vault has ~1,167 orphans and unreconciled
+#     contradictions — blindly injecting a stale note every turn would make the
+#     agent answer confidently wrong, the exact hallucination this is meant to
+#     PREVENT. A floor is what keeps noise out.
+#   * FRAMED, NOT ASSERTED. The block is a ``<system-reminder>`` that says these
+#     are UNVERIFIED leads to CHECK against current state, never established
+#     fact. Sibling of ``_with_vault_reminder``; same wrapper, same rationale.
+#   * BOUNDED. Top-K small and a hard char cap, because this fires on EVERY turn
+#     including every sub-agent and cron firing (§15), so its cost multiplies.
+#   * CACHE-SAFE. Prepended to the USER-MESSAGE path (like the vault reminder),
+#     NEVER to the cached system prefix. Per-turn content in the ~10.8k-token
+#     cached prefix busts the cache every turn — the exact regression the
+#     ``<session-id>`` split in ``_combined_system_prompt`` guards against.
+#   * NEVER RAISES and is TIME-BOXED. It embeds the query (one network call) off
+#     the event loop under a timeout; a slow/unreachable endpoint degrades to
+#     "inject nothing", never to a stalled or failed turn.
+#
+# Outcome-weighting (prefer notes that preceded good runs, via
+# ``vault_recall_stats``) is DEFERRED — see ``_recall_block``. For now recency
+# is the tie-breaker the search already applies through ``updated``.
+
+# One SemanticIndex per source DB, shared across agent instances (same db = same
+# cache file). Built lazily on first recall; the inert (no-embedder) case is
+# NOT cached, so enabling a model later — a restart, like a provider key —
+# takes effect without stale state.
+_RECALL_INDEX_CACHE: dict[str, Any] = {}
+_RECALL_INDEX_LOCK = threading.Lock()
+
+
+def _recall_enabled() -> bool:
+    return (
+        os.environ.get("OPENAGENT_AUTO_RECALL_ENABLED", "0").strip().lower()
+        in ("1", "true", "yes", "on")
+    )
+
+
+def _recall_float(name: str, default: float) -> float:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _recall_int(name: str, default: int) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _get_recall_index(agent: Any) -> Any:
+    """Return the shared :class:`SemanticIndex` for this agent's DB, or ``None``
+    when the semantic layer is inert (no embedding model resolved)."""
+    db = getattr(agent, "_db", None)
+    db_path = getattr(db, "db_path", None)
+    if not db_path:
+        return None
+    db_path = str(db_path)
+    with _RECALL_INDEX_LOCK:
+        cached = _RECALL_INDEX_CACHE.get(db_path)
+        if cached is not None:
+            return cached
+        try:
+            from src.memory.semantic_index import SemanticIndex, resolve_embedder
+        except Exception:  # noqa: BLE001 — numpy/module issue must not break turns
+            return None
+        embedder = resolve_embedder(getattr(agent, "_providers_config", None))
+        if embedder is None:
+            return None  # inert; not cached so a later config takes effect
+        try:
+            vault_root = agent._resolve_vault_path()
+        except Exception:  # noqa: BLE001
+            vault_root = None
+        try:
+            idx = SemanticIndex(db_path, vault_root=vault_root, embedder=embedder)
+        except Exception as exc:  # noqa: BLE001
+            elog("auto_recall.index_open_error", level="warning",
+                 error=str(exc) or type(exc).__name__)
+            return None
+        _RECALL_INDEX_CACHE[db_path] = idx
+        return idx
+
+
+def _format_recall_block(hits: list[dict], max_chars: int) -> str:
+    """Render recall hits as a verify-framed ``<system-reminder>`` block.
+
+    The FRAMING is the safety property, not decoration: a note surfaced as fact
+    that turns out stale is a confident hallucination. So the block says plainly
+    that these are unverified leads to check, and how to check them.
+    """
+    header = (
+        "Possibly-relevant memory (semantic match on the user's message). "
+        "These are UNVERIFIED and may be stale, superseded, or contradicted — "
+        "treat each as a LEAD to check against current state before relying on "
+        "it (read the note with vault_read_note, or open the session), never as "
+        "established fact. If none is actually relevant, ignore this block."
+    )
+    lines = [header]
+    for h in hits:
+        score = h.get("score")
+        if h.get("kind") == "note":
+            label = f"note `{h.get('path', '')}`"
+            upd = h.get("updated")
+            if upd:
+                label += f" (updated {upd})"
+        else:
+            title = h.get("title") or "untitled"
+            label = f"past session `{h.get('session_id', '')}` — {title}"
+        lines.append(f"- {label}  [similarity {score}]")
+    body = "\n".join(lines)
+    if len(body) > max_chars:
+        body = body[:max_chars].rstrip() + " …"
+    return f"<system-reminder>\n{body}\n</system-reminder>"
+
+
+def _recall_block(agent: Any, query: str) -> str:
+    """Sync worker (runs off the event loop): warm, search, format. Returns the
+    ``<system-reminder>`` string, or ``""`` when nothing clears the threshold.
+
+    Outcome-weighting via ``vault_recall_stats`` is deferred here: the honest
+    tie-breaker today is recency (the index carries each note's ``updated``),
+    and the threshold is what does the real quality-gating. Wiring the recall
+    ledger in — prefer notes with a good measured ok_rate — is the follow-up.
+    """
+    idx = _get_recall_index(agent)
+    if idx is None or not idx.active:
+        return ""
+    # Warm a bounded number of changed items so a cold index becomes useful over
+    # the first few turns without ever firing an unbounded burst of embedding
+    # calls on the turn path. Steady state (nothing changed) embeds only the
+    # query below — one call per turn. 0 disables warming (query-only).
+    warm = _recall_int("OPENAGENT_AUTO_RECALL_WARM_BUDGET", 24)
+    if warm > 0:
+        try:
+            idx.sync(max_items=warm)
+        except Exception:  # noqa: BLE001 — a warm failure must not block recall
+            pass
+    k = max(1, _recall_int("OPENAGENT_AUTO_RECALL_TOP_K", 3))
+    floor = _recall_float("OPENAGENT_AUTO_RECALL_MIN_SCORE", 0.75)
+    hits = idx.search(query, scope="all", limit=k, min_score=floor)
+    if not hits:
+        return ""
+    max_chars = max(200, _recall_int("OPENAGENT_AUTO_RECALL_MAX_TOKENS", 400) * 4)
+    return _format_recall_block(hits, max_chars)
+
+
+async def _with_recall(agent: Any, session_id: str | None, query: str,
+                       text: str) -> str:
+    """Prepend a semantic-recall ``<system-reminder>`` to a turn's input.
+
+    Sibling of :func:`_with_vault_reminder`, hooked on the same shared run path
+    so chat, delegation, the scheduler and workflow AI blocks all get it (§15).
+    ``query`` is the RAW user message (what to embed); ``text`` is what to
+    prepend to (already carrying the vault reminder). Cache-safe: the result is
+    the user-message string, never the system prompt.
+
+    Never raises, and time-boxed: the embed + brute-force cosine run off the
+    event loop under ``OPENAGENT_AUTO_RECALL_TIMEOUT`` seconds. A miss, an error,
+    or a slow endpoint all degrade to returning ``text`` unchanged.
+    """
+    if not _recall_enabled() or not query or not query.strip():
+        return text
+    try:
+        timeout = _recall_float("OPENAGENT_AUTO_RECALL_TIMEOUT", 4.0)
+        block = await asyncio.wait_for(
+            asyncio.to_thread(_recall_block, agent, query), timeout=timeout)
+    except Exception as exc:  # noqa: BLE001 — recall must never fail a turn
+        elog("auto_recall.hook_error", level="warning",
+             session_id=session_id, error_type=type(exc).__name__,
+             error=str(exc) or repr(exc))
+        return text
+    return f"{block}\n\n{text}" if block else text
 
 
 # Status callback type: async def on_status(status: str) -> None
@@ -1185,6 +1380,10 @@ class Agent:
         # re-entries below reassign ``current_input``, so a long tool-driven
         # turn doesn't re-pay the nudge on every iteration.
         current_input = await _with_vault_reminder(self._db, session_id, message)
+        # Semantic auto-recall, on the same user-message path (cache-safe).
+        # ``message`` (not ``current_input``) is embedded so the recall query is
+        # the user's actual words, not the reminder prose wrapped around them.
+        current_input = await _with_recall(self, session_id, message, current_input)
         last_response = None
         iter_count = 0
 
@@ -1479,6 +1678,7 @@ class Agent:
 
         # Streaming twin of the reminder hook in ``_run_inner`` — see there.
         current_input = await _with_vault_reminder(self._db, session_id, message)
+        current_input = await _with_recall(self, session_id, message, current_input)
         accumulated: list[str] = []
         iter_count = 0
 
