@@ -209,6 +209,11 @@ _TEST_MODULES: tuple[str, ...] = (
     # MCP marketplace — pure schema-mapping unit tests, plus one REST
     # shape check that skips when no gateway fixture is wired.
     "test_marketplace",
+    # ``mcps.install_policy`` driven through its real callsites (mcp-manager
+    # against a temp DB + the marketplace install handler with a pre-warmed
+    # cache, so no network). Sits next to test_marketplace because it pins the
+    # other half of that endpoint's contract. Pure-unit; restores its own env.
+    "test_mcp_install_policy",
     # Catalog tool-key inlining (pure renderer — no pool/network needed).
     "test_catalog_inline",
     # Dry-run meta propagation (ContextVar scope + MCP call-site stamping).
@@ -308,6 +313,12 @@ _TEST_MODULES: tuple[str, ...] = (
     # asserts the per-workflow lock keeps SAME-workflow runs ordered.
     "test_workflow_parallel_execution",
     "test_dream",
+    # There is exactly ONE dream mode: the scheduled task. Pins the deletion
+    # of the parallel 12-hourly vault-maintenance loop — the module stays
+    # gone, its retired config keys stay inert-not-fatal, and they never come
+    # back as write-only env vars. Pure-unit; sits next to test_dream because
+    # it is the other half of that prompt's contract.
+    "test_dream_consolidation",
     "test_dream_surfacing",
     "test_updater",
     "test_update_guard",
@@ -400,6 +411,11 @@ _TEST_MODULES: tuple[str, ...] = (
     # The safety.approvals blocklist, driven through the shell_exec callsite.
     # Runs right after test_shell since it shares the ShellHub fixture reset.
     "test_safety",
+    # ``network.peers`` allowlist + scope, driven through the real auth
+    # middleware with the agent-ALPN contextvar set. Same family as
+    # test_safety: a security gate asserted at its callsite, never in
+    # isolation. Pure-unit (mocked request, no iroh); restores its own env.
+    "test_peer_policy",
     # 9. Gateway /stop, /clear, /new command semantics
     "test_gateway_commands",
     # SessionManager must run sessions in parallel on one client
@@ -447,6 +463,12 @@ _TEST_MODULES: tuple[str, ...] = (
     #     over throwaway temp vaults, like the two above; weighted toward false
     #     positives, because dream mode holds delete_note.
     "test_vault_contradiction",
+    # Vault TWINS — the quality system is enforced twice, in two languages
+    #     (Python gate/service + the vendored Node vault MCP's validate.ts),
+    #     and the copies drifted twice. Pins the write scope (one declaration,
+    #     rendered into scope.generated.ts) and runs a 20-fixture boundary
+    #     corpus through BOTH write gates. Skips without node/tsx.
+    "test_vault_twins",
 )
 
 

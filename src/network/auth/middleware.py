@@ -31,6 +31,7 @@ from src.network.auth.device_cert import (
     DeviceCert,
     verify_cert,
 )
+from src.network.auth.peer_policy import check_peer_request
 from src.network.transport.aiohttp_iroh_site import (
     current_device_cert_wire,
     current_is_authenticated_agent,
@@ -128,9 +129,31 @@ def make_auth_middleware(state: NetworkAuthState):
             peer_id = current_peer_node_id() or "unknown-agent"
             # Phase-0 security: record every first-contact agent node_id so the
             # allowlist can be built/audited and unexpected dialers spotted.
-            # (Enforcement is a documented opt-in fast-follow; today the
-            # agent-ALPN endpoint trusts any node that can dial it.)
+            # This line is why ``network.peers.allowlist`` is enable-able on a
+            # live mesh: it has been accumulating the operator's real peer list
+            # since the ALPN shipped, so building the allowlist is a grep, not
+            # a maintenance window. Kept unconditional for exactly that reason.
             elog("agent.contact", level="info", node_id=peer_id, path=request.path)
+
+            # The enforcement that line was staged for. Proving node_id
+            # ownership is not enrolment: nothing here consumed an invite or
+            # checked a coordinator cert, so without this gate any node that
+            # can dial reaches EVERY route on the shared app — see
+            # ``peer_policy`` for what that really opens. It is not just
+            # ``/api/events/{id}/trigger``: ``POST /api/mcps`` takes arbitrary
+            # argv and the pool spawns it. ``capabilities=["agent"]`` below is
+            # a provenance label, not a scope — the only two readers of it
+            # (events.py, chat.py) use it to pick a source string and a session
+            # prefix, and no ``require_capability`` helper exists in src/.
+            #
+            # Both toggles default OFF and ``check_peer_request`` returns
+            # before reading any list when they are — an allowlist that armed
+            # itself on upgrade would cut a running mesh dead with no warning.
+            denial = check_peer_request(
+                node_id=peer_id, method=request.method, path=request.path,
+            )
+            if denial is not None:
+                return web.Response(status=403, text=denial)
             # Derive a stable synthetic device_pubkey from the peer's node_id.
             # sha256 gives us a deterministic 32-byte key that's unique per
             # peer without requiring the coordinator.

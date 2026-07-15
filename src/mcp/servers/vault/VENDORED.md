@@ -36,6 +36,18 @@ The upstream test suite (205 tests) still passes unmodified.
 4. **`server.ts`.** When no vault-path argv is given, fall back to the
    `OPENAGENT_VAULT_PATH` env var (how OpenAgent launches this server).
 
+5. **`src/scope.generated.ts` (new, GENERATED — do not hand-edit).** The
+   answer to "which notes does the quality system apply to", rendered from the
+   single declaration in `src/memory/vault/taxonomy.py` +
+   `model.py:GateConfig`. Regenerate with
+   `.venv/bin/python -m src.memory.vault.taxonomy`; `scripts/tests/test_vault_twins.py`
+   fails CI if it drifts. It exists because this server is a separate Node
+   process that cannot call the Python declaration — but the previous
+   hand-kept copy in `validate.ts` (a `_`/`.`-prefix heuristic commented as
+   "mirrors taxonomy.is_raw/is_index") did not mirror it: on the owner's real
+   2,116-note vault it skipped **413 notes — 20%** — that the Python gate
+   graded and failed, with no path to green.
+
 Validation is gated by `OPENAGENT_VAULT_VALIDATE_WRITES` (default **off**, so
 the package behaves exactly like upstream); OpenAgent sets it to `1` in the
 MCP spec. Tune the size limit with `OPENAGENT_VAULT_MAX_LINES` (default 300).

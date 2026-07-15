@@ -87,8 +87,12 @@ body [[c]] and [[ d ]] em dash —
     assert n.missing_frontmatter_fields == ["summary"], n.missing_frontmatter_fields
 
 
-@test("vault_gate", "parser detects multiline related + counts body lines")
-async def t_parser_multiline(ctx: TestContext) -> None:
+@test("vault_gate", "parser reads a block-list related + counts body lines")
+async def t_parser_block_related(ctx: TestContext) -> None:
+    """This used to assert ``related_multiline is True`` — pinning the signal
+    that fed the deleted "collapse related onto one line" demand. The block
+    list below is the CORRECT form, so the note is simply valid; what is worth
+    pinning is that we read its targets and its length."""
     n = parse_note_text("e/x.md", """---
 title: X
 related:
@@ -98,7 +102,7 @@ related:
 line1
 line2
 """)
-    assert n.related_multiline is True
+    assert n.frontmatter_valid is True
     assert set(n.related) == {"a", "b"}
     assert n.line_count == 2, n.line_count
 
@@ -1038,5 +1042,205 @@ async def t_scale(ctx: TestContext) -> None:
         s3 = idx.sync()
         assert s3.updated == 1 and s3.unchanged == n, s3.to_dict()
         idx.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# ── frontmatter YAML repair (the 38 damaged notes) ────────────────────
+
+@test("vault_gate", "repair: inline `related: [[a]], [[b]]` becomes a valid block list")
+async def t_repair_inline_related(ctx: TestContext) -> None:
+    """24 of the 38 unparseable notes in the owner's real vault are this, and
+    it is OUR OWN damage: the deleted ``wikilink_format`` rule demanded this
+    form and the deleted ``_collapse_related`` wrote it.
+
+    The fixture must be UNPARSEABLE to begin with (asserted below) — a
+    fixture that already parsed would sail through the repair's early return
+    and the test would pass against a no-op.
+    """
+    import yaml
+    from src.memory.vault.doctor import _repair_frontmatter_yaml
+
+    raw = ("title: X\nsummary: s\ntags: [e]\nstatus: active\n"
+           "created: 2026-07-01\nupdated: 2026-07-01\n"
+           "related: [[hub]], [[acme]]\n")
+    try:
+        yaml.safe_load(raw)
+        raise AssertionError("fixture must NOT parse before the repair")
+    except yaml.YAMLError:
+        pass
+
+    fixed, changed = _repair_frontmatter_yaml(raw)
+    assert changed is True
+    meta = yaml.safe_load(fixed)          # must NOT raise
+    assert meta["related"] == ["[[hub]]", "[[acme]]"], meta["related"]
+    # every other field survives untouched
+    assert meta["title"] == "X" and meta["status"] == "active", meta
+
+
+@test("vault_gate", "repair: space-separated inline related is the same damage")
+async def t_repair_inline_related_spaces(ctx: TestContext) -> None:
+    """3 of the 27 use spaces, not commas (e.g. the real
+    ``_inherited-from-lyra/features/youtube-embed-playback.md``). A repair
+    that only handled commas would leave them broken forever."""
+    import yaml
+    from src.memory.vault.doctor import _repair_frontmatter_yaml
+
+    raw = "title: X\nrelated: [[a]] [[b]] [[c]]\n"
+    fixed, changed = _repair_frontmatter_yaml(raw)
+    assert changed is True
+    assert yaml.safe_load(fixed)["related"] == ["[[a]]", "[[b]]", "[[c]]"]
+
+
+@test("vault_gate", "repair: an unquoted title containing ': ' gets quoted")
+async def t_repair_unquoted_colon(ctx: TestContext) -> None:
+    """11 of the 38, e.g. the real ``title: Bug: App crashes after 2 songs —
+    Fix Applied``.
+
+    The em-dash assertion is on the BYTES, deliberately. The first draft of
+    this test asserted the parsed value and claimed that was what
+    ``ensure_ascii=False`` protected — planting ``json.dumps(s)`` proved the
+    claim false: a YAML double-quoted scalar decodes ``\\u2014`` exactly like
+    JSON, so the value is identical either way and the test passed against the
+    defect. What ``ensure_ascii=False`` actually protects is the markdown a
+    human reads in Obsidian (§5), so that is what this pins.
+    """
+    import yaml
+    from src.memory.vault.doctor import _repair_frontmatter_yaml
+
+    raw = ("title: Bug: App crashes after 2 songs — Fix Applied\n"
+           'summary: "Bug: App crashes after 2 songs — Fix Applied"\n'
+           "status: active\n")
+    fixed, changed = _repair_frontmatter_yaml(raw)
+    assert changed is True
+    meta = yaml.safe_load(fixed)
+    assert meta["title"] == "Bug: App crashes after 2 songs — Fix Applied", meta["title"]
+    # the summary next door already carried the intended value verbatim —
+    # they must now agree, which is what proves the reading was right
+    assert meta["title"] == meta["summary"], meta
+    # ...and the note stays human-readable markdown, not an escape soup
+    assert "—" in fixed, f"the em dash must survive as itself on disk: {fixed!r}"
+    assert "\\u2014" not in fixed, f"escaped em dash leaked to disk: {fixed!r}"
+
+
+@test("vault_gate", "repair: never writes frontmatter that still does not parse")
+async def t_repair_guard(ctx: TestContext) -> None:
+    """The guard that keeps a partial repair from silently editing a file the
+    agent still cannot read. Here the inline `related` IS repairable but the
+    tab-indented mapping next to it is not, so the whole repair must be
+    abandoned rather than half-applied."""
+    from src.memory.vault.doctor import _repair_frontmatter_yaml
+
+    raw = "title: X\nrelated: [[a]], [[b]]\nbad:\n\t- \tx: [\n"
+    fixed, changed = _repair_frontmatter_yaml(raw)
+    assert changed is False, "a repair that does not land must not be written"
+    assert fixed == raw, "the original bytes must be preserved verbatim"
+
+
+@test("vault_gate", "repair: a MIXED related value is left for judgement")
+async def t_repair_mixed_related_untouched(ctx: TestContext) -> None:
+    """``related: [[a]], some prose`` has no single safe reading — dropping
+    the prose would be data loss, so the doctor must decline. (Measured: 0
+    such notes in the real vault, but the guard is what makes the 27 it DOES
+    repair trustworthy.)"""
+    from src.memory.vault.doctor import _repair_frontmatter_yaml
+
+    raw = "title: X\nrelated: [[a]], some prose\n"
+    fixed, changed = _repair_frontmatter_yaml(raw)
+    assert changed is False, "a mixed value must not be mechanically rewritten"
+    assert fixed == raw
+
+
+@test("vault_gate", "gate: unparseable frontmatter is an ERROR, not silence")
+async def t_gate_reports_bad_yaml(ctx: TestContext) -> None:
+    """Before this rule the damage was invisible: the loose parser recovered
+    what it could and the gate graded the note as if it had been read. 38
+    notes in the real vault were in this state, and the agent read every one
+    of them with `title: undefined`."""
+    d, vault, idxp = _mkvault()
+    try:
+        (vault / "e").mkdir()
+        (vault / "e" / "hub.md").write_text(_note(links=["x"], title="Hub"))
+        (vault / "e" / "x.md").write_text(
+            "---\ntitle: X\nsummary: s\ntags: [e]\nstatus: active\n"
+            "created: 2026-07-01\nupdated: 2026-07-01\n"
+            "related: [[hub]], [[other]]\n---\nBody [[hub]].\n")
+        idx = VaultIndex(vault, idxp)
+        idx.sync(force=True)
+        rep = run_gate(idx, GateConfig())
+        bad = [v for v in rep.violations if v.rule == "frontmatter_yaml"]
+        assert len(bad) == 1, [v.to_dict() for v in rep.violations]
+        assert bad[0].path == "e/x.md"
+        assert bad[0].severity == "error", bad[0].severity
+        assert bad[0].fixable is True
+        assert not rep.ok, "an unreadable note must fail the gate"
+        idx.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@test("vault_gate", "write_note: a damaged note is repairable, not permanently rejected")
+async def t_write_damaged_note_repaired(ctx: TestContext) -> None:
+    """The bug that stranded the 38: ``_enforce_write`` rejected any
+    frontmatter PyYAML disliked, so ``write_note`` refused the very notes that
+    needed fixing. A repair path the vault itself blocks is not a repair path.
+
+    The fix is NOT a looser check — it is that the doctor's repair runs first,
+    so the content reaching the (unchanged) check is valid YAML.
+    """
+    d, vault, idxp = _mkvault()
+    try:
+        svc = VaultService(vault, index_path=idxp)
+        damaged = ("---\ntitle: Bug: it broke\nsummary: s\ntags: [e]\n"
+                   "status: active\ncreated: 2026-07-01\nupdated: 2026-07-01\n"
+                   "related: [[hub]], [[acme]]\n---\nBody.\n")
+        res = await svc.write_note("e/x.md", damaged)
+        assert res["ok"] is True, f"write_note still refuses the damaged note: {res}"
+        assert "repaired frontmatter into valid YAML" in res["applied"], res["applied"]
+
+        import yaml
+        from src.memory.vault.parser import split_frontmatter
+        raw_fm, _ = split_frontmatter((vault / "e" / "x.md").read_text())
+        meta = yaml.safe_load(raw_fm)     # what landed on disk must parse
+        assert meta["title"] == "Bug: it broke", meta
+        assert meta["related"] == ["[[hub]]", "[[acme]]"], meta
+        await svc.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@test("vault_gate", "write_note: frontmatter that CANNOT be repaired is still blocked")
+async def t_write_unrepairable_still_blocked(ctx: TestContext) -> None:
+    """The other half of the decision: loosening ``_enforce_write`` to the
+    tolerant parser's contract was rejected because it would let NEW
+    unparseable notes in. Damage we can repair is repaired; damage we cannot
+    is still refused."""
+    d, vault, idxp = _mkvault()
+    try:
+        svc = VaultService(vault, index_path=idxp)
+        res = await svc.write_note(
+            "e/y.md", "---\ntitle: X\nbad:\n\t- \tx: [\n---\nBody.\n")
+        assert res["ok"] is False and res.get("blocked"), res
+        assert [e["rule"] for e in res["errors"]] == ["frontmatter_yaml"], res["errors"]
+        assert not (vault / "e" / "y.md").exists(), "nothing must be written"
+        await svc.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@test("vault_gate", "scope: raw-material writes are not enforced (sources/ is a drop zone)")
+async def t_write_scope_skips_raw(ctx: TestContext) -> None:
+    """``_enforce_write`` used to skip NOTHING, so it rejected writes to
+    ``sources/`` — the folder the docs call an un-gated drop zone and the gate
+    deliberately never grades. All three copies of the scope now derive from
+    one declaration."""
+    d, vault, idxp = _mkvault()
+    try:
+        svc = VaultService(vault, index_path=idxp)
+        junk = "---\ntitle: X\nbad:\n\t- \tx: [\n---\nRaw dump.\n"
+        res = await svc.write_note("sources/raw.md", junk)
+        assert res["ok"] is True, f"sources/ is un-gated raw material: {res}"
+        assert (vault / "sources" / "raw.md").read_text() == junk, "written verbatim"
+        await svc.close()
     finally:
         shutil.rmtree(d, ignore_errors=True)

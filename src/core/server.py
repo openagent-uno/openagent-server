@@ -338,6 +338,81 @@ def _build_agent(config: dict) -> Agent:
         elif isinstance(allows, str):
             os.environ["OPENAGENT_SAFETY_ALLOW_PATTERNS"] = allows
 
+    # ``mcps.install_policy`` — gates REGISTERING an MCP, which is the act that
+    # hands a third party's argv this agent's whole environment. Exported as
+    # env vars rather than plumbed, because the ``mcp-manager`` MCP runs as a
+    # subprocess and can only see the policy through what it inherits — the
+    # same constraint ``scheduler.timezone`` above has.
+    #
+    # Default OFF: vision §6 makes runtime registration a documented capability
+    # ("Users can register custom MCPs at any time, by command, URL, or
+    # marketplace pick"), so arming this by default would break a shipped
+    # feature on someone's nightly cron. Enforced by
+    # ``src.mcp.install_policy.check_mcp_install_allowed`` at the marketplace
+    # and mcp-manager callsites — read that module's header for what it covers
+    # and, importantly, what it does not (``POST /api/mcps`` and the pool spawn
+    # are not yet wired).
+    _mcps_cfg = config.get("mcps") or {}
+    _install_cfg = (_mcps_cfg.get("install_policy") or {})
+    if "enabled" in _install_cfg:
+        os.environ["OPENAGENT_MCP_INSTALL_POLICY"] = (
+            "1" if bool(_install_cfg["enabled"]) else "0"
+        )
+    # With the policy on and no ``allow_patterns``, the capability set is
+    # frozen — no new MCPs at runtime, which is the right posture for an
+    # unattended agent and needs no per-package inventory. These carve the
+    # exceptions for agents that legitimately install, for the same reason
+    # ``safety.approvals.allow_patterns`` exists: with no exception mechanism
+    # the operator chooses between "off entirely" and "break my agent".
+    if _install_cfg.get("allow_patterns"):
+        _ip_allows = _install_cfg["allow_patterns"]
+        if isinstance(_ip_allows, (list, tuple)):
+            os.environ["OPENAGENT_MCP_INSTALL_ALLOW_PATTERNS"] = ",".join(
+                str(p) for p in _ip_allows
+            )
+        elif isinstance(_ip_allows, str):
+            os.environ["OPENAGENT_MCP_INSTALL_ALLOW_PATTERNS"] = _ip_allows
+
+    # ``network.peers`` — who may dial the ``openagent/agent/1`` ALPN, and what
+    # they may reach once they have. Both default OFF and both are enforced in
+    # ``src.network.auth.peer_policy`` at the single agent-ALPN branch of the
+    # auth middleware; read that module's header for why the ALPN opened far
+    # more than federation ever needed.
+    #
+    # Default OFF is not timidity, it is the requirement: these agents run
+    # unattended, and an allowlist that armed itself on upgrade would cut a
+    # live mesh dead at 3am with no human attached to notice.
+    _peers_cfg = ((config.get("network") or {}).get("peers") or {})
+    _allowlist_cfg = (_peers_cfg.get("allowlist") or {})
+    if "enabled" in _allowlist_cfg:
+        os.environ["OPENAGENT_NETWORK_PEER_ALLOWLIST_ENABLED"] = (
+            "1" if bool(_allowlist_cfg["enabled"]) else "0"
+        )
+    if _allowlist_cfg.get("node_ids"):
+        _nodes = _allowlist_cfg["node_ids"]
+        if isinstance(_nodes, (list, tuple)):
+            os.environ["OPENAGENT_NETWORK_PEER_ALLOWLIST"] = ",".join(
+                str(n) for n in _nodes
+            )
+        elif isinstance(_nodes, str):
+            os.environ["OPENAGENT_NETWORK_PEER_ALLOWLIST"] = _nodes
+    _scope_cfg = (_peers_cfg.get("scope") or {})
+    if "enabled" in _scope_cfg:
+        os.environ["OPENAGENT_NETWORK_PEER_SCOPE_ENABLED"] = (
+            "1" if bool(_scope_cfg["enabled"]) else "0"
+        )
+    # ``extra_paths`` is the escape hatch that keeps ``scope`` from being a
+    # release-blocker: a federation feature this build's built-in route list
+    # doesn't know about is one config line, not a wait for a new version.
+    if _scope_cfg.get("extra_paths"):
+        _paths = _scope_cfg["extra_paths"]
+        if isinstance(_paths, (list, tuple)):
+            os.environ["OPENAGENT_NETWORK_PEER_SCOPE_EXTRA_PATHS"] = ",".join(
+                str(p) for p in _paths
+            )
+        elif isinstance(_paths, str):
+            os.environ["OPENAGENT_NETWORK_PEER_SCOPE_EXTRA_PATHS"] = _paths
+
     memory_cfg = config.get("memory", {})
     # Learning toggles — mapped to env vars so the loops in ``src.learning``
     # can read them without plumbing the agent config through every callsite.
@@ -349,13 +424,24 @@ def _build_agent(config: dict) -> Agent:
     # existing ``openagent.yaml`` is inert rather than an error, which is the
     # same way every other retired key degrades here.
     #
-    # ``memory.learning_model`` names the model the background loops use for
-    # their optional AI step (currently dream-mode's fix suggestions), as
-    # ``<provider>:<model>``. Unset → those steps no-op and keep their
-    # mechanical half. It is explicit config rather than an inference over the
-    # catalog for the reasons in ``learning/_model.py``.
-    if memory_cfg.get("learning_model"):
-        os.environ["OPENAGENT_LEARNING_MODEL"] = str(memory_cfg["learning_model"]).strip()
+    # ``memory.learning_model`` is no longer read, and ``learning/_model.py``
+    # is gone with it. It named the model for one caller — the vault-
+    # maintenance loop's AI-suggestion step — and that loop was deleted in
+    # v0.16.1 when dream mode was consolidated onto the scheduled task (see the
+    # ``memory.vault.maintenance`` note below). The step asked a cheap model to
+    # write prose advice ("this orphan should link to X") into a log note that
+    # nothing then acted on; the scheduled task reads the SAME
+    # ``open_suggestions`` from ``vault_dream()`` while holding
+    # ``write_note``/``patch_note``/``delete_note``, so it fixes what the loop
+    # could only describe. Keeping the key to feed a deleted advisor would have
+    # left exactly the write-only export the five ``OPENAGENT_SAFETY_*`` vars
+    # were: set from yaml, read by nobody, greps like a live feature. The
+    # reasoning for why such a model must be named explicitly rather than
+    # inferred from ``is_classifier``/``tier_hint`` is not lost — it is the
+    # same argument, in the module this one was modelled on:
+    # ``src/core/compaction.py``'s ``_SUMMARY_MODEL_ENV``. A stale
+    # ``learning_model`` key in an existing ``openagent.yaml`` is inert rather
+    # than an error, the same way every other retired key degrades here.
     # ``memory.semantic_search`` is no longer read. The subsystem it gated was
     # an OpenAI-pinned embedding index whose only writer had zero callers, so
     # it could never return a row on any deployment; ``search_past_conversations``
@@ -413,21 +499,42 @@ def _build_agent(config: dict) -> Agent:
                 os.environ[_env] = str(int(_vault_cfg[_k]))
             except (TypeError, ValueError):
                 pass
-    _vm_cfg = (_vault_cfg.get("maintenance") or {})
-    for _k, _env in (
-        ("enabled",            "OPENAGENT_VAULT_MAINTENANCE_ENABLED"),
-        ("autofix",            "OPENAGENT_VAULT_MAINTENANCE_AUTOFIX"),
-        ("regenerate_derived", "OPENAGENT_VAULT_MAINTENANCE_DERIVED"),
-    ):
-        if _k in _vm_cfg:
-            os.environ[_env] = "1" if bool(_vm_cfg[_k]) else "0"
-    if "interval_hours" in _vm_cfg:
-        try:
-            os.environ["OPENAGENT_VAULT_MAINTENANCE_INTERVAL_HOURS"] = str(
-                int(_vm_cfg["interval_hours"])
-            )
-        except (TypeError, ValueError):
-            pass
+    # ``memory.vault.maintenance.*`` (``enabled``, ``interval_hours``,
+    # ``autofix``, ``regenerate_derived``) is no longer read. It configured a
+    # SECOND dream mode: a 12-hourly asyncio loop in
+    # ``learning/vault_maintenance.py`` that ran the mechanical pass and wrote
+    # its own dream-log, in parallel with — and unaware of — the ``dream_mode``
+    # scheduled task. Both were off by default, both could be on at once, and
+    # they logged to two paths in two formats.
+    #
+    # Vision §12 describes ONE thing: "The agent runs a scheduled 'dream' task
+    # ... nightly by default, at a time the user can adjust. It does not
+    # compete with user-facing work." A scheduled task is that. A hidden
+    # interval loop is not: 12h from boot lands mid-conversation half the time,
+    # and no ``time:``/``timezone:`` could move it.
+    #
+    # The loop survived this long because deleting it would have dropped the
+    # mechanical pass entirely — ``DREAM_MODE_PROMPT`` named ``vault_dream``,
+    # ``vault_gate``, ``vault_doctor`` and ``vault_regenerate_derived`` zero
+    # times each, so the loop was the only caller of ``VaultService.maintenance``
+    # on a live deployment. ``89c7379`` fixed that: Mission 1 now opens with
+    # ``vault_dream()``, which is the same ``svc.maintenance(apply_fixes=True,
+    # regenerate=True)`` call the loop made. With both halves in the task, the
+    # loop was pure duplication and went in v0.16.1.
+    #
+    # The knobs died with their reader rather than being re-homed: the task is
+    # an agent holding finer-grained tools, so ``autofix: false`` is
+    # ``vault_doctor(apply=False)`` and ``regenerate_derived: false`` is simply
+    # not calling ``vault_regenerate_derived()`` — a boolean cannot express
+    # "preview this one, apply that one", and the agent can. ``interval_hours``
+    # is answered by ``dream_mode.time`` + ``dream_mode.timezone``, which §12
+    # asks for by name and the loop could never honour.
+    #
+    # A stale ``maintenance`` block in an existing ``openagent.yaml`` is inert
+    # rather than an error, the same way every other retired key degrades here.
+    # Nothing is exported: an env var set from yaml and read by nobody is how
+    # five ``OPENAGENT_SAFETY_*`` vars sat here for months describing
+    # protection that never fired (``t_no_write_only_safety_env``).
     # Git-backed vault: every change is auto-committed with provenance.
     _vgit_cfg = (_vault_cfg.get("git") or {})
     if "enabled" in _vgit_cfg:
@@ -877,15 +984,11 @@ class AgentServer:
             logger.warning("Curator failed to start: %s", e)
             self._curator_task = None
 
-        # 6. Vault maintenance — dream-mode pass over the memory vault: gate,
-        # mechanically fix, regenerate derived artifacts, write a dream-log.
-        # No-op when ``memory.vault.maintenance.enabled`` is false.
-        try:
-            from src.learning.vault_maintenance import start as _vault_maint_start
-            self._vault_maint_task = _vault_maint_start(self.agent._db)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("Vault maintenance failed to start: %s", e)
-            self._vault_maint_task = None
+        # 6. (was: the vault-maintenance loop — a second, hidden dream mode.
+        # Deleted in v0.16.1; the ``dream-mode`` scheduled task seeded by
+        # ``_sync_dream_mode`` now runs the mechanical pass itself via
+        # ``vault_dream()``. See the ``memory.vault.maintenance`` note in
+        # ``_build_agent``.)
 
         # 7. Vault git — the memory vault is a git repo; commit every change
         # automatically (with provenance). The loop is the safety net for
@@ -1009,8 +1112,9 @@ class AgentServer:
                 pass
             self._curator_task = None
 
-        # 1c. Vault maintenance + autocommit loops
-        for _attr in ("_vault_maint_task", "_vault_autocommit_task"):
+        # 1c. Vault autocommit loop. ``_vault_maint_task`` used to be cancelled
+        # here too; that loop is gone (v0.16.1 — see ``_build_agent``).
+        for _attr in ("_vault_autocommit_task",):
             _vt = getattr(self, _attr, None)
             if _vt is not None:
                 _vt.cancel()

@@ -157,12 +157,17 @@ async def t_dream_runs_mechanical_pass(ctx: TestContext) -> None:
     `vault_gate`, `vault_doctor` and `vault_regenerate_derived` ZERO
     times each, so it only ever did the AI half.
 
-    The mechanical half then ran nowhere by default: the only other
-    caller is `learning/vault_maintenance.py`'s background loop, which
-    is off unless `memory.vault.maintenance.enabled` is set. Measured
+    The mechanical half then ran nowhere by default: its only other
+    caller was `learning/vault_maintenance.py`'s background loop, which
+    was off unless `memory.vault.maintenance.enabled` was set. Measured
     consequence on a real 2,116-note vault: 38 `wikilink_format` and 24
     `frontmatter` violations, every one of them mechanically fixable,
     none of them fixed — and `llms.txt` / the showcase never regenerated.
+
+    That loop was deleted in v0.16.1, which makes this assertion the ONLY
+    thing standing between the vault and no mechanical pass at all: there
+    is no longer a second code path that would quietly cover for the
+    prompt dropping `vault_dream()`. Do not relax it.
     """
     from src.core.server import DREAM_MODE_PROMPT
 

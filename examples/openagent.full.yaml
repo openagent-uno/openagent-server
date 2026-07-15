@@ -22,6 +22,87 @@ network:
     key_path: ./coordinator.key
   derp_url: ""                # empty = Iroh's public DERP relay
 
+  # ── Federation peers (the openagent/agent/1 ALPN) ────────────────
+  # An inbound agent-ALPN stream is authenticated by the Iroh QUIC
+  # handshake, which proves the dialler owns its node_id — NOT that it
+  # is anyone you enrolled. Nothing on that path consumes an invite or
+  # checks a coordinator cert, and the synthesised cert's
+  # capabilities=["agent"] is a provenance label, not a scope (the only
+  # two readers of it pick a log string and a session-id prefix). So
+  # with both toggles off, any node that can dial this one reaches
+  # EVERY gateway route — including POST /api/mcps, which takes
+  # arbitrary argv the MCP pool then spawns.
+  #
+  # Both DEFAULT OFF. They can reject live traffic, and these agents run
+  # unattended; arming either on upgrade would cut a running mesh dead.
+  peers:
+    # WHO may dial. Needs your peer list, so turn `scope` on first.
+    allowlist:
+      enabled: false          # DEFAULT — any node that can dial is trusted
+      # Build the list from logs you are ALREADY collecting — the
+      # `agent.contact` line has recorded every dialling node_id since
+      # the ALPN shipped, so this is a grep, not a maintenance window:
+      #   grep '"event":"agent.contact"' ~/.openagent/events.jsonl \
+      #     | jq -r .node_id | sort -u
+      # A peer that has not dialled within your log retention will NOT
+      # appear — check the list against `openagent network agents`
+      # before enabling, or you will lock out a quiet peer. Denials are
+      # logged as `peer.denied` (reason=not_in_allowlist).
+      node_ids: []
+    # WHAT a peer may reach. No list to maintain: the built-in set is
+    # the routes federation actually uses (POST /api/chat, POST
+    # /api/events/{id}/trigger, GET /api/health, GET /api/agent-info).
+    # Everything else a peer asks for is administration, not the
+    # collaboration vision §11 describes — so this shrinks the blast
+    # radius even for peers you DID enrol, and needs no per-deployment
+    # data. Turn this on before the allowlist.
+    scope:
+      enabled: false          # DEFAULT — peers reach every gateway route
+      # Anything outside the built-in set is refused with 403 and logged
+      # as `peer.denied` (reason=outside_scope) with the method+path —
+      # grep that if a federation feature needs a door this build's list
+      # doesn't know about, then add it here as "<METHOD> <path-regex>":
+      # extra_paths:
+      #   - "GET ^/api/vault/notes/.+$"
+
+# ── MCP install policy ──────────────────────────────────────────────
+# Registering an MCP is not "adding an app": it runs that server's
+# command on this host, as this agent, with its full environment — every
+# API key and mounted path the process can read. Three surfaces reach
+# that outcome and all three end at the same mcps row the pool spawns:
+# POST /api/marketplace/install (resolves a public no-auth registry entry
+# into `npx -y <pkg>` — no signature check, no publisher allowlist, no
+# sandbox), POST /api/mcps (raw argv), and the mcp-manager MCP's
+# add_custom_mcp / update_mcp — which the AGENT itself can call, so
+# prompt-injected content in a page or a ticket is enough to reach it.
+mcps:
+  install_policy:
+    # DEFAULT off — every registration goes through unchecked, because
+    # vision §6 makes runtime registration a documented capability and
+    # arming this by default would break it mid-cron.
+    #
+    # `true` with no allow_patterns = FREEZE: no new MCPs at runtime.
+    # For an unattended production agent that is the whole config — one
+    # line, no package inventory to maintain. Currently enforced at the
+    # marketplace and mcp-manager surfaces; POST /api/mcps is NOT yet
+    # gated (it needs a device cert — an operator administering their own
+    # agent on purpose — but do not read this as covering it).
+    enabled: false
+    # Exceptions, for agents that legitimately install. Matched
+    # case-insensitively (regex, comma-joined) against a one-line
+    # descriptor of what would be registered. The descriptor format is
+    # stable config surface:
+    #   marketplace:io.github.foo/postgres npx -y @foo/postgres@1.0.0
+    #   npx -y @modelcontextprotocol/server-filesystem /srv
+    #   url:https://mcp.example.com/sse
+    # A blocked attempt logs `mcp.install_blocked` with the descriptor
+    # verbatim — that is what you paste here. Anchor patterns at a
+    # publisher or a package, never a bare runtime: "npx" as a pattern
+    # re-permits every npm package in existence.
+    # allow_patterns:
+    #   - "^marketplace:io\\.github\\.trusted/"
+    #   - "^npx -y @modelcontextprotocol/server-filesystem\\b"
+
 # ── Channels (platform bridges) ─────────────────────────────────────
 # Each bridge is opt-in: omit the section and the bridge isn't started.
 # ``personality`` accepts a preset name (casual, technical, teacher,
@@ -163,11 +244,15 @@ memory:
       autocommit_seconds: 25            # sweep interval that captures edits made outside OpenAgent (Obsidian, external MCP); 0 disables
       author_name: OpenAgent            # committer identity (no global git config needed)
       author_email: agent@openagent.local
-    maintenance:
-      enabled: false                    # dream-mode pass: gate, auto-fix, regenerate derived, write a dream-log
-      interval_hours: 12
-      autofix: true                     # apply the mechanical fixes a script can make safely
-      regenerate_derived: true          # rewrite llms.txt + _showcase/showcase.md each pass
+    # ``maintenance:`` (enabled/interval_hours/autofix/regenerate_derived) was
+    # removed in v0.16.1 — it configured a second, hidden dream mode that ran
+    # the same vault pass on a 12h timer from boot. There is one dream mode now
+    # and it is the top-level ``dream_mode:`` task (see guide/scheduler.md):
+    # it runs that pass itself via ``vault_dream()``, and unlike a timer it can
+    # be aimed at an hour, which is what §12 asks for. Old logs under
+    # ``workspace/_dream/`` are left alone; dream mode writes to
+    # ``dream-logs/``. An openagent.yaml still carrying the block boots fine —
+    # the keys are inert, not fatal.
 
 # ── Quick commands ──────────────────────────────────────────────────
 # Bridges expand ``/<trigger>`` to the configured prompt before the

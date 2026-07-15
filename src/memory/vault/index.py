@@ -38,7 +38,10 @@ from src.memory.vault.parser import link_key, parse_note_text
 # Bumped to 2 when ``stem`` joined notes_fts: the FTS table's COLUMN COUNT
 # changed, so an index built by an older build cannot be reused — see
 # ``_ensure_vault_meta``, which drops it rather than clearing it.
-_SCHEMA_VERSION = "2"
+# Bumped to 3: ``related_multiline`` -> ``frontmatter_valid`` (the old
+# column fed a rule deleted in 89c7379). The index is a pure cache, so a
+# version bump just re-parses the markdown that was always the truth.
+_SCHEMA_VERSION = "3"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -69,7 +72,7 @@ CREATE TABLE IF NOT EXISTS notes (
     has_frontmatter   INTEGER,
     is_index          INTEGER,
     is_journal        INTEGER,
-    related_multiline INTEGER,
+    frontmatter_valid INTEGER DEFAULT 1,
     em_dash           INTEGER,
     inlink_count      INTEGER DEFAULT 0
 );
@@ -170,7 +173,7 @@ def _row_to_note(row: sqlite3.Row) -> Note:
         has_frontmatter=bool(row["has_frontmatter"]),
         is_index=bool(row["is_index"]),
         is_journal=bool(row["is_journal"]),
-        related_multiline=bool(row["related_multiline"]),
+        frontmatter_valid=bool(row["frontmatter_valid"]),
         spaced_wikilinks=json.loads(row["spaced_json"] or "[]"),
         missing_frontmatter_fields=json.loads(row["missing_fm_json"] or "[]"),
         body_has_em_dash=bool(row["em_dash"]),
@@ -355,7 +358,7 @@ class VaultIndex:
                 status, created, updated, tags_json, outlinks_json,
                 related_json, spaced_json, missing_fm_json, line_count,
                 byte_size, mtime, content_hash, has_frontmatter, is_index,
-                is_journal, related_multiline, em_dash, inlink_count
+                is_journal, frontmatter_valid, em_dash, inlink_count
             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)
             ON CONFLICT(path) DO UPDATE SET
                 folder=excluded.folder, stem=excluded.stem,
@@ -370,7 +373,7 @@ class VaultIndex:
                 mtime=excluded.mtime, content_hash=excluded.content_hash,
                 has_frontmatter=excluded.has_frontmatter, is_index=excluded.is_index,
                 is_journal=excluded.is_journal,
-                related_multiline=excluded.related_multiline, em_dash=excluded.em_dash
+                frontmatter_valid=excluded.frontmatter_valid, em_dash=excluded.em_dash
             """,
             (
                 note.path, note.folder, note.stem, note.stem.lower(),
@@ -381,7 +384,7 @@ class VaultIndex:
                 json.dumps(note.missing_frontmatter_fields), note.line_count,
                 note.byte_size, note.mtime, note.content_hash,
                 int(note.has_frontmatter), int(note.is_index),
-                int(note.is_journal), int(note.related_multiline),
+                int(note.is_journal), int(note.frontmatter_valid),
                 int(note.body_has_em_dash),
             ),
         )

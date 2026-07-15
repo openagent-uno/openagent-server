@@ -94,6 +94,20 @@ describe("shouldValidate — path scoping", () => {
     ["_showcase/showcase.md", false],
     [".trash/old.md", false],
     ["templates/note.md", false],
+    // The 413. This scope used to skip any segment starting with "_", which
+    // on the owner's real 2,116-note vault silently excluded 404 notes under
+    // `_inherited-from-lyra/**` and 16 `_index.md` hubs — 20% of the vault —
+    // that the Python gate graded and failed with no path to green. `_index`
+    // hubs are first-class notes the gate has explicit support for.
+    ["_index.md", true],
+    ["esound/receipts/_index.md", true],
+    ["_inherited-from-lyra/features/equalizer.md", true],
+    // ...and the raw-material folders the Python gate skips are skipped here
+    // too, which the old heuristic got wrong in the other direction.
+    ["sources/raw-dump.md", false],
+    ["workspace/scratch.md", false],
+    // ...except the journal, which is dynamic memory, not scratch.
+    ["workspace/journal/sessions/2026-07-15.md", true],
   ])("%s → %s", (p, expected) => {
     expect(shouldValidate(p)).toBe(expected);
   });

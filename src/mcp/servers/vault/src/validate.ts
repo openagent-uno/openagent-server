@@ -24,6 +24,7 @@
  * doctor.py — they are direct ports.
  */
 import { parse as parseYaml } from "yaml";
+import { isInQualityScope } from "./scope.generated.js";
 
 const MAX_LINES = (() => {
   const n = parseInt(process.env.OPENAGENT_VAULT_MAX_LINES || "", 10);
@@ -45,15 +46,28 @@ export function validationEnabled(): boolean {
   return v === "1" || v === "true" || v === "yes" || v === "on";
 }
 
-// Paths we never gate: non-markdown, derived artifacts (`_showcase`, llms.txt),
-// trash, dotfiles, and templates — mirrors taxonomy.is_raw/is_index exclusions.
+/**
+ * Which notes this writer gates.
+ *
+ * This USED TO be a hand-kept heuristic — skip any path segment starting with
+ * `_` or `.`, plus `templates/` — written to "mirror taxonomy.is_raw/is_index".
+ * It did not mirror them. Measured on the owner's real 2,116-note vault, it
+ * skipped **413 notes (20%) that the Python gate grades**: 404 under
+ * `_inherited-from-lyra/**` and 16 `_index.md` hubs. The agent wrote them
+ * through a writer that never validated them, and the gate then failed them
+ * forever with no path to green. The `_` rule was wrong on its own terms too:
+ * `_index.md` hubs are first-class notes the gate has explicit support for.
+ *
+ * The scope is now derived from the one declaration in Python's taxonomy (see
+ * scope.generated.ts). The only thing decided HERE is the file-type guard:
+ * this server writes arbitrary files, so non-markdown never reaches a
+ * markdown validator. That is not a scope disagreement — the Python side only
+ * ever sees notes.
+ */
 export function shouldValidate(relPath: string): boolean {
   const p = relPath.replace(/\\/g, "/").replace(/^\/+/, "");
   if (!p.toLowerCase().endsWith(".md")) return false;
-  const segs = p.split("/");
-  if (segs.some((s) => s.startsWith("_") || s.startsWith("."))) return false;
-  if (p.toLowerCase().includes("templates/")) return false;
-  return true;
+  return isInQualityScope(p);
 }
 
 // ── split frontmatter (mirror parser.split_frontmatter) ──────────────────
@@ -146,6 +160,65 @@ function replaceEmDash(body: string): string {
   return body.replace(/—/g, "--");
 }
 
+// ── frontmatter YAML repair (port of doctor._repair_frontmatter_yaml) ────
+// Two deterministic shapes, together accounting for ALL 38 notes with
+// unparseable frontmatter in the owner's real 2,116-note vault:
+//   1. `related: [[a]], [[b]]` — bare double-brackets are not a YAML flow
+//      sequence, so the whole mapping fails to parse (27 notes). This is the
+//      form the deleted `wikilink_format` rule DEMANDED.
+//   2. `title: Bug: it broke` — an unquoted scalar containing ": " (11 notes).
+// Without this port the two write gates disagree: Python repairs the note and
+// accepts it while this gate still blocks it, so the same bytes are accepted
+// over REST and rejected through `vault_write_note`. Pinned by
+// scripts/tests/test_vault_twins.py.
+const INLINE_LINK_SEQ =
+  /^([A-Za-z0-9_][A-Za-z0-9_-]*):[ \t]*(\[\[[^\[\]]+\]\](?:[ \t]*,?[ \t]*\[\[[^\[\]]+\]\])*)[ \t]*,?[ \t]*$/;
+const UNQUOTED_SCALAR = /^([A-Za-z0-9_][A-Za-z0-9_-]*):[ \t]+(\S.*)$/;
+const WIKILINK_BRACED = /\[\[([^\[\]]+?)\]\]/g;
+
+function parsesAsYaml(fm: string): boolean {
+  try {
+    parseYaml(fm);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Repair frontmatter that does not parse. Never returns a change unless the
+ *  result actually parses — a repair that leaves the note broken is worse
+ *  than none, because it edits the file while the agent still cannot read it. */
+function repairFrontmatterYaml(fm: string): string {
+  if (parsesAsYaml(fm)) return fm;
+  let touched = false;
+  const out: string[] = [];
+  for (const line of fm.split("\n")) {
+    const seq = line.match(INLINE_LINK_SEQ);
+    if (seq) {
+      const links = [...(seq[2] ?? "").matchAll(WIKILINK_BRACED)].map((m) => m[1]!.trim());
+      if (links.length) {
+        out.push(`${seq[1]!}:`);
+        for (const t of links) out.push(`  - ${JSON.stringify(`[[${t}]]`)}`);
+        touched = true;
+        continue;
+      }
+    }
+    const sc = line.match(UNQUOTED_SCALAR);
+    if (sc) {
+      const value = (sc[2] ?? "").replace(/\s+$/, "");
+      if (!/^['"\[{&*|>]/.test(value) && /:(?:[ \t]|$)/.test(value)) {
+        out.push(`${sc[1]!}: ${JSON.stringify(value)}`);
+        touched = true;
+        continue;
+      }
+    }
+    out.push(line);
+  }
+  if (!touched) return fm;
+  const repaired = out.join("\n");
+  return parsesAsYaml(repaired) ? repaired : fm;
+}
+
 export interface ValidateOptions {
   /** Block when the (new) note exceeds the atomic size limit. Creation only. */
   checkSize?: boolean;
@@ -182,6 +255,10 @@ export function validateAndFix(
   if (fmA !== fm || bodyA !== body) applied.push("stripped spaces inside [[ ]]");
   fm = fmA;
   body = bodyA;
+  // frontmatter YAML repair — must run before anything that reads the
+  // frontmatter as YAML (same order as doctor.fix_note_content)
+  const fmR = repairFrontmatterYaml(fm);
+  if (fmR !== fm) { fm = fmR; applied.push("repaired frontmatter into valid YAML"); }
   // dates
   const fmB = normalizeDates(fm);
   if (fmB !== fm) { fm = fmB; applied.push("normalized date(s) to YYYY-MM-DD"); }

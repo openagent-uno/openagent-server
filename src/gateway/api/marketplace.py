@@ -27,6 +27,25 @@ Three endpoints:
        source="marketplace:registry.modelcontextprotocol.io@{version}".
        The pool's hot-reload picks the new server up on the next message.
 
+WHAT "INSTALL" ACTUALLY MEANS — SAY IT PLAINLY
+----------------------------------------------
+``install`` reads like "add an app". It is not. The resolved runtimes are
+``npx`` / ``uvx`` / ``docker`` / ``dnx`` (``_KNOWN_RUNTIMES``), so accepting a
+card runs code that a third party published to a public, no-auth registry, as
+this process, with this agent's full environment — every API key, every
+mounted path, every credential the host has. There is no signature check, no
+publisher allowlist, and no sandbox anywhere on this path: ``server.json``
+says ``npx -y <pkg>`` and the pool's hot-reload spawns it on the next message.
+The registry is a distribution channel, not a trust boundary; ``status`` and
+``_meta`` on a card are self-reported by the publisher.
+
+``src/mcp/install_policy.py`` is the opt-in gate (default OFF — vision §6
+makes runtime registration a documented capability, so it cannot arm itself on
+upgrade). Anyone editing this file should keep the paragraph above true rather
+than tidy it away: the reason this survived review is that every description
+of the endpoint — including this docstring — described the plumbing accurately
+and the consequence not at all.
+
 Caching: small in-memory LRU on the running gateway. Search responses live
 300 s (queries change as users type); per-server-version detail lives 3600 s
 because server.json is immutable per version. Cache evaporates on restart.
@@ -50,6 +69,7 @@ from urllib.parse import quote
 
 from src.core.logging import elog
 from src.gateway.api._common import gateway_db as _db
+from src.mcp.install_policy import BlockedInstallError, check_mcp_install_allowed
 
 
 REGISTRY_BASE = "https://registry.modelcontextprotocol.io/v0.1"
@@ -570,6 +590,25 @@ async def handle_install(request):
         if err.startswith("missing required") or "out of range" in err or err.startswith("unknown choice"):
             return web.json_response({"error": err}, status=400)
         return web.json_response({"error": err}, status=422)
+
+    # Install policy — no-op unless ``mcps.install_policy.enabled: true``.
+    # Checked here, AFTER the payload is resolved, because the resolved argv is
+    # the thing that actually runs: what the registry card advertises and what
+    # ``npx -y`` ends up executing are different strings, and a policy matching
+    # the card would be checking the brochure rather than the package.
+    # Checked BEFORE the duplicate-name 409 so a blocked install reports why it
+    # was blocked rather than a name collision it never got past.
+    try:
+        check_mcp_install_allowed(
+            name=install_name,
+            surface="marketplace",
+            command=kwargs["command"],
+            args=kwargs["args"],
+            url=kwargs["url"],
+            registry_name=name,
+        )
+    except BlockedInstallError as e:
+        return web.json_response({"error": str(e), "descriptor": e.descriptor}, status=403)
 
     # Duplicate-name check.
     if await db.get_mcp(install_name) is not None:

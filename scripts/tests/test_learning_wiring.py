@@ -119,29 +119,17 @@ async def t_no_reimplemented_flag_check(ctx: TestContext) -> None:
     )
 
 
-@test("learning_wiring", "learning model no-ops when unconfigured, never picks one itself")
-async def t_learning_model_degrades(ctx: TestContext) -> None:
-    os.environ.pop("OPENAGENT_LEARNING_MODEL", None)
-    from src.learning._model import complete
-
-    class _DB:
-        db_path = ":memory:"
-
-        async def materialise_providers_config(self, *, enabled_only=False):
-            # A fully-configured catalog. Unconfigured learning model must
-            # still no-op rather than helpfully grabbing the user's model:
-            # this runs unattended on a timer, so an inferred pick is a
-            # silent recurring bill. See learning/_model.py.
-            return [{
-                "id": 1, "name": "anthropic", "framework": "api-based",
-                "api_key": "sk-test", "enabled": True,
-                "models": [{"id": 9, "model": "claude-opus-4-8", "enabled": True}],
-            }]
-
-    assert await complete(db=_DB(), prompt="hi", log_event="test.learning") is None, (
-        "unset OPENAGENT_LEARNING_MODEL must no-op, not auto-select a model"
-    )
-
+# ``t_learning_model_degrades`` lived here: it pinned that an unconfigured
+# ``OPENAGENT_LEARNING_MODEL`` made ``_model.complete`` no-op rather than
+# helpfully grabbing the user's most expensive model on a timer. Both the test
+# and ``_model.py`` went in v0.16.1 with their only caller — the
+# vault-maintenance loop's AI-suggestion step (see ``learning/__init__.py``).
+# The concern it guarded is real and is still guarded, one module over: the
+# same "name the model, never infer it" rule now lives only in
+# ``core/compaction.py``'s ``_SUMMARY_MODEL_ENV``, which is where the argument
+# came from in the first place. Nothing under ``src/learning`` calls a model
+# any more, which is why there is no replacement test here rather than a
+# renamed one.
 
 # Modules under src/learning that are KNOWN to still pin a vendor and are
 # awaiting deletion rather than repair. Every entry here is a live §17

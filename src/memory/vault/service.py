@@ -16,14 +16,21 @@ import os
 from pathlib import Path
 from typing import Any, Optional
 
+from src.memory.vault import taxonomy
 from src.memory.vault.derived import generate_llms_txt, generate_showcase
 from src.memory.vault.doctor import apply_mechanical_fixes
-from src.memory.vault.gate import run_gate
+from src.memory.vault.gate import _is_valid_iso, run_gate
 from src.memory.vault.index import VaultIndex
 from src.memory.vault.model import GateConfig, GateReport
 from src.memory.vault.parser import parse_note_text
 
-_DATE_RE = __import__("re").compile(r"^\d{4}-\d{2}-\d{2}$")
+# ``validate_note`` below used to own a private ``_DATE_RE`` that checked only
+# the SHAPE (``^\d{4}-\d{2}-\d{2}$``) — a third hand-kept copy of the gate's
+# date rule, and a copy that had drifted: it passed ``created: 2024-13-04``,
+# the exact input ``gate._is_valid_iso`` names in its docstring as the one it
+# exists to catch. So the tool the agent calls to check a note before writing
+# it said "fine" about a date the gate then flagged. Call the gate's
+# predicate; do not re-derive it.
 
 
 def resolve_vault_root(explicit: str | Path | None = None) -> Path:
@@ -150,9 +157,12 @@ class VaultService:
         (validate.ts). Pure CPU; runs in a thread. Returns
         ``(fixed_content, errors, warnings, applied)``."""
         import datetime
-        import yaml
         from src.memory.vault.doctor import fix_note_content, _FIXABLE_RULES
-        from src.memory.vault.parser import split_frontmatter
+        from src.memory.vault.parser import (
+            FrontmatterSyntaxError,
+            load_frontmatter_yaml,
+            split_frontmatter,
+        )
 
         def work() -> tuple[str, list, list, list]:
             note = parse_note_text(rel, content, journal_root=self.journal_root)
@@ -161,12 +171,23 @@ class VaultService:
                 content, note, set(_FIXABLE_RULES), today)
             errors: list = []
             warnings: list = []
+            # NOTE the order: the auto-fixer above has already run, so this
+            # asks "is the frontmatter valid AFTER repair?", not "was it valid
+            # as submitted?". That is what makes the 38 damaged notes in the
+            # real vault writable again without loosening this check by one
+            # inch — the doctor's ``frontmatter_yaml`` repair lands them in
+            # valid YAML and they sail through. Loosening it to the tolerant
+            # parser's contract was the alternative and was rejected: it would
+            # have let NEW unparseable notes in (the vendored MCP's gray-matter
+            # reader would still hand the agent ``frontmatter: {}``), i.e. it
+            # would have made the vault writable by breaking the promise that
+            # made it readable.
             raw_fm, _ = split_frontmatter(fixed)
             if raw_fm is not None and raw_fm.strip():
                 try:
-                    yaml.safe_load(raw_fm)
-                except Exception as e:  # noqa: BLE001
-                    errors.append({"rule": "frontmatter", "severity": "error",
+                    load_frontmatter_yaml(raw_fm)
+                except FrontmatterSyntaxError as e:
+                    errors.append({"rule": "frontmatter_yaml", "severity": "error",
                                    "message": f"frontmatter is not valid YAML: {e}"})
             note2 = parse_note_text(rel, fixed, journal_root=self.journal_root)
             if is_new and note2.line_count > self.config.max_lines:
@@ -200,7 +221,17 @@ class VaultService:
             warnings: list = []
             applied: list = []
 
-            gated = validate and rel.lower().endswith(".md") and self._enforce_writes()
+            # ``is_in_quality_scope`` is the third caller of the ONE scope
+            # declaration (gate.py grades by it; the Node writer derives
+            # scope.generated.ts from it). This path used to skip nothing, so
+            # REST/CLI writes were enforced against raw-material folders the
+            # gate deliberately never grades — ``sources/`` is documented as
+            # an un-gated drop zone, and we were rejecting writes to it.
+            gated = (validate and rel.lower().endswith(".md")
+                     and self._enforce_writes()
+                     and taxonomy.is_in_quality_scope(
+                         rel, self.config.excluded_folders,
+                         self.config.raw_prefixes, self.config.journal_root))
             if gated:
                 try:
                     content, errors, warnings, applied = await self._enforce_write(
@@ -358,13 +389,22 @@ class VaultService:
         if note.line_count > cfg.max_lines:
             add("atomicity",
                 f"{note.line_count} body lines exceeds {cfg.max_lines}")
-        if note.related_multiline:
-            add("wikilink_format", "related spans multiple lines", fixable=True)
+        # The gate's ``wikilink_format`` stopped demanding a one-line
+        # ``related:`` in 89c7379 (the form it wanted is not valid YAML), but
+        # THIS copy of the rule was missed and went on telling the agent to
+        # collapse a correct block list — the deleted rule outliving its own
+        # deletion in the one place the agent actually asks. It is gone; what
+        # replaces it is the check that matters:
+        if not note.frontmatter_valid:
+            add("frontmatter_yaml",
+                "frontmatter is not valid YAML — every field below was read "
+                "by a tolerant fallback parser and may be wrong",
+                fixable=True)
         if note.spaced_wikilinks:
             add("wikilink_format", "wikilink(s) contain inner spaces", fixable=True)
         for fld in ("created", "updated"):
             val = getattr(note, fld)
-            if val and not _DATE_RE.match(val):
+            if val and not _is_valid_iso(val):
                 add("date_format", f"{fld} '{val}' is not YYYY-MM-DD", fixable=True)
         # broken links — resolve against the current index
         for target in note.outlinks:

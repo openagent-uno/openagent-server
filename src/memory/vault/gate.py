@@ -13,7 +13,8 @@ mode / the agent to act on. Code finds and reports; code fixes what code can;
 the rest is handed up with enough structure to fix.
 
 Rule coverage (every Company-Brain gate rule + extras):
-  frontmatter, atomicity (<=max_lines), min_links (>=3 unique real),
+  frontmatter_yaml (the --- block parses at all), frontmatter,
+  atomicity (<=max_lines), min_links (>=3 unique real),
   broken_link, orphan, connectivity (single component), filename
   (uniqueness + prefix), wikilink_format (related one-line / no inner
   spaces), date_format (YYYY-MM-DD), taxonomy (tags[0]==folder, channels as
@@ -67,12 +68,13 @@ def run_gate(index: VaultIndex, config: GateConfig | None = None) -> GateReport:
         ))
 
     notes = index.all_notes()
-    # The set of notes the structural rules apply to (skip raw material and
-    # excluded folders, but keep journal notes — they get journal rules).
+    # The set of notes the quality system applies to — ONE shared predicate,
+    # also called by the write path and rendered into the Node writer's
+    # scope.generated.ts, so all three agree by construction.
     gated: list[Note] = [
         n for n in notes
-        if not taxonomy.is_excluded(n.path, cfg.excluded_folders)
-        and not taxonomy.is_raw(n.path, cfg.raw_prefixes, cfg.journal_root)
+        if taxonomy.is_in_quality_scope(
+            n.path, cfg.excluded_folders, cfg.raw_prefixes, cfg.journal_root)
     ]
     gated_paths = {n.path for n in gated}
 
@@ -82,6 +84,23 @@ def run_gate(index: VaultIndex, config: GateConfig | None = None) -> GateReport:
 
     # ── per-note rules ────────────────────────────────────────────────
     for n in gated:
+        # R14 frontmatter is not valid YAML
+        #
+        # Reported FIRST and separately from R1 because it subsumes it: when
+        # the strict parse throws, every field the loose parser recovered is a
+        # guess, so a co-firing "missing summary" may be an artifact rather
+        # than a real gap. This rule is the reason the note's grade is
+        # untrustworthy, and it is what the doctor must fix before the rest of
+        # the report about that note means anything.
+        if not n.frontmatter_valid:
+            emit("frontmatter_yaml", n.path,
+                 "frontmatter is not valid YAML — the agent reads this note "
+                 "with every field undefined and the --- block in the body",
+                 fixable=True,
+                 suggestion="repair the YAML (run the doctor); a bare "
+                            "`related: [[a]], [[b]]` must be a block list and "
+                            "a value containing ': ' must be quoted")
+
         # R1 frontmatter completeness
         if n.missing_frontmatter_fields:
             miss = ", ".join(n.missing_frontmatter_fields)

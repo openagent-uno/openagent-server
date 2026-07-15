@@ -14,11 +14,67 @@ import hashlib
 import re
 from pathlib import Path
 
+import yaml
+
 from src.memory.vault import taxonomy
 from src.memory.vault.model import Note
 
 # Capture the target of [[target]] / [[target|alias]] (alias ignored).
 _WIKILINK_RE = re.compile(r"\[\[([^\]|\n]+)(?:\|[^\]\n]+)?\]\]")
+
+
+class FrontmatterSyntaxError(Exception):
+    """``raw_fm`` is not well-formed YAML. Raised only for real syntax
+    errors — see ``_FrontmatterLoader`` for what we deliberately do not
+    treat as one."""
+
+
+class _FrontmatterLoader(yaml.SafeLoader):
+    """``SafeLoader`` minus the implicit *timestamp* resolver.
+
+    WHY: PyYAML is a YAML 1.1 implementation and eagerly constructs anything
+    date-shaped into a ``datetime.date``. On ``created: 2024-13-04`` that
+    construction raises ``ValueError: month must be in 1..12`` — from a
+    document that is *syntactically perfect*. The TS ``yaml`` package (YAML
+    1.2 core schema), which the vendored vault MCP's write gate uses, returns
+    the plain string ``"2024-13-04"`` and allows the write. Measured: this was
+    the one case where the two write gates reached opposite verdicts on
+    identical bytes — Python blocked, Node allowed.
+
+    "Is this valid YAML?" is a question about *syntax*, and a bogus month is
+    not a syntax error. Resolving it here also meant the note was blocked
+    outright instead of being reported by ``date_format`` — the rule written
+    for exactly this input (``gate._is_valid_iso`` cites ``2024-13-04`` by
+    name). Dropping the resolver makes PyYAML agree with the TS engine on the
+    blocking decision AND hands the bogus date back to the rule that reports
+    it.
+
+    Safe for every field the gate reads: ``created``/``updated`` were already
+    funnelled through ``_str_field`` (``str(datetime.date(...))`` ==
+    ``"2026-06-09"``), so a date now arriving as that same string changes
+    nothing downstream.
+    """
+    yaml_implicit_resolvers = {
+        prefix: [(tag, regexp) for tag, regexp in resolvers
+                 if tag != "tag:yaml.org,2002:timestamp"]
+        for prefix, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+    }
+
+
+def load_frontmatter_yaml(raw_fm: str) -> dict:
+    """Strict-parse ``raw_fm``. Returns the mapping (``{}`` for an empty or
+    non-mapping document); raises ``FrontmatterSyntaxError`` when the YAML is
+    genuinely malformed.
+
+    THE single answer to "is this frontmatter valid YAML?" — the gate, the
+    doctor's repair guard, and ``VaultService._enforce_write`` all ask here,
+    so a note can never be graded broken by one and fine by another.
+    """
+    try:
+        loaded = yaml.load(raw_fm, Loader=_FrontmatterLoader)
+    except Exception as e:  # noqa: BLE001 — any PyYAML failure is a bad parse
+        raise FrontmatterSyntaxError(str(e)) from e
+    return loaded if isinstance(loaded, dict) else {}
 
 
 def link_key(s: str) -> str:
@@ -140,26 +196,17 @@ def _tags_list(meta: dict) -> list[str]:
     return []
 
 
-def _related_is_multiline(raw_fm: str) -> bool:
-    """True when the ``related:`` frontmatter value spreads across more than
-    one physical line (a YAML block list). Company-Brain wants it on one
-    line, comma-separated; the doctor collapses block lists back."""
-    lines = raw_fm.split("\n")
-    for idx, line in enumerate(lines):
-        stripped = line.lstrip()
-        if not stripped.startswith("related:"):
-            continue
-        value = stripped[len("related:"):].strip()
-        if value and not value.endswith(","):
-            # has an inline value that looks complete
-            # (block lists leave the value empty after the colon)
-            # still flag if the next line continues the block
-            nxt = lines[idx + 1].lstrip() if idx + 1 < len(lines) else ""
-            return nxt.startswith("- ")
-        # empty value after colon -> the targets live on following lines
-        nxt = lines[idx + 1] if idx + 1 < len(lines) else ""
-        return nxt.startswith(" ") or nxt.lstrip().startswith("- ")
-    return False
+# ``_related_is_multiline`` USED TO LIVE HERE. It flagged a block-style
+# ``related:`` list so the ``wikilink_format`` rule could demand it be
+# collapsed onto one line as ``related: [[a]], [[b]]`` — a form that is not
+# valid YAML (see ``doctor.py``, where ``_collapse_related`` was deleted for
+# the damage it caused). The rule was deleted in 89c7379, but the signal
+# outlived it and kept ONE consumer alive: ``VaultService.validate_note``
+# still emitted "related spans multiple lines", so the agent calling
+# ``vault_validate_note`` on a correct block list was told to break it, long
+# after the gate had stopped saying so. A signal nothing should read is a
+# signal something will. Both are gone; the column it occupied now carries
+# ``frontmatter_valid``, which the gate actually reads.
 
 
 def _str_field(meta: dict, key: str) -> str:
@@ -178,19 +225,24 @@ def parse_note_text(rel_path: str, content: str, mtime: float = 0.0,
     has_fm = raw_fm is not None
 
     meta: dict = {}
+    # Vacuously true for a note with no frontmatter at all — there is no YAML
+    # to be invalid, and the gate must not flag plain markdown.
+    fm_valid = True
     if has_fm:
         try:
-            import yaml
-            loaded = yaml.safe_load(raw_fm)
-            if isinstance(loaded, dict):
-                meta = loaded
-        except Exception:
-            meta = {}
-        # YAML chokes on bare ``[[wikilinks]]`` in frontmatter (the canon
-        # ``related:`` syntax). Fall back to a tolerant line parser so a
-        # single unquoted link doesn't blank out the whole note's metadata.
-        if not meta:
+            meta = load_frontmatter_yaml(raw_fm)
+        except FrontmatterSyntaxError:
+            # The frontmatter is genuinely broken. Fall back to a tolerant
+            # line parser so a single bad line doesn't blank out the whole
+            # note's metadata — but REMEMBER that we had to, so the gate can
+            # report the damage instead of silently grading a half-read note.
+            # (The vendored MCP's gray-matter reader has no such fallback: it
+            # swallows the throw and hands the agent ``frontmatter: {}``.)
+            fm_valid = False
             meta = _loose_frontmatter(raw_fm)
+        else:
+            if not meta:
+                meta = _loose_frontmatter(raw_fm)
 
     stem = taxonomy.stem_of(rel)
     folder = taxonomy.top_folder(rel)
@@ -250,7 +302,7 @@ def parse_note_text(rel_path: str, content: str, mtime: float = 0.0,
         has_frontmatter=has_fm,
         is_index=taxonomy.is_index_note(rel),
         is_journal=taxonomy.is_journal_note(rel, journal_root),
-        related_multiline=_related_is_multiline(raw_fm or ""),
+        frontmatter_valid=fm_valid,
         spaced_wikilinks=spaced,
         missing_frontmatter_fields=missing,
         body_has_em_dash="—" in body,

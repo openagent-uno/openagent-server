@@ -46,6 +46,18 @@ RULES: dict[str, Rule] = {
     for r in (
         Rule("frontmatter", "Frontmatter completeness", SEVERITY_WARN, True,
              "title, summary, tags, status, created, updated must all be present"),
+        # ``error``, unlike every other frontmatter rule, because this is not a
+        # note that is missing something — it is a note the agent CANNOT READ.
+        # The vendored vault MCP's gray-matter reader throws and returns
+        # ``frontmatter: {}``, so ``vault_read_note`` hands back title/tags/
+        # related as undefined with the raw ``---`` block leaking into the
+        # body, and the agent believes it has read the note. Both write gates
+        # (validate.ts, VaultService._enforce_write) already refuse to write
+        # this; the gate calling it an error is what makes all three agree.
+        # Mechanically fixable as of this change, so it converges to 0.
+        Rule("frontmatter_yaml", "Frontmatter is not valid YAML", SEVERITY_ERROR, True,
+             "the --- block must parse as YAML; a note whose frontmatter throws "
+             "is read by the agent with every field undefined"),
         Rule("atomicity", "Atomic note size", SEVERITY_WARN, False,
              "a note should hold one idea and stay under the line limit (default 300)"),
         Rule("min_links", "Minimum outgoing links", SEVERITY_INFO, False,
@@ -105,12 +117,13 @@ class Note:
     is_index: bool = False            # _index hub note (exempt from orphan/min_links)
     is_journal: bool = False          # under the journal root
     # Lint signals captured at parse time so the gate/doctor needn't re-derive:
-    # Parsed and stored by index.py, but NO rule reads it any more: the
-    # "related on one line" requirement it fed was deleted (see gate.py R8 /
-    # doctor.py) once it turned out to demand invalid YAML. Kept only because
-    # ``index.py`` binds the column; it and the ``related_multiline`` column
-    # should be dropped together by that file's owner.
-    related_multiline: bool = False   # `related:` value spanned >1 physical line
+    # False when the frontmatter failed a strict YAML parse and the tolerant
+    # line parser had to stand in — so every field above was read by guesswork
+    # and may be wrong or absent. This replaces ``related_multiline``, which
+    # fed a rule deleted in 89c7379 (it demanded invalid YAML) yet stayed
+    # wired to ``VaultService.validate_note``, which went on giving the
+    # deleted advice. Same column, a signal the gate actually reads.
+    frontmatter_valid: bool = True
     spaced_wikilinks: list[str] = field(default_factory=list)  # `[[ a ]]` style
     missing_frontmatter_fields: list[str] = field(default_factory=list)
     body_has_em_dash: bool = False    # captured at parse so the index needn't store bodies
@@ -186,7 +199,17 @@ class GateReport:
 # Folders treated as raw material / scratch and skipped by the structural
 # gate (Company-Brain skips sources/ + workspace/). ``workspace/journal`` is
 # the exception: it holds real dynamic memory and gets the journal rule.
-_DEFAULT_EXCLUDED = ("sources", "_showcase", "_templates", ".obsidian", ".git", ".openagent")
+# ``templates`` earns its place from the Node writer: unifying the scope
+# revealed that ``validate.ts`` had always skipped ``templates/`` and
+# ``.trash/`` while the Python gate graded both. Its ``_``-prefix rule was
+# wrong (it cost 413 real notes), but THESE two were right — a template is a
+# form with placeholder links, and trash is deleted content; grading either
+# manufactures violations nobody can fix. Merged into the one declaration
+# rather than deleted with the rest of that heuristic. Dot-directories are
+# handled by rule in ``taxonomy.is_excluded`` (see there) rather than by
+# name, so the next tool that makes one is covered without an edit here.
+_DEFAULT_EXCLUDED = ("sources", "_showcase", "_templates", "templates",
+                     ".obsidian", ".git", ".openagent")
 _DEFAULT_RAW_PREFIXES = ("sources/", "workspace/")
 _DEFAULT_JOURNAL_ROOT = "workspace/journal"
 

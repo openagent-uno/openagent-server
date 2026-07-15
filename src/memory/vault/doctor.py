@@ -4,7 +4,9 @@ Company-Brain Prompt 6 is a loop: fix the issues the gate flagged, re-run the
 gate, repeat until "0 errori". This module is the *mechanical* half of that
 loop — the fixes a script can apply deterministically and safely:
 
-- collapse a multi-line ``related:`` onto one comma-separated line,
+- repair frontmatter that does not parse as YAML back into YAML (the bare
+  ``related: [[a]], [[b]]`` sequence, and an unquoted scalar containing
+  ": ") — verified by re-parsing, never written unless it lands,
 - strip whitespace from inside ``[[ wikilinks ]]``,
 - normalize ``created`` / ``updated`` to ``YYYY-MM-DD`` when coercible,
 - scaffold missing mechanical frontmatter fields (title, tags, status,
@@ -32,9 +34,107 @@ from src.memory.vault.model import GateReport, Note
 from src.memory.vault.parser import parse_note_text, split_frontmatter
 
 # Rules the doctor can fix mechanically (everything else is a suggestion).
-_FIXABLE_RULES = {"wikilink_format", "date_format", "frontmatter", "em_dash"}
+_FIXABLE_RULES = {"frontmatter_yaml", "wikilink_format", "date_format",
+                  "frontmatter", "em_dash"}
 
 _WIKILINK_BRACED = re.compile(r"\[\[([^\[\]]+?)\]\]")
+
+
+# ── frontmatter YAML repair ───────────────────────────────────────────
+# Repairs the two shapes that account for ALL 38 notes with unparseable
+# frontmatter in the owner's real 2,116-note vault. Both are deterministic:
+# there is exactly one reading of the author's intent, and we verify it by
+# re-parsing before we keep the result.
+
+# ``related: [[a]], [[b]]`` (or space-separated) — bare double-brackets are
+# not a YAML flow sequence, so the whole mapping fails to parse. 27 notes.
+# This is the damage the deleted ``wikilink_format`` rule DEMANDED, written
+# by the doctor's own deleted ``_collapse_related``: we are undoing our own
+# vandalism. The value must be EXCLUSIVELY wikilinks — a mixed value like
+# ``related: [[a]], some prose`` has no single safe reading, so it is left
+# alone and reported (measured: 0 such notes in the real vault).
+_INLINE_LINK_SEQ = re.compile(
+    r"^([A-Za-z0-9_][A-Za-z0-9_-]*):[ \t]*"
+    r"(\[\[[^\[\]]+\]\](?:[ \t]*,?[ \t]*\[\[[^\[\]]+\]\])*)[ \t]*,?[ \t]*$")
+
+# ``title: Bug: it broke`` — an unquoted scalar containing ": ", which YAML
+# reads as a nested mapping and rejects. 11 notes, every one a ``title``
+# whose intended value is confirmed verbatim by the quoted ``summary:`` the
+# same generator wrote on the next line. Only ever applied to a line YAML has
+# already rejected, and only at column 0.
+_UNQUOTED_SCALAR = re.compile(r"^([A-Za-z0-9_][A-Za-z0-9_-]*):[ \t]+(\S.*)$")
+
+
+def _yaml_quote(s: str) -> str:
+    """Emit ``s`` as a YAML double-quoted scalar.
+
+    ``json.dumps`` is the emitter on purpose: a JSON string literal is a valid
+    YAML double-quoted scalar in both YAML 1.1 (PyYAML) and 1.2 (the TS
+    ``yaml`` package and gray-matter), and it escapes ``"`` / ``\\`` for us.
+
+    ``ensure_ascii=False`` is for the HUMAN, not the parser. A planted-defect
+    run corrected an earlier claim here: with ``ensure_ascii=True`` the value
+    still round-trips *perfectly*, because a YAML double-quoted scalar decodes
+    ``\\u2014`` exactly like JSON does — no test could tell the difference by
+    reading the parsed value, and none did. What it changes is the bytes on
+    disk, and §5 promises a vault the user reads in Obsidian: a title sitting
+    in the Properties panel as ``Bug: crashes \\u2014 fixed`` breaks that
+    promise. Several of the 11 real titles this repairs carry an em dash.
+    """
+    import json
+    return json.dumps(s, ensure_ascii=False)
+
+
+def _repair_frontmatter_yaml(raw_fm: str) -> tuple[str, bool]:
+    """Best-effort deterministic repair of frontmatter that does not parse.
+
+    Returns ``(new_fm, changed)``. NEVER returns a change unless the result
+    actually parses — a repair that leaves the note broken is worse than no
+    repair, because it silently edits a file while the agent still cannot read
+    it. Anything we cannot mechanically repair is left exactly as-is for the
+    gate to keep reporting.
+    """
+    from src.memory.vault.parser import FrontmatterSyntaxError, load_frontmatter_yaml
+
+    try:
+        load_frontmatter_yaml(raw_fm)
+        return raw_fm, False       # already valid — nothing to repair
+    except FrontmatterSyntaxError:
+        pass
+
+    out: list[str] = []
+    touched = False
+    for line in raw_fm.split("\n"):
+        m = _INLINE_LINK_SEQ.match(line)
+        if m:
+            key, value = m.group(1), m.group(2)
+            links = _WIKILINK_BRACED.findall(value)
+            if links:
+                out.append(f"{key}:")
+                out.extend(f"  - {_yaml_quote('[[' + t.strip() + ']]')}"
+                           for t in links)
+                touched = True
+                continue
+        m = _UNQUOTED_SCALAR.match(line)
+        if m:
+            key, value = m.group(1), m.group(2).rstrip()
+            # Only a value YAML cannot read: it must contain ": " (or end in
+            # ":") and not already be quoted or a flow collection.
+            if not value.startswith(("'", '"', "[", "{", "&", "*", "|", ">")) \
+                    and re.search(r":(?:[ \t]|$)", value):
+                out.append(f"{key}: {_yaml_quote(value)}")
+                touched = True
+                continue
+        out.append(line)
+
+    if not touched:
+        return raw_fm, False
+    new_fm = "\n".join(out)
+    try:
+        load_frontmatter_yaml(new_fm)
+    except FrontmatterSyntaxError:
+        return raw_fm, False       # repair did not land it — do not write
+    return new_fm, True
 
 
 @dataclass
@@ -201,6 +301,15 @@ def fix_note_content(content: str, note: Note, rules: set[str],
         fm, body = nfm, nbody
         if c1 or c2:
             applied.append("stripped spaces inside [[ ]]")
+
+    # Before anything else that reads the frontmatter as YAML: an unparseable
+    # block makes every field below it a guess, so repair it first and let the
+    # remaining fixes work on a document that actually parses.
+    if "frontmatter_yaml" in rules:
+        nfm, c = _repair_frontmatter_yaml(fm)
+        if c:
+            fm = nfm
+            applied.append("repaired frontmatter into valid YAML")
 
     if "date_format" in rules:
         nfm, c = _normalize_dates(fm)
