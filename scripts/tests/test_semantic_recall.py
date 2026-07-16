@@ -674,3 +674,189 @@ async def t_background_builder(ctx: TestContext) -> None:
             _os.environ.pop("OPENAGENT_SEMANTIC_RESYNC_SECONDS", None)
     finally:
         _cleanup(db, idx_path, vault)
+
+
+# ── Hybrid recall (FTS ∪ semantic) ────────────────────────────────────
+# The eval finding: semantic cosine bands overlap (nomic ~0.59–0.83) so no
+# min_score cleanly separates relevant from noise — a refund-policy note scored
+# 0.592, BELOW the floor, while a generic thread scored 0.604 above it. FTS
+# keyword search catches the exact term the floor drops; hybrid fuses both.
+
+def _prime_fts_cache(vault: Path, index_path: Path) -> Any:
+    """Build a real FTS ``VaultIndex`` over ``vault`` and install it in the
+    hybrid hook's cache, so ``_recall_block`` uses it without touching
+    ``data_dir()`` (mirrors ``_prime_recall_cache`` for the semantic side)."""
+    import src.core.agent as agent_mod
+    from src.memory.vault.index import VaultIndex
+
+    fts = VaultIndex(vault, index_path)
+    fts.sync()
+    agent_mod._FTS_INDEX_CACHE[str(vault)] = fts
+    return fts
+
+
+def _clear_recall_env() -> None:
+    for _v in ("HYBRID", "MIN_SCORE", "WARM_BUDGET", "ENABLED",
+               "FTS_TOP_K", "FTS_EXTRA", "TOP_K"):
+        os.environ.pop(f"OPENAGENT_AUTO_RECALL_{_v}", None)
+
+
+@test("semantic_recall", "hybrid: an FTS keyword hit BELOW the semantic floor is still recalled (the eval finding)")
+async def t_hybrid_rescues_below_floor(ctx: TestContext) -> None:
+    """The whole justification: pin ``min_score`` so high the semantic side
+    returns NOTHING, and show the note is injected anyway because FTS matched the
+    exact term — then that with hybrid OFF it is lost (the pre-hybrid regression
+    the eval measured on the refund rule)."""
+    import src.core.agent as agent_mod
+
+    db, idx_path, vault = _paths(ctx, "hybrid-floor")
+    fts_path = ctx.db_path.with_name(f"{vault.name}-fts.db")
+    try:
+        _write_note(vault, "refund-policy", "Refund policy",
+                    "refund double charges within 14 days via Stripe")
+        d = await _open_db(db); await d.close()
+        sem = _prime_recall_cache(db, vault)     # semantic index active
+        fts = _prime_fts_cache(vault, fts_path)  # FTS index active
+
+        os.environ["OPENAGENT_AUTO_RECALL_ENABLED"] = "1"
+        os.environ["OPENAGENT_AUTO_RECALL_WARM_BUDGET"] = "0"
+        os.environ["OPENAGENT_AUTO_RECALL_MIN_SCORE"] = "0.999"  # semantic → nothing
+        os.environ["OPENAGENT_AUTO_RECALL_HYBRID"] = "1"
+        out = await agent_mod._with_recall(
+            _fake_agent(db, vault), "sess",
+            "customer wants a refund", "USER MESSAGE")
+        assert "refund-policy.md" in out, \
+            f"FTS hit below the semantic floor was NOT recalled: {out!r}"
+        assert "keyword match" in out, f"FTS-only hit not tagged: {out!r}"
+        assert out.endswith("USER MESSAGE")
+
+        # Hybrid OFF → the below-floor note is lost, exactly the regression.
+        os.environ["OPENAGENT_AUTO_RECALL_HYBRID"] = "0"
+        out2 = await agent_mod._with_recall(
+            _fake_agent(db, vault), "sess",
+            "customer wants a refund", "USER MESSAGE")
+        assert out2 == "USER MESSAGE", \
+            f"semantic-only leaked/rescued a below-floor hit: {out2!r}"
+        sem.close(); fts.close()
+    finally:
+        agent_mod._RECALL_INDEX_CACHE.pop(str(db), None)
+        agent_mod._FTS_INDEX_CACHE.pop(str(vault), None)
+        _clear_recall_env()
+        _cleanup(db, idx_path, vault, fts_path)
+
+
+@test("semantic_recall", "hybrid: a note found by BOTH sides is deduped and tagged as both")
+async def t_hybrid_dedup(ctx: TestContext) -> None:
+    import src.core.agent as agent_mod
+
+    db, idx_path, vault = _paths(ctx, "hybrid-dedup")
+    fts_path = ctx.db_path.with_name(f"{vault.name}-fts.db")
+    try:
+        _write_note(vault, "acme", "Acme refund dispute",
+                    "the customer complained and demanded a refund")
+        d = await _open_db(db); await d.close()
+        sem = _prime_recall_cache(db, vault)
+        fts = _prime_fts_cache(vault, fts_path)
+
+        os.environ["OPENAGENT_AUTO_RECALL_ENABLED"] = "1"
+        os.environ["OPENAGENT_AUTO_RECALL_WARM_BUDGET"] = "0"
+        os.environ["OPENAGENT_AUTO_RECALL_MIN_SCORE"] = "0.4"  # semantic returns it too
+        os.environ["OPENAGENT_AUTO_RECALL_HYBRID"] = "1"
+        out = await agent_mod._with_recall(
+            _fake_agent(db, vault), "sess",
+            "customer complained refund", "USER MESSAGE")
+        assert out.count("`acme.md`") == 1, \
+            f"note not deduped across FTS+semantic: {out!r}"
+        assert "+ keyword" in out, \
+            f"a both-sides hit should read 'similarity X + keyword': {out!r}"
+        sem.close(); fts.close()
+    finally:
+        agent_mod._RECALL_INDEX_CACHE.pop(str(db), None)
+        agent_mod._FTS_INDEX_CACHE.pop(str(vault), None)
+        _clear_recall_env()
+        _cleanup(db, idx_path, vault, fts_path)
+
+
+@test("semantic_recall", "hybrid degrades to FTS-only when the embedder is down")
+async def t_hybrid_degrades_no_embedder(ctx: TestContext) -> None:
+    """Embedder unreachable → ``_get_recall_index`` is None → recall must still
+    work off FTS alone (§17). The pre-hybrid code bailed here and injected
+    nothing."""
+    import src.core.agent as agent_mod
+
+    db, idx_path, vault = _paths(ctx, "hybrid-noembed")
+    fts_path = ctx.db_path.with_name(f"{vault.name}-fts.db")
+    try:
+        _write_note(vault, "refund-policy", "Refund policy",
+                    "refund double charges within 14 days")
+        agent_mod._RECALL_INDEX_CACHE.pop(str(db), None)  # force live resolution
+        os.environ.pop("OPENAGENT_EMBEDDING_MODEL", None)  # embedder inert
+        fts = _prime_fts_cache(vault, fts_path)
+
+        os.environ["OPENAGENT_AUTO_RECALL_ENABLED"] = "1"
+        os.environ["OPENAGENT_AUTO_RECALL_WARM_BUDGET"] = "0"
+        os.environ["OPENAGENT_AUTO_RECALL_HYBRID"] = "1"
+        out = await agent_mod._with_recall(
+            _fake_agent(db, vault), "sess", "refund policy", "USER MESSAGE")
+        assert "refund-policy.md" in out, \
+            f"FTS-only recall failed with the embedder down: {out!r}"
+        assert "keyword match" in out
+        fts.close()
+    finally:
+        agent_mod._RECALL_INDEX_CACHE.pop(str(db), None)
+        agent_mod._FTS_INDEX_CACHE.pop(str(vault), None)
+        _clear_recall_env()
+        _cleanup(db, idx_path, vault, fts_path)
+
+
+@test("semantic_recall", "hybrid degrades to semantic-only when the FTS index is unavailable")
+async def t_hybrid_degrades_no_fts(ctx: TestContext) -> None:
+    import src.core.agent as agent_mod
+
+    db, idx_path, vault = _paths(ctx, "hybrid-nofts")
+    orig = agent_mod._get_vault_fts_index
+    try:
+        _write_note(vault, "acme", "Acme refund dispute",
+                    "the customer complained and demanded a refund")
+        d = await _open_db(db); await d.close()
+        sem = _prime_recall_cache(db, vault)
+        agent_mod._get_vault_fts_index = lambda _a: None  # FTS unavailable
+
+        os.environ["OPENAGENT_AUTO_RECALL_ENABLED"] = "1"
+        os.environ["OPENAGENT_AUTO_RECALL_WARM_BUDGET"] = "0"
+        os.environ["OPENAGENT_AUTO_RECALL_MIN_SCORE"] = "0.4"
+        os.environ["OPENAGENT_AUTO_RECALL_HYBRID"] = "1"
+        out = await agent_mod._with_recall(
+            _fake_agent(db, vault), "sess",
+            "has this customer complained before?", "USER MESSAGE")
+        assert "acme.md" in out, \
+            f"semantic-only recall broke when FTS was unavailable: {out!r}"
+        sem.close()
+    finally:
+        agent_mod._get_vault_fts_index = orig
+        agent_mod._RECALL_INDEX_CACHE.pop(str(db), None)
+        _clear_recall_env()
+        _cleanup(db, idx_path, vault)
+
+
+@test("semantic_recall", "RRF merge: dedup, FTS-only inclusion, both-sides boost, limit")
+async def t_rrf_merge_unit(ctx: TestContext) -> None:
+    from src.core.agent import _rrf_merge
+
+    sem = [{"kind": "note", "path": "a.md", "score": 0.8, "title": "A"},
+           {"kind": "note", "path": "b.md", "score": 0.7, "title": "B"}]
+    fts = [{"path": "c.md", "title": "C"}, {"path": "a.md", "title": "A"}]
+    merged = _rrf_merge(sem, fts, limit=5)
+    paths = [h["path"] for h in merged]
+
+    assert paths.count("a.md") == 1, f"a.md not deduped: {paths}"
+    assert "c.md" in paths, f"FTS-only note dropped: {paths}"
+    assert paths[0] == "a.md", f"both-sides hit should rank first: {paths}"
+
+    a = next(h for h in merged if h["path"] == "a.md")
+    assert a.get("fts_matched") is True and a["score"] == 0.8, \
+        "both-sides hit must keep its cosine and be marked fts_matched"
+    c = next(h for h in merged if h["path"] == "c.md")
+    assert c["score"] is None and c.get("fts_matched") is True, \
+        "FTS-only hit must have no cosine and be marked fts_matched"
+    assert len(_rrf_merge(sem, fts, limit=2)) == 2, "limit not respected"

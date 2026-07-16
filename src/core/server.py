@@ -466,9 +466,15 @@ def _build_agent(config: dict) -> Agent:
     _ar_cfg = (memory_cfg.get("auto_recall") or {})
     if "enabled" in _ar_cfg:
         os.environ["OPENAGENT_AUTO_RECALL_ENABLED"] = "1" if bool(_ar_cfg["enabled"]) else "0"
+    # Hybrid FTS∪semantic recall (default ON in code). Only export when the
+    # operator sets it explicitly, so the default lives in one place.
+    if "hybrid" in _ar_cfg:
+        os.environ["OPENAGENT_AUTO_RECALL_HYBRID"] = "1" if bool(_ar_cfg["hybrid"]) else "0"
     for _k, _env in (
         ("min_score",   "OPENAGENT_AUTO_RECALL_MIN_SCORE"),
         ("top_k",       "OPENAGENT_AUTO_RECALL_TOP_K"),
+        ("fts_top_k",   "OPENAGENT_AUTO_RECALL_FTS_TOP_K"),
+        ("fts_extra",   "OPENAGENT_AUTO_RECALL_FTS_EXTRA"),
         ("max_tokens",  "OPENAGENT_AUTO_RECALL_MAX_TOKENS"),
         ("warm_budget", "OPENAGENT_AUTO_RECALL_WARM_BUDGET"),
         ("timeout",     "OPENAGENT_AUTO_RECALL_TIMEOUT"),
@@ -476,6 +482,27 @@ def _build_agent(config: dict) -> Agent:
         if _k in _ar_cfg:
             try:
                 os.environ[_env] = str(_ar_cfg[_k])
+            except (TypeError, ValueError):
+                pass
+    # Quality monitor (opt-in): an LLM-as-judge grades a SAMPLED fraction of
+    # completed turns for correctness, logged as ``quality.score`` beside the
+    # ``router.cost_recorded`` spend events — usage AND quality in one place.
+    # Maps ``quality_monitor.*`` (top-level, or under ``memory:``) to the env
+    # vars ``src/core/quality_monitor.py`` reads. OFF unless enabled (§17).
+    _qm_cfg = (config.get("quality_monitor") or memory_cfg.get("quality_monitor") or {})
+    if "enabled" in _qm_cfg:
+        os.environ["OPENAGENT_QUALITY_MONITOR_ENABLED"] = (
+            "1" if bool(_qm_cfg["enabled"]) else "0"
+        )
+    for _k, _env in (
+        ("sample_rate", "OPENAGENT_QUALITY_MONITOR_SAMPLE_RATE"),
+        ("model",       "OPENAGENT_QUALITY_MONITOR_MODEL"),
+        ("timeout",     "OPENAGENT_QUALITY_MONITOR_TIMEOUT"),
+        ("min_len",     "OPENAGENT_QUALITY_MONITOR_MIN_LEN"),
+    ):
+        if _k in _qm_cfg:
+            try:
+                os.environ[_env] = str(_qm_cfg[_k])
             except (TypeError, ValueError):
                 pass
     _cur_cfg = (memory_cfg.get("curator") or {})

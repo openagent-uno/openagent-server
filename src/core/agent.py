@@ -457,6 +457,23 @@ _RECALL_INDEX_LOCK = threading.Lock()
 # not per turn — see ``_get_recall_index``.
 _RECALL_IMPORT_WARNED = False
 
+# ── Hybrid recall (Layer A ∪ Layer B) ─────────────────────────────────
+# Semantic search matches MEANING but its cosine scores compress into a narrow
+# band (nomic ~0.59–0.83) where relevant notes and noise OVERLAP, so no single
+# ``min_score`` cleanly separates them — a refund-policy note scored 0.592
+# (below the floor) while a generic thread scored 0.604 (above it). FTS keyword
+# search does the opposite: it nails EXACT terms ("rimborso" → the refund rule)
+# that semantic ranks below the floor. So we run BOTH and fuse them: an FTS hit
+# is injected regardless of its semantic score, which is precisely the note the
+# semantic floor was dropping. Fusion is Reciprocal Rank Fusion (RRF, k=60) —
+# rank-based so it needs no score calibration between the two very different
+# scales, and a note found by both sides is boosted. Degrades cleanly (§17):
+# embedder down → FTS-only; FTS index unavailable → semantic-only.
+_FTS_INDEX_CACHE: dict[str, Any] = {}
+_FTS_INDEX_LOCK = threading.Lock()
+_FTS_IMPORT_WARNED = False
+_RRF_K = 60  # standard RRF damping constant
+
 
 def _recall_enabled() -> bool:
     return (
@@ -528,6 +545,93 @@ def _get_recall_index(agent: Any) -> Any:
         return idx
 
 
+def _hybrid_enabled() -> bool:
+    """Hybrid FTS∪semantic recall. Default ON; set to 0/false for semantic-only
+    (the pre-hybrid behaviour), which is what the tests pin as the fallback."""
+    return (
+        os.environ.get("OPENAGENT_AUTO_RECALL_HYBRID", "1").strip().lower()
+        in ("1", "true", "yes", "on")
+    )
+
+
+def _get_vault_fts_index(agent: Any) -> Any:
+    """Return a cached FTS :class:`VaultIndex` over this agent's vault, or
+    ``None`` when it can't be opened. Mirrors ``_get_recall_index`` (cache keyed
+    by vault root; open failures degrade to None so recall stays semantic-only).
+
+    Synced once on open so a cold index is usable; steady-state freshness rides
+    the shared WAL db that the gateway's ``VaultService`` keeps reconciled. This
+    runs from the recall worker thread — the sync is a cheap stat scan (no
+    embeddings), bounded by the caller's ``OPENAGENT_AUTO_RECALL_TIMEOUT``."""
+    try:
+        vault_root = agent._resolve_vault_path()
+    except Exception:  # noqa: BLE001
+        vault_root = None
+    if not vault_root:
+        return None
+    key = str(vault_root)
+    with _FTS_INDEX_LOCK:
+        cached = _FTS_INDEX_CACHE.get(key)
+        if cached is not None:
+            return cached
+        try:
+            from src.memory.vault.index import VaultIndex
+            from src.memory.vault.service import default_index_path
+        except Exception as exc:  # noqa: BLE001 — an import issue must not break turns
+            global _FTS_IMPORT_WARNED
+            if not _FTS_IMPORT_WARNED:
+                _FTS_IMPORT_WARNED = True
+                elog("auto_recall.fts_import_failed", level="warning",
+                     error=str(exc) or type(exc).__name__)
+            return None
+        try:
+            idx = VaultIndex(vault_root, default_index_path(vault_root))
+            idx.sync()  # populate a cold index once; warm re-opens are a stat scan
+        except Exception as exc:  # noqa: BLE001
+            elog("auto_recall.fts_open_error", level="warning",
+                 error=str(exc) or type(exc).__name__)
+            return None
+        _FTS_INDEX_CACHE[key] = idx
+        return idx
+
+
+def _rrf_merge(sem_hits: list[dict], fts_hits: list[dict], limit: int) -> list[dict]:
+    """Fuse semantic hits (already ``min_score``-filtered) with FTS note hits by
+    Reciprocal Rank Fusion, deduped by identity, best first, capped at ``limit``.
+
+    The whole point: an FTS-matched note is admitted even when its semantic score
+    is below the floor (it isn't in ``sem_hits`` at all) — that is how the
+    exact-term policy note the floor dropped gets back in. A note found by both
+    sides accumulates both RRF contributions and rises.
+    """
+    fused: dict[tuple, dict[str, Any]] = {}
+
+    def _key(h: dict) -> tuple:
+        return ("note", h.get("path")) if h.get("kind") != "session" \
+            else ("session", h.get("session_id"))
+
+    for rank, h in enumerate(sem_hits):
+        k = _key(h)
+        fused[k] = {"hit": dict(h), "rrf": 1.0 / (_RRF_K + rank)}
+
+    for rank, h in enumerate(fts_hits):
+        k = ("note", h.get("path"))
+        if k in fused:
+            fused[k]["rrf"] += 1.0 / (_RRF_K + rank)
+            fused[k]["hit"]["fts_matched"] = True
+        else:
+            # FTS-only: no semantic score (below the floor or unembedded).
+            fused[k] = {
+                "hit": {"kind": "note", "path": h.get("path"),
+                        "title": h.get("title") or "", "score": None,
+                        "fts_matched": True},
+                "rrf": 1.0 / (_RRF_K + rank),
+            }
+
+    ranked = sorted(fused.values(), key=lambda e: e["rrf"], reverse=True)
+    return [e["hit"] for e in ranked[:limit]]
+
+
 def _format_recall_block(hits: list[dict], max_chars: int) -> str:
     """Render recall hits as a verify-framed ``<system-reminder>`` block.
 
@@ -553,14 +657,21 @@ def _format_recall_block(hits: list[dict], max_chars: int) -> str:
         else:
             title = h.get("title") or "untitled"
             label = f"past session `{h.get('session_id', '')}` — {title}"
-        lines.append(f"- {label}  [similarity {score}]")
+        # How the hit was found: semantic similarity, exact keyword, or both.
+        if score is None:
+            tag = "keyword match"
+        elif h.get("fts_matched"):
+            tag = f"similarity {score} + keyword"
+        else:
+            tag = f"similarity {score}"
+        lines.append(f"- {label}  [{tag}]")
     body = "\n".join(lines)
     if len(body) > max_chars:
         body = body[:max_chars].rstrip() + " …"
     return f"<system-reminder>\n{body}\n</system-reminder>"
 
 
-def _recall_block(agent: Any, query: str) -> str:
+def _recall_block(agent: Any, query: str, session_id: str | None = None) -> str:
     """Sync worker (runs off the event loop): warm, search, format. Returns the
     ``<system-reminder>`` string, or ``""`` when nothing clears the threshold.
 
@@ -569,22 +680,62 @@ def _recall_block(agent: Any, query: str) -> str:
     and the threshold is what does the real quality-gating. Wiring the recall
     ledger in — prefer notes with a good measured ok_rate — is the follow-up.
     """
-    idx = _get_recall_index(agent)
-    if idx is None or not idx.active:
-        return ""
-    # Warm a bounded number of changed items so a cold index becomes useful over
-    # the first few turns without ever firing an unbounded burst of embedding
-    # calls on the turn path. Steady state (nothing changed) embeds only the
-    # query below — one call per turn. 0 disables warming (query-only).
-    warm = _recall_int("OPENAGENT_AUTO_RECALL_WARM_BUDGET", 24)
-    if warm > 0:
-        try:
-            idx.sync(max_items=warm)
-        except Exception:  # noqa: BLE001 — a warm failure must not block recall
-            pass
     k = max(1, _recall_int("OPENAGENT_AUTO_RECALL_TOP_K", 3))
     floor = _recall_float("OPENAGENT_AUTO_RECALL_MIN_SCORE", 0.75)
-    hits = idx.search(query, scope="all", limit=k, min_score=floor)
+    # SEMANTIC side (Layer B). Runs only when an embedder is wired; when it isn't,
+    # sem_hits stays empty and recall rides FTS alone — that IS the §17 fallback,
+    # so we do NOT bail here the way the pre-hybrid code did.
+    idx = _get_recall_index(agent)
+    semantic_active = idx is not None and idx.active
+    sem_hits: list[dict] = []
+    if semantic_active:
+        # Warm a bounded number of changed items so a cold index becomes useful
+        # over the first few turns without an unbounded burst of embedding calls.
+        # Steady state embeds only the query below. 0 disables warming.
+        warm = _recall_int("OPENAGENT_AUTO_RECALL_WARM_BUDGET", 24)
+        if warm > 0:
+            try:
+                idx.sync(max_items=warm)
+            except Exception:  # noqa: BLE001 — a warm failure must not block recall
+                pass
+        sem_hits = idx.search(query, scope="all", limit=k, min_score=floor)
+    hits = sem_hits
+    # FTS side (Layer A) — fuse in exact-term keyword hits so a note the semantic
+    # floor dropped still surfaces. Independent of the embedder: this is what
+    # makes recall degrade to FTS-only when the embedder is down, and it never
+    # blocks recall (open/search failures → semantic-only).
+    fts_used = False
+    if _hybrid_enabled():
+        fts_idx = _get_vault_fts_index(agent)
+        if fts_idx is not None:
+            try:
+                fts_k = max(1, _recall_int("OPENAGENT_AUTO_RECALL_FTS_TOP_K", 3))
+                fts_hits = fts_idx.search(query, limit=fts_k)
+            except Exception:  # noqa: BLE001 — FTS failure → semantic-only
+                fts_hits = []
+            if fts_hits:
+                fts_used = True
+                # Cap the fused set a little above k so FTS-only policy notes get
+                # room without unbounding the injected block.
+                extra = max(0, _recall_int("OPENAGENT_AUTO_RECALL_FTS_EXTRA", 2))
+                hits = _rrf_merge(sem_hits, fts_hits, limit=k + extra)
+    # Inert: neither layer could run (no embedder AND no FTS) — byte-identical to
+    # pre-recall, and nothing to record.
+    if not semantic_active and not fts_used:
+        return ""
+    # Quality monitor (opt-in): record this turn's recall outcome — hit-rate and
+    # top-score feed the aggregate and the min_score tuning signal. No-op when
+    # the monitor is off; safe from this worker thread (logging is thread-safe).
+    # top_score is the strongest SEMANTIC cosine among the fused hits; FTS-only
+    # hits carry no cosine and don't contribute to it.
+    try:
+        from src.core import quality_monitor
+        _top = max((h["score"] for h in hits if h.get("score") is not None),
+                   default=0.0)
+        quality_monitor.note_recall(
+            session_id, used=True, hits=len(hits), top_score=_top)
+    except Exception:  # noqa: BLE001 — a metric must never block recall
+        pass
     if not hits:
         return ""
     max_chars = max(200, _recall_int("OPENAGENT_AUTO_RECALL_MAX_TOKENS", 400) * 4)
@@ -610,7 +761,7 @@ async def _with_recall(agent: Any, session_id: str | None, query: str,
     try:
         timeout = _recall_float("OPENAGENT_AUTO_RECALL_TIMEOUT", 4.0)
         block = await asyncio.wait_for(
-            asyncio.to_thread(_recall_block, agent, query), timeout=timeout)
+            asyncio.to_thread(_recall_block, agent, query, session_id), timeout=timeout)
     except Exception as exc:  # noqa: BLE001 — recall must never fail a turn
         elog("auto_recall.hook_error", level="warning",
              session_id=session_id, error_type=type(exc).__name__,
@@ -1267,7 +1418,16 @@ class Agent:
                 model_class=type(model_override or self.model).__name__,
                 attachments=len(attachments or []),
             )
-            return await self._run_inner(message, attachments, _status, session_id=session_id, model_override=model_override, author=author)
+            result = await self._run_inner(message, attachments, _status, session_id=session_id, model_override=model_override, author=author)
+            # Quality monitor (opt-in, sampled): grade this completed turn off
+            # the reply path — fire-and-forget, so the judge's latency/cost never
+            # sit on the response. Zero allocation + no task when disabled.
+            try:
+                from src.core import quality_monitor
+                quality_monitor.spawn_scoring(self, session_id, message, result)
+            except Exception:  # noqa: BLE001 — monitoring must never affect the turn
+                pass
+            return result
         except asyncio.CancelledError:
             # Shutdown or task-level cancellation is NOT a fatal error — it's
             # the runtime telling us to stop cleanly. Log it as such, tell the
