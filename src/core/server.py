@@ -505,6 +505,24 @@ def _build_agent(config: dict) -> Agent:
                 os.environ[_env] = str(_qm_cfg[_k])
             except (TypeError, ValueError):
                 pass
+    # ``quality_monitor.digest.*`` → the scheduled digest/alerting loop
+    # (``src/core/quality_digest.py``). Defaults ON when the monitor is on.
+    _qd_cfg = (_qm_cfg.get("digest") or {})
+    if "enabled" in _qd_cfg:
+        os.environ["OPENAGENT_QUALITY_DIGEST_ENABLED"] = (
+            "1" if bool(_qd_cfg["enabled"]) else "0"
+        )
+    for _k, _env in (
+        ("interval_hours",       "OPENAGENT_QUALITY_DIGEST_INTERVAL_HOURS"),
+        ("min_score_alert",      "OPENAGENT_QUALITY_DIGEST_MIN_SCORE_ALERT"),
+        ("recall_timeout_alert", "OPENAGENT_QUALITY_DIGEST_RECALL_TIMEOUT_ALERT"),
+        ("embed_error_alert",    "OPENAGENT_QUALITY_DIGEST_EMBED_ERROR_ALERT"),
+    ):
+        if _k in _qd_cfg:
+            try:
+                os.environ[_env] = str(_qd_cfg[_k])
+            except (TypeError, ValueError):
+                pass
     _cur_cfg = (memory_cfg.get("curator") or {})
     if "enabled" in _cur_cfg:
         os.environ["OPENAGENT_CURATOR_ENABLED"] = (
@@ -1115,6 +1133,17 @@ class AgentServer:
         except Exception as e:  # noqa: BLE001
             logger.warning("Semantic index builder failed to start: %s", e)
             self._semantic_index_task = None
+
+        # 9. Quality digest — a periodic aggregate of quality/recall/cost with
+        # a flagged-sessions review list + threshold alerts (incl. embedder-down
+        # via semantic.embed_error spikes). No-op when the quality monitor is off
+        # (start() returns None); reads events.jsonl only, no agent/db needed.
+        try:
+            from src.core.quality_digest import start as _quality_digest_start
+            self._quality_digest_task = _quality_digest_start()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Quality digest failed to start: %s", e)
+            self._quality_digest_task = None
 
     async def _build_bridge_session_and_bridges(self) -> None:
         """Provision the in-process bridge sessions + concrete bridges.

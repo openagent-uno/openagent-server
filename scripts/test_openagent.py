@@ -251,6 +251,9 @@ _TEST_MODULES: tuple[str, ...] = (
     # Quality monitor — the correctness half beside budget's cost half:
     # OFF no-op, deterministic sampling, judge parse/emit, gating, aggregate.
     "test_quality_monitor",
+    # Quality digest — the scheduled push side: summary + flagged-session review
+    # list + threshold alerts (incl. embedder-down via embed-error spikes).
+    "test_quality_digest",
     # 4. Gateway — sets ctx.extras["gateway_port"]/gateway/agent
     "test_gateway",
     # 5. HTTP surface + WS + files/images (need gateway)

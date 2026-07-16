@@ -53,6 +53,7 @@ _RATE_ENV = "OPENAGENT_QUALITY_MONITOR_SAMPLE_RATE"
 _MODEL_ENV = "OPENAGENT_QUALITY_MONITOR_MODEL"
 _TIMEOUT_ENV = "OPENAGENT_QUALITY_MONITOR_TIMEOUT"
 _MIN_LEN_ENV = "OPENAGENT_QUALITY_MONITOR_MIN_LEN"
+_RULES_CHARS_ENV = "OPENAGENT_QUALITY_MONITOR_RULES_CHARS"
 
 
 def _truthy(v: str) -> bool:
@@ -86,6 +87,20 @@ def _min_len() -> int:
         return max(0, int(os.environ.get(_MIN_LEN_ENV, "40")))
     except ValueError:
         return 40
+
+
+def _rules_chars() -> int:
+    """Cap on the agent-rules grounding text spliced into the judge prompt.
+
+    Grounding lets the judge grade against THIS agent's playbook instead of a
+    generic standard, but the rules must be bounded or the judge prompt balloons
+    (judge cost + latency matter — we've already seen judge timeouts). ``0``
+    disables grounding entirely (pure generic rubric). Default 2000 chars — the
+    operating principles fit; the exhaustive procedures live in the vault."""
+    try:
+        return max(0, int(os.environ.get(_RULES_CHARS_ENV, "2000")))
+    except ValueError:
+        return 2000
 
 
 def should_sample(session_id: Optional[str], response: str) -> bool:
@@ -148,6 +163,27 @@ _MAX_EXCERPT = 4000
 def _excerpt(s: str, n: int = _MAX_EXCERPT) -> str:
     s = (s or "").strip()
     return s if len(s) <= n else s[:n] + " …[truncated]"
+
+
+def _agent_rules(agent: Any) -> str:
+    """The agent's OWN operating rules for grounding the judge.
+
+    Sourced from the operator-configured ``system_prompt`` — the actual playbook
+    (refund policy, triage codes, anti-fabrication, "a bug becomes a task", …) —
+    NOT the generic framework boilerplate. That is what makes "policy followed?"
+    precise for THIS agent instead of a one-size rubric. Capped by
+    ``_rules_chars`` so the judge stays cheap, and empty (→ generic-rubric
+    fallback, never raises) when no ``system_prompt`` is set (§17)."""
+    cap = _rules_chars()
+    if cap <= 0:
+        return ""
+    try:
+        rules = str(getattr(agent, "system_prompt", "") or "").strip()
+    except Exception:  # noqa: BLE001 — grounding is best-effort, never fatal
+        return ""
+    if not rules:
+        return ""
+    return rules if len(rules) <= cap else rules[:cap] + " …[truncated]"
 
 
 def _pick_judge_model(agent: Any) -> Any:
@@ -227,11 +263,26 @@ async def _judge(agent: Any, session_id: Optional[str],
     model = _pick_judge_model(agent)
     if model is None:
         return
-    prompt = (
-        f"USER:\n{_excerpt(user_message)}\n\n"
-        f"ASSISTANT:\n{_excerpt(response)}\n\n"
-        "Grade the ASSISTANT reply now."
-    )
+    rules = _agent_rules(agent)
+    if rules:
+        # Grounded: grade compliance with THIS agent's own playbook, so
+        # "policy followed?" / "right action?" are precise, not generic.
+        prompt = (
+            "The ASSISTANT operates under these OPERATING RULES. Grade whether "
+            "the reply complied with THESE specific rules — the policy it must "
+            "follow, the action/next-step it must take, and what it must NEVER "
+            "do — not a generic standard:\n"
+            f"--- OPERATING RULES ---\n{rules}\n--- END RULES ---\n\n"
+            f"USER:\n{_excerpt(user_message)}\n\n"
+            f"ASSISTANT:\n{_excerpt(response)}\n\n"
+            "Grade the ASSISTANT reply against the RULES now."
+        )
+    else:
+        prompt = (
+            f"USER:\n{_excerpt(user_message)}\n\n"
+            f"ASSISTANT:\n{_excerpt(response)}\n\n"
+            "Grade the ASSISTANT reply now."
+        )
     try:
         result = await asyncio.wait_for(
             model.generate([{"role": "user", "content": prompt}],
@@ -249,7 +300,7 @@ async def _judge(agent: Any, session_id: Optional[str],
              session_id=session_id, judge_model=judge_id)
         return
     elog("quality.score", level=("warning" if verdict["verdict"] == "bad" else "info"),
-         session_id=session_id, judge_model=judge_id, **verdict)
+         session_id=session_id, judge_model=judge_id, grounded=bool(rules), **verdict)
 
 
 async def maybe_score_turn(agent: Any, session_id: Optional[str],

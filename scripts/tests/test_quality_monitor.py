@@ -240,3 +240,55 @@ async def t_scoring_wired_on_both_paths(ctx: TestContext) -> None:
     assert 'kind") == "done"' in stream_src or "'done'" in stream_src, (
         "run_stream must gate spawn_scoring on the done event"
     )
+
+
+@test("quality", "judge grounds on the agent's own operating rules when present")
+async def t_judge_grounded(ctx: TestContext) -> None:
+    """A generic rubric can't tell 'followed the refund policy' from 'sounded
+    reasonable'. When the agent has a system_prompt (its playbook), the judge
+    prompt must carry those rules and the score event must mark itself grounded."""
+    import src.core.quality_monitor as qm
+
+    model = _FakeModel('{"score":0.9,"verdict":"good","fabrication":false,"rationale":"ok"}')
+    agent = _agent(model)
+    agent.system_prompt = (
+        "OPERATING RULES: never invent an order id; issue a refund ONLY after "
+        "verifying the receipt; a reported bug MUST become a Replio task."
+    )
+    with _env(OPENAGENT_QUALITY_MONITOR_ENABLED="1"), _capture() as evs:
+        await qm._judge(agent, "s", "I want a refund", "Sure — let me verify your receipt first.")
+
+    assert model.calls, "judge model was never called"
+    prompt = model.calls[0][0][0]["content"]
+    assert "OPERATING RULES" in prompt and "verifying the receipt" in prompt, prompt[:200]
+    scores = [kw for name, kw in evs if name == "quality.score"]
+    assert scores and scores[0].get("grounded") is True, scores
+
+
+@test("quality", "judge falls back to the generic rubric when no rules are available")
+async def t_judge_generic_fallback(ctx: TestContext) -> None:
+    import src.core.quality_monitor as qm
+
+    model = _FakeModel('{"score":0.7,"verdict":"warn","fabrication":false,"rationale":"x"}')
+    agent = _agent(model)  # SimpleNamespace has no system_prompt
+    with _env(OPENAGENT_QUALITY_MONITOR_ENABLED="1"), _capture() as evs:
+        await qm._judge(agent, "s", "hi", "a sufficiently long assistant reply to grade")
+
+    prompt = model.calls[0][0][0]["content"]
+    assert "OPERATING RULES" not in prompt, prompt[:200]
+    scores = [kw for name, kw in evs if name == "quality.score"]
+    assert scores and scores[0].get("grounded") is False, scores
+
+
+@test("quality", "grounding rules are length-capped to bound judge cost")
+async def t_judge_rules_capped(ctx: TestContext) -> None:
+    import src.core.quality_monitor as qm
+
+    agent = _agent(_FakeModel("{}"))
+    agent.system_prompt = "R" * 5000
+    with _env(OPENAGENT_QUALITY_MONITOR_RULES_CHARS="100"):
+        rules = qm._agent_rules(agent)
+    assert rules.endswith("…[truncated]") and len(rules) <= 100 + len(" …[truncated]"), len(rules)
+    # 0 disables grounding entirely (pure generic rubric).
+    with _env(OPENAGENT_QUALITY_MONITOR_RULES_CHARS="0"):
+        assert qm._agent_rules(agent) == ""
