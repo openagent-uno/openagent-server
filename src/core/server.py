@@ -1070,6 +1070,25 @@ class AgentServer:
             logger.warning("Vault autocommit failed to start: %s", e)
             self._vault_autocommit_task = None
 
+        # 8. Semantic index builder — build the recall index OFF the turn path.
+        # The on-turn auto-recall hook is time-boxed and can only search + top up
+        # a few vectors; the full build (2000+ notes) belongs in the background or
+        # it silently times out and recall stays empty. No-op when no embedding
+        # model is configured (resolve_embedder → None).
+        try:
+            from src.memory.semantic_index_builder import start as _sem_index_start
+            _db = getattr(self.agent, "_db", None)
+            _db_path = str(getattr(_db, "db_path", "") or "")
+            try:
+                _vault = self.agent._resolve_vault_path()
+            except Exception:  # noqa: BLE001
+                _vault = None
+            self._semantic_index_task = _sem_index_start(
+                _db_path, _vault, getattr(self.agent, "_providers_config", None))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Semantic index builder failed to start: %s", e)
+            self._semantic_index_task = None
+
     async def _build_bridge_session_and_bridges(self) -> None:
         """Provision the in-process bridge sessions + concrete bridges.
 

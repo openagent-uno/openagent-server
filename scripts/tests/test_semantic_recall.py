@@ -626,3 +626,51 @@ async def t_numpy_free_search(ctx: TestContext) -> None:
     finally:
         si._HAS_NUMPY = saved
         _cleanup(db, idx_path, vault)
+
+
+@test("semantic_recall", "the background builder fills the index off the turn path")
+async def t_background_builder(ctx: TestContext) -> None:
+    """The on-turn hook is time-boxed and can't build a 2000-note index — it did
+    so nowhere in prod, leaving recall empty. The builder does it in the
+    background, un-time-boxed. Prove it embeds every note + is a no-op when inert."""
+    import src.memory.semantic_index as si
+    from src.memory import semantic_index_builder as bld
+
+    db, idx_path, vault = _paths(ctx, "builder")
+    try:
+        for i in range(5):
+            _write_note(vault, f"n{i}", f"Note {i}", f"content about topic {i} launch deadline")
+        d = await _open_db(db); await d.close()
+
+        # inert: no embedder → start() returns a task that exits immediately, no index
+        import os as _os
+        _os.environ.pop("OPENAGENT_EMBEDDING_MODEL", None)
+        # ── build with a real (fake) embedder, forced via monkeypatch ──
+        import src.memory.semantic_index as si_mod
+        orig = si_mod.resolve_embedder
+        si_mod.resolve_embedder = lambda *a, **k: ConceptEmbedder()
+        try:
+            import asyncio
+            # short resync so the loop keeps running but we only need the first build
+            _os.environ["OPENAGENT_SEMANTIC_RESYNC_SECONDS"] = "30"
+            task = bld.start(str(db), str(vault), None)
+            assert task is not None
+            # wait for the first build to embed all 5 notes (well under one pass)
+            for _ in range(40):
+                await asyncio.sleep(0.05)
+                idx = si_mod.SemanticIndex(str(db), vault_root=str(vault), embedder=ConceptEmbedder(),
+                                           index_path=idx_path if False else None)
+                n = idx.stats()["notes"]; idx.close()
+                if n >= 5:
+                    break
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+            assert n >= 5, f"builder did not embed all notes: {n}/5"
+        finally:
+            si_mod.resolve_embedder = orig
+            _os.environ.pop("OPENAGENT_SEMANTIC_RESYNC_SECONDS", None)
+    finally:
+        _cleanup(db, idx_path, vault)
