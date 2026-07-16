@@ -217,3 +217,26 @@ async def t_spawn_disabled(ctx: TestContext) -> None:
         # Must not raise, must not schedule anything.
         qm.spawn_scoring(_agent(_FakeModel("{}")), "s", "q", "r" * 100)
     assert True
+
+
+@test("quality", "both run AND run_stream wire spawn_scoring (real traffic streams)")
+async def t_scoring_wired_on_both_paths(ctx: TestContext) -> None:
+    """Regression for the 0.18.5→6 gap: the monitor was wired into ``run()`` only,
+    but events go through ``run_stream`` (support turns log ``run_stream.done``),
+    so ``quality.score`` never fired on real traffic. Both paths must schedule the
+    judge — pin it structurally since the pure-unit fakes can't drive a real
+    streaming turn."""
+    import inspect
+    from src.core.agent import Agent
+
+    for meth in ("run", "run_stream"):
+        src = inspect.getsource(getattr(Agent, meth))
+        assert "spawn_scoring" in src, (
+            f"Agent.{meth} must call quality_monitor.spawn_scoring — "
+            f"without it the monitor never fires on that path"
+        )
+    # run_stream must schedule on the terminal 'done' event, not per-delta.
+    stream_src = inspect.getsource(Agent.run_stream)
+    assert 'kind") == "done"' in stream_src or "'done'" in stream_src, (
+        "run_stream must gate spawn_scoring on the done event"
+    )

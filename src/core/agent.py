@@ -1753,6 +1753,21 @@ class Agent:
                 session_id=session_id, model_override=model_override,
                 author=author,
             ):
+                if event.get("kind") == "done":
+                    # Quality monitor (opt-in, sampled): grade this completed
+                    # STREAMING turn off the reply path. Scheduled here on the
+                    # 'done' event (not after the loop) because the consumer
+                    # typically breaks on 'done' → GeneratorExit, which would
+                    # skip any post-loop code. spawn_scoring is fire-and-forget,
+                    # so the judge's latency/cost never touch the response.
+                    # (run() has the same hook; events go through run_stream, so
+                    # without this the monitor never fires on real traffic.)
+                    try:
+                        from src.core import quality_monitor
+                        quality_monitor.spawn_scoring(
+                            self, session_id, message, event.get("text", ""))
+                    except Exception:  # noqa: BLE001 — monitoring must never affect the turn
+                        pass
                 yield event
         except asyncio.CancelledError:
             elog(
