@@ -502,6 +502,56 @@ def _recall_int(name: str, default: int) -> int:
         return default
 
 
+def _origin_of(session_id: str | None) -> str:
+    """The origin tag of a session id — the prefix before the first ':'
+    (``event``, ``scheduler``, ``chat``, …), or ``""`` for a bare/None id. Lets
+    recall be scoped per-origin: a shared support+dev-ops agent can drop dev-ops
+    notes on its ``event`` (support) turns without starving its dev-ops turns."""
+    if not session_id or ":" not in session_id:
+        return ""
+    return session_id.split(":", 1)[0].strip()
+
+
+def _recall_scoping(origin: str) -> tuple[str, list[str], list[str], str]:
+    """Per-origin recall-corpus config: ``(scope, include, exclude, reserve)``.
+
+    Each knob reads an ORIGIN-suffixed env var first (e.g.
+    ``OPENAGENT_AUTO_RECALL_EXCLUDE_PATHS_EVENT``) and falls back to the
+    un-suffixed default. Every default is the identity (scope ``all``, no path
+    filters, no reserved slot) so an unconfigured deployment is byte-identical
+    to the pre-scoping behaviour (§17)."""
+    o = (origin or "").strip().upper()
+
+    def pick(base: str, default: str = "") -> str:
+        if o:
+            v = (os.environ.get(f"{base}_{o}") or "").strip()
+            if v:
+                return v
+        return (os.environ.get(base) or "").strip() or default
+
+    def prefixes(base: str) -> list[str]:
+        return [p.strip().lstrip("/") for p in pick(base).split(",") if p.strip()]
+
+    scope = pick("OPENAGENT_AUTO_RECALL_SCOPE", "all").lower()
+    if scope not in ("all", "vault", "sessions"):
+        scope = "all"
+    return (scope,
+            prefixes("OPENAGENT_AUTO_RECALL_INCLUDE_PATHS"),
+            prefixes("OPENAGENT_AUTO_RECALL_EXCLUDE_PATHS"),
+            pick("OPENAGENT_AUTO_RECALL_RESERVE_PREFIX").lstrip("/"))
+
+
+def _path_allowed(path: str, include: list[str], exclude: list[str]) -> bool:
+    """True when a note ``path`` clears the include/exclude prefix filters (used
+    for the FTS side; the semantic side filters inside ``SemanticIndex.search``)."""
+    p = (path or "").lstrip("/")
+    if include and not any(p.startswith(pre) for pre in include):
+        return False
+    if exclude and any(p.startswith(pre) for pre in exclude):
+        return False
+    return True
+
+
 def _get_recall_index(agent: Any) -> Any:
     """Return the shared :class:`SemanticIndex` for this agent's DB, or ``None``
     when the semantic layer is inert (no embedding model resolved)."""
@@ -682,6 +732,11 @@ def _recall_block(agent: Any, query: str, session_id: str | None = None) -> str:
     """
     k = max(1, _recall_int("OPENAGENT_AUTO_RECALL_TOP_K", 3))
     floor = _recall_float("OPENAGENT_AUTO_RECALL_MIN_SCORE", 0.75)
+    # Per-origin corpus scoping. Defaults are the identity (scope 'all', no path
+    # filters, no reserved slot), so an unconfigured agent behaves exactly as
+    # before; a shared support+dev-ops agent can, on its 'event' (support) turns,
+    # drop dev-ops notes + peer sessions and reserve a slot for its playbooks.
+    scope, incl, excl, reserve = _recall_scoping(_origin_of(session_id))
     # SEMANTIC side (Layer B). Runs only when an embedder is wired; when it isn't,
     # sem_hits stays empty and recall rides FTS alone — that IS the §17 fallback,
     # so we do NOT bail here the way the pre-hybrid code did.
@@ -698,7 +753,9 @@ def _recall_block(agent: Any, query: str, session_id: str | None = None) -> str:
                 idx.sync(max_items=warm)
             except Exception:  # noqa: BLE001 — a warm failure must not block recall
                 pass
-        sem_hits = idx.search(query, scope="all", limit=k, min_score=floor)
+        sem_hits = idx.search(query, scope=scope, limit=k, min_score=floor,
+                              include_prefixes=incl or None,
+                              exclude_prefixes=excl or None)
     hits = sem_hits
     # FTS side (Layer A) — fuse in exact-term keyword hits so a note the semantic
     # floor dropped still surfaces. Independent of the embedder: this is what
@@ -710,15 +767,40 @@ def _recall_block(agent: Any, query: str, session_id: str | None = None) -> str:
         if fts_idx is not None:
             try:
                 fts_k = max(1, _recall_int("OPENAGENT_AUTO_RECALL_FTS_TOP_K", 3))
-                fts_hits = fts_idx.search(query, limit=fts_k)
+                # Over-fetch when path-filtering (VaultIndex has no prefix filter
+                # of its own) so the same include/exclude the semantic side got
+                # in-index can be applied here without starving the fused set.
+                fts_hits = fts_idx.search(
+                    query, limit=fts_k * 3 if (incl or excl) else fts_k)
             except Exception:  # noqa: BLE001 — FTS failure → semantic-only
                 fts_hits = []
+            if incl or excl:
+                fts_hits = [h for h in fts_hits
+                            if _path_allowed(h.get("path", ""), incl, excl)][:fts_k]
             if fts_hits:
                 fts_used = True
                 # Cap the fused set a little above k so FTS-only policy notes get
                 # room without unbounding the injected block.
                 extra = max(0, _recall_int("OPENAGENT_AUTO_RECALL_FTS_EXTRA", 2))
                 hits = _rrf_merge(sem_hits, fts_hits, limit=k + extra)
+    # Reserve a slot for the authoritative playbook subtree so a curated rule
+    # always surfaces ALONGSIDE near-duplicate precedent (which by sheer volume
+    # otherwise buries it). No-op unless configured, semantic is live, and no
+    # reserved-prefix note is already in the set.
+    if reserve and semantic_active and hits and not any(
+            (h.get("path") or "").lstrip("/").startswith(reserve) for h in hits):
+        try:
+            res = idx.search(query, scope="vault", limit=1, min_score=0.0,
+                             include_prefixes=[reserve])
+        except Exception:  # noqa: BLE001 — reserve is best-effort, never fatal
+            res = []
+        if res:
+            # Prepend the reserved playbook WITHOUT evicting a real hit — grow the
+            # block by one rather than dropping precedent to make room (the block
+            # is still bounded by _format_recall_block's char cap). Data-safe: the
+            # authoritative rule is ADDED alongside the precedent, never instead.
+            hits = [res[0]] + [h for h in hits
+                               if (h.get("path") or "") != (res[0].get("path") or "")]
     # Inert: neither layer could run (no embedder AND no FTS) — byte-identical to
     # pre-recall, and nothing to record.
     if not semantic_active and not fts_used:

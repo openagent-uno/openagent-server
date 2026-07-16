@@ -484,6 +484,33 @@ def _build_agent(config: dict) -> Agent:
                 os.environ[_env] = str(_ar_cfg[_k])
             except (TypeError, ValueError):
                 pass
+    # Per-origin recall CORPUS scoping (default = identity: no filtering). Maps
+    # ``scope`` / ``include_path_prefixes`` / ``exclude_path_prefixes`` /
+    # ``reserve_prefix`` → the ``OPENAGENT_AUTO_RECALL_{SCOPE,INCLUDE_PATHS,
+    # EXCLUDE_PATHS,RESERVE_PREFIX}`` env, and per-origin overrides under
+    # ``by_origin.<origin>`` → the same names with an ``_<ORIGIN>`` suffix (e.g.
+    # ``..._EVENT``), which ``agent._recall_scoping`` prefers for that origin. A
+    # shared support+dev-ops agent uses this to drop dev-ops notes on its
+    # ``event`` (support) turns only.
+    def _export_recall_scoping(cfg: dict, suffix: str = "") -> None:
+        def _csv(v: Any) -> str:
+            if isinstance(v, (list, tuple)):
+                return ",".join(str(x).strip() for x in v if str(x).strip())
+            return str(v).strip()
+        for _key, _base in (
+            ("scope",                 "OPENAGENT_AUTO_RECALL_SCOPE"),
+            ("include_path_prefixes", "OPENAGENT_AUTO_RECALL_INCLUDE_PATHS"),
+            ("exclude_path_prefixes", "OPENAGENT_AUTO_RECALL_EXCLUDE_PATHS"),
+            ("reserve_prefix",        "OPENAGENT_AUTO_RECALL_RESERVE_PREFIX"),
+        ):
+            if _key in cfg:
+                _val = _csv(cfg[_key])
+                if _val:
+                    os.environ[_base + suffix] = _val
+    _export_recall_scoping(_ar_cfg)
+    for _origin, _ocfg in (_ar_cfg.get("by_origin") or {}).items():
+        if isinstance(_ocfg, dict) and str(_origin).strip():
+            _export_recall_scoping(_ocfg, "_" + str(_origin).strip().upper())
     # Quality monitor (opt-in): an LLM-as-judge grades a SAMPLED fraction of
     # completed turns for correctness, logged as ``quality.score`` beside the
     # ``router.cost_recorded`` spend events — usage AND quality in one place.

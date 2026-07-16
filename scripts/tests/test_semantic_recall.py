@@ -696,9 +696,154 @@ def _prime_fts_cache(vault: Path, index_path: Path) -> Any:
 
 
 def _clear_recall_env() -> None:
-    for _v in ("HYBRID", "MIN_SCORE", "WARM_BUDGET", "ENABLED",
-               "FTS_TOP_K", "FTS_EXTRA", "TOP_K"):
-        os.environ.pop(f"OPENAGENT_AUTO_RECALL_{_v}", None)
+    # Prefix-based so it also clears the scoping knobs (SCOPE / INCLUDE_PATHS /
+    # EXCLUDE_PATHS / RESERVE_PREFIX) and their per-origin ``_<ORIGIN>`` suffixes.
+    for _k in [k for k in os.environ if k.startswith("OPENAGENT_AUTO_RECALL_")]:
+        os.environ.pop(_k, None)
+
+
+def _write_note_at(vault: Path, relpath: str, title: str, body: str) -> Path:
+    """Write a note at a vault-RELATIVE path (creating parent dirs) so tests can
+    exercise path-prefix corpus scoping."""
+    p = vault / relpath
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(f"---\ntitle: {title}\n---\n{body}\n")
+    return p
+
+
+@test("semantic_recall", "recall scoping helpers: origin parse, per-origin env selection, path filter")
+async def t_recall_scoping_helpers(ctx: TestContext) -> None:
+    from src.core.agent import _origin_of, _recall_scoping, _path_allowed
+
+    assert _origin_of("event:aa:bb") == "event"
+    assert _origin_of("scheduler:x") == "scheduler"
+    assert _origin_of("bare") == "" and _origin_of(None) == ""
+
+    assert _path_allowed("esound/procedures/refund.md", ["esound/"], []) is True
+    assert _path_allowed("devops/build.md", ["esound/"], []) is False
+    assert _path_allowed("esound/x.md", [], ["esound/triage/"]) is True
+    assert _path_allowed("esound/triage/t.md", [], ["esound/triage/"]) is False
+
+    _clear_recall_env()
+    try:
+        # unconfigured = identity (byte-identical to pre-scoping behaviour)
+        assert _recall_scoping("event") == ("all", [], [], "")
+        # default applies to every origin
+        os.environ["OPENAGENT_AUTO_RECALL_EXCLUDE_PATHS"] = "devops/, arc/"
+        assert _recall_scoping("chat")[2] == ["devops/", "arc/"]
+        # per-origin override wins for that origin only; others keep the default
+        os.environ["OPENAGENT_AUTO_RECALL_SCOPE_EVENT"] = "vault"
+        os.environ["OPENAGENT_AUTO_RECALL_EXCLUDE_PATHS_EVENT"] = "devops/"
+        assert _recall_scoping("event")[0] == "vault"
+        assert _recall_scoping("event")[2] == ["devops/"]
+        assert _recall_scoping("chat")[0] == "all"          # default, not the EVENT override
+        assert _recall_scoping("chat")[2] == ["devops/", "arc/"]
+        # an unknown scope degrades to 'all'
+        os.environ["OPENAGENT_AUTO_RECALL_SCOPE"] = "bogus"
+        assert _recall_scoping("chat")[0] == "all"
+    finally:
+        _clear_recall_env()
+
+
+@test("semantic_recall", "SemanticIndex.search filters notes by include/exclude path prefixes")
+async def t_search_path_prefix_filter(ctx: TestContext) -> None:
+    from src.memory.semantic_index import SemanticIndex
+
+    db, idx_path, vault = _paths(ctx, "prefix")
+    try:
+        _write_note_at(vault, "esound/procedures/refund.md", "Refund",
+                       "the customer demanded a refund")
+        _write_note_at(vault, "devops/build.md", "Build",
+                       "the customer demanded a refund pipeline build")
+        idx = SemanticIndex(db, vault_root=vault, index_path=idx_path,
+                            embedder=ConceptEmbedder())
+        idx.sync()
+        q = "customer refund"
+        allp = {h["path"] for h in idx.search(q, scope="vault", limit=5, min_score=0.0)}
+        assert any("devops/build.md" in p for p in allp), f"devops note not matched at all: {allp}"
+        exc = idx.search(q, scope="vault", limit=5, min_score=0.0,
+                         exclude_prefixes=["devops/"])
+        assert exc and all("devops/" not in h["path"] for h in exc), f"exclude leaked: {exc}"
+        inc = idx.search(q, scope="vault", limit=5, min_score=0.0,
+                         include_prefixes=["esound/procedures/"])
+        assert inc and all(h["path"].startswith("esound/procedures/") for h in inc), \
+            f"include admitted a non-matching prefix: {inc}"
+        idx.close()
+    finally:
+        _cleanup(db, idx_path, vault)
+
+
+@test("semantic_recall", "per-origin scoping: an event turn drops a dev-ops note a chat turn keeps")
+async def t_per_origin_scoping_e2e(ctx: TestContext) -> None:
+    import src.core.agent as agent_mod
+
+    db, idx_path, vault = _paths(ctx, "origin")
+    try:
+        _write_note_at(vault, "devops/build.md", "Build ops",
+                       "the customer complained about the refund build pipeline")
+        d = await _open_db(db)
+        await d.close()
+        idx = _prime_recall_cache(db, vault)
+        _clear_recall_env()
+        try:
+            os.environ["OPENAGENT_AUTO_RECALL_ENABLED"] = "1"
+            os.environ["OPENAGENT_AUTO_RECALL_WARM_BUDGET"] = "0"
+            os.environ["OPENAGENT_AUTO_RECALL_MIN_SCORE"] = "0.5"
+            os.environ["OPENAGENT_AUTO_RECALL_HYBRID"] = "0"   # isolate the corpus filter
+            os.environ["OPENAGENT_AUTO_RECALL_EXCLUDE_PATHS_EVENT"] = "devops/"
+            q = "customer complained about a refund"
+            chat = await agent_mod._with_recall(_fake_agent(db, vault), "chat:1", q, "MSG")
+            assert "devops/build.md" in chat, f"chat turn should KEEP the note: {chat!r}"
+            ev = await agent_mod._with_recall(_fake_agent(db, vault), "event:abc:def", q, "MSG")
+            assert "devops/build.md" not in ev, f"event turn must DROP the devops note: {ev!r}"
+        finally:
+            _clear_recall_env()
+        idx.close()
+    finally:
+        agent_mod._RECALL_INDEX_CACHE.pop(str(db), None)
+        _cleanup(db, idx_path, vault)
+
+
+@test("semantic_recall", "reserve_prefix surfaces the authoritative playbook alongside precedent")
+async def t_reserve_prefix(ctx: TestContext) -> None:
+    import src.core.agent as agent_mod
+
+    db, idx_path, vault = _paths(ctx, "reserve")
+    try:
+        # A prior-thread precedent that matches the query strongly, and a playbook
+        # under a reserve prefix that DOESN'T match the query (would be dropped).
+        _write_note_at(vault, "esound/triage/thread-1.md", "Prior thread",
+                       "the customer complained and demanded a refund twice")
+        _write_note_at(vault, "esound/procedures/customer-response/refund-policy.md",
+                       "Dashboard config", "quarterly metrics dashboard configuration")
+        d = await _open_db(db)
+        await d.close()
+        idx = _prime_recall_cache(db, vault)
+        _clear_recall_env()
+        try:
+            os.environ["OPENAGENT_AUTO_RECALL_ENABLED"] = "1"
+            os.environ["OPENAGENT_AUTO_RECALL_WARM_BUDGET"] = "0"
+            os.environ["OPENAGENT_AUTO_RECALL_MIN_SCORE"] = "0.5"
+            os.environ["OPENAGENT_AUTO_RECALL_HYBRID"] = "0"
+            os.environ["OPENAGENT_AUTO_RECALL_TOP_K"] = "2"
+            q = "customer complained and demanded a refund"
+            base = await agent_mod._with_recall(_fake_agent(db, vault), "event:1", q, "MSG")
+            assert "thread-1.md" in base, f"precedent should surface: {base!r}"
+            assert "refund-policy.md" not in base, \
+                f"the off-topic playbook should NOT surface on its own: {base!r}"
+            os.environ["OPENAGENT_AUTO_RECALL_RESERVE_PREFIX"] = \
+                "esound/procedures/customer-response/"
+            withres = await agent_mod._with_recall(_fake_agent(db, vault), "event:1", q, "MSG")
+            assert "refund-policy.md" in withres, \
+                f"reserve failed to surface the playbook: {withres!r}"
+            assert "thread-1.md" in withres, \
+                f"reserve must keep the precedent ALONGSIDE the playbook: {withres!r}"
+        finally:
+            _clear_recall_env()
+        idx.close()
+    finally:
+        agent_mod._RECALL_INDEX_CACHE.pop(str(db), None)
+        _cleanup(db, idx_path, vault)
 
 
 @test("semantic_recall", "hybrid: an FTS keyword hit BELOW the semantic floor is still recalled (the eval finding)")

@@ -754,7 +754,10 @@ class SemanticIndex:
         return out
 
     def search(self, query: str, *, scope: str = "all", limit: int = 5,
-               min_score: float = 0.0) -> list[dict[str, Any]]:
+               min_score: float = 0.0,
+               include_prefixes: Optional[Sequence[str]] = None,
+               exclude_prefixes: Optional[Sequence[str]] = None
+               ) -> list[dict[str, Any]]:
         """Cosine-nearest vault notes / sessions to ``query``, best first.
 
         ``scope`` is ``"all"`` | ``"vault"`` | ``"sessions"``. Returns
@@ -762,6 +765,12 @@ class SemanticIndex:
         ``min_score`` — a weak match is NO match, which is what keeps auto-recall
         from injecting noise. Each hit carries a ``score`` (cosine, 0..1) so the
         caller can threshold and frame it as "verify", never assert it as fact.
+
+        ``include_prefixes`` / ``exclude_prefixes`` scope the NOTE side by
+        vault-relative path prefix (keep only / drop matches) — the corpus knob
+        that lets support recall skip dev-ops notes. Both default to no filter
+        (unchanged behaviour). Sessions carry no path and are governed by
+        ``scope`` alone.
         """
         q = (query or "").strip()
         if not self.active or not q:
@@ -777,13 +786,21 @@ class SemanticIndex:
         hits: list[dict[str, Any]] = []
         with self._lock:
             if "vault" in want:
+                inc = tuple(p for p in (include_prefixes or ()) if p)
+                exc = tuple(p for p in (exclude_prefixes or ()) if p)
                 for r, s in self._sims_for("vault_vectors", qunit):
-                    if float(s) >= min_score:
-                        hits.append({
-                            "kind": "note", "score": round(float(s), 4),
-                            "path": r["path"], "title": r["title"] or "",
-                            "updated": r["updated"] or "",
-                        })
+                    if float(s) < min_score:
+                        continue
+                    path = str(r["path"] or "").lstrip("/")
+                    if inc and not path.startswith(inc):
+                        continue
+                    if exc and path.startswith(exc):
+                        continue
+                    hits.append({
+                        "kind": "note", "score": round(float(s), 4),
+                        "path": r["path"], "title": r["title"] or "",
+                        "updated": r["updated"] or "",
+                    })
             if "sessions" in want:
                 for r, s in self._sims_for("session_vectors", qunit):
                     if float(s) >= min_score:

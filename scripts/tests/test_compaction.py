@@ -742,3 +742,74 @@ async def t_cost_ceiling_bites_before_the_window(ctx: TestContext) -> None:
         assert should_compact("sid", agent.model, agent=agent) is True
     finally:
         os.environ.pop("OPENAGENT_COMPACTION_MAX_HISTORY_TOKENS", None)
+
+
+@test("compaction", "history tool-result elision is OFF by default (byte-identical)")
+async def t_history_elide_off_by_default(ctx: TestContext) -> None:
+    from src.core.compaction import _trim_kept_tool_results
+
+    os.environ.pop("OPENAGENT_COMPACTION_HISTORY_TOOL_RESULT_CHARS", None)
+    kept = [
+        {"messages": [{"role": "tool", "tool_name": "vault_search",
+                       "content": "X" * 500_000}]},
+        {"messages": [{"role": "tool", "tool_name": "vault_search",
+                       "content": "Y" * 500_000}]},
+    ]
+    out, n, chars = _trim_kept_tool_results(kept)
+    assert out is kept and n == 0 and chars == 0, "default must be a no-op"
+
+
+@test("compaction", "history tool-result elision trims OLD kept runs, spares the most recent")
+async def t_history_elide_trims_old_keeps_recent(ctx: TestContext) -> None:
+    from src.core.compaction import _trim_kept_tool_results
+
+    os.environ["OPENAGENT_COMPACTION_HISTORY_TOOL_RESULT_CHARS"] = "1000"
+    try:
+        big = "X" * 50_000
+        kept = [
+            {"run_id": "old", "messages": [
+                {"role": "assistant", "content": "let me search"},
+                {"role": "tool", "tool_name": "vault_search",
+                 "tool_call_id": "c1", "content": big},
+            ]},
+            {"run_id": "recent", "messages": [
+                {"role": "tool", "tool_name": "vault_search",
+                 "tool_call_id": "c2", "content": big},
+            ]},
+        ]
+        out, n, chars = _trim_kept_tool_results(kept)
+        assert n == 1 and chars == 50_000, (n, chars)
+        old_tool = out[0]["messages"][1]
+        # role + tool_call_id preserved (the assistant/tool pairing must survive)
+        assert old_tool["role"] == "tool" and old_tool["tool_call_id"] == "c1"
+        assert "elided from history" in old_tool["content"]
+        assert "re-run `vault_search`" in old_tool["content"]  # re-fetch pointer
+        assert len(old_tool["content"]) < 1000                 # collapsed small
+        assert out[0]["messages"][0]["content"] == "let me search"  # non-tool untouched
+        # the MOST RECENT run keeps its full tool output (still live context)
+        assert out[1]["messages"][0]["content"] == big
+    finally:
+        os.environ.pop("OPENAGENT_COMPACTION_HISTORY_TOOL_RESULT_CHARS", None)
+
+
+@test("compaction", "history tool-result elision keeps normal results + non-text blocks")
+async def t_history_elide_preserves_normal_and_blocks(ctx: TestContext) -> None:
+    from src.core.compaction import _trim_kept_tool_results, _elide_tool_content
+
+    os.environ["OPENAGENT_COMPACTION_HISTORY_TOOL_RESULT_CHARS"] = "1000"
+    try:
+        kept = [
+            {"messages": [{"role": "tool", "tool_name": "t", "content": "small ok"}]},
+            {"messages": [{"role": "user", "content": "next"}]},
+        ]
+        out, n, _ = _trim_kept_tool_results(kept)
+        assert n == 0 and out[0]["messages"][0]["content"] == "small ok"  # small = untouched
+        # list content-block form: image block PRESERVED, oversized text collapsed
+        blocks = [{"type": "image", "source": "…"}, {"type": "text", "text": "Z" * 5000}]
+        new_c, elided = _elide_tool_content(blocks, "docs_search", 1000)
+        assert elided == 5000
+        assert any(isinstance(b, dict) and b.get("type") == "image" for b in new_c), \
+            "image block was dropped — data loss"
+        assert any("elided from history" in b.get("text", "") for b in new_c)
+    finally:
+        os.environ.pop("OPENAGENT_COMPACTION_HISTORY_TOOL_RESULT_CHARS", None)

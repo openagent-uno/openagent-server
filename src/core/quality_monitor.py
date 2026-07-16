@@ -210,6 +210,21 @@ def _pick_judge_model(agent: Any) -> Any:
                  and e.framework == FRAMEWORK_API_BASED),
                 None,
             )
+            if match is None:
+                # The judge model is often intentionally DISABLED in the routable
+                # catalog (e.g. local:claude-sonnet-4-6 is the $0 default but kept
+                # out of the delegation set, so only deepseek is "enabled"). A
+                # judge is an explicit operator choice AND a direct throwaway call
+                # (a NativeProvider, not the router), so honour a disabled row too
+                # as long as its provider row is api-based — otherwise the judge
+                # falls back to agent.model and routes through the full router
+                # (slow → the judge timeouts we saw, and it may bill DeepSeek).
+                match = next(
+                    (e for e in iter_configured_models(providers_config)
+                     if e.runtime_id == configured
+                     and e.framework == FRAMEWORK_API_BASED),
+                    None,
+                )
             if match is not None:
                 db_path = getattr(getattr(agent, "_db", None), "db_path", None)
                 return NativeProvider(

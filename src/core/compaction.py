@@ -179,6 +179,31 @@ def _keep_runs() -> int:
     return max(1, v)
 
 
+# When > 0, an oversized tool-result message in a KEPT-in-history run (every run
+# the compaction keeps verbatim EXCEPT the most recent) is elided down to a
+# re-fetch pointer. This is the second half of the bound-session bloat fix:
+# ``src/core/tool_output.py`` caps ONE tool result at fetch time, but a long
+# tool-loop's MANY (individually-capped) results still SUM into a kept run, and
+# every kept run is re-sent on every following turn — the live symptom was lyra
+# turns at 0.9–1.2M input tokens. Eliding stale tool output from history bounds
+# that footprint WITHOUT touching the turn that fetched it (it already reasoned
+# over the full result) and WITHOUT touching the most recent run (its tool
+# output is still live context). 0 (default) = OFF, byte-identical to before.
+_DEFAULT_HISTORY_TOOL_RESULT_CHARS = 0
+
+
+def _history_tool_result_chars() -> int:
+    """Char ceiling for a tool-result message kept in HISTORY (0 = off)."""
+    raw = os.environ.get(
+        "OPENAGENT_COMPACTION_HISTORY_TOOL_RESULT_CHARS", "").strip()
+    if not raw:
+        return _DEFAULT_HISTORY_TOOL_RESULT_CHARS
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return _DEFAULT_HISTORY_TOOL_RESULT_CHARS
+
+
 # ── Token estimation ──────────────────────────────────────────────────
 
 
@@ -234,6 +259,91 @@ def _extract_run_text(run: dict[str, Any]) -> str:
                 elif isinstance(part, str):
                     chunks.append(part)
     return "\n".join(chunks)
+
+
+def _tool_result_pointer(tool_name: Any, orig_len: int, cap: int) -> str:
+    """The data-safe placeholder that replaces an elided tool result in history.
+
+    States exactly what was cut and how to get it back — never a silent drop."""
+    name = str(tool_name or "the tool")
+    return (
+        f"[tool result from `{name}` elided from history: {orig_len} chars "
+        f"exceeded the {cap}-char history ceiling and would otherwise be re-sent "
+        f"on every following turn. The turn that ran this tool already used the "
+        f"FULL result; re-run `{name}` with the same arguments to fetch it again "
+        f"if you still need it.]"
+    )
+
+
+def _elide_tool_content(content: Any, tool_name: Any, cap: int) -> tuple[Any, int]:
+    """Replace an oversized tool-result ``content`` with a pointer.
+
+    Returns ``(new_content, chars_elided)`` (0 elided ⇒ untouched). Handles a
+    plain string and the provider content-block list form; only the oversized
+    text is collapsed — image/other non-text blocks are preserved, mirroring
+    ``tool_output.cap_tool_output`` so nothing binary is dropped."""
+    if isinstance(content, str):
+        if len(content) <= cap:
+            return content, 0
+        return _tool_result_pointer(tool_name, len(content), cap), len(content)
+    if isinstance(content, list):
+        total = (
+            sum(len(p) for p in content if isinstance(p, str))
+            + sum(len(p["text"]) for p in content
+                  if isinstance(p, dict) and isinstance(p.get("text"), str))
+        )
+        if total <= cap:
+            return content, 0
+        preserved = [
+            p for p in content
+            if not isinstance(p, str)
+            and not (isinstance(p, dict) and isinstance(p.get("text"), str))
+        ]
+        pointer = {"type": "text", "text": _tool_result_pointer(tool_name, total, cap)}
+        return [*preserved, pointer], total
+    return content, 0
+
+
+def _trim_kept_tool_results(
+    kept: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int, int]:
+    """Elide oversized tool-result messages from the KEPT runs — every one the
+    compaction preserves verbatim EXCEPT the most recent (whose tool output is
+    still live context). Returns ``(new_kept, results_elided, chars_elided)``.
+    No-op (returns the input) when the knob is 0 or there is ≤1 kept run.
+
+    Data-safety: the turn that produced each result already reasoned over it in
+    full; only the copy retained for FUTURE turns is shrunk, and to a pointer
+    that says how to re-fetch — never a silent tail-drop."""
+    cap = _history_tool_result_chars()
+    if cap <= 0 or len(kept) <= 1:
+        return kept, 0, 0
+    out: list[dict[str, Any]] = []
+    n_elided = 0
+    chars = 0
+    for i, run in enumerate(kept):
+        if i == len(kept) - 1 or not isinstance(run, dict):
+            out.append(run)  # never touch the most recent run
+            continue
+        msgs = run.get("messages")
+        if not isinstance(msgs, list):
+            out.append(run)
+            continue
+        new_msgs: list[Any] = []
+        touched = False
+        for msg in msgs:
+            if isinstance(msg, dict) and msg.get("role") == "tool":
+                new_c, elided = _elide_tool_content(
+                    msg.get("content"), msg.get("tool_name"), cap)
+                if elided:
+                    new_msgs.append({**msg, "content": new_c})
+                    n_elided += 1
+                    chars += elided
+                    touched = True
+                    continue
+            new_msgs.append(msg)
+        out.append({**run, "messages": new_msgs} if touched else run)
+    return out, n_elided, chars
 
 
 def _resolve_model_id(model: Any) -> str | None:
@@ -767,8 +877,22 @@ async def compact(
         },
         "created_at": int(time.time()),
     }
+    # Second-stage bound (opt-in): elide oversized tool results from the KEPT
+    # runs (all but the most recent) so a long tool-loop's accumulated output
+    # stops being re-sent on every following turn. No-op unless the operator
+    # sets OPENAGENT_COMPACTION_HISTORY_TOOL_RESULT_CHARS.
+    kept, results_elided, chars_elided = _trim_kept_tool_results(kept)
     new_runs = [recap_run, *kept]
     _save_runs(db_path, session_id, new_runs)
+
+    if results_elided:
+        elog(
+            "runtime.compaction.history_tool_results_elided",
+            session_id=session_id,
+            results_elided=results_elided,
+            chars_elided=chars_elided,
+            cap=_history_tool_result_chars(),
+        )
 
     elog(
         "runtime.compaction.done",
