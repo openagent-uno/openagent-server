@@ -77,10 +77,8 @@ async def t_bundle_numpy(ctx: TestContext) -> None:
     import re
 
     spec_text = (REPO_ROOT / "openagent.spec").read_text()
-    assert re.search(r'collect_submodules\("numpy"\)', spec_text), \
-        "openagent.spec must collect_submodules(\"numpy\") — else the bundle omits it"
-    assert re.search(r'collect_dynamic_libs\("numpy"\)', spec_text), \
-        "openagent.spec must collect_dynamic_libs(\"numpy\") for its C extensions"
+    assert re.search(r'collect_all\("numpy"\)', spec_text), \
+        "openagent.spec must collect_all(\"numpy\") — collect_submodules shipped it absent twice"
     assert re.search(r'^import numpy', spec_text, re.MULTILINE), \
         "openagent.spec must import numpy in the build-env guard (fail loud, not silent)"
 
@@ -88,9 +86,20 @@ async def t_bundle_numpy(ctx: TestContext) -> None:
     assert re.search(r'"numpy[><=!]', toml_text), \
         "pyproject.toml must list numpy as a dependency so the build env has it"
 
-    # And it must actually be importable + usable here (the real dep, not a stub).
-    import numpy as _np
-    assert _np.dot(_np.array([1.0, 0.0]), _np.array([1.0, 0.0])) == 1.0
+    # numpy is now OPTIONAL: semantic_index must import + search with it FORCED
+    # OFF, so a bundle that omits numpy still recalls (just slower). This is the
+    # guarantee that a fragile numpy bundle can never again silently break recall.
+    import src.memory.semantic_index as si
+    saved = si._HAS_NUMPY
+    try:
+        si._HAS_NUMPY = False
+        b, dim = si._to_blob([3.0, 4.0])
+        import array as _arr
+        v = _arr.array("f"); v.frombytes(b)
+        assert dim == 2 and abs(v[0] - 0.6) < 1e-6 and abs(v[1] - 0.8) < 1e-6, \
+            "numpy-free _to_blob failed to unit-normalise"
+    finally:
+        si._HAS_NUMPY = saved
 
 
 @test("imports", "frozen BUILTIN_MCPS_DIR matches PyInstaller spec layout")

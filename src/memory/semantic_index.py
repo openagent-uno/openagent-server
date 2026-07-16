@@ -60,12 +60,25 @@ import hashlib
 import os
 import sqlite3
 import threading
+import array
+import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional, Protocol, Sequence
 
-import numpy as np
+# numpy makes the cosine matmul ~100x faster, but it is FRAGILE to bundle into
+# the PyInstaller onefile (it shipped absent twice, silently disabling recall
+# with "No module named 'numpy'"). So it is OPTIONAL: with it, search is a fast
+# matmul; without it, a pure-Python dot product (stdlib ``array`` + a loop) does
+# the same over the few-thousand unit vectors a vault holds — slower per query
+# but correct, and it can NEVER be missing from the bundle.
+try:
+    import numpy as np  # type: ignore
+    _HAS_NUMPY = True
+except Exception:  # noqa: BLE001 — a broken/absent numpy must degrade, not crash
+    np = None  # type: ignore
+    _HAS_NUMPY = False
 
 # Bump when the stored-row SHAPE changes (a new column, a different blob
 # encoding). A pure cache, so a bump just re-embeds from the sources that were
@@ -349,15 +362,27 @@ CREATE TABLE IF NOT EXISTS session_vectors (
 """
 
 
+def _unit(vec: Sequence[float]) -> array.array:
+    """Return ``vec`` as a float32 ``array`` normalised to unit length (numpy-free)."""
+    a = array.array("f", (float(x) for x in vec))
+    norm = math.sqrt(sum(x * x for x in a))
+    if norm > 0:
+        a = array.array("f", (x / norm for x in a))
+    return a
+
+
 def _to_blob(vec: Sequence[float]) -> tuple[bytes, int]:
     """Normalise to unit length and pack as float32. Storing UNIT vectors turns
     cosine similarity into a plain dot product at search time — no per-query
     renormalisation over the whole matrix."""
-    arr = np.asarray(vec, dtype=np.float32)
-    norm = float(np.linalg.norm(arr))
-    if norm > 0:
-        arr = arr / norm
-    return arr.tobytes(), int(arr.shape[0])
+    if _HAS_NUMPY:
+        arr = np.asarray(vec, dtype=np.float32)
+        norm = float(np.linalg.norm(arr))
+        if norm > 0:
+            arr = arr / norm
+        return arr.tobytes(), int(arr.shape[0])
+    a = _unit(vec)
+    return a.tobytes(), len(a)
 
 
 def _prep_text(text: str) -> str:
@@ -701,17 +726,32 @@ class SemanticIndex:
 
     # ── search ────────────────────────────────────────────────────────
 
-    def _load_matrix(self, table: str) -> tuple[np.ndarray, list[sqlite3.Row]]:
-        """Stack every stored unit vector in ``table`` into one (N, dim) matrix,
-        paired with its rows in the same order. Returns an empty matrix when the
-        table is empty."""
+    def _sims_for(self, table: str, q: Sequence[float]) -> list[tuple[sqlite3.Row, float]]:
+        """``(row, cosine)`` for every stored unit vector in ``table``. Both are
+        unit vectors so cosine == dot product. numpy path: one matmul over the
+        stacked matrix; numpy-free path: a stdlib dot-product loop (fine over the
+        few-thousand vectors a vault holds). Rows whose ``dim`` mismatches the
+        query — e.g. a leftover from a different embed model — are skipped."""
         rows = list(self._conn.execute(f"SELECT * FROM {table}"))
         if not rows:
-            return np.empty((0, 0), dtype=np.float32), []
-        mat = np.frombuffer(b"".join(r["vec"] for r in rows), dtype=np.float32)
-        dim = rows[0]["dim"]
-        mat = mat.reshape(len(rows), dim)
-        return mat, rows
+            return []
+        dim = len(q)
+        if _HAS_NUMPY:
+            keep = [r for r in rows if r["dim"] == dim]
+            if not keep:
+                return []
+            mat = np.frombuffer(b"".join(r["vec"] for r in keep), dtype=np.float32)
+            mat = mat.reshape(len(keep), dim)
+            sims = (mat @ np.asarray(q, dtype=np.float32)).tolist()
+            return list(zip(keep, sims))
+        out: list[tuple[sqlite3.Row, float]] = []
+        for r in rows:
+            if r["dim"] != dim:
+                continue
+            v = array.array("f")
+            v.frombytes(r["vec"])
+            out.append((r, math.fsum(a * b for a, b in zip(v, q))))
+        return out
 
     def search(self, query: str, *, scope: str = "all", limit: int = 5,
                min_score: float = 0.0) -> list[dict[str, Any]]:
@@ -731,36 +771,27 @@ class SemanticIndex:
         except EmbeddingError as exc:
             self._log_embed_error("query", exc)
             return []
-        qarr = np.asarray(qv, dtype=np.float32)
-        qn = float(np.linalg.norm(qarr))
-        if qn > 0:
-            qarr = qarr / qn
+        qunit = list(_unit(qv))  # unit float list — numpy-free, works for both paths
 
         want = {"vault", "sessions"} if scope == "all" else {scope}
         hits: list[dict[str, Any]] = []
         with self._lock:
             if "vault" in want:
-                mat, rows = self._load_matrix("vault_vectors")
-                if rows and mat.shape[1] == qarr.shape[0]:
-                    sims = mat @ qarr
-                    for r, s in zip(rows, sims):
-                        if float(s) >= min_score:
-                            hits.append({
-                                "kind": "note", "score": round(float(s), 4),
-                                "path": r["path"], "title": r["title"] or "",
-                                "updated": r["updated"] or "",
-                            })
+                for r, s in self._sims_for("vault_vectors", qunit):
+                    if float(s) >= min_score:
+                        hits.append({
+                            "kind": "note", "score": round(float(s), 4),
+                            "path": r["path"], "title": r["title"] or "",
+                            "updated": r["updated"] or "",
+                        })
             if "sessions" in want:
-                mat, rows = self._load_matrix("session_vectors")
-                if rows and mat.shape[1] == qarr.shape[0]:
-                    sims = mat @ qarr
-                    for r, s in zip(rows, sims):
-                        if float(s) >= min_score:
-                            hits.append({
-                                "kind": "session", "score": round(float(s), 4),
-                                "session_id": r["session_id"],
-                                "title": r["title"] or "", "origin": r["origin"] or "",
-                            })
+                for r, s in self._sims_for("session_vectors", qunit):
+                    if float(s) >= min_score:
+                        hits.append({
+                            "kind": "session", "score": round(float(s), 4),
+                            "session_id": r["session_id"],
+                            "title": r["title"] or "", "origin": r["origin"] or "",
+                        })
         hits.sort(key=lambda h: h["score"], reverse=True)
         return hits[:max(1, int(limit))]
 

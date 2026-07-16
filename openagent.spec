@@ -23,6 +23,7 @@ reuse that cache and start in under a second.
 import sys
 from pathlib import Path
 from PyInstaller.utils.hooks import (
+    collect_all,
     collect_data_files,
     collect_dynamic_libs,
     collect_submodules,
@@ -45,7 +46,13 @@ import iroh  # noqa: F401 — P2P transport (src.network.iroh_node) — Rust FFI
 import pydantic  # noqa: F401 — runtime calls importlib.metadata.version("pydantic")
 import email_validator  # noqa: F401 — pydantic.EmailStr validation calls version("email-validator")
 import telegram  # noqa: F401 — Telegram bridge is a first-class production channel
-import numpy  # noqa: F401 — src.memory.semantic_index cosine matmul; a missing numpy silently disables semantic recall (auto-recall + the semantic_recall MCP tool)
+import numpy  # noqa: F401 — src.memory.semantic_index cosine (fast path; a pure-Python fallback covers a missing numpy, but bundle it for speed)
+
+# ``collect_all`` returns (datas, binaries, hiddenimports) for the WHOLE numpy
+# package — the only reliable way to bundle its C extensions for numpy 2.x
+# (plain collect_submodules shipped it absent twice). Spread into the three
+# lists below.
+_numpy_all = collect_all("numpy")
 
 block_cipher = None
 
@@ -160,12 +167,12 @@ hiddenimports = [
     *collect_submodules("pydantic"),
     *collect_submodules("pydantic_core"),
     *collect_submodules("email_validator"),
-    # numpy: src.memory.semantic_index does the cosine matmul with it. It ships
-    # per-platform C extensions loaded dynamically; a missing/partial collect
-    # silently breaks semantic recall with "No module named 'numpy'" at runtime
-    # (the import is behind a try/except so auto-recall just goes inert). PyInstaller
-    # ships a numpy hook, but collect explicitly as belt-and-suspenders.
-    *collect_submodules("numpy"),
+    # numpy: the FAST path for src.memory.semantic_index's cosine (there is a
+    # pure-Python fallback, so a missing numpy no longer breaks recall — it just
+    # runs slower). ``collect_submodules`` alone shipped it ABSENT twice for
+    # numpy 2.x, so use ``collect_all`` below (datas+binaries+hiddenimports) —
+    # the documented reliable way to bundle numpy's C extensions + data.
+    *_numpy_all[2],
 ]
 
 # ── Dynamic libs ──
@@ -174,8 +181,8 @@ hiddenimports = [
 # see the dependency. ``collect_dynamic_libs`` finds the platform's
 # .so/.dylib/.dll inside the installed iroh wheel and bundles it.
 binaries = collect_dynamic_libs("iroh")
-# numpy's compiled BLAS/C extensions (loaded at import) — see the hiddenimport.
-binaries += collect_dynamic_libs("numpy")
+# numpy's compiled BLAS/C extensions (loaded at import) — from collect_all.
+binaries += _numpy_all[1]
 
 # ── Data files ──
 # Bundle the entire mcp/servers/ directory (built-in MCP servers).
@@ -216,6 +223,7 @@ if _aic_dir.exists() and not (_aic_dir / "node_modules").exists():
         print(f"openagent.spec: WARNING — agent-in-chrome npm install failed ({_e})")
 
 datas = []
+datas += _numpy_all[0]  # numpy data files (from collect_all)
 if mcps_dir.exists():
     # Bundle every MCP EXCEPT computer-control. The Rust binary for
     # computer-control must ship as a *sidecar* next to the openagent

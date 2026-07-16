@@ -592,3 +592,37 @@ async def t_memory_search_env_absent_when_unset(ctx: TestContext) -> None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+
+
+@test("semantic_recall", "the numpy-FREE fallback finds the same matches (bundle-proof)")
+async def t_numpy_free_search(ctx: TestContext) -> None:
+    """numpy shipped ABSENT from the frozen bundle twice, silently breaking
+    recall with 'No module named numpy'. So the cosine is numpy-OPTIONAL: this
+    forces the pure-Python path and asserts it still finds a strong match and
+    respects the threshold — recall can never again be disabled by a missing C
+    library."""
+    import src.memory.semantic_index as si
+    from src.memory.semantic_index import SemanticIndex
+
+    db, idx_path, vault = _paths(ctx, "nonumpy")
+    saved = si._HAS_NUMPY
+    try:
+        _write_note(vault, "deadline", "Launch deadline",
+                    "the ship date we agreed for the migration")
+        d = await _open_db(db); await d.close()
+        si._HAS_NUMPY = False   # force the pure-Python dot-product path
+        idx = SemanticIndex(db, vault_root=vault, index_path=idx_path,
+                            embedder=ConceptEmbedder())
+        idx.sync()
+        assert idx.stats()["notes"] == 1, "pure-Python path failed to store a vector"
+        # paraphrase with zero shared words must still match via the concept embedder
+        hits = idx.search("when is the launch target", limit=3, min_score=0.3)
+        assert hits and hits[0]["path"].endswith("deadline.md"), (
+            f"numpy-free search missed the match: {hits}")
+        # threshold still bites without numpy
+        assert idx.search("sourdough bread baking", limit=3, min_score=0.5) == [], (
+            "numpy-free path ignored the min_score floor")
+        idx.close()
+    finally:
+        si._HAS_NUMPY = saved
+        _cleanup(db, idx_path, vault)
