@@ -453,6 +453,9 @@ async def _with_vault_reminder(db: Any, session_id: str | None, text: str) -> st
 # takes effect without stale state.
 _RECALL_INDEX_CACHE: dict[str, Any] = {}
 _RECALL_INDEX_LOCK = threading.Lock()
+# One-shot guard so a missing-numpy (or other import) failure is logged once,
+# not per turn — see ``_get_recall_index``.
+_RECALL_IMPORT_WARNED = False
 
 
 def _recall_enabled() -> bool:
@@ -496,7 +499,17 @@ def _get_recall_index(agent: Any) -> Any:
             return cached
         try:
             from src.memory.semantic_index import SemanticIndex, resolve_embedder
-        except Exception:  # noqa: BLE001 — numpy/module issue must not break turns
+        except Exception as exc:  # noqa: BLE001 — numpy/module issue must not break turns
+            # Don't fail the turn, but DON'T fail silently either: a missing
+            # numpy in a frozen build disables all of semantic recall, and a
+            # silent ``return None`` made that look like "recall found nothing"
+            # for hours. Log once so it's diagnosable.
+            global _RECALL_IMPORT_WARNED
+            if not _RECALL_IMPORT_WARNED:
+                _RECALL_IMPORT_WARNED = True
+                elog("auto_recall.import_failed", level="warning",
+                     error=str(exc) or type(exc).__name__,
+                     hint="semantic recall is INERT — is numpy in the build?")
             return None
         embedder = resolve_embedder(getattr(agent, "_providers_config", None))
         if embedder is None:

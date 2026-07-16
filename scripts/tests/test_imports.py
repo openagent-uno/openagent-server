@@ -64,6 +64,35 @@ async def t_bundle_groq_and_src(ctx: TestContext) -> None:
         "pyproject.toml must NOT list agno as a dependency"
 
 
+@test("imports", "numpy in deps + spec (semantic recall bundle completeness)")
+async def t_bundle_numpy(ctx: TestContext) -> None:
+    """``src.memory.semantic_index`` does its cosine matmul with numpy. numpy
+    was NOT declared as a dependency nor collected in the spec, so the frozen
+    binary shipped WITHOUT it — semantic recall (auto-recall + the
+    ``semantic_recall`` MCP tool) failed at runtime with "No module named
+    'numpy'", and because the import sits behind a try/except it went INERT
+    silently for hours. Pin all three so it can't regress: the dep, the spec
+    collect, and the build-env guard import that turns a missing numpy into a
+    loud build failure instead of a broken bundle."""
+    import re
+
+    spec_text = (REPO_ROOT / "openagent.spec").read_text()
+    assert re.search(r'collect_submodules\("numpy"\)', spec_text), \
+        "openagent.spec must collect_submodules(\"numpy\") — else the bundle omits it"
+    assert re.search(r'collect_dynamic_libs\("numpy"\)', spec_text), \
+        "openagent.spec must collect_dynamic_libs(\"numpy\") for its C extensions"
+    assert re.search(r'^import numpy', spec_text, re.MULTILINE), \
+        "openagent.spec must import numpy in the build-env guard (fail loud, not silent)"
+
+    toml_text = (REPO_ROOT / "pyproject.toml").read_text()
+    assert re.search(r'"numpy[><=!]', toml_text), \
+        "pyproject.toml must list numpy as a dependency so the build env has it"
+
+    # And it must actually be importable + usable here (the real dep, not a stub).
+    import numpy as _np
+    assert _np.dot(_np.array([1.0, 0.0]), _np.array([1.0, 0.0])) == 1.0
+
+
 @test("imports", "frozen BUILTIN_MCPS_DIR matches PyInstaller spec layout")
 async def t_frozen_builtin_mcps_dir_matches_spec(ctx: TestContext) -> None:
     """Regression for the openagent→src rename (commit 4b5efb5) where

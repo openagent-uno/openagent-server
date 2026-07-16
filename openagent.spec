@@ -45,6 +45,7 @@ import iroh  # noqa: F401 — P2P transport (src.network.iroh_node) — Rust FFI
 import pydantic  # noqa: F401 — runtime calls importlib.metadata.version("pydantic")
 import email_validator  # noqa: F401 — pydantic.EmailStr validation calls version("email-validator")
 import telegram  # noqa: F401 — Telegram bridge is a first-class production channel
+import numpy  # noqa: F401 — src.memory.semantic_index cosine matmul; a missing numpy silently disables semantic recall (auto-recall + the semantic_recall MCP tool)
 
 block_cipher = None
 
@@ -159,6 +160,12 @@ hiddenimports = [
     *collect_submodules("pydantic"),
     *collect_submodules("pydantic_core"),
     *collect_submodules("email_validator"),
+    # numpy: src.memory.semantic_index does the cosine matmul with it. It ships
+    # per-platform C extensions loaded dynamically; a missing/partial collect
+    # silently breaks semantic recall with "No module named 'numpy'" at runtime
+    # (the import is behind a try/except so auto-recall just goes inert). PyInstaller
+    # ships a numpy hook, but collect explicitly as belt-and-suspenders.
+    *collect_submodules("numpy"),
 ]
 
 # ── Dynamic libs ──
@@ -167,6 +174,8 @@ hiddenimports = [
 # see the dependency. ``collect_dynamic_libs`` finds the platform's
 # .so/.dylib/.dll inside the installed iroh wheel and bundles it.
 binaries = collect_dynamic_libs("iroh")
+# numpy's compiled BLAS/C extensions (loaded at import) — see the hiddenimport.
+binaries += collect_dynamic_libs("numpy")
 
 # ── Data files ──
 # Bundle the entire mcp/servers/ directory (built-in MCP servers).

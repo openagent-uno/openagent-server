@@ -37,6 +37,11 @@ dependencies = [
     # doesn't silently drop it from the PyInstaller build env.
     "httpx>=0.24",
     "packaging>=21.0",
+    # numpy: src.memory.semantic_index does the brute-force cosine matmul with
+    # it. Declared here so the frozen build env has it — without it, semantic
+    # recall (auto-recall + the semantic_recall MCP tool) silently goes inert
+    # with "No module named 'numpy'" (the import sits behind a try/except).
+    "numpy>=1.24",
     # Groq SDK: imported by src.models.providers.groq when a groq-based
     # provider is selected. Declaring it here ensures it is installed in
     # the build environment so PyInstaller bundles it
