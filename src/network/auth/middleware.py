@@ -84,9 +84,25 @@ def make_auth_middleware(state: NetworkAuthState):
     transport isn't reachable. The token is captured at middleware
     construction time, not per-request, so changing the env var
     requires a gateway restart.
+
+    An OPTIONAL second token, ``OPENAGENT_LLM_TOKEN``, is a
+    least-privilege credential scoped to the LLM gateway ONLY: a holder
+    of that token (and NOT the full ``OPENAGENT_HTTP_TOKEN``) may reach
+    ``/api/llm/*`` and is rejected on every other route. This lets a
+    caller that only needs the LLM gateway (e.g. Replio's reply-guard
+    calling ``/api/llm/chat/completions``) be handed a token that cannot
+    reach vault, config, scheduled-tasks, terminal-backed chat, etc. It
+    is fully backward compatible: when ``OPENAGENT_LLM_TOKEN`` is unset,
+    behaviour is identical to today, and the full token keeps working
+    everywhere.
     """
 
     http_token = os.environ.get("OPENAGENT_HTTP_TOKEN", "").strip()
+    # Optional SECOND, least-privilege token scoped to the LLM gateway.
+    # Captured at construction time like the full token above. Unset ⇒
+    # ``accepted`` below is just ``[http_token]`` on every path, exactly
+    # as before this token existed.
+    llm_token = os.environ.get("OPENAGENT_LLM_TOKEN", "").strip()
 
     @web.middleware
     async def auth_middleware(request: web.Request, handler):
@@ -103,18 +119,20 @@ def make_auth_middleware(state: NetworkAuthState):
         # the ``client_id`` dict key (StreamSession lookup, last-write-
         # wins kick on collision), and a stable key would cause
         # legitimate reconnects to kick each other in a loop.
-        if http_token:
-            # Two equivalent ways to present the shared secret, both
-            # compared against the SAME ``http_token`` — this only ADDS an
-            # accepted header, it does not weaken anything:
+        if http_token or llm_token:
+            # Two equivalent ways to present a shared secret, both compared
+            # with ``secrets.compare_digest`` — this only ADDS accepted
+            # headers, it does not weaken anything:
             #   1. ``X-OpenAgent-Token: <token>`` — the original bridge
             #      header (Virgil's orchestrator, ngrok dev tunnels).
             #   2. ``Authorization: Bearer <token>`` — the standard header
             #      every OpenAI-compatible client sends, so the whole
             #      gateway (incl. /api/llm/chat/completions) is reachable
             #      by an off-the-shelf OpenAI SDK with no custom headers.
-            # We gather whatever tokens the request presented and accept if
-            # ANY matches; a valid X-OpenAgent-Token keeps working exactly
+            # We gather whatever tokens the request presented (both header
+            # forms are honoured for BOTH tokens) and accept if ANY of them
+            # matches ANY token valid for THIS request's path; a valid
+            # X-OpenAgent-Token carrying the full token keeps working exactly
             # as before.
             candidates: list[str] = []
             x_token = request.headers.get("X-OpenAgent-Token", "").strip()
@@ -125,7 +143,27 @@ def make_auth_middleware(state: NetworkAuthState):
                 bearer = authz[7:].strip()
                 if bearer:
                     candidates.append(bearer)
-            if any(secrets.compare_digest(c, http_token) for c in candidates):
+
+            # Least-privilege scoping by request PATH. The full
+            # ``OPENAGENT_HTTP_TOKEN`` is accepted on EVERY route (unchanged).
+            # The optional ``OPENAGENT_LLM_TOKEN`` is accepted ONLY on the LLM
+            # gateway (paths under ``/api/llm/``) — so a caller holding only
+            # that token reaches the LLM routes and is rejected everywhere
+            # else (falling through to the device-cert path → 401). When
+            # ``OPENAGENT_LLM_TOKEN`` is unset this list is just
+            # ``[http_token]`` on every path, i.e. behaviour is unchanged.
+            path = request.rel_url.path
+            accepted: list[str] = []
+            if http_token:
+                accepted.append(http_token)
+            if llm_token and path.startswith("/api/llm/"):
+                accepted.append(llm_token)
+
+            if candidates and accepted and any(
+                secrets.compare_digest(c, tok)
+                for c in candidates
+                for tok in accepted
+            ):
                 handle_hint = request.headers.get("X-OpenAgent-Handle", "") or "http-bridge"
                 synthetic = DeviceCert(
                     handle=handle_hint[:64],

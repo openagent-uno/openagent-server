@@ -180,6 +180,11 @@ _TEST_MODULES: tuple[str, ...] = (
     # OpenAI-client usable. Pure-unit: fake providers DB + patched
     # httpx.AsyncClient + the real auth middleware; no live gateway/network.
     "test_llm_gateway",
+    # Least-privilege scoped LLM token: the optional ``OPENAGENT_LLM_TOKEN``
+    # authenticates ONLY ``/api/llm/*`` and is rejected on every other route,
+    # while the full ``OPENAGENT_HTTP_TOKEN`` keeps working everywhere. Pure-unit:
+    # drives the REAL auth middleware with both header forms; no live gateway.
+    "test_llm_scoped_token",
     # Cross-device chat visibility: ``upsert_session`` writes the user
     # handle as the row owner and ``list_all_sessions`` soft-falls back
     # to legacy device-pubkey rows via ``network_devices``.
@@ -347,6 +352,11 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_dream_surfacing",
     "test_updater",
     "test_update_guard",
+    # ``openagent update`` restart fallback: when systemctl is absent (the
+    # k8s pods run supervisord, not systemd), auto-restart falls back to
+    # ``supervisorctl -c <conf> restart <program>`` instead of printing
+    # "could not auto-restart". Pure-unit; sits by the updater tests.
+    "test_supervisord_restart",
     "test_task_hooks",
     "test_shell_hooks",
     "test_tool_labels",
