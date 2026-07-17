@@ -1883,6 +1883,7 @@ class Gateway:
                 text = "No active session to compact."
             else:
                 try:
+                    from src.core import compaction as _compaction
                     from src.core.compaction import compact as _compact
                     from src.channels.base import parse_compaction_status
                     from src.stream.events import SessionCompacted
@@ -1915,13 +1916,21 @@ class Gateway:
                     # rather than only folding turns older than the automatic
                     # keep window (which no-ops on short chats). The automatic
                     # context-pressure path keeps its default keep window.
-                    result = await _compact(
-                        session_id,
-                        self.agent.model,
-                        self.agent,
-                        on_status=_compact_status,
-                        keep=0,
-                    )
+                    #
+                    # Under the per-session compaction lock so a hand-typed
+                    # /compact can't race the proactive background pass
+                    # (compaction.compact_after_turn) rewriting the same
+                    # sessions.runs row — both rewrite it, and the lock is the
+                    # single mutex that serialises every compaction for a
+                    # session. See src/core/compaction.py.
+                    async with _compaction.session_lock(session_id):
+                        result = await _compact(
+                            session_id,
+                            self.agent.model,
+                            self.agent,
+                            on_status=_compact_status,
+                            keep=0,
+                        )
                     if result is None:
                         text = "Nothing to compact — the conversation is empty or already compacted."
                     else:
