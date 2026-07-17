@@ -27,6 +27,12 @@ _DEFAULT_SERVICE_NAME = "com.openagent.serve"
 _DEFAULT_SERVICE_LABEL = "OpenAgent"
 _DEFAULT_SYSTEMD_UNIT = "openagent.service"
 
+# supervisord fallback (the k8s pods run OpenAgent under supervisord, not
+# systemd, so ``systemctl`` is absent inside the container). Both are env-
+# overridable so a pod can point at its own conf / program name.
+_DEFAULT_SUPERVISOR_PROGRAM = "openagent"
+_DEFAULT_SUPERVISORD_CONF = "/data/agent/supervisord.conf"
+
 
 def _sanitize_name(name: str) -> str:
     """Sanitize a directory name for use in service identifiers."""
@@ -413,10 +419,63 @@ def _linux_status(agent_dir: Path | None = None) -> str:
     return result.stdout.strip() if result.stdout else "Not running"
 
 
+def _supervisor_program() -> str:
+    """Name of the supervisord ``program`` running OpenAgent."""
+    return os.environ.get("OPENAGENT_SUPERVISOR_PROGRAM", _DEFAULT_SUPERVISOR_PROGRAM)
+
+
+def _supervisord_conf() -> str:
+    """Path to the supervisord config to drive supervisorctl with."""
+    return os.environ.get("OPENAGENT_SUPERVISORD_CONF", _DEFAULT_SUPERVISORD_CONF)
+
+
+def _supervisord_restart() -> str:
+    """Restart the OpenAgent server program under supervisord.
+
+    The k8s pods have no systemd — OpenAgent runs as a supervisord
+    ``program`` — so ``systemctl`` is missing and the systemd path above
+    raises ``FileNotFoundError``. This runs
+    ``supervisorctl -c <conf> restart <program>`` instead.
+
+    ``openagent update`` runs as a SEPARATE short-lived process (invoked
+    via ``kubectl exec``); the long-running server is the supervisord
+    ``openagent`` program. So restarting that program bounces the SERVER,
+    not this update command — correct and safe.
+
+    Raises ``RuntimeError`` when ``supervisorctl`` or its conf is
+    unavailable, so the caller can fall through to the "restart manually"
+    message rather than crash.
+    """
+    program = _supervisor_program()
+    conf = _supervisord_conf()
+    if not shutil.which("supervisorctl"):
+        raise RuntimeError("supervisorctl not found on PATH")
+    if not Path(conf).exists():
+        raise RuntimeError(f"supervisord config not found at {conf}")
+    subprocess.run(["supervisorctl", "-c", conf, "restart", program], check=True)
+    return f"supervisorctl -c {conf} restart {program}"
+
+
 def _linux_restart(agent_dir: Path | None = None) -> str:
     _, _, unit_name = _service_names(agent_dir)
-    subprocess.run(["systemctl", "--user", "restart", unit_name], check=True)
-    return f"systemctl --user restart {unit_name}"
+    # Systemd hosts: prefer systemctl when it's present and working.
+    systemctl_err: Exception | None = None
+    if shutil.which("systemctl"):
+        try:
+            subprocess.run(["systemctl", "--user", "restart", unit_name], check=True)
+            return f"systemctl --user restart {unit_name}"
+        except (OSError, subprocess.CalledProcessError) as exc:
+            # systemctl exists but the restart failed (e.g. no systemd user
+            # bus inside a container) — fall through to supervisord.
+            systemctl_err = exc
+    # No systemd (k8s pods run supervisord): fall back to supervisorctl.
+    try:
+        return _supervisord_restart()
+    except RuntimeError as sup_err:
+        # Neither manager could restart us. Prefer the systemctl error on a
+        # systemd host (more actionable); otherwise surface the supervisord
+        # one. Either way the caller renders it as "restart manually".
+        raise systemctl_err or sup_err
 
 
 # ---------------------------------------------------------------------------
