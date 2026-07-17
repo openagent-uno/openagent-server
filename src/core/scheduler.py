@@ -64,6 +64,30 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_int(name: str, default: int) -> int:
+    """An int env override that falls back to ``default`` on unset/garbage."""
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+# Bounded event-delivery dispatch. ``_drain_event_deliveries`` claims the
+# ``received`` rows the events-manager MCP enqueued and dispatches each as a
+# DETACHED turn. An event turn can be very heavy (a ~250k-token support-thread
+# turn), so an UNBOUNDED drain — the old behaviour, which claimed + dispatched a
+# whole burst at once — could saturate the runtime and hang the entire pipeline:
+# when ~66 deliveries were re-enqueued at once (a manual backfill), all ~66 heavy
+# turns fired concurrently and NO delivery completed for ~19 min, including
+# brand-new inbound tickets. The DB's ``received`` rows are already the queue;
+# this cap is the missing piece. At most OPENAGENT_EVENT_DISPATCH_CONCURRENCY
+# event turns run at once; the rest stay ``received`` (unclaimed) and are picked
+# up on later ticks as slots free. Read live each tick (like the stale-sweep
+# knobs) so an operator can retune the ceiling without a redeploy.
+_EVENT_DISPATCH_CONCURRENCY_ENV = "OPENAGENT_EVENT_DISPATCH_CONCURRENCY"
+_EVENT_DISPATCH_CONCURRENCY_DEFAULT = 4
+
+
 # Periodic stale-orphan sweep for event deliveries. The startup reap
 # (``server.py`` → ``reap_orphan_event_deliveries``) only recovers CRASH
 # orphans: a crash → restart → reap. A delivery orphaned WITHOUT a restart —
@@ -188,6 +212,16 @@ class Scheduler:
         # the run's ``finally`` — the map only ever holds live runs.
         self._workflow_run_tasks: dict[str, asyncio.Task] = {}
         self._scheduled_run_tasks: dict[str, asyncio.Task] = {}
+        # Number of event-delivery dispatch turns currently in flight. The
+        # bound that stops a burst from jamming the pipeline: each drain tick
+        # claims + dispatches at most ``(concurrency - in_flight)`` deliveries,
+        # so at most ``OPENAGENT_EVENT_DISPATCH_CONCURRENCY`` heavy event turns
+        # run at once and the rest wait in the DB queue. Incremented
+        # synchronously in ``_spawn_event_dispatch`` (before the task is
+        # scheduled, so the next tick's free-slot math already counts it) and
+        # decremented in that task's ``finally`` — a crashing/cancelled turn
+        # still frees its slot. Single-threaded asyncio: no lock needed.
+        self._event_dispatch_in_flight: int = 0
         # Monotonic timestamp of the last periodic stale-orphan sweep. Set at
         # the top of ``_cancellation_loop`` so the first sweep fires one
         # interval AFTER boot (the startup reap already covers t=0), then gated
@@ -430,20 +464,73 @@ class Scheduler:
                 )
             )
 
+    def _event_dispatch_concurrency(self) -> int:
+        """Max event-delivery turns allowed in flight at once (always >= 1).
+
+        Read live each tick from ``OPENAGENT_EVENT_DISPATCH_CONCURRENCY`` so the
+        ceiling can be retuned without a redeploy; garbage / unset falls back to
+        the default, and a sub-1 value is clamped to 1 so the drain never wedges
+        itself into dispatching nothing forever."""
+        return max(1, _env_int(
+            _EVENT_DISPATCH_CONCURRENCY_ENV, _EVENT_DISPATCH_CONCURRENCY_DEFAULT,
+        ))
+
+    def _spawn_event_dispatch(self, coro) -> asyncio.Task:
+        """Dispatch one event-delivery turn as a slot-bounded background task.
+
+        Reserves an in-flight slot SYNCHRONOUSLY (before the task is scheduled,
+        so a same-tick or next-tick free-slot calculation already accounts for
+        it) and releases it in a ``finally`` so a crashing or cancelled turn
+        still frees its slot. Tracked in ``_workflow_tasks`` like every other
+        detached run, so ``stop()`` drains it on shutdown and the GC can't
+        collect a still-running task."""
+        self._event_dispatch_in_flight += 1
+
+        async def _runner() -> None:
+            try:
+                await coro
+            finally:
+                self._event_dispatch_in_flight -= 1
+
+        task = asyncio.create_task(_runner())
+        self._workflow_tasks.add(task)
+        task.add_done_callback(self._workflow_tasks.discard)
+        return task
+
     async def _drain_event_deliveries(self) -> None:
-        """Claim and dispatch every unclaimed event delivery.
+        """Claim and dispatch pending event deliveries, BOUNDED so a burst can
+        never jam the pipeline.
 
         The ``events-manager`` MCP subprocess cannot reach the in-process
         runtime, so ``trigger_event`` inserts an ``event_deliveries`` row with
         ``claimed_at IS NULL``; this drain claims it (atomically) and runs the
         bound action via the shared ``dispatch_event``. The webhook listener
         and the REST trigger dispatch in-process and never hit this path (they
-        create their rows already ``claimed``)."""
+        create their rows already ``claimed``).
+
+        BOUND — the fix for the burst-jam. An event turn can be very heavy, so
+        this claims + dispatches at most ``(concurrency - in_flight)`` deliveries
+        per tick — never more than can currently run under
+        ``OPENAGENT_EVENT_DISPATCH_CONCURRENCY``. The claim ``limit`` is EXACTLY
+        the number of free slots, so a delivery is never claimed unless it is
+        dispatched in the same breath (a claimed-but-undispatched row would
+        become a stuck orphan). Deliveries beyond the cap stay ``received``
+        (unclaimed) — the DB rows ARE the queue — and later ticks pick them up
+        as slots free. The loop keeps running every tick; when every slot is
+        busy it simply claims nothing and returns, so a slow/hanging turn holds
+        its slot without ever blocking the drain (the stale-orphan reaper
+        recovers a truly stuck one)."""
         if self.db is None:
+            return
+        # Only claim what we can immediately dispatch. When the runtime is
+        # saturated (in_flight == concurrency) free is 0 and we touch nothing
+        # this tick — the queued ``received`` rows wait in the DB for a slot.
+        free = self._event_dispatch_concurrency() - self._event_dispatch_in_flight
+        if free <= 0:
             return
         try:
             deliveries = await self.db.claim_pending_event_deliveries(
-                limit=_CANCEL_SCAN_LIMIT,
+                limit=free,
             )
         except Exception as e:  # noqa: BLE001
             elog("scheduler.event_claim_failed", level="warning",
@@ -462,7 +549,7 @@ class Scheduler:
                 payload = json.loads(dl.get("payload_json") or "{}")
             except (TypeError, ValueError):
                 payload = {}
-            self._spawn_workflow(
+            self._spawn_event_dispatch(
                 dispatch_event(
                     agent=self.agent, db=self.db, scheduler=self,
                     event=event, payload=payload,

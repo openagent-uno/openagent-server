@@ -329,6 +329,13 @@ _TEST_MODULES: tuple[str, ...] = (
     # but only when its claim is older than the age threshold, so a
     # legitimately-running turn is never double-dispatched.
     "test_event_delivery_stale_sweep",
+    # Bounded event-delivery dispatch: the scheduler's event drain caps
+    # in-flight turns at OPENAGENT_EVENT_DISPATCH_CONCURRENCY (default 4) so a
+    # burst (e.g. ~66 re-enqueued deliveries) can never spawn a stampede of
+    # heavy turns and jam the pipeline. Proves at most K run at once, the rest
+    # stay ``received`` (unclaimed) in the DB queue and drain as slots free, and
+    # a hanging turn holds its slot without blocking the drain loop.
+    "test_event_dispatch_concurrency",
     # Workflow ai-prompt must forget/release at the right moment (same
     # bug class as scheduler issue #5 but for workflows).
     "test_workflow_forgets_session",
