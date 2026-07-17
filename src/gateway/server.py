@@ -189,6 +189,14 @@ class Gateway:
         # can tear it down explicitly (the runner cleanup doesn't track
         # externally-attached sites).
         self._tcp_site = None
+        # Optional SECOND plain-TCP listener bound to 0.0.0.0, enabled when
+        # OPENAGENT_CLUSTER_HTTP_PORT is set. The primary ``_tcp_site`` binds
+        # OPENAGENT_HTTP_HOST (usually 127.0.0.1, fronted by tailscale-serve),
+        # which a Kubernetes ClusterIP Service can't reach — and it can't move
+        # to 0.0.0.0 because tailscaled already holds the tailnet IP on the
+        # same port. This one gives in-cluster peers a reachable address on a
+        # distinct port. Same runner/app/routes/auth; torn down in ``stop``.
+        self._cluster_tcp_site = None
         # Optional dedicated webhook listener (the ``webhook`` channel). A
         # SEPARATE aiohttp Application on its own TCP port serving ONLY
         # ``/hooks/*`` — never ``/api/*`` — so the external-facing surface
@@ -919,6 +927,55 @@ class Gateway:
                 "<set>" if http_token_raw else "",
             )
 
+        # Additional CLUSTER-facing HTTP listener, bound to 0.0.0.0 on a
+        # distinct port. Rationale: the primary listener above binds
+        # OPENAGENT_HTTP_HOST — typically 127.0.0.1, fronted by a
+        # ``tailscale serve`` proxy that already holds the tailnet IP on
+        # OPENAGENT_HTTP_PORT. A loopback bind is unreachable from a
+        # Kubernetes ClusterIP Service, and simply moving the primary to
+        # 0.0.0.0 fails (EADDRINUSE against tailscaled's tailnet-IP bind on
+        # the same port). So when OPENAGENT_CLUSTER_HTTP_PORT is set we start
+        # a SECOND TCPSite on 0.0.0.0:<that port> on the SAME AppRunner —
+        # identical app, routes, and token auth — giving in-cluster peers
+        # (e.g. the LLM-gateway Service) a reachable address without touching
+        # the tailscale path. Requires OPENAGENT_HTTP_TOKEN (auth is shared).
+        cluster_port_raw = os.environ.get("OPENAGENT_CLUSTER_HTTP_PORT", "").strip()
+        if cluster_port_raw and http_token_raw:
+            try:
+                cluster_port = int(cluster_port_raw)
+            except ValueError:
+                logger.error(
+                    "OPENAGENT_CLUSTER_HTTP_PORT=%r is not an integer — cluster listener skipped",
+                    cluster_port_raw,
+                )
+            else:
+                try:
+                    cluster_site = web.TCPSite(runner, "0.0.0.0", cluster_port)
+                    await cluster_site.start()
+                    self._cluster_tcp_site = cluster_site
+                    elog(
+                        "gateway.cluster_http_listener.start",
+                        host="0.0.0.0",
+                        port=cluster_port,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception(
+                        "cluster HTTP listener failed to start on 0.0.0.0:%s",
+                        cluster_port,
+                    )
+                    elog(
+                        "gateway.cluster_http_listener.error",
+                        level="error",
+                        host="0.0.0.0",
+                        port=cluster_port,
+                        error=str(exc),
+                    )
+        elif cluster_port_raw and not http_token_raw:
+            logger.warning(
+                "OPENAGENT_CLUSTER_HTTP_PORT=%r set but OPENAGENT_HTTP_TOKEN missing — cluster listener disabled (auth required)",
+                cluster_port_raw,
+            )
+
         # Dedicated webhook listener (the ``webhook`` channel). A separate
         # aiohttp Application on its own port, serving ONLY ``/hooks/*`` — the
         # gateway API is structurally absent from it. Built from
@@ -1006,6 +1063,12 @@ class Gateway:
             except Exception as e:  # noqa: BLE001
                 logger.debug("tcp site stop failed: %s", e)
             self._tcp_site = None
+        if self._cluster_tcp_site is not None:
+            try:
+                await self._cluster_tcp_site.stop()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("cluster tcp site stop failed: %s", e)
+            self._cluster_tcp_site = None
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
