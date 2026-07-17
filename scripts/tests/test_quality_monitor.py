@@ -292,3 +292,196 @@ async def t_judge_rules_capped(ctx: TestContext) -> None:
     # 0 disables grounding entirely (pure generic rubric).
     with _env(OPENAGENT_QUALITY_MONITOR_RULES_CHARS="0"):
         assert qm._agent_rules(agent) == ""
+
+
+# ══ Defect 1 — the judge must SEE the tool trace so it stops false-flagging a
+#    tool-grounded id as fabrication ═══════════════════════════════════════════
+
+
+class _GroundingJudge:
+    """A fake judge that HONOURS the grounding rule: an id present in the TOOL
+    TRACE section of the prompt is grounded (good), otherwise it is fabricated
+    (bad). This is exactly the discrimination the real judge could not make
+    before the trace was passed — so it pins that the fix reaches the outcome,
+    not just the prompt text."""
+
+    model = "fake:judge"
+
+    def __init__(self, cited_id: str):
+        self._id = cited_id
+        self.calls: list[tuple] = []
+
+    async def generate(self, messages, system=None, session_id=None):
+        self.calls.append((messages, system, session_id))
+        prompt = messages[0]["content"]
+        # Inspect ONLY the tool-trace block (between its markers), never the
+        # ASSISTANT reply that follows — otherwise the reply's own mention of
+        # the id would read as grounding.
+        trace = ""
+        if "--- TOOL TRACE" in prompt and "--- END TOOL TRACE ---" in prompt:
+            trace = prompt.split("--- TOOL TRACE", 1)[1].split("--- END TOOL TRACE ---", 1)[0]
+        if self._id in trace:
+            return SimpleNamespace(content=(
+                '{"score":0.9,"verdict":"good","fabrication":false,'
+                '"rationale":"id present in tool result"}'))
+        return SimpleNamespace(content=(
+            '{"score":0.3,"verdict":"bad","fabrication":true,'
+            '"rationale":"ungrounded id / no tool calls shown"}'))
+
+
+@test("quality", "a reply citing an id present in a tool RESULT is NOT flagged fabrication")
+async def t_judge_grounded_by_tool_trace(ctx: TestContext) -> None:
+    import src.core.quality_monitor as qm
+
+    fm = _GroundingJudge("86cat39x8")
+    # The id and user were returned by a tool — a Replio thread brief — so the
+    # reply that quotes them is grounded, not invented.
+    rows = [("replio_thread_brief",
+             "thread for user stav; linked ClickUp task 86cat39x8, priority high")]
+    with _env(OPENAGENT_QUALITY_MONITOR_ENABLED="1",
+              OPENAGENT_QUALITY_MONITOR_MODEL=None,
+              OPENAGENT_COMPACTION_MODEL=None), _capture() as ev:
+        await qm._judge(
+            _agent(fm), "3243dae6", "what's the status of my ticket?",
+            "Hi stav — your ticket 86cat39x8 is high priority and in progress.",
+            rows,
+        )
+    prompt = fm.calls[0][0][0]["content"]
+    assert "TOOL TRACE" in prompt and "86cat39x8" in prompt, prompt[:300]
+    scores = [kw for name, kw in ev if name == "quality.score"]
+    assert scores, ev
+    assert scores[0]["verdict"] == "good" and scores[0]["fabrication"] is False, scores
+    assert scores[0]["tool_calls"] == 1, scores  # the trace count is recorded
+
+
+@test("quality", "a genuinely-absent id IS still flagged fabrication (trace lacks it)")
+async def t_judge_absent_id_still_flagged(ctx: TestContext) -> None:
+    import src.core.quality_monitor as qm
+
+    fm = _GroundingJudge("ZZ999NOTREAL")
+    # The tool trace is present but does NOT contain the cited id — so it really
+    # was invented, and the judge must still catch it.
+    rows = [("replio_thread_brief", "thread for user stav; task 86cat39x8")]
+    with _env(OPENAGENT_QUALITY_MONITOR_ENABLED="1",
+              OPENAGENT_QUALITY_MONITOR_MODEL=None,
+              OPENAGENT_COMPACTION_MODEL=None), _capture() as ev:
+        await qm._judge(
+            _agent(fm), "s", "status?",
+            "Your order ZZ999NOTREAL shipped yesterday.",
+            rows,
+        )
+    scores = [kw for name, kw in ev if name == "quality.score"]
+    assert scores and scores[0]["verdict"] == "bad" and scores[0]["fabrication"] is True, scores
+
+
+@test("quality", "the system rubric carries the tool-trace grounding rule")
+async def t_judge_system_rubric_grounding(ctx: TestContext) -> None:
+    import src.core.quality_monitor as qm
+
+    sysrub = qm._JUDGE_SYSTEM.lower()
+    assert "tool trace" in sysrub and "grounded" in sysrub, qm._JUDGE_SYSTEM[:200]
+    # No trace → the prompt must NOT invent a trace block, and the judge must not
+    # be told tools ran.
+    fm = _FakeModel('{"score":0.8,"verdict":"good"}')
+    with _env(OPENAGENT_QUALITY_MONITOR_ENABLED="1",
+              OPENAGENT_QUALITY_MONITOR_MODEL=None,
+              OPENAGENT_COMPACTION_MODEL=None):
+        await qm._judge(_agent(fm), "s", "hi",
+                        "a sufficiently long assistant reply here", None)
+    prompt = fm.calls[0][0][0]["content"]
+    assert "TOOL TRACE" not in prompt, prompt[:200]
+
+
+@test("quality", "spawn_scoring drains the run's captured tool trace into the judge")
+async def t_spawn_scoring_drains_trace(ctx: TestContext) -> None:
+    """End-to-end plumbing: tool_trace.publish (what the dispatcher does on a
+    completed run) → spawn_scoring drains it synchronously → the judge prompt
+    carries it. Pins that the capture-and-handoff actually reaches the judge."""
+    import asyncio
+    import src.core.quality_monitor as qm
+    from src.core import tool_trace
+
+    fm = _GroundingJudge("86cat39x8")
+    with _env(OPENAGENT_QUALITY_MONITOR_ENABLED="1",
+              OPENAGENT_QUALITY_MONITOR_SAMPLE_RATE="1",
+              OPENAGENT_QUALITY_MONITOR_MIN_LEN="10",
+              OPENAGENT_QUALITY_MONITOR_MODEL=None,
+              OPENAGENT_COMPACTION_MODEL=None):
+        # Simulate the dispatcher publishing this run's trace for the session.
+        sink, tok = tool_trace.maybe_open()
+        tool_trace.record("replio_thread_brief", "user stav; task 86cat39x8")
+        tool_trace.publish("sessX", sink)
+        tool_trace.close(tok)
+        qm.spawn_scoring(_agent(fm), "sessX", "status?",
+                         "Your task 86cat39x8 is in progress, stav.")
+        # Drain the fire-and-forget judge task.
+        if qm._INFLIGHT:
+            await asyncio.gather(*list(qm._INFLIGHT))
+    assert fm.calls, "spawn_scoring never reached the judge"
+    prompt = fm.calls[0][0][0]["content"]
+    assert "86cat39x8" in prompt and "TOOL TRACE" in prompt, prompt[:300]
+    # And the trace was consumed (not left dangling for the next turn).
+    assert tool_trace.take("sessX") is None
+
+
+# ══ Defect 2 — a configured-but-unresolvable judge model must resolve to a
+#    valid non-null cheap row, not silently fall to the router ═══════════════════
+
+
+def _providers(*entries):
+    """Minimal v0.12 providers_config from (name, [models]) pairs."""
+    out = []
+    for i, (name, models) in enumerate(entries, start=1):
+        out.append({
+            "id": i, "name": name, "framework": "api-based",
+            "api_key": "sk-test-not-dialled", "base_url": None, "enabled": True,
+            "models": [{"id": i * 100 + j, "model": m} for j, m in enumerate(models)],
+        })
+    return out
+
+
+@contextlib.contextmanager
+def _primed_pricing():
+    """Prime OpenRouter pricing so deepseek is priced and local:* is $0."""
+    import time as _t
+    from src.models import discovery
+    import src.models.catalog as catalog
+
+    fake = [{"id": "deepseek/deepseek-v4-pro",
+             "pricing": {"prompt": "0.000000435", "completion": "0.00000087"}}]
+    saved_cache = getattr(discovery, "_OPENROUTER_CACHE", None)
+    saved_index = catalog._OPENROUTER_INDEX
+    discovery._OPENROUTER_CACHE = (_t.time() + 1e6, fake)
+    catalog._OPENROUTER_INDEX = None
+    try:
+        yield
+    finally:
+        discovery._OPENROUTER_CACHE = saved_cache
+        catalog._OPENROUTER_INDEX = saved_index
+
+
+@test("quality", "configured-but-unresolvable judge → cheapest NativeProvider, not the null router")
+async def t_judge_unresolved_resolves_cheap(ctx: TestContext) -> None:
+    import src.core.quality_monitor as qm
+    from src.models.dispatcher import ModelDispatcher
+
+    providers = _providers(("deepseek", ["deepseek-v4-pro"]), ("local", ["claude-sub"]))
+    router = ModelDispatcher(providers)  # the OLD null-yielding fallback
+    agent = SimpleNamespace(model=router, _providers_config=providers,
+                            _db=None, system_prompt="")
+    # A model id that matches NO configured api-based row (the production
+    # misconfig): the judge must NOT fall to the router (whose .model/.id is
+    # None → judge_model: null + weak verdicts).
+    qm._JUDGE_UNRESOLVED_WARNED.discard("bogus:not-a-real-model")
+    with _env(OPENAGENT_QUALITY_MONITOR_MODEL="bogus:not-a-real-model",
+              OPENAGENT_COMPACTION_MODEL=None), _primed_pricing(), _capture() as ev:
+        judge = qm._pick_judge_model(agent)
+        judge2 = qm._pick_judge_model(agent)  # a second sampled turn
+    assert judge is not router, "unresolvable config still fell through to the router"
+    assert type(judge).__name__ == "NativeProvider", f"expected NativeProvider, got {judge!r}"
+    judge_id = getattr(judge, "model", None) or getattr(judge, "id", None)
+    assert judge_id == "local:claude-sub", f"judge model unresolved/null: {judge_id!r}"
+    assert getattr(judge2, "model", None) == "local:claude-sub"
+    # The unresolved WARNING is emitted at most once (not per sampled turn).
+    warns = [1 for name, _ in ev if name == "quality.judge_model_unresolved"]
+    assert len(warns) <= 1, f"unresolved warning spammed {len(warns)}x (should warn once)"
