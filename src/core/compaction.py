@@ -1129,10 +1129,103 @@ def compact_after_turn(
     return task
 
 
+async def emit_wait_notice(
+    on_status: Any | None, session_id: str, phase: str,
+) -> None:
+    """Emit ONE compaction progress envelope for a turn WAITING on a background
+    fold (the contended/overlap case — the user sent a message while a
+    background compaction held the session lock, so their turn briefly blocks).
+
+    ``phase`` is ``"running"`` (fired before the wait, so the channel shows
+    e.g. "🗜 Compacting conversation") or ``"done"`` (after the lock is
+    acquired, flipping it to "🗜 Compacted conversation"). It rides the exact
+    same ``session.compacted`` plumbing the reactive/manual folds use, so every
+    interactive bridge renders it with no new wiring. Best-effort and silent on
+    failure. The BACKGROUND fold passes ``on_status=None`` and so never reaches
+    this — that path stays invisible, which is the whole point.
+    """
+    await _emit_compaction_status(on_status, session_id, {"phase": phase})
+
+
+async def run_start_of_turn(
+    session_id: str, model: Any, agent: Any, on_status: Any | None,
+) -> bool:
+    """Start-of-turn compaction step for the turn loop (``run`` + ``run_stream``).
+
+    Returns ``True`` iff this turn was registered active — the caller MUST then
+    call :func:`mark_turn_done` in its ``finally``. Returns ``False`` when
+    nothing was registered (feature off / no session id / an error before the
+    registration point), so the caller skips the balancing decrement.
+
+    Three things happen here, all keyed to the per-session lock so the proactive
+    invariants stay intact (a background fold can never overlap a turn's history
+    read/write):
+
+    * **Safety backstop** — ``should_compact`` → ``compact`` under the lock, for
+      the rare case a background pass was skipped/failed or one turn blew past
+      the threshold on its own.
+    * **Registration** — ``mark_turn_active`` under the lock, so a background
+      pass that acquires the lock afterwards sees the turn and skips.
+    * **Contention notice** — if the lock is ALREADY held when this turn starts,
+      a background fold is mid-flight and this turn must WAIT for it. That is the
+      ONE case the user is told about: exactly one "optimizing…" notice brackets
+      the wait (``running`` before, ``done`` after). With no contention the turn
+      stays SILENT (the common proactive case, nobody waiting → invisible); and
+      when the backstop itself does the fold with no contention, it shows its
+      own notice, exactly as before. ``compact``'s own envelopes are suppressed
+      while we show the wait notice so a contended turn never doubles up.
+
+    Never raises: a compaction hiccup must never block a turn.
+    """
+    registered = False
+    waited = False
+    try:
+        lock = session_lock(session_id)
+        # locked() is a synchronous read; when it is False the acquire below
+        # completes without ever yielding, so no background fold can slip in
+        # between the check and the acquire — the "silent when free" case is
+        # race-free. When it is True a background fold holds the lock and we
+        # will genuinely wait, so the notice is warranted.
+        waited = lock.locked()
+        if waited:
+            await emit_wait_notice(on_status, session_id, "running")
+        async with lock:
+            mark_turn_active(session_id)
+            registered = True
+            if should_compact(session_id, model, agent=agent):
+                # If we already showed the wait notice, keep compact() silent so
+                # the turn surfaces at most ONE compaction notice; otherwise let
+                # the backstop show its own running→done as it always has.
+                await compact(
+                    session_id, model, agent,
+                    on_status=(None if waited else on_status),
+                )
+    except Exception as exc:  # noqa: BLE001 — never block a turn
+        elog(
+            "runtime.compaction.error",
+            level="warning",
+            session_id=session_id,
+            error_type=type(exc).__name__,
+            error=str(exc) or repr(exc),
+        )
+    finally:
+        # Resolve the wait notice we posted, so a contended turn's "🗜
+        # Compacting…" bubble always flips to "🗜 Compacted…" — even if the
+        # backstop raised. Only when we actually posted one (waited).
+        if waited:
+            try:
+                await emit_wait_notice(on_status, session_id, "done")
+            except Exception:  # noqa: BLE001 — a UI hint must never block a turn
+                pass
+    return registered
+
+
 __all__ = [
     "should_compact",
     "compact",
     "compact_after_turn",
+    "run_start_of_turn",
+    "emit_wait_notice",
     "session_lock",
     "mark_turn_active",
     "mark_turn_done",

@@ -1667,36 +1667,22 @@ class Agent:
                 # post-turn background pass (see the end of this method and
                 # ``compaction.compact_after_turn``) keeps sessions under the
                 # threshold OFF the user's critical path, so this start-of-turn
-                # check is now a SAFETY BACKSTOP that rarely fires — only when a
-                # background pass was skipped/failed, or a single turn blew past
-                # the threshold on its own. We run the backstop AND register
-                # this turn as active under the per-session compaction lock so a
-                # background pass can neither overlap our history read/write nor
-                # race our active-turn count. See ``src/core/compaction.py``
-                # ("Proactive (background) compaction") for the full invariant.
-                # The reactive ContextWindowExceeded fallback
-                # (src/models/providers/fallback.py) still backstops even this.
+                # step is now a SAFETY BACKSTOP that rarely folds. It also
+                # registers this turn as active and — only when this turn had to
+                # WAIT on an in-flight background fold (lock contention) — emits
+                # one brief "optimizing…" notice so the user knows why there was
+                # a short pause; the no-contention case stays silent. All of it
+                # runs under the per-session compaction lock so a background pass
+                # can neither overlap our history read/write nor race our
+                # active-turn count. See ``compaction.run_start_of_turn`` and
+                # ``src/core/compaction.py`` ("Proactive (background)
+                # compaction") for the invariant. The reactive
+                # ContextWindowExceeded fallback still backstops even this.
                 if iter_count == 1 and session_id:
-                    try:
-                        from src.core import compaction
-                        async with compaction.session_lock(session_id):
-                            compaction.mark_turn_active(session_id)
-                            turn_registered = True
-                            if compaction.should_compact(
-                                session_id, active_model, agent=self,
-                            ):
-                                await compaction.compact(
-                                    session_id, active_model, self,
-                                    on_status=_status,
-                                )
-                    except Exception as exc:  # noqa: BLE001 — never block a turn
-                        elog(
-                            "runtime.compaction.error",
-                            level="warning",
-                            session_id=session_id,
-                            error_type=type(exc).__name__,
-                            error=str(exc) or repr(exc),
-                        )
+                    from src.core import compaction
+                    turn_registered = await compaction.run_start_of_turn(
+                        session_id, active_model, self, _status,
+                    )
 
                 messages: list[dict[str, Any]] = [{"role": "user", "content": current_input}]
                 await _status("Thinking...")
@@ -1801,12 +1787,15 @@ class Agent:
         # this or the next turn's history I/O, and an exception can never touch
         # the reply. Placed AFTER the ``finally`` (mark_turn_done already ran)
         # so it only fires on normal completion, and sees active-turns == 0.
+        #
+        # No ``on_status``: a background fold has NO ONE waiting on it, so it
+        # must be INVISIBLE — it emits no channel notice. The only user-facing
+        # compaction notice is the contention one in ``run_start_of_turn``, when
+        # the NEXT turn actually blocks on this fold.
         if session_id:
             try:
                 from src.core import compaction
-                compaction.compact_after_turn(
-                    session_id, active_model, self, on_status=_status,
-                )
+                compaction.compact_after_turn(session_id, active_model, self)
             except Exception as exc:  # noqa: BLE001 — never touch the reply
                 elog(
                     "runtime.compaction.error",
@@ -2022,37 +2011,17 @@ class Agent:
                          session_id=session_id, cap=cap)
                     break
 
-                # Streaming twin of the in-session compaction call in
-                # _run_inner — same PROACTIVE design and same per-session
-                # concurrency guard. This start-of-turn pass is a SAFETY
-                # BACKSTOP (the post-turn background pass below keeps sessions
-                # under the threshold); we run it AND register this turn as
-                # active under the per-session compaction lock so a background
-                # pass can neither overlap our history read/write nor race our
-                # active-turn count. See ``src/core/compaction.py`` ("Proactive
-                # (background) compaction") for the invariant. Only on the first
-                # iteration so shell-reminder re-entries don't re-check.
+                # Streaming twin of the in-session compaction step in
+                # _run_inner — same PROACTIVE design, same per-session guard, and
+                # the same one-time "optimizing…" notice when THIS turn had to
+                # wait on an in-flight background fold (silent otherwise). See
+                # ``compaction.run_start_of_turn``. Only on the first iteration
+                # so shell-reminder re-entries don't re-check.
                 if iter_count == 1 and session_id:
-                    try:
-                        from src.core import compaction
-                        async with compaction.session_lock(session_id):
-                            compaction.mark_turn_active(session_id)
-                            turn_registered = True
-                            if compaction.should_compact(
-                                session_id, active_model, agent=self,
-                            ):
-                                await compaction.compact(
-                                    session_id, active_model, self,
-                                    on_status=_status,
-                                )
-                    except Exception as exc:  # noqa: BLE001 — never block a turn
-                        elog(
-                            "runtime.compaction.error",
-                            level="warning",
-                            session_id=session_id,
-                            error_type=type(exc).__name__,
-                            error=str(exc) or repr(exc),
-                        )
+                    from src.core import compaction
+                    turn_registered = await compaction.run_start_of_turn(
+                        session_id, active_model, self, _status,
+                    )
 
                 messages: list[dict[str, Any]] = [{"role": "user", "content": current_input}]
                 await _status("Thinking...")
@@ -2279,12 +2248,12 @@ class Agent:
         # compact_after_turn for the concurrency guard). After the ``finally``
         # so mark_turn_done already ran and this fires only on normal
         # completion; on error the run_stream() wrapper handles the turn.
+        # No ``on_status``: a background fold has no waiter, so it stays
+        # INVISIBLE — see _run_inner's post-turn block for the rationale.
         if session_id:
             try:
                 from src.core import compaction
-                compaction.compact_after_turn(
-                    session_id, active_model, self, on_status=_status,
-                )
+                compaction.compact_after_turn(session_id, active_model, self)
             except Exception as exc:  # noqa: BLE001 — never touch the reply
                 elog(
                     "runtime.compaction.error",

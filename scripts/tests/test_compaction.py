@@ -999,3 +999,140 @@ async def t_background_uses_model_slot(ctx: TestContext) -> None:
     # concurrent swap/shutdown can't tear it down mid-summary.
     assert agent.acquired == 1, agent.acquired
     assert agent.released == 1, agent.released
+
+
+# ── 9. Contention progress notice (Telegram/channel) ───────────────────
+#
+# The owner's UX rule: a BACKGROUND fold (nobody waiting) is INVISIBLE, but a
+# turn that arrives WHILE a fold is mid-flight — so it blocks on
+# session_lock(session_id) — gets ONE brief "optimizing…" notice explaining the
+# pause. run_start_of_turn owns that: it emits the compaction envelope only on
+# lock contention, and compact_after_turn (the background path) carries no
+# on_status so it can never reach a channel.
+
+
+def _phase_recorder():
+    """Return ``(recorder_list, on_status)`` where on_status parses each
+    session.compacted envelope and appends its phase — a stand-in for the
+    bridge collector that would render "🗜 Compacting…" → "🗜 Compacted…"."""
+    from src.channels.base import parse_compaction_status
+
+    phases: list[str] = []
+
+    async def on_status(raw: str) -> None:
+        parsed = parse_compaction_status(raw)
+        if parsed is not None:
+            phases.append(parsed["phase"])
+
+    return phases, on_status
+
+
+@test("compaction", "notice: a CONTENDED turn emits exactly one progress notice")
+async def t_contended_turn_emits_one_notice(ctx: TestContext) -> None:
+    """A turn that starts while a background fold holds the session lock must
+    surface exactly one notice bracketing its wait: a single ``running`` then a
+    single ``done``, and nothing more (compact()'s own envelopes are suppressed
+    so a contended turn never doubles up)."""
+    from src.core import compaction
+
+    os.environ.pop("OPENAGENT_COMPACTION_ENABLED", None)
+    os.environ["OPENAGENT_COMPACTION_THRESHOLD"] = "0.5"
+    os.environ["OPENAGENT_COMPACTION_KEEP_RUNS"] = "2"
+
+    sid = "notice-contended"
+    db_path = str(ctx.test_dir / "notice-contended.db")
+    _seed_breaching(db_path, sid)
+    model = _FakeModel(max_context=200, summary="Recap.")
+    agent = _FakeAgent(db_path, model)
+
+    phases, on_status = _phase_recorder()
+
+    # Simulate an in-flight background fold by holding the session lock.
+    lock = compaction.session_lock(sid)
+    await lock.acquire()
+    try:
+        turn = asyncio.create_task(
+            compaction.run_start_of_turn(sid, model, agent, on_status))
+        # The turn detects contention, emits ONE "running", then blocks on the
+        # held lock. Let it reach that point.
+        for _ in range(200):
+            if phases:
+                break
+            await asyncio.sleep(0)
+        assert phases == ["running"], phases
+    finally:
+        lock.release()
+
+    registered = await turn
+    assert registered is True, "a registered turn must report True for its finally"
+    # One notice lifecycle: running → done, and NOTHING extra.
+    assert phases == ["running", "done"], phases
+    compaction.mark_turn_done(sid)  # balance the registration
+
+
+@test("compaction", "notice: an UNCONTENDED turn stays silent")
+async def t_uncontended_turn_is_silent(ctx: TestContext) -> None:
+    """The common proactive case: the lock is free and nothing is over
+    threshold, so the turn emits no channel notice at all."""
+    from src.core import compaction
+
+    os.environ.pop("OPENAGENT_COMPACTION_ENABLED", None)
+    os.environ["OPENAGENT_COMPACTION_KEEP_RUNS"] = "4"
+
+    sid = "notice-silent"
+    db_path = str(ctx.test_dir / "notice-silent.db")
+    # A short, under-threshold session: no fold, no contention.
+    _make_session_row(db_path, sid, [
+        {"content": "hi", "messages": [{"role": "user", "content": "hi"}]},
+        {"content": "hello", "messages": [{"role": "assistant", "content": "hello"}]},
+    ])
+    model = _FakeModel(max_context=200)
+    agent = _FakeAgent(db_path, model)
+
+    phases, on_status = _phase_recorder()
+    registered = await compaction.run_start_of_turn(sid, model, agent, on_status)
+    assert registered is True
+    assert phases == [], f"an uncontended turn must be silent, got {phases}"
+    assert len(model.generate_calls) == 0, "no summariser call on an uncontended turn"
+    compaction.mark_turn_done(sid)
+
+
+@test("compaction", "notice: a BACKGROUND fold with no waiter emits nothing to the channel")
+async def t_background_fold_is_silent(ctx: TestContext) -> None:
+    """compact_after_turn (the post-turn background trigger, called exactly as
+    the turn loop does — with NO on_status) folds without ever routing a status
+    to a channel. We spy on the envelope emitter and prove every emission during
+    the fold carried a None channel, so nothing could reach the user."""
+    from src.core import compaction
+
+    os.environ.pop("OPENAGENT_COMPACTION_ENABLED", None)
+    os.environ["OPENAGENT_COMPACTION_THRESHOLD"] = "0.5"
+    os.environ["OPENAGENT_COMPACTION_KEEP_RUNS"] = "2"
+
+    sid = "notice-bg-silent"
+    db_path = str(ctx.test_dir / "notice-bg-silent.db")
+    _seed_breaching(db_path, sid)
+    model = _FakeModel(max_context=200, summary="Background recap.")
+    agent = _FakeAgent(db_path, model)
+
+    seen: list[tuple[bool, str]] = []
+    orig = compaction._emit_compaction_status
+
+    async def spy(on_status, session_id, fields):  # noqa: ANN001
+        seen.append((on_status is None, fields.get("phase")))
+        return await orig(on_status, session_id, fields)
+
+    compaction._emit_compaction_status = spy
+    try:
+        task = compaction.compact_after_turn(sid, model, agent)  # no on_status
+        assert task is not None
+        await task
+    finally:
+        compaction._emit_compaction_status = orig
+
+    # The fold really happened (recap landed) ...
+    saved = _read_runs(db_path, sid)
+    assert saved and saved[0].get("metadata", {}).get("compaction") is True, saved
+    # ... and every status emission during it had a None channel — invisible.
+    assert seen, "compact() should have emitted running/done envelopes internally"
+    assert all(is_none for (is_none, _phase) in seen), seen
