@@ -262,9 +262,19 @@ _TEST_MODULES: tuple[str, ...] = (
     # Quality monitor — the correctness half beside budget's cost half:
     # OFF no-op, deterministic sampling, judge parse/emit, gating, aggregate.
     "test_quality_monitor",
+    # Cost-control gaps (C1/C2/C3): the budget guard must gate Team MEMBERS not
+    # just the leader; a cost_usd cap on the $0 sub-proxy must WARN not silently
+    # no-op; compaction + the quality judge must default background jobs to the
+    # cheapest enabled row, not the full Team router. Pure-unit: throwaway DB +
+    # real dispatcher/guard, hand-primed OpenRouter pricing.
+    "test_cost_control_gaps",
     # Quality digest — the scheduled push side: summary + flagged-session review
     # list + threshold alerts (incl. embedder-down via embed-error spikes).
     "test_quality_digest",
+    # Quality-digest alert WEBHOOK — the "reach a human" half: an optional
+    # generic webhook that POSTs each newly active quality.alert (edge-triggered
+    # de-dupe) IN ADDITION to the elog; unset → elog-only, unchanged.
+    "test_quality_digest_webhook",
     # 4. Gateway — sets ctx.extras["gateway_port"]/gateway/agent
     "test_gateway",
     # 5. HTTP surface + WS + files/images (need gateway)
@@ -308,6 +318,11 @@ _TEST_MODULES: tuple[str, ...] = (
     # generic bearer), listener isolation (/hooks yes, /api never), the three
     # dispatch action kinds, and resource-event surfacing.
     "test_events",
+    # At-least-once event delivery: an orphaned (claimed-but-incomplete)
+    # webhook delivery is re-enqueued and re-dispatched instead of dropped as
+    # ``failed``, bounded by a replay budget, and a replay resumes the SAME
+    # bound session so Replio's reply_guard blocks a double customer reply.
+    "test_event_delivery_reenqueue",
     # Workflow ai-prompt must forget/release at the right moment (same
     # bug class as scheduler issue #5 but for workflows).
     "test_workflow_forgets_session",
@@ -357,6 +372,13 @@ _TEST_MODULES: tuple[str, ...] = (
     # ``supervisorctl -c <conf> restart <program>`` instead of printing
     # "could not auto-restart". Pure-unit; sits by the updater tests.
     "test_supervisord_restart",
+    # DB-retention daemon (src/core/session_retention.py): the prod pruner
+    # that keeps openagent.db bounded. Pins that the module imports + its
+    # entry points are callable, that run_once prunes/keeps/trims a mock DB
+    # per the yaml knobs, and that the image's deploy/supervisord.conf wires
+    # the [program:session-retention] daemon so a fresh pod runs it (it used
+    # to live only on the PVC). Pure-unit; sits by test_supervisord_restart.
+    "test_session_retention",
     "test_task_hooks",
     "test_shell_hooks",
     "test_tool_labels",

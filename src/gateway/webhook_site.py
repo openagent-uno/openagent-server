@@ -192,6 +192,19 @@ class WebhookSite:
 
         # Record the delivery (already claimed — we dispatch it in-process) and
         # respond fast; the LLM run happens in the background.
+        #
+        # AT-LEAST-ONCE CONTRACT: the row is durable BEFORE we return 202, and
+        # the background turn is best-effort within this process. If the
+        # process dies after this insert but before the turn finishes, the row
+        # is left ``received``/``running`` with ``claimed_at`` set — an orphan.
+        # ``MemoryDB.reap_orphan_event_deliveries`` re-enqueues such orphans on
+        # the next startup (``claimed_at=NULL``, status back to ``received``) so
+        # the Scheduler's drain re-dispatches them, instead of dropping them as
+        # ``failed``. Do NOT "optimise" this into a fire-and-forget with no DB
+        # row, and do NOT assume the in-process dispatch is the only run: replay
+        # resumes the SAME child session (bound thread session, or the
+        # deterministic ``event:{event_id}:{delivery_id}`` id), so the customer
+        # reply stays idempotent through Replio's reply_guard.
         delivery_id = await db.add_event_delivery(
             event_id=event_id, source="webhook",
             external_id=external_id, payload=payload, claimed=True,

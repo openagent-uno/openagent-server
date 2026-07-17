@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from collections import deque
@@ -799,7 +800,14 @@ CREATE TABLE IF NOT EXISTS event_deliveries (
     session_id       TEXT,
     workflow_run_id  TEXT,
     task_run_id      TEXT,
-    claimed_at       REAL
+    claimed_at       REAL,
+    -- How many times this delivery has been re-enqueued by the orphan reaper
+    -- (``reap_orphan_event_deliveries``). At-least-once delivery bounds the
+    -- replay budget on this counter so a delivery that keeps orphaning (e.g.
+    -- one that reliably kills the process mid-turn) is eventually parked
+    -- terminal instead of churning forever. Added on old DBs by
+    -- ``_migrate_event_deliveries_reenqueue_count``.
+    reenqueue_count  INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_evdel_event     ON event_deliveries(event_id);
 CREATE INDEX IF NOT EXISTS idx_evdel_started   ON event_deliveries(started_at);
@@ -1043,6 +1051,23 @@ class MemoryDB:
         await self._migrate_scheduled_tasks_model_column()
         await self._migrate_scheduled_tasks_timezone_column()
         await self._migrate_events_session_binding()
+        await self._migrate_event_deliveries_reenqueue_count()
+
+    async def _migrate_event_deliveries_reenqueue_count(self) -> None:
+        """At-least-once event delivery re-enqueues an orphaned (claimed but
+        never-completed) delivery on startup instead of dropping it as
+        ``failed``. ``reenqueue_count`` bounds that replay so a delivery that
+        keeps orphaning can't churn forever. Old DBs predate the column; add
+        it idempotently (DEFAULT 0 = never re-enqueued)."""
+        assert self._conn is not None
+        cursor = await self._conn.execute("PRAGMA table_info(event_deliveries)")
+        cols = {row[1] for row in await cursor.fetchall()}
+        if "reenqueue_count" not in cols:
+            await self._conn.execute(
+                "ALTER TABLE event_deliveries "
+                "ADD COLUMN reenqueue_count INTEGER NOT NULL DEFAULT 0"
+            )
+            await self._conn.commit()
 
     async def _migrate_scheduled_tasks_model_column(self) -> None:
         """A scheduled task can now pin an optional per-task model (a
@@ -2335,24 +2360,160 @@ class MemoryDB:
         )
         return [dict(row) for row in await cursor.fetchall()]
 
-    async def reap_orphan_event_deliveries(self) -> int:
-        """Mark every delivery still ``received`` / ``running`` as ``failed`` —
-        the events analogue of ``reap_orphan_task_runs``. Called from
-        ``AgentServer.start()`` so a delivery that was in flight when the
-        process died doesn't hang forever as ``running``."""
+    # Marker the OLD reaper stamped on the deliveries it (wrongly) failed. It
+    # is the one-time backfill signal: a ``failed`` row carrying this exact
+    # phrase was never a genuine failure — it was a support ticket dropped by
+    # ``reap → failed`` on a prior restart. Matched verbatim so a real
+    # application failure (a bad template, a rejected action) is never
+    # resurrected. The re-enqueue path never re-writes this phrase, so it
+    # only ever marks the pre-fix historical rows.
+    _REAP_ORPHAN_MARK = "reaped: orphan from prior process"
+
+    async def reap_orphan_event_deliveries(
+        self,
+        *,
+        enabled: bool | None = None,
+        max_attempts: int | None = None,
+        recover_failed: bool | None = None,
+    ) -> int:
+        """Recover deliveries a prior process left mid-flight so no inbound
+        (support ticket) is ever silently dropped.
+
+        The old behaviour marked every ``received`` / ``running`` orphan
+        ``failed`` and forgot it — *at-most-once*. A delivery that was claimed
+        and dispatched but whose process died before the turn finished was
+        never re-fired, so on the live esound-openagent pod **1181 of 1267
+        ``failed`` rows carried this exact ``reaped: orphan …`` marker**: not
+        failures, dropped tickets.
+
+        This re-enqueues an orphan instead — resets it to ``received`` with
+        ``claimed_at = NULL`` — so the Scheduler's ``_drain_event_deliveries``
+        loop claims and re-dispatches it (*at-least-once*). Two recoverable
+        classes:
+
+        * **in-flight orphans** — ``status IN ('received','running')`` with a
+          claim, i.e. interrupted by *this* deploy's restart; and
+        * **historical orphans** — ``status='failed'`` carrying the old
+          reaper's marker, i.e. dropped by a *prior* restart (a one-time
+          backfill; gate off with ``recover_failed=False`` /
+          ``OPENAGENT_EVENT_REENQUEUE_BACKFILL=0`` to only fix go-forward).
+
+        SAFETY — why a replay never double-messages a customer. The only
+        externally-fired event (``Replio inbound thread``) is a ``prompt``
+        action with ``session_binding_enabled=1`` bound on the thread id, and
+        an event child session id is the deterministic
+        ``event:{event_id}:{delivery_id}``. So a replay *always* resumes the
+        SAME session as the original attempt — bound events via
+        ``event_session_bindings`` (keyed on the thread), unbound events via
+        the deterministic id keyed on the replayed delivery id. The agent
+        therefore re-runs with its own prior transcript in context, and the
+        customer reply itself goes through Replio's server-side ``reply_guard``
+        (LIVE/armed), which suppresses a second outbound when the thread
+        already has one newer than the triggering inbound. Re-enqueue adds no
+        new reply path; it only re-drives the existing, thread-scoped,
+        reply-idempotent one. A ``received`` orphan is safe unconditionally —
+        ``dispatch_event`` flips a delivery to ``running`` as its very first
+        act, so a still-``received`` row proves the turn never ran and no reply
+        could have been sent.
+
+        ``reenqueue_count`` bounds the replay: an orphan re-enqueued
+        ``max_attempts`` times is parked terminal ``failed`` so a delivery that
+        keeps killing the process can't crash-loop the pod and starve every
+        other ticket. Set ``OPENAGENT_EVENT_REENQUEUE_ENABLED=0`` to fall back
+        to the legacy mark-``failed`` behaviour without a redeploy.
+
+        Returns the number of rows acted on (re-enqueued + parked), preserving
+        the ``int`` contract the ``AgentServer.start()`` caller logs on.
+        """
         conn = await self._ensure_connected()
         now = time.time()
-        cursor = await conn.execute(
+
+        def _flag(name: str, default: bool) -> bool:
+            raw = os.environ.get(name)
+            if raw is None:
+                return default
+            return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+        if enabled is None:
+            enabled = _flag("OPENAGENT_EVENT_REENQUEUE_ENABLED", True)
+        if recover_failed is None:
+            recover_failed = _flag("OPENAGENT_EVENT_REENQUEUE_BACKFILL", True)
+        if max_attempts is None:
+            try:
+                max_attempts = int(
+                    os.environ.get("OPENAGENT_EVENT_REENQUEUE_MAX_ATTEMPTS", "5")
+                )
+            except (TypeError, ValueError):
+                max_attempts = 5
+        max_attempts = max(1, int(max_attempts))
+
+        if not enabled:
+            # Kill-switch: the legacy at-most-once behaviour (mark orphans
+            # failed, never re-fire) — a redeploy-free escape hatch.
+            cursor = await conn.execute(
+                "UPDATE event_deliveries "
+                "SET status='failed', finished_at=?, "
+                "    error=COALESCE(error,'') || "
+                "          CASE WHEN error IS NULL OR error='' THEN '' ELSE ' | ' END || "
+                "          ? "
+                "WHERE status IN ('received','running') AND claimed_at IS NOT NULL",
+                (now, self._REAP_ORPHAN_MARK),
+            )
+            await conn.commit()
+            n = cursor.rowcount or 0
+            if n:
+                from src.core.logging import elog
+                elog("event.orphan_reaped", mode="legacy-failed", count=n)
+            return n
+
+        # 1. Park orphans that have exhausted the replay budget FIRST, so a row
+        #    at the cap is retired here and not re-enqueued below (order
+        #    matters: re-enqueue increments the counter). Only in-flight rows
+        #    are parked — a historical ``failed`` row at/over the cap is already
+        #    terminal and left alone.
+        parked_cur = await conn.execute(
             "UPDATE event_deliveries "
             "SET status='failed', finished_at=?, "
             "    error=COALESCE(error,'') || "
             "          CASE WHEN error IS NULL OR error='' THEN '' ELSE ' | ' END || "
-            "          'reaped: orphan from prior process' "
-            "WHERE status IN ('received','running') AND claimed_at IS NOT NULL",
-            (now,),
+            "          'reaped: retry budget exhausted (' || reenqueue_count || ' attempts)' "
+            "WHERE claimed_at IS NOT NULL AND reenqueue_count >= ? "
+            "  AND status IN ('received','running')",
+            (now, max_attempts),
         )
+        parked = parked_cur.rowcount or 0
+
+        # 2. Re-enqueue every recoverable orphan under the budget: reset to
+        #    ``received`` + drop the claim so the scheduler drain re-dispatches
+        #    it; clear ``finished_at``; bump the replay counter.
+        where = (
+            "claimed_at IS NOT NULL AND reenqueue_count < ? "
+            "AND (status IN ('received','running')"
+        )
+        params: list[Any] = [max_attempts]
+        if recover_failed:
+            where += " OR (status='failed' AND error LIKE ?)"
+            params.append(f"%{self._REAP_ORPHAN_MARK}%")
+        where += ")"
+        requeue_cur = await conn.execute(
+            "UPDATE event_deliveries "
+            "SET status='received', claimed_at=NULL, finished_at=NULL, "
+            "    reenqueue_count = reenqueue_count + 1, "
+            "    error='re-enqueued: recovered orphan (attempt ' "
+            "          || (reenqueue_count + 1) || ')' "
+            "WHERE " + where,
+            params,
+        )
+        requeued = requeue_cur.rowcount or 0
+
         await conn.commit()
-        return cursor.rowcount or 0
+        if requeued or parked:
+            from src.core.logging import elog
+            elog(
+                "event.orphan_reaped", mode="re-enqueue",
+                requeued=requeued, parked=parked, max_attempts=max_attempts,
+            )
+        return requeued + parked
 
     # ── Workflow Tasks ──
 

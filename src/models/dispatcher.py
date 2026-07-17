@@ -812,6 +812,17 @@ class TeamRouterProvider(BaseModel):
             )
 
         members_catalog = [e for e in catalog if e.runtime_id != entry.runtime_id]
+        # Budget gate for MEMBERS (C1). The leader is already gated upstream
+        # (``ModelDispatcher._enabled_catalog`` → ``guard.filter_catalog``), but
+        # members were built straight from the catalog — so an over-cap provider
+        # still got delegated member work, bypassing its own spend cap. Apply
+        # the SAME filter here. ``filter_catalog`` carries the never-empty
+        # guarantee and the "a global cap must not mask a scope-specific brake"
+        # logic, so an all-over-budget member set falls back exactly as the
+        # leader does. Off-by-default (no rules) returns the list unchanged, and
+        # a model-pinned override run (no guard wired) skips it entirely.
+        if self._budget_guard is not None and members_catalog:
+            members_catalog = self._budget_guard.filter_catalog(members_catalog)
         entry_framework = framework_of(entry.runtime_id)
 
         # No other LLM model to delegate to — a Team of one is degenerate
@@ -1433,6 +1444,10 @@ class ModelDispatcher(BaseModel):
         """
         if providers_config is not None:
             self._providers_config = providers_config
+        # Keep the guard's providers view current so the C2 $0-priced-scope
+        # warning tracks a hot-reloaded catalog.
+        if self._budget_guard is not None:
+            self._budget_guard.set_providers_config(self._providers_config)
         for provider in self._team_providers.values():
             fn = getattr(provider, "rebuild_routing", None)
             if callable(fn):
@@ -1444,7 +1459,9 @@ class ModelDispatcher(BaseModel):
     def set_db(self, db: Any) -> None:
         self._db = db
         self._budget = BudgetTracker(db, 0.0)
-        self._budget_guard = BudgetGuard(db)
+        # Hand the guard the providers view so it can warn when a cost_usd rule
+        # is scoped to a $0-priced provider (the sub-proxy) that it can't cap.
+        self._budget_guard = BudgetGuard(db, providers_config=self._providers_config)
         if self._budget_seed is not None:
             self._budget_guard.set_seed_rules(self._budget_seed)
         for provider in self._team_providers.values():

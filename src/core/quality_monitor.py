@@ -237,7 +237,26 @@ def _pick_judge_model(agent: Any) -> Any:
         except Exception as exc:  # noqa: BLE001
             elog("quality.judge_model_failed", level="warning",
                  configured=configured, error=str(exc) or type(exc).__name__)
-    return getattr(agent, "model", None)
+        # Configured but unresolved/errored → historical fallback to the agent's
+        # own model. Env IS set, so behaviour is unchanged (C3 keeps the set
+        # path identical).
+        return getattr(agent, "model", None)
+    # UNSET (C3): no dedicated judge or compaction model configured. The old
+    # behaviour returned ``agent.model`` — the full Team router — so a grader ran
+    # up to a ~150k-token judge prompt through the premium leader (and could bill
+    # a paid DeepSeek delegation) on every sampled turn. Default instead to the
+    # cheapest enabled row as a toolkit-free NativeProvider. Only a *router*
+    # fallback is rewritten (see ``_cheap_background_model``), so a non-router
+    # ``agent.model`` — e.g. the fake model in unit tests — is untouched.
+    from src.core.compaction import _cheap_background_model
+    return _cheap_background_model(
+        agent, getattr(agent, "model", None),
+        picked_event="quality.judge_model",
+        fallback_event="quality.judge_model_dispatcher_fallback",
+        failed_event="quality.judge_model_failed",
+        what="quality judge",
+        env_hint=_MODEL_ENV,
+    )
 
 
 def _parse_verdict(text: str) -> Optional[dict]:

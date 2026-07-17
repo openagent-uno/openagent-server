@@ -158,6 +158,59 @@ class RuleState:
     spend: float
     ratio: float
     over: bool
+    # True when this is a ``cost_usd`` rule whose scope resolves to a $0-priced
+    # provider/model (e.g. the claude-sub-proxy, absent from OpenRouter pricing):
+    # its measured spend is 0 forever, so the cap can NEVER trip. A ``tokens``
+    # rule is required to constrain such a scope. See ``_scope_is_cost_ineffective``.
+    cost_ineffective: bool = False
+
+
+def _scope_is_cost_ineffective(
+    scope_kind: str, scope_value: str, providers_config: Any,
+) -> bool:
+    """True when a ``cost_usd`` rule on this scope can never accrue spend because
+    every model it targets prices at $0.
+
+    The ``local:`` claude-sub-proxy is absent from OpenRouter pricing, so its
+    per-token cost resolves to $0 forever; a ``cost_usd`` cap on it computes 0
+    spend and never trips. This detects that so the guard can warn.
+
+    Gated on :func:`openrouter_pricing_ready` — a COLD pricing cache also reads
+    as $0, so we only judge a scope "ineffective" once real pricing has loaded;
+    otherwise we return ``False`` (unknown) and never false-warn at boot.
+
+    - ``model`` scope   → the one runtime_id must be $0-priced.
+    - ``provider`` scope → the provider must have at least one enabled model and
+      EVERY enabled model must be $0-priced (a mixed provider is still capped by
+      its priced models, so it is not ineffective).
+    - ``global`` scope   → spans everything; not a single priced target → False.
+    """
+    from src.models.catalog import (
+        get_model_pricing,
+        iter_configured_models,
+        openrouter_pricing_ready,
+    )
+
+    if not openrouter_pricing_ready():
+        return False
+
+    def _zero(runtime_id: str) -> bool:
+        pricing = get_model_pricing(runtime_id)
+        return (
+            float(pricing.get("input_cost_per_million", 0.0) or 0.0) <= 0.0
+            and float(pricing.get("output_cost_per_million", 0.0) or 0.0) <= 0.0
+        )
+
+    if scope_kind == "model":
+        return bool(scope_value) and _zero(scope_value)
+    if scope_kind == "provider":
+        models = [
+            e
+            for e in iter_configured_models(providers_config)
+            if e.provider == scope_value and not e.disabled
+        ]
+        return bool(models) and all(_zero(e.runtime_id) for e in models)
+    return False
 
 
 def _infer_scope_kind(scope_value: str | None) -> str:
@@ -228,8 +281,14 @@ class BudgetGuard:
     with every ``TeamRouterProvider`` so ``record_cost`` can nudge a refresh.
     """
 
-    def __init__(self, db: Any):
+    def __init__(self, db: Any, providers_config: Any = None):
         self._db = db
+        # Configured providers/models, used ONLY to resolve whether a
+        # ``cost_usd`` rule's provider-scope targets a $0-priced provider (the
+        # sub-proxy) so we can warn it is un-capped by the intuitive metric.
+        # Kept fresh by ``set_providers_config`` on hot-reload. Never gates
+        # enforcement — the router filter operates on the entries it is handed.
+        self._providers_config = providers_config
         self._snapshot: list[RuleState] = []
         self._has_rules = False
         # yaml seed rules (raw dicts); applied once, additively, at first refresh.
@@ -246,11 +305,20 @@ class BudgetGuard:
         # Log throttles so the gate is not chatty per turn.
         self._last_excluded_key: frozenset[str] | None = None
         self._last_would_empty_key: frozenset[str] | None = None
+        # rule_ids already warned as "cost_usd on a $0-priced scope". Warned
+        # once each (loud but not per-refresh spam); a rule is discarded from
+        # the set when its scope stops being $0-priced so it re-arms.
+        self._zero_price_warned: set[str] = set()
 
     # ── seed (yaml) ───────────────────────────────────────────────────
 
     def set_seed_rules(self, rules: Any) -> None:
         self._seed_rules = list(rules) if isinstance(rules, (list, tuple)) else []
+
+    def set_providers_config(self, providers_config: Any) -> None:
+        """Refresh the providers view used to detect $0-priced cost_usd scopes
+        (hot-reload). Cheap; never touches enforcement."""
+        self._providers_config = providers_config
 
     async def _seed_once(self) -> None:
         """Additively seed yaml rules the first time we refresh. Idempotent at
@@ -320,6 +388,7 @@ class BudgetGuard:
                 continue
             snapshot.append(st)
             self._maybe_fire_alerts(st)
+            self._maybe_warn_cost_ineffective(st)
         self._snapshot = snapshot
         self._has_rules = bool(rules)
         self._last_refresh_monotonic = time.monotonic()
@@ -357,6 +426,14 @@ class BudgetGuard:
         thresholds = tuple(
             float(t) for t in (rule.get("alert_thresholds") or []) if 0 < float(t) < 1
         )
+        cost_ineffective = False
+        if metric == "cost_usd":
+            try:
+                cost_ineffective = _scope_is_cost_ineffective(
+                    scope_kind, scope_value, self._providers_config,
+                )
+            except Exception:  # noqa: BLE001 — a pricing probe must never break the gate
+                cost_ineffective = False
         return RuleState(
             rule_id=str(rule.get("id")),
             scope_kind=scope_kind,
@@ -371,6 +448,7 @@ class BudgetGuard:
             spend=spend,
             ratio=ratio,
             over=spend >= amount,
+            cost_ineffective=cost_ineffective,
         )
 
     # ── read-side gate (sync, hot path) ───────────────────────────────
@@ -529,6 +607,33 @@ class BudgetGuard:
                 fired.add(t)
                 self._emit_alert(st, t)
 
+    def _maybe_warn_cost_ineffective(self, st: RuleState) -> None:
+        """A ``cost_usd`` rule scoped to a $0-priced provider/model can never
+        accrue spend, so its cap silently never trips (the sub-proxy is
+        unprotected by the intuitive metric). Warn LOUDLY — once per rule, not
+        per refresh — that a ``tokens``-metric rule is required to constrain it.
+        Do NOT silently no-op. Re-arms if the scope later prices non-zero."""
+        if not st.cost_ineffective:
+            self._zero_price_warned.discard(st.rule_id)
+            return
+        if st.rule_id in self._zero_price_warned:
+            return
+        self._zero_price_warned.add(st.rule_id)
+        elog(
+            "budget.cost_metric_ineffective_zero_price",
+            level="warning",
+            budget_id=st.rule_id,
+            scope_kind=st.scope_kind,
+            scope=st.scope_value or "*",
+            metric=st.metric,
+            window=st.window,
+            limit=st.amount,
+            note="this scope prices at $0 (e.g. the claude-sub-proxy, absent "
+            "from OpenRouter pricing), so a cost_usd cap can NEVER trip and the "
+            "provider is uncapped — configure a tokens-metric budget rule to "
+            "constrain it",
+        )
+
     def _prune_alert_state(self, snapshot: list[RuleState]) -> None:
         """Drop alert bookkeeping for windows that are no longer current so the
         de-dupe map does not grow without bound."""
@@ -616,7 +721,9 @@ def _public_rule(rule: dict) -> dict:
     }
 
 
-async def compute_budget_usage(db: Any, *, enabled_only: bool = False) -> list[dict]:
+async def compute_budget_usage(
+    db: Any, *, enabled_only: bool = False, providers_config: Any = None,
+) -> list[dict]:
     """Per-rule current spend vs limit — the meter the app and the agent read.
 
     Computed FRESH from the DB (not the guard's cached snapshot) so it is always
@@ -625,6 +732,11 @@ async def compute_budget_usage(db: Any, *, enabled_only: bool = False) -> list[d
     and ``per_run`` windows report ``enforced: false`` (phase 2). The single
     cost path (``usage_log`` via ``get_scope_spend``) is reused — no second
     accounting.
+
+    ``cost_metric_ineffective`` surfaces the C2 hazard: a ``cost_usd`` rule
+    whose scope prices at $0 (the sub-proxy) can never trip. Detecting a
+    ``provider`` scope needs ``providers_config``; a ``model`` scope is judged
+    from live pricing alone, so it is flagged even when config is not passed.
     """
     rules = await db.list_budgets(enabled_only=enabled_only)
     now = time.time()
@@ -637,6 +749,20 @@ async def compute_budget_usage(db: Any, *, enabled_only: bool = False) -> list[d
         metric = rule.get("metric")
         enforced = scope_kind in ENFORCEABLE_SCOPE_KINDS and window in ENFORCEABLE_WINDOWS
         base["enforced"] = enforced
+        cost_ineffective = False
+        if metric == "cost_usd":
+            try:
+                cost_ineffective = _scope_is_cost_ineffective(
+                    scope_kind, rule.get("scope_value") or "", providers_config,
+                )
+            except Exception:  # noqa: BLE001 — surfacing a warning must never break the meter
+                cost_ineffective = False
+        base["cost_metric_ineffective"] = cost_ineffective
+        if cost_ineffective:
+            base["warning"] = (
+                "a cost_usd cap on this $0-priced scope can never trip; "
+                "configure a tokens-metric rule to constrain it"
+            )
         bounds = _window_bounds(window, now, zone)
         if bounds is None:
             # per_run (or unknown) — no window to sum over.

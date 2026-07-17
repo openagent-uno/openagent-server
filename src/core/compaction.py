@@ -642,6 +642,74 @@ async def _summarize_runs(
     return summary
 
 
+def _is_router(model: Any) -> bool:
+    """True when *model* is the full dispatcher / Team router — the expensive
+    path background jobs (compaction, quality judge) must avoid — rather than an
+    already-cheap single model. Never raises."""
+    try:
+        from src.models.dispatcher import ModelDispatcher, TeamRouterProvider
+    except Exception:  # noqa: BLE001
+        return False
+    return isinstance(model, (ModelDispatcher, TeamRouterProvider))
+
+
+def _cheap_background_model(
+    agent: Any,
+    fallback: Any,
+    *,
+    picked_event: str,
+    fallback_event: str,
+    failed_event: str,
+    what: str,
+    env_hint: str,
+) -> Any:
+    """Default a background job to the cheapest enabled row (a toolkit-free
+    ``NativeProvider``) when no dedicated model is configured, instead of the
+    full Team router handed in as *fallback*.
+
+    Only a ROUTER fallback (``ModelDispatcher`` / ``TeamRouterProvider``) is
+    rewritten; an already-plain model is returned unchanged, so the old
+    "unset env → fallback" contract still holds for non-router callers. Logs a
+    WARNING and returns *fallback* when no cheap row can be resolved, so the
+    expensive path stays visible. Never fatal — this runs on the turn's
+    critical path.
+    """
+    if not _is_router(fallback):
+        return fallback
+    try:
+        from src.models.catalog import cheapest_enabled_model
+        from src.models.native_provider import NativeProvider
+
+        providers_config = getattr(agent, "_providers_config", None) or []
+        cheap = cheapest_enabled_model(providers_config)
+        if cheap is None:
+            elog(
+                fallback_event,
+                level="warning",
+                reason="no_enabled_api_based_row",
+                note=f"{what} will run through the full Team router (expensive); "
+                f"set {env_hint} to a cheap row to silence this",
+            )
+            return fallback
+        db_path = getattr(getattr(agent, "_db", None), "db_path", None)
+        provider = NativeProvider(
+            model=cheap.runtime_id,
+            providers_config=providers_config,
+            db_path=str(db_path) if db_path else None,
+        )
+        elog(picked_event, model=cheap.runtime_id, reason="cheapest_enabled_default")
+        return provider
+    except Exception as exc:  # noqa: BLE001 — a cost win must never break a turn
+        elog(
+            failed_event,
+            level="warning",
+            configured="<cheapest-default>",
+            error_type=type(exc).__name__,
+            error=str(exc) or repr(exc),
+        )
+        return fallback
+
+
 def _pick_summary_model(agent: Any, *, fallback: Any) -> Any:
     """Return the configured cheap summariser model, else *fallback*.
 
@@ -670,7 +738,21 @@ def _pick_summary_model(agent: Any, *, fallback: Any) -> Any:
     """
     configured = os.environ.get(_SUMMARY_MODEL_ENV, "").strip()
     if not configured:
-        return fallback
+        # C3: no dedicated summariser configured. The old behaviour returned
+        # ``fallback`` — the ACTIVE model — which on a live turn is the full
+        # ModelDispatcher / Team router: a ~150k-token fold would then pay the
+        # user's premium leader (plus tool schemas + possible delegation). Default
+        # instead to the cheapest enabled row as a toolkit-free NativeProvider.
+        # Only a *router* fallback is rewritten — an already-plain model is
+        # returned unchanged (byte-identical to the old contract for such callers).
+        return _cheap_background_model(
+            agent, fallback,
+            picked_event="runtime.compaction.summary_model",
+            fallback_event="runtime.compaction.summary_model_dispatcher_fallback",
+            failed_event="runtime.compaction.summary_model_failed",
+            what="compaction summary",
+            env_hint=_SUMMARY_MODEL_ENV,
+        )
     try:
         from src.models.catalog import FRAMEWORK_API_BASED, iter_configured_models
         from src.models.native_provider import NativeProvider

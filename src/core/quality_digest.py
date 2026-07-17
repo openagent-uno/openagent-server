@@ -12,7 +12,14 @@ periodic, push side: a background loop that every ``interval_hours``
     quality drops below a floor, any fabrication is flagged, the recall-timeout
     rate is too high, or the embedder looks DOWN — inferred from a spike in
     ``semantic.embed_error`` (so this doubles as remote-ollama/Mac-Mini health
-    monitoring; no separate healthcheck).
+    monitoring; no separate healthcheck); and, when
+    ``OPENAGENT_QUALITY_DIGEST_ALERT_WEBHOOK_URL`` is set, ALSO POSTs each newly
+    active alert to that generic webhook (Slack/Telegram/PagerDuty bridge) so a
+    human actually gets paged instead of the alert dying in a log line. The POST
+    mirrors ``budget_guard._fire_webhook`` — best-effort, tightly bounded, and it
+    can never break the digest loop — and is edge-triggered so a persisting
+    condition is not re-POSTed every cycle. Unset → byte-identical to before
+    (``elog`` only).
 
 Same shape as ``learning.curator`` / ``memory.semantic_index_builder``: a
 ``start()`` returning a task, a **no-op when disabled** (§17) — the digest
@@ -24,9 +31,11 @@ off. Reuses ``quality_monitor.aggregate()`` and the one-reverse-scan
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 from typing import Any, Optional
+from urllib import request as _urllib_request
 
 from src.core.logging import elog, iter_events_reverse
 from src.core import quality_monitor
@@ -37,6 +46,10 @@ _INTERVAL_ENV = "OPENAGENT_QUALITY_DIGEST_INTERVAL_HOURS"
 _MIN_SCORE_ALERT_ENV = "OPENAGENT_QUALITY_DIGEST_MIN_SCORE_ALERT"
 _RECALL_TIMEOUT_ALERT_ENV = "OPENAGENT_QUALITY_DIGEST_RECALL_TIMEOUT_ALERT"
 _EMBED_ERROR_ALERT_ENV = "OPENAGENT_QUALITY_DIGEST_EMBED_ERROR_ALERT"
+# Optional generic alert webhook. When set, each newly active ``quality.alert``
+# is ALSO POSTed here (provider-neutral — a Slack/Telegram/PagerDuty bridge
+# consumes it). Env-driven like every other knob above; unset → elog only.
+_ALERT_WEBHOOK_ENV = "OPENAGENT_QUALITY_DIGEST_ALERT_WEBHOOK_URL"
 
 _DEFAULT_INTERVAL_HOURS = 24.0
 _DEFAULT_MIN_SCORE_ALERT = 0.70          # alert if avg judged score dips below this
@@ -44,6 +57,9 @@ _DEFAULT_RECALL_TIMEOUT_ALERT = 0.25     # alert if >25% of turns time out on re
 _DEFAULT_EMBED_ERROR_ALERT = 10          # alert if > this many embed errors in the window
 _MIN_INTERVAL_SECONDS = 300.0            # floor so a misconfig can't tight-loop
 _MAX_FLAGGED = 50                        # bound the flagged-session list in one event
+# Outbound alert-webhook timeout — mirrors ``budget_guard._WEBHOOK_TIMEOUT_S``: a
+# slow/dead endpoint must never wedge the digest, so the POST is tightly bounded.
+_WEBHOOK_TIMEOUT_S = 8.0
 
 
 def _truthy(v: str) -> bool:
@@ -179,6 +195,91 @@ def evaluate_alerts(digest: dict[str, Any]) -> list[dict[str, Any]]:
     return alerts
 
 
+# ── alert webhook (optional; provider-neutral) ────────────────────────────
+# Edge-trigger de-dupe: the alert ``kind``s we have already POSTed while they
+# stay continuously active. A persisting condition (e.g. avg quality stuck low)
+# thus pages ONCE, not every cycle; a kind that clears and later recurs pages
+# again. The ``elog`` side is untouched — it still fires every cycle — so the
+# unset-webhook behaviour is byte-identical to before.
+_alerted_kinds: set[str] = set()
+
+
+def _alert_webhook_url() -> Optional[str]:
+    raw = os.environ.get(_ALERT_WEBHOOK_ENV, "").strip()
+    return raw or None
+
+
+def _alert_summary(a: dict[str, Any]) -> str:
+    """One human-readable line per alert kind (for the webhook consumer)."""
+    kind = a.get("kind")
+    if kind == "quality_low":
+        return (f"avg quality {a.get('avg_score')} below floor {a.get('threshold')} "
+                f"({a.get('judged')} judged)")
+    if kind == "fabrication":
+        return f"{a.get('count')} fabrication-flagged repl(y/ies) this window"
+    if kind == "recall_timeouts":
+        return (f"recall timeout rate {a.get('rate')} ({a.get('count')} timeouts) "
+                f"over threshold {a.get('threshold')}")
+    if kind == "embedder_down":
+        return (f"embedder likely DOWN: {a.get('embed_errors')} embed errors "
+                f"(> {a.get('threshold')})")
+    return f"quality alert: {kind}"
+
+
+def _alert_payload(alert: dict[str, Any], digest: dict[str, Any]) -> dict[str, Any]:
+    """Compact, provider-neutral JSON body: alert type, severity, summary,
+    counts, and the timestamp source (wall clock + window + emitter)."""
+    return {
+        "event": "quality.alert",
+        "kind": alert.get("kind"),
+        "severity": "warning",
+        "summary": _alert_summary(alert),
+        "counts": {k: v for k, v in alert.items() if k != "kind"},
+        "window_hours": digest.get("window_hours"),
+        "ts": time.time(),
+        "source": "quality_digest",
+    }
+
+
+def _post_webhook(url: str, payload: dict[str, Any]) -> None:
+    """Best-effort POST of one alert. SYNCHRONOUS on purpose: ``run_once`` runs
+    in a worker thread (``asyncio.to_thread``) with no running event loop, so
+    ``budget_guard``'s ``loop.create_task(_fire_webhook)`` pattern does not apply
+    here — a blocking POST with a tight timeout stalls only the digest worker
+    thread (interval apart), never the event loop. A dead endpoint must NEVER
+    break the digest, so every failure is swallowed and logged (like the budget
+    one)."""
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req = _urllib_request.Request(
+            url, data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with _urllib_request.urlopen(req, timeout=_WEBHOOK_TIMEOUT_S) as resp:
+            resp.read()
+    except Exception as e:  # noqa: BLE001 — a dead webhook never breaks the digest
+        elog("quality.webhook_error", level="warning", url=url[:120], error=str(e))
+
+
+def _dispatch_alert_webhooks(alerts: list[dict[str, Any]], digest: dict[str, Any]) -> None:
+    """POST the newly-active alerts to the configured webhook, if any. Unset →
+    no POST and no state change (behaviour unchanged). Edge-triggered so a
+    persisting condition is not re-POSTed every cycle."""
+    url = _alert_webhook_url()
+    if not url:
+        return
+    current = {a["kind"] for a in alerts}
+    new_kinds = current - _alerted_kinds
+    for a in alerts:
+        if a["kind"] in new_kinds:
+            _post_webhook(url, _alert_payload(a, digest))
+    # Remember exactly what is active now: a cleared kind drops out (so it can
+    # re-fire on recurrence), a still-active kind stays (so it is not re-POSTed).
+    _alerted_kinds.clear()
+    _alerted_kinds.update(current)
+
+
 def run_once(window_seconds: Optional[float] = None,
              path: Any = None) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Build + emit one ``quality.digest`` and any ``quality.alert`` events.
@@ -199,6 +300,8 @@ def run_once(window_seconds: Optional[float] = None,
     alerts = evaluate_alerts(digest)
     for a in alerts:
         elog("quality.alert", level="warning", **a)
+    # In addition to the elog above, page a human via the optional webhook.
+    _dispatch_alert_webhooks(alerts, digest)
     return digest, alerts
 
 
