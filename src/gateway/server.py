@@ -21,7 +21,7 @@ from src.gateway import protocol as P
 from src.gateway.commands import command_help_text
 from src.gateway.sessions import SessionManager
 from src.gateway.terminals import TerminalManager
-from src.gateway.api import vault, config, health, logs, control, usage, providers, models, scheduled_tasks, workflow_tasks, mcps, marketplace, sessions as sessions_api, system as system_api, network as network_api, chat as chat_api, terminals as terminals_api, commands as commands_api, events as events_api, budgets as budgets_api, quality as quality_api
+from src.gateway.api import vault, config, health, logs, control, usage, providers, models, scheduled_tasks, workflow_tasks, mcps, marketplace, sessions as sessions_api, system as system_api, network as network_api, chat as chat_api, terminals as terminals_api, commands as commands_api, events as events_api, budgets as budgets_api, quality as quality_api, llm as llm_api
 from src.network import peers as peers_api
 from src.network.auth.middleware import make_auth_middleware
 from src.network.transport.aiohttp_iroh_site import IrohSite
@@ -1215,6 +1215,14 @@ class Gateway:
             # iOS / external REST chat (no WebSocket required)
             ("POST",   "/api/chat",                          chat_api.handle_chat),
             ("POST",   "/api/health/ingest",                 chat_api.handle_health_ingest),
+
+            # Generic LLM gateway — a stateless, product-neutral
+            # chat-completions passthrough. Any service in the suite makes
+            # an LLM call THROUGH OpenAgent's configured providers (reusing
+            # the registry + stored keys) by POSTing an OpenAI-shaped body
+            # with model="<provider>:<model_id>". OpenAI-client compatible:
+            # base_url=".../api/llm" + POST {base_url}/chat/completions.
+            ("POST",   "/api/llm/chat/completions",          llm_api.handle_chat_completions),
         )
         for method, path, handler in routes:
             app.router.add_route(method, path, handler)

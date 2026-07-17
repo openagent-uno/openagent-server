@@ -104,8 +104,28 @@ def make_auth_middleware(state: NetworkAuthState):
         # wins kick on collision), and a stable key would cause
         # legitimate reconnects to kick each other in a loop.
         if http_token:
-            provided = request.headers.get("X-OpenAgent-Token", "").strip()
-            if provided and secrets.compare_digest(provided, http_token):
+            # Two equivalent ways to present the shared secret, both
+            # compared against the SAME ``http_token`` — this only ADDS an
+            # accepted header, it does not weaken anything:
+            #   1. ``X-OpenAgent-Token: <token>`` — the original bridge
+            #      header (Virgil's orchestrator, ngrok dev tunnels).
+            #   2. ``Authorization: Bearer <token>`` — the standard header
+            #      every OpenAI-compatible client sends, so the whole
+            #      gateway (incl. /api/llm/chat/completions) is reachable
+            #      by an off-the-shelf OpenAI SDK with no custom headers.
+            # We gather whatever tokens the request presented and accept if
+            # ANY matches; a valid X-OpenAgent-Token keeps working exactly
+            # as before.
+            candidates: list[str] = []
+            x_token = request.headers.get("X-OpenAgent-Token", "").strip()
+            if x_token:
+                candidates.append(x_token)
+            authz = request.headers.get("Authorization", "").strip()
+            if authz[:7].lower() == "bearer ":  # strip prefix case-insensitively
+                bearer = authz[7:].strip()
+                if bearer:
+                    candidates.append(bearer)
+            if any(secrets.compare_digest(c, http_token) for c in candidates):
                 handle_hint = request.headers.get("X-OpenAgent-Handle", "") or "http-bridge"
                 synthetic = DeviceCert(
                     handle=handle_hint[:64],

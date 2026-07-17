@@ -174,6 +174,12 @@ _TEST_MODULES: tuple[str, ...] = (
     # specialist's own model attribution. Pure-unit; no gateway needed.
     "test_rehydration_parity",
     "test_db_providers",
+    # Generic LLM gateway (POST /api/llm/chat/completions) — a stateless,
+    # product-neutral chat-completions passthrough over the providers
+    # registry, plus the Authorization: Bearer auth bypass that makes it
+    # OpenAI-client usable. Pure-unit: fake providers DB + patched
+    # httpx.AsyncClient + the real auth middleware; no live gateway/network.
+    "test_llm_gateway",
     # Cross-device chat visibility: ``upsert_session`` writes the user
     # handle as the row owner and ``list_all_sessions`` soft-falls back
     # to legacy device-pubkey rows via ``network_devices``.
