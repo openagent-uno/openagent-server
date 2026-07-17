@@ -56,6 +56,30 @@ CANCEL_CHECK_INTERVAL = 2  # seconds between draining cancellation requests
 _CANCEL_SCAN_LIMIT = 500
 
 
+def _env_float(name: str, default: float) -> float:
+    """A float env override that falls back to ``default`` on unset/garbage."""
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+# Periodic stale-orphan sweep for event deliveries. The startup reap
+# (``server.py`` → ``reap_orphan_event_deliveries``) only recovers CRASH
+# orphans: a crash → restart → reap. A delivery orphaned WITHOUT a restart —
+# a detached dispatch task that dies silently while the process keeps running —
+# would otherwise sit ``running``/claimed until the next restart. This sweep
+# re-enqueues those on a cadence, but AGE-GATED so a legitimately-running turn
+# is never double-dispatched: only deliveries claimed longer ago than
+# STALE_SWEEP_AGE (default 1800 s = 2× the OPENAGENT_CHAT_TURN_TIMEOUT 900 s
+# single-turn wall-clock cap) are eligible. Both knobs are read live each tick
+# so an operator can retune without a redeploy.
+_STALE_SWEEP_INTERVAL_ENV = "OPENAGENT_EVENT_STALE_SWEEP_INTERVAL_SECONDS"
+_STALE_SWEEP_AGE_ENV = "OPENAGENT_EVENT_STALE_SWEEP_AGE_SECONDS"
+_STALE_SWEEP_INTERVAL_DEFAULT = 600.0   # 10 min between sweeps
+_STALE_SWEEP_AGE_DEFAULT = 1800.0       # 30 min = 2× the single-turn cap
+
+
 # Resource broadcast hook. ``AgentServer`` plugs the Gateway's
 # ``broadcast_resource_sync`` in here so that internal mutations (a
 # one-shot task auto-disabling itself, a workflow run starting from
@@ -164,6 +188,11 @@ class Scheduler:
         # the run's ``finally`` — the map only ever holds live runs.
         self._workflow_run_tasks: dict[str, asyncio.Task] = {}
         self._scheduled_run_tasks: dict[str, asyncio.Task] = {}
+        # Monotonic timestamp of the last periodic stale-orphan sweep. Set at
+        # the top of ``_cancellation_loop`` so the first sweep fires one
+        # interval AFTER boot (the startup reap already covers t=0), then gated
+        # to at most once per STALE_SWEEP_INTERVAL.
+        self._last_stale_sweep: float = 0.0
 
     def _next_run(
         self,
@@ -305,7 +334,14 @@ class Scheduler:
         subprocess uses to reach the in-process runtime: ``status='cancelling'``
         rows (a "completely stop" request) and ``task_run_requests`` rows (a
         "run now" request). Kept off the heavy 30 s due-task scan so both feel
-        near-immediate."""
+        near-immediate.
+
+        It also hosts the periodic stale-orphan sweep (throttled to
+        STALE_SWEEP_INTERVAL via a monotonic gate rather than its own task) so
+        an event delivery orphaned without a restart is still recovered."""
+        # Anchor the throttle at loop start so the first sweep is one interval
+        # out — the startup reap already handled boot orphans at t=0.
+        self._last_stale_sweep = time.monotonic()
         while True:
             try:
                 await self._drain_cancellations()
@@ -319,7 +355,42 @@ class Scheduler:
                 await self._drain_event_deliveries()
             except Exception as e:  # noqa: BLE001
                 elog("scheduler.event_delivery_loop_error", level="error", error=str(e))
+            # Periodic, age-gated stale-orphan sweep. Self-guarded: a sweep
+            # error must never break this loop, so the interval gate and the DB
+            # call are wrapped whole. Cheap (one or two UPDATEs) and fires at
+            # most once per STALE_SWEEP_INTERVAL.
+            try:
+                interval = _env_float(
+                    _STALE_SWEEP_INTERVAL_ENV, _STALE_SWEEP_INTERVAL_DEFAULT
+                )
+                nowmono = time.monotonic()
+                if nowmono - self._last_stale_sweep >= interval:
+                    self._last_stale_sweep = nowmono
+                    await self._sweep_stale_event_deliveries()
+            except Exception as e:  # noqa: BLE001
+                elog("scheduler.stale_sweep_loop_error", level="error", error=str(e))
             await asyncio.sleep(CANCEL_CHECK_INTERVAL)
+
+    async def _sweep_stale_event_deliveries(self) -> None:
+        """Recover event deliveries orphaned WITHOUT a process restart.
+
+        A detached ``dispatch_event`` task can die silently — its turn task
+        cancelled, an unhandled error in the background coroutine — while the
+        server keeps running. The startup reap never sees that row (there is no
+        restart), so it sits ``running``/claimed until the next deploy. This
+        re-enqueues it via ``MemoryDB.reap_stale_event_deliveries``, which
+        AGE-GATES on ``claimed_at`` (default 2× the single-turn wall-clock cap)
+        so a legitimately-running turn is never re-enqueued into a second
+        concurrent dispatch. The DB method logs (``mode='stale-sweep'``) only
+        when it acts and stays silent otherwise."""
+        if self.db is None:
+            return
+        # Defensive: an older MemoryDB without the stale reap simply no-ops
+        # (mirrors server.py's ``hasattr`` guard around the startup reap).
+        if not hasattr(self.db, "reap_stale_event_deliveries"):
+            return
+        age = _env_float(_STALE_SWEEP_AGE_ENV, _STALE_SWEEP_AGE_DEFAULT)
+        await self.db.reap_stale_event_deliveries(min_claim_age_seconds=age)
 
     async def _drain_task_run_requests(self) -> None:
         """Claim and fire every pending on-demand "run now" request.

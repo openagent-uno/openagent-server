@@ -323,6 +323,12 @@ _TEST_MODULES: tuple[str, ...] = (
     # ``failed``, bounded by a replay budget, and a replay resumes the SAME
     # bound session so Replio's reply_guard blocks a double customer reply.
     "test_event_delivery_reenqueue",
+    # The PERIODIC, age-gated sibling of the above: a delivery orphaned
+    # WITHOUT a restart (detached dispatch task died while the process kept
+    # running) is recovered by ``reap_stale_event_deliveries`` on a sweep —
+    # but only when its claim is older than the age threshold, so a
+    # legitimately-running turn is never double-dispatched.
+    "test_event_delivery_stale_sweep",
     # Workflow ai-prompt must forget/release at the right moment (same
     # bug class as scheduler issue #5 but for workflows).
     "test_workflow_forgets_session",

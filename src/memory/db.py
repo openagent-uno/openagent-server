@@ -2515,6 +2515,131 @@ class MemoryDB:
             )
         return requeued + parked
 
+    async def reap_stale_event_deliveries(
+        self,
+        *,
+        min_claim_age_seconds: float,
+        max_attempts: int | None = None,
+        enabled: bool | None = None,
+    ) -> int:
+        """Periodic, age-gated sibling of ``reap_orphan_event_deliveries`` for
+        deliveries orphaned WITHOUT a process restart.
+
+        The startup reap fires once, on boot: every claimed row is *provably* an
+        orphan there because the process just started, so it re-enqueues them
+        all. But a delivery whose detached dispatch task dies silently while the
+        process keeps running — the turn task cancelled, an unhandled crash in
+        the background coroutine, an event-loop stall — never gets a restart, so
+        it sits ``running``/claimed forever until the next deploy. This sweep,
+        called on the Scheduler's fast loop, recovers those go-forward.
+
+        CRITICAL — the age guard. Because the process is *live*, a claimed row is
+        NOT provably an orphan: a claim 30 s old is a legitimately-running turn,
+        and re-enqueuing it would spawn a SECOND concurrent turn for the same
+        delivery. So this only touches rows whose ``claimed_at`` is OLDER than
+        ``min_claim_age_seconds`` — a threshold the caller sets comfortably above
+        the single-turn wall-clock cap (``OPENAGENT_CHAT_TURN_TIMEOUT``, default
+        900 s); the Scheduler passes 2× that (1800 s) by default. A row claimed
+        more recently is assumed still running and left strictly alone. Replio's
+        thread-scoped ``reply_guard`` remains the final backstop, but the age
+        gate is what prevents the double-dispatch in the first place.
+
+        Differences from the startup reap, all deliberate:
+
+        * **age-gated** — only ``claimed_at <= now - min_claim_age_seconds``;
+        * **go-forward only** — NEVER touches ``status='failed'`` history (no
+          backfill of the old reaper's dropped-ticket rows; that one-time
+          recovery is the startup reap's job). Only in-flight
+          ``status IN ('received','running')`` rows are eligible.
+
+        Same re-enqueue / park semantics otherwise: reset a recoverable orphan
+        to ``received`` with ``claimed_at=NULL`` (so the drain re-dispatches it)
+        and bump ``reenqueue_count``; park a stale row that has exhausted the
+        ``max_attempts`` budget as terminal ``failed``. Respects the
+        ``OPENAGENT_EVENT_REENQUEUE_ENABLED`` kill-switch (off → no-op, returns
+        0 — no marking, since a live process has no boot-time proof of orphaning).
+
+        Returns the number of rows acted on (re-enqueued + parked); 0 when it
+        finds nothing (and it logs only when it acts).
+        """
+        conn = await self._ensure_connected()
+        now = time.time()
+
+        def _flag(name: str, default: bool) -> bool:
+            raw = os.environ.get(name)
+            if raw is None:
+                return default
+            return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+        if enabled is None:
+            enabled = _flag("OPENAGENT_EVENT_REENQUEUE_ENABLED", True)
+        if not enabled:
+            # Kill-switch: unlike the startup reap this does NOT fall back to
+            # mark-failed. A periodic sweep on a live process has no proof a
+            # claimed row is orphaned (that's the whole point of the age gate),
+            # so with re-enqueue disabled the safe action is to do nothing and
+            # let the next restart's reap handle it.
+            return 0
+
+        if max_attempts is None:
+            try:
+                max_attempts = int(
+                    os.environ.get("OPENAGENT_EVENT_REENQUEUE_MAX_ATTEMPTS", "5")
+                )
+            except (TypeError, ValueError):
+                max_attempts = 5
+        max_attempts = max(1, int(max_attempts))
+
+        # A row is "stale" only if it was claimed at/before this cutoff. Never
+        # negative — a caller passing 0 would sweep everything, so clamp at 0
+        # and let the caller own the safety of the threshold it chooses.
+        min_claim_age_seconds = max(0.0, float(min_claim_age_seconds))
+        cutoff = now - min_claim_age_seconds
+
+        # 1. Park stale in-flight rows over the replay budget FIRST (retire them
+        #    here so the re-enqueue below can't bump them past the cap). Only
+        #    stale, in-flight rows — a recently-claimed row at the cap is still
+        #    a live turn and must not be parked; a historical ``failed`` row is
+        #    already terminal and never matched.
+        parked_cur = await conn.execute(
+            "UPDATE event_deliveries "
+            "SET status='failed', finished_at=?, "
+            "    error=COALESCE(error,'') || "
+            "          CASE WHEN error IS NULL OR error='' THEN '' ELSE ' | ' END || "
+            "          'stale-sweep: retry budget exhausted (' || reenqueue_count || ' attempts)' "
+            "WHERE claimed_at IS NOT NULL AND claimed_at <= ? "
+            "  AND reenqueue_count >= ? "
+            "  AND status IN ('received','running')",
+            (now, cutoff, max_attempts),
+        )
+        parked = parked_cur.rowcount or 0
+
+        # 2. Re-enqueue every stale in-flight orphan under the budget: same SET
+        #    clause as the startup reap (received, drop claim, clear finished_at,
+        #    bump counter) with a distinct ``stale-sweep`` error marker.
+        requeue_cur = await conn.execute(
+            "UPDATE event_deliveries "
+            "SET status='received', claimed_at=NULL, finished_at=NULL, "
+            "    reenqueue_count = reenqueue_count + 1, "
+            "    error='re-enqueued: stale-sweep recovered orphan (attempt ' "
+            "          || (reenqueue_count + 1) || ')' "
+            "WHERE claimed_at IS NOT NULL AND claimed_at <= ? "
+            "  AND reenqueue_count < ? "
+            "  AND status IN ('received','running')",
+            (cutoff, max_attempts),
+        )
+        requeued = requeue_cur.rowcount or 0
+
+        await conn.commit()
+        if requeued or parked:
+            from src.core.logging import elog
+            elog(
+                "event.orphan_reaped", mode="stale-sweep",
+                requeued=requeued, parked=parked, max_attempts=max_attempts,
+                min_claim_age_seconds=min_claim_age_seconds,
+            )
+        return requeued + parked
+
     # ── Workflow Tasks ──
 
     @staticmethod
