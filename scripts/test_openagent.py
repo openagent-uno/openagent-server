@@ -268,6 +268,10 @@ _TEST_MODULES: tuple[str, ...] = (
     # cheapest enabled row, not the full Team router. Pure-unit: throwaway DB +
     # real dispatcher/guard, hand-primed OpenRouter pricing.
     "test_cost_control_gaps",
+    # Per-run cost-anomaly alert: page on REAL cost / non-cached input, never on
+    # the summed input_tokens counter a cached agentic loop inflates ~10x (the
+    # "447,229 input tokens!" false alarm on a $0.018 run). Pure-unit.
+    "test_cost_anomaly",
     # Quality digest — the scheduled push side: summary + flagged-session review
     # list + threshold alerts (incl. embedder-down via embed-error spikes).
     "test_quality_digest",

@@ -38,7 +38,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable
 
-from src.core import vault_recall
+from src.core import tool_trace, vault_recall
 from src.core.budget_guard import BudgetGuard
 from src.core.logging import elog
 from src.models import stream_usage
@@ -303,6 +303,7 @@ async def _arun_runtime_collect(
         if name:
             tools_used.append(str(name))
         vault_recall.record_tool(name, getattr(tc, "tool_args", None))
+        tool_trace.record_execution(tc)
         if on_delegate is not None:
             member_id = _extract_delegated_member_id(tc)
             if member_id:
@@ -521,6 +522,7 @@ async def _arun_runtime_stream(
                     getattr(tool, "tool_name", None),
                     getattr(tool, "tool_args", None),
                 )
+                tool_trace.record_execution(tool)
                 await _emit_status(tool)
             elif isinstance(event, tool_error_event_types):
                 tool = getattr(event, "tool", None)
@@ -1174,7 +1176,21 @@ class TeamRouterProvider(BaseModel):
                 model=runtime_id,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
+                # Surface the cache-read subset that ``compute_cost`` already
+                # priced cheap, so any downstream cost view can separate a
+                # re-sent cached prefix from a genuinely large fresh prompt
+                # (the raw ``input_tokens`` sums both across every agentic step).
+                cache_read_tokens=cache_read_tokens,
                 cost_usd=cost,
+            )
+            # Per-run cost-anomaly alert (opt-in): page on REAL cost / non-cached
+            # input, NEVER on the summed ``input_tokens`` counter, which a cached
+            # agentic loop inflates ~10x. No-op when disabled.
+            from src.core import cost_anomaly
+            cost_anomaly.note_run(
+                session_id=session_id, model=runtime_id, cost_usd=cost,
+                input_tokens=input_tokens, output_tokens=output_tokens,
+                cache_read_tokens=cache_read_tokens,
             )
         except Exception as e:  # noqa: BLE001
             elog(
@@ -1208,6 +1224,10 @@ class TeamRouterProvider(BaseModel):
         # the ones with the user's seat empty, where a note that misleads has
         # nobody watching to notice.
         recall_sink, recall_token = vault_recall.open_sink()
+        # Capture the run's tool trace so the quality judge can verify grounding
+        # (a cited id present in a tool RESULT is not fabrication). No-op sink
+        # when the monitor is off — byte-identical to before.
+        trace_sink, trace_token = tool_trace.maybe_open()
         outcome = vault_recall.OUTCOME_OK
         in_tokens = out_tokens = 0
         try:
@@ -1257,6 +1277,8 @@ class TeamRouterProvider(BaseModel):
             raise
         finally:
             vault_recall.close_sink(recall_token)
+            tool_trace.publish(session_id, trace_sink)
+            tool_trace.close(trace_token)
             await self.record_vault_recalls(
                 sink=recall_sink,
                 session_id=session_id,
@@ -1288,6 +1310,9 @@ class TeamRouterProvider(BaseModel):
         # attributed to them. Opened next to the usage sink because they are
         # flushed together and share a lifetime.
         recall_sink, recall_token = vault_recall.open_sink()
+        # Capture the run's tool trace for the quality judge (see generate()).
+        # Same lifetime as the recall sink; no-op when the monitor is off.
+        trace_sink, trace_token = tool_trace.maybe_open()
         # How the turn ended, from the exception (if any) that unwinds this
         # generator. Assume OK and let the handlers below correct it: a
         # generator that runs to completion never raises at all.
@@ -1342,6 +1367,8 @@ class TeamRouterProvider(BaseModel):
         finally:
             stream_usage.close_sink(sink_token)
             vault_recall.close_sink(recall_token)
+            tool_trace.publish(session_id, trace_sink)
+            tool_trace.close(trace_token)
             await self.record_cost(
                 input_tokens=sink.get("input_tokens", 0),
                 output_tokens=sink.get("output_tokens", 0),

@@ -33,7 +33,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 
-from src.core import vault_recall
+from src.core import tool_trace, vault_recall
 from src.core.logging import elog
 from src.models.base import BaseModel, ModelResponse
 from src.models.catalog import (
@@ -396,6 +396,7 @@ def _record_vault_recalls(response: Any) -> None:
     for entry in getattr(response, "tools", None) or []:
         name, args = _tool_name_args(entry)
         vault_recall.record_tool(name, args)
+        tool_trace.record_execution(entry)
 
 
 def _summarize_provider_errors(errs: list[str]) -> str:
@@ -1735,6 +1736,7 @@ class NativeProvider(BaseModel):
                         # production — the non-streaming path above ran 11
                         # times against 697 streamed turns.
                         vault_recall.record_tool(*_tool_name_args(tool_exec))
+                        tool_trace.record_execution(tool_exec)
                         if on_status is not None:
                             await self._emit_agno_tool_status(
                                 on_status, tool_exec,
