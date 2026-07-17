@@ -813,3 +813,189 @@ async def t_history_elide_preserves_normal_and_blocks(ctx: TestContext) -> None:
         assert any("elided from history" in b.get("text", "") for b in new_c)
     finally:
         os.environ.pop("OPENAGENT_COMPACTION_HISTORY_TOOL_RESULT_CHARS", None)
+
+
+# ── 8. Proactive (background) compaction ───────────────────────────────
+#
+# The reactive path above blocks the USER on the summariser. The proactive
+# path (``compact_after_turn`` + the per-session lock / active-turn guard)
+# moves the fold OFF the critical path AFTER a turn completes, while
+# guaranteeing a background fold never overlaps a turn's history read/write for
+# the same session. These tests pin that contract directly (no full Agent).
+
+
+def _seed_breaching(db_path: str, session_id: str, *, runs: int = 6) -> None:
+    """Seed a session whose history trips should_compact at the tiny-context
+    settings used below (max_context=200, threshold=0.5, keep=2)."""
+    long_text = "the quick brown fox jumps over the lazy dog " * 30
+    _make_session_row(db_path, session_id, [
+        {"content": long_text,
+         "messages": [{"role": "assistant", "content": long_text}]}
+        for _ in range(runs)
+    ])
+
+
+class _SlotAgent(_FakeAgent):
+    """``_FakeAgent`` that also implements the model-slot counter, so we can
+    prove the background pass keeps the model alive across the summariser call
+    and releases it exactly once."""
+
+    def __init__(self, db_path: str, model: _FakeModel) -> None:
+        super().__init__(db_path, model)
+        self.acquired = 0
+        self.released = 0
+
+    def _acquire_model_slot(self, model):  # noqa: ANN001
+        self.acquired += 1
+        return model
+
+    def _release_model_slot(self, model):  # noqa: ANN001
+        self.released += 1
+
+
+@test("compaction", "proactive: compact_after_turn folds in the background when breached")
+async def t_compact_after_turn_folds(ctx: TestContext) -> None:
+    from src.core import compaction
+
+    os.environ.pop("OPENAGENT_COMPACTION_ENABLED", None)
+    os.environ["OPENAGENT_COMPACTION_THRESHOLD"] = "0.5"
+    os.environ["OPENAGENT_COMPACTION_KEEP_RUNS"] = "2"
+
+    sid = "proactive-fold"
+    db_path = str(ctx.test_dir / "proactive-fold.db")
+    _seed_breaching(db_path, sid)
+    model = _FakeModel(max_context=200, summary="Background recap.")
+    agent = _FakeAgent(db_path, model)
+
+    task = compaction.compact_after_turn(sid, model, agent)
+    assert task is not None, "a breaching session must schedule a background pass"
+    await task  # drain the background work the user never waited on
+
+    # The fold landed: recap + last 2 kept, summariser called once, off session.
+    saved = _read_runs(db_path, sid)
+    assert len(saved) == 3, saved
+    assert saved[0].get("metadata", {}).get("compaction") is True, saved[0]
+    assert len(model.generate_calls) == 1, model.generate_calls
+    assert model.generate_calls[0]["kwargs"].get("session_id") is None
+    # The in-flight guard cleared itself so the next turn can schedule again.
+    assert sid not in compaction._INFLIGHT_SESSIONS
+
+
+@test("compaction", "proactive: compact_after_turn no-ops when disabled or session-less")
+async def t_compact_after_turn_noops(ctx: TestContext) -> None:
+    from src.core import compaction
+
+    db_path = str(ctx.test_dir / "proactive-noop.db")
+    _seed_breaching(db_path, "sid")
+    model = _FakeModel(max_context=200)
+    agent = _FakeAgent(db_path, model)
+
+    # No session id → nothing to key on.
+    assert compaction.compact_after_turn(None, model, agent) is None
+
+    # Feature flag off → inert, allocates no task.
+    os.environ["OPENAGENT_COMPACTION_ENABLED"] = "false"
+    try:
+        assert compaction.compact_after_turn("sid", model, agent) is None
+        assert len(model.generate_calls) == 0
+    finally:
+        os.environ.pop("OPENAGENT_COMPACTION_ENABLED", None)
+
+
+@test("compaction", "proactive: background pass SKIPS while a turn is active (no race)")
+async def t_background_skips_active_turn(ctx: TestContext) -> None:
+    """Invariant #2: a background fold must not run while a turn for the same
+    session is reading/writing history — that turn will fire its own post-turn
+    pass. We simulate an in-progress turn with ``mark_turn_active`` and prove
+    the scheduled pass observes it and leaves the runs byte-identical."""
+    from src.core import compaction
+
+    os.environ.pop("OPENAGENT_COMPACTION_ENABLED", None)
+    os.environ["OPENAGENT_COMPACTION_THRESHOLD"] = "0.5"
+    os.environ["OPENAGENT_COMPACTION_KEEP_RUNS"] = "2"
+
+    sid = "proactive-active"
+    db_path = str(ctx.test_dir / "proactive-active.db")
+    _seed_breaching(db_path, sid)
+    before = _read_runs(db_path, sid)
+    model = _FakeModel(max_context=200, summary="should not be written")
+    agent = _FakeAgent(db_path, model)
+
+    # A turn is active for this session (as the turn loop would register it).
+    compaction.mark_turn_active(sid)
+    try:
+        task = compaction.compact_after_turn(sid, model, agent)
+        assert task is not None
+        await task
+        # Skipped: no summariser call, runs untouched.
+        assert len(model.generate_calls) == 0, model.generate_calls
+        assert _read_runs(db_path, sid) == before
+    finally:
+        compaction.mark_turn_done(sid)
+
+
+@test("compaction", "proactive: only one background compaction per session at a time")
+async def t_background_dedup(ctx: TestContext) -> None:
+    from src.core import compaction
+
+    os.environ.pop("OPENAGENT_COMPACTION_ENABLED", None)
+    os.environ["OPENAGENT_COMPACTION_THRESHOLD"] = "0.5"
+    os.environ["OPENAGENT_COMPACTION_KEEP_RUNS"] = "2"
+
+    sid = "proactive-dedup"
+    db_path = str(ctx.test_dir / "proactive-dedup.db")
+    _seed_breaching(db_path, sid)
+    model = _FakeModel(max_context=200, summary="Dedup recap.")
+    agent = _FakeAgent(db_path, model)
+
+    # Two fire-and-forget calls before the first task runs: the second must
+    # dedup to None because the session is already in-flight.
+    first = compaction.compact_after_turn(sid, model, agent)
+    second = compaction.compact_after_turn(sid, model, agent)
+    assert first is not None
+    assert second is None, "a second concurrent pass for one session must dedup"
+    await first
+    # Exactly one summariser round-trip happened for the two calls.
+    assert len(model.generate_calls) == 1, model.generate_calls
+
+
+@test("compaction", "proactive: mark_turn_done balances the count and prunes the idle lock")
+async def t_mark_turn_done_prunes_lock(_ctx: TestContext) -> None:
+    from src.core import compaction
+
+    sid = "proactive-prune"
+    # A turn registers (creating the lock on first acquire, which the turn loop
+    # does; here we materialise it explicitly) then completes.
+    _ = compaction.session_lock(sid)
+    compaction.mark_turn_active(sid)
+    assert compaction._ACTIVE_TURNS.get(sid) == 1
+    assert sid in compaction._SESSION_LOCKS
+
+    compaction.mark_turn_done(sid)
+    # Count balanced back to nothing and the idle lock dropped so the map
+    # stays bounded across many short-lived sessions.
+    assert sid not in compaction._ACTIVE_TURNS
+    assert sid not in compaction._SESSION_LOCKS
+
+
+@test("compaction", "proactive: background pass acquires and releases the model slot")
+async def t_background_uses_model_slot(ctx: TestContext) -> None:
+    from src.core import compaction
+
+    os.environ.pop("OPENAGENT_COMPACTION_ENABLED", None)
+    os.environ["OPENAGENT_COMPACTION_THRESHOLD"] = "0.5"
+    os.environ["OPENAGENT_COMPACTION_KEEP_RUNS"] = "2"
+
+    sid = "proactive-slot"
+    db_path = str(ctx.test_dir / "proactive-slot.db")
+    _seed_breaching(db_path, sid)
+    model = _FakeModel(max_context=200, summary="Slot recap.")
+    agent = _SlotAgent(db_path, model)
+
+    task = compaction.compact_after_turn(sid, model, agent)
+    assert task is not None
+    await task
+    # The model was pinned for the whole pass and released exactly once, so a
+    # concurrent swap/shutdown can't tear it down mid-summary.
+    assert agent.acquired == 1, agent.acquired
+    assert agent.released == 1, agent.released

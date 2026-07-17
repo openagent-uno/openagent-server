@@ -1641,6 +1641,11 @@ class Agent:
         current_input = await _with_recall(self, session_id, message, current_input)
         last_response = None
         iter_count = 0
+        # Set once this turn has registered itself as active with the
+        # compaction subsystem (under the per-session lock), so the ``finally``
+        # decrements exactly what it incremented — see the compaction block
+        # below and ``src/core/compaction.py``.
+        turn_registered = False
 
         pending = hub.drain(session_id)
         if pending:
@@ -1658,22 +1663,32 @@ class Agent:
                     )
                     break
 
-                # In-session compaction (vision §2): before driving the
-                # model, check whether the cumulative stored history is
-                # about to breach the model's context budget. If so,
-                # fold the oldest runs into a recap row first so the
-                # next ``add_history_to_context=True`` reload stays
-                # under the limit. The reactive ContextWindowExceeded
-                # fallback (src/models/providers/fallback.py) still
-                # backstops this in case the heuristic underestimates.
+                # In-session compaction (vision §2). PROACTIVE design: the
+                # post-turn background pass (see the end of this method and
+                # ``compaction.compact_after_turn``) keeps sessions under the
+                # threshold OFF the user's critical path, so this start-of-turn
+                # check is now a SAFETY BACKSTOP that rarely fires — only when a
+                # background pass was skipped/failed, or a single turn blew past
+                # the threshold on its own. We run the backstop AND register
+                # this turn as active under the per-session compaction lock so a
+                # background pass can neither overlap our history read/write nor
+                # race our active-turn count. See ``src/core/compaction.py``
+                # ("Proactive (background) compaction") for the full invariant.
+                # The reactive ContextWindowExceeded fallback
+                # (src/models/providers/fallback.py) still backstops even this.
                 if iter_count == 1 and session_id:
                     try:
-                        from src.core.compaction import should_compact, compact
-                        if should_compact(session_id, active_model, agent=self):
-                            await compact(
-                                session_id, active_model, self,
-                                on_status=_status,
-                            )
+                        from src.core import compaction
+                        async with compaction.session_lock(session_id):
+                            compaction.mark_turn_active(session_id)
+                            turn_registered = True
+                            if compaction.should_compact(
+                                session_id, active_model, agent=self,
+                            ):
+                                await compaction.compact(
+                                    session_id, active_model, self,
+                                    on_status=_status,
+                                )
                     except Exception as exc:  # noqa: BLE001 — never block a turn
                         elog(
                             "runtime.compaction.error",
@@ -1766,6 +1781,40 @@ class Agent:
                 current_input = _format_shell_reminder(events)
         finally:
             self._release_model_slot(active_model)
+            # Balance the mark_turn_active above. In ``finally`` (not the
+            # normal-completion path) so the active-turn count is released even
+            # if the turn raised — otherwise a background pass would treat the
+            # session as permanently busy and never compact it.
+            if turn_registered and session_id:
+                try:
+                    from src.core import compaction
+                    compaction.mark_turn_done(session_id)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        # PROACTIVE compaction: the turn is fully done and its final run is
+        # persisted to ``sessions.runs`` (the last ``generate()`` returned), so
+        # fold older history in the BACKGROUND now. The user's NEXT message then
+        # hits an already-compacted session instead of waiting on the
+        # summariser. Fire-and-forget and fully guarded — the per-session lock +
+        # active-turn check in ``compact_after_turn`` guarantee it can't race
+        # this or the next turn's history I/O, and an exception can never touch
+        # the reply. Placed AFTER the ``finally`` (mark_turn_done already ran)
+        # so it only fires on normal completion, and sees active-turns == 0.
+        if session_id:
+            try:
+                from src.core import compaction
+                compaction.compact_after_turn(
+                    session_id, active_model, self, on_status=_status,
+                )
+            except Exception as exc:  # noqa: BLE001 — never touch the reply
+                elog(
+                    "runtime.compaction.error",
+                    level="warning",
+                    session_id=session_id,
+                    error_type=type(exc).__name__,
+                    error=str(exc) or repr(exc),
+                )
 
         self._store_response_meta(session_id, last_response)
         elog(
@@ -1951,6 +2000,8 @@ class Agent:
         current_input = await _with_recall(self, session_id, message, current_input)
         accumulated: list[str] = []
         iter_count = 0
+        # Streaming twin of ``_run_inner``'s ``turn_registered`` — see there.
+        turn_registered = False
 
         pending = hub.drain(session_id)
         if pending:
@@ -1972,19 +2023,28 @@ class Agent:
                     break
 
                 # Streaming twin of the in-session compaction call in
-                # _run_inner. See that branch (or src/core/compaction.py)
-                # for the rationale — vision §2 "the session compacts in
-                # place". Only runs on the first iteration so shell-
-                # reminder re-entries don't pay the threshold check on
-                # every loop.
+                # _run_inner — same PROACTIVE design and same per-session
+                # concurrency guard. This start-of-turn pass is a SAFETY
+                # BACKSTOP (the post-turn background pass below keeps sessions
+                # under the threshold); we run it AND register this turn as
+                # active under the per-session compaction lock so a background
+                # pass can neither overlap our history read/write nor race our
+                # active-turn count. See ``src/core/compaction.py`` ("Proactive
+                # (background) compaction") for the invariant. Only on the first
+                # iteration so shell-reminder re-entries don't re-check.
                 if iter_count == 1 and session_id:
                     try:
-                        from src.core.compaction import should_compact, compact
-                        if should_compact(session_id, active_model, agent=self):
-                            await compact(
-                                session_id, active_model, self,
-                                on_status=_status,
-                            )
+                        from src.core import compaction
+                        async with compaction.session_lock(session_id):
+                            compaction.mark_turn_active(session_id)
+                            turn_registered = True
+                            if compaction.should_compact(
+                                session_id, active_model, agent=self,
+                            ):
+                                await compaction.compact(
+                                    session_id, active_model, self,
+                                    on_status=_status,
+                                )
                     except Exception as exc:  # noqa: BLE001 — never block a turn
                         elog(
                             "runtime.compaction.error",
@@ -2204,6 +2264,35 @@ class Agent:
                     )
         finally:
             self._release_model_slot(active_model)
+            # Balance the mark_turn_active above (streaming twin of _run_inner).
+            if turn_registered and session_id:
+                try:
+                    from src.core import compaction
+                    compaction.mark_turn_done(session_id)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        # PROACTIVE compaction: the streamed turn is done and its final run is
+        # persisted, so fold older history in the BACKGROUND now — the next
+        # message hits an already-compacted session. Fire-and-forget, fully
+        # guarded (see _run_inner for the full rationale, and
+        # compact_after_turn for the concurrency guard). After the ``finally``
+        # so mark_turn_done already ran and this fires only on normal
+        # completion; on error the run_stream() wrapper handles the turn.
+        if session_id:
+            try:
+                from src.core import compaction
+                compaction.compact_after_turn(
+                    session_id, active_model, self, on_status=_status,
+                )
+            except Exception as exc:  # noqa: BLE001 — never touch the reply
+                elog(
+                    "runtime.compaction.error",
+                    level="warning",
+                    session_id=session_id,
+                    error_type=type(exc).__name__,
+                    error=str(exc) or repr(exc),
+                )
 
         full_text = "".join(accumulated)
         # Prefer the real ModelResponse from the generate() fallback so

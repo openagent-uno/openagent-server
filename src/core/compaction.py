@@ -60,6 +60,7 @@ What compaction is NOT:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sqlite3
@@ -926,4 +927,213 @@ async def compact(
     }
 
 
-__all__ = ["should_compact", "compact"]
+# ── Proactive (background) compaction ─────────────────────────────────
+#
+# Reactive compaction (``should_compact`` → ``compact`` at the START of a turn)
+# makes the USER wait for an LLM summarisation before their reply lands. This
+# section moves that cost OFF the critical path: once a turn fully completes,
+# :func:`compact_after_turn` folds older history in the BACKGROUND, so the
+# NEXT turn's start-of-turn check almost always finds ``should_compact()``
+# already False and returns instantly. The bot stays "always available".
+#
+# The crux is concurrency safety. ``compact()`` does read → summarise (a slow
+# LLM round-trip) → write on ``sessions.runs``; a turn's ``generate()`` does
+# read-history → append-run on the SAME row. If the two interleave, the
+# background write rewrites ``[recap] + last_N`` from a snapshot that predates
+# the turn's freshly appended run — silently dropping it. That is the session
+# corruption the owner flagged. Three invariants, all keyed by ``session_id``,
+# make an overlap impossible:
+#
+#   1. Per-session lock (:func:`session_lock`). ``compact()`` runs ENTIRELY
+#      under it (both the reactive backstop below and every background pass),
+#      and a turn acquires it at its start to register itself active + run the
+#      backstop. A turn therefore cannot begin its history read/write until any
+#      in-flight background compaction has released the lock — i.e. fully
+#      committed its rewrite.
+#
+#   2. Active-turn count (:func:`mark_turn_active` / :func:`mark_turn_done`). A
+#      turn increments it (under the lock) at start and decrements it in its
+#      ``finally``. A background pass, once it holds the lock, SKIPS compaction
+#      whenever the count is > 0 — a turn is (or just became) active and will
+#      fire its OWN post-turn pass, so nothing is lost. Because the turn
+#      registers under the SAME lock, the background pass can never "miss" it:
+#      either it observes the increment (and skips), or the turn is still
+#      blocked behind the lock waiting for the pass to finish (and is safe).
+#
+#   3. In-flight dedup (``_INFLIGHT_SESSIONS``). At most one background
+#      compaction is queued/running per session at a time.
+#
+# Net effect: a background compaction NEVER overlaps a turn's history I/O for
+# the same session, and no two compactions for one session run at once — while
+# different sessions still compact fully in parallel.
+
+# Per-session mutex. Created on first use; opportunistically dropped by
+# ``mark_turn_done`` when a session goes fully idle so the map stays bounded
+# across the many short-lived (support-thread) sessions a long-running bot sees.
+_SESSION_LOCKS: dict[str, asyncio.Lock] = {}
+# In-progress turn count per session (a count, not a flag, so overlapping turns
+# on one session — should they ever happen — still bracket correctly).
+_ACTIVE_TURNS: dict[str, int] = {}
+# Sessions with a background compaction queued or running (dedup guard).
+_INFLIGHT_SESSIONS: set[str] = set()
+# Strong references to the background tasks themselves. ``asyncio.create_task``
+# keeps only a WEAK reference, so without this set the garbage collector can
+# drop a still-running compaction mid-flight (mirrors
+# ``scheduler._spawn_workflow`` and ``quality_monitor._INFLIGHT``).
+_INFLIGHT_TASKS: set[asyncio.Task[Any]] = set()
+
+
+def session_lock(session_id: str) -> asyncio.Lock:
+    """Return the per-session compaction lock, creating it on first use.
+
+    The turn loop wraps its start-of-turn registration + reactive backstop in
+    ``async with session_lock(sid):``; the background pass wraps its whole
+    should_compact→compact span in the same lock. That shared mutex is what
+    serialises a turn's history I/O against a background rewrite (invariant #1).
+    """
+    lock = _SESSION_LOCKS.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _SESSION_LOCKS[session_id] = lock
+    return lock
+
+
+def mark_turn_active(session_id: str) -> None:
+    """Register that a turn for *session_id* is about to read/write history.
+
+    MUST be called under ``session_lock(session_id)`` (so its ordering against
+    a background pass's active-count check is well-defined) and balanced by
+    exactly one :func:`mark_turn_done` in the turn's ``finally``.
+    """
+    _ACTIVE_TURNS[session_id] = _ACTIVE_TURNS.get(session_id, 0) + 1
+
+
+def mark_turn_done(session_id: str) -> None:
+    """Balance a prior :func:`mark_turn_active`. Clamps at 0.
+
+    When the session goes fully idle (no active turn, no queued/running
+    background pass, lock free) this also drops the per-session lock so
+    ``_SESSION_LOCKS`` stays bounded. That prune is safe because it runs
+    synchronously — there is no ``await`` between the checks and the ``pop``,
+    so no coroutine can be mid-acquire — and because every acquirer funnels
+    through ``session_lock`` (get-or-create), the next user of this session
+    simply mints a fresh lock. No two live locks for one session can coexist,
+    since at prune time nobody holds or is waiting on the old one.
+    """
+    n = _ACTIVE_TURNS.get(session_id, 0) - 1
+    if n > 0:
+        _ACTIVE_TURNS[session_id] = n
+        return
+    _ACTIVE_TURNS.pop(session_id, None)
+    if session_id in _INFLIGHT_SESSIONS:
+        return
+    lock = _SESSION_LOCKS.get(session_id)
+    if lock is not None and not lock.locked():
+        _SESSION_LOCKS.pop(session_id, None)
+
+
+def _turn_active(session_id: str) -> bool:
+    return _ACTIVE_TURNS.get(session_id, 0) > 0
+
+
+async def _run_background_compaction(
+    session_id: str, model: Any, agent: Any, on_status: Any | None,
+) -> None:
+    """Body of the post-turn background compaction task.
+
+    Holds the per-session lock across the whole should_compact→compact span
+    (invariant #1) and bails without compacting if a turn became active for
+    this session (invariant #2 — that turn runs its own post-turn pass). Every
+    failure is logged and swallowed: this runs detached from any turn, so an
+    exception here must never surface to a user or crash the loop.
+    """
+    slot_model = None
+    try:
+        # Keep the model alive across the (possibly multi-second) summariser
+        # call so a concurrent model swap/shutdown can't tear it down
+        # mid-summary. Guarded — a lightweight/fake agent (tests) need not
+        # implement the slot counter.
+        acquire = getattr(agent, "_acquire_model_slot", None)
+        if callable(acquire):
+            slot_model = acquire(model)
+
+        async with session_lock(session_id):
+            if _turn_active(session_id):
+                elog(
+                    "runtime.compaction.background_skipped",
+                    session_id=session_id,
+                    reason="turn_active",
+                )
+                return
+            if not should_compact(session_id, model, agent=agent):
+                return
+            elog("runtime.compaction.background_start", session_id=session_id)
+            await compact(session_id, model, agent, on_status=on_status)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — a detached task must never crash
+        elog(
+            "runtime.compaction.background_error",
+            level="warning",
+            session_id=session_id,
+            error_type=type(exc).__name__,
+            error=str(exc) or repr(exc),
+        )
+    finally:
+        release = getattr(agent, "_release_model_slot", None)
+        if callable(release) and slot_model is not None:
+            try:
+                release(slot_model)
+            except Exception:  # noqa: BLE001
+                pass
+        _INFLIGHT_SESSIONS.discard(session_id)
+
+
+def compact_after_turn(
+    session_id: str | None, model: Any, agent: Any,
+    *, on_status: Any | None = None,
+) -> asyncio.Task[Any] | None:
+    """Fire a background compaction for *session_id* AFTER a turn completed.
+
+    Fire-and-forget: schedules the work on the running loop and returns
+    immediately (the created ``Task`` is returned so tests can await it). The
+    heavy part — ``should_compact`` plus the summariser LLM round-trip — runs
+    ON that task, entirely off the turn's (the user's) critical path.
+
+    No-ops, allocating nothing, when: the feature flag is off, there is no
+    session id, no event loop is running (a sync caller), or a background
+    compaction is already queued/running for this session. ``should_compact``
+    is intentionally NOT evaluated here — it is evaluated inside the task under
+    the lock, so the hot path stays cheap and the decision is made against the
+    freshest persisted runs.
+
+    Call this only once the turn's final run has been persisted to
+    ``sessions.runs`` (i.e. after the last ``generate()`` returned), so the
+    background pass folds a complete, up-to-date history.
+    """
+    if not _flag_enabled() or not session_id:
+        return None
+    if session_id in _INFLIGHT_SESSIONS:
+        return None
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+    _INFLIGHT_SESSIONS.add(session_id)
+    task = loop.create_task(
+        _run_background_compaction(session_id, model, agent, on_status),
+        name=f"compaction:{session_id}",
+    )
+    _INFLIGHT_TASKS.add(task)
+    task.add_done_callback(_INFLIGHT_TASKS.discard)
+    return task
+
+
+__all__ = [
+    "should_compact",
+    "compact",
+    "compact_after_turn",
+    "session_lock",
+    "mark_turn_active",
+    "mark_turn_done",
+]
