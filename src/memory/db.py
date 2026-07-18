@@ -888,7 +888,11 @@ CREATE INDEX IF NOT EXISTS idx_evdel_started   ON event_deliveries(started_at);
 CREATE INDEX IF NOT EXISTS idx_evdel_status    ON event_deliveries(status);
 CREATE INDEX IF NOT EXISTS idx_evdel_external  ON event_deliveries(event_id, external_id);
 CREATE INDEX IF NOT EXISTS idx_evdel_unclaimed ON event_deliveries(claimed_at);
-CREATE INDEX IF NOT EXISTS idx_evdel_lease     ON event_deliveries(claim_expires);
+-- idx_evdel_lease ON event_deliveries(claim_expires) is created in
+-- _migrate_event_deliveries_lease, NOT here: claim_expires is added by that
+-- migration on a pre-existing DB, so indexing it in this base schema block —
+-- which runs BEFORE _apply_legacy_alters — crashes boot with
+-- "no such column: claim_expires". Create the index right after the ADD COLUMN.
 """
 
 
@@ -1179,6 +1183,17 @@ class MemoryDB:
                 "last_heartbeat_at": "REAL",
             },
         )
+        # Index the lease column HERE — the columns above now exist on BOTH a
+        # fresh DB (from the CREATE TABLE) and a pre-existing one (just ALTERed
+        # in). The base schema block deliberately does NOT index claim_expires,
+        # because it runs before this migration and would crash boot on an old
+        # DB ("no such column: claim_expires"). IF NOT EXISTS keeps it idempotent.
+        assert self._conn is not None
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_evdel_lease "
+            "ON event_deliveries(claim_expires)"
+        )
+        await self._conn.commit()
 
     async def _migrate_events_breaker(self) -> None:
         """Per-event circuit-breaker columns. Off by default (gated by
