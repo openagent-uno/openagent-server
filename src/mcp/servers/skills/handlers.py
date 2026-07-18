@@ -16,6 +16,7 @@ system prompt mid-session.
 """
 from __future__ import annotations
 
+import os
 import re
 import shutil
 from pathlib import Path
@@ -38,6 +39,45 @@ AGENT_PROVENANCE = "agent"
 
 def _skills_root() -> Path:
     return default_skills_path()
+
+
+def _db_path() -> str:
+    """Resolve the same ``openagent.db`` the writer used, so the semantic skill
+    cache lands beside the agent's other derived caches.
+
+    Mirrors ``vault_gate/recall.py:_db_path`` — env override first, then the
+    packaged default — so this in-process tool and the recall index agree on
+    which database keys the shared ``semantic_index_*.db`` cache."""
+    override = os.environ.get("OPENAGENT_DB_PATH")
+    if override:
+        return override
+    from src.core.paths import default_db_path
+
+    return str(default_db_path())
+
+
+def _semantic_skill_index():
+    """Return a ``SemanticIndex`` over the skills dir when an embedder is
+    configured, else ``None``.
+
+    ``None`` is the inert-by-default path: with no ``OPENAGENT_EMBEDDING_MODEL``
+    (the self-hosted default) ``resolve_embedder`` returns ``None`` and
+    ``skill_search`` degrades to the substring scan, byte-identically to before
+    this routing existed. The index is a rebuildable DERIVED cache — SKILL.md
+    stays the source of truth."""
+    try:
+        from src.core.config import load_config
+        from src.memory.semantic_index import SemanticIndex, resolve_embedder
+    except Exception:  # noqa: BLE001 — a missing numpy/module must not break search
+        return None
+    providers = (load_config() or {}).get("providers")
+    embedder = resolve_embedder(providers)
+    if embedder is None:
+        return None
+    try:
+        return SemanticIndex(_db_path(), skills_root=_skills_root(), embedder=embedder)
+    except Exception:  # noqa: BLE001 — degrade to substring on any open failure
+        return None
 
 
 def _registry() -> SkillsRegistry:
@@ -96,13 +136,52 @@ async def skill_view(name: str) -> dict:
 # ── skill_search ──────────────────────────────────────────────────────
 
 async def skill_search(query: str, limit: int = 20) -> dict:
-    """Find skills by a plain substring over name, description, AND body.
-    Use it when you don't know the exact skill name, or to discover which
-    skill covers a task. Returns metadata + a short snippet per hit; call
-    ``skill_view`` to read the full body of the one you want."""
-    q = (query or "").strip().lower()
+    """Find skills by MEANING when an embedding model is configured, else by a
+    plain substring over name, description, AND body. Use it when you don't know
+    the exact skill name, or to discover which skill covers a task — the
+    semantic path finds a skill by a PARAPHRASE the substring scan would miss.
+    Returns metadata per hit; call ``skill_view`` to read the full body of the
+    one you want."""
+    q = (query or "").strip()
+    # Semantic routing: only for a non-empty query and only when an embedder is
+    # active. An empty query (list-all) and the no-embedder case both fall
+    # through to the substring scan below, byte-identical to the original.
+    if q:
+        idx = _semantic_skill_index()
+        if idx is not None:
+            try:
+                idx.sync_skills()
+                hits = idx.search(q, scope="skills", limit=limit, min_score=0.0)
+            except Exception:  # noqa: BLE001 — endpoint down → keyword fallback
+                hits = None
+            finally:
+                try:
+                    idx.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            if hits:
+                reg = _registry()
+                results: list[dict] = []
+                for h in hits:
+                    meta = reg.get(h.get("name") or "")
+                    if meta is None:
+                        continue
+                    results.append({
+                        "name": meta.name,
+                        "description": meta.description,
+                        "category": meta.category,
+                        "matched_in": ["semantic"],
+                        "path": str(meta.path),
+                        "score": h.get("score"),
+                    })
+                    if len(results) >= limit:
+                        break
+                return {"query": query, "count": len(results), "results": results}
+            # semantic active but no hit (or endpoint down) → keyword still useful
+    # ── substring scan (unchanged; the only path when no embedder) ──
+    q = q.lower()
     reg = _registry()
-    results: list[dict] = []
+    results = []
     for meta in reg.skills():
         try:
             body = meta.path.read_text(errors="replace")

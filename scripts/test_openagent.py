@@ -100,6 +100,15 @@ _TEST_MODULES: tuple[str, ...] = (
     # exclusion from the frozen index. Pure-unit; sits by test_skills because
     # it extends the same subsystem.
     "test_skill_curator",
+    # The skill-distiller: the automatic WRITER half of the self-improvement
+    # loop (the curator is the consolidator). Pins the OFF-by-default seeding
+    # gate (skills.enabled AND skills.distiller_enabled), that the distiller and
+    # curator seed DISTINCT rows on independent toggles, and the CREATE-only
+    # layering encoded in the prompt (creates via skill_manage, never
+    # merges/archives; names its real signals — search_past_conversations +
+    # the vault_recall_stats OUTCOME_OK ledger + skill_search overlap check).
+    # Pure-unit; sits by test_skill_curator because it is the other half.
+    "test_skill_distiller",
     # Skills-Hub: pull SKILL.md skills from a shared git tap into the local
     # skills dir. Pins the pull round-trip (created_by:hub provenance +
     # hub_repo/hub_commit + .hub/lock.json + curator-safety), the safety

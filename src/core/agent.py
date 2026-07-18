@@ -590,8 +590,20 @@ def _get_recall_index(agent: Any) -> Any:
             vault_root = agent._resolve_vault_path()
         except Exception:  # noqa: BLE001
             vault_root = None
+        # Skills leg (Layer C): index the SKILL.md library so a written skill is
+        # discoverable by MEANING per turn. Wired ONLY when the skills subsystem
+        # is enabled — with skills off (the default) skills_root stays None, the
+        # index carries no skill leg, and recall is byte-identical to before.
+        skills_root = None
         try:
-            idx = SemanticIndex(db_path, vault_root=vault_root, embedder=embedder)
+            from src.core.config import skills_settings
+            if skills_settings(getattr(agent, "config", None) or {}).enabled:
+                skills_root = agent._resolve_skills_path()
+        except Exception:  # noqa: BLE001
+            skills_root = None
+        try:
+            idx = SemanticIndex(db_path, vault_root=vault_root,
+                                skills_root=skills_root, embedder=embedder)
         except Exception as exc:  # noqa: BLE001
             elog("auto_recall.index_open_error", level="warning",
                  error=str(exc) or type(exc).__name__)
@@ -704,7 +716,19 @@ def _format_recall_block(hits: list[dict], max_chars: int) -> str:
     lines = [header]
     for h in hits:
         score = h.get("score")
-        if h.get("kind") == "note":
+        kind = h.get("kind")
+        # A skill hit is an ACTION, not a note to read: surface it as a
+        # verify-framed one-liner pointing at ``skill_view`` so the model loads
+        # the written playbook before acting. Rendered inline in the same block.
+        if kind == "skill":
+            name = h.get("name") or ""
+            tag = f"similarity {score}" if score is not None else "match"
+            lines.append(
+                f"- a relevant SKILL exists: `{name}` — load it with "
+                f"`skill_view {name}` before acting  [{tag}]"
+            )
+            continue
+        if kind == "note":
             label = f"note `{h.get('path', '')}`"
             upd = h.get("updated")
             if upd:
@@ -806,6 +830,20 @@ def _recall_block(agent: Any, query: str, session_id: str | None = None) -> str:
             # authoritative rule is ADDED alongside the precedent, never instead.
             hits = [res[0]] + [h for h in hits
                                if (h.get("path") or "") != (res[0].get("path") or "")]
+    # Skills leg (Layer C): surface the single most relevant WRITTEN skill by
+    # MEANING, so a distilled skill is discoverable per turn — not only via the
+    # static index the model has to think to consult. A separate query over the
+    # skill_vectors table (independent of the note/session RRF above), thresholded
+    # on the same floor. Inert without an embedder (semantic_active False) or when
+    # skills are unindexed — so it adds nothing at defaults. The hit renders as a
+    # verify-framed "load it with skill_view" one-liner in the block below.
+    if semantic_active:
+        try:
+            skill_hits = idx.search(query, scope="skills", limit=1, min_score=floor)
+        except Exception:  # noqa: BLE001 — a skills miss must not block recall
+            skill_hits = []
+        if skill_hits:
+            hits = hits + [skill_hits[0]]
     # Inert: neither layer could run (no embedder AND no FTS) — byte-identical to
     # pre-recall, and nothing to record.
     if not semantic_active and not fts_used:

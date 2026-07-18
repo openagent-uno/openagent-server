@@ -1005,3 +1005,251 @@ async def t_rrf_merge_unit(ctx: TestContext) -> None:
     assert c["score"] is None and c.get("fts_matched") is True, \
         "FTS-only hit must have no cosine and be marked fts_matched"
     assert len(_rrf_merge(sem, fts, limit=2)) == 2, "limit not respected"
+
+
+# ── Layer C: semantic SKILL recall (SKILL.md indexed by MEANING) ──────
+# Gap 2: the file-backed skills subsystem gains semantic recall. sync_skills
+# embeds each SKILL.md into a THIRD SemanticIndex source; search(scope="skills")
+# finds a skill by a PARAPHRASE the substring scan misses; skill_search routes
+# through it when an embedder is active and degrades to the substring scan when
+# not; and _recall_block surfaces the top skill as a "load with skill_view" line.
+# SKILL.md stays the source of truth — skill_vectors is a rebuildable cache.
+
+
+def _write_skill(skills_root: Path, folder: str, name: str, description: str,
+                 body: str, *, category: str = "support",
+                 created_by: str = "agent", status: str | None = None) -> Path:
+    d = skills_root / folder
+    d.mkdir(parents=True, exist_ok=True)
+    fm = (f"---\nname: {name}\ndescription: {description}\n"
+          f"category: {category}\n")
+    if created_by:
+        fm += f"created_by: {created_by}\n"
+    if status:
+        fm += f"status: {status}\n"
+    fm += "---\n\n" + body + "\n"
+    (d / "SKILL.md").write_text(fm)
+    return d
+
+
+def _skills_dir(ctx: TestContext, tag: str) -> Path:
+    p = ctx.db_path.with_name(f"sr-{tag}-{uuid.uuid4().hex[:8]}-skills")
+    p.mkdir(exist_ok=True)
+    return p
+
+
+@test("semantic_recall", "sync_skills embeds SKILL.md; scope=skills matches a PARAPHRASE")
+async def t_skill_index_semantic(ctx: TestContext) -> None:
+    """The headline for Gap 2: a skill about a 'customer refund complaint' is
+    found by the query 'angry unhappy client' — zero shared words, same meaning.
+    Also proves the leg is opt-in (scope='all' never surfaces a skill), archived
+    skills are not indexed, and the sync is incremental + rebuildable."""
+    from src.memory.semantic_index import SemanticIndex
+
+    db, idx_path, vault = _paths(ctx, "skillidx")
+    skills = _skills_dir(ctx, "skillidx")
+    try:
+        _write_skill(skills, "refunds", "refund-playbook",
+                     "how to handle a customer complaint about a refund",
+                     "Offer the refund and apologise to the customer.")
+        _write_skill(skills, "bread", "sourdough-guide",
+                     "bake a good loaf of bread", "Proof the starter overnight.")
+        # An archived skill must NOT be indexed (parity with the frozen index).
+        _write_skill(skills, "old", "stale-refund-note",
+                     "an old refund complaint skill", "Outdated.",
+                     status="archived")
+
+        idx = SemanticIndex(db, vault_root=vault, skills_root=str(skills),
+                            index_path=idx_path, embedder=ConceptEmbedder())
+        stats = idx.sync()
+        assert "skills" in stats, "sync() dropped the skills leg despite a skills_root"
+        assert stats["skills"].embedded == 2, (
+            f"expected 2 live skills embedded (archived excluded): {stats['skills']}")
+        assert idx.stats()["skills"] == 2
+
+        # PARAPHRASE: shares NO words with the refund skill, only the concept.
+        hits = idx.search("angry unhappy client", scope="skills", limit=3, min_score=0.4)
+        assert hits, f"SEMANTIC MISS on a clear skill paraphrase: {hits}"
+        assert hits[0]["name"] == "refund-playbook", hits
+        assert hits[0]["kind"] == "skill" and hits[0]["score"] >= 0.4, hits
+
+        # The archived skill never surfaces even at min_score 0.
+        names = {h["name"] for h in idx.search("refund complaint", scope="skills",
+                                               limit=10, min_score=0.0)}
+        assert "stale-refund-note" not in names, "an archived skill leaked into recall"
+
+        # scope="all" is byte-identical to before skills existed — NO skill hits.
+        allhits = idx.search("angry unhappy client", scope="all", limit=10, min_score=0.0)
+        assert all(h.get("kind") != "skill" for h in allhits), (
+            "scope='all' surfaced a skill — it must stay vault+sessions only")
+
+        # Incremental: nothing changed → nothing re-embedded.
+        again = idx.sync()
+        assert again["skills"].embedded == 0 and again["skills"].unchanged == 2, again
+
+        # Touch one skill → only it re-embeds.
+        _time.sleep(0.01)
+        _write_skill(skills, "refunds", "refund-playbook",
+                     "how to handle a customer complaint about a refund",
+                     "Offer the refund FAST and apologise to the customer.")
+        third = idx.sync()
+        assert third["skills"].embedded == 1 and third["skills"].updated == 1, third
+        idx.close()
+
+        # Rebuildable: nuke the cache, it rebuilds from the SKILL.md files.
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                Path(str(idx_path) + suffix).unlink()
+            except FileNotFoundError:
+                pass
+        idx2 = SemanticIndex(db, vault_root=vault, skills_root=str(skills),
+                             index_path=idx_path, embedder=ConceptEmbedder())
+        assert idx2.sync()["skills"].embedded == 2, "skills leg did not rebuild"
+        assert idx2.search("angry unhappy client", scope="skills", min_score=0.4)
+        idx2.close()
+    finally:
+        _cleanup(db, idx_path, vault, skills)
+
+
+@test("semantic_recall", "sync_skills / scope=skills are INERT without an embedder")
+async def t_skill_index_inert(ctx: TestContext) -> None:
+    """The §17 fallback for the skills leg: no model → sync_skills embeds nothing
+    and search(scope='skills') returns [] — no second opaque store, byte-identical
+    to before the leg existed."""
+    from src.memory.semantic_index import SemanticIndex
+
+    db, idx_path, vault = _paths(ctx, "skillinert")
+    skills = _skills_dir(ctx, "skillinert")
+    try:
+        _write_skill(skills, "refunds", "refund-playbook",
+                     "customer refund complaint", "body")
+        idx = SemanticIndex(db, vault_root=vault, skills_root=str(skills),
+                            index_path=idx_path, embedder=None)
+        assert idx.active is False
+        st = idx.sync()
+        assert st["skills"].embedded == 0, st
+        assert idx.stats()["skills"] == 0
+        assert idx.search("anything", scope="skills") == []
+        idx.close()
+    finally:
+        _cleanup(db, idx_path, vault, skills)
+
+
+@test("semantic_recall", "skill_search routes semantic with an embedder, substring without")
+async def t_skill_search_routing(ctx: TestContext) -> None:
+    """Gap 2 routing: with an embedder, skill_search finds a paraphrase hit the
+    substring scan MISSES; with no embedder, it is the byte-identical substring
+    scan (no 'semantic' matched_in, no score key)."""
+    import src.mcp.servers.skills.handlers as handlers
+    import src.memory.semantic_index as si_mod
+
+    skills = _skills_dir(ctx, "search")
+    db = ctx.db_path.with_name(f"sr-search-{uuid.uuid4().hex[:8]}.db")
+    prev_skills = os.environ.get("OPENAGENT_SKILLS_PATH")
+    prev_db = os.environ.get("OPENAGENT_DB_PATH")
+    prev_model = os.environ.get("OPENAGENT_EMBEDDING_MODEL")
+    orig_resolve = si_mod.resolve_embedder
+    try:
+        _write_skill(skills, "refunds", "refund-playbook",
+                     "how to handle a customer complaint about a refund",
+                     "Offer the refund and apologise.")
+        os.environ["OPENAGENT_SKILLS_PATH"] = str(skills)
+        os.environ["OPENAGENT_DB_PATH"] = str(db)
+
+        # ── (a) NO embedder → substring scan, byte-identical to the original ──
+        os.environ.pop("OPENAGENT_EMBEDDING_MODEL", None)
+        # The paraphrase shares no full substring with the skill → substring MISS.
+        miss = await handlers.skill_search("angry unhappy client")
+        assert miss["count"] == 0 and miss["results"] == [], (
+            f"substring scan should MISS the paraphrase: {miss}")
+        # A literal term IS found by the substring scan, tagged by field (not
+        # 'semantic'), and with NO score key — proof it is the original path.
+        kw = await handlers.skill_search("refund")
+        assert kw["count"] == 1, kw
+        r0 = kw["results"][0]
+        assert r0["name"] == "refund-playbook", kw
+        assert r0["matched_in"] != ["semantic"] and "matched_in" in r0, r0
+        assert "score" not in r0, "substring result must not carry a semantic score"
+
+        # ── (b) WITH an embedder → semantic path finds the paraphrase ──
+        os.environ["OPENAGENT_EMBEDDING_MODEL"] = "fake:concept-v1"
+        si_mod.resolve_embedder = lambda *a, **k: ConceptEmbedder()
+        hit = await handlers.skill_search("angry unhappy client")
+        assert hit["count"] == 1, f"semantic path missed the paraphrase: {hit}"
+        h0 = hit["results"][0]
+        assert h0["name"] == "refund-playbook", hit
+        assert h0["matched_in"] == ["semantic"], h0
+        assert "score" in h0 and h0["score"] >= 0.4, h0
+    finally:
+        si_mod.resolve_embedder = orig_resolve
+        for k, v in (("OPENAGENT_SKILLS_PATH", prev_skills),
+                     ("OPENAGENT_DB_PATH", prev_db),
+                     ("OPENAGENT_EMBEDDING_MODEL", prev_model)):
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        _cleanup(db, skills)
+
+
+def _prime_recall_cache_with_skills(db_path: Path, vault: Path, skills: Path) -> Any:
+    """Pre-build a fake-embedder index that ALSO carries a skills_root, sync it
+    (so skill_vectors are populated), and install it in the hook's cache — the
+    skills-leg analogue of ``_prime_recall_cache``."""
+    import src.core.agent as agent_mod
+    from src.memory.semantic_index import SemanticIndex
+
+    idx = SemanticIndex(db_path, vault_root=vault, skills_root=str(skills),
+                        embedder=ConceptEmbedder())
+    idx.sync()
+    agent_mod._RECALL_INDEX_CACHE[str(db_path)] = idx
+    return idx
+
+
+@test("semantic_recall", "_recall_block surfaces the top skill as a 'skill_view' line")
+async def t_recall_block_skills_leg(ctx: TestContext) -> None:
+    """Gap 2's per-turn payoff: a written skill becomes discoverable by MEANING
+    on the turn path. With a fake embedder + a relevant skill, recall injects a
+    verify-framed 'load it with skill_view <name>' line; with no embedder, the
+    turn text is byte-identical."""
+    import src.core.agent as agent_mod
+
+    db, idx_path, vault = _paths(ctx, "skillleg")
+    skills = _skills_dir(ctx, "skillleg")
+    _clear_recall_env()
+    try:
+        _write_skill(skills, "refunds", "refund-playbook",
+                     "how to handle a customer complaint about a refund",
+                     "Offer the refund and apologise.")
+        d = await _open_db(db)
+        await d.close()
+        idx = _prime_recall_cache_with_skills(db, vault, skills)
+
+        os.environ["OPENAGENT_AUTO_RECALL_ENABLED"] = "1"
+        os.environ["OPENAGENT_AUTO_RECALL_WARM_BUDGET"] = "0"  # already synced
+        os.environ["OPENAGENT_AUTO_RECALL_MIN_SCORE"] = "0.5"
+        os.environ["OPENAGENT_AUTO_RECALL_HYBRID"] = "0"  # isolate the skills leg
+
+        out = await agent_mod._with_recall(
+            _fake_agent(db, vault), "sess",
+            "the client is angry and unhappy", "USER MESSAGE")
+
+        assert out != "USER MESSAGE", "the skills leg surfaced nothing"
+        assert out.endswith("USER MESSAGE"), "user message must stay at the end"
+        assert "<system-reminder>" in out and "</system-reminder>" in out
+        assert "skill_view refund-playbook" in out, (
+            f"recall did not point at skill_view: {out!r}")
+        assert "load it" in out.lower(), "skill line not framed as an action"
+        idx.close()
+
+        # No embedder → the skills leg is inert; the turn text is unchanged.
+        agent_mod._RECALL_INDEX_CACHE.pop(str(db), None)
+        os.environ.pop("OPENAGENT_EMBEDDING_MODEL", None)
+        out2 = await agent_mod._with_recall(
+            _fake_agent(db, vault), "sess",
+            "the client is angry and unhappy", "USER MESSAGE")
+        assert out2 == "USER MESSAGE", f"skills leg fired with no embedder: {out2!r}"
+    finally:
+        agent_mod._RECALL_INDEX_CACHE.pop(str(db), None)
+        _clear_recall_env()
+        _cleanup(db, idx_path, vault, skills)

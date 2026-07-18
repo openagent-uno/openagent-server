@@ -359,6 +359,27 @@ CREATE TABLE IF NOT EXISTS session_vectors (
     vec         BLOB NOT NULL,
     embedded_at REAL NOT NULL
 );
+
+-- One row per embedded SKILL (``<skills_root>/<slug>/SKILL.md``). Same
+-- ``(mtime, byte_size)`` invalidation pair as ``vault_vectors``, so a
+-- touch-free skills dir re-syncs on a stat scan with zero embedding calls.
+-- This is a DERIVED cache: the SKILL.md Markdown stays the sole source of
+-- truth (the file-based skills subsystem is NOT moved under the vault — it is
+-- only indexed here), and deleting this table rebuilds it from those files.
+-- ``path`` is the skills-root-relative SKILL.md path (the invalidation key);
+-- ``name`` is the frontmatter name a search hit surfaces so the agent can
+-- ``skill_view`` it. Archived skills are not embedded (parity with the frozen
+-- index render), so an archived skill drops out on the next sync.
+CREATE TABLE IF NOT EXISTS skill_vectors (
+    path        TEXT PRIMARY KEY,
+    mtime       REAL,
+    byte_size   INTEGER,
+    name        TEXT,
+    category    TEXT,
+    dim         INTEGER NOT NULL,
+    vec         BLOB NOT NULL,
+    embedded_at REAL NOT NULL
+);
 """
 
 
@@ -400,10 +421,12 @@ class SemanticIndex:
 
     def __init__(self, db_path: str | Path, *,
                  vault_root: str | Path | None = None,
+                 skills_root: str | Path | None = None,
                  index_path: str | Path | None = None,
                  embedder: Optional[Embedder] = None):
         self.db_path = str(Path(db_path).expanduser())
         self.vault_root = Path(vault_root).expanduser() if vault_root else None
+        self.skills_root = Path(skills_root).expanduser() if skills_root else None
         self.index_path = (Path(index_path) if index_path
                            else default_semantic_index_path(self.db_path))
         self.embedder = embedder
@@ -450,7 +473,8 @@ class SemanticIndex:
                     or meta.get("schema") != _SCHEMA_VERSION
                     or meta.get("embed_model") != model):
                 self._conn.executescript(
-                    "DELETE FROM vault_vectors; DELETE FROM session_vectors;"
+                    "DELETE FROM vault_vectors; DELETE FROM session_vectors; "
+                    "DELETE FROM skill_vectors;"
                 )
                 for k, v in (("source_db", src), ("schema", _SCHEMA_VERSION),
                              ("embed_model", model)):
@@ -707,13 +731,155 @@ class SemanticIndex:
         stats.elapsed_ms = int((time.monotonic() - t0) * 1000)
         return stats
 
+    # ── sync: skills ──────────────────────────────────────────────────
+
+    def sync_skills(self, *, force: bool = False,
+                    max_items: int = _MAX_ITEMS_PER_SYNC) -> SyncStats:
+        """Reconcile the skill vectors with the SKILL.md files on disk.
+
+        THIRD source, mirroring ``sync_vault``: walk ``<skills_root>/*/SKILL.md``
+        (the same one-level glob the ``SkillsRegistry`` uses — NOT the recursive
+        vault walk), embed ``name + description + body``, and gate re-embedding
+        on the ``(mtime, byte_size)`` pair. A vanished OR newly-archived skill
+        drops its vector (parity with the frozen index render, which also hides
+        archived skills), so a retired skill stops being findable by meaning.
+
+        The SKILL.md Markdown stays the source of truth — this only INDEXES the
+        file-based subsystem, it does not move it under the vault. Skills are few
+        (unlike a 2,100-note vault), so the whole set is parsed each sync and the
+        stat/read is negligible; the ``(mtime, byte_size)`` gate still keeps
+        embedding calls to only what changed.
+        """
+        t0 = time.monotonic()
+        stats = SyncStats()
+        if not self.active or not self.skills_root:
+            stats.elapsed_ms = int((time.monotonic() - t0) * 1000)
+            return stats
+
+        from src.memory.vault.parser import (
+            FrontmatterSyntaxError,
+            load_frontmatter_yaml,
+            split_frontmatter,
+        )
+
+        root = self.skills_root
+        if not root.is_dir():
+            # A configured-but-absent skills dir drops every stored vector, the
+            # same way a vanished note does — never leave a stale hit behind.
+            with self._lock:
+                existing = [r["path"] for r in self._conn.execute(
+                    "SELECT path FROM skill_vectors")]
+                for rel in existing:
+                    self._conn.execute(
+                        "DELETE FROM skill_vectors WHERE path = ?", (rel,))
+                    stats.deleted += 1
+                self._conn.commit()
+            stats.elapsed_ms = int((time.monotonic() - t0) * 1000)
+            return stats
+
+        with self._lock:
+            existing = {
+                r["path"]: (r["mtime"], r["byte_size"])
+                for r in self._conn.execute(
+                    "SELECT path, mtime, byte_size FROM skill_vectors")
+            }
+            seen: set[str] = set()
+            # (rel, name, category, digest, mtime, size)
+            stale: list[tuple[str, str, str, str, float, int]] = []
+            for md in sorted(root.glob("*/SKILL.md")):
+                try:
+                    st = md.stat()
+                except OSError:
+                    continue
+                try:
+                    content = md.read_text(errors="replace")
+                except OSError:
+                    continue
+                raw_fm, body = split_frontmatter(content)
+                if raw_fm is None:
+                    continue
+                try:
+                    fm = load_frontmatter_yaml(raw_fm)
+                except FrontmatterSyntaxError:
+                    continue
+                if not isinstance(fm, dict):
+                    continue
+                name = str(fm.get("name") or "").strip()
+                if not name:
+                    continue
+                # Archived skills are retired: not embedded, and any prior vector
+                # drops below (they never enter ``seen``). Parity with
+                # ``SkillsRegistry.render_skills_index``.
+                if str(fm.get("status") or "").strip().lower() == "archived":
+                    continue
+                rel = md.relative_to(root).as_posix()
+                seen.add(rel)
+                prev = existing.get(rel)
+                if (not force and prev is not None
+                        and abs(prev[0] - st.st_mtime) < 1e-6
+                        and prev[1] == st.st_size):
+                    stats.unchanged += 1
+                    continue
+                description = str(fm.get("description") or "").strip()
+                category = str(fm.get("category") or "").strip() or "general"
+                digest = "\n".join(x for x in (name, description, body) if x)
+                stale.append((rel, name, category, _prep_text(digest),
+                              st.st_mtime, st.st_size))
+
+            for rel in existing.keys() - seen:
+                self._conn.execute(
+                    "DELETE FROM skill_vectors WHERE path = ?", (rel,))
+                stats.deleted += 1
+
+            stale.sort(key=lambda t: t[4], reverse=True)  # newest first
+            if len(stale) > max_items:
+                stats.pending = len(stale) - max_items
+                stale = stale[:max_items]
+
+            if stale:
+                texts = [t[3] for t in stale]
+                try:
+                    blobs = self._embed_batch(texts)
+                except EmbeddingError as exc:
+                    self._log_embed_error("skills", exc)
+                    stats.errored = True
+                    self._conn.commit()
+                    stats.elapsed_ms = int((time.monotonic() - t0) * 1000)
+                    return stats
+                for (rel, name, category, _digest, mtime, size), (blob, dim) in zip(
+                        stale, blobs):
+                    self._conn.execute(
+                        "INSERT INTO skill_vectors "
+                        "(path, mtime, byte_size, name, category, dim, vec, "
+                        " embedded_at) VALUES (?,?,?,?,?,?,?,?) "
+                        "ON CONFLICT(path) DO UPDATE SET "
+                        "  mtime=excluded.mtime, byte_size=excluded.byte_size, "
+                        "  name=excluded.name, category=excluded.category, "
+                        "  dim=excluded.dim, vec=excluded.vec, "
+                        "  embedded_at=excluded.embedded_at",
+                        (rel, mtime, size, name, category, dim, blob, time.time()),
+                    )
+                    stats.embedded += 1
+                    stats.added += 1 if rel not in existing else 0
+                    stats.updated += 1 if rel in existing else 0
+            self._conn.commit()
+        stats.elapsed_ms = int((time.monotonic() - t0) * 1000)
+        return stats
+
     def sync(self, *, force: bool = False,
              max_items: int = _MAX_ITEMS_PER_SYNC) -> dict[str, SyncStats]:
-        """Sync both sources. Returns per-source stats; a no-op when inert."""
-        return {
+        """Sync every source. Returns per-source stats; a no-op when inert.
+
+        The ``skills`` leg is present only when a ``skills_root`` was wired, so
+        the returned dict is byte-identical (``{vault, sessions}``) for an index
+        built without one — the recall index and the memory-search subprocess."""
+        out = {
             "vault": self.sync_vault(force=force, max_items=max_items),
             "sessions": self.sync_sessions(force=force, max_items=max_items),
         }
+        if self.skills_root:
+            out["skills"] = self.sync_skills(force=force, max_items=max_items)
+        return out
 
     def _log_embed_error(self, source: str, exc: Exception) -> None:
         try:
@@ -758,9 +924,12 @@ class SemanticIndex:
                include_prefixes: Optional[Sequence[str]] = None,
                exclude_prefixes: Optional[Sequence[str]] = None
                ) -> list[dict[str, Any]]:
-        """Cosine-nearest vault notes / sessions to ``query``, best first.
+        """Cosine-nearest vault notes / sessions / skills to ``query``, best first.
 
-        ``scope`` is ``"all"`` | ``"vault"`` | ``"sessions"``. Returns
+        ``scope`` is ``"all"`` | ``"vault"`` | ``"sessions"`` | ``"skills"``.
+        ``"all"`` covers vault + sessions ONLY (byte-identical to before skills
+        existed); ``"skills"`` is an explicit, separate leg over the SKILL.md
+        index so wiring skills in never perturbs note/session recall. Returns
         ``[]`` when inert, on an empty query, or when nothing clears
         ``min_score`` — a weak match is NO match, which is what keeps auto-recall
         from injecting noise. Each hit carries a ``score`` (cosine, 0..1) so the
@@ -769,8 +938,8 @@ class SemanticIndex:
         ``include_prefixes`` / ``exclude_prefixes`` scope the NOTE side by
         vault-relative path prefix (keep only / drop matches) — the corpus knob
         that lets support recall skip dev-ops notes. Both default to no filter
-        (unchanged behaviour). Sessions carry no path and are governed by
-        ``scope`` alone.
+        (unchanged behaviour). Sessions and skills carry no vault path and are
+        governed by ``scope`` alone.
         """
         q = (query or "").strip()
         if not self.active or not q:
@@ -782,9 +951,19 @@ class SemanticIndex:
             return []
         qunit = list(_unit(qv))  # unit float list — numpy-free, works for both paths
 
+        # ``all`` stays vault+sessions (skills are an opt-in, explicit scope), so
+        # note/session recall is byte-identical to before this leg existed.
         want = {"vault", "sessions"} if scope == "all" else {scope}
         hits: list[dict[str, Any]] = []
         with self._lock:
+            if "skills" in want:
+                for r, s in self._sims_for("skill_vectors", qunit):
+                    if float(s) >= min_score:
+                        hits.append({
+                            "kind": "skill", "score": round(float(s), 4),
+                            "name": r["name"] or "", "category": r["category"] or "",
+                            "path": r["path"],
+                        })
             if "vault" in want:
                 inc = tuple(p for p in (include_prefixes or ()) if p)
                 exc = tuple(p for p in (exclude_prefixes or ()) if p)
@@ -816,8 +995,9 @@ class SemanticIndex:
         with self._lock:
             v = self._conn.execute("SELECT COUNT(*) FROM vault_vectors").fetchone()[0]
             s = self._conn.execute("SELECT COUNT(*) FROM session_vectors").fetchone()[0]
+            k = self._conn.execute("SELECT COUNT(*) FROM skill_vectors").fetchone()[0]
         return {
-            "notes": int(v), "sessions": int(s),
+            "notes": int(v), "sessions": int(s), "skills": int(k),
             "active": self.active,
             "model": self.embedder.model_id if self.embedder else None,
         }

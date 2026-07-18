@@ -125,6 +125,23 @@ class SkillsSettings:
         ``None`` falls back to a weekly default (Sunday 04:00) — parity with
         ``dream_mode.cron`` / ``auto_update.check_interval``.
 
+    distiller_enabled:
+        Master switch for the self-improving skill-distiller scheduled task —
+        the automatic WRITER that reviews recent successful sessions and
+        CREATES new agent-authored skills. Reads ``skills.distiller_enabled``
+        (default ``False``). SECOND gate on top of ``enabled``, exactly like
+        ``curator_enabled``: the distiller only seeds/enables when BOTH are
+        true, so with the default the ``scheduled_tasks`` table gains no row and
+        the system is byte-identical to a build without the feature. Distinct
+        toggle from ``curator_enabled`` — distiller CREATES, curator
+        CONSOLIDATES; either half may run without the other.
+
+    distiller_schedule:
+        Optional cron for the distiller run. Reads ``skills.distiller_schedule``.
+        ``None`` falls back to a daily default (03:00) — the distiller mines new
+        patterns on a shorter cadence than the weekly curator that consolidates
+        them.
+
     hub_enabled:
         Master switch for the Skills-Hub (pull SKILL.md skills from a shared
         git tap). Reads ``skills.hub.enabled`` (default ``False``). SECOND gate
@@ -143,6 +160,8 @@ class SkillsSettings:
     path: str | None = None
     curator_enabled: bool = False
     curator_schedule: str | None = None
+    distiller_enabled: bool = False
+    distiller_schedule: str | None = None
     hub_enabled: bool = False
     hub_taps: tuple[str, ...] = ()
 
@@ -158,6 +177,7 @@ def skills_settings(config: dict) -> SkillsSettings:
         raw = {}
     path = raw.get("path")
     schedule = raw.get("curator_schedule")
+    distiller_schedule = raw.get("distiller_schedule")
     hub_raw = raw.get("hub") or {}
     if not isinstance(hub_raw, dict):
         hub_raw = {}
@@ -168,6 +188,8 @@ def skills_settings(config: dict) -> SkillsSettings:
         path=str(path) if path else None,
         curator_enabled=bool(raw.get("curator_enabled", False)),
         curator_schedule=str(schedule) if schedule else None,
+        distiller_enabled=bool(raw.get("distiller_enabled", False)),
+        distiller_schedule=str(distiller_schedule) if distiller_schedule else None,
         hub_enabled=bool(hub_raw.get("enabled", False)),
         hub_taps=hub_taps,
     )

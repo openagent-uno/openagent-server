@@ -56,6 +56,7 @@ from src.core.builtin_tasks import (
     AUTO_UPDATE_TASK_NAME,
     DREAM_MODE_TASK_NAME,
     SKILL_CURATOR_TASK_NAME,
+    SKILL_DISTILLER_TASK_NAME,
 )
 from src.memory.schedule import default_timezone_name
 
@@ -302,6 +303,104 @@ pass is a valid outcome.
 
 Remember: seed and user skills are never yours to touch. The only skills
 that leave this pass changed are ones stamped `created_by: agent`.
+"""
+
+# Daily by default (03:00). The distiller MINES new patterns, so it runs on a
+# shorter cadence than the weekly curator that CONSOLIDATES them: a new recurring
+# resolution should become a skill within a day of recurring, and the curator's
+# weekly pass then folds any near-duplicates together. Overridable via
+# ``skills.distiller_schedule``.
+SKILL_DISTILLER_DEFAULT_CRON = "0 3 * * *"
+
+SKILL_DISTILLER_PROMPT = """\
+You are running as the Skill Distiller — OpenAgent's self-improvement pass
+that WRITES new skills. This is the automatic authoring half of the loop:
+you run on a schedule while the agent is otherwise idle, look back over the
+work that actually went well, and turn a *recurring, reusable* resolution
+into a brand-new SKILL.md so the next agent that hits the same task starts
+from a playbook instead of re-deriving it. Be generous in what you look at
+but stingy in what you write: a skill earns its place only by being both
+NOVEL and RECURRING. When in doubt, write nothing and log why.
+
+## Your lane — you CREATE, you never consolidate
+
+There are two skill-improvement passes and they are cleanly layered:
+   - YOU (the distiller) only CREATE new skills, via
+     `skill_manage(action="create", ...)`. Every skill you write is stamped
+     `created_by: agent` automatically — that is what makes it yours and the
+     curator's, never a seed/user skill.
+   - The skill-curator is the OTHER pass. IT merges overlapping skills,
+     archives stale or redundant ones, and rewrites bodies. That is NOT your
+     job. Do NOT call `skill_manage` with `action` of `update`, `archive`, or
+     `remove`. If you find two skills that ought to be merged, that is a note
+     for the curator — leave them both and say so in your log.
+
+## Mission 1 — Find what actually recurs and actually worked
+
+Distil from EVIDENCE of success, not a hunch. You have three real signals
+OpenAgent already collects; use them, don't guess:
+
+   - `search_past_conversations` — keyword recall over what was SAID in recent
+     sessions. Probe for repeated task shapes: the same kind of request, the
+     same failure hit more than once, the same fix applied again. A pattern
+     that shows up in ONE session is a one-off; one that shows up across
+     several is a candidate.
+   - Your own semantic recall — when a task reminds you of earlier ones,
+     follow that thread. Two conversations that reached the same resolution by
+     different wording are exactly the recurring pattern worth a skill, and
+     keyword search alone will miss them.
+   - `vault_recall_stats` — the outcome ledger. It records which notes were
+     recalled and how those runs ended (the `ok` count is the `OUTCOME_OK`
+     tally). A note with several recalls and a high share of `ok` runs marks a
+     resolution that keeps getting reused AND keeps landing well — a strong
+     distillation target. Heed its `caveat`: this is ASSOCIATION not
+     causation, and a note with a tiny `scorable` count is noise, so READ the
+     underlying sessions before you trust the number.
+
+Build a short shortlist of candidate patterns, each backed by more than one
+successful session.
+
+## Mission 2 — Reject anything that already exists
+
+Before writing ANY skill, search the existing library for overlap — this is
+the one check that keeps you from flooding the index with near-duplicates
+(which is precisely the mess the curator then has to clean up):
+   - Run `skill_search` with the candidate's key terms AND a paraphrase of
+     what it does. Read any hit with `skill_view`.
+   - If a skill already covers this task — even under a different name or with
+     slightly different steps — do NOT create a second one. Skip it and log
+     the overlap so the curator can improve the existing skill if yours had a
+     better step. Adding value to an existing skill is the curator's job, not
+     a new file.
+   - Only a candidate with NO existing coverage survives to Mission 3.
+
+## Mission 3 — Write the new skill
+
+For each surviving candidate, write ONE skill with
+`skill_manage(action="create", name=..., description=..., category=...,
+body=...)`:
+   - `name`: short, task-shaped, unique (Mission 2 proved it's not taken).
+   - `description`: one line — what task it's for, so the index entry alone
+     tells a future agent when to open it.
+   - `category`: reuse an existing category when the task fits one (check the
+     index), so related skills group together.
+   - `body`: the actual playbook — the concrete steps, the tools to call, the
+     edge cases you saw recur, and a real example drawn from the sessions you
+     distilled from. Write what you WISH had existed the first time. Do not
+     include your own `---` frontmatter block; it is generated for you.
+   Keep each skill to a single coherent task. If a candidate is really two
+   tasks, write two skills or write none — never a grab-bag.
+
+## Log what you did
+
+Write a concise note via the `vault` MCP under
+`skill-distiller-logs/skill-distiller-YYYY-MM-DD.md` (frontmatter
+`type: skill-distiller-log`, `date:` today): which patterns you found and the
+sessions that evidenced them, which you created (with names), which you
+skipped for overlap (naming the existing skill), and any merge the curator
+should look at. If you created nothing, log that too — a pass that writes no
+skill because nothing new recurred is a correct, valid outcome, not a
+failure. Writing a marginal skill just to have written one is the failure.
 """
 
 
@@ -1553,6 +1652,7 @@ class AgentServer:
         await self._sync_dream_mode(scheduler)
         await self._sync_auto_update(scheduler)
         await self._sync_skill_curator(scheduler)
+        await self._sync_skill_distiller(scheduler)
 
         await scheduler.start()
         self._scheduler = scheduler
@@ -1615,13 +1715,15 @@ class AgentServer:
             gw.broadcast_resource_sync("scheduled_task", "updated")
 
         async def _skills(patch: dict) -> None:
-            # The ``skills`` section carries the curator toggle
-            # (``skills.curator_enabled``); re-sync the scheduled task so a
-            # runtime flip enables/disables it without a restart. (Toggling
-            # ``skills.enabled`` itself still needs a restart to (de)register
-            # the skills MCP — this only governs the curator task.)
+            # The ``skills`` section carries BOTH the curator toggle
+            # (``skills.curator_enabled``) and the distiller toggle
+            # (``skills.distiller_enabled``); re-sync both scheduled tasks so a
+            # runtime flip of either enables/disables it without a restart.
+            # (Toggling ``skills.enabled`` itself still needs a restart to
+            # (de)register the skills MCP — this only governs the two tasks.)
             self.config["skills"] = patch or {}
             await self._sync_skill_curator(scheduler)
+            await self._sync_skill_distiller(scheduler)
             gw.broadcast_resource_sync("scheduled_task", "updated")
 
         gw._config_change_callbacks["dream_mode"] = _dream
@@ -1867,6 +1969,66 @@ class AgentServer:
                 await _orig(task)
 
         self._install_task_hook(scheduler, SKILL_CURATOR_TASK_NAME, _curator_run)
+
+    async def _sync_skill_distiller(self, scheduler) -> None:
+        """Seed/enable the ``skill-distiller`` scheduled task — the automatic
+        WRITER of the self-improvement loop. Gated on BOTH ``skills.enabled``
+        and ``skills.distiller_enabled`` (default OFF).
+
+        Sibling of ``_sync_skill_curator`` and identical in discipline: like the
+        curator (and unlike dream-mode / auto-update), it has no manual-fire
+        entry point, so when it is OFF it seeds NOTHING — with the default config
+        the ``scheduled_tasks`` table gains no distiller row and the scheduler is
+        byte-identical to a build without this feature. A row left behind by an
+        earlier enable is parked disabled (not deleted) when the operator turns
+        it off at runtime.
+
+        Layering: the distiller and curator are DISTINCT tasks that both live in
+        the ``skills`` config section but flip independently — the distiller
+        CREATES new skills, the curator CONSOLIDATES them, and either half may
+        run without the other.
+        """
+        from src.core.config import skills_settings
+
+        settings = skills_settings(self.config)
+        enabled = settings.enabled and settings.distiller_enabled
+
+        if not enabled:
+            # OFF → seed nothing. Disable a surviving row from an earlier enable
+            # so the scheduler stops firing it.
+            tasks = await self.agent._db.get_tasks()
+            existing = next(
+                (t for t in tasks if t["name"] == SKILL_DISTILLER_TASK_NAME), None,
+            )
+            if existing is not None and existing["enabled"]:
+                await scheduler.disable_task(existing["id"])
+            self._install_task_hook(scheduler, SKILL_DISTILLER_TASK_NAME, None)
+            return
+
+        cron_expr = settings.distiller_schedule or SKILL_DISTILLER_DEFAULT_CRON
+        # Same timezone treatment as dream mode / the curator: an untagged cron
+        # evaluates in UTC, so inherit the box's configured zone (falls back to
+        # UTC) so a "03:00" run lands overnight local, not mid-morning.
+        distiller_tz = default_timezone_name()
+
+        await self._sync_scheduled_task(
+            scheduler,
+            name=SKILL_DISTILLER_TASK_NAME,
+            enabled=True,
+            cron_expr=cron_expr,
+            prompt=SKILL_DISTILLER_PROMPT,
+            timezone=distiller_tz,
+        )
+
+        async def _distiller_run(task, _orig):
+            if task["name"] == SKILL_DISTILLER_TASK_NAME:
+                elog("skill_distiller.start")
+                await _orig(task)
+                elog("skill_distiller.done")
+            else:
+                await _orig(task)
+
+        self._install_task_hook(scheduler, SKILL_DISTILLER_TASK_NAME, _distiller_run)
 
 
 # ── Auto-update helpers (used by AgentServer and the manual `update` command) ──
