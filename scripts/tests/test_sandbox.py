@@ -1,5 +1,5 @@
 """Opt-in exec sandbox — the local default must stay byte-identical, and the
-docker backend must route correctly and leak no host environment.
+docker / ssh backends must route correctly and leak no host environment.
 
 Like ``test_safety``, these drive the REAL ``handlers.shell_exec`` callsite
 rather than asserting things about ``backends`` in isolation: the whole value of
@@ -7,17 +7,26 @@ this feature is "with no config, nothing changed", and the only honest way to
 prove that is to run a command through the same funnel production uses and watch
 it behave exactly as before. The docker daemon is never required — routing is
 proven with a fake backend, and the real ``DockerBackend.build_spawn`` is a pure
-function that builds an argv without touching docker.
+function that builds an argv without touching docker. The ssh backend is proven
+the same way: its ``build_spawn`` argv is asserted purely (no connection), and a
+live-localhost integration test exercises the whole path when passwordless ssh
+to ``localhost`` is available, skipping cleanly when it is not.
 """
 from __future__ import annotations
 
+import getpass
+import json
 import os
+import shlex
+import socket
+import time
 from contextlib import contextmanager
 
-from ._framework import TestContext, test
+from ._framework import TestContext, TestSkip, test
 
 _BACKEND_ENV = "OPENAGENT_SANDBOX_BACKEND"
 _DOCKER_CFG_ENV = "OPENAGENT_SANDBOX_DOCKER"
+_SSH_CFG_ENV = "OPENAGENT_SANDBOX_SSH"
 
 
 @contextmanager
@@ -236,3 +245,149 @@ async def t_unknown_backend_fails_safe(ctx: TestContext) -> None:
 
     assert out["exit_code"] == 0
     assert "still-runs" in out["stdout"]
+
+
+# ── The ssh path: routing (real class) + a pure real build_spawn ─────
+
+
+@test("sandbox", "ssh config routes through the ssh backend and builds an ssh argv")
+async def t_ssh_routing_and_build_spawn(ctx: TestContext) -> None:
+    """No connection touched: the ssh sub-config must select the REAL
+    ``SSHBackend`` and its ``build_spawn`` must produce a pure ``ssh`` client
+    argv targeting ``user@host``, running the command via ``bash -lc``, and
+    carrying the docker-client's spawn discipline (cwd=None, no host pgroup).
+    """
+    from src.mcp.servers.shell import backends
+
+    with _sandbox_env(
+        OPENAGENT_SANDBOX_BACKEND="ssh",
+        OPENAGENT_SANDBOX_SSH='{"host": "sandbox.example", "user": "agent", "port": 2022}',
+    ):
+        selected = backends.select_backend()
+        assert selected.name == "ssh", "ssh config must select the ssh backend"
+        assert isinstance(selected, backends.SSHBackend), "must be the real SSHBackend"
+        assert selected.cfg.host == "sandbox.example", "ssh sub-config host must be parsed"
+        assert selected.cfg.user == "agent", "ssh sub-config user must be parsed"
+        assert selected.cfg.port == 2022, "ssh sub-config port must be parsed"
+
+        # Simulate a prepared ControlMaster (test seam; no live connection) so
+        # build_spawn can run — mirrors the docker test setting ``_cid``.
+        selected._ctl_path = "/tmp/oassh-test/cm"
+        spec = selected.build_spawn(command="echo x", cwd="/ignored-on-host", env=None)
+
+    assert spec.argv[0] == selected.ssh_exe, f"argv[0] must be the ssh exe, got {spec.argv[0]!r}"
+    assert spec.argv[0].endswith("ssh"), "argv head must be the ssh client"
+    assert "agent@sandbox.example" in spec.argv, f"argv must target user@host: {spec.argv}"
+    assert "ControlPath=/tmp/oassh-test/cm" in spec.argv, "argv must reuse the ControlMaster socket"
+    # Non-default port surfaces as a ``-p 2022`` flag pair.
+    pi = spec.argv.index("-p")
+    assert spec.argv[pi + 1] == "2022", f"non-default port must be passed: {spec.argv}"
+    joined = " ".join(spec.argv)
+    assert "bash -lc" in joined, f"remote command must be run via a login bash: {joined}"
+    # The command is shlex-quoted as ONE argv element so it survives ssh's
+    # space-join + remote re-parse (a bare token would word-split remotely).
+    assert shlex.quote("echo x") in spec.argv, f"command must be shlex-quoted: {spec.argv}"
+    assert spec.cwd is None, "ssh client must not carry a host cwd"
+    assert spec.start_new_session is False, "no host process group for the ssh client"
+
+    # build_spawn before prepare() must fail loudly, never silently spawn nothing.
+    unprepared = backends.SSHBackend(backends.SSHConfig(host="h", user="u"))
+    try:
+        unprepared.build_spawn(command="echo x", cwd=None, env=None)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("build_spawn before prepare() must raise, not fabricate an argv")
+
+
+@test("sandbox", "unknown ssh-like backend name fails safe to local and still runs")
+async def t_unknown_ssh_backend_fails_safe(ctx: TestContext) -> None:
+    """A typo for ``ssh`` must degrade to local, exactly like the ``dcoker``
+    case — never raise, never arm ssh on a name we don't recognise."""
+    from src.mcp.servers.shell import backends, handlers
+
+    _reset_shell_hub()
+    with _sandbox_env(OPENAGENT_SANDBOX_BACKEND="sssh"):  # typo for "ssh"
+        assert backends.select_backend().name == "local", (
+            "an unrecognised backend name must select local, not raise or arm ssh"
+        )
+        out = await handlers.shell_exec("echo still-runs-ssh", session_id="s_typo_ssh")
+
+    assert out["exit_code"] == 0
+    assert "still-runs-ssh" in out["stdout"]
+
+
+@test("sandbox", "live localhost ssh backend runs a command on the remote side")
+async def t_ssh_live_localhost(ctx: TestContext) -> None:
+    """End-to-end through the REAL ``handlers.shell_exec``: with the ssh backend
+    pointed at ``localhost``, a command must execute on the remote side and its
+    written marker file must read back locally with exactly the bytes it wrote
+    (localhost == same fs), proving the whole prepare→build_spawn→spawn path.
+    ``cleanup()`` must then drop the ControlMaster.
+
+    Guarded twice: if localhost:22 is not listening, or the handshake fails for
+    lack of a passwordless key/agent, the test SKIPS with the reason rather than
+    failing — the live path is opportunistic, the pure routing test above is the
+    hard contract.
+    """
+    from src.mcp.servers.shell import backends, handlers
+
+    # Guard 1 — port reachability. Skip cleanly if nothing answers on :22.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(2.0)
+        try:
+            s.connect(("127.0.0.1", 22))
+        except OSError as e:
+            raise TestSkip(f"localhost:22 not reachable ({e}); ssh live test skipped")
+
+    user = getpass.getuser()
+    marker = f"oa-ssh-live-{os.getpid()}-{int(time.time() * 1000)}"
+    marker_file = os.path.join("/tmp", f"{marker}.txt")
+
+    _reset_shell_hub()
+    try:
+        with _sandbox_env(
+            OPENAGENT_SANDBOX_BACKEND="ssh",
+            OPENAGENT_SANDBOX_SSH=json.dumps({"host": "localhost", "user": user}),
+        ):
+            backend = backends.get_exec_backend()
+            assert backend.name == "ssh", "localhost config must select the ssh backend"
+
+            # The remote command writes the marker file, then prints its hostname.
+            cmd = (
+                f"printf '%s' {shlex.quote(marker)} > {shlex.quote(marker_file)}; hostname"
+            )
+            try:
+                out = await handlers.shell_exec(cmd, session_id="s_ssh_live")
+            except backends.SandboxUnavailableError as e:
+                # Guard 2 — handshake failed (no passwordless key/agent for
+                # localhost). Opportunistic path: skip, don't fail.
+                raise TestSkip(
+                    f"localhost ssh handshake failed ({e}); passwordless key/agent "
+                    "for localhost is required to run the live ssh test"
+                )
+
+            assert out["exit_code"] == 0, f"remote command must succeed: {out}"
+            # Proof it ran on the REMOTE side: the file the remote command wrote
+            # exists locally with the exact bytes (same fs on localhost).
+            assert os.path.exists(marker_file), (
+                "remote command did not create the marker file — it may not have run remotely"
+            )
+            with open(marker_file, encoding="utf-8") as f:
+                assert f.read() == marker, (
+                    "marker file contents mismatch — the command did not run as written "
+                    "(a quoting bug would corrupt this)"
+                )
+            assert out["stdout"].strip(), "hostname output expected from the remote side"
+
+            # cleanup() must drop the ControlMaster socket and clear the handle.
+            ctl_path = backend._ctl_path
+            await backend.cleanup()
+            assert backend._ctl_path is None, "cleanup must clear the ControlMaster handle"
+            assert not (ctl_path and os.path.exists(ctl_path)), (
+                "ControlMaster socket must be gone after ssh -O exit"
+            )
+    finally:
+        if os.path.exists(marker_file):
+            os.remove(marker_file)
+        backends._reset_backend_for_tests()

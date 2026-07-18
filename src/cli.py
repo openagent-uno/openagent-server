@@ -545,6 +545,100 @@ def serve(ctx, agent_dir: str | None, channel: tuple[str, ...], no_auto_init: bo
     asyncio.run(_serve())
 
 
+@main.command("acp")
+@click.argument("agent_dir", required=False, default=None)
+@click.pass_context
+def acp(ctx, agent_dir: str | None):
+    """Expose this agent over ACP (Agent Client Protocol) on stdio.
+
+    Speaks the Agent Client Protocol as a stdin/stdout JSON-RPC server so an
+    ACP-capable editor (Zed, etc.) can drive OpenAgent as a coding agent. It
+    reuses the SAME turn machinery as ``POST /api/chat`` — a batched
+    ``StreamSession`` per ACP session — and streams the reply back as ACP
+    ``session_update`` notifications.
+
+    Opt-in: requires the ``acp`` extra (``pip install openagent[acp]``).
+
+    stdout is the JSON-RPC frame channel and MUST stay byte-clean — every log
+    line and any stray print goes to stderr.
+    """
+    import os
+    import sys
+
+    # The ACP SDK is an OPTIONAL extra. Import it lazily so the base install
+    # (which never runs this subcommand) stays byte-identical and importing
+    # ``src.cli`` never pulls it in. A missing extra is a clean, actionable
+    # message on stderr — not a traceback.
+    try:
+        import acp as _acp
+    except ImportError:
+        print(
+            "openagent acp requires the 'acp' extra. Install it with:\n"
+            "    pip install openagent[acp]\n"
+            "(or: uv pip install agent-client-protocol)",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    # fd 1 is the JSON-RPC frame channel and MUST stay byte-clean. Agent
+    # startup fans out background warmup tasks (Piper/Whisper prefetch,
+    # OpenRouter catalog) and spawns MCP child processes — any of which can
+    # write to fd 1 at any time, corrupting the stream. A Python-level
+    # ``redirect_stdout`` can't catch native writes, child processes, or
+    # background tasks that finish after it exits. So redirect fd 1 → fd 2 for
+    # the WHOLE process (inherited by every child) and hand the ACP transport a
+    # saved dup of the real stdout. After this, everything "printed" — logs,
+    # stray prints, child output — lands on stderr; only the transport reaches
+    # the real channel.
+    _real_stdout_fd = os.dup(1)
+    os.dup2(2, 1)
+
+    if agent_dir is not None and paths.get_agent_dir() is None:
+        _setup_agent_dir(agent_dir)
+        setup_logging(verbose=ctx.obj.get("verbose", False))
+        _reload_context_config(ctx, str(paths.default_config_path()))
+
+    from src.core.server import _build_agent
+
+    config = dict(ctx.obj["config"])
+    config["_config_path"] = str(Path(ctx.obj["config_path"]).resolve())
+
+    async def _run_acp():
+        from acp.stdio import stdio_streams
+
+        from src.acp.agent import OpenAgentACPAgent
+
+        # Build + initialize the same Agent object /api/chat runs on. Any
+        # stdout it (or its background tasks / MCP children) produces now goes
+        # to fd 2 (stderr) thanks to the redirect above.
+        oa_agent = _build_agent(config)
+        await oa_agent.initialize()
+        acp_agent = OpenAgentACPAgent(oa_agent)
+
+        # Bind the ACP stdio transport to the SAVED real stdout fd, not fd 1.
+        # stdio_streams() reads ``sys.stdout`` for connect_write_pipe, so point
+        # it at the saved fd just for that call, then restore it (→ fd 1 → fd 2)
+        # so any later print/log stays off the channel. ``_real_channel`` is
+        # kept referenced for the process lifetime so its fd isn't GC-closed
+        # out from under the transport.
+        _real_channel = os.fdopen(_real_stdout_fd, "wb", buffering=0)
+        _prev_stdout = sys.stdout
+        sys.stdout = _real_channel  # type: ignore[assignment]
+        try:
+            reader, writer = await stdio_streams()
+        finally:
+            sys.stdout = _prev_stdout
+
+        # run_agent wires AgentSideConnection(agent, input_stream=writer,
+        # output_stream=reader) and listens until the client disconnects.
+        await _acp.run_agent(acp_agent, input_stream=writer, output_stream=reader)
+
+    try:
+        asyncio.run(_run_acp())
+    except KeyboardInterrupt:
+        pass
+
+
 @main.command("migrate")
 @click.option("--to", "dest", required=True, help="Target agent directory")
 def migrate_cmd(dest: str):

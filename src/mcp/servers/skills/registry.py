@@ -78,6 +78,16 @@ class SkillMeta:
         archived``). Archived skills are kept out of the active index."""
         return (self.status or "").strip().lower() == "archived"
 
+    @property
+    def is_hub(self) -> bool:
+        """True when this skill was pulled from a Skills-Hub tap (frontmatter
+        ``created_by: hub``). Hub skills are owned by their external upstream:
+        because the curator boundary is ``created_by == "agent"``, they are
+        automatically excluded from :meth:`SkillsRegistry.agent_authored` and
+        the curator can never merge or archive one. This property is a LABEL
+        only — nothing in the index render depends on it."""
+        return (self.created_by or "").strip().lower() == "hub"
+
 
 def parse_skill_file(md_path: Path) -> SkillMeta | None:
     """Parse one ``SKILL.md`` into a :class:`SkillMeta`, or ``None`` when it

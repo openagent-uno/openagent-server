@@ -14,13 +14,15 @@ a drop-in, opt-in swap and the host variant stays byte-for-byte what it was.
 OFF BY DEFAULT, AND THAT IS LOAD-BEARING
 ----------------------------------------
 :func:`select_backend` returns :class:`LocalBackend` unless
-``OPENAGENT_SANDBOX_BACKEND`` is exactly ``docker`` (and any unrecognised value
-reads as local, the same fail-safe as ``safety.approvals``). ``LocalBackend``
-reproduces the exact spawn tuple ``start()`` built before this module existed,
-so with no config the code path is unchanged. The docker path never activates
-implicitly — misconfiguration fails *closed* (an unavailable daemon/image
-raises in :meth:`DockerBackend.prepare`) rather than silently falling back to
-running on the host, which would defeat the whole point of turning it on.
+``OPENAGENT_SANDBOX_BACKEND`` names an opt-in backend (``docker`` or ``ssh``);
+any unrecognised value reads as local, the same fail-safe as
+``safety.approvals``. ``LocalBackend`` reproduces the exact spawn tuple
+``start()`` built before this module existed, so with no config the code path is
+unchanged. An opt-in path never activates implicitly — misconfiguration fails
+*closed* (an unavailable daemon/image raises in :meth:`DockerBackend.prepare`;
+an unreachable host raises in :meth:`SSHBackend.prepare`) rather than silently
+falling back to running on the host, which would defeat the whole point of
+turning it on.
 """
 from __future__ import annotations
 
@@ -31,6 +33,8 @@ import logging
 import os
 import shlex
 import shutil
+import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
@@ -44,6 +48,7 @@ logger = logging.getLogger(__name__)
 # uses the same channel for consistency.
 _BACKEND_ENV = "OPENAGENT_SANDBOX_BACKEND"
 _DOCKER_CFG_ENV = "OPENAGENT_SANDBOX_DOCKER"
+_SSH_CFG_ENV = "OPENAGENT_SANDBOX_SSH"
 
 # Label stamped on every sandbox container so orphans (a crashed process that
 # never reached cleanup) can be reaped with ``docker rm -f $(docker ps -aq
@@ -373,14 +378,221 @@ class DockerBackend:
         await self._exec(["rm", "-rf", path])
 
 
+# ── SSH (opt-in) backend ─────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class SSHConfig:
+    """Parsed ``sandbox.ssh`` config. The REMOTE host IS the sandbox — there is
+    no image to harden and no filesystem to sync (parity with DockerBackend's
+    empty tmpfs workdir); the operator is responsible for the remote account's
+    isolation. ``host``/``user`` are required in practice; an empty ``host``
+    fails closed in :meth:`SSHBackend.prepare` rather than degrading to local."""
+
+    host: str = ""
+    user: str = ""
+    port: int = 22
+    key_path: str | None = None
+    login_shell: bool = True        # True → remote ``bash -lc`` (login shell)
+    workdir: str | None = None      # remote cwd to ``cd`` into before each command
+
+
+def load_ssh_config() -> SSHConfig:
+    """Build an :class:`SSHConfig` from ``OPENAGENT_SANDBOX_SSH`` (JSON).
+
+    Mirrors :func:`load_sandbox_config`: only consulted for the ssh backend
+    (opt-in), so malformed JSON raises rather than falling back — a broken
+    opt-in config must fail closed, not silently run on the host.
+    """
+    raw = os.environ.get(_SSH_CFG_ENV)
+    data = json.loads(raw) if raw else {}
+    return SSHConfig(
+        host=str(data.get("host") or ""),
+        user=str(data.get("user") or ""),
+        port=int(data.get("port", SSHConfig.port)),
+        key_path=(str(data["key_path"]) if data.get("key_path") else None),
+        login_shell=bool(data.get("login_shell", True)),
+        workdir=(str(data["workdir"]) if data.get("workdir") else None),
+    )
+
+
+class SSHBackend:
+    """Run each command on a REMOTE host over ``ssh``, multiplexed through one
+    long-lived ControlMaster connection opened on first use.
+
+    The remote host is the sandbox: there is no file sync (parity with the
+    docker backend's ephemeral tmpfs workdir). :meth:`prepare` opens the master
+    and FAILS CLOSED (:class:`SandboxUnavailableError`) if the host is
+    unreachable — it never falls back to running on the local host, which would
+    defeat the isolation the operator asked for. :meth:`build_spawn` produces an
+    ``ssh`` client argv that reuses the master; :meth:`cleanup` drops it with
+    ``ssh -O exit``.
+    """
+
+    name = "ssh"
+
+    def __init__(self, cfg: SSHConfig) -> None:
+        self.cfg = cfg
+        # Resolve now so build_spawn stays pure (no connection needed to build
+        # the argv). Falls back to the bare name if ssh isn't on PATH; prepare()
+        # is where an actually-missing ssh fails loudly.
+        self.ssh_exe = shutil.which("ssh") or "ssh"
+        self._ctl_dir: str | None = None
+        self._ctl_path: str | None = None
+
+    @property
+    def _target(self) -> str:
+        return f"{self.cfg.user}@{self.cfg.host}"
+
+    def _endpoint_opts(self) -> list[str]:
+        """The ``-p``/``-i`` flags shared by prepare/build_spawn/cleanup."""
+        opts: list[str] = []
+        if self.cfg.port != 22:
+            opts += ["-p", str(self.cfg.port)]
+        if self.cfg.key_path:
+            opts += ["-i", self.cfg.key_path]
+        return opts
+
+    async def prepare(self) -> None:
+        if self._ctl_path is not None:
+            return  # idempotent — one ControlMaster per process
+        if not self.cfg.host or not self.cfg.user:
+            raise SandboxUnavailableError(
+                "ssh sandbox backend is enabled but host/user are not configured "
+                f"(host={self.cfg.host!r}, user={self.cfg.user!r})"
+            )
+        ctl_dir = tempfile.mkdtemp(prefix="oassh-")
+        ctl_path = os.path.join(ctl_dir, "cm")
+        argv = [
+            self.ssh_exe,
+            "-o", "BatchMode=yes",                       # never prompt — fail instead
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ControlMaster=yes",
+            "-o", f"ControlPath={ctl_path}",
+            "-o", "ControlPersist=60",                   # keep master ~60s past last use
+            "-o", "ConnectTimeout=10",
+            *self._endpoint_opts(),
+            self._target,
+            "true",
+        ]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError as e:
+            shutil.rmtree(ctl_dir, ignore_errors=True)
+            raise SandboxUnavailableError(
+                f"ssh executable not found ({self.ssh_exe!r}); the ssh sandbox "
+                "backend is enabled but ssh is not installed"
+            ) from e
+        _out, err = await proc.communicate()
+        if proc.returncode != 0:
+            shutil.rmtree(ctl_dir, ignore_errors=True)
+            raise SandboxUnavailableError(
+                f"ssh master connection to {self._target} failed "
+                f"(rc={proc.returncode}): {err.decode('utf-8', 'replace').strip()}"
+            )
+        self._ctl_dir = ctl_dir
+        self._ctl_path = ctl_path
+        elog("sandbox.ssh.prepared", host=self.cfg.host, user=self.cfg.user)
+
+    def build_spawn(
+        self, *, command: str, cwd: str | None, env: dict[str, str] | None
+    ) -> SpawnSpec:
+        if self._ctl_path is None:
+            raise RuntimeError(
+                "SSHBackend.build_spawn called before prepare() — no ControlMaster"
+            )
+        # Optionally cd into the configured remote workdir first. cwd (the host
+        # tool's local dir) is meaningless on the remote, exactly as it is for
+        # docker; the remote working dir comes from cfg.workdir, not from cwd.
+        inner = command
+        if self.cfg.workdir:
+            inner = f"cd {shlex.quote(self.cfg.workdir)} && {command}"
+        # ssh CONCATENATES its command args with spaces and the remote login
+        # shell re-parses the result, so the command element is ``shlex.quote``d:
+        # the literal quotes survive the join and the remote shell sees exactly
+        # ``bash -lc '<command>'`` — one intact argument, no word-splitting.
+        flag = "-lc" if self.cfg.login_shell else "-c"
+        argv = [
+            self.ssh_exe,
+            "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", f"ControlPath={self._ctl_path}",       # reuse the master
+            *self._endpoint_opts(),
+            self._target,
+            "bash", flag, shlex.quote(inner),
+        ]
+        # env: for the local ssh CLIENT, not the remote (which gets the login
+        # shell's own environment). cwd=None: the client needs no host cwd.
+        # start_new_session=False: the spawned process is the ssh CLIENT — a host
+        # process group buys nothing, and killpg on it reaps the client, NOT the
+        # remote process tree (carried over from the docker-exec client; see
+        # kill() limitation). A per-command ``env`` is merged into the client env
+        # for parity with the other backends.
+        proc_env = os.environ.copy()
+        if env:
+            proc_env.update(env)
+        return SpawnSpec(
+            argv=argv,
+            env=proc_env,
+            cwd=None,
+            start_new_session=False,
+        )
+
+    async def cleanup(self) -> None:
+        if self._ctl_path is None:
+            return
+        ctl_path, self._ctl_path = self._ctl_path, None
+        ctl_dir, self._ctl_dir = self._ctl_dir, None
+        argv = [
+            self.ssh_exe,
+            "-o", f"ControlPath={ctl_path}",
+            *self._endpoint_opts(),
+            "-O", "exit",                                # tell the master to quit
+            self._target,
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, err = await proc.communicate()
+        if proc.returncode != 0:
+            # Best-effort at teardown: log loudly but do not raise — shutdown
+            # must complete. ControlPersist expires the master on its own.
+            logger.warning(
+                "ssh -O exit for %s failed: %s",
+                self._target, err.decode("utf-8", "replace").strip(),
+            )
+        else:
+            elog("sandbox.ssh.removed", host=self.cfg.host, user=self.cfg.user)
+        if ctl_dir:
+            shutil.rmtree(ctl_dir, ignore_errors=True)
+
+
 # ── Selection + process-wide memoization ─────────────────────────────────
 
 # Also the test seam: tests monkeypatch ``_BACKENDS["docker"] = FakeDocker`` to
 # exercise routing without a daemon. Any non-local class here is constructed
-# with a :class:`DockerConfig` (see select_backend), so a fake must accept one.
+# with its config object (see select_backend / _CONFIG_LOADERS), so a fake must
+# accept one.
 _BACKENDS: dict[str, type] = {
     "local": LocalBackend,
     "docker": DockerBackend,
+    "ssh": SSHBackend,
+}
+
+# Per-backend config loader, keyed the same as ``_BACKENDS``. A backend WITHOUT
+# an entry here is constructed with no argument. Keeping this a table (rather
+# than an ``if name == "docker"``) is what lets ``select_backend`` stay generic
+# as backends are added, while preserving the fake-docker test seam: a fake
+# injected under ``"docker"``/``"ssh"`` is still handed the parsed config.
+_CONFIG_LOADERS: dict[str, Callable[[], object]] = {
+    "docker": load_sandbox_config,
+    "ssh": load_ssh_config,
 }
 
 
@@ -395,8 +607,10 @@ def select_backend() -> ExecBackend:
     cls = _BACKENDS.get(name)
     if cls is None or cls is LocalBackend:
         return LocalBackend()
-    # Non-local (docker or a test-injected fake): hand it the parsed config.
-    return cls(load_sandbox_config())
+    # Non-local (docker / ssh / a test-injected fake): hand it the parsed config
+    # for its backend name. A backend without a registered loader takes none.
+    loader = _CONFIG_LOADERS.get(name)
+    return cls(loader()) if loader else cls()
 
 
 _backend_singleton: ExecBackend | None = None

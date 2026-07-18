@@ -124,11 +124,27 @@ class SkillsSettings:
         Optional cron for the curator run. Reads ``skills.curator_schedule``.
         ``None`` falls back to a weekly default (Sunday 04:00) — parity with
         ``dream_mode.cron`` / ``auto_update.check_interval``.
+
+    hub_enabled:
+        Master switch for the Skills-Hub (pull SKILL.md skills from a shared
+        git tap). Reads ``skills.hub.enabled`` (default ``False``). SECOND gate
+        on top of ``enabled``, mirroring ``curator_enabled``: the ``skill_hub_*``
+        tools are only EXPOSED when BOTH ``enabled`` and ``hub_enabled`` are
+        true. With the default the skills toolkit exposes exactly its three
+        original tools and the system is byte-identical to a build without hub.
+
+    hub_taps:
+        Optional list of default git taps (remotes) to advertise. Reads
+        ``skills.hub.taps`` (default empty). Purely informational today — a
+        ``skill_hub_pull`` still names its own tap — so an empty list changes
+        nothing.
     """
     enabled: bool = False
     path: str | None = None
     curator_enabled: bool = False
     curator_schedule: str | None = None
+    hub_enabled: bool = False
+    hub_taps: tuple[str, ...] = ()
 
 
 def skills_settings(config: dict) -> SkillsSettings:
@@ -142,11 +158,18 @@ def skills_settings(config: dict) -> SkillsSettings:
         raw = {}
     path = raw.get("path")
     schedule = raw.get("curator_schedule")
+    hub_raw = raw.get("hub") or {}
+    if not isinstance(hub_raw, dict):
+        hub_raw = {}
+    taps = hub_raw.get("taps")
+    hub_taps = tuple(str(t) for t in taps) if isinstance(taps, (list, tuple)) else ()
     return SkillsSettings(
         enabled=bool(raw.get("enabled", False)),
         path=str(path) if path else None,
         curator_enabled=bool(raw.get("curator_enabled", False)),
         curator_schedule=str(schedule) if schedule else None,
+        hub_enabled=bool(hub_raw.get("enabled", False)),
+        hub_taps=hub_taps,
     )
 
 

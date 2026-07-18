@@ -53,7 +53,38 @@ def build_runtime_toolkit() -> Any:
             description=description, category=category,
         )
 
-    return Toolkit(
-        name="skills",
-        tools=[skill_view, skill_search, skill_manage],
-    )
+    tools = [skill_view, skill_search, skill_manage]
+
+    # Skills-Hub tools are a SECOND gate on top of ``skills.enabled``: they are
+    # only EXPOSED when ``skills.hub.enabled`` is also true (mirrors how the
+    # curator's scheduled task is only seeded when ``skills.curator_enabled``).
+    # With hub off the toolkit is byte-identical to the three-tool original —
+    # the hub tools never enter the tool list, so the schema the model sees is
+    # unchanged.
+    from src.core.config import load_config, skills_settings
+
+    if skills_settings(load_config()).hub_enabled:
+        from src.mcp.servers.skills import hub
+
+        async def skill_hub_pull(tap: str, force: bool = False) -> dict:
+            """Pull SKILL.md skills from a shared git *tap* into your skills
+            dir. ``tap`` is any git remote (``https://``, ``git@…``, or
+            ``file://…``). The remote is shallow-cloned into quarantine, every
+            skill is safety-scanned, and only the ones that pass are installed —
+            each stamped ``created_by: hub`` (so the curator leaves it alone)
+            with its source ``hub_repo`` / ``hub_commit``. A malicious skill is
+            refused: ``dangerous`` always, ``caution`` unless ``force=True``.
+            New/updated skills appear in the skills index on the next
+            boot/reload."""
+            return await hub.skill_hub_pull(tap=tap, force=force)
+
+        async def skill_hub_list() -> dict:
+            """List the hub skills installed locally (``created_by: hub``),
+            each with the source repo / commit / content hash it was pinned to
+            in ``.hub/lock.json``. Use it to see what shared playbooks are
+            installed and exactly where they came from."""
+            return await hub.skill_hub_list()
+
+        tools = tools + [skill_hub_pull, skill_hub_list]
+
+    return Toolkit(name="skills", tools=tools)

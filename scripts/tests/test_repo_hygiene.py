@@ -184,6 +184,15 @@ _SMOKE_IMPORT_SKIP: frozenset[str] = frozenset({
     # and harmless (the federation MCP simply isn't available there).
     "src.mcp.servers.agent_federation.adapters",
     "src.mcp.servers.agent_federation.backend",
+    # ACP adapter — imports the optional ``agent-client-protocol`` SDK
+    # (the ``[acp]`` extra) at module top because ``OpenAgentACPAgent``
+    # subclasses ``acp.Agent``. Absent the extra (base install / CI) these
+    # raise ModuleNotFoundError, which is expected: the adapter is only
+    # reachable via ``openagent acp``, which lazily imports the SDK and
+    # errors cleanly if it's missing. Same rationale as the federation
+    # adapters above. (When the extra IS installed, test_acp exercises them.)
+    "src.acp.agent",
+    "src.acp.events",
 })
 
 

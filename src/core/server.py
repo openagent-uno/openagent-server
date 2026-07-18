@@ -433,6 +433,13 @@ def _build_agent(config: dict) -> Agent:
         os.environ["OPENAGENT_SANDBOX_DOCKER"] = json.dumps(
             _sandbox_cfg.get("docker") or {}
         )
+    elif _sandbox_backend == "ssh":
+        # Same rule for the ssh backend: the remote host IS the sandbox, so the
+        # ssh sub-config (host/user/port/key_path) is only serialised when ssh is
+        # actually selected. An unreachable host fails closed in prepare().
+        os.environ["OPENAGENT_SANDBOX_SSH"] = json.dumps(
+            _sandbox_cfg.get("ssh") or {}
+        )
 
     # ``mcps.install_policy`` — gates REGISTERING an MCP, which is the act that
     # hands a third party's argv this agent's whole environment. Exported as

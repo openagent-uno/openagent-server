@@ -213,6 +213,16 @@ safety:
 # daemon or image is unavailable the shell tool FAILS (it never silently falls
 # back to the host), because falling back would defeat the isolation you asked
 # for. Requires a working docker daemon on the host.
+#
+# ``ssh`` runs each command on a REMOTE host over ssh, multiplexed through one
+# ControlMaster connection opened on first use. The remote host IS the sandbox:
+# there is NO file sync (parity with docker's ephemeral tmpfs workdir) — the
+# remote account's isolation is yours to provision. If the host is unreachable
+# the shell tool FAILS at connect time (it never silently falls back to the
+# local host). NOTE: the spawned process is the ssh CLIENT, so a killed/timed-out
+# command reaps the client — the remote process tree may keep running (same
+# limitation as the docker-exec client). Uses your default ssh key/agent unless
+# ``key_path`` is set; host keys are accepted on first use (accept-new).
 sandbox:
   backend: local                        # DEFAULT — run on the host, unchanged
   # When ``backend: docker`` the block below configures the container:
@@ -225,6 +235,14 @@ sandbox:
   #   workdir: /workspace               # container working dir (tmpfs unless persistent)
   #   forward_env: []                   # host env keys allowed INTO the container
   #   persistent: false                 # false → workdir is a non-persistent tmpfs
+  # When ``backend: ssh`` the block below configures the remote host:
+  # ssh:
+  #   host: sandbox.internal            # REQUIRED — remote host to ssh into
+  #   user: agent                       # REQUIRED — remote login user
+  #   port: 22                          # ssh port (omit for 22)
+  #   key_path: ~/.ssh/id_ed25519       # identity file (omit → default key/agent)
+  #   login_shell: true                 # true → remote ``bash -lc`` (login shell)
+  #   workdir: /home/agent/work         # remote cwd to cd into before each command
 
 # ── Model runtime ───────────────────────────────────────────────────
 # Which LLMs the agent uses lives in the DB (the Models screen / model-manager
@@ -386,6 +404,46 @@ memory:
     # ``workspace/_dream/`` are left alone; dream mode writes to
     # ``dream-logs/``. An openagent.yaml still carrying the block boots fine —
     # the keys are inert, not fatal.
+
+# ── Skills ──────────────────────────────────────────────────────────
+# File-backed SKILL.md playbooks (Hermes / Claude-Code progressive
+# disclosure). Only a small INDEX (category → name: description) is
+# injected into the cached system prompt; full bodies load on demand via
+# ``skill_view``. OFF BY DEFAULT — with ``enabled: false`` nothing is
+# injected, the ``skills`` builtin MCP is never registered, and the prompt
+# is byte-identical to a build without the feature.
+#
+# skills:
+#   enabled: false            # master switch for the whole subsystem
+#   # path: ~/my-skills       # override the skills dir (default: <data-dir>/skills;
+#                             #   also honours the OPENAGENT_SKILLS_PATH env var)
+#   curator_enabled: false    # "dream mode for skills": a scheduled pass that
+#                             #   consolidates AGENT-authored skills. SECOND gate —
+#                             #   needs enabled: true as well. Only ever touches
+#                             #   created_by: agent skills (seed/user/hub are safe).
+#   # curator_schedule: "0 4 * * 0"   # cron (default: weekly, Sunday 04:00)
+#
+#   # ── Skills-Hub ──────────────────────────────────────────────────
+#   # Pull SKILL.md skills from a shared git remote ("tap") so several
+#   # agents share one versioned source of playbooks. Additive and OFF by
+#   # default; a SECOND gate on top of skills.enabled (mirrors
+#   # curator_enabled). When enabled, two tools appear in the skills MCP:
+#   #   skill_hub_pull(tap, force=False) — shallow-clone the tap into a
+#   #     quarantine dir, safety-scan every */SKILL.md (symlink escape,
+#   #     curl|sh exfil, rm -rf /, invisible/bidi unicode, injection
+#   #     markers), and install the ones that pass — each stamped
+#   #     created_by: hub (so the curator never rewrites upstream-owned
+#   #     skills) with hub_repo / hub_commit lineage. dangerous skills are
+#   #     always refused; caution skills only with force=True. A lockfile
+#   #     at <skills-dir>/.hub/lock.json pins repo+commit+content_hash.
+#   #   skill_hub_list() — what hub skills are installed and from where.
+#   # With hub.enabled: false the two tools are never exposed and the
+#   # skills toolkit is byte-identical to its three-tool original.
+#   hub:
+#     enabled: false          # master switch for the Skills-Hub tools
+#     taps: []                # optional default git taps to advertise, e.g.
+#                             #   - https://git.example.com/org/skills-hub.git
+#                             #   - file:///srv/shared/skills-hub/.git
 
 # ── Quick commands ──────────────────────────────────────────────────
 # Bridges expand ``/<trigger>`` to the configured prompt before the

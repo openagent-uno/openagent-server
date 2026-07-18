@@ -100,6 +100,14 @@ _TEST_MODULES: tuple[str, ...] = (
     # exclusion from the frozen index. Pure-unit; sits by test_skills because
     # it extends the same subsystem.
     "test_skill_curator",
+    # Skills-Hub: pull SKILL.md skills from a shared git tap into the local
+    # skills dir. Pins the pull round-trip (created_by:hub provenance +
+    # hub_repo/hub_commit + .hub/lock.json + curator-safety), the safety
+    # scanner (curl-exfil / symlink-escape → dangerous, refused), and the
+    # OFF-by-default second gate (skills.hub.enabled — toolkit byte-identical
+    # when closed). Pure-unit; git is available, no LLM. Sits by the other
+    # skills tests because it extends the same subsystem.
+    "test_skill_hub",
     "test_model_fallback",
     # Additive multi-account credential pool: a native provider rotates across
     # N accounts on 429/529 BEFORE the turn spills to DeepSeek. Pins the
@@ -178,6 +186,12 @@ _TEST_MODULES: tuple[str, ...] = (
     # StreamSession, channel profiles. Pure-unit; uses a fake agent
     # so no network or DB is required.
     "test_stream",
+    # ACP (Agent Client Protocol) stdio adapter — spawns ``openagent acp``
+    # as a subprocess and drives it with the acp SDK's client harness:
+    # initialize handshake + session/new + session/cancel lifecycle. Skips
+    # cleanly when the optional ``[acp]`` extra isn't installed. LLM-free —
+    # the handshake + lifecycle need no provider key.
+    "test_acp",
     # Agent.run_stream empty-stream safety net — pure-unit, no fixtures.
     # Guards the contract that voice mode (and the soon-to-be-streaming
     # web chat) always gets text even when the streaming provider yields

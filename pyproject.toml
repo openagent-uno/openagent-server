@@ -119,6 +119,11 @@ telegram = []
 discord = ["discord.py>=2.3.0"]
 whatsapp = ["whatsapp-api-client-python>=0.0.46"]
 slack = ["slack-bolt>=1.20.0", "slack-sdk>=3.30.0"]
+# ACP (Agent Client Protocol) stdio adapter — exposes ``openagent acp`` so
+# editors (Zed, etc.) can drive the agent as a coding agent over stdin/stdout.
+# Opt-in: the base install and every existing runtime path stay byte-identical
+# because ``acp`` is imported ONLY when the ``openagent acp`` subcommand runs.
+acp = ["agent-client-protocol>=0.11.0"]
 # Voice in (faster-whisper) AND voice out (piper-tts) are core deps
 # so the bundled Python release ships voice mode working out of the
 # box. The ``voice`` extra is kept as an empty alias so existing
