@@ -20,12 +20,19 @@ from __future__ import annotations
 
 DREAM_MODE_TASK_NAME = "dream-mode"
 AUTO_UPDATE_TASK_NAME = "auto-update"
+# The skill-curator: "dream-mode for skills". A scheduled child session that
+# consolidates AGENT-authored SKILL.md playbooks. OFF by default and gated on
+# BOTH ``skills.enabled`` and ``skills.curator_enabled`` — see
+# ``AgentServer._sync_skill_curator``. Its config section is ``skills`` (the
+# ``skills.curator_enabled`` toggle lives there), not a section of its own.
+SKILL_CURATOR_TASK_NAME = "skill-curator"
 
 BUILTIN_TASK_NAMES: frozenset[str] = frozenset(
-    {DREAM_MODE_TASK_NAME, AUTO_UPDATE_TASK_NAME}
+    {DREAM_MODE_TASK_NAME, AUTO_UPDATE_TASK_NAME, SKILL_CURATOR_TASK_NAME}
 )
 
 CONFIG_SECTION_BY_TASK: dict[str, str] = {
     DREAM_MODE_TASK_NAME: "dream_mode",
     AUTO_UPDATE_TASK_NAME: "auto_update",
+    SKILL_CURATOR_TASK_NAME: "skills",
 }

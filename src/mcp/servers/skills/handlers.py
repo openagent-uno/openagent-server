@@ -28,6 +28,13 @@ from src.mcp.servers.skills.registry import SkillsRegistry, parse_skill_file
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
+# The provenance stamp written into the frontmatter of every skill the AGENT
+# creates. It is the boundary the skill-curator respects: skills WITHOUT this
+# stamp are seed/user content and are off-limits to consolidation. A constant
+# (never a timestamp), so it can safely live in a file that feeds the index —
+# the index render ignores it, and it never changes between writes.
+AGENT_PROVENANCE = "agent"
+
 
 def _skills_root() -> Path:
     return default_skills_path()
@@ -122,16 +129,42 @@ async def skill_search(query: str, limit: int = 20) -> dict:
 
 # ── skill_manage ──────────────────────────────────────────────────────
 
-def _skill_markdown(name: str, description: str, category: str, body: str) -> str:
+def _skill_markdown(
+    name: str, description: str, category: str, body: str,
+    *, extra: dict[str, str] | None = None,
+) -> str:
     """Render a well-formed SKILL.md. Frontmatter is emitted via
     ``yaml.safe_dump`` so a colon / quote in a description can never produce
-    invalid YAML (which the registry would then skip)."""
-    fm = yaml.safe_dump(
-        {"name": name, "description": description, "category": category},
-        sort_keys=False, allow_unicode=True,
-    ).strip()
+    invalid YAML (which the registry would then skip).
+
+    ``extra`` carries provenance/lifecycle keys (``created_by`` / ``status``)
+    AFTER the three core keys, so ``name`` / ``description`` / ``category``
+    stay first in the file. ``None`` values are dropped — never written as a
+    literal ``null``."""
+    data: dict[str, str] = {
+        "name": name, "description": description, "category": category,
+    }
+    for k, v in (extra or {}).items():
+        if v is not None:
+            data[k] = v
+    fm = yaml.safe_dump(data, sort_keys=False, allow_unicode=True).strip()
     body = (body or "").strip("\n")
     return f"---\n{fm}\n---\n\n{body}\n" if body else f"---\n{fm}\n---\n"
+
+
+def _preserved_provenance(existing) -> dict[str, str]:
+    """Frontmatter keys carried forward when an existing skill is rewritten:
+    its ``created_by`` provenance and any ``status``. Losing ``created_by``
+    on an update would silently strip a skill of its agent-authored mark and
+    push it out of the curator's reach — so it must survive every rewrite."""
+    out: dict[str, str] = {}
+    if existing is None:
+        return out
+    if existing.created_by:
+        out["created_by"] = existing.created_by
+    if existing.status:
+        out["status"] = existing.status
+    return out
 
 
 async def skill_manage(
@@ -141,12 +174,15 @@ async def skill_manage(
     description: str | None = None,
     category: str | None = None,
 ) -> dict:
-    """Create, update, or remove a skill on disk. ``action`` is one of
-    ``create`` / ``update`` / ``remove``. For create/update, ``body`` is the
-    markdown instructions (frontmatter is generated from ``name`` /
-    ``description`` / ``category`` — do NOT include your own ``---`` block).
-    Changes take effect in the system-prompt skills index on the next
-    boot/reload, not mid-session."""
+    """Create, update, remove, or archive a skill on disk. ``action`` is one
+    of ``create`` / ``update`` / ``remove`` / ``archive``. For create/update,
+    ``body`` is the markdown instructions (frontmatter is generated from
+    ``name`` / ``description`` / ``category`` — do NOT include your own
+    ``---`` block). Skills you create are stamped ``created_by: agent`` in
+    their frontmatter. ``archive`` retires a skill (sets ``status: archived``,
+    drops it from the prompt index) WITHOUT deleting the file, so the change
+    is reversible and auditable. Changes take effect in the system-prompt
+    skills index on the next boot/reload, not mid-session."""
     action = (action or "").strip().lower()
     root = _skills_root()
 
@@ -157,6 +193,33 @@ async def skill_manage(
             return {"ok": False, "error": f"No skill named {name!r} to remove."}
         shutil.rmtree(target, ignore_errors=True)
         return {"ok": True, "action": "remove", "name": name, "path": str(target)}
+
+    if action == "archive":
+        existing = _registry().get(name)
+        if existing is None:
+            return {"ok": False, "error": f"No skill named {name!r} to archive."}
+        # Retire in place: keep name/description/category/body verbatim, flip
+        # status to archived, and carry provenance forward. The registry
+        # drops archived skills from the index render on the next reload.
+        content = existing.path.read_text(errors="replace")
+        _fm, existing_body = split_frontmatter(content)
+        extra = _preserved_provenance(existing)
+        extra["status"] = "archived"
+        existing.path.write_text(_skill_markdown(
+            name=existing.name,
+            description=existing.description,
+            category=existing.category,
+            body=(existing_body or "").strip("\n"),
+            extra=extra,
+        ))
+        meta = parse_skill_file(existing.path)
+        return {
+            "ok": meta is not None,
+            "action": "archive",
+            "name": name,
+            "status": "archived",
+            "path": str(existing.path),
+        }
 
     if action in ("create", "update"):
         existing = _registry().get(name)
@@ -174,11 +237,20 @@ async def skill_manage(
         skill_dir = existing.directory if existing else (root / _slug(name))
         skill_dir.mkdir(parents=True, exist_ok=True)
         md_path = skill_dir / "SKILL.md"
+        # Stamp provenance. A fresh create is authored by the agent; an update
+        # preserves whatever provenance/status the file already carried (so a
+        # seed skill the user asked the agent to edit is NOT re-labelled as
+        # agent-authored, and an agent skill keeps its mark).
+        if action == "create":
+            extra = {"created_by": AGENT_PROVENANCE}
+        else:
+            extra = _preserved_provenance(existing)
         md_path.write_text(_skill_markdown(
             name=name,
             description=(description or "").strip(),
             category=(category or "").strip() or "general",
             body=body or "",
+            extra=extra,
         ))
         # Re-parse to confirm the written file is valid (defensive).
         meta = parse_skill_file(md_path)
@@ -191,5 +263,7 @@ async def skill_manage(
 
     return {
         "ok": False,
-        "error": f"Unknown action {action!r}. Use create, update, or remove.",
+        "error": (
+            f"Unknown action {action!r}. Use create, update, remove, or archive."
+        ),
     }

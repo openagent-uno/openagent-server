@@ -36,16 +36,47 @@ DEFAULT_CATEGORY = "general"
 
 @dataclass(frozen=True)
 class SkillMeta:
-    """Frontmatter-derived metadata for one skill (never the full body)."""
+    """Frontmatter-derived metadata for one skill (never the full body).
+
+    ``created_by`` and ``status`` back the skill-curator's two invariants:
+
+      * **Provenance.** ``created_by`` records who authored the skill —
+        ``"agent"`` for skills the agent wrote via ``skill_manage``, ``None``
+        for seed/user skills. The curator only ever touches agent-authored
+        skills (see :meth:`SkillsRegistry.agent_authored`), so a consolidation
+        pass can never merge or archive curated seed content.
+      * **Archival.** ``status == "archived"`` retires a skill WITHOUT deleting
+        it: the file stays on disk (auditable, reversible) but it is dropped
+        from :meth:`SkillsRegistry.render_skills_index`, so an archived skill
+        never reaches the frozen system-prompt index.
+
+    Neither field is rendered into the index — the index derives solely from
+    ``name`` / ``description`` / ``category`` — so provenance/status changes
+    never perturb the byte-stable cached prompt.
+    """
     name: str
     description: str
     category: str
     path: Path  # the SKILL.md file itself
+    created_by: str | None = None
+    status: str | None = None
 
     @property
     def directory(self) -> Path:
         """The skill's folder — where bundled files live alongside SKILL.md."""
         return self.path.parent
+
+    @property
+    def is_agent_authored(self) -> bool:
+        """True when the AGENT wrote this skill (frontmatter ``created_by:
+        agent``). Seed/user skills carry no such stamp and return False."""
+        return (self.created_by or "").strip().lower() == "agent"
+
+    @property
+    def is_archived(self) -> bool:
+        """True when this skill has been retired (frontmatter ``status:
+        archived``). Archived skills are kept out of the active index."""
+        return (self.status or "").strip().lower() == "archived"
 
 
 def parse_skill_file(md_path: Path) -> SkillMeta | None:
@@ -87,8 +118,11 @@ def parse_skill_file(md_path: Path) -> SkillMeta | None:
 
     description = str(meta.get("description") or "").strip()
     category = (str(meta.get("category") or "").strip() or DEFAULT_CATEGORY)
+    created_by = str(meta.get("created_by") or "").strip() or None
+    status = str(meta.get("status") or "").strip() or None
     return SkillMeta(name=name, description=description,
-                     category=category, path=md_path)
+                     category=category, path=md_path,
+                     created_by=created_by, status=status)
 
 
 class SkillsRegistry:
@@ -144,6 +178,21 @@ class SkillsRegistry:
                 return s
         return None
 
+    def agent_authored(self) -> list[SkillMeta]:
+        """The skills the skill-curator MAY touch: those the agent itself
+        wrote (frontmatter ``created_by: agent``).
+
+        This is the provenance boundary. Seed and user skills carry no
+        ``created_by`` stamp, so they are excluded here and a consolidation
+        pass — which discovers its work set through this filter — can never
+        merge away or archive hand-curated seed content. Archived agent
+        skills are still returned (the curator may legitimately re-open or
+        delete one it retired earlier); callers that want only the LIVE set
+        can filter on :attr:`SkillMeta.is_archived`.
+        """
+        self._ensure_loaded()
+        return [s for s in (self._skills or []) if s.is_agent_authored]
+
     # ── index render (goes into the CACHED system prefix) ─────────────
     def render_skills_index(self) -> str:
         """Compact, byte-stable index grouped by category. Cached."""
@@ -153,7 +202,11 @@ class SkillsRegistry:
 
     def _build_index(self) -> str:
         self._ensure_loaded()
-        skills = self._skills or []
+        # Archived skills are retired: their file stays on disk (auditable,
+        # reversible) but it is dropped from the index so the frozen
+        # system-prompt prefix only ever advertises live skills. This is a
+        # deterministic function of disk contents, so byte-stability holds.
+        skills = [s for s in (self._skills or []) if not s.is_archived]
         if not skills:
             return "_(no skills installed.)_"
 

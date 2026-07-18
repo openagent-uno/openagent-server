@@ -55,6 +55,7 @@ except Exception:  # noqa: BLE001 — best-effort, never block startup
 from src.core.builtin_tasks import (
     AUTO_UPDATE_TASK_NAME,
     DREAM_MODE_TASK_NAME,
+    SKILL_CURATOR_TASK_NAME,
 )
 from src.memory.schedule import default_timezone_name
 
@@ -226,6 +227,81 @@ forever and the number slowly reads as guilt rather than as a pointer.
 
 Use the `vault` MCP's tools for all vault access — never shell out for
 anything under the memory vault.
+"""
+
+# Weekly by default (Sunday 04:00). Skills change far more slowly than the
+# memory vault, so the curator runs on a longer cadence than nightly dream
+# mode. Overridable via ``skills.curator_schedule``.
+SKILL_CURATOR_DEFAULT_CRON = "0 4 * * 0"
+
+SKILL_CURATOR_PROMPT = """\
+You are running as the Skill Curator — OpenAgent's self-improvement pass
+for its SKILL.md library. This is "dream mode for skills": you run on a
+schedule while the agent is otherwise idle, consolidate the skills the
+AGENT has taught itself, and leave everything else untouched. Be
+thorough but conservative: when in doubt, skip and log it, never delete
+or overwrite on a guess.
+
+## The provenance boundary — read this first, it is the whole job
+
+You may ONLY touch skills that the agent authored itself. Those carry
+`created_by: agent` in their SKILL.md frontmatter. Every other skill —
+the seed/bundled playbooks that shipped with OpenAgent, and any skill a
+human wrote or edited — has NO such stamp and is OFF-LIMITS. Do not
+merge it, do not archive it, do not rewrite it, do not fold its content
+into another skill. Curated seed content is not yours to consolidate.
+
+Concretely, before you act on ANY skill:
+   - Open it with `skill_view` and check its frontmatter `created_by`.
+   - If it is not exactly `agent`, leave it exactly as it is.
+   - Your entire work set is the agent-authored skills. If none exist
+     yet, there is nothing to do — say so in the log and stop.
+
+## Mission 1 — Find the agent-authored skills
+
+Use `skill_search` (empty or broad query) to list what exists, then
+`skill_view` each candidate to read the full body AND confirm
+`created_by: agent`. Build your work set from only those. Note which
+category each sits in — overlap within a category is where consolidation
+pays off.
+
+## Mission 2 — Merge overlapping agent skills
+
+When two or more AGENT-authored skills cover the same task with only
+minor variation:
+   - Decide the single canonical skill (the clearest, most complete one).
+   - `skill_manage(action="update", ...)` it to absorb anything useful
+     from the others — steps, edge cases, examples — into one coherent
+     body. Keep the frontmatter `name`/`description`/`category` accurate.
+   - `skill_manage(action="archive", ...)` the now-redundant duplicates.
+     Archiving retires them from the prompt index but keeps the file on
+     disk, so the merge is reversible if you got it wrong. Do NOT
+     `remove` (hard-delete) unless a skill is empty or plainly junk.
+   - Never merge ACROSS the provenance boundary: if the overlap is with
+     a seed/user skill, the agent skill is the redundant one — archive
+     the agent skill, and leave the seed skill alone.
+
+## Mission 3 — Archive stale agent skills
+
+An agent skill is stale when its steps reference tools, paths, hosts, or
+flows that no longer exist, or it was written for a one-off that will not
+recur. Verify the staleness from the current environment before acting —
+a skill that merely looks unfamiliar is not stale. Retire a genuinely
+stale agent skill with `skill_manage(action="archive", ...)`, never a
+hard `remove`, so a human can review the decision.
+
+## Log what you did
+
+Write a concise note via the `vault` MCP under
+`skill-curator-logs/skill-curator-YYYY-MM-DD.md` (frontmatter
+`type: skill-curator-log`, `date:` today): which agent skills you
+reviewed, what you merged into what, what you archived and why, and
+which overlaps you deliberately left alone (especially any that touched
+the seed/user boundary). If you changed nothing, log that too — a clean
+pass is a valid outcome.
+
+Remember: seed and user skills are never yours to touch. The only skills
+that leave this pass changed are ones stamped `created_by: agent`.
 """
 
 
@@ -1469,6 +1545,7 @@ class AgentServer:
 
         await self._sync_dream_mode(scheduler)
         await self._sync_auto_update(scheduler)
+        await self._sync_skill_curator(scheduler)
 
         await scheduler.start()
         self._scheduler = scheduler
@@ -1530,8 +1607,19 @@ class AgentServer:
             await self._sync_auto_update(scheduler)
             gw.broadcast_resource_sync("scheduled_task", "updated")
 
+        async def _skills(patch: dict) -> None:
+            # The ``skills`` section carries the curator toggle
+            # (``skills.curator_enabled``); re-sync the scheduled task so a
+            # runtime flip enables/disables it without a restart. (Toggling
+            # ``skills.enabled`` itself still needs a restart to (de)register
+            # the skills MCP — this only governs the curator task.)
+            self.config["skills"] = patch or {}
+            await self._sync_skill_curator(scheduler)
+            gw.broadcast_resource_sync("scheduled_task", "updated")
+
         gw._config_change_callbacks["dream_mode"] = _dream
         gw._config_change_callbacks["auto_update"] = _autoupdate
+        gw._config_change_callbacks["skills"] = _skills
 
     async def _sync_scheduled_task(
         self, scheduler, *, name: str, enabled: bool, cron_expr: str, prompt: str,
@@ -1712,6 +1800,66 @@ class AgentServer:
 
             update_hook = _auto_update_run
         self._install_task_hook(scheduler, AUTO_UPDATE_TASK_NAME, update_hook)
+
+    async def _sync_skill_curator(self, scheduler) -> None:
+        """Seed/enable the ``skill-curator`` scheduled task — "dream mode for
+        skills". Gated on BOTH ``skills.enabled`` and ``skills.curator_enabled``
+        (default OFF).
+
+        Unlike dream-mode / auto-update — which ALWAYS seed a disabled row so a
+        manual firing has somewhere to hang its run history — the curator has
+        no manual-fire entry point, so when it is OFF it seeds NOTHING. With the
+        default config the ``scheduled_tasks`` table gains no row and the
+        scheduler is byte-identical to a build without this feature. That is the
+        safety property this whole subsystem is built around: disabled means
+        invisible, not merely dormant.
+
+        When a previous enable left a row behind and the operator later turns
+        the curator off at runtime, we disable that row (so it stops firing)
+        rather than deleting it — same "toggleable but not removable" spirit as
+        the other built-ins, without seeding one that never existed.
+        """
+        from src.core.config import skills_settings
+
+        settings = skills_settings(self.config)
+        enabled = settings.enabled and settings.curator_enabled
+
+        if not enabled:
+            # OFF → seed nothing. If a row survives from an earlier enable,
+            # park it disabled so the scheduler stops firing it.
+            tasks = await self.agent._db.get_tasks()
+            existing = next(
+                (t for t in tasks if t["name"] == SKILL_CURATOR_TASK_NAME), None,
+            )
+            if existing is not None and existing["enabled"]:
+                await scheduler.disable_task(existing["id"])
+            self._install_task_hook(scheduler, SKILL_CURATOR_TASK_NAME, None)
+            return
+
+        cron_expr = settings.curator_schedule or SKILL_CURATOR_DEFAULT_CRON
+        # Same timezone treatment as dream mode: an untagged cron evaluates in
+        # UTC, so inherit the box's configured zone (falls back to UTC) so a
+        # "Sunday 04:00" run lands overnight local, not mid-morning.
+        curator_tz = default_timezone_name()
+
+        await self._sync_scheduled_task(
+            scheduler,
+            name=SKILL_CURATOR_TASK_NAME,
+            enabled=True,
+            cron_expr=cron_expr,
+            prompt=SKILL_CURATOR_PROMPT,
+            timezone=curator_tz,
+        )
+
+        async def _curator_run(task, _orig):
+            if task["name"] == SKILL_CURATOR_TASK_NAME:
+                elog("skill_curator.start")
+                await _orig(task)
+                elog("skill_curator.done")
+            else:
+                await _orig(task)
+
+        self._install_task_hook(scheduler, SKILL_CURATOR_TASK_NAME, _curator_run)
 
 
 # ── Auto-update helpers (used by AgentServer and the manual `update` command) ──

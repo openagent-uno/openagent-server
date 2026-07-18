@@ -39,12 +39,15 @@ def build_runtime_toolkit() -> Any:
         description: str | None = None,
         category: str | None = None,
     ) -> dict:
-        """Create, update, or remove a skill on disk. ``action`` is
-        ``create`` / ``update`` / ``remove``. For create/update, ``body`` is
-        the markdown instructions — frontmatter (``name`` / ``description`` /
-        ``category``) is generated for you, so do not include your own
-        ``---`` block. Edits appear in the system-prompt skills index on the
-        next boot/reload, not mid-session."""
+        """Create, update, remove, or archive a skill on disk. ``action`` is
+        ``create`` / ``update`` / ``remove`` / ``archive``. For create/update,
+        ``body`` is the markdown instructions — frontmatter (``name`` /
+        ``description`` / ``category``) is generated for you, so do not include
+        your own ``---`` block. Skills you create are stamped
+        ``created_by: agent``. ``archive`` retires a skill (drops it from the
+        prompt index) without deleting the file, so it is reversible. Edits
+        appear in the system-prompt skills index on the next boot/reload, not
+        mid-session."""
         return await handlers.skill_manage(
             action=action, name=name, body=body,
             description=description, category=category,

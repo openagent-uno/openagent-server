@@ -110,9 +110,25 @@ class SkillsSettings:
         (``<data_dir>/skills``), which itself honours the
         ``OPENAGENT_SKILLS_PATH`` env var — parity with
         ``memory.vault_path`` / ``OPENAGENT_VAULT_PATH``.
+
+    curator_enabled:
+        Master switch for the self-improving skill-curator scheduled task
+        ("dream-mode for skills"). Reads ``skills.curator_enabled`` (default
+        ``False``). SECOND gate on top of ``enabled``: the curator only
+        seeds/enables when BOTH are true, so with the default the
+        ``scheduled_tasks`` table gains no row and the system is
+        byte-identical to a build without the feature. Mirrors how
+        ``dream_mode.enabled`` gates the nightly vault pass.
+
+    curator_schedule:
+        Optional cron for the curator run. Reads ``skills.curator_schedule``.
+        ``None`` falls back to a weekly default (Sunday 04:00) — parity with
+        ``dream_mode.cron`` / ``auto_update.check_interval``.
     """
     enabled: bool = False
     path: str | None = None
+    curator_enabled: bool = False
+    curator_schedule: str | None = None
 
 
 def skills_settings(config: dict) -> SkillsSettings:
@@ -125,7 +141,10 @@ def skills_settings(config: dict) -> SkillsSettings:
     if not isinstance(raw, dict):
         raw = {}
     path = raw.get("path")
+    schedule = raw.get("curator_schedule")
     return SkillsSettings(
         enabled=bool(raw.get("enabled", False)),
         path=str(path) if path else None,
+        curator_enabled=bool(raw.get("curator_enabled", False)),
+        curator_schedule=str(schedule) if schedule else None,
     )

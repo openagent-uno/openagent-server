@@ -86,6 +86,13 @@ _TEST_MODULES: tuple[str, ...] = (
     # in a tmpdir, no LLM/pool/gateway. Sits by the pure-unit vault tests
     # because it shares their shape (frontmatter parser, throwaway dirs).
     "test_skills",
+    # The self-improving skill-curator: "dream mode for skills". Pins the
+    # provenance stamp (created_by:agent), the OFF-by-default seeding gate
+    # (skills.enabled AND skills.curator_enabled), the provenance boundary
+    # (agent_authored filter excludes seed/user skills), and archived-skill
+    # exclusion from the frozen index. Pure-unit; sits by test_skills because
+    # it extends the same subsystem.
+    "test_skill_curator",
     "test_model_fallback",
     # Additive multi-account credential pool: a native provider rotates across
     # N accounts on 429/529 BEFORE the turn spills to DeepSeek. Pins the
