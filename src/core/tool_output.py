@@ -24,7 +24,10 @@ instead of the whole call dying on a non-retryable context-length error.
 """
 from __future__ import annotations
 
+import hashlib
 import os
+import time
+from pathlib import Path
 from typing import Any
 
 # ~12k tokens for a SINGLE tool result. Generous for a real answer, and far
@@ -59,6 +62,126 @@ def _cap_text(text: str, limit: int) -> str:
     return text[:head] + marker + (text[-tail:] if tail else "")
 
 
+# ── Lossless offload (opt-in) ─────────────────────────────────────────
+#
+# Truncation is lossy: the dropped bytes are gone, and a support agent that was
+# told to read a 200 KB KB article or a long re-quoted email thread cannot
+# recover them. Offload trades that for a spill-to-disk — the FULL result is
+# written to a file and the in-context value becomes a compact preview plus the
+# path, which the agent re-reads with its ``read_file`` / editor tool on demand.
+#
+# It is OPT-IN (default OFF) and strictly additive: with offload disabled,
+# ``cap_tool_output`` truncates byte-identically to before. Policy is read from
+# the environment at call time (parity with ``max_tool_result_chars``);
+# ``src/core/server.py`` exports it from the ``tool_output:`` config stanza so
+# this in-process reader sees it without any config plumbing.
+
+# Chars of the original kept inline as a preview ahead of the read handle.
+OFFLOAD_PREVIEW_CHARS = 1_500
+
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def _offload_enabled() -> bool:
+    return (
+        os.environ.get("OPENAGENT_TOOL_OFFLOAD_ENABLED", "0").strip().lower()
+        in _TRUTHY
+    )
+
+
+def _offload_threshold() -> int:
+    """Chars above which a result is offloaded. Defaults to the truncation cap."""
+    raw = os.environ.get("OPENAGENT_TOOL_OFFLOAD_THRESHOLD", "").strip()
+    if raw:
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            pass
+    return max_tool_result_chars()
+
+
+def _offload_keep() -> int:
+    """Retention cap — how many offload files to keep. Default 200."""
+    raw = os.environ.get("OPENAGENT_TOOL_OFFLOAD_KEEP", "").strip()
+    if raw:
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            pass
+    return 200
+
+
+def _offload_dir() -> Path:
+    """The directory offloaded results are written to.
+
+    Defaults to ``paths.data_dir()/tool_outputs`` — inside the data dir that
+    the filesystem/editor MCP root already covers by default, so the handle the
+    preview hands back is re-readable without widening any root.
+    """
+    raw = os.environ.get("OPENAGENT_TOOL_OFFLOAD_DIR", "").strip()
+    if raw:
+        d = Path(raw).expanduser()
+    else:
+        from src.core.paths import data_dir
+
+        d = data_dir() / "tool_outputs"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _prune_offload_dir(directory: Path, keep: int) -> None:
+    """Keep only the ``keep`` newest ``*.txt`` files so the dir stays bounded.
+
+    A tiny prune-on-write — no daemon. ``keep <= 0`` disables pruning.
+    """
+    if keep <= 0:
+        return
+    files = sorted(
+        directory.glob("*.txt"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for stale in files[keep:]:
+        stale.unlink(missing_ok=True)
+
+
+def _offload_text(text: str) -> str:
+    """Write the FULL ``text`` to the offload dir; return preview + read handle.
+
+    Lossless: the file on disk equals ``text`` byte-for-byte (surrogatepass on
+    both the hash and the write, so nothing is mangled). The returned in-context
+    value is a short preview followed by one line naming the path and how to
+    read it back.
+    """
+    directory = _offload_dir()
+    digest = hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()[:12]
+    name = f"{time.strftime('%Y%m%dT%H%M%S')}-{digest}.txt"
+    path = directory / name
+    path.write_text(text, encoding="utf-8", errors="surrogatepass")
+    _prune_offload_dir(directory, _offload_keep())
+
+    preview = text[:OFFLOAD_PREVIEW_CHARS]
+    dropped = len(text) - len(preview)
+    marker = (
+        f"\n\n[... {dropped} characters truncated by OpenAgent; FULL output "
+        f"({len(text)} chars) saved to {path} — read it with the read_file/editor "
+        f"tool if you need the rest ...]\n"
+    )
+    return preview + marker
+
+
+def _cap_or_offload(text: str, limit: int) -> str:
+    """Offload branch of the cap: spill over-threshold results, else truncate.
+
+    Only reached when offload is ENABLED. A result at or below the offload
+    threshold is handed to the normal cap (returned inline if it also fits under
+    ``limit``, truncated otherwise), so small results stay untouched.
+    """
+    if len(text) <= _offload_threshold():
+        return _cap_text(text, limit)
+    return _offload_text(text)
+
+
 def cap_tool_output(output: Any) -> Any:
     """Cap an oversized tool result before it becomes part of the context.
 
@@ -67,21 +190,30 @@ def cap_tool_output(output: Any) -> Any:
     so an image block or other structured content is never mangled. Anything
     else passes through untouched: guessing at the shape of a value we do not
     understand is how you corrupt a tool call.
+
+    When ``tool_output.offload_enabled`` is set (default OFF), an over-threshold
+    result is spilled LOSSLESSLY to disk and replaced with a preview + path
+    instead of being truncated. With offload disabled this is byte-identical to
+    the historical truncation.
     """
     limit = max_tool_result_chars()
     if limit <= 0:
         return output
 
+    # OPT-IN: with offload disabled (default), ``transform`` is the historical
+    # truncation, so every byte this function returns is identical to before.
+    transform = _cap_or_offload if _offload_enabled() else _cap_text
+
     if isinstance(output, str):
-        return _cap_text(output, limit)
+        return transform(output, limit)
 
     if isinstance(output, list):
         capped: list[Any] = []
         for item in output:
             if isinstance(item, str):
-                capped.append(_cap_text(item, limit))
+                capped.append(transform(item, limit))
             elif isinstance(item, dict) and isinstance(item.get("text"), str):
-                capped.append({**item, "text": _cap_text(item["text"], limit)})
+                capped.append({**item, "text": transform(item["text"], limit)})
             else:
                 capped.append(item)
         return capped

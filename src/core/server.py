@@ -540,6 +540,30 @@ def _build_agent(config: dict) -> Agent:
             _sandbox_cfg.get("ssh") or {}
         )
 
+    # ``tool_output`` — opt-in LOSSLESS offload of oversized tool results. Off by
+    # default: with offload disabled ``cap_tool_output`` truncates a too-large
+    # result byte-identically to before. Exported as env vars for the same reason
+    # as the sandbox/safety blocks above — the reader lives in-process in
+    # ``src/core/tool_output.py`` and reads its policy from the environment at
+    # call time (parity with ``OPENAGENT_MAX_TOOL_RESULT_CHARS``), so a
+    # config-only knob would never reach it. Only ENABLED serialises the optional
+    # threshold/dir overrides; an unset stanza exports just a "0" flag and
+    # changes nothing downstream.
+    from src.core.config import tool_output_settings
+
+    _tool_output_cfg = tool_output_settings(config)
+    os.environ["OPENAGENT_TOOL_OFFLOAD_ENABLED"] = (
+        "1" if _tool_output_cfg.offload_enabled else "0"
+    )
+    if _tool_output_cfg.offload_enabled:
+        if _tool_output_cfg.offload_threshold is not None:
+            os.environ["OPENAGENT_TOOL_OFFLOAD_THRESHOLD"] = str(
+                _tool_output_cfg.offload_threshold
+            )
+        if _tool_output_cfg.offload_dir:
+            os.environ["OPENAGENT_TOOL_OFFLOAD_DIR"] = _tool_output_cfg.offload_dir
+        os.environ["OPENAGENT_TOOL_OFFLOAD_KEEP"] = str(_tool_output_cfg.offload_keep)
+
     # ``mcps.install_policy`` — gates REGISTERING an MCP, which is the act that
     # hands a third party's argv this agent's whole environment. Exported as
     # env vars rather than plumbed, because the ``mcp-manager`` MCP runs as a

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable, Iterator, List, Optional, Union
 
@@ -128,6 +130,230 @@ def _clean_kwargs_for_fallback(kwargs: dict) -> dict:
     return cleaned
 
 
+# ---------------------------------------------------------------------------
+# In-place deterministic recovery (additive; runs on the model-error HOT PATH,
+# BEFORE credential rotation / get_fallback_models). For a matched, recoverable
+# error signature we apply a PURE transform to a *copy* of the request and retry
+# the SAME model once. If nothing matches — or the repair/retry fails — the
+# original request is untouched and control falls through to the exact existing
+# fallback path (byte-identical to today). Every branch below repairs a case
+# that hard-fails today: a 400 that OpenAgent classifies as a non-retryable
+# client error and raises straight up (proven in recon). The whole block is
+# defensively wrapped by callers so any bug here degrades to today's fallback.
+# ---------------------------------------------------------------------------
+
+# Kill-switch: default ON — each branch is a strict improvement over a turn
+# that otherwise fails outright. Set OPENAGENT_INPLACE_RECOVERY_ENABLED to a
+# falsy value (0/false/no/off) to disable the whole feature redeploy-free.
+_INPLACE_RECOVERY_ENV = "OPENAGENT_INPLACE_RECOVERY_ENABLED"
+
+# Anthropic per-image ceiling & generic image-rejection wordings (narrow on
+# purpose — each is a verbatim provider phrase, not a generic word like "large").
+_IMAGE_TOO_LARGE_PATTERNS = (
+    "image exceeds",
+    "image too large",
+    "image_too_large",
+    "image size exceeds",
+    "image dimensions exceed",
+    "dimensions exceed max allowed size",
+)
+# HTTP-413-style payload rejections. Only actioned when the request actually
+# carries images (else it is a text-size overflow that the existing
+# context-overflow path already handles — see get_fallback_models).
+_PAYLOAD_TOO_LARGE_PATTERNS = (
+    "request entity too large",
+    "payload too large",
+    "error code: 413",
+)
+
+
+def _inplace_recovery_enabled() -> bool:
+    return os.getenv(_INPLACE_RECOVERY_ENV, "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _classify_inplace_recovery(error: Exception) -> Optional[str]:
+    """Return a recovery-kind tag for a deterministically-repairable error, else None.
+
+    Signatures are matched on (status_code + verbatim message pattern) and are
+    intentionally narrow so an unrelated error is NEVER captured — that is what
+    keeps the no-match path byte-identical to today.
+    """
+    status = getattr(error, "status_code", None)
+    msg = str(getattr(error, "message", "") or error).lower()
+
+    # Anthropic thinking-block signature invalidated by upstream history
+    # mutation (compaction / truncation / merge) → 400 "signature" + "thinking".
+    if status == 400 and "signature" in msg and "thinking" in msg:
+        return "thinking_signature"
+
+    # Strict json-schema-to-grammar backends (e.g. llama.cpp's OAI server)
+    # reject regex escapes in tool-schema `pattern` / `format` → 400.
+    if status == 400 and (
+        "error parsing grammar" in msg
+        or "json-schema-to-grammar" in msg
+        or ("unable to generate parser" in msg and "template" in msg)
+    ):
+        return "tool_schema_pattern"
+
+    # Oversized image / payload-too-large → strip images, retry text-only.
+    if status in (400, 413):
+        if any(p in msg for p in _IMAGE_TOO_LARGE_PATTERNS):
+            return "image_too_large"
+        if any(p in msg for p in _PAYLOAD_TOO_LARGE_PATTERNS):
+            return "payload_too_large"
+    return None
+
+
+def _is_image_content_part(part: Any) -> bool:
+    """True for a structured content part that carries an image."""
+    return isinstance(part, dict) and part.get("type") in ("image", "image_url", "input_image")
+
+
+def _strip_images_from_kwargs(kwargs: dict) -> Optional[dict]:
+    """Return a repaired kwargs copy with image parts removed, or None if none found.
+
+    Clears ``Message.images`` and drops image content-parts from list-shaped
+    content. Builds fresh Message copies via ``model_copy`` — the caller's
+    original message objects are never mutated.
+    """
+    messages = kwargs.get("messages")
+    if not messages:
+        return None
+    changed = False
+    new_messages: list = []
+    for m in messages:
+        update: dict = {}
+        if getattr(m, "images", None):
+            update["images"] = None
+        content = getattr(m, "content", None)
+        if isinstance(content, list):
+            filtered = [p for p in content if not _is_image_content_part(p)]
+            if len(filtered) != len(content):
+                update["content"] = filtered
+        if update:
+            new_messages.append(m.model_copy(update=update))
+            changed = True
+        else:
+            new_messages.append(m)
+    if not changed:
+        return None
+    repaired = dict(kwargs)
+    repaired["messages"] = new_messages
+    return repaired
+
+
+def _strip_thinking_from_kwargs(kwargs: dict) -> Optional[dict]:
+    """Return a repaired kwargs copy with reasoning/thinking blocks stripped.
+
+    Anthropic emits a thinking block for an assistant message only when
+    ``reasoning_content`` and ``provider_data`` are both set (see
+    ``format_messages``); clearing ``reasoning_content`` /
+    ``redacted_reasoning_content`` and dropping the ``signature`` from
+    ``provider_data`` is enough to send no signed thinking blocks on retry.
+    """
+    messages = kwargs.get("messages")
+    if not messages:
+        return None
+    changed = False
+    new_messages: list = []
+    for m in messages:
+        update: dict = {}
+        if getattr(m, "reasoning_content", None) is not None:
+            update["reasoning_content"] = None
+        if getattr(m, "redacted_reasoning_content", None) is not None:
+            update["redacted_reasoning_content"] = None
+        pd = getattr(m, "provider_data", None)
+        if isinstance(pd, dict) and "signature" in pd:
+            update["provider_data"] = {k: v for k, v in pd.items() if k != "signature"}
+        if update:
+            new_messages.append(m.model_copy(update=update))
+            changed = True
+        else:
+            new_messages.append(m)
+    if not changed:
+        return None
+    repaired = dict(kwargs)
+    repaired["messages"] = new_messages
+    return repaired
+
+
+def _strip_schema_keys(node: Any, keys: tuple) -> int:
+    """Recursively drop ``keys`` from a JSON-schema tree / Function.parameters.
+
+    Returns the number of keys removed. Walks dicts, lists, and any object that
+    exposes a ``parameters`` attribute (a Function tool).
+    """
+    removed = 0
+    if isinstance(node, dict):
+        for k in keys:
+            if k in node:
+                node.pop(k, None)
+                removed += 1
+        for v in list(node.values()):
+            removed += _strip_schema_keys(v, keys)
+    elif isinstance(node, list):
+        for item in node:
+            removed += _strip_schema_keys(item, keys)
+    else:
+        params = getattr(node, "parameters", None)
+        if params is not None:
+            removed += _strip_schema_keys(params, keys)
+    return removed
+
+
+def _strip_tool_schema_patterns_from_kwargs(kwargs: dict) -> Optional[dict]:
+    """Return a repaired kwargs copy with ``pattern``/``format`` stripped from tools.
+
+    Tools are deep-copied first so the caller's shared Function/dict objects are
+    never mutated. Returns None if nothing was stripped.
+    """
+    tools = kwargs.get("tools")
+    if not tools:
+        return None
+    new_tools = deepcopy(tools)
+    if _strip_schema_keys(new_tools, ("pattern", "format")) == 0:
+        return None
+    repaired = dict(kwargs)
+    repaired["tools"] = new_tools
+    return repaired
+
+
+def _repair_kwargs_for_recovery(kind: str, kwargs: dict) -> Optional[dict]:
+    """Dispatch a recovery kind to its pure request transform.
+
+    Returns a repaired shallow-copy of kwargs (originals untouched), or None if
+    the fix does not actually apply to this request (→ caller falls through).
+    """
+    if kind in ("image_too_large", "payload_too_large"):
+        return _strip_images_from_kwargs(kwargs)
+    if kind == "thinking_signature":
+        return _strip_thinking_from_kwargs(kwargs)
+    if kind == "tool_schema_pattern":
+        return _strip_tool_schema_patterns_from_kwargs(kwargs)
+    return None
+
+
+def _plan_inplace_recovery(error: Exception, kwargs: dict) -> Optional[tuple]:
+    """Best-effort: return (kind, repaired_kwargs) if this error is repairable.
+
+    Fully self-contained and exception-safe: any failure inside classification
+    or transform is swallowed and reported as "no recovery", so the model-error
+    hot path can never be made worse than today by a bug in here.
+    """
+    try:
+        if not _inplace_recovery_enabled():
+            return None
+        kind = _classify_inplace_recovery(error)
+        if kind is None:
+            return None
+        repaired = _repair_kwargs_for_recovery(kind, kwargs)
+        if repaired is None:
+            return None
+        return kind, repaired
+    except Exception:
+        return None
+
+
 def call_model_with_fallback(
     model: Model,
     fallback_config: Optional[FallbackConfig],
@@ -158,6 +384,28 @@ async def acall_model_with_fallback(
     try:
         return await model.aresponse(**kwargs)
     except ModelProviderError as primary_error:
+        # ── In-place deterministic recovery (additive, best-effort) ──
+        # Before rotating credentials or falling over to another provider,
+        # try a deterministic repair of the request and retry the SAME model
+        # once. Only matched, recoverable signatures are touched; the original
+        # `kwargs` is never mutated, so if this yields nothing (no match) or the
+        # repaired retry fails, control drops to the exact existing path below
+        # with a byte-identical request. Fully wrapped so any bug degrades to
+        # today's fallback contract, never propagates.
+        try:
+            plan = _plan_inplace_recovery(primary_error, kwargs)
+            if plan is not None:
+                kind, repaired = plan
+                log_warning(
+                    f"In-place recovery '{kind}' for model '{model.id}': "
+                    f"repaired request and retrying same model once."
+                )
+                return await model.aresponse(**repaired)
+        except ModelProviderError:
+            pass  # repaired retry still failed → existing fallback path below
+        except Exception:
+            pass  # any recovery bug → existing fallback path below
+
         # ── Credential-pool rotation (inert unless the model carries a pool) ──
         # On a rate-limit, rotate across this provider's other accounts BEFORE
         # consulting get_fallback_models. Best-effort: any exception inside the
@@ -241,6 +489,32 @@ async def acall_model_stream_with_fallback(
     # emitted output, so rotating would duplicate it — those cases fall
     # straight through to the existing fallback path. Best-effort throughout;
     # any pool bug degrades to that same path.
+    # ── In-place deterministic recovery (stream, additive, best-effort) ──
+    # Safe ONLY before the first event (a mid-stream failure has already emitted
+    # output). The repaired attempt is BUFFERED and only flushed once it streams
+    # to completion — so if it fails at any point we discard the buffer and drop
+    # to the exact existing path with zero committed output (byte-identical).
+    if not any_event_emitted:
+        plan = _plan_inplace_recovery(primary_error, kwargs)
+        if plan is not None:
+            kind, repaired = plan
+            buffered: list = []
+            recovered = False
+            try:
+                async for event in model.aresponse_stream(**repaired):
+                    buffered.append(event)
+                recovered = True
+            except Exception:
+                recovered = False  # discard buffer → existing path unchanged
+            if recovered:
+                log_warning(
+                    f"In-place recovery '{kind}' for model '{model.id}': "
+                    f"repaired request streamed cleanly on the same model."
+                )
+                for event in buffered:
+                    yield event
+                return
+
     if not any_event_emitted:
         pool = getattr(model, "_openagent_cred_pool", None)
         if pool is not None:

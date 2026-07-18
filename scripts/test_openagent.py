@@ -54,6 +54,13 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_serve_singleton",
     "test_cli_cleanup",
     "test_tool_result_cap",
+    # Opt-in LOSSLESS tool-output offload (additive over the truncation cap):
+    # spill an over-threshold result to disk + replace it with a preview + path,
+    # instead of truncating lossily. Pins the byte-identical-when-disabled
+    # default, the lossless round-trip, retention pruning, and under-threshold
+    # passthrough. Pure-unit — env-gated, temp offload dir, no LLM/pool/gateway;
+    # sits by test_tool_result_cap because it extends the same cap.
+    "test_tool_output_offload",
     # In-process `logs` MCP: structured query over the agent's own
     # events.jsonl (vision §14). Pure-unit — synthetic logs in a temp
     # agent dir, no pool/gateway.
@@ -124,6 +131,14 @@ _TEST_MODULES: tuple[str, ...] = (
     # rotation seam (async + stream) with a fake Model — no live LLM. Sits by
     # test_model_fallback because it guards the same fallback chokepoint.
     "test_credential_pool",
+    # In-place deterministic recovery: at the model-error boundary, a repairable
+    # request (oversized image, invalid thinking-signature, strict tool-schema
+    # grammar) is fixed in place and retried on the SAME model BEFORE credential
+    # rotation / provider fallback. Pins each branch's transform + retry, the
+    # byte-identical no-match fall-through (async + stream), and degrade-to-
+    # fallback on a repaired-retry failure or a recovery bug. Fake Model, no
+    # live LLM. Sits by test_credential_pool: same fallback.py error boundary.
+    "test_inplace_recovery",
     # Every tool name the framework / dream prompts hand the model must
     # resolve to a real MCP registration. Pure-unit: introspects the
     # adapters + parses the vendored vault server; no Node, no subprocess.

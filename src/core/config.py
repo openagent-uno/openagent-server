@@ -255,3 +255,64 @@ def ptc_settings(config: dict) -> PtcSettings:
         max_tool_calls=int(raw.get("max_tool_calls", 50)),
         timeout_s=int(raw.get("timeout_s", 120)),
     )
+
+
+@dataclass(frozen=True)
+class ToolOutputSettings:
+    """Runtime knobs for the oversized-tool-result ceiling (``cap_tool_output``).
+
+    OFF BY DEFAULT. With ``offload_enabled=False`` the cap behaves exactly as it
+    always has: an over-cap result is truncated in place (head + tail + a loud
+    marker) and the dropped bytes are gone. The offload path is purely additive
+    — it activates only when the operator opts in — so an absent/empty
+    ``tool_output:`` stanza leaves ``cap_tool_output`` byte-identical.
+
+    offload_enabled:
+        Master switch. Reads ``tool_output.offload_enabled`` (default
+        ``False``). When ``True``, an over-threshold result is spilled LOSSLESSLY
+        to a file and replaced in-context by a compact preview + the file path
+        the agent can re-read with its ``read_file``/editor tool, instead of
+        being truncated lossily.
+
+    offload_threshold:
+        Chars above which a result is offloaded rather than returned inline.
+        Reads ``tool_output.offload_threshold``. ``None`` (default) falls back at
+        call time to the existing cap (``OPENAGENT_MAX_TOOL_RESULT_CHARS`` /
+        ``DEFAULT_MAX_TOOL_RESULT_CHARS``), so by default offload kicks in at
+        exactly the point truncation used to.
+
+    offload_dir:
+        Directory the full results are written to. Reads
+        ``tool_output.offload_dir``. ``None`` (default) falls back at call time
+        to ``paths.data_dir()/tool_outputs`` — inside the data dir the agent's
+        filesystem/editor MCP root already covers by default, so the handle is
+        re-readable without widening any root.
+
+    offload_keep:
+        Retention cap — the offload dir is pruned to the newest this-many files
+        on every write, so it can never grow unbounded. Reads
+        ``tool_output.offload_keep`` (default 200). ``<= 0`` disables pruning.
+    """
+    offload_enabled: bool = False
+    offload_threshold: int | None = None
+    offload_dir: str | None = None
+    offload_keep: int = 200
+
+
+def tool_output_settings(config: dict) -> ToolOutputSettings:
+    """Parse ToolOutputSettings out of the top-level ``openagent.yaml`` dict.
+
+    Defensive: a missing/empty ``tool_output:`` stanza yields the OFF default,
+    so a deployment that never heard of offload behaves exactly as before.
+    """
+    raw = (config or {}).get("tool_output") or {}
+    if not isinstance(raw, dict):
+        raw = {}
+    threshold = raw.get("offload_threshold")
+    offload_dir = raw.get("offload_dir")
+    return ToolOutputSettings(
+        offload_enabled=bool(raw.get("offload_enabled", False)),
+        offload_threshold=int(threshold) if threshold is not None else None,
+        offload_dir=str(offload_dir) if offload_dir else None,
+        offload_keep=int(raw.get("offload_keep", 200)),
+    )
