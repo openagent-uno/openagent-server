@@ -379,3 +379,89 @@ async def t_locked_writer_lands_after_release(ctx: TestContext) -> None:
             path.unlink()
         except FileNotFoundError:
             pass
+
+
+# ── 4. Regression: boot against a legacy DB that predates the lease columns ──
+
+
+@test("event_delivery_lease",
+      "connect() migrates a pre-lease DB without crashing (lease index off SCHEMA_SQL)")
+async def t_legacy_db_migrates_without_crash(ctx: TestContext) -> None:
+    """A production DB written before the lease columns shipped has an
+    ``event_deliveries`` table with NO ``claim_expires`` and NO
+    ``idx_evdel_lease``. The index on that post-ship column MUST be created by
+    ``_migrate_event_deliveries_lease`` — which runs from ``_apply_legacy_alters``
+    AFTER the ALTER that adds the column — never in ``SCHEMA_SQL`` (whose
+    ``executescript`` runs before any ALTER).
+
+    Regression: the index lived in ``SCHEMA_SQL``, so on a migrated DB (table
+    already exists → ``CREATE TABLE IF NOT EXISTS`` is a no-op → column absent)
+    the ``CREATE INDEX`` raised ``sqlite3.OperationalError: no such column:
+    claim_expires`` and the process died before serving. On prod that tripped
+    update_guard's 3-boot rollback (the 0.18.18 incident). Fresh DBs never hit
+    it because their ``CREATE TABLE`` already carries the column."""
+    import sqlite3
+
+    from src.memory.db import MemoryDB
+
+    path = _fresh_db_path(ctx)
+    lease_cols = ("claim_expires", "worker_id", "worker_pid", "last_heartbeat_at")
+
+    # Hand-write the pre-lease ``event_deliveries`` table (every column the older
+    # SCHEMA_SQL shipped, minus the four lease columns; the pre-lease indexes,
+    # minus ``idx_evdel_lease``) into a raw file. This is exactly what a
+    # production DB predating the lease deploy looks like. ``connect()`` will then
+    # CREATE-IF-NOT-EXISTS the rest of the schema around it and run the migration.
+    legacy_ddl = """
+    CREATE TABLE event_deliveries (
+        id               TEXT PRIMARY KEY,
+        event_id         TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+        source           TEXT NOT NULL DEFAULT 'webhook',
+        external_id      TEXT,
+        status           TEXT NOT NULL,
+        payload_json     TEXT NOT NULL DEFAULT '{}',
+        started_at       REAL NOT NULL,
+        finished_at      REAL,
+        output           TEXT,
+        error            TEXT,
+        session_id       TEXT,
+        workflow_run_id  TEXT,
+        task_run_id      TEXT,
+        claimed_at       REAL,
+        reenqueue_count  INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX idx_evdel_event     ON event_deliveries(event_id);
+    CREATE INDEX idx_evdel_started   ON event_deliveries(started_at);
+    CREATE INDEX idx_evdel_status    ON event_deliveries(status);
+    CREATE INDEX idx_evdel_unclaimed ON event_deliveries(claimed_at);
+    """
+    raw = sqlite3.connect(str(path))
+    try:
+        raw.executescript(legacy_ddl)
+        raw.commit()
+    finally:
+        raw.close()
+
+    # The boot that used to crash: opening this legacy file ran
+    # ``executescript(SCHEMA_SQL)``, whose ``CREATE INDEX idx_evdel_lease ON
+    # event_deliveries(claim_expires)`` referenced a not-yet-added column.
+    db = MemoryDB(str(path))
+    try:
+        await db.connect()  # regression: raised "no such column: claim_expires"
+        conn = await db._ensure_connected()
+        cur = await conn.execute("PRAGMA table_info(event_deliveries)")
+        cols = {row[1] for row in await cur.fetchall()}
+        for col in lease_cols:
+            assert col in cols, f"migration must add {col} to a legacy table"
+        cur = await conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='index' AND name='idx_evdel_lease'"
+        )
+        assert await cur.fetchone() is not None, \
+            "migration must create idx_evdel_lease after the ALTER"
+    finally:
+        await db.close()
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
