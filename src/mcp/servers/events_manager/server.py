@@ -448,6 +448,130 @@ async def trigger_event(
     )
 
 
+# Fields a GUARDED change may write/rollback. Must match MemoryDB._GUARDED_EVENT_FIELDS.
+_GUARDED_FIELDS = ("prompt_template", "model", "input_schema_json", "action_ref", "enabled")
+
+# Baseline window (seconds before apply) for the failure-rate comparison.
+_GUARDED_BASELINE_WINDOW = 1800.0
+
+
+async def _ensure_guarded_changes_schema(conn: aiosqlite.Connection) -> None:
+    """Idempotently ensure the guarded_changes table exists from this MCP path
+    too (the main process migrates it at startup; this covers a first-boot race).
+    Indexes + columns all reference only what this statement creates."""
+    await conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS guarded_changes (
+            id TEXT PRIMARY KEY, target_kind TEXT NOT NULL, target_id TEXT NOT NULL,
+            field TEXT NOT NULL, old_value TEXT, new_value TEXT, metric_event_id TEXT,
+            applied_at REAL NOT NULL, check_after REAL NOT NULL,
+            baseline_fail_rate REAL, baseline_n INTEGER,
+            status TEXT NOT NULL DEFAULT 'pending', after_fail_rate REAL,
+            after_n INTEGER, resolved_at REAL, note TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_guarded_pending ON guarded_changes(status, check_after);
+        CREATE INDEX IF NOT EXISTS idx_guarded_block ON guarded_changes(target_kind, target_id, field, status);
+        """
+    )
+    await conn.commit()
+
+
+@mcp.tool()
+async def guarded_update_event(
+    id_or_slug: str,
+    field: str,
+    new_value: str,
+    watch_minutes: float = 10.0,
+) -> dict[str, Any]:
+    """Change one field of a webhook event UNDER GUARD — the ONLY sanctioned way
+    for an autonomous fix to edit an event; never write the events table directly.
+
+    It (1) REFUSES a change that was auto-rolled-back before (blocklist — so a
+    broken fix is never re-applied), (2) SNAPSHOTS the old value, (3) applies the
+    change, and (4) registers it so the scheduler's deterministic watcher measures
+    this event's REAL delivery failure-rate over the next ``watch_minutes`` and
+    AUTO-ROLLS-BACK (restoring the snapshot) + blocklists it if the rate regressed.
+    So an auto-apply can safely fail: it self-heals and does not repeat.
+
+    Args:
+        id_or_slug: the event to change.
+        field: one of prompt_template, model, input_schema_json, action_ref, enabled.
+        new_value: the new value (a string; SQLite coerces for enabled).
+        watch_minutes: how long the watcher observes before confirming (default 10).
+
+    Returns the guarded-change record (id, status='pending', old/new, baseline).
+    """
+    if field not in _GUARDED_FIELDS:
+        raise ValueError(f"field must be one of {_GUARDED_FIELDS}")
+    conn = await _get_conn()
+    await _ensure_guarded_changes_schema(conn)
+    eid = await _resolve_event_id(conn, id_or_slug)
+
+    # (1) blocklist — this exact change was auto-rolled-back before → refuse.
+    cur = await conn.execute(
+        "SELECT 1 FROM guarded_changes WHERE target_kind='event_field' AND target_id=? "
+        "AND field=? AND new_value=? AND status='rolled_back' LIMIT 1",
+        (eid, field, new_value),
+    )
+    if await cur.fetchone() is not None:
+        raise ValueError(
+            f"blocked: this exact change to {field!r} on event {eid} was previously "
+            "auto-rolled-back for regressing delivery — it will not be re-applied. "
+            "Propose it to a human instead."
+        )
+
+    # (2) snapshot old value.
+    cur = await conn.execute(f"SELECT {field} AS v FROM events WHERE id=?", (eid,))
+    row = await cur.fetchone()
+    if row is None:
+        raise ValueError(f"event {eid} not found")
+    old_value = row["v"]
+    if str(old_value) == str(new_value):
+        return {"status": "noop", "reason": "new_value equals current value", "event_id": eid}
+
+    now = time.time()
+    # baseline: failure-rate in the window BEFORE the change.
+    cur = await conn.execute(
+        "SELECT status, COUNT(*) AS n FROM event_deliveries "
+        "WHERE event_id=? AND started_at>=? AND started_at<? GROUP BY status",
+        (eid, now - _GUARDED_BASELINE_WINDOW, now),
+    )
+    brows = await cur.fetchall()
+    btotal = sum(r["n"] for r in brows)
+    bfailed = sum(r["n"] for r in brows if r["status"] == "failed")
+    baseline_rate = (bfailed / btotal) if btotal else 0.0
+
+    # (3) apply + reset the breaker for a clean measurement window.
+    await conn.execute(
+        f"UPDATE events SET {field}=?, consecutive_failures=0, "
+        f"breaker_tripped_at=NULL, last_failure_error=NULL, updated_at=? WHERE id=?",
+        (new_value, now, eid),
+    )
+    # (4) record the pending guarded change for the watcher.
+    cid = uuid.uuid4().hex
+    await conn.execute(
+        "INSERT INTO guarded_changes (id, target_kind, target_id, field, old_value, "
+        "new_value, metric_event_id, applied_at, check_after, baseline_fail_rate, "
+        "baseline_n, status, note) VALUES (?,?,?,?,?,?,?,?,?,?,?, 'pending', ?)",
+        (cid, "event_field", eid, field, old_value, new_value, eid, now,
+         now + max(1.0, watch_minutes) * 60.0, baseline_rate, btotal,
+         f"guarded apply of {field}"),
+    )
+    await conn.commit()
+    return {
+        "id": cid,
+        "status": "pending",
+        "event_id": eid,
+        "field": field,
+        "old_value": old_value,
+        "new_value": new_value,
+        "baseline_fail_rate": round(baseline_rate, 3),
+        "baseline_n": btotal,
+        "watch_minutes": watch_minutes,
+        "note": "applied under guard; watcher will auto-rollback + blocklist if delivery fail-rate regresses",
+    }
+
+
 def main() -> None:
     logging.basicConfig(
         level=os.environ.get("OPENAGENT_EVENTS_MCP_LOGLEVEL", "INFO"),

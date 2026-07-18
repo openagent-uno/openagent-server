@@ -1137,6 +1137,7 @@ class MemoryDB:
         await self._migrate_event_deliveries_reenqueue_count()
         await self._migrate_event_deliveries_lease()
         await self._migrate_events_breaker()
+        await self._migrate_guarded_changes()
 
     async def _add_columns_if_missing(
         self, table: str, columns: dict[str, str],
@@ -1209,6 +1210,172 @@ class MemoryDB:
                 "last_failure_error": "TEXT",
             },
         )
+
+    async def _migrate_guarded_changes(self) -> None:
+        """Guarded auto-applied changes — snapshot + watch + auto-rollback +
+        blocklist. When an autonomous fix (the self-remediation cycle) applies a
+        config/template change, it records a row here; the scheduler's
+        ``reap_guarded_changes`` watcher then measures the target's REAL delivery
+        failure-rate after the change and, if it regressed, RESTORES the old
+        value and marks the row ``rolled_back`` — which also blocklists that exact
+        (target, field, new_value) so it is NEVER re-applied. This is what makes
+        auto-apply safe: a fix that breaks something self-heals and does not
+        repeat. Idle by default: the table is empty until a guarded change runs.
+
+        CREATE TABLE + its indexes together (both reference only columns this
+        statement creates — the claim_expires boot-crash lesson: never index a
+        column in a block that runs before the column exists)."""
+        assert self._conn is not None
+        await self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS guarded_changes (
+                id                 TEXT PRIMARY KEY,
+                target_kind        TEXT NOT NULL,    -- 'event_field'
+                target_id          TEXT NOT NULL,    -- e.g. the event id
+                field              TEXT NOT NULL,    -- e.g. 'prompt_template'
+                old_value          TEXT,             -- snapshot for rollback
+                new_value          TEXT,
+                metric_event_id    TEXT,             -- event whose fail-rate we watch
+                applied_at         REAL NOT NULL,
+                check_after        REAL NOT NULL,    -- watcher evaluates at/after this
+                baseline_fail_rate REAL,             -- fail-rate in the window BEFORE apply
+                baseline_n         INTEGER,
+                status             TEXT NOT NULL DEFAULT 'pending', -- pending|confirmed|rolled_back
+                after_fail_rate    REAL,
+                after_n            INTEGER,
+                resolved_at        REAL,
+                note               TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_guarded_pending
+                ON guarded_changes(status, check_after);
+            CREATE INDEX IF NOT EXISTS idx_guarded_block
+                ON guarded_changes(target_kind, target_id, field, status);
+            """
+        )
+        await self._conn.commit()
+
+    # ── Guarded-change watcher (deterministic auto-rollback) ────────────────
+    # Columns of `events` that a guarded change may restore on rollback. A tight
+    # whitelist keeps the rollback UPDATE from ever touching an unexpected field.
+    _GUARDED_EVENT_FIELDS = frozenset(
+        {"prompt_template", "model", "input_schema_json", "action_ref", "enabled"}
+    )
+
+    async def event_fail_rate(
+        self, event_id: str, since: float, until: float | None = None
+    ) -> tuple[float, int]:
+        """(failure_rate, sample_count) for one event's deliveries in
+        ``[since, until)``. A render error / broken template shows up as
+        ``status='failed'`` rows, so a change that breaks delivery drives this up."""
+        assert self._conn is not None
+        until = time.time() if until is None else until
+        cur = await self._conn.execute(
+            "SELECT status, COUNT(*) AS n FROM event_deliveries "
+            "WHERE event_id = ? AND started_at >= ? AND started_at < ? "
+            "GROUP BY status",
+            (event_id, since, until),
+        )
+        rows = await cur.fetchall()
+        total = sum(r["n"] for r in rows)
+        failed = sum(r["n"] for r in rows if r["status"] == "failed")
+        return (failed / total if total else 0.0), total
+
+    async def is_guarded_change_blocked(
+        self, *, target_kind: str, target_id: str, field: str, new_value: str
+    ) -> bool:
+        """True when this exact (target, field, new_value) was auto-rolled-back
+        before — the blocklist that stops a broken auto-fix from repeating."""
+        assert self._conn is not None
+        cur = await self._conn.execute(
+            "SELECT 1 FROM guarded_changes WHERE target_kind=? AND target_id=? "
+            "AND field=? AND new_value=? AND status='rolled_back' LIMIT 1",
+            (target_kind, target_id, field, new_value),
+        )
+        return (await cur.fetchone()) is not None
+
+    async def _restore_guarded_target(self, ch: Any) -> bool:
+        """Restore a guarded change's snapshot (rollback). Only ``event_field``
+        targets, only whitelisted columns. Returns True if a row was restored."""
+        assert self._conn is not None
+        if ch["target_kind"] != "event_field":
+            return False
+        field = ch["field"]
+        if field not in self._GUARDED_EVENT_FIELDS:
+            return False
+        # Field name is whitelist-checked above, so this f-string is safe.
+        await self._conn.execute(
+            f"UPDATE events SET {field}=?, consecutive_failures=0, "
+            f"breaker_tripped_at=NULL, last_failure_error=NULL WHERE id=?",
+            (ch["old_value"], ch["target_id"]),
+        )
+        await self._conn.commit()
+        return True
+
+    async def reap_guarded_changes(
+        self,
+        *,
+        regression_margin: float = 0.15,
+        min_after_samples: int = 3,
+        give_up_after_seconds: float = 3600.0,
+    ) -> int:
+        """Deterministic watcher: resolve every pending guarded change whose
+        ``check_after`` has passed. Measures the target's REAL delivery
+        failure-rate since the change vs the recorded baseline:
+
+        * regressed (after_rate > baseline + margin, with ≥ min_after_samples
+          observed) → RESTORE the snapshot and mark ``rolled_back`` (which also
+          blocklists that exact change);
+        * stable with enough samples → ``confirmed``;
+        * too few samples but past ``give_up_after_seconds`` → ``confirmed``
+          (nothing ran → nothing broke); otherwise left pending for a later tick.
+
+        Self-guarded and cheap; returns the number of changes resolved."""
+        assert self._conn is not None
+        now = time.time()
+        cur = await self._conn.execute(
+            "SELECT * FROM guarded_changes WHERE status='pending' AND check_after<=?",
+            (now,),
+        )
+        pending = await cur.fetchall()
+        resolved = 0
+        for ch in pending:
+            metric_ev = ch["metric_event_id"] or ch["target_id"]
+            after_rate, after_n = await self.event_fail_rate(metric_ev, ch["applied_at"], now)
+            base = ch["baseline_fail_rate"] or 0.0
+            new_status: str | None = None
+            note = ch["note"] or ""
+            if after_n >= min_after_samples and after_rate > base + regression_margin:
+                restored = await self._restore_guarded_target(ch)
+                new_status = "rolled_back"
+                note = (
+                    f"auto-rollback: fail-rate {after_rate:.0%} (n={after_n}) vs "
+                    f"baseline {base:.0%}; snapshot restored={restored}"
+                )
+            elif after_n >= min_after_samples:
+                new_status = "confirmed"
+                note = f"confirmed: fail-rate {after_rate:.0%} (n={after_n}) ≤ baseline {base:.0%}+margin"
+            elif now - ch["applied_at"] >= give_up_after_seconds:
+                new_status = "confirmed"
+                note = f"confirmed (idle): only {after_n} deliveries observed, nothing regressed"
+            if new_status is not None:
+                await self._conn.execute(
+                    "UPDATE guarded_changes SET status=?, after_fail_rate=?, "
+                    "after_n=?, resolved_at=?, note=? WHERE id=?",
+                    (new_status, after_rate, after_n, now, note[:500], ch["id"]),
+                )
+                await self._conn.commit()
+                resolved += 1
+                try:
+                    from src.core.logging import elog
+                    elog(
+                        "guarded_change." + new_status,
+                        target=f"{ch['target_kind']}:{ch['target_id']}.{ch['field']}",
+                        after_fail_rate=round(after_rate, 3),
+                        after_n=after_n,
+                    )
+                except Exception:  # noqa: BLE001 — logging must never break the sweep
+                    pass
+        return resolved
 
     async def _migrate_event_deliveries_reenqueue_count(self) -> None:
         """At-least-once event delivery re-enqueues an orphaned (claimed but

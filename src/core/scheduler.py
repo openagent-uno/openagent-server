@@ -414,6 +414,17 @@ class Scheduler:
                     await self._sweep_stale_event_deliveries()
             except Exception as e:  # noqa: BLE001
                 elog("scheduler.stale_sweep_loop_error", level="error", error=str(e))
+            # Guarded-change watcher: resolve any auto-applied config/template
+            # change whose watch window has elapsed — measure the target's real
+            # failure-rate and auto-rollback + blocklist it if it regressed. Each
+            # row is self-gated by its own ``check_after`` timestamp, so this is a
+            # no-op (one indexed SELECT) unless a guarded change is actually
+            # pending. Self-guarded: a watcher error must never break the loop.
+            try:
+                if hasattr(self.db, "reap_guarded_changes"):
+                    await self.db.reap_guarded_changes()
+            except Exception as e:  # noqa: BLE001
+                elog("scheduler.guarded_change_loop_error", level="error", error=str(e))
             await asyncio.sleep(CANCEL_CHECK_INTERVAL)
 
     async def _reap_expired_event_leases(self) -> None:
