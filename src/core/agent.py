@@ -16,6 +16,7 @@ from src.mcp.pool import MCPPool
 from src.core.prompts import (
     FRAMEWORK_SYSTEM_PROMPT,
     build_mcp_catalog_summary,
+    build_ptc_note,
     build_skills_index,
 )
 from src.models.runtime import wire_model_runtime
@@ -2375,6 +2376,13 @@ class Agent:
         """Skills section for ``{{SKILLS_INDEX}}`` — "" when disabled."""
         return build_skills_index(getattr(self, "_skills", None))
 
+    def _render_ptc_note(self) -> str:
+        """PTC note for ``{{PTC_NOTE}}`` — "" when ``ptc.enabled`` is unset, so
+        the placeholder (flush against the next header) collapses to a
+        byte-identical prompt."""
+        from src.core.config import ptc_settings
+        return build_ptc_note(ptc_settings(getattr(self, "config", None) or {}).enabled)
+
     def _resolve_db_path(self) -> str:
         """Return the SQLite DB path backing runtime state for this agent."""
         from pathlib import Path
@@ -2432,6 +2440,12 @@ class Agent:
             # Frozen snapshot above <session-id>, safe for the prompt cache.
             "{{SKILLS_INDEX}}",
             self._render_skills_index(),
+        ).replace(
+            # PTC note — "" when ``ptc.enabled`` is unset. Same flush-placeholder
+            # discipline as SKILLS_INDEX: an empty render is byte-identical, and
+            # a static render stays cache-safe above <session-id>.
+            "{{PTC_NOTE}}",
+            self._render_ptc_note(),
         )
 
         user = (self.system_prompt or "").strip()

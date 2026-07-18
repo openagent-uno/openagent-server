@@ -536,6 +536,12 @@ _TEST_MODULES: tuple[str, ...] = (
     # same shell_exec callsite. Sits by test_safety: another additive gate whose
     # off/default path must stay byte-identical, asserted at the real callsite.
     "test_sandbox",
+    # Programmatic Tool Calling (the opt-in ``run_python`` tool): the UDS RPC
+    # bridge over a raw socket, a real script round-trip through BackgroundShell,
+    # the byte-identical-when-off guarantee, output cap, dry-run stamping, auth,
+    # and the fail-closed sandbox guards. Sits by test_sandbox: it reuses the
+    # exec backend and is another additive, off-by-default gate. LLM-free.
+    "test_ptc",
     # ``network.peers`` allowlist + scope, driven through the real auth
     # middleware with the agent-ALPN contextvar set. Same family as
     # test_safety: a security gate asserted at its callsite, never in

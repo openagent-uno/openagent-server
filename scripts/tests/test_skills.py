@@ -224,8 +224,13 @@ async def t_disabled_path_is_inert(ctx: TestContext) -> None:
     # flush against the next header, so an empty render leaves no gap).
     assert build_skills_index(None) == ""
     assert "{{SKILLS_INDEX}}" in FRAMEWORK_SYSTEM_PROMPT
+    # Neutralize the sibling ``{{PTC_NOTE}}`` placeholder too: it sits flush
+    # against ``{{SKILLS_INDEX}}`` (``{{SKILLS_INDEX}}{{PTC_NOTE}}## Builtin``)
+    # and both collapse to "" when their features are off — the header is only
+    # contiguous once BOTH are rendered, exactly as ``_combined_system_prompt``
+    # does. See test_ptc for PTC's own byte-identical guarantee.
     disabled = FRAMEWORK_SYSTEM_PROMPT.replace(
-        "{{SKILLS_INDEX}}", build_skills_index(None))
+        "{{SKILLS_INDEX}}", build_skills_index(None)).replace("{{PTC_NOTE}}", "")
     assert "{{SKILLS_INDEX}}" not in disabled
     assert "\n\n## Builtin management MCPs (canonical paths)" in disabled
     assert "## Skills\n" not in disabled, (

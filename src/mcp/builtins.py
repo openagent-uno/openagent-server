@@ -251,6 +251,25 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
             "skill_manage creates/updates/removes them on disk"
         ),
     },
+    # Programmatic Tool Calling — the ``run_python`` tool. In-process because
+    # it starts a Unix-socket RPC server on the running gateway loop and
+    # dispatches through the live ``MCPPool`` (a subprocess could reach neither).
+    #
+    # DELIBERATELY NOT in DEFAULT_MCPS: registration is gated on ``ptc.enabled``
+    # (see ``config_gated_mcp_entries`` + bootstrap), mirroring ``skills``. With
+    # PTC disabled this spec is inert — a dict entry nothing ever seeds a row
+    # for — so the running system is byte-identical.
+    "ptc": {
+        "in_process": True,
+        "adapter_module": "src.mcp.servers.ptc.adapters",
+        "runtime_toolkit_factory": "build_runtime_toolkit",
+        "description": (
+            "run_python(code) — write a Python script that reaches your own "
+            "tools via call_tool(server, tool, args); the script runs in a "
+            "sandbox and only its stdout returns to you. Collapses a multi-step "
+            "tool pipeline into one turn"
+        ),
+    },
     # In-process on purpose: the log path comes from ``paths.log_dir()``,
     # which resolves against the live agent dir set by ``set_agent_dir``. A
     # subprocess would re-resolve it from platform defaults and read a
@@ -503,13 +522,16 @@ def config_gated_mcp_entries(config: dict | None) -> list[dict[str, Any]]:
     the operator opts in. ``ensure_builtin_mcps`` appends whatever this
     returns to the seed set, so an unset flag seeds nothing new.
 
-    Today this is just the native Skills subsystem (``skills.enabled``).
+    Today this is the native Skills subsystem (``skills.enabled``) and
+    Programmatic Tool Calling (``ptc.enabled``).
     """
-    from src.core.config import skills_settings
+    from src.core.config import ptc_settings, skills_settings
 
     entries: list[dict[str, Any]] = []
     if skills_settings(config).enabled:
         entries.append({"builtin": "skills", "_default": True})
+    if ptc_settings(config).enabled:
+        entries.append({"builtin": "ptc", "_default": True})
     return entries
 
 

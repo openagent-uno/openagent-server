@@ -148,3 +148,65 @@ def skills_settings(config: dict) -> SkillsSettings:
         curator_enabled=bool(raw.get("curator_enabled", False)),
         curator_schedule=str(schedule) if schedule else None,
     )
+
+
+@dataclass(frozen=True)
+class PtcSettings:
+    """Runtime knobs for Programmatic Tool Calling (the ``run_python`` tool).
+
+    OFF BY DEFAULT. With ``enabled=False`` the ``ptc`` builtin MCP is never
+    registered (see ``config_gated_mcp_entries``), the ``{{PTC_NOTE}}`` prompt
+    slot renders "", and the tool list / system prompt / every code path stay
+    byte-identical to a build without this feature.
+
+    enabled:
+        Master switch. Reads ``ptc.enabled`` (default ``False``).
+
+    require_sandbox:
+        When ``True`` (default), ``run_python`` refuses UNLESS the docker
+        sandbox backend is active (``OPENAGENT_SANDBOX_BACKEND=docker``) — it
+        fails closed rather than running the model's script on the host. Set
+        ``False`` to allow host execution via the LOCAL exec backend (the same
+        surface the ``shell`` tool already runs on).
+
+    allowed_tools:
+        Optional secondary allowlist intersected with the pool's own grant. The
+        bridge can already only reach tools the agent has (dispatch goes through
+        ``_call_tool_impl``); this narrows that further to specific tool keys.
+        ``None`` (default) imposes no extra narrowing.
+
+    max_tool_calls:
+        Hard cap on ``call_tool`` round-trips within a SINGLE ``run_python``
+        call (default 50). These are internal to the one tool call and do NOT
+        count against the agentic-loop ``autoloop_cap``.
+
+    timeout_s:
+        Wall-clock cap on the child script (default 120), enforced by
+        ``BackgroundShell.run_with_timeout`` (killpg tree-kill on expiry).
+    """
+    enabled: bool = False
+    require_sandbox: bool = True
+    allowed_tools: tuple[str, ...] | None = None
+    max_tool_calls: int = 50
+    timeout_s: int = 120
+
+
+def ptc_settings(config: dict) -> PtcSettings:
+    """Parse PtcSettings out of the top-level ``openagent.yaml`` dict.
+
+    Defensive: a missing/empty ``ptc:`` stanza yields the OFF default, so a
+    deployment that never heard of PTC behaves exactly as before.
+    """
+    raw = (config or {}).get("ptc") or {}
+    if not isinstance(raw, dict):
+        raw = {}
+    allowed = raw.get("allowed_tools")
+    if allowed is not None:
+        allowed = tuple(str(x) for x in allowed)
+    return PtcSettings(
+        enabled=bool(raw.get("enabled", False)),
+        require_sandbox=bool(raw.get("require_sandbox", True)),
+        allowed_tools=allowed,
+        max_tool_calls=int(raw.get("max_tool_calls", 50)),
+        timeout_s=int(raw.get("timeout_s", 120)),
+    )

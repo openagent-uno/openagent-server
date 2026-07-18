@@ -205,7 +205,7 @@ report the result. Do NOT guess from memory.
 
 {{MCP_CATALOG_SUMMARY}}
 
-{{SKILLS_INDEX}}## Builtin management MCPs (canonical paths)
+{{SKILLS_INDEX}}{{PTC_NOTE}}## Builtin management MCPs (canonical paths)
 
 The catalog above describes each builtin MCP and lists its exact tool
 keys. They give you authority over the framework itself and are the
@@ -982,4 +982,31 @@ def build_skills_index(registry) -> str:
         "to create/update/remove one. Do not guess a skill's contents from "
         "its description — open it.\n\n"
         f"{index}\n\n"
+    )
+
+
+def build_ptc_note(enabled: bool) -> str:
+    """Render the ``## Programmatic tool calling`` section for the
+    ``{{PTC_NOTE}}`` slot — "" when PTC is disabled.
+
+    CACHE DISCIPLINE — like :func:`build_skills_index`, this lands in the CACHED
+    system prefix (above ``<session-id>``), so it is a STATIC render: no
+    per-turn tokens. Returns "" when ``enabled`` is False, and because the
+    placeholder sits flush against the next header
+    (``{{SKILLS_INDEX}}{{PTC_NOTE}}## Builtin management MCPs``), that empty
+    render leaves the framework prompt BYTE-IDENTICAL to a build without this
+    feature.
+    """
+    if not enabled:
+        return ""
+    return (
+        "## Programmatic tool calling\n\n"
+        "You have ``run_python(code)`` — write a Python script that reaches "
+        "your OWN tools via ``call_tool(server, tool, args)`` (already in "
+        "scope, no import needed; same server/tool names as "
+        "``tool_search_call_tool``). The script runs in a sandbox and ONLY its "
+        "stdout is returned to you. Reach for it to collapse a multi-step tool "
+        "pipeline into ONE turn — fan out over many items, filter/aggregate in "
+        "code, or join results from several tools — instead of paying a model "
+        "round-trip per tool call. Print just the distilled answer.\n\n"
     )
