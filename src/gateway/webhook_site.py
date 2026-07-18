@@ -211,6 +211,26 @@ class WebhookSite:
         )
         elog("event.received", id=event_id, result="accepted", delivery=delivery_id)
 
+        # Per-event circuit breaker: if this event's breaker is OPEN, park the
+        # delivery durably as ``blocked`` (visible in history) and do NOT run the
+        # turn. Inert by default — ``is_event_breaker_tripped`` returns False
+        # unless OPENAGENT_EVENT_BREAKER_ENABLED is set — so this is a no-op on
+        # today's behaviour. The row is still recorded above so nothing is lost.
+        breaker_tripped = False
+        try:
+            breaker_tripped = await db.is_event_breaker_tripped(event_id)
+        except Exception:  # noqa: BLE001
+            breaker_tripped = False
+        if breaker_tripped:
+            await db.update_event_delivery(
+                delivery_id, status="blocked",
+                error="event circuit breaker open", finished_at=time.time(),
+            )
+            elog("event.blocked", id=event_id, delivery=delivery_id)
+            return web.json_response(
+                {"delivery_id": delivery_id, "status": "blocked"}, status=202,
+            )
+
         scheduler = getattr(gw, "_scheduler", None)
         from src.core.event_dispatcher import dispatch_event
         coro = dispatch_event(

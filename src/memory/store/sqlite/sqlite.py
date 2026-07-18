@@ -37,13 +37,64 @@ from src.core._runner.utils.log import log_debug, log_error, log_info, log_warni
 from src.core._runner.utils.string import generate_id
 
 try:
-    from sqlalchemy import Column, MetaData, String, Table, func, or_, select, text
+    from sqlalchemy import Column, MetaData, String, Table, event, func, or_, select, text
     from sqlalchemy.dialects import sqlite
     from sqlalchemy.engine import Engine, create_engine
     from sqlalchemy.orm import scoped_session, sessionmaker
     from sqlalchemy.schema import ForeignKey, Index, UniqueConstraint
 except ImportError:
     raise ImportError("`sqlalchemy` not installed. Please install it using `pip install sqlalchemy`")
+
+
+def _session_store_pragma_enabled() -> bool:
+    """Gate for the runtime session-store PRAGMA hook. OFF by default so the
+    engine stays byte-identical to the historical ``create_engine(url)`` (the
+    current QueuePool, no busy_timeout) — turning it on is behaviour-changing."""
+    import os
+    raw = os.environ.get("OPENAGENT_SESSION_STORE_PRAGMA_ENABLED")
+    if raw is None:
+        return False
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _make_session_store_engine(url: str) -> "Engine":
+    """Create the runtime session-store SQLAlchemy engine.
+
+    This engine is the confirmed WAL-writer wedge: it commits a big ``runs`` blob
+    per step and, under a rate-limit storm, hogs the single SQLite writer so
+    MemoryDB's finalizer/reaper UPDATEs lose the race ("database is locked").
+
+    Default (flag OFF): exactly the previous ``create_engine(url)`` — no
+    ``busy_timeout``, no PRAGMA — so nothing changes until an operator opts in.
+
+    ``OPENAGENT_SESSION_STORE_PRAGMA_ENABLED`` on (SQLite URLs only): set a
+    per-connection ``busy_timeout`` (so a step commit WAITS for the writer to
+    free instead of raising immediately), ``journal_mode=WAL`` and
+    ``synchronous=NORMAL`` so this engine and MemoryDB coexist on one file with
+    far fewer lock errors. Passes ``connect_args={"timeout": ...}`` so the very
+    first connect also honours the wait."""
+    is_sqlite = url.startswith("sqlite")
+    if not is_sqlite or not _session_store_pragma_enabled():
+        return create_engine(url)
+
+    import os
+    try:
+        timeout = float(os.environ.get("OPENAGENT_SESSION_STORE_BUSY_TIMEOUT_SECONDS", "10"))
+    except (TypeError, ValueError):
+        timeout = 10.0
+    engine = create_engine(url, connect_args={"timeout": timeout})
+
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragma(dbapi_conn, _rec):  # noqa: ANN001
+        cur = dbapi_conn.cursor()
+        try:
+            cur.execute(f"PRAGMA busy_timeout = {int(timeout * 1000)}")
+            cur.execute("PRAGMA journal_mode=WAL")
+            cur.execute("PRAGMA synchronous=NORMAL")
+        finally:
+            cur.close()
+
+    return engine
 
 
 class SqliteDb(BaseDb):
@@ -130,16 +181,16 @@ class SqliteDb(BaseDb):
         _engine: Optional[Engine] = db_engine
         if _engine is None:
             if db_url is not None:
-                _engine = create_engine(db_url)
+                _engine = _make_session_store_engine(db_url)
             elif db_file is not None:
                 db_path = Path(db_file).resolve()
                 db_path.parent.mkdir(parents=True, exist_ok=True)
                 db_file = str(db_path)
-                _engine = create_engine(f"sqlite:///{db_path}")
+                _engine = _make_session_store_engine(f"sqlite:///{db_path}")
             else:
                 # If none of db_engine, db_url, or db_file are provided, create a db in the current directory
                 default_db_path = Path("./openagent_runtime.db").resolve()
-                _engine = create_engine(f"sqlite:///{default_db_path}")
+                _engine = _make_session_store_engine(f"sqlite:///{default_db_path}")
                 db_file = str(default_db_path)
                 log_debug(f"Created SQLite database: {default_db_path}")
 

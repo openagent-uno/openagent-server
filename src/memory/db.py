@@ -6,6 +6,8 @@ import asyncio
 import json
 import logging
 import os
+import random
+import sqlite3
 import time
 import uuid
 from collections import deque
@@ -26,6 +28,53 @@ from src.models.catalog import (
 
 
 logger = logging.getLogger(__name__)
+
+# Per-process worker identity, stamped on an event-delivery claim so the
+# heartbeat can prove "still mine" (``WHERE worker_id = ?``) and an operator
+# can see which pod/process owns an in-flight row. Generated once per process;
+# a claim + its heartbeat + its dispatch all run in the SAME process (the
+# gateway for webhook deliveries, the scheduler for the out-of-process drain),
+# so this constant is always the owner of the leases it stamps.
+WORKER_ID = str(uuid.uuid4())
+WORKER_PID = os.getpid()
+
+# Lease defaults. The lease is SHORT so a frozen turn is reclaimed in ~LEASE_TTL
+# rather than the coarse 30-min stale-sweep age; the heartbeat (a tiny single-row
+# write that survives writer contention) keeps a legitimately-running turn's
+# lease alive, so failure-to-heartbeat is the freeze signal. Both are read live
+# from the environment so an operator can retune without a redeploy.
+_LEASE_TTL_ENV = "OPENAGENT_EVENT_LEASE_TTL_SECONDS"
+_LEASE_TTL_DEFAULT = 120.0
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """A boolean env override; unset → ``default``. Off values: 0/false/no/off/''."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _env_float(name: str, default: float) -> float:
+    """A float env override that falls back to ``default`` on unset/garbage."""
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    """An int env override that falls back to ``default`` on unset/garbage."""
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _lease_ttl_seconds() -> float:
+    """The claim-lease TTL in seconds (>= 1), read live from the environment."""
+    return max(1.0, _env_float(_LEASE_TTL_ENV, _LEASE_TTL_DEFAULT))
+
 
 VALID_MCP_KINDS = ("builtin", "custom", "default")
 # Alias kept for the ``from src.memory.db import VALID_FRAMEWORKS``
@@ -755,6 +804,18 @@ CREATE TABLE IF NOT EXISTS events (
     rate_limit_per_min INTEGER NOT NULL DEFAULT 60,
     max_payload_bytes  INTEGER NOT NULL DEFAULT 262144,
     last_triggered_at  REAL,
+    -- Per-event circuit breaker (``_migrate_events_breaker`` on old DBs). Off by
+    -- default (gated by ``OPENAGENT_EVENT_BREAKER_ENABLED``); all columns work at
+    -- their 0/NULL defaults with no backfill. ``consecutive_failures`` counts ONLY
+    -- permanent failures in a row (transient provider-429/throttle/timeout are NOT
+    -- counted — the storm must not block a healthy event); once it reaches the
+    -- effective limit (per-event ``max_retries``, else the global default) the
+    -- breaker trips and ``breaker_tripped_at`` is stamped, parking further
+    -- deliveries ``blocked`` until a success resets the counter.
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    max_retries        INTEGER,
+    breaker_tripped_at REAL,
+    last_failure_error TEXT,
     created_at         REAL NOT NULL,
     updated_at         REAL NOT NULL
 );
@@ -807,13 +868,27 @@ CREATE TABLE IF NOT EXISTS event_deliveries (
     -- one that reliably kills the process mid-turn) is eventually parked
     -- terminal instead of churning forever. Added on old DBs by
     -- ``_migrate_event_deliveries_reenqueue_count``.
-    reenqueue_count  INTEGER NOT NULL DEFAULT 0
+    reenqueue_count  INTEGER NOT NULL DEFAULT 0,
+    -- Claim-lease + heartbeat (``_migrate_event_deliveries_lease`` on old DBs).
+    -- ``claim_expires`` is when the lease this claim holds runs out; the
+    -- dispatch runner heartbeats it forward while the turn is live, and
+    -- ``reap_expired_event_leases`` re-enqueues a row whose lease has lapsed
+    -- (the freeze signal). ``worker_id``/``worker_pid`` record the owning
+    -- process; ``last_heartbeat_at`` is the last time it proved liveness. ALL
+    -- NULL on a legacy in-flight row → the lease reaper never touches it (that
+    -- is what makes the new columns additive at deploy: pre-existing in-flight
+    -- rows stay handled by the age-gated stale sweep / startup reap).
+    claim_expires     REAL,
+    worker_id         TEXT,
+    worker_pid        INTEGER,
+    last_heartbeat_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_evdel_event     ON event_deliveries(event_id);
 CREATE INDEX IF NOT EXISTS idx_evdel_started   ON event_deliveries(started_at);
 CREATE INDEX IF NOT EXISTS idx_evdel_status    ON event_deliveries(status);
 CREATE INDEX IF NOT EXISTS idx_evdel_external  ON event_deliveries(event_id, external_id);
 CREATE INDEX IF NOT EXISTS idx_evdel_unclaimed ON event_deliveries(claimed_at);
+CREATE INDEX IF NOT EXISTS idx_evdel_lease     ON event_deliveries(claim_expires);
 """
 
 
@@ -823,6 +898,10 @@ class MemoryDB:
     def __init__(self, db_path: str = "openagent.db"):
         self.db_path = db_path
         self._conn: aiosqlite.Connection | None = None
+        # Per-process claim owner (see module-level ``WORKER_ID``). Exposed on
+        # the instance so the dispatch runner can heartbeat "still mine".
+        self.worker_id = WORKER_ID
+        self.worker_pid = WORKER_PID
 
     async def connect(self) -> None:
         if self._conn is not None:
@@ -1052,6 +1131,69 @@ class MemoryDB:
         await self._migrate_scheduled_tasks_timezone_column()
         await self._migrate_events_session_binding()
         await self._migrate_event_deliveries_reenqueue_count()
+        await self._migrate_event_deliveries_lease()
+        await self._migrate_events_breaker()
+
+    async def _add_columns_if_missing(
+        self, table: str, columns: dict[str, str],
+    ) -> None:
+        """Idempotent ``ALTER TABLE ADD COLUMN`` for each ``{name: coldef}`` not
+        already present. ADD COLUMN only — NEVER a whole-table backfill UPDATE
+        (that rewrites/locks the 2 GB event table; the exact outage lesson). New
+        columns must work at their NULL/0 defaults with no backfill.
+
+        Swallows SQLite's "duplicate column name" so a concurrent DDL race across
+        the gateway + scheduler-MCP subprocess + a per-test connection (all
+        pointing at the same file) can't crash a second connect."""
+        assert self._conn is not None
+        cursor = await self._conn.execute(f"PRAGMA table_info({table})")
+        existing = {row[1] for row in await cursor.fetchall()}
+        for name, coldef in columns.items():
+            if name in existing:
+                continue
+            try:
+                await self._conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {name} {coldef}"
+                )
+                await self._conn.commit()
+            except sqlite3.OperationalError as e:
+                # Another connection won the DDL race between our PRAGMA read
+                # and this ALTER — the column now exists, which is what we
+                # wanted. Any other operational error is a real problem.
+                if "duplicate column name" not in str(e).lower():
+                    raise
+
+    async def _migrate_event_deliveries_lease(self) -> None:
+        """Claim-lease + heartbeat columns for at-least-once recovery at
+        ~LEASE_TTL instead of the coarse 30-min stale-sweep age. All NULL on a
+        legacy in-flight row, so ``reap_expired_event_leases`` (which only acts
+        on ``claim_expires IS NOT NULL``) never touches pre-existing rows — the
+        age-gated stale sweep / startup reap keep handling those. ADD COLUMN
+        only; no backfill."""
+        await self._add_columns_if_missing(
+            "event_deliveries",
+            {
+                "claim_expires": "REAL",
+                "worker_id": "TEXT",
+                "worker_pid": "INTEGER",
+                "last_heartbeat_at": "REAL",
+            },
+        )
+
+    async def _migrate_events_breaker(self) -> None:
+        """Per-event circuit-breaker columns. Off by default (gated by
+        ``OPENAGENT_EVENT_BREAKER_ENABLED``); every column works at its 0/NULL
+        default with no backfill, so a fresh column changes nothing until the
+        flag is turned on. ADD COLUMN only."""
+        await self._add_columns_if_missing(
+            "events",
+            {
+                "consecutive_failures": "INTEGER NOT NULL DEFAULT 0",
+                "max_retries": "INTEGER",
+                "breaker_tripped_at": "REAL",
+                "last_failure_error": "TEXT",
+            },
+        )
 
     async def _migrate_event_deliveries_reenqueue_count(self) -> None:
         """At-least-once event delivery re-enqueues an orphaned (claimed but
@@ -1687,6 +1829,28 @@ class MemoryDB:
             await self.connect()
         return self._conn
 
+    async def _write_with_retry(self, do_write, *, attempts: int = 3):
+        """Run an idempotent single-row write, retrying on "database is locked".
+
+        The runtime session store commits a big ``runs`` blob per step and can
+        hog the single SQLite WAL writer during a rate-limit storm; a finalizer /
+        heartbeat / lease-reaper UPDATE that loses that race raises
+        ``sqlite3.OperationalError: database is locked``. Before this, a locked
+        reaper tick was silently swallowed and the row stayed ``running``
+        forever. These writes are idempotent last-writer-wins single-row UPDATEs,
+        so a bounded retry (3× with 50–200 ms jittered backoff) simply lands the
+        write once the writer frees up. A non-lock OperationalError, or exhausting
+        the budget, re-raises to the caller (who logs it)."""
+        delay = 0.05
+        for i in range(attempts):
+            try:
+                return await do_write()
+            except sqlite3.OperationalError as e:
+                if "locked" not in str(e).lower() or i == attempts - 1:
+                    raise
+                await asyncio.sleep(delay + random.uniform(0.0, 0.05))
+                delay = min(delay * 2, 0.2)
+
     # ── Scheduled Tasks ──
 
     async def add_task(
@@ -2259,17 +2423,29 @@ class MemoryDB:
         """Open a delivery row. ``claimed=False`` leaves ``claimed_at`` NULL so
         the Scheduler's drain picks it up (the out-of-process MCP path);
         in-process callers pass ``claimed=True`` (the default) since they
-        dispatch it themselves."""
+        dispatch it themselves.
+
+        An in-process (``claimed=True``) insert also stamps the claim-lease
+        (``claim_expires``, ``worker_id``, ``worker_pid``) so the same
+        dispatch-runner heartbeat + lease-reaper recovery covers a webhook
+        delivery from the moment it is born. An out-of-process insert leaves
+        the lease NULL; ``claim_pending_event_deliveries`` stamps it when the
+        Scheduler claims the row."""
         conn = await self._ensure_connected()
         did = delivery_id or str(uuid.uuid4())
         now = time.time()
+        claim_expires = (now + _lease_ttl_seconds()) if claimed else None
+        wid = WORKER_ID if claimed else None
+        wpid = WORKER_PID if claimed else None
         await conn.execute(
             "INSERT INTO event_deliveries "
-            "(id, event_id, source, external_id, status, payload_json, started_at, claimed_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "(id, event_id, source, external_id, status, payload_json, started_at, "
+            " claimed_at, claim_expires, worker_id, worker_pid) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 did, event_id, source, external_id, status,
                 json.dumps(payload or {}), now, (now if claimed else None),
+                claim_expires, wid, wpid,
             ),
         )
         # Stamp last_triggered_at so the events list can show recency.
@@ -2287,13 +2463,21 @@ class MemoryDB:
         updates = {k: v for k, v in kwargs.items() if k in allowed}
         if not updates:
             return
-        conn = await self._ensure_connected()
         set_clause = ", ".join(f"{k} = ?" for k in updates)
-        await conn.execute(
-            f"UPDATE event_deliveries SET {set_clause} WHERE id = ?",
-            list(updates.values()) + [delivery_id],
-        )
-        await conn.commit()
+        params = list(updates.values()) + [delivery_id]
+
+        # Lock-surviving: this is the finalizer that a rate-limit storm used to
+        # lose to the runtime's big ``runs`` commit — leaving the row ``running``
+        # forever. A bounded retry lands the (idempotent, single-row) write once
+        # the writer frees up.
+        async def _do() -> None:
+            conn = await self._ensure_connected()
+            await conn.execute(
+                f"UPDATE event_deliveries SET {set_clause} WHERE id = ?", params,
+            )
+            await conn.commit()
+
+        await self._write_with_retry(_do)
 
     async def get_event_delivery(self, delivery_id: str) -> dict | None:
         conn = await self._ensure_connected()
@@ -2333,9 +2517,15 @@ class MemoryDB:
     async def claim_pending_event_deliveries(self, *, limit: int = 20) -> list[dict]:
         """Atomically claim up to ``limit`` unclaimed deliveries (those the
         events-manager MCP enqueued out-of-process). Same ``WHERE claimed_at
-        IS NULL`` race guard as ``claim_pending_task_requests``."""
+        IS NULL`` race guard as ``claim_pending_task_requests``.
+
+        The claim also stamps the lease (``claim_expires`` = now + LEASE_TTL,
+        ``worker_id``, ``worker_pid``) so the Scheduler's dispatch runner
+        heartbeats it while the turn runs and ``reap_expired_event_leases``
+        recovers it if the turn freezes."""
         conn = await self._ensure_connected()
         now = time.time()
+        claim_expires = now + _lease_ttl_seconds()
         cursor = await conn.execute(
             "SELECT * FROM event_deliveries "
             "WHERE claimed_at IS NULL ORDER BY started_at ASC LIMIT ?",
@@ -2347,9 +2537,10 @@ class MemoryDB:
         ids = [row["id"] for row in rows]
         placeholders = ",".join("?" for _ in ids)
         await conn.execute(
-            f"UPDATE event_deliveries SET claimed_at = ? "
+            f"UPDATE event_deliveries SET claimed_at = ?, claim_expires = ?, "
+            f"worker_id = ?, worker_pid = ? "
             f"WHERE id IN ({placeholders}) AND claimed_at IS NULL",
-            [now, *ids],
+            [now, claim_expires, WORKER_ID, WORKER_PID, *ids],
         )
         await conn.commit()
         cursor = await conn.execute(
@@ -2359,6 +2550,202 @@ class MemoryDB:
             [*ids, now],
         )
         return [dict(row) for row in await cursor.fetchall()]
+
+    async def heartbeat_event_delivery(
+        self, delivery_id: str, worker_id: str,
+    ) -> int:
+        """Extend the claim lease on an in-flight delivery: ``claim_expires`` =
+        now + LEASE_TTL, ``last_heartbeat_at`` = now, but ONLY while the row is
+        still owned by ``worker_id`` (``AND worker_id = ?``) — a row that has
+        already been reclaimed and re-dispatched by another owner is left alone.
+
+        This is a tiny single-row write: it survives writer contention far better
+        than the runtime's big per-step ``runs`` commit, so *failing* to land it
+        (heartbeat stops) is the freeze signal the lease reaper acts on. Wrapped
+        in the same bounded lock-surviving retry as ``update_event_delivery``.
+        Returns the number of rows updated (0 = the lease was already lost)."""
+        now = time.time()
+        claim_expires = now + _lease_ttl_seconds()
+
+        async def _do() -> int:
+            conn = await self._ensure_connected()
+            cur = await conn.execute(
+                "UPDATE event_deliveries "
+                "SET claim_expires = ?, last_heartbeat_at = ? "
+                "WHERE id = ? AND worker_id = ?",
+                (claim_expires, now, delivery_id, worker_id),
+            )
+            await conn.commit()
+            return cur.rowcount or 0
+
+        return await self._write_with_retry(_do)
+
+    async def reap_expired_event_leases(
+        self,
+        *,
+        enabled: bool | None = None,
+        max_attempts: int | None = None,
+    ) -> int:
+        """Reclaim event deliveries whose claim lease has EXPIRED — the fast
+        (~2 s loop) recovery path, so a frozen turn is recovered in ~LEASE_TTL
+        instead of the coarse 30-min stale-sweep age.
+
+        A live turn's dispatch runner heartbeats ``claim_expires`` forward, so a
+        row with ``claim_expires < now`` provably has not heartbeated for a full
+        lease window — its process/turn is frozen (the WAL-writer wedge) or dead.
+        Reset it to ``received`` with ``claimed_at``/lease cleared so the drain
+        re-dispatches it, and bump ``reenqueue_count``; a row past the replay
+        budget is parked terminal ``failed`` instead.
+
+        SAFE AT DEPLOY — the load-bearing property. This ONLY touches rows with
+        ``claim_expires IS NOT NULL``. Every in-flight row that predates this
+        deploy has ``claim_expires = NULL`` (the column was just added, and only
+        a NEW claim stamps it), so the lease reaper never reclaims a pre-existing
+        row — those stay handled by the age-gated stale sweep / startup reap.
+        Going forward, only leases this build stamped (and thus heartbeats) are
+        eligible, so a still-running turn that keeps heartbeating is never
+        reclaimed. Respects the shared ``OPENAGENT_EVENT_REENQUEUE_ENABLED``
+        kill-switch (off → no-op, returns 0), the redeploy-free escape hatch.
+
+        Returns the number of rows acted on (re-enqueued + parked)."""
+        conn = await self._ensure_connected()
+        now = time.time()
+
+        if enabled is None:
+            enabled = _env_bool("OPENAGENT_EVENT_REENQUEUE_ENABLED", True)
+        if not enabled:
+            return 0
+        if max_attempts is None:
+            max_attempts = _env_int("OPENAGENT_EVENT_REENQUEUE_MAX_ATTEMPTS", 5)
+        max_attempts = max(1, int(max_attempts))
+
+        async def _do() -> tuple[int, int]:
+            # 1. Park expired-lease rows over the replay budget FIRST (so the
+            #    re-enqueue below can't bump them past the cap). Clear the lease.
+            parked_cur = await conn.execute(
+                "UPDATE event_deliveries "
+                "SET status='failed', finished_at=?, "
+                "    claim_expires=NULL, worker_id=NULL, worker_pid=NULL, "
+                "    error=COALESCE(error,'') || "
+                "          CASE WHEN error IS NULL OR error='' THEN '' ELSE ' | ' END || "
+                "          'lease-reap: retry budget exhausted (' || reenqueue_count || ' attempts)' "
+                "WHERE claim_expires IS NOT NULL AND claim_expires < ? "
+                "  AND reenqueue_count >= ? "
+                "  AND status IN ('received','running')",
+                (now, now, max_attempts),
+            )
+            parked = parked_cur.rowcount or 0
+
+            # 2. Re-enqueue every expired-lease orphan under the budget: reset to
+            #    ``received``, drop the claim + lease, clear finished_at, bump the
+            #    replay counter (distinct ``lease-reap`` marker).
+            requeue_cur = await conn.execute(
+                "UPDATE event_deliveries "
+                "SET status='received', claimed_at=NULL, finished_at=NULL, "
+                "    claim_expires=NULL, worker_id=NULL, worker_pid=NULL, "
+                "    reenqueue_count = reenqueue_count + 1, "
+                "    error='re-enqueued: lease-reap recovered orphan (attempt ' "
+                "          || (reenqueue_count + 1) || ')' "
+                "WHERE claim_expires IS NOT NULL AND claim_expires < ? "
+                "  AND reenqueue_count < ? "
+                "  AND status IN ('received','running')",
+                (now, max_attempts),
+            )
+            requeued = requeue_cur.rowcount or 0
+            await conn.commit()
+            return requeued, parked
+
+        requeued, parked = await self._write_with_retry(_do)
+        if requeued or parked:
+            from src.core.logging import elog
+            elog(
+                "event.orphan_reaped", mode="lease-reap",
+                requeued=requeued, parked=parked, max_attempts=max_attempts,
+            )
+        return requeued + parked
+
+    # ── Per-event circuit breaker (gated by OPENAGENT_EVENT_BREAKER_ENABLED) ──
+
+    def _breaker_enabled(self) -> bool:
+        """Master gate. OFF by default → every breaker method is a no-op and
+        behaviour is byte-identical to today (mirrors the
+        ``OPENAGENT_EVENT_REENQUEUE_ENABLED`` kill-switch shape)."""
+        return _env_bool("OPENAGENT_EVENT_BREAKER_ENABLED", False)
+
+    def _breaker_threshold(self) -> int:
+        """Global consecutive-permanent-failure limit (>= 1) when an event has
+        no per-event ``max_retries`` override."""
+        return max(1, _env_int("OPENAGENT_EVENT_BREAKER_THRESHOLD", 5))
+
+    async def record_event_failure(
+        self, event_id: str, error: str | None = None,
+    ) -> None:
+        """Count ONE permanent failure against the event's breaker and trip it
+        when the streak reaches the effective limit (per-event ``max_retries``,
+        else the global default). No-op when the breaker is disabled — so the
+        counter never leaves 0 and nothing is ever blocked (identical to today).
+
+        The caller is responsible for classifying: a transient
+        provider-429/throttle/timeout or a cancellation must NOT reach here, or a
+        rate-limit storm would trip the breaker on the very event it should keep
+        serving."""
+        if not self._breaker_enabled():
+            return
+        now = time.time()
+        conn = await self._ensure_connected()
+        await conn.execute(
+            "UPDATE events "
+            "SET consecutive_failures = consecutive_failures + 1, "
+            "    last_failure_error = ? "
+            "WHERE id = ?",
+            ((str(error)[:2000] if error else None), event_id),
+        )
+        cursor = await conn.execute(
+            "SELECT consecutive_failures, max_retries FROM events WHERE id = ?",
+            (event_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            await conn.commit()
+            return
+        limit = row["max_retries"] if row["max_retries"] is not None else self._breaker_threshold()
+        limit = max(1, int(limit))
+        if int(row["consecutive_failures"]) >= limit:
+            # Idempotent: only stamp the trip time once (first time it crosses).
+            await conn.execute(
+                "UPDATE events SET breaker_tripped_at = ? "
+                "WHERE id = ? AND breaker_tripped_at IS NULL",
+                (now, event_id),
+            )
+        await conn.commit()
+
+    async def reset_event_breaker(self, event_id: str) -> None:
+        """Clear the breaker on a terminal success: streak → 0, un-trip, drop the
+        last-error. No-op when the breaker is disabled."""
+        if not self._breaker_enabled():
+            return
+        conn = await self._ensure_connected()
+        await conn.execute(
+            "UPDATE events "
+            "SET consecutive_failures = 0, breaker_tripped_at = NULL, "
+            "    last_failure_error = NULL "
+            "WHERE id = ?",
+            (event_id,),
+        )
+        await conn.commit()
+
+    async def is_event_breaker_tripped(self, event_id: str) -> bool:
+        """True when the event's breaker is open (``breaker_tripped_at`` set).
+        Always False when the breaker is disabled — so the enforcement checks in
+        the webhook path and the scheduler drain are inert by default."""
+        if not self._breaker_enabled():
+            return False
+        conn = await self._ensure_connected()
+        cursor = await conn.execute(
+            "SELECT breaker_tripped_at FROM events WHERE id = ?", (event_id,),
+        )
+        row = await cursor.fetchone()
+        return bool(row and row["breaker_tripped_at"] is not None)
 
     # Marker the OLD reaper stamped on the deliveries it (wrongly) failed. It
     # is the one-time backfill signal: a ``failed`` row carrying this exact

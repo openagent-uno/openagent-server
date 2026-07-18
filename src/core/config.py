@@ -89,3 +89,43 @@ def shell_settings(config: dict) -> ShellSettings:
         wake_wait_window_seconds=float(raw.get("wake_wait_window_seconds", 60.0)),
         autoloop_cap=int(raw.get("autoloop_cap", 25)),
     )
+
+
+@dataclass(frozen=True)
+class SkillsSettings:
+    """Runtime knobs for the native Skills subsystem (Hermes/Claude-Code
+    SKILL.md progressive disclosure).
+
+    OFF BY DEFAULT. With ``enabled=False`` nothing is injected into the
+    system prompt and the ``skills`` builtin MCP is never registered — the
+    production prompt and every code path stay byte-identical to a build
+    without this feature.
+
+    enabled:
+        Master switch. Reads ``skills.enabled`` (default ``False``).
+
+    path:
+        Optional override for the skills directory. Reads ``skills.path``.
+        ``None`` falls back to ``paths.default_skills_path()``
+        (``<data_dir>/skills``), which itself honours the
+        ``OPENAGENT_SKILLS_PATH`` env var — parity with
+        ``memory.vault_path`` / ``OPENAGENT_VAULT_PATH``.
+    """
+    enabled: bool = False
+    path: str | None = None
+
+
+def skills_settings(config: dict) -> SkillsSettings:
+    """Parse SkillsSettings out of the top-level ``openagent.yaml`` dict.
+
+    Defensive: a missing/empty ``skills:`` stanza yields the OFF default,
+    so a deployment that never heard of skills behaves exactly as before.
+    """
+    raw = (config or {}).get("skills") or {}
+    if not isinstance(raw, dict):
+        raw = {}
+    path = raw.get("path")
+    return SkillsSettings(
+        enabled=bool(raw.get("enabled", False)),
+        path=str(path) if path else None,
+    )

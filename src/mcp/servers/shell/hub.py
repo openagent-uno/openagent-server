@@ -13,6 +13,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from src.mcp.servers.shell.backends import get_exec_backend
 from src.mcp.servers.shell.events import ShellEvent, ShellEventKind
 
 if TYPE_CHECKING:
@@ -230,3 +231,8 @@ class ShellHub:
             del self._shells[sid]
         self._events.clear()
         self._queues.clear()
+        # Tear down the active exec backend so a docker sandbox container does
+        # not leak past process exit. No-op for the default LocalBackend; the
+        # DockerBackend runs ``docker rm -f`` (and handles its own errors, so
+        # this call never raises during shutdown).
+        await get_exec_backend().cleanup()

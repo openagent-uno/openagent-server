@@ -385,6 +385,17 @@ class Scheduler:
                 await self._drain_task_run_requests()
             except Exception as e:  # noqa: BLE001
                 elog("scheduler.run_request_loop_error", level="error", error=str(e))
+            # FAST lease reclaim, every tick: a delivery whose claim lease has
+            # lapsed (its dispatch runner stopped heartbeating — a frozen turn /
+            # dead process) is re-enqueued in ~LEASE_TTL, not the coarse 30-min
+            # stale-sweep age. Runs BEFORE the drain so a just-recovered row is
+            # re-dispatched in the same tick. Only touches rows with a NON-NULL
+            # ``claim_expires``, so pre-existing (legacy) in-flight rows are never
+            # reclaimed here — the age-gated sweep below still covers those.
+            try:
+                await self._reap_expired_event_leases()
+            except Exception as e:  # noqa: BLE001
+                elog("scheduler.lease_reap_loop_error", level="error", error=str(e))
             try:
                 await self._drain_event_deliveries()
             except Exception as e:  # noqa: BLE001
@@ -404,6 +415,18 @@ class Scheduler:
             except Exception as e:  # noqa: BLE001
                 elog("scheduler.stale_sweep_loop_error", level="error", error=str(e))
             await asyncio.sleep(CANCEL_CHECK_INTERVAL)
+
+    async def _reap_expired_event_leases(self) -> None:
+        """Fast-loop lease reclaim: re-enqueue deliveries whose claim lease has
+        lapsed (heartbeat stopped → frozen/dead runner), so recovery ≈ LEASE_TTL
+        rather than the 30-min stale-sweep age. Only touches rows with a non-NULL
+        ``claim_expires``, so a legacy in-flight row (NULL lease at deploy) is
+        untouched. Defensive: an older MemoryDB without the method no-ops."""
+        if self.db is None:
+            return
+        if not hasattr(self.db, "reap_expired_event_leases"):
+            return
+        await self.db.reap_expired_event_leases()
 
     async def _sweep_stale_event_deliveries(self) -> None:
         """Recover event deliveries orphaned WITHOUT a process restart.
@@ -545,6 +568,22 @@ class Scheduler:
                 elog("scheduler.event_delivery_orphan", level="warning",
                      delivery_id=dl.get("id"), event_id=dl.get("event_id"))
                 continue
+            # Per-event circuit breaker: an open breaker parks this (already
+            # claimed) delivery ``blocked`` and skips dispatch — no slot spent,
+            # the row is terminal so it is not re-claimed. Inert by default
+            # (``is_event_breaker_tripped`` → False unless the flag is on).
+            try:
+                if await self.db.is_event_breaker_tripped(dl.get("event_id")):
+                    await self.db.update_event_delivery(
+                        dl["id"], status="blocked",
+                        error="event circuit breaker open", finished_at=time.time(),
+                    )
+                    elog("scheduler.event_blocked", level="info",
+                         delivery_id=dl.get("id"), event_id=dl.get("event_id"))
+                    continue
+            except Exception as e:  # noqa: BLE001
+                elog("scheduler.event_breaker_check_failed", level="warning",
+                     error=str(e) or type(e).__name__)
             try:
                 payload = json.loads(dl.get("payload_json") or "{}")
             except (TypeError, ValueError):

@@ -196,6 +196,36 @@ safety:
     # allow_patterns:
     #   - "git push --force[a-z-]* origin lyra-agent/"
 
+# ── Sandbox ─────────────────────────────────────────────────────────
+# Where the ``shell`` tool's commands actually run. Independent of the
+# ``safety`` blocklist above: that filters WHICH commands run; this decides
+# WHERE they run.
+#
+# ``local`` (the default) runs each command on the host exactly as before —
+# same shell, same environment, same working directory. Leaving this stanza
+# out is identical to ``backend: local``; nothing changes.
+#
+# ``docker`` runs each command as ``docker exec`` inside one hardened,
+# throwaway container (all caps dropped bar a build-minimal few,
+# no-new-privileges, capped pids/cpu/memory, tmpfs /tmp + /var/tmp + workdir,
+# and NETWORK DENIED by default). The container inherits NONE of the host
+# environment — only the ``forward_env`` allowlist crosses in. If the docker
+# daemon or image is unavailable the shell tool FAILS (it never silently falls
+# back to the host), because falling back would defeat the isolation you asked
+# for. Requires a working docker daemon on the host.
+sandbox:
+  backend: local                        # DEFAULT — run on the host, unchanged
+  # When ``backend: docker`` the block below configures the container:
+  # docker:
+  #   image: debian:stable-slim         # any image with bash on PATH
+  #   network: false                    # false → --network none (deny egress)
+  #   cpus: 2.0                          # --cpus
+  #   memory_mb: 2048                   # --memory (megabytes)
+  #   pids_limit: 256                   # --pids-limit
+  #   workdir: /workspace               # container working dir (tmpfs unless persistent)
+  #   forward_env: []                   # host env keys allowed INTO the container
+  #   persistent: false                 # false → workdir is a non-persistent tmpfs
+
 # ── Model runtime ───────────────────────────────────────────────────
 # Which LLMs the agent uses lives in the DB (the Models screen / model-manager
 # MCP), not here. This block is for runtime knobs that apply across models.
@@ -382,6 +412,49 @@ hooks:
 #   OPENAGENT_MCP_PRIORITY=vault,messaging,shell,editor,filesystem,web-search,scheduler
 #     # override the default priority order used when trimming above the budget.
 #     # Unlisted MCPs fall back to alphabetical, then get dropped.
+
+# ── Credential pool (multi-account rotation) ────────────────────────
+# OPTIONAL, OFF BY DEFAULT. A single provider can hold MORE THAN ONE
+# credential and rotate across them on a rate-limit (HTTP 429 / 529)
+# BEFORE the turn falls back to another provider (e.g. DeepSeek). Handy
+# when several accounts sit behind one OpenAI-compatible proxy (the
+# ``local`` provider) and you want to exhaust all of them before spilling
+# to a paid secondary.
+#
+# INERT UNLESS CONFIGURED. With no ``accounts`` (or a single account) the
+# dispatch path is byte-identical to today — no pool is built, nothing on
+# the hot path changes. A pool only comes into being at >= 2 accounts.
+#
+# Accounts are NOT a top-level yaml key: like every provider setting they
+# live in the DB, under the provider row's ``metadata_json``. Set them via
+# the model-manager MCP / Providers UI / REST, storing a JSON blob shaped:
+#
+#   metadata_json = {
+#     "accounts": [
+#       {"api_key": "sk-acct-1", "label": "primary",   "priority": 10},
+#       {"api_key": "sk-acct-2", "label": "secondary", "priority": 0,
+#        "base_url": "https://alt-proxy.internal/v1"}   # optional; omit to
+#     ],                                                 # inherit the row's
+#     "pool_strategy": "fill_first"                      # base_url
+#   }
+#
+#   • api_key   (required) the credential for this account.
+#   • base_url  (optional) per-account endpoint; defaults to the provider's.
+#   • label     (optional) human tag surfaced in logs.
+#   • priority  (optional, default 0) higher wins first under ``fill_first``.
+#
+# Cooldowns are automatic: a 429/529 parks that account for ~1h then it
+# re-enters rotation; a 401/403 marks it DEAD (terminal — a bad key won't
+# be retried). Cooldown state is shared process-wide across sessions.
+#
+# Rotation strategy is per-provider. Set it inline (``metadata.pool_strategy``
+# above) or centrally via this top-level map keyed by provider name:
+credential_pool_strategies:
+  # local: fill_first        # DEFAULT — drain the top-priority account first
+  # openai: round_robin      # spread each request across accounts in turn
+  # anthropic: least_used    # pick the account with the fewest requests so far
+  # Strategies: fill_first (default) | round_robin | least_used.
+  # An unset / unknown value falls back to fill_first.
 
 # ── Notes ───────────────────────────────────────────────────────────
 # Providers, models, MCP entries, scheduled tasks, and workflows are

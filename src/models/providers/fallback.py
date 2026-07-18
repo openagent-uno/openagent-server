@@ -158,9 +158,39 @@ async def acall_model_with_fallback(
     try:
         return await model.aresponse(**kwargs)
     except ModelProviderError as primary_error:
+        # ── Credential-pool rotation (inert unless the model carries a pool) ──
+        # On a rate-limit, rotate across this provider's other accounts BEFORE
+        # consulting get_fallback_models. Best-effort: any exception inside the
+        # pool block degrades to the existing fallback path, never propagates.
+        pool = getattr(model, "_openagent_cred_pool", None)
+        if pool is not None:
+            try:
+                classified = ModelProviderError.classify(primary_error)
+                if isinstance(classified, ModelRateLimitError):
+                    while True:
+                        nxt = pool.mark_exhausted_and_rotate(
+                            status_code=classified.status_code,
+                            api_key_hint=model.api_key,
+                        )
+                        if nxt is None:
+                            break  # pool drained → existing fallback path below
+                        model.api_key, model.base_url = nxt.api_key, nxt.base_url
+                        model.client = model.async_client = None
+                        try:
+                            return await model.aresponse(**kwargs)
+                        except ModelProviderError as e:
+                            if not isinstance(ModelProviderError.classify(e), ModelRateLimitError):
+                                # A non-rate-limit failure on the rotated account
+                                # is the more actionable error — surface it.
+                                primary_error = e
+                                break
+                            # This account is also rate-limited → keep rotating.
+            except Exception:
+                pass  # never let a pool bug break the fallback contract
+
         fallbacks = get_fallback_models(fallback_config, primary_error)
         if not fallbacks:
-            raise
+            raise primary_error
         log_warning(f"Primary model '{model.id}' failed. Trying fallback models...: {primary_error}")
         return await _atry_fallback_models(
             fallbacks, primary_error, "aresponse", _clean_kwargs_for_fallback(kwargs), model.id, fallback_config
@@ -197,19 +227,74 @@ async def acall_model_stream_with_fallback(
     **kwargs: Any,
 ) -> AsyncIterator[StreamEvent]:
     """Async variant of call_model_stream_with_fallback."""
+    any_event_emitted = False
     try:
         async for event in model.aresponse_stream(**kwargs):
+            any_event_emitted = True
             yield event
-    except ModelProviderError as primary_error:
-        fallbacks = get_fallback_models(fallback_config, primary_error)
-        if not fallbacks:
-            raise
-        log_warning(f"Primary model '{model.id}' failed. Trying fallback models...: {primary_error}")
-        yield ModelResponse(event=ModelResponseEvent.fallback_model_activated.value)
-        async for event in _atry_fallback_models_stream(
-            fallbacks, primary_error, _clean_kwargs_for_fallback(kwargs), model.id, fallback_config
-        ):
-            yield event
+        return
+    except ModelProviderError as e:
+        primary_error: ModelProviderError = e
+
+    # ── Credential-pool rotation (inert unless the model carries a pool) ──
+    # Only safe BEFORE the first event: a mid-stream failure has already
+    # emitted output, so rotating would duplicate it — those cases fall
+    # straight through to the existing fallback path. Best-effort throughout;
+    # any pool bug degrades to that same path.
+    if not any_event_emitted:
+        pool = getattr(model, "_openagent_cred_pool", None)
+        if pool is not None:
+            try:
+                classified = ModelProviderError.classify(primary_error)
+                rotate = isinstance(classified, ModelRateLimitError)
+            except Exception:
+                rotate = False
+            while rotate:
+                try:
+                    nxt = pool.mark_exhausted_and_rotate(
+                        status_code=classified.status_code,
+                        api_key_hint=model.api_key,
+                    )
+                except Exception:
+                    break
+                if nxt is None:
+                    break  # pool drained → existing fallback path below
+                model.api_key, model.base_url = nxt.api_key, nxt.base_url
+                model.client = model.async_client = None
+                attempt_emitted = False
+                try:
+                    async for event in model.aresponse_stream(**kwargs):
+                        attempt_emitted = True
+                        yield event
+                    return  # rotated account streamed cleanly
+                except ModelProviderError as e:
+                    if attempt_emitted:
+                        # Committed output on this account then failed — cannot
+                        # rotate again without duplicating; degrade to fallback.
+                        primary_error = e
+                        break
+                    try:
+                        classified = ModelProviderError.classify(e)
+                    except Exception:
+                        primary_error = e
+                        break
+                    if not isinstance(classified, ModelRateLimitError):
+                        primary_error = e
+                        break
+                    # zero-event rate-limit on this account → try the next one
+                except Exception:
+                    break  # non-provider stream error → degrade to fallback
+
+    # ── existing fallback path (unchanged behaviour) ──
+    fallbacks = get_fallback_models(fallback_config, primary_error)
+    if not fallbacks:
+        raise primary_error
+    log_warning(f"Primary model '{model.id}' failed. Trying fallback models...: {primary_error}")
+    yield ModelResponse(event=ModelResponseEvent.fallback_model_activated.value)
+    async for event in _atry_fallback_models_stream(
+        fallbacks, primary_error, _clean_kwargs_for_fallback(kwargs), model.id, fallback_config
+    ):
+        yield event
 
 
 # ---------------------------------------------------------------------------

@@ -98,6 +98,7 @@ def ensure_agent_dir(path: Path) -> Path:
 
     (path / "memories").mkdir(exist_ok=True)
     (path / "logs").mkdir(exist_ok=True)
+    (path / "skills").mkdir(exist_ok=True)
 
     return path
 
@@ -158,5 +159,23 @@ def default_db_path() -> Path:
 def default_vault_path() -> Path:
     """Return the default memory vault directory."""
     d = data_dir() / "memories"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def default_skills_path() -> Path:
+    """Return the default skills directory.
+
+    Mirrors :func:`default_vault_path` (``<data_dir>/skills`` — honours
+    ``--agent-dir`` via the ``_agent_dir`` global), with one addition:
+    an explicit ``OPENAGENT_SKILLS_PATH`` env override wins. The override
+    is the seam that keeps the in-process skills MCP handlers (which have
+    no config) pointed at the same directory the Agent resolved from
+    ``skills.path`` in YAML — the Agent exports it into the process env at
+    startup (parity with how ``OPENAGENT_VAULT_PATH`` reaches the vault
+    subprocess).
+    """
+    override = os.environ.get("OPENAGENT_SKILLS_PATH", "").strip()
+    d = Path(override).expanduser() if override else data_dir() / "skills"
     d.mkdir(parents=True, exist_ok=True)
     return d

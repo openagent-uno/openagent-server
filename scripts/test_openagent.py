@@ -80,7 +80,19 @@ _TEST_MODULES: tuple[str, ...] = (
     # TeamRouterProvider.stream path with genuine runtime events; pure-unit
     # otherwise (temp DB, fake runtime, no pool/gateway).
     "test_vault_recall",
+    # Native Skills subsystem: file-backed SKILL.md progressive disclosure
+    # (registry scan + byte-stable index + view/search/manage tools +
+    # off-by-default gating + malformed-skip). Pure-unit — temp skills trees
+    # in a tmpdir, no LLM/pool/gateway. Sits by the pure-unit vault tests
+    # because it shares their shape (frontmatter parser, throwaway dirs).
+    "test_skills",
     "test_model_fallback",
+    # Additive multi-account credential pool: a native provider rotates across
+    # N accounts on 429/529 BEFORE the turn spills to DeepSeek. Pins the
+    # inert-by-default gate, the pool strategies/cooldown, and the fallback.py
+    # rotation seam (async + stream) with a fake Model — no live LLM. Sits by
+    # test_model_fallback because it guards the same fallback chokepoint.
+    "test_credential_pool",
     # Every tool name the framework / dream prompts hand the model must
     # resolve to a real MCP registration. Pure-unit: introspects the
     # adapters + parses the vendored vault server; no Node, no subprocess.
@@ -340,6 +352,20 @@ _TEST_MODULES: tuple[str, ...] = (
     # stay ``received`` (unclaimed) in the DB queue and drain as slots free, and
     # a hanging turn holds its slot without blocking the drain loop.
     "test_event_dispatch_concurrency",
+    # Claim-lease + heartbeat: a FROZEN in-flight delivery (the WAL-writer
+    # wedge — heartbeat stops) is reclaimed in ~LEASE_TTL by
+    # ``reap_expired_event_leases`` on the fast loop, instead of the 30-min
+    # stale-sweep age. Only touches rows with a non-NULL lease, so pre-deploy
+    # in-flight rows (NULL lease) are untouched — the deploy-safety property.
+    # Also pins the lock-surviving bounded-retry write (the finalizer that used
+    # to lose the writer race and leave a row ``running`` forever).
+    "test_event_delivery_lease",
+    # Per-event circuit breaker (gated OFF by default): N consecutive PERMANENT
+    # failures trip it and park further deliveries ``blocked``; a success resets
+    # it. The load-bearing property: a transient provider-429 / throttle /
+    # timeout / cancellation is classified transient and NEVER counted, so a
+    # rate-limit storm cannot trip the breaker on a healthy support event.
+    "test_event_breaker",
     # Workflow ai-prompt must forget/release at the right moment (same
     # bug class as scheduler issue #5 but for workflows).
     "test_workflow_forgets_session",
@@ -485,6 +511,10 @@ _TEST_MODULES: tuple[str, ...] = (
     # The safety.approvals blocklist, driven through the shell_exec callsite.
     # Runs right after test_shell since it shares the ShellHub fixture reset.
     "test_safety",
+    # Opt-in exec sandbox (local default / docker backend), driven through the
+    # same shell_exec callsite. Sits by test_safety: another additive gate whose
+    # off/default path must stay byte-identical, asserted at the real callsite.
+    "test_sandbox",
     # ``network.peers`` allowlist + scope, driven through the real auth
     # middleware with the agent-ALPN contextvar set. Same family as
     # test_safety: a security gate asserted at its callsite, never in

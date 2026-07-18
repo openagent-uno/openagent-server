@@ -230,6 +230,27 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
             "screenshots, images, pasted text, uploads from the chat UI"
         ),
     },
+    # Native Skills subsystem — Hermes / Claude-Code SKILL.md progressive
+    # disclosure. In-process (the skills dir resolves from paths.default_
+    # skills_path, which honours the live agent dir set by set_agent_dir —
+    # a subprocess would re-resolve it from platform defaults, the same
+    # bug that forced OPENAGENT_DB_PATH injection elsewhere).
+    #
+    # DELIBERATELY NOT in DEFAULT_MCPS: registration is gated on
+    # ``skills.enabled`` (see ``config_gated_mcp_entries`` + bootstrap).
+    # With skills disabled this spec is inert — a dict entry that nothing
+    # ever seeds a row for — so the running system is byte-identical.
+    "skills": {
+        "in_process": True,
+        "adapter_module": "src.mcp.servers.skills.adapters",
+        "runtime_toolkit_factory": "build_runtime_toolkit",
+        "description": (
+            "your file-backed skills — SKILL.md playbooks surfaced by an "
+            "index in the system prompt. skill_view loads a full skill body "
+            "on demand, skill_search finds one by name/description/body, and "
+            "skill_manage creates/updates/removes them on disk"
+        ),
+    },
     # In-process on purpose: the log path comes from ``paths.log_dir()``,
     # which resolves against the live agent dir set by ``set_agent_dir``. A
     # subprocess would re-resolve it from platform defaults and read a
@@ -471,6 +492,25 @@ DEFAULT_MCPS: list[dict[str, Any]] = [
     {"builtin": "delegation", "_default": True},
     {"builtin": "agent-federation", "_default": True},
 ]
+
+
+def config_gated_mcp_entries(config: dict | None) -> list[dict[str, Any]]:
+    """Extra builtin MCP entries that are OFF by default and only registered
+    when their opt-in config stanza is set.
+
+    Kept OUT of ``DEFAULT_MCPS`` on purpose: those are seeded unconditionally
+    on every boot, whereas these must leave the system byte-identical unless
+    the operator opts in. ``ensure_builtin_mcps`` appends whatever this
+    returns to the seed set, so an unset flag seeds nothing new.
+
+    Today this is just the native Skills subsystem (``skills.enabled``).
+    """
+    from src.core.config import skills_settings
+
+    entries: list[dict[str, Any]] = []
+    if skills_settings(config).enabled:
+        entries.append({"builtin": "skills", "_default": True})
+    return entries
 
 
 def _default_filesystem_roots() -> list[str]:

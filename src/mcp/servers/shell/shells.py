@@ -13,6 +13,7 @@ import time
 from typing import Literal
 
 from src.core.logging import elog
+from src.mcp.servers.shell.backends import get_exec_backend
 
 logger = logging.getLogger(__name__)
 
@@ -103,18 +104,24 @@ class BackgroundShell:
     # ── Spawn ───────────────────────────────────────────────────────
 
     async def start(self) -> None:
-        shell, flag = _pick_shell()
-        proc_env = os.environ.copy()
-        if self.env:
-            proc_env.update(self.env)
+        # The spawn tuple (argv/env/cwd/start_new_session) now comes from the
+        # active ExecBackend. With no ``sandbox`` config this is LocalBackend,
+        # which reproduces the exact host-shell tuple this method built inline
+        # before — so the default path is byte-identical. The docker backend
+        # returns a ``docker exec`` argv instead. prepare() is a no-op for
+        # local and a one-time container bring-up for docker (and fails closed
+        # if the daemon/image is unavailable).
+        backend = get_exec_backend()
+        await backend.prepare()
+        spec = backend.build_spawn(command=self.command, cwd=self.cwd, env=self.env)
         self._proc = await asyncio.create_subprocess_exec(
-            shell, flag, self.command,
+            *spec.argv,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=self.cwd,
-            env=proc_env,
-            start_new_session=True,  # own process group → killpg on kill
+            cwd=spec.cwd,
+            env=spec.env,
+            start_new_session=spec.start_new_session,  # local: own pgroup → killpg
         )
         self._started_at = time.time()
         self._stdout_task = asyncio.create_task(self._drain(self._proc.stdout, is_stderr=False))
@@ -311,6 +318,14 @@ class BackgroundShell:
         ``start_new_session=True`` — child processes of the shell get
         the signal too (important for ``npm run build`` style commands
         that spawn their own children).
+
+        DOCKER LIMITATION: under the docker backend the spawned process is the
+        host ``docker exec`` CLIENT (started with ``start_new_session=False``),
+        so killpg reaps that client but does NOT reach the process tree inside
+        the container. An individual ``shell_kill`` / timeout therefore only
+        stops the client; the in-container processes are reclaimed when the
+        container is force-removed at ``ShellHub.shutdown`` (``docker rm -f``).
+        The local path below is intentionally left byte-identical.
         """
         if self._proc is None or self._proc.returncode is not None:
             return

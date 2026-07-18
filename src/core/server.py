@@ -12,6 +12,7 @@ starts, supervises and shuts everything down.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -337,6 +338,25 @@ def _build_agent(config: dict) -> Agent:
             )
         elif isinstance(allows, str):
             os.environ["OPENAGENT_SAFETY_ALLOW_PATTERNS"] = allows
+
+    # ``sandbox`` — opt-in hardened exec backend for the ``shell`` tool. The
+    # default is the local host backend, whose spawn path is byte-identical to
+    # pre-sandbox behaviour, so an absent stanza (or ``backend: local``) changes
+    # nothing. Only ``backend: docker`` routes shell commands into a locked-down
+    # container (see ``src/mcp/servers/shell/backends.py``). Exported as env
+    # vars for the same reason as ``safety.approvals`` above: the in-process
+    # shell backend reads them via a selector that defaults to local when unset,
+    # and any subprocess-hosted reader could only see policy through the
+    # environment anyway. ``local`` downstream is a harmless no-op.
+    _sandbox_cfg = config.get("sandbox") or {}
+    _sandbox_backend = str(_sandbox_cfg.get("backend") or "local").strip().lower()
+    os.environ["OPENAGENT_SANDBOX_BACKEND"] = _sandbox_backend
+    if _sandbox_backend == "docker":
+        # Only serialise the docker sub-config when docker is actually selected —
+        # a misconfigured opt-in must fail closed at spawn, not degrade to host.
+        os.environ["OPENAGENT_SANDBOX_DOCKER"] = json.dumps(
+            _sandbox_cfg.get("docker") or {}
+        )
 
     # ``mcps.install_policy`` — gates REGISTERING an MCP, which is the act that
     # hands a third party's argv this agent's whole environment. Exported as

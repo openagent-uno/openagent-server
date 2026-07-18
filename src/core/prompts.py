@@ -205,7 +205,7 @@ report the result. Do NOT guess from memory.
 
 {{MCP_CATALOG_SUMMARY}}
 
-## Builtin management MCPs (canonical paths)
+{{SKILLS_INDEX}}## Builtin management MCPs (canonical paths)
 
 The catalog above describes each builtin MCP and lists its exact tool
 keys. They give you authority over the framework itself and are the
@@ -939,3 +939,47 @@ def build_mcp_catalog_summary(pool) -> str:
         tool_names = {}
 
     return _render_catalog_summary_lines(summary, descriptions, tool_names)
+
+
+def build_skills_index(registry) -> str:
+    """Render the ``## Skills`` section for the ``{{SKILLS_INDEX}}`` slot.
+
+    Mirrors :func:`build_mcp_catalog_summary`: called per-turn by
+    ``Agent._combined_system_prompt`` to substitute the placeholder.
+    Progressive disclosure — the model sees only a category → ``name:
+    description`` index here and loads full bodies on demand via
+    ``skill_view`` (reached through ``tool_search_call_tool``).
+
+    CACHE DISCIPLINE — critical. This lands in the CACHED system prefix
+    (above ``<session-id>``), so it must be byte-identical across every
+    session/turn on a box. The registry's ``render_skills_index`` is a
+    frozen snapshot (cached, invalidated only on load/reload, no volatile
+    tokens), and this wrapper adds only static prose.
+
+    Returns "" when ``registry`` is None — i.e. skills disabled. Because
+    the placeholder sits flush against the next header
+    (``{{SKILLS_INDEX}}## Builtin management MCPs``), an empty render leaves
+    the framework prompt BYTE-IDENTICAL to a build without this feature.
+    Defensive: never raises (a broken registry degrades to "").
+    """
+    if registry is None:
+        return ""
+    try:
+        index = registry.render_skills_index()
+    except Exception:
+        return ""
+
+    return (
+        "## Skills\n\n"
+        "You have a library of SKILLS — SKILL.md playbooks for recurring "
+        "tasks. Only the INDEX below is loaded up front (progressive "
+        "disclosure): each entry is ``name``: a one-line description, grouped "
+        "by category. When a task matches one, load its full body ON DEMAND "
+        "with ``skill_view`` (reached via "
+        "``tool_search_call_tool(server=\"skills\", tool=\"skill_view\", "
+        "args={\"name\": \"...\"})``) BEFORE acting, then follow it. Use "
+        "``skill_search`` to find a skill you can't see, and ``skill_manage`` "
+        "to create/update/remove one. Do not guess a skill's contents from "
+        "its description — open it.\n\n"
+        f"{index}\n\n"
+    )

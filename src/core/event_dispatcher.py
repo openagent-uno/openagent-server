@@ -177,6 +177,120 @@ class EventDispatchError(Exception):
     The caller records the delivery as ``rejected`` / ``failed``."""
 
 
+# ── Per-event circuit-breaker: failure classification ────────────────────────
+#
+# A failure is TRANSIENT (do NOT count against the breaker — "release without
+# counting a failure", mirroring Hermes' KANBAN_RATE_LIMIT_EXIT_CODE=75) or
+# PERMANENT (count it). The root incident this whole change hardens against is a
+# provider rate-limit STORM: a naive breaker that counted every failed turn would
+# trip on the healthy support event exactly when the provider is throttled and
+# block it — the opposite of what we want. So every rate-limit / quota / throttle
+# / overload / turn-timeout signal is transient and released without a mark; only
+# a genuine, non-throttle failure (a bad template, a rejected action, an
+# unexpected crash) is permanent and moves the breaker toward tripping.
+_TRANSIENT_TOKENS = (
+    "rate limit", "ratelimit", "rate_limit", "429", "529", "503",
+    "quota", "throttl", "overloaded", "too many requests",
+    "temporarily unavailable", "service unavailable", "capacity",
+    "timed out", "timeout", "exit code 75", "exit_code 75", "code 75",
+)
+
+
+def _classify_delivery_failure(error: Any) -> str:
+    """Classify a delivery failure as ``"transient"`` or ``"permanent"``.
+
+    Accepts either the raised exception or a failure-output string. Transient =
+    a rate-limit-storm signal that must NOT count against the per-event breaker;
+    permanent = a genuine fault that should."""
+    if isinstance(error, BaseException):
+        # A cancellation is a barge-in, never a fault (also handled in its own
+        # except branch; belt-and-suspenders here).
+        if isinstance(error, asyncio.CancelledError):
+            return "transient"
+        # A turn wall-clock timeout is the provider stall (backoff on every
+        # rate-limited proxy account), not a bad event.
+        if isinstance(error, (TimeoutError, asyncio.TimeoutError)):
+            return "transient"
+        # Provider rate-limit / overloaded / unavailable status codes.
+        status = getattr(error, "status_code", None)
+        if status in (429, 529, 503):
+            return "transient"
+        try:
+            from src.core.runtime_errors import ModelRateLimitError
+            if isinstance(error, ModelRateLimitError):
+                return "transient"
+        except Exception:  # noqa: BLE001
+            pass
+    msg = (str(error) or "").lower()
+    if any(tok in msg for tok in _TRANSIENT_TOKENS):
+        return "transient"
+    return "permanent"
+
+
+# ── Lease heartbeat ──────────────────────────────────────────────────────────
+#
+# While a turn runs, a lightweight background task periodically extends the
+# delivery's claim lease with a tiny single-row write. That write survives the
+# WAL-writer contention that the big per-step ``runs`` commit loses, so a healthy
+# (even very long) turn keeps its lease alive and the lease reaper leaves it be;
+# if the process/turn FREEZES, the heartbeat stops, the lease lapses after
+# LEASE_TTL, and ``reap_expired_event_leases`` re-enqueues the delivery. The beat
+# interval is well under LEASE_TTL so several beats occur per window.
+_HEARTBEAT_INTERVAL_ENV = "OPENAGENT_EVENT_HEARTBEAT_INTERVAL_SECONDS"
+_LEASE_TTL_ENV = "OPENAGENT_EVENT_LEASE_TTL_SECONDS"
+
+
+def _heartbeat_interval_seconds() -> float:
+    """Beat cadence (>= 1 s). Defaults to LEASE_TTL/3 so ~3 beats fit in one
+    lease window; overridable for tuning."""
+    try:
+        ttl = float(os.environ.get(_LEASE_TTL_ENV, "120"))
+    except (TypeError, ValueError):
+        ttl = 120.0
+    default = max(1.0, ttl / 3.0)
+    try:
+        return max(1.0, float(os.environ.get(_HEARTBEAT_INTERVAL_ENV, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _start_lease_heartbeat(db: Any, delivery_id: str) -> Optional[asyncio.Task]:
+    """Spawn the lease-heartbeat task for a live delivery, or None when the DB
+    predates the lease columns (older MemoryDB → graceful no-op)."""
+    worker_id = getattr(db, "worker_id", None)
+    if worker_id is None or not hasattr(db, "heartbeat_event_delivery"):
+        return None
+    interval = _heartbeat_interval_seconds()
+
+    async def _beat() -> None:
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    await db.heartbeat_event_delivery(delivery_id, worker_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    # A missed beat is not fatal — the lease simply shortens; the
+                    # reaper is the backstop. Never let it crash the turn.
+                    logger.debug("lease heartbeat failed for %s: %s", delivery_id, e)
+        except asyncio.CancelledError:
+            return
+
+    return asyncio.create_task(_beat())
+
+
+async def _stop_lease_heartbeat(task: Optional[asyncio.Task]) -> None:
+    """Cancel and await the heartbeat task (called in dispatch's finally)."""
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+        pass
+
+
 async def dispatch_event(
     *,
     agent: Any,
@@ -216,76 +330,115 @@ async def dispatch_event(
     elog("event.dispatch", id=event_id, name=event.get("name", ""),
          action=action_kind, source=source, delivery=delivery_id)
 
-    try:
-        if action_kind == "workflow":
-            result = await _dispatch_workflow(scheduler=scheduler, db=db, event=event, payload=payload, delivery_id=delivery_id)
-        elif action_kind == "scheduled_task":
-            result = await _dispatch_task(scheduler=scheduler, db=db, event=event, payload=payload, delivery_id=delivery_id)
-        elif action_kind == "prompt":
-            result = await _dispatch_prompt(
-                agent=agent, db=db, event=event, payload=payload,
-                delivery_id=delivery_id, source=source, on_link=_emit,
-            )
-        else:
-            raise EventDispatchError(f"unknown action_kind {action_kind!r}")
-    except asyncio.CancelledError:
-        # A cancelled delivery is NOT a failure, and calling it one poisons
-        # the log the agent reads to diagnose itself.
-        #
-        # The common cause is a barge-in: a newer delivery for the same bound
-        # session supersedes the one in flight (§8.5 session binding), which
-        # vision §2 calls first-class behaviour — "interrupt and barge-in are
-        # first-class behaviors, not afterthoughts". The old code caught it
-        # here, logged ``level="error"``, and stamped ``error=str(e)`` — and
-        # ``str(CancelledError())`` is the EMPTY STRING, so the log filled with
-        # `event.failed level=error error=""`: an error record that cannot say
-        # what went wrong, because nothing did.
-        #
-        # Measured cost of that lie: on a live agent, 11 of these in one window
-        # on a single hot Replio thread, and 230 of 230 `errored=True` entries
-        # across the whole log were also `cancelled=True` — every one an
-        # interrupt. Dream mode had to spend a `logs_context` round-trip
-        # reasoning its way to "this is a barge-in, not a genuine failure",
-        # and the recall scorer has to exclude them by construction or it
-        # learns that users interrupting is a defect.
-        #
-        # Recorded as its own terminal state so it stays visible and countable
-        # — the delivery did stop — without being counted as a fault. Re-raised
-        # bare: swallowing a CancelledError breaks cooperative cancellation.
-        elog("event.cancelled", level="info", id=event_id, delivery=delivery_id)
-        await db.update_event_delivery(
-            delivery_id,
-            status="cancelled",
-            error=None,
-            finished_at=_now(),
-        )
-        _emit()
-        raise
-    except Exception as e:  # noqa: BLE001
-        # A genuine failure must never arrive with an empty message — that was
-        # the shape of the cancellation bug above, and it is indistinguishable
-        # from a real exception whose ``str()`` happens to be blank.
-        detail = str(e) or f"{type(e).__name__} (no message)"
-        elog("event.failed", level="error", id=event_id, delivery=delivery_id, error=detail)
-        await db.update_event_delivery(
-            delivery_id,
-            status="failed",
-            error=detail[:2000],
-            finished_at=_now(),
-        )
-        _emit()
-        raise
+    # Keep the claim lease alive while the turn runs (cancelled in the finally).
+    # A frozen turn stops beating → the lease lapses → the reaper re-enqueues it.
+    heartbeat = _start_lease_heartbeat(db, delivery_id)
 
-    await db.update_event_delivery(
-        delivery_id,
-        status=result.get("status", "success"),
-        output=(result.get("output") or "")[:2000],
-        finished_at=_now(),
-        **{k: v for k, v in result.items() if k in ("session_id", "workflow_run_id", "task_run_id")},
-    )
-    _emit()
-    elog("event.done", id=event_id, delivery=delivery_id, action=action_kind)
-    return result
+    async def _record_breaker_failure(err: Any) -> None:
+        """Move the per-event breaker only for a PERMANENT failure; a transient
+        (rate-limit-storm) failure is released without a count. No-op unless the
+        breaker is enabled (``db.record_event_failure`` gates internally)."""
+        if _classify_delivery_failure(err) != "permanent":
+            return
+        try:
+            await db.record_event_failure(event_id, str(err))
+        except Exception:  # noqa: BLE001
+            pass
+
+    try:
+        try:
+            if action_kind == "workflow":
+                result = await _dispatch_workflow(scheduler=scheduler, db=db, event=event, payload=payload, delivery_id=delivery_id)
+            elif action_kind == "scheduled_task":
+                result = await _dispatch_task(scheduler=scheduler, db=db, event=event, payload=payload, delivery_id=delivery_id)
+            elif action_kind == "prompt":
+                result = await _dispatch_prompt(
+                    agent=agent, db=db, event=event, payload=payload,
+                    delivery_id=delivery_id, source=source, on_link=_emit,
+                )
+            else:
+                raise EventDispatchError(f"unknown action_kind {action_kind!r}")
+        except asyncio.CancelledError:
+            # A cancelled delivery is NOT a failure, and calling it one poisons
+            # the log the agent reads to diagnose itself.
+            #
+            # The common cause is a barge-in: a newer delivery for the same bound
+            # session supersedes the one in flight (§8.5 session binding), which
+            # vision §2 calls first-class behaviour — "interrupt and barge-in are
+            # first-class behaviors, not afterthoughts". The old code caught it
+            # here, logged ``level="error"``, and stamped ``error=str(e)`` — and
+            # ``str(CancelledError())`` is the EMPTY STRING, so the log filled with
+            # `event.failed level=error error=""`: an error record that cannot say
+            # what went wrong, because nothing did.
+            #
+            # Measured cost of that lie: on a live agent, 11 of these in one window
+            # on a single hot Replio thread, and 230 of 230 `errored=True` entries
+            # across the whole log were also `cancelled=True` — every one an
+            # interrupt. Dream mode had to spend a `logs_context` round-trip
+            # reasoning its way to "this is a barge-in, not a genuine failure",
+            # and the recall scorer has to exclude them by construction or it
+            # learns that users interrupting is a defect.
+            #
+            # It also must NOT count against the per-event circuit breaker — a
+            # barge-in is not a fault. (Classified transient; no record here.)
+            #
+            # Recorded as its own terminal state so it stays visible and countable
+            # — the delivery did stop — without being counted as a fault. Re-raised
+            # bare: swallowing a CancelledError breaks cooperative cancellation.
+            elog("event.cancelled", level="info", id=event_id, delivery=delivery_id)
+            await db.update_event_delivery(
+                delivery_id,
+                status="cancelled",
+                error=None,
+                finished_at=_now(),
+            )
+            _emit()
+            raise
+        except Exception as e:  # noqa: BLE001
+            # A genuine failure must never arrive with an empty message — that was
+            # the shape of the cancellation bug above, and it is indistinguishable
+            # from a real exception whose ``str()`` happens to be blank.
+            detail = str(e) or f"{type(e).__name__} (no message)"
+            kind = _classify_delivery_failure(e)
+            elog("event.failed", level="error", id=event_id, delivery=delivery_id,
+                 error=detail, failure_kind=kind)
+            await db.update_event_delivery(
+                delivery_id,
+                status="failed",
+                error=detail[:2000],
+                finished_at=_now(),
+            )
+            # Circuit breaker: count only a permanent failure. A transient
+            # provider-429 / throttle / turn-timeout is the rate-limit storm and
+            # is released WITHOUT a mark, so the storm can't trip the breaker on a
+            # healthy event.
+            await _record_breaker_failure(e)
+            _emit()
+            raise
+
+        final_status = result.get("status", "success")
+        await db.update_event_delivery(
+            delivery_id,
+            status=final_status,
+            output=(result.get("output") or "")[:2000],
+            finished_at=_now(),
+            **{k: v for k, v in result.items() if k in ("session_id", "workflow_run_id", "task_run_id")},
+        )
+        # Terminal success resets the breaker streak; a non-raising terminal
+        # ``failed`` (a workflow/task that reported failure without throwing) is
+        # counted through the same transient/permanent classifier on its output.
+        try:
+            if final_status == "success":
+                await db.reset_event_breaker(event_id)
+            elif final_status in ("failed", "error"):
+                await _record_breaker_failure(result.get("output") or final_status)
+        except Exception:  # noqa: BLE001
+            pass
+        _emit()
+        elog("event.done", id=event_id, delivery=delivery_id, action=action_kind)
+        return result
+    finally:
+        await _stop_lease_heartbeat(heartbeat)
 
 
 def _now() -> float:

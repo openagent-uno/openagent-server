@@ -13,7 +13,11 @@ from typing import Any, AsyncIterator, Callable, Awaitable
 from src.models.base import BaseModel, ModelResponse
 from src.memory.db import MemoryDB
 from src.mcp.pool import MCPPool
-from src.core.prompts import FRAMEWORK_SYSTEM_PROMPT, build_mcp_catalog_summary
+from src.core.prompts import (
+    FRAMEWORK_SYSTEM_PROMPT,
+    build_mcp_catalog_summary,
+    build_skills_index,
+)
 from src.models.runtime import wire_model_runtime
 
 from src.core.logging import elog
@@ -915,6 +919,13 @@ class Agent:
         else:
             self._db = None
 
+        # Native Skills subsystem (Hermes/Claude-Code SKILL.md progressive
+        # disclosure). OFF by default: stays None unless ``skills.enabled``,
+        # in which case ``initialize`` attaches a loaded ``SkillsRegistry``.
+        # When None, ``{{SKILLS_INDEX}}`` renders to "" and the framework
+        # prompt is byte-identical to a build without skills.
+        self._skills: Any = None
+
         self._initialized = False
         self._idle_cleanup_task: asyncio.Task | None = None
         self._runtime_models: list[BaseModel] = []
@@ -1185,7 +1196,9 @@ class Agent:
                 # doesn't have a row yet (forward-compat for future
                 # builtins + safety net against manual DB tampering).
                 # Existing rows — including disabled ones — are untouched.
-                await ensure_builtin_mcps(self._db)
+                # ``config`` gates opt-in, off-by-default builtins (the
+                # skills MCP behind ``skills.enabled``); unset → no-op.
+                await ensure_builtin_mcps(self._db, config=self.config)
                 # Provider keys and the model catalog are DB-backed. Pull
                 # the rows into ``self._providers_config`` so ModelDispatcher
                 # / NativeProvider see the materialised view.
@@ -1222,6 +1235,8 @@ class Agent:
 
         _preload_frozen_runtime_modules()
         await self._mcp.connect_all()
+
+        self._init_skills_registry()
 
         self._prepare_model_runtime(self.model)
         self._ensure_idle_cleanup_task()
@@ -2311,6 +2326,55 @@ class Agent:
             return str(Path(cfg_path).expanduser().resolve())
         return str(default_vault_path())
 
+    def _resolve_skills_path(self) -> str:
+        """Return the on-disk skills directory for this agent.
+
+        Precedence, mirroring ``_resolve_vault_path``:
+          1. ``OPENAGENT_SKILLS_PATH`` env (parity with ``OPENAGENT_VAULT_PATH``);
+          2. a YAML ``skills.path`` override;
+          3. ``default_skills_path()`` (``<data_dir>/skills`` — honours
+             ``--agent-dir`` via the ``_agent_dir`` global, and the env var).
+        """
+        import os
+        from pathlib import Path
+        from src.core.config import skills_settings
+        from src.core.paths import default_skills_path
+
+        env = os.environ.get("OPENAGENT_SKILLS_PATH", "").strip()
+        if env:
+            return str(Path(env).expanduser().resolve())
+        cfg_path = skills_settings(self.config).path
+        if cfg_path:
+            return str(Path(cfg_path).expanduser().resolve())
+        return str(default_skills_path())
+
+    def _init_skills_registry(self) -> None:
+        """Attach a loaded ``SkillsRegistry`` when ``skills.enabled``; else
+        leave ``self._skills`` None so the feature is fully inert.
+
+        Also exports the resolved path into ``OPENAGENT_SKILLS_PATH`` (via
+        ``setdefault``, so an operator-set env always wins) so the in-process
+        skills MCP handlers — which have no config — resolve the SAME
+        directory the prompt index was built from.
+        """
+        from src.core.config import skills_settings
+
+        if not skills_settings(self.config).enabled:
+            self._skills = None
+            return
+        import os
+        from src.mcp.servers.skills.registry import SkillsRegistry
+
+        path = self._resolve_skills_path()
+        os.environ.setdefault("OPENAGENT_SKILLS_PATH", path)
+        registry = SkillsRegistry(path)
+        registry.load()
+        self._skills = registry
+
+    def _render_skills_index(self) -> str:
+        """Skills section for ``{{SKILLS_INDEX}}`` — "" when disabled."""
+        return build_skills_index(getattr(self, "_skills", None))
+
     def _resolve_db_path(self) -> str:
         """Return the SQLite DB path backing runtime state for this agent."""
         from pathlib import Path
@@ -2362,6 +2426,12 @@ class Agent:
         ).replace(
             "{{MCP_CATALOG_SUMMARY}}",
             build_mcp_catalog_summary(self._mcp),
+        ).replace(
+            # Skills index — "" when disabled, so the placeholder (flush
+            # against the next header) collapses to a byte-identical prompt.
+            # Frozen snapshot above <session-id>, safe for the prompt cache.
+            "{{SKILLS_INDEX}}",
+            self._render_skills_index(),
         )
 
         user = (self.system_prompt or "").strip()

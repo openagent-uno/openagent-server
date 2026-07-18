@@ -53,6 +53,7 @@ from src.models.catalog import (
     normalize_runtime_model_id,
     split_runtime_id,
 )
+from src.models.credential_pool import get_or_build_pool
 
 logger = logging.getLogger(__name__)
 
@@ -979,10 +980,10 @@ class NativeProvider(BaseModel):
         per ``_build_runtime_model`` (and there are 2 per turn — see
         ``_resolved_api_key`` and ``_resolved_base_url``).
         """
-        if self._provider_config_cache is not None:
+        if getattr(self, "_provider_config_cache", None) is not None:
             return self._provider_config_cache
         provider_name, _ = self._runtime_parts()
-        for entry in _iter_provider_entries(self._providers_config):
+        for entry in _iter_provider_entries(getattr(self, "_providers_config", None) or []):
             if str(entry.get("name") or "").strip() != provider_name:
                 continue
             if entry.get("framework", FRAMEWORK_API_BASED) != FRAMEWORK_API_BASED:
@@ -1057,13 +1058,26 @@ class NativeProvider(BaseModel):
                 **extra_kwargs,
                 **_thinking_kwarg(provider_name, model_id),
             }
-            return self._construct_model(
+            model = self._construct_model(
                 model_class,
                 id=model_id,
                 api_key=api_key,
                 base_url=base_url,
                 **extra_kwargs,
             )
+            # Credential pool — inert unless this provider has >= 2 accounts
+            # configured (metadata.accounts). When present, seed the model's
+            # initial credential from the pool and stash it so the fallback
+            # chokepoint can rotate on 429/529 before spilling to DeepSeek.
+            pool = get_or_build_pool(provider_name, self._provider_config())
+            if pool is not None:
+                selected = pool.select()
+                if selected is not None:
+                    model.api_key = selected.api_key
+                    model.base_url = selected.base_url
+                    model.client = model.async_client = None
+                model._openagent_cred_pool = pool
+            return model
 
         from src.models.providers.utils import get_model
 

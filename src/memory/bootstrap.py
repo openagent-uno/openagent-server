@@ -17,8 +17,14 @@ from src.memory.db import MemoryDB
 logger = logging.getLogger(__name__)
 
 
-async def ensure_builtin_mcps(db: MemoryDB) -> int:
+async def ensure_builtin_mcps(db: MemoryDB, config: dict | None = None) -> int:
     """Make sure every ``DEFAULT_MCPS`` entry has a row in the ``mcps`` table.
+
+    ``config`` is the agent's ``openagent.yaml`` dict. It is consulted ONLY
+    for opt-in, off-by-default builtins (``config_gated_mcp_entries`` — today
+    just the native Skills subsystem behind ``skills.enabled``). With no
+    config, or the flags unset, nothing beyond ``DEFAULT_MCPS`` is seeded, so
+    the ``mcps`` table is byte-identical to before this feature existed.
 
     Runs every boot. Two shapes coexist in ``DEFAULT_MCPS``:
 
@@ -38,7 +44,7 @@ async def ensure_builtin_mcps(db: MemoryDB) -> int:
     compat for future defaults + safety net for manual deletions).
     Returns the number of rows added this boot (zero is steady state).
     """
-    from src.mcp.builtins import DEFAULT_MCPS
+    from src.mcp.builtins import DEFAULT_MCPS, config_gated_mcp_entries
 
     rows = await db.list_mcps()
 
@@ -88,7 +94,7 @@ async def ensure_builtin_mcps(db: MemoryDB) -> int:
 
     existing = {row["name"] for row in (rows if not migrated else await db.list_mcps())}
     added = 0
-    for entry in DEFAULT_MCPS:
+    for entry in [*DEFAULT_MCPS, *config_gated_mcp_entries(config)]:
         if "builtin" in entry:
             name = entry["builtin"]
             if name in existing:
