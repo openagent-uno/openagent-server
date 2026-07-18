@@ -485,3 +485,101 @@ async def t_judge_unresolved_resolves_cheap(ctx: TestContext) -> None:
     # The unresolved WARNING is emitted at most once (not per sampled turn).
     warns = [1 for name, _ in ev if name == "quality.judge_model_unresolved"]
     assert len(warns) <= 1, f"unresolved warning spammed {len(warns)}x (should warn once)"
+
+
+# ══ Defect 3 — the DEFAULT judge (env unset) must be deepseek:deepseek-chat,
+#    an isolated cheap model, NOT the $0 claude-sub-proxy that competes with the
+#    live agents for the shared Claude subscription ═══════════════════════════════
+
+
+@contextlib.contextmanager
+def _primed_pricing_rows(rows):
+    """Prime OpenRouter pricing with arbitrary ``rows`` (each ``{"id": ...,
+    "pricing": {"prompt","completion"}}``). Ids absent from ``rows`` price as $0
+    (the local sub-proxy / self-hosted case)."""
+    import time as _t
+    from src.models import discovery
+    import src.models.catalog as catalog
+
+    saved_cache = getattr(discovery, "_OPENROUTER_CACHE", None)
+    saved_index = catalog._OPENROUTER_INDEX
+    discovery._OPENROUTER_CACHE = (_t.time() + 1e6, rows)
+    catalog._OPENROUTER_INDEX = None
+    try:
+        yield
+    finally:
+        discovery._OPENROUTER_CACHE = saved_cache
+        catalog._OPENROUTER_INDEX = saved_index
+
+
+# deepseek-chat priced ABOVE $0 so pure "cheapest enabled" would NOT pick it
+# (local:* and anthropic:* price $0 here) — the ONLY reason it wins is the
+# explicit deepseek-default preference. That's the discrimination we want.
+_DEEPSEEK_PRICED = [{"id": "deepseek/deepseek-chat",
+                     "pricing": {"prompt": "0.0000002", "completion": "0.0000002"}}]
+
+
+@test("quality", "UNSET env defaults the judge to deepseek:deepseek-chat when enabled")
+async def t_default_judge_is_deepseek(ctx: TestContext) -> None:
+    import src.core.quality_monitor as qm
+    from src.models.dispatcher import ModelDispatcher
+
+    # local FIRST + $0 (so old cheapest-logic would pick it), an anthropic row
+    # ALSO $0 (so 'never an Anthropic key' has teeth), deepseek LAST + priced.
+    providers = _providers(("anthropic", ["claude-x"]),
+                           ("local", ["claude-sub"]),
+                           ("deepseek", ["deepseek-chat"]))
+    router = ModelDispatcher(providers)
+    agent = SimpleNamespace(model=router, _providers_config=providers,
+                            _db=None, system_prompt="")
+    with _env(OPENAGENT_QUALITY_MONITOR_MODEL=None, OPENAGENT_COMPACTION_MODEL=None), \
+            _primed_pricing_rows(_DEEPSEEK_PRICED):
+        judge = qm._pick_judge_model(agent)
+    assert judge is not router, "default judge fell through to the null router"
+    assert type(judge).__name__ == "NativeProvider", f"expected NativeProvider, got {judge!r}"
+    judge_id = getattr(judge, "model", None)
+    assert judge_id == "deepseek:deepseek-chat", (
+        f"default judge resolved to {judge_id!r}, not the isolated deepseek default"
+    )
+    # never null, never an Anthropic key.
+    assert judge_id is not None and not judge_id.startswith("anthropic:"), judge_id
+
+
+@test("quality", "env override wins over the deepseek default")
+async def t_env_override_beats_default(ctx: TestContext) -> None:
+    import src.core.quality_monitor as qm
+    from src.models.dispatcher import ModelDispatcher
+
+    providers = _providers(("local", ["claude-sub"]), ("deepseek", ["deepseek-chat"]))
+    router = ModelDispatcher(providers)
+    agent = SimpleNamespace(model=router, _providers_config=providers,
+                            _db=None, system_prompt="")
+    # An explicit configured judge must be honoured verbatim — NOT the default.
+    with _env(OPENAGENT_QUALITY_MONITOR_MODEL="local:claude-sub",
+              OPENAGENT_COMPACTION_MODEL=None):
+        judge = qm._pick_judge_model(agent)
+    assert type(judge).__name__ == "NativeProvider", judge
+    assert getattr(judge, "model", None) == "local:claude-sub", (
+        f"env override ignored — got {getattr(judge, 'model', None)!r}"
+    )
+
+
+@test("quality", "deepseek NOT enabled → default falls back to cheapest-enabled (never null)")
+async def t_default_falls_back_when_no_deepseek(ctx: TestContext) -> None:
+    import src.core.quality_monitor as qm
+    from src.models.dispatcher import ModelDispatcher
+
+    # No deepseek row at all — the default must fall back to the prior
+    # cheapest-enabled logic (local:claude-sub, $0), never null, never anthropic.
+    providers = _providers(("local", ["claude-sub"]), ("openai", ["gpt-x"]))
+    router = ModelDispatcher(providers)
+    agent = SimpleNamespace(model=router, _providers_config=providers,
+                            _db=None, system_prompt="")
+    with _env(OPENAGENT_QUALITY_MONITOR_MODEL=None, OPENAGENT_COMPACTION_MODEL=None), \
+            _primed_pricing_rows([]):
+        judge = qm._pick_judge_model(agent)
+    assert judge is not router, "fallback fell through to the null router"
+    assert type(judge).__name__ == "NativeProvider", judge
+    judge_id = getattr(judge, "model", None)
+    assert judge_id == "local:claude-sub", f"expected cheapest-enabled fallback, got {judge_id!r}"
+    assert judge_id is not None and not judge_id.startswith("anthropic:"), judge_id

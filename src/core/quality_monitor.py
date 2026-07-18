@@ -55,6 +55,17 @@ _TIMEOUT_ENV = "OPENAGENT_QUALITY_MONITOR_TIMEOUT"
 _MIN_LEN_ENV = "OPENAGENT_QUALITY_MONITOR_MIN_LEN"
 _RULES_CHARS_ENV = "OPENAGENT_QUALITY_MONITOR_RULES_CHARS"
 
+# The DEFAULT judge model when no judge/compaction model is configured.
+# ``deepseek:deepseek-chat`` is cheap-but-capable AND isolated from the Claude
+# subscription: the previous default resolved to the cheapest enabled row, which
+# is the $0 ``local`` claude-sub-proxy — grading THROUGH the same subscription
+# the live agents run on, competing with them for it. DeepSeek is a paid
+# api-based provider off that sub, so the grader runs on its own budget. It is
+# still only a DEFAULT — ``OPENAGENT_QUALITY_MONITOR_MODEL`` (and the compaction
+# model) override it — and it is NEVER an Anthropic key: when deepseek is not an
+# enabled api-based row we fall back to the existing cheapest-enabled logic.
+_DEFAULT_JUDGE_MODEL = "deepseek:deepseek-chat"
+
 
 def _truthy(v: str) -> bool:
     return v.strip().lower() in ("1", "true", "yes", "on")
@@ -224,6 +235,64 @@ def _warn_judge_unresolved_once(configured: str) -> None:
     )
 
 
+def _default_judge_model(agent: Any) -> Any:
+    """Resolve the DEFAULT judge (no judge/compaction model configured).
+
+    Prefer ``deepseek:deepseek-chat`` when it is an enabled api-based row — a
+    cheap-but-capable grader isolated from the $0 claude-sub-proxy, so the judge
+    does not compete with the live agents for the shared Claude subscription.
+    When deepseek is NOT enabled, fall back to the existing cheapest-enabled
+    default (``_cheap_background_model``). Never routes to an Anthropic key:
+    both branches build a toolkit-free ``NativeProvider`` over an api-based row,
+    and the fallback's own catalog-cheapest pick is the same $0-first path used
+    before. Only a ROUTER ``agent.model`` is rewritten — a non-router model
+    (e.g. a unit-test fake) is returned unchanged, preserving the old contract.
+    """
+    fallback = getattr(agent, "model", None)
+    # Only a full Team-router fallback is worth overriding; an already-plain
+    # model was chosen deliberately (or is a test fake) — leave it be, exactly
+    # as ``_cheap_background_model`` does for non-router callers.
+    from src.core.compaction import _cheap_background_model, _is_router
+
+    if _is_router(fallback):
+        try:
+            from src.models.catalog import FRAMEWORK_API_BASED, iter_configured_models
+            from src.models.native_provider import NativeProvider
+
+            providers_config = getattr(agent, "_providers_config", None) or []
+            match = next(
+                (e for e in iter_configured_models(providers_config)
+                 if e.runtime_id == _DEFAULT_JUDGE_MODEL and not e.disabled
+                 and e.framework == FRAMEWORK_API_BASED),
+                None,
+            )
+            if match is not None:
+                db_path = getattr(getattr(agent, "_db", None), "db_path", None)
+                provider = NativeProvider(
+                    model=match.runtime_id,
+                    providers_config=providers_config,
+                    db_path=str(db_path) if db_path else None,
+                )
+                elog("quality.judge_model", model=match.runtime_id,
+                     reason="deepseek_default")
+                return provider
+        except Exception as exc:  # noqa: BLE001 — a default pick must never break a turn
+            elog("quality.judge_model_failed", level="warning",
+                 configured=_DEFAULT_JUDGE_MODEL,
+                 error_type=type(exc).__name__, error=str(exc) or repr(exc))
+    # deepseek not enabled (or a non-router model) → the prior cheapest-enabled
+    # default. Routing still only touches the local sub-proxy / deepseek, never
+    # an Anthropic key.
+    return _cheap_background_model(
+        agent, fallback,
+        picked_event="quality.judge_model",
+        fallback_event="quality.judge_model_dispatcher_fallback",
+        failed_event="quality.judge_model_failed",
+        what="quality judge",
+        env_hint=_MODEL_ENV,
+    )
+
+
 def _pick_judge_model(agent: Any) -> Any:
     """Resolve the judge model, cheap-by-config, never fatal.
 
@@ -298,19 +367,14 @@ def _pick_judge_model(agent: Any) -> Any:
     # UNSET (C3): no dedicated judge or compaction model configured. The old
     # behaviour returned ``agent.model`` — the full Team router — so a grader ran
     # up to a ~150k-token judge prompt through the premium leader (and could bill
-    # a paid DeepSeek delegation) on every sampled turn. Default instead to the
-    # cheapest enabled row as a toolkit-free NativeProvider. Only a *router*
-    # fallback is rewritten (see ``_cheap_background_model``), so a non-router
-    # ``agent.model`` — e.g. the fake model in unit tests — is untouched.
-    from src.core.compaction import _cheap_background_model
-    return _cheap_background_model(
-        agent, getattr(agent, "model", None),
-        picked_event="quality.judge_model",
-        fallback_event="quality.judge_model_dispatcher_fallback",
-        failed_event="quality.judge_model_failed",
-        what="quality judge",
-        env_hint=_MODEL_ENV,
-    )
+    # a paid DeepSeek delegation) on every sampled turn. Then it defaulted to the
+    # cheapest enabled row — which is the $0 ``local`` claude-sub-proxy, i.e. the
+    # grader ran THROUGH the Claude subscription, competing with the live agents.
+    # Default instead to ``deepseek:deepseek-chat`` (isolated, cheap, capable)
+    # when it is enabled, falling back to the cheapest-enabled row otherwise —
+    # never an Anthropic key. Only a *router* ``agent.model`` is rewritten, so a
+    # non-router fake in unit tests is untouched (see ``_default_judge_model``).
+    return _default_judge_model(agent)
 
 
 def _parse_verdict(text: str) -> Optional[dict]:

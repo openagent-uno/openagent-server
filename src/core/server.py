@@ -570,6 +570,26 @@ def _build_agent(config: dict) -> Agent:
                 os.environ[_env] = str(_qd_cfg[_k])
             except (TypeError, ValueError):
                 pass
+    # Per-run cost-anomaly alerting (``src/core/cost_anomaly.py``). Defaults ON
+    # with safe thresholds (a mostly-cached few-cent run can't page); maps
+    # ``cost_anomaly.*`` (top-level, or under ``memory:``) to the env vars that
+    # module reads. An operator disables it or retunes thresholds / the alert
+    # webhook here without touching env.
+    _ca_cfg = (config.get("cost_anomaly") or memory_cfg.get("cost_anomaly") or {})
+    if "enabled" in _ca_cfg:
+        os.environ["OPENAGENT_COST_ANOMALY_ENABLED"] = (
+            "1" if bool(_ca_cfg["enabled"]) else "0"
+        )
+    for _k, _env in (
+        ("cost_usd",              "OPENAGENT_COST_ANOMALY_COST_USD"),
+        ("uncached_input_tokens", "OPENAGENT_COST_ANOMALY_UNCACHED_INPUT_TOKENS"),
+        ("alert_webhook_url",     "OPENAGENT_COST_ANOMALY_ALERT_WEBHOOK_URL"),
+    ):
+        if _k in _ca_cfg:
+            try:
+                os.environ[_env] = str(_ca_cfg[_k])
+            except (TypeError, ValueError):
+                pass
     _cur_cfg = (memory_cfg.get("curator") or {})
     if "enabled" in _cur_cfg:
         os.environ["OPENAGENT_CURATOR_ENABLED"] = (

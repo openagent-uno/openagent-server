@@ -145,3 +145,120 @@ async def t_thresholds_configurable(ctx: TestContext) -> None:
                           cache_read_tokens=_CACHED_READS)
     assert got is not None and "cost_usd" in got["reasons"], got
     assert got["cost_threshold"] == 0.01
+
+
+# ══ Default-ON + alert-webhook wiring — a real runaway run pages, the known
+#    false-alarm run never does, and the webhook is optional ═══════════════════
+
+
+@contextlib.contextmanager
+def _capture_webhook():
+    """Capture the anomaly webhook POSTs as (url, payload) without touching the
+    network — replaces the async ``_fire_webhook`` with a recording coroutine."""
+    import src.core.cost_anomaly as ca
+
+    sent: list[tuple] = []
+    orig = ca._fire_webhook
+
+    async def _fake(url, payload):
+        sent.append((url, payload))
+
+    ca._fire_webhook = _fake
+    try:
+        yield sent
+    finally:
+        ca._fire_webhook = orig
+
+
+@test("cost_anomaly", "ENABLED defaults ON — a genuine anomaly pages with no env set")
+async def t_default_on(ctx: TestContext) -> None:
+    import src.core.cost_anomaly as ca
+
+    # No OPENAGENT_COST_ANOMALY_ENABLED in the environment at all.
+    with _env(OPENAGENT_COST_ANOMALY_ENABLED=None):
+        assert ca.enabled() is True, "cost-anomaly monitor did not default ON"
+        # A genuinely expensive run → exactly one router.cost_anomaly, unprompted.
+        with _capture() as ev:
+            ca.note_run(session_id="sD", model="deepseek:x", cost_usd=3.0,
+                        input_tokens=100_000, cache_read_tokens=0)
+        anomalies = [kw for name, kw in ev if name == "router.cost_anomaly"]
+        assert len(anomalies) == 1 and anomalies[0]["session_id"] == "sD", ev
+
+        # The KNOWN false alarm (447k summed / 94% cached / ~$0.018) must stay
+        # silent under the default-on thresholds — the whole point of the fix.
+        with _capture() as ev:
+            ca.note_run(session_id="sD", model="local:sub", cost_usd=_CACHED_COST,
+                        input_tokens=_CACHED_INPUT, cache_read_tokens=_CACHED_READS)
+        assert [kw for n, kw in ev if n == "router.cost_anomaly"] == [], (
+            f"the false-alarm run paged under default-on thresholds: {ev}"
+        )
+
+
+@test("cost_anomaly", "genuine anomaly + configured webhook → the webhook is POSTed")
+async def t_webhook_fires_on_anomaly(ctx: TestContext) -> None:
+    import asyncio
+    import src.core.cost_anomaly as ca
+
+    with _env(OPENAGENT_COST_ANOMALY_ENABLED="1",
+              OPENAGENT_COST_ANOMALY_ALERT_WEBHOOK_URL="https://hook.example/paging",
+              OPENAGENT_QUALITY_DIGEST_ALERT_WEBHOOK_URL=None), \
+            _capture_webhook() as sent:
+        ca.note_run(session_id="s7", model="deepseek:x", cost_usd=3.0,
+                    input_tokens=100_000, cache_read_tokens=0)
+        await asyncio.sleep(0.05)  # let the fire-and-forget task run
+    assert len(sent) == 1, f"expected exactly one webhook POST, got {sent}"
+    url, payload = sent[0]
+    assert url == "https://hook.example/paging", url
+    assert payload["event"] == "router.cost_anomaly" and payload["source"] == "cost_anomaly"
+    assert payload["session_id"] == "s7" and payload["severity"] == "warning"
+    assert "cost_usd" in payload["counts"]["reasons"], payload
+
+
+@test("cost_anomaly", "the false-alarm run never POSTs the webhook (even when configured)")
+async def t_webhook_silent_on_false_alarm(ctx: TestContext) -> None:
+    import asyncio
+    import src.core.cost_anomaly as ca
+
+    with _env(OPENAGENT_COST_ANOMALY_ENABLED="1",
+              OPENAGENT_COST_ANOMALY_ALERT_WEBHOOK_URL="https://hook.example/paging"), \
+            _capture_webhook() as sent:
+        ca.note_run(session_id="s", model="local:sub", cost_usd=_CACHED_COST,
+                    input_tokens=_CACHED_INPUT, cache_read_tokens=_CACHED_READS)
+        await asyncio.sleep(0.05)
+    assert sent == [], f"the $0.018/94%-cached false alarm paged a human: {sent}"
+
+
+@test("cost_anomaly", "the webhook is OPTIONAL — a genuine anomaly with no URL still elogs, no POST")
+async def t_webhook_optional(ctx: TestContext) -> None:
+    import asyncio
+    import src.core.cost_anomaly as ca
+
+    with _env(OPENAGENT_COST_ANOMALY_ENABLED="1",
+              OPENAGENT_COST_ANOMALY_ALERT_WEBHOOK_URL=None,
+              OPENAGENT_QUALITY_DIGEST_ALERT_WEBHOOK_URL=None), \
+            _capture() as ev, _capture_webhook() as sent:
+        ca.note_run(session_id="s", model="deepseek:x", cost_usd=3.0,
+                    input_tokens=100_000, cache_read_tokens=0)
+        await asyncio.sleep(0.05)
+    assert [kw for n, kw in ev if n == "router.cost_anomaly"], "the elog floor did not fire"
+    assert sent == [], f"a webhook was POSTed with no URL configured: {sent}"
+
+
+@test("cost_anomaly", "the alert webhook reuses the shared quality-digest URL when unset")
+async def t_webhook_url_fallback(ctx: TestContext) -> None:
+    import src.core.cost_anomaly as ca
+
+    # Neither set → None.
+    with _env(OPENAGENT_COST_ANOMALY_ALERT_WEBHOOK_URL=None,
+              OPENAGENT_QUALITY_DIGEST_ALERT_WEBHOOK_URL=None):
+        assert ca._alert_webhook_url() is None
+
+    # Only the shared quality-digest webhook set → reused for cost anomalies.
+    with _env(OPENAGENT_COST_ANOMALY_ALERT_WEBHOOK_URL=None,
+              OPENAGENT_QUALITY_DIGEST_ALERT_WEBHOOK_URL="https://hook.example/shared"):
+        assert ca._alert_webhook_url() == "https://hook.example/shared"
+
+    # Dedicated var wins over the shared one.
+    with _env(OPENAGENT_COST_ANOMALY_ALERT_WEBHOOK_URL="https://hook.example/dedicated",
+              OPENAGENT_QUALITY_DIGEST_ALERT_WEBHOOK_URL="https://hook.example/shared"):
+        assert ca._alert_webhook_url() == "https://hook.example/dedicated"

@@ -197,6 +197,13 @@ _TEST_MODULES: tuple[str, ...] = (
     # while the full ``OPENAGENT_HTTP_TOKEN`` keeps working everywhere. Pure-unit:
     # drives the REAL auth middleware with both header forms; no live gateway.
     "test_llm_scoped_token",
+    # Health-probe auth exemption: ``GET /api/health`` bypasses auth (a plain
+    # k8s httpGet liveness probe works) via an EXACT path match, while every
+    # other /api/* route — including the sensitive /api/health/ingest — stays
+    # authed, and the health payload leaks nothing sensitive. Pure-unit: drives
+    # the REAL auth middleware + the real handler; sits by test_llm_scoped_token
+    # because it pins the same middleware.
+    "test_health_probe_auth",
     # Cross-device chat visibility: ``upsert_session`` writes the user
     # handle as the row owner and ``list_all_sessions`` soft-falls back
     # to legacy device-pubkey rows via ``network_devices``.

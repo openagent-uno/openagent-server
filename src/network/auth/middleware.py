@@ -111,6 +111,20 @@ def make_auth_middleware(state: NetworkAuthState):
         if request.method == "OPTIONS":
             return await handler(request)
 
+        # Liveness-probe exemption. ``GET /api/health`` is the ONE route that
+        # skips auth entirely, so a k8s liveness/readiness probe can issue a
+        # PLAIN httpGet with no device cert and no bearer token — the earlier
+        # attempt to smuggle a token into an exec probe mangled its shell
+        # quoting and crash-looped a pod. The match is EXACT on the resolved
+        # path (``rel_url.path`` has query string + params stripped), NOT a
+        # prefix, so it can never be widened to reach ``/api/health/ingest`` or
+        # any other ``/api/*`` route. The handler itself returns only basic
+        # liveness status (agent name, version, connected-client count) — no
+        # secrets, config, or session data — so exposing it unauthenticated is
+        # safe. Everything else below still requires a cert/token.
+        if request.rel_url.path == "/api/health":
+            return await handler(request)
+
         # HTTP token bypass: trusted reverse proxies present a shared
         # secret in lieu of a device cert. We synthesize a minimal
         # request['device_cert'] so downstream handlers don't need to
