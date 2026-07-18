@@ -109,6 +109,16 @@ class ModelProviderError(OpenAgentError):
         "exceeds the model",
     ]
 
+    # Messages that signal a TRANSIENT CAPACITY exhaustion rather than a config
+    # bug, even though the upstream returns a client status (e.g. 404). The
+    # in-pod claude-sub-proxy emits this when all its rotating Claude accounts
+    # are cooling down / rate-limited ("...Retry after about Ns"). Classified as
+    # a rate-limit so the run degrades to the fallback model instead of failing.
+    RATE_LIMIT_MESSAGE_PATTERNS = [
+        "no available claude oauth account",   # sub-proxy: all accounts exhausted
+        "no available oauth account",
+    ]
+
     def __init__(
         self, message: str, status_code: int = 502, model_name: Optional[str] = None, model_id: Optional[str] = None
     ):
@@ -141,8 +151,23 @@ class ModelProviderError(OpenAgentError):
                 model_id=error.model_id,
             )
 
-        # Context-window detection
         error_msg = str(error.message).lower()
+
+        # Capacity-exhaustion detection by message: the in-pod claude-sub-proxy
+        # returns a client status (e.g. 404) when all its rotating Claude
+        # accounts are cooling down. That is a transient capacity signal, not a
+        # config bug — classify it as a rate-limit so ``get_fallback_models``
+        # degrades to the configured fallback (DeepSeek) instead of surfacing the
+        # hard failure it (correctly) raises for a genuine 4xx client error.
+        if any(pattern in error_msg for pattern in cls.RATE_LIMIT_MESSAGE_PATTERNS):
+            return ModelRateLimitError(
+                message=error.message,
+                status_code=error.status_code,
+                model_name=error.model_name,
+                model_id=error.model_id,
+            )
+
+        # Context-window detection
         if any(pattern in error_msg for pattern in cls.CONTEXT_WINDOW_PATTERNS):
             return ContextWindowExceededError(
                 message=error.message,

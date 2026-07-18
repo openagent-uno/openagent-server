@@ -47,3 +47,36 @@ async def t_build_agent_wires_fallback_config(ctx: TestContext) -> None:
 
     agent._prepare_model_runtime(agent.model)
     assert getattr(agent.model, "_fallback_config", None) is agent.fallback_config
+
+
+@test("model_fallback",
+      "sub-proxy 'no available accounts' (4xx) classifies as rate-limit and falls back")
+async def t_account_exhaustion_falls_back(_ctx: TestContext) -> None:
+    """The in-pod claude-sub-proxy returns a client status (e.g. 404) when all
+    its rotating Claude accounts are cooling down. That is a TRANSIENT capacity
+    signal ("Retry after ..."), not a config bug — it must degrade to the
+    configured fallback (DeepSeek). Regression: it was hitting the "non-retryable
+    4xx client error → return None" branch, so the run hard-failed (the
+    skill-distiller ``failed`` with exactly this message) instead of falling
+    back, and Claude-account saturation could take out live support turns."""
+    from src.core.runtime_errors import ModelProviderError, ModelRateLimitError
+    from src.models.providers.fallback import FallbackConfig, get_fallback_models
+
+    fc = FallbackConfig(on_rate_limit=["deepseek:deepseek-v4-pro"])
+    exhausted = ModelProviderError(
+        "No available Claude OAuth accounts. Run `claude-sub-proxy login "
+        "--priority 10` to add one. Last account error: HTTP 404: "
+        '{"type":"error"}. Retry after about 171s.',
+        status_code=404,
+    )
+    # Upgraded to a rate-limit despite the 4xx status …
+    assert isinstance(ModelProviderError.classify(exhausted), ModelRateLimitError)
+    # … so it degrades to the fallback instead of the hard-fail `return None`.
+    assert get_fallback_models(fc, exhausted) == ["deepseek:deepseek-v4-pro"]
+
+    # Guard against over-breadth: an UNRELATED real 404 (config bug) must STILL
+    # be non-retryable — masking it with a silent fallback is the anti-pattern
+    # the `return None` branch exists to prevent.
+    real_404 = ModelProviderError("model `foo` not found", status_code=404)
+    assert not isinstance(ModelProviderError.classify(real_404), ModelRateLimitError)
+    assert get_fallback_models(fc, real_404) is None
