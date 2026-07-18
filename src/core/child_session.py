@@ -46,6 +46,12 @@ from typing import Any, Optional
 
 from src.core.identity_context import agent_author
 from src.core.logging import elog
+from src.core.tool_scope import (
+    current_tool_allowlist,
+    normalize_family,
+    reset_tool_allowlist,
+    set_tool_allowlist,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -370,6 +376,7 @@ async def run_child_session(
     on_status: Any = None,
     stream: bool = False,
     session_id: Optional[str] = None,
+    allowed_tools: Optional[Any] = None,
 ) -> ChildSessionResult:
     """Spawn ``prompt`` as a full durable child session and return its result.
 
@@ -396,6 +403,15 @@ async def run_child_session(
             normal one-spawn/one-session path; pass an existing OpenAgent
             session id when a caller intentionally injects another turn into a
             durable child transcript (event payload binding).
+        allowed_tools: OPTIONAL opt-in per-child tool scoping. Omit (``None``,
+            the default) and the child runs with the FULL toolset exactly as
+            today — byte-identical, no contextvar touched. When an iterable of
+            MCP tool-family / server names (e.g. ``["vault", "web"]``) is passed,
+            the child's runtime is built with only those families for the
+            duration of its run (see ``src.core.tool_scope`` +
+            ``models.native_provider``). The child can therefore only ever be
+            NARROWER than the parent's grant, never broader. This never changes
+            what an unrestricted child receives.
         stream: when True, drive ``Agent.run_stream`` and forward each content
             delta / tool status as a child-tagged frame (``emit_child_frame``),
             so a DETACHED run (a scheduled firing, a workflow node) streams live
@@ -611,6 +627,19 @@ async def run_child_session(
     # and the chain would appear to deepen when it had not.
     depth_tok = _depth_var.set(depth)
     root_tok = _root_var.set(root)
+    # Opt-in per-child tool scoping. Default (allowed_tools is None) → the
+    # contextvar is NOT touched, so an unrestricted child runs with the full
+    # toolset exactly as before (byte-identical). When a subset IS requested we
+    # additionally INTERSECT it with any allowlist already in force on this
+    # context (a restricted ancestor), so a descendant can only ever NARROW its
+    # parent's grant, never widen it — the single choke point where that
+    # invariant holds for every spawn origin, not just ``delegate_task``.
+    scope_tok = None
+    if allowed_tools is not None:
+        requested = frozenset(normalize_family(t) for t in allowed_tools)
+        ambient = current_tool_allowlist()
+        effective = requested if ambient is None else (requested & ambient)
+        scope_tok = set_tool_allowlist(effective)
     try:
         if chain_sem is None:
             async with global_sem:
@@ -646,6 +675,8 @@ async def run_child_session(
     finally:
         _depth_var.reset(depth_tok)
         _root_var.reset(root_tok)
+        if scope_tok is not None:
+            reset_tool_allowlist(scope_tok)
 
     return ChildSessionResult(session_id=child_sid, text=text or "")
 

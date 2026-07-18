@@ -27,6 +27,7 @@ import logging
 from typing import Any, Optional
 
 from src.core.logging import elog
+from src.core.tool_scope import current_tool_allowlist, normalize_family
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +101,32 @@ def current_parent_session_id() -> Optional[str]:
     return _session_id_var.get()
 
 
-async def delegate_task(task: str, model_id: str | None = None) -> dict[str, Any]:
+def _resolve_parent_grant() -> Optional[frozenset[str]]:
+    """The tool FAMILIES (MCP server names) the current run may use, normalised.
+
+    This is the parent's effective grant that an ``allowed_tools`` request is
+    intersected against, so a sub-agent can never be handed a family the parent
+    itself lacks. It is the ambient allowlist when a restricted ancestor already
+    narrowed the grant (monotonic narrowing down a chain), otherwise the live
+    MCP pool's full server set. Returns ``None`` only when neither is resolvable
+    (no pool bound and no ambient restriction), which the caller turns into an
+    explicit error rather than silently running unrestricted.
+    """
+    ambient = current_tool_allowlist()
+    if ambient is not None:
+        return ambient
+    pool = _pool_var.get()
+    names = getattr(pool, "server_tool_names", None)
+    if pool is None or not callable(names):
+        return None
+    return frozenset(normalize_family(s) for s in names().keys())
+
+
+async def delegate_task(
+    task: str,
+    model_id: str | None = None,
+    allowed_tools: list[str] | None = None,
+) -> dict[str, Any]:
     """Run ``task`` as a sub-agent (its own child session) and return the answer.
 
     Args:
@@ -113,6 +139,14 @@ async def delegate_task(task: str, model_id: str | None = None) -> dict[str, Any
             default/router model — a fresh, independent child session that
             still decomposes work off your own transcript. Call
             ``list_delegatable_models`` first if you want to choose by scope.
+        allowed_tools: OPTIONAL list of MCP tool-family / server names
+            (e.g. ``["vault", "web"]``) to SCOPE the sub-agent to. OMIT it (the
+            default) and the sub-agent gets the full toolset exactly as before.
+            When provided, the sub-agent's runtime is built with only those
+            families, intersected with what THIS run is allowed to use — a child
+            can never be granted a tool family its parent lacks. An empty
+            intersection is refused with a clear error (never a silent
+            zero-tool sub-agent).
 
     Returns:
         A dict with ``status`` (``"ok"`` / ``"error"``), the delegated
@@ -137,6 +171,38 @@ async def delegate_task(task: str, model_id: str | None = None) -> dict[str, Any
                 "running — the runtime didn't install a delegation context."
             ),
         }
+
+    # Opt-in tool scoping. Default (allowed_tools is None) → resolved_tools stays
+    # None and NOTHING below changes: the child gets today's full toolset,
+    # byte-identical. Only an explicit request resolves + intersects a grant.
+    resolved_tools: Optional[list[str]] = None
+    if allowed_tools is not None:
+        grant = _resolve_parent_grant()
+        if grant is None:
+            return {
+                "status": "error",
+                "model_id": model_id,
+                "error": (
+                    "allowed_tools was requested but this run's tool grant "
+                    "could not be resolved (no MCP pool is bound to the "
+                    "delegation context). Retry without allowed_tools, or run "
+                    "where a pool is installed."
+                ),
+            }
+        requested = {normalize_family(t) for t in allowed_tools}
+        intersected = requested & grant
+        if not intersected:
+            return {
+                "status": "error",
+                "model_id": model_id,
+                "error": (
+                    f"allowed_tools {sorted(requested)} does not intersect this "
+                    f"run's tool grant {sorted(grant)}, so the sub-agent would "
+                    f"have no tools. Choose families from the grant, or omit "
+                    f"allowed_tools to give the sub-agent the full toolset."
+                ),
+            }
+        resolved_tools = sorted(intersected)
 
     elog(
         "subagent.start",
@@ -163,6 +229,7 @@ async def delegate_task(task: str, model_id: str | None = None) -> dict[str, Any
             prompt=task,
             owner_client_id=owner_handle,
             model_id=model_id,
+            allowed_tools=resolved_tools,
         )
     except DelegationDepthExceeded as e:
         # Structural limit, not a fault: hand the model a plain explanation it

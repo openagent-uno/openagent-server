@@ -35,6 +35,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 
 from src.core import tool_trace, vault_recall
 from src.core.logging import elog
+from src.core.tool_scope import current_tool_allowlist, normalize_family
 from src.models.base import BaseModel, ModelResponse
 from src.models.catalog import (
     DEFAULT_CEREBRAS_BASE_URL,
@@ -902,14 +903,13 @@ class NativeProvider(BaseModel):
             or "default"
         )
 
-    def _compatible_mcp_toolkits(self) -> tuple[list[Any], list[str]]:
-        if self._compatible_cache is not None:
-            allowed, filtered = self._compatible_cache
-            return list(allowed), list(filtered)
+    def _base_compatible_mcp_toolkits(self) -> tuple[list[Any], list[str]]:
+        """The provider-compatible toolkits (drop families this provider can't
+        use). This is the whole of the historical behaviour — no per-run
+        scoping — extracted so the scoping wrapper below can reuse it."""
         provider_name, _model_id = self._runtime_parts()
         blocked = _INCOMPATIBLE_TOOL_FAMILIES_BY_PROVIDER.get(provider_name, frozenset())
         if not blocked:
-            self._compatible_cache = (list(self._mcp_toolkits), [])
             return list(self._mcp_toolkits), []
         allowed: list[Any] = []
         filtered: set[str] = set()
@@ -919,8 +919,33 @@ class NativeProvider(BaseModel):
                 filtered.add(family)
                 continue
             allowed.append(toolkit)
-        self._compatible_cache = (allowed, sorted(filtered))
-        return list(allowed), sorted(filtered)
+        return allowed, sorted(filtered)
+
+    def _compatible_mcp_toolkits(self) -> tuple[list[Any], list[str]]:
+        # Opt-in per-child tool scoping. ``current_tool_allowlist()`` is ``None``
+        # for every ordinary run (chat, automation, unrestricted delegation), so
+        # this takes the EXACT historical path: the memoised cache fast-path, and
+        # the same list it always returned — byte-identical. Only a delegated
+        # child that was spawned with an explicit ``allowed_tools`` subset (see
+        # ``core.tool_scope`` / ``core.child_session``) installs an allowlist,
+        # and that case is request-scoped: it NEITHER reads NOR writes
+        # ``self._compatible_cache``, so a restricted run can never pollute the
+        # shared cache an unrestricted run relies on.
+        allow = current_tool_allowlist()
+        if allow is None:
+            if self._compatible_cache is not None:
+                allowed, filtered = self._compatible_cache
+                return list(allowed), list(filtered)
+            base, filtered = self._base_compatible_mcp_toolkits()
+            self._compatible_cache = (base, filtered)
+            return list(base), list(filtered)
+        # Restricted: keep only toolkits whose (normalised) family is allowed.
+        base, filtered = self._base_compatible_mcp_toolkits()
+        restricted = [
+            tk for tk in base
+            if normalize_family(self._toolkit_family_name(tk)) in allow
+        ]
+        return restricted, list(filtered)
 
     @staticmethod
     def _is_session_corruption_error(error_msg: str) -> bool:

@@ -75,6 +75,13 @@ _TEST_MODULES: tuple[str, ...] = (
     # network. Pure-unit; sits by test_transcript_index (its keyword sibling).
     "test_semantic_recall",
     "test_delegation_depth",
+    # Opt-in per-child tool scoping (additive, default-preserving): the new
+    # ``allowed_tools`` seam on ``delegate_task`` / ``run_child_session`` narrows
+    # a sub-agent to a SUBSET of the parent's grant, while the default path stays
+    # byte-identical (no allowlist installed, native-provider toolkit cache
+    # untouched). Also locks the pre-existing per-child model override. Pure-unit
+    # — fake agent/pool/toolkits, no live LLM; sits by test_delegation_depth.
+    "test_delegation_tool_scope",
     "test_stream_usage",
     # Vault recall attribution (note → run → outcome). Drives the REAL
     # TeamRouterProvider.stream path with genuine runtime events; pure-unit
