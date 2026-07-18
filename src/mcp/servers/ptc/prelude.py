@@ -77,6 +77,76 @@ def call_tool(server, tool, args=None):
     return resp.get("result")
 '''
 
+# The docker-variant bridge, also written as ``openagent_tools.py`` but into the
+# container's per-run dir. A ``--network none`` container can't reach the host
+# Unix socket the UDS bridge uses, so this variant does the round-trip over
+# FILES: each ``call_tool`` writes a request file and blocks polling for the
+# matching response file, which a host-side poller services via ``docker exec``.
+# Same public surface (``call_tool`` / ``PtcError``) and the same stdlib-only,
+# no-OpenAgent-imports discipline as the UDS bridge above.
+_DOCKER_BRIDGE_MODULE = r'''"""Auto-generated OpenAgent PTC bridge (docker) — do not edit.
+
+Reaches the agent's own tools over request/response files in a per-run dir that
+a host-side poller services. Import is injected for you, so a PTC script can just
+call ``call_tool(server, tool, args)``.
+"""
+import json
+import os
+import time
+
+_RUNDIR = os.environ.get("OPENAGENT_PTC_RUNDIR")
+_TOKEN = os.environ.get("OPENAGENT_PTC_TOKEN")
+try:
+    _CALL_TIMEOUT = float(os.environ.get("OPENAGENT_PTC_CALL_TIMEOUT") or "120")
+except (TypeError, ValueError):
+    _CALL_TIMEOUT = 120.0
+_POLL = 0.02
+_SEQ = 0
+
+
+class PtcError(RuntimeError):
+    """Raised when a call_tool round-trip fails (transport or tool error)."""
+
+
+def call_tool(server, tool, args=None):
+    """Invoke one of the agent's tools and return its JSON-coerced result.
+
+    ``server`` / ``tool`` are the same names you would pass to
+    ``tool_search_call_tool``; ``args`` is a dict of tool arguments. Writes a
+    request file and blocks until the host poller writes the matching response
+    file. Raises ``PtcError`` on an unknown tool, a rejected call, or a
+    transport timeout.
+    """
+    global _SEQ
+    if not _RUNDIR or not _TOKEN:
+        raise PtcError("PTC bridge is not configured (no rundir/token in env)")
+    _SEQ += 1
+    seq = _SEQ
+    req_path = os.path.join(_RUNDIR, "req_%d.json" % seq)
+    resp_path = os.path.join(_RUNDIR, "resp_%d.json" % seq)
+    payload = json.dumps(
+        {"token": _TOKEN, "server": server, "tool": tool, "args": args or {}, "seq": seq}
+    )
+    tmp = req_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(payload)
+    os.rename(tmp, req_path)  # atomic publish — the poller never sees a partial request
+    deadline = time.time() + _CALL_TIMEOUT
+    while True:
+        try:
+            with open(resp_path, "r", encoding="utf-8") as fh:
+                resp = json.loads(fh.read())
+        except (OSError, ValueError):
+            resp = None  # not written yet, or a partial read — keep polling
+        if resp is not None:
+            if not resp.get("ok"):
+                raise PtcError(str(resp.get("error") or "unknown PTC error"))
+            return resp.get("result")
+        if time.time() > deadline:
+            raise PtcError("timed out waiting for PTC response")
+        time.sleep(_POLL)
+'''
+
 # Prepended to the model's ``code`` so ``call_tool`` is a bare global. A blank
 # line follows so a leading ``"""docstring"""`` in the user's code still parses.
 _SCRIPT_HEADER = "from openagent_tools import call_tool  # injected by OpenAgent PTC\n\n"

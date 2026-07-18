@@ -60,6 +60,84 @@ def _local_settings(**over):
     return PtcSettings(**base)
 
 
+# ── Fake docker backend: exercises the file transport without a daemon ──
+
+
+class _FakePtcDocker:
+    """A daemon-free stand-in for ``DockerBackend`` for the PTC docker path.
+
+    Its "container filesystem" is a host tmpdir rooted at ``container_workdir``;
+    the container-fs helpers operate on it directly, and ``build_spawn`` runs the
+    shipped script LOCALLY (swapping the container's ``python3`` for the test
+    interpreter, so the round-trip doesn't depend on a system python3) with the
+    per-command env merged in. That makes the file-transport RPC round-trip
+    testable end to end without docker. Constructed by ``select_backend`` with a
+    ``DockerConfig`` (same contract as the real backend).
+    """
+
+    name = "docker"
+
+    def __init__(self, cfg=None) -> None:
+        self.cfg = cfg
+        self._root = None
+        self.prepare_called = False
+        self.cleanup_called = False
+
+    async def prepare(self) -> None:
+        self.prepare_called = True
+        if self._root is None:
+            self._root = tempfile.mkdtemp(prefix="oa-ptc-fakedock-")
+
+    @property
+    def container_workdir(self) -> str:
+        return self._root
+
+    async def container_mkdir(self, path) -> None:
+        os.makedirs(path, exist_ok=True)
+
+    async def container_write(self, path, data) -> None:
+        tmp = f"{path}.tmp"
+        with open(tmp, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp, path)  # atomic — mirrors the real base64+mv
+
+    async def container_read(self, path):
+        try:
+            with open(path, "rb") as fh:
+                return fh.read()
+        except OSError:
+            return None
+
+    async def container_listdir(self, path):
+        try:
+            return os.listdir(path)
+        except OSError:
+            return []
+
+    async def container_rmtree(self, path) -> None:
+        shutil.rmtree(path, ignore_errors=True)
+
+    def build_spawn(self, *, command, cwd, env):
+        import sys
+        from src.mcp.servers.shell.backends import SpawnSpec
+        from src.mcp.servers.shell.shells import _pick_shell
+
+        if command.startswith("python3 "):
+            command = sys.executable + command[len("python3"):]
+        shell, flag = _pick_shell()
+        proc_env = os.environ.copy()
+        if env:
+            proc_env.update(env)
+        return SpawnSpec(
+            argv=[shell, flag, command], env=proc_env, cwd=cwd, start_new_session=True
+        )
+
+    async def cleanup(self) -> None:
+        self.cleanup_called = True
+        if self._root:
+            shutil.rmtree(self._root, ignore_errors=True)
+
+
 # ── 1. RPC server proxies a tool call, args intact ──────────────────
 
 
@@ -289,8 +367,16 @@ async def t_fail_closed(_ctx: TestContext) -> None:
     assert out["status"] == "refused", out
     assert out["tool_calls_made"] == 0
 
-    # docker backend → refused (file-based RPC unimplemented), never on host.
+    # docker backend whose prepare() raises → refused, never on host. Fake the
+    # daemon-bring-up failure so this stays hermetic (no real docker required).
+    class _PrepFails(_FakePtcDocker):
+        async def prepare(self):
+            from src.mcp.servers.shell.backends import SandboxUnavailableError
+            raise SandboxUnavailableError("no docker daemon in this test")
+
     prev = os.environ.get("OPENAGENT_SANDBOX_BACKEND")
+    orig = backends._BACKENDS["docker"]
+    backends._BACKENDS["docker"] = _PrepFails
     try:
         os.environ["OPENAGENT_SANDBOX_BACKEND"] = "docker"
         os.environ["OPENAGENT_SANDBOX_DOCKER"] = "{}"
@@ -303,7 +389,9 @@ async def t_fail_closed(_ctx: TestContext) -> None:
         )
         assert out2["status"] == "refused", out2
         assert "docker" in out2["output"], out2
+        assert out2["tool_calls_made"] == 0, out2
     finally:
+        backends._BACKENDS["docker"] = orig
         if prev is None:
             os.environ.pop("OPENAGENT_SANDBOX_BACKEND", None)
         else:
@@ -313,3 +401,111 @@ async def t_fail_closed(_ctx: TestContext) -> None:
 
     # In neither refusal did the fake tool run.
     assert ran["n"] == 0
+
+
+# ── 8. Docker path: file-transport RPC round-trip (faked docker) ────
+
+
+@test("ptc", "docker path: file-transport RPC round-trips through _call_tool_impl (fake docker)")
+async def t_docker_round_trip(_ctx: TestContext) -> None:
+    from src.mcp.servers.ptc import handlers
+    from src.mcp.servers.shell import backends
+
+    seen: dict = {}
+
+    def echo(**kwargs):
+        seen["args"] = kwargs
+        return {"sentinel": "PTC_DOCKER_OK", "x": kwargs.get("x")}
+
+    pool = _FakePool({"fake": _FakeToolkit({"echo": echo})})
+
+    prev = os.environ.get("OPENAGENT_SANDBOX_BACKEND")
+    orig = backends._BACKENDS["docker"]
+    backends._BACKENDS["docker"] = _FakePtcDocker
+    try:
+        os.environ["OPENAGENT_SANDBOX_BACKEND"] = "docker"
+        os.environ["OPENAGENT_SANDBOX_DOCKER"] = "{}"
+        backends._reset_backend_for_tests()
+
+        # require_sandbox=True is SATISFIED by docker → the docker path runs.
+        out = await handlers.run_python_impl(
+            'print(call_tool("fake", "echo", {"x": 7}))',
+            pool=pool,
+            settings=_local_settings(require_sandbox=True),
+            dry_run=False,
+        )
+        assert out["status"] == "ok", out
+        assert out["tool_calls_made"] == 1, out
+        # The fake result reaches the model ONLY via the script's stdout.
+        assert "PTC_DOCKER_OK" in out["output"], out
+        assert "'x': 7" in out["output"], out
+        assert seen["args"] == {"x": 7}, seen  # args survived the file transport
+        # It genuinely routed through the docker backend, not the local one.
+        inst = backends.get_exec_backend()
+        assert isinstance(inst, _FakePtcDocker) and inst.prepare_called, inst
+    finally:
+        backends._BACKENDS["docker"] = orig
+        if prev is None:
+            os.environ.pop("OPENAGENT_SANDBOX_BACKEND", None)
+        else:
+            os.environ["OPENAGENT_SANDBOX_BACKEND"] = prev
+        os.environ.pop("OPENAGENT_SANDBOX_DOCKER", None)
+        backends._reset_backend_for_tests()
+
+
+# ── 9. Docker path: wrong token on the file transport is not dispatched ─
+
+
+@test("ptc", "docker path: a wrong-token request file is rejected, uncounted (file transport)")
+async def t_docker_auth(_ctx: TestContext) -> None:
+    from src.mcp.servers.ptc import handlers
+
+    ran = {"n": 0}
+
+    def tool_fn(**kwargs):
+        ran["n"] += 1
+        return "ran-ok"
+
+    pool = _FakePool({"fake": _FakeToolkit({"tool_fn": tool_fn})})
+
+    backend = _FakePtcDocker()
+    await backend.prepare()
+    rundir = os.path.join(backend.container_workdir, "run")
+    await backend.container_mkdir(rundir)
+
+    state: dict = {"calls": 0}
+    dispatch = handlers._make_file_dispatch(
+        pool=pool, token="the-real-token", dry_run=False,
+        allowed_tools=None, max_tool_calls=50, state=state,
+    )
+    poller = asyncio.create_task(handlers._poll_rundir(backend, rundir, dispatch))
+
+    async def _wait_resp(seq):
+        for _ in range(300):
+            raw = await backend.container_read(os.path.join(rundir, f"resp_{seq}.json"))
+            if raw is not None:
+                return json.loads(raw)
+            await asyncio.sleep(0.01)
+        raise AssertionError(f"no resp_{seq}.json produced")
+
+    try:
+        # A wrong-token request, then a correct one.
+        await backend.container_write(
+            os.path.join(rundir, "req_1.json"),
+            json.dumps({"token": "WRONG", "server": "fake", "tool": "tool_fn", "args": {}, "seq": 1}).encode(),
+        )
+        await backend.container_write(
+            os.path.join(rundir, "req_2.json"),
+            json.dumps({"token": "the-real-token", "server": "fake", "tool": "tool_fn", "args": {}, "seq": 2}).encode(),
+        )
+        r1 = await _wait_resp(1)
+        r2 = await _wait_resp(2)
+    finally:
+        poller.cancel()
+        await asyncio.gather(poller, return_exceptions=True)
+        await backend.cleanup()
+
+    assert r1 == {"ok": False, "error": "unauthorized"}, r1
+    assert r2["ok"] is True and r2["result"] == "ran-ok", r2
+    assert ran["n"] == 1, ran            # only the authorized call reached the tool
+    assert state["calls"] == 1, state    # the wrong-token call never incremented

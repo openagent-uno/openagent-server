@@ -25,9 +25,11 @@ running on the host, which would defeat the whole point of turning it on.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
+import shlex
 import shutil
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
@@ -296,6 +298,79 @@ class DockerBackend:
             )
         else:
             elog("sandbox.docker.removed", cid=cid[:12])
+
+    # ── Container filesystem helpers (used by the PTC docker path) ───────
+    #
+    # Programmatic Tool Calling ships a script + a file-based RPC bridge INTO
+    # this container and services the bridge's request/response files from the
+    # host — all over ``docker exec``, so the container keeps its
+    # ``--network none`` isolation (a host Unix socket is unreachable from it).
+    # These helpers are the only seam that path needs; ``build_spawn`` (which
+    # runs the script itself) is untouched, so the shell tool's behaviour is
+    # unchanged. A test double overrides these same methods to simulate the
+    # container filesystem without a daemon.
+
+    @property
+    def container_workdir(self) -> str:
+        """The in-container working dir (the tmpfs the PTC per-run dir sits under)."""
+        return self.cfg.workdir
+
+    async def _exec(
+        self, argv: list[str], *, stdin: bytes | None = None
+    ) -> tuple[int | None, bytes, bytes]:
+        """Run one ``docker exec -i <cid> <argv...>`` and capture ``(rc, out, err)``."""
+        if self._cid is None:
+            raise RuntimeError(
+                "DockerBackend._exec called before prepare() — no container"
+            )
+        proc = await asyncio.create_subprocess_exec(
+            self.docker_exe, "exec", "-i", self._cid, *argv,
+            stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await proc.communicate(stdin)
+        return proc.returncode, out, err
+
+    async def container_mkdir(self, path: str) -> None:
+        rc, _out, err = await self._exec(["mkdir", "-p", path])
+        if rc != 0:
+            raise SandboxUnavailableError(
+                f"container mkdir {path!r} failed: {err.decode('utf-8', 'replace').strip()}"
+            )
+
+    async def container_write(self, path: str, data: bytes) -> None:
+        """Write ``data`` to ``path`` atomically: base64 in on stdin, decode in
+        the container to a temp file, then ``mv`` into place — so a concurrent
+        reader (the sandboxed script polling for its response) never observes a
+        half-written file."""
+        tmp = f"{path}.tmp"
+        script = (
+            f"base64 -d > {shlex.quote(tmp)} && mv {shlex.quote(tmp)} {shlex.quote(path)}"
+        )
+        rc, _out, err = await self._exec(
+            ["sh", "-c", script], stdin=base64.b64encode(data)
+        )
+        if rc != 0:
+            raise SandboxUnavailableError(
+                f"container write {path!r} failed: {err.decode('utf-8', 'replace').strip()}"
+            )
+
+    async def container_read(self, path: str) -> bytes | None:
+        """Return the bytes of ``path``, or ``None`` if it does not exist yet."""
+        rc, out, _err = await self._exec(["cat", path])
+        return out if rc == 0 else None
+
+    async def container_listdir(self, path: str) -> list[str]:
+        """List the entry names in ``path`` (empty list if it does not exist)."""
+        rc, out, _err = await self._exec(["ls", "-1", path])
+        if rc != 0:
+            return []
+        return [ln for ln in out.decode("utf-8", "replace").splitlines() if ln]
+
+    async def container_rmtree(self, path: str) -> None:
+        """Best-effort ``rm -rf`` of a per-run dir (the container itself lives on)."""
+        await self._exec(["rm", "-rf", path])
 
 
 # ── Selection + process-wide memoization ─────────────────────────────────
