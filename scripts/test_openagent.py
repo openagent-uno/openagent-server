@@ -638,6 +638,10 @@ _TEST_MODULES: tuple[str, ...] = (
     #     rendered into scope.generated.ts) and runs a 20-fixture boundary
     #     corpus through BOTH write gates. Skips without node/tsx.
     "test_vault_twins",
+    # Tool-call argument decoding: tolerate trailing content after valid JSON
+    #     args ("Extra data") via raw_decode, instead of forcing a retry.
+    #     Pure-unit (string in, dict out), so it can run anywhere in the order.
+    "test_function_args_decode",
 )
 
 
