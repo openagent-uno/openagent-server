@@ -55,6 +55,17 @@ def _decode_function_arguments(arguments: str) -> Any:
     try:
         return json.loads(arguments)
     except Exception as json_error:
+        # Tolerate trailing content after a valid JSON object (json.loads raises
+        # "Extra data"): models occasionally append prose, a second object, or a
+        # stray token after the arguments. raw_decode parses the FIRST JSON value
+        # and ignores the rest — recover the leading object instead of forcing a
+        # full retry round-trip.
+        try:
+            obj, _end = json.JSONDecoder().raw_decode(arguments.lstrip())
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
         try:
             import ast
 
