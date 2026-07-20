@@ -327,6 +327,36 @@ async def t_query_filters(ctx: TestContext) -> None:
     assert text["returned"] == 2, f"contains= should find both nightly-report rows: {text}"
 
 
+@test("logs_mcp", "logs_query/summary accept time_window_minutes as a since= alias")
+async def t_query_time_window_minutes(ctx: TestContext) -> None:
+    from src.mcp.servers.logs.adapters import build_runtime_toolkit
+
+    tk = build_runtime_toolkit()
+    fns = {
+        **(getattr(tk, "functions", {}) or {}),
+        **(getattr(tk, "async_functions", {}) or {}),
+    }
+    query = fns["logs_query"].entrypoint
+
+    with _agent_dir(ctx, "twm") as d:
+        _write_log(d, _sample_entries())
+        # 2880 minutes = 2 days → maps to since="2880m", must exclude the 3-day-old "ancient".
+        windowed = await query(time_window_minutes=2880)
+        # An explicit since= must win over the alias (alias only fills a gap).
+        explicit_wins = await query(since="2d", time_window_minutes=1)
+
+    assert not any(r.get("name") == "ancient" for r in windowed["entries"]), \
+        "time_window_minutes=2880 (2d) leaked a 3-day-old entry"
+    assert windowed["window"]["since"], "window.since should be resolved from the alias"
+    assert not any(r.get("name") == "ancient" for r in explicit_wins["entries"]), \
+        "explicit since= must win over time_window_minutes"
+
+    # The alias must appear in the schema so tool-search can surface it.
+    fns["logs_query"].process_entrypoint()
+    props = (getattr(fns["logs_query"], "parameters", {}) or {}).get("properties", {})
+    assert "time_window_minutes" in props, f"alias missing from schema: {sorted(props)}"
+
+
 @test("logs_mcp", "logs_query pages with limit/offset and reports what it withheld")
 async def t_query_paging(ctx: TestContext) -> None:
     from src.mcp.servers.logs import handlers

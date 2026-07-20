@@ -62,6 +62,7 @@ def build_runtime_toolkit() -> Any:
         until: str | None = None,
         limit: int = 50,
         offset: int = 0,
+        time_window_minutes: int | None = None,
     ) -> dict:
         """Search YOUR OWN event log (events.jsonl) — every user turn, model
         call, MCP invocation, sub-agent delegation, scheduled-task fire,
@@ -86,6 +87,8 @@ def build_runtime_toolkit() -> Any:
           large, use ``errors_only`` instead — it spans both.
         - ``since`` / ``until``: ``"24h"``, ``"90m"``, ``"7d"`` (that long
           ago), an ISO date ``"2026-07-13"``, or epoch seconds.
+        - ``time_window_minutes``: convenience alias — the last N minutes,
+          equivalent to ``since="Nm"`` (ignored if ``since`` is set).
         - ``limit`` (max 200) / ``offset``: page through matches.
 
         Returns entries oldest→newest with ``matched_in_scan`` (how many
@@ -95,6 +98,8 @@ def build_runtime_toolkit() -> Any:
 
         Start with ``logs_summary`` for an overview; use this to drill in.
         """
+        if time_window_minutes is not None and since is None:
+            since = f"{int(time_window_minutes)}m"
         return await handlers.logs_query(
             event=event, contains=contains, session_id=session_id,
             run_id=run_id, errors_only=errors_only, since=since, until=until,
@@ -107,6 +112,7 @@ def build_runtime_toolkit() -> Any:
         session_id: str | None = None,
         event: str | None = None,
         top: int = 15,
+        time_window_minutes: int | None = None,
     ) -> dict:
         """Aggregate YOUR OWN event log into a small report — the first call
         for "what went wrong yesterday?", "how did this run end?", or "what
@@ -139,6 +145,8 @@ def build_runtime_toolkit() -> Any:
         Note: the log records no per-call latency, so this cannot rank MCP
         calls by duration — it ranks them by failure and timeout counts.
         """
+        if time_window_minutes is not None and since is None:
+            since = f"{int(time_window_minutes)}m"
         return await handlers.logs_summary(
             since=since, until=until, session_id=session_id, event=event,
             top=top,

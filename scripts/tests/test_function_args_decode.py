@@ -9,9 +9,16 @@ out), so it can run anywhere in the order.
 """
 from __future__ import annotations
 
+from pydantic import BaseModel
+
 from src.core._runner.utils.functions import _decode_function_arguments
+from src.core._runner.utils.string import parse_response_model_str
 
 from ._framework import TestContext, test
+
+
+class _M(BaseModel):
+    a: int
 
 
 @test("function-args", "clean JSON args decode unchanged")
@@ -38,3 +45,17 @@ async def test_control_chars_still_repaired(ctx: TestContext) -> None:
 @test("function-args", "leading whitespace then trailing extra data")
 async def test_leading_ws_then_extra_data(ctx: TestContext) -> None:
     assert _decode_function_arguments('  {"a": 1}  trailing') == {"a": 1}
+
+
+@test("response-parse", "empty model-response content returns None (no parse-chain noise)")
+async def test_empty_response_returns_none(ctx: TestContext) -> None:
+    # A model that produced no output (e.g. an empty session-summary) must not
+    # run through the whole parse chain logging warnings + a traceback.
+    assert parse_response_model_str("", _M) is None
+    assert parse_response_model_str("   \n\t ", _M) is None
+
+
+@test("response-parse", "valid model-response content still parses")
+async def test_valid_response_parses(ctx: TestContext) -> None:
+    out = parse_response_model_str('{"a": 5}', _M)
+    assert out is not None and out.a == 5

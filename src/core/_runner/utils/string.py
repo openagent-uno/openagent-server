@@ -161,6 +161,13 @@ def _parse_individual_json(content: str, output_schema: Type[BaseModel]) -> Opti
 def parse_response_model_str(content: str, output_schema: Type[BaseModel]) -> Optional[BaseModel]:
     structured_output = None
 
+    # Empty / whitespace-only content has nothing to parse — a model that
+    # returned no output (e.g. an empty session-summary generation). Return
+    # None immediately instead of running it through the whole parse chain,
+    # which otherwise logs three WARNINGs + a traceback for a non-event.
+    if content is None or not content.strip():
+        return None
+
     # Extract thinking content first to prevent <think> tags from corrupting JSON
     from src.core._runner.utils.reasoning import extract_thinking_content
 
