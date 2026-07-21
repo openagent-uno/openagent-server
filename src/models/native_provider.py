@@ -1057,6 +1057,24 @@ class NativeProvider(BaseModel):
 
     def _construct_model(self, cls: type, **kwargs: Any) -> Any:
         accepted = _model_class_accepted_params(cls)
+        # Anti-wedge: give every model call a per-read socket timeout so a hung
+        # provider connection RAISES instead of silently wedging the worker.
+        # The event claim lease (120s) is shorter than the 600s turn timeout,
+        # and the yaml top-level ``timeout:`` key is not wired to model calls,
+        # so without this a frozen socket holds the worker until the lease
+        # reaper eventually re-enqueues it. This is a per-READ httpx timeout
+        # (not a whole-request deadline): it fires only on a genuinely stalled
+        # socket, never on a legitimately slow stream — and MUST stay under the
+        # 120s lease TTL. An operator can override the 90s default via
+        # ``OPENAGENT_MODEL_TIMEOUT_SECONDS`` (wired from ``model.timeout_seconds``
+        # in yaml). This is the common constructor for the main agent, team
+        # members, and the routing classifier, so it covers every model call.
+        if kwargs.get("timeout") is None and "timeout" in accepted:
+            env_timeout = os.environ.get("OPENAGENT_MODEL_TIMEOUT_SECONDS")
+            try:
+                kwargs["timeout"] = float(env_timeout) if env_timeout else 90.0
+            except (TypeError, ValueError):
+                kwargs["timeout"] = 90.0
         filtered = {k: v for k, v in kwargs.items() if v is not None and k in accepted}
         return cls(**filtered)
 

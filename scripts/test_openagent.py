@@ -124,6 +124,16 @@ _TEST_MODULES: tuple[str, ...] = (
     # when closed). Pure-unit; git is available, no LLM. Sits by the other
     # skills tests because it extends the same subsystem.
     "test_skill_hub",
+    # Intrinsic self-improvement: the quality-scorer (every-2h grader) and
+    # quality-digest (daily synthesis) built-ins. Unlike the skill builtins,
+    # these are ON by default (self_improvement.enabled). Pins the ON-by-default
+    # seeding, the per-task/master toggles that park them, the DEDUP that defers
+    # to an agent's own tuned custom scorer/digest (so eSound/Lyra don't
+    # double-run), and the prompt discipline. Also pins Feature B: the
+    # anti-wedge per-LLM-call timeout in native_provider._construct_model and its
+    # model.timeout_seconds yaml wiring. Pure-unit; sits by the skills tests
+    # because it is the other half of the self-improvement story.
+    "test_self_improvement",
     "test_model_fallback",
     # Additive multi-account credential pool: a native provider rotates across
     # N accounts on 429/529 BEFORE the turn spills to DeepSeek. Pins the

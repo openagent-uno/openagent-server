@@ -196,6 +196,71 @@ def skills_settings(config: dict) -> SkillsSettings:
 
 
 @dataclass(frozen=True)
+class SelfImprovementSettings:
+    """Runtime knobs for the INTRINSIC self-improvement loop (the
+    ``quality-scorer`` + ``quality-digest`` built-in scheduled tasks).
+
+    ON BY DEFAULT. Continuous quality self-critique is a built-in capability
+    of every agent — a support agent scores its own replies, an ops agent
+    scores its own actions — so unlike the skills builtins (which are
+    opt-in) this seeds and enables with no per-agent config. Set
+    ``self_improvement.enabled: false`` to switch the whole loop off.
+
+    enabled:
+        Master switch for the loop. Reads ``self_improvement.enabled``
+        (default ``True``). With it false BOTH tasks are parked disabled.
+
+    scorer_enabled:
+        Per-task switch for the ``quality-scorer`` (every-2h grader). Reads
+        ``self_improvement.scorer_enabled`` (default ``True``). SECOND gate
+        on top of ``enabled``: the scorer runs only when BOTH are true.
+
+    digest_enabled:
+        Per-task switch for the ``quality-digest`` (daily synthesis). Reads
+        ``self_improvement.digest_enabled`` (default ``True``). SECOND gate
+        on top of ``enabled``, independent of ``scorer_enabled`` — either
+        half may run without the other.
+
+    scorer_schedule:
+        Optional cron for the scorer. Reads
+        ``self_improvement.scorer_schedule``. ``None`` falls back to the
+        every-2-hours default — parity with ``skills.curator_schedule``.
+
+    digest_schedule:
+        Optional cron for the digest. Reads
+        ``self_improvement.digest_schedule``. ``None`` falls back to the
+        daily 09:00 default.
+    """
+    enabled: bool = True
+    scorer_enabled: bool = True
+    digest_enabled: bool = True
+    scorer_schedule: str | None = None
+    digest_schedule: str | None = None
+
+
+def self_improvement_settings(config: dict) -> SelfImprovementSettings:
+    """Parse SelfImprovementSettings out of the top-level ``openagent.yaml``
+    dict.
+
+    Defensive: a missing/empty ``self_improvement:`` stanza yields the ON
+    default, so an agent that never configured it still gets the intrinsic
+    quality loop.
+    """
+    raw = (config or {}).get("self_improvement") or {}
+    if not isinstance(raw, dict):
+        raw = {}
+    scorer_schedule = raw.get("scorer_schedule")
+    digest_schedule = raw.get("digest_schedule")
+    return SelfImprovementSettings(
+        enabled=bool(raw.get("enabled", True)),
+        scorer_enabled=bool(raw.get("scorer_enabled", True)),
+        digest_enabled=bool(raw.get("digest_enabled", True)),
+        scorer_schedule=str(scorer_schedule) if scorer_schedule else None,
+        digest_schedule=str(digest_schedule) if digest_schedule else None,
+    )
+
+
+@dataclass(frozen=True)
 class PtcSettings:
     """Runtime knobs for Programmatic Tool Calling (the ``run_python`` tool).
 

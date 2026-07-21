@@ -257,6 +257,16 @@ model:
   # Omit the key to leave thinking off everywhere.
   extended_thinking_tokens: 0            # e.g. 4096; 0 / unset = off
 
+  # Per-LLM-call read timeout, in seconds (anti-wedge). A hung provider
+  # connection RAISES instead of silently wedging the worker until the event
+  # lease reaper (120s) reclaims it. This is a per-READ socket timeout, not a
+  # whole-request deadline, so it never trips a legitimately slow stream — it
+  # only fires on a genuinely stalled socket. Applies to every model call (main
+  # agent, team members, routing classifier). Default 90s; MUST stay under the
+  # 120s lease TTL. Omit to use the default; also honours the
+  # OPENAGENT_MODEL_TIMEOUT_SECONDS env var.
+  # timeout_seconds: 90
+
 # ── Budgets ─────────────────────────────────────────────────────────
 # Per-scope spend caps, so a metered API (DeepSeek's pay-as-you-go, an OpenAI
 # key) can't run away with your balance. At the cap the scope is EXCLUDED FROM
@@ -444,6 +454,31 @@ memory:
 #     taps: []                # optional default git taps to advertise, e.g.
 #                             #   - https://git.example.com/org/skills-hub.git
 #                             #   - file:///srv/shared/skills-hub/.git
+
+# ── Self-improvement (intrinsic quality loop) ───────────────────────
+# Two built-in scheduled tasks that make continuous quality self-critique an
+# intrinsic capability of EVERY agent — no per-agent config needed:
+#   quality-scorer  — every ~2h, reads the agent's OWN recent outputs (a support
+#                     agent's replies, an ops agent's actions), grades them
+#                     against the agent's OWN vault rules, and files a grounded
+#                     correction for each weak one. Silent unless a real
+#                     regression (batch avg below bar OR >=2 BAD).
+#   quality-digest  — daily, synthesises the scorer's findings into concrete
+#                     improvements: auto-applies only SAFE grounded vault
+#                     rule/doc updates, PROPOSES anything risky, sends the
+#                     operator one short recap. A quiet day = one line.
+#
+# ON BY DEFAULT — this is intrinsic. DEDUP: an agent that already ships its own
+# tuned, non-builtin quality-scorer / quality-digest scheduled task keeps it;
+# the builtin defers rather than double-running. Set enabled: false to switch
+# the whole loop off, or use the per-task toggles.
+#
+# self_improvement:
+#   enabled: true             # master switch (default true)
+#   scorer_enabled: true      # per-task gate for quality-scorer (default true)
+#   digest_enabled: true      # per-task gate for quality-digest (default true)
+#   # scorer_schedule: "0 */2 * * *"  # cron (default: every 2 hours)
+#   # digest_schedule: "0 9 * * *"    # cron (default: daily 09:00)
 
 # ── Quick commands ──────────────────────────────────────────────────
 # Bridges expand ``/<trigger>`` to the configured prompt before the

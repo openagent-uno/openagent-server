@@ -54,7 +54,10 @@ except Exception:  # noqa: BLE001 — best-effort, never block startup
 
 from src.core.builtin_tasks import (
     AUTO_UPDATE_TASK_NAME,
+    BUILTIN_TASK_NAMES,
     DREAM_MODE_TASK_NAME,
+    QUALITY_DIGEST_TASK_NAME,
+    QUALITY_SCORER_TASK_NAME,
     SKILL_CURATOR_TASK_NAME,
     SKILL_DISTILLER_TASK_NAME,
 )
@@ -402,6 +405,178 @@ should look at. If you created nothing, log that too — a pass that writes no
 skill because nothing new recurred is a correct, valid outcome, not a
 failure. Writing a marginal skill just to have written one is the failure.
 """
+
+# Every 2 hours by default. The scorer grades a short window of the agent's own
+# recent output, so it runs frequently and cheaply — a regression should surface
+# within a couple of hours, not the next day. Overridable via
+# ``self_improvement.scorer_schedule``.
+QUALITY_SCORER_DEFAULT_CRON = "0 */2 * * *"
+
+QUALITY_SCORER_PROMPT = """\
+You are running as the Quality Scorer — OpenAgent's INTRINSIC self-improvement
+pass. Every couple of hours you look back at what THIS agent itself just
+produced, grade it honestly against the agent's OWN rules, and write a grounded
+correction for anything weak so the same mistake does not recur. This is
+role-agnostic: if the agent answers customers, its outputs are the replies it
+sent; if the agent runs ops, its outputs are the actions, decisions, and edits
+it made. Grade whatever this agent actually produces.
+
+You are a STRICT, INDEPENDENT judge of your own work — not a cheerleader. A
+clean run that finds nothing wrong is the EXPECTED, normal outcome: do NOT
+invent faults to look busy, and do NOT fabricate work that did not happen.
+Equally, do not wave through a real error to be kind to yourself. Stay SILENT
+unless there is a real regression (STEP 4) — no per-run status message.
+
+## STEP 1 — Gather this agent's OWN recent outputs (since the last run, ~2h)
+
+Read the agent's own recent COMPLETED sessions for the window and extract what
+it actually PRODUCED — the customer-facing replies it sent, and/or the ops
+actions / decisions / edits it took. Use the tools OpenAgent already gives you,
+never shell out:
+   - `search_past_conversations` — keyword recall over what was said/done in
+     recent sessions; probe for the outbound work of the last ~2 hours.
+   - the `logs` MCP — `logs_summary(since="2h")` for the shape of the window,
+     then `logs_query` / `logs_context` to pull the specific outputs and the
+     context around them (what was asked, what the agent answered or did).
+If there is NOTHING new to grade in the window, STOP — a quiet window is a valid
+outcome. Do not manufacture a batch.
+
+## STEP 2 — Ground in the agent's OWN rules FIRST, then grade
+
+Before scoring anything, SEARCH AND READ the agent's OWN vault for the
+rules, procedures, and quality-bar that apply to this work — use the `vault`
+MCP (`search_notes`, `read_note`) to find the standing rules, the
+anti-fabrication discipline, the product/ops facts, and any escalation policy.
+You grade against the agent's OWN documented bar, not a generic one.
+
+Then grade EACH output GOOD / OK / BAD with a 0..1 score and short per-dimension
+notes:
+   - **correctness** — is the substance right for the real situation?
+   - **grounding / no-fabrication** — every claim true and verifiable; NO
+     invented state (no "we've logged/escalated/fixed it" that never happened,
+     no facts the agent could not have known). Fabrication is the cardinal sin:
+     a fabricated claim caps the verdict at BAD.
+   - **follows-own-rules** — does it obey the standing rules you just read from
+     the vault, or does it violate one?
+   - **tone** — appropriate and, where a human is involved, warm/empathetic —
+     especially with a frustrated user.
+   - **completeness** — does it actually resolve the ask / finish the action,
+     or leave it dangling?
+The overall score is your honest weighting of these (weight correctness and
+grounding highest). Verdict: GOOD >= 0.8, OK 0.5–0.8, BAD < 0.5.
+
+## STEP 3 — Write a grounded correction for each weak output
+
+For every BAD output — and every OK one with a real, nameable flaw — write ONE
+grounded CORRECTION tied to that specific work, via the `vault` MCP
+(`write_note`, or `patch_note` to extend a matching note). Each correction
+states plainly: WHAT was wrong, WHICH of the agent's own rules it violated (cite
+the note/rule), and HOW to do it right next time. Keep it about procedure and
+discipline — a repeatable lesson — not a new product fact you are unsure of. If
+what's missing is a FACT you cannot verify, record it as a "grounding gap" to
+review rather than asserting it as truth. File corrections under a stable
+folder (e.g. `quality-corrections/`) with frontmatter `type: quality-correction`
+and `date:` today, so the daily digest can find them.
+
+## STEP 4 — Save, stay quiet, and alert ONLY on a real regression
+
+SAVE the scores and corrections and STOP. Do NOT send a per-run message — a
+clean or ordinary batch produces no notification at all; the daily digest is
+where routine results are summarised.
+
+Send the operator EXACTLY ONE short alert — via whatever operator-notification
+tool this agent has (its Telegram / Slack / messaging tool) — ONLY when THIS
+batch is a genuine regression: the batch average falls below the quality bar
+(~0.65) OR there are >= 2 BAD outputs. The alert names the batch average, how
+many BAD, and the single worst item with a one-line reason. In every other case
+send nothing.
+
+## Log the pass
+
+Write a concise note via the `vault` MCP under
+`quality-scorer-logs/quality-scorer-YYYY-MM-DD.md` (frontmatter
+`type: quality-scorer-log`, `date:` today): how many outputs you graded, the
+GOOD/OK/BAD split and average, the corrections you wrote, and whether you
+alerted. If the window was empty or clean, log that too — it is a correct
+outcome, not a failure.
+"""
+
+# Daily at 09:00 by default. The digest CONSOLIDATES what the every-2h scorer
+# found, so it runs on a slower cadence — one operator-facing recap a day.
+# Overridable via ``self_improvement.digest_schedule``.
+QUALITY_DIGEST_DEFAULT_CRON = "0 9 * * *"
+
+QUALITY_DIGEST_PROMPT = """\
+You are running as the Quality Digest — the daily synthesis half of OpenAgent's
+intrinsic self-improvement loop. The quality-scorer grades the agent's own work
+every couple of hours and files corrections; ONCE a day you roll those findings
+into concrete, grounded improvements, apply the safe ones yourself, propose the
+risky ones, and send the operator a single short recap. Cheap by design: no
+fan-out, one pass. A quiet day is the normal outcome — say so in one line and
+stop.
+
+## STEP 1 — Read the recent quality findings (read-only)
+
+Gather what the scorer produced over roughly the last 7 days via the `vault`
+MCP: the corrections it filed (`search_notes` for `type: quality-correction`)
+and the scorer logs (`type: quality-scorer-log`). Compute the trend — is the
+average holding, rising, or falling? — and group the corrections by RECURRING
+PATTERN (e.g. fabricated state, ignored attachment/context, wrong procedure,
+tone with a frustrated user, incomplete action). Count each pattern.
+
+## STEP 2 — Turn recurring patterns into improvements
+
+For each pattern that recurs (roughly 3+ times), decide the concrete fix and
+split by SAFETY:
+   - **AUTO-APPLY — only SAFE, grounded fixes.** A tightening of an existing
+     vault rule / doc, or a small new procedural rule that is clearly grounded
+     in the corrections and does not assert an unverified fact. Apply it with
+     the `vault` MCP (`patch_note` to extend an existing rule — prefer this — or
+     `write_note` for a genuinely new one). Before writing: DEDUP against the
+     existing rules so you extend rather than duplicate, and keep always-injected
+     standing rules LEAN (they cost tokens on every run) — cap yourself at a few
+     changes per day and prefer editing an existing rule over adding another.
+   - **PROPOSE — everything risky.** Anything that asserts a NEW product/ops
+     fact you cannot fully verify, changes behaviour beyond a doc/rule, or that
+     you are unsure about: do NOT apply it. Write the exact proposed change and
+     hand it to the operator in the recap. Never ship a code/release/behaviour
+     change autonomously from here.
+
+## STEP 3 — One short operator recap, then stop
+
+Send the operator EXACTLY ONE short, scannable message via whatever
+operator-notification tool this agent has (Telegram / Slack / messaging): the
+7-day average and its trend, the GOOD/OK/BAD counts, the weakest area, the rules
+you auto-improved today (by title), the recurring patterns with counts, and any
+proposals or grounding-gaps that need the operator's decision. If the day is
+quiet — quality stable and nothing to promote — send only a single line, e.g.
+"Quality stable: avg <X>, 0 changes.", and stop. No walls of text, no second
+message.
+
+## Log the digest
+
+Write a concise note via the `vault` MCP under
+`quality-digest-logs/quality-digest-YYYY-MM-DD.md` (frontmatter
+`type: quality-digest-log`, `date:` today): the trend, the patterns you found
+with counts, what you auto-applied, what you proposed, and what still needs the
+operator. A quiet day is a valid, correct outcome — log it as such.
+"""
+
+
+def _is_custom_quality_scorer_name(name: str) -> bool:
+    """A NON-builtin scheduled-task name that serves the quality-scorer
+    purpose — an agent's own tuned grader (eSound/Lyra ship one). Matches when
+    the name mentions quality AND scoring, case-insensitively."""
+    low = name.lower()
+    return "quality" in low and ("scor" in low or "score" in low)
+
+
+def _is_custom_quality_digest_name(name: str) -> bool:
+    """A NON-builtin scheduled-task name that serves the quality-digest
+    purpose — an agent's own tuned synthesis pass. Matches when the name
+    mentions quality AND digest/improvement, case-insensitively."""
+    low = name.lower()
+    return "quality" in low and ("digest" in low or "improve" in low)
 
 
 def _build_agent(config: dict) -> Agent:
@@ -907,6 +1082,19 @@ def _build_agent(config: dict) -> Agent:
         try:
             os.environ["OPENAGENT_EXTENDED_THINKING_TOKENS"] = str(
                 int(_model_cfg["extended_thinking_tokens"])
+            )
+        except (TypeError, ValueError):
+            pass
+
+    # Per-LLM-call read timeout (anti-wedge). Surfaces as
+    # ``model.timeout_seconds`` in yaml — an operator override of the 90s
+    # default that ``NativeProvider._construct_model`` applies to every model
+    # build. It MUST stay under the 120s event-lease TTL so a hung socket
+    # raises before the worker wedges; a value >= 120 defeats the purpose.
+    if "timeout_seconds" in _model_cfg:
+        try:
+            os.environ["OPENAGENT_MODEL_TIMEOUT_SECONDS"] = str(
+                float(_model_cfg["timeout_seconds"])
             )
         except (TypeError, ValueError):
             pass
@@ -1677,6 +1865,8 @@ class AgentServer:
         await self._sync_auto_update(scheduler)
         await self._sync_skill_curator(scheduler)
         await self._sync_skill_distiller(scheduler)
+        await self._sync_quality_scorer(scheduler)
+        await self._sync_quality_digest(scheduler)
 
         await scheduler.start()
         self._scheduler = scheduler
@@ -1750,9 +1940,22 @@ class AgentServer:
             await self._sync_skill_distiller(scheduler)
             gw.broadcast_resource_sync("scheduled_task", "updated")
 
+        async def _self_improvement(patch: dict) -> None:
+            # The ``self_improvement`` section carries the master ``enabled``
+            # switch plus the per-task ``scorer_enabled`` / ``digest_enabled``
+            # gates and optional schedule overrides; re-sync both built-in
+            # tasks so a runtime flip enables/disables (or reschedules) either
+            # without a restart. The dedup against a tuned custom task is
+            # re-evaluated on every sync, so this stays safe on eSound/Lyra.
+            self.config["self_improvement"] = patch or {}
+            await self._sync_quality_scorer(scheduler)
+            await self._sync_quality_digest(scheduler)
+            gw.broadcast_resource_sync("scheduled_task", "updated")
+
         gw._config_change_callbacks["dream_mode"] = _dream
         gw._config_change_callbacks["auto_update"] = _autoupdate
         gw._config_change_callbacks["skills"] = _skills
+        gw._config_change_callbacks["self_improvement"] = _self_improvement
 
     async def _sync_scheduled_task(
         self, scheduler, *, name: str, enabled: bool, cron_expr: str, prompt: str,
@@ -2053,6 +2256,145 @@ class AgentServer:
                 await _orig(task)
 
         self._install_task_hook(scheduler, SKILL_DISTILLER_TASK_NAME, _distiller_run)
+
+    async def _sync_quality_scorer(self, scheduler) -> None:
+        """Seed/enable the ``quality-scorer`` built-in — the INTRINSIC
+        self-improvement grader. Unlike the skill builtins (opt-in), this is ON
+        by default (``self_improvement.enabled`` AND ``scorer_enabled``, both
+        defaulting True): every agent scores its own recent output against its
+        own vault rules and files grounded corrections, with no per-agent config.
+
+        DEDUP — the one thing that makes "intrinsic" safe on tuned agents: an
+        agent that already ships a NON-builtin, hand-tuned quality-scorer
+        (eSound/Lyra do) keeps it. Before seeding the builtin we scan
+        ``scheduled_tasks`` for a non-builtin task whose name serves the same
+        purpose (mentions quality + scoring); if one exists we DEFER — park any
+        stray builtin row disabled and install no hook — so we never double-run.
+        Fresh agents (spicysparks, new deployments) get the generic builtin.
+
+        Which branch was taken is logged so a firing's provenance is auditable.
+        """
+        from src.core.config import self_improvement_settings
+
+        settings = self_improvement_settings(self.config)
+        enabled = settings.enabled and settings.scorer_enabled
+
+        tasks = await self.agent._db.get_tasks()
+        existing = next(
+            (t for t in tasks if t["name"] == QUALITY_SCORER_TASK_NAME), None,
+        )
+
+        # DEDUP: defer to an agent's own tuned, non-builtin quality-scorer.
+        custom = next(
+            (t for t in tasks
+             if t["name"] not in BUILTIN_TASK_NAMES
+             and _is_custom_quality_scorer_name(t["name"])),
+            None,
+        )
+        if custom is not None:
+            elog("quality_scorer.deferred_to_custom", custom_task=custom["name"])
+            if existing is not None and existing["enabled"]:
+                await scheduler.disable_task(existing["id"])
+            self._install_task_hook(scheduler, QUALITY_SCORER_TASK_NAME, None)
+            return
+
+        if not enabled:
+            # OFF → disable a surviving row so the scheduler stops firing it.
+            elog("quality_scorer.disabled")
+            if existing is not None and existing["enabled"]:
+                await scheduler.disable_task(existing["id"])
+            self._install_task_hook(scheduler, QUALITY_SCORER_TASK_NAME, None)
+            return
+
+        elog("quality_scorer.enabled_builtin")
+        cron_expr = settings.scorer_schedule or QUALITY_SCORER_DEFAULT_CRON
+        # Same timezone treatment as the skill builtins: an untagged cron
+        # evaluates in UTC, so inherit the box's configured zone (falls back to
+        # UTC) so a 09:00-anchored cadence lands on local wall-clock.
+        scorer_tz = default_timezone_name()
+
+        await self._sync_scheduled_task(
+            scheduler,
+            name=QUALITY_SCORER_TASK_NAME,
+            enabled=True,
+            cron_expr=cron_expr,
+            prompt=QUALITY_SCORER_PROMPT,
+            timezone=scorer_tz,
+        )
+
+        async def _scorer_run(task, _orig):
+            if task["name"] == QUALITY_SCORER_TASK_NAME:
+                elog("quality_scorer.start")
+                await _orig(task)
+                elog("quality_scorer.done")
+            else:
+                await _orig(task)
+
+        self._install_task_hook(scheduler, QUALITY_SCORER_TASK_NAME, _scorer_run)
+
+    async def _sync_quality_digest(self, scheduler) -> None:
+        """Seed/enable the ``quality-digest`` built-in — the daily synthesis
+        half of the intrinsic loop. Sibling of ``_sync_quality_scorer`` and
+        identical in discipline: ON by default (``self_improvement.enabled`` AND
+        ``digest_enabled``), and it DEFERS to an agent's own tuned, non-builtin
+        quality-digest (name mentions quality + digest/improvement) so
+        eSound/Lyra keep their custom pass while fresh agents get the builtin.
+
+        Independent of the scorer's toggle — either half may run alone.
+        """
+        from src.core.config import self_improvement_settings
+
+        settings = self_improvement_settings(self.config)
+        enabled = settings.enabled and settings.digest_enabled
+
+        tasks = await self.agent._db.get_tasks()
+        existing = next(
+            (t for t in tasks if t["name"] == QUALITY_DIGEST_TASK_NAME), None,
+        )
+
+        # DEDUP: defer to an agent's own tuned, non-builtin quality-digest.
+        custom = next(
+            (t for t in tasks
+             if t["name"] not in BUILTIN_TASK_NAMES
+             and _is_custom_quality_digest_name(t["name"])),
+            None,
+        )
+        if custom is not None:
+            elog("quality_digest.deferred_to_custom", custom_task=custom["name"])
+            if existing is not None and existing["enabled"]:
+                await scheduler.disable_task(existing["id"])
+            self._install_task_hook(scheduler, QUALITY_DIGEST_TASK_NAME, None)
+            return
+
+        if not enabled:
+            elog("quality_digest.disabled")
+            if existing is not None and existing["enabled"]:
+                await scheduler.disable_task(existing["id"])
+            self._install_task_hook(scheduler, QUALITY_DIGEST_TASK_NAME, None)
+            return
+
+        elog("quality_digest.enabled_builtin")
+        cron_expr = settings.digest_schedule or QUALITY_DIGEST_DEFAULT_CRON
+        digest_tz = default_timezone_name()
+
+        await self._sync_scheduled_task(
+            scheduler,
+            name=QUALITY_DIGEST_TASK_NAME,
+            enabled=True,
+            cron_expr=cron_expr,
+            prompt=QUALITY_DIGEST_PROMPT,
+            timezone=digest_tz,
+        )
+
+        async def _digest_run(task, _orig):
+            if task["name"] == QUALITY_DIGEST_TASK_NAME:
+                elog("quality_digest.start")
+                await _orig(task)
+                elog("quality_digest.done")
+            else:
+                await _orig(task)
+
+        self._install_task_hook(scheduler, QUALITY_DIGEST_TASK_NAME, _digest_run)
 
 
 # ── Auto-update helpers (used by AgentServer and the manual `update` command) ──

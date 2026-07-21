@@ -35,6 +35,22 @@ SKILL_CURATOR_TASK_NAME = "skill-curator"
 # ``skills`` config section as the curator (its ``skills.distiller_enabled``
 # toggle lives there), not a section of its own.
 SKILL_DISTILLER_TASK_NAME = "skill-distiller"
+# The quality-scorer: the INTRINSIC self-improvement pass. Unlike the skill
+# builtins (OFF by default), this is ON by default (``self_improvement.enabled``)
+# — continuous quality self-critique is a built-in capability of every agent, not
+# an opt-in. It reads the agent's OWN recent outputs, grades them against the
+# agent's OWN vault rules, and writes a grounded correction for each weak one —
+# see ``AgentServer._sync_quality_scorer``. Its config section is
+# ``self_improvement``. DEDUP: an agent that already ships a tuned, NON-builtin
+# quality-scorer (eSound/Lyra do) keeps it — the builtin defers rather than
+# double-running.
+QUALITY_SCORER_TASK_NAME = "quality-scorer"
+# The quality-digest: the daily synthesis half of the intrinsic loop. It rolls
+# the scorer's recent findings into concrete grounded improvements —
+# auto-applying only SAFE vault rule/doc fixes, proposing anything risky — and
+# sends the operator one short recap. ON by default, same
+# ``self_improvement`` section, same DEDUP discipline as the scorer.
+QUALITY_DIGEST_TASK_NAME = "quality-digest"
 
 BUILTIN_TASK_NAMES: frozenset[str] = frozenset(
     {
@@ -42,6 +58,8 @@ BUILTIN_TASK_NAMES: frozenset[str] = frozenset(
         AUTO_UPDATE_TASK_NAME,
         SKILL_CURATOR_TASK_NAME,
         SKILL_DISTILLER_TASK_NAME,
+        QUALITY_SCORER_TASK_NAME,
+        QUALITY_DIGEST_TASK_NAME,
     }
 )
 
@@ -50,4 +68,6 @@ CONFIG_SECTION_BY_TASK: dict[str, str] = {
     AUTO_UPDATE_TASK_NAME: "auto_update",
     SKILL_CURATOR_TASK_NAME: "skills",
     SKILL_DISTILLER_TASK_NAME: "skills",
+    QUALITY_SCORER_TASK_NAME: "self_improvement",
+    QUALITY_DIGEST_TASK_NAME: "self_improvement",
 }
