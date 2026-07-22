@@ -241,14 +241,27 @@ class SelfImprovementSettings:
         Optional cron for the cost watcher. Reads
         ``self_improvement.cost_observability_schedule``. ``None`` falls back to
         the hourly default.
+
+    escalation_audit_enabled:
+        Per-task switch for the ``escalation-audit`` (the HANDOFF arm — audits
+        the agent's own escalations/handoffs for OVER-escalation). Reads
+        ``self_improvement.escalation_audit_enabled`` (default ``True``). SECOND
+        gate on top of ``enabled``, independent of the other halves.
+
+    escalation_audit_schedule:
+        Optional cron for the escalation audit. Reads
+        ``self_improvement.escalation_audit_schedule``. ``None`` falls back to the
+        daily default.
     """
     enabled: bool = True
     scorer_enabled: bool = True
     digest_enabled: bool = True
     cost_observability_enabled: bool = True
+    escalation_audit_enabled: bool = True
     scorer_schedule: str | None = None
     digest_schedule: str | None = None
     cost_observability_schedule: str | None = None
+    escalation_audit_schedule: str | None = None
 
 
 def self_improvement_settings(config: dict) -> SelfImprovementSettings:
@@ -265,15 +278,20 @@ def self_improvement_settings(config: dict) -> SelfImprovementSettings:
     scorer_schedule = raw.get("scorer_schedule")
     digest_schedule = raw.get("digest_schedule")
     cost_observability_schedule = raw.get("cost_observability_schedule")
+    escalation_audit_schedule = raw.get("escalation_audit_schedule")
     return SelfImprovementSettings(
         enabled=bool(raw.get("enabled", True)),
         scorer_enabled=bool(raw.get("scorer_enabled", True)),
         digest_enabled=bool(raw.get("digest_enabled", True)),
         cost_observability_enabled=bool(raw.get("cost_observability_enabled", True)),
+        escalation_audit_enabled=bool(raw.get("escalation_audit_enabled", True)),
         scorer_schedule=str(scorer_schedule) if scorer_schedule else None,
         digest_schedule=str(digest_schedule) if digest_schedule else None,
         cost_observability_schedule=(
             str(cost_observability_schedule) if cost_observability_schedule else None
+        ),
+        escalation_audit_schedule=(
+            str(escalation_audit_schedule) if escalation_audit_schedule else None
         ),
     )
 

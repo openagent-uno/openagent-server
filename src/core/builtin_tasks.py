@@ -62,6 +62,20 @@ QUALITY_DIGEST_TASK_NAME = "quality-digest"
 # agent that already ships a tuned, NON-builtin cost watcher (eSound/Lyra do)
 # keeps it. See ``AgentServer._sync_cost_observability``.
 COST_OBSERVABILITY_TASK_NAME = "cost-observability"
+# The escalation-audit: the HANDOFF arm of the intrinsic self-improvement loop.
+# Where quality-scorer grades the agent's OUTPUT and cost-observability watches
+# its SPEND, this audits the agent's HANDOFFS — the things it escalated to a
+# human / marked needs-human / left unresolved — and asks whether each GENUINELY
+# needed a human or was an OVER-ESCALATION the agent could have handled with its
+# own tools (agents routinely have more capability than they use). ROLE-AGNOSTIC
+# and TOOL-AGNOSTIC by design: OpenAgent is a general engine (not only a support
+# runtime), so the builtin NEVER hardcodes Replio/support specifics — it prompts
+# the agent to audit its OWN escalations against its OWN tools + vault. ON by
+# default (``self_improvement.enabled`` AND ``escalation_audit_enabled``), same
+# ``self_improvement`` section + DEDUP: an agent that already ships a tuned,
+# NON-builtin escalation auditor (eSound/Lyra's ``support-escalation-audit``)
+# keeps it. See ``AgentServer._sync_escalation_audit``.
+ESCALATION_AUDIT_TASK_NAME = "escalation-audit"
 
 BUILTIN_TASK_NAMES: frozenset[str] = frozenset(
     {
@@ -72,6 +86,7 @@ BUILTIN_TASK_NAMES: frozenset[str] = frozenset(
         QUALITY_SCORER_TASK_NAME,
         QUALITY_DIGEST_TASK_NAME,
         COST_OBSERVABILITY_TASK_NAME,
+        ESCALATION_AUDIT_TASK_NAME,
     }
 )
 
@@ -83,4 +98,5 @@ CONFIG_SECTION_BY_TASK: dict[str, str] = {
     QUALITY_SCORER_TASK_NAME: "self_improvement",
     QUALITY_DIGEST_TASK_NAME: "self_improvement",
     COST_OBSERVABILITY_TASK_NAME: "self_improvement",
+    ESCALATION_AUDIT_TASK_NAME: "self_improvement",
 }

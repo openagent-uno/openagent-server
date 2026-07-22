@@ -57,6 +57,7 @@ from src.core.builtin_tasks import (
     BUILTIN_TASK_NAMES,
     COST_OBSERVABILITY_TASK_NAME,
     DREAM_MODE_TASK_NAME,
+    ESCALATION_AUDIT_TASK_NAME,
     QUALITY_DIGEST_TASK_NAME,
     QUALITY_SCORER_TASK_NAME,
     SKILL_CURATOR_TASK_NAME,
@@ -651,6 +652,95 @@ def _is_custom_cost_observability_name(name: str) -> bool:
     case-insensitively, so the builtin defers to it rather than double-running."""
     low = name.lower()
     return "cost" in low and ("observ" in low or "anomal" in low or "monitor" in low)
+
+
+# Daily by default: a cheap self-audit of the agent's own handoffs. Overridable
+# via ``self_improvement.escalation_audit_schedule``.
+ESCALATION_AUDIT_DEFAULT_CRON = "30 8 * * *"
+
+ESCALATION_AUDIT_PROMPT = """\
+You are running as the Escalation Audit — the HANDOFF arm of OpenAgent's
+intrinsic self-improvement loop. The quality-scorer grades what this agent
+PRODUCES and cost-observability watches what it SPENDS; you audit what it HANDS
+OFF — the things it escalated to a human, flagged as needing a human, or left
+unresolved — and ask, honestly, whether each GENUINELY needed a human or was an
+OVER-ESCALATION the agent could have handled itself. Agents routinely have more
+capability than they use: they escalate a case a tool of theirs would resolve,
+or give up instead of asking for the one missing piece of information. Cheap by
+design: read-only inspection, no fan-out. A clean audit is the normal, expected
+outcome — stay SILENT unless there is a real regression.
+
+This is ROLE-AGNOSTIC and TOOL-AGNOSTIC. OpenAgent is a general engine, not only
+a support runtime — so audit whatever THIS agent actually hands off, using
+whatever tools and vault knowledge THIS agent has. Do not assume any particular
+product, queue, or MCP. If this agent never hands work to a human, there is
+nothing to audit — say so in one line and stop.
+
+## STEP 1 — Gather this agent's OWN recent handoffs (since the last run)
+
+Find what this agent escalated / marked needs-human / handed to a person / left
+unresolved in the recent window. Use the tools this agent already has: its
+support/queue tools if it is a support agent (e.g. list the items currently
+waiting for a human), its `logs` MCP (`logs_summary`/`logs_query`) for escalation
+events, `search_past_conversations` for "escalated / forwarded to the team /
+marked for human" moments. If there are NONE, STOP — a quiet window is a valid,
+healthy outcome. Do not manufacture a batch.
+
+## STEP 2 — Ground in this agent's OWN capabilities, then judge each handoff
+
+SEARCH AND READ this agent's OWN vault (`vault` MCP) for what it is ACTUALLY able
+to do — its tools, procedures, resolution playbooks, and its escalation policy
+(when a human IS genuinely required). Then judge each handoff:
+   - **JUSTIFIED** — genuinely needs a human: a real decision/policy call, a
+     legal matter, a platform limit that blocks any reply (e.g. a channel's
+     messaging window has closed — no human could act either), or a case no tool
+     of this agent covers. These are correct; leave them.
+   - **OVER-ESCALATED** — the agent had a tool/procedure that would have resolved
+     it, or only needed to ASK the user for the one missing detail (an id, an
+     email, a receipt) instead of handing off. This is the defect.
+Be careful NOT to count a platform-unreachable case (nobody can act) as
+over-escalation — that inflates the number and makes the audit cry wolf. Only a
+handoff the agent COULD have progressed is over-escalation.
+
+## STEP 3 — File a grounded correction for the over-escalation PATTERN
+
+If over-escalations recur, write ONE grounded correction via the `vault` MCP
+(`write_note`/`patch_note`, folder e.g. `quality-corrections/`, frontmatter
+`type: quality-correction`, `date:` today): NAME the pattern (e.g. "asked-nothing,
+escalated instead of requesting the missing id"; "had a tool that resolves this,
+didn't use it"), CITE the agent's own rule/tool that should prevent it, and state
+the fix. Keep it a repeatable lesson, not a new unverified fact. The daily
+quality-digest promotes it. Do NOT mass-mutate the individual handed-off items
+here — correct the RULE; the normal flow re-processes them.
+
+## STEP 4 — Save, stay quiet, alert ONLY on a real regression
+
+Send the operator EXACTLY ONE short alert — via whatever operator-notification
+tool this agent has — ONLY when the over-escalation rate is a genuine regression
+(e.g. > 30% of the audited handoffs were avoidable). Name the rate, the dominant
+pattern, and that a correction is filed. In every other case send nothing.
+
+## Log the pass
+
+Write a concise note via the `vault` MCP under
+`escalation-audit-logs/escalation-audit-YYYY-MM-DD.md` (frontmatter
+`type: escalation-audit-log`, `date:` today): how many handoffs you reviewed, the
+justified/over-escalated split and rate, the pattern, and whether you alerted.
+Track the rate's trend so you can tell if the correction is working. A quiet or
+clean window is a correct outcome — log it as such.
+"""
+
+
+def _is_custom_escalation_audit_name(name: str) -> bool:
+    """A NON-builtin scheduled-task name that serves the escalation-audit
+    purpose — an agent's own tuned handoff/escalation auditor (eSound/Lyra ship
+    ``support-escalation-audit``). Matches when the name mentions
+    escalation/handoff AND audit/hygiene, case-insensitively, so the builtin
+    defers to it rather than double-running."""
+    low = name.lower()
+    return ("escalat" in low or "handoff" in low or "hand-off" in low) and (
+        "audit" in low or "hygiene" in low or "review" in low
+    )
 
 
 def _build_agent(config: dict) -> Agent:
@@ -1942,6 +2032,7 @@ class AgentServer:
         await self._sync_quality_scorer(scheduler)
         await self._sync_quality_digest(scheduler)
         await self._sync_cost_observability(scheduler)
+        await self._sync_escalation_audit(scheduler)
 
         await scheduler.start()
         self._scheduler = scheduler
@@ -2026,6 +2117,7 @@ class AgentServer:
             await self._sync_quality_scorer(scheduler)
             await self._sync_quality_digest(scheduler)
             await self._sync_cost_observability(scheduler)
+            await self._sync_escalation_audit(scheduler)
             gw.broadcast_resource_sync("scheduled_task", "updated")
 
         gw._config_change_callbacks["dream_mode"] = _dream
@@ -2539,6 +2631,71 @@ class AgentServer:
                 await _orig(task)
 
         self._install_task_hook(scheduler, COST_OBSERVABILITY_TASK_NAME, _cost_run)
+
+    async def _sync_escalation_audit(self, scheduler) -> None:
+        """Seed/enable the ``escalation-audit`` built-in — the HANDOFF arm of the
+        intrinsic loop. Sibling of the quality/cost builtins and identical in
+        discipline: ON by default (``self_improvement.enabled`` AND
+        ``escalation_audit_enabled``), and it DEFERS to an agent's own tuned,
+        non-builtin escalation auditor (name mentions escalation/handoff + audit)
+        so eSound/Lyra keep their tuned ``support-escalation-audit`` while fresh
+        agents get the generic, ROLE-/TOOL-agnostic builtin.
+
+        Independent of the other self_improvement toggles — any arm may run alone.
+        """
+        from src.core.config import self_improvement_settings
+
+        settings = self_improvement_settings(self.config)
+        enabled = settings.enabled and settings.escalation_audit_enabled
+
+        tasks = await self.agent._db.get_tasks()
+        existing = next(
+            (t for t in tasks if t["name"] == ESCALATION_AUDIT_TASK_NAME), None,
+        )
+
+        # DEDUP: defer to an agent's own tuned, non-builtin escalation auditor.
+        custom = next(
+            (t for t in tasks
+             if t["name"] not in BUILTIN_TASK_NAMES
+             and _is_custom_escalation_audit_name(t["name"])),
+            None,
+        )
+        if custom is not None:
+            elog("escalation_audit.deferred_to_custom", custom_task=custom["name"])
+            if existing is not None and existing["enabled"]:
+                await scheduler.disable_task(existing["id"])
+            self._install_task_hook(scheduler, ESCALATION_AUDIT_TASK_NAME, None)
+            return
+
+        if not enabled:
+            elog("escalation_audit.disabled")
+            if existing is not None and existing["enabled"]:
+                await scheduler.disable_task(existing["id"])
+            self._install_task_hook(scheduler, ESCALATION_AUDIT_TASK_NAME, None)
+            return
+
+        elog("escalation_audit.enabled_builtin")
+        cron_expr = settings.escalation_audit_schedule or ESCALATION_AUDIT_DEFAULT_CRON
+        audit_tz = default_timezone_name()
+
+        await self._sync_scheduled_task(
+            scheduler,
+            name=ESCALATION_AUDIT_TASK_NAME,
+            enabled=True,
+            cron_expr=cron_expr,
+            prompt=ESCALATION_AUDIT_PROMPT,
+            timezone=audit_tz,
+        )
+
+        async def _audit_run(task, _orig):
+            if task["name"] == ESCALATION_AUDIT_TASK_NAME:
+                elog("escalation_audit.start")
+                await _orig(task)
+                elog("escalation_audit.done")
+            else:
+                await _orig(task)
+
+        self._install_task_hook(scheduler, ESCALATION_AUDIT_TASK_NAME, _audit_run)
 
 
 # ── Auto-update helpers (used by AgentServer and the manual `update` command) ──

@@ -455,8 +455,8 @@ memory:
 #                             #   - https://git.example.com/org/skills-hub.git
 #                             #   - file:///srv/shared/skills-hub/.git
 
-# ── Self-improvement (intrinsic quality + cost loop) ────────────────
-# Three built-in scheduled tasks that make continuous self-critique an intrinsic
+# ── Self-improvement (intrinsic quality + cost + handoff loop) ──────
+# Four built-in scheduled tasks that make continuous self-critique an intrinsic
 # capability of EVERY agent — no per-agent config needed:
 #   quality-scorer  — every ~2h, reads the agent's OWN recent outputs (a support
 #                     agent's replies, an ops agent's actions), grades them
@@ -472,20 +472,27 @@ memory:
 #                     non-cached tokens via the engine's own router.cost_anomaly),
 #                     NEVER on the raw summed input-token count (which is mostly
 #                     cheap cache-reads of the re-sent prefix). Silent otherwise.
+#   escalation-audit — daily, the HANDOFF arm. Audits what the agent handed off
+#                     to a human / marked needs-human / left unresolved, and flags
+#                     OVER-ESCALATIONS it could have handled with its own tools
+#                     (vs genuinely-human cases). ROLE-/TOOL-agnostic (not tied to
+#                     any product/queue); files a correction, alerts on regression.
 #
 # ON BY DEFAULT — this is intrinsic. DEDUP: an agent that already ships its own
-# tuned, non-builtin quality-scorer / quality-digest / cost-observability task
-# keeps it; the builtin defers rather than double-running. Set enabled: false to
-# switch the whole loop off, or use the per-task toggles.
+# tuned, non-builtin quality-scorer / quality-digest / cost-observability /
+# escalation-audit task keeps it; the builtin defers rather than double-running.
+# Set enabled: false to switch the whole loop off, or use the per-task toggles.
 #
 # self_improvement:
 #   enabled: true             # master switch (default true)
 #   scorer_enabled: true      # per-task gate for quality-scorer (default true)
 #   digest_enabled: true      # per-task gate for quality-digest (default true)
 #   cost_observability_enabled: true  # per-task gate for cost-observability (default true)
+#   escalation_audit_enabled: true    # per-task gate for escalation-audit (default true)
 #   # scorer_schedule: "0 */2 * * *"  # cron (default: every 2 hours)
 #   # digest_schedule: "0 9 * * *"    # cron (default: daily 09:00)
 #   # cost_observability_schedule: "0 * * * *"  # cron (default: hourly)
+#   # escalation_audit_schedule: "30 8 * * *"   # cron (default: daily 08:30)
 
 # ── Quick commands ──────────────────────────────────────────────────
 # Bridges expand ``/<trigger>`` to the configured prompt before the

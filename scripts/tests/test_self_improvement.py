@@ -71,6 +71,11 @@ async def _cost_row(db):
     return await _row(db, COST_OBSERVABILITY_TASK_NAME)
 
 
+async def _audit_row(db):
+    from src.core.builtin_tasks import ESCALATION_AUDIT_TASK_NAME
+    return await _row(db, ESCALATION_AUDIT_TASK_NAME)
+
+
 def _fresh_db(ctx: TestContext, tag: str):
     from src.memory.db import MemoryDB
     return MemoryDB(str(ctx.db_path.with_name(f"selfimp-{tag}-{uuid.uuid4().hex[:8]}.db")))
@@ -107,6 +112,12 @@ async def t_settings_defaults(_ctx: TestContext) -> None:
         "intrinsic, like the quality halves"
     )
     assert d.cost_observability_schedule is None
+    # The HANDOFF arm (escalation-audit) is part of the same intrinsic loop.
+    assert d.escalation_audit_enabled, (
+        "escalation-audit must default ON — auditing your own handoffs is "
+        "intrinsic, like the quality/cost arms"
+    )
+    assert d.escalation_audit_schedule is None
 
     # Explicit overrides parse, including the per-task gates and schedules.
     o = self_improvement_settings({
@@ -115,16 +126,20 @@ async def t_settings_defaults(_ctx: TestContext) -> None:
             "scorer_enabled": False,
             "digest_enabled": True,
             "cost_observability_enabled": False,
+            "escalation_audit_enabled": False,
             "scorer_schedule": "*/30 * * * *",
             "digest_schedule": "0 8 * * *",
             "cost_observability_schedule": "*/15 * * * *",
+            "escalation_audit_schedule": "0 7 * * *",
         }
     })
     assert not o.enabled and not o.scorer_enabled and o.digest_enabled
     assert not o.cost_observability_enabled
+    assert not o.escalation_audit_enabled
     assert o.scorer_schedule == "*/30 * * * *"
     assert o.digest_schedule == "0 8 * * *"
     assert o.cost_observability_schedule == "*/15 * * * *"
+    assert o.escalation_audit_schedule == "0 7 * * *"
 
 
 # ── 2. gating — ON by default, parked when disabled ───────────────────
@@ -319,15 +334,16 @@ async def t_is_builtin(_ctx: TestContext) -> None:
     from src.core.builtin_tasks import (
         BUILTIN_TASK_NAMES, CONFIG_SECTION_BY_TASK,
         QUALITY_SCORER_TASK_NAME, QUALITY_DIGEST_TASK_NAME,
-        COST_OBSERVABILITY_TASK_NAME,
+        COST_OBSERVABILITY_TASK_NAME, ESCALATION_AUDIT_TASK_NAME,
     )
 
     assert QUALITY_SCORER_TASK_NAME == "quality-scorer"
     assert QUALITY_DIGEST_TASK_NAME == "quality-digest"
     assert COST_OBSERVABILITY_TASK_NAME == "cost-observability"
+    assert ESCALATION_AUDIT_TASK_NAME == "escalation-audit"
     for name in (
         QUALITY_SCORER_TASK_NAME, QUALITY_DIGEST_TASK_NAME,
-        COST_OBSERVABILITY_TASK_NAME,
+        COST_OBSERVABILITY_TASK_NAME, ESCALATION_AUDIT_TASK_NAME,
     ):
         assert name in BUILTIN_TASK_NAMES, f"{name} not registered as a built-in"
         assert CONFIG_SECTION_BY_TASK[name] == "self_improvement", (
@@ -459,6 +475,100 @@ async def t_cost_prompt(_ctx: TestContext) -> None:
     # Silent-by-default discipline + real-cost framing.
     assert "silent" in low and ("cost_usd" in low or "real cost" in low)
     assert COST_OBSERVABILITY_DEFAULT_CRON == "0 * * * *", COST_OBSERVABILITY_DEFAULT_CRON
+
+
+# ── 5c. escalation-audit — the ROLE-AGNOSTIC handoff arm ──────────────
+
+@test("self_improvement", "escalation-audit: ON by default; its own gate parks it")
+async def t_audit_gating(ctx: TestContext) -> None:
+    from src.core.scheduler import Scheduler
+
+    on_db = _fresh_db(ctx, "audit-on")
+    await on_db.connect()
+    try:
+        srv, agent = await _bare_server({}, on_db)
+        sched = Scheduler(on_db, agent)
+        await srv._sync_escalation_audit(sched)
+        row = await _audit_row(on_db)
+        assert row is not None and row["enabled"], (
+            "escalation-audit must seed AND enable by default — auditing your own "
+            "handoffs is intrinsic, not opt-in"
+        )
+        assert row["cron_expression"] == "30 8 * * *", row["cron_expression"]
+        assert row["prompt"]
+    finally:
+        await on_db.close()
+
+    gate_db = _fresh_db(ctx, "audit-gate")
+    await gate_db.connect()
+    try:
+        srv, agent = await _bare_server(
+            {"self_improvement": {"escalation_audit_enabled": False}}, gate_db)
+        sched = Scheduler(gate_db, agent)
+        await srv._sync_escalation_audit(sched)
+        row = await _audit_row(gate_db)
+        assert row is None or not row["enabled"], (
+            "escalation_audit_enabled:false must not enable the auditor"
+        )
+    finally:
+        await gate_db.close()
+
+
+@test("self_improvement", "escalation-audit DEDUP: a custom auditor suppresses the builtin")
+async def t_audit_dedup(ctx: TestContext) -> None:
+    from src.core.scheduler import Scheduler
+
+    db = _fresh_db(ctx, "audit-dedup")
+    await db.connect()
+    try:
+        srv, agent = await _bare_server({}, db)
+        sched = Scheduler(db, agent)
+        # eSound/Lyra ship `support-escalation-audit` → the builtin must NOT seed.
+        await sched.add_task("support-escalation-audit", "30 8 * * *", "custom audit prompt")
+        await srv._sync_escalation_audit(sched)
+        assert await _audit_row(db) is None, (
+            "the builtin escalation-audit was seeded despite a tuned custom one — "
+            "eSound/Lyra would double-run their auditor"
+        )
+        assert await _row(db, "support-escalation-audit") is not None
+    finally:
+        await db.close()
+
+
+@test("self_improvement", "escalation dedup name-matcher: correct scope, no false positives")
+async def t_audit_name_matcher(_ctx: TestContext) -> None:
+    from src.core.server import _is_custom_escalation_audit_name
+
+    assert _is_custom_escalation_audit_name("support-escalation-audit")
+    assert _is_custom_escalation_audit_name("Handoff Audit")
+    assert _is_custom_escalation_audit_name("escalation-hygiene")
+    # Not an escalation auditor → must not be swallowed.
+    assert not _is_custom_escalation_audit_name("response-quality-scorer")
+    assert not _is_custom_escalation_audit_name("repo-sync")
+    assert not _is_custom_escalation_audit_name("dream-mode")
+
+
+@test("self_improvement", "escalation-audit prompt is ROLE/TOOL-agnostic and window-aware")
+async def t_audit_prompt(_ctx: TestContext) -> None:
+    from src.core.server import (
+        ESCALATION_AUDIT_DEFAULT_CRON, ESCALATION_AUDIT_PROMPT,
+    )
+
+    p = ESCALATION_AUDIT_PROMPT
+    low = p.lower()
+    norm = " ".join(low.split())  # collapse the block-scalar line wrapping
+    # MUST be generic — OpenAgent is a general engine, not only a support runtime.
+    assert "role-agnostic" in low and "tool-agnostic" in low
+    assert "general engine" in low and "not only" in low
+    assert "do not assume any particular product, queue, or mcp" in norm
+    # Audits HANDOFFS / escalations, distinguishing justified vs over-escalated.
+    assert "hand" in low and "escalat" in low
+    assert "over-escalat" in low and "justified" in low
+    # Must NOT cry wolf on platform-unreachable handoffs (the window lesson).
+    assert "nobody can act" in low or "no human could act" in low
+    # Silent unless regression; files a grounded correction.
+    assert "regression" in low and "correction" in low
+    assert ESCALATION_AUDIT_DEFAULT_CRON == "30 8 * * *", ESCALATION_AUDIT_DEFAULT_CRON
 
 
 # ── 6. Feature B — anti-wedge per-LLM-call timeout ────────────────────
