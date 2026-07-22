@@ -51,6 +51,17 @@ QUALITY_SCORER_TASK_NAME = "quality-scorer"
 # sends the operator one short recap. ON by default, same
 # ``self_improvement`` section, same DEDUP discipline as the scorer.
 QUALITY_DIGEST_TASK_NAME = "quality-digest"
+# The cost-observability watcher: the CONSUMPTION arm of the intrinsic
+# self-improvement loop. Where the quality builtins grade the agent's OUTPUT,
+# this watches its SPEND — but CACHE-AWARE: it pages only on REAL cost and FRESH
+# (non-cached) tokens via the engine's own ``router.cost_anomaly`` signal, NEVER
+# on the raw summed input-token count (which is ~85-90% cheap cache-reads of the
+# fixed prefix re-sent every step, so alerting on it pages on nonsense). ON by
+# default (``self_improvement.enabled`` AND ``cost_observability_enabled``), same
+# ``self_improvement`` section, same DEDUP discipline as the scorer/digest: an
+# agent that already ships a tuned, NON-builtin cost watcher (eSound/Lyra do)
+# keeps it. See ``AgentServer._sync_cost_observability``.
+COST_OBSERVABILITY_TASK_NAME = "cost-observability"
 
 BUILTIN_TASK_NAMES: frozenset[str] = frozenset(
     {
@@ -60,6 +71,7 @@ BUILTIN_TASK_NAMES: frozenset[str] = frozenset(
         SKILL_DISTILLER_TASK_NAME,
         QUALITY_SCORER_TASK_NAME,
         QUALITY_DIGEST_TASK_NAME,
+        COST_OBSERVABILITY_TASK_NAME,
     }
 )
 
@@ -70,4 +82,5 @@ CONFIG_SECTION_BY_TASK: dict[str, str] = {
     SKILL_DISTILLER_TASK_NAME: "skills",
     QUALITY_SCORER_TASK_NAME: "self_improvement",
     QUALITY_DIGEST_TASK_NAME: "self_improvement",
+    COST_OBSERVABILITY_TASK_NAME: "self_improvement",
 }

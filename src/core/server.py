@@ -55,6 +55,7 @@ except Exception:  # noqa: BLE001 — best-effort, never block startup
 from src.core.builtin_tasks import (
     AUTO_UPDATE_TASK_NAME,
     BUILTIN_TASK_NAMES,
+    COST_OBSERVABILITY_TASK_NAME,
     DREAM_MODE_TASK_NAME,
     QUALITY_DIGEST_TASK_NAME,
     QUALITY_SCORER_TASK_NAME,
@@ -577,6 +578,79 @@ def _is_custom_quality_digest_name(name: str) -> bool:
     mentions quality AND digest/improvement, case-insensitively."""
     low = name.lower()
     return "quality" in low and ("digest" in low or "improve" in low)
+
+
+# Hourly by default: a cheap check that pages only on a genuine, CACHE-AWARE
+# cost anomaly. Overridable via ``self_improvement.cost_observability_schedule``.
+COST_OBSERVABILITY_DEFAULT_CRON = "0 * * * *"
+
+COST_OBSERVABILITY_PROMPT = """\
+You are running as Cost Observability — the CONSUMPTION arm of OpenAgent's
+intrinsic self-improvement loop. Where the quality pass grades what this agent
+PRODUCES, you watch what it SPENDS, and you page the operator ONLY when spend is
+genuinely anomalous. Cheap by design: a couple of reads, no fan-out. A quiet
+hour is the normal, expected outcome — stay SILENT.
+
+## The cardinal rule: be CACHE-AWARE — never alert on raw token counts
+
+An agentic run makes many model calls, each re-sending the growing conversation
+prefix (system prompt + memory + tool schemas). That prefix is CACHED, so each
+re-send is a cheap cache-READ — but the raw summed ``input_tokens`` counts it at
+full face value, so an ordinary run shows a six-figure "input" while ~85-90% is
+cached and the real cost is a fraction of a cent. NEVER alert on that raw number:
+it is noise, and paging on it is exactly the nonsense this task exists to avoid.
+Alert only on signals that track ACTUAL spend:
+   - **real cost** (``cost_usd`` — already cache-discounted); and
+   - **FRESH / non-cached tokens** = ``input_tokens - cache_read_tokens`` — the
+     tokens genuinely re-processed (a real loop or a truly huge fresh prompt),
+     not the cached prefix re-sent each step.
+The engine already does this math for you and emits a ``router.cost_anomaly``
+event (carrying ``cost_usd`` and ``uncached_input_tokens``) ONLY when a run
+crosses a real-cost or fresh-token threshold. Your job is to surface those —
+never to re-derive an alarm from raw input.
+
+## STEP 1 — Check for genuine cost anomalies since the last run (~1h)
+
+Using the `logs` MCP, look for any ``router.cost_anomaly`` warning in the last
+~65 minutes (`logs_query` for that event name; `logs_summary(since="1h")` for
+the window shape). Each carries the real ``cost_usd``, the
+``uncached_input_tokens`` (fresh), the model, and the session id — the engine
+already did the cache-aware math. If there are NONE, the hour is clean: send
+nothing and go to STEP 2.
+
+If one or more fired, send the operator EXACTLY ONE short alert via whatever
+operator-notification tool this agent has (its Telegram / Slack / messaging
+tool). For each anomaly name the REAL cost, the FRESH (non-cached) token count,
+the model, and the session — and say plainly whether it is paid-model spend or a
+possible context loop. Report cost and FRESH tokens ONLY — NEVER the raw summed
+input. If a flagged session is still RUNNING (a live runaway), say so first:
+that is the one worth stopping.
+
+## STEP 2 — Daily cost recap (ONLY once a day, near 08:00 local time)
+
+Only when it is roughly 08:00 in this agent's local timezone (otherwise SKIP
+entirely — no message): send the operator ONE short line summarising the last
+24h of real spend. State the real cost for the day (metered models only — a
+flat-rate / subscription proxy logs $0, which is correct, not a bug) and, if you
+can get it cheaply, the cache hit-rate as context (raw input vs fresh). One
+scannable line, e.g. "Cost 24h: $X real (local proxy $0); ~P% cached." No walls
+of text, no second message.
+
+## Nothing else
+
+Do not fan out and do not touch customer/billing state. If STEP 1 found no
+anomaly and it is not the daily-recap hour, send NOTHING at all — a silent hour
+is a correct, healthy outcome, not a failure to report.
+"""
+
+
+def _is_custom_cost_observability_name(name: str) -> bool:
+    """A NON-builtin scheduled-task name that serves the cost-observability
+    purpose — an agent's own tuned cost/spend watcher (eSound/Lyra ship one).
+    Matches when the name mentions cost AND observe/anomaly/monitor,
+    case-insensitively, so the builtin defers to it rather than double-running."""
+    low = name.lower()
+    return "cost" in low and ("observ" in low or "anomal" in low or "monitor" in low)
 
 
 def _build_agent(config: dict) -> Agent:
@@ -1867,6 +1941,7 @@ class AgentServer:
         await self._sync_skill_distiller(scheduler)
         await self._sync_quality_scorer(scheduler)
         await self._sync_quality_digest(scheduler)
+        await self._sync_cost_observability(scheduler)
 
         await scheduler.start()
         self._scheduler = scheduler
@@ -1950,6 +2025,7 @@ class AgentServer:
             self.config["self_improvement"] = patch or {}
             await self._sync_quality_scorer(scheduler)
             await self._sync_quality_digest(scheduler)
+            await self._sync_cost_observability(scheduler)
             gw.broadcast_resource_sync("scheduled_task", "updated")
 
         gw._config_change_callbacks["dream_mode"] = _dream
@@ -2395,6 +2471,74 @@ class AgentServer:
                 await _orig(task)
 
         self._install_task_hook(scheduler, QUALITY_DIGEST_TASK_NAME, _digest_run)
+
+    async def _sync_cost_observability(self, scheduler) -> None:
+        """Seed/enable the ``cost-observability`` built-in — the CONSUMPTION arm
+        of the intrinsic loop. Sibling of the quality builtins and identical in
+        discipline: ON by default (``self_improvement.enabled`` AND
+        ``cost_observability_enabled``), and it DEFERS to an agent's own tuned,
+        non-builtin cost watcher (name mentions cost + observe/anomaly/monitor)
+        so eSound/Lyra keep their custom, more-sensitive pass while fresh agents
+        (spicysparks, new deployments) get the generic builtin.
+
+        The builtin is CACHE-AWARE by construction: its prompt pages only on the
+        engine's own ``router.cost_anomaly`` signal (real cost + fresh/non-cached
+        tokens), never on raw summed input. Independent of the scorer/digest
+        toggles — any of the three halves may run alone.
+        """
+        from src.core.config import self_improvement_settings
+
+        settings = self_improvement_settings(self.config)
+        enabled = settings.enabled and settings.cost_observability_enabled
+
+        tasks = await self.agent._db.get_tasks()
+        existing = next(
+            (t for t in tasks if t["name"] == COST_OBSERVABILITY_TASK_NAME), None,
+        )
+
+        # DEDUP: defer to an agent's own tuned, non-builtin cost watcher.
+        custom = next(
+            (t for t in tasks
+             if t["name"] not in BUILTIN_TASK_NAMES
+             and _is_custom_cost_observability_name(t["name"])),
+            None,
+        )
+        if custom is not None:
+            elog("cost_observability.deferred_to_custom", custom_task=custom["name"])
+            if existing is not None and existing["enabled"]:
+                await scheduler.disable_task(existing["id"])
+            self._install_task_hook(scheduler, COST_OBSERVABILITY_TASK_NAME, None)
+            return
+
+        if not enabled:
+            elog("cost_observability.disabled")
+            if existing is not None and existing["enabled"]:
+                await scheduler.disable_task(existing["id"])
+            self._install_task_hook(scheduler, COST_OBSERVABILITY_TASK_NAME, None)
+            return
+
+        elog("cost_observability.enabled_builtin")
+        cron_expr = settings.cost_observability_schedule or COST_OBSERVABILITY_DEFAULT_CRON
+        cost_tz = default_timezone_name()
+
+        await self._sync_scheduled_task(
+            scheduler,
+            name=COST_OBSERVABILITY_TASK_NAME,
+            enabled=True,
+            cron_expr=cron_expr,
+            prompt=COST_OBSERVABILITY_PROMPT,
+            timezone=cost_tz,
+        )
+
+        async def _cost_run(task, _orig):
+            if task["name"] == COST_OBSERVABILITY_TASK_NAME:
+                elog("cost_observability.start")
+                await _orig(task)
+                elog("cost_observability.done")
+            else:
+                await _orig(task)
+
+        self._install_task_hook(scheduler, COST_OBSERVABILITY_TASK_NAME, _cost_run)
 
 
 # ── Auto-update helpers (used by AgentServer and the manual `update` command) ──

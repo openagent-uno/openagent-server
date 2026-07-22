@@ -66,6 +66,11 @@ async def _digest_row(db):
     return await _row(db, QUALITY_DIGEST_TASK_NAME)
 
 
+async def _cost_row(db):
+    from src.core.builtin_tasks import COST_OBSERVABILITY_TASK_NAME
+    return await _row(db, COST_OBSERVABILITY_TASK_NAME)
+
+
 def _fresh_db(ctx: TestContext, tag: str):
     from src.memory.db import MemoryDB
     return MemoryDB(str(ctx.db_path.with_name(f"selfimp-{tag}-{uuid.uuid4().hex[:8]}.db")))
@@ -95,19 +100,31 @@ async def t_settings_defaults(_ctx: TestContext) -> None:
     # A non-dict stanza is defensive, not fatal.
     assert self_improvement_settings({"self_improvement": "nope"}) == SelfImprovementSettings()
 
+    # The CONSUMPTION arm (cost-observability) is part of the same intrinsic
+    # loop — ON by default, its own independent gate + schedule.
+    assert d.cost_observability_enabled, (
+        "cost-observability must default ON — cache-aware cost monitoring is "
+        "intrinsic, like the quality halves"
+    )
+    assert d.cost_observability_schedule is None
+
     # Explicit overrides parse, including the per-task gates and schedules.
     o = self_improvement_settings({
         "self_improvement": {
             "enabled": False,
             "scorer_enabled": False,
             "digest_enabled": True,
+            "cost_observability_enabled": False,
             "scorer_schedule": "*/30 * * * *",
             "digest_schedule": "0 8 * * *",
+            "cost_observability_schedule": "*/15 * * * *",
         }
     })
     assert not o.enabled and not o.scorer_enabled and o.digest_enabled
+    assert not o.cost_observability_enabled
     assert o.scorer_schedule == "*/30 * * * *"
     assert o.digest_schedule == "0 8 * * *"
+    assert o.cost_observability_schedule == "*/15 * * * *"
 
 
 # ── 2. gating — ON by default, parked when disabled ───────────────────
@@ -302,15 +319,146 @@ async def t_is_builtin(_ctx: TestContext) -> None:
     from src.core.builtin_tasks import (
         BUILTIN_TASK_NAMES, CONFIG_SECTION_BY_TASK,
         QUALITY_SCORER_TASK_NAME, QUALITY_DIGEST_TASK_NAME,
+        COST_OBSERVABILITY_TASK_NAME,
     )
 
     assert QUALITY_SCORER_TASK_NAME == "quality-scorer"
     assert QUALITY_DIGEST_TASK_NAME == "quality-digest"
-    for name in (QUALITY_SCORER_TASK_NAME, QUALITY_DIGEST_TASK_NAME):
+    assert COST_OBSERVABILITY_TASK_NAME == "cost-observability"
+    for name in (
+        QUALITY_SCORER_TASK_NAME, QUALITY_DIGEST_TASK_NAME,
+        COST_OBSERVABILITY_TASK_NAME,
+    ):
         assert name in BUILTIN_TASK_NAMES, f"{name} not registered as a built-in"
         assert CONFIG_SECTION_BY_TASK[name] == "self_improvement", (
             f"{name} not mapped to the self_improvement config section"
         )
+
+
+# ── 5b. cost-observability — the CACHE-AWARE consumption arm ──────────
+
+@test("self_improvement", "cost-observability: ON by default; its own gate parks it")
+async def t_cost_gating(ctx: TestContext) -> None:
+    from src.core.scheduler import Scheduler
+
+    # (a) DEFAULT config → the cost watcher seeds AND enables, hourly.
+    on_db = _fresh_db(ctx, "cost-on")
+    await on_db.connect()
+    try:
+        srv, agent = await _bare_server({}, on_db)
+        sched = Scheduler(on_db, agent)
+        await srv._sync_cost_observability(sched)
+        row = await _cost_row(on_db)
+        assert row is not None and row["enabled"], (
+            "cost-observability must seed AND enable by default — cache-aware "
+            "cost monitoring is intrinsic, not opt-in"
+        )
+        assert row["cron_expression"] == "0 * * * *", row["cron_expression"]
+        assert row["prompt"]
+    finally:
+        await on_db.close()
+
+    # (b) its OWN gate off (master still on) → parked, independent of quality.
+    gate_db = _fresh_db(ctx, "cost-gate")
+    await gate_db.connect()
+    try:
+        srv, agent = await _bare_server(
+            {"self_improvement": {"cost_observability_enabled": False}}, gate_db)
+        sched = Scheduler(gate_db, agent)
+        await srv._sync_cost_observability(sched)
+        row = await _cost_row(gate_db)
+        assert row is None or not row["enabled"], (
+            "cost_observability_enabled:false must not enable the watcher"
+        )
+    finally:
+        await gate_db.close()
+
+    # (c) master switch off → parked too.
+    off_db = _fresh_db(ctx, "cost-off")
+    await off_db.connect()
+    try:
+        srv, agent = await _bare_server({}, off_db)
+        sched = Scheduler(off_db, agent)
+        await srv._sync_cost_observability(sched)
+        srv.config = {"self_improvement": {"enabled": False}}
+        await srv._sync_cost_observability(sched)
+        row = await _cost_row(off_db)
+        assert row is not None and not row["enabled"], "cost watcher not parked on master disable"
+    finally:
+        await off_db.close()
+
+
+@test("self_improvement", "cost-observability DEDUP: a custom cost watcher suppresses the builtin")
+async def t_cost_dedup(ctx: TestContext) -> None:
+    from src.core.scheduler import Scheduler
+
+    # (a) eSound/Lyra ship `*-cost-observability` → the builtin must NOT seed.
+    db = _fresh_db(ctx, "cost-dedup")
+    await db.connect()
+    try:
+        srv, agent = await _bare_server({}, db)
+        sched = Scheduler(db, agent)
+        await sched.add_task("esound-cost-observability", "0 * * * *", "custom cost prompt")
+        await srv._sync_cost_observability(sched)
+        assert await _cost_row(db) is None, (
+            "the builtin cost-observability was seeded despite a tuned custom "
+            "one — eSound/Lyra would double-run their cost watcher"
+        )
+        assert await _row(db, "esound-cost-observability") is not None
+    finally:
+        await db.close()
+
+    # (b) a builtin that pre-dates the custom one is PARKED when it appears.
+    db2 = _fresh_db(ctx, "cost-dedup-park")
+    await db2.connect()
+    try:
+        srv, agent = await _bare_server({}, db2)
+        sched = Scheduler(db2, agent)
+        await srv._sync_cost_observability(sched)
+        assert (await _cost_row(db2))["enabled"], "builtin cost watcher should enable first"
+        await sched.add_task("lyra-cost-observability", "0 * * * *", "tuned")
+        await srv._sync_cost_observability(sched)
+        row = await _cost_row(db2)
+        assert row is not None and not row["enabled"], (
+            "the builtin cost watcher kept firing alongside a newly-added custom one"
+        )
+    finally:
+        await db2.close()
+
+
+@test("self_improvement", "cost dedup name-matcher: correct scope, no false positives")
+async def t_cost_dedup_name_matcher(_ctx: TestContext) -> None:
+    from src.core.server import _is_custom_cost_observability_name
+
+    assert _is_custom_cost_observability_name("esound-cost-observability")
+    assert _is_custom_cost_observability_name("lyra-cost-observability")
+    assert _is_custom_cost_observability_name("Cost Anomaly Monitor")
+    # Not a cost watcher → must not be swallowed.
+    assert not _is_custom_cost_observability_name("response-quality-scorer")
+    assert not _is_custom_cost_observability_name("repo-sync")
+    assert not _is_custom_cost_observability_name("dream-mode")
+
+
+@test("self_improvement", "cost-observability prompt is CACHE-AWARE and hourly")
+async def t_cost_prompt(_ctx: TestContext) -> None:
+    from src.core.server import (
+        COST_OBSERVABILITY_DEFAULT_CRON, COST_OBSERVABILITY_PROMPT,
+    )
+
+    p = COST_OBSERVABILITY_PROMPT
+    low = p.lower()
+    # The cardinal rule: cache-aware, never alert on raw summed input.
+    assert "cache-aware" in low, "prompt must state the cache-aware rule"
+    assert "cache_read" in low or "non-cached" in low or "uncached" in low
+    assert "fresh" in low, "prompt must key on FRESH / re-processed tokens"
+    assert "never" in low and "raw" in low, (
+        "prompt must forbid alerting on the raw summed input count"
+    )
+    # Sources the engine's own cache-aware signal, not a re-derived alarm.
+    assert "router.cost_anomaly" in low
+    # Silent-by-default discipline + real-cost framing.
+    assert "silent" in low and ("cost_usd" in low or "real cost" in low)
+    assert COST_OBSERVABILITY_DEFAULT_CRON == "0 * * * *", COST_OBSERVABILITY_DEFAULT_CRON
 
 
 # ── 6. Feature B — anti-wedge per-LLM-call timeout ────────────────────
