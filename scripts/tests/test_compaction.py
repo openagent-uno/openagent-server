@@ -1136,3 +1136,160 @@ async def t_background_fold_is_silent(ctx: TestContext) -> None:
     # ... and every status emission during it had a None channel — invisible.
     assert seen, "compact() should have emitted running/done envelopes internally"
     assert all(is_none for (is_none, _phase) in seen), seen
+
+
+# ── 6. summariser fallback (proxy-exhaustion resilience) ────────────────
+# When the primary summariser call raises (typically an OAuth-limited proxy
+# row exhausted under load), compaction must retry ONCE with a distinct
+# provider instead of skipping the fold and letting the session balloon.
+
+
+class _FailModel:
+    """Summariser stand-in whose generate() always raises — mimics the
+    'No available Claude OAuth accounts' failure of an exhausted proxy row."""
+
+    def __init__(self, model: str = "anthropic:claude-proxy") -> None:
+        self.model = model
+        self.generate_calls: list[dict] = []
+
+    async def generate(self, messages, **kwargs):  # noqa: ANN001
+        self.generate_calls.append({"messages": messages, "kwargs": kwargs})
+        raise RuntimeError("No available Claude OAuth accounts")
+
+
+_FOLD_RUNS = [
+    {"content": "hi", "messages": [
+        {"role": "user", "content": "the user asked about a billing charge"}]},
+]
+
+
+@test("compaction", "summarise retries with fallback when the primary summariser fails")
+async def t_summary_fallback_on_primary_failure(ctx: TestContext) -> None:
+    from src.core import compaction
+
+    primary = _FailModel()
+    fallback = _FakeModel(model="deepseek:deepseek-chat", summary="Fallback recap.")
+    agent = _FakeAgent(str(ctx.test_dir / "fb1.db"), primary)
+
+    orig_pick = compaction._pick_summary_model
+    orig_fb = compaction._summary_fallback_model
+    compaction._pick_summary_model = lambda a, *, fallback: primary
+    compaction._summary_fallback_model = lambda a, *, exclude_provider: fallback
+    try:
+        out = await compaction._summarize_runs(_FOLD_RUNS, primary, agent)
+    finally:
+        compaction._pick_summary_model = orig_pick
+        compaction._summary_fallback_model = orig_fb
+
+    assert out == "Fallback recap.", out
+    assert len(primary.generate_calls) == 1, "primary tried once"
+    assert len(fallback.generate_calls) == 1, "fallback tried once"
+    # The fallback call, like the primary, must not pollute the session.
+    assert fallback.generate_calls[0]["kwargs"].get("session_id") is None
+
+
+@test("compaction", "summarise returns '' when the primary fails and no fallback exists")
+async def t_summary_no_fallback_available(ctx: TestContext) -> None:
+    from src.core import compaction
+
+    primary = _FailModel()
+    agent = _FakeAgent(str(ctx.test_dir / "fb2.db"), primary)
+
+    orig_pick = compaction._pick_summary_model
+    orig_fb = compaction._summary_fallback_model
+    compaction._pick_summary_model = lambda a, *, fallback: primary
+    compaction._summary_fallback_model = lambda a, *, exclude_provider: None
+    try:
+        out = await compaction._summarize_runs(_FOLD_RUNS, primary, agent)
+    finally:
+        compaction._pick_summary_model = orig_pick
+        compaction._summary_fallback_model = orig_fb
+
+    assert out == "", "no fallback → skip compaction (original contract)"
+    assert len(primary.generate_calls) == 1
+
+
+@test("compaction", "summarise returns '' when both primary and fallback fail")
+async def t_summary_fallback_also_fails(ctx: TestContext) -> None:
+    from src.core import compaction
+
+    primary = _FailModel(model="anthropic:claude-proxy")
+    fallback = _FailModel(model="deepseek:deepseek-chat")
+    agent = _FakeAgent(str(ctx.test_dir / "fb3.db"), primary)
+
+    orig_pick = compaction._pick_summary_model
+    orig_fb = compaction._summary_fallback_model
+    compaction._pick_summary_model = lambda a, *, fallback: primary
+    compaction._summary_fallback_model = lambda a, *, exclude_provider: fallback
+    try:
+        out = await compaction._summarize_runs(_FOLD_RUNS, primary, agent)
+    finally:
+        compaction._pick_summary_model = orig_pick
+        compaction._summary_fallback_model = orig_fb
+
+    assert out == "", "both failed → skip compaction, never crash the turn"
+    assert len(primary.generate_calls) == 1
+    assert len(fallback.generate_calls) == 1
+
+
+@test("compaction", "_provider_of extracts the provider from a runtime id")
+async def t_provider_of(ctx: TestContext) -> None:
+    from src.core.compaction import _provider_of
+
+    class _M:
+        pass
+
+    m = _M(); m.model = "anthropic:claude-haiku-4-5"
+    assert _provider_of(m) == "anthropic"
+    m2 = _M(); m2.model = "deepseek:deepseek-chat"
+    assert _provider_of(m2) == "deepseek"
+    m3 = _M(); m3.model = "plainmodel-no-colon"
+    assert _provider_of(m3) is None
+    assert _provider_of(object()) is None
+
+
+@test("compaction", "summary fallback picks a distinct-provider row and never the failed one")
+async def t_summary_fallback_picker(ctx: TestContext) -> None:
+    from src.core import compaction
+    import src.models.native_provider as np_mod
+
+    providers_config = [
+        {"id": 1, "name": "anthropic", "framework": "api-based", "enabled": True,
+         "models": [{"id": 101, "model": "claude-haiku-4-5"}]},
+        {"id": 2, "name": "deepseek", "framework": "api-based", "enabled": True,
+         "models": [{"id": 201, "model": "deepseek-chat"}]},
+    ]
+    agent = _FakeAgent(str(ctx.test_dir / "pk.db"), _FakeModel())
+    agent._providers_config = providers_config
+
+    captured: dict = {}
+
+    class _FakeNP:
+        def __init__(self, *, model, providers_config, db_path):  # noqa: ANN001
+            captured["model"] = model
+            self.model = model
+
+    orig_np = np_mod.NativeProvider
+    np_mod.NativeProvider = _FakeNP
+    os.environ.pop(compaction._SUMMARY_FALLBACK_MODEL_ENV, None)
+    try:
+        # exclude the failed anthropic proxy → prefers deepseek (never OAuth-limited)
+        fb = compaction._summary_fallback_model(agent, exclude_provider="anthropic")
+        assert fb is not None
+        assert captured.get("model") == "deepseek:deepseek-chat", captured
+
+        # explicit operator override wins when it is a distinct provider
+        captured.clear()
+        os.environ[compaction._SUMMARY_FALLBACK_MODEL_ENV] = "deepseek:deepseek-chat"
+        compaction._summary_fallback_model(agent, exclude_provider="anthropic")
+        assert captured.get("model") == "deepseek:deepseek-chat", captured
+        os.environ.pop(compaction._SUMMARY_FALLBACK_MODEL_ENV, None)
+
+        # only one provider, and it IS the excluded one → no distinct fallback
+        captured.clear()
+        agent._providers_config = [providers_config[1]]  # deepseek only
+        fb_none = compaction._summary_fallback_model(agent, exclude_provider="deepseek")
+        assert fb_none is None, "no distinct-provider row → give up (caller skips)"
+    finally:
+        np_mod.NativeProvider = orig_np
+        os.environ.pop(compaction._SUMMARY_FALLBACK_MODEL_ENV, None)

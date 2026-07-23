@@ -125,6 +125,15 @@ _MAX_HISTORY_TOKENS = 150_000
 # above. The operator names the model; we never guess one.
 _SUMMARY_MODEL_ENV = "OPENAGENT_COMPACTION_MODEL"
 
+# Second summariser tried when the primary summarise call raises — typically
+# because the primary routes through an OAuth-limited local proxy (e.g. a
+# Claude subscription proxy) that is momentarily exhausted. Without a fallback
+# the compaction pass is skipped and the session keeps growing (ballooning
+# token spend). The operator may name an explicit fallback row here; otherwise
+# the picker defaults to a cheap enabled row from a DIFFERENT provider than the
+# one that just failed (an API-key provider is never OAuth-limited).
+_SUMMARY_FALLBACK_MODEL_ENV = "OPENAGENT_COMPACTION_FALLBACK_MODEL"
+
 
 def _cost_ceiling() -> int:
     raw = os.environ.get("OPENAGENT_COMPACTION_MAX_HISTORY_TOKENS", "").strip()
@@ -631,13 +640,43 @@ async def _summarize_runs(
             session_id=None,
         )
     except Exception as exc:  # noqa: BLE001 — never crash the turn
+        # The primary summariser failed (commonly an OAuth-limited proxy row
+        # exhausted under load). Skipping compaction here is what lets the
+        # session balloon, so retry ONCE with a distinct-provider fallback
+        # (DeepSeek etc. — API-key based, never OAuth-limited) before giving up.
+        fallback_summariser = _summary_fallback_model(
+            agent, exclude_provider=_provider_of(summariser),
+        )
+        if fallback_summariser is None:
+            elog(
+                "runtime.compaction.summary_failed",
+                level="warning",
+                error_type=type(exc).__name__,
+                error=str(exc) or repr(exc),
+                fallback="none_available",
+            )
+            return ""
         elog(
-            "runtime.compaction.summary_failed",
+            "runtime.compaction.summary_fallback",
             level="warning",
             error_type=type(exc).__name__,
-            error=str(exc) or repr(exc),
+            error=(str(exc) or repr(exc))[:200],
         )
-        return ""
+        try:
+            response = await fallback_summariser.generate(
+                [{"role": "user", "content": user_prompt}],
+                system=system_prompt,
+                session_id=None,
+            )
+        except Exception as exc2:  # noqa: BLE001 — never crash the turn
+            elog(
+                "runtime.compaction.summary_failed",
+                level="warning",
+                error_type=type(exc2).__name__,
+                error=str(exc2) or repr(exc2),
+                fallback="also_failed",
+            )
+            return ""
     summary = (getattr(response, "content", "") or "").strip()
     return summary
 
@@ -793,6 +832,95 @@ def _pick_summary_model(agent: Any, *, fallback: Any) -> Any:
             error=str(exc) or repr(exc),
         )
         return fallback
+
+
+def _provider_of(model_obj: Any) -> str | None:
+    """Best-effort provider name of a summariser (the ``<provider>`` half of its
+    ``<provider>:<model>`` runtime id), so the fallback picker can avoid
+    re-picking the same exhausted provider. Never raises."""
+    for attr in ("model", "runtime_id", "id", "_model", "model_id"):
+        v = getattr(model_obj, attr, None)
+        if isinstance(v, str) and ":" in v:
+            return v.split(":", 1)[0]
+    return None
+
+
+def _summary_fallback_model(agent: Any, *, exclude_provider: str | None) -> Any:
+    """A second summariser to try when the primary summarise call fails.
+
+    The primary summariser defaults to the cheapest enabled row; when a $0
+    OAuth-proxy row (e.g. a Claude subscription proxy) is the cheapest, it is
+    also the one that fails under load ("no available OAuth accounts"). Retrying
+    with a DIFFERENT provider — an API-key row such as DeepSeek, never
+    OAuth-limited — lets the compaction complete instead of being skipped (which
+    is what balloons the session). Prefers ``OPENAGENT_COMPACTION_FALLBACK_MODEL``
+    when set; otherwise picks a cheap enabled api-based row whose provider is not
+    *exclude_provider*, preferring ``deepseek``. Returns ``None`` when no
+    distinct fallback exists (the caller then gives up). Never raises."""
+    try:
+        from src.models.catalog import (
+            FRAMEWORK_API_BASED,
+            cheapest_enabled_model,
+            iter_configured_models,
+        )
+        from src.models.native_provider import NativeProvider
+
+        providers_config = getattr(agent, "_providers_config", None) or []
+        db_path = getattr(getattr(agent, "_db", None), "db_path", None)
+        db_path = str(db_path) if db_path else None
+
+        def _mk(runtime_id: str) -> Any:
+            return NativeProvider(
+                model=runtime_id,
+                providers_config=providers_config,
+                db_path=db_path,
+            )
+
+        enabled = [
+            e
+            for e in iter_configured_models(providers_config)
+            if not e.disabled and e.framework == FRAMEWORK_API_BASED
+        ]
+        # 1) explicit operator choice (only if it is a distinct provider)
+        configured = os.environ.get(_SUMMARY_FALLBACK_MODEL_ENV, "").strip()
+        if configured:
+            m = next((e for e in enabled if e.runtime_id == configured), None)
+            if m is not None and m.provider != exclude_provider:
+                elog(
+                    "runtime.compaction.summary_fallback_model",
+                    model=m.runtime_id,
+                    reason="configured",
+                )
+                return _mk(m.runtime_id)
+        # 2) distinct-provider rows, DeepSeek first (never OAuth-limited)
+        distinct = [e for e in enabled if e.provider != exclude_provider]
+        if not distinct:
+            return None
+        pref = next((e for e in distinct if e.provider == "deepseek"), None)
+        if pref is not None:
+            elog(
+                "runtime.compaction.summary_fallback_model",
+                model=pref.runtime_id,
+                reason="deepseek_default",
+            )
+            return _mk(pref.runtime_id)
+        # 3) cheapest distinct row otherwise
+        cheap = cheapest_enabled_model(providers_config)
+        pick = cheap if (cheap is not None and cheap.provider != exclude_provider) else distinct[0]
+        elog(
+            "runtime.compaction.summary_fallback_model",
+            model=pick.runtime_id,
+            reason="cheapest_distinct",
+        )
+        return _mk(pick.runtime_id)
+    except Exception as exc:  # noqa: BLE001 — a fallback must never break the turn
+        elog(
+            "runtime.compaction.summary_fallback_unresolved",
+            level="warning",
+            error_type=type(exc).__name__,
+            error=str(exc) or repr(exc),
+        )
+        return None
 
 
 async def _emit_compaction_status(
