@@ -1115,6 +1115,26 @@ def _build_agent(config: dict) -> Agent:
                 os.environ[_env] = str(_qd_cfg[_k])
             except (TypeError, ValueError):
                 pass
+    # Anti-fabrication reply guard (``src/core/reply_guard.py``). OFF by default.
+    # Maps ``reply_guard.*`` (top-level, or under ``memory:``) to the env vars
+    # the guard reads: a boolean gate and an optional backing-tool substring
+    # list. Needs the quality monitor on for tool-trace grounding visibility.
+    _rg_cfg = (config.get("reply_guard") or memory_cfg.get("reply_guard") or {})
+    if "enabled" in _rg_cfg:
+        os.environ["OPENAGENT_REPLY_GUARD_ENABLED"] = (
+            "1" if bool(_rg_cfg["enabled"]) else "0"
+        )
+    _rg_backing = _rg_cfg.get("backing_tools")
+    if _rg_backing:
+        try:
+            if isinstance(_rg_backing, (list, tuple)):
+                os.environ["OPENAGENT_REPLY_GUARD_BACKING_TOOLS"] = ",".join(
+                    str(x) for x in _rg_backing
+                )
+            else:
+                os.environ["OPENAGENT_REPLY_GUARD_BACKING_TOOLS"] = str(_rg_backing)
+        except (TypeError, ValueError):
+            pass
     # Per-run cost-anomaly alerting (``src/core/cost_anomaly.py``). Defaults ON
     # with safe thresholds (a mostly-cached few-cent run can't page); maps
     # ``cost_anomaly.*`` (top-level, or under ``memory:``) to the env vars that

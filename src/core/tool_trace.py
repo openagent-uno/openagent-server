@@ -164,6 +164,16 @@ def take(session_id: Optional[str]) -> Optional[list[tuple[str, str]]]:
     return _PUBLISHED.pop(session_id, None)
 
 
+def peek(session_id: Optional[str]) -> Optional[list[tuple[str, str]]]:
+    """Read the most recent published trace for ``session_id`` WITHOUT consuming
+    it, so a pre-send reader (the reply guard) can inspect this turn's tool calls
+    while leaving the entry for ``take`` (the quality judge) to drain afterwards.
+    Returns ``None`` when nothing was published (disabled, or a no-tool run)."""
+    if not session_id:
+        return None
+    return _PUBLISHED.get(session_id)
+
+
 def render(rows: Optional[list[tuple[str, str]]], *, max_chars: int = 3000) -> str:
     """Render a compact, bounded TOOL TRACE block for the judge prompt.
 

@@ -353,6 +353,10 @@ _TEST_MODULES: tuple[str, ...] = (
     # the summed input_tokens counter a cached agentic loop inflates ~10x (the
     # "447,229 input tokens!" false alarm on a $0.018 run). Pure-unit.
     "test_cost_anomaly",
+    # Anti-fabrication reply guard — rewrites an unbacked human-follow-up
+    # promise before send; fail-open on disabled / no-promise / backed / no
+    # tool visibility / regeneration failure. Pure-unit (fake model + trace).
+    "test_reply_guard",
     # Quality digest — the scheduled push side: summary + flagged-session review
     # list + threshold alerts (incl. embedder-down via embed-error spikes).
     "test_quality_digest",

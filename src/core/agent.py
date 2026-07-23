@@ -1555,6 +1555,16 @@ class Agent:
                 attachments=len(attachments or []),
             )
             result = await self._run_inner(message, attachments, _status, session_id=session_id, model_override=model_override, author=author)
+            # Anti-fabrication guard (opt-in): if the reply promises human/team
+            # follow-up but no backing action tool ran this turn, rewrite it
+            # once to drop the unbacked promise. Runs BEFORE the quality monitor
+            # so its non-consuming tool-trace peek leaves the trace for the
+            # judge's take(). Fail-open: any failure returns `result` unchanged.
+            try:
+                from src.core import reply_guard
+                result = await reply_guard.guard_reply(self, session_id, message, result)
+            except Exception:  # noqa: BLE001 — the guard must never affect the turn
+                pass
             # Quality monitor (opt-in, sampled): grade this completed turn off
             # the reply path — fire-and-forget, so the judge's latency/cost never
             # sit on the response. Zero allocation + no task when disabled.
