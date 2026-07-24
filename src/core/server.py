@@ -1135,6 +1135,25 @@ def _build_agent(config: dict) -> Agent:
                 os.environ["OPENAGENT_REPLY_GUARD_BACKING_TOOLS"] = str(_rg_backing)
         except (TypeError, ValueError):
             pass
+    # Hard ("strict") budget scopes (``src/core/budget_guard.py``). A scope
+    # listed here has its cap enforced even when that leaves ZERO enabled models
+    # — the agent goes OFFLINE rather than overspend (overrides the default
+    # never-empty-catalog safety for the named scopes only). Maps
+    # ``budget.strict_scopes`` (a list like ``["provider:deepseek"]``, or a
+    # comma string) to ``OPENAGENT_BUDGET_STRICT_SCOPES``. Absent → no strict
+    # scopes (default safety holds).
+    _bg_cfg = (config.get("budget") or memory_cfg.get("budget") or {})
+    _strict = _bg_cfg.get("strict_scopes")
+    if _strict:
+        try:
+            if isinstance(_strict, (list, tuple)):
+                os.environ["OPENAGENT_BUDGET_STRICT_SCOPES"] = ",".join(
+                    str(x) for x in _strict
+                )
+            else:
+                os.environ["OPENAGENT_BUDGET_STRICT_SCOPES"] = str(_strict)
+        except (TypeError, ValueError):
+            pass
     # Per-run cost-anomaly alerting (``src/core/cost_anomaly.py``). Defaults ON
     # with safe thresholds (a mostly-cached few-cent run can't page); maps
     # ``cost_anomaly.*`` (top-level, or under ``memory:``) to the env vars that

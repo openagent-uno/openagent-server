@@ -61,6 +61,7 @@ bad regex — and never crashes a turn or takes the agent offline.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone as _timezone
@@ -73,6 +74,37 @@ from src.core.logging import elog
 # (scheduler skip + mid-run cancel) is phase 2 and lives at other hooks — a task
 # is a CALLER, not a routing target, so excluding a model can't stop it.
 ENFORCEABLE_SCOPE_KINDS = frozenset({"global", "provider", "model"})
+
+# Scopes whose cap is HARD ("strict"): enforced even when excluding them would
+# leave ZERO enabled models — the agent goes OFFLINE rather than overspend. This
+# deliberately overrides the "never empty the catalog" safety for the named
+# scopes only. Set ``OPENAGENT_BUDGET_STRICT_SCOPES`` to a comma list of
+# ``kind:value`` (e.g. ``provider:deepseek``) or the bare word ``global``.
+# Unset/empty (the default) → no strict scopes: the never-empty safety holds
+# exactly as before, so a deployment that never opts in is byte-identical.
+_STRICT_SCOPES_ENV = "OPENAGENT_BUDGET_STRICT_SCOPES"
+
+
+def _strict_scopes() -> frozenset[tuple[str, str]]:
+    """Parse ``OPENAGENT_BUDGET_STRICT_SCOPES`` into a set of (scope_kind,
+    scope_value) keys. Never raises — a malformed token is skipped."""
+    raw = os.environ.get(_STRICT_SCOPES_ENV, "").strip()
+    if not raw:
+        return frozenset()
+    out: set[tuple[str, str]] = set()
+    for tok in raw.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if tok == "global":
+            out.add(("global", ""))
+        elif ":" in tok:
+            kind, value = tok.split(":", 1)
+            kind = kind.strip()
+            value = value.strip()
+            if kind in ENFORCEABLE_SCOPE_KINDS:
+                out.add((kind, "" if kind == "global" else value))
+    return frozenset(out)
 ENFORCEABLE_WINDOWS = frozenset({"hour", "day", "month"})
 ALL_SCOPE_KINDS = frozenset({"global", "provider", "model", "task"})
 ALL_WINDOWS = frozenset({"hour", "day", "month", "per_run"})
@@ -536,9 +568,35 @@ class BudgetGuard:
             self._log_excluded({e.runtime_id for e in entries if _specific(e)})
             return only_global
 
-        # Nothing left to route to without going fully offline (all models are
-        # individually capped, or the only cap is a global one that can't be
-        # routed around). Stay online and log that the cap was not enforced.
+        # Nothing left to route to without going fully offline. Default policy
+        # is to stay online (never leave zero models). BUT a scope named in
+        # ``OPENAGENT_BUDGET_STRICT_SCOPES`` is HARD: its cap is enforced even
+        # here, dropping its models from routing even if that empties the
+        # catalog (the operator chose "go offline rather than overspend").
+        strict = _strict_scopes()
+        if strict:
+            def _strict_blocked(e) -> bool:
+                rid = getattr(e, "runtime_id", None)
+                provider = getattr(e, "provider", None)
+                if ("global", "") in strict and global_over:
+                    return True
+                if ("provider", provider) in strict and ("provider", provider) in keys:
+                    return True
+                if ("model", rid) in strict and ("model", rid) in keys:
+                    return True
+                return False
+
+            survivors = [e for e in entries if not _strict_blocked(e)]
+            if len(survivors) < len(entries):
+                # At least one strict scope is enforcing. Return the survivors
+                # (possibly EMPTY → the agent goes offline, by design).
+                self._log_strict_enforced(
+                    {e.runtime_id for e in entries if _strict_blocked(e)},
+                    offline=not survivors,
+                )
+                return survivors
+
+        # No strict scope in play — stay online and log the cap was not enforced.
         self._log_would_empty({e.runtime_id for e in entries if _blocked(e)})
         return entries
 
@@ -549,6 +607,27 @@ class BudgetGuard:
         self._last_excluded_key = key
         self._last_would_empty_key = None
         elog("budget.scope_excluded", level="warning", blocked=sorted(blocked))
+
+    def _log_strict_enforced(self, blocked: set[str], *, offline: bool) -> None:
+        key = frozenset(blocked)
+        if key == self._last_excluded_key:
+            return
+        self._last_excluded_key = key
+        self._last_would_empty_key = None
+        elog(
+            "budget.cap_enforced_strict",
+            level="warning",
+            blocked=sorted(blocked),
+            offline=offline,
+            note=(
+                "a strict-scope cap (OPENAGENT_BUDGET_STRICT_SCOPES) is over "
+                "budget and enforced" + (
+                    " — no models remain, the agent is OFFLINE until the window "
+                    "resets (chose to go offline rather than overspend)"
+                    if offline else " while other models stay online"
+                )
+            ),
+        )
 
     def _log_would_empty(self, blocked: set[str]) -> None:
         key = frozenset(blocked)

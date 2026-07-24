@@ -394,3 +394,98 @@ async def t_budget_seed_reconcile(ctx: TestContext) -> None:
         assert rows2[0]["amount"] == 25.0, "operator's app edit was clobbered on reboot"
     finally:
         await db.close()
+
+
+# ── strict scopes (hard cap: enforce even if it empties the catalog) ────
+# OPENAGENT_BUDGET_STRICT_SCOPES lets an operator say "for THIS scope, go
+# offline rather than overspend" — overriding the never-empty safety for the
+# named scope only.
+
+
+@test("budget_guard", "_strict_scopes parses kind:value list + bare 'global'")
+async def t_strict_scopes_parse(ctx: TestContext) -> None:
+    import os
+    from src.core.budget_guard import _strict_scopes
+    os.environ["OPENAGENT_BUDGET_STRICT_SCOPES"] = "provider:deepseek, model:x:y , global, junk, task:t"
+    try:
+        got = _strict_scopes()
+    finally:
+        os.environ.pop("OPENAGENT_BUDGET_STRICT_SCOPES", None)
+    assert ("provider", "deepseek") in got
+    assert ("model", "x:y") in got          # value may itself contain a colon
+    assert ("global", "") in got
+    assert ("junk", "") not in got          # no colon, not 'global' → skipped
+    assert ("task", "t") not in got         # task is not an enforceable scope
+    # unset → empty
+    os.environ.pop("OPENAGENT_BUDGET_STRICT_SCOPES", None)
+    assert _strict_scopes() == frozenset()
+
+
+@test("budget_guard", "STRICT scope cap enforces even if it empties the catalog (agent goes offline)")
+async def t_budget_strict_offline(ctx: TestContext) -> None:
+    import os
+    db, disp = await _make(ctx, _providers(("deepseek", ["deepseek-v4-pro"])))
+    os.environ["OPENAGENT_BUDGET_STRICT_SCOPES"] = "provider:deepseek"
+    try:
+        await db.add_budget(scope_kind="provider", scope_value="deepseek",
+                            metric="tokens", window="day", amount=100)
+        await _rec(db, "deepseek:deepseek-v4-pro", tokens=120)  # over 100
+        with _capture_elog() as events:
+            await disp.budget_guard.refresh()
+            ids = _ids(disp)
+        assert ids == [], f"strict cap must take the ONLY model offline, got {ids}"
+        names = [n for n, _ in events]
+        assert "budget.cap_enforced_strict" in names, "strict enforcement not logged"
+        assert "budget.cap_not_enforced_would_empty_catalog" not in names, (
+            "strict scope must NOT fall through to the never-empty refusal")
+    finally:
+        os.environ.pop("OPENAGENT_BUDGET_STRICT_SCOPES", None)
+        await db.close()
+
+
+@test("budget_guard", "STRICT drops its own models but keeps NON-strict models online")
+async def t_budget_strict_partial(ctx: TestContext) -> None:
+    import os
+    db, disp = await _make(ctx, _providers(
+        ("deepseek", ["deepseek-v4-pro"]), ("anthropic", ["claude-opus-4-8"])))
+    os.environ["OPENAGENT_BUDGET_STRICT_SCOPES"] = "provider:deepseek"
+    try:
+        # both providers over their OWN token caps → both blocked → would-empty
+        await db.add_budget(scope_kind="provider", scope_value="deepseek",
+                            metric="tokens", window="day", amount=100)
+        await db.add_budget(scope_kind="provider", scope_value="anthropic",
+                            metric="tokens", window="day", amount=100)
+        await _rec(db, "deepseek:deepseek-v4-pro", tokens=120)
+        await _rec(db, "anthropic:claude-opus-4-8", tokens=120)
+        await disp.budget_guard.refresh()
+        ids = _ids(disp)
+        # strict deepseek dropped (offline for it); non-strict anthropic kept
+        # online by the never-empty safety.
+        assert ids == ["anthropic:claude-opus-4-8"], (
+            f"strict deepseek should drop, non-strict anthropic stay: {ids}")
+    finally:
+        os.environ.pop("OPENAGENT_BUDGET_STRICT_SCOPES", None)
+        await db.close()
+
+
+@test("budget_guard", "STRICT env naming a DIFFERENT scope → never-empty safety still holds")
+async def t_budget_strict_nonmatching(ctx: TestContext) -> None:
+    import os
+    db, disp = await _make(ctx, _providers(("deepseek", ["deepseek-v4-pro"])))
+    # strict names anthropic, but it is deepseek that is over cap → not strict
+    os.environ["OPENAGENT_BUDGET_STRICT_SCOPES"] = "provider:anthropic"
+    try:
+        await db.add_budget(scope_kind="provider", scope_value="deepseek",
+                            metric="tokens", window="day", amount=100)
+        await _rec(db, "deepseek:deepseek-v4-pro", tokens=120)
+        with _capture_elog() as events:
+            await disp.budget_guard.refresh()
+            ids = _ids(disp)
+        assert ids == ["deepseek:deepseek-v4-pro"], (
+            "a non-matching strict scope must not take the agent offline")
+        names = [n for n, _ in events]
+        assert "budget.cap_not_enforced_would_empty_catalog" in names
+        assert "budget.cap_enforced_strict" not in names
+    finally:
+        os.environ.pop("OPENAGENT_BUDGET_STRICT_SCOPES", None)
+        await db.close()
