@@ -1293,3 +1293,75 @@ async def t_summary_fallback_picker(ctx: TestContext) -> None:
     finally:
         np_mod.NativeProvider = orig_np
         os.environ.pop(compaction._SUMMARY_FALLBACK_MODEL_ENV, None)
+
+
+# ── 6. the fold is bounded by the SUMMARISER's window, not the primary's ──
+
+
+@test("compaction", "summary transcript is clamped to the summariser's context window")
+async def t_summary_transcript_clamped_to_summariser_window(ctx: TestContext) -> None:
+    """A fold sized for the primary must not overflow a smaller summariser.
+
+    Regression for the 2026-07-30 production break: the trigger budget is
+    computed against the PRIMARY's window, the fold is sent to the summariser
+    (``OPENAGENT_COMPACTION_MODEL`` exists to make that a different, cheaper,
+    smaller-window row), and nothing reconciled the two — the provider rejected
+    the call with ``prompt is too long: 213760 tokens > 200000 maximum`` and
+    every long session silently stopped compacting.
+    """
+    from src.core import compaction
+
+    # 40 turns of ~400 chars each: comfortably past a 1000-token window.
+    runs = [
+        {"content": "", "messages": [
+            {"role": "user", "content": f"turn {i} " + ("lorem ipsum " * 30)}]}
+        for i in range(40)
+    ]
+    # Primary has a huge window; the summariser is the small one that matters.
+    primary = _FakeModel(model="big/primary", max_context=1_000_000)
+    summariser = _FakeModel(model="small/summariser", max_context=1000,
+                            summary="Recap.")
+    agent = _FakeAgent(str(ctx.test_dir / "clamp.db"), primary)
+
+    orig_pick = compaction._pick_summary_model
+    compaction._pick_summary_model = lambda a, *, fallback: summariser
+    try:
+        out = await compaction._summarize_runs(runs, primary, agent)
+    finally:
+        compaction._pick_summary_model = orig_pick
+
+    assert out == "Recap.", out
+    assert len(summariser.generate_calls) == 1, "summariser called once"
+    sent = summariser.generate_calls[0]["messages"][0]["content"]
+    budget = int(1000 * compaction._summary_input_fraction())
+    sent_tokens = compaction._estimate_text_tokens(sent, "small/summariser")
+    # The wrapper text rides along, so allow it — what must NOT happen is the
+    # whole 40-turn transcript going out at ~4000 tokens against a 1000 window.
+    assert sent_tokens < 1000, f"prompt still overflows the window: {sent_tokens}"
+    assert sent_tokens <= budget * 2, f"prompt far past budget {budget}: {sent_tokens}"
+    # Oldest dropped, newest kept: the recap must describe where we ARE.
+    assert "turn 39" in sent, "most recent turn must survive the clamp"
+    assert "turn 0" not in sent, "oldest turn should have been dropped"
+
+
+@test("compaction", "no clamp when the transcript already fits the summariser")
+async def t_summary_transcript_untouched_when_it_fits(ctx: TestContext) -> None:
+    from src.core import compaction
+
+    runs = [{"content": "", "messages": [
+        {"role": "user", "content": "short turn about a billing charge"}]}]
+    primary = _FakeModel(model="big/primary", max_context=1_000_000)
+    summariser = _FakeModel(model="small/summariser", max_context=200_000,
+                            summary="Recap.")
+    agent = _FakeAgent(str(ctx.test_dir / "noclamp.db"), primary)
+
+    orig_pick = compaction._pick_summary_model
+    compaction._pick_summary_model = lambda a, *, fallback: summariser
+    try:
+        out = await compaction._summarize_runs(runs, primary, agent)
+    finally:
+        compaction._pick_summary_model = orig_pick
+
+    assert out == "Recap."
+    sent = summariser.generate_calls[0]["messages"][0]["content"]
+    assert "billing charge" in sent, "a fitting transcript must pass through intact"

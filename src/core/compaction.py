@@ -134,6 +134,41 @@ _SUMMARY_MODEL_ENV = "OPENAGENT_COMPACTION_MODEL"
 # one that just failed (an API-key provider is never OAuth-limited).
 _SUMMARY_FALLBACK_MODEL_ENV = "OPENAGENT_COMPACTION_FALLBACK_MODEL"
 
+# Fraction of the SUMMARISER's context window the folded transcript may fill.
+#
+# The trigger budget above answers "is the PRIMARY about to overflow?" and is
+# computed against the primary's window. The fold itself is then sent to the
+# summariser — which ``_SUMMARY_MODEL_ENV`` exists specifically to make a
+# different, cheaper, and therefore often SMALLER-window row. Nothing
+# reconciled the two, so a transcript sized for a 1M-window primary was handed
+# to a 200k summariser verbatim.
+#
+# Observed 2026-07-30 on a Claude-subscription proxy: a ~150k-token history
+# produced a 213_760-token summary prompt and the provider rejected the call
+# with ``prompt is too long: 213760 tokens > 200000 maximum``. Every long
+# session then stopped compacting — precisely the sessions compaction exists
+# for — and grew until the turn itself failed.
+#
+# 0.60 leaves room for the system prompt, the wrapper text, tokenizer estimate
+# error (we measure with tiktoken; the provider counts its own way), and the
+# recap the model still has to write back.
+_DEFAULT_SUMMARY_INPUT_FRACTION = 0.60
+
+
+def _summary_input_fraction() -> float:
+    """Fraction of the summariser's window the transcript may occupy."""
+    raw = os.environ.get(
+        "OPENAGENT_COMPACTION_SUMMARY_INPUT_FRACTION", "").strip()
+    if not raw:
+        return _DEFAULT_SUMMARY_INPUT_FRACTION
+    try:
+        val = float(raw)
+    except ValueError:
+        return _DEFAULT_SUMMARY_INPUT_FRACTION
+    if not 0 < val < 1:
+        return _DEFAULT_SUMMARY_INPUT_FRACTION
+    return val
+
 
 def _cost_ceiling() -> int:
     raw = os.environ.get("OPENAGENT_COMPACTION_MAX_HISTORY_TOKENS", "").strip()
@@ -599,6 +634,13 @@ async def _summarize_runs(
 
     Returns an empty string on failure — the caller treats that as "skip
     this compaction pass" rather than blowing up the turn.
+
+    The transcript is bounded by the SUMMARISER's own context window, not the
+    primary's: see ``_DEFAULT_SUMMARY_INPUT_FRACTION`` for why those are not
+    the same number and what breaks when you assume they are. When the fold
+    doesn't fit we drop the OLDEST turns — the recent ones carry the state a
+    future assistant actually has to continue from — and say so in the log
+    rather than silently losing them.
     """
     transcript_parts: list[str] = []
     for idx, run in enumerate(runs, start=1):
@@ -608,6 +650,40 @@ async def _summarize_runs(
         transcript_parts.append(f"[Turn {idx}]\n{block}")
     if not transcript_parts:
         return ""
+
+    # Resolve the summariser BEFORE sizing the transcript: it decides the
+    # window we have to fit into, and it may not be the model we were called
+    # with. A summariser we can't resolve is an immediate skip anyway.
+    summariser = _pick_summary_model(agent, fallback=model)
+    if summariser is None:
+        return ""
+
+    summary_model_id = _resolve_model_id(summariser)
+    input_budget = int(
+        _resolve_max_context(summariser) * _summary_input_fraction())
+    kept: list[str] = []
+    used = 0
+    for part in reversed(transcript_parts):        # newest first
+        cost = _estimate_text_tokens(part, summary_model_id)
+        if kept and used + cost > input_budget:
+            break
+        kept.append(part)
+        used += cost
+    dropped = len(transcript_parts) - len(kept)
+    if dropped:
+        # Not silent: a fold that lost its oldest turns is a real (if
+        # acceptable) loss of context, and the operator should see it before
+        # they see a user complaining the assistant forgot something.
+        elog(
+            "runtime.compaction.transcript_trimmed",
+            level="warning",
+            dropped_turns=dropped,
+            kept_turns=len(kept),
+            input_budget=input_budget,
+            estimated_tokens=used,
+            summary_model=summary_model_id,
+        )
+    transcript_parts = list(reversed(kept))
     transcript = "\n\n".join(transcript_parts)
 
     system_prompt = (
@@ -625,10 +701,6 @@ async def _summarize_runs(
         "can read to continue it without loss of important context:\n\n"
         + transcript
     )
-
-    summariser = _pick_summary_model(agent, fallback=model)
-    if summariser is None:
-        return ""
 
     try:
         response = await summariser.generate(
