@@ -15,7 +15,15 @@ dependencies = [
     # submodule that ``collect_submodules("mcp")`` walks at PyInstaller build
     # time, so without typer the frozen build aborts with
     # "typer is required. Install with 'pip install mcp[cli]'".
-    "mcp[cli]>=1.0.0",
+    #
+    # Capped below 2.0: ``mcp`` 2.0.0 (2026-07-28) moved ``mcp.server.fastmcp``,
+    # which every server under ``src/mcp/servers/*`` imports directly. With no
+    # lock file committed, CI resolves this floor to the newest release on each
+    # run — so the day 2.0 shipped, a build that changed nothing relevant died
+    # with ``No module named 'mcp.server.fastmcp'`` across the whole suite.
+    # Migrating to the 2.x layout is real work and does not belong in whatever
+    # unrelated commit happens to run first after an upstream major.
+    "mcp[cli]>=1.0.0,<2",
     "click>=8.1.0",
     "rich>=13.0.0",
     "pyyaml>=6.0",
