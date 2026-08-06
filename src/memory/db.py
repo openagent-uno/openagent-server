@@ -2762,6 +2762,20 @@ class MemoryDB:
 
         return await self._write_with_retry(_do)
 
+    async def count_open_event_deliveries(self) -> int:
+        """Quante delivery non sono ancora finite (``received`` + ``running``).
+
+        Serve al battito dello scheduler: un numero che non scende mentre i beat
+        continuano dice che il loop e' vivo ma la coda non avanza — che e' un
+        guasto diverso da "il loop e' fermo", e i due vanno distinti."""
+        conn = await self._ensure_connected()
+        cur = await conn.execute(
+            "SELECT COUNT(*) FROM event_deliveries "
+            "WHERE status IN ('received','running')"
+        )
+        row = await cur.fetchone()
+        return int(row[0]) if row else 0
+
     async def reap_expired_event_leases(
         self,
         *,

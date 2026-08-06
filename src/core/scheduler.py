@@ -48,6 +48,13 @@ CHECK_INTERVAL = 30  # seconds between checking for due tasks
 # CHECK_INTERVAL — so "completely stop" actually feels immediate instead of
 # waiting up to a full 30 s due-task tick.
 CANCEL_CHECK_INTERVAL = 2  # seconds between draining cancellation requests
+# Battito di vita del loop. Il loop tick ogni 2s in SILENZIO: quando si ferma
+# (6-ago-2026: fermo ~17 minuti dopo un riavvio, con 4 delivery in coda che
+# nessuno riclamava) non resta traccia di nulla, e "zitto perche' non c'e'
+# lavoro" e' indistinguibile da "morto". Un beat ogni 5 minuti costa ~288 righe
+# al giorno e rende la differenza misurabile — da fuori bastano due beat
+# mancati per sapere che il reaper e i drain non stanno piu' girando.
+BEAT_INTERVAL = 300
 
 # Per-tick cap on how many ``cancelling`` rows a single drain processes. A
 # healthy system has ~0 at any moment; a high cap only matters after a mass
@@ -376,7 +383,10 @@ class Scheduler:
         # Anchor the throttle at loop start so the first sweep is one interval
         # out — the startup reap already handled boot orphans at t=0.
         self._last_stale_sweep = time.monotonic()
+        self._last_beat = 0.0
+        self._ticks = 0
         while True:
+            self._ticks += 1
             try:
                 await self._drain_cancellations()
             except Exception as e:  # noqa: BLE001
@@ -392,6 +402,22 @@ class Scheduler:
             # re-dispatched in the same tick. Only touches rows with a NON-NULL
             # ``claim_expires``, so pre-existing (legacy) in-flight rows are never
             # reclaimed here — the age-gated sweep below still covers those.
+            # Battito: prova che il loop e' vivo, con la profondita' della coda.
+            # Va PRIMA del reap/drain cosi' esce anche se uno di quelli si pianta.
+            try:
+                _now = time.monotonic()
+                if _now - self._last_beat >= BEAT_INTERVAL:
+                    self._last_beat = _now
+                    _pending = None
+                    if self.db is not None and hasattr(self.db, "count_open_event_deliveries"):
+                        try:
+                            _pending = await self.db.count_open_event_deliveries()
+                        except Exception:  # noqa: BLE001 — il beat non deve mai fallire
+                            _pending = None
+                    elog("scheduler.beat", ticks=self._ticks,
+                         pending=_pending if _pending is not None else -1)
+            except Exception as e:  # noqa: BLE001
+                elog("scheduler.beat_error", level="warning", error=str(e))
             try:
                 await self._reap_expired_event_leases()
             except Exception as e:  # noqa: BLE001
