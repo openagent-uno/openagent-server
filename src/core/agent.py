@@ -759,6 +759,8 @@ def _recall_block(agent: Any, query: str, session_id: str | None = None) -> str:
     and the threshold is what does the real quality-gating. Wiring the recall
     ledger in — prefer notes with a good measured ok_rate — is the follow-up.
     """
+    import time as _time  # locale: questo modulo non importa time a livello globale
+    _t0 = _time.monotonic()
     k = max(1, _recall_int("OPENAGENT_AUTO_RECALL_TOP_K", 3))
     floor = _recall_float("OPENAGENT_AUTO_RECALL_MIN_SCORE", 0.75)
     # Per-origin corpus scoping. Defaults are the identity (scope 'all', no path
@@ -858,7 +860,8 @@ def _recall_block(agent: Any, query: str, session_id: str | None = None) -> str:
         _top = max((h["score"] for h in hits if h.get("score") is not None),
                    default=0.0)
         quality_monitor.note_recall(
-            session_id, used=True, hits=len(hits), top_score=_top)
+            session_id, used=True, hits=len(hits), top_score=_top,
+            ms=int((_time.monotonic() - _t0) * 1000) if _t0 else None)
     except Exception:  # noqa: BLE001 — a metric must never block recall
         pass
     if not hits:

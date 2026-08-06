@@ -431,6 +431,13 @@ class SemanticIndex:
                            else default_semantic_index_path(self.db_path))
         self.embedder = embedder
         self._lock = threading.RLock()
+        # Matrice impilata per tabella, tenuta in RAM fra una query e l'altra.
+        # Senza, ogni search() rifa` `SELECT *` su TUTTI i vettori (16 MB su un
+        # vault da 5k note) e ricostruisce la matrice, sotto il lock globale: con
+        # piu` run in parallelo le recall si serializzano e sforano il timeout.
+        # {tabella: (generazione, dim, matrice|None, righe)}
+        self._mat_cache: dict[str, tuple[int, int, Any, list[sqlite3.Row]]] = {}
+        self._gen = 0
         self.index_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.index_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
@@ -452,6 +459,24 @@ class SemanticIndex:
     def active(self) -> bool:
         """True when an embedder is wired — i.e. the layer is not inert."""
         return self.embedder is not None
+
+    def _commit(self) -> None:
+        """Commit + invalidazione, sempre insieme.
+
+        Ogni scrittura sui vettori rende stantia la matrice in cache: tenerle
+        legate qui e` cio` che impedisce a una recall di rispondere su un indice
+        vecchio. Tutti i ``sync_*`` chiamano questo, mai ``_conn.commit()``."""
+        self._conn.commit()
+        self._invalidate_cache()
+
+    def _invalidate_cache(self) -> None:
+        """Butta la matrice in cache: da chiamare dopo OGNI scrittura sui vettori.
+
+        Va sempre invocata con ``self._lock`` gia` preso (come fanno tutti i
+        ``sync_*``), cosi` una query concorrente non puo` vedere una matrice
+        disallineata rispetto alle righe."""
+        self._gen += 1
+        self._mat_cache.clear()
 
     def _ensure_meta(self) -> None:
         """Wipe the cache when it was built from a different DB, a different
@@ -480,7 +505,7 @@ class SemanticIndex:
                              ("embed_model", model)):
                     self._conn.execute(
                         "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)", (k, v))
-                self._conn.commit()
+                self._commit()
 
     def _open_source(self) -> Optional[sqlite3.Connection]:
         """Open the agent DB read-write (a ``mode=ro`` connection cannot recover
@@ -590,7 +615,7 @@ class SemanticIndex:
                 except EmbeddingError as exc:
                     self._log_embed_error("vault", exc)
                     stats.errored = True
-                    self._conn.commit()
+                    self._commit()
                     stats.elapsed_ms = int((time.monotonic() - t0) * 1000)
                     return stats
                 for (rel, mtime, size, title, updated), (blob, dim) in zip(rows, blobs):
@@ -608,7 +633,7 @@ class SemanticIndex:
                     stats.embedded += 1
                     stats.added += 1 if rel not in existing else 0
                     stats.updated += 1 if rel in existing else 0
-            self._conn.commit()
+            self._commit()
         stats.elapsed_ms = int((time.monotonic() - t0) * 1000)
         return stats
 
@@ -704,7 +729,7 @@ class SemanticIndex:
                     except EmbeddingError as exc:
                         self._log_embed_error("sessions", exc)
                         stats.errored = True
-                        self._conn.commit()
+                        self._commit()
                         stats.elapsed_ms = int((time.monotonic() - t0) * 1000)
                         return stats
                     for (sid, upd, rlen, title, origin), (blob, dim) in zip(metas, blobs):
@@ -722,7 +747,7 @@ class SemanticIndex:
                         stats.embedded += 1
                         stats.added += 1 if sid not in existing else 0
                         stats.updated += 1 if sid in existing else 0
-                self._conn.commit()
+                self._commit()
             finally:
                 try:
                     src.close()
@@ -773,7 +798,7 @@ class SemanticIndex:
                     self._conn.execute(
                         "DELETE FROM skill_vectors WHERE path = ?", (rel,))
                     stats.deleted += 1
-                self._conn.commit()
+                self._commit()
             stats.elapsed_ms = int((time.monotonic() - t0) * 1000)
             return stats
 
@@ -843,7 +868,7 @@ class SemanticIndex:
                 except EmbeddingError as exc:
                     self._log_embed_error("skills", exc)
                     stats.errored = True
-                    self._conn.commit()
+                    self._commit()
                     stats.elapsed_ms = int((time.monotonic() - t0) * 1000)
                     return stats
                 for (rel, name, category, _digest, mtime, size), (blob, dim) in zip(
@@ -862,7 +887,7 @@ class SemanticIndex:
                     stats.embedded += 1
                     stats.added += 1 if rel not in existing else 0
                     stats.updated += 1 if rel in existing else 0
-            self._conn.commit()
+            self._commit()
         stats.elapsed_ms = int((time.monotonic() - t0) * 1000)
         return stats
 
@@ -898,26 +923,30 @@ class SemanticIndex:
         stacked matrix; numpy-free path: a stdlib dot-product loop (fine over the
         few-thousand vectors a vault holds). Rows whose ``dim`` mismatches the
         query — e.g. a leftover from a different embed model — are skipped."""
-        rows = list(self._conn.execute(f"SELECT * FROM {table}"))
-        if not rows:
-            return []
         dim = len(q)
-        if _HAS_NUMPY:
+        cached = self._mat_cache.get(table)
+        if cached is None or cached[0] != self._gen or cached[1] != dim:
+            rows = list(self._conn.execute(f"SELECT * FROM {table}"))
             keep = [r for r in rows if r["dim"] == dim]
-            if not keep:
-                return []
-            mat = np.frombuffer(b"".join(r["vec"] for r in keep), dtype=np.float32)
-            mat = mat.reshape(len(keep), dim)
+            mat = None
+            if keep and _HAS_NUMPY:
+                mat = np.frombuffer(
+                    b"".join(r["vec"] for r in keep), dtype=np.float32
+                ).reshape(len(keep), dim)
+            elif keep:
+                # Senza numpy si tengono i vettori gia` decodificati: la decodifica
+                # da blob e` la meta` del costo, e rifarla a ogni query e` sprecata.
+                mat = [array.array("f", r["vec"]) for r in keep]
+            self._mat_cache[table] = (self._gen, dim, mat, keep)
+            cached = self._mat_cache[table]
+        _gen, _dim, mat, keep = cached
+        if not keep:
+            return []
+        if _HAS_NUMPY:
             sims = (mat @ np.asarray(q, dtype=np.float32)).tolist()
             return list(zip(keep, sims))
-        out: list[tuple[sqlite3.Row, float]] = []
-        for r in rows:
-            if r["dim"] != dim:
-                continue
-            v = array.array("f")
-            v.frombytes(r["vec"])
-            out.append((r, math.fsum(a * b for a, b in zip(v, q))))
-        return out
+        return [(r, math.fsum(a * b for a, b in zip(v, q)))
+                for r, v in zip(keep, mat)]
 
     def search(self, query: str, *, scope: str = "all", limit: int = 5,
                min_score: float = 0.0,

@@ -135,19 +135,27 @@ def should_sample(session_id: Optional[str], response: str) -> bool:
 # ── recall-quality metric (called from the auto-recall path) ─────────────
 
 def note_recall(session_id: Optional[str], *, used: bool,
-                hits: int, top_score: float) -> None:
+                hits: int, top_score: float, ms: Optional[int] = None) -> None:
     """Record one turn's recall outcome as a ``recall.metric`` event.
 
     No-op when the monitor is disabled. ``used`` is whether semantic recall was
     even attempted (an embedder is wired), ``hits``/``top_score`` describe what
     cleared the threshold — so the aggregate can report a hit-rate and a score
-    distribution, the signal for tuning ``min_score``.
+    distribution, the signal for tuning ``min_score``. ``ms`` is how long the
+    whole recall took: it is what tells you how much room is left before
+    ``OPENAGENT_AUTO_RECALL_TIMEOUT`` starts cutting turns off in silence.
     """
     if not enabled():
         return
     try:
+        fields = {}
+        # Durata del recall: senza, un timeout si vede solo come
+        # ``auto_recall.hook_error`` e non si sa MAI quanto margine restava.
+        # Con questa il p95 e' misurabile e il timeout si tara sui dati.
+        if ms is not None:
+            fields["ms"] = int(ms)
         elog("recall.metric", session_id=session_id, used=bool(used),
-             hits=int(hits), top_score=round(float(top_score), 4))
+             hits=int(hits), top_score=round(float(top_score), 4), **fields)
     except Exception:  # noqa: BLE001 — a metric must never break a turn
         pass
 
