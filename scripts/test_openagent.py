@@ -412,6 +412,14 @@ _TEST_MODULES: tuple[str, ...] = (
     # ``failed``, bounded by a replay budget, and a replay resumes the SAME
     # bound session so Replio's reply_guard blocks a double customer reply.
     "test_event_delivery_reenqueue",
+    # Pre-delivery precondition: an event can declare a cheap check that
+    # settles "is there still work here?" with one HTTP call, so a delivery
+    # whose state moved on while it queued closes as ``skipped`` instead of
+    # paying a model turn to discover it. Pins the safety property that makes
+    # the feature acceptable at all — it skips only on an unambiguous match,
+    # and every other outcome (unreachable, non-2xx, absent field, unresolved
+    # payload path, missing credential, malformed spec) runs the delivery.
+    "test_event_precondition",
     # The PERIODIC, age-gated sibling of the above: a delivery orphaned
     # WITHOUT a restart (detached dispatch task died while the process kept
     # running) is recovered by ``reap_stale_event_deliveries`` on a sweep —

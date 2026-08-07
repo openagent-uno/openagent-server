@@ -325,6 +325,27 @@ async def dispatch_event(
             except Exception:  # noqa: BLE001
                 pass
 
+    # Cheapest possible exit first: is there still work to do? A queued
+    # delivery runs against state that has moved on since it was enqueued, and
+    # discovering that inside the model turn costs a full turn to learn
+    # nothing. Fails open — see ``event_precondition``.
+    try:
+        from src.core.event_precondition import should_skip
+        skip, reason = await should_skip(event, payload)
+    except Exception as exc:  # noqa: BLE001 — never let the guard eat a delivery
+        elog("event.precondition_error", level="warning",
+             id=event_id, error=f"{type(exc).__name__}: {exc}"[:200])
+        skip, reason = False, ""
+    if skip:
+        await db.update_event_delivery(
+            delivery_id, status="skipped", output=reason[:500],
+            finished_at=_now(),
+        )
+        _emit()
+        elog("event.skipped", id=event_id, name=event.get("name", ""),
+             source=source, delivery=delivery_id, reason=reason[:160])
+        return {"status": "skipped", "output": reason[:500]}
+
     await db.update_event_delivery(delivery_id, status="running")
     _emit()
     elog("event.dispatch", id=event_id, name=event.get("name", ""),

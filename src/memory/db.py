@@ -797,6 +797,11 @@ CREATE TABLE IF NOT EXISTS events (
     -- one fresh event run session per delivery.
     session_binding_enabled INTEGER NOT NULL DEFAULT 0,
     session_binding_path    TEXT,
+    -- Optional cheap check run BEFORE the delivery (``_migrate_events_
+    -- precondition`` on old DBs). A queued delivery runs against state that has
+    -- moved on since it was enqueued; this settles "is there still work here?"
+    -- with one HTTP call instead of a model turn. NULL → always run.
+    precondition_json  TEXT,
     -- Guardrails (the webhook is the first cert-less inbound surface, and
     -- every delivery is a paid LLM run): requests over the cap are 413'd,
     -- more than ``rate_limit_per_min`` deliveries in a rolling minute are
@@ -1134,6 +1139,7 @@ class MemoryDB:
         await self._migrate_scheduled_tasks_model_column()
         await self._migrate_scheduled_tasks_timezone_column()
         await self._migrate_events_session_binding()
+        await self._migrate_events_precondition()
         await self._migrate_event_deliveries_reenqueue_count()
         await self._migrate_event_deliveries_lease()
         await self._migrate_events_breaker()
@@ -1422,6 +1428,29 @@ class MemoryDB:
         if "timezone" not in cols:
             await self._conn.execute(
                 "ALTER TABLE scheduled_tasks ADD COLUMN timezone TEXT"
+            )
+            await self._conn.commit()
+
+    async def _migrate_events_precondition(self) -> None:
+        """An event can declare a cheap check that runs BEFORE the delivery does.
+
+        Every prompt delivery is a paid model run, and a queued one runs against
+        state that has since moved on. On a support webhook that is the common
+        case, not the edge: measured 2026-08-07, ~22% of deliveries reached the
+        model only to read the thread and conclude someone had already answered.
+        The idempotency check itself was correct — it was just being performed
+        by the most expensive component available.
+
+        ``precondition_json`` lets the event state that check declaratively, so
+        the dispatcher can settle it with one HTTP call. NULL keeps the old
+        behaviour (always run).
+        """
+        assert self._conn is not None
+        cursor = await self._conn.execute("PRAGMA table_info(events)")
+        cols = {row[1] for row in await cursor.fetchall()}
+        if "precondition_json" not in cols:
+            await self._conn.execute(
+                "ALTER TABLE events ADD COLUMN precondition_json TEXT"
             )
             await self._conn.commit()
 
@@ -2482,6 +2511,7 @@ class MemoryDB:
             "action_ref", "prompt_template", "model", "rate_limit_per_min",
             "max_payload_bytes", "last_triggered_at",
             "session_binding_enabled", "session_binding_path",
+            "precondition_json",
             # Secret rotation goes through ``rotate_event_secret``; these are
             # accepted here too so that path can reuse the same UPDATE.
             "secret_enc", "secret_hint",
@@ -2494,6 +2524,10 @@ class MemoryDB:
                 v = 1 if v else 0
             if k == "session_binding_path":
                 v = (str(v).strip() if v is not None else "") or None
+            if k == "precondition_json" and v is not None and not isinstance(v, str):
+                # Accept the spec as a dict from callers that build it in code;
+                # store the canonical JSON either way.
+                v = json.dumps(v)
             updates[k] = v
         # ``input_schema`` is passed as a list and serialised here.
         if "input_schema" in kwargs:
