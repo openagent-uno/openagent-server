@@ -66,6 +66,7 @@ import os
 import re
 import sqlite3
 import time
+from functools import lru_cache
 from typing import Any
 
 from src.core.logging import elog
@@ -252,20 +253,31 @@ def _history_tool_result_chars() -> int:
 
 # ── Token estimation ──────────────────────────────────────────────────
 
-# Characters per token assumed when NO tokenizer exists for the model.
-#
-# The runtime's generic fallback is ``len(text) // 4`` — the ratio for English
-# prose. A compaction transcript is not English prose: it is tool-call JSON,
-# ids, paths, quoted logs, and (on a support agent) non-English text, all of
-# which tokenize far denser. Measured 2026-08-07 on a real Claude support fold:
-# ``len//4`` said 112_088 tokens, the provider counted 278_002 — 2.5x under. We
-# sized the fold on the wrong number, overflowed the summariser's window on
-# every attempt, and the session never deflated.
-#
-# 2.0 is deliberately pessimistic for prose and about right for transcripts.
-# The asymmetry is the whole point: over-estimating costs a few dropped old
-# turns, under-estimating costs the entire compaction pass.
+# Characters per token assumed when NO tokenizer at all is available (tiktoken
+# not installed). The runtime's own fallback here is ``len // 4`` — the ratio
+# for English prose — and a compaction transcript is not English prose: it is
+# tool-call JSON, ids, paths, quoted logs and (on a support agent) non-English
+# text, all of which tokenize denser.
 _DENSE_CHARS_PER_TOKEN = 2.0
+
+# Safety factor for a count produced by a tokenizer that is NOT the model's own.
+#
+# The trap this exists for: ``_get_tiktoken_encoding`` never says "I don't know
+# this model". For an id it doesn't recognise — every Anthropic row, everything
+# behind a local proxy — it silently returns ``o200k_base``, OpenAI's encoder.
+# So the count always LOOKS authoritative while being a guess about a different
+# vendor's tokenizer, and nothing downstream could tell the two apart.
+#
+# Measured 2026-08-07 on a real Claude support fold: we sized the transcript at
+# 112_088 tokens and the provider counted 278_002 — 2.5x. The fold overflowed
+# the summariser's window on every attempt, compaction was skipped every time,
+# and the session grew until it drained a weekly quota.
+#
+# 1.5 does not "correct" the estimate — nothing static could, the ratio depends
+# on the text. It buys enough headroom that the FIRST fold of a process usually
+# fits; when it doesn't, the provider tells us its real count and
+# ``_learn_density`` replaces this guess with a measurement for good.
+_PROXY_COUNT_MARGIN = 1.5
 
 # What a provider told us it ACTUALLY counted, per model id.
 #
@@ -302,36 +314,61 @@ def _learn_density(
     return _MEASURED_DENSITY[key]
 
 
+@lru_cache(maxsize=32)
+def _is_native_tokenizer(model_id: str | None) -> bool:
+    """True when the tokenizer we'd use is genuinely *this model's*.
+
+    ``count_text_tokens`` always answers. For a model it recognises it answers
+    with that model's own encoder; for one it doesn't it answers with
+    ``o200k_base`` and says nothing about the substitution. Only the first case
+    is a measurement — the second is an OpenAI-shaped guess at an Anthropic (or
+    anyone else's) tokenizer, and the difference decides whether the fold we
+    build fits the window we built it for.
+    """
+    mid = (model_id or "").lower()
+    if not mid:
+        return False
+    try:
+        from src.core._runner.utils.tokens import _get_hf_tokenizer
+        if _get_hf_tokenizer(mid) is not None:
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import tiktoken
+        tiktoken.encoding_for_model(mid)   # raises KeyError when unknown
+        return True
+    except Exception:  # noqa: BLE001 — KeyError, or tiktoken not installed
+        return False
+
+
 def _estimate_text_tokens(text: str, model_id: str | None) -> int:
     """Best-effort token count for *text* under *model_id*.
 
-    Defers to the runtime's existing tiktoken / HuggingFace tokenizer
-    selector (``src.core._runner.utils.tokens.count_text_tokens``) when one
-    genuinely covers *model_id* — it knows about Llama, Cohere, OpenAI
-    variants, etc. and keeps the answer aligned with what providers see
-    internally.
+    Defers to the runtime's tiktoken / HuggingFace selector
+    (``src.core._runner.utils.tokens.count_text_tokens``), then corrects it for
+    how much we should actually trust the answer:
 
-    When no tokenizer covers the model (every Anthropic row, and anything
-    behind a local proxy) that helper silently degrades to ``len // 4``, which
-    is not a measurement of this text — see ``_DENSE_CHARS_PER_TOKEN``. We use
-    the denser ratio instead, then apply whatever correction the provider has
-    already taught us for this model.
+    * a tokenizer that really covers this model is taken at face value;
+    * a stand-in encoder gets ``_PROXY_COUNT_MARGIN`` of headroom;
+    * whatever the provider has already told us about its own count
+      (``_learn_density``) overrides both, because that is a measurement.
+
+    Deliberately biased upward. Over-estimating drops a couple of old turns
+    from a fold; under-estimating loses the whole compaction pass, and with it
+    the only thing keeping a long session from growing without bound.
     """
     if not text:
         return 0
-    measured: int | None = None
+    native = _is_native_tokenizer(model_id)
     try:
-        from src.core._runner.utils.tokens import (
-            _select_tokenizer, count_text_tokens,
-        )
-        kind, _tok = _select_tokenizer(model_id or "gpt-4o")
-        if kind != "none":
-            measured = count_text_tokens(text, model_id or "gpt-4o")
+        from src.core._runner.utils.tokens import count_text_tokens
+        measured = count_text_tokens(text, model_id or "gpt-4o")
     except Exception:  # noqa: BLE001 — never let measurement block a turn
-        measured = None
-    if measured is None:
         measured = int(len(text) / _DENSE_CHARS_PER_TOKEN)
-    return max(1, int(measured * _density_factor(model_id)))
+        native = True   # already the pessimistic ratio; don't inflate twice
+    margin = 1.0 if native else _PROXY_COUNT_MARGIN
+    return max(1, int(measured * margin * _density_factor(model_id)))
 
 
 def _extract_run_text(run: dict[str, Any]) -> str:

@@ -1407,16 +1407,61 @@ async def t_context_window_is_per_model(_ctx: TestContext) -> None:
     assert unknown == compaction._FALLBACK_MAX_CONTEXT, unknown
 
 
-@test("compaction", "a model with no tokenizer is counted dense, not as prose")
-async def t_token_estimate_is_dense_without_a_tokenizer(_ctx: TestContext) -> None:
+@test("compaction", "a stand-in tokenizer is trusted less than the model's own")
+async def t_token_estimate_margins_a_foreign_tokenizer(_ctx: TestContext) -> None:
+    """``count_text_tokens`` never admits it is guessing — so we have to.
+
+    For an id it doesn't recognise, ``_get_tiktoken_encoding`` quietly returns
+    ``o200k_base`` instead of saying "no tokenizer for this model". The count
+    then looks as authoritative as any other while being an OpenAI-shaped guess
+    at Anthropic's tokenizer. Measured on a real fold, that guess was 2.5x low
+    and every fold overflowed.
+    """
     from src.core import compaction
 
-    text = "x" * 400_000
-    est = compaction._estimate_text_tokens(text, "local:claude-haiku-4-5")
+    # A transcript-shaped sample: JSON, ids, paths, non-English — not prose.
+    text = json.dumps({
+        "tool": "replio_thread_brief",
+        "thread_id": "5e547cd3-b137-4add-8130-cf8261655405",
+        "body": "porque me sale la suscripción cancelada si tiene que estar "
+                "activa, me podéis ayudar" * 40,
+        "path": "/data/agent/logs/events.jsonl",
+    }) * 20
 
-    # len//4 would say 100_000. That number is what overflowed every fold.
-    assert est > 150_000, f"still counting like English prose: {est}"
-    assert est <= 250_000, f"absurdly pessimistic: {est}"
+    foreign = compaction._estimate_text_tokens(text, "local:claude-haiku-4-5")
+    native = compaction._estimate_text_tokens(text, "gpt-4o")
+
+    assert not compaction._is_native_tokenizer("local:claude-haiku-4-5")
+    assert compaction._is_native_tokenizer("gpt-4o")
+    # Same bytes, same encoder underneath — the only difference is how much we
+    # are entitled to believe it.
+    assert foreign > native, (
+        f"a foreign tokenizer got no margin: {foreign} vs {native}")
+    assert foreign == int(native * compaction._PROXY_COUNT_MARGIN), (
+        f"unexpected margin: {foreign} vs {native}")
+
+
+@test("compaction", "the provider's own count replaces our guess, for good")
+async def t_learned_density_overrides_the_margin(_ctx: TestContext) -> None:
+    from src.core import compaction
+
+    model = "local:claude-test-density"
+    text = "some transcript content " * 500
+    orig = dict(compaction._MEASURED_DENSITY)
+    try:
+        before = compaction._estimate_text_tokens(text, model)
+        # The provider rejected a fold and stated its real count: 3x ours.
+        compaction._learn_density(model, counted=300_000, estimated=100_000)
+        after = compaction._estimate_text_tokens(text, model)
+        assert after > before, f"learning had no effect: {before} -> {after}"
+        assert abs(after / before - 3.0) < 0.05, f"ratio {after / before}"
+
+        # Ratcheted: a smaller correction must not undo a bigger measured one.
+        compaction._learn_density(model, counted=110_000, estimated=100_000)
+        assert compaction._estimate_text_tokens(text, model) == after
+    finally:
+        compaction._MEASURED_DENSITY.clear()
+        compaction._MEASURED_DENSITY.update(orig)
 
 
 @test("compaction", "a provider's size rejection is parsed; other failures are not")
