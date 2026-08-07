@@ -1365,3 +1365,146 @@ async def t_summary_transcript_untouched_when_it_fits(ctx: TestContext) -> None:
     assert out == "Recap."
     sent = summariser.generate_calls[0]["messages"][0]["content"]
     assert "billing charge" in sent, "a fitting transcript must pass through intact"
+
+
+# ── 7. sizing the fold: per-model windows and an honest token count ─────
+# The fold is bounded by the summariser's window (§6 above) — which is only
+# worth anything if BOTH numbers are right. Two ways they were wrong at once,
+# and together they kept a support agent from compacting for four days:
+#
+#   * every model resolved to the same 200k fallback, because the window
+#     lookup only answered for ids in OpenRouter's catalog and a proxy-served
+#     id ("local:claude-haiku-4-5") is never in it; and
+#   * the token count degraded to len//4 for any model without a tokenizer —
+#     an English-prose ratio applied to tool JSON, which undercounted a real
+#     transcript by 2.5x (112_088 estimated, 278_002 counted).
+#
+# So the fold was cut to a budget that was not the summariser's, using a size
+# that was not the transcript's, and the provider rejected every attempt.
+
+
+@test("compaction", "the context window is per-model, not one fallback for all")
+async def t_context_window_is_per_model(_ctx: TestContext) -> None:
+    from src.core import compaction
+
+    class _Bare:
+        """A provider row that exposes only its id — the proxy-served shape."""
+
+        def __init__(self, model: str) -> None:
+            self.model = model
+
+    wide = compaction._resolve_max_context(_Bare("local:claude-opus-5"))
+    narrow = compaction._resolve_max_context(_Bare("local:claude-haiku-4-5"))
+    tiny = compaction._resolve_max_context(_Bare("local:deepseek-v4-pro"))
+
+    assert wide == 1_000_000, f"1M row resolved to {wide}"
+    assert narrow == 200_000, f"200k row resolved to {narrow}"
+    assert tiny < 200_000, f"deepseek resolved to {tiny}"
+    assert wide != narrow, "two different models must not share one window"
+
+    # An id we publish nothing about still falls back — conservatively.
+    unknown = compaction._resolve_max_context(_Bare("local:some-new-model"))
+    assert unknown == compaction._FALLBACK_MAX_CONTEXT, unknown
+
+
+@test("compaction", "a model with no tokenizer is counted dense, not as prose")
+async def t_token_estimate_is_dense_without_a_tokenizer(_ctx: TestContext) -> None:
+    from src.core import compaction
+
+    text = "x" * 400_000
+    est = compaction._estimate_text_tokens(text, "local:claude-haiku-4-5")
+
+    # len//4 would say 100_000. That number is what overflowed every fold.
+    assert est > 150_000, f"still counting like English prose: {est}"
+    assert est <= 250_000, f"absurdly pessimistic: {est}"
+
+
+@test("compaction", "a provider's size rejection is parsed; other failures are not")
+async def t_parse_too_long(_ctx: TestContext) -> None:
+    from src.core import compaction
+
+    anthropic = RuntimeError(
+        "{'type': 'error', 'error': {'type': 'invalid_request_error', "
+        "'message': 'prompt is too long: 278002 tokens > 200000 maximum'}}")
+    assert compaction._parse_too_long(anthropic) == (278002, 200000)
+
+    openai = RuntimeError(
+        "This model's maximum context length is 104856 tokens. However, "
+        "your messages resulted in 131204 tokens")
+    assert compaction._parse_too_long(openai) == (131204, 104856)
+
+    # A timeout or an exhausted account must NEVER be "fixed" by shrinking
+    # the transcript — that would silently throw away context to cure a
+    # problem that has nothing to do with size.
+    assert compaction._parse_too_long(RuntimeError("Request timed out.")) == (None, None)
+    assert compaction._parse_too_long(
+        RuntimeError("No available Claude OAuth accounts")) == (None, None)
+
+
+class _TooLongOnceModel:
+    """Rejects the first fold for size, then accepts a smaller one.
+
+    Mimics the real failure exactly: the provider states its own count and its
+    own maximum, which is the only honest measurement of the transcript we
+    ever get.
+    """
+
+    def __init__(self, model: str = "small/summariser", limit_chars: int = 4000):
+        self.model = model
+        self.max_context = 200_000
+        self.limit_chars = limit_chars
+        self.generate_calls: list[dict] = []
+
+    async def generate(self, messages, **kwargs):  # noqa: ANN001
+        self.generate_calls.append({"messages": messages, "kwargs": kwargs})
+        body = messages[0]["content"]
+        if len(body) > self.limit_chars:
+            raise RuntimeError(
+                "prompt is too long: "
+                f"{len(body)} tokens > {self.limit_chars} maximum")
+
+        class _R:
+            content = "Recap."
+        return _R()
+
+
+@test("compaction", "a fold rejected for size is re-cut and retried on the same model")
+async def t_summary_refits_after_too_long(ctx: TestContext) -> None:
+    """The whole point: a fold that overflows is a fold WE sized wrong.
+
+    Before, an oversized fold fell through to a different provider carrying
+    the identical oversized prompt (failing again) or returned "" — which
+    left the session uncompacted, so the next turn was bigger, breached the
+    threshold again, and burned another oversized attempt. Four days of that
+    is what exhausted a weekly model quota.
+    """
+    from src.core import compaction
+
+    runs = [
+        {"content": "", "messages": [
+            {"role": "user", "content": f"turn {i} " + ("lorem ipsum " * 40)}]}
+        for i in range(30)
+    ]
+    primary = _FakeModel(model="big/primary", max_context=1_000_000)
+    summariser = _TooLongOnceModel()
+    agent = _FakeAgent(str(ctx.test_dir / "refit.db"), primary)
+
+    orig_pick = compaction._pick_summary_model
+    orig_density = dict(compaction._MEASURED_DENSITY)
+    compaction._pick_summary_model = lambda a, *, fallback: summariser
+    try:
+        out = await compaction._summarize_runs(runs, primary, agent)
+    finally:
+        compaction._pick_summary_model = orig_pick
+        compaction._MEASURED_DENSITY.clear()
+        compaction._MEASURED_DENSITY.update(orig_density)
+
+    assert out == "Recap.", f"the retry should have produced a recap, got {out!r}"
+    assert len(summariser.generate_calls) == 2, (
+        "expected exactly one re-cut retry, got "
+        f"{len(summariser.generate_calls)} calls")
+    first = summariser.generate_calls[0]["messages"][0]["content"]
+    second = summariser.generate_calls[1]["messages"][0]["content"]
+    assert len(second) < len(first), "the retry must be SMALLER, not identical"
+    # Still the recent end of the conversation, which is the part that matters.
+    assert "turn 29" in second, "the newest turn must survive the re-cut"

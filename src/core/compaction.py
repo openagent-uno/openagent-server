@@ -63,6 +63,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sqlite3
 import time
 from typing import Any
@@ -251,24 +252,86 @@ def _history_tool_result_chars() -> int:
 
 # ── Token estimation ──────────────────────────────────────────────────
 
+# Characters per token assumed when NO tokenizer exists for the model.
+#
+# The runtime's generic fallback is ``len(text) // 4`` — the ratio for English
+# prose. A compaction transcript is not English prose: it is tool-call JSON,
+# ids, paths, quoted logs, and (on a support agent) non-English text, all of
+# which tokenize far denser. Measured 2026-08-07 on a real Claude support fold:
+# ``len//4`` said 112_088 tokens, the provider counted 278_002 — 2.5x under. We
+# sized the fold on the wrong number, overflowed the summariser's window on
+# every attempt, and the session never deflated.
+#
+# 2.0 is deliberately pessimistic for prose and about right for transcripts.
+# The asymmetry is the whole point: over-estimating costs a few dropped old
+# turns, under-estimating costs the entire compaction pass.
+_DENSE_CHARS_PER_TOKEN = 2.0
+
+# What a provider told us it ACTUALLY counted, per model id.
+#
+# A rejection like ``prompt is too long: 278002 tokens > 200000 maximum`` is
+# ground truth about that model's tokenizer, handed to us for free. We keep the
+# ratio between its count and our estimate and apply it to later folds, so a
+# model only has to teach us once. Ratcheted upward only: the provider's number
+# is a measurement, ours is a guess.
+_MEASURED_DENSITY: dict[str, float] = {}
+
+
+def _density_factor(model_id: str | None) -> float:
+    """Correction learned from this model's own "too long" rejections."""
+    return max(1.0, _MEASURED_DENSITY.get(model_id or "", 1.0))
+
+
+def _learn_density(
+    model_id: str | None, *, counted: int, estimated: int,
+) -> float | None:
+    """Record that *model_id* counted *counted* where we estimated *estimated*.
+
+    Returns the factor now in force, or ``None`` when the numbers carry no
+    information (either side non-positive, or the provider counted FEWER
+    tokens than we assumed — in which case our estimate was already safe).
+    """
+    if counted <= 0 or estimated <= 0:
+        return None
+    ratio = counted / estimated
+    if ratio <= 1.0:
+        return None
+    key = model_id or ""
+    if ratio > _MEASURED_DENSITY.get(key, 1.0):
+        _MEASURED_DENSITY[key] = ratio
+    return _MEASURED_DENSITY[key]
+
 
 def _estimate_text_tokens(text: str, model_id: str | None) -> int:
     """Best-effort token count for *text* under *model_id*.
 
     Defers to the runtime's existing tiktoken / HuggingFace tokenizer
-    selector (``src.core._runner.utils.tokens.count_text_tokens``) when
-    available — it knows about Llama, Cohere, OpenAI variants, etc. and
-    keeps the answer aligned with what providers see internally. Falls
-    back to ``len(text) // 4`` (the same fallback the runtime uses) when
-    tiktoken isn't installed.
+    selector (``src.core._runner.utils.tokens.count_text_tokens``) when one
+    genuinely covers *model_id* — it knows about Llama, Cohere, OpenAI
+    variants, etc. and keeps the answer aligned with what providers see
+    internally.
+
+    When no tokenizer covers the model (every Anthropic row, and anything
+    behind a local proxy) that helper silently degrades to ``len // 4``, which
+    is not a measurement of this text — see ``_DENSE_CHARS_PER_TOKEN``. We use
+    the denser ratio instead, then apply whatever correction the provider has
+    already taught us for this model.
     """
     if not text:
         return 0
+    measured: int | None = None
     try:
-        from src.core._runner.utils.tokens import count_text_tokens
-        return count_text_tokens(text, model_id or "gpt-4o")
+        from src.core._runner.utils.tokens import (
+            _select_tokenizer, count_text_tokens,
+        )
+        kind, _tok = _select_tokenizer(model_id or "gpt-4o")
+        if kind != "none":
+            measured = count_text_tokens(text, model_id or "gpt-4o")
     except Exception:  # noqa: BLE001 — never let measurement block a turn
-        return max(1, len(text) // 4)
+        measured = None
+    if measured is None:
+        measured = int(len(text) / _DENSE_CHARS_PER_TOKEN)
+    return max(1, int(measured * _density_factor(model_id)))
 
 
 def _extract_run_text(run: dict[str, Any]) -> str:
@@ -435,16 +498,22 @@ def _resolve_max_context(model: Any) -> int:
         if isinstance(val, (int, float)) and val > 0:
             return int(val)
     # No provider attribute set — consult the shared catalog (OpenRouter's
-    # live ``context_length``) so compaction and the /context panel agree
-    # on the denominator. Only trust a real catalog hit; the catalog's own
-    # fallback is the same 200k we return below, so a miss changes nothing.
+    # live ``context_length``, or the vendor-published table it falls back to)
+    # so compaction and the /context panel agree on the denominator. Only
+    # trust a real hit; the catalog's own last resort is the same 200k we
+    # return below, so a miss changes nothing.
+    #
+    # ``static`` matters as much as ``openrouter`` here: a model served through
+    # a local or subscription proxy is never in OpenRouter's catalog under our
+    # id for it, so before the table existed EVERY such model resolved to the
+    # same 200k and this function could not tell a 1M row from a 200k one.
     model_id = _resolve_model_id(model)
     if model_id:
         try:
             from src.models.catalog import get_model_context_window
 
             window, source = get_model_context_window(model_id)
-            if source == "openrouter" and window > 0:
+            if source in {"openrouter", "static"} and window > 0:
                 return int(window)
         except Exception:  # noqa: BLE001 — never let a lookup block a turn
             pass
@@ -619,6 +688,65 @@ def should_compact(session_id: str | None, model: Any, *, agent: Any) -> bool:
     return breached
 
 
+# How providers say "your prompt does not fit". Two shapes cover everything we
+# have actually been rejected by:
+#   Anthropic — "prompt is too long: 278002 tokens > 200000 maximum"
+#   OpenAI-compatible — "maximum context length is 104856 tokens. However, your
+#                        messages resulted in 131204 tokens"
+# Both hand us the number the provider counted, which is the only honest
+# measurement of our transcript we will ever get.
+_TOO_LONG_PATTERNS: tuple[tuple[re.Pattern[str], int, int], ...] = (
+    (re.compile(r"too long:\s*([\d_,]+)\s*tokens?\s*>\s*([\d_,]+)", re.I),
+     1, 2),
+    (re.compile(
+        r"maximum context length is\s*([\d_,]+)\s*tokens?.{0,80}?"
+        r"resulted in\s*([\d_,]+)\s*tokens?", re.I | re.S), 2, 1),
+)
+
+
+def _parse_too_long(exc: Exception) -> tuple[int | None, int | None]:
+    """Pull ``(counted, maximum)`` out of a provider's size rejection.
+
+    Returns ``(None, None)`` for any failure that is not about size — a
+    timeout, a rate limit, a revoked token — because those must NOT be
+    "fixed" by shrinking the transcript.
+    """
+    text = str(exc) or repr(exc)
+    for pattern, counted_grp, max_grp in _TOO_LONG_PATTERNS:
+        m = pattern.search(text)
+        if not m:
+            continue
+        try:
+            counted = int(m.group(counted_grp).replace(",", "").replace("_", ""))
+            maximum = int(m.group(max_grp).replace(",", "").replace("_", ""))
+        except (ValueError, IndexError):
+            return None, None
+        return counted or None, maximum or None
+    return None, None
+
+
+def _fit_transcript(
+    parts: list[str], model_id: str | None, budget: int,
+) -> tuple[list[str], int, int]:
+    """Keep the newest turns of *parts* that fit *budget*.
+
+    Returns ``(kept_in_chronological_order, estimated_tokens, dropped)``. The
+    OLDEST turns go first: the recent ones carry the state a future assistant
+    has to continue from. At least one turn is always kept — a fold of nothing
+    summarises nothing, and returning empty here is indistinguishable from
+    failure to the caller.
+    """
+    kept: list[str] = []
+    used = 0
+    for part in reversed(parts):          # newest first
+        cost = _estimate_text_tokens(part, model_id)
+        if kept and used + cost > budget:
+            break
+        kept.append(part)
+        used += cost
+    return list(reversed(kept)), used, len(parts) - len(kept)
+
+
 async def _summarize_runs(
     runs: list[dict[str, Any]], model: Any, agent: Any,
 ) -> str:
@@ -659,17 +787,10 @@ async def _summarize_runs(
         return ""
 
     summary_model_id = _resolve_model_id(summariser)
-    input_budget = int(
-        _resolve_max_context(summariser) * _summary_input_fraction())
-    kept: list[str] = []
-    used = 0
-    for part in reversed(transcript_parts):        # newest first
-        cost = _estimate_text_tokens(part, summary_model_id)
-        if kept and used + cost > input_budget:
-            break
-        kept.append(part)
-        used += cost
-    dropped = len(transcript_parts) - len(kept)
+    summary_window = _resolve_max_context(summariser)
+    input_budget = int(summary_window * _summary_input_fraction())
+    kept_parts, used, dropped = _fit_transcript(
+        transcript_parts, summary_model_id, input_budget)
     if dropped:
         # Not silent: a fold that lost its oldest turns is a real (if
         # acceptable) loss of context, and the operator should see it before
@@ -678,13 +799,12 @@ async def _summarize_runs(
             "runtime.compaction.transcript_trimmed",
             level="warning",
             dropped_turns=dropped,
-            kept_turns=len(kept),
+            kept_turns=len(kept_parts),
             input_budget=input_budget,
             estimated_tokens=used,
             summary_model=summary_model_id,
         )
-    transcript_parts = list(reversed(kept))
-    transcript = "\n\n".join(transcript_parts)
+    transcript = "\n\n".join(kept_parts)
 
     system_prompt = (
         "You are compacting an ongoing conversation into a recap that "
@@ -696,11 +816,14 @@ async def _summarize_runs(
         "pending tasks. Be thorough but compact — drop tool-call mechanics "
         "and verbatim rephrasing, keep the substance."
     )
-    user_prompt = (
-        "Compact the following conversation into a recap a future assistant "
-        "can read to continue it without loss of important context:\n\n"
-        + transcript
-    )
+    def _wrap(body: str) -> str:
+        return (
+            "Compact the following conversation into a recap a future "
+            "assistant can read to continue it without loss of important "
+            "context:\n\n" + body
+        )
+
+    user_prompt = _wrap(transcript)
 
     try:
         response = await summariser.generate(
@@ -712,6 +835,49 @@ async def _summarize_runs(
             session_id=None,
         )
     except Exception as exc:  # noqa: BLE001 — never crash the turn
+        # Did the provider reject us for SIZE, and tell us its own count? That
+        # is a measurement of this model's tokenizer, free of charge. Learn it,
+        # re-cut the transcript with the corrected estimate, and try the same
+        # summariser again — a fold that overflows is not a broken summariser,
+        # it is a fold we sized wrong. Retrying it verbatim (or falling through
+        # to another provider with the SAME oversized prompt) is what left
+        # sessions uncompacted for days.
+        counted, stated_max = _parse_too_long(exc)
+        if counted:
+            factor = _learn_density(
+                summary_model_id, counted=counted, estimated=used)
+            # The provider's stated maximum is also ground truth about the
+            # window — trust it over our table when it is smaller.
+            window = min(summary_window, stated_max or summary_window)
+            retry_budget = int(window * _summary_input_fraction())
+            retry_parts, retry_used, retry_dropped = _fit_transcript(
+                transcript_parts, summary_model_id, retry_budget)
+            elog(
+                "runtime.compaction.transcript_refit",
+                level="warning",
+                counted_tokens=counted,
+                estimated_tokens=used,
+                density_factor=round(factor or 1.0, 3),
+                stated_max=stated_max,
+                retry_budget=retry_budget,
+                retry_estimated_tokens=retry_used,
+                dropped_turns=retry_dropped,
+                kept_turns=len(retry_parts),
+                summary_model=summary_model_id,
+            )
+            if retry_parts and len(retry_parts) < len(kept_parts):
+                try:
+                    response = await summariser.generate(
+                        [{"role": "user",
+                          "content": _wrap("\n\n".join(retry_parts))}],
+                        system=system_prompt,
+                        session_id=None,
+                    )
+                    summary = (
+                        getattr(response, "content", "") or "").strip()
+                    return summary
+                except Exception as exc_refit:  # noqa: BLE001
+                    exc = exc_refit
         # The primary summariser failed (commonly an OAuth-limited proxy row
         # exhausted under load). Skipping compaction here is what lets the
         # session balloon, so retry ONCE with a distinct-provider fallback

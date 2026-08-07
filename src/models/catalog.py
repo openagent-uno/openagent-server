@@ -547,6 +547,48 @@ def cheapest_enabled_model(providers_config: Any) -> "CatalogModel | None":
 # compaction trigger agree on the denominator for unknown models.
 _FALLBACK_CONTEXT_WINDOW = 200_000
 
+# Context windows published by the vendors themselves, matched on a substring
+# of the runtime model id, most specific first.
+#
+# Why this table has to exist: the OpenRouter lookup only answers for ids
+# OpenRouter serves. A model reached through a local or subscription proxy has
+# an id of OUR making (``local:claude-haiku-4-5``), so the lookup always missed
+# and every such model reported the generic 200k fallback. Anything that reads
+# this number was therefore unable to tell two models apart — including
+# compaction, which sizes the transcript it hands the summariser with it. A
+# 1M-window model was under-used, and a small-window one was handed folds it
+# could never accept.
+#
+# An unknown model still falls back to 200k, which is the conservative choice:
+# we would rather compact a long-context model too eagerly than hand a short
+# one a prompt it must reject.
+_STATIC_CONTEXT_WINDOWS: tuple[tuple[str, int], ...] = (
+    ("claude-opus-5", 1_000_000),
+    ("claude-opus-4", 200_000),
+    ("claude-sonnet-5", 200_000),
+    ("claude-sonnet-4", 200_000),
+    ("claude-haiku-4", 200_000),
+    ("claude-3-5", 200_000),
+    ("deepseek-v4", 104_856),
+    ("gpt-4o", 128_000),
+)
+
+
+def _static_context_length_lookup(runtime_id: str) -> int | None:
+    """Vendor-published window for *runtime_id*, or ``None`` if we don't know.
+
+    Substring match, in table order, against the id lowercased — so it works
+    whether the caller passes ``claude-opus-5``, ``local:claude-opus-5`` or
+    ``us.anthropic.claude-opus-5-v1``.
+    """
+    if not runtime_id:
+        return None
+    needle = runtime_id.lower()
+    for marker, window in _STATIC_CONTEXT_WINDOWS:
+        if marker in needle:
+            return window
+    return None
+
 
 def get_model_context_window(
     model_ref: str, providers_config: dict | None = None
@@ -555,15 +597,21 @@ def get_model_context_window(
 
     ``source`` is ``"openrouter"`` when the size came from OpenRouter's
     live catalog (which already carries a ``context_length`` per model,
-    see :func:`_openrouter_context_length_lookup`), or ``"fallback"``
-    when the model isn't in the catalog and we assume
-    ``_FALLBACK_CONTEXT_WINDOW``. Never raises — mirrors
+    see :func:`_openrouter_context_length_lookup`), ``"static"`` when it came
+    from the vendor-published table above (the normal answer for a
+    proxy-served id), or ``"fallback"`` when we know nothing about the model
+    and assume ``_FALLBACK_CONTEXT_WINDOW``. Never raises — mirrors
     :func:`get_model_pricing` so any configured provider resolves.
     """
     runtime_id = normalize_runtime_model_id(model_ref, providers_config)
     online = _openrouter_context_length_lookup(runtime_id)
     if online:
         return online, "openrouter"
+    static = _static_context_length_lookup(runtime_id)
+    if static:
+        # Prime the cache anyway: a live answer outranks the table next time.
+        _maybe_prime_openrouter_cache()
+        return static, "static"
     # Cache miss — prime for next time, same as the pricing path.
     _maybe_prime_openrouter_cache()
     return _FALLBACK_CONTEXT_WINDOW, "fallback"
