@@ -103,23 +103,59 @@ def _render(template: str, payload: dict[str, Any]) -> tuple[str, bool]:
     return rendered, resolved
 
 
+def _parse_ts(value: Any) -> float | None:
+    """ISO-8601 (with or without a trailing ``Z``) → epoch seconds, else None."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
 def _matches(body: Any, skip_when: dict[str, Any]) -> bool:
     """Evaluate the (single, deliberately simple) skip condition.
 
-    One field, one comparison. Anything richer belongs in the endpoint being
-    called, not in a config string interpreted at dispatch time — a condition
-    language here would be a second place where "should we answer this
-    customer?" gets decided, and the wrong answer is silence.
+    Two forms, one comparison each:
+
+    * ``{"path": P, "equals": V}`` — the field at P equals V.
+    * ``{"path": P, "after": Q}`` — the timestamp at P is strictly later than
+      the one at Q. This is the "someone already replied" test: an outbound
+      newer than the newest inbound.
+
+    Why the second form exists, rather than reading a ready-made boolean: on
+    the system this was built for, the obvious flag (``waiting_for_team``) is
+    not that predicate. Measured over 14 days, 774 of 1325 threads with an
+    unanswered inbound had it false — using it would have silently dropped 58%
+    of real customer messages. The two timestamps are load-bearing state and
+    say what actually happened; the flag is derived, and drifts.
+
+    Anything richer than this belongs in the endpoint being called, not in a
+    config string interpreted at dispatch time — a condition language here
+    would become a second place where "should we answer this customer?" gets
+    decided, and the wrong answer is silence.
     """
     path = skip_when.get("path")
     if not isinstance(path, str) or not path:
         return False
-    if "equals" not in skip_when:
-        return False
     actual = _dotted(body, path)
-    if actual is None:
-        return False        # field absent → we don't know → run
-    return actual == skip_when["equals"]
+
+    if "equals" in skip_when:
+        if actual is None:
+            return False    # field absent → we don't know → run
+        return actual == skip_when["equals"]
+
+    if "after" in skip_when:
+        other = skip_when["after"]
+        if not isinstance(other, str) or not other:
+            return False
+        lhs, rhs = _parse_ts(actual), _parse_ts(_dotted(body, other))
+        if lhs is None or rhs is None:
+            return False    # either side missing/unparseable → run
+        return lhs > rhs
+
+    return False            # no comparator → not a condition → run
 
 
 async def _fetch_json(url: str, headers: dict[str, str], timeout_s: float) -> Any:

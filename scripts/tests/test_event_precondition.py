@@ -137,6 +137,48 @@ async def t_fails_open(_ctx: TestContext) -> None:
         os.environ.pop("TEST_PRECOND_KEY", None)
 
 
+@test("event-precondition", "the 'after' comparator is the real already-answered test")
+async def t_after_comparator(_ctx: TestContext) -> None:
+    """Skip only when an outbound is strictly newer than the newest inbound.
+
+    Built because the obvious boolean lied: over 14 days, 774 of 1325 threads
+    with an unanswered inbound had ``waiting_for_team`` false. Gating on it
+    would have dropped 58% of real customer messages — the timestamps are the
+    state that actually says what happened.
+    """
+    from src.core import event_precondition as ep
+    import os
+    spec = _spec(skip_when={"path": "last_outbound_at", "after": "last_inbound_at"})
+    cases = [
+        ("replied after the inbound → skip", True,
+         {"last_inbound_at": "2026-08-07T10:45:24Z",
+          "last_outbound_at": "2026-08-07T11:06:12.349081Z"}),
+        ("inbound is newer → run", False,
+         {"last_inbound_at": "2026-08-07T12:00:00Z",
+          "last_outbound_at": "2026-08-07T11:06:12Z"}),
+        ("never replied → run", False,
+         {"last_inbound_at": "2026-08-07T10:45:24Z", "last_outbound_at": None}),
+        ("no inbound recorded → run", False,
+         {"last_inbound_at": None, "last_outbound_at": "2026-08-07T11:06:12Z"}),
+        ("unparseable timestamp → run", False,
+         {"last_inbound_at": "yesterday-ish",
+          "last_outbound_at": "2026-08-07T11:06:12Z"}),
+        ("identical timestamps → run (strictly later only)", False,
+         {"last_inbound_at": "2026-08-07T11:06:12Z",
+          "last_outbound_at": "2026-08-07T11:06:12Z"}),
+    ]
+    orig = ep._fetch_json
+    os.environ["TEST_PRECOND_KEY"] = "k"
+    try:
+        for label, want_skip, body in cases:
+            ep._fetch_json = _Fetch(body=body)
+            skip, _ = await ep.should_skip(_event(spec), _PAYLOAD)
+            assert skip is want_skip, f"{label}: got skip={skip}"
+    finally:
+        ep._fetch_json = orig
+        os.environ.pop("TEST_PRECOND_KEY", None)
+
+
 @test("event-precondition", "a missing credential does not leak an unauthenticated call")
 async def t_missing_env_does_not_call(_ctx: TestContext) -> None:
     from src.core import event_precondition as ep
