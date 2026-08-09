@@ -814,6 +814,24 @@ async def _summarize_runs(
             continue
         transcript_parts.append(f"[Turn {idx}]\n{block}")
     if not transcript_parts:
+        # NON e' un riassuntore che fallisce: nei run da ripiegare non c'e'
+        # testo da riassumere. Il chiamante vedeva solo ``empty_summary``, lo
+        # stesso log che riceve quando il modello risponde vuoto e quando il
+        # riassuntore non si risolve — tre cause diverse indistinguibili, e per
+        # sceglierne una si tirava a indovinare.
+        #
+        # Conta perche' e' anche una condizione PERMANENTE: ``_extract_run_text``
+        # legge ``content`` e ``messages[*].content`` e ignora di proposito le
+        # tool call, quindi un turno fatto di soli tool non ha niente da
+        # ripiegare — e ripassera' di qui identico al giro dopo, mentre il suo
+        # peso nel contesto resta. Sui nostri agent il turno tipico chiama 8
+        # tool: se questo evento e' frequente, e' li' che la sessione non si
+        # sgonfia piu', non nel riassuntore.
+        elog(
+            "runtime.compaction.no_text_to_fold",
+            level="warning",
+            runs=len(runs),
+        )
         return ""
 
     # Resolve the summariser BEFORE sizing the transcript: it decides the
@@ -821,6 +839,15 @@ async def _summarize_runs(
     # with. A summariser we can't resolve is an immediate skip anyway.
     summariser = _pick_summary_model(agent, fallback=model)
     if summariser is None:
+        # Seconda delle tre cause che finivano tutte in ``empty_summary``: qui
+        # c'e' del testo da ripiegare ma non esiste un modello a cui chiederlo
+        # (catalogo vuoto, o ``OPENAGENT_COMPACTION_MODEL`` che punta a una riga
+        # disabilitata). Si risolve nella configurazione, non nel codice.
+        elog(
+            "runtime.compaction.no_summariser",
+            level="warning",
+            runs=len(runs),
+        )
         return ""
 
     summary_model_id = _resolve_model_id(summariser)
@@ -953,6 +980,16 @@ async def _summarize_runs(
             )
             return ""
     summary = (getattr(response, "content", "") or "").strip()
+    if not summary:
+        # Terza causa: la chiamata e' RIUSCITA e ha risposto vuoto. E' l'unica
+        # delle tre che riguarda davvero il riassuntore, ed e' quella che il
+        # nome ``empty_summary`` lasciava intendere per tutte e tre.
+        elog(
+            "runtime.compaction.summary_blank",
+            level="warning",
+            summary_model=summary_model_id,
+            runs=len(runs),
+        )
     return summary
 
 
