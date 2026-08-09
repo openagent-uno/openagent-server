@@ -235,6 +235,9 @@ _TEST_MODULES: tuple[str, ...] = (
     # The completion-event net one layer below: the runtime stream recovers the
     # final text instead of letting run_stream re-run the whole turn.
     "test_stream_completed_net",
+    # Bulk re-injection: N thread in ONE tool call, because every tool call is
+    # another full model round-trip with the whole context resent.
+    "test_trigger_events_bulk",
     # New DB-backed registry tests: pure CRUD against ctx.db_path, no pool.
     "test_db_mcps",
     # Bootstrap MCP-row seeding: regression for the missing-vault bug.

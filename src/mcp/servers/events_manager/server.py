@@ -448,6 +448,45 @@ async def trigger_event(
     )
 
 
+@mcp.tool()
+async def trigger_events(
+    id_or_slug: str,
+    payloads: list[dict],
+) -> dict[str, Any]:
+    """Fire the SAME event once per payload, in ONE call. Fire-and-forget.
+
+    Perche' esiste: `trigger_event` ne accetta uno solo, e chi deve ri-iniettare N
+    thread lo chiama N volte. Ogni chiamata a un tool e' un giro completo dal modello,
+    con l'intero contesto rispedito: misurato sul task `support-coverage-delegated`,
+    un ciclo con lavoro fa fino a **15 trigger separati** — 15 contesti — e il task
+    e' il 45% del consumo di tutti gli scheduled task (31,76M token in 8 giorni,
+    mediana 353k a giro). Le 15 righe da inserire sono le stesse: e' l'andata e ritorno
+    dal modello a costare, non il lavoro.
+
+    Un solo giro, una sola transazione, gli stessi delivery_id di prima. Niente `wait`:
+    aspettare N delivery dentro una chiamata sola rimetterebbe il costo da un'altra
+    parte, e chi ri-inietta vuole comunque proseguire — gli esiti si leggono dopo con
+    `list_event_deliveries` sugli id restituiti.
+    """
+    if not payloads:
+        return {"delivery_ids": [], "count": 0}
+    conn = await _get_conn()
+    eid = await _resolve_event_id(conn, id_or_slug)
+    now = time.time()
+    rows = [(str(uuid.uuid4()), eid, json.dumps(p or {}), now) for p in payloads]
+    # Una transazione sola: o entrano tutte o nessuna. Con N insert separate un errore
+    # a meta' lascerebbe una coda parziale che nessuno sa piu' ricostruire.
+    await conn.executemany(
+        "INSERT INTO event_deliveries "
+        "(id, event_id, source, status, payload_json, started_at, claimed_at) "
+        "VALUES (?, ?, 'agent', 'received', ?, ?, NULL)",
+        rows,
+    )
+    await conn.execute("UPDATE events SET last_triggered_at = ? WHERE id = ?", (now, eid))
+    await conn.commit()
+    return {"delivery_ids": [r[0] for r in rows], "count": len(rows), "status": "received"}
+
+
 # Fields a GUARDED change may write/rollback. Must match MemoryDB._GUARDED_EVENT_FIELDS.
 _GUARDED_FIELDS = ("prompt_template", "model", "input_schema_json", "action_ref", "enabled")
 
