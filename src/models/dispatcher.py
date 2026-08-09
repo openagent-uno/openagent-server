@@ -451,6 +451,11 @@ async def _arun_runtime_stream(
         member_sessions_on = _team_member_sessions_enabled()
         yielded_content = False
         suppressed_content: list[str] = []
+        # Final answer as reported by the run's own completion event. This is the
+        # last-resort source of content: whatever happens to the per-delta events,
+        # the completed run always carries the text it produced. See the net at the
+        # bottom of this function for why that matters.
+        completed_content: str | None = None
         stream_iter = runtime.arun(prompt, **stream_kwargs)
         async for event in stream_iter:
             # Capture the agno run_id (first event wins) so a barge-in can
@@ -473,6 +478,10 @@ async def _arun_runtime_stream(
                     cr = stream_usage.metrics_to_cache_read(_ev_metrics)
                     stream_usage.record(
                         input_tokens=inp, output_tokens=out, cache_read_tokens=cr)
+                    # Same parent-only guard, same event: keep the final text too.
+                    _ev_content = getattr(event, "content", None)
+                    if isinstance(_ev_content, str) and _ev_content.strip():
+                        completed_content = _ev_content
             # Suppress a delegated member's OWN content + nested tool events
             # from the PARENT live stream when the member runs in its own child
             # session. That work belongs to the child session (navigable via the
@@ -537,6 +546,34 @@ async def _arun_runtime_stream(
         # has content. The normal case (leader synthesises) never hits this.
         if member_sessions_on and not yielded_content and suppressed_content:
             yield "".join(suppressed_content)
+            yielded_content = True
+
+        # Completed-run safety net: the LAST line of defence before
+        # ``run_stream``'s ``no_deltas_yielded`` fallback, which re-runs the
+        # entire turn through ``generate()`` — a second full model call, paid at
+        # full price, for an answer the runtime had already produced.
+        #
+        # Why this net and not another isinstance union: the two nets above each
+        # cure ONE way of losing the deltas (a content event class that isn't in
+        # ``content_event_types``; a leader that delegates and stays silent). Every
+        # such fix is a guess about which frame went missing, and the guess has been
+        # wrong before — the module split documented at the top of this function was
+        # exactly that. The completion event sidesteps the question: whatever
+        # happened to the per-delta frames, a run that finished carries its own final
+        # text, and both classes are already matched here for token accounting.
+        #
+        # Measured on production 2026-08-09: the fallback fired on 16% of eSound runs
+        # and 25% of Lyra's, single reason ``no_deltas_yielded``, on turns whose
+        # leader ran 8 tools and emitted no prose. At ~315k cumulative tokens per run
+        # against a weekly quota already ~30% short, those are the most expensive
+        # duplicate calls in the system.
+        if not yielded_content and completed_content:
+            elog(
+                "team_stream.completed_content_recovered",
+                session_id=session_id,
+                chars=len(completed_content),
+            )
+            yield completed_content
     except Exception as e:  # noqa: BLE001
         elog(error_event, session_id=session_id, error=str(e))
         raise
