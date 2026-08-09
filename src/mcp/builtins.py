@@ -459,6 +459,11 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
             "MCPs and tools, or to delegate a task to it"
         ),
     },
+    "skill-data": {
+        "dir": "skill_data",
+        "command": ["python", "-m", "src.mcp.servers.skill_data.server"],
+        "python": True,
+    },
 }
 
 DEFAULT_MCPS: list[dict[str, Any]] = [
@@ -508,6 +513,7 @@ DEFAULT_MCPS: list[dict[str, Any]] = [
     # tool schemas are deferred so it costs 0 prompt tokens until the agent
     # queries its budget.
     {"builtin": "budget-manager", "_default": True},
+    {"builtin": "skill-data", "_default": True},
     {"builtin": "delegation", "_default": True},
     {"builtin": "agent-federation", "_default": True},
 ]
