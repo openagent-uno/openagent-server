@@ -232,6 +232,9 @@ _TEST_MODULES: tuple[str, ...] = (
     # zero deltas (tool-only turns, or the runtime when no
     # RunContentEvent fires).
     "test_agent_run_stream",
+    # The completion-event net one layer below: the runtime stream recovers the
+    # final text instead of letting run_stream re-run the whole turn.
+    "test_stream_completed_net",
     # New DB-backed registry tests: pure CRUD against ctx.db_path, no pool.
     "test_db_mcps",
     # Bootstrap MCP-row seeding: regression for the missing-vault bug.
