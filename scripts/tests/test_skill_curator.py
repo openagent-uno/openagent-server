@@ -319,4 +319,4 @@ async def t_curator_prompt(_ctx: TestContext) -> None:
     # It archives rather than hard-deletes by default (reversible).
     assert "archive" in lower
     # Default cadence is weekly (Sunday).
-    assert SKILL_CURATOR_DEFAULT_CRON == "0 4 * * 0", SKILL_CURATOR_DEFAULT_CRON
+    assert SKILL_CURATOR_DEFAULT_CRON == "53 4 * * 0", SKILL_CURATOR_DEFAULT_CRON

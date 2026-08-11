@@ -142,6 +142,54 @@ async def t_settings_defaults(_ctx: TestContext) -> None:
     assert o.escalation_audit_schedule == "0 7 * * *"
 
 
+@test("self_improvement", "model-driven builtin defaults never fire together")
+async def t_builtin_default_schedules_do_not_collide(_ctx: TestContext) -> None:
+    """Intrinsic maintenance must leave a single-concurrency model usable.
+
+    Each job is a full agent loop, not a cheap callback. A pair sharing one
+    minute can alternate tool/model calls for several minutes and exhaust the
+    provider before a chat turn gets a slot. Walk a complete week so the
+    Sunday-only curator is covered as well as the hourly/daily jobs.
+    """
+    import datetime as dt
+
+    from croniter import croniter
+
+    from src.core.server import (
+        COST_OBSERVABILITY_DEFAULT_CRON,
+        DREAM_MODE_DEFAULT_TIME,
+        ESCALATION_AUDIT_DEFAULT_CRON,
+        QUALITY_DIGEST_DEFAULT_CRON,
+        QUALITY_SCORER_DEFAULT_CRON,
+        SKILL_CURATOR_DEFAULT_CRON,
+        SKILL_DISTILLER_DEFAULT_CRON,
+    )
+
+    dream_hour, dream_minute = (int(part) for part in DREAM_MODE_DEFAULT_TIME.split(":"))
+    schedules = {
+        "dream-mode": f"{dream_minute} {dream_hour} * * *",
+        "skill-curator": SKILL_CURATOR_DEFAULT_CRON,
+        "skill-distiller": SKILL_DISTILLER_DEFAULT_CRON,
+        "quality-scorer": QUALITY_SCORER_DEFAULT_CRON,
+        "quality-digest": QUALITY_DIGEST_DEFAULT_CRON,
+        "cost-observability": COST_OBSERVABILITY_DEFAULT_CRON,
+        "escalation-audit": ESCALATION_AUDIT_DEFAULT_CRON,
+    }
+    start = dt.datetime(2026, 8, 9, tzinfo=dt.timezone.utc)  # Sunday
+    end = start + dt.timedelta(days=8)
+    by_fire: dict[dt.datetime, list[str]] = {}
+    for name, expression in schedules.items():
+        cursor = croniter(expression, start)
+        while True:
+            fire = cursor.get_next(dt.datetime)
+            if fire >= end:
+                break
+            by_fire.setdefault(fire, []).append(name)
+
+    collisions = {fire: names for fire, names in by_fire.items() if len(names) > 1}
+    assert not collisions, f"model-driven builtin schedule collision: {collisions}"
+
+
 # ── 2. gating — ON by default, parked when disabled ───────────────────
 
 @test("self_improvement", "ON by default: both tasks seeded+enabled; toggles park them")
@@ -165,8 +213,8 @@ async def t_gating(ctx: TestContext) -> None:
         )
         assert d_row is not None and d_row["enabled"], "quality-digest not enabled by default"
         assert s_row["prompt"] and d_row["prompt"]
-        assert s_row["cron_expression"] == "0 */2 * * *", s_row["cron_expression"]
-        assert d_row["cron_expression"] == "0 9 * * *", d_row["cron_expression"]
+        assert s_row["cron_expression"] == "23 */2 * * *", s_row["cron_expression"]
+        assert d_row["cron_expression"] == "41 9 * * *", d_row["cron_expression"]
     finally:
         await on_db.close()
 
@@ -313,7 +361,7 @@ async def t_prompts(_ctx: TestContext) -> None:
     # Verdict scale.
     for v in ("GOOD", "OK", "BAD"):
         assert v in s, f"scorer prompt missing verdict {v!r}"
-    assert QUALITY_SCORER_DEFAULT_CRON == "0 */2 * * *", QUALITY_SCORER_DEFAULT_CRON
+    assert QUALITY_SCORER_DEFAULT_CRON == "23 */2 * * *", QUALITY_SCORER_DEFAULT_CRON
 
     d = QUALITY_DIGEST_PROMPT
     d_low = d.lower()
@@ -324,7 +372,7 @@ async def t_prompts(_ctx: TestContext) -> None:
     assert "recap" in d_low and ("one line" in d_low or "single line" in d_low)
     # Never ship a release autonomously.
     assert "autonomous" in d_low or "release" in d_low
-    assert QUALITY_DIGEST_DEFAULT_CRON == "0 9 * * *", QUALITY_DIGEST_DEFAULT_CRON
+    assert QUALITY_DIGEST_DEFAULT_CRON == "41 9 * * *", QUALITY_DIGEST_DEFAULT_CRON
 
 
 # ── 5. both are built-ins mapped to the self_improvement section ───────
@@ -369,7 +417,7 @@ async def t_cost_gating(ctx: TestContext) -> None:
             "cost-observability must seed AND enable by default — cache-aware "
             "cost monitoring is intrinsic, not opt-in"
         )
-        assert row["cron_expression"] == "0 * * * *", row["cron_expression"]
+        assert row["cron_expression"] == "7 * * * *", row["cron_expression"]
         assert row["prompt"]
     finally:
         await on_db.close()
@@ -474,7 +522,7 @@ async def t_cost_prompt(_ctx: TestContext) -> None:
     assert "router.cost_anomaly" in low
     # Silent-by-default discipline + real-cost framing.
     assert "silent" in low and ("cost_usd" in low or "real cost" in low)
-    assert COST_OBSERVABILITY_DEFAULT_CRON == "0 * * * *", COST_OBSERVABILITY_DEFAULT_CRON
+    assert COST_OBSERVABILITY_DEFAULT_CRON == "7 * * * *", COST_OBSERVABILITY_DEFAULT_CRON
 
 
 # ── 5c. escalation-audit — the ROLE-AGNOSTIC handoff arm ──────────────
@@ -494,7 +542,7 @@ async def t_audit_gating(ctx: TestContext) -> None:
             "escalation-audit must seed AND enable by default — auditing your own "
             "handoffs is intrinsic, not opt-in"
         )
-        assert row["cron_expression"] == "30 8 * * *", row["cron_expression"]
+        assert row["cron_expression"] == "47 8 * * *", row["cron_expression"]
         assert row["prompt"]
     finally:
         await on_db.close()
@@ -568,7 +616,7 @@ async def t_audit_prompt(_ctx: TestContext) -> None:
     assert "nobody can act" in low or "no human could act" in low
     # Silent unless regression; files a grounded correction.
     assert "regression" in low and "correction" in low
-    assert ESCALATION_AUDIT_DEFAULT_CRON == "30 8 * * *", ESCALATION_AUDIT_DEFAULT_CRON
+    assert ESCALATION_AUDIT_DEFAULT_CRON == "47 8 * * *", ESCALATION_AUDIT_DEFAULT_CRON
 
 
 # ── 6. Feature B — anti-wedge per-LLM-call timeout ────────────────────

@@ -77,6 +77,12 @@ def _compose_task_hook(hook, nxt):
         await hook(task, nxt)
     return _composed
 
+
+# Nightly default for the model-driven dream pass. Kept in the staggered
+# maintenance lattice with the other intrinsic agent loops below.
+DREAM_MODE_DEFAULT_TIME = "3:31"
+
+
 DREAM_MODE_PROMPT = """\
 You are running in Dream Mode — OpenAgent's nightly self-maintenance
 routine. You run while the agent is otherwise idle. Work through both
@@ -235,10 +241,13 @@ Use the `vault` MCP's tools for all vault access — never shell out for
 anything under the memory vault.
 """
 
-# Weekly by default (Sunday 04:00). Skills change far more slowly than the
+# Weekly by default (Sunday 04:53). Skills change far more slowly than the
 # memory vault, so the curator runs on a longer cadence than nightly dream
-# mode. Overridable via ``skills.curator_schedule``.
-SKILL_CURATOR_DEFAULT_CRON = "0 4 * * 0"
+# mode. The :53 slot deliberately avoids every other model-driven builtin:
+# otherwise several full agent loops can hit a single-concurrency local model
+# at once and starve an interactive turn. Overridable via
+# ``skills.curator_schedule``.
+SKILL_CURATOR_DEFAULT_CRON = "53 4 * * 0"
 
 SKILL_CURATOR_PROMPT = """\
 You are running as the Skill Curator — OpenAgent's self-improvement pass
@@ -310,12 +319,13 @@ Remember: seed and user skills are never yours to touch. The only skills
 that leave this pass changed are ones stamped `created_by: agent`.
 """
 
-# Daily by default (03:00). The distiller MINES new patterns, so it runs on a
+# Daily by default (03:53). The distiller MINES new patterns, so it runs on a
 # shorter cadence than the weekly curator that CONSOLIDATES them: a new recurring
 # resolution should become a skill within a day of recurring, and the curator's
-# weekly pass then folds any near-duplicates together. Overridable via
+# weekly pass then folds any near-duplicates together. Its minute slot is part
+# of the staggered builtin-maintenance schedule. Overridable via
 # ``skills.distiller_schedule``.
-SKILL_DISTILLER_DEFAULT_CRON = "0 3 * * *"
+SKILL_DISTILLER_DEFAULT_CRON = "53 3 * * *"
 
 SKILL_DISTILLER_PROMPT = """\
 You are running as the Skill Distiller — OpenAgent's self-improvement pass
@@ -408,11 +418,11 @@ skill because nothing new recurred is a correct, valid outcome, not a
 failure. Writing a marginal skill just to have written one is the failure.
 """
 
-# Every 2 hours by default. The scorer grades a short window of the agent's own
+# Every 2 hours at :23 by default. The scorer grades a short window of the agent's own
 # recent output, so it runs frequently and cheaply — a regression should surface
-# within a couple of hours, not the next day. Overridable via
-# ``self_improvement.scorer_schedule``.
-QUALITY_SCORER_DEFAULT_CRON = "0 */2 * * *"
+# within a couple of hours, not the next day. The offset keeps it from colliding
+# with the hourly cost watcher. Overridable via ``self_improvement.scorer_schedule``.
+QUALITY_SCORER_DEFAULT_CRON = "23 */2 * * *"
 
 QUALITY_SCORER_PROMPT = """\
 You are running as the Quality Scorer — OpenAgent's INTRINSIC self-improvement
@@ -503,10 +513,11 @@ alerted. If the window was empty or clean, log that too — it is a correct
 outcome, not a failure.
 """
 
-# Daily at 09:00 by default. The digest CONSOLIDATES what the every-2h scorer
+# Daily at 09:41 by default. The digest CONSOLIDATES what the every-2h scorer
 # found, so it runs on a slower cadence — one operator-facing recap a day.
-# Overridable via ``self_improvement.digest_schedule``.
-QUALITY_DIGEST_DEFAULT_CRON = "0 9 * * *"
+# Its offset avoids the hourly cost watcher. Overridable via
+# ``self_improvement.digest_schedule``.
+QUALITY_DIGEST_DEFAULT_CRON = "41 9 * * *"
 
 QUALITY_DIGEST_PROMPT = """\
 You are running as the Quality Digest — the daily synthesis half of OpenAgent's
@@ -581,9 +592,12 @@ def _is_custom_quality_digest_name(name: str) -> bool:
     return "quality" in low and ("digest" in low or "improve" in low)
 
 
-# Hourly by default: a cheap check that pages only on a genuine, CACHE-AWARE
-# cost anomaly. Overridable via ``self_improvement.cost_observability_schedule``.
-COST_OBSERVABILITY_DEFAULT_CRON = "0 * * * *"
+# Hourly at :07 by default: a cheap check that pages only on a genuine,
+# CACHE-AWARE cost anomaly. Running off the hour is load-bearing: several other
+# builtin maintenance jobs used to start at :00, creating competing full agent
+# loops that could exhaust or starve a single-concurrency model provider.
+# Overridable via ``self_improvement.cost_observability_schedule``.
+COST_OBSERVABILITY_DEFAULT_CRON = "7 * * * *"
 
 COST_OBSERVABILITY_PROMPT = """\
 You are running as Cost Observability — the CONSUMPTION arm of OpenAgent's
@@ -654,9 +668,10 @@ def _is_custom_cost_observability_name(name: str) -> bool:
     return "cost" in low and ("observ" in low or "anomal" in low or "monitor" in low)
 
 
-# Daily by default: a cheap self-audit of the agent's own handoffs. Overridable
-# via ``self_improvement.escalation_audit_schedule``.
-ESCALATION_AUDIT_DEFAULT_CRON = "30 8 * * *"
+# Daily at 08:47 by default: a cheap self-audit of the agent's own handoffs.
+# The stagger leaves room around the :07 cost watcher and :23 scorer.
+# Overridable via ``self_improvement.escalation_audit_schedule``.
+ESCALATION_AUDIT_DEFAULT_CRON = "47 8 * * *"
 
 ESCALATION_AUDIT_PROMPT = """\
 You are running as the Escalation Audit — the HANDOFF arm of OpenAgent's
@@ -2265,7 +2280,11 @@ class AgentServer:
 
         cron_expr = dream_cfg.get("cron")
         if not cron_expr:
-            time_str = str(dream_cfg.get("time", "3:00"))
+            # Keep the nightly model-driven pass away from the :07 cost
+            # watcher and :53 skill distiller. Dreaming must not compete with
+            # user-facing work (§12), and the same discipline applies to the
+            # agent's other intrinsic maintenance loops.
+            time_str = str(dream_cfg.get("time", DREAM_MODE_DEFAULT_TIME))
             parts = time_str.split(":")
             hour = int(parts[0])
             minute = int(parts[1]) if len(parts) > 1 else 0
@@ -2382,7 +2401,7 @@ class AgentServer:
         cron_expr = settings.curator_schedule or SKILL_CURATOR_DEFAULT_CRON
         # Same timezone treatment as dream mode: an untagged cron evaluates in
         # UTC, so inherit the box's configured zone (falls back to UTC) so a
-        # "Sunday 04:00" run lands overnight local, not mid-morning.
+        # "Sunday 04:53" run lands overnight local, not mid-morning.
         curator_tz = default_timezone_name()
 
         await self._sync_scheduled_task(
@@ -2442,7 +2461,7 @@ class AgentServer:
         cron_expr = settings.distiller_schedule or SKILL_DISTILLER_DEFAULT_CRON
         # Same timezone treatment as dream mode / the curator: an untagged cron
         # evaluates in UTC, so inherit the box's configured zone (falls back to
-        # UTC) so a "03:00" run lands overnight local, not mid-morning.
+        # UTC) so a "03:53" run lands overnight local, not mid-morning.
         distiller_tz = default_timezone_name()
 
         await self._sync_scheduled_task(
@@ -2517,7 +2536,7 @@ class AgentServer:
         cron_expr = settings.scorer_schedule or QUALITY_SCORER_DEFAULT_CRON
         # Same timezone treatment as the skill builtins: an untagged cron
         # evaluates in UTC, so inherit the box's configured zone (falls back to
-        # UTC) so a 09:00-anchored cadence lands on local wall-clock.
+        # UTC) so a 2-hour cadence remains anchored to the local wall-clock.
         scorer_tz = default_timezone_name()
 
         await self._sync_scheduled_task(

@@ -253,7 +253,7 @@ async def t_distiller_prompt(_ctx: TestContext) -> None:
     assert p != SKILL_CURATOR_PROMPT
 
     # Default cadence is daily (shorter than the weekly curator).
-    assert SKILL_DISTILLER_DEFAULT_CRON == "0 3 * * *", SKILL_DISTILLER_DEFAULT_CRON
+    assert SKILL_DISTILLER_DEFAULT_CRON == "53 3 * * *", SKILL_DISTILLER_DEFAULT_CRON
 
 
 # ── 4. wiring: the task is a hidden built-in in the config-skills section ─
