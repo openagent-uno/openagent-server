@@ -144,6 +144,24 @@ class _FakeAgent:
         self.model = model
 
 
+class _BlockingModel(_FakeModel):
+    """Provider that never returns unless its task is cancelled."""
+
+    def __init__(self, **kwargs) -> None:  # noqa: ANN003
+        super().__init__(**kwargs)
+        self.started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    async def generate(self, messages, **kwargs):  # noqa: ANN001
+        self.generate_calls.append({"messages": messages, "kwargs": kwargs})
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+
+
 # ── 1. should_compact threshold behaviour ──────────────────────────────
 
 
@@ -957,6 +975,72 @@ async def t_background_dedup(ctx: TestContext) -> None:
     await first
     # Exactly one summariser round-trip happened for the two calls.
     assert len(model.generate_calls) == 1, model.generate_calls
+
+
+@test("compaction", "proactive: an incoming turn preempts a stuck background fold")
+async def t_incoming_turn_preempts_background_fold(ctx: TestContext) -> None:
+    """Regression: provider Retry-After used to hold the session lock for
+    minutes, making Telegram appear frozen on "Compacting conversation"."""
+    from src.core import compaction
+
+    os.environ.pop("OPENAGENT_COMPACTION_ENABLED", None)
+    os.environ["OPENAGENT_COMPACTION_THRESHOLD"] = "0.5"
+    os.environ["OPENAGENT_COMPACTION_KEEP_RUNS"] = "2"
+    os.environ["OPENAGENT_COMPACTION_SUMMARY_TIMEOUT_SECONDS"] = "30"
+
+    sid = "proactive-preempt"
+    db_path = str(ctx.test_dir / "proactive-preempt.db")
+    _seed_breaching(db_path, sid)
+    before = _read_runs(db_path, sid)
+    model = _BlockingModel(max_context=200)
+    agent = _FakeAgent(db_path, model)
+
+    background = compaction.compact_after_turn(sid, model, agent)
+    assert background is not None
+    await asyncio.wait_for(model.started.wait(), timeout=1)
+    assert compaction.session_lock(sid).locked()
+
+    try:
+        registered = await asyncio.wait_for(
+            compaction.run_start_of_turn(sid, model, agent, None),
+            timeout=1,
+        )
+        assert registered is True
+        assert model.cancelled.is_set(), "the provider call must be cancelled"
+        assert background.cancelled(), "the detached fold must be cancelled"
+        assert len(model.generate_calls) == 1, "the turn must not retry the fold"
+        assert _read_runs(db_path, sid) == before, "a cancelled fold writes nothing"
+        assert sid not in compaction._INFLIGHT_SESSIONS
+        assert sid not in compaction._BACKGROUND_TASKS
+    finally:
+        compaction.mark_turn_done(sid)
+        os.environ.pop("OPENAGENT_COMPACTION_SUMMARY_TIMEOUT_SECONDS", None)
+
+
+@test("compaction", "summary provider calls stop at the maintenance timeout")
+async def t_summary_provider_timeout(ctx: TestContext) -> None:
+    from src.core import compaction
+
+    primary = _BlockingModel(max_context=200)
+    agent = _FakeAgent(str(ctx.test_dir / "summary-timeout.db"), primary)
+    orig_pick = compaction._pick_summary_model
+    orig_fb = compaction._summary_fallback_model
+    compaction._pick_summary_model = lambda a, *, fallback: primary
+    compaction._summary_fallback_model = lambda a, *, exclude_provider: None
+    os.environ["OPENAGENT_COMPACTION_SUMMARY_TIMEOUT_SECONDS"] = "0.01"
+    try:
+        out = await asyncio.wait_for(
+            compaction._summarize_runs(_FOLD_RUNS, primary, agent),
+            timeout=1,
+        )
+    finally:
+        compaction._pick_summary_model = orig_pick
+        compaction._summary_fallback_model = orig_fb
+        os.environ.pop("OPENAGENT_COMPACTION_SUMMARY_TIMEOUT_SECONDS", None)
+
+    assert out == ""
+    assert primary.cancelled.is_set(), "wait_for must cancel the provider call"
+    assert len(primary.generate_calls) == 1
 
 
 @test("compaction", "proactive: mark_turn_done balances the count and prunes the idle lock")

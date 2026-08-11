@@ -136,6 +136,15 @@ _SUMMARY_MODEL_ENV = "OPENAGENT_COMPACTION_MODEL"
 # one that just failed (an API-key provider is never OAuth-limited).
 _SUMMARY_FALLBACK_MODEL_ENV = "OPENAGENT_COMPACTION_FALLBACK_MODEL"
 
+# A summariser call is maintenance, not the user's turn. Provider SDKs may
+# honour a long Retry-After internally (the Claude subscription proxy can
+# legitimately return five-minute cooldowns), so without our own ceiling a
+# background fold can hold the per-session lock for minutes. Incoming turns
+# pre-empt background work below; this timeout also bounds manual compaction
+# and unattended background passes when nobody arrives to cancel them.
+_SUMMARY_TIMEOUT_ENV = "OPENAGENT_COMPACTION_SUMMARY_TIMEOUT_SECONDS"
+_DEFAULT_SUMMARY_TIMEOUT_SECONDS = 45.0
+
 # Fraction of the SUMMARISER's context window the folded transcript may fill.
 #
 # The trigger budget above answers "is the PRIMARY about to overflow?" and is
@@ -170,6 +179,20 @@ def _summary_input_fraction() -> float:
     if not 0 < val < 1:
         return _DEFAULT_SUMMARY_INPUT_FRACTION
     return val
+
+
+def _summary_timeout_seconds() -> float:
+    """Maximum wall time for one summariser provider call."""
+    raw = os.environ.get(_SUMMARY_TIMEOUT_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_SUMMARY_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return _DEFAULT_SUMMARY_TIMEOUT_SECONDS
+    if value <= 0:
+        return _DEFAULT_SUMMARY_TIMEOUT_SECONDS
+    return value
 
 
 def _cost_ceiling() -> int:
@@ -784,6 +807,37 @@ def _fit_transcript(
     return list(reversed(kept)), used, len(parts) - len(kept)
 
 
+async def _generate_summary(
+    summariser: Any,
+    messages: list[dict[str, str]],
+    *,
+    system_prompt: str,
+) -> Any:
+    """Run one summary call inside OpenAgent's maintenance time budget."""
+    timeout_s = _summary_timeout_seconds()
+    try:
+        return await asyncio.wait_for(
+            summariser.generate(
+                messages,
+                system=system_prompt,
+                # Never append the fold to the session it is replacing.
+                session_id=None,
+            ),
+            timeout=timeout_s,
+        )
+    except TimeoutError as exc:
+        model_id = _resolve_model_id(summariser)
+        elog(
+            "runtime.compaction.summary_timeout",
+            level="warning",
+            summary_model=model_id,
+            timeout_seconds=timeout_s,
+        )
+        raise TimeoutError(
+            f"compaction summary exceeded {timeout_s:g}s"
+        ) from exc
+
+
 async def _summarize_runs(
     runs: list[dict[str, Any]], model: Any, agent: Any,
 ) -> str:
@@ -890,13 +944,10 @@ async def _summarize_runs(
     user_prompt = _wrap(transcript)
 
     try:
-        response = await summariser.generate(
+        response = await _generate_summary(
+            summariser,
             [{"role": "user", "content": user_prompt}],
-            system=system_prompt,
-            # Pass no session_id so the summariser doesn't append a row
-            # to the very session we're compacting (that would defeat
-            # the purpose).
-            session_id=None,
+            system_prompt=system_prompt,
         )
     except Exception as exc:  # noqa: BLE001 — never crash the turn
         # Did the provider reject us for SIZE, and tell us its own count? That
@@ -931,11 +982,11 @@ async def _summarize_runs(
             )
             if retry_parts and len(retry_parts) < len(kept_parts):
                 try:
-                    response = await summariser.generate(
+                    response = await _generate_summary(
+                        summariser,
                         [{"role": "user",
                           "content": _wrap("\n\n".join(retry_parts))}],
-                        system=system_prompt,
-                        session_id=None,
+                        system_prompt=system_prompt,
                     )
                     summary = (
                         getattr(response, "content", "") or "").strip()
@@ -965,10 +1016,10 @@ async def _summarize_runs(
             error=(str(exc) or repr(exc))[:200],
         )
         try:
-            response = await fallback_summariser.generate(
+            response = await _generate_summary(
+                fallback_summariser,
                 [{"role": "user", "content": user_prompt}],
-                system=system_prompt,
-                session_id=None,
+                system_prompt=system_prompt,
             )
         except Exception as exc2:  # noqa: BLE001 — never crash the turn
             elog(
@@ -1470,8 +1521,9 @@ async def compact(
 #      under it (both the reactive backstop below and every background pass),
 #      and a turn acquires it at its start to register itself active + run the
 #      backstop. A turn therefore cannot begin its history read/write until any
-#      in-flight background compaction has released the lock — i.e. fully
-#      committed its rewrite.
+#      in-flight background compaction has released the lock — either after
+#      committing its rewrite or, when an interactive turn arrives, after that
+#      turn cancels the maintenance task before it can write.
 #
 #   2. Active-turn count (:func:`mark_turn_active` / :func:`mark_turn_done`). A
 #      turn increments it (under the lock) at start and decrements it in its
@@ -1486,8 +1538,9 @@ async def compact(
 #      compaction is queued/running per session at a time.
 #
 # Net effect: a background compaction NEVER overlaps a turn's history I/O for
-# the same session, and no two compactions for one session run at once — while
-# different sessions still compact fully in parallel.
+# the same session, never makes an interactive turn wait for a provider retry,
+# and no two compactions for one session run at once — while different sessions
+# still compact fully in parallel.
 
 # Per-session mutex. Created on first use; opportunistically dropped by
 # ``mark_turn_done`` when a session goes fully idle so the map stays bounded
@@ -1503,6 +1556,10 @@ _INFLIGHT_SESSIONS: set[str] = set()
 # drop a still-running compaction mid-flight (mirrors
 # ``scheduler._spawn_workflow`` and ``quality_monitor._INFLIGHT``).
 _INFLIGHT_TASKS: set[asyncio.Task[Any]] = set()
+# Direct lookup lets a newly-arrived turn cancel only its own detached
+# compaction. The set above remains the strong-reference owner for parity with
+# the other long-running background subsystems.
+_BACKGROUND_TASKS: dict[str, asyncio.Task[Any]] = {}
 
 
 def session_lock(session_id: str) -> asyncio.Lock:
@@ -1611,6 +1668,30 @@ async def _run_background_compaction(
         _INFLIGHT_SESSIONS.discard(session_id)
 
 
+def _background_task_done(
+    session_id: str, task: asyncio.Task[Any],
+) -> None:
+    """Drop all dedup/ownership state, even if cancelled before first run."""
+    _INFLIGHT_TASKS.discard(task)
+    if _BACKGROUND_TASKS.get(session_id) is task:
+        _BACKGROUND_TASKS.pop(session_id, None)
+    _INFLIGHT_SESSIONS.discard(session_id)
+
+
+async def _preempt_background_compaction(session_id: str) -> bool:
+    """Cancel a detached fold so an interactive turn never queues behind it."""
+    task = _BACKGROUND_TASKS.get(session_id)
+    if task is None or task.done():
+        return False
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    elog("runtime.compaction.background_preempted", session_id=session_id)
+    return True
+
+
 def compact_after_turn(
     session_id: str | None, model: Any, agent: Any,
     *, on_status: Any | None = None,
@@ -1647,18 +1728,22 @@ def compact_after_turn(
         name=f"compaction:{session_id}",
     )
     _INFLIGHT_TASKS.add(task)
-    task.add_done_callback(_INFLIGHT_TASKS.discard)
+    _BACKGROUND_TASKS[session_id] = task
+    task.add_done_callback(
+        lambda done, sid=session_id: _background_task_done(sid, done))
     return task
 
 
 async def emit_wait_notice(
     on_status: Any | None, session_id: str, phase: str,
 ) -> None:
-    """Emit ONE compaction progress envelope for a turn WAITING on a background
-    fold (the contended/overlap case — the user sent a message while a
-    background compaction held the session lock, so their turn briefly blocks).
+    """Emit ONE compaction progress envelope for a turn waiting on compaction.
 
-    ``phase`` is ``"running"`` (fired before the wait, so the channel shows
+    Detached background folds are pre-empted by interactive turns and stay
+    invisible. This notice is therefore reserved for a non-background holder
+    of the session lock (for example a manual fold) that cannot be pre-empted.
+
+    ``phase`` is ``"running"`` (fired before that wait, so the channel shows
     e.g. "🗜 Compacting conversation") or ``"done"`` (after the lock is
     acquired, flipping it to "🗜 Compacted conversation"). It rides the exact
     same ``session.compacted`` plumbing the reactive/manual folds use, so every
@@ -1688,19 +1773,18 @@ async def run_start_of_turn(
       the threshold on its own.
     * **Registration** — ``mark_turn_active`` under the lock, so a background
       pass that acquires the lock afterwards sees the turn and skips.
-    * **Contention notice** — if the lock is ALREADY held when this turn starts,
-      a background fold is mid-flight and this turn must WAIT for it. That is the
-      ONE case the user is told about: exactly one "optimizing…" notice brackets
-      the wait (``running`` before, ``done`` after). With no contention the turn
-      stays SILENT (the common proactive case, nobody waiting → invisible); and
-      when the backstop itself does the fold with no contention, it shows its
-      own notice, exactly as before. ``compact``'s own envelopes are suppressed
-      while we show the wait notice so a contended turn never doubles up.
+    * **Interactive priority** — if a detached background fold holds the lock,
+      cancel and await it before registering the turn. Maintenance is invisible
+      and never wins over a user message. A non-background lock holder cannot
+      be pre-empted, so exactly one "optimizing…" notice brackets that genuine
+      wait (``running`` before, ``done`` after). When the lock is free the turn
+      stays silent; when the backstop itself folds, it shows its own notice.
 
     Never raises: a compaction hiccup must never block a turn.
     """
     registered = False
     waited = False
+    preempted = False
     try:
         lock = session_lock(session_id)
         # locked() is a synchronous read; when it is False the acquire below
@@ -1708,13 +1792,18 @@ async def run_start_of_turn(
         # between the check and the acquire — the "silent when free" case is
         # race-free. When it is True a background fold holds the lock and we
         # will genuinely wait, so the notice is warranted.
+        if lock.locked():
+            # Background maintenance loses to an interactive message. Awaiting
+            # the cancelled task is what guarantees it released the lock and
+            # can no longer commit a stale snapshot before the turn proceeds.
+            preempted = await _preempt_background_compaction(session_id)
         waited = lock.locked()
         if waited:
             await emit_wait_notice(on_status, session_id, "running")
         async with lock:
             mark_turn_active(session_id)
             registered = True
-            if should_compact(session_id, model, agent=agent):
+            if not preempted and should_compact(session_id, model, agent=agent):
                 # If we already showed the wait notice, keep compact() silent so
                 # the turn surfaces at most ONE compaction notice; otherwise let
                 # the backstop show its own running→done as it always has.
