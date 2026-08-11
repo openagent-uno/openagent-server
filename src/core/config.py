@@ -200,15 +200,15 @@ class SelfImprovementSettings:
     """Runtime knobs for the INTRINSIC self-improvement loop (the
     ``quality-scorer`` + ``quality-digest`` built-in scheduled tasks).
 
-    ON BY DEFAULT. Continuous quality self-critique is a built-in capability
-    of every agent — a support agent scores its own replies, an ops agent
-    scores its own actions — so unlike the skills builtins (which are
-    opt-in) this seeds and enables with no per-agent config. Set
-    ``self_improvement.enabled: false`` to switch the whole loop off.
+    OPT-IN. Every arm is a full model-driven agent run, so enabling the loop on
+    an installation with one subscription/OAuth account can consume the
+    provider's rolling allowance and make an interactive turn unavailable.
+    Set ``self_improvement.enabled: true`` when the operator has budgeted
+    background-model capacity for it.
 
     enabled:
         Master switch for the loop. Reads ``self_improvement.enabled``
-        (default ``True``). With it false BOTH tasks are parked disabled.
+        (default ``False``). With it false all four tasks are parked disabled.
 
     scorer_enabled:
         Per-task switch for the ``quality-scorer`` (every-2h grader). Reads
@@ -253,7 +253,7 @@ class SelfImprovementSettings:
         ``self_improvement.escalation_audit_schedule``. ``None`` falls back to the
         daily default.
     """
-    enabled: bool = True
+    enabled: bool = False
     scorer_enabled: bool = True
     digest_enabled: bool = True
     cost_observability_enabled: bool = True
@@ -268,9 +268,9 @@ def self_improvement_settings(config: dict) -> SelfImprovementSettings:
     """Parse SelfImprovementSettings out of the top-level ``openagent.yaml``
     dict.
 
-    Defensive: a missing/empty ``self_improvement:`` stanza yields the ON
-    default, so an agent that never configured it still gets the intrinsic
-    quality loop.
+    Defensive: a missing/empty ``self_improvement:`` stanza yields the OFF
+    default. Model-driven maintenance must be an explicit capacity decision;
+    it must not silently compete with user-facing turns.
     """
     raw = (config or {}).get("self_improvement") or {}
     if not isinstance(raw, dict):
@@ -280,7 +280,7 @@ def self_improvement_settings(config: dict) -> SelfImprovementSettings:
     cost_observability_schedule = raw.get("cost_observability_schedule")
     escalation_audit_schedule = raw.get("escalation_audit_schedule")
     return SelfImprovementSettings(
-        enabled=bool(raw.get("enabled", True)),
+        enabled=bool(raw.get("enabled", False)),
         scorer_enabled=bool(raw.get("scorer_enabled", True)),
         digest_enabled=bool(raw.get("digest_enabled", True)),
         cost_observability_enabled=bool(raw.get("cost_observability_enabled", True)),

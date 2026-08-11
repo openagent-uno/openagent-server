@@ -66,6 +66,7 @@ import os
 import re
 import sqlite3
 import time
+import uuid
 from functools import lru_cache
 from typing import Any
 
@@ -165,6 +166,21 @@ _DEFAULT_SUMMARY_TIMEOUT_SECONDS = 45.0
 # recap the model still has to write back.
 _DEFAULT_SUMMARY_INPUT_FRACTION = 0.60
 
+# Absolute per-request ceiling for the transcript handed to the summariser.
+#
+# A provider's context window is a TECHNICAL limit, not an admission budget.
+# Subscription/OAuth proxies commonly enforce a much smaller rolling input-
+# token allowance. A 200k-window model therefore accepts a 120k-token fold in
+# theory while the account rejects it immediately as rate limited in practice.
+# That failure is especially toxic here: the compaction is skipped, the live
+# turn replays the still-huge history, and the same account is then cooling.
+#
+# Keep the default fold to one modest request. Operators with dedicated API
+# capacity can raise it explicitly; small-context models remain governed by
+# ``_DEFAULT_SUMMARY_INPUT_FRACTION`` via ``min()`` below.
+_SUMMARY_MAX_INPUT_TOKENS_ENV = "OPENAGENT_COMPACTION_SUMMARY_MAX_INPUT_TOKENS"
+_DEFAULT_SUMMARY_MAX_INPUT_TOKENS = 16_000
+
 
 def _summary_input_fraction() -> float:
     """Fraction of the summariser's window the transcript may occupy."""
@@ -179,6 +195,20 @@ def _summary_input_fraction() -> float:
     if not 0 < val < 1:
         return _DEFAULT_SUMMARY_INPUT_FRACTION
     return val
+
+
+def _summary_max_input_tokens() -> int:
+    """Absolute transcript-token ceiling for one summariser request."""
+    raw = os.environ.get(_SUMMARY_MAX_INPUT_TOKENS_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_SUMMARY_MAX_INPUT_TOKENS
+    try:
+        value = int(raw)
+    except ValueError:
+        return _DEFAULT_SUMMARY_MAX_INPUT_TOKENS
+    if value <= 0:
+        return _DEFAULT_SUMMARY_MAX_INPUT_TOKENS
+    return value
 
 
 def _summary_timeout_seconds() -> float:
@@ -785,26 +815,90 @@ def _parse_too_long(exc: Exception) -> tuple[int | None, int | None]:
     return None, None
 
 
+_PARTIAL_TURN_MARKER = (
+    "[Earlier content from this turn was omitted to fit the compaction "
+    "request budget.]\n"
+)
+
+
+def _tail_within_budget(
+    part: str, model_id: str | None, budget: int,
+) -> tuple[str, int, int]:
+    """Return the newest suffix of one oversized turn that fits *budget*.
+
+    A single tool-heavy run can exceed the whole fold budget. The old fitter
+    kept at least one turn verbatim, so that one run silently defeated every
+    transcript clamp. Binary-searching the suffix keeps the continuation-
+    relevant end of the turn while enforcing the ceiling for real.
+    """
+    if budget <= 0 or not part:
+        return "", 0, len(part)
+    cost = _estimate_text_tokens(part, model_id)
+    if cost <= budget:
+        return part, cost, 0
+
+    first_line, separator, body = part.partition("\n")
+    if separator and first_line.startswith("[Turn "):
+        source = body
+        marker = first_line + "\n" + _PARTIAL_TURN_MARKER
+    else:
+        source = part
+        marker = _PARTIAL_TURN_MARKER
+    # If the budget is unusually tiny, spend it on real transcript rather than
+    # letting the explanatory marker consume the whole request.
+    if _estimate_text_tokens(marker, model_id) >= budget:
+        source = part
+        marker = ""
+
+    lo, hi = 0, len(source)
+    best = ""
+    best_cost = 0
+    best_trimmed = len(source)
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        candidate = marker + source[mid:]
+        candidate_cost = _estimate_text_tokens(candidate, model_id)
+        if candidate_cost <= budget:
+            best = candidate
+            best_cost = candidate_cost
+            best_trimmed = mid
+            hi = mid - 1
+        else:
+            lo = mid + 1
+    if not best:
+        return "", 0, len(part)
+    return best, best_cost, best_trimmed
+
+
 def _fit_transcript(
     parts: list[str], model_id: str | None, budget: int,
-) -> tuple[list[str], int, int]:
+) -> tuple[list[str], int, int, int]:
     """Keep the newest turns of *parts* that fit *budget*.
 
-    Returns ``(kept_in_chronological_order, estimated_tokens, dropped)``. The
-    OLDEST turns go first: the recent ones carry the state a future assistant
-    has to continue from. At least one turn is always kept — a fold of nothing
-    summarises nothing, and returning empty here is indistinguishable from
-    failure to the caller.
+    Returns ``(kept_in_chronological_order, estimated_tokens, dropped_turns,
+    trimmed_chars)``. The OLDEST turns go first: the recent ones carry the
+    state a future assistant has to continue from. Oversized boundary turns are
+    suffix-trimmed, so the returned token estimate never exceeds *budget*.
     """
     kept: list[str] = []
     used = 0
+    trimmed_chars = 0
     for part in reversed(parts):          # newest first
+        remaining = budget - used
+        if remaining <= 0:
+            break
         cost = _estimate_text_tokens(part, model_id)
-        if kept and used + cost > budget:
+        if cost > remaining:
+            fitted, fitted_cost, trimmed = _tail_within_budget(
+                part, model_id, remaining)
+            if fitted:
+                kept.append(fitted)
+                used += fitted_cost
+                trimmed_chars += trimmed
             break
         kept.append(part)
         used += cost
-    return list(reversed(kept)), used, len(parts) - len(kept)
+    return list(reversed(kept)), used, len(parts) - len(kept), trimmed_chars
 
 
 async def _generate_summary(
@@ -813,15 +907,23 @@ async def _generate_summary(
     *,
     system_prompt: str,
 ) -> Any:
-    """Run one summary call inside OpenAgent's maintenance time budget."""
+    """Run one stateless summary call inside the maintenance time budget.
+
+    ``NativeProvider.generate(session_id=None)`` does *not* mean stateless: it
+    resolves ``None`` to the shared ``default`` runtime session.  A large row
+    there is then injected by ``add_history_to_context`` before the summary
+    prompt, turning a tiny fold into a long-context request.  Use a unique,
+    disposable session instead and erase it after every outcome.
+    """
     timeout_s = _summary_timeout_seconds()
+    summary_session_id = f"compaction:{uuid.uuid4().hex}"
     try:
         return await asyncio.wait_for(
             summariser.generate(
                 messages,
                 system=system_prompt,
-                # Never append the fold to the session it is replacing.
-                session_id=None,
+                # Never read from or append to a user/default session.
+                session_id=summary_session_id,
             ),
             timeout=timeout_s,
         )
@@ -836,6 +938,19 @@ async def _generate_summary(
         raise TimeoutError(
             f"compaction summary exceeded {timeout_s:g}s"
         ) from exc
+    finally:
+        forget_session = getattr(summariser, "forget_session", None)
+        if callable(forget_session):
+            try:
+                await forget_session(summary_session_id)
+            except Exception as exc:  # noqa: BLE001 — cleanup must not mask result
+                elog(
+                    "runtime.compaction.summary_session_cleanup_failed",
+                    level="warning",
+                    session_id=summary_session_id,
+                    error_type=type(exc).__name__,
+                    error=str(exc) or repr(exc),
+                )
 
 
 async def _summarize_runs(
@@ -847,9 +962,8 @@ async def _summarize_runs(
     in the catalog (per vision §3 — "Cheap and fast classifier suitable
     for routing decisions" — the same routing pick that the dispatcher
     uses for cheap calls). Falls back to the agent's primary model when
-    no classifier is configured. The summarisation call passes
-    ``session_id=None`` so it doesn't pollute the very session history
-    it's trying to fold.
+    no classifier is configured. The summarisation call uses a unique,
+    disposable runtime session so it neither reads nor pollutes user history.
 
     Returns an empty string on failure — the caller treats that as "skip
     this compaction pass" rather than blowing up the turn.
@@ -906,10 +1020,13 @@ async def _summarize_runs(
 
     summary_model_id = _resolve_model_id(summariser)
     summary_window = _resolve_max_context(summariser)
-    input_budget = int(summary_window * _summary_input_fraction())
-    kept_parts, used, dropped = _fit_transcript(
+    input_budget = min(
+        int(summary_window * _summary_input_fraction()),
+        _summary_max_input_tokens(),
+    )
+    kept_parts, used, dropped, trimmed_chars = _fit_transcript(
         transcript_parts, summary_model_id, input_budget)
-    if dropped:
+    if dropped or trimmed_chars:
         # Not silent: a fold that lost its oldest turns is a real (if
         # acceptable) loss of context, and the operator should see it before
         # they see a user complaining the assistant forgot something.
@@ -920,6 +1037,7 @@ async def _summarize_runs(
             kept_turns=len(kept_parts),
             input_budget=input_budget,
             estimated_tokens=used,
+            trimmed_chars=trimmed_chars,
             summary_model=summary_model_id,
         )
     transcript = "\n\n".join(kept_parts)
@@ -964,8 +1082,11 @@ async def _summarize_runs(
             # The provider's stated maximum is also ground truth about the
             # window — trust it over our table when it is smaller.
             window = min(summary_window, stated_max or summary_window)
-            retry_budget = int(window * _summary_input_fraction())
-            retry_parts, retry_used, retry_dropped = _fit_transcript(
+            retry_budget = min(
+                int(window * _summary_input_fraction()),
+                _summary_max_input_tokens(),
+            )
+            retry_parts, retry_used, retry_dropped, retry_trimmed_chars = _fit_transcript(
                 transcript_parts, summary_model_id, retry_budget)
             elog(
                 "runtime.compaction.transcript_refit",
@@ -977,6 +1098,7 @@ async def _summarize_runs(
                 retry_budget=retry_budget,
                 retry_estimated_tokens=retry_used,
                 dropped_turns=retry_dropped,
+                trimmed_chars=retry_trimmed_chars,
                 kept_turns=len(retry_parts),
                 summary_model=summary_model_id,
             )

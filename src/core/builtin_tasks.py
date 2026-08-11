@@ -35,10 +35,10 @@ SKILL_CURATOR_TASK_NAME = "skill-curator"
 # ``skills`` config section as the curator (its ``skills.distiller_enabled``
 # toggle lives there), not a section of its own.
 SKILL_DISTILLER_TASK_NAME = "skill-distiller"
-# The quality-scorer: the INTRINSIC self-improvement pass. Unlike the skill
-# builtins (OFF by default), this is ON by default (``self_improvement.enabled``)
-# — continuous quality self-critique is a built-in capability of every agent, not
-# an opt-in. It reads the agent's OWN recent outputs, grades them against the
+# The quality-scorer: the model-driven self-improvement pass. It is available
+# everywhere but OPT-IN (``self_improvement.enabled``): on a single-account
+# provider, unsolicited background loops can consume the allowance needed by a
+# user turn. It reads the agent's OWN recent outputs, grades them against the
 # agent's OWN vault rules, and writes a grounded correction for each weak one —
 # see ``AgentServer._sync_quality_scorer``. Its config section is
 # ``self_improvement``. DEDUP: an agent that already ships a tuned, NON-builtin
@@ -48,7 +48,7 @@ QUALITY_SCORER_TASK_NAME = "quality-scorer"
 # The quality-digest: the daily synthesis half of the intrinsic loop. It rolls
 # the scorer's recent findings into concrete grounded improvements —
 # auto-applying only SAFE vault rule/doc fixes, proposing anything risky — and
-# sends the operator one short recap. ON by default, same
+# sends the operator one short recap. Opt-in, same
 # ``self_improvement`` section, same DEDUP discipline as the scorer.
 QUALITY_DIGEST_TASK_NAME = "quality-digest"
 # The cost-observability watcher: the CONSUMPTION arm of the intrinsic
@@ -57,7 +57,8 @@ QUALITY_DIGEST_TASK_NAME = "quality-digest"
 # (non-cached) tokens via the engine's own ``router.cost_anomaly`` signal, NEVER
 # on the raw summed input-token count (which is ~85-90% cheap cache-reads of the
 # fixed prefix re-sent every step, so alerting on it pages on nonsense). ON by
-# default (``self_improvement.enabled`` AND ``cost_observability_enabled``), same
+# explicit gate (``self_improvement.enabled`` AND
+# ``cost_observability_enabled``), same
 # ``self_improvement`` section, same DEDUP discipline as the scorer/digest: an
 # agent that already ships a tuned, NON-builtin cost watcher (eSound/Lyra do)
 # keeps it. See ``AgentServer._sync_cost_observability``.
@@ -71,7 +72,8 @@ COST_OBSERVABILITY_TASK_NAME = "cost-observability"
 # and TOOL-AGNOSTIC by design: OpenAgent is a general engine (not only a support
 # runtime), so the builtin NEVER hardcodes Replio/support specifics — it prompts
 # the agent to audit its OWN escalations against its OWN tools + vault. ON by
-# default (``self_improvement.enabled`` AND ``escalation_audit_enabled``), same
+# explicit gate (``self_improvement.enabled`` AND
+# ``escalation_audit_enabled``), same
 # ``self_improvement`` section + DEDUP: an agent that already ships a tuned,
 # NON-builtin escalation auditor (eSound/Lyra's ``support-escalation-audit``)
 # keeps it. See ``AgentServer._sync_escalation_audit``.

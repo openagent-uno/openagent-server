@@ -456,8 +456,7 @@ memory:
 #                             #   - file:///srv/shared/skills-hub/.git
 
 # ── Self-improvement (intrinsic quality + cost + handoff loop) ──────
-# Four built-in scheduled tasks that make continuous self-critique an intrinsic
-# capability of EVERY agent — no per-agent config needed:
+# Four optional built-in scheduled tasks for continuous self-critique:
 #   quality-scorer  — every ~2h, reads the agent's OWN recent outputs (a support
 #                     agent's replies, an ops agent's actions), grades them
 #                     against the agent's OWN vault rules, and files a grounded
@@ -478,13 +477,15 @@ memory:
 #                     (vs genuinely-human cases). ROLE-/TOOL-agnostic (not tied to
 #                     any product/queue); files a correction, alerts on regression.
 #
-# ON BY DEFAULT — this is intrinsic. DEDUP: an agent that already ships its own
+# OPT-IN — each task is a full model-driven run. Leaving this off preserves
+# provider capacity for interactive turns, especially behind a single
+# subscription/OAuth account. DEDUP: an agent that already ships its own
 # tuned, non-builtin quality-scorer / quality-digest / cost-observability /
 # escalation-audit task keeps it; the builtin defers rather than double-running.
-# Set enabled: false to switch the whole loop off, or use the per-task toggles.
+# Set enabled: true to switch the loop on, or use the per-task toggles.
 #
 # self_improvement:
-#   enabled: true             # master switch (default true)
+#   enabled: false            # master switch (default false; set true to opt in)
 #   scorer_enabled: true      # per-task gate for quality-scorer (default true)
 #   digest_enabled: true      # per-task gate for quality-digest (default true)
 #   cost_observability_enabled: true  # per-task gate for cost-observability (default true)

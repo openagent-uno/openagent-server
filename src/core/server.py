@@ -627,8 +627,9 @@ never to re-derive an alarm from raw input.
 ## STEP 1 — Check for genuine cost anomalies since the last run (~1h)
 
 Using the `logs` MCP, look for any ``router.cost_anomaly`` warning in the last
-~65 minutes (`logs_query` for that event name; `logs_summary(since="1h")` for
-the window shape). Each carries the real ``cost_usd``, the
+~65 minutes with exactly ``logs_query(event="router.cost_anomaly",
+since="65m")``; use ``logs_summary(since="1h")`` only when the first call
+found an anomaly and you need the window shape. Each carries the real ``cost_usd``, the
 ``uncached_input_tokens`` (fresh), the model, and the session id — the engine
 already did the cache-aware math. If there are NONE, the hour is clean: send
 nothing and go to STEP 2.
@@ -2484,11 +2485,10 @@ class AgentServer:
         self._install_task_hook(scheduler, SKILL_DISTILLER_TASK_NAME, _distiller_run)
 
     async def _sync_quality_scorer(self, scheduler) -> None:
-        """Seed/enable the ``quality-scorer`` built-in — the INTRINSIC
-        self-improvement grader. Unlike the skill builtins (opt-in), this is ON
-        by default (``self_improvement.enabled`` AND ``scorer_enabled``, both
-        defaulting True): every agent scores its own recent output against its
-        own vault rules and files grounded corrections, with no per-agent config.
+        """Seed/enable the ``quality-scorer`` built-in self-improvement grader.
+        It is opt-in (``self_improvement.enabled`` AND ``scorer_enabled``):
+        each firing is a full agent loop, so operators explicitly budget its
+        background model capacity instead of letting it compete with user turns.
 
         DEDUP — the one thing that makes "intrinsic" safe on tuned agents: an
         agent that already ships a NON-builtin, hand-tuned quality-scorer
@@ -2561,7 +2561,7 @@ class AgentServer:
     async def _sync_quality_digest(self, scheduler) -> None:
         """Seed/enable the ``quality-digest`` built-in — the daily synthesis
         half of the intrinsic loop. Sibling of ``_sync_quality_scorer`` and
-        identical in discipline: ON by default (``self_improvement.enabled`` AND
+        identical in discipline: opt-in (``self_improvement.enabled`` AND
         ``digest_enabled``), and it DEFERS to an agent's own tuned, non-builtin
         quality-digest (name mentions quality + digest/improvement) so
         eSound/Lyra keep their custom pass while fresh agents get the builtin.
@@ -2625,7 +2625,7 @@ class AgentServer:
     async def _sync_cost_observability(self, scheduler) -> None:
         """Seed/enable the ``cost-observability`` built-in — the CONSUMPTION arm
         of the intrinsic loop. Sibling of the quality builtins and identical in
-        discipline: ON by default (``self_improvement.enabled`` AND
+        discipline: opt-in (``self_improvement.enabled`` AND
         ``cost_observability_enabled``), and it DEFERS to an agent's own tuned,
         non-builtin cost watcher (name mentions cost + observe/anomaly/monitor)
         so eSound/Lyra keep their custom, more-sensitive pass while fresh agents
@@ -2693,7 +2693,7 @@ class AgentServer:
     async def _sync_escalation_audit(self, scheduler) -> None:
         """Seed/enable the ``escalation-audit`` built-in — the HANDOFF arm of the
         intrinsic loop. Sibling of the quality/cost builtins and identical in
-        discipline: ON by default (``self_improvement.enabled`` AND
+        discipline: opt-in (``self_improvement.enabled`` AND
         ``escalation_audit_enabled``), and it DEFERS to an agent's own tuned,
         non-builtin escalation auditor (name mentions escalation/handoff + audit)
         so eSound/Lyra keep their tuned ``support-escalation-audit`` while fresh

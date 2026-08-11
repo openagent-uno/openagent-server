@@ -4,8 +4,8 @@ Two features, both LLM-free (the grading/synthesis itself is LLM-driven and
 deferred, exactly like the dream-mode / skill-curator live tests):
 
   * **Self-improvement (Feature A)** — the ``quality-scorer`` (every-2h grader)
-    and ``quality-digest`` (daily synthesis) are INTRINSIC built-in scheduled
-    tasks: ON by default, no per-agent config. Asserted through the real
+    and ``quality-digest`` (daily synthesis) are optional built-in scheduled
+    tasks: available everywhere but explicitly enabled by the operator. Asserted through the real
     seeding path (``AgentServer._sync_quality_scorer`` /
     ``_sync_quality_digest``), no live run. The load-bearing property beyond
     "it seeds" is the DEDUP: an agent that already ships its own tuned,
@@ -88,17 +88,18 @@ def _set_env(key: str, value):
         os.environ[key] = value
 
 
-# ── 1. config settings — ON by default, overrides parse ───────────────
+# ── 1. config settings — capacity-safe OFF default, overrides parse ───
 
-@test("self_improvement", "settings are ON by default and overrides parse")
+@test("self_improvement", "settings are OFF by default and explicit opt-in parses")
 async def t_settings_defaults(_ctx: TestContext) -> None:
     from src.core.config import SelfImprovementSettings, self_improvement_settings
 
-    # Empty / missing stanza → the intrinsic ON default.
+    # Empty / missing stanza → no unsolicited model-driven maintenance.
     d = self_improvement_settings({})
     assert d == SelfImprovementSettings(), d
-    assert d.enabled and d.scorer_enabled and d.digest_enabled, (
-        "the intrinsic quality loop must default ON — that is the whole point"
+    assert not d.enabled and d.scorer_enabled and d.digest_enabled, (
+        "the master gate must default OFF while per-task defaults stay ready "
+        "for an explicit enabled:true opt-in"
     )
     assert d.scorer_schedule is None and d.digest_schedule is None
 
@@ -106,23 +107,21 @@ async def t_settings_defaults(_ctx: TestContext) -> None:
     assert self_improvement_settings({"self_improvement": "nope"}) == SelfImprovementSettings()
 
     # The CONSUMPTION arm (cost-observability) is part of the same intrinsic
-    # loop — ON by default, its own independent gate + schedule.
+    # loop — ready behind the OFF master gate, with its own gate + schedule.
     assert d.cost_observability_enabled, (
-        "cost-observability must default ON — cache-aware cost monitoring is "
-        "intrinsic, like the quality halves"
+        "the per-task cost gate should default on once the master is opted in"
     )
     assert d.cost_observability_schedule is None
     # The HANDOFF arm (escalation-audit) is part of the same intrinsic loop.
     assert d.escalation_audit_enabled, (
-        "escalation-audit must default ON — auditing your own handoffs is "
-        "intrinsic, like the quality/cost arms"
+        "the per-task audit gate should default on once the master is opted in"
     )
     assert d.escalation_audit_schedule is None
 
     # Explicit overrides parse, including the per-task gates and schedules.
     o = self_improvement_settings({
         "self_improvement": {
-            "enabled": False,
+            "enabled": True,
             "scorer_enabled": False,
             "digest_enabled": True,
             "cost_observability_enabled": False,
@@ -133,7 +132,7 @@ async def t_settings_defaults(_ctx: TestContext) -> None:
             "escalation_audit_schedule": "0 7 * * *",
         }
     })
-    assert not o.enabled and not o.scorer_enabled and o.digest_enabled
+    assert o.enabled and not o.scorer_enabled and o.digest_enabled
     assert not o.cost_observability_enabled
     assert not o.escalation_audit_enabled
     assert o.scorer_schedule == "*/30 * * * *"
@@ -190,14 +189,13 @@ async def t_builtin_default_schedules_do_not_collide(_ctx: TestContext) -> None:
     assert not collisions, f"model-driven builtin schedule collision: {collisions}"
 
 
-# ── 2. gating — ON by default, parked when disabled ───────────────────
+# ── 2. gating — OFF by default, enabled only by explicit opt-in ──────
 
-@test("self_improvement", "ON by default: both tasks seeded+enabled; toggles park them")
+@test("self_improvement", "OFF by default: explicit opt-in enables; toggles park tasks")
 async def t_gating(ctx: TestContext) -> None:
     from src.core.scheduler import Scheduler
 
-    # (a) DEFAULT config → BOTH intrinsic tasks seeded AND enabled. This is the
-    #     opposite of the skill builtins (OFF-by-default): intrinsic means on.
+    # (a) DEFAULT config → no model-driven task is enabled.
     on_db = _fresh_db(ctx, "on")
     await on_db.connect()
     try:
@@ -207,22 +205,17 @@ async def t_gating(ctx: TestContext) -> None:
         await srv._sync_quality_digest(sched)
         s_row = await _scorer_row(on_db)
         d_row = await _digest_row(on_db)
-        assert s_row is not None and s_row["enabled"], (
-            "the quality-scorer must seed AND enable with default config — it is "
-            "intrinsic, not opt-in"
-        )
-        assert d_row is not None and d_row["enabled"], "quality-digest not enabled by default"
-        assert s_row["prompt"] and d_row["prompt"]
-        assert s_row["cron_expression"] == "23 */2 * * *", s_row["cron_expression"]
-        assert d_row["cron_expression"] == "41 9 * * *", d_row["cron_expression"]
+        assert s_row is None or not s_row["enabled"]
+        assert d_row is None or not d_row["enabled"]
     finally:
         await on_db.close()
 
-    # (b) master switch off → BOTH parked disabled (row kept, not deleted).
+    # (b) explicit opt-in seeds both, then switching off parks both.
     off_db = _fresh_db(ctx, "off")
     await off_db.connect()
     try:
-        srv, agent = await _bare_server({}, off_db)
+        srv, agent = await _bare_server(
+            {"self_improvement": {"enabled": True}}, off_db)
         sched = Scheduler(off_db, agent)
         await srv._sync_quality_scorer(sched)
         await srv._sync_quality_digest(sched)
@@ -242,7 +235,7 @@ async def t_gating(ctx: TestContext) -> None:
     await half_db.connect()
     try:
         srv, agent = await _bare_server(
-            {"self_improvement": {"scorer_enabled": False}}, half_db)
+            {"self_improvement": {"enabled": True, "scorer_enabled": False}}, half_db)
         sched = Scheduler(half_db, agent)
         await srv._sync_quality_scorer(sched)
         await srv._sync_quality_digest(sched)
@@ -297,7 +290,8 @@ async def t_dedup(ctx: TestContext) -> None:
     db2 = _fresh_db(ctx, "dedup-park")
     await db2.connect()
     try:
-        srv, agent = await _bare_server({}, db2)
+        srv, agent = await _bare_server(
+            {"self_improvement": {"enabled": True}}, db2)
         sched = Scheduler(db2, agent)
         # First boot: no custom task → builtin seeds+enables.
         await srv._sync_quality_scorer(sched)
@@ -401,21 +395,21 @@ async def t_is_builtin(_ctx: TestContext) -> None:
 
 # ── 5b. cost-observability — the CACHE-AWARE consumption arm ──────────
 
-@test("self_improvement", "cost-observability: ON by default; its own gate parks it")
+@test("self_improvement", "cost-observability: opt-in; its own gate parks it")
 async def t_cost_gating(ctx: TestContext) -> None:
     from src.core.scheduler import Scheduler
 
-    # (a) DEFAULT config → the cost watcher seeds AND enables, hourly.
+    # (a) Explicit master opt-in → the cost watcher seeds and enables, hourly.
     on_db = _fresh_db(ctx, "cost-on")
     await on_db.connect()
     try:
-        srv, agent = await _bare_server({}, on_db)
+        srv, agent = await _bare_server(
+            {"self_improvement": {"enabled": True}}, on_db)
         sched = Scheduler(on_db, agent)
         await srv._sync_cost_observability(sched)
         row = await _cost_row(on_db)
         assert row is not None and row["enabled"], (
-            "cost-observability must seed AND enable by default — cache-aware "
-            "cost monitoring is intrinsic, not opt-in"
+            "cost-observability must seed after explicit opt-in"
         )
         assert row["cron_expression"] == "7 * * * *", row["cron_expression"]
         assert row["prompt"]
@@ -427,7 +421,9 @@ async def t_cost_gating(ctx: TestContext) -> None:
     await gate_db.connect()
     try:
         srv, agent = await _bare_server(
-            {"self_improvement": {"cost_observability_enabled": False}}, gate_db)
+            {"self_improvement": {
+                "enabled": True, "cost_observability_enabled": False,
+            }}, gate_db)
         sched = Scheduler(gate_db, agent)
         await srv._sync_cost_observability(sched)
         row = await _cost_row(gate_db)
@@ -441,7 +437,8 @@ async def t_cost_gating(ctx: TestContext) -> None:
     off_db = _fresh_db(ctx, "cost-off")
     await off_db.connect()
     try:
-        srv, agent = await _bare_server({}, off_db)
+        srv, agent = await _bare_server(
+            {"self_improvement": {"enabled": True}}, off_db)
         sched = Scheduler(off_db, agent)
         await srv._sync_cost_observability(sched)
         srv.config = {"self_improvement": {"enabled": False}}
@@ -476,7 +473,8 @@ async def t_cost_dedup(ctx: TestContext) -> None:
     db2 = _fresh_db(ctx, "cost-dedup-park")
     await db2.connect()
     try:
-        srv, agent = await _bare_server({}, db2)
+        srv, agent = await _bare_server(
+            {"self_improvement": {"enabled": True}}, db2)
         sched = Scheduler(db2, agent)
         await srv._sync_cost_observability(sched)
         assert (await _cost_row(db2))["enabled"], "builtin cost watcher should enable first"
@@ -520,6 +518,10 @@ async def t_cost_prompt(_ctx: TestContext) -> None:
     )
     # Sources the engine's own cache-aware signal, not a re-derived alarm.
     assert "router.cost_anomaly" in low
+    assert 'logs_query(event="router.cost_anomaly"' in low, (
+        "the prompt must name the real logs_query argument; an ambiguous "
+        "'event name' instruction made the model invent event_name and loop"
+    )
     # Silent-by-default discipline + real-cost framing.
     assert "silent" in low and ("cost_usd" in low or "real cost" in low)
     assert COST_OBSERVABILITY_DEFAULT_CRON == "7 * * * *", COST_OBSERVABILITY_DEFAULT_CRON
@@ -527,20 +529,20 @@ async def t_cost_prompt(_ctx: TestContext) -> None:
 
 # ── 5c. escalation-audit — the ROLE-AGNOSTIC handoff arm ──────────────
 
-@test("self_improvement", "escalation-audit: ON by default; its own gate parks it")
+@test("self_improvement", "escalation-audit: opt-in; its own gate parks it")
 async def t_audit_gating(ctx: TestContext) -> None:
     from src.core.scheduler import Scheduler
 
     on_db = _fresh_db(ctx, "audit-on")
     await on_db.connect()
     try:
-        srv, agent = await _bare_server({}, on_db)
+        srv, agent = await _bare_server(
+            {"self_improvement": {"enabled": True}}, on_db)
         sched = Scheduler(on_db, agent)
         await srv._sync_escalation_audit(sched)
         row = await _audit_row(on_db)
         assert row is not None and row["enabled"], (
-            "escalation-audit must seed AND enable by default — auditing your own "
-            "handoffs is intrinsic, not opt-in"
+            "escalation-audit must seed after explicit opt-in"
         )
         assert row["cron_expression"] == "47 8 * * *", row["cron_expression"]
         assert row["prompt"]
@@ -551,7 +553,9 @@ async def t_audit_gating(ctx: TestContext) -> None:
     await gate_db.connect()
     try:
         srv, agent = await _bare_server(
-            {"self_improvement": {"escalation_audit_enabled": False}}, gate_db)
+            {"self_improvement": {
+                "enabled": True, "escalation_audit_enabled": False,
+            }}, gate_db)
         sched = Scheduler(gate_db, agent)
         await srv._sync_escalation_audit(sched)
         row = await _audit_row(gate_db)

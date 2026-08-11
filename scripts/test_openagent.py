@@ -124,10 +124,10 @@ _TEST_MODULES: tuple[str, ...] = (
     # when closed). Pure-unit; git is available, no LLM. Sits by the other
     # skills tests because it extends the same subsystem.
     "test_skill_hub",
-    # Intrinsic self-improvement: the quality-scorer (every-2h grader) and
-    # quality-digest (daily synthesis) built-ins. Unlike the skill builtins,
-    # these are ON by default (self_improvement.enabled). Pins the ON-by-default
-    # seeding, the per-task/master toggles that park them, the DEDUP that defers
+    # Optional self-improvement: the quality-scorer (every-2h grader) and
+    # quality-digest (daily synthesis) built-ins. They are opt-in because each
+    # firing consumes background model capacity. Pins the capacity-safe default,
+    # explicit enable, per-task/master toggles, and the DEDUP that defers
     # to an agent's own tuned custom scorer/digest (so eSound/Lyra don't
     # double-run), and the prompt discipline. Also pins Feature B: the
     # anti-wedge per-LLM-call timeout in native_provider._construct_model and its

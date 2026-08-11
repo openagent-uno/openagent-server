@@ -121,6 +121,7 @@ class _FakeModel:
         self.context_window = max_context
         self._summary = summary
         self.generate_calls: list[dict] = []
+        self.forgotten_sessions: list[str] = []
 
     async def generate(self, messages, **kwargs):  # noqa: ANN001
         self.generate_calls.append({"messages": messages, "kwargs": kwargs})
@@ -130,6 +131,9 @@ class _FakeModel:
         r = _R()
         r.content = self._summary
         return r
+
+    async def forget_session(self, session_id: str) -> None:
+        self.forgotten_sessions.append(session_id)
 
 
 class _FakeAgent:
@@ -250,11 +254,15 @@ async def t_compact_rewrites_runs(ctx: TestContext) -> None:
     assert new_runs[1]["content"] == "run-3-text"
     assert new_runs[2]["content"] == "run-4-text"
 
-    # The summariser was called exactly once with no session_id so it
-    # doesn't pollute the session it's compacting.
+    # The summariser must run in a unique disposable session.  Passing None
+    # used to resolve to the shared 9.8 MB ``default`` runtime session in
+    # production, silently injecting that history into this tiny prompt.
     assert len(model.generate_calls) == 1, model.generate_calls
     call = model.generate_calls[0]
-    assert call["kwargs"].get("session_id") is None, call
+    summary_sid = call["kwargs"].get("session_id")
+    assert summary_sid.startswith("compaction:"), call
+    assert summary_sid not in {"default", "sid"}, call
+    assert model.forgotten_sessions == [summary_sid], model.forgotten_sessions
 
 
 @test("compaction", "compact is a no-op when history is within keep window")
@@ -889,12 +897,16 @@ async def t_compact_after_turn_folds(ctx: TestContext) -> None:
     assert task is not None, "a breaching session must schedule a background pass"
     await task  # drain the background work the user never waited on
 
-    # The fold landed: recap + last 2 kept, summariser called once, off session.
+    # The fold landed: recap + last 2 kept, summariser called once in an
+    # isolated disposable runtime session.
     saved = _read_runs(db_path, sid)
     assert len(saved) == 3, saved
     assert saved[0].get("metadata", {}).get("compaction") is True, saved[0]
     assert len(model.generate_calls) == 1, model.generate_calls
-    assert model.generate_calls[0]["kwargs"].get("session_id") is None
+    summary_sid = model.generate_calls[0]["kwargs"].get("session_id")
+    assert summary_sid.startswith("compaction:"), summary_sid
+    assert summary_sid not in {"default", sid}, summary_sid
+    assert model.forgotten_sessions == [summary_sid], model.forgotten_sessions
     # The in-flight guard cleared itself so the next turn can schedule again.
     assert sid not in compaction._INFLIGHT_SESSIONS
 
@@ -1268,8 +1280,11 @@ async def t_summary_fallback_on_primary_failure(ctx: TestContext) -> None:
     assert out == "Fallback recap.", out
     assert len(primary.generate_calls) == 1, "primary tried once"
     assert len(fallback.generate_calls) == 1, "fallback tried once"
-    # The fallback call, like the primary, must not pollute the session.
-    assert fallback.generate_calls[0]["kwargs"].get("session_id") is None
+    # The fallback call, like the primary, must not read/pollute shared history.
+    summary_sid = fallback.generate_calls[0]["kwargs"].get("session_id")
+    assert summary_sid.startswith("compaction:"), summary_sid
+    assert summary_sid != "default", summary_sid
+    assert fallback.forgotten_sessions == [summary_sid]
 
 
 @test("compaction", "summarise returns '' when the primary fails and no fallback exists")
@@ -1449,6 +1464,51 @@ async def t_summary_transcript_untouched_when_it_fits(ctx: TestContext) -> None:
     assert out == "Recap."
     sent = summariser.generate_calls[0]["messages"][0]["content"]
     assert "billing charge" in sent, "a fitting transcript must pass through intact"
+
+
+@test("compaction", "summary transcript has an absolute provider-admission ceiling")
+async def t_summary_transcript_absolute_ceiling(ctx: TestContext) -> None:
+    """A huge context window must not license a huge subscription-proxy call.
+
+    Regression from Friday: a 200k-window Claude row received one ~77k-token
+    compaction request, the OAuth account rate-limited it immediately, and the
+    live Telegram turn then had no provider. One run alone was larger than the
+    desired clamp, so the fitter must suffix-trim that boundary run too.
+    """
+    from src.core import compaction
+
+    runs = [
+        {"content": "", "messages": [{
+            "role": "assistant",
+            "content": f"turn {i} " + ("tool output and decisions " * 3000),
+        }]}
+        for i in range(8)
+    ]
+    primary = _FakeModel(model="local:claude-sonnet-4-6", max_context=200_000)
+    summariser = _FakeModel(
+        model="local:claude-sonnet-4-6", max_context=200_000, summary="Recap.")
+    agent = _FakeAgent(str(ctx.test_dir / "absolute-clamp.db"), primary)
+
+    orig_pick = compaction._pick_summary_model
+    compaction._pick_summary_model = lambda a, *, fallback: summariser
+    os.environ[compaction._SUMMARY_MAX_INPUT_TOKENS_ENV] = "2000"
+    try:
+        out = await compaction._summarize_runs(runs, primary, agent)
+    finally:
+        compaction._pick_summary_model = orig_pick
+        os.environ.pop(compaction._SUMMARY_MAX_INPUT_TOKENS_ENV, None)
+
+    assert out == "Recap."
+    sent = summariser.generate_calls[0]["messages"][0]["content"]
+    sent_tokens = compaction._estimate_text_tokens(
+        sent, "local:claude-sonnet-4-6")
+    # Wrapper prose adds a small amount beyond the transcript ceiling.
+    assert sent_tokens < 2300, sent_tokens
+    assert "[Turn 8]" in sent, "the newest run marker must survive"
+    assert "turn 0" not in sent, "oldest runs must yield first"
+    assert "Earlier content from this turn" in sent, (
+        "a single oversized newest run must be suffix-trimmed, not sent whole"
+    )
 
 
 # ── 7. sizing the fold: per-model windows and an honest token count ─────
