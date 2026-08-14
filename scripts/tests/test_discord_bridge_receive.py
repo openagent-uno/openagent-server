@@ -1,20 +1,16 @@
 """Discord bridge — on_message receive-path tests.
 
-Pins three contracts that broke silently before:
+Pins the independent Discord access boundaries:
 
-1. An authorized user (uid in ``allowed_users``) sending a plain message
-   in a guild channel — WITHOUT @mentioning the bot and with NO
-   ``listen_channels`` configured — is dispatched, not dropped. Before
-   the fix Discord required an @mention or a listen-channel match even
-   for vetted users, asymmetric with Telegram, and the drop happened
-   silently (no log line).
+1. ``listen_channels`` is the hard boundary for guild messages. Every
+   human member of a listed channel can talk to the agent, while even a
+   user in ``allowed_users`` is dropped outside those channels.
 
-2. An UNauthorized user is still dropped, AND the drop is now visible
-   in ``events.jsonl`` as ``bridge.discord.dropped``. Silent drops were
-   the root cause of "I sent a message and nothing happened" reports.
+2. ``allowed_users`` controls private DMs and slash commands only. It
+   does not grant a server-wide bypass around ``listen_channels``.
 
-3. Authorized user in an UNallowed guild is dropped with the right
-   reason string.
+3. ``allowed_guilds`` remains an optional outer boundary for listed
+   channels, and every dropped path emits a diagnostic event.
 
 We never actually start the Discord client — instead we patch the
 ``discord`` and ``discord.app_commands`` modules into ``sys.modules``,
@@ -40,6 +36,9 @@ class _FakeDMChannel:
     ``on_message`` — we install ``_FakeDMChannel`` as ``discord.DMChannel``
     so the bridge's ``isinstance(message.channel, discord.DMChannel)``
     test resolves against our fake class hierarchy."""
+
+    def __init__(self, channel_id: int = 777):
+        self.id = channel_id
 
 
 class _FakeGuildChannel:
@@ -166,7 +165,11 @@ def _install_fake_discord_modules():
     return restore, recorded, _Done
 
 
-async def _capture_on_message():
+async def _capture_on_message(
+    *,
+    allowed_users: list[str] | None = None,
+    listen_channels: list[str] | None = None,
+):
     """Boot a DiscordBridge with the fake discord shim and return its
     registered ``on_message`` callback, along with the bridge instance
     and the captured event log."""
@@ -175,9 +178,9 @@ async def _capture_on_message():
     restore, recorded, _Done = _install_fake_discord_modules()
     bridge = DiscordBridge(
         token="fake",
-        allowed_users=["123"],
+        allowed_users=["123"] if allowed_users is None else allowed_users,
         allowed_guilds=None,
-        listen_channels=None,
+        listen_channels=["555"] if listen_channels is None else listen_channels,
         dm_only=False,
     )
     try:
@@ -199,8 +202,32 @@ async def _capture_on_message():
 # ── Tests ────────────────────────────────────────────────────────────
 
 
-@test("bridges", "discord on_message: authorized user in guild WITHOUT mention is dispatched")
-async def t_discord_authorized_user_no_mention_dispatched(ctx: TestContext) -> None:
+@test("bridges", "discord config supports shared channels with no DM users")
+async def t_discord_channel_only_config_builds_bridge(ctx: TestContext) -> None:
+    from src.bridges.discord import DiscordBridge
+    from src.core.server import _build_bridges
+
+    bridges = _build_bridges(
+        {
+            "channels": {
+                "discord": {
+                    "token": "fake",
+                    "allowed_users": [],
+                    "listen_channels": ["555"],
+                },
+            },
+        },
+        per_bridge_url={"discord": "ws://127.0.0.1:8765/ws"},
+    )
+
+    assert len(bridges) == 1, bridges
+    assert isinstance(bridges[0], DiscordBridge), type(bridges[0])
+    assert bridges[0].allowed_users == set(), bridges[0].allowed_users
+    assert bridges[0].listen_channels == {"555"}, bridges[0].listen_channels
+
+
+@test("bridges", "discord on_message: every user in a listened channel is dispatched")
+async def t_discord_listened_channel_accepts_every_user(ctx: TestContext) -> None:
     on_message, bridge, restore = await _capture_on_message()
     try:
         dispatched: list[tuple[str, str]] = []
@@ -211,11 +238,11 @@ async def t_discord_authorized_user_no_mention_dispatched(ctx: TestContext) -> N
         bridge.dispatch_turn = fake_dispatch_turn  # type: ignore[assignment]
 
         msg = _FakeMessage(
-            author_id=123,  # in allowed_users
+            author_id=999,  # deliberately NOT in allowed_users
             channel=_FakeGuildChannel(channel_id=555),
             guild=_FakeGuild(guild_id=42),
-            mentions=[],  # NOT mentioning the bot
-            content="hi from a non-mentioning guild message",
+            mentions=[],
+            content="hi from a shared channel member",
         )
 
         events: list[tuple[str, dict]] = []
@@ -228,15 +255,15 @@ async def t_discord_authorized_user_no_mention_dispatched(ctx: TestContext) -> N
             await on_message(msg)
 
         assert dispatched == [
-            ("dc:123", "hi from a non-mentioning guild message"),
+            ("dc:999", "hi from a shared channel member"),
         ], (
-            f"authorized user in guild WITHOUT mention should be dispatched; "
+            f"every user in an explicitly listened channel should dispatch; "
             f"got {dispatched}. Events: {[e for e, _ in events]}"
         )
         # Should NOT have any drop events for this path.
         drop_events = [e for e, _ in events if e == "bridge.discord.dropped"]
         assert not drop_events, (
-            f"authorized user must not trigger a drop event; got {drop_events}"
+            f"listened-channel member must not trigger a drop; got {drop_events}"
         )
         # Should have emitted bridge.message instead.
         assert any(e == "bridge.message" for e, _ in events), (
@@ -246,8 +273,8 @@ async def t_discord_authorized_user_no_mention_dispatched(ctx: TestContext) -> N
         restore()
 
 
-@test("bridges", "discord on_message: UNauthorized user is dropped AND emits diagnostic event")
-async def t_discord_unauthorized_user_dropped_with_event(ctx: TestContext) -> None:
+@test("bridges", "discord on_message: allowed DM user cannot bypass listen_channels")
+async def t_discord_allowed_user_outside_listened_channel_is_dropped(ctx: TestContext) -> None:
     on_message, bridge, restore = await _capture_on_message()
     try:
         dispatched: list = []
@@ -258,11 +285,11 @@ async def t_discord_unauthorized_user_dropped_with_event(ctx: TestContext) -> No
         bridge.dispatch_turn = fake_dispatch_turn  # type: ignore[assignment]
 
         msg = _FakeMessage(
-            author_id=999,  # NOT in allowed_users={"123"}
-            channel=_FakeGuildChannel(channel_id=555),
+            author_id=123,  # allowed for DMs, not for arbitrary channels
+            channel=_FakeGuildChannel(channel_id=777),
             guild=_FakeGuild(guild_id=42),
             mentions=[],
-            content="random guest message",
+            content="message in an unrelated channel",
         )
 
         events: list[tuple[str, dict]] = []
@@ -275,7 +302,7 @@ async def t_discord_unauthorized_user_dropped_with_event(ctx: TestContext) -> No
             await on_message(msg)
 
         assert dispatched == [], (
-            f"unauthorized user must NEVER reach dispatch_turn; got {dispatched}"
+            f"allowed DM user must not bypass listen_channels; got {dispatched}"
         )
         drop_events = [
             (e, kw) for e, kw in events if e == "bridge.discord.dropped"
@@ -283,15 +310,55 @@ async def t_discord_unauthorized_user_dropped_with_event(ctx: TestContext) -> No
         assert drop_events, (
             f"expected bridge.discord.dropped event; got {[e for e, _ in events]}"
         )
-        # First drop is the not_allowed_user reason — that's the early-out path.
         _, kw = drop_events[0]
-        assert kw.get("reason") == "not_allowed_user", kw
-        assert kw.get("user_id") == "999", kw
+        assert kw.get("reason") == "channel_not_listened", kw
+        assert kw.get("user_id") == "123", kw
+        assert kw.get("channel_id") == "777", kw
     finally:
         restore()
 
 
-@test("bridges", "discord on_message: authorized user in DISALLOWED guild is dropped with right reason")
+@test("bridges", "discord on_message: allowed_users gates DMs only")
+async def t_discord_dm_user_allowlist(ctx: TestContext) -> None:
+    on_message, bridge, restore = await _capture_on_message()
+    try:
+        dispatched: list[tuple[str, str]] = []
+
+        async def fake_dispatch_turn(channel, session_id, content, **kwargs):
+            dispatched.append((session_id, content))
+
+        bridge.dispatch_turn = fake_dispatch_turn  # type: ignore[assignment]
+        events: list[tuple[str, dict]] = []
+
+        def capture(event: str, *_a, **kw):
+            events.append((event, kw))
+
+        import src.bridges.discord as dc_mod
+        with patch.object(dc_mod, "elog", side_effect=capture):
+            await on_message(_FakeMessage(
+                author_id=123,
+                channel=_FakeDMChannel(),
+                content="authorized DM",
+            ))
+            await on_message(_FakeMessage(
+                author_id=999,
+                channel=_FakeDMChannel(),
+                content="unauthorized DM",
+            ))
+
+        assert dispatched == [("dc:123", "authorized DM")], dispatched
+        dm_drops = [
+            kw for event, kw in events
+            if event == "bridge.discord.dropped"
+        ]
+        assert len(dm_drops) == 1, dm_drops
+        assert dm_drops[0].get("reason") == "not_allowed_user", dm_drops[0]
+        assert dm_drops[0].get("user_id") == "999", dm_drops[0]
+    finally:
+        restore()
+
+
+@test("bridges", "discord on_message: listened channel in DISALLOWED guild is dropped")
 async def t_discord_disallowed_guild_drop(ctx: TestContext) -> None:
     on_message, bridge, restore = await _capture_on_message()
     try:
@@ -307,7 +374,7 @@ async def t_discord_disallowed_guild_drop(ctx: TestContext) -> None:
         bridge.dispatch_turn = fake_dispatch_turn  # type: ignore[assignment]
 
         msg = _FakeMessage(
-            author_id=123,
+            author_id=999,
             channel=_FakeGuildChannel(channel_id=555),
             guild=_FakeGuild(guild_id=42),  # NOT in allowed_guilds
             mentions=[],

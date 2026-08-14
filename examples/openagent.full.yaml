@@ -124,9 +124,9 @@ channels:
 
   discord:
     token: "${DISCORD_BOT_TOKEN}"
-    allowed_users: ["123456789012345678"]
+    allowed_users: ["123456789012345678"] # users allowed to DM/use commands
     allowed_guilds: []
-    listen_channels: []                # public channels to listen to
+    listen_channels: []                # shared channels; all members may talk
     dm_only: false
     personality: technical
 

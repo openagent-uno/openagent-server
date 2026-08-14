@@ -127,7 +127,7 @@ class DiscordBridge(BaseBridge):
     def __init__(
         self,
         token: str,
-        allowed_users: list[str],
+        allowed_users: list[str] | None = None,
         allowed_guilds: list[str] | None = None,
         listen_channels: list[str] | None = None,
         dm_only: bool = False,
@@ -138,7 +138,7 @@ class DiscordBridge(BaseBridge):
     ):
         super().__init__(gateway_url, gateway_token, personality=personality, live=live)
         self.token = token
-        self.allowed_users = set(str(u) for u in allowed_users)
+        self.allowed_users = set(str(u) for u in (allowed_users or []))
         self.allowed_guilds = set(str(g) for g in (allowed_guilds or []))
         self.listen_channels = set(str(c) for c in (listen_channels or []))
         self.dm_only = dm_only
@@ -219,34 +219,34 @@ class DiscordBridge(BaseBridge):
             uid = str(message.author.id)
             cid = str(getattr(message.channel, "id", "")) or None
             gid = str(message.guild.id) if getattr(message, "guild", None) else None
-            if uid not in self.allowed_users:
-                elog("bridge.discord.dropped", reason="not_allowed_user",
-                     user_id=uid, channel_id=cid)
-                return
-
             is_dm = isinstance(message.channel, discord.DMChannel)
-            if not is_dm and self.dm_only:
+            if is_dm:
+                # ``allowed_users`` is the private-conversation boundary.
+                # Public channel access is controlled independently below by
+                # ``listen_channels`` so every member of an explicitly listed
+                # channel can talk to the agent without also being copied into
+                # a global user allowlist.
+                if uid not in self.allowed_users:
+                    elog("bridge.discord.dropped", reason="not_allowed_user",
+                         user_id=uid, channel_id=cid)
+                    return
+            elif self.dm_only:
                 elog("bridge.discord.dropped", reason="dm_only_rejecting_guild",
                      user_id=uid, channel_id=cid, guild_id=gid)
                 return
-            if not is_dm and self.allowed_guilds and gid not in self.allowed_guilds:
+            elif self.allowed_guilds and gid not in self.allowed_guilds:
                 elog("bridge.discord.dropped", reason="guild_not_allowed",
                      user_id=uid, channel_id=cid, guild_id=gid)
                 return
-            if not is_dm:
-                mentioned = client.user and client.user in message.mentions
-                in_listen = cid in self.listen_channels
-                # Authorized users bypass the @mention / listen_channels gate.
-                # Symmetry with Telegram: once a user is in allowed_users they
-                # can DM-style chat the bot in any channel without ceremony.
-                # Safe because DiscordBridge REQUIRES non-empty allowed_users
-                # at construction time (openagent/core/server.py:232-234), so
-                # this bypass is always narrowly scoped to vetted accounts.
-                is_allowed_user = bool(self.allowed_users) and uid in self.allowed_users
-                if not mentioned and not in_listen and not is_allowed_user:
-                    elog("bridge.discord.dropped", reason="no_mention_no_listen",
-                         user_id=uid, channel_id=cid, guild_id=gid)
-                    return
+            elif cid not in self.listen_channels:
+                # A configured channel is an explicit shared doorway: accept
+                # all of its human members, and never let an ``allowed_users``
+                # entry bypass the channel boundary. This keeps two agents in
+                # the same Discord server from both answering an operator in
+                # an unrelated channel.
+                elog("bridge.discord.dropped", reason="channel_not_listened",
+                     user_id=uid, channel_id=cid, guild_id=gid)
+                return
 
             elog("bridge.message", bridge="discord", user_id=uid)
             content = message.content or ""

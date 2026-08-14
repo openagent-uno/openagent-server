@@ -1486,15 +1486,19 @@ def _build_bridges(config: dict, per_bridge_url: dict[str, str]) -> list:
             if not token:
                 logger.warning("Discord token not configured; skipping")
                 continue
-            allowed = cfg.get("allowed_users")
-            if not allowed:
-                logger.warning("Discord needs allowed_users; skipping")
+            allowed = cfg.get("allowed_users") or []
+            listen_channels = cfg.get("listen_channels") or []
+            if not allowed and not listen_channels:
+                logger.warning(
+                    "Discord needs allowed_users for DMs or listen_channels "
+                    "for shared channels; skipping"
+                )
                 continue
             out.append(DiscordBridge(
                 token=token,
                 allowed_users=allowed,
                 allowed_guilds=cfg.get("allowed_guilds"),
-                listen_channels=cfg.get("listen_channels"),
+                listen_channels=listen_channels,
                 dm_only=bool(cfg.get("dm_only", False)),
                 gateway_url=gateway_url,
                 gateway_token=None,
