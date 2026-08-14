@@ -13,6 +13,82 @@ from typing import Any
 from ._framework import TestContext, TestSkip, have_openai_key, test
 
 
+@test("runtime", "tool-search schema accepts target tool arguments")
+async def t_tool_search_freeform_args_schema(_ctx: TestContext) -> None:
+    """Regression for Friday's GLM/Kimi all-arguments outage.
+
+    A bare ``dict`` used to become ``additionalProperties: false`` in the
+    provider schema.  Models therefore emitted the valid-but-useless
+    ``args: {}`` for every target, and required parameters such as
+    ``vault_search.query`` disappeared before dispatch.
+    """
+    from types import SimpleNamespace
+
+    from src.mcp.servers.tool_search.adapters import build_runtime_toolkit
+
+    received: list[dict[str, Any]] = []
+
+    async def vault_search(query: str) -> dict[str, str]:
+        received.append({"query": query})
+        return {"query": query}
+
+    target = SimpleNamespace(
+        entrypoint=vault_search,
+        description="Search the vault",
+        parameters={
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        },
+    )
+    target_toolkit = SimpleNamespace(
+        functions={},
+        async_functions={"vault_search": target},
+    )
+
+    class Pool:
+        _toolkit_by_name = {"vault-gate": target_toolkit}
+
+        def toolkit_by_name(self, name: str) -> Any:
+            return self._toolkit_by_name.get(name)
+
+    toolkit = build_runtime_toolkit(pool=Pool())
+    call = toolkit.async_functions["tool_search_call_tool"]
+    # ``parse_tools`` performs this processing before the schema is sent to
+    # every provider. Exercise that exact transformation here.
+    call.process_entrypoint()
+
+    args_schema = call.parameters["properties"]["args"]
+    variants = args_schema.get("anyOf", [args_schema])
+    object_schema = next(
+        item for item in variants if item.get("type") == "object"
+    )
+    assert any(item.get("type") == "string" for item in variants), (
+        f"provider JSON-string fallback is absent: {args_schema}"
+    )
+    assert object_schema.get("additionalProperties") is True, (
+        f"target args are still closed in provider schema: {args_schema}"
+    )
+
+    result = await call.entrypoint(
+        server="vault-gate",
+        tool="vault_search",
+        args={"query": "identity banking"},
+    )
+    assert result == {"query": "identity banking"}
+    assert received == [{"query": "identity banking"}]
+
+    # GLM-5 currently stringifies the nested object on ZAI even when the
+    # schema says object.  The provider boundary must decode it losslessly.
+    result = await call.entrypoint(
+        server="vault-gate",
+        tool="vault_search",
+        args='{"query":"glm encoded args"}',
+    )
+    assert result == {"query": "glm encoded args"}
+    assert received[-1] == {"query": "glm encoded args"}
+
+
 @test("runtime", "live generate + tokens + cost + system_message routing")
 async def t_agno_generate(ctx: TestContext) -> None:
     if not have_openai_key(ctx.config):

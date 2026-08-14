@@ -255,7 +255,7 @@ async def _resolve_tool(
 
 
 async def _call_tool_impl(
-    pool: Any, server: str, tool: str, args: dict | None,
+    pool: Any, server: str, tool: str, args: dict | str | None,
 ) -> Any:
     fn, _resolved_server = await _resolve_tool(pool, server, tool)
 
@@ -271,10 +271,21 @@ async def _call_tool_impl(
             f"No loaded MCP has a tool named {tool!r}. "
             f"MCP {server!r} exposes: {avail}." + _did_you_mean(tool, avail)
         )
+    if isinstance(args, str):
+        # Some OpenAI-compatible models (observed: GLM-5 on ZAI) encode the
+        # nested free-form ``args`` object as a JSON string even though the
+        # outer function-call arguments are valid JSON.  Accept that harmless
+        # representation drift at the provider boundary; otherwise Pydantic
+        # rejects the call before the target tool ever sees its required
+        # arguments.
+        try:
+            args = json.loads(args)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("args must be a JSON object or encoded JSON object") from exc
     if args is None:
         args = {}
     if not isinstance(args, dict):
-        raise ValueError(f"args must be a dict, got {type(args).__name__}")
+        raise ValueError(f"args must decode to an object, got {type(args).__name__}")
     # The runtime's ``Function`` exposes ``entrypoint``; raw callables don't.
     # Prefer ``entrypoint`` when present (matches the test fixtures in
     # ``scripts/tests/test_mcp.py``) and fall back to direct call for
@@ -324,11 +335,19 @@ def build_runtime_toolkit(*, pool: Any | None = None) -> Any:
         return _describe_tool_impl(pool, server, tool)
 
     async def tool_search_call_tool(
-        server: str, tool: str, args: dict | None = None,
+        server: str, tool: str, args: dict | str | None = None,
     ) -> Any:
         """Invoke any tool on any connected MCP and return its result.
 
         Use this when the tool you need was trimmed from the upfront list.
+
+        Args:
+            server: Connected MCP server name.
+            tool: Exact tool name returned by list_tools.
+            args: Target tool arguments as a nested object. Copy required
+                properties from describe_tool's input_schema into this object.
+                A JSON-encoded object string is also accepted for provider
+                compatibility.
         """
         return await _call_tool_impl(pool, server, tool, args)
 

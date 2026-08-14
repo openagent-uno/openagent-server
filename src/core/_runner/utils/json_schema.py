@@ -199,6 +199,14 @@ def get_json_schema_for_arg(type_hint: Any) -> Optional[Dict[str, Any]]:
             arg_json_schema["required"] = required
         return arg_json_schema
 
+    # A bare ``dict`` annotation has no declared key set, so it is a free-form
+    # JSON object.  Describing it as a closed object made model providers
+    # correctly erase every property.  This broke tool-search's generic
+    # ``args`` envelope: GLM/Kimi could select a target tool but were only
+    # allowed to send ``args: {}``, so required target parameters vanished.
+    if type_hint is dict:
+        return {"type": "object", "additionalProperties": True}
+
     json_schema: Dict[str, Any] = {"type": get_json_type_for_py_type(type_hint.__name__)}
     if json_schema["type"] == "object":
         json_schema["properties"] = {}
