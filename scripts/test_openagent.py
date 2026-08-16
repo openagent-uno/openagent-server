@@ -439,6 +439,11 @@ _TEST_MODULES: tuple[str, ...] = (
     # stay ``received`` (unclaimed) in the DB queue and drain as slots free, and
     # a hanging turn holds its slot without blocking the drain loop.
     "test_event_dispatch_concurrency",
+    # OPENAGENT_EVENT_STREAM: an unattended event turn need not be streamed.
+    # Streaming it costs a second, tool-less generate() whenever the turn ends
+    # in tool calls with no closing sentence — 83% of support firings measured.
+    # Opt-out, read per turn so it flips with a reload instead of a release.
+    "test_event_stream_knob",
     # Claim-lease + heartbeat: a FROZEN in-flight delivery (the WAL-writer
     # wedge — heartbeat stops) is reclaimed in ~LEASE_TTL by
     # ``reap_expired_event_leases`` on the fast loop, instead of the 30-min
