@@ -454,6 +454,9 @@ _TEST_MODULES: tuple[str, ...] = (
     # Una chiamata a tool malformata deve tornare al modello con nome, tipi e un
     # esempio: il messaggio di Python nomina una closure e non insegna niente.
     "test_tool_signature_help",
+    # Il freno del clone: un gemello eredita le credenziali vere della produzione,
+    # quindi il dry-run deve poter essere inchiodato al processo, non al payload.
+    "test_force_dry_run",
     # Claim-lease + heartbeat: a FROZEN in-flight delivery (the WAL-writer
     # wedge — heartbeat stops) is reclaimed in ~LEASE_TTL by
     # ``reap_expired_event_leases`` on the fast loop, instead of the 30-min

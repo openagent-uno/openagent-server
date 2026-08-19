@@ -50,6 +50,27 @@ _EVENT_RUN_TIMEOUT_SECONDS = int(
 )
 
 
+def _force_dry_run() -> bool:
+    """Whether EVERY event turn is forced into dry-run, regardless of payload.
+
+    Dry-run is per-delivery: the payload asks for it. That is right for
+    production, and wrong for a CLONE. A staging twin is built by copying a
+    production agent's directory, which brings along its credentials — the same
+    write-capable keys for the support platform, the task tracker, billing, the
+    release pipeline — because a twin that cannot read what production reads is
+    not a twin. Nothing in a per-payload flag protects that: measured 19-ago-2026,
+    a clone inherited **1061 pending production deliveries** in the copied DB and
+    started working them with the real key seconds after boot.
+
+    So the operator can nail the whole process to dry-run with
+    ``OPENAGENT_FORCE_DRY_RUN=1``: writes are captured, never executed, whatever
+    any payload says. Read per turn, so it cannot be flipped by a stale import.
+    """
+    return os.environ.get("OPENAGENT_FORCE_DRY_RUN", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
 def _event_stream_enabled() -> bool:
     """Whether an event turn is driven through ``run_stream``.
 
@@ -583,7 +604,7 @@ async def _dispatch_prompt(*, agent, db, event, payload, delivery_id, source, on
     # turn only.
     from src.core.dry_run import dry_run_scope
 
-    is_dry = bool((payload or {}).get("dry_run"))
+    is_dry = bool((payload or {}).get("dry_run")) or _force_dry_run()
 
     async def _run_bound_turn():
         with dry_run_scope(is_dry):
