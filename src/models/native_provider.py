@@ -1027,12 +1027,15 @@ class NativeProvider(BaseModel):
         if explicit:
             return explicit
         provider_name, _ = self._runtime_parts()
-        if provider_name in PROVIDER_REQUIRES_BASE_URL:
-            # Local servers (Ollama / vLLM / LM Studio) ignore the key, but the
-            # OpenAI SDK client refuses to initialise without one — supply a
-            # harmless placeholder so a keyless local setup still works. A real
-            # key (e.g. a vLLM ``--api-key``) configured on the provider wins
-            # above via ``explicit``.
+        if provider_name in PROVIDER_REQUIRES_BASE_URL or self._self_hosted_spec(provider_name):
+            # Local servers (Ollama / vLLM / LM Studio / llama.cpp) ignore the
+            # key, but the OpenAI SDK client refuses to initialise without one —
+            # supply a harmless placeholder so a keyless local setup still
+            # works. A real key (e.g. a vLLM ``--api-key``) configured on the
+            # provider wins above via ``explicit``. This covers BOTH the
+            # reserved ``local`` name and any other operator-registered
+            # self-hosted server (see ``_self_hosted_spec``): the second one
+            # would otherwise build a client with no credential at all.
             return "local"
         return explicit
 
@@ -1044,7 +1047,8 @@ class NativeProvider(BaseModel):
         default = PROVIDER_DEFAULT_BASE_URLS.get(provider_name)
         if default is not None:
             return configured or default
-        if not configured and provider_name in PROVIDER_REQUIRES_BASE_URL:
+        known = provider_name in RUNTIME_PROVIDER_CLASSES
+        if not configured and (provider_name in PROVIDER_REQUIRES_BASE_URL or not known):
             raise ValueError(
                 f"The '{provider_name}' provider requires a base_url pointing "
                 "at your OpenAI-compatible server's /v1 root — e.g. "
@@ -1081,10 +1085,40 @@ class NativeProvider(BaseModel):
     def _load_runtime_model_class(self, provider_name: str) -> tuple[type | None, dict[str, Any]]:
         spec = RUNTIME_PROVIDER_CLASSES.get(provider_name)
         if not spec:
+            spec = self._self_hosted_spec(provider_name)
+        if not spec:
             return None, {}
         module_name, class_name, extra_kwargs = spec
         module = importlib.import_module(module_name)
         return getattr(module, class_name), dict(extra_kwargs)
+
+    def _self_hosted_spec(self, provider_name: str) -> tuple[str, str, dict[str, Any]] | None:
+        """Driver for an operator-registered OpenAI-compatible server.
+
+        ``RUNTIME_PROVIDER_CLASSES`` keys the driver off the provider NAME, so
+        ``local`` — the entry meant for self-hosted servers — is a single slot.
+        An operator who already spends it (a subscription proxy, say) and then
+        registers a second server gets ``Model provider 'x' is not supported``,
+        with a suggestion list naming only hosted vendors. Nothing about the
+        second server is unsupported: it speaks the same OpenAI schema the
+        first one does. The name was never the driver — it is an identity.
+
+        So: a provider row the operator created WITH a ``base_url`` is treated
+        as self-hosted and built through ``OpenAILike``, exactly like ``local``.
+        The base_url is the discriminator on purpose — it is what an operator
+        must supply for a self-hosted endpoint and what no typo produces. A
+        misspelled vendor (``anthropci:...``) has no row and no base_url, so it
+        still raises, which is the property the strict map was protecting.
+        """
+        if not provider_name:
+            return None
+        try:
+            configured = (self._provider_setting("base_url") or "").strip()
+        except Exception:  # noqa: BLE001 — a missing/odd config must not break the build
+            return None
+        if not configured:
+            return None
+        return ("src.models.providers.openai.like", "OpenAILike", {"name": provider_name})
 
     def build_runtime_model(self) -> Any:
         """Construct the underlying ``Model`` instance for this runtime.

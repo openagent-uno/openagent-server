@@ -444,6 +444,10 @@ _TEST_MODULES: tuple[str, ...] = (
     # in tool calls with no closing sentence — 83% of support firings measured.
     # Opt-out, read per turn so it flips with a reload instead of a release.
     "test_event_stream_knob",
+    # Un secondo server OpenAI-compatibile self-hosted: il driver si sceglieva
+    # dal NOME del provider, e lo slot "local" e' uno solo. Il base_url e' il
+    # discriminante; un vendor scritto male deve continuare a fallire.
+    "test_self_hosted_provider",
     # Claim-lease + heartbeat: a FROZEN in-flight delivery (the WAL-writer
     # wedge — heartbeat stops) is reclaimed in ~LEASE_TTL by
     # ``reap_expired_event_leases`` on the fast loop, instead of the 30-min
