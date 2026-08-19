@@ -15,6 +15,57 @@ from src.core._runner.utils.log import log_debug, log_exception, log_warning
 T = TypeVar("T")
 
 
+def signature_help(entrypoint, tool_name: str, exc: Exception) -> Optional[str]:
+    """A tool-call error a MODEL can act on, or ``None`` if this isn't one.
+
+    A malformed call raises Python's own message — ``build_runtime_toolkit.
+    <locals>.vault_search() missing 1 required positional argument: 'query'``.
+    It names a closure the model has never heard of, quotes no types and shows
+    no example, so the retry is a guess. Measured 19-ago-2026 on a self-hosted
+    24B driving a real agent: the turn survived (the error is caught) but the
+    call was simply burned.
+
+    Frontier models mostly recover from anything; smaller ones need to be told
+    the shape. So when the failure IS a signature mismatch, rewrite it into the
+    tool's real name, its required arguments with types, and a call to copy.
+    Anything else is returned untouched — a tool's own error must not be
+    dressed up as a usage problem.
+    """
+    from inspect import signature as _signature
+
+    text = str(exc)
+    if not isinstance(exc, TypeError):
+        return None
+    if not any(k in text for k in ("required positional argument",
+                                   "required keyword-only argument",
+                                   "unexpected keyword argument",
+                                   "missing")):
+        return None
+    try:
+        sig = _signature(entrypoint)
+    except (TypeError, ValueError):
+        return None
+    required, optional = [], []
+    for name, param in sig.parameters.items():
+        if name in ("self", "cls") or param.kind in (param.VAR_POSITIONAL, param.VAR_KEYWORD):
+            continue
+        ann = getattr(param.annotation, "__name__", None)
+        if ann is None and param.annotation is not param.empty:
+            ann = str(param.annotation).replace("typing.", "")
+        desc = f"{name}: {ann}" if ann else name
+        (optional if param.default is not param.empty else required).append((name, desc))
+    if not required and "unexpected keyword argument" not in text:
+        return None
+    example = ", ".join(f"{n}=..." for n, _ in required) or "…"
+    parts = [f"{tool_name}: invalid call."]
+    if required:
+        parts.append("REQUIRED arguments: " + ", ".join(d for _, d in required) + ".")
+    if optional:
+        parts.append("Optional: " + ", ".join(d for _, d in optional) + ".")
+    parts.append(f"Call it again as {tool_name}({example}).")
+    return " ".join(parts)
+
+
 def get_entrypoint_docstring(entrypoint: Callable) -> str:
     from inspect import getdoc
 
@@ -1091,12 +1142,14 @@ class FunctionCall(BaseModel):
             log_debug(f"{e.__class__.__name__}: {e}")
             self.error = str(e)
             exception_to_raise = e
-            execution_result = FunctionExecutionResult(status="failure", error=str(e))
+            _help = signature_help(self.function.entrypoint, self.function.name, e)
+            execution_result = FunctionExecutionResult(status="failure", error=_help or str(e))
         except Exception as e:
             log_warning(f"Could not run function {self.get_call_str()}: {str(e)}")
             log_exception(e)
             self.error = str(e)
-            execution_result = FunctionExecutionResult(status="failure", error=str(e))
+            _help = signature_help(self.function.entrypoint, self.function.name, e)
+            execution_result = FunctionExecutionResult(status="failure", error=_help or str(e))
 
         finally:
             self._handle_post_hook()
@@ -1311,12 +1364,14 @@ class FunctionCall(BaseModel):
             log_debug(f"{e.__class__.__name__}: {e}")
             self.error = str(e)
             exception_to_raise = e
-            execution_result = FunctionExecutionResult(status="failure", error=str(e))
+            _help = signature_help(self.function.entrypoint, self.function.name, e)
+            execution_result = FunctionExecutionResult(status="failure", error=_help or str(e))
         except Exception as e:
             log_warning(f"Could not run function {self.get_call_str()}: {str(e)}")
             log_exception(e)
             self.error = str(e)
-            execution_result = FunctionExecutionResult(status="failure", error=str(e))
+            _help = signature_help(self.function.entrypoint, self.function.name, e)
+            execution_result = FunctionExecutionResult(status="failure", error=_help or str(e))
 
         finally:
             if iscoroutinefunction(self.function.post_hook):

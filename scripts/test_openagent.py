@@ -451,6 +451,9 @@ _TEST_MODULES: tuple[str, ...] = (
     # Sampling params (temperature & co.) dalla riga del modello: senza, un server
     # self-hosted gira col suo default (llama.cpp: 0.8) e nessuno se ne accorge.
     "test_model_sampling_params",
+    # Una chiamata a tool malformata deve tornare al modello con nome, tipi e un
+    # esempio: il messaggio di Python nomina una closure e non insegna niente.
+    "test_tool_signature_help",
     # Claim-lease + heartbeat: a FROZEN in-flight delivery (the WAL-writer
     # wedge — heartbeat stops) is reclaimed in ~LEASE_TTL by
     # ``reap_expired_event_leases`` on the fast loop, instead of the 30-min
