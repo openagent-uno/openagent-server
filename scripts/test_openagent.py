@@ -448,6 +448,9 @@ _TEST_MODULES: tuple[str, ...] = (
     # dal NOME del provider, e lo slot "local" e' uno solo. Il base_url e' il
     # discriminante; un vendor scritto male deve continuare a fallire.
     "test_self_hosted_provider",
+    # Sampling params (temperature & co.) dalla riga del modello: senza, un server
+    # self-hosted gira col suo default (llama.cpp: 0.8) e nessuno se ne accorge.
+    "test_model_sampling_params",
     # Claim-lease + heartbeat: a FROZEN in-flight delivery (the WAL-writer
     # wedge — heartbeat stops) is reclaimed in ~LEASE_TTL by
     # ``reap_expired_event_leases`` on the fast loop, instead of the 30-min

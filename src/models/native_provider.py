@@ -1059,6 +1059,62 @@ class NativeProvider(BaseModel):
             )
         return configured
 
+    # Parametri di campionamento che un operatore puo' scrivere sulla riga del
+    # modello (``models.metadata_json``). Whitelist stretta: qui passa solo cio'
+    # che e' campionamento, mai credenziali o url.
+    _SAMPLING_KEYS = ("temperature", "top_p", "top_k", "min_p", "max_tokens",
+                      "presence_penalty", "frequency_penalty", "repeat_penalty", "seed")
+
+    def _sampling_from_model_row(self) -> dict[str, Any]:
+        """Sampling params declared on the model row, or ``{}``.
+
+        Before this, ``RUNTIME_PROVIDER_CLASSES``' ``extra_kwargs`` was the only
+        channel into a provider constructor, and it is keyed by PROVIDER — so
+        two models on the same provider could not differ, and nothing could be
+        changed without a release. For a self-hosted server that gap is not
+        cosmetic: llama.cpp defaults to ``temperature 0.8``, and a provider that
+        sends no temperature (this one does not — ``OpenAIChat.temperature`` is
+        ``Optional[float] = None``) inherits it silently. A support agent was
+        therefore running far hotter than anyone had chosen, which is exactly
+        the setting that turns "I cannot verify that" into an invented answer.
+
+        Read from the DB row rather than yaml so it can be tuned per model with
+        one UPDATE, and re-read per build so a change needs a reload, not a
+        release.
+        """
+        raw = (self._model_row_metadata() or {})
+        out: dict[str, Any] = {}
+        for key in self._SAMPLING_KEYS:
+            if key in raw and raw[key] is not None:
+                out[key] = raw[key]
+        return out
+
+    def _model_row_metadata(self) -> dict[str, Any]:
+        import json as _json
+        import sqlite3 as _sqlite3
+
+        db_path = self._runtime_db_path() if hasattr(self, "_runtime_db_path") else self._db_path
+        if not db_path:
+            return {}
+        _, model_id = self._runtime_parts()
+        try:
+            con = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
+            try:
+                row = con.execute(
+                    "select metadata_json from models where model=? limit 1", (model_id,)
+                ).fetchone()
+            finally:
+                con.close()
+        except Exception:  # noqa: BLE001 — una config illeggibile non deve fermare un turno
+            return {}
+        if not row or not row[0]:
+            return {}
+        try:
+            data = _json.loads(row[0])
+        except Exception:  # noqa: BLE001
+            return {}
+        return data if isinstance(data, dict) else {}
+
     def _construct_model(self, cls: type, **kwargs: Any) -> Any:
         accepted = _model_class_accepted_params(cls)
         # Anti-wedge: give every model call a per-read socket timeout so a hung
@@ -1135,6 +1191,9 @@ class NativeProvider(BaseModel):
                 **extra_kwargs,
                 **_thinking_kwarg(provider_name, model_id),
             }
+            # I parametri di campionamento della riga del modello vincono sui
+            # default del provider: sono la scelta esplicita di un operatore.
+            extra_kwargs = {**extra_kwargs, **self._sampling_from_model_row()}
             model = self._construct_model(
                 model_class,
                 id=model_id,
