@@ -2743,8 +2743,17 @@ class MemoryDB:
         now = time.time()
         claim_expires = now + _lease_ttl_seconds()
         cursor = await conn.execute(
+            # ``finished_at IS NULL`` is load-bearing, not tidiness. The claim
+            # orders by ``started_at ASC`` and does NOT look at status, so a row
+            # that finished without ever being claimed — cancelled out of band,
+            # imported, or written by a tool that set an outcome directly — sits
+            # at the head of the queue forever and is re-claimed on every tick,
+            # spending the whole batch. Measured 19-ago-2026 on a cloned agent:
+            # 1057 such rows starved every genuinely pending delivery behind
+            # them, and from the outside it looked exactly like "no work".
             "SELECT * FROM event_deliveries "
-            "WHERE claimed_at IS NULL ORDER BY started_at ASC LIMIT ?",
+            "WHERE claimed_at IS NULL AND finished_at IS NULL "
+            "ORDER BY started_at ASC LIMIT ?",
             (int(limit),),
         )
         rows = await cursor.fetchall()

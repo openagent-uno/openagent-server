@@ -457,6 +457,9 @@ _TEST_MODULES: tuple[str, ...] = (
     # Il freno del clone: un gemello eredita le credenziali vere della produzione,
     # quindi il dry-run deve poter essere inchiodato al processo, non al payload.
     "test_force_dry_run",
+    # La coda delle delivery: una riga conclusa ma mai rivendicata resta in testa
+    # per sempre e affama tutto il resto (1057 righe su un agent clonato).
+    "test_delivery_queue_starvation",
     # Claim-lease + heartbeat: a FROZEN in-flight delivery (the WAL-writer
     # wedge — heartbeat stops) is reclaimed in ~LEASE_TTL by
     # ``reap_expired_event_leases`` on the fast loop, instead of the 30-min

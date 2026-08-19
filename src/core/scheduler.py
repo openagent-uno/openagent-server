@@ -587,6 +587,16 @@ class Scheduler:
         # this tick — the queued ``received`` rows wait in the DB for a slot.
         free = self._event_dispatch_concurrency() - self._event_dispatch_in_flight
         if free <= 0:
+            # Say so. A saturated dispatcher and an empty queue look identical
+            # from outside — nothing runs, nothing is logged — and an in-flight
+            # counter that never came back down stalls the agent in silence.
+            # Throttled so a legitimately busy runtime doesn't spam the log.
+            now = time.time()
+            if now - getattr(self, "_last_saturation_log", 0.0) >= 60.0:
+                self._last_saturation_log = now
+                elog("scheduler.event_dispatch_saturated", level="warning",
+                     in_flight=self._event_dispatch_in_flight,
+                     concurrency=self._event_dispatch_concurrency())
             return
         try:
             deliveries = await self.db.claim_pending_event_deliveries(
