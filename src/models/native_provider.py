@@ -854,8 +854,13 @@ class NativeProvider(BaseModel):
             _set_env_key_once("OPENAI_BASE_URL", self._base_url)
 
     def _runtime_db_path(self) -> str:
-        if self._db_path:
-            return str(self._db_path)
+        # ``getattr``, not attribute access: the per-model sampling lookup now
+        # runs inside ``build_runtime_model``, which some callers reach on an
+        # instance built without ``__init__``. A missing path means "no row
+        # override", never a crash on the build path.
+        db_path = getattr(self, "_db_path", None)
+        if db_path:
+            return str(db_path)
         from src.core.paths import default_db_path
 
         return str(default_db_path())
