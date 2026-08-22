@@ -510,6 +510,18 @@ DEFAULT_MCPS: list[dict[str, Any]] = [
     {"builtin": "budget-manager", "_default": True},
     {"builtin": "delegation", "_default": True},
     {"builtin": "agent-federation", "_default": True},
+    # On by default now that ``generate_image`` resolves its backend by
+    # CAPABILITY rather than by vendor key. It was correctly left out while it
+    # meant "call the metered OpenAI API or fail": seeding a tool nobody had a
+    # key for only taught the model that images do not work here.
+    #
+    # It now uses whichever enabled model declares ``image_generation`` in its
+    # metadata — a subscription-backed proxy included — and when nothing
+    # declares it the tool says exactly that instead of failing blank. So the
+    # cost of seeding it is one Python subprocess of the same kind as the six
+    # already here, and the benefit is that an agent whose catalog CAN draw
+    # actually can. Operators who don't want it disable the row.
+    {"builtin": "media-gen", "_default": True},
 ]
 
 
