@@ -5,12 +5,28 @@ render visuals inline (Telegram replies, vault notes, workflow outputs).
 Subprocess MCP (stdio transport) — same pattern as the scheduler.
 
 Providers:
-  • image:  ``openai`` (DALL·E-3 / gpt-image-1) — uses ``OPENAI_API_KEY``
+  • image:  any OpenAI-compatible ``/v1/images/generations`` endpoint
   • video:  ``fal``     (pixverse / runway etc.)  — uses ``FAL_KEY``
 
-Both providers are auto-detected from env vars. When a provider's key is
-missing, the corresponding tool surfaces a clear "not configured" error
-instead of silently failing — the model can fall back or tell the user.
+The image backend is resolved BY CAPABILITY, not by hardcoding a vendor:
+the server looks through the enabled model catalog for a model whose
+``metadata.capabilities`` declares ``image_generation`` and uses that
+model's provider. A subscription-backed proxy therefore serves images the
+moment its models declare the capability, with no key to configure and
+nothing metered.
+
+Resolution order:
+  1. ``OPENAGENT_IMAGE_BASE_URL`` (+ ``_API_KEY`` / ``_MODEL``) — explicit override.
+  2. a catalog model declaring ``image_generation`` → its provider's base_url.
+  3. ``OPENAI_API_KEY`` → api.openai.com, the metered fallback.
+
+Generation stays a TOOL rather than a routing decision on purpose. Making
+it a model choice would mean a turn that needs reasoning AND a picture
+could not exist — the agent would have to abandon the model mid-thought to
+draw. As a tool, every model in the roster can produce images.
+
+When nothing is configured, the tool surfaces a clear "not configured"
+error instead of silently failing — the model can fall back or tell the user.
 
 Files are written under ``~/.cache/openagent/media/<timestamp>-<hash>.{ext}``
 so disk usage stays predictable; the tool returns the local path AND the
@@ -34,12 +50,96 @@ from typing import Any, Optional
 import httpx
 from mcp.server.fastmcp import FastMCP
 
+from src.mcp.servers._common import SharedConnection
+
 logger = logging.getLogger(__name__)
 
 mcp = FastMCP("media-gen")
 
 
 _CACHE_DIR = Path(os.path.expanduser("~/.cache/openagent/media"))
+
+_IMAGE_CAPABILITY = "image_generation"
+_conn = SharedConnection("media-gen")
+
+
+def _images_url(base_url: str) -> str:
+    """Build the images endpoint from a provider base_url.
+
+    Providers are stored either as ``https://host/v1`` or ``https://host``;
+    both must land on the same place, and a double ``/v1/v1`` 404s in a way
+    that reads like the endpoint does not exist.
+    """
+    base = (base_url or "").rstrip("/")
+    if not base:
+        return ""
+    if base.endswith("/v1"):
+        return f"{base}/images/generations"
+    return f"{base}/v1/images/generations"
+
+
+async def _capability_backend() -> Optional[tuple[str, str, str]]:
+    """Find an enabled model that declares image generation.
+
+    Returns ``(images_url, api_key, model_id)`` or None. The capability lives
+    in the model's metadata, which is the same field the runtime already
+    hydrates onto the catalog — so declaring it once makes it visible both
+    here and to anything that later routes on it.
+    """
+    try:
+        conn = await _conn.get()
+        rows = await (await conn.execute(
+            """
+            SELECT p.base_url AS base_url, p.api_key AS api_key, m.model AS model,
+                   m.metadata_json AS metadata_json
+            FROM models m JOIN providers p ON p.id = m.provider_id
+            WHERE m.enabled = 1 AND p.enabled = 1 AND m.kind = 'llm'
+            ORDER BY m.id
+            """
+        )).fetchall()
+    except Exception as e:  # noqa: BLE001 - never fail generation over lookup
+        logger.debug("media-gen capability lookup failed: %s", e)
+        return None
+
+    import json as _json
+
+    for row in rows or []:
+        try:
+            meta = _json.loads(row["metadata_json"] or "{}")
+        except Exception:  # noqa: BLE001
+            continue
+        caps = meta.get("capabilities") or []
+        if not isinstance(caps, (list, tuple)) or _IMAGE_CAPABILITY not in caps:
+            continue
+        url = _images_url(str(row["base_url"] or ""))
+        if url:
+            return url, str(row["api_key"] or ""), str(row["model"] or "")
+    return None
+
+
+async def _image_backend(model: str) -> tuple[Optional[tuple[str, str, str]], Optional[str]]:
+    """Resolve where to send an image request. Returns ``(backend, reason)``."""
+    base = (os.environ.get("OPENAGENT_IMAGE_BASE_URL") or "").strip()
+    if base:
+        return (
+            _images_url(base),
+            (os.environ.get("OPENAGENT_IMAGE_API_KEY") or "").strip(),
+            (os.environ.get("OPENAGENT_IMAGE_MODEL") or model or "").strip(),
+        ), None
+
+    backend = await _capability_backend()
+    if backend:
+        return backend, None
+
+    api_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
+    if api_key:
+        return ("https://api.openai.com/v1/images/generations", api_key, model), None
+
+    return None, (
+        "no image backend: no enabled model declares the "
+        f"'{_IMAGE_CAPABILITY}' capability, OPENAGENT_IMAGE_BASE_URL is unset, "
+        "and OPENAI_API_KEY is not configured."
+    )
 
 
 def _cache_path(prefix: str, prompt: str, ext: str) -> Path:
@@ -71,67 +171,74 @@ async def generate_image(
     size: str = "1024x1024",
     quality: str = "standard",
 ) -> dict[str, Any]:
-    """Generate an image from a text prompt via OpenAI.
+    """Generate an image from a text prompt.
 
     Args:
         prompt: What to draw — natural-language description.
-        model: ``gpt-image-1`` (recommended) or ``dall-e-3``.
-        size: ``1024x1024`` / ``1792x1024`` / ``1024x1792``.
-        quality: ``standard`` (faster) or ``hd`` (slower, sharper).
+        model: Only used by the metered OpenAI fallback; a capability-resolved
+            backend picks its own host model and ignores this.
+        size: ``1024x1024`` / ``1536x1024`` / ``1024x1536``. Honoured on a
+            best-effort basis — the returned ``size`` is what was actually
+            produced, which is not always what was asked for.
+        quality: ``standard`` or ``hd``. Metered OpenAI only.
 
-    Returns ``{ok, local_path, remote_url, model, size}``. ``ok`` is
-    False with a ``reason`` field when the OpenAI key is missing or
-    the request failed."""
-    api_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
-    if not api_key:
-        return {
-            "ok": False,
-            "reason": "OPENAI_API_KEY not set — configure under "
-                      "media_gen.openai.api_key or as env var.",
-        }
-    try:
-        # Lazy import so missing-dependency installs don't fail import-time.
-        from openai import AsyncOpenAI  # type: ignore
-    except Exception as e:
-        return {"ok": False, "reason": f"openai SDK missing: {e}"}
+    Returns ``{ok, local_path, remote_url, model, size}``. ``ok`` is False
+    with a ``reason`` field when no backend is configured or the request
+    failed."""
+    backend, reason = await _image_backend(model)
+    if backend is None:
+        return {"ok": False, "reason": reason}
+    url, api_key, backend_model = backend
 
-    client = AsyncOpenAI(api_key=api_key)
+    payload: dict[str, Any] = {"prompt": prompt[:4000], "n": 1, "size": size}
+    if backend_model:
+        payload["model"] = backend_model
+    if "api.openai.com" in url:
+        # Only the metered endpoint has a quality knob; sending it elsewhere
+        # is at best ignored and at worst a 400.
+        payload["quality"] = quality
+    headers = {"content-type": "application/json"}
+    if api_key:
+        headers["authorization"] = f"Bearer {api_key}"
+
     try:
-        resp = await client.images.generate(
-            model=model,
-            prompt=prompt[:4000],
-            size=size,
-            quality=quality,
-            n=1,
-        )
+        async with httpx.AsyncClient(timeout=600.0) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+        if resp.status_code >= 300:
+            return {"ok": False, "reason": f"image generation failed ({resp.status_code}): {resp.text[:300]}"}
+        body = resp.json()
     except Exception as e:  # noqa: BLE001
-        return {"ok": False, "reason": f"OpenAI image generation failed: {e}"}
+        return {"ok": False, "reason": f"image generation failed: {e}"}
 
-    if not resp.data:
-        return {"ok": False, "reason": "OpenAI returned no images"}
-    item = resp.data[0]
-    url = getattr(item, "url", None)
-    b64 = getattr(item, "b64_json", None)
+    data = (body or {}).get("data") or []
+    if not data:
+        return {"ok": False, "reason": "the backend returned no images"}
+    item = data[0] or {}
+    remote_url = item.get("url")
+    b64 = item.get("b64_json")
     local = _cache_path("img", prompt, "png")
 
     if b64:
         import base64
+
         try:
             local.write_bytes(base64.b64decode(b64))
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "reason": f"b64 decode failed: {e}"}
-    elif url:
-        if not await _save_url_to_file(url, local):
+    elif remote_url:
+        if not await _save_url_to_file(remote_url, local):
             return {"ok": False, "reason": "failed to download generated image"}
     else:
-        return {"ok": False, "reason": "OpenAI returned neither url nor b64"}
+        return {"ok": False, "reason": "the backend returned neither url nor b64"}
 
     return {
         "ok": True,
         "local_path": str(local),
-        "remote_url": url,
-        "model": model,
-        "size": size,
+        "remote_url": remote_url,
+        "model": backend_model or model,
+        # What came back, not what was asked for.
+        "size": item.get("size") or size,
+        "bytes": local.stat().st_size,
     }
 
 
