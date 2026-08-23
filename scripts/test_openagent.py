@@ -346,6 +346,9 @@ _TEST_MODULES: tuple[str, ...] = (
     # blocked scope), never-empty, window rollover, alert de-dupe, usage view,
     # and yaml seed reconcile.
     "test_budget_guard",
+    # Hybrid local standby: explicit event/scheduler pins must remain valid
+    # even while standby routing hides the local model from ordinary traffic.
+    "test_local_fallback",
     # Quality monitor — the correctness half beside budget's cost half:
     # OFF no-op, deterministic sampling, judge parse/emit, gating, aggregate.
     "test_quality_monitor",
@@ -363,6 +366,8 @@ _TEST_MODULES: tuple[str, ...] = (
     # promise before send; fail-open on disabled / no-promise / backed / no
     # tool visibility / regeneration failure. Pure-unit (fake model + trace).
     "test_reply_guard",
+    "test_local_support_controller",
+    "test_task_directive",
     # Quality digest — the scheduled push side: summary + flagged-session review
     # list + threshold alerts (incl. embedder-down via embed-error spikes).
     "test_quality_digest",
