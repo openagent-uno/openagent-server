@@ -3475,7 +3475,17 @@ async def _compose_local(
         model = model.build_override_model(model_id)
     if model is None:
         state.facts["reply_source"] = "deterministic:no_model"
-        return _fallback_reply(state)
+        # Il testo predefinito e' bilingue (italiano/inglese): consegnarlo
+        # grezzo significa rispondere in inglese a chi ha scritto in
+        # portoghese, spagnolo, indonesiano o cinese. Misurato il 23-ago-2026
+        # su 40 thread reali: 18 risposte su 40 erano IDENTICHE parola per
+        # parola fra luna, claude-haiku e claude-sonnet-5, e tutte in inglese,
+        # perche' nascevano qui e non passavano dalla traduzione. Era il
+        # difetto n.1 del revisore (lingua_sbagliata, 22,5%) e non dipendeva
+        # dal modello: dipendeva da questi due `return`.
+        return await _fallback_in_language(
+            agent, event, state, session_id, "no_model",
+        )
 
     token = set_tool_allowlist([])
     try:
@@ -3499,7 +3509,9 @@ async def _compose_local(
         # Falling back is correct, but it must be visible: an untagged bucket
         # made the model's share of replies look larger than it was.
         state.facts["reply_source"] = "deterministic:compose_failed"
-        return _fallback_reply(state)
+        return await _fallback_in_language(
+            agent, event, state, session_id, "compose_failed",
+        )
     finally:
         reset_tool_allowlist(token)
 
