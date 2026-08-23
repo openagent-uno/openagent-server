@@ -89,6 +89,76 @@ async def t_tool_search_freeform_args_schema(_ctx: TestContext) -> None:
     assert received[-1] == {"query": "glm encoded args"}
 
 
+@test("runtime", "tool-search drops invented arguments only for read-only tools")
+async def t_tool_search_filters_read_only_argument_drift(_ctx: TestContext) -> None:
+    """A small model may copy ``tags``/``include`` onto a vault read.
+
+    That mechanical drift is safe to repair for reads, but the same repair on
+    a mutation could silently remove a confirmation, dry-run flag, amount, or
+    idempotency key. Exercise both halves of that boundary.
+    """
+    from types import SimpleNamespace
+
+    from src.mcp.servers.tool_search.adapters import build_runtime_toolkit
+
+    reads: list[dict[str, str]] = []
+    mutations: list[dict[str, str]] = []
+
+    async def vault_read_note(path: str) -> dict[str, str]:
+        reads.append({"path": path})
+        return {"path": path}
+
+    async def billingbear_cancel_subscription(
+        subscription_id: str, confirmation: str,
+    ) -> dict[str, str]:
+        mutations.append({
+            "subscription_id": subscription_id,
+            "confirmation": confirmation,
+        })
+        return {"status": "cancelled"}
+
+    target_toolkit = SimpleNamespace(
+        functions={},
+        async_functions={
+            "vault_read_note": vault_read_note,
+            "billingbear_cancel_subscription": billingbear_cancel_subscription,
+        },
+    )
+
+    class Pool:
+        _toolkit_by_name = {"test": target_toolkit}
+
+        def toolkit_by_name(self, name: str) -> Any:
+            return self._toolkit_by_name.get(name)
+
+    toolkit = build_runtime_toolkit(pool=Pool())
+    call = toolkit.async_functions["tool_search_call_tool"].entrypoint
+
+    result = await call(
+        server="test",
+        tool="vault_read_note",
+        args={"path": "access.md", "tags": ["support"], "include": "body"},
+    )
+    assert result == {"path": "access.md"}
+    assert reads == [{"path": "access.md"}]
+
+    try:
+        await call(
+            server="test",
+            tool="billingbear_cancel_subscription",
+            args={
+                "subscription_id": "sub-test",
+                "confirmation": "CONFIRM",
+                "invented": "must-not-be-dropped",
+            },
+        )
+    except TypeError as exc:
+        assert "invented" in str(exc)
+    else:
+        raise AssertionError("mutation argument drift was silently discarded")
+    assert mutations == [], "mutation ran despite an invalid argument envelope"
+
+
 @test("runtime", "live generate + tokens + cost + system_message routing")
 async def t_agno_generate(ctx: TestContext) -> None:
     if not have_openai_key(ctx.config):

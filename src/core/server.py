@@ -1383,6 +1383,32 @@ def _build_agent(config: dict) -> Agent:
             on_context_overflow=list(fallback_raw.get("on_context_overflow") or []),
         )
 
+    # Hybrid cloud/local lane. Local model ids are explicit because a private
+    # base_url may be a Claude subscription proxy rather than local inference.
+    # The dispatcher keeps these rows in standby, while FallbackConfig uses
+    # them inside the current tool loop on quota/provider failures.
+    routing_cfg = config.get("routing") or {}
+    local_fallback_cfg = (
+        routing_cfg.get("local_fallback")
+        if isinstance(routing_cfg, dict) else None
+    )
+    _set_local_fallback = getattr(model, "set_local_fallback_policy", None)
+    if callable(_set_local_fallback):
+        _set_local_fallback(local_fallback_cfg)
+    if isinstance(local_fallback_cfg, dict) and local_fallback_cfg.get("enabled", True):
+        local_models = [
+            str(item).strip()
+            for item in (local_fallback_cfg.get("models") or [])
+            if str(item).strip()
+        ]
+        if local_models:
+            # Also scope lean-event detection to the actual inference rows. A
+            # private Claude proxy must retain the full cloud prompt.
+            os.environ["OPENAGENT_LOCAL_INFERENCE_MODELS"] = ",".join(local_models)
+            if fallback_config is None:
+                from src.models.providers.fallback import FallbackConfig
+                fallback_config = FallbackConfig()
+
     # ── budgets: per-scope spend caps (off by default) ──
     # Hand the yaml ``budgets:`` list to the dispatcher's BudgetGuard, which
     # seeds the rules additively (only-if-absent, so an app edit is never

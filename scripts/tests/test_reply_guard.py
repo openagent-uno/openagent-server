@@ -7,7 +7,9 @@ regeneration failure all return the reply unchanged.
 """
 from __future__ import annotations
 
+import json
 import os
+import re
 
 from ._framework import TestContext, test
 
@@ -244,3 +246,458 @@ async def t_enabled_default_off(ctx: TestContext) -> None:
 
     os.environ.pop("OPENAGENT_REPLY_GUARD_ENABLED", None)
     assert reply_guard.enabled() is False
+
+
+@test("reply_guard", "future release detector matches F11 commitments precisely")
+async def t_future_release_detector(ctx: TestContext) -> None:
+    from src.core.reply_guard import promises_future_release
+
+    positives = [
+        "Both fixes will be included in the next app update.",
+        "The fixes will be included in a future release.",
+        "This is coming in the upcoming release.",
+        "La correzione sarà inclusa nel prossimo aggiornamento.",
+        "Il problema verrà risolto con il prossimo aggiornamento.",
+    ]
+    negatives = [
+        "The fix is complete and awaiting release.",
+        "Update to version 5.0.18, which is already available.",
+        "I cannot promise a date or version.",
+    ]
+    for value in positives:
+        assert promises_future_release(value), f"should match: {value!r}"
+    for value in negatives:
+        assert not promises_future_release(value), f"should not match: {value!r}"
+
+
+@test("reply_guard", "lean local event rewrites a next-update promise")
+async def t_local_future_release_rewrite(ctx: TestContext) -> None:
+    from src.core import reply_guard
+    from src.core.execution_profile import lean_local_event_scope
+
+    _guard_on(False)  # strict local profile enables the F11 net itself
+    model = _FakeModel(revised="The issue is verified and currently tracked.")
+    with lean_local_event_scope(True):
+        out = await reply_guard.guard_reply(
+            _FakeAgent(model), "sid", "When will it be fixed?",
+            "Both fixes will be included in the next app update.",
+        )
+    assert out == "The issue is verified and currently tracked."
+    assert len(model.calls) == 1
+
+
+@test("reply_guard", "lean local event strips a forbidden sentence if rewrite fails")
+async def t_local_future_release_fail_closed(ctx: TestContext) -> None:
+    from src.core import reply_guard
+    from src.core.execution_profile import lean_local_event_scope
+
+    _guard_on(False)
+    model = _RaisingModel()
+    draft = (
+        "The issue has been documented. "
+        "Both fixes will be included in the next app update."
+    )
+    with lean_local_event_scope(True):
+        out = await reply_guard.guard_reply(
+            _FakeAgent(model), "sid", "When?", draft,
+        )
+    assert out == "The issue has been documented."
+    assert not reply_guard.promises_future_release(out)
+
+
+@test("reply_guard", "lean dry-run removes fabricated completed actions (F9)")
+async def t_local_dry_run_action_claim(ctx: TestContext) -> None:
+    from src.core import reply_guard
+    from src.core.dry_run import dry_run_scope
+    from src.core.execution_profile import lean_local_event_scope
+
+    assert reply_guard.claims_completed_action(
+        "I've linked your report to the existing tracking tasks."
+    )
+    model = _FakeModel(revised="This report matches an issue documented in the vault.")
+    with lean_local_event_scope(True), dry_run_scope(True):
+        out = await reply_guard.guard_reply(
+            _FakeAgent(model), "sid", "Please fix it",
+            "I've linked your report to the existing tracking tasks.",
+        )
+    assert out == "This report matches an issue documented in the vault."
+    assert not reply_guard.claims_completed_action(out)
+
+
+@test("reply_guard", "lean dry-run rejects unverified account state")
+async def t_local_dry_run_account_state(ctx: TestContext) -> None:
+    from src.core import reply_guard
+    from src.core.dry_run import dry_run_scope
+    from src.core.execution_profile import lean_local_event_scope
+
+    draft = (
+        "```json\n"
+        '{"language":"en","reply":"Your Premium subscription is active. '
+        'Try restarting.","evidence_files":["receipt.md"]}'
+        "\n```"
+    )
+    with lean_local_event_scope(True), dry_run_scope(True):
+        out = await reply_guard.guard_reply(
+            _FakeAgent(_RaisingModel()), "sid", "I still see ads", draft,
+        )
+    assert "subscription is active" not in out
+    assert "account email" in out
+    assert "Try restarting" not in out
+    match = re.search(r"```json\s*(.*?)```", out, re.DOTALL)
+    assert match
+    json.loads(match.group(1))
+
+
+@test("reply_guard", "lean live turn removes an unbacked completed action")
+async def t_local_live_action_requires_receipt(ctx: TestContext) -> None:
+    from src.core import reply_guard
+    from src.core.execution_profile import lean_local_event_scope
+
+    model = _FakeModel(revised="I found the duplicate charge, but no refund was completed.")
+    with lean_local_event_scope(True), _Trace(enabled=True, rows=[
+        ("billingbear_detect_duplicate_subscriptions", '{"duplicatesFound":true}'),
+    ]):
+        out = await reply_guard.guard_reply(
+            _FakeAgent(model), "sid", "I was charged twice",
+            "I've refunded the duplicate charge.",
+        )
+    assert out == "I found the duplicate charge, but no refund was completed."
+    assert len(model.calls) == 1
+
+
+@test("reply_guard", "lean live turn keeps an action backed by a success receipt")
+async def t_local_live_action_with_receipt(ctx: TestContext) -> None:
+    from src.core import reply_guard
+    from src.core.execution_profile import lean_local_event_scope
+
+    draft = "I've refunded the duplicate charge."
+    model = _FakeModel()
+    with lean_local_event_scope(True), _Trace(enabled=True, rows=[
+        ("billingbear_refund_duplicate_subscriptions", '{"success":true,"refunded":1}'),
+    ]):
+        out = await reply_guard.guard_reply(
+            _FakeAgent(model), "sid", "I was charged twice", draft,
+        )
+    assert out == draft
+    assert model.calls == []
+
+
+@test("reply_guard", "lean live account state requires a same-turn BillingBear read")
+async def t_local_live_account_state_grounding(ctx: TestContext) -> None:
+    from src.core import reply_guard
+    from src.core.execution_profile import lean_local_event_scope
+
+    draft = "Your Premium subscription is active."
+    with lean_local_event_scope(True), _Trace(enabled=True, rows=None):
+        out = await reply_guard.guard_reply(
+            _FakeAgent(_RaisingModel()), "sid", "I see ads", draft,
+        )
+    assert "subscription is active" not in out
+    assert "account email" in out
+
+    model = _FakeModel()
+    with lean_local_event_scope(True), _Trace(enabled=True, rows=[
+        ("billingbear_get_v1_customers_by_appUserId", '{"isPremium":true}'),
+    ]):
+        grounded = await reply_guard.guard_reply(
+            _FakeAgent(model), "sid", "I see ads", draft,
+        )
+    assert grounded == draft
+    assert model.calls == []
+
+
+@test("reply_guard", "failed handoff tool does not back a human promise")
+async def t_failed_handoff_is_not_backing(ctx: TestContext) -> None:
+    from src.core import reply_guard
+    from src.core.execution_profile import lean_local_event_scope
+
+    model = _FakeModel(revised="Please send the account email and order ID.")
+    with lean_local_event_scope(True), _Trace(enabled=True, rows=[
+        ("replio_threads_mark_for_human", "Error from MCP tool: HTTP 500 failed"),
+    ]):
+        out = await reply_guard.guard_reply(
+            _FakeAgent(model), "sid", "Help", "A teammate will follow up.",
+        )
+    assert out == "Please send the account email and order ID."
+    assert len(model.calls) == 1
+
+
+@test("reply_guard", "lean event removes commercial commitments (F12)")
+async def t_local_commercial_commitment(ctx: TestContext) -> None:
+    from src.core import reply_guard
+    from src.core.execution_profile import lean_local_event_scope
+
+    assert reply_guard.promises_commercial_value(
+        "We can refund the purchase and give you free Premium."
+    )
+    model = _FakeModel(revised="A person must review any refund request.")
+    with lean_local_event_scope(True):
+        out = await reply_guard.guard_reply(
+            _FakeAgent(model), "sid", "Refund me", "We can refund the purchase.",
+        )
+    assert out == "A person must review any refund request."
+
+
+@test("reply_guard", "lean event rejects completed-fix status contradicted by evidence (F10)")
+async def t_local_fix_status_contradiction(ctx: TestContext) -> None:
+    from src.core import reply_guard
+    from src.core.execution_profile import lean_local_event_scope
+
+    draft = (
+        "This is a known issue. The correction has already been implemented "
+        "and is awaiting release."
+    )
+    assert reply_guard.claims_completed_fix(draft)
+    evidence = (
+        "{'summary':'Root-cause analysis of wrong-audio-on-download. "
+        "DRY RUN only - no code modified.', 'status':'analysis'}"
+    )
+    assert reply_guard._trace_contradicts_completed_fix([("vault_read_note", evidence)])
+    model = _FakeModel(revised="This is a known issue under investigation.")
+    with lean_local_event_scope(True), _Trace(
+        enabled=True, rows=[("tool_search_call_tool", evidence)],
+    ):
+        out = await reply_guard.guard_reply(
+            _FakeAgent(model), "sid", "Please fix it", draft,
+        )
+    assert out == "This is a known issue under investigation."
+    assert not reply_guard.claims_completed_fix(out)
+
+
+@test("reply_guard", "lean rewrite cannot introduce a different policy violation")
+async def t_local_rewrite_cross_violation(ctx: TestContext) -> None:
+    from src.core import reply_guard
+    from src.core.execution_profile import lean_local_event_scope
+
+    draft = "The correction has already been implemented. The issue is tracked."
+    evidence = "DRY RUN only - no code modified; status: analysis"
+    model = _FakeModel(revised="A fix will be included in the next update.")
+    with lean_local_event_scope(True), _Trace(
+        enabled=True, rows=[("tool_search_call_tool", evidence)],
+    ):
+        out = await reply_guard.guard_reply(
+            _FakeAgent(model), "sid", "Please fix it", draft,
+        )
+    assert not reply_guard.claims_completed_fix(out)
+    assert not reply_guard.promises_future_release(out)
+    assert out == (
+        "The issue is tracked. Available evidence confirms tracking only; no "
+        "remediation state or release date is established."
+    )
+
+
+@test("reply_guard", "strict fallback preserves valid fenced JSON")
+async def t_local_stripper_preserves_json(ctx: TestContext) -> None:
+    from src.core import reply_guard
+
+    draft = (
+        "This is a known issue. The correction has already been implemented "
+        "and is awaiting release.\n\n"
+        "```json\n"
+        '{"language":"en","reply":"Known issue. The fix is implemented '
+        'and awaiting release.","evidence_files":["bug.md"]}'
+        "\n```"
+    )
+    out = reply_guard._strip_forbidden_sentences(
+        draft, explain_unverified_fix=True,
+    )
+    assert not reply_guard.claims_completed_fix(out)
+    match = re.search(r"```json\s*(.*?)```", out, re.DOTALL)
+    assert match, out
+    payload = json.loads(match.group(1))
+    assert payload["language"] == "en"
+    assert payload["evidence_files"] == ["bug.md"]
+    assert payload["reply"] == (
+        "Known issue. Available evidence confirms tracking only; no remediation "
+        "state or release date is established."
+    )
+
+
+@test("reply_guard", "lean event never promotes a historical receipt to current fix status")
+async def t_local_receipt_fix_status(ctx: TestContext) -> None:
+    from src.core import reply_guard
+    from src.core.execution_profile import lean_local_event_scope
+
+    draft = (
+        "```json\n"
+        '{"language":"it","reply":"Problema noto. La correzione è già stata '
+        'implementata e completata.","evidence_files":["old.md"]}'
+        "\n```"
+    )
+    rows = [("tool_search_call_tool", "path: esound/receipts/old-task.md status: complete")]
+    model = _RaisingModel()
+    with lean_local_event_scope(True), _Trace(enabled=True, rows=rows):
+        out = await reply_guard.guard_reply(
+            _FakeAgent(model), "sid", "Succede ancora oggi", draft,
+        )
+    assert not reply_guard.claims_completed_fix(out)
+    assert model.calls == [], "receipt guard is deterministic and does not regenerate"
+    match = re.search(r"```json\s*(.*?)```", out, re.DOTALL)
+    assert match
+    payload = json.loads(match.group(1))
+    assert "non è verificato" in payload["reply"]
+
+
+@test("reply_guard", "tool trace capture is automatically enabled for lean events")
+async def t_local_trace_enabled(ctx: TestContext) -> None:
+    from src.core import tool_trace
+    from src.core.execution_profile import lean_local_event_scope
+
+    os.environ.pop("OPENAGENT_QUALITY_MONITOR_ENABLED", None)
+    assert not tool_trace._enabled()
+    with lean_local_event_scope(True):
+        assert tool_trace._enabled()
+
+
+@test("reply_guard", "tool trace records nested tool-search args with secrets redacted")
+async def t_local_trace_nested_tool_args(ctx: TestContext) -> None:
+    from src.core import tool_trace
+    from src.core.execution_profile import lean_local_event_scope
+
+    with lean_local_event_scope(True):
+        sink, token = tool_trace.maybe_open()
+        try:
+            tool_trace.record_execution({
+                "tool_name": "tool_search_call_tool",
+                "tool_args": {
+                    "server": "billingbear",
+                    "tool": "billingbear_get_v1_customers_by_appUserId",
+                    "args": {"appUserId": "abc123", "email": "person@example.com"},
+                    "api_key": "must-not-leak",
+                },
+                "result": '{"isPremium":true}',
+            })
+        finally:
+            tool_trace.close(token)
+        tool_trace.publish("nested-sid", sink)
+        rows = tool_trace.peek("nested-sid") or []
+        tool_trace.take("nested-sid")
+
+    assert len(rows) == 1
+    _name, excerpt = rows[0]
+    assert "billingbear_get_v1_customers_by_appUserId" in excerpt
+    assert "abc123" in excerpt
+    assert "person@example.com" not in excerpt
+    assert "must-not-leak" not in excerpt
+    assert excerpt.count("[redacted]") >= 2
+
+
+@test("reply_guard", "an invented task id or amount never survives the guard")
+async def t_ungrounded_identifiers(_ctx: TestContext) -> None:
+    from src.core import reply_guard
+    from src.core.execution_profile import lean_local_event_scope
+
+    rows = [("tool_search_call_tool", 'result={"id": "86-local-created-esound"}')]
+
+    # The two fabrications a local model actually produced in a dry run.
+    assert reply_guard.unbacked_task_ids(
+        "We're tracking it under ClickUp task #86cavv98q.", rows,
+    ) == ["86cavv98q"]
+    assert reply_guard.unbacked_money(
+        "The refund of €9.99 will be issued.", rows,
+    ) == ["€9.99"]
+    # Tenant-agnostic on purpose: the same agent will serve Lyra, so the rule
+    # keys on the context word, not on one workspace's id shape.
+    assert reply_guard.unbacked_identifiers(
+        "Lyra ticket LYR-4471 is tracking this.", rows,
+    ) == ["LYR-4471"]
+    assert reply_guard.unbacked_identifiers(
+        "Il tuo ordine 12345-ABC non risulta.", rows,
+    ) == ["12345-ABC"]
+    # Parentheses and quotes separate a keyword from its id as often as a
+    # space does; this exact sentence slipped through the first version.
+    assert reply_guard.unbacked_identifiers(
+        "A ClickUp task (86cb3fy30) is open and assigned to the team.", rows,
+    ) == ["86cb3fy30"]
+    assert reply_guard.claims_issue_tracked(
+        "The issue is already known and being tracked."
+    ) is True
+
+    # And it must not cry wolf on ordinary prose, or it gets switched off.
+    for innocuous in (
+        "On iPhone16 with iOS 19 the app crashes.",
+        "Update to version 5.0.18 and reopen the app.",
+        "Please send the receipt and the order ID.",
+        "Sign in with the same email used for the purchase.",
+        "Sign in with the same email used for the purchase (the paying one).",
+    ):
+        assert reply_guard.unbacked_identifiers(innocuous, rows) == [], innocuous
+
+    # An identifier the tools really returned is not a fabrication.
+    assert reply_guard.unbacked_task_ids(
+        "Linked to task 86-local-created-esound.", rows,
+    ) == []
+    assert reply_guard.unbacked_money(
+        "Your last payment of 4.99 is on the receipt.",
+        [("t", 'result={"lastPaymentAmount": 4.99}')],
+    ) == []
+    # Digits alone must not ground an amount: matching "999" inside a
+    # timestamp would let an invented figure through.
+    assert reply_guard.unbacked_money(
+        "The refund of €9.99 will be issued.",
+        [("t", 'result={"created_at": "1999-01-01", "n": 999}')],
+    ) == ["€9.99"]
+
+    # Passive and timeline promises count as commercial commitments.
+    assert reply_guard.promises_commercial_value(
+        "The refund will be issued within 5-10 business days."
+    ) is True
+    assert reply_guard.promises_commercial_value(
+        "Il rimborso sarà elaborato entro 5 giorni lavorativi."
+    ) is True
+    assert reply_guard.promises_commercial_value(
+        "Please send the receipt and the order ID."
+    ) is False
+
+    # End to end: the sentence carrying the invented id is removed.
+    class _Agent:
+        pass
+
+    with lean_local_event_scope(True):
+        cleaned = await reply_guard.guard_reply(
+            _Agent(), None,
+            "my app crashes",
+            "Thanks for the report. We're tracking it under ClickUp task #86cavv98q.",
+        )
+    assert "86cavv98q" not in cleaned, cleaned
+
+
+@test("reply_guard", "a tracking claim needs a task receipt, id or no id")
+async def t_unbacked_tracking(_ctx: TestContext) -> None:
+    from src.core import reply_guard
+    from src.core.execution_profile import lean_local_event_scope
+
+    # Stripping the invented id alone was not enough: the model then makes the
+    # same promise without one.
+    for claim in (
+        "A task already exists for this type of crash.",
+        "We're tracking it internally.",
+        "Your report is being tracked.",
+        "Una segnalazione e' gia' aperta.",
+    ):
+        assert reply_guard.claims_issue_tracked(claim) is True, claim
+    # "known issue" is deliberately out of scope: a vault analysis note can
+    # ground it honestly, and firing on those would get the guard turned off.
+    for fine in (
+        "Please send the app version and the steps to reproduce.",
+        "This is a known issue under investigation.",
+    ):
+        assert reply_guard.claims_issue_tracked(fine) is False, fine
+
+    empty = [("clickup_get_workspace_tasks", 'result={"tasks": []}')]
+    found = [("clickup_get_workspace_tasks", 'result={"tasks": [{"id": "86-real"}]}')]
+    # An empty search proves the opposite of tracking.
+    assert reply_guard._trace_supports_tracking(empty) is False
+    assert reply_guard._trace_supports_tracking(found) is True
+
+    class _Agent:
+        pass
+
+    with lean_local_event_scope(True):
+        cleaned = await reply_guard.guard_reply(
+            _Agent(), None, "the app crashes",
+            "Thanks for the report. A task already exists for it. "
+            "Please send your app version.",
+        )
+    assert "task already exists" not in cleaned.lower(), cleaned
+    assert "app version" in cleaned.lower(), cleaned

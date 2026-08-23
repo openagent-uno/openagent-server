@@ -41,6 +41,7 @@ a bookkeeping miss must cost a trace, never a turn.
 from __future__ import annotations
 
 import contextvars
+import json
 import os
 from collections import OrderedDict
 from typing import Any, Optional
@@ -70,7 +71,16 @@ def _truthy(v: str) -> bool:
 
 
 def _enabled() -> bool:
-    return _truthy(os.environ.get(_ENABLED_ENV, "0"))
+    if _truthy(os.environ.get(_ENABLED_ENV, "0")):
+        return True
+    # The lean local-event reply guard verifies final status/action claims
+    # against the tool evidence before sending. Capture is therefore part of
+    # execution correctness for this profile, not merely quality telemetry.
+    try:
+        from src.core.execution_profile import lean_local_event_active
+        return lean_local_event_active()
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _excerpt(value: Any) -> str:
@@ -135,9 +145,37 @@ def record_execution(entry: Any) -> None:
     if _SINK.get() is None:
         return
     if isinstance(entry, dict):
-        record(entry.get("tool_name"), entry.get("result"))
+        name = entry.get("tool_name")
+        args = entry.get("tool_args")
+        result = entry.get("result")
     else:
-        record(getattr(entry, "tool_name", None), getattr(entry, "result", None))
+        name = getattr(entry, "tool_name", None)
+        args = getattr(entry, "tool_args", None)
+        result = getattr(entry, "result", None)
+
+    # ``tool_search_call_tool`` is only a wrapper. Without its arguments the
+    # trace cannot prove which nested server/tool actually ran, nor which vault
+    # path was read. Keep a compact redacted argument envelope next to the
+    # result so policy guards and benchmarks can verify the real trajectory.
+    def redact(value: Any, key: str = "") -> Any:
+        low = key.lower()
+        if any(marker in low for marker in (
+            "password", "secret", "token", "api_key", "apikey",
+            "authorization", "cookie", "headers", "email",
+        )):
+            return "[redacted]"
+        if isinstance(value, dict):
+            return {str(k): redact(v, str(k)) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [redact(item, key) for item in value[:20]]
+        text = str(value) if value is not None else None
+        return text if text is None or len(text) <= 180 else text[:180] + "…"
+
+    try:
+        args_text = json.dumps(redact(args), ensure_ascii=False, separators=(",", ":"))
+    except Exception:  # noqa: BLE001
+        args_text = "{}"
+    record(name, f"args={args_text} result={_excerpt(result)}")
 
 
 def publish(session_id: Optional[str], sink: Optional[dict]) -> None:

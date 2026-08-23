@@ -504,6 +504,13 @@ class _ToolkitSupervisor:
     stop_event: asyncio.Event
 
 
+def _normalized_mcp_name(name: object) -> str:
+    """Lowercase, separator-insensitive form of an MCP server name."""
+    return "".join(
+        ch for ch in str(name or "").lower() if ch.isalnum()
+    )
+
+
 class MCPPool:
     """Owns the lifecycle of MCP toolkits for the current process.
 
@@ -1317,7 +1324,22 @@ class MCPPool:
         toolkits — used by the workflow executor to dispatch
         ``mcp-tool`` blocks.
         """
-        return self._toolkit_by_name.get(mcp_name)
+        toolkit = self._toolkit_by_name.get(mcp_name)
+        if toolkit is not None:
+            return toolkit
+        # A model that read "BillingBear" in a note will ask for
+        # "BillingBear". Exact-match only turned that into "MCP is not loaded"
+        # and cost a whole round-trip to recover from - measured on a local
+        # model, which then wandered off the tool entirely. Server names are
+        # identities, not case-sensitive secrets: fall back to a normalised
+        # match before declaring the MCP absent.
+        wanted = _normalized_mcp_name(mcp_name)
+        if not wanted:
+            return None
+        for name, candidate in self._toolkit_by_name.items():
+            if _normalized_mcp_name(name) == wanted:
+                return candidate
+        return None
 
     def list_mcp_tools(self) -> list[dict[str, Any]]:
         """Shape-for-UI list of every loaded MCP and the tool names it

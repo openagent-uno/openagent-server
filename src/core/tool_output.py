@@ -38,6 +38,14 @@ DEFAULT_MAX_TOOL_RESULT_CHARS = 50_000
 
 def max_tool_result_chars() -> int:
     """The cap, read at call time so it can be tuned without a restart."""
+    from src.core.execution_profile import lean_local_event_active
+
+    if lean_local_event_active():
+        try:
+            lean_cap = int(os.environ.get("OPENAGENT_LEAN_EVENT_TOOL_RESULT_CHARS", "2500"))
+        except (TypeError, ValueError):
+            lean_cap = 2500
+        return max(500, lean_cap)
     try:
         return int(
             os.environ.get(

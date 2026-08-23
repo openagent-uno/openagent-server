@@ -523,6 +523,17 @@ async def run_child_session(
                 override = smart.build_override_model(model_id)
             except Exception as e:  # noqa: BLE001
                 logger.warning("child_session: model_override %r failed: %s", model_id, e)
+                from src.core.execution_profile import strict_local_only_active
+                if strict_local_only_active():
+                    raise RuntimeError(
+                        f"strict local-only model pin {model_id!r} could not be resolved"
+                    ) from e
+        if override is None:
+            from src.core.execution_profile import strict_local_only_active
+            if strict_local_only_active():
+                raise RuntimeError(
+                    f"strict local-only model pin {model_id!r} has no runnable override"
+                )
 
     if author is None:
         author = agent_author(title or origin, agent_name=getattr(agent, "name", None))

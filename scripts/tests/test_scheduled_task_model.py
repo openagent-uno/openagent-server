@@ -142,6 +142,39 @@ class _FakeDB:
         return None
 
 
+@test(
+    "scheduled_task_model",
+    "strict local-only refuses an unresolved child model pin instead of using default",
+)
+async def t_strict_local_bad_pin_fails_closed(ctx: TestContext) -> None:
+    from src.core.child_session import run_child_session
+    from src.core.execution_profile import strict_local_only_scope
+
+    class _BadModel:
+        def build_override_model(self, runtime_id: str):
+            raise ValueError(f"unknown runtime {runtime_id}")
+
+    class _Agent:
+        name = "local"
+        model = _BadModel()
+
+        async def run(self, **kwargs):  # noqa: ANN003
+            raise AssertionError("default model must never run after a bad local pin")
+
+    try:
+        with strict_local_only_scope(True):
+            await run_child_session(
+                agent=_Agent(), db=None, parent_session_id="scheduler:test",
+                origin="scheduler", origin_ref={"task_id": "test", "run_id": "1"},
+                title="bad pin", prompt="read only",
+                model_id="windows-local:not-registered", stream=False,
+            )
+    except RuntimeError as exc:
+        assert "strict local-only model pin" in str(exc)
+    else:
+        raise AssertionError("unresolved strict-local pin silently used the default model")
+
+
 async def _run_delegate(task: str, model_id=None):
     """Drive ``handlers.delegate_task`` with a fresh fake context, returning
     ``(result, agent)`` so callers can assert on both."""

@@ -41,6 +41,11 @@ logger = logging.getLogger(__name__)
 # for the summary/context a template usually needs.
 MAX_PAYLOAD_BLOCK_BYTES = 8 * 1024
 
+# Preserve a complete compact answer/JSON in the delivery row. 500 chars cut a
+# valid support payload mid-string even though the child session held the full
+# answer; 4 KB matches scheduled-task output retention and remains bounded.
+MAX_EVENT_OUTPUT_CHARS = 4_000
+
 # Wall-clock cap on a single event turn (see _dispatch_prompt). A support turn
 # is normally 1-3 min; anything past this is a stuck/jammed run (a rate-limited
 # model blocking on backoff, a loop) and is aborted so it can't zombie. Env
@@ -605,9 +610,33 @@ async def _dispatch_prompt(*, agent, db, event, payload, delivery_id, source, on
     from src.core.dry_run import dry_run_scope
 
     is_dry = bool((payload or {}).get("dry_run")) or _force_dry_run()
+    from src.core.execution_profile import (
+        lean_local_event_scope,
+        should_use_lean_local_event,
+    )
+    use_lean_local = await should_use_lean_local_event(event, db)
 
     async def _run_bound_turn():
-        with dry_run_scope(is_dry):
+        with dry_run_scope(is_dry), lean_local_event_scope(use_lean_local):
+            # Opt-in deterministic eSound lane. It performs policy/tool routing
+            # itself and uses the pinned local model only as a tool-less final
+            # composer. Disabled by default; copied agents can exercise it
+            # against simulators without changing ordinary prompt events.
+            from src.core import local_support_controller
+            if (
+                use_lean_local
+                and local_support_controller.enabled(event)
+            ):
+                return await asyncio.wait_for(
+                    local_support_controller.run(
+                        agent=agent,
+                        event=event,
+                        payload=payload,
+                        session_id=session_id,
+                        delivery_id=delivery_id,
+                    ),
+                    timeout=_EVENT_RUN_TIMEOUT_SECONDS,
+                )
             # Wall-clock cap so a single event turn can never become a zombie.
             # When the model provider is jammed (e.g. every proxy account
             # rate-limited), a call can block on backoff and a turn with many
@@ -648,4 +677,8 @@ async def _dispatch_prompt(*, agent, db, event, payload, delivery_id, source, on
             reused=reused,
             path=event.get("session_binding_path") or "",
         )
-    return {"status": "success", "session_id": result.session_id, "output": (result.text or "")[:500]}
+    return {
+        "status": "success",
+        "session_id": result.session_id,
+        "output": (result.text or "")[:MAX_EVENT_OUTPUT_CHARS],
+    }
