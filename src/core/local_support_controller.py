@@ -2868,7 +2868,21 @@ def _fallback_reply(state: SupportState) -> str:
                 if italian else
                 f"The dry run found existing task {task_id} and simulated adding this evidence and linking the thread; no real change was made."
             )
-        missing = ", ".join(state.facts.get("missing_evidence") or ["app version, device/OS, and reproduction steps"])
+        # `missing_evidence` vuoto significa "non manca niente", NON "non lo so":
+        # l'`or` di prima lo scambiava per il secondo e faceva chiedere di nuovo
+        # versione, dispositivo e passi a chi li aveva gia' scritti nel modulo.
+        # Misurato il 23-ago-2026 su traffico vero: un thread con
+        # `app_version=3.0.9` nel modulo si e' sentito chiedere la versione.
+        # Se non manca nulla la richiesta non ha oggetto: si chiede il materiale
+        # che serve DAVVERO per riprodurre, come fa il ramo `bug_no_grounded_match`.
+        evidenze = [e for e in (state.facts.get("missing_evidence") or []) if e]
+        if not evidenze:
+            return (
+                "Grazie, le informazioni ci sono. Per riprodurlo mi servono un log o una breve registrazione dello schermo."
+                if italian else
+                "Thanks, those details are enough. To reproduce it I need a log or a short screen recording."
+            )
+        missing = ", ".join(evidenze)
         return (
             f"Per verificare il problema, inviami: {missing}. Non aprirò un task finché non abbiamo evidenze sufficienti."
             if italian else
