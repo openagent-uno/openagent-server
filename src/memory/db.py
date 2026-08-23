@@ -923,11 +923,21 @@ class MemoryDB:
         # MCP subprocess + a fresh per-test MemoryDB all pointing at the same
         # file), two DDL calls can race. Raise the timeout so the second
         # connect waits a few seconds instead of deadlocking the event loop.
-        self._conn = await aiosqlite.connect(self.db_path, timeout=10.0)
+        self._conn = await aiosqlite.connect(self.db_path, timeout=60.0)
         self._conn.row_factory = aiosqlite.Row
         # ``busy_timeout`` gives the same guarantee at every subsequent
         # statement on this connection — not just the initial open.
-        await self._conn.execute("PRAGMA busy_timeout = 10000")
+        #
+        # 23-ago-2026: alzato da 10s a 60s. Con il solo scrittore WAL occupato
+        # da una transazione lunga, il ciclo dello scheduler falliva
+        # `_reap_expired_event_leases` con `database is locked` centinaia di
+        # volte al giorno (836 in un'ora sola) — e proprio quel reaper e' la
+        # via di recupero delle consegne bloccate, quindi si arrendeva quando
+        # sarebbe servito di piu'. Il reaper non e' il colpevole della contesa:
+        # misurato, aveva ZERO righe da toccare. Aspettare e' corretto,
+        # arrendersi no. Il valore alto e' gia' quello usato da
+        # `session_retention`, che convive con lo stesso scrittore.
+        await self._conn.execute("PRAGMA busy_timeout = 60000")
         await self._conn.execute("PRAGMA journal_mode=WAL")
         # Enable FK constraints per-connection. SQLite's default is OFF,
         # so without this the ON DELETE CASCADE on models.provider_id is
