@@ -64,6 +64,18 @@ def set_telemetry(agent: Agent) -> None:
 
 
 def set_default_model(agent: Agent) -> None:
+    # A run bound to the local model must never silently acquire an OpenAI
+    # one. Reaching here means something built a runtime with no model at all:
+    # under a strict-local boundary that has to be a visible error, not a
+    # quiet call to a cloud endpoint the operator did not choose.
+    if agent.model is None:
+        from src.core.execution_profile import strict_local_only_active
+
+        if strict_local_only_active():
+            raise RuntimeError(
+                "runtime built with no model inside a strict local-only scope; "
+                "refusing to default to a cloud provider"
+            )
     # Use the default Model (OpenAIResponses) if no model is provided
     if agent.model is None:
         try:

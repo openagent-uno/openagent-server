@@ -64,7 +64,26 @@ _RULES_CHARS_ENV = "OPENAGENT_QUALITY_MONITOR_RULES_CHARS"
 # still only a DEFAULT — ``OPENAGENT_QUALITY_MONITOR_MODEL`` (and the compaction
 # model) override it — and it is NEVER an Anthropic key: when deepseek is not an
 # enabled api-based row we fall back to the existing cheapest-enabled logic.
+# 2026-08-22: the same reasoning now points at the self-hosted row FIRST. Our
+# own GPU is off every subscription and costs nothing per call, so it beats a
+# paid api-based provider on the very grounds deepseek was chosen for. Deepseek
+# stays as the second choice when no self-hosted row is enabled.
 _DEFAULT_JUDGE_MODEL = "deepseek:deepseek-chat"
+
+
+def _preferred_judge_ids(providers_config: Any) -> list[str]:
+    """Self-hosted rows first, then the deepseek default."""
+    from src.core.execution_profile import _is_cloud_model_id
+    from src.models.catalog import FRAMEWORK_API_BASED, iter_configured_models
+
+    local = [
+        entry.runtime_id
+        for entry in iter_configured_models(providers_config)
+        if not entry.disabled
+        and entry.framework == FRAMEWORK_API_BASED
+        and not _is_cloud_model_id(entry.runtime_id)
+    ]
+    return [*local, _DEFAULT_JUDGE_MODEL]
 
 
 def _truthy(v: str) -> bool:
@@ -268,11 +287,13 @@ def _default_judge_model(agent: Any) -> Any:
             from src.models.native_provider import NativeProvider
 
             providers_config = getattr(agent, "_providers_config", None) or []
+            wanted = _preferred_judge_ids(providers_config)
+            by_id = {
+                e.runtime_id: e for e in iter_configured_models(providers_config)
+                if not e.disabled and e.framework == FRAMEWORK_API_BASED
+            }
             match = next(
-                (e for e in iter_configured_models(providers_config)
-                 if e.runtime_id == _DEFAULT_JUDGE_MODEL and not e.disabled
-                 and e.framework == FRAMEWORK_API_BASED),
-                None,
+                (by_id[rid] for rid in wanted if rid in by_id), None,
             )
             if match is not None:
                 db_path = getattr(getattr(agent, "_db", None), "db_path", None)
@@ -282,7 +303,7 @@ def _default_judge_model(agent: Any) -> Any:
                     db_path=str(db_path) if db_path else None,
                 )
                 elog("quality.judge_model", model=match.runtime_id,
-                     reason="deepseek_default")
+                     reason="self_hosted_first")
                 return provider
         except Exception as exc:  # noqa: BLE001 — a default pick must never break a turn
             elog("quality.judge_model_failed", level="warning",

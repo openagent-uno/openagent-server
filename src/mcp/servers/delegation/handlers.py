@@ -131,9 +131,11 @@ async def delegate_task(
 
     Args:
         task: the prompt to hand the sub-agent.
-        model_id: OPTIONAL runtime id of a model registered in the catalog,
-            e.g. ``"anthropic:claude-opus-4-8"``, ``"openai:gpt-4o"``. Pick a
-            model when you want this part of the work handled by a specific
+        model_id: OPTIONAL runtime id of a model registered in THIS agent's
+            catalog, in ``"provider:model"`` form. Never invent one and never
+            name a provider this agent is not configured for - an id that is
+            not in the catalog is rejected. Pick a model when you want this
+            part of the work handled by a specific
             one (its scope matches the task, or you want a second opinion from
             a different model). OMIT it to run the sub-agent on this session's
             default/router model — a fresh, independent child session that

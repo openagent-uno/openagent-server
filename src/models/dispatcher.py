@@ -44,6 +44,7 @@ from src.core.logging import elog
 from src.models import stream_usage
 from src.models.base import BaseModel, ModelResponse
 from src.models.budget import BudgetTracker
+from src.models.local_fallback import LocalFallbackPolicy
 from src.models.catalog import (
     CatalogModel,
     FRAMEWORK_API_BASED,
@@ -626,6 +627,7 @@ class TeamRouterProvider(BaseModel):
         history_runs: int = FULL_SESSION_HISTORY_RUNS,
         budget: Any = None,
         budget_guard: Any = None,
+        local_fallback: LocalFallbackPolicy | None = None,
     ):
         self._entry_runtime_id = entry_runtime_id
         self._providers_config = providers_config if providers_config is not None else []
@@ -639,6 +641,7 @@ class TeamRouterProvider(BaseModel):
         # run built via ``build_override_model`` (no dispatcher), which is fine:
         # the guard still refreshes on its TTL from the live dispatcher.
         self._budget_guard = budget_guard
+        self._local_fallback = local_fallback or LocalFallbackPolicy()
         # Cost telemetry lives HERE, not in ModelDispatcher, because not every
         # run goes through the dispatcher: a model-PINNED run (an Events
         # delivery, a scheduled task with a `model`, a workflow ai-prompt
@@ -741,7 +744,9 @@ class TeamRouterProvider(BaseModel):
             if framework_of(entry.runtime_id) != FRAMEWORK_API_BASED:
                 continue
             out.append(entry)
-        return out
+        return self._local_fallback.filter_catalog(
+            out, explicit_runtime_id=self._entry_runtime_id,
+        )
 
     def _build_api_agent_for(
         self,
@@ -851,6 +856,8 @@ class TeamRouterProvider(BaseModel):
             )
 
         members_catalog = [e for e in catalog if e.runtime_id != entry.runtime_id]
+        from src.core.execution_profile import lean_local_event_active
+        force_solo = lean_local_event_active()
         # Budget gate for MEMBERS (C1). The leader is already gated upstream
         # (``ModelDispatcher._enabled_catalog`` → ``guard.filter_catalog``), but
         # members were built straight from the catalog — so an over-cap provider
@@ -867,7 +874,7 @@ class TeamRouterProvider(BaseModel):
         # No other LLM model to delegate to — a Team of one is degenerate
         # (nothing to route TO). Skip Team and dispatch the lone leader as
         # a single agent via NativeProvider.
-        if not members_catalog:
+        if force_solo or not members_catalog:
             from src.models.native_provider import NativeProvider
 
             provider = NativeProvider(
@@ -886,7 +893,7 @@ class TeamRouterProvider(BaseModel):
                 "team_router.single_agent",
                 session_id=session_id,
                 entry=entry.runtime_id,
-                reason="no_other_llm_models",
+                reason=("lean_local_event" if force_solo else "no_other_llm_models"),
             )
             return provider
 
@@ -1487,6 +1494,7 @@ class ModelDispatcher(BaseModel):
         self._db: Any = None
         self._mcp_pool: Any = None
         self._fallback_config: Any = None
+        self._local_fallback = LocalFallbackPolicy()
 
         # Per-entry-model TeamRouterProvider. The provider's session
         # cache picks up where this one leaves off, so reusing a single
@@ -1555,9 +1563,22 @@ class ModelDispatcher(BaseModel):
             wire_model_runtime(provider, mcp_pool=pool)
 
     def set_fallback_config(self, fallback_config: Any) -> None:
-        self._fallback_config = fallback_config
+        self._fallback_config = self._local_fallback.augment_fallback_config(
+            fallback_config, providers_config=self._providers_config,
+        )
         for provider in self._team_providers.values():
-            wire_model_runtime(provider, fallback_config=fallback_config)
+            wire_model_runtime(provider, fallback_config=self._fallback_config)
+
+    def set_local_fallback_policy(self, raw: Any) -> None:
+        """Configure cloud/local standby routing before Agent.initialize()."""
+        self._local_fallback = LocalFallbackPolicy(raw)
+        if self._fallback_config is not None:
+            self._fallback_config = self._local_fallback.augment_fallback_config(
+                self._fallback_config, providers_config=self._providers_config,
+            )
+        for provider in self._team_providers.values():
+            provider._local_fallback = self._local_fallback
+        self._team_providers.clear()
 
     def set_session_handle(self, session_id: str, handle: str | None) -> None:
         """Bind a user handle to ``session_id`` across every cached
@@ -1704,9 +1725,9 @@ class ModelDispatcher(BaseModel):
         # budgets configured is byte-identical to before — and NEVER empties the
         # catalog (a cap must not take the agent fully offline).
         guard = self._budget_guard
-        if guard is None:
-            return out
-        return guard.filter_catalog(out)
+        if guard is not None:
+            out = guard.filter_catalog(out)
+        return self._local_fallback.filter_catalog(out)
 
     def build_override_model(self, runtime_id: str) -> BaseModel:
         """Construct a BaseModel bound to a specific runtime_id.
@@ -1719,7 +1740,12 @@ class ModelDispatcher(BaseModel):
         """
         if not runtime_id:
             raise ValueError("runtime_id is required")
-        known = {m.runtime_id for m in self._enabled_catalog()}
+        # Validate explicit pins against the configured catalog, before the
+        # standby/cooldown router hides local fallback entries from ordinary
+        # unpinned selection.  A standby local model is still a valid explicit
+        # operator pin (events and scheduled tasks rely on this); filtering it
+        # here made the pin fail and silently sent the run to the default.
+        known = {m.runtime_id for m in self._configured_enabled_catalog()}
         if runtime_id not in known:
             raise ValueError(
                 f"runtime_id {runtime_id!r} is not an enabled model. "
@@ -1741,6 +1767,7 @@ class ModelDispatcher(BaseModel):
                 # the dispatcher at all.
                 budget=self._budget,
                 budget_guard=self._budget_guard,
+                local_fallback=self._local_fallback,
             )
             wire_model_runtime(
                 provider,
@@ -1788,9 +1815,13 @@ class ModelDispatcher(BaseModel):
                         logger.debug("unpin_session_model failed for %s: %s", session_id, e)
                     pinned_id = None
                 else:
-                    enabled_ids = {
-                        entry.runtime_id for entry in self._enabled_catalog()
-                    }
+                    # A manual pin overrides the standby/cooldown policy, but
+                    # never a real spend cap. Check the budget-filtered catalog
+                    # before local policy removes standby models.
+                    pin_catalog = self._configured_enabled_catalog()
+                    if self._budget_guard is not None:
+                        pin_catalog = self._budget_guard.filter_catalog(pin_catalog)
+                    enabled_ids = {entry.runtime_id for entry in pin_catalog}
                     if pinned_id not in enabled_ids:
                         # Enabled but budget-excluded THIS window. Route elsewhere
                         # for this turn only — do NOT unpin: the cap is temporary
