@@ -184,7 +184,28 @@ def _list_tools_impl(pool: Any, server: str) -> list[dict[str, Any]]:
         # token budget even on MCPs with 40+ tools (see firebase: 44).
         desc = (getattr(fn, "description", "") or "").strip()
         first_line = desc.split("\n", 1)[0][:200] if desc else ""
-        out.append({"name": tool_name, "description": first_line})
+        entry: dict[str, Any] = {"name": tool_name, "description": first_line}
+        # Under the lean local profile, carry each tool's signature in the
+        # listing. Measured on Qwen3-30B: without it the model reached the
+        # right server and then invented argument names, and a mutation that
+        # fails validation is indistinguishable from one that never ran. One
+        # short line here removes a describe_tool round-trip AND the guess.
+        try:
+            from src.core.execution_profile import lean_local_event_active
+
+            if lean_local_event_active():
+                params = getattr(fn, "parameters", None) or {}
+                properties = params.get("properties") or {}
+                required = [str(name) for name in (params.get("required") or [])]
+                optional = [
+                    str(name) for name in properties if str(name) not in required
+                ]
+                if required or optional:
+                    entry["required_args"] = required
+                    entry["optional_args"] = optional[:8]
+        except Exception:  # noqa: BLE001 - a listing must never fail on metadata
+            pass
+        out.append(entry)
     out.sort(key=lambda x: x["name"])
     return out
 
@@ -291,10 +312,79 @@ async def _call_tool_impl(
     # ``scripts/tests/test_mcp.py``) and fall back to direct call for
     # plain functions.
     callable_to_call = getattr(fn, "entrypoint", None) or fn
+    # Small local models sometimes copy optional filters from another search
+    # surface (observed: ``tags``/``include`` on vault_search). For a read-only
+    # tool, dropping keys that the actual callable signature does not accept is
+    # safe and avoids spending another complete model round-trip. Never do this
+    # for mutations: silently dropping ``dryRun``, confirmation, amount, or an
+    # idempotency key could change external state.
+    low_tool = str(tool or getattr(fn, "name", "") or "").lower()
+    leaf = low_tool.rsplit("_", 1)[-1]
+    read_only = (
+        any(marker in low_tool for marker in (
+            "_get_", "_list_", "_search", "_read_", "_lookup", "_detect",
+            "_describe", "_stats", "_brief",
+        ))
+        or leaf in {"get", "list", "search", "read", "lookup", "detect", "describe", "stats", "brief"}
+    )
+    if read_only and args:
+        try:
+            sig = inspect.signature(callable_to_call)
+            accepts_kwargs = any(
+                p.kind is inspect.Parameter.VAR_KEYWORD
+                for p in sig.parameters.values()
+            )
+            if not accepts_kwargs:
+                allowed = set(sig.parameters)
+                args = {key: value for key, value in args.items() if key in allowed}
+        except (TypeError, ValueError):
+            pass
     result = callable_to_call(**args)
     if inspect.isawaitable(result):
         result = await result
-    return _coerce_to_jsonable(result)
+    result = _coerce_to_jsonable(result)
+    return _with_signature_hint(fn, tool, result)
+
+
+_ARG_ERROR_MARKERS = (
+    "validation error", "field required", "unexpected keyword",
+    "missing 1 required", "got an unexpected",
+)
+
+
+def _with_signature_hint(fn: Any, tool: str, result: Any) -> Any:
+    """Append the real signature when a call failed on its arguments.
+
+    A raw pydantic dump tells a model that something is wrong, not what to send
+    instead. Observed on Qwen3-30B: it called ``threads_respond`` with
+    ``message`` rather than ``body_text``, read the dump, and gave up — leaving
+    an approved reply unsent while the task reported success. Naming the
+    accepted arguments turns a dead end into a retry that can work.
+    """
+    # Only a real protocol-error envelope qualifies. A vault note that happens
+    # to contain the words "validation error" is DATA: enriching it would turn
+    # a successful structured read into a string and break every caller that
+    # reads fields off it.
+    if not isinstance(result, str):
+        return result
+    low = result.lower()
+    if not low.lstrip().startswith(("error from mcp tool", "error executing tool")):
+        return result
+    if not any(marker in low for marker in _ARG_ERROR_MARKERS):
+        return result
+    rendered = result
+    params = getattr(fn, "parameters", None) or {}
+    properties = params.get("properties") or {}
+    if not properties:
+        return result
+    required = [str(name) for name in (params.get("required") or [])]
+    optional = [str(name) for name in properties if str(name) not in required]
+    hint = (
+        f"\n\n[signature] {tool} accepts: required={required or 'none'}, "
+        f"optional={optional[:8] or 'none'}. Retry with exactly these argument "
+        f"names."
+    )
+    return rendered + hint
 
 
 def _json_dump(value: Any) -> str:

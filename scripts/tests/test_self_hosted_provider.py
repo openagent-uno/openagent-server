@@ -77,3 +77,26 @@ async def test_unknown_without_base_url_refuses(ctx: TestContext) -> None:
         assert "base_url" in str(e)
         return
     raise AssertionError("doveva chiedere un base_url invece di lasciar cadere la chiamata su OpenAI")
+
+
+@test("self_hosted_provider",
+      "Qwen locale usa il template non-thinking soltanto nel profilo event lean")
+async def test_qwen_lean_event_disables_thinking(ctx: TestContext) -> None:
+    from src.core.execution_profile import lean_local_event_scope
+    from src.models.native_provider import NativeProvider
+
+    entries = [{
+        "name": "windows-local", "framework": "api-based", "kind": "llm",
+        "enabled": True, "base_url": "http://192.168.22.145:8099/v1",
+    }]
+    provider = NativeProvider(
+        model="windows-local:qwen35-local", providers_config=entries,
+    )
+    normal = provider.build_runtime_model()
+    assert getattr(normal, "extra_body", None) is None
+
+    with lean_local_event_scope(True):
+        lean = provider.build_runtime_model()
+    assert lean.extra_body == {
+        "chat_template_kwargs": {"enable_thinking": False}
+    }

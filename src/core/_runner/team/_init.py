@@ -542,6 +542,14 @@ def propagate_run_hooks_in_background(team: "Team", run_in_background: bool = Tr
 def _set_default_model(team: "Team") -> None:
     # Set the default model
     if team.model is None:
+        from src.core.execution_profile import strict_local_only_active
+
+        if strict_local_only_active():
+            raise RuntimeError(
+                "team built with no model inside a strict local-only scope; "
+                "refusing to default to a cloud provider"
+            )
+
         try:
             from src.models.providers.openai import OpenAIResponses
         except ModuleNotFoundError as e:

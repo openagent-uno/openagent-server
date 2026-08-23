@@ -215,8 +215,10 @@ BLOCK_CATALOG: dict[str, BlockSpec] = {
             "model_override": _field(
                 "string",
                 description=(
-                    "runtime_id such as 'openai:gpt-4o-mini' or "
-                    "'anthropic:claude-opus-4-7'. When set, this model "
+                    "runtime_id of a model REGISTERED IN THIS CATALOG, in "
+                    "'provider:model' form. Never invent one, and never name "
+                    "a provider this agent is not configured for. When set, "
+                    "this model "
                     "becomes the block's entry model instead of the "
                     "resolved default. It still leads the team and may "
                     "delegate to other enabled models — this pins where "

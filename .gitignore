@@ -33,3 +33,4 @@ Thumbs.db
 *.db-shm
 *.db-wal
 .claude/
+.venv-gemello/

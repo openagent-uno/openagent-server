@@ -1377,16 +1377,26 @@ def _summary_fallback_model(agent: Any, *, exclude_provider: str | None) -> Any:
                     reason="configured",
                 )
                 return _mk(m.runtime_id)
-        # 2) distinct-provider rows, DeepSeek first (never OAuth-limited)
+        # 2) distinct-provider rows. A self-hosted row comes FIRST: it is off
+        # every subscription and every rate limit, which is the property this
+        # step was reaching for when it named DeepSeek. DeepSeek stays second.
+        from src.core.execution_profile import _is_cloud_model_id
+
         distinct = [e for e in enabled if e.provider != exclude_provider]
         if not distinct:
             return None
-        pref = next((e for e in distinct if e.provider == "deepseek"), None)
+        pref = next(
+            (e for e in distinct if not _is_cloud_model_id(e.runtime_id)), None,
+        )
+        reason = "self_hosted_first"
+        if pref is None:
+            pref = next((e for e in distinct if e.provider == "deepseek"), None)
+            reason = "deepseek_default"
         if pref is not None:
             elog(
                 "runtime.compaction.summary_fallback_model",
                 model=pref.runtime_id,
-                reason="deepseek_default",
+                reason=reason,
             )
             return _mk(pref.runtime_id)
         # 3) cheapest distinct row otherwise

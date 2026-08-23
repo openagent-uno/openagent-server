@@ -526,8 +526,10 @@ def cheapest_enabled_model(providers_config: Any) -> "CatalogModel | None":
     throwaway single-model call at the cheapest enabled row instead of routing
     the whole ~150k-token fold through the full Team leader.
     """
+    from src.core.execution_profile import _is_cloud_model_id
+
     best: CatalogModel | None = None
-    best_cost: float | None = None
+    best_key: tuple[float, int] | None = None
     for entry in iter_configured_models(providers_config):
         if entry.disabled or entry.framework != FRAMEWORK_API_BASED:
             continue
@@ -536,8 +538,13 @@ def cheapest_enabled_model(providers_config: Any) -> "CatalogModel | None":
             float(pricing.get("input_cost_per_million", 0.0) or 0.0)
             + float(pricing.get("output_cost_per_million", 0.0) or 0.0)
         )
-        if best_cost is None or cost < best_cost:
-            best, best_cost = entry, cost
+        # Tie-break towards a self-hosted row. Both a subscription proxy and
+        # our own GPU report $0 here, so cost alone left the choice to
+        # configuration order - and a background job silently landed on cloud
+        # Claude. A self-hosted row is the only one that is genuinely free.
+        key = (cost, 1 if _is_cloud_model_id(entry.runtime_id) else 0)
+        if best_key is None or key < best_key:
+            best, best_key = entry, key
     return best
 
 

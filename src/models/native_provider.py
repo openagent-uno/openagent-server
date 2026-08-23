@@ -70,6 +70,15 @@ _DEFAULT_MAX_TOOL_CALLS_PER_RUN = 60
 
 
 def _max_tool_calls_per_run() -> Optional[int]:
+    from src.core.execution_profile import lean_local_event_active
+
+    if lean_local_event_active():
+        raw = os.environ.get("OPENAGENT_LEAN_EVENT_MAX_TOOL_CALLS", "10").strip()
+        try:
+            value = int(raw)
+        except ValueError:
+            value = 10
+        return value if value > 0 else 10
     raw = os.environ.get("OPENAGENT_MAX_TOOL_CALLS_PER_RUN", "").strip()
     if not raw:
         return _DEFAULT_MAX_TOOL_CALLS_PER_RUN
@@ -1196,6 +1205,50 @@ class NativeProvider(BaseModel):
                 **extra_kwargs,
                 **_thinking_kwarg(provider_name, model_id),
             }
+            # Qwen's llama.cpp template defaults to extended thinking. On a
+            # tool loop that means paying a fresh hidden essay before every
+            # vault read; measured on Qwen3.5, even "reply exactly OK" exhausted
+            # a 32-token cap without producing visible text. The local-event
+            # profile values short, evidence-backed execution, so request the
+            # model's native non-thinking mode. ``extra_body`` is accepted by
+            # OpenAILike and forwarded as ``chat_template_kwargs`` by
+            # llama.cpp. Scope it narrowly to self-hosted Qwen aliases so cloud
+            # providers and non-Qwen local templates stay untouched.
+            from src.core.execution_profile import lean_local_event_active
+            if (
+                lean_local_event_active()
+                and self._self_hosted_spec(provider_name) is not None
+                and "qwen" in model_id.lower()
+            ):
+                extra_kwargs["extra_body"] = {
+                    "chat_template_kwargs": {"enable_thinking": False}
+                }
+                # A self-hosted support turn must have a finite completion
+                # budget. llama.cpp otherwise reports ``n_predict=-1`` and a
+                # malformed/tool-loop response can occupy the only useful slot
+                # indefinitely. Operators can raise this for broader local
+                # workloads without changing cloud behaviour.
+                # A scheduled task writes a report and calls tools with long
+                # argument objects; a support reply is a few sentences. One
+                # budget for both truncated a tool call mid-JSON, and the run
+                # died on a parse error rather than on anything it did wrong.
+                from src.core.execution_profile import lean_local_task_active
+
+                is_task = lean_local_task_active()
+                # 2500, not 1200: a tool call carrying an object argument
+                # (a quality row with its six sub-scores) was being cut off
+                # mid-JSON and the whole run died on a parse error. The budget
+                # is still finite, which is what protects the single slot; a
+                # support reply never approaches either number.
+                env_key, default = (
+                    ("OPENAGENT_LEAN_TASK_MAX_TOKENS", "4000") if is_task
+                    else ("OPENAGENT_LEAN_EVENT_MAX_TOKENS", "2500")
+                )
+                try:
+                    lean_max_tokens = int(os.environ.get(env_key, default))
+                except (TypeError, ValueError):
+                    lean_max_tokens = int(default)
+                extra_kwargs["max_tokens"] = max(128, lean_max_tokens)
             # I parametri di campionamento della riga del modello vincono sui
             # default del provider: sono la scelta esplicita di un operatore.
             extra_kwargs = {**extra_kwargs, **self._sampling_from_model_row()}
@@ -1206,6 +1259,18 @@ class NativeProvider(BaseModel):
                 base_url=base_url,
                 **extra_kwargs,
             )
+            # A self-hosted server's context window is a CAPABILITY, not a
+            # sampling parameter, so it does not belong in _SAMPLING_KEYS.
+            # Publish it on the model object instead, where compaction's
+            # _resolve_max_context already looks first. Without this the qwen
+            # row declared 40960 and compaction still budgeted against the
+            # 200k default, so history overflowed before it ever compacted.
+            declared_context = (self._model_row_metadata() or {}).get("context")
+            if isinstance(declared_context, (int, float)) and declared_context > 0:
+                try:
+                    model.context_window = int(declared_context)
+                except Exception:  # noqa: BLE001 - never fail a build over a hint
+                    pass
             # Credential pool — inert unless this provider has >= 2 accounts
             # configured (metadata.accounts). When present, seed the model's
             # initial credential from the pool and stash it so the fallback
@@ -1267,13 +1332,28 @@ class NativeProvider(BaseModel):
                 runner="agent",
             )
         agent_tools: list[Any] = list(compatible_toolkits)
+        from src.core.execution_profile import lean_local_event_active
+        summaries_enabled = not lean_local_event_active()
+        from src.core.execution_profile import strict_local_only_active
+
+        from src.core.execution_profile import stateless_completion_active
+
+        stateless = stateless_completion_active()
         agent = RuntimeAgent(
             model=self._build_runtime_model(),
-            fallback_config=self._fallback_config,
-            db=SqliteDb(db_file=str(db_path)),
+            # Controller-owned support composition is explicitly local-only.
+            # A local outage must fail closed, never spill customer data or an
+            # operational decision into a configured cloud fallback.
+            fallback_config=(
+                None if strict_local_only_active() else self._fallback_config
+            ),
+            # A stateless completion writes nothing: no session row, no
+            # history replay, no summary. That removes the only writer in the
+            # composer path and with it the lock contention above.
+            db=None if stateless else SqliteDb(db_file=str(db_path)),
             tools=agent_tools,
             system_message=sys_key or None,
-            add_history_to_context=True,
+            add_history_to_context=not stateless,
             # Replay the ENTIRE stored transcript for this session, not a
             # trailing window (vision §16). ``_history_runs`` defaults to
             # ``FULL_SESSION_HISTORY_RUNS`` so the runtime's ``runs[-N:]``
@@ -1283,8 +1363,8 @@ class NativeProvider(BaseModel):
             num_history_runs=self._history_runs,
             # The runtime also maintains a rolling summary of older turns in
             # the same SqliteDb and injects it into context on each call.
-            enable_session_summaries=True,
-            add_session_summary_to_context=True,
+            enable_session_summaries=summaries_enabled and not stateless,
+            add_session_summary_to_context=summaries_enabled and not stateless,
             # Agentic memory is disabled — OpenAgent uses the vault for
             # user-scoped persistence. Keeping it off avoids the legacy agno_memories
             # table creation and keeps all state in the sessions table.

@@ -15,6 +15,7 @@ from src.memory.db import MemoryDB
 from src.mcp.pool import MCPPool
 from src.core.prompts import (
     FRAMEWORK_SYSTEM_PROMPT,
+    LEAN_LOCAL_EVENT_SYSTEM_PROMPT,
     build_mcp_catalog_summary,
     build_ptc_note,
     build_skills_index,
@@ -400,7 +401,9 @@ async def _with_vault_reminder(db: Any, session_id: str | None, text: str) -> st
 
     Never raises: a memory nudge must not be able to fail a turn.
     """
-    if db is None or not session_id:
+    from src.core.execution_profile import lean_local_event_active
+
+    if lean_local_event_active() or db is None or not session_id:
         return text
     try:
         from src.learning.vault_reminder import maybe_render_reminder
@@ -884,7 +887,9 @@ async def _with_recall(agent: Any, session_id: str | None, query: str,
     event loop under ``OPENAGENT_AUTO_RECALL_TIMEOUT`` seconds. A miss, an error,
     or a slow endpoint all degrade to returning ``text`` unchanged.
     """
-    if not _recall_enabled() or not query or not query.strip():
+    from src.core.execution_profile import lean_local_event_active
+
+    if lean_local_event_active() or not _recall_enabled() or not query or not query.strip():
         return text
     try:
         timeout = _recall_float("OPENAGENT_AUTO_RECALL_TIMEOUT", 4.0)
@@ -1565,7 +1570,14 @@ class Agent:
             # judge's take(). Fail-open: any failure returns `result` unchanged.
             try:
                 from src.core import reply_guard
-                result = await reply_guard.guard_reply(self, session_id, message, result)
+                # Pass the model this turn ACTUALLY ran on. Reading it off the
+                # agent gave the guard the dispatcher, so a reply produced by a
+                # locally pinned run was rewritten on the cloud router - the
+                # one path that leaked out of a strict-local turn.
+                result = await reply_guard.guard_reply(
+                    self, session_id, message, result,
+                    model_override=model_override,
+                )
             except Exception:  # noqa: BLE001 — the guard must never affect the turn
                 pass
             # Quality monitor (opt-in, sampled): grade this completed turn off
@@ -2478,26 +2490,34 @@ class Agent:
         also match this tag (to key their Agent caches), so its shape is a
         contract, not a formatting choice.
         """
-        framework = FRAMEWORK_SYSTEM_PROMPT.replace(
+        from src.core.execution_profile import lean_local_event_active
+
+        framework_template = (
+            LEAN_LOCAL_EVENT_SYSTEM_PROMPT
+            if lean_local_event_active()
+            else FRAMEWORK_SYSTEM_PROMPT
+        )
+        framework = framework_template.replace(
             "{{OPENAGENT_VAULT_PATH}}", self._resolve_vault_path()
         ).replace(
             "{{OPENAGENT_DB_PATH}}", self._resolve_db_path()
-        ).replace(
-            "{{MCP_CATALOG_SUMMARY}}",
-            build_mcp_catalog_summary(self._mcp),
-        ).replace(
-            # Skills index — "" when disabled, so the placeholder (flush
-            # against the next header) collapses to a byte-identical prompt.
-            # Frozen snapshot above <session-id>, safe for the prompt cache.
-            "{{SKILLS_INDEX}}",
-            self._render_skills_index(),
-        ).replace(
-            # PTC note — "" when ``ptc.enabled`` is unset. Same flush-placeholder
-            # discipline as SKILLS_INDEX: an empty render is byte-identical, and
-            # a static render stays cache-safe above <session-id>.
-            "{{PTC_NOTE}}",
-            self._render_ptc_note(),
         )
+        if not lean_local_event_active():
+            framework = framework.replace(
+                "{{MCP_CATALOG_SUMMARY}}",
+                build_mcp_catalog_summary(self._mcp),
+            ).replace(
+                # Skills index — "" when disabled, so the placeholder (flush
+                # against the next header) collapses to a byte-identical prompt.
+                # Frozen snapshot above <session-id>, safe for the prompt cache.
+                "{{SKILLS_INDEX}}",
+                self._render_skills_index(),
+            ).replace(
+                # PTC note — "" when ``ptc.enabled`` is unset. Same
+                # flush-placeholder discipline as SKILLS_INDEX.
+                "{{PTC_NOTE}}",
+                self._render_ptc_note(),
+            )
 
         user = (self.system_prompt or "").strip()
         if not user:
