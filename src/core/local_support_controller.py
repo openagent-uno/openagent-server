@@ -894,8 +894,18 @@ def _intent(text: str, channel: str = "") -> str:
         "premium", "subscription*", "abbonamento", "suscripción", "ads",
         "advertis*", "pubblicità", "restore purchase",
         "an ad", "the ads", "too many ad*", "getting an ad", "full of ad*",
-        "anuncio*", "publicidad", "reclame", "werbung", "publicit*",
-        "propaganda", "iklan", "reklam",
+        "anuncio*", "anúncio*", "publicidad*", "reclame", "werbung", "publicit*",
+        "pubblicit*", "propaganda", "iklan*", "reklam*",
+        # 24-ago-2026: la lamentela sulla pubblicita' e' la piu' frequente e
+        # arriva in ogni lingua, ma la lista prendeva solo cinque idiomi latini.
+        # Misurato: "Muitos anúncios" (pt), "Слишком много рекламы" (ru),
+        # "広告が多すぎます" (ja) e "Iklannya terlalu banyak" (id) finivano in
+        # `general` e da li' nella raccolta evidenze, cioe' a un cliente che si
+        # lamenta degli ads veniva chiesto che dispositivo ha. `anuncio*` non
+        # copriva `anúncios` per via dell'accento e `iklan` non copriva il
+        # suffisso indonesiano.
+        "реклам*", "広告", "광고", "广告", "廣告",
+        "quảng cáo", "โฆษณา", "विज्ञापन", "إعلان*",
         "プレミアム", "有料", "課金", "프리미엄",
         "会员", "會員", "订阅", "訂閱",
         "премиум", "подписк*",
