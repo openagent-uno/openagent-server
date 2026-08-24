@@ -21,7 +21,7 @@ from src.gateway import protocol as P
 from src.gateway.commands import command_help_text
 from src.gateway.sessions import SessionManager
 from src.gateway.terminals import TerminalManager
-from src.gateway.api import vault, config, health, logs, control, usage, providers, models, scheduled_tasks, workflow_tasks, mcps, marketplace, sessions as sessions_api, system as system_api, network as network_api, chat as chat_api, terminals as terminals_api, commands as commands_api, events as events_api, budgets as budgets_api, quality as quality_api, llm as llm_api
+from src.gateway.api import vault, config, health, logs, control, usage, providers, models, scheduled_tasks, workflow_tasks, mcps, marketplace, sessions as sessions_api, system as system_api, network as network_api, chat as chat_api, terminals as terminals_api, commands as commands_api, events as events_api, budgets as budgets_api, quality as quality_api, llm as llm_api, skills as skills_api, accounts as accounts_api
 from src.network import peers as peers_api
 from src.network.auth.middleware import make_auth_middleware
 from src.network.transport.aiohttp_iroh_site import IrohSite
@@ -1188,6 +1188,15 @@ class Gateway:
             ("GET", "/api/quality", quality_api.handle_report),
             # Budgets (per-scope spend caps). Static ``/usage`` BEFORE the
             # ``{id}`` wildcard so the meter view isn't captured as an id.
+            ("GET", "/api/accounts", accounts_api.handle_list),
+            # ``search`` before ``{name}`` so it is not captured as a name.
+            ("GET", "/api/skills/search", skills_api.handle_search),
+            ("GET", "/api/skills", skills_api.handle_list),
+            ("POST", "/api/skills", skills_api.handle_create),
+            ("GET", "/api/skills/{name}", skills_api.handle_get),
+            ("PUT", "/api/skills/{name}", skills_api.handle_update),
+            ("DELETE", "/api/skills/{name}", skills_api.handle_delete),
+            ("POST", "/api/skills/{name}/archive", skills_api.handle_archive),
             ("GET", "/api/budgets/usage", budgets_api.handle_usage),
             ("GET", "/api/budgets", budgets_api.handle_list),
             ("POST", "/api/budgets", budgets_api.handle_create),

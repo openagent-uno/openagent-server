@@ -50,6 +50,10 @@ from scripts.tests._setup import build_test_config, cleanup_extras  # noqa: E402
 _TEST_MODULES: tuple[str, ...] = (
     # 1. Lightweight / pure-unit (no fixtures needed)
     "test_imports",
+    # REST surfaces added alongside the accounts / skills / session-pin work.
+    "test_rest_accounts",
+    "test_rest_session_pin",
+    "test_rest_skills",
     "test_setup",
     "test_serve_singleton",
     "test_cli_cleanup",
