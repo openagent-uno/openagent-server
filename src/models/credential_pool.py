@@ -145,6 +145,44 @@ class CredentialPool:
                     break
             return self._select_locked()
 
+    def snapshot(self) -> list[dict]:
+        """A read-only view of the pool for the accounts API.
+
+        Deliberately NEVER includes ``api_key`` or ``base_url``: this is
+        rendered in a UI and travels over the gateway, and a rotation pool is
+        precisely where several live credentials sit together. The label,
+        health and request count are the whole useful surface.
+
+        ``cooldown_remaining_s`` is derived here rather than shipping the raw
+        ``last_error_reset_at``, which is a ``time.monotonic()`` value — the
+        client has no shared origin for it and would render nonsense.
+        """
+        with self._lock:
+            now = time.monotonic()
+            out: list[dict] = []
+            for i, acc in enumerate(self._accounts):
+                remaining = None
+                if (
+                    acc.last_status == _STATUS_EXHAUSTED
+                    and acc.last_error_reset_at is not None
+                ):
+                    remaining = max(0.0, round(acc.last_error_reset_at - now, 1))
+                out.append({
+                    "id": acc.label or f"account-{i + 1}",
+                    "name": acc.label or f"account-{i + 1}",
+                    "priority": acc.priority,
+                    "limited": acc.last_status == _STATUS_EXHAUSTED,
+                    "dead": acc.last_status == _STATUS_DEAD,
+                    "status": acc.last_status,
+                    "cooldown_remaining_s": remaining,
+                    "request_count": acc.request_count,
+                    # The pool learns health from errors; it is never told a
+                    # remaining allowance, so there is no quota to report.
+                    "quota": None,
+                    "source": "pool",
+                })
+            return out
+
     def has_available(self) -> bool:
         """True if any account is OK now or has a cooldown that has elapsed."""
         with self._lock:
