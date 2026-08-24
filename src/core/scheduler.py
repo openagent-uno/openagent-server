@@ -1057,9 +1057,18 @@ class Scheduler:
             )
             raise
         except Exception as e:
-            elog("task.error", level="error", name=task_name, error=str(e))
+            # ``str(e)`` is EMPTY for an exception raised without a message,
+            # and several are. That produced `task.error … error=""` — an
+            # error event that does not say what went wrong, which is the one
+            # thing it exists to do. Keep the type so an argument-less
+            # exception still identifies itself, in the log and on the run row
+            # the dashboard reads.
+            detail = str(e).strip()
+            detail = f"{type(e).__name__}: {detail}" if detail else type(e).__name__
+            elog("task.error", level="error", name=task_name,
+                 error=detail, error_type=type(e).__name__)
             await self._record_task_finish(
-                finish_run_id, task, status="failed", error=str(e),
+                finish_run_id, task, status="failed", error=detail,
             )
         finally:
             if scope_token is not None:
