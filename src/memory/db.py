@@ -3280,15 +3280,45 @@ class MemoryDB:
         )
         requeued = requeue_cur.rowcount or 0
 
+        # 3. E le delivery morte per MANCANZA DI CAPACITA'. Sono terminali
+        #    (``failed``), quindi qui non c'e' nessun turno vivo da duplicare e
+        #    il cancello dell'eta' non serve a quello: serve a non rilanciarle
+        #    dentro lo stesso blackout che le ha uccise, cioe' a dare al pool il
+        #    tempo di tornare. Senza questo passaggio sarebbero ripescate solo
+        #    dal reap di avvio, cioe' al prossimo riavvio: ore, per il messaggio
+        #    di un cliente. Il marcatore lo mette il dispatcher SOLO quando la
+        #    morte e' transitoria (un guasto permanente non finisce mai qui) e il
+        #    tetto dei tentativi resta quello di sempre.
+        try:
+            retry_delay = max(0.0, float(
+                os.environ.get("OPENAGENT_EVENT_RETRY_DELAY_SECONDS", "300")))
+        except (TypeError, ValueError):
+            retry_delay = 300.0
+        retried = 0
+        if _flag("OPENAGENT_EVENT_REENQUEUE_TRANSIENT", True):
+            retry_cur = await conn.execute(
+                "UPDATE event_deliveries "
+                "SET status='received', claimed_at=NULL, finished_at=NULL, "
+                "    reenqueue_count = reenqueue_count + 1, "
+                "    error='re-enqueued: no model capacity (attempt ' "
+                "          || (reenqueue_count + 1) || ')' "
+                "WHERE status='failed' AND error LIKE ? "
+                "  AND reenqueue_count < ? "
+                "  AND finished_at IS NOT NULL AND finished_at <= ?",
+                (f"%{self._RETRYABLE_TURN_MARK}%", max_attempts, now - retry_delay),
+            )
+            retried = retry_cur.rowcount or 0
+
         await conn.commit()
-        if requeued or parked:
+        if requeued or parked or retried:
             from src.core.logging import elog
             elog(
                 "event.orphan_reaped", mode="stale-sweep",
-                requeued=requeued, parked=parked, max_attempts=max_attempts,
+                requeued=requeued, parked=parked, retried=retried,
+                max_attempts=max_attempts,
                 min_claim_age_seconds=min_claim_age_seconds,
             )
-        return requeued + parked
+        return requeued + parked + retried
 
     # ── Workflow Tasks ──
 
