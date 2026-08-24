@@ -781,6 +781,10 @@ class Scheduler:
         from src.core.dry_run import dry_run_scope
 
         use_lean_local = await should_use_lean_local_scheduled_task(task, self.db)
+        # Always bound: the error handler below reads it, and it is only
+        # assigned inside the lean-local branch. Leaving it unbound would
+        # raise NameError from the handler and bury the real failure.
+        run_timeout_s: float | None = None
         # Existing dry-run evaluation tasks predate a schema-level flag.  Make
         # their long-standing, explicit naming/prompt convention an execution
         # boundary as well as prose.  Ordinary tasks remain byte-identical.
@@ -996,6 +1000,7 @@ class Scheduler:
                         timeout = max(5.0, float(os.environ.get(
                             "OPENAGENT_LOCAL_SCHEDULED_TASK_TIMEOUT_SECONDS", "120",
                         )))
+                        run_timeout_s = timeout
                         result = await asyncio.wait_for(run, timeout=timeout)
                     else:
                         result = await run
@@ -1019,6 +1024,7 @@ class Scheduler:
                         timeout = max(5.0, float(os.environ.get(
                             "OPENAGENT_LOCAL_SCHEDULED_TASK_TIMEOUT_SECONDS", "120",
                         )))
+                        run_timeout_s = timeout
                         response = await asyncio.wait_for(run, timeout=timeout)
                     else:
                         response = await run
@@ -1064,7 +1070,18 @@ class Scheduler:
             # exception still identifies itself, in the log and on the run row
             # the dashboard reads.
             detail = str(e).strip()
-            detail = f"{type(e).__name__}: {detail}" if detail else type(e).__name__
+            if isinstance(e, asyncio.TimeoutError):
+                # The dominant failure on the lean-local path, and the one
+                # that produced the empty message: ``asyncio.wait_for``
+                # cancels the run and raises TimeoutError, whose ``str()`` is
+                # "". Name the budget it blew — "failed" with no reason sends
+                # you reading the model's output for a bug that is a clock.
+                detail = (f"timed out after {run_timeout_s:.0f}s"
+                          if run_timeout_s else "timed out")
+            elif detail:
+                detail = f"{type(e).__name__}: {detail}"
+            else:
+                detail = type(e).__name__
             elog("task.error", level="error", name=task_name,
                  error=detail, error_type=type(e).__name__)
             await self._record_task_finish(
