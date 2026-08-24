@@ -286,3 +286,49 @@ async def t_retry_budget_is_respected(ctx: TestContext) -> None:
         assert row["status"] == "failed", row
     finally:
         await db.close()
+
+
+@test("event_failed_turn", "un updated_at scritto a mano non azzera il catalogo")
+async def t_text_updated_at_does_not_break_hydration(ctx: TestContext) -> None:
+    import time
+    import uuid
+    from src.memory.db import MemoryDB, _as_epoch
+
+    # Il 24-ago-2026 un `update models set updated_at=datetime('now')` fatto a
+    # mano ha scritto TEXT dove tutto il resto e' REAL. In SQLite il testo ordina
+    # SOPRA i numeri, quindi MAX(updated_at) tornava la stringa, float() alzava
+    # ValueError e l'idratazione del catalogo moriva: dispatcher con
+    # providers_config vuoto e ogni turno di supporto che rispondeva "No model is
+    # currently enabled." con la delivery chiusa success.
+    assert _as_epoch(None) == 0.0
+    assert _as_epoch(1787516804.7) == 1787516804.7
+    assert _as_epoch("2026-08-24 11:28:57") > 0.0     # non alza, e da' un epoch vero
+    assert _as_epoch("robaccia") == 0.0               # e nemmeno qui alza
+
+    # DB tutto suo: questo test inserisce provider e modelli, e su quello
+    # condiviso li lascerebbe in eredita' ai test che vengono dopo.
+    db = MemoryDB(str(ctx.test_dir / f"updated_at_{uuid.uuid4().hex}.db"))
+    await db.connect()
+    try:
+        conn = await db._ensure_connected()
+        await conn.execute(
+            "insert into providers (name, kind, framework, enabled, base_url, created_at, updated_at) "
+            "values ('local','llm','api-based',1,'http://x/v1',?,?)", (time.time(), time.time()))
+        pid = (await (await conn.execute("select id from providers where name='local'")).fetchone())[0]
+        await conn.execute(
+            "insert into models (provider_id, model, enabled, kind, created_at, updated_at) "
+            "values (?,?,1,'llm',?,?)", (pid, "m-real", time.time(), time.time()))
+        # la riga scritta a mano, col timestamp testuale
+        await conn.execute(
+            "insert into models (provider_id, model, enabled, kind, created_at, updated_at) "
+            "values (?,?,1,'llm',?,'2026-08-24 11:28:57')", (pid, "m-text", time.time()))
+        await conn.commit()
+
+        # Prima alzava ValueError qui, e con lei moriva tutta l'idratazione.
+        got = await db.models_max_updated()
+        assert isinstance(got, float) and got > 0.0, got
+        status = await db.registry_status()
+        assert isinstance(status[1], float), status
+        assert status[2] >= 2, status   # i modelli abilitati si contano ancora
+    finally:
+        await db.close()

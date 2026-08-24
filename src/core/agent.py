@@ -96,6 +96,16 @@ _run_failure_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 )
 
 
+def mark_run_failure(detail: str) -> None:
+    """Segna il turno corrente come fallito senza passare da un'eccezione.
+
+    Serve ai rami che NON alzano ma nemmeno rispondono davvero — il router
+    senza modelli abilitati e' il caso che ha bruciato 13 messaggi il
+    24-ago-2026.
+    """
+    _run_failure_var.set((detail or "unknown")[:500])
+
+
 def clear_run_failure() -> None:
     """Azzera il marcatore prima di un turno, cosi' non eredita il precedente."""
     _run_failure_var.set(None)

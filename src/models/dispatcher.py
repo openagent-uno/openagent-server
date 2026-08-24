@@ -142,6 +142,27 @@ def _compose_member_system(system: str | None, role_blurb: str) -> str | None:
     )
 
 
+def _mark_no_capacity(reason: str) -> None:
+    """Segna il turno come FALLITO quando il router non ha nessun modello.
+
+    Il 24-ago-2026 questo ramo ha risposto "No model is currently enabled." per
+    17 minuti su ogni turno di supporto, e ogni delivery e' stata chiusa
+    `success`: terminale, mai ritentata, messaggio del cliente perso. Il fix di
+    quel giorno copriva solo le morti che ALZANO, e questa non alza: restituisce
+    una frase. Qui non si cambia il flusso — restituire la frase resta il
+    comportamento — si scrive solo il marcatore che ``run_child_session`` legge,
+    cosi' la delivery diventa `failed` ritentabile e torna in coda quando il
+    catalogo c'e' di nuovo. Import locale: ``src.core.agent`` sta piu' in alto
+    nella catena di import.
+    """
+    try:
+        from src.core.agent import mark_run_failure
+
+        mark_run_failure(f"router: {reason or 'no_enabled_model'}")
+    except Exception:  # noqa: BLE001 - la telemetria non deve mai rompere il turno
+        pass
+
+
 def _build_role_blurb(entry: CatalogModel) -> str:
     """Compose the natural-language description the team leader uses
     to route a turn to a specialist member.
@@ -1890,6 +1911,7 @@ class ModelDispatcher(BaseModel):
                 session_id=session_id,
                 reason=decision.reason,
             )
+            _mark_no_capacity(decision.reason)
             return ModelResponse(content="No model is currently enabled.", stop_reason="error")
 
         runtime_id = decision.primary_model
@@ -1966,6 +1988,7 @@ class ModelDispatcher(BaseModel):
                 session_id=session_id,
                 reason=decision.reason,
             )
+            _mark_no_capacity(decision.reason)
             yield "No model is currently enabled."
             return
 

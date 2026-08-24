@@ -251,6 +251,10 @@ _TRANSIENT_TOKENS = (
     # riconosceva, quindi finiva classificata permanente e la delivery restava
     # terminale invece di essere ritentata quando la capacita' tornava.
     "no available", "noavailableaccount",
+    # Il router senza catalogo. Non alza: risponde "No model is currently
+    # enabled." e il turno si chiude. E' mancanza di capacita' quanto un 429,
+    # e come quella va ritentata appena il catalogo torna.
+    "no_enabled_model", "no model is currently enabled",
 )
 
 

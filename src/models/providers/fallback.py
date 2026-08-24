@@ -190,8 +190,16 @@ def _classify_inplace_recovery(error: Exception) -> Optional[str]:
 
     # Strict json-schema-to-grammar backends (e.g. llama.cpp's OAI server)
     # reject regex escapes in tool-schema `pattern` / `format` → 400.
+    # ``failed to parse grammar`` is the wording llama.cpp actually returns
+    # today, inside "Failed to initialize samplers: failed to parse grammar":
+    # measured 24-ago-2026 against the self-hosted Qwen row, where a tool schema
+    # carrying an e-mail ``pattern`` made EVERY tool call 400 while the identical
+    # schema without it answered fine. The three signatures below did not match
+    # it, so the repair that exists for exactly this case never fired and the
+    # turn died — the one thing that broke when switching to that model.
     if status == 400 and (
         "error parsing grammar" in msg
+        or "failed to parse grammar" in msg
         or "json-schema-to-grammar" in msg
         or ("unable to generate parser" in msg and "template" in msg)
     ):

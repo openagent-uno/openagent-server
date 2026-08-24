@@ -901,6 +901,33 @@ CREATE INDEX IF NOT EXISTS idx_evdel_unclaimed ON event_deliveries(claimed_at);
 """
 
 
+def _as_epoch(value: Any) -> float:
+    """Epoch da una colonna ``updated_at`` che DOVREBBE essere REAL.
+
+    Il 24-ago-2026 un `update ... set updated_at=datetime('now')` fatto a mano
+    ha scritto TEXT in tre righe di ``models``. In SQLite il testo ordina SOPRA
+    i numeri, quindi ``MAX(updated_at)`` restituiva quella stringa,
+    ``float()`` alzava ValueError e l'idratazione del catalogo moriva li':
+    il dispatcher restava con providers_config VUOTO e ogni turno di supporto
+    rispondeva "No model is currently enabled." per 17 minuti, con la delivery
+    chiusa `success`. Una riga scritta male e' un bug di chi la scrive; farne
+    morire il catalogo e' un bug di chi la legge.
+    """
+    if value is None:
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            import datetime as _dt
+            return _dt.datetime.strptime(str(value).strip()[:19], fmt).timestamp()
+        except ValueError:
+            continue
+    return 0.0
+
+
 class MemoryDB:
     """SQLite storage for OpenAgent's runtime state."""
 
@@ -4507,9 +4534,9 @@ class MemoryDB:
         a bump to the bootstrap write and reload once, which is fine.
         """
         conn = await self._ensure_connected()
-        cursor = await conn.execute("SELECT MAX(updated_at) FROM mcps")
+        cursor = await conn.execute("SELECT MAX(CAST(updated_at AS REAL)) FROM mcps")
         row = await cursor.fetchone()
-        return float(row[0] or 0.0) if row else 0.0
+        return _as_epoch(row[0]) if row else 0.0
 
     # ── Providers (v0.12: one row per (name, framework) pair) ──
 
@@ -4681,9 +4708,9 @@ class MemoryDB:
 
     async def providers_max_updated(self) -> float:
         conn = await self._ensure_connected()
-        cursor = await conn.execute("SELECT MAX(updated_at) FROM providers")
+        cursor = await conn.execute("SELECT MAX(CAST(updated_at AS REAL)) FROM providers")
         row = await cursor.fetchone()
-        return float(row[0] or 0.0) if row else 0.0
+        return _as_epoch(row[0]) if row else 0.0
 
     # ── Models (v0.12: provider_id FK, no runtime_id column) ──
 
@@ -5077,9 +5104,9 @@ class MemoryDB:
 
     async def models_max_updated(self) -> float:
         conn = await self._ensure_connected()
-        cursor = await conn.execute("SELECT MAX(updated_at) FROM models")
+        cursor = await conn.execute("SELECT MAX(CAST(updated_at AS REAL)) FROM models")
         row = await cursor.fetchone()
-        return float(row[0] or 0.0) if row else 0.0
+        return _as_epoch(row[0]) if row else 0.0
 
     async def registry_status(self) -> tuple[float, float, int, float]:
         """One-shot probe used by the gateway's per-message hot-reload loop.
@@ -5095,21 +5122,21 @@ class MemoryDB:
         conn = await self._ensure_connected()
         cursor = await conn.execute(
             "SELECT "
-            "  COALESCE((SELECT MAX(updated_at) FROM mcps), 0), "
-            "  COALESCE((SELECT MAX(updated_at) FROM models), 0), "
+            "  COALESCE((SELECT MAX(CAST(updated_at AS REAL)) FROM mcps), 0), "
+            "  COALESCE((SELECT MAX(CAST(updated_at AS REAL)) FROM models), 0), "
             "  COALESCE(("
             "    SELECT COUNT(*) FROM models m "
             "    JOIN providers p ON p.id = m.provider_id "
             "    WHERE m.enabled = 1 AND p.enabled = 1"
             "  ), 0), "
-            "  COALESCE((SELECT MAX(updated_at) FROM providers), 0)"
+            "  COALESCE((SELECT MAX(CAST(updated_at AS REAL)) FROM providers), 0)"
         )
         row = await cursor.fetchone()
         if not row:
             return 0.0, 0.0, 0, 0.0
         return (
-            float(row[0] or 0.0), float(row[1] or 0.0),
-            int(row[2] or 0), float(row[3] or 0.0),
+            _as_epoch(row[0]), _as_epoch(row[1]),
+            int(row[2] or 0), _as_epoch(row[3]),
         )
 
     # ── Per-Session Pin ──
