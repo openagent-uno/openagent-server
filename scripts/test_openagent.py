@@ -135,6 +135,16 @@ _TEST_MODULES: tuple[str, ...] = (
     # because it is the other half of the self-improvement story.
     "test_self_improvement",
     "test_model_fallback",
+    # Breaker half-open sui gradini della catena: chi fallisce scivola in fondo,
+    # chi torna a rispondere rientra subito. Nasce dal 24-ago-2026, quando un
+    # modello parcheggiato veniva ripagato a ogni turno e la sua ripresa era
+    # solo lo scadere di un timer da 3 ore. Fake Model, nessun LLM vero. Sta
+    # accanto a test_model_fallback perche' guarda lo stesso punto di fallback.py.
+    "test_fallback_breaker",
+    # Un turno che muore rende l'errore come TESTO invece di alzare, quindi
+    # la sua delivery finiva chiusa `success`: terminale, mai ritentata,
+    # messaggio del cliente perso in silenzio (12 casi il 23-ago-2026).
+    "test_event_failed_turn",
     # Additive multi-account credential pool: a native provider rotates across
     # N accounts on 429/529 BEFORE the turn spills to DeepSeek. Pins the
     # inert-by-default gate, the pool strategies/cooldown, and the fallback.py

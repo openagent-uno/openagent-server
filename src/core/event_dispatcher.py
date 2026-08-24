@@ -244,7 +244,25 @@ _TRANSIENT_TOKENS = (
     "quota", "throttl", "overloaded", "too many requests",
     "temporarily unavailable", "service unavailable", "capacity",
     "timed out", "timeout", "exit code 75", "exit_code 75", "code 75",
+    # Pool di credenziali esaurito. E' la forma in cui la mancanza di capacita'
+    # arriva davvero dai due proxy di sottoscrizione ("No available ChatGPT
+    # accounts.", "No available Claude OAuth accounts"), ed e' quella che il
+    # 23-ago-2026 ha ucciso 8 turni di supporto: nessuno dei token qui sopra la
+    # riconosceva, quindi finiva classificata permanente e la delivery restava
+    # terminale invece di essere ritentata quando la capacita' tornava.
+    "no available", "noavailableaccount",
 )
+
+
+def _retryable_mark() -> str:
+    """Il marcatore che lo sweep cerca per ripescare una delivery ritentabile.
+
+    Importato qui e non in testa perche' il dispatcher riceve il ``db`` gia'
+    costruito e non dipende dal modulo a livello di import.
+    """
+    from src.memory.db import MemoryDB
+
+    return MemoryDB._RETRYABLE_TURN_MARK
 
 
 def _classify_delivery_failure(error: Any) -> str:
@@ -494,7 +512,10 @@ async def dispatch_event(
             status=final_status,
             output=(result.get("output") or "")[:2000],
             finished_at=_now(),
-            **{k: v for k, v in result.items() if k in ("session_id", "workflow_run_id", "task_run_id")},
+            # ``error`` incluso: un terminale `failed` che non ha alzato deve
+            # comunque lasciare il MOTIVO nella colonna, come fa il ramo che alza.
+            **{k: v for k, v in result.items()
+               if k in ("session_id", "workflow_run_id", "task_run_id", "error")},
         )
         # Terminal success resets the breaker streak; a non-raising terminal
         # ``failed`` (a workflow/task that reported failure without throwing) is
@@ -677,8 +698,40 @@ async def _dispatch_prompt(*, agent, db, event, payload, delivery_id, source, on
             reused=reused,
             path=event.get("session_binding_path") or "",
         )
+    # Un turno che e' morto rende l'errore come testo invece di alzare, quindi
+    # senza questo controllo la delivery veniva chiusa `success` con l'errore
+    # dentro: terminale, mai ritentata, e la coda che risulta sana mentre il
+    # messaggio del cliente e' perso (12 casi il 23-ago-2026, di cui 8 su
+    # "No available ChatGPT accounts"). ``failed`` viene dal marcatore che
+    # ``run_child_session`` legge nel task del turno.
+    # `failed` qui NON e' una risposta al cliente: e' la riga di coda. Il
+    # re-enqueue e' sicuro perche' la sessione dell'evento e' deterministica
+    # (``event:{event_id}:{delivery_id}``), quindi il tentativo successivo
+    # riprende LA STESSA sessione, e il reply_guard di Replio sopprime un
+    # secondo outbound sul thread che ne ha gia' uno piu' recente dell'inbound.
+    failed = bool(getattr(result, "failed", False))
+    failure_detail = ""
+    if failed:
+        detail = (getattr(result, "error", None) or "unknown error")
+        kind = _classify_delivery_failure(detail)
+        # Transitorio = mancanza di capacita' (429 ovunque, nessun account,
+        # timeout del provider): la delivery va marcata perche' lo sweep la
+        # ripeschi quando la capacita' torna, invece di lasciarla terminale.
+        # Permanente = un guasto vero, che riprovare non aggiusta.
+        failure_detail = (
+            f"{_retryable_mark()}: {detail}" if kind == "transient" else detail
+        )
+        elog(
+            "event.turn_failed",
+            level="warning",
+            delivery=delivery_id,
+            session_id=result.session_id,
+            failure_kind=kind,
+            error=detail[:300],
+        )
     return {
-        "status": "success",
+        "status": "failed" if failed else "success",
         "session_id": result.session_id,
         "output": (result.text or "")[:MAX_EVENT_OUTPUT_CHARS],
+        **({"error": failure_detail[:2000]} if failed else {}),
     }

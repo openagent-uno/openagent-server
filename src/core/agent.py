@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import importlib
 import inspect
 import logging
@@ -74,6 +75,40 @@ _FROZEN_RUNTIME_PRELOADS = (
 )
 
 
+# Un turno che muore NON alza: l'eccezione viene resa come testo (vedi
+# ``_format_run_error``) e diventa la risposta. Chi sta piu' in alto vede solo
+# una stringa, e per questo una delivery di supporto morta su "nessun modello
+# disponibile" finiva registrata `success`: terminale, mai ritentata, messaggio
+# del cliente bruciato in silenzio (12 casi il 23-ago-2026).
+#
+# Questa variabile e' il canale che mancava. La scrive ``_format_run_error``,
+# cioe' l'unico punto dove un errore diventa testo, e la legge chi ha bisogno
+# di distinguere "ha risposto" da "e' morto e te lo racconta". Contextvar e non
+# attributo sull'Agent perche' lo stesso Agent serve piu' turni insieme: il
+# valore deve appartenere al turno, non all'oggetto.
+#
+# ATTENZIONE al confine dei task: ``asyncio.wait_for``/``create_task`` copiano
+# il contesto, quindi la scrittura fatta dentro il task NON risale al chiamante.
+# Va letta dentro lo stesso task che ha eseguito il turno (lo fa
+# ``run_child_session``), non dal dispatcher che lo avvolge in ``wait_for``.
+_run_failure_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "openagent_run_failure", default=None,
+)
+
+
+def clear_run_failure() -> None:
+    """Azzera il marcatore prima di un turno, cosi' non eredita il precedente."""
+    _run_failure_var.set(None)
+
+
+def take_run_failure() -> str | None:
+    """Restituisce l'errore del turno appena concluso e azzera il marcatore."""
+    failure = _run_failure_var.get()
+    if failure is not None:
+        _run_failure_var.set(None)
+    return failure
+
+
 def _format_run_error(e: BaseException) -> str:
     """Produce a chat-renderable error string for any agent-run failure.
 
@@ -88,6 +123,9 @@ def _format_run_error(e: BaseException) -> str:
     """
     from src.models.native_provider import NativeProviderError
 
+    # Il marcatore vale per QUALSIASI errore di run, non solo per quelli di
+    # modello: se il turno e' morto, chi lo ha chiesto deve poterlo sapere.
+    _run_failure_var.set(f"{type(e).__name__}: {str(e) or repr(e)}"[:500])
     if isinstance(e, NativeProviderError):
         return f"⚠️ Model provider error\n\n{e}"
     msg = str(e) or repr(e)

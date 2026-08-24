@@ -3004,6 +3004,13 @@ class MemoryDB:
     # resurrected. The re-enqueue path never re-writes this phrase, so it
     # only ever marks the pre-fix historical rows.
     _REAP_ORPHAN_MARK = "reaped: orphan from prior process"
+    # Un turno che muore senza capacita' di modello (nessun account,
+    # 429 ovunque, timeout del provider) chiude la delivery `failed` ma
+    # NON e' un evento difettoso: e' lo stesso messaggio del cliente che
+    # va riprovato quando la capacita' torna. Marcato a parte dagli
+    # orfani del reaper perche' i due casi hanno interruttori diversi:
+    # BACKFILL riguarda la storia vecchia, questo il go-forward.
+    _RETRYABLE_TURN_MARK = "retryable: turn died without model capacity"
 
     async def reap_orphan_event_deliveries(
         self,
@@ -3074,6 +3081,10 @@ class MemoryDB:
             enabled = _flag("OPENAGENT_EVENT_REENQUEUE_ENABLED", True)
         if recover_failed is None:
             recover_failed = _flag("OPENAGENT_EVENT_REENQUEUE_BACKFILL", True)
+        # Separato da BACKFILL apposta: sui tre agent in produzione BACKFILL e'
+        # a 0 (non si resuscita la storia vecchia), ma un turno morto adesso per
+        # mancanza di capacita' va ritentato lo stesso.
+        recover_transient = _flag("OPENAGENT_EVENT_REENQUEUE_TRANSIENT", True)
         if max_attempts is None:
             try:
                 max_attempts = int(
@@ -3130,6 +3141,9 @@ class MemoryDB:
         if recover_failed:
             where += " OR (status='failed' AND error LIKE ?)"
             params.append(f"%{self._REAP_ORPHAN_MARK}%")
+        if recover_transient:
+            where += " OR (status='failed' AND error LIKE ?)"
+            params.append(f"%{self._RETRYABLE_TURN_MARK}%")
         where += ")"
         requeue_cur = await conn.execute(
             "UPDATE event_deliveries "

@@ -44,6 +44,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from src.core.agent import clear_run_failure, take_run_failure
 from src.core.identity_context import agent_author
 from src.core.logging import elog
 from src.core.tool_scope import (
@@ -313,6 +314,12 @@ class ChildSessionResult:
 
     session_id: str
     text: str
+    # Un turno morto rende l'errore COME TESTO e non alza (``_format_run_error``).
+    # Senza questo campo chi chiama non ha modo di distinguerlo da una risposta
+    # vera, ed e' cosi' che una delivery morta finiva registrata `success`.
+    # Default False: ogni chiamante esistente continua a costruirlo com'era.
+    failed: bool = False
+    error: str | None = None
 
 
 def mint_child_session_id(origin: str, origin_ref: dict[str, Any]) -> str:
@@ -636,6 +643,7 @@ async def run_child_session(
     # ``delegate_task`` twice in a row, unfanned) must each be measured from the
     # parent's depth — without the reset the second would inherit the first's
     # and the chain would appear to deepen when it had not.
+    run_failure: Optional[str] = None
     depth_tok = _depth_var.set(depth)
     root_tok = _root_var.set(root)
     # Opt-in per-child tool scoping. Default (allowed_tools is None) → the
@@ -681,7 +689,14 @@ async def run_child_session(
                 )
             async with chain_sem:
                 async with global_sem:
+                    # Il marcatore va azzerato PRIMA (un turno riuscito dopo uno
+                    # fallito non deve ereditarne l'esito) e letto QUI dentro:
+                    # siamo nello stesso task che esegue il turno, mentre il
+                    # dispatcher ci avvolge in ``asyncio.wait_for``, che copia il
+                    # contesto e non lo restituisce indietro.
+                    clear_run_failure()
                     text = await _run()
+                    run_failure = take_run_failure()
             _maybe_prune_chain_sem(root, depth, chain_sem)
     finally:
         _depth_var.reset(depth_tok)
@@ -689,7 +704,12 @@ async def run_child_session(
         if scope_tok is not None:
             reset_tool_allowlist(scope_tok)
 
-    return ChildSessionResult(session_id=child_sid, text=text or "")
+    return ChildSessionResult(
+        session_id=child_sid,
+        text=text or "",
+        failed=run_failure is not None,
+        error=run_failure,
+    )
 
 
 def _maybe_prune_chain_sem(root: Optional[str], depth: int,
