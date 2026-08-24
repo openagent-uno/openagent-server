@@ -1069,19 +1069,20 @@ class Scheduler:
             # thing it exists to do. Keep the type so an argument-less
             # exception still identifies itself, in the log and on the run row
             # the dashboard reads.
+            # Keep the CAUSE too. The informative half is usually the wrapped
+            # original — a read timeout on the upstream call surfacing as a
+            # provider error, say — and it is what tells a timeout on the
+            # socket apart from a budget the scheduler itself imposed. Only
+            # the lean-local path imposes one, so it is absent for most tasks
+            # and must not be implied when it is.
             detail = str(e).strip()
-            if isinstance(e, asyncio.TimeoutError):
-                # The dominant failure on the lean-local path, and the one
-                # that produced the empty message: ``asyncio.wait_for``
-                # cancels the run and raises TimeoutError, whose ``str()`` is
-                # "". Name the budget it blew — "failed" with no reason sends
-                # you reading the model's output for a bug that is a clock.
-                detail = (f"timed out after {run_timeout_s:.0f}s"
-                          if run_timeout_s else "timed out")
-            elif detail:
-                detail = f"{type(e).__name__}: {detail}"
-            else:
-                detail = type(e).__name__
+            detail = f"{type(e).__name__}: {detail}" if detail else type(e).__name__
+            cause = e.__cause__ or e.__context__
+            if cause is not None and type(cause) is not type(e):
+                cause_txt = str(cause).strip() or type(cause).__name__
+                detail = f"{detail} (caused by {type(cause).__name__}: {cause_txt})"
+            if run_timeout_s and isinstance(e, asyncio.TimeoutError):
+                detail = f"{detail} — scheduler budget was {run_timeout_s:.0f}s"
             elog("task.error", level="error", name=task_name,
                  error=detail, error_type=type(e).__name__)
             await self._record_task_finish(
