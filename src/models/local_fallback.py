@@ -124,8 +124,22 @@ class LocalFallbackPolicy:
 
         ``explicit_runtime_id`` is the entry selected by a pin/override.  An
         explicit local entry gets a local-only Team; an explicit cloud entry
-        gets a cloud-only Team.  Thus manual pins remain an operator override,
-        while ordinary unpinned routing honours the cooldown circuit.
+        gets a cloud-only Team **when the lane is standby-only**.  Thus manual
+        pins remain an operator override, while ordinary unpinned routing
+        honours the cooldown circuit.
+
+        ``standby_only=False`` now means the same thing on BOTH paths.  It did
+        not: ``TeamRouterProvider`` always passes its leader as
+        ``explicit_runtime_id``, so a cloud leader took the pin branch and the
+        lane rows were dropped from every Team regardless of the flag.  The
+        24-ago-2026 config declared ``standby_only: false`` precisely to keep
+        the two codex models as ordinary members — they are the only ones
+        carrying web search and image generation — and put them in the fallback
+        chain as well; instead they silently left the roster, and the leader
+        lost the ability to delegate anything needing those capabilities.  A
+        row can now be both a member and a rung, which is what the flag
+        promises; ``standby_only: true`` keeps the old, deliberate behaviour of
+        a row that only exists as a safety lane.
         """
         if not self.configured or not entries:
             return entries
@@ -134,7 +148,9 @@ class LocalFallbackPolicy:
         if not local:
             return entries
         if explicit_runtime_id:
-            return local if self.is_local_ref(explicit_runtime_id) else (cloud or entries)
+            if self.is_local_ref(explicit_runtime_id):
+                return local
+            return (cloud or entries) if self.standby_only else entries
         if self.local_only_active():
             return local
         if self.standby_only and cloud:

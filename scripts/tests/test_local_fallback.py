@@ -253,3 +253,38 @@ async def t_no_cloud_default_under_strict_local(ctx: TestContext) -> None:
             assert "strict local" in str(exc).lower(), str(exc)
         else:  # pragma: no cover - the guard is the point of the test
             raise AssertionError("a cloud model was defaulted to under strict local")
+
+
+@test("local_fallback", "standby_only=false tiene i modelli della corsia anche nel Team")
+async def t_non_standby_lane_stays_in_team(_ctx: TestContext) -> None:
+    from src.models.local_fallback import LocalFallbackPolicy
+    from src.models.catalog import iter_configured_models
+
+    # Il TeamRouterProvider passa SEMPRE il leader come explicit_runtime_id, quindi
+    # e' il ramo del pin a decidere chi entra nel team. Con standby_only false i
+    # modelli della corsia devono restare membri: sono gli stessi che portano web
+    # search e generazione immagini, e toglierli dal roster ha tolto al leader la
+    # possibilita' di delegare qualunque cosa ne avesse bisogno (24-ago-2026).
+    policy = LocalFallbackPolicy({
+        "enabled": True, "models": [LOCAL_ID], "standby_only": False,
+    })
+    entries = iter_configured_models(_providers())
+    got = [e.runtime_id for e in policy.filter_catalog(entries, explicit_runtime_id=CLOUD_ID)]
+    assert LOCAL_ID in got, got
+    assert CLOUD_ID in got, got
+
+    # standby_only true resta com'era: la corsia esiste solo come rete.
+    policy = LocalFallbackPolicy({
+        "enabled": True, "models": [LOCAL_ID], "standby_only": True,
+    })
+    got = [e.runtime_id for e in policy.filter_catalog(entries, explicit_runtime_id=CLOUD_ID)]
+    assert LOCAL_ID not in got, got
+
+    # E un pin ESPLICITO sul modello della corsia continua a dare un team di soli
+    # locali, in entrambi i casi: quello e' un override dell'operatore.
+    for standby in (True, False):
+        policy = LocalFallbackPolicy({
+            "enabled": True, "models": [LOCAL_ID], "standby_only": standby,
+        })
+        got = [e.runtime_id for e in policy.filter_catalog(entries, explicit_runtime_id=LOCAL_ID)]
+        assert got == [LOCAL_ID], (standby, got)
