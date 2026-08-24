@@ -717,7 +717,16 @@ async def handle_pin(request):
     runtime_id = str(body.get("runtime_id") or "").strip()
     if not runtime_id:
         return web.json_response({"error": "runtime_id is required"}, status=400)
-    model = await db.get_model(runtime_id)
+    # Look the model up BY RUNTIME_ID. ``get_model`` takes the surrogate
+    # row id and casts it with ``int()``, so passing a runtime_id here made
+    # every pin a 500 ("invalid literal for int()") — this endpoint had
+    # never succeeded, which is why no client called it. ``runtime_id`` is
+    # not a column: it is derived per row, so the enriched listing is the
+    # only place it can be matched.
+    model = next(
+        (m for m in await db.list_models_enriched() if m.get("runtime_id") == runtime_id),
+        None,
+    )
     if model is None:
         return web.json_response(
             {"error": f"model {runtime_id!r} is not registered"},
@@ -726,6 +735,13 @@ async def handle_pin(request):
     if not model.get("enabled"):
         return web.json_response(
             {"error": f"model {runtime_id!r} is disabled — enable it before pinning"},
+            status=400,
+        )
+    # A model whose PROVIDER is disabled cannot run either, and pinning to
+    # it would strand the session on a model the dispatcher will skip.
+    if not model.get("provider_enabled", True):
+        return web.json_response(
+            {"error": f"provider {model.get('provider_name')!r} is disabled — enable it before pinning"},
             status=400,
         )
     try:
