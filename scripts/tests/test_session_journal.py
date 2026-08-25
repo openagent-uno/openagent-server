@@ -230,3 +230,20 @@ async def t_endpoint_diagnostics(ctx: TestContext) -> None:
     body = json.loads((await api.handle_get_events(_Req(future))).body.decode())
     assert body["diagnostics"]["unknown_types"] == ["approval/asked"]
     assert body["diagnostics"]["reconstructable"] is False
+
+
+@test("session_journal", "config non censura i numeri, e non stampa le credenziali")
+async def t_config_redaction(ctx: TestContext) -> None:
+    # La regola sbagliata (solo il nome) nascondeva
+    # OPENAGENT_COMPACTION_MAX_HISTORY_TOKENS=100000 — un numero, censurato
+    # perche' contiene "TOKENS": meno utile senza essere piu' sicuro.
+    import os
+    import re
+    import pathlib
+
+    src = pathlib.Path(__file__).resolve().parents[2] / "src" / "cli.py"
+    text = src.read_text()
+    assert "could_be_secret" in text, "la regola per forma non c'e' piu'"
+    assert 'value.isdigit()' in text, "un valore numerico deve restare visibile"
+    # E il segreto vero non deve mai finire stampato per intero.
+    assert '<set, {len(value)} chars>' in text

@@ -330,7 +330,15 @@ def config_cmd(ctx, as_json: bool, show_env: bool) -> None:
                 "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY",
             ):
                 continue
-            if any(marker in name.upper() for marker in secretish):
+            # Redact by name AND shape. Matching the name alone hid
+            # ``OPENAGENT_COMPACTION_MAX_HISTORY_TOKENS=100000`` — a plain
+            # number, censored because the word "TOKENS" appears in it — which
+            # makes the output less useful without making anything safer. A
+            # value that is purely numeric (or trivially short) cannot be the
+            # credential the marker is warning about.
+            looks_named = any(marker in name.upper() for marker in secretish)
+            could_be_secret = len(value) >= 8 and not value.isdigit()
+            if looks_named and could_be_secret:
                 env[name] = f"<set, {len(value)} chars>"
             else:
                 env[name] = value
