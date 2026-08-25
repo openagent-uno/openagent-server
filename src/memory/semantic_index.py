@@ -699,15 +699,29 @@ class SemanticIndex:
                 texts.append(_prep_text(digest))
                 rows.append((rel, mtime, size, note.title or "", note.updated or ""))
 
-            if texts:
-                try:
-                    blobs = self._embed_batch(texts)
-                except EmbeddingError as exc:
-                    self._log_embed_error("vault", exc)
-                    stats.errored = True
-                    self._commit()
-                    stats.elapsed_ms = int((time.monotonic() - t0) * 1000)
-                    return stats
+            self._commit()
+
+        # ── the embedding round trip happens OUTSIDE the lock ─────────────
+        # ``search`` takes the same lock, so embedding under it made every
+        # recall that landed mid-sync wait for the whole batch to come back
+        # from the embedder. Measured on lyra-agent: query embedding 342ms and
+        # the vector scan 420ms, yet recall ran to a 7.4s median, 25.6s p90 and
+        # 56.6s max — the remainder was purely this wait, and 5 turns in 76
+        # blew the 30s ceiling and answered the customer with NO vault rules.
+        # The network call needs no lock: it touches neither the connection nor
+        # the matrix cache. Re-take the lock only to write the rows.
+        blobs = None
+        if texts:
+            try:
+                blobs = self._embed_batch(texts)
+            except EmbeddingError as exc:
+                self._log_embed_error("vault", exc)
+                stats.errored = True
+                stats.elapsed_ms = int((time.monotonic() - t0) * 1000)
+                return stats
+
+        with self._lock:
+            if blobs:
                 for (rel, mtime, size, title, updated), (blob, dim) in zip(rows, blobs):
                     self._conn.execute(
                         "INSERT INTO vault_vectors "

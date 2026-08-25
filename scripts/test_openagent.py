@@ -51,6 +51,7 @@ _TEST_MODULES: tuple[str, ...] = (
     # 1. Lightweight / pure-unit (no fixtures needed)
     "test_imports",
     # REST surfaces added alongside the accounts / skills / session-pin work.
+    "test_semantic_lock",
     "test_semantic_oversized",
     "test_rest_accounts",
     "test_rest_session_pin",
