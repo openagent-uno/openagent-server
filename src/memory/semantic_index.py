@@ -105,6 +105,15 @@ _EMBED_BATCH = 32
 # head, the rest is one open away).
 _MAX_EMBED_CHARS = 6_000
 
+# How many halvings before an item is given up on. Six takes 6,000 chars down
+# to under 100 — far past any real window — so the loop always terminates well
+# before it stops being useful.
+_SHRINK_ATTEMPTS = 6
+
+# Never shrink below this: under it the head no longer identifies the note, so
+# an embedding of it would be worse than none.
+_MIN_EMBED_CHARS = 200
+
 # Directory names never descended into when walking the vault — copied from
 # ``vault/index.py._PRUNE_DIRS`` so this cache and the FTS cache agree on what
 # "the vault" is (indexing ``_showcase`` would embed a derived artifact).
@@ -522,15 +531,96 @@ class SemanticIndex:
 
     def _embed_batch(self, texts: list[str]) -> list[tuple[bytes, int]]:
         """Embed ``texts`` (already truncated) into ``(blob, dim)`` pairs.
-        Raises ``EmbeddingError`` on any endpoint failure; callers catch it and
-        mark the sync errored rather than letting it reach the turn path."""
+
+        ``_MAX_EMBED_CHARS`` caps the text in CHARACTERS, but an embedding
+        model's window is measured in TOKENS — and the exchange rate is not a
+        constant. It depends on the model's tokenizer and on the LANGUAGE:
+        Italian costs meaningfully more tokens per character than English, so
+        a note that fits the cap can still overflow the window. Measured on
+        the eSound vault against ``snowflake-arctic-embed2``: a 5,871-char
+        Italian note (under the 6,000 cap) returns
+        ``the input length exceeds the context length``.
+
+        The damage was not the rejected note, it was the BATCH. One oversized
+        item raised, and all 32 texts in that request went unindexed — 1,589
+        such failures on that vault, so large parts of it silently never made
+        it into the index the agent recalls from. An agent that cannot find
+        what it knows answers from nothing, which is the expensive failure.
+
+        So a failed batch is retried one item at a time, and an item that is
+        still too long is halved until it fits or is given up on alone. The
+        common path is unchanged — one request per batch — and the fallback
+        only costs anything on the rare batch that actually contains an
+        oversized item.
+        """
         assert self.embedder is not None
         out: list[tuple[bytes, int]] = []
         for i in range(0, len(texts), _EMBED_BATCH):
             chunk = texts[i:i + _EMBED_BATCH]
-            for vec in self.embedder.embed(chunk):
-                out.append(_to_blob(vec))
+            try:
+                for vec in self.embedder.embed(chunk):
+                    if not getattr(self, "_dim_cache", None):
+                        self._dim_cache = len(vec)
+                    out.append(_to_blob(vec))
+                continue
+            except EmbeddingError:
+                if len(chunk) == 1:
+                    out.append(self._embed_one_shrinking(chunk[0]))
+                    continue
+                from src.core.logging import elog as _elog
+
+                _elog(
+                    "semantic.batch_split",
+                    level="warning",
+                    items=len(chunk),
+                )
+            for text in chunk:
+                out.append(self._embed_one_shrinking(text))
         return out
+
+    def _embed_one_shrinking(self, text: str) -> tuple[bytes, int]:
+        """Embed one text, halving it until the endpoint accepts it.
+
+        Returns a zero vector only when even a very short head is refused —
+        which means the endpoint is broken rather than the text oversized. A
+        zero vector scores 0 against every query, so a note that cannot be
+        embedded is invisible to recall rather than poisoning it.
+        """
+        assert self.embedder is not None
+        candidate = text
+        for _ in range(_SHRINK_ATTEMPTS):
+            try:
+                return _to_blob(self.embedder.embed([candidate])[0])
+            except EmbeddingError:
+                if len(candidate) <= _MIN_EMBED_CHARS:
+                    break
+                candidate = candidate[: max(_MIN_EMBED_CHARS, len(candidate) // 2)]
+        from src.core.logging import elog as _elog
+
+        _elog(
+            "semantic.embed_skipped",
+            level="warning",
+            chars=len(text),
+            head=text[:80],
+        )
+        # One blob per text is the caller's contract — the vectors are zipped
+        # back onto the items — so a skipped note still needs a placeholder of
+        # the RIGHT width, or the matrix is ragged. The width is learned from
+        # a vector this endpoint actually produced, never guessed.
+        return _to_blob([0.0] * self._embedding_dim())
+
+    def _embedding_dim(self) -> int:
+        """Vector width of the configured endpoint, learned once and cached."""
+        cached = getattr(self, "_dim_cache", None)
+        if cached:
+            return int(cached)
+        assert self.embedder is not None
+        try:
+            dim = len(self.embedder.embed(["x"])[0])
+        except EmbeddingError:
+            dim = 1
+        self._dim_cache = dim
+        return dim
 
     # ── sync: vault notes ─────────────────────────────────────────────
 
