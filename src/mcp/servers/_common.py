@@ -34,7 +34,24 @@ def db_path() -> str:
     in the current working directory so the server still works when
     invoked directly with ``python -m openagent.mcp.servers.X.server``.
     """
-    return os.environ.get("OPENAGENT_DB_PATH") or "openagent.db"
+    injected = (os.environ.get("OPENAGENT_DB_PATH") or "").strip()
+    if injected:
+        return injected
+    # NOT ``"openagent.db"``. Relative to the CWD means, under PyInstaller, a
+    # scratch directory that gets a brand-new empty schema written into it —
+    # so a subprocess whose env was not injected does not fail, it silently
+    # answers every question from an empty database. Fall back to the same
+    # file the main process uses.
+    try:
+        from src.core.paths import default_db_path
+
+        resolved = str(default_db_path())
+        logger.warning(
+            "OPENAGENT_DB_PATH not injected; falling back to %s", resolved,
+        )
+        return resolved
+    except Exception:  # noqa: BLE001
+        return "openagent.db"
 
 
 class SharedConnection:

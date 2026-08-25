@@ -64,7 +64,11 @@ def _db_path() -> str:
          standalone `python -m openagent.mcp.servers.scheduler.server` run still
          points at the same file.
     """
-    return os.environ.get("OPENAGENT_DB_PATH") or "openagent.db"
+    # Same rule as ``_common.db_path``: never the CWD (see that docstring —
+    # under PyInstaller it means an empty database nobody notices).
+    from src.mcp.servers._common import db_path as _shared_db_path
+
+    return _shared_db_path()
 
 
 # Single shared connection per MCP process. SQLite handles this fine

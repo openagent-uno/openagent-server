@@ -40,7 +40,11 @@ _VALID_ACTION_KINDS = ("workflow", "scheduled_task", "prompt")
 
 
 def _db_path() -> str:
-    return os.environ.get("OPENAGENT_DB_PATH") or "openagent.db"
+    # Same rule as ``_common.db_path``: never the CWD (see that docstring —
+    # under PyInstaller it means an empty database nobody notices).
+    from src.mcp.servers._common import db_path as _shared_db_path
+
+    return _shared_db_path()
 
 
 _conn_lock = asyncio.Lock()

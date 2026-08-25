@@ -763,23 +763,23 @@ def resolve_default_entry(entry: dict[str, Any], db_path: str | None = None) -> 
             return None
 
         extra_env: dict[str, str] = dict(entry.get("env") or {})
-        # The scheduler, mcp-manager, model-manager, workflow-manager and
-        # events-manager all speak to the shared OpenAgent SQLite DB. Inject
-        # OPENAGENT_DB_PATH so they land on the same file as the main
-        # process (otherwise they'd fall back to ``./openagent.db`` in
-        # each subprocess CWD and every write would go to a different
-        # file). events-manager ALSO needs it to resolve the events.key
-        # encryption file that sits next to the DB.
-        if entry["builtin"] in (
-            "scheduler", "mcp-manager", "model-manager", "workflow-manager",
-            "events-manager", "budget-manager", "memory-search",
-        ):
-            if db_path:
-                extra_env["OPENAGENT_DB_PATH"] = os.path.abspath(db_path)
-            else:
-                from src.core.paths import default_db_path
+        # Every builtin gets OPENAGENT_DB_PATH, whether or not it looks like
+        # it needs one. This used to be a hand-kept list of the servers known
+        # to touch the shared SQLite DB — and the very next builtin that
+        # started touching it (media-gen, which resolves the image backend by
+        # reading the model catalogue) was not on it. It fell back to
+        # ``./openagent.db`` relative to the subprocess CWD, which under
+        # PyInstaller is a scratch directory: it CREATED an empty database
+        # there, found no models, and reported "no image backend configured"
+        # for a fleet that had one. A list you must remember to update is a
+        # list that will be wrong; the variable costs nothing to a server that
+        # ignores it. events-manager also resolves its events.key next to it.
+        if db_path:
+            extra_env.setdefault("OPENAGENT_DB_PATH", os.path.abspath(db_path))
+        else:
+            from src.core.paths import default_db_path
 
-                extra_env["OPENAGENT_DB_PATH"] = str(default_db_path())
+            extra_env.setdefault("OPENAGENT_DB_PATH", str(default_db_path()))
 
         # The vault MCP needs to know which folder is the vault. It reads
         # OPENAGENT_VAULT_PATH (server.ts), so the subprocess lands on the
