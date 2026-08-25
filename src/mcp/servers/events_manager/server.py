@@ -30,7 +30,7 @@ from typing import Any
 import aiosqlite
 from mcp.server.fastmcp import FastMCP
 
-from src.memory.db import SCHEMA_SQL
+from src.memory.db import SCHEMA_SQL, sqlite_busy_timeout_ms, sqlite_busy_timeout_s
 from src.core.event_secret import make_secret_material, slugify, random_slug_suffix
 from src.core.event_types import EVENT_TYPES, DEFAULT_TYPE, is_valid_type, public_types
 
@@ -52,9 +52,9 @@ async def _get_conn() -> aiosqlite.Connection:
     async with _conn_lock:
         if _conn is None:
             path = _db_path()
-            conn = await aiosqlite.connect(path)
+            conn = await aiosqlite.connect(path, timeout=sqlite_busy_timeout_s())
             conn.row_factory = aiosqlite.Row
-            await conn.execute("PRAGMA busy_timeout = 10000")
+            await conn.execute(f"PRAGMA busy_timeout = {sqlite_busy_timeout_ms()}")
             await conn.execute("PRAGMA journal_mode=WAL")
             await conn.executescript(SCHEMA_SQL)
             await _ensure_event_session_binding_schema(conn)

@@ -46,7 +46,7 @@ from src.workflow.schedule_sync import (
     iter_trigger_schedule_blocks,
     trigger_types_from_graph,
 )
-from src.memory.db import SCHEMA_SQL
+from src.memory.db import SCHEMA_SQL, sqlite_busy_timeout_ms, sqlite_busy_timeout_s
 from src.memory.schedule import (
     epoch_to_iso,
     next_run_for_expression,
@@ -69,9 +69,9 @@ async def _get_conn() -> aiosqlite.Connection:
     async with _conn_lock:
         if _conn is None:
             path = _db_path()
-            conn = await aiosqlite.connect(path)
+            conn = await aiosqlite.connect(path, timeout=sqlite_busy_timeout_s())
             conn.row_factory = aiosqlite.Row
-            await conn.execute("PRAGMA busy_timeout = 10000")
+            await conn.execute(f"PRAGMA busy_timeout = {sqlite_busy_timeout_ms()}")
             await conn.execute("PRAGMA journal_mode=WAL")
             await conn.execute("PRAGMA foreign_keys = ON")
             await conn.executescript(SCHEMA_SQL)

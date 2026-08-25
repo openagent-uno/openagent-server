@@ -21,7 +21,7 @@ import logging
 import os
 
 import aiosqlite
-from src.memory.db import SCHEMA_SQL
+from src.memory.db import SCHEMA_SQL, sqlite_busy_timeout_ms, sqlite_busy_timeout_s
 
 logger = logging.getLogger(__name__)
 
@@ -59,9 +59,13 @@ class SharedConnection:
         async with self._lock:
             if self._conn is None:
                 path = db_path()
-                conn = await aiosqlite.connect(path, timeout=10.0)
+                conn = await aiosqlite.connect(
+                    path, timeout=sqlite_busy_timeout_s(),
+                )
                 conn.row_factory = aiosqlite.Row
-                await conn.execute("PRAGMA busy_timeout = 10000")
+                await conn.execute(
+                    f"PRAGMA busy_timeout = {sqlite_busy_timeout_ms()}"
+                )
                 await conn.execute("PRAGMA journal_mode=WAL")
                 await conn.executescript(SCHEMA_SQL)
                 await conn.commit()

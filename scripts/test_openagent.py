@@ -56,6 +56,7 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_rest_session_pin",
     "test_session_patch_owner",
     "test_tool_search_repeat_miss",
+    "test_sqlite_busy_timeout",
     "test_rest_skills",
     "test_setup",
     "test_serve_singleton",

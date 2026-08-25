@@ -47,13 +47,24 @@ except ImportError:
 
 
 def _session_store_pragma_enabled() -> bool:
-    """Gate for the runtime session-store PRAGMA hook. OFF by default so the
-    engine stays byte-identical to the historical ``create_engine(url)`` (the
-    current QueuePool, no busy_timeout) — turning it on is behaviour-changing."""
+    """Gate for the runtime session-store PRAGMA hook.
+
+    **ON by default since 0.19.6.** It shipped OFF — "nothing changes until an
+    operator opts in" — and then nobody ever opted in, so the one engine this
+    docstring calls the confirmed WAL-writer wedge kept running with SQLite's
+    stock settings: no ``busy_timeout`` at all. It commits a big ``runs`` blob
+    per step, and every other writer on the file waits patiently for 60s while
+    THIS one gives up the instant it meets a lock — which is how a workflow
+    finalize ended up stranded in 'running' and a compaction got thrown away.
+    An engine that waits is not a behaviour change anyone has to opt into; it
+    is the same engine, told to be as patient as its neighbours.
+
+    ``OPENAGENT_SESSION_STORE_PRAGMA_ENABLED=0`` still turns it off for a
+    deployment that wants the old behaviour back."""
     import os
     raw = os.environ.get("OPENAGENT_SESSION_STORE_PRAGMA_ENABLED")
     if raw is None:
-        return False
+        return True
     return raw.strip().lower() not in ("0", "false", "no", "off", "")
 
 
@@ -64,24 +75,34 @@ def _make_session_store_engine(url: str) -> "Engine":
     per step and, under a rate-limit storm, hogs the single SQLite writer so
     MemoryDB's finalizer/reaper UPDATEs lose the race ("database is locked").
 
-    Default (flag OFF): exactly the previous ``create_engine(url)`` — no
-    ``busy_timeout``, no PRAGMA — so nothing changes until an operator opts in.
+    On (the default, SQLite URLs only): set a per-connection ``busy_timeout``
+    (so a step commit WAITS for the writer to free instead of raising
+    immediately), ``journal_mode=WAL`` and ``synchronous=NORMAL`` so this
+    engine and MemoryDB coexist on one file with far fewer lock errors. The
+    wait defaults to the SAME budget every other writer uses
+    (``sqlite_busy_timeout_ms``) — a shorter one here is exactly how this
+    engine used to lose races it should have won. Passes
+    ``connect_args={"timeout": ...}`` so the very first connect also honours
+    the wait.
 
-    ``OPENAGENT_SESSION_STORE_PRAGMA_ENABLED`` on (SQLite URLs only): set a
-    per-connection ``busy_timeout`` (so a step commit WAITS for the writer to
-    free instead of raising immediately), ``journal_mode=WAL`` and
-    ``synchronous=NORMAL`` so this engine and MemoryDB coexist on one file with
-    far fewer lock errors. Passes ``connect_args={"timeout": ...}`` so the very
-    first connect also honours the wait."""
+    Off (``OPENAGENT_SESSION_STORE_PRAGMA_ENABLED=0``): exactly the historical
+    ``create_engine(url)`` — no ``busy_timeout``, no PRAGMA."""
     is_sqlite = url.startswith("sqlite")
     if not is_sqlite or not _session_store_pragma_enabled():
         return create_engine(url)
 
     import os
+
+    from src.memory.db import sqlite_busy_timeout_s
+
+    default_timeout = sqlite_busy_timeout_s()
+    raw = os.environ.get("OPENAGENT_SESSION_STORE_BUSY_TIMEOUT_SECONDS")
     try:
-        timeout = float(os.environ.get("OPENAGENT_SESSION_STORE_BUSY_TIMEOUT_SECONDS", "10"))
+        timeout = float(raw) if raw is not None else default_timeout
     except (TypeError, ValueError):
-        timeout = 10.0
+        timeout = default_timeout
+    if timeout <= 0:
+        timeout = default_timeout
     engine = create_engine(url, connect_args={"timeout": timeout})
 
     @event.listens_for(engine, "connect")

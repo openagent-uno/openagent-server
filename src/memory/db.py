@@ -38,6 +38,45 @@ logger = logging.getLogger(__name__)
 WORKER_ID = str(uuid.uuid4())
 WORKER_PID = os.getpid()
 
+
+# ── One busy timeout for everything that writes this file ────────────────────
+#
+# SQLite in WAL mode has exactly ONE writer, and this agent has many: the
+# gateway, the scheduler, the workflow executor, compaction, the runtime's own
+# session store, and every in-tree MCP subprocess — several of them in separate
+# processes, so Python-level serialisation buys nothing. A writer that waits
+# gets its turn; a writer that gives up early raises "database is locked" and
+# leaves work half-done (a workflow_run stranded in 'running', a compaction
+# thrown away, an event lease unreaped).
+#
+# The failures we kept seeing were never "the lock was held forever" — they
+# were connections that had been given a *different*, shorter patience than
+# everyone else: 10s here, 5s there, none at all in the runtime store. So the
+# number lives here, once, and every writer reads it. Tunable per deployment
+# via ``OPENAGENT_SQLITE_BUSY_TIMEOUT_MS`` for the rare host that needs it.
+_DEFAULT_SQLITE_BUSY_TIMEOUT_MS = 60_000
+
+
+def sqlite_busy_timeout_ms() -> int:
+    """Milliseconds every connection to the agent DB should wait for the
+    writer before giving up. Read live so a redeploy is not needed to retune."""
+    raw = os.environ.get("OPENAGENT_SQLITE_BUSY_TIMEOUT_MS")
+    if raw is None:
+        return _DEFAULT_SQLITE_BUSY_TIMEOUT_MS
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError):
+        return _DEFAULT_SQLITE_BUSY_TIMEOUT_MS
+    # A zero/negative timeout would mean "fail instantly", which is the bug
+    # this constant exists to remove. Treat it as "use the default".
+    return value if value > 0 else _DEFAULT_SQLITE_BUSY_TIMEOUT_MS
+
+
+def sqlite_busy_timeout_s() -> float:
+    """The same budget in seconds, for ``sqlite3.connect(timeout=...)`` — which
+    covers the window BEFORE the first PRAGMA can run on a new connection."""
+    return sqlite_busy_timeout_ms() / 1000.0
+
 # Lease defaults. The lease is SHORT so a frozen turn is reclaimed in ~LEASE_TTL
 # rather than the coarse 30-min stale-sweep age; the heartbeat (a tiny single-row
 # write that survives writer contention) keeps a legitimately-running turn's
@@ -950,7 +989,9 @@ class MemoryDB:
         # MCP subprocess + a fresh per-test MemoryDB all pointing at the same
         # file), two DDL calls can race. Raise the timeout so the second
         # connect waits a few seconds instead of deadlocking the event loop.
-        self._conn = await aiosqlite.connect(self.db_path, timeout=60.0)
+        self._conn = await aiosqlite.connect(
+            self.db_path, timeout=sqlite_busy_timeout_s(),
+        )
         self._conn.row_factory = aiosqlite.Row
         # ``busy_timeout`` gives the same guarantee at every subsequent
         # statement on this connection — not just the initial open.
@@ -964,7 +1005,7 @@ class MemoryDB:
         # misurato, aveva ZERO righe da toccare. Aspettare e' corretto,
         # arrendersi no. Il valore alto e' gia' quello usato da
         # `session_retention`, che convive con lo stesso scrittore.
-        await self._conn.execute("PRAGMA busy_timeout = 60000")
+        await self._conn.execute(f"PRAGMA busy_timeout = {sqlite_busy_timeout_ms()}")
         await self._conn.execute("PRAGMA journal_mode=WAL")
         # Enable FK constraints per-connection. SQLite's default is OFF,
         # so without this the ON DELETE CASCADE on models.provider_id is

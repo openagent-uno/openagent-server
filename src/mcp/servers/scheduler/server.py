@@ -26,7 +26,7 @@ from typing import Any
 
 import aiosqlite
 from mcp.server.fastmcp import FastMCP
-from src.memory.db import SCHEMA_SQL
+from src.memory.db import SCHEMA_SQL, sqlite_busy_timeout_ms, sqlite_busy_timeout_s
 from src.memory.schedule import (
     build_one_shot_expression,
     decorate_scheduled_task,
@@ -79,9 +79,9 @@ async def _get_conn() -> aiosqlite.Connection:
     async with _conn_lock:
         if _conn is None:
             path = _db_path()
-            conn = await aiosqlite.connect(path)
+            conn = await aiosqlite.connect(path, timeout=sqlite_busy_timeout_s())
             conn.row_factory = aiosqlite.Row
-            await conn.execute("PRAGMA busy_timeout = 10000")
+            await conn.execute(f"PRAGMA busy_timeout = {sqlite_busy_timeout_ms()}")
             await conn.execute("PRAGMA journal_mode=WAL")
             await conn.executescript(SCHEMA_SQL)
             await conn.commit()

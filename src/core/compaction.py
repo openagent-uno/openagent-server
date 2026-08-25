@@ -685,7 +685,13 @@ def _save_runs(db_path: str, session_id: str, runs: list[dict[str, Any]]) -> Non
     rewriting a phantom row would resurrect deleted history.
     """
     try:
-        conn = sqlite3.connect(db_path, timeout=5.0)
+        # A read-then-write on one connection: the SELECT below opens the
+        # transaction and the UPDATE upgrades it, which is precisely the shape
+        # that needs the full shared patience rather than a private 5s.
+        from src.memory.db import sqlite_busy_timeout_ms, sqlite_busy_timeout_s
+
+        conn = sqlite3.connect(db_path, timeout=sqlite_busy_timeout_s())
+        conn.execute(f"PRAGMA busy_timeout = {sqlite_busy_timeout_ms()}")
     except sqlite3.Error as exc:
         elog("compaction.save_open_failed", level="warning",
              session_id=session_id, error=str(exc))
