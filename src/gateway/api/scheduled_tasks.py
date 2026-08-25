@@ -224,11 +224,26 @@ async def handle_run(request):
 
     # wait=True: run_task swallows task errors (records them on the row), so
     # awaiting it resolves once the firing reaches a terminal state.
-    try:
-        await asyncio.wait_for(run_task, timeout=timeout_s)
-    except asyncio.TimeoutError:
+    # ``asyncio.wait`` — NOT ``wait_for``, which cancels the awaited task when
+    # the deadline passes. That cancellation killed a real production firing
+    # because an HTTP client got bored: the run recorded "Stopped by user" and
+    # 22 minutes of completed work were thrown away. A manual trigger is a
+    # convenience for the caller; the firing itself belongs to the scheduler
+    # and must outlive the request that started it.
+    done, _pending = await asyncio.wait({run_task}, timeout=timeout_s)
+    if not done:
+        runs = await scheduler.db.list_task_runs(task_id, limit=1)
         return web.json_response(
-            {"error": f"task did not finish within {timeout_s}s"}, status=504,
+            {
+                "status": "running",
+                "run_id": runs[0]["id"] if runs else None,
+                "detail": (
+                    f"still running after {timeout_s}s — left running, not cancelled. "
+                    f"Poll /api/scheduled-tasks/{task_id}/runs for the outcome, "
+                    f"or POST .../stop to end it deliberately."
+                ),
+            },
+            status=202,
         )
     runs = await scheduler.db.list_task_runs(task_id, limit=1)
     if not runs:

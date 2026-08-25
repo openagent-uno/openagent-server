@@ -429,6 +429,8 @@ _TEST_MODULES: tuple[str, ...] = (
     # Scheduled-task execution history (task_runs) — DB layer + the
     # Scheduler recording each firing's status/output preview, mirroring
     # workflow_runs. Backs GET /api/scheduled-tasks/{id}/runs.
+    "test_manual_run_no_cancel",
+    "test_run_truncation",
     "test_task_runs",
     # Optional per-run model selection: scheduled_tasks.model column (DB
     # round-trip + idempotent ALTER migration) and delegate_task's now-optional

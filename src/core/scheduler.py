@@ -133,6 +133,23 @@ _CHILD_FAILURE_STATUSES = {"ERROR", "FAILED"}
 _CHILD_CANCELLED_STATUSES = {"CANCELLED"}
 _CHILD_INCOMPLETE_STATUSES = {"PAUSED", "PENDING", "RUNNING"}
 
+# The runtime does not raise when a run exhausts its tool-call budget: it feeds
+# the model "Tool call limit reached" and lets it write a final answer. The run
+# then ends COMPLETED, so the task recorded `success` — while having done
+# nothing. Measured on clickup-task-quality-audit: three runs in a row reported
+# success with 0/4 lists audited, 0 tasks checked and 0 mutations, and only
+# firing the task by hand revealed it. A budget that truncates the work must
+# leave a mark in the run history, exactly as the timeout budget does.
+_TOOL_LIMIT_MARKER = "Tool call limit reached"
+
+
+def _run_was_truncated(run: dict) -> bool:
+    """True when the stored child run shows the tool-call budget cut it short."""
+    try:
+        return _TOOL_LIMIT_MARKER in json.dumps(run, default=str)
+    except Exception:  # noqa: BLE001 — detection must never fail a run
+        return False
+
 
 def _status_name(status: object) -> str:
     """Normalize runtime RunStatus enum/string values from session JSON."""
@@ -1028,7 +1045,9 @@ class Scheduler:
                         response = await asyncio.wait_for(run, timeout=timeout)
                     else:
                         response = await run
-                child_issue = None
+                # The non-streaming branch used to skip the check entirely, so a
+                # truncated run here looked like a clean success.
+                child_issue = await self._child_session_terminal_issue(session_id)
             elog("task.done", name=task_name, preview=str(response)[:100])
             if child_issue is not None:
                 final_status, final_error = child_issue
@@ -1156,6 +1175,16 @@ class Scheduler:
             return (
                 "failed",
                 f"Child session {session_id} ended without a completed runtime run: {status}",
+            )
+        if _run_was_truncated(latest):
+            # Completed, but only because the budget stopped it. Say so: a run
+            # that never reached its work is not a success, and reading it as
+            # one is how this task stayed broken unnoticed.
+            return (
+                "failed",
+                "Run truncated: the tool-call budget was exhausted before the "
+                "task finished its work. Raise OPENAGENT_LEAN_EVENT_MAX_TOOL_CALLS "
+                "(lean profile) or OPENAGENT_MAX_TOOL_CALLS_PER_RUN.",
             )
         return None
 
