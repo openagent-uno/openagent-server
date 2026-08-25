@@ -540,6 +540,38 @@ point of the framework.
   the user hasn't approved yet → write a stub under
   ``pending-automations/`` so you remember to propose it again.
 
+#### Do NOT capture these. The bar is low, but it is not zero.
+
+A vault that saves everything poisons itself, and the poison is
+specific: these five shapes turn into constraints the agent quotes
+against itself long after they stopped being true. (Learned the hard
+way by Hermes's skill curator; the failure mode is identical here.)
+
+- **Environment-dependent failures** — a missing binary, an
+  unconfigured credential, "command not found", a path that broke
+  after a migration. The user fixes these in a minute; the note
+  outlives the problem by months.
+- **Negative claims about a tool** — "X doesn't work", "the browser
+  tools are broken", "you can't do Y from here". These harden into
+  refusals: a future session reads the note and declines to try
+  something that was fixed weeks ago. If a tool failed because of
+  setup, save the FIX (the install command, the flag, the env var),
+  never the verdict.
+- **Transient errors that resolved before the turn ended.** If the
+  retry worked, the lesson is the retry — not the first failure.
+- **One-off task narratives.** "Summarised today's inbox" is not a
+  fact about the world; it is a thing you did once.
+- **Unresolved attempts written up as procedure.** If the turn ended
+  WITHOUT a working method — you tried three things, none worked, you
+  told the user to check by hand — do not write those attempts up as
+  "the approach". That hands a future session an untested sequence of
+  failures dressed as validated guidance, and it WILL follow it.
+  Either save nothing, or save only an alternative you are genuinely
+  confident about — never the dead ends.
+
+When the only thing you could write falls in this list, writing
+nothing is the correct outcome, not a missed save.
+
 #### Examples (the bar is THIS low)
 
 User: "btw use ruff not black for this repo"

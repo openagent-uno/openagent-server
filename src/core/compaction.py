@@ -459,6 +459,57 @@ def _extract_run_text(run: dict[str, Any]) -> str:
     return "\n".join(chunks)
 
 
+# ── Skills that the summariser is about to make invisible ────────────────────
+#
+# A ``skill_view`` result is instructions: while it sits verbatim in history the
+# model behaves as if it has read them. Fold it into a recap and the model still
+# BELIEVES it has them — the tool call is right there in the summarised past —
+# but the steps are gone, paraphrased into a sentence. It then improvises, with
+# the confidence of someone following a procedure.
+#
+# The elision path already handles this (``_tool_result_pointer`` names the
+# exact re-run). The summariser path cannot: we hand the runs to a model and
+# get prose back, and no instruction reliably survives being summarised. So we
+# do what dsh/Hermes do — extract the fact BEFORE the call and re-inject it
+# deterministically AFTER, rather than hoping the model kept it.
+def _skills_loaded_in(runs: list[dict[str, Any]]) -> list[str]:
+    """Names of skills whose body was read in the runs about to be folded."""
+    seen: list[str] = []
+    for run in runs or []:
+        for message in (run.get("messages") or []):
+            for call in (message.get("tool_calls") or []):
+                fn = (call or {}).get("function") or {}
+                if "skill_view" not in str(fn.get("name") or ""):
+                    continue
+                raw = fn.get("arguments")
+                name = ""
+                if isinstance(raw, str):
+                    try:
+                        name = str((json.loads(raw) or {}).get("name") or "")
+                    except (TypeError, ValueError):
+                        name = ""
+                elif isinstance(raw, dict):
+                    name = str(raw.get("name") or "")
+                if name and name not in seen:
+                    seen.append(name)
+    return seen
+
+
+def _reinject_skill_notice(summary: str, skill_names: list[str]) -> str:
+    """Append the reload notice unless the summary already carries it."""
+    if not skill_names:
+        return summary
+    if "skill_view" in summary:
+        return summary  # the model kept it; adding ours twice would be noise
+    listed = ", ".join(f"`{n}`" for n in skill_names[:8])
+    return summary.rstrip() + (
+        "\n\n[Skills read earlier in this conversation are NO LONGER in "
+        f"context verbatim: {listed}. What is above is a summary, not their "
+        "instructions. Before following any procedure from one of them, "
+        "re-read it with `skill_view`.]"
+    )
+
+
 def _tool_result_pointer(tool_name: Any, orig_len: int, cap: int) -> str:
     """The data-safe placeholder that replaces an elided tool result in history.
 
@@ -1549,7 +1600,10 @@ async def compact(
         "tokens_before": tokens_before,
     })
 
+    skills_folded = _skills_loaded_in(old_runs)
     summary = await _summarize_runs(old_runs, model, agent)
+    if summary:
+        summary = _reinject_skill_notice(summary, skills_folded)
     if not summary:
         elog(
             "runtime.compaction.skipped",

@@ -60,6 +60,7 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_sqlite_busy_timeout",
     "test_mcp_db_path",
     "test_session_journal",
+    "test_ghost_skill",
     "test_rest_skills",
     "test_setup",
     "test_serve_singleton",
