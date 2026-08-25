@@ -121,6 +121,54 @@ def _did_you_mean(name: str, available: list[str]) -> str:
     return f" Did you mean: {close}?" if close else ""
 
 
+# ── repeated-miss guard ──────────────────────────────────────────────────────
+#
+# A miss means the model invented a name, and the error above already lists the
+# real ones. What it never did was get LOUDER when the invention repeated, so a
+# model that keeps guessing turns one trivial prompt into a pile of upstream
+# calls — measured on a live agent: 22 subscription calls for "reply with the
+# word OK", spent alternating between ``file``, ``run_command`` and
+# ``shell_run_command``, none of which exist.
+#
+# The guard escalates the wording; it never refuses. A refusal that tripped on
+# a legitimate call would cost far more than the tokens it saves, and this
+# counter is deliberately process-wide (there is no turn identity down here),
+# so it must not be able to deny anyone a working tool. Any successful call
+# clears it, which is what keeps a busy agent from drifting into the loud
+# wording on unrelated work.
+_MISS_COUNTS: dict[tuple[str, str], int] = {}
+_MISS_COUNTS_MAX = 64
+_LOUD_AFTER = 2
+
+
+def _note_miss(server: str, tool: str) -> int:
+    """Record a failed lookup; return how many times this exact pair has now
+    missed in a row (a successful call resets the whole table)."""
+    key = (str(server or ""), str(tool or ""))
+    count = _MISS_COUNTS.get(key, 0) + 1
+    if len(_MISS_COUNTS) >= _MISS_COUNTS_MAX and key not in _MISS_COUNTS:
+        _MISS_COUNTS.clear()
+    _MISS_COUNTS[key] = count
+    return count
+
+
+def _clear_misses() -> None:
+    _MISS_COUNTS.clear()
+
+
+def _repeat_warning(server: str, tool: str, count: int) -> str:
+    """The escalation suffix, empty until the same call has failed enough
+    times that repeating it is clearly not a strategy."""
+    if count <= _LOUD_AFTER:
+        return ""
+    return (
+        f" STOP: {server}.{tool} has now failed {count} times — this exact call"
+        " cannot succeed, and guessing another name will not help either."
+        " List what exists (tool_search_list_servers / tool_search_list_tools)"
+        " or answer with the tools you already have."
+    )
+
+
 # Lazy-recovery timeout for ``call_tool``. Lower than the connect-time
 # recovery budget — by the time the model invokes a trimmed tool we want
 # to fail fast rather than make the user wait. One short attempt is enough
@@ -281,17 +329,22 @@ async def _call_tool_impl(
     fn, _resolved_server = await _resolve_tool(pool, server, tool)
 
     if fn is None:
+        misses = _note_miss(server, tool)
         toolkit = pool.toolkit_by_name(server) if server else None
         if toolkit is None:
             raise ValueError(
                 f"MCP {server!r} is not loaded, and no loaded MCP exposes a "
                 f"tool named {tool!r}. Known MCPs: {sorted(pool._toolkit_by_name)}"
+                + _repeat_warning(server, tool, misses)
             )
         avail = sorted(await _ensure_functions_loaded(toolkit, server))
         raise ValueError(
             f"No loaded MCP has a tool named {tool!r}. "
             f"MCP {server!r} exposes: {avail}." + _did_you_mean(tool, avail)
+            + _repeat_warning(server, tool, misses)
         )
+    # A call that resolves means the model is back on solid ground.
+    _clear_misses()
     if isinstance(args, str):
         # Some OpenAI-compatible models (observed: GLM-5 on ZAI) encode the
         # nested free-form ``args`` object as a JSON string even though the

@@ -54,6 +54,8 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_semantic_oversized",
     "test_rest_accounts",
     "test_rest_session_pin",
+    "test_session_patch_owner",
+    "test_tool_search_repeat_miss",
     "test_rest_skills",
     "test_setup",
     "test_serve_singleton",

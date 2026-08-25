@@ -666,6 +666,18 @@ async def handle_patch_metadata(request):
     """PATCH /api/sessions/{session_id} — update session title/model.
 
     Body: ``{"title": "...", "model": "..."}``. Both fields optional.
+
+    Stamps the caller as the row's owner, because this endpoint frequently
+    *creates* the row: the app titles a chat from its first message, and that
+    PATCH can land before anything else has persisted the session. An owner is
+    not decoration — ``list_all_sessions`` filters on ``metadata.client_id``,
+    so a row written here without one is invisible in every session listing,
+    forever. That is survivable while a turn is running (the client keeps its
+    own copy in memory), and permanent once the turn dies before the runtime
+    writes its runs: the agent restarts, the chat is on disk, and the user
+    never sees it again. Ownership only ever gets *added* here —
+    ``upsert_session`` merges metadata, so a row that already has an owner
+    keeps it, and ``user_id`` stays untouched for the runtime to claim.
     """
     from aiohttp import web
 
@@ -683,7 +695,12 @@ async def handle_patch_metadata(request):
     if not title and not model:
         return web.json_response({"error": "title or model is required"}, status=400)
 
-    await db.upsert_session(session_id, title=title, model=model)
+    # Prefer the user handle (same across their devices, which is what makes
+    # the chat list cross-device); fall back to the device pubkey. Both can be
+    # absent on a trusted-proxy / single-owner deploy, and then this behaves
+    # exactly as before.
+    owner = request.get("user_handle") or request.get("client_id") or None
+    await db.upsert_session(session_id, client_id=owner, title=title, model=model)
     return web.json_response({"session_id": session_id, "ok": True})
 
 
