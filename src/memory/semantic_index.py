@@ -827,36 +827,51 @@ class SemanticIndex:
                     metas.append((sid, live[sid][0], live[sid][1], title[:200],
                                   str(meta.get("origin") or "")[:40]))
 
-                if texts:
-                    try:
-                        blobs = self._embed_batch(texts)
-                    except EmbeddingError as exc:
-                        self._log_embed_error("sessions", exc)
-                        stats.errored = True
-                        self._commit()
-                        stats.elapsed_ms = int((time.monotonic() - t0) * 1000)
-                        return stats
-                    for (sid, upd, rlen, title, origin), (blob, dim) in zip(metas, blobs):
-                        self._conn.execute(
-                            "INSERT INTO session_vectors "
-                            "(session_id, updated_at, runs_len, title, origin, dim, "
-                            " vec, embedded_at) VALUES (?,?,?,?,?,?,?,?) "
-                            "ON CONFLICT(session_id) DO UPDATE SET "
-                            "  updated_at=excluded.updated_at, runs_len=excluded.runs_len, "
-                            "  title=excluded.title, origin=excluded.origin, "
-                            "  dim=excluded.dim, vec=excluded.vec, "
-                            "  embedded_at=excluded.embedded_at",
-                            (sid, upd, rlen, title, origin, dim, blob, time.time()),
-                        )
-                        stats.embedded += 1
-                        stats.added += 1 if sid not in existing else 0
-                        stats.updated += 1 if sid in existing else 0
                 self._commit()
             finally:
                 try:
                     src.close()
                 except Exception:
                     pass
+
+        # ── the embedding round trip happens OUTSIDE the lock ─────────────
+        # Same defect, and the WORSE half: session digests carry a whole run,
+        # so they are far bigger than a note. Measured against the live
+        # embedder — one query 362ms, one note 774ms, one session digest
+        # 1037ms, but a batch of 32 notes 15.2s and a batch of 32 sessions
+        # 22.7s. Held under the lock, one such batch stalled every concurrent
+        # recall for that long, which is what put lyra-agent's recall p90 at
+        # 66.9s and its max at 128.7s. Sessions churn far faster than notes
+        # (50 re-embeds an hour against 6), so this is the path that actually
+        # hurt. See the matching fix in ``sync_vault``.
+        blobs = None
+        if texts:
+            try:
+                blobs = self._embed_batch(texts)
+            except EmbeddingError as exc:
+                self._log_embed_error("sessions", exc)
+                stats.errored = True
+                stats.elapsed_ms = int((time.monotonic() - t0) * 1000)
+                return stats
+
+        with self._lock:
+            if blobs:
+                for (sid, upd, rlen, title, origin), (blob, dim) in zip(metas, blobs):
+                    self._conn.execute(
+                        "INSERT INTO session_vectors "
+                        "(session_id, updated_at, runs_len, title, origin, dim, "
+                        " vec, embedded_at) VALUES (?,?,?,?,?,?,?,?) "
+                        "ON CONFLICT(session_id) DO UPDATE SET "
+                        "  updated_at=excluded.updated_at, runs_len=excluded.runs_len, "
+                        "  title=excluded.title, origin=excluded.origin, "
+                        "  dim=excluded.dim, vec=excluded.vec, "
+                        "  embedded_at=excluded.embedded_at",
+                        (sid, upd, rlen, title, origin, dim, blob, time.time()),
+                    )
+                    stats.embedded += 1
+                    stats.added += 1 if sid not in existing else 0
+                    stats.updated += 1 if sid in existing else 0
+            self._commit()
         stats.elapsed_ms = int((time.monotonic() - t0) * 1000)
         return stats
 
