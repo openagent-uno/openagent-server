@@ -89,6 +89,7 @@ def child_frame_to_event(frame: dict[str, Any], *, seq: int = 0, ts_ms: int = 0)
     the detached broadcast sink (the gateway). Returns ``None`` for an unknown
     kind or a frame with no ``session_id``."""
     from src.stream.events import (
+        TURN_END_COMPLETED,
         OutSeedMessage, OutTextDelta, OutTextFinal, OutToolStatus, TurnComplete,
     )
     sid = frame.get("session_id")
@@ -107,7 +108,11 @@ def child_frame_to_event(frame: dict[str, Any], *, seq: int = 0, ts_ms: int = 0)
             text=frame.get("text") or "", author=frame.get("author"),
         )
     if kind == "turn_complete":
-        return TurnComplete(session_id=sid, seq=seq, ts_ms=ts_ms)
+        return TurnComplete(
+            session_id=sid, seq=seq, ts_ms=ts_ms,
+            reason=str(frame.get("reason") or TURN_END_COMPLETED),
+            error=str(frame.get("error") or ""),
+        )
     return None
 
 

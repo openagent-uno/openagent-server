@@ -495,6 +495,41 @@ CREATE TABLE IF NOT EXISTS config_state (
 -- a framework lock on top of the pin). With history unified in
 -- the runtime's ``sessions`` across every framework, the lock is no longer
 -- needed — only the pin value itself survives.
+-- ── Session journal: what happened, written while it happened ──
+--
+-- ``sessions.runs`` is the surface the MODEL sees, and the runtime writes it
+-- when a turn ENDS. That is a fine contract for the model and a terrible one
+-- for everybody else: a turn interrupted before it closes leaves no trace at
+-- all, so an app that was mid-conversation has nothing to reconcile against
+-- and a support question about "what did it do at 14:32" has no answer.
+--
+-- This table is the other half — an append-only journal of the facts of a
+-- turn, written as they occur: the user's message, the assistant's message,
+-- tool status, compaction, errors, and how the turn ended. Borrowed from
+-- DeepSeek Harness's session log, minus what does not apply to us (we do not
+-- journal every stream delta: they are re-derivable from the final message and
+-- would be the bulk of the volume).
+--
+-- Rules that make it worth having:
+--   * append-only — rows are never updated, only inserted;
+--   * ``seq`` is monotonic per session, so a client can ask "what happened
+--     after 41" and get an answer instead of inferring from silence;
+--   * ``data`` is JSON and may grow new keys; a reader that meets an unknown
+--     ``type`` skips it rather than failing (nothing here is load-bearing for
+--     reconstruction yet — when something becomes so, it gets an explicit
+--     non-ignorable marker, as dsh does).
+CREATE TABLE IF NOT EXISTS session_events (
+    session_id TEXT NOT NULL,
+    seq        INTEGER NOT NULL,
+    ts_ms      INTEGER NOT NULL,
+    type       TEXT NOT NULL,
+    data       TEXT,
+    PRIMARY KEY (session_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_events_session
+    ON session_events(session_id, seq);
+
 CREATE TABLE IF NOT EXISTS pinned_sessions (
     session_id TEXT PRIMARY KEY,
     runtime_id TEXT NOT NULL,
@@ -5672,6 +5707,7 @@ class MemoryDB:
     # is permanently deleted — most importantly ``conversation_embeddings``, or
     # a deleted chat would keep resurfacing through memory-search.
     _SESSION_SATELLITE_TABLES: tuple[str, ...] = (
+        "session_events",
         "pinned_sessions",
         "conversation_embeddings",
         "user_profiles",
@@ -5702,6 +5738,81 @@ class MemoryDB:
                     table, session_id, e,
                 )
         await conn.commit()
+
+    # ── Session journal (append-only) ──
+
+    async def append_session_event(
+        self, session_id: str, event_type: str, data: dict | None = None,
+    ) -> int:
+        """Append one fact to a session's journal and return its ``seq``.
+
+        Best-effort by contract: journalling must never be the reason a turn
+        fails, so a write error is logged and swallowed (returning 0). The
+        journal is a witness, not a participant.
+
+        ``seq`` is allocated as ``max(seq) + 1`` for the session inside the
+        same statement, so two writers cannot mint the same number — the
+        PRIMARY KEY would reject the loser anyway, and the retry lands on a
+        fresh value.
+        """
+        if not session_id or not event_type:
+            return 0
+        payload = "{}"
+        if data:
+            try:
+                payload = json.dumps(data, default=str)
+            except (TypeError, ValueError):
+                payload = json.dumps({"unserializable": True})
+        conn = await self._ensure_connected()
+        for _attempt in range(3):
+            try:
+                cursor = await conn.execute(
+                    "INSERT INTO session_events (session_id, seq, ts_ms, type, data) "
+                    "VALUES (?, COALESCE((SELECT MAX(seq) FROM session_events "
+                    "WHERE session_id = ?), 0) + 1, ?, ?, ?) RETURNING seq",
+                    (session_id, session_id, int(time.time() * 1000), event_type, payload),
+                )
+                row = await cursor.fetchone()
+                await conn.commit()
+                return int(row[0]) if row else 0
+            except sqlite3.IntegrityError:
+                continue  # lost the seq race — take the next number
+            except Exception as e:  # noqa: BLE001
+                logger.debug("session journal write failed (%s): %s", event_type, e)
+                return 0
+        return 0
+
+    async def list_session_events(
+        self, session_id: str, *, after_seq: int = 0, limit: int = 500,
+    ) -> list[dict]:
+        """Read a session's journal in order, from ``after_seq`` exclusive.
+
+        This is what lets a client ask "what happened while I was away" and
+        get facts instead of inferring from silence."""
+        conn = await self._ensure_connected()
+        try:
+            cursor = await conn.execute(
+                "SELECT seq, ts_ms, type, data FROM session_events "
+                "WHERE session_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?",
+                (session_id, int(after_seq), max(1, min(int(limit), 2000))),
+            )
+            rows = await cursor.fetchall()
+        except Exception as e:  # noqa: BLE001 — older DB without the table
+            logger.debug("session journal read failed: %s", e)
+            return []
+        out: list[dict] = []
+        for row in rows:
+            try:
+                data = json.loads(row["data"] or "{}")
+            except (TypeError, ValueError):
+                data = {}
+            out.append({
+                "seq": int(row["seq"]),
+                "ts_ms": int(row["ts_ms"]),
+                "type": str(row["type"]),
+                "data": data if isinstance(data, dict) else {},
+            })
+        return out
 
     # ── Session runs (the runtime SqliteDb owns writes) ──
     #

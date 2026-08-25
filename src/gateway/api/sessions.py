@@ -10,7 +10,11 @@
 ``DELETE /api/sessions/{session_id}/model`` — unpin. Session returns to
     normal entry-model resolution (default-leader flag → first enabled).
 ``DELETE /api/sessions/{session_id}`` — delete a session and its history.
-``GET /api/sessions/{session_id}/runs`` — turn history for a session.
+``GET /api/sessions/{session_id}/runs`` — turn history for a session (the
+    transcript the MODEL sees, written by the runtime when a turn ends).
+``GET /api/sessions/{session_id}/events`` — the session journal: the facts of
+    each turn, written WHILE it happens. A turn that dies before it closes is
+    in here and nowhere else.
 """
 
 from __future__ import annotations
@@ -659,6 +663,46 @@ async def handle_get_runs(request):
     return web.json_response({
         "session_id": session_id,
         "messages": messages,
+    })
+
+
+async def handle_get_events(request):
+    """GET /api/sessions/{session_id}/events?after=<seq>&limit=<n>
+
+    The session journal: what happened during the turns, in order, written as
+    it happened. ``runs`` (the sibling endpoint) is the transcript the MODEL
+    sees, assembled by the runtime when a turn ends — so a turn that died
+    before it closed appears in neither the transcript nor anywhere else. This
+    endpoint is where it does appear.
+
+    A client polls it with the last ``seq`` it saw. That is the difference
+    between "I heard nothing, so I will guess" and "the turn ended at seq 42,
+    reason: error".
+    """
+    from aiohttp import web
+
+    db = _db(request)
+    if db is None:
+        return web.json_response({"error": "memory DB not available"}, status=500)
+    session_id = request.match_info["session_id"]
+    if not session_id:
+        return web.json_response({"error": "session_id is required"}, status=400)
+    try:
+        after = int(request.query.get("after", "0"))
+    except (TypeError, ValueError):
+        after = 0
+    try:
+        limit = int(request.query.get("limit", "500"))
+    except (TypeError, ValueError):
+        limit = 500
+
+    events = await db.list_session_events(session_id, after_seq=after, limit=limit)
+    return web.json_response({
+        "session_id": session_id,
+        "events": events,
+        # The caller's next cursor. Absent events, it is whatever they asked
+        # from — so an idle poll is a no-op instead of a rewind.
+        "last_seq": events[-1]["seq"] if events else after,
     })
 
 

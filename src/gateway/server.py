@@ -1248,6 +1248,7 @@ class Gateway:
             ("DELETE", "/api/sessions/{session_id}", sessions_api.handle_delete),
             ("PATCH", "/api/sessions/{session_id}", sessions_api.handle_patch_metadata),
             ("GET", "/api/sessions/{session_id}/runs", sessions_api.handle_get_runs),
+            ("GET", "/api/sessions/{session_id}/events", sessions_api.handle_get_events),
             ("GET", "/api/sessions/{session_id}/context", sessions_api.handle_get_context),
             ("POST", "/api/update", control.handle_update),
             ("POST", "/api/restart", control.handle_restart),

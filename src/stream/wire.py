@@ -39,6 +39,7 @@ from src.stream.events import (
     OutAudioStart,
     OutError,
     OutReasoning,
+    TURN_END_COMPLETED,
     OutSeedMessage,
     OutTextDelta,
     OutTextFinal,
@@ -143,7 +144,10 @@ def event_to_wire(evt: Event) -> dict[str, Any]:
             "height": evt.height,
         }
     if isinstance(evt, TurnComplete):
-        return {**base, "type": TURN_COMPLETE}
+        frame = {**base, "type": TURN_COMPLETE, "reason": evt.reason}
+        if evt.error:
+            frame["error"] = evt.error
+        return frame
     if isinstance(evt, SessionCompacted):
         return {
             **base,
@@ -390,7 +394,11 @@ def wire_to_event(frame: dict[str, Any]) -> Event | None:
             height=int(frame.get("height") or 0),
         )
     if t == TURN_COMPLETE:
-        return TurnComplete(session_id=sid, seq=seq, ts_ms=ts)
+        return TurnComplete(
+            session_id=sid, seq=seq, ts_ms=ts,
+            reason=str(frame.get("reason") or TURN_END_COMPLETED),
+            error=str(frame.get("error") or ""),
+        )
     if t == SESSION_COMPACTED:
         return SessionCompacted(
             session_id=sid, seq=seq, ts_ms=ts,

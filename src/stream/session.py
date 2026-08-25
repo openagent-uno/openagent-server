@@ -40,6 +40,10 @@ from src.stream.events import (
     OutAudioStart,
     OutError,
     OutReasoning,
+    TURN_END_CANCELLED,
+    TURN_END_COMPLETED,
+    TURN_END_EMPTY,
+    TURN_END_ERROR,
     OutTextDelta,
     OutTextFinal,
     OutToolStatus,
@@ -303,7 +307,39 @@ class StreamSession:
 
     async def push_in(self, evt: Event) -> None:
         """Append an inbound event for the dispatch loop to handle."""
+        # The user's own message is the first fact of a turn, and until now it
+        # existed only in RAM until the runtime wrote the whole turn at the
+        # end: a turn that died before that took the question with it.
+        if isinstance(evt, TextFinal) and getattr(evt, "text", ""):
+            await self._journal("user/message", {
+                "text": evt.text[:4000],
+                "source": getattr(evt, "source", "") or "",
+                "handle": self.handle or "",
+            })
         await self.inbound.put(evt)
+
+    # ── session journal ─────────────────────────────────────────────
+    #
+    # Append-only, written DURING the turn. ``sessions.runs`` remains the
+    # surface the model reads (and the runtime still owns it, written at turn
+    # end); this is the record of what happened, for the client, for support,
+    # and for anyone asking "what did it do at 14:32". A witness never gets to
+    # break the thing it witnesses, so every failure here is swallowed.
+    _JOURNALLED_TYPES = ("user/message", "assistant/message", "tool/status",
+                         "turn/end", "error", "compaction")
+
+    async def _journal(self, event_type: str, data: dict) -> None:
+        db = (
+            getattr(self._agent, "memory_db", None)
+            or getattr(self._agent, "db", None)
+        )
+        append = getattr(db, "append_session_event", None)
+        if append is None:
+            return
+        try:
+            await append(self.session_id, event_type, data)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("session journal append failed (%s): %s", event_type, e)
 
     def has_active_turn(self) -> bool:
         """True iff a turn is running or a burst is buffered to dispatch.
@@ -342,6 +378,33 @@ class StreamSession:
         # await (status tee, post_turn_hook) has a chance to trip over
         # the cancellation.
         self.outbound.put_nowait(evt)
+        # Journal AFTER the frame is queued, never before: the client's copy
+        # must not wait on a disk write, and a journal that is behind by
+        # milliseconds is still a journal. Deltas are deliberately not written
+        # — they are re-derivable from the final message and would be the bulk
+        # of the volume.
+        if isinstance(evt, OutTextFinal):
+            await self._journal("assistant/message", {
+                "text": (evt.text or "")[:8000],
+                "model": getattr(evt, "model", None) or "",
+                "attachments": [dict(a) for a in (evt.attachments or ())][:20],
+            })
+        elif isinstance(evt, TurnComplete):
+            await self._journal("turn/end", {
+                "reason": evt.reason,
+                "error": (evt.error or "")[:500],
+            })
+        elif isinstance(evt, OutToolStatus):
+            await self._journal("tool/status", {"text": (evt.text or "")[:4000]})
+        elif isinstance(evt, OutError):
+            await self._journal("error", {"text": (evt.text or "")[:2000]})
+        elif isinstance(evt, SessionCompacted):
+            await self._journal("compaction", {
+                "phase": evt.phase,
+                "folded_runs": evt.folded_runs,
+                "tokens_before": evt.tokens_before,
+                "tokens_after": evt.tokens_after,
+            })
         if isinstance(evt, OutToolStatus):
             if self.post_turn_hook is not None:
                 self._track_tool_prefix(evt.text)
@@ -592,10 +655,14 @@ class StreamSession:
                     ts_ms=now_ms(),
                     text=err,
                 ))
+                # Refused before it ever ran: that is an error, and saying so
+                # here is what stops the client rendering it as an answer.
                 await self._publish(TurnComplete(
                     session_id=self.session_id,
                     seq=self.next_seq(),
                     ts_ms=now_ms(),
+                    reason=TURN_END_ERROR,
+                    error=err[:500],
                 ))
                 return
 
@@ -1166,10 +1233,30 @@ class StreamTurnRunner:
                 attachments=tuple(att_list),
                 model=meta.get("model"),
             ))
+            # How it ended, not just that it did. All three facts are already
+            # in hand here — they were simply dropped on the floor, leaving the
+            # client to infer "answered" from an empty frame and "died" from
+            # silence. Orthogonal outcomes stay separate: ``cancelled`` wins
+            # over ``error`` because a user who pressed Stop does not want to
+            # be told about the exception their stop caused.
+            if cancelled:
+                turn_reason = TURN_END_CANCELLED
+                turn_error = cancel_reason or ""
+            elif stream_error is not None:
+                turn_reason = TURN_END_ERROR
+                turn_error = str(stream_error)
+            elif not clean:
+                turn_reason = TURN_END_EMPTY
+                turn_error = ""
+            else:
+                turn_reason = TURN_END_COMPLETED
+                turn_error = ""
             await publish(TurnComplete(
                 session_id=session_id,
                 seq=sess.next_seq(),
                 ts_ms=now_ms(),
+                reason=turn_reason,
+                error=turn_error[:500],
             ))
 
             # Push the fresh context-window composition so a client's

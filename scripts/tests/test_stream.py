@@ -1919,7 +1919,12 @@ async def t_child_frame_nonblocking(ctx: TestContext) -> None:
     q = gw._child_frame_q
     assert q.qsize() == 2, q.qsize()
     assert q.get_nowait() == {"session_id": "scheduler:t:r", "type": "delta", "text": "hi"}
-    assert q.get_nowait() == {"session_id": "scheduler:t:r", "type": "turn_complete"}
+    # ``reason`` viaggia insieme al marcatore: un turno finito e un turno morto
+    # non possono piu' arrivare come lo stesso frame vuoto. Assente = completato,
+    # quindi un client vecchio legge questo esattamente come prima.
+    assert q.get_nowait() == {
+        "session_id": "scheduler:t:r", "type": "turn_complete", "reason": "completed",
+    }
 
 
 @test("stream", "Gateway._adopt_sessions_to_ws rebinds every channel for the client_id")
