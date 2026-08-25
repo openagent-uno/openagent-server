@@ -5740,6 +5740,24 @@ class MemoryDB:
         await conn.commit()
 
     # ── Session journal (append-only) ──
+    #
+    # Which types this build knows, and which of them are merely informational.
+    # Taken from dsh's ``ignorable`` flag and the rule that goes with it: a
+    # reader that meets an unknown type which is NOT ignorable must refuse to
+    # reconstruct rather than quietly skip it and hand back a plausible,
+    # incomplete history. Nothing reconstructs from this journal yet — but the
+    # rule has to exist before the first consumer does, not after it has
+    # already guessed.
+    JOURNAL_KNOWN_TYPES: frozenset[str] = frozenset({
+        "user/message", "assistant/message", "tool/status",
+        "turn/end", "error", "compaction",
+    })
+    JOURNAL_IGNORABLE_TYPES: frozenset[str] = frozenset({
+        # Progress chatter and accounting: losing one cannot change what the
+        # conversation WAS.
+        "tool/status", "compaction",
+    })
+
 
     async def append_session_event(
         self, session_id: str, event_type: str, data: dict | None = None,

@@ -171,3 +171,62 @@ async def t_tool_call_result_pairing(ctx: TestContext) -> None:
         assert unclosed == ["shell_run"], unclosed
     finally:
         await _cleanup(db, path)
+
+
+@test("session_journal", "l'endpoint dichiara se il giornale e' ricostruibile")
+async def t_endpoint_diagnostics(ctx: TestContext) -> None:
+    # La regola presa da dsh: un tipo sconosciuto e NON ignorabile deve far
+    # dire "non ricostruibile", non essere saltato in silenzio. Una storia
+    # plausibile a cui manca un fatto e' peggio di un rifiuto onesto.
+    import json
+
+    from src.gateway.api import sessions as api
+
+    class _FakeDB:
+        JOURNAL_KNOWN_TYPES = frozenset({"user/message", "turn/end", "tool/status"})
+        JOURNAL_IGNORABLE_TYPES = frozenset({"tool/status"})
+
+        def __init__(self, events):
+            self._events = events
+
+        async def list_session_events(self, session_id, *, after_seq=0, limit=500):
+            return [e for e in self._events if e["seq"] > after_seq][:limit]
+
+    class _Req:
+        def __init__(self, db):
+            class _H:
+                pass
+            agent = _H(); agent.memory_db = db
+            gw = _H(); gw.agent = agent
+            self.app = {"gateway": gw}
+            self.match_info = {"session_id": "s1"}
+            self.query = {}
+
+        def get(self, key, default=None):
+            return default
+
+    def ev(seq, typ, data=None):
+        return {"seq": seq, "ts_ms": seq, "type": typ, "data": data or {}}
+
+    call = json.dumps({"tool_name": "shell_run"})
+    done = json.dumps({"tool_name": "read_file", "result": "ok"})
+    opened = json.dumps({"tool_name": "read_file"})
+
+    healthy = _FakeDB([ev(1, "user/message"), ev(2, "tool/status", {"text": opened}),
+                       ev(3, "tool/status", {"text": done}), ev(4, "turn/end")])
+    resp = await api.handle_get_events(_Req(healthy))
+    body = json.loads(resp.body.decode())
+    assert body["diagnostics"]["reconstructable"] is True
+    assert body["diagnostics"]["unpaired_tool_calls"] == []
+    assert body["last_seq"] == 4
+
+    # Un tool aperto e mai chiuso viene nominato.
+    flailing = _FakeDB([ev(1, "tool/status", {"text": call})])
+    body = json.loads((await api.handle_get_events(_Req(flailing))).body.decode())
+    assert body["diagnostics"]["unpaired_tool_calls"] == ["shell_run"]
+
+    # Un tipo sconosciuto e non ignorabile blocca la ricostruzione.
+    future = _FakeDB([ev(1, "approval/asked")])
+    body = json.loads((await api.handle_get_events(_Req(future))).body.decode())
+    assert body["diagnostics"]["unknown_types"] == ["approval/asked"]
+    assert body["diagnostics"]["reconstructable"] is False

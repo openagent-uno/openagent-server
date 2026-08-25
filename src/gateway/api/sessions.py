@@ -697,12 +697,51 @@ async def handle_get_events(request):
         limit = 500
 
     events = await db.list_session_events(session_id, after_seq=after, limit=limit)
+
+    # Two invariants, reported rather than assumed — both borrowed from dsh.
+    #
+    # ``unknown_types``: a type this build does not know AND that is not
+    # marked ignorable. A consumer that reconstructs anything from this
+    # journal must refuse when this list is non-empty instead of skipping the
+    # row: a plausible history missing one fact is worse than an honest
+    # refusal.
+    #
+    # ``unpaired_tool_calls``: every tool that was opened and never closed in
+    # this window. It is the measure that would have counted, by itself, the
+    # 22 dead tool lookups of 2026-08-25 — instead of leaving them to be
+    # noticed by hand.
+    known = getattr(db, "JOURNAL_KNOWN_TYPES", frozenset())
+    ignorable = getattr(db, "JOURNAL_IGNORABLE_TYPES", frozenset())
+    unknown = sorted({
+        e["type"] for e in events
+        if e["type"] not in known and e["type"] not in ignorable
+    })
+
+    import json as _json
+    open_tools: dict[str, int] = {}
+    for e in events:
+        if e["type"] != "tool/status":
+            continue
+        try:
+            info = _json.loads((e.get("data") or {}).get("text") or "{}")
+        except (TypeError, ValueError):
+            continue
+        name = info.get("tool_name")
+        if not name:
+            continue
+        open_tools[name] = open_tools.get(name, 0) + (-1 if "result" in info else 1)
+
     return web.json_response({
         "session_id": session_id,
         "events": events,
         # The caller's next cursor. Absent events, it is whatever they asked
         # from — so an idle poll is a no-op instead of a rewind.
         "last_seq": events[-1]["seq"] if events else after,
+        "diagnostics": {
+            "unknown_types": unknown,
+            "reconstructable": not unknown,
+            "unpaired_tool_calls": sorted(n for n, c in open_tools.items() if c > 0),
+        },
     })
 
 
