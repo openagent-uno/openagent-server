@@ -1683,12 +1683,40 @@ async def compact(
         "tokens_after": tokens_after,
     })
 
+    # WHICH runs the recap now stands for. ``tokens_before`` already prices
+    # exactly the folded range, so the cost side was honest; what was missing
+    # is the identity — with only a count, nobody can check afterwards whether
+    # a particular exchange was folded, dropped, or never existed. dsh states
+    # this as ``sourceEventSeqs`` on the replacement; ours are run ids, and
+    # they go in the journal rather than the UI frame because this is an audit
+    # fact, not something to render.
+    replaced_ids = [
+        str(r.get("run_id") or "") for r in old_runs if r.get("run_id")
+    ][:200]
+    journal = getattr(getattr(agent, "memory_db", None), "append_session_event", None)
+    if journal is not None:
+        try:
+            await journal(session_id, "compaction", {
+                "phase": "done",
+                "folded_runs": len(old_runs),
+                "kept_runs": len(kept),
+                "replaced_run_ids": replaced_ids,
+                "replaced_run_ids_truncated": len(old_runs) > len(replaced_ids),
+                "tokens_replaced": tokens_before,
+                "tokens_after": tokens_after,
+                "recap_run_id": recap_run.get("run_id"),
+            })
+        except Exception as e:  # noqa: BLE001 — auditing never breaks a fold
+            elog("runtime.compaction.journal_failed", level="debug",
+                 session_id=session_id, error=str(e))
+
     return {
         "folded_runs": len(old_runs),
         "kept_runs": len(kept),
         "summary_chars": len(summary),
         "tokens_before": tokens_before,
         "tokens_after": tokens_after,
+        "replaced_run_ids": replaced_ids,
     }
 
 
