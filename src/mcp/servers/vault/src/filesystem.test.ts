@@ -1455,3 +1455,44 @@ describe("classifyWriteError (#109)", () => {
     );
   });
 });
+
+// ============================================================================
+// EXTENSION-LESS READ (wikilink form) — OpenAgent addition
+// ============================================================================
+
+describe("readNote resolves the .md sibling of an extension-less path", () => {
+  test("the exact production miss: a governing procedure asked for without .md", async () => {
+    // Measured in production: read_note failed 46 times in 300 sessions, and the
+    // top two misses were these very paths, asked for in wikilink form.
+    await mkdir(join(testVaultPath, "esound/procedures/customer-response"), { recursive: true });
+    await writeFile(
+      join(testVaultPath, "esound/procedures/customer-response/triage-workflow.md"),
+      "---\ntitle: Triage\n---\n\n# Triage workflow\n"
+    );
+
+    const note = await fileSystem.readNote("esound/procedures/customer-response/triage-workflow");
+    expect(note.content).toContain("Triage workflow");
+  });
+
+  test("an explicit .md path is untouched", async () => {
+    await writeFile(join(testVaultPath, "plain.md"), "# Plain\n");
+    const note = await fileSystem.readNote("plain.md");
+    expect(note.content).toContain("Plain");
+  });
+
+  test("the real file wins over its .md sibling when both exist", async () => {
+    await writeFile(join(testVaultPath, "clash"), "# Extensionless\n");
+    await writeFile(join(testVaultPath, "clash.md"), "# Sibling\n");
+    const note = await fileSystem.readNote("clash");
+    expect(note.content).toContain("Extensionless");
+  });
+
+  test("a genuinely missing path still reports not found, not the sibling name", async () => {
+    await expect(fileSystem.readNote("nope/missing")).rejects.toThrow(/not found/i);
+  });
+
+  test("a directory is still refused rather than resolved to a sibling", async () => {
+    await mkdir(join(testVaultPath, "adir"), { recursive: true });
+    await expect(fileSystem.readNote("adir")).rejects.toThrow(/directory/i);
+  });
+});

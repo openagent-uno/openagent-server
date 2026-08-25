@@ -8,6 +8,7 @@ import importlib
 import inspect
 import logging
 import os
+import re
 import threading
 from typing import Any, AsyncIterator, Callable, Awaitable
 
@@ -558,6 +559,40 @@ def _recall_int(name: str, default: int) -> int:
         return default
 
 
+def _recall_query(message: str) -> str:
+    """The text to embed for auto-recall — by default the whole message.
+
+    When ``OPENAGENT_AUTO_RECALL_QUERY_MARKER`` names a tag and the message
+    carries the paired ``<tag>``/``</tag>`` lines, only the span between them is
+    embedded. Everything else about the turn is untouched: the model still reads
+    the full message, markers included.
+
+    Why: an event lane hands the agent an orchestration prompt with the person's
+    own sentence buried inside it, and embedding all of it dilutes the query
+    past the point of usefulness. Measured 2026-08-25 against the live
+    ``replio-thread`` prompt (12,159 chars, vault of 1,066 notes): the note that
+    answers the question ranked #244-#262 with the full prompt as the query, and
+    #1 with the customer's sentence alone. At ``top_k`` 6 that is the difference
+    between injecting the right note and injecting nothing.
+
+    Falls back to the full message whenever the markers are absent, malformed,
+    or wrap only whitespace — an unconfigured deployment is byte-identical to
+    the pre-marker behaviour.
+    """
+    tag = (os.environ.get("OPENAGENT_AUTO_RECALL_QUERY_MARKER") or "").strip()
+    if not tag or not message:
+        return message
+    # Only a plain tag name is honoured: anything else would build a bogus regex
+    # out of operator-supplied text.
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", tag):
+        return message
+    m = re.search(rf"<{tag}>(.*?)</{tag}>", message, re.DOTALL)
+    if not m:
+        return message
+    span = m.group(1).strip()
+    return span or message
+
+
 def _origin_of(session_id: str | None) -> str:
     """The origin tag of a session id — the prefix before the first ':'
     (``event``, ``scheduler``, ``chat``, …), or ``""`` for a bare/None id. Lets
@@ -939,6 +974,9 @@ async def _with_recall(agent: Any, session_id: str | None, query: str,
 
     if lean_local_event_active() or not _recall_enabled() or not query or not query.strip():
         return text
+    # Narrow the query to the marked span (usually the customer's own words)
+    # before embedding. ``text`` — what the model reads — is left alone.
+    query = _recall_query(query)
     try:
         timeout = _recall_float("OPENAGENT_AUTO_RECALL_TIMEOUT", 4.0)
         block = await asyncio.wait_for(
