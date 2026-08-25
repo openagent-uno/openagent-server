@@ -1253,3 +1253,109 @@ async def t_recall_block_skills_leg(ctx: TestContext) -> None:
         agent_mod._RECALL_INDEX_CACHE.pop(str(db), None)
         _clear_recall_env()
         _cleanup(db, idx_path, vault, skills)
+
+
+# ─── the recall QUERY: marker-scoped span ─────────────────────────────────────
+# Measured 2026-08-25 on the live replio-thread lane: the orchestration prompt
+# around the customer's sentence had grown to 12,159 chars, and embedding all of
+# it put the note that answers the question at #244-#262 instead of #1. At
+# top_k 6 the right note was never injected. These pin the fix and its fallbacks.
+
+@test("semantic_recall", "query marker: the SPAN is embedded, not the boilerplate around it")
+async def t_query_marker_span_is_embedded(ctx: TestContext) -> None:
+    import src.core.agent as agent_mod
+
+    db, idx_path, vault = _paths(ctx, "qmarker")
+    try:
+        # Two notes: one answers the boilerplate, one answers the customer.
+        _write_note(vault, "escalation-rules", "Escalation rules",
+                    "escalation ticket triage workflow queue assignment")
+        _write_note(vault, "refund-policy", "Refund policy",
+                    "refund double charges within 14 days via Stripe")
+        d = await _open_db(db); await d.close()
+        sem = _prime_recall_cache(db, vault)
+
+        os.environ["OPENAGENT_AUTO_RECALL_ENABLED"] = "1"
+        os.environ["OPENAGENT_AUTO_RECALL_WARM_BUDGET"] = "0"
+        os.environ["OPENAGENT_AUTO_RECALL_MIN_SCORE"] = "0.1"
+        os.environ["OPENAGENT_AUTO_RECALL_TOP_K"] = "1"   # only the best survives
+        # Semantic leg only: the marker governs what gets EMBEDDED, and with
+        # hybrid on the FTS side rescues the answer by exact keyword and hides
+        # the very dilution under test.
+        os.environ["OPENAGENT_AUTO_RECALL_HYBRID"] = "0"
+
+        prompt = (
+            "escalation ticket triage workflow queue assignment " * 40
+            + "\n<customer-message>\ncustomer wants a refund\n</customer-message>\n"
+            + "escalation ticket triage workflow queue assignment " * 40
+        )
+
+        # Without the marker the boilerplate wins — the dilution, reproduced.
+        out = await agent_mod._with_recall(_fake_agent(db, vault), "event:1", prompt, "MSG")
+        assert "escalation-rules.md" in out, f"boilerplate did NOT dominate: {out!r}"
+        assert "refund-policy.md" not in out, f"unexpectedly found the answer: {out!r}"
+
+        # With the marker the customer's sentence is the query.
+        os.environ["OPENAGENT_AUTO_RECALL_QUERY_MARKER"] = "customer-message"
+        out2 = await agent_mod._with_recall(_fake_agent(db, vault), "event:1", prompt, "MSG")
+        assert "refund-policy.md" in out2, f"marked span was NOT used as the query: {out2!r}"
+        assert "escalation-rules.md" not in out2, f"boilerplate still won: {out2!r}"
+        # What the model reads is untouched.
+        assert out2.endswith("MSG")
+        sem.close()
+    finally:
+        agent_mod._RECALL_INDEX_CACHE.pop(str(db), None)
+        _clear_recall_env()
+        _cleanup(db, idx_path, vault)
+
+
+@test("semantic_recall", "query marker: unset / absent / empty / bogus all fall back to the whole message")
+async def t_query_marker_fallbacks(ctx: TestContext) -> None:
+    """Every degradation returns the FULL message, so a deployment that has not
+    configured the marker — or a turn whose prompt lost it — behaves exactly as
+    it did before the marker existed."""
+    import src.core.agent as agent_mod
+
+    msg = "before <customer-message>the span</customer-message> after"
+    try:
+        # unset
+        os.environ.pop("OPENAGENT_AUTO_RECALL_QUERY_MARKER", None)
+        assert agent_mod._recall_query(msg) == msg
+
+        os.environ["OPENAGENT_AUTO_RECALL_QUERY_MARKER"] = "customer-message"
+        assert agent_mod._recall_query(msg) == "the span"
+
+        # tag configured but absent from the message
+        assert agent_mod._recall_query("no tags here") == "no tags here"
+
+        # present but wrapping only whitespace
+        blank = "a <customer-message>   \n  </customer-message> b"
+        assert agent_mod._recall_query(blank) == blank
+
+        # unclosed
+        unclosed = "a <customer-message>the span b"
+        assert agent_mod._recall_query(unclosed) == unclosed
+
+        # a tag name that is not a plain identifier is ignored, never compiled
+        os.environ["OPENAGENT_AUTO_RECALL_QUERY_MARKER"] = "cust(o.*)mer"
+        assert agent_mod._recall_query(msg) == msg
+
+        # empty message
+        os.environ["OPENAGENT_AUTO_RECALL_QUERY_MARKER"] = "customer-message"
+        assert agent_mod._recall_query("") == ""
+    finally:
+        _clear_recall_env()
+
+
+@test("semantic_recall", "query marker: multi-line span, and only the FIRST occurrence is taken")
+async def t_query_marker_multiline(ctx: TestContext) -> None:
+    import src.core.agent as agent_mod
+    try:
+        os.environ["OPENAGENT_AUTO_RECALL_QUERY_MARKER"] = "customer-message"
+        multi = "x <customer-message>line one\nline two</customer-message> y"
+        assert agent_mod._recall_query(multi) == "line one\nline two"
+        two = ("<customer-message>first</customer-message> mid "
+               "<customer-message>second</customer-message>")
+        assert agent_mod._recall_query(two) == "first"
+    finally:
+        _clear_recall_env()
