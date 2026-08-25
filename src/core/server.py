@@ -1065,6 +1065,12 @@ def _build_agent(config: dict) -> Agent:
                 os.environ[_env] = str(_ar_cfg[_k])
             except (TypeError, ValueError):
                 pass
+    # Which SPAN of the turn message to embed. Names a tag: only the text inside
+    # the paired ``<tag>``/``</tag>`` becomes the recall query, so an event lane
+    # can mark the customer's own sentence inside its orchestration prompt and
+    # stop the boilerplate from describing the query. Unset = embed it all.
+    if _ar_cfg.get("query_marker"):
+        os.environ["OPENAGENT_AUTO_RECALL_QUERY_MARKER"] = str(_ar_cfg["query_marker"]).strip()
     # Per-origin recall CORPUS scoping (default = identity: no filtering). Maps
     # ``scope`` / ``include_path_prefixes`` / ``exclude_path_prefixes`` /
     # ``reserve_prefix`` → the ``OPENAGENT_AUTO_RECALL_{SCOPE,INCLUDE_PATHS,
