@@ -1,6 +1,6 @@
-import { test, expect, beforeEach, afterEach } from "vitest";
+import { test, expect, beforeEach, afterEach, describe } from "vitest";
 import { createServer } from "./createServer.js";
-import { mkdtemp, rm } from "fs/promises";
+import { mkdtemp, rm, writeFile, readFile } from "fs/promises";
 import { join } from "path";
 import { tmpdir } from "os";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -92,4 +92,80 @@ test("custom options are applied", () => {
     version: "2.0.0",
   });
   expect(server).toBeDefined();
+});
+
+
+// ============================================================================
+// patch_note: an ADD intent must not lose the text — OpenAgent addition
+// ============================================================================
+
+/** Connect an in-memory client and call one tool, as the agent would. */
+async function callTool(vault: string, name: string, args: Record<string, unknown>) {
+  const server = createServer(vault, { version: "1.0.0" });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "test-client", version: "1.0.0" });
+  await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+  return await client.callTool({ name, arguments: args }) as {
+    content: { text: string }[]; isError?: boolean;
+  };
+}
+
+describe("patch_note recovers an append intent instead of dropping the content", () => {
+  test("operation:append writes the text instead of failing on oldString", async () => {
+    // The exact production shape: 18 of 28 patch_note failures looked like this.
+    await writeFile(join(testVaultPath, "note.md"), "---\ntitle: N\n---\n\nbody\n");
+    const res = await callTool(testVaultPath, "patch_note", {
+      path: "note.md", operation: "append", content: "\nADDED\n"
+    });
+    expect(JSON.parse(res.content[0].text).success).toBe(true);
+    const after = await readFile(join(testVaultPath, "note.md"), "utf-8");
+    expect(after).toContain("ADDED");
+    expect(after).toContain("body");
+    expect(after).toContain("title: N");
+  });
+
+  test("operation:prepend puts the text before the existing body", async () => {
+    await writeFile(join(testVaultPath, "p.md"), "---\ntitle: P\n---\n\nORIGINAL\n");
+    await callTool(testVaultPath, "patch_note", {
+      path: "p.md", operation: "prepend", content: "FIRST\n"
+    });
+    const after = await readFile(join(testVaultPath, "p.md"), "utf-8");
+    expect(after.indexOf("FIRST")).toBeLessThan(after.indexOf("ORIGINAL"));
+  });
+
+  test("oldContent/newContent are accepted as aliases for a real replace", async () => {
+    await writeFile(join(testVaultPath, "a.md"), "---\ntitle: A\n---\n\nold text here\n");
+    const res = await callTool(testVaultPath, "patch_note", {
+      path: "a.md", oldContent: "old text", newContent: "new text"
+    });
+    expect(JSON.parse(res.content[0].text).success).toBe(true);
+    expect(await readFile(join(testVaultPath, "a.md"), "utf-8")).toContain("new text");
+  });
+
+  test("an append with no content is refused and writes nothing", async () => {
+    await writeFile(join(testVaultPath, "e.md"), "---\ntitle: E\n---\n\nkeep\n");
+    const res = await callTool(testVaultPath, "patch_note", {
+      path: "e.md", operation: "append"
+    });
+    expect(res.isError).toBe(true);
+    expect(await readFile(join(testVaultPath, "e.md"), "utf-8")).toContain("keep");
+  });
+
+  test("a missing oldString now says which tool to use", async () => {
+    await writeFile(join(testVaultPath, "m.md"), "---\ntitle: M\n---\n\nx\n");
+    const res = await callTool(testVaultPath, "patch_note", { path: "m.md", newString: "y" });
+    expect(res.isError).toBe(true);
+    const msg = JSON.parse(res.content[0].text).message;
+    expect(msg).toContain("write_note");
+    expect(msg).toContain("append");
+  });
+
+  test("a normal replace is unchanged", async () => {
+    await writeFile(join(testVaultPath, "r.md"), "---\ntitle: R\n---\n\nalpha\n");
+    const res = await callTool(testVaultPath, "patch_note", {
+      path: "r.md", oldString: "alpha", newString: "beta"
+    });
+    expect(JSON.parse(res.content[0].text).success).toBe(true);
+    expect(await readFile(join(testVaultPath, "r.md"), "utf-8")).toContain("beta");
+  });
 });

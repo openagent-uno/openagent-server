@@ -63,7 +63,7 @@ export function createServer(vaultPath: string, options: CreateServerOptions = {
         },
         {
           name: "patch_note",
-          description: "Efficiently update part of a note by replacing a specific string. This is more efficient than rewriting the entire note for small changes.",
+          description: "Replace an exact string inside a note. Requires 'oldString' (text already present) and 'newString'. To ADD text rather than replace it, use write_note with mode 'append' or 'prepend' — an append expressed here is routed there, but calling the right tool is clearer.",
           inputSchema: {
             type: "object",
             properties: {
@@ -269,10 +269,78 @@ export function createServer(vaultPath: string, options: CreateServerOptions = {
         }
 
         case "patch_note": {
+          // A caller that reaches for patch_note to ADD text — no oldString to
+          // match against, just an `operation: "append"` and the new content —
+          // used to get "oldString cannot be empty" and lose the text
+          // entirely: the dispatch forwards only the replace parameters, so
+          // the content never reached the filesystem layer at all.
+          //
+          // Measured on the eSound agent: 27 of 28 patch_note failures across
+          // 400 sessions were exactly this, 18 of them carrying real content.
+          // Every one was a note the agent believed it had written — that is
+          // how a wrong support doctrine came within one malformed argument of
+          // being recorded as canonical. writeNote already implements append,
+          // prepend and frontmatter merge, so route the intent there instead
+          // of dropping it on the floor.
+          const patchOld = trimmedArgs.oldString ?? trimmedArgs.oldContent ?? trimmedArgs.old_string;
+          const patchNew = trimmedArgs.newString ?? trimmedArgs.newContent ?? trimmedArgs.new_string;
+          const hasOld = typeof patchOld === "string" && patchOld.trim() !== "";
+          const op = String(trimmedArgs.mode ?? trimmedArgs.operation ?? "").toLowerCase();
+          const addition = trimmedArgs.content ?? trimmedArgs.data ?? patchNew;
+          const wantsFrontmatter = op === "update_frontmatter" || op === "add_frontmatter";
+
+          if (!hasOld && (op === "append" || op === "prepend" || wantsFrontmatter)) {
+            const writeMode = op === "prepend" ? "prepend" : "append";
+            const body = typeof addition === "string" ? addition : "";
+            if (body === "" && !trimmedArgs.frontmatter) {
+              return {
+                content: [{ type: "text", text: JSON.stringify({
+                  success: false, path: trimmedArgs.path,
+                  message: `patch_note '${op}' needs the text to add, in 'content'. Nothing was written.`
+                }, null, 2) }],
+                isError: true
+              };
+            }
+            try {
+              await fileSystem.writeNote({
+                path: trimmedArgs.path,
+                content: body,
+                frontmatter: trimmedArgs.frontmatter,
+                mode: writeMode
+              });
+              return {
+                content: [{ type: "text", text: JSON.stringify({
+                  success: true, path: trimmedArgs.path,
+                  message: `Applied as write_note mode '${writeMode}' (patch_note replaces a string; use write_note for this next time).`
+                }, null, 2) }]
+              };
+            } catch (error) {
+              return {
+                content: [{ type: "text", text: JSON.stringify({
+                  success: false, path: trimmedArgs.path,
+                  message: error instanceof Error ? error.message : String(error)
+                }, null, 2) }],
+                isError: true
+              };
+            }
+          }
+
+          if (!hasOld) {
+            // Say what to do instead. The old message named the missing
+            // parameter and stopped there, which left the caller no route.
+            return {
+              content: [{ type: "text", text: JSON.stringify({
+                success: false, path: trimmedArgs.path,
+                message: "patch_note replaces an exact string: pass 'oldString' (the text already in the note) and 'newString'. To ADD text instead, call write_note with mode 'append' or 'prepend'. Nothing was written."
+              }, null, 2) }],
+              isError: true
+            };
+          }
+
           const result = await fileSystem.patchNote({
             path: trimmedArgs.path,
-            oldString: trimmedArgs.oldString,
-            newString: trimmedArgs.newString,
+            oldString: patchOld,
+            newString: typeof patchNew === "string" ? patchNew : "",
             replaceAll: trimmedArgs.replaceAll
           });
           return {
