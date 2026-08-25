@@ -59,6 +59,10 @@ class SkillMeta:
     category: str
     path: Path  # the SKILL.md file itself
     created_by: str | None = None
+    # ``pinned: true`` in the frontmatter. The user's lock: it blocks the
+    # autonomous passes even on a skill the agent itself wrote, because a
+    # skill that has become load-bearing stops being the agent's to edit.
+    pinned: bool = False
     status: str | None = None
 
     @property
@@ -130,9 +134,17 @@ def parse_skill_file(md_path: Path) -> SkillMeta | None:
     category = (str(meta.get("category") or "").strip() or DEFAULT_CATEGORY)
     created_by = str(meta.get("created_by") or "").strip() or None
     status = str(meta.get("status") or "").strip() or None
+    # ``pinned`` accepts what a human would plausibly type in frontmatter, not
+    # just the YAML boolean: a pin written as "yes" that silently parsed to
+    # false would be a lock the user believes is on and isn't.
+    raw_pin = meta.get("pinned")
+    if isinstance(raw_pin, bool):
+        pinned = raw_pin
+    else:
+        pinned = str(raw_pin or "").strip().lower() in ("true", "yes", "on", "1")
     return SkillMeta(name=name, description=description,
                      category=category, path=md_path,
-                     created_by=created_by, status=status)
+                     created_by=created_by, status=status, pinned=pinned)
 
 
 class SkillsRegistry:

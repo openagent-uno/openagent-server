@@ -346,9 +346,19 @@ There are two skill-improvement passes and they are cleanly layered:
      curator's, never a seed/user skill.
    - The skill-curator is the OTHER pass. IT merges overlapping skills,
      archives stale or redundant ones, and rewrites bodies. That is NOT your
-     job. Do NOT call `skill_manage` with `action` of `update`, `archive`, or
-     `remove`. If you find two skills that ought to be merged, that is a note
-     for the curator — leave them both and say so in your log.
+     job. Do NOT call `skill_manage` with `action` of `archive` or `remove`,
+     and never `update` to MERGE or REWRITE. If you find two skills that
+     ought to be merged, that is a note for the curator — leave them both and
+     say so in your log.
+   - ONE exception, and it is narrow: when the evidence shows an existing
+     AGENT-AUTHORED skill (`created_by: agent`, confirmed with `skill_view`)
+     is now WRONG or missing a step the transcripts prove, you may `update`
+     it to ADD the correction — a pitfall, a missing step, a corrected
+     command. Additive only. Without this the loop has a hole: a correction
+     could only ever become a NEW skill sitting next to the wrong one, and
+     the wrong one would keep being read until the weekly curator noticed.
+     A skill WITHOUT `created_by: agent` stays untouchable even here: say it
+     is wrong in your log and leave it exactly as it is.
 
 ## Mission 1 — Find what actually recurs and actually worked
 
@@ -371,6 +381,14 @@ OpenAgent already collects; use them, don't guess:
      distillation target. Heed its `caveat`: this is ASSOCIATION not
      causation, and a note with a tiny `scorable` count is noise, so READ the
      underlying sessions before you trust the number.
+
+   - CORRECTIONS the user made. This one is not about recurrence: a single
+     "no, do it this way", "stop formatting like that", "you always do X and I
+     hate it", or an outright "remember this" is a first-class signal on its
+     own, because a correction you don't capture becomes a repeat failure.
+     Hunt for them explicitly — they are the highest-value material in the
+     transcripts and the easiest to walk past, since they rarely look like a
+     "task pattern".
 
 Build a short shortlist of candidate patterns, each backed by more than one
 successful session.
@@ -405,6 +423,33 @@ body=...)`:
      include your own `---` frontmatter block; it is generated for you.
    Keep each skill to a single coherent task. If a candidate is really two
    tasks, write two skills or write none — never a grab-bag.
+
+## Never distil these — they become constraints that bite later
+
+A library that captures everything poisons itself, and the poison has
+names. None of the following is a skill, however tempting:
+
+   - A failure that depended on the ENVIRONMENT: a missing binary, an
+     unconfigured credential, "command not found", a path that broke after a
+     migration. The user fixes those in a minute; the skill outlives them.
+   - A NEGATIVE CLAIM about a tool — "X doesn't work", "you can't do Y from
+     here". These harden into refusals a future agent quotes against itself
+     for months after the thing was fixed. If a tool failed for setup
+     reasons, the skill is the FIX (the install, the flag, the env var),
+     never the verdict.
+   - A transient error that resolved before the session ended. If the retry
+     worked, the lesson is the retry, not the first failure.
+   - A one-off task narrative. "Summarised the inbox on Tuesday" is something
+     that happened, not a class of work.
+   - An UNRESOLVED attempt written up as a procedure. If the session ended
+     without a working method — several things tried, none landed, the user
+     told to check by hand — do not write those attempts up as "the
+     approach". That hands the next agent an untested sequence of failures
+     dressed as validated guidance, and it will follow it. Write nothing, or
+     write only an alternative you are genuinely confident about.
+
+When the only candidates you have fall in this list, writing nothing is the
+correct outcome — say so in the log and stop.
 
 ## Log what you did
 

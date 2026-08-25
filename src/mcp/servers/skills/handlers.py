@@ -243,6 +243,10 @@ def _preserved_provenance(existing) -> dict[str, str]:
         out["created_by"] = existing.created_by
     if existing.status:
         out["status"] = existing.status
+    # The pin must survive a rewrite for the same reason ``created_by`` must:
+    # a lock that a legitimate edit silently drops is not a lock.
+    if getattr(existing, "pinned", False):
+        out["pinned"] = "true"
     return out
 
 
@@ -264,6 +268,26 @@ async def skill_manage(
     skills index on the next boot/reload, not mid-session."""
     action = (action or "").strip().lower()
     root = _skills_root()
+
+    # The provenance boundary, enforced HERE and not only in the curator's
+    # prompt. An autonomous pass may create freely, but every mutation of an
+    # existing skill is checked against who owns it and whether it is pinned.
+    # A prompt is guidance a model follows most of the time; this decides
+    # whether a scheduled job can rewrite the playbook eSound answers
+    # customers with.
+    if action in ("update", "archive", "remove"):
+        from src.mcp.servers.skills.provenance import mutation_refusal
+
+        target_skill = _registry().get(name)
+        if target_skill is not None:
+            refusal = mutation_refusal(
+                action, name,
+                created_by=getattr(target_skill, "created_by", None),
+                pinned=bool(getattr(target_skill, "pinned", False)),
+            )
+            if refusal:
+                return {"ok": False, "action": action, "name": name,
+                        "error": refusal, "refused": "provenance"}
 
     if action == "remove":
         existing = _registry().get(name)

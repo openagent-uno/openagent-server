@@ -838,6 +838,22 @@ class Scheduler:
                     dropped=max(0, len(available) - len(allowed_families)),
                 )
         scope_token = set_tool_allowlist(allowed_families) if allowed_families else None
+        # The two self-improvement passes run with nobody watching, so they
+        # declare themselves: the skill tool then refuses, in code, any write
+        # outside their lane (someone else's skill, or a pinned one). Every
+        # other task keeps the foreground default — a scheduled report that
+        # happens to write a skill is doing it because a human asked for that
+        # task, and is not the autonomous curator.
+        from src.core.builtin_tasks import (
+            SKILL_CURATOR_TASK_NAME, SKILL_DISTILLER_TASK_NAME,
+        )
+        from src.mcp.servers.skills.provenance import (
+            BACKGROUND, reset_write_origin, set_write_origin,
+        )
+
+        origin_token = None
+        if task_name in (SKILL_CURATOR_TASK_NAME, SKILL_DISTILLER_TASK_NAME):
+            origin_token = set_write_origin(BACKGROUND)
         elog("task.run", name=task_name)
         # Record this firing in ``task_runs`` so the dashboard can show a
         # per-task execution history (status / output preview / timing) —
@@ -1108,6 +1124,8 @@ class Scheduler:
                 finish_run_id, task, status="failed", error=detail,
             )
         finally:
+            if origin_token is not None:
+                reset_write_origin(origin_token)
             if scope_token is not None:
                 reset_tool_allowlist(scope_token)
             if recorded:
