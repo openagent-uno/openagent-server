@@ -250,6 +250,9 @@ async def handle_create(request):
         return web.json_response({"error": str(exc)}, status=400)
 
     row = await scheduler.db.get_workflow(workflow_id)
+    from .operational import claim_created_resource
+
+    await claim_created_resource(request, "workflow_definition", workflow_id)
     elog("workflow.create", id=workflow_id, name=name)
     await request.app["gateway"].broadcast_resource(
         "workflow", "created", workflow_id,
@@ -616,7 +619,12 @@ async def handle_run_get(request):
     row = await scheduler.db.get_workflow_run(run_id)
     if row is None:
         return web.json_response({"error": f"run {run_id!r} not found"}, status=404)
-    return web.json_response(_decorate_run(row))
+    from .operational import decorate_workflow_run_detail
+
+    detail = await decorate_workflow_run_detail(request, _decorate_run(row))
+    if detail is None:
+        return web.json_response({"error": "This result is no longer available"}, status=404)
+    return web.json_response(detail, headers={"Cache-Control": "no-store"})
 
 
 async def handle_stats(request):

@@ -224,6 +224,9 @@ if _aic_dir.exists() and not (_aic_dir / "node_modules").exists():
 
 datas = []
 datas += _numpy_all[0]  # numpy data files (from collect_all)
+# Normative additive operational-storage/search schemas.  The runtime loads
+# these through importlib.resources, so one-file builds must carry them too.
+datas += collect_data_files("src.memory.operational", includes=["sql/*.sql"])
 if mcps_dir.exists():
     # Bundle every MCP EXCEPT computer-control. The Rust binary for
     # computer-control must ship as a *sidecar* next to the openagent

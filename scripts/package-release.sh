@@ -26,10 +26,6 @@ set -euo pipefail
 APP="${1:?usage: $0 <app> <dist-dir>}"
 DIST="${2:?usage: $0 <app> <dist-dir>}"
 
-# The PyPI package is ``openagent-framework``; its metadata carries the
-# version.  Use importlib.metadata to avoid importing ``src`` (heavy deps).
-PKG_NAME="openagent-framework"
-
 # ── Detect OS and arch in release-filename convention ────────────────
 
 case "${RUNNER_OS:-$(uname -s)}" in
@@ -46,10 +42,11 @@ case "$ARCH_RAW" in
     *) ARCH="$ARCH_RAW" ;;
 esac
 
-# Resolve the version from the installed Python package. Runs in the
-# repo root (the CI job's default cwd) so PyInstaller's dist/ tree
-# can't shadow the import.
-VERSION="$(python -c "from importlib.metadata import version; print(version('${PKG_NAME}'))")"
+# Distribution metadata normalizes ``0.20.0-beta.1`` to ``0.20.0b1``. Release
+# tags, updater lookup, checksums, and filenames use the external SemVer form,
+# so read the deliberately lightweight source constant instead. This runs in
+# the repo root, before ``cd dist``, and cannot be shadowed by PyInstaller.
+VERSION="$(python -c "from src import __version__; print(__version__)")"
 
 # Unified SHA-256 helper — macOS has ``shasum``, Linux/Git Bash have
 # ``sha256sum``. ``shasum -a 256`` on macOS and ``sha256sum`` on Linux

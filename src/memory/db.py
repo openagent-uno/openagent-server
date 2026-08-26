@@ -1042,6 +1042,10 @@ class MemoryDB:
         # `session_retention`, che convive con lo stesso scrittore.
         await self._conn.execute(f"PRAGMA busy_timeout = {sqlite_busy_timeout_ms()}")
         await self._conn.execute("PRAGMA journal_mode=WAL")
+        # Canonical history must survive an OS/power loss once SQLite reports
+        # the transaction committed.  Rebuildable FTS indexes may use NORMAL;
+        # the canonical operational database may not.
+        await self._conn.execute("PRAGMA synchronous=FULL")
         # Enable FK constraints per-connection. SQLite's default is OFF,
         # so without this the ON DELETE CASCADE on models.provider_id is
         # silently a no-op and deleting a provider orphans its models.
@@ -1060,6 +1064,38 @@ class MemoryDB:
         # runs again. See ``upsert_session`` and ``RUNTIME_SESSION_USER_ID``.
         await self._migrate_reclaim_session_owners()
         await self._conn.commit()
+        # Additive only: takes a verified SQLite backup before the first v2
+        # DDL, installs the downgrade journal, and enters shadow.  Legacy
+        # ``sessions.runs`` remains intact and canonical until parity gates
+        # promote individual reads.
+        from src import __version__
+        from src.memory.operational.schema import ensure_operational_storage
+
+        await ensure_operational_storage(
+            self._conn,
+            self.db_path,
+            app_version=__version__,
+        )
+        # Drain a bounded page before the connection becomes visible to the
+        # agent/scheduler. Larger legacy datasets continue through the durable
+        # trigger journal and API/search reconciliation; startup never parses
+        # the entire historical runs corpus in one blocking transaction.
+        try:
+            from src.memory.operational.repository import (
+                backfill_batch_async,
+                reconcile_pending_async,
+            )
+
+            await reconcile_pending_async(
+                self._conn,
+                limit=250,
+                worker_id=f"startup:{WORKER_ID}",
+            )
+            await backfill_batch_async(self._conn, limit=250)
+            await self._conn.commit()
+        except Exception as exc:  # shadow reads remain legacy-safe
+            await self._conn.rollback()
+            logger.warning("operational storage startup reconciliation failed: %s", exc)
 
     async def _migrate_reclaim_session_owners(self) -> None:
         """One-shot UPDATE: NULL any ``sessions.user_id`` the runtime won't
@@ -2152,6 +2188,34 @@ class MemoryDB:
         if self._conn is None:
             await self.connect()
         return self._conn
+
+    async def _project_operational_session(self, session_id: str) -> None:
+        """Best-effort same-transaction v2 projection for reviewed writers.
+
+        The legacy change trigger is outside this savepoint, so a projection
+        bug rolls back only v2 mutations while the durable pending journal row
+        survives with the accepted legacy write for later reconciliation.
+        """
+
+        if not session_id or self._conn is None:
+            return
+        savepoint = f"operational_projection_{uuid.uuid4().hex}"
+        await self._conn.execute(f"SAVEPOINT {savepoint}")
+        try:
+            from src.memory.operational.repository import (
+                project_legacy_session_async,
+            )
+
+            await project_legacy_session_async(self._conn, session_id)
+            await self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        except Exception as exc:
+            await self._conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            await self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            logger.warning(
+                "operational session projection deferred for %s: %s",
+                session_id,
+                exc,
+            )
 
     async def _write_with_retry(self, do_write, *, attempts: int = 3):
         """Run an idempotent single-row write, retrying on "database is locked".
@@ -4481,6 +4545,7 @@ class MemoryDB:
             "UPDATE sessions SET metadata = ?, updated_at = ? WHERE session_id = ?",
             (json.dumps(meta), int(time.time()), session_id),
         )
+        await self._project_operational_session(session_id)
         await conn.commit()
 
     # ── MCP Registry ──
@@ -5449,6 +5514,7 @@ class MemoryDB:
         stale = sids[keep:]
         for sid in stale:
             await conn.execute("DELETE FROM sessions WHERE session_id = ?", (sid,))
+            await self._project_operational_session(sid)
         if stale:
             await conn.commit()
         return len(stale)
@@ -5590,6 +5656,7 @@ class MemoryDB:
                 "VALUES (?, 'agent', NULL, ?, ?, ?)",
                 (session_id, json.dumps(meta), now, now),
             )
+        await self._project_operational_session(session_id)
         await conn.commit()
 
     async def delete_session(self, session_id: str) -> None:
@@ -5598,6 +5665,7 @@ class MemoryDB:
             "DELETE FROM sessions WHERE session_id = ?",
             (session_id,),
         )
+        await self._project_operational_session(session_id)
         await conn.commit()
 
     async def get_session(self, session_id: str) -> dict | None:
@@ -5727,6 +5795,7 @@ class MemoryDB:
         caller via :meth:`list_descendant_sessions`."""
         conn = await self._ensure_connected()
         await conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+        await self._project_operational_session(session_id)
         for table in self._SESSION_SATELLITE_TABLES:
             try:
                 await conn.execute(

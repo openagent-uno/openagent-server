@@ -1624,6 +1624,19 @@ def _build_bridges(config: dict, per_bridge_url: dict[str, str]) -> list:
     return out
 
 
+def _selected_bridge_names(
+    config: dict, only_channels: list[str] | None
+) -> list[str]:
+    """Resolve the explicit CLI bridge filter; ``gateway`` means none."""
+
+    channels_config = config.get("channels") or {}
+    supported = ("telegram", "discord", "whatsapp")
+    if only_channels is None:
+        return [name for name in supported if channels_config.get(name)]
+    selected = {str(name).strip().lower() for name in only_channels}
+    return [name for name in supported if name in selected and channels_config.get(name)]
+
+
 class AgentServer:
     """Owns the lifecycle of agent, gateway, bridges, and scheduler.
 
@@ -1936,11 +1949,9 @@ class AgentServer:
             BridgeSessionUnavailable,
         )
 
-        channels_config = self.config.get("channels") or {}
-        enabled_bridges = [
-            name for name in ("telegram", "discord", "whatsapp")
-            if name in channels_config and channels_config[name]
-        ]
+        enabled_bridges = _selected_bridge_names(
+            self.config, getattr(self, "_only_channels", None)
+        )
         if not enabled_bridges:
             return
 
@@ -2446,6 +2457,7 @@ class AgentServer:
         update_cfg = self.config.get("auto_update", {})
         enabled = update_cfg.get("enabled", False)
         mode = update_cfg.get("mode", "auto")
+        channel = update_cfg.get("channel")
         cron_expr = update_cfg.get("check_interval", "0 4 * * *")
 
         prompt = (
@@ -2472,6 +2484,7 @@ class AgentServer:
                 if task["name"] == AUTO_UPDATE_TASK_NAME:
                     await _do_auto_update(
                         agent, mode, stop_event=stop_event, gateway=gateway,
+                        channel=channel,
                     )
                 else:
                     await _orig(task)
@@ -2949,7 +2962,7 @@ def _read_disk_binary_version() -> str | None:
         return None
 
 
-def run_upgrade() -> tuple[str, str]:
+def run_upgrade(channel: str | None = None) -> tuple[str, str]:
     """Upgrade OpenAgent and return (old_version, new_version).
 
     Dispatches to executable self-update when running from a frozen
@@ -2974,7 +2987,7 @@ def run_upgrade() -> tuple[str, str]:
             )
             return current, new
         from src.updater import perform_self_update_sync
-        return perform_self_update_sync()
+        return perform_self_update_sync() if channel is None else perform_self_update_sync(channel=channel)
     return _run_pip_upgrade()
 
 
@@ -2987,6 +3000,7 @@ async def _do_auto_update(
     mode: str,
     stop_event: asyncio.Event | None = None,
     gateway=None,
+    channel: str | None = None,
 ) -> None:
     """Check for updates and act according to *mode* (auto/notify/manual).
 
@@ -3003,7 +3017,10 @@ async def _do_auto_update(
     POST happens before the loop tears down.
     """
     try:
-        old_ver, new_ver = await asyncio.to_thread(run_upgrade)
+        if channel is None:
+            old_ver, new_ver = await asyncio.to_thread(run_upgrade)
+        else:
+            old_ver, new_ver = await asyncio.to_thread(run_upgrade, channel)
     except Exception as exc:
         logger.error("Auto-update check failed: %s", exc)
         elog("update.error", level="warning", error=str(exc) or type(exc).__name__)
