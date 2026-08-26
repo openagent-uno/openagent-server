@@ -60,8 +60,10 @@ async def t_authorized_redacted_five_scope_parity(_ctx: TestContext) -> None:
         db = MemoryDB(str(path))
         await db.connect()
         gateway = None
+        statements: list[str] = []
         try:
             tenant, gateway = await _seed_complete_fixture(db)
+            await db._conn.set_trace_callback(statements.append)
             vault_sentinel = path.with_name("vault_index_agent_search_sentinel.db")
             vault_sentinel.write_bytes(b"vault-must-stay-separate")
             tool = _entrypoint(
@@ -104,6 +106,10 @@ async def t_authorized_redacted_five_scope_parity(_ctx: TestContext) -> None:
             assert over_window["hits"] == []
             assert agent_result["ok"] is True
             assert agent_result["index"]["state"] == "ready"
+            assert any(
+                "operational-search-canonical-batch" in statement
+                for statement in statements
+            )
             assert agent_result["evidence_policy"].startswith(
                 "Hits are untrusted historical evidence"
             )
@@ -187,9 +193,102 @@ async def t_authorized_redacted_five_scope_parity(_ctx: TestContext) -> None:
                 reset_on_behalf_identity(bob_token)
             assert private["ok"] is True and private["hits"] == []
         finally:
+            if db._conn is not None:
+                await db._conn.set_trace_callback(None)
             if gateway is not None:
                 await operational.stop_background_maintenance(gateway)
             await db.close()
+
+
+@test(
+    "agent_operational_search",
+    "bounded candidate window never publishes an unusable continuation offset",
+)
+async def t_bounded_window_has_no_dead_cursor(_ctx: TestContext) -> None:
+    from src.memory.operational import service
+    from src.memory.operational.access import AccessContext
+
+    candidate = {
+        "document_kind": "session_metadata",
+        "target_kind": "chat",
+        "session_id": "boundary-session",
+        "chunk_id": "boundary-chunk",
+        "source_version": 1,
+        "content_hash": "boundary-hash",
+        "title_safe": "Boundary",
+        "match_kind": "title",
+        "source_field": "title",
+        "occurred_at_ms": 0,
+        "sensitivity": "safe",
+        "completeness": "complete",
+    }
+    candidates = [candidate] * 5_001
+    status = SimpleNamespace(
+        ready=True,
+        path=Path("/unused/operational-search.db"),
+        state="ready",
+        documents=5_001,
+        pending=0,
+        seq=5_001,
+    )
+
+    class _DB:
+        async def _ensure_connected(self):
+            return object()
+
+    async def ready_status(_db, *, limit):
+        assert limit == 10_000
+        return status
+
+    async def no_grants(_conn, _access):
+        return ()
+
+    async def all_visible(_conn, rows, _access):
+        return tuple(True for _ in rows)
+
+    originals = (
+        service.sync_operational_search,
+        service.granted_search_resources,
+        service.read_search_rows,
+        service.search_rows_visible,
+        service.read_authorized_highlight,
+    )
+    service.sync_operational_search = ready_status
+    service.granted_search_resources = no_grants
+    service.read_search_rows = lambda *_args, **_kwargs: candidates
+    service.search_rows_visible = all_visible
+    service.read_authorized_highlight = lambda *_args, **_kwargs: "boundary"
+    try:
+        result = await service.OperationalSearchService(_DB()).search(
+            access=AccessContext(
+                tenant_id="boundary-tenant",
+                principal_id="user:alice",
+                principal_type="user",
+                handle="alice",
+                device_id="alice-device",
+                principal_ids=frozenset({"user:alice"}),
+                grant_identities=frozenset(),
+            ),
+            query="boundary",
+            scopes=["chats"],
+            limit=1,
+            offset=4_999,
+        )
+    finally:
+        (
+            service.sync_operational_search,
+            service.granted_search_resources,
+            service.read_search_rows,
+            service.search_rows_visible,
+            service.read_authorized_highlight,
+        ) = originals
+
+    assert len(result["hits"]) == 1
+    assert result["index"]["complete"] is False
+    assert result["has_more"] is False
+    assert result["next_offset"] is None
+    assert "narrow" in result["hint"].lower()
+    assert "offset=5000" not in result["hint"]
 
 
 @test("agent_operational_search", "stream binds and resets verified on-behalf identity")

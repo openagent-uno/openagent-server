@@ -47,6 +47,7 @@ _MAX_SNAPSHOT_ITEMS = 50_000
 _MAX_SNAPSHOTS_PER_PRINCIPAL = 4
 _MAX_SNAPSHOTS_GLOBAL = 32
 _MAX_SNAPSHOT_ROWS_GLOBAL = 100_000
+_SEARCH_PAGE_LOOKAHEAD = 128
 
 
 class ApiProblem(Exception):
@@ -1129,6 +1130,20 @@ async def _search_row_visible(conn: Any, row: dict[str, Any], access: AccessCont
     return await search_row_visible(conn, row, access)
 
 
+async def _search_rows_visible(
+    conn: Any,
+    rows: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+    access: AccessContext,
+) -> tuple[bool, ...]:
+    from src.memory.operational.service import search_rows_visible
+
+    return await search_rows_visible(
+        conn,
+        rows,
+        access,
+    )
+
+
 async def _granted_search_resources(
     conn: Any, access: AccessContext
 ) -> tuple[tuple[str, str, int], ...]:
@@ -1260,6 +1275,15 @@ async def handle_search(request: web.Request) -> web.Response:
         if not index_status.ready:
             _start_background(request, db)
             raise ApiProblem(503, "warming", "Search is still indexing authorized history")
+        # Grants from this projection are only an FTS prefilter.  The compound
+        # canonical statement independently reads current grants immediately
+        # before serialization, so a stale prefilter can cause at most an
+        # extra candidate, never disclosure.  Cursor pages need no prefilter.
+        granted_resources = (
+            ()
+            if cursor_token
+            else await _granted_search_resources(conn, access)
+        )
 
         normalized_request = {
             "query_digest": hashlib.sha256(query.encode()).hexdigest(),
@@ -1289,7 +1313,6 @@ async def handle_search(request: web.Request) -> web.Response:
             if offset < 0:
                 raise ApiProblem(409, "cursor_stale", "The search cursor is invalid", reason="invalid_signature")
         else:
-            granted_resources = await _granted_search_resources(conn, access)
             candidates = await __import__("asyncio").to_thread(
                 read_search_rows,
                 index_status.path,
@@ -1323,7 +1346,12 @@ async def handle_search(request: web.Request) -> web.Response:
             wanted_status = set(filters.get("status") or [])
             root_filter = filters.get("root") or None
             authorized: list[dict[str, Any]] = []
-            for row in candidates:
+            canonical_visibility = await _search_rows_visible(
+                conn,
+                candidates,
+                access,
+            )
+            for row, row_visible in zip(candidates, canonical_visibility):
                 if row["tenant_id"] != access.tenant_id:
                     continue
                 if wanted_status and row.get("status") not in wanted_status:
@@ -1338,7 +1366,7 @@ async def handle_search(request: web.Request) -> web.Response:
                     continue
                 if root_filter and (row.get("root_kind"), row.get("root_id")) != (root_filter.get("kind"), root_filter.get("id")):
                     continue
-                if await _search_row_visible(conn, row, access):
+                if row_visible:
                     row["_candidate_truncated"] = candidate_truncated
                     authorized.append(_compact_search_row(row))
             if grouping == "root":
@@ -1369,13 +1397,32 @@ async def handle_search(request: web.Request) -> web.Response:
         output: list[dict[str, Any]] = []
         visible_page_matches: list[dict[str, Any]] = []
         next_offset = offset
+        current_visibility = iter(())
+        visibility_through = offset
         while next_offset < len(snapshot.rows) and len(output) < limit:
+            if next_offset >= visibility_through:
+                lookahead = snapshot.rows[
+                    next_offset : next_offset + _SEARCH_PAGE_LOOKAHEAD
+                ]
+                lookahead_matches = [
+                    match
+                    for snapshot_row in lookahead
+                    for match in snapshot_row["_matches"]
+                ]
+                current_visibility = iter(
+                    await _search_rows_visible(
+                        conn,
+                        lookahead_matches,
+                        access,
+                    )
+                )
+                visibility_through = next_offset + len(lookahead)
             row = snapshot.rows[next_offset]
             next_offset += 1
             current_matches: list[tuple[dict[str, Any], dict[str, Any]]] = []
             visible_match_count = 0
             for match_row in row["_matches"]:
-                if not await _search_row_visible(conn, match_row, access):
+                if not next(current_visibility):
                     continue
                 visible_match_count += 1
                 # The wire contract exposes at most two snippets per root. Keep

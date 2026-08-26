@@ -391,6 +391,205 @@ async def t_capability_and_all_targets(_ctx: TestContext) -> None:
                 "chat", "chat_message", "chat_tool", "workflow_definition", "workflow_run",
                 "scheduled_definition", "scheduled_run", "event_definition", "event_delivery",
             }, targets
+            from src.memory.operational.access import AccessContext
+            from src.memory.operational.service import search_rows_visible
+
+            search_snapshot = next(
+                iter(gateway._operational_cursor_state.search.values())
+            )
+            canonical_rows = [
+                dict(snapshot_row["_matches"][0])
+                for snapshot_row in search_snapshot.rows
+            ]
+            alice_access = AccessContext.from_request(
+                _Request(
+                    gateway,
+                    tenant=tenant,
+                    handle="alice",
+                    device="alice-device",
+                )
+            )
+            mixed_statements: list[str] = []
+            await db._conn.set_trace_callback(mixed_statements.append)
+            try:
+                assert all(
+                    await search_rows_visible(
+                        db._conn,
+                        canonical_rows,
+                        alice_access,
+                    )
+                )
+            finally:
+                await db._conn.set_trace_callback(None)
+            assert sum(
+                "operational-search-canonical-batch" in statement
+                for statement in mixed_statements
+            ) == 1
+            target_fields = {
+                "chat": ("session_id",),
+                "chat_message": ("session_id", "message_id"),
+                "chat_tool": (
+                    "session_id",
+                    "message_id",
+                    "tool_invocation_id",
+                ),
+                "workflow_definition": ("workflow_id",),
+                "workflow_run": ("workflow_run_id", "workflow_id"),
+                "scheduled_definition": ("scheduled_task_id",),
+                "scheduled_run": ("scheduled_run_id", "scheduled_task_id"),
+                "event_definition": ("event_id",),
+                "event_delivery": ("event_delivery_id", "event_id"),
+            }
+            forged_rows: list[dict] = []
+            for canonical_row in canonical_rows:
+                for field in target_fields[str(canonical_row["target_kind"])]:
+                    forged_rows.append({**canonical_row, field: f"forged-{field}"})
+            assert not any(
+                await search_rows_visible(db._conn, forged_rows, alice_access)
+            )
+            hierarchy_forged_rows: list[dict] = []
+            for canonical_row in canonical_rows:
+                hierarchy_forged_rows.append(
+                    {**canonical_row, "root_kind": "forged-root-kind"}
+                )
+                hierarchy_forged_rows.append(
+                    {**canonical_row, "root_id": "forged-root-id"}
+                )
+                if canonical_row.get("parent_type") is None:
+                    hierarchy_forged_rows.append(
+                        {
+                            **canonical_row,
+                            "parent_type": "session",
+                            "parent_id": "forged-parent-id",
+                        }
+                    )
+                else:
+                    hierarchy_forged_rows.append(
+                        {**canonical_row, "parent_id": "forged-parent-id"}
+                    )
+            assert not any(
+                await search_rows_visible(
+                    db._conn,
+                    hierarchy_forged_rows,
+                    alice_access,
+                )
+            )
+            tool_row = next(
+                row for row in canonical_rows if row["target_kind"] == "chat_tool"
+            )
+            alternate_tool_message = await (
+                await db._conn.execute(
+                    "SELECT m.id FROM session_messages AS m "
+                    "JOIN tool_invocations AS t ON t.id=? "
+                    "WHERE m.session_id=t.session_id "
+                    "AND m.run_id=t.session_run_id AND m.id<>? "
+                    "AND m.visibility='user_visible' ORDER BY m.sequence LIMIT 1",
+                    (tool_row["resource_id"], tool_row["message_id"]),
+                )
+            ).fetchone()
+            assert alternate_tool_message is not None
+            assert not (
+                await search_rows_visible(
+                    db._conn,
+                    [
+                        {
+                            **tool_row,
+                            "message_id": str(alternate_tool_message[0]),
+                        }
+                    ],
+                    alice_access,
+                )
+            )[0]
+            stale_source_rows = [
+                {**row, "source_version": int(row["source_version"]) + 1}
+                for row in canonical_rows
+            ]
+            stale_acl_rows = [
+                {**row, "acl_version": int(row["acl_version"]) + 1}
+                for row in canonical_rows
+            ]
+            assert not any(
+                await search_rows_visible(
+                    db._conn,
+                    stale_source_rows,
+                    alice_access,
+                )
+            )
+            assert not any(
+                await search_rows_visible(
+                    db._conn,
+                    stale_acl_rows,
+                    alice_access,
+                )
+            )
+            chat_row = next(
+                row for row in canonical_rows if row["target_kind"] == "chat"
+            )
+            malformed_version_rows = [
+                {
+                    **chat_row,
+                    "acl_version": f"{int(chat_row['acl_version'])}evil",
+                },
+                {
+                    **chat_row,
+                    "source_version": f"{int(chat_row['source_version'])}junk",
+                },
+                {
+                    **chat_row,
+                    "acl_version": float(chat_row["acl_version"]) + 0.9,
+                },
+                {
+                    **chat_row,
+                    "source_version": float(chat_row["source_version"]) + 0.2,
+                },
+                {**chat_row, "acl_version": True},
+            ]
+            assert not any(
+                await search_rows_visible(
+                    db._conn,
+                    malformed_version_rows,
+                    alice_access,
+                )
+            )
+
+            # Legacy automation has one installation tenant.  Neither a
+            # forged derived tenant nor an attacker-supplied AccessContext can
+            # manufacture the previous installation_shared fallback.
+            workflow_row = next(
+                row
+                for row in canonical_rows
+                if row["target_kind"] == "workflow_definition"
+            )
+            forged_tenant_row = {**workflow_row, "tenant_id": "attacker-network"}
+            attacker_access = AccessContext.from_request(
+                _Request(
+                    gateway,
+                    tenant="attacker-network",
+                    handle="mallory",
+                    device="mallory-device",
+                )
+            )
+            assert not (
+                await search_rows_visible(
+                    db._conn,
+                    [forged_tenant_row],
+                    attacker_access,
+                )
+            )[0]
+            assert not (
+                await search_rows_visible(
+                    db._conn,
+                    [workflow_row],
+                    attacker_access,
+                )
+            )[0]
+            assert not (
+                await search_rows_visible(
+                    db._conn,
+                    [chat_row],
+                    attacker_access,
+                )
+            )[0]
             workflow_target = next(item["target"] for item in page["items"] if item["target"]["kind"] == "workflow_run")
             definition_target = next(item["target"] for item in page["items"] if item["target"]["kind"] == "workflow_definition")
             assert "trace_step_id" not in workflow_target
@@ -459,6 +658,51 @@ async def t_capability_and_all_targets(_ctx: TestContext) -> None:
                 pragma_conn.close()
             after = {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in (vault, transcript)}
             assert before == after
+
+            # Canonical run authority includes the definition it names.  Even
+            # if a damaged/imported database has foreign keys disabled, a
+            # stale run and search projection may not fall back to
+            # installation-shared after its parent has disappeared.
+            orphan_candidates = [
+                row
+                for row in canonical_rows
+                if row["target_kind"]
+                in {"workflow_run", "scheduled_run", "event_delivery"}
+            ]
+            await db._conn.commit()
+            await db._conn.execute("PRAGMA foreign_keys=OFF")
+            try:
+                await db._conn.execute(
+                    "DELETE FROM workflow_tasks WHERE id='orchid-workflow'"
+                )
+                await db._conn.execute(
+                    "DELETE FROM scheduled_tasks WHERE id='orchid-task'"
+                )
+                await db._conn.execute(
+                    "DELETE FROM events WHERE id='orchid-event'"
+                )
+                await db._conn.commit()
+                surviving_runs = await (
+                    await db._conn.execute(
+                        "SELECT "
+                        "(SELECT COUNT(*) FROM workflow_runs "
+                        " WHERE id='orchid-workflow-run') + "
+                        "(SELECT COUNT(*) FROM task_runs "
+                        " WHERE id='orchid-task-run') + "
+                        "(SELECT COUNT(*) FROM event_deliveries "
+                        " WHERE id='orchid-delivery')"
+                    )
+                ).fetchone()
+                assert int(surviving_runs[0]) == 3
+                assert not any(
+                    await search_rows_visible(
+                        db._conn,
+                        orphan_candidates,
+                        alice_access,
+                    )
+                )
+            finally:
+                await db._conn.execute("PRAGMA foreign_keys=ON")
         finally:
             if "gateway" in locals():
                 await operational.stop_background_maintenance(gateway)
@@ -693,6 +937,246 @@ async def t_acl_history_messages_and_snapshot(_ctx: TestContext) -> None:
             assert second["snapshot"]["search_session_id"] == first["snapshot"]["search_session_id"]
         finally:
             await operational.stop_background_maintenance(gateway)
+            await db.close()
+
+
+@test(
+    "operational_api",
+    "canonical search authorization is batched across snapshots and cursors",
+)
+async def t_batched_search_authorization_query_budget(_ctx: TestContext) -> None:
+    """A 40-result packaged-style query must not issue SQL per candidate.
+
+    The trace contains synthetic IDs only.  It also proves that current grants,
+    ACL revocation, and source-version invalidation are still canonical on a
+    cursor continuation rather than inherited from the derived snapshot.
+    """
+
+    from src.gateway.api import operational
+    from src.memory.db import MemoryDB
+
+    with TemporaryDirectory(prefix="openagent-operational-batch-auth-") as directory:
+        db = MemoryDB(str(Path(directory) / "openagent.db"))
+        await db.connect()
+        statements: list[str] = []
+        gateway = None
+        try:
+            tenant, gateway = await _seed_complete_fixture(db)
+            for index in range(192):
+                await db.upsert_session(
+                    f"batch-auth-{index:03d}",
+                    client_id="alice",
+                    title=f"batchauthorizationneedle unique{index:03d}",
+                )
+            alice = lambda **kwargs: _Request(
+                gateway,
+                tenant=tenant,
+                handle="alice",
+                device="alice-device",
+                **kwargs,
+            )
+            bob = lambda **kwargs: _Request(
+                gateway,
+                tenant=tenant,
+                handle="bob",
+                device="bob-device",
+                **kwargs,
+            )
+            await _ready_capabilities(operational, alice())
+            await operational.stop_background_maintenance(gateway)
+
+            # Explicit grants use the same canonical batch decision as owner
+            # visibility.  The derived FTS owner metadata alone cannot admit
+            # Bob, while this current search grant can admit exactly one row.
+            await db._conn.execute(
+                "INSERT INTO resource_acl "
+                "(tenant_id,resource_type,resource_id,principal_type,principal_id,"
+                "permission,acl_version,granted_by_principal_id,granted_at_ms) "
+                "VALUES(?,?,?,?,?,'search',1,?,?)",
+                (
+                    tenant,
+                    "session",
+                    "batch-auth-000",
+                    "user",
+                    "bob",
+                    "user:alice",
+                    int(time.time() * 1000),
+                ),
+            )
+            await db._conn.commit()
+            granted = _payload(
+                await operational.handle_search(
+                    bob(
+                        body={
+                            "query": "unique000",
+                            "scopes": ["chats"],
+                            "filters": {},
+                            "sort": "relevance",
+                            "grouping": "match",
+                            "limit": 10,
+                            "cursor": None,
+                        }
+                    )
+                )
+            )
+            assert [item["root"]["id"] for item in granted["items"]] == [
+                "batch-auth-000"
+            ]
+            from src.memory.operational.access import AccessContext
+            from src.memory.operational.service import (
+                granted_search_resources,
+                search_rows_visible,
+            )
+
+            bob_snapshot = next(
+                snapshot
+                for snapshot in gateway._operational_cursor_state.search.values()
+                if snapshot.principal_id == "user:bob"
+            )
+            bob_row = dict(bob_snapshot.rows[0]["_matches"][0])
+            stale_prefilter_grants = await granted_search_resources(
+                db._conn,
+                AccessContext.from_request(bob()),
+            )
+            assert ("session", "batch-auth-000", 1) in stale_prefilter_grants
+            await db._conn.execute(
+                "DELETE FROM resource_acl WHERE tenant_id=? "
+                "AND resource_type='session' AND resource_id='batch-auth-000' "
+                "AND principal_type='user' AND principal_id='bob'",
+                (tenant,),
+            )
+            await db._conn.commit()
+            # A projection fetched for FTS prefiltering before the revoke must
+            # not authorize the canonical batch that precedes serialization.
+            assert not (
+                await search_rows_visible(
+                    db._conn,
+                    [bob_row],
+                    AccessContext.from_request(bob()),
+                )
+            )[0]
+
+            await db._conn.set_trace_callback(statements.append)
+            body = {
+                "query": "batchauthorizationneedle",
+                "scopes": ["chats"],
+                "filters": {},
+                "sort": "relevance",
+                "grouping": "match",
+                "limit": 40,
+                "cursor": None,
+            }
+            first = _payload(await operational.handle_search(alice(body=body)))
+            assert len(first["items"]) == 40
+            assert first["has_more"] and first["next_cursor"]
+
+            canonical_tables = (
+                " FROM SESSIONS_V2 ",
+                " FROM SESSION_MESSAGES ",
+                " FROM TOOL_INVOCATIONS ",
+                " FROM OPERATIONAL_RESOURCE_OWNERS ",
+                " FROM OPERATIONAL_AUTOMATION_PROJECTION ",
+                " FROM RESOURCE_ACL ",
+            )
+
+            def canonical_select_count() -> int:
+                normalized = [
+                    f" {' '.join(statement.upper().split())} "
+                    for statement in statements
+                    if statement.lstrip().upper().startswith("SELECT")
+                ]
+                direct = sum(
+                    any(table in statement for table in canonical_tables)
+                    for statement in normalized
+                )
+                compound = sum(
+                    "operational-search-canonical-batch" in statement
+                    for statement in statements
+                )
+                return direct + compound
+
+            def compound_count() -> int:
+                return sum(
+                    "operational-search-canonical-batch" in statement
+                    for statement in statements
+                )
+
+            # One grants read plus one batched session read for snapshot
+            # creation and one for page-time reauthorization.  Leave small
+            # headroom for harmless metadata reads, but never candidate-scale
+            # growth (the old N+1 path is >380 statements for this fixture).
+            assert canonical_select_count() <= 8, statements
+            assert compound_count() == 2, statements
+
+            decoded = gateway._operational_cursor_state.decode(first["next_cursor"])
+            snapshot = gateway._operational_cursor_state.search[decoded["s"]]
+            # JSON1 batching has one compound statement through 1,000
+            # candidates and exactly one additional statement at the bound.
+            repeated = [
+                dict(snapshot.rows[index % len(snapshot.rows)])
+                for index in range(1_001)
+            ]
+            statements.clear()
+            repeated_visibility = await search_rows_visible(
+                db._conn,
+                repeated,
+                AccessContext.from_request(alice()),
+            )
+            assert all(repeated_visibility)
+            assert compound_count() == 2, statements
+
+            revoked_id = str(snapshot.rows[45]["resource_id"])
+            stale_id = str(snapshot.rows[46]["resource_id"])
+            await db._conn.execute(
+                "UPDATE sessions_v2 SET owner_principal_id='user:bob', "
+                "acl_version=acl_version+1 WHERE id=?",
+                (revoked_id,),
+            )
+            await db._conn.execute(
+                "UPDATE sessions_v2 SET source_version=source_version+1 WHERE id=?",
+                (stale_id,),
+            )
+            await db._conn.commit()
+            statements.clear()
+            body["cursor"] = first["next_cursor"]
+            second = _payload(await operational.handle_search(alice(body=body)))
+            returned = {item["root"]["id"] for item in second["items"]}
+            assert len(second["items"]) == 40
+            assert revoked_id not in returned and stale_id not in returned
+            assert second["snapshot"]["search_session_id"] == first["snapshot"][
+                "search_session_id"
+            ]
+            assert canonical_select_count() <= 8, statements
+            assert compound_count() == 1, statements
+
+            # A tiny page may materialize the bounded snapshot once, but its
+            # pre-snippet recheck must not rehydrate every remaining match.
+            # Record only cardinalities; no query or result content leaves
+            # this synthetic test process.
+            original_batch = operational._search_rows_visible
+            batch_sizes: list[int] = []
+
+            async def recorded_batch(conn, rows, access):
+                batch_sizes.append(len(rows))
+                return await original_batch(conn, rows, access)
+
+            operational._search_rows_visible = recorded_batch
+            try:
+                one_item_body = {**body, "limit": 1, "cursor": None}
+                one_item = _payload(
+                    await operational.handle_search(alice(body=one_item_body))
+                )
+            finally:
+                operational._search_rows_visible = original_batch
+            assert len(one_item["items"]) == 1
+            assert len(batch_sizes) == 2, batch_sizes
+            assert batch_sizes[0] > 128
+            assert 0 < batch_sizes[1] <= 128 < batch_sizes[0]
+        finally:
+            if db._conn is not None:
+                await db._conn.set_trace_callback(None)
+            if gateway is not None:
+                await operational.stop_background_maintenance(gateway)
             await db.close()
 
 
