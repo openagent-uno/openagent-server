@@ -657,7 +657,7 @@ async def t_legacy_status_aliases_fail_closed(_ctx: TestContext) -> None:
         ),
         (
             "failed",
-            {"tools": [{"name": "broken", "status": "FAILED"}]},
+            {"tools": [{"name": "broken", "status": " ", "state": "FAILED"}]},
             "legacy_missing_inferred_failed",
         ),
         (
@@ -681,6 +681,23 @@ async def t_legacy_status_aliases_fail_closed(_ctx: TestContext) -> None:
         assert projection.runs[0]["status_raw"] == expected_raw
         metadata = json.loads(str(projection.session["metadata_json"]))
         assert f"inferred {expected_status}" in metadata["projection_error"]
+
+    for tool in (
+        {"name": "unknown", "status": "SUCCESS", "state": "UNKNOWN"},
+        {"name": "conflict", "status": "SUCCESS", "state": "FAILED"},
+    ):
+        projection = build_session_projection(
+            {
+                **common,
+                "session_id": f"tool-alias-{tool['name']}-canary",
+                "runs": [{"status": "COMPLETED", "tools": [tool]}],
+            },
+            tenant_id="tenant-canary",
+            now_ms=1_700_000_002_000,
+        )
+        assert projection.session["completeness"] == "malformed_source"
+        assert projection.runs == ()
+        assert projection.tools == ()
 
 
 @test("operational_storage", "tool_call_id reuse is isolated by run and search message")

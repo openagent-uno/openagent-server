@@ -176,6 +176,34 @@ def _message_fingerprint(message: dict[str, Any], role: str) -> str:
     )
 
 
+def _normalized_tool_lifecycle(tool: dict[str, Any]) -> tuple[str, str]:
+    """Validate every populated legacy tool lifecycle alias fail-closed."""
+
+    values = [
+        value
+        for value in (tool.get("status"), tool.get("state"))
+        if str(getattr(value, "value", value) or "").strip()
+    ]
+    result = tool.get("result")
+    if not values:
+        return normalize_tool_status(
+            None,
+            tool_call_error=tool.get("tool_call_error"),
+            result_present=result is not None,
+        )
+    normalized = [
+        normalize_tool_status(
+            value,
+            tool_call_error=tool.get("tool_call_error"),
+            result_present=result is not None,
+        )
+        for value in values
+    ]
+    if len({value[0] for value in normalized}) != 1:
+        raise UnmappedStatusError("tool has conflicting lifecycle statuses")
+    return normalized[0]
+
+
 def _missing_run_status_inference(run: dict[str, Any]) -> tuple[str, str] | None:
     """Infer only enough lifecycle state to index a legacy transcript safely.
 
@@ -221,26 +249,25 @@ def _missing_run_status_inference(run: dict[str, Any]) -> tuple[str, str] | None
     if not content_text and not materialized_messages and not materialized_tools:
         return None
 
-    tool_states = {
-        str(tool.get("status") or tool.get("state") or "").strip().upper()
+    normalized_tool_states = {
+        _normalized_tool_lifecycle(tool)[0]
         for tool in materialized_tools
     }
-    tool_failed = any(tool.get("tool_call_error") is True for tool in materialized_tools) or bool(
-        tool_states & {"FAILED", "ERROR", "DENIED"}
-    )
-    tool_cancelled = bool(tool_states & {"CANCELLED", "CANCELED"})
-    tool_interrupted = "INTERRUPTED" in tool_states
+    raw_tool_states = {
+        str(getattr(value, "value", value) or "").strip().upper()
+        for tool in materialized_tools
+        for value in (tool.get("status"), tool.get("state"))
+        if str(getattr(value, "value", value) or "").strip()
+    }
+    tool_failed = "error" in normalized_tool_states
+    tool_cancelled = "cancelled" in normalized_tool_states
+    tool_interrupted = "INTERRUPTED" in raw_tool_states
     assistant_output = any(
         _message_role(message.get("role")) == "assistant"
         and bool(_text(message.get("content")).strip())
         for message in materialized_messages
     )
-    tool_finished = any(
-        tool.get("result") is not None
-        or str(tool.get("status") or tool.get("state") or "").strip().upper()
-        in {"COMPLETED", "SUCCEEDED", "SUCCESS", "FAILED", "ERROR"}
-        for tool in materialized_tools
-    )
+    tool_finished = bool(normalized_tool_states & {"success", "error", "cancelled"})
     if tool_failed:
         inferred = "failed"
     elif tool_interrupted:
@@ -546,11 +573,7 @@ def build_session_projection(
                 if not isinstance(raw_tool, dict):
                     continue
                 result = raw_tool.get("result")
-                tool_status, tool_status_raw = normalize_tool_status(
-                    raw_tool.get("status") or raw_tool.get("state"),
-                    tool_call_error=raw_tool.get("tool_call_error"),
-                    result_present=result is not None,
-                )
+                tool_status, tool_status_raw = _normalized_tool_lifecycle(raw_tool)
                 tool_call_id = str(
                     raw_tool.get("tool_call_id") or raw_tool.get("tool_use_id") or ""
                 ).strip() or None
