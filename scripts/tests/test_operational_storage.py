@@ -504,6 +504,95 @@ async def t_session_projection(_ctx: TestContext) -> None:
         assert pending is not None and pending[0] == 0
 
 
+@test("operational_storage", "empty and statusless legacy runs project without transcript loss")
+async def t_legacy_empty_and_statusless_projection(_ctx: TestContext) -> None:
+    import json
+
+    from src.memory.db import MemoryDB
+
+    with TemporaryDirectory(prefix="openagent-operational-legacy-gaps-") as directory:
+        db = MemoryDB(str(Path(directory) / "openagent.db"))
+        await db.connect()
+        conn = db._conn
+        assert conn is not None
+        try:
+            await db.upsert_session("empty-canary", client_id="alice")
+            await conn.execute(
+                "UPDATE sessions SET runs=NULL WHERE session_id='empty-canary'"
+            )
+            await db._project_operational_session("empty-canary")
+
+            await db.upsert_session("statusless-canary", client_id="alice")
+            await conn.execute(
+                "UPDATE sessions SET runs=?, updated_at=? WHERE session_id=?",
+                (
+                    json.dumps([{
+                        "run_id": "statusless-run",
+                        "content": "durable final answer",
+                        "messages": [
+                            {"role": "user", "content": "durable question"},
+                            {"role": "assistant", "content": "durable final answer"},
+                        ],
+                    }]),
+                    1_700_000_002,
+                    "statusless-canary",
+                ),
+            )
+            await db._project_operational_session("statusless-canary")
+            await conn.commit()
+
+            empty = await (
+                await conn.execute(
+                    "SELECT completeness FROM sessions_v2 WHERE id='empty-canary'"
+                )
+            ).fetchone()
+            empty_runs = await (
+                await conn.execute(
+                    "SELECT COUNT(*) FROM session_runs WHERE session_id='empty-canary'"
+                )
+            ).fetchone()
+            statusless = await (
+                await conn.execute(
+                    "SELECT completeness FROM sessions_v2 "
+                    "WHERE id='statusless-canary'"
+                )
+            ).fetchone()
+            normalized_run = await (
+                await conn.execute(
+                    "SELECT status, status_raw, completeness, raw_envelope_json "
+                    "FROM session_runs WHERE session_id='statusless-canary'"
+                )
+            ).fetchone()
+            messages = await (
+                await conn.execute(
+                    "SELECT role, text FROM session_messages "
+                    "WHERE session_id='statusless-canary' ORDER BY sequence"
+                )
+            ).fetchall()
+
+            prefer = await db.set_operational_storage_phase("prefer_v2")
+            assert prefer.verified_sessions == 2
+            assert prefer.v2_eligible_sessions == 1
+        finally:
+            await db.close()
+
+        assert empty is not None and str(empty[0]) == "complete"
+        assert empty_runs is not None and int(empty_runs[0]) == 0
+        assert statusless is not None and str(statusless[0]) == "partial"
+        assert normalized_run is not None
+        assert tuple(normalized_run[:3]) == (
+            "success",
+            "legacy_missing_inferred_success",
+            "partial",
+        )
+        raw_envelope = json.loads(str(normalized_run[3]))
+        assert "status" not in raw_envelope
+        assert [tuple(row) for row in messages] == [
+            ("user", "durable question"),
+            ("assistant", "durable final answer"),
+        ]
+
+
 @test("operational_storage", "tool_call_id reuse is isolated by run and search message")
 async def t_tool_call_id_reuse_across_runs(_ctx: TestContext) -> None:
     import json

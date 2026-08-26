@@ -201,11 +201,16 @@ def build_session_projection(
     session_data = loads_maybe_double(legacy.get("session_data"), {})
     if not isinstance(session_data, dict):
         session_data = {}
-    runs_raw = loads_maybe_double(legacy.get("runs"), [])
+    legacy_runs = legacy.get("runs")
+    # A newly-created legacy session legitimately has no transcript yet.  The
+    # runtime stores that state as SQL NULL, which is semantically the same as
+    # an empty run list and must not quarantine otherwise valid sessions.
+    runs_raw = [] if legacy_runs is None else loads_maybe_double(legacy_runs, [])
     malformed: str | None = None
     if not isinstance(runs_raw, list):
         runs_raw = []
         malformed = "runs is not a JSON array"
+    partial: str | None = None
 
     owner_raw = str(metadata.get("client_id") or "").strip()
     owner_principal = _principal(
@@ -252,9 +257,44 @@ def build_session_projection(
         for run_ordinal, run in enumerate(runs_raw):
             if not isinstance(run, dict):
                 raise UnmappedStatusError(f"run {run_ordinal} is not an object")
-            status, status_raw = normalize_run_status(
+            source_status = (
                 run.get("status") or run.get("run_status") or run.get("state")
             )
+            if str(getattr(source_status, "value", source_status) or "").strip():
+                # A non-empty status must have an explicit reviewed mapping.
+                # Unknown values remain fail-closed and quarantine the whole
+                # projection rather than inventing lifecycle semantics.
+                status, status_raw = normalize_run_status(source_status)
+                run_completeness = "complete"
+            else:
+                # A small number of old SDK rows omitted status even though a
+                # durable final answer and transcript were persisted.  Keep
+                # that evidence searchable, but mark it partial so prefer_v2
+                # continues to read the canonical legacy blob.  The untouched
+                # raw envelope preserves the missing source field exactly.
+                has_durable_transcript = bool(
+                    _text(run.get("content"))
+                    or (
+                        isinstance(run.get("messages"), list)
+                        and len(run["messages"]) > 0
+                    )
+                    or (
+                        isinstance(run.get("tools"), list)
+                        and len(run["tools"]) > 0
+                    )
+                )
+                if not has_durable_transcript:
+                    raise UnmappedStatusError(
+                        f"run {run_ordinal} has no status or durable transcript"
+                    )
+                status = "success"
+                status_raw = "legacy_missing_inferred_success"
+                run_completeness = "partial"
+                if partial is None:
+                    partial = (
+                        f"run {run_ordinal} status missing; inferred success "
+                        "for normalized transcript indexing"
+                    )
             source_run_id = str(run.get("run_id") or run.get("id") or "").strip()
             run_id = (
                 f"run:{session_id}:{source_run_id}"
@@ -288,7 +328,7 @@ def build_session_projection(
                     "output_json": _json(run.get("content")) if run.get("content") is not None else None,
                     "metrics_json": _json(run.get("metrics")) if run.get("metrics") is not None else None,
                     "metadata_json": _json(run.get("metadata") or {}, object_only=True),
-                    "completeness": "complete",
+                    "completeness": run_completeness,
                     "raw_envelope_json": _json(
                         bounded_envelope, object_only=True
                     ),
@@ -502,7 +542,9 @@ def build_session_projection(
         message_rows.clear()
         tool_rows.clear()
 
-    completeness = "malformed_source" if malformed else "complete"
+    completeness = (
+        "malformed_source" if malformed else "partial" if partial else "complete"
+    )
     session_row = {
         "id": session_id,
         "tenant_id": tenant_id,
@@ -554,7 +596,7 @@ def build_session_projection(
                         "updated_at",
                     )
                 },
-                "projection_error": malformed,
+                "projection_error": malformed or partial,
             },
             object_only=True,
         ),
