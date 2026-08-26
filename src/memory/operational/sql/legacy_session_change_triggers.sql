@@ -28,7 +28,7 @@ BEGIN
     ) VALUES (
         NEW.session_id,
         'insert',
-        NEW.updated_at
+        CAST(NEW.updated_at AS INTEGER)
     );
 END;
 
@@ -42,7 +42,7 @@ BEGIN
     ) VALUES (
         NEW.session_id,
         'update',
-        NEW.updated_at
+        CAST(NEW.updated_at AS INTEGER)
     );
 END;
 
@@ -56,9 +56,8 @@ BEGIN
     ) VALUES (
         OLD.session_id,
         'delete',
-        OLD.updated_at
+        CAST(OLD.updated_at AS INTEGER)
     );
 END;
 
 COMMIT;
-

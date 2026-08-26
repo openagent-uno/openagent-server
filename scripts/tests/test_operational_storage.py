@@ -133,6 +133,35 @@ async def t_executescript_crash_recovery(_ctx: TestContext) -> None:
         assert recovered[2]["phase_changed"] == 1
 
 
+@test("operational_storage", "legacy REAL timestamps are accepted by the strict change journal")
+async def t_legacy_real_timestamp_journal(_ctx: TestContext) -> None:
+    from src.memory.operational.schema import ensure_operational_storage
+
+    with TemporaryDirectory(prefix="openagent-operational-real-time-") as directory:
+        path = Path(directory) / "openagent.db"
+        _seed_legacy(path)
+        conn = await aiosqlite.connect(path)
+        try:
+            await ensure_operational_storage(conn, str(path), app_version="test-beta")
+            await conn.execute(
+                "UPDATE sessions SET updated_at=? WHERE session_id=?",
+                (1_700_000_000.75, "legacy-canary"),
+            )
+            row = await (
+                await conn.execute(
+                    "SELECT legacy_updated_at, typeof(legacy_updated_at) "
+                    "FROM legacy_session_changes WHERE session_id=? "
+                    "ORDER BY seq DESC LIMIT 1",
+                    ("legacy-canary",),
+                )
+            ).fetchone()
+        finally:
+            await conn.close()
+
+        assert row is not None
+        assert tuple(row) == (1_700_000_000, "integer")
+
+
 @test("operational_storage", "non-contention lock errors fail immediately")
 async def t_lock_error_classification(_ctx: TestContext) -> None:
     import fcntl
