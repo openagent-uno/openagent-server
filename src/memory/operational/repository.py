@@ -85,6 +85,7 @@ class ProjectionVerification:
     source_hash: str | None
     source_version: int | None
     reason: str | None = None
+    mismatched_fields: tuple[str, ...] = ()
 
 
 def _row_dict(cursor: Any, row: Any) -> dict[str, Any]:
@@ -517,6 +518,17 @@ def _row_changed(
         existing.get(column) != desired.get(column)
         for column in columns
         if column != "source_version"
+    )
+
+
+def _changed_columns(
+    existing: dict[str, Any], desired: dict[str, Any], columns: Sequence[str]
+) -> tuple[str, ...]:
+    return tuple(
+        column
+        for column in columns
+        if column != "source_version"
+        and existing.get(column) != desired.get(column)
     )
 
 
@@ -1388,15 +1400,13 @@ def verify_session_projection(
         source_version=source_version,
         deleted_at_ms=None,
     )
-    if _row_changed(stored_session, expected_session, _SESSION_COLUMNS):
-        return ProjectionVerification(
-            session_id,
-            False,
-            False,
-            projection.source_hash,
-            source_version,
-            "session_header_mismatch",
-        )
+    session_mismatches = _changed_columns(
+        stored_session, expected_session, _SESSION_COLUMNS
+    )
+    mismatch_fields = {
+        f"session.{column}" for column in session_mismatches
+    }
+    mismatch_labels = {"session"} if session_mismatches else set()
 
     run_ids = {str(row["id"]) for row in projection.runs}
     expected_runs: dict[str, dict[str, Any]] = {}
@@ -1447,18 +1457,36 @@ def verify_session_projection(
                 source_version,
                 f"{label}_identity_mismatch",
             )
-        if any(
-            _row_changed(actual[resource_id], expected[resource_id], columns)
+        content_mismatches = tuple(sorted({
+            column
             for resource_id in expected
-        ):
-            return ProjectionVerification(
-                session_id,
-                False,
-                False,
-                projection.source_hash,
-                source_version,
-                f"{label}_content_mismatch",
+            for column in _changed_columns(
+                actual[resource_id], expected[resource_id], columns
             )
+        }))
+        if content_mismatches:
+            mismatch_labels.add(label)
+            mismatch_fields.update(
+                f"{label}.{column}" for column in content_mismatches
+            )
+
+    if mismatch_fields:
+        reason = (
+            "session_header_mismatch"
+            if mismatch_labels == {"session"}
+            else f"{next(iter(mismatch_labels))}_content_mismatch"
+            if len(mismatch_labels) == 1
+            else "projection_content_mismatch"
+        )
+        return ProjectionVerification(
+            session_id,
+            False,
+            False,
+            projection.source_hash,
+            source_version,
+            reason,
+            tuple(sorted(mismatch_fields)),
+        )
 
     complete = str(expected_session.get("completeness")) == "complete"
     header_ready = _projection_schema(expected_session.get("metadata_json")) >= 3

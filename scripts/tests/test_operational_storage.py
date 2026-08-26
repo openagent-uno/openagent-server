@@ -1324,10 +1324,11 @@ async def t_incremental_cumulative_run(_ctx: TestContext) -> None:
             await db.close()
 
 
-@test("operational_storage", "child projected before parent relinks on replay")
+@test("operational_storage", "promotion relinks sessions and tools projected before targets")
 async def t_projection_dependency_relink(_ctx: TestContext) -> None:
+    import json
+
     from src.memory.db import MemoryDB
-    from src.memory.operational.repository import project_legacy_session_async
 
     with TemporaryDirectory(prefix="openagent-operational-relink-") as directory:
         db = MemoryDB(str(Path(directory) / "openagent.db"))
@@ -1341,31 +1342,55 @@ async def t_projection_dependency_relink(_ctx: TestContext) -> None:
                 parent_session_id="late-parent",
                 origin="delegation",
             )
+            await conn.execute(
+                "UPDATE sessions SET runs=?, updated_at=? "
+                "WHERE session_id='child-first'",
+                (
+                    json.dumps([{
+                        "run_id": "dependency-run",
+                        "status": "COMPLETED",
+                        "tools": [{
+                            "tool_call_id": "dependency-call",
+                            "tool_name": "delegate_task",
+                            "status": "completed",
+                            "result": "synthetic result",
+                            "child_session_id": "late-tool-child",
+                        }],
+                    }]),
+                    1_700_000_200,
+                ),
+            )
+            await db._project_operational_session("child-first")
+            await conn.commit()
             before = await (
                 await conn.execute(
-                    "SELECT parent_session_id, root_session_id FROM sessions_v2 "
-                    "WHERE id='child-first'"
+                    "SELECT s.parent_session_id, s.root_session_id, "
+                    "t.child_session_id FROM sessions_v2 s "
+                    "JOIN tool_invocations t ON t.session_id=s.id "
+                    "WHERE s.id='child-first'"
                 )
             ).fetchone()
             assert before is not None and before[0] is None
             assert str(before[1]) == "child-first"
+            assert before[2] is None
 
             await db.upsert_session("late-parent", client_id="alice")
-            replay = await project_legacy_session_async(conn, "child-first")
-            await conn.commit()
+            await db.upsert_session("late-tool-child", client_id="alice")
+            promoted = await db.set_operational_storage_phase("prefer_v2")
             after = await (
                 await conn.execute(
-                    "SELECT parent_session_id, root_session_id FROM sessions_v2 "
-                    "WHERE id='child-first'"
+                    "SELECT s.parent_session_id, s.root_session_id, "
+                    "t.child_session_id FROM sessions_v2 s "
+                    "JOIN tool_invocations t ON t.session_id=s.id "
+                    "WHERE s.id='child-first'"
                 )
             ).fetchone()
-            assert replay.changed
             assert after is not None and tuple(after) == (
                 "late-parent",
                 "late-parent",
+                "late-tool-child",
             )
-            promoted = await db.set_operational_storage_phase("prefer_v2")
-            assert promoted.verified_sessions == 2
+            assert promoted.verified_sessions == 3
         finally:
             await db.close()
 

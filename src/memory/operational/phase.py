@@ -20,6 +20,7 @@ from .repository import (
     ProjectionVerification,
     _aiosqlite_raw,
     operational_storage_available,
+    project_legacy_session,
     projection_coverage,
     record_session_verification,
     session_v2_is_verified,
@@ -33,6 +34,13 @@ _FORWARD = {
     "legacy": "shadow",
     "shadow": "prefer_v2",
     "prefer_v2": "v2",
+}
+
+_DERIVED_LINK_FIELDS = {
+    "session.parent_session_id",
+    "session.root_session_id",
+    "tool.child_run_id",
+    "tool.child_session_id",
 }
 
 
@@ -362,10 +370,31 @@ def transition_storage_phase(
         ).fetchall()
     ]
     verifications: list[ProjectionVerification] = []
+    repaired_dependency_sessions = 0
     for session_id in session_ids:
         verification = verify_session_projection(
             conn, session_id, now_ms=effective_now
         )
+        mismatch_fields = set(verification.mismatched_fields)
+        if (
+            not verification.matches
+            and mismatch_fields
+            and mismatch_fields <= _DERIVED_LINK_FIELDS
+        ):
+            # Backfill order can temporarily null relational lineage while the
+            # raw legacy envelope remains exact. Once every target exists,
+            # replay only this proven derived-link mismatch, then run the full
+            # byte-for-byte verifier again. Any content mismatch still fails
+            # closed and rolls back the entire phase transaction.
+            project_legacy_session(
+                conn,
+                session_id,
+                now_ms=effective_now,
+            )
+            repaired_dependency_sessions += 1
+            verification = verify_session_projection(
+                conn, session_id, now_ms=effective_now
+            )
         if not verification.matches:
             raise StoragePhaseError(
                 f"session {session_id!r} failed v2 verification: {verification.reason}"
@@ -422,6 +451,7 @@ def transition_storage_phase(
         details={
             "verified_sessions": len(verifications),
             "v2_eligible_sessions": eligible,
+            "repaired_dependency_sessions": repaired_dependency_sessions,
             "source_hash": source_digest,
         },
     )
