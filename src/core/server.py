@@ -1889,8 +1889,20 @@ class AgentServer:
                 _vault = self.agent._resolve_vault_path()
             except Exception:  # noqa: BLE001
                 _vault = None
+            # Le skill sono la TERZA sorgente dell'indice, alla pari di note e
+            # sessioni — ma solo se la radice arriva fin qui. Risolta con gli
+            # stessi cancelli del resto: niente skill attive, niente gamba.
+            _skills = None
+            try:
+                from src.core.config import skills_settings
+
+                if skills_settings(getattr(self.agent, "config", None) or {}).enabled:
+                    _skills = self.agent._resolve_skills_path()
+            except Exception:  # noqa: BLE001
+                _skills = None
             self._semantic_index_task = _sem_index_start(
-                _db_path, _vault, getattr(self.agent, "_providers_config", None))
+                _db_path, _vault, getattr(self.agent, "_providers_config", None),
+                _skills)
         except Exception as e:  # noqa: BLE001
             logger.warning("Semantic index builder failed to start: %s", e)
             self._semantic_index_task = None

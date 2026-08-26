@@ -69,6 +69,7 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_run_evidence",
     "test_tool_repeat",
     "test_vault_search_wrong_index",
+    "test_skills_semantic_leg",
     "test_config_patch_merge",
     "test_rest_skills",
     "test_setup",
