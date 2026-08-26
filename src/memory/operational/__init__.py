@@ -9,9 +9,19 @@ from .schema import (
     OperationalMigrationError,
     ensure_operational_storage,
 )
+from .phase import (
+    PhaseTransition,
+    StoragePhaseError,
+    transition_storage_phase,
+    transition_storage_phase_async,
+)
 
 __all__ = [
     "OPERATIONAL_SCHEMA_VERSION",
     "OperationalMigrationError",
     "ensure_operational_storage",
+    "PhaseTransition",
+    "StoragePhaseError",
+    "transition_storage_phase",
+    "transition_storage_phase_async",
 ]

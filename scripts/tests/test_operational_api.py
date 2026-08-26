@@ -972,6 +972,7 @@ async def t_persistent_search_consumer(_ctx: TestContext) -> None:
 @test("operational_api", "consumed outbox keeps only the replayable latest resource rows")
 async def t_search_outbox_compaction(_ctx: TestContext) -> None:
     from src.memory.db import MemoryDB
+    from src.memory.operational.repository import project_legacy_session_async
     from src.memory.operational.search import sync_operational_search
 
     with TemporaryDirectory(prefix="openagent-operational-outbox-") as directory:
@@ -1003,7 +1004,27 @@ async def t_search_outbox_compaction(_ctx: TestContext) -> None:
             before = int(
                 (await (await db._conn.execute("SELECT COUNT(*) FROM search_outbox")).fetchone())[0]
             )
-            assert before == 21
+            resource_counts = {
+                (str(row[0]), str(row[1])): int(row[2])
+                for row in await (
+                    await db._conn.execute(
+                        "SELECT source_kind, source_id, COUNT(*) FROM search_outbox "
+                        "GROUP BY source_kind, source_id"
+                    )
+                ).fetchall()
+            }
+            # The initial session plus five incremental turns produce one new
+            # session revision and one newly appended message per turn.  An
+            # unchanged message must not be republished on every projection.
+            assert before == 11
+            assert resource_counts[("session", "outbox-chat")] == 6
+            message_counts = [
+                count
+                for (kind, _resource_id), count in resource_counts.items()
+                if kind == "message"
+            ]
+            assert len(message_counts) == 5
+            assert set(message_counts) == {1}
             status = await sync_operational_search(db, limit=1000)
             assert status.ready
             after = int(
@@ -1011,6 +1032,43 @@ async def t_search_outbox_compaction(_ctx: TestContext) -> None:
             )
             # One replayable upsert for the session and each of its five messages.
             assert after == 6
+
+            outbox_head = int(
+                (
+                    await (
+                        await db._conn.execute(
+                            "SELECT COALESCE(MAX(seq), 0) FROM search_outbox"
+                        )
+                    ).fetchone()
+                )[0]
+            )
+            await db._conn.execute(
+                "UPDATE sessions SET metadata=?, updated_at=? "
+                "WHERE session_id='outbox-chat'",
+                (
+                    json.dumps({"client_id": "alice", "title": "Renamed outbox"}),
+                    int(now) + 10,
+                ),
+            )
+            renamed = await project_legacy_session_async(
+                db._conn, "outbox-chat"
+            )
+            await db._conn.commit()
+            assert renamed is not None and renamed.delta.nested_writes == 0
+            inherited_replays = {
+                str(row[0]): int(row[1])
+                for row in await (
+                    await db._conn.execute(
+                        "SELECT source_kind, COUNT(*) FROM search_outbox "
+                        "WHERE seq>? GROUP BY source_kind",
+                        (outbox_head,),
+                    )
+                ).fetchall()
+            }
+            # Message documents inherit title/owner/visibility/ACL from the
+            # root session. Re-publish them even though their canonical rows
+            # stayed byte-identical, or derived search authorization goes stale.
+            assert inherited_replays == {"message": 5, "session": 1}
         finally:
             await db.close()
 

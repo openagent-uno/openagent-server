@@ -15,6 +15,9 @@ from typing import Any, Iterable
 from .enums import UnmappedStatusError, normalize_run_status, normalize_tool_status
 
 
+NESTED_LAYOUT_KEY = "__openagent_normalized_nested_v2__"
+
+
 def loads_maybe_double(value: Any, fallback: Any) -> Any:
     current = value
     for _ in range(2):
@@ -77,6 +80,45 @@ def _text(value: Any) -> str:
             if key in value:
                 return _text(value[key])
     return ""
+
+
+def _bounded_run_envelope(run: dict[str, Any]) -> dict[str, Any]:
+    """Keep provider run fields without duplicating normalized transcripts."""
+
+    envelope = dict(run)
+    layout: dict[str, Any] = {}
+    raw_messages = run.get("messages")
+    if isinstance(raw_messages, list):
+        envelope.pop("messages", None)
+        layout["messages"] = {
+            "passthrough": {
+                str(ordinal): value
+                for ordinal, value in enumerate(raw_messages)
+                if not isinstance(value, dict)
+                or (
+                    _message_role(value.get("role")) is None
+                    and str(value.get("role") or "").strip().lower()
+                    not in {"system", "developer"}
+                )
+            },
+        }
+    raw_tools = run.get("tools")
+    if isinstance(raw_tools, list):
+        envelope.pop("tools", None)
+        layout["tools"] = {
+            "passthrough": {
+                str(ordinal): value
+                for ordinal, value in enumerate(raw_tools)
+                if not isinstance(value, dict)
+            },
+        }
+    if layout:
+        # Reserved projection metadata is removed during runtime rehydration.
+        # Preserve a provider collision losslessly inside that metadata.
+        if NESTED_LAYOUT_KEY in envelope:
+            layout["provider_reserved_value"] = envelope.pop(NESTED_LAYOUT_KEY)
+        envelope[NESTED_LAYOUT_KEY] = layout
+    return envelope
 
 
 def _principal(kind: str, value: Any) -> str | None:
@@ -187,10 +229,16 @@ def build_session_projection(
         legacy.get("agent_id"),
         legacy.get("team_id"),
         legacy.get("workflow_id"),
+        legacy.get("user_id"),
         metadata,
         session_data,
+        legacy.get("agent_data"),
+        legacy.get("team_data"),
+        legacy.get("workflow_data"),
         runs_raw,
         legacy.get("summary"),
+        legacy.get("created_at"),
+        legacy.get("updated_at"),
     )
 
     run_rows: list[dict[str, Any]] = []
@@ -216,6 +264,7 @@ def build_session_projection(
             run_created = _ms(run.get("created_at") or run.get("started_at"), updated_ms)
             terminal = status not in {"pending", "queued", "received", "running"}
             finished = _ms(run.get("finished_at") or run.get("completed_at"), run_created) if terminal else None
+            bounded_envelope = _bounded_run_envelope(run)
             run_rows.append(
                 {
                     "id": run_id,
@@ -240,30 +289,42 @@ def build_session_projection(
                     "metrics_json": _json(run.get("metrics")) if run.get("metrics") is not None else None,
                     "metadata_json": _json(run.get("metadata") or {}, object_only=True),
                     "completeness": "complete",
-                    "raw_envelope_json": _json(run, object_only=True),
+                    "raw_envelope_json": _json(
+                        bounded_envelope, object_only=True
+                    ),
                     "created_at_ms": run_created,
                     "finished_at_ms": finished,
                 }
             )
 
             current_counts: dict[str, int] = {}
+            skipped_message_passthrough: dict[str, Any] = {}
             raw_messages = run.get("messages") if isinstance(run.get("messages"), list) else []
             for message_ordinal, raw_message in enumerate(raw_messages):
                 if not isinstance(raw_message, dict):
                     continue
-                role = _message_role(raw_message.get("role"))
-                if role is None:
+                raw_role = str(raw_message.get("role") or "").strip().lower()
+                role = _message_role(raw_role)
+                internal = role is None and raw_role in {"system", "developer"}
+                if role is None and not internal:
                     continue
+                if internal:
+                    role = "compaction"
                 fingerprint = _message_fingerprint(raw_message, role)
                 occurrence = current_counts.get(fingerprint, 0)
                 current_counts[fingerprint] = occurrence + 1
                 if occurrence < seen_message_counts.get(fingerprint, 0):
+                    skipped_message_passthrough[str(message_ordinal)] = raw_message
                     continue
                 source_message_id = str(raw_message.get("id") or "").strip()
                 message_id = (
                     f"msg:{session_id}:{source_message_id}"
                     if source_message_id
-                    else _stable_id("msg", session_id, fingerprint, occurrence)
+                    # Provider-less messages keep one anchor while streaming
+                    # content/status changes. The run-local ordinal is stable
+                    # for append-only transcripts; content-derived ids churned
+                    # rows and broke deep links on every partial update.
+                    else _stable_id("msg", session_id, run_id, message_ordinal)
                 )
                 author_kind, author_principal, author_handle, author_display, inferred = _author(
                     raw_message, role, owner_raw or None, agent_id
@@ -291,7 +352,7 @@ def build_session_projection(
                         "reasoning_content": raw_message.get("reasoning_content"),
                         "redacted_reasoning_content": raw_message.get("redacted_reasoning_content"),
                         "tool_call_id": raw_message.get("tool_call_id"),
-                        "visibility": "user_visible",
+                        "visibility": "internal" if internal else "user_visible",
                         "completeness": "complete",
                         "raw_envelope_json": _json(raw_message, object_only=True),
                         "legacy_inferred": inferred,
@@ -301,6 +362,12 @@ def build_session_projection(
                     }
                 )
                 sequence += 1
+            if skipped_message_passthrough:
+                message_layout = bounded_envelope[NESTED_LAYOUT_KEY]["messages"]
+                message_layout["passthrough"].update(skipped_message_passthrough)
+                run_rows[-1]["raw_envelope_json"] = _json(
+                    bounded_envelope, object_only=True
+                )
             for fingerprint, count in current_counts.items():
                 seen_message_counts[fingerprint] = max(seen_message_counts.get(fingerprint, 0), count)
 
@@ -459,7 +526,34 @@ def build_session_projection(
         "legacy_source_hash": source_hash,
         "metadata_json": _json(
             {
+                # The normalized rows are the transcript source in prefer_v2/v2,
+                # but the runtime Session classes still need the bounded header
+                # fields that used to sit beside ``sessions.runs``.  Preserve
+                # those fields losslessly per session rather than forcing a v2
+                # read to fetch the legacy transcript blob.  This is deliberately
+                # *not* a second per-session history blob: runs/messages/tools
+                # remain separate rows and only their raw per-record envelopes
+                # carry provider-specific data.
+                "projection_schema": 3,
                 "legacy": metadata,
+                "legacy_header": {
+                    key: legacy.get(key)
+                    for key in (
+                        "session_type",
+                        "agent_id",
+                        "team_id",
+                        "workflow_id",
+                        "user_id",
+                        "session_data",
+                        "agent_data",
+                        "team_data",
+                        "workflow_data",
+                        "metadata",
+                        "summary",
+                        "created_at",
+                        "updated_at",
+                    )
+                },
                 "projection_error": malformed,
             },
             object_only=True,

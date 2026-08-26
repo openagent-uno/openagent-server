@@ -1135,3 +1135,641 @@ async def t_ownerless_visibility_policy(_ctx: TestContext) -> None:
             )
         finally:
             search.close()
+
+
+@test("operational_storage", "append mutates only the normalized tail and preserves prefix rowids")
+async def t_incremental_projection_append_cost(_ctx: TestContext) -> None:
+    import json
+
+    from src.memory.db import MemoryDB
+    from src.memory.operational.repository import project_legacy_session_async
+
+    def run(number: int) -> dict[str, object]:
+        return {
+            "run_id": f"run-{number}",
+            "status": "COMPLETED",
+            "created_at": 1_700_000_000 + number,
+            "content": f"assistant {number}",
+            "messages": [
+                {"id": f"user-{number}", "role": "user", "content": f"question {number}"},
+                {"id": f"assistant-{number}", "role": "assistant", "content": f"assistant {number}"},
+            ],
+            "tools": [{
+                "tool_call_id": f"call-{number}",
+                "tool_name": "shell_execute",
+                "tool_args": {"cmd": f"printf {number}"},
+                "result": f"result {number}",
+                "status": "completed",
+            }],
+        }
+
+    with TemporaryDirectory(prefix="openagent-operational-incremental-") as directory:
+        db = MemoryDB(str(Path(directory) / "openagent.db"))
+        await db.connect()
+        conn = db._conn
+        assert conn is not None
+        try:
+            await db.upsert_session(
+                "incremental-canary", client_id="alice", title="Incremental"
+            )
+            initial_runs = [run(number) for number in range(40)]
+            await conn.execute(
+                "UPDATE sessions SET runs=?, updated_at=? WHERE session_id=?",
+                (json.dumps(initial_runs), 1_700_000_040, "incremental-canary"),
+            )
+            initial = await project_legacy_session_async(conn, "incremental-canary")
+            await conn.commit()
+            assert initial.delta.runs_inserted == 40
+            assert initial.delta.messages_inserted == 80
+            assert initial.delta.tools_inserted == 40
+
+            before: dict[str, list[tuple[object, ...]]] = {}
+            for table in ("session_runs", "session_messages", "tool_invocations"):
+                rows = await (
+                    await conn.execute(
+                        f"SELECT id, rowid, source_version FROM {table} "
+                        "WHERE session_id=? ORDER BY id",
+                        ("incremental-canary",),
+                    )
+                ).fetchall()
+                before[table] = [tuple(row) for row in rows]
+
+            await conn.execute(
+                "UPDATE sessions SET runs=?, updated_at=? WHERE session_id=?",
+                (json.dumps([*initial_runs, run(40)]), 1_700_000_041, "incremental-canary"),
+            )
+            appended = await project_legacy_session_async(conn, "incremental-canary")
+            await conn.commit()
+
+            assert appended.delta.runs_inserted == 1
+            assert appended.delta.messages_inserted == 2
+            assert appended.delta.tools_inserted == 1
+            assert appended.delta.nested_writes == 4
+            assert appended.delta.nested_deletes == 0
+            assert appended.delta.runs_updated == 0
+            assert appended.delta.messages_updated == 0
+            assert appended.delta.tools_updated == 0
+
+            for table in ("session_runs", "session_messages", "tool_invocations"):
+                prefix_ids = [str(row[0]) for row in before[table]]
+                placeholders = ",".join("?" for _ in prefix_ids)
+                rows = await (
+                    await conn.execute(
+                        f"SELECT id, rowid, source_version FROM {table} "
+                        f"WHERE id IN ({placeholders}) ORDER BY id",
+                        tuple(prefix_ids),
+                    )
+                ).fetchall()
+                assert [tuple(row) for row in rows] == before[table]
+        finally:
+            await db.close()
+
+
+@test("operational_storage", "cumulative run append and streaming edit keep stable anchors")
+async def t_incremental_cumulative_run(_ctx: TestContext) -> None:
+    import json
+
+    from src.memory.db import MemoryDB
+    from src.memory.operational.projection import NESTED_LAYOUT_KEY
+    from src.memory.operational.repository import project_legacy_session_async
+
+    with TemporaryDirectory(prefix="openagent-operational-cumulative-") as directory:
+        db = MemoryDB(str(Path(directory) / "openagent.db"))
+        await db.connect()
+        conn = db._conn
+        assert conn is not None
+        try:
+            await db.upsert_session("cumulative-canary", client_id="alice")
+            run = {
+                "run_id": "one-long-run",
+                "status": "RUNNING",
+                "created_at": 1_700_000_000,
+                "messages": [{"role": "user", "content": "question"}],
+            }
+            await conn.execute(
+                "UPDATE sessions SET runs=?, updated_at=? WHERE session_id=?",
+                (json.dumps([run]), 1_700_000_001, "cumulative-canary"),
+            )
+            await project_legacy_session_async(conn, "cumulative-canary")
+            await conn.commit()
+            user_before = await (
+                await conn.execute(
+                    "SELECT id, rowid, source_version FROM session_messages "
+                    "WHERE session_id='cumulative-canary' AND ordinal=0"
+                )
+            ).fetchone()
+            raw_run = await (
+                await conn.execute(
+                    "SELECT raw_envelope_json FROM session_runs "
+                    "WHERE session_id='cumulative-canary'"
+                )
+            ).fetchone()
+            assert user_before is not None and raw_run is not None
+            bounded = json.loads(str(raw_run[0]))
+            assert "messages" not in bounded
+            assert bounded[NESTED_LAYOUT_KEY]["messages"]["passthrough"] == {}
+
+            run["messages"].append(
+                {"role": "assistant", "content": "partial answer"}
+            )
+            await conn.execute(
+                "UPDATE sessions SET runs=?, updated_at=? WHERE session_id=?",
+                (json.dumps([run]), 1_700_000_002, "cumulative-canary"),
+            )
+            appended = await project_legacy_session_async(
+                conn, "cumulative-canary"
+            )
+            await conn.commit()
+            assert appended.delta.messages_inserted == 1
+            assert appended.delta.messages_updated == 0
+            assert appended.delta.runs_updated == 0
+            user_after = await (
+                await conn.execute(
+                    "SELECT id, rowid, source_version FROM session_messages "
+                    "WHERE session_id='cumulative-canary' AND ordinal=0"
+                )
+            ).fetchone()
+            assistant_before = await (
+                await conn.execute(
+                    "SELECT id, rowid FROM session_messages "
+                    "WHERE session_id='cumulative-canary' AND ordinal=1"
+                )
+            ).fetchone()
+            assert tuple(user_after) == tuple(user_before)
+            assert assistant_before is not None
+
+            run["status"] = "COMPLETED"
+            run["messages"][1]["content"] = "final answer"
+            await conn.execute(
+                "UPDATE sessions SET runs=?, updated_at=? WHERE session_id=?",
+                (json.dumps([run]), 1_700_000_003, "cumulative-canary"),
+            )
+            completed = await project_legacy_session_async(
+                conn, "cumulative-canary"
+            )
+            await conn.commit()
+            assistant_after = await (
+                await conn.execute(
+                    "SELECT id, rowid, text FROM session_messages "
+                    "WHERE session_id='cumulative-canary' AND ordinal=1"
+                )
+            ).fetchone()
+            assert completed.delta.messages_inserted == 0
+            assert completed.delta.messages_updated == 1
+            assert completed.delta.messages_deleted == 0
+            assert assistant_after is not None
+            assert tuple(assistant_after[:2]) == tuple(assistant_before)
+            assert str(assistant_after[2]) == "final answer"
+        finally:
+            await db.close()
+
+
+@test("operational_storage", "child projected before parent relinks on replay")
+async def t_projection_dependency_relink(_ctx: TestContext) -> None:
+    from src.memory.db import MemoryDB
+    from src.memory.operational.repository import project_legacy_session_async
+
+    with TemporaryDirectory(prefix="openagent-operational-relink-") as directory:
+        db = MemoryDB(str(Path(directory) / "openagent.db"))
+        await db.connect()
+        conn = db._conn
+        assert conn is not None
+        try:
+            await db.upsert_session(
+                "child-first",
+                client_id="alice",
+                parent_session_id="late-parent",
+                origin="delegation",
+            )
+            before = await (
+                await conn.execute(
+                    "SELECT parent_session_id, root_session_id FROM sessions_v2 "
+                    "WHERE id='child-first'"
+                )
+            ).fetchone()
+            assert before is not None and before[0] is None
+            assert str(before[1]) == "child-first"
+
+            await db.upsert_session("late-parent", client_id="alice")
+            replay = await project_legacy_session_async(conn, "child-first")
+            await conn.commit()
+            after = await (
+                await conn.execute(
+                    "SELECT parent_session_id, root_session_id FROM sessions_v2 "
+                    "WHERE id='child-first'"
+                )
+            ).fetchone()
+            assert replay.changed
+            assert after is not None and tuple(after) == (
+                "late-parent",
+                "late-parent",
+            )
+            promoted = await db.set_operational_storage_phase("prefer_v2")
+            assert promoted.verified_sessions == 2
+        finally:
+            await db.close()
+
+
+@test("operational_storage", "guarded phases verify v2 reads, fall back, recover and roll back")
+async def t_guarded_phase_cutover(_ctx: TestContext) -> None:
+    import json
+
+    from src.memory.db import MemoryDB
+    from src.memory.operational.phase import (
+        guard_storage_phase_async,
+        preferred_session_source_async,
+    )
+    from src.memory.operational.repository import reconcile_pending_async
+
+    with TemporaryDirectory(prefix="openagent-operational-phase-") as directory:
+        db = MemoryDB(str(Path(directory) / "openagent.db"))
+        await db.connect()
+        conn = db._conn
+        assert conn is not None
+        try:
+            await db.upsert_session(
+                "phase-canary", client_id="alice", title="Phase canary"
+            )
+            runs = [{
+                "run_id": "phase-run-1",
+                "status": "COMPLETED",
+                "created_at": 1_700_000_000,
+                "messages": [
+                    {"id": "phase-user-1", "role": "user", "content": "one"},
+                    {"id": "phase-agent-1", "role": "assistant", "content": "two"},
+                ],
+                "content": "two",
+            }]
+            await conn.execute(
+                "UPDATE sessions SET runs=?, updated_at=? WHERE session_id=?",
+                (json.dumps(runs), 1_700_000_001, "phase-canary"),
+            )
+            await db._project_operational_session("phase-canary")
+            await conn.commit()
+
+            prefer = await db.set_operational_storage_phase("prefer_v2")
+            assert (prefer.from_phase, prefer.to_phase) == ("shadow", "prefer_v2")
+            assert prefer.verified_sessions == prefer.v2_eligible_sessions == 1
+            assert await preferred_session_source_async(conn, "phase-canary") == "v2"
+
+            promoted = await db.set_operational_storage_phase("v2")
+            assert (promoted.from_phase, promoted.to_phase) == ("prefer_v2", "v2")
+
+            # A direct/pre-v2 compatibility write immediately invalidates this
+            # session and the global guard rolls back before reconciliation.
+            changed_runs = [*runs, {
+                "run_id": "phase-run-2",
+                "status": "COMPLETED",
+                "created_at": 1_700_000_010,
+                "messages": [
+                    {"id": "phase-user-2", "role": "user", "content": "three"},
+                    {"id": "phase-agent-2", "role": "assistant", "content": "four"},
+                ],
+                "content": "four",
+            }]
+            await conn.execute(
+                "UPDATE sessions SET runs=?, updated_at=? WHERE session_id=?",
+                (json.dumps(changed_runs), 1_700_000_011, "phase-canary"),
+            )
+            assert await preferred_session_source_async(conn, "phase-canary") == "legacy"
+            guarded = await guard_storage_phase_async(conn, writer_version="test-beta")
+            await conn.commit()
+            assert (guarded.from_phase, guarded.to_phase, guarded.reason) == (
+                "v2", "shadow", "pending_legacy_change"
+            )
+
+            writes = await reconcile_pending_async(conn, limit=10)
+            await conn.commit()
+            assert [write.session_id for write in writes] == ["phase-canary"]
+            await db.set_operational_storage_phase("prefer_v2")
+            await db.set_operational_storage_phase("v2")
+            rolled_back = await db.set_operational_storage_phase("shadow")
+            assert (rolled_back.from_phase, rolled_back.to_phase) == ("v2", "shadow")
+            legacy = await (
+                await conn.execute(
+                    "SELECT runs FROM sessions WHERE session_id='phase-canary'"
+                )
+            ).fetchone()
+            normalized = await (
+                await conn.execute(
+                    "SELECT COUNT(*) FROM session_runs WHERE session_id='phase-canary'"
+                )
+            ).fetchone()
+            assert legacy is not None and json.loads(str(legacy[0])) == changed_runs
+            assert normalized is not None and int(normalized[0]) == 2
+        finally:
+            await db.close()
+
+
+@test("operational_storage", "runtime prefer_v2 rehydrates full runs without selecting legacy blob")
+async def t_runtime_v2_read_fidelity(_ctx: TestContext) -> None:
+    from sqlalchemy import event
+
+    from src.core._run_state.agent import RunOutput
+    from src.core._run_state.base import RunStatus
+    from src.memory.db import MemoryDB
+    from src.memory.sessions import AgentSession
+    from src.memory.store.base import SessionType
+    from src.memory.store.sqlite import SqliteDb
+    from src.models.providers.message import Message
+
+    with TemporaryDirectory(prefix="openagent-operational-v2-read-") as directory:
+        path = Path(directory) / "openagent.db"
+        db = MemoryDB(str(path))
+        await db.connect()
+        now = int(time.time())
+        runtime = SqliteDb(db_file=str(path), session_table="sessions")
+        session = AgentSession(
+            session_id="v2-read-canary",
+            agent_id="agent-canary",
+            user_id="openagent",
+            metadata={"client_id": "alice", "title": "V2 read"},
+            created_at=now,
+            updated_at=now,
+        )
+        session.upsert_run(
+            RunOutput(
+                run_id="v2-read-run",
+                agent_id="agent-canary",
+                session_id="v2-read-canary",
+                user_id="openagent",
+                content="full fidelity answer",
+                messages=[
+                    Message(role="user", content="full fidelity question"),
+                    Message(role="assistant", content="full fidelity answer"),
+                ],
+                status=RunStatus.completed,
+                created_at=now,
+            )
+        )
+        try:
+            assert runtime.upsert_session(session) is not None
+        finally:
+            runtime.close()
+
+        try:
+            await db.set_operational_storage_phase("prefer_v2")
+            runtime = SqliteDb(db_file=str(path), session_table="sessions")
+            statements: list[str] = []
+
+            @event.listens_for(runtime.db_engine, "before_cursor_execute")
+            def _capture(_conn, _cursor, statement, _parameters, _context, _many):
+                statements.append(str(statement))
+
+            try:
+                loaded = runtime.get_session(
+                    "v2-read-canary",
+                    SessionType.AGENT,
+                    user_id="openagent",
+                )
+            finally:
+                runtime.close()
+            assert isinstance(loaded, AgentSession)
+            assert loaded.runs is not None and len(loaded.runs) == 1
+            assert loaded.runs[0].content == "full fidelity answer"
+            normalized = [" ".join(statement.lower().split()) for statement in statements]
+            assert not any(
+                " sessions.runs" in statement and " from sessions" in statement
+                for statement in normalized
+            ), normalized
+        finally:
+            await db.close()
+
+
+@test("operational_storage", "prefer_v2 is per-session and v2 rejects partial or corrupted projections")
+async def t_phase_readiness_and_corruption_recovery(_ctx: TestContext) -> None:
+    import json
+
+    from src.memory.db import MemoryDB
+    from src.memory.operational.phase import StoragePhaseError
+
+    with TemporaryDirectory(prefix="openagent-operational-phase-gates-") as directory:
+        path = Path(directory) / "openagent.db"
+        db = MemoryDB(str(path))
+        await db.connect()
+        conn = db._conn
+        assert conn is not None
+        try:
+            await db.upsert_session("partial-canary", client_id="alice")
+            await conn.execute(
+                "UPDATE sessions SET runs=?, updated_at=? WHERE session_id=?",
+                (
+                    json.dumps([{"run_id": "bad", "status": "NOT_A_STATUS"}]),
+                    1_700_000_001,
+                    "partial-canary",
+                ),
+            )
+            await db._project_operational_session("partial-canary")
+            await conn.commit()
+            prefer = await db.set_operational_storage_phase("prefer_v2")
+            assert prefer.verified_sessions == 1
+            assert prefer.v2_eligible_sessions == 0
+            try:
+                await db.set_operational_storage_phase("v2")
+            except StoragePhaseError:
+                pass
+            else:
+                raise AssertionError("v2 accepted a malformed legacy session")
+            phase = await (
+                await conn.execute(
+                    "SELECT phase FROM storage_migration_state WHERE singleton_id=1"
+                )
+            ).fetchone()
+            assert phase is not None and str(phase[0]) == "prefer_v2"
+            await db.set_operational_storage_phase("shadow")
+
+            await db.delete_session("partial-canary")
+            await db.upsert_session("corrupt-canary", client_id="alice")
+            await conn.execute(
+                "UPDATE sessions SET runs=?, updated_at=? WHERE session_id=?",
+                (
+                    json.dumps([{
+                        "run_id": "good",
+                        "status": "COMPLETED",
+                        "messages": [{
+                            "id": "good-message",
+                            "role": "user",
+                            "content": "canonical text",
+                        }],
+                    }]),
+                    1_700_000_010,
+                    "corrupt-canary",
+                ),
+            )
+            await db._project_operational_session("corrupt-canary")
+            await conn.commit()
+            await db.set_operational_storage_phase("prefer_v2")
+            await conn.execute(
+                "UPDATE session_messages SET text='corrupted text' "
+                "WHERE id='msg:corrupt-canary:good-message'"
+            )
+            await conn.commit()
+            try:
+                await db.set_operational_storage_phase("v2")
+            except StoragePhaseError:
+                pass
+            else:
+                raise AssertionError("v2 accepted a corrupted normalized row")
+            # Model an old binary/table replacement that lost one downgrade
+            # trigger. A clean boot trusts the durable journal and stays O(1)
+            # in transcript size; missing trigger evidence forces the exact
+            # audit which detects and repairs this mismatch.
+            await conn.execute(
+                "DROP TRIGGER trg_legacy_sessions_update_journal"
+            )
+            await conn.commit()
+        finally:
+            await db.close()
+
+        # Promoted boot audit demotes, queues the exact mismatch, and startup
+        # reconciliation repairs it from the still-canonical legacy source.
+        recovered = MemoryDB(str(path))
+        await recovered.connect()
+        conn = recovered._conn
+        assert conn is not None
+        try:
+            phase = await (
+                await conn.execute(
+                    "SELECT phase FROM storage_migration_state WHERE singleton_id=1"
+                )
+            ).fetchone()
+            message = await (
+                await conn.execute(
+                    "SELECT text FROM session_messages "
+                    "WHERE id='msg:corrupt-canary:good-message'"
+                )
+            ).fetchone()
+            pending = await (
+                await conn.execute(
+                    "SELECT COUNT(*) FROM legacy_session_changes "
+                    "WHERE processed_at_ms IS NULL"
+                )
+            ).fetchone()
+            assert phase is not None and str(phase[0]) == "shadow"
+            assert message is not None and str(message[0]) == "canonical text"
+            assert pending is not None and int(pending[0]) == 0
+        finally:
+            await recovered.close()
+
+
+@test("operational_storage", "lost legacy triggers repair missing and extra v2 ids")
+async def t_lost_trigger_set_drift_recovery(_ctx: TestContext) -> None:
+    import json
+
+    from src.memory.db import MemoryDB
+
+    with TemporaryDirectory(prefix="openagent-operational-set-drift-") as directory:
+        path = Path(directory) / "openagent.db"
+        db = MemoryDB(str(path))
+        await db.connect()
+        conn = db._conn
+        assert conn is not None
+        try:
+            for session_id in ("missing-v2-canary", "extra-v2-canary"):
+                await db.upsert_session(session_id, client_id="alice")
+                await conn.execute(
+                    "UPDATE sessions SET runs=?, updated_at=? WHERE session_id=?",
+                    (
+                        json.dumps([{
+                            "run_id": f"run-{session_id}",
+                            "status": "COMPLETED",
+                            "messages": [{
+                                "id": f"message-{session_id}",
+                                "role": "user",
+                                "content": session_id,
+                            }],
+                        }]),
+                        1_700_000_100,
+                        session_id,
+                    ),
+                )
+                await db._project_operational_session(session_id)
+            await conn.commit()
+            await db.set_operational_storage_phase("prefer_v2")
+
+            # Simulate an old binary replacing the compatibility table: trigger
+            # evidence disappears and neither set mutation reaches the journal.
+            await conn.execute("DROP TRIGGER trg_legacy_sessions_update_journal")
+            await conn.execute("DROP TRIGGER trg_legacy_sessions_delete_journal")
+            await conn.execute(
+                "UPDATE sessions_v2 SET status='deleted', "
+                "deleted_at_ms=MAX(created_at_ms, updated_at_ms, last_activity_at_ms) "
+                "WHERE id='missing-v2-canary'"
+            )
+            await conn.execute(
+                "DELETE FROM sessions WHERE session_id='extra-v2-canary'"
+            )
+            await conn.commit()
+        finally:
+            await db.close()
+
+        recovered = MemoryDB(str(path))
+        await recovered.connect()
+        conn = recovered._conn
+        assert conn is not None
+        try:
+            phase = await (
+                await conn.execute(
+                    "SELECT phase FROM storage_migration_state WHERE singleton_id=1"
+                )
+            ).fetchone()
+            missing = await (
+                await conn.execute(
+                    "SELECT deleted_at_ms FROM sessions_v2 "
+                    "WHERE id='missing-v2-canary'"
+                )
+            ).fetchone()
+            extra = await (
+                await conn.execute(
+                    "SELECT deleted_at_ms FROM sessions_v2 "
+                    "WHERE id='extra-v2-canary'"
+                )
+            ).fetchone()
+            pending = await (
+                await conn.execute(
+                    "SELECT COUNT(*) FROM legacy_session_changes "
+                    "WHERE processed_at_ms IS NULL"
+                )
+            ).fetchone()
+            assert phase is not None and str(phase[0]) == "shadow"
+            assert missing is not None and missing[0] is None
+            assert extra is not None and extra[0] is not None
+            assert pending is not None and int(pending[0]) == 0
+        finally:
+            await recovered.close()
+
+
+@test("operational_storage", "clean promoted boot trusts intact downgrade journal")
+async def t_clean_promoted_boot_skips_transcript_audit(_ctx: TestContext) -> None:
+    from src.memory.db import MemoryDB
+    from src.memory.operational import phase as phase_module
+
+    with TemporaryDirectory(prefix="openagent-operational-clean-boot-") as directory:
+        path = Path(directory) / "openagent.db"
+        db = MemoryDB(str(path))
+        await db.connect()
+        try:
+            await db.upsert_session("clean-boot-canary", client_id="alice")
+            await db.set_operational_storage_phase("prefer_v2")
+        finally:
+            await db.close()
+
+        original_verify = phase_module.verify_session_projection
+
+        def unexpected_full_audit(*_args, **_kwargs):
+            raise AssertionError("clean promoted boot reparsed transcript")
+
+        phase_module.verify_session_projection = unexpected_full_audit
+        reopened = MemoryDB(str(path))
+        try:
+            await reopened.connect()
+            assert reopened._conn is not None
+            row = await (
+                await reopened._conn.execute(
+                    "SELECT phase FROM storage_migration_state WHERE singleton_id=1"
+                )
+            ).fetchone()
+            assert row is not None and str(row[0]) == "prefer_v2"
+        finally:
+            phase_module.verify_session_projection = original_verify
+            await reopened.close()

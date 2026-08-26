@@ -1071,10 +1071,41 @@ class MemoryDB:
         from src import __version__
         from src.memory.operational.schema import ensure_operational_storage
 
+        # Capture downgrade-trigger evidence before the additive migrator
+        # reinstalls any missing trigger.  A clean promoted boot can trust the
+        # append-only change journal and avoid reparsing the whole transcript;
+        # a table replacement/old binary that dropped a trigger forces the
+        # expensive exact audit once.
+        required_legacy_triggers = {
+            "trg_legacy_sessions_insert_journal",
+            "trg_legacy_sessions_update_journal",
+            "trg_legacy_sessions_delete_journal",
+        }
+        trigger_rows = await (
+            await self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' "
+                "AND name IN (?,?,?)",
+                tuple(sorted(required_legacy_triggers)),
+            )
+        ).fetchall()
+        legacy_triggers_intact = {
+            str(row[0]) for row in trigger_rows
+        } == required_legacy_triggers
         await ensure_operational_storage(
             self._conn,
             self.db_path,
             app_version=__version__,
+        )
+        # A pre-v2 binary may have written the compatibility table while this
+        # build was offline.  Its durable triggers leave pending journal rows;
+        # promoted reads must fall back to shadow *before* any runtime writer or
+        # scheduler becomes visible, then normal reconciliation can catch up.
+        from src.memory.operational.phase import guard_storage_phase_atomic_async
+
+        await guard_storage_phase_atomic_async(
+            self._conn,
+            writer_version=__version__,
+            audit_content=not legacy_triggers_intact,
         )
         # Drain a bounded page before the connection becomes visible to the
         # agent/scheduler. Larger legacy datasets continue through the durable
@@ -2216,6 +2247,26 @@ class MemoryDB:
                 session_id,
                 exc,
             )
+
+    async def set_operational_storage_phase(self, phase: str):
+        """Explicitly promote or roll back normalized runtime reads.
+
+        Promotion performs full parity verification in the caller's
+        transaction.  The default boot path never invokes it automatically;
+        beta operators/tests must opt in after backfill is complete.
+        """
+
+        conn = await self._ensure_connected()
+        from src import __version__
+        from src.memory.operational.phase import (
+            transition_storage_phase_atomic_async,
+        )
+
+        return await transition_storage_phase_atomic_async(
+            conn,
+            phase,
+            writer_version=__version__,
+        )
 
     async def _write_with_retry(self, do_write, *, attempts: int = 3):
         """Run an idempotent single-row write, retrying on "database is locked".
