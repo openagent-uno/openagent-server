@@ -106,12 +106,67 @@ def _mark_legacy_changes(
     source_hash: str | None,
     error_class: str | None = None,
 ) -> None:
+    had_failed_retry = conn.execute(
+        "SELECT 1 FROM legacy_session_changes WHERE session_id=? "
+        "AND processed_at_ms IS NULL AND last_error_class IS NOT NULL LIMIT 1",
+        (session_id,),
+    ).fetchone() is not None
     conn.execute(
         "UPDATE legacy_session_changes SET processed_at_ms=?, source_hash=?, "
         "last_error_class=?, claimed_by=NULL, claimed_at_ms=NULL "
         "WHERE session_id=? AND processed_at_ms IS NULL",
         (now_ms, source_hash, error_class, session_id),
     )
+    if had_failed_retry:
+        conn.execute(
+            "UPDATE storage_migration_state SET "
+            "failed_sessions=MAX(0, failed_sessions-1), updated_at_ms=? "
+            "WHERE singleton_id=1",
+            (now_ms,),
+        )
+
+
+def _record_projection_failure(
+    conn: Any,
+    session_id: str,
+    *,
+    legacy_updated_at: int | None,
+    error_class: str,
+    now_ms: int,
+) -> bool:
+    """Persist a fair retry and report whether it is a newly failed session."""
+
+    pending = conn.execute(
+        "SELECT 1 FROM legacy_session_changes WHERE session_id=? "
+        "AND processed_at_ms IS NULL LIMIT 1",
+        (session_id,),
+    ).fetchone() is not None
+    already_failed = conn.execute(
+        "SELECT 1 FROM legacy_session_changes WHERE session_id=? "
+        "AND processed_at_ms IS NULL AND last_error_class IS NOT NULL LIMIT 1",
+        (session_id,),
+    ).fetchone() is not None
+    if pending:
+        conn.execute(
+            "UPDATE legacy_session_changes SET attempt_count=attempt_count+1, "
+            "last_error_class=?, claimed_by=NULL, claimed_at_ms=NULL "
+            "WHERE session_id=? AND processed_at_ms IS NULL",
+            (error_class[:200], session_id),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO legacy_session_changes "
+            "(session_id, operation, legacy_updated_at, observed_at_ms, "
+            "attempt_count, last_error_class) "
+            "VALUES (?, 'update', ?, ?, 1, ?)",
+            (
+                session_id,
+                legacy_updated_at,
+                now_ms,
+                error_class[:200],
+            ),
+        )
+    return not already_failed
 
 
 def _insert_outbox(
@@ -750,9 +805,10 @@ def reconcile_pending(
         return []
     effective_now = int(time.time() * 1000) if now_ms is None else int(now_ms)
     rows = conn.execute(
-        "SELECT session_id, MIN(seq) AS first_seq FROM legacy_session_changes "
+        "SELECT session_id, MIN(seq) AS first_seq, "
+        "MIN(attempt_count) AS fewest_attempts FROM legacy_session_changes "
         "WHERE processed_at_ms IS NULL GROUP BY session_id "
-        "ORDER BY first_seq LIMIT ?",
+        "ORDER BY fewest_attempts, first_seq LIMIT ?",
         (max(1, min(int(limit), 1000)),),
     ).fetchall()
     results: list[ProjectionWrite] = []
@@ -775,12 +831,20 @@ def reconcile_pending(
         except Exception as exc:
             conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
             conn.execute(f"RELEASE SAVEPOINT {savepoint}")
-            conn.execute(
-                "UPDATE legacy_session_changes SET attempt_count=attempt_count+1, "
-                "last_error_class=?, claimed_by=NULL, claimed_at_ms=NULL "
-                "WHERE session_id=? AND processed_at_ms IS NULL",
-                (type(exc).__name__[:200], session_id),
+            newly_failed = _record_projection_failure(
+                conn,
+                session_id,
+                legacy_updated_at=None,
+                error_class=type(exc).__name__,
+                now_ms=effective_now,
             )
+            if newly_failed:
+                conn.execute(
+                    "UPDATE storage_migration_state SET "
+                    "failed_sessions=failed_sessions+1, updated_at_ms=? "
+                    "WHERE singleton_id=1",
+                    (effective_now,),
+                )
     return results
 
 
@@ -819,7 +883,7 @@ def backfill_batch(
         return [], True
 
     results: list[ProjectionWrite] = []
-    failed = 0
+    newly_failed = 0
     for ordinal, row in enumerate(rows):
         session_id = str(row[0])
         savepoint = f"operational_backfill_{ordinal}"
@@ -830,10 +894,17 @@ def backfill_batch(
             )
             conn.execute(f"RELEASE SAVEPOINT {savepoint}")
             results.append(result)
-        except Exception:
+        except Exception as exc:
             conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
             conn.execute(f"RELEASE SAVEPOINT {savepoint}")
-            failed += 1
+            if _record_projection_failure(
+                conn,
+                session_id,
+                legacy_updated_at=int(row[1]),
+                error_class=type(exc).__name__,
+                now_ms=effective_now,
+            ):
+                newly_failed += 1
     last_id, last_updated = str(rows[-1][0]), int(rows[-1][1])
     conn.execute(
         "UPDATE storage_migration_state SET checkpoint_updated_at=?, "
@@ -844,7 +915,7 @@ def backfill_batch(
             last_updated,
             last_id,
             sum(1 for result in results if result.changed),
-            failed,
+            newly_failed,
             "operational-v2",
             effective_now,
         ),
@@ -860,9 +931,18 @@ def projection_coverage(conn: Any) -> dict[str, int | bool]:
             "SELECT COUNT(*) FROM sessions_v2 WHERE deleted_at_ms IS NULL"
         ).fetchone()[0]
     )
+    missing = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM sessions legacy WHERE NOT EXISTS ("
+            "SELECT 1 FROM sessions_v2 projected "
+            "WHERE projected.id=legacy.session_id "
+            "AND projected.deleted_at_ms IS NULL)"
+        ).fetchone()[0]
+    )
     failed = int(
         conn.execute(
-            "SELECT failed_sessions FROM storage_migration_state WHERE singleton_id=1"
+            "SELECT COUNT(DISTINCT session_id) FROM legacy_session_changes "
+            "WHERE processed_at_ms IS NULL AND last_error_class IS NOT NULL"
         ).fetchone()[0]
     )
     pending = int(
@@ -876,7 +956,7 @@ def projection_coverage(conn: Any) -> dict[str, int | bool]:
         "projected_sessions": projected,
         "failed_sessions": failed,
         "pending_sessions": pending,
-        "complete": projected >= legacy and failed == 0 and pending == 0,
+        "complete": missing == 0 and failed == 0 and pending == 0,
     }
 
 

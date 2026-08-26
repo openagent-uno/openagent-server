@@ -97,6 +97,131 @@ async def t_principal_type_isolation(_ctx: TestContext) -> None:
     assert ("user", "same-handle") not in agent.grant_identities
 
 
+@test("operational_api", "reused tool call ids keep message and detail deep-links run-local")
+async def t_run_local_tool_deep_links(_ctx: TestContext) -> None:
+    from src.gateway.api import operational
+    from src.memory.db import MemoryDB
+
+    with TemporaryDirectory(prefix="openagent-operational-tool-links-") as directory:
+        db = MemoryDB(str(Path(directory) / "openagent.db"))
+        await db.connect()
+        conn = db._conn
+        assert conn is not None
+        gateway = SimpleNamespace(
+            agent=SimpleNamespace(memory_db=db),
+            _operational_history_ready=True,
+        )
+        try:
+            await db.upsert_session(
+                "run-local-tools",
+                client_id="alice",
+                title="Run-local tools",
+            )
+            runs = []
+            for suffix, result in (("a", "first result"), ("b", "second result")):
+                runs.append(
+                    {
+                        "run_id": f"run-{suffix}",
+                        "status": "COMPLETED",
+                        "created_at": 1_700_000_000 + len(runs),
+                        "messages": [
+                            {
+                                "id": f"tool-message-{suffix}",
+                                "role": "tool",
+                                "tool_call_id": "reused-call",
+                                "content": result,
+                            }
+                        ],
+                        "tools": [
+                            {
+                                "tool_call_id": "reused-call",
+                                "tool_name": "shell_execute",
+                                "tool_args": {"run": suffix},
+                                "result": result,
+                                "status": "completed",
+                            }
+                        ],
+                    }
+                )
+            await conn.execute(
+                "UPDATE sessions SET runs=?, updated_at=? WHERE session_id=?",
+                (json.dumps(runs), 1_700_000_100, "run-local-tools"),
+            )
+            await db._project_operational_session("run-local-tools")
+            await conn.commit()
+            tenant = str(
+                (
+                    await (
+                        await conn.execute(
+                            "SELECT tenant_id FROM sessions_v2 WHERE id=?",
+                            ("run-local-tools",),
+                        )
+                    ).fetchone()
+                )[0]
+            )
+            request = lambda **kwargs: _Request(
+                gateway,
+                tenant=tenant,
+                handle="alice",
+                device="alice-device",
+                **kwargs,
+            )
+
+            messages_response = await operational.handle_session_messages(
+                request(
+                    match={"session_id": "run-local-tools"},
+                    query={"limit": "100"},
+                )
+            )
+            assert messages_response.status == 200, messages_response.text
+            messages = {
+                item["id"]: item["tool_invocation_id"]
+                for item in _payload(messages_response)["messages"]
+            }
+            tools = await (
+                await conn.execute(
+                    "SELECT id, session_run_id FROM tool_invocations "
+                    "WHERE session_id=? ORDER BY session_run_id",
+                    ("run-local-tools",),
+                )
+            ).fetchall()
+            query_plan = await (
+                await conn.execute(
+                    "EXPLAIN QUERY PLAN SELECT t.id FROM tool_invocations t "
+                    "WHERE t.root_kind='session' AND t.session_id=? "
+                    "AND t.session_run_id=? AND t.tool_call_id=? LIMIT 1",
+                    (
+                        "run-local-tools",
+                        "run:run-local-tools:run-a",
+                        "reused-call",
+                    ),
+                )
+            ).fetchall()
+            assert any(
+                "uq_tool_invocations_session_run_call_context" in str(row[3])
+                for row in query_plan
+            ), [str(row[3]) for row in query_plan]
+            expected = {
+                "msg:run-local-tools:tool-message-a": str(tools[0][0]),
+                "msg:run-local-tools:tool-message-b": str(tools[1][0]),
+            }
+            assert {key: messages[key] for key in expected} == expected
+
+            for index, tool in enumerate(tools):
+                detail_response = await operational.handle_tool_invocation(
+                    request(match={"tool_id": str(tool[0])})
+                )
+                assert detail_response.status == 200, detail_response.text
+                detail = _payload(detail_response)
+                suffix = "a" if index == 0 else "b"
+                assert detail["message_id"] == (
+                    f"msg:run-local-tools:tool-message-{suffix}"
+                )
+        finally:
+            await operational.stop_background_maintenance(gateway)
+            await db.close()
+
+
 async def _ready_capabilities(operational, request: _Request) -> dict:
     payload = _payload(await operational.handle_capabilities(request))
     if not payload.get("storage", {}).get("search_ready"):

@@ -581,11 +581,14 @@ async def _source_row(conn: Any, source_kind: str, source_id: str) -> tuple[dict
             await conn.execute(
                 "SELECT t.*, s.title, s.parent_session_id, s.origin, "
                 "COALESCE((SELECT m.id FROM session_messages m WHERE m.session_id=t.session_id "
-                "AND m.tool_call_id=t.tool_call_id LIMIT 1), "
+                "AND t.root_kind='session' AND m.run_id=t.session_run_id "
+                "AND m.tool_call_id=t.tool_call_id "
+                "ORDER BY m.sequence, m.id LIMIT 1), "
                 "(SELECT m.id FROM session_messages m WHERE m.session_id=t.session_id "
                 "AND m.run_id=t.session_run_id ORDER BY m.sequence DESC LIMIT 1)) AS message_id "
                 "FROM tool_invocations t JOIN sessions_v2 s ON s.id=t.session_id "
-                "WHERE t.id=? AND s.deleted_at_ms IS NULL",
+                "WHERE t.id=? AND t.root_kind='session' "
+                "AND s.deleted_at_ms IS NULL",
                 (source_id,),
             )
         ).fetchone()

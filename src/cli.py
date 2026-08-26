@@ -433,14 +433,18 @@ def selfcheck(quiet: bool, expect: str | None) -> None:
         from src.memory.operational.schema import (
             operational_schema_sql,
             operational_search_schema_sql,
+            tool_call_context_repair_sql,
         )
 
         canonical_sql = operational_schema_sql()
         search_sql = operational_search_schema_sql()
+        repair_sql = tool_call_context_repair_sql()
         if "CREATE TABLE IF NOT EXISTS operational_storage_state" not in canonical_sql:
             raise RuntimeError("canonical operational schema resource is invalid")
         if "CREATE VIRTUAL TABLE IF NOT EXISTS search_fts" not in search_sql:
             raise RuntimeError("operational search schema resource is invalid")
+        if "uq_tool_invocations_session_run_call_context" not in repair_sql:
+            raise RuntimeError("operational tool-call repair resource is invalid")
     except Exception as exc:
         if not quiet:
             console.print("[red]selfcheck failed:[/red] operational SQL resources unavailable")

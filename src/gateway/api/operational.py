@@ -864,8 +864,10 @@ async def handle_session_messages(request: web.Request) -> web.Response:
             raise ApiProblem(400, "invalid_request", "before and after require around")
         state = _state(request)
         base_select = (
-            "SELECT m.*, (SELECT t.id FROM tool_invocations t WHERE t.session_id=m.session_id "
-            "AND t.tool_call_id=m.tool_call_id LIMIT 1) AS resolved_tool_id "
+            "SELECT m.*, (SELECT t.id FROM tool_invocations t "
+            "WHERE t.root_kind='session' AND t.session_id=m.session_id "
+            "AND t.session_run_id=m.run_id AND t.tool_call_id=m.tool_call_id "
+            "LIMIT 1) AS resolved_tool_id "
             "FROM session_messages m WHERE m.session_id=? AND m.visibility='user_visible' "
         )
         anchor_found: bool | None = None
@@ -968,9 +970,12 @@ async def handle_tool_invocation(request: web.Request) -> web.Response:
                 "s.owner_principal_id AS parent_owner_principal_id, "
                 "s.visibility AS parent_visibility, s.acl_version AS parent_acl_version, "
                 "(SELECT m.id FROM session_messages m WHERE m.session_id=t.session_id "
-                "AND m.tool_call_id=t.tool_call_id LIMIT 1) AS message_id "
+                "AND t.root_kind='session' AND m.run_id=t.session_run_id "
+                "AND m.tool_call_id=t.tool_call_id "
+                "ORDER BY m.sequence, m.id LIMIT 1) AS message_id "
                 "FROM tool_invocations t JOIN sessions_v2 s ON s.id=t.session_id "
-                "AND s.tenant_id=t.tenant_id WHERE t.id=? AND s.deleted_at_ms IS NULL",
+                "AND s.tenant_id=t.tenant_id WHERE t.id=? "
+                "AND t.root_kind='session' AND s.deleted_at_ms IS NULL",
                 (tool_id,),
             )
         ).fetchone()

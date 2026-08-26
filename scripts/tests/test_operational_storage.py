@@ -30,6 +30,57 @@ def _seed_legacy(path: Path) -> None:
         conn.close()
 
 
+def _reused_tool_call_runs() -> list[dict[str, object]]:
+    """Two distinct runs that legitimately reuse one provider call id."""
+
+    return [
+        {
+            "run_id": "run-a",
+            "status": "COMPLETED",
+            "created_at": 1_700_000_000,
+            "messages": [
+                {
+                    "id": "tool-message-a",
+                    "role": "tool",
+                    "tool_call_id": "reused-call",
+                    "content": "first distinct result",
+                }
+            ],
+            "tools": [
+                {
+                    "tool_call_id": "reused-call",
+                    "tool_name": "shell_execute",
+                    "tool_args": {"cmd": "printf first"},
+                    "result": "first distinct result",
+                    "status": "completed",
+                }
+            ],
+        },
+        {
+            "run_id": "run-b",
+            "status": "COMPLETED",
+            "created_at": 1_700_000_100,
+            "messages": [
+                {
+                    "id": "tool-message-b",
+                    "role": "tool",
+                    "tool_call_id": "reused-call",
+                    "content": "second distinct result",
+                }
+            ],
+            "tools": [
+                {
+                    "tool_call_id": "reused-call",
+                    "tool_name": "shell_execute",
+                    "tool_args": {"cmd": "printf second"},
+                    "result": "second distinct result",
+                    "status": "completed",
+                }
+            ],
+        },
+    ]
+
+
 async def _migration_state(path: Path) -> tuple[str, str, dict[str, int]]:
     from src.memory.operational.schema import MIGRATION_ID
 
@@ -72,6 +123,12 @@ async def t_backup_and_idempotence(_ctx: TestContext) -> None:
             assert backup is not None
             assert Path(backup.database_path).is_file()
             assert Path(backup.manifest_path).is_file()
+            pending_after_repair = await (
+                await conn.execute(
+                    "SELECT COUNT(*) FROM legacy_session_changes "
+                    "WHERE processed_at_ms IS NULL"
+                )
+            ).fetchone()
             first = await _migration_state(path)
 
             repeated = await ensure_operational_storage(
@@ -82,6 +139,10 @@ async def t_backup_and_idempotence(_ctx: TestContext) -> None:
             await conn.close()
 
         assert repeated is None
+        # A first upgrade has no backfill checkpoint yet. The post-v2 repair
+        # must not synchronously enumerate/queue the whole legacy corpus.
+        assert pending_after_repair is not None
+        assert int(pending_after_repair[0]) == 0
         assert first == second
         status, phase, events = second
         assert (status, phase) == ("complete", "shadow")
@@ -131,6 +192,128 @@ async def t_executescript_crash_recovery(_ctx: TestContext) -> None:
         assert recovered[0:2] == ("complete", "shadow")
         assert recovered[2]["ddl_completed"] == 1
         assert recovered[2]["phase_changed"] == 1
+
+
+@test("operational_storage", "committed tool-context DDL resumes without duplicate retries")
+async def t_tool_context_repair_crash_recovery(_ctx: TestContext) -> None:
+    import json
+
+    import src.memory.operational.schema as schema
+    from src.memory.db import MemoryDB
+
+    with TemporaryDirectory(prefix="openagent-operational-repair-recovery-") as directory:
+        path = Path(directory) / "openagent.db"
+        real_ensure = schema._ensure_tool_call_context_repair
+
+        async def _skip_repair(
+            _conn: aiosqlite.Connection,
+            *,
+            app_version: str,
+        ) -> bool:
+            del app_version
+            return False
+
+        schema._ensure_tool_call_context_repair = _skip_repair
+        db = MemoryDB(str(path))
+        try:
+            await db.connect()
+        finally:
+            schema._ensure_tool_call_context_repair = real_ensure
+        conn = db._conn
+        assert conn is not None
+        try:
+            await conn.execute(
+                "INSERT INTO sessions "
+                "(session_id, session_type, agent_id, user_id, metadata, runs, "
+                "created_at, updated_at) "
+                "VALUES ('repair-gap', 'agent', 'openagent', 'openagent', ?, "
+                "'[]', 1700000000, 1700000100)",
+                (json.dumps({"client_id": "alice", "title": "Repair gap"}),),
+            )
+            await conn.execute("DELETE FROM legacy_session_changes")
+            await conn.execute(
+                "UPDATE storage_migration_state SET checkpoint_updated_at=1700000100, "
+                "checkpoint_session_id='repair-gap', failed_sessions=1 "
+                "WHERE singleton_id=1"
+            )
+            await conn.commit()
+
+            real_verify = schema._verify_tool_call_context_repair
+            failed_once = False
+
+            async def _fail_after_committed_ddl(
+                raw_conn: aiosqlite.Connection,
+            ) -> None:
+                nonlocal failed_once
+                await real_verify(raw_conn)
+                if not failed_once:
+                    failed_once = True
+                    raise RuntimeError("synthetic crash after repair DDL commit")
+
+            schema._verify_tool_call_context_repair = _fail_after_committed_ddl
+            try:
+                try:
+                    await schema._ensure_tool_call_context_repair(
+                        conn,
+                        app_version="test-beta",
+                    )
+                except RuntimeError:
+                    pass
+                else:
+                    raise AssertionError("post-DDL repair crash was not injected")
+            finally:
+                schema._verify_tool_call_context_repair = real_verify
+
+            failed_ledger = await (
+                await conn.execute(
+                    "SELECT status FROM schema_migrations WHERE migration_id=?",
+                    (schema.TOOL_CALL_CONTEXT_REPAIR_MIGRATION_ID,),
+                )
+            ).fetchone()
+            indexes_after_crash = {
+                str(row[1])
+                for row in await (
+                    await conn.execute("PRAGMA index_list(tool_invocations)")
+                ).fetchall()
+            }
+            retries_after_crash = await (
+                await conn.execute(
+                    "SELECT COUNT(*) FROM legacy_session_changes "
+                    "WHERE session_id='repair-gap'"
+                )
+            ).fetchone()
+            assert failed_ledger is not None and str(failed_ledger[0]) == "failed"
+            assert "uq_tool_invocations_call_context" not in indexes_after_crash
+            assert (
+                "uq_tool_invocations_session_run_call_context"
+                in indexes_after_crash
+            )
+            assert retries_after_crash is not None
+            assert int(retries_after_crash[0]) == 1
+
+            resumed = await schema._ensure_tool_call_context_repair(
+                conn,
+                app_version="test-beta",
+            )
+            complete_ledger = await (
+                await conn.execute(
+                    "SELECT status FROM schema_migrations WHERE migration_id=?",
+                    (schema.TOOL_CALL_CONTEXT_REPAIR_MIGRATION_ID,),
+                )
+            ).fetchone()
+            retries_after_resume = await (
+                await conn.execute(
+                    "SELECT COUNT(*) FROM legacy_session_changes "
+                    "WHERE session_id='repair-gap'"
+                )
+            ).fetchone()
+            assert resumed is True
+            assert complete_ledger is not None
+            assert str(complete_ledger[0]) == "complete"
+            assert retries_after_resume is not None
+            assert int(retries_after_resume[0]) == 1
+        finally:
+            await db.close()
 
 
 @test("operational_storage", "legacy REAL timestamps are accepted by the strict change journal")
@@ -319,6 +502,478 @@ async def t_session_projection(_ctx: TestContext) -> None:
         ]
         assert [tuple(row) for row in tools] == [("shell_execute", "success")]
         assert pending is not None and pending[0] == 0
+
+
+@test("operational_storage", "tool_call_id reuse is isolated by run and search message")
+async def t_tool_call_id_reuse_across_runs(_ctx: TestContext) -> None:
+    import json
+
+    from src.memory.db import MemoryDB
+    from src.memory.operational.search import _source_row
+
+    with TemporaryDirectory(prefix="openagent-operational-tool-context-") as directory:
+        db = MemoryDB(str(Path(directory) / "openagent.db"))
+        await db.connect()
+        conn = db._conn
+        assert conn is not None
+        try:
+            await db.upsert_session(
+                "tool-context-canary",
+                client_id="alice",
+                title="Tool context canary",
+            )
+            await conn.execute(
+                "UPDATE sessions SET runs=?, updated_at=? WHERE session_id=?",
+                (
+                    json.dumps(_reused_tool_call_runs()),
+                    1_700_000_200,
+                    "tool-context-canary",
+                ),
+            )
+            await db._project_operational_session("tool-context-canary")
+            await conn.commit()
+
+            tools = await (
+                await conn.execute(
+                    "SELECT id, session_run_id, tool_call_id, result_text "
+                    "FROM tool_invocations WHERE session_id=? "
+                    "ORDER BY session_run_id",
+                    ("tool-context-canary",),
+                )
+            ).fetchall()
+            assert len(tools) == 2
+            assert len({str(row[0]) for row in tools}) == 2
+            assert [str(row[1]) for row in tools] == [
+                "run:tool-context-canary:run-a",
+                "run:tool-context-canary:run-b",
+            ]
+            assert [str(row[2]) for row in tools] == [
+                "reused-call",
+                "reused-call",
+            ]
+            assert [str(row[3]) for row in tools] == [
+                "first distinct result",
+                "second distinct result",
+            ]
+
+            message_ids: list[str] = []
+            for row in tools:
+                source = await _source_row(conn, "tool_invocation", str(row[0]))
+                assert source is not None
+                message_ids.append(str(source[0]["message_id"]))
+            assert message_ids == [
+                "msg:tool-context-canary:tool-message-a",
+                "msg:tool-context-canary:tool-message-b",
+            ]
+        finally:
+            await db.close()
+
+
+@test("operational_storage", "same-run duplicate tool_call_id is rejected atomically")
+async def t_same_run_duplicate_tool_call_id(_ctx: TestContext) -> None:
+    import json
+
+    from src.memory.db import MemoryDB
+    from src.memory.operational.repository import project_legacy_session_async
+
+    with TemporaryDirectory(prefix="openagent-operational-tool-duplicate-") as directory:
+        db = MemoryDB(str(Path(directory) / "openagent.db"))
+        await db.connect()
+        conn = db._conn
+        assert conn is not None
+        try:
+            await db.upsert_session(
+                "same-run-duplicate",
+                client_id="alice",
+                title="Same run duplicate",
+            )
+            run = _reused_tool_call_runs()[0]
+            assert isinstance(run["tools"], list)
+            run["tools"] = [run["tools"][0], dict(run["tools"][0])]
+            await conn.execute(
+                "UPDATE sessions SET runs=?, updated_at=? WHERE session_id=?",
+                (json.dumps([run]), 1_700_000_200, "same-run-duplicate"),
+            )
+
+            await conn.execute("SAVEPOINT same_run_duplicate")
+            try:
+                await project_legacy_session_async(conn, "same-run-duplicate")
+            except sqlite3.IntegrityError:
+                await conn.execute("ROLLBACK TO SAVEPOINT same_run_duplicate")
+                await conn.execute("RELEASE SAVEPOINT same_run_duplicate")
+            else:
+                raise AssertionError("same-run duplicate tool_call_id was accepted")
+
+            projected_tools = await (
+                await conn.execute(
+                    "SELECT COUNT(*) FROM tool_invocations WHERE session_id=?",
+                    ("same-run-duplicate",),
+                )
+            ).fetchone()
+            pending = await (
+                await conn.execute(
+                    "SELECT COUNT(*) FROM legacy_session_changes "
+                    "WHERE session_id=? AND processed_at_ms IS NULL",
+                    ("same-run-duplicate",),
+                )
+            ).fetchone()
+            assert projected_tools is not None and int(projected_tools[0]) == 0
+            assert pending is not None and int(pending[0]) == 1
+            await conn.commit()
+        finally:
+            await db.close()
+
+
+@test("operational_storage", "failed backfill retries durably without starving new work")
+async def t_backfill_retry_is_durable_and_fair(_ctx: TestContext) -> None:
+    import json
+
+    import src.memory.operational.repository as repository
+    from src.memory.db import MemoryDB
+
+    with TemporaryDirectory(prefix="openagent-operational-retry-") as directory:
+        db = MemoryDB(str(Path(directory) / "openagent.db"))
+        await db.connect()
+        conn = db._conn
+        assert conn is not None
+        try:
+            for session_id, updated_at in (
+                ("retry-a", 1_700_000_100),
+                ("retry-b", 1_700_000_200),
+            ):
+                await conn.execute(
+                    "INSERT INTO sessions "
+                    "(session_id, session_type, agent_id, user_id, metadata, "
+                    "runs, created_at, updated_at) "
+                    "VALUES (?, 'agent', 'openagent', 'openagent', ?, '[]', ?, ?)",
+                    (
+                        session_id,
+                        json.dumps({"client_id": "alice", "title": session_id}),
+                        updated_at - 1,
+                        updated_at,
+                    ),
+                )
+            await conn.execute("DELETE FROM legacy_session_changes")
+            await conn.commit()
+
+            real_project = repository.project_legacy_session
+
+            def _fail_one(raw_conn, session_id: str, *, now_ms=None):
+                if session_id == "retry-a":
+                    raise RuntimeError("synthetic transient projection failure")
+                return real_project(raw_conn, session_id, now_ms=now_ms)
+
+            repository.project_legacy_session = _fail_one
+            try:
+                writes, complete = await repository.backfill_batch_async(
+                    conn,
+                    limit=100,
+                )
+                await conn.commit()
+            finally:
+                repository.project_legacy_session = real_project
+
+            before = await repository.projection_coverage_async(conn)
+            state_before = await (
+                await conn.execute(
+                    "SELECT failed_sessions FROM storage_migration_state "
+                    "WHERE singleton_id=1"
+                )
+            ).fetchone()
+            retry = await (
+                await conn.execute(
+                    "SELECT attempt_count, last_error_class "
+                    "FROM legacy_session_changes WHERE session_id='retry-a' "
+                    "AND processed_at_ms IS NULL"
+                )
+            ).fetchone()
+            assert complete is True
+            assert [write.session_id for write in writes] == ["retry-b"]
+            assert before == {
+                "legacy_sessions": 2,
+                "projected_sessions": 1,
+                "failed_sessions": 1,
+                "pending_sessions": 1,
+                "complete": False,
+            }
+            assert state_before is not None and int(state_before[0]) == 1
+            assert retry is not None
+            assert tuple(retry) == (1, "RuntimeError")
+
+            # A new attempt-0 journal row must run before the older failed
+            # attempt-1 row, so a poison session cannot monopolize a batch.
+            await conn.execute(
+                "INSERT INTO sessions "
+                "(session_id, session_type, agent_id, user_id, metadata, runs, "
+                "created_at, updated_at) "
+                "VALUES ('retry-c', 'agent', 'openagent', 'openagent', ?, '[]', ?, ?)",
+                (
+                    json.dumps({"client_id": "alice", "title": "retry-c"}),
+                    1_700_000_299,
+                    1_700_000_300,
+                ),
+            )
+            await conn.commit()
+            first_retry = await repository.reconcile_pending_async(conn, limit=1)
+            await conn.commit()
+            assert [write.session_id for write in first_retry] == ["retry-c"]
+            still_failed = await (
+                await conn.execute(
+                    "SELECT 1 FROM legacy_session_changes "
+                    "WHERE session_id='retry-a' AND processed_at_ms IS NULL"
+                )
+            ).fetchone()
+            assert still_failed is not None
+
+            recovered = await repository.reconcile_pending_async(conn, limit=10)
+            await conn.commit()
+            assert [write.session_id for write in recovered] == ["retry-a"]
+            after = await repository.projection_coverage_async(conn)
+            state_after = await (
+                await conn.execute(
+                    "SELECT failed_sessions FROM storage_migration_state "
+                    "WHERE singleton_id=1"
+                )
+            ).fetchone()
+            assert after == {
+                "legacy_sessions": 3,
+                "projected_sessions": 3,
+                "failed_sessions": 0,
+                "pending_sessions": 0,
+                "complete": True,
+            }
+            assert state_after is not None and int(state_after[0]) == 0
+        finally:
+            await db.close()
+
+
+@test("operational_storage", "beta3 ledger repair retries missing backfill and stays downgrade-readable")
+async def t_beta3_tool_context_repair(_ctx: TestContext) -> None:
+    import json
+
+    import src.memory.operational.schema as schema
+    from src.memory.db import MemoryDB
+    from src.memory.operational.repository import (
+        project_legacy_session_async,
+        projection_coverage_async,
+    )
+
+    with TemporaryDirectory(prefix="openagent-operational-beta3-repair-") as directory:
+        path = Path(directory) / "openagent.db"
+        real_repair = schema._ensure_tool_call_context_repair
+
+        async def _old_beta3_no_repair(
+            _conn: aiosqlite.Connection,
+            *,
+            app_version: str,
+        ) -> bool:
+            del app_version
+            return False
+
+        # Build the exact already-ledgerized beta3 shape: v2 is complete and
+        # still owns the old session-global unique index.
+        schema._ensure_tool_call_context_repair = _old_beta3_no_repair
+        beta3 = MemoryDB(str(path))
+        try:
+            await beta3.connect()
+        finally:
+            schema._ensure_tool_call_context_repair = real_repair
+        conn = beta3._conn
+        assert conn is not None
+        legacy_runs = json.dumps(_reused_tool_call_runs(), separators=(",", ":"))
+        try:
+            await conn.executemany(
+                "INSERT INTO sessions "
+                "(session_id, session_type, agent_id, user_id, metadata, runs, "
+                "created_at, updated_at) VALUES (?, 'agent', 'openagent', "
+                "'openagent', ?, ?, ?, ?)",
+                (
+                    (
+                        "beta3-missing",
+                        json.dumps(
+                            {"client_id": "alice", "title": "Beta3 missing"}
+                        ),
+                        legacy_runs,
+                        1_700_000_000,
+                        1_700_000_200,
+                    ),
+                    (
+                        "beta3-pending",
+                        json.dumps(
+                            {"client_id": "alice", "title": "Beta3 pending"}
+                        ),
+                        "[]",
+                        1_700_000_000,
+                        1_700_000_300,
+                    ),
+                ),
+            )
+            await conn.execute("DELETE FROM legacy_session_changes")
+
+            # Prove that the already-shipped index rejects this valid source,
+            # then construct beta3's persisted aggregate-only failure state.
+            await conn.execute("SAVEPOINT beta3_old_projection")
+            try:
+                await project_legacy_session_async(conn, "beta3-missing")
+            except sqlite3.IntegrityError:
+                await conn.execute("ROLLBACK TO SAVEPOINT beta3_old_projection")
+                await conn.execute("RELEASE SAVEPOINT beta3_old_projection")
+            else:
+                raise AssertionError("old beta3 index accepted cross-run call reuse")
+            await conn.execute(
+                "INSERT INTO legacy_session_changes "
+                "(session_id, operation, legacy_updated_at) "
+                "VALUES ('beta3-pending', 'update', 1700000300)"
+            )
+            await conn.execute(
+                "UPDATE storage_migration_state SET checkpoint_updated_at=?, "
+                "checkpoint_session_id=?, failed_sessions=2 WHERE singleton_id=1",
+                (1_700_000_300, "beta3-pending"),
+            )
+            await conn.commit()
+            before = await projection_coverage_async(conn)
+            state_before = await (
+                await conn.execute(
+                    "SELECT failed_sessions FROM storage_migration_state "
+                    "WHERE singleton_id=1"
+                )
+            ).fetchone()
+            base_ledger = await (
+                await conn.execute(
+                    "SELECT checksum, status FROM schema_migrations "
+                    "WHERE migration_id=?",
+                    (schema.MIGRATION_ID,),
+                )
+            ).fetchone()
+            old_index = await (
+                await conn.execute(
+                    "SELECT 1 FROM sqlite_schema WHERE type='index' AND name=?",
+                    ("uq_tool_invocations_call_context",),
+                )
+            ).fetchone()
+            assert before == {
+                "legacy_sessions": 2,
+                "projected_sessions": 0,
+                "failed_sessions": 0,
+                "pending_sessions": 1,
+                "complete": False,
+            }
+            assert state_before is not None and int(state_before[0]) == 2
+            assert base_ledger is not None
+            assert tuple(base_ledger) == (schema.operational_schema_checksum(), "complete")
+            assert schema.operational_schema_checksum() == (
+                "ce406057aec3d3b0076e3750045ae24ab50f7829396809ae8f72defdd2111863"
+            )
+            assert old_index is not None
+        finally:
+            await beta3.close()
+
+        # A current binary applies only the separate repair ledger, queues the
+        # missing source and lets normal startup reconciliation finish it.
+        repaired = MemoryDB(str(path))
+        await repaired.connect()
+        conn = repaired._conn
+        assert conn is not None
+        try:
+            after = await projection_coverage_async(conn)
+            base_ledger = await (
+                await conn.execute(
+                    "SELECT checksum, status FROM schema_migrations "
+                    "WHERE migration_id=?",
+                    (schema.MIGRATION_ID,),
+                )
+            ).fetchone()
+            repair_ledger = await (
+                await conn.execute(
+                    "SELECT checksum, status FROM schema_migrations "
+                    "WHERE migration_id=?",
+                    (schema.TOOL_CALL_CONTEXT_REPAIR_MIGRATION_ID,),
+                )
+            ).fetchone()
+            tools = await (
+                await conn.execute(
+                    "SELECT session_run_id, tool_call_id FROM tool_invocations "
+                    "WHERE session_id=? ORDER BY session_run_id",
+                    ("beta3-missing",),
+                )
+            ).fetchall()
+            preserved = await (
+                await conn.execute(
+                    "SELECT runs FROM sessions WHERE session_id=?",
+                    ("beta3-missing",),
+                )
+            ).fetchone()
+            state_after = await (
+                await conn.execute(
+                    "SELECT failed_sessions FROM storage_migration_state "
+                    "WHERE singleton_id=1"
+                )
+            ).fetchone()
+            pending_journal_rows = await (
+                await conn.execute(
+                    "SELECT session_id, COUNT(*) FROM legacy_session_changes "
+                    "GROUP BY session_id ORDER BY session_id"
+                )
+            ).fetchall()
+            assert after == {
+                "legacy_sessions": 2,
+                "projected_sessions": 2,
+                "failed_sessions": 0,
+                "pending_sessions": 0,
+                "complete": True,
+            }
+            assert state_after is not None and int(state_after[0]) == 0
+            assert base_ledger is not None
+            assert tuple(base_ledger) == (schema.operational_schema_checksum(), "complete")
+            assert repair_ledger is not None
+            assert tuple(repair_ledger) == (
+                schema.tool_call_context_repair_checksum(),
+                "complete",
+            )
+            assert [tuple(row) for row in tools] == [
+                ("run:beta3-missing:run-a", "reused-call"),
+                ("run:beta3-missing:run-b", "reused-call"),
+            ]
+            assert preserved is not None and str(preserved[0]) == legacy_runs
+            assert [tuple(row) for row in pending_journal_rows] == [
+                ("beta3-missing", 1),
+                ("beta3-pending", 1),
+            ]
+
+            # Re-entry is ledger-idempotent and does not fabricate retry rows.
+            repeated = await schema._ensure_tool_call_context_repair(
+                conn,
+                app_version="test-beta",
+            )
+            pending = await (
+                await conn.execute(
+                    "SELECT COUNT(*) FROM legacy_session_changes "
+                    "WHERE processed_at_ms IS NULL"
+                )
+            ).fetchone()
+            assert repeated is False
+            assert pending is not None and int(pending[0]) == 0
+        finally:
+            await repaired.close()
+
+        # Simulate the previous beta's bootstrap after rollback. It knows only
+        # the immutable v2 ledger; the additive indexes and projected rows do
+        # not prevent it from opening and reading the canonical legacy blob.
+        schema._ensure_tool_call_context_repair = _old_beta3_no_repair
+        downgraded = MemoryDB(str(path))
+        try:
+            await downgraded.connect()
+            assert downgraded._conn is not None
+            row = await (
+                await downgraded._conn.execute(
+                    "SELECT runs FROM sessions WHERE session_id=?",
+                    ("beta3-missing",),
+                )
+            ).fetchone()
+            assert row is not None and str(row[0]) == legacy_runs
+        finally:
+            schema._ensure_tool_call_context_repair = real_repair
+            await downgraded.close()
 
 
 @test("operational_storage", "SQLAlchemy runtime write is query-ready before restart")

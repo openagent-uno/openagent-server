@@ -28,6 +28,10 @@ import aiosqlite
 OPERATIONAL_SCHEMA_VERSION = 2
 MIGRATION_ID = "operational-storage-v2"
 MIGRATION_DESCRIPTION = "add normalized operational history and projections"
+TOOL_CALL_CONTEXT_REPAIR_MIGRATION_ID = "operational-tool-call-context-v1"
+TOOL_CALL_CONTEXT_REPAIR_DESCRIPTION = (
+    "scope session tool-call uniqueness to one run and retry missing projections"
+)
 _MIN_SQLITE_VERSION = (3, 38, 0)
 _LOCK_CONTENTION_ERRNOS = {
     errno.EACCES,
@@ -70,8 +74,18 @@ def operational_search_schema_sql() -> str:
     return _resource_text("operational_search_v1.sql")
 
 
+def tool_call_context_repair_sql() -> str:
+    return _resource_text("operational_tool_call_context_v1.sql")
+
+
 def operational_schema_checksum() -> str:
     return hashlib.sha256(operational_schema_sql().encode("utf-8")).hexdigest()
+
+
+def tool_call_context_repair_checksum() -> str:
+    return hashlib.sha256(
+        tool_call_context_repair_sql().encode("utf-8")
+    ).hexdigest()
 
 
 class _MigrationFileLock:
@@ -443,6 +457,212 @@ async def _verify_installed_schema(conn: aiosqlite.Connection) -> None:
         raise OperationalMigrationError("operational storage state is missing or stale")
 
 
+async def _verify_tool_call_context_repair(
+    conn: aiosqlite.Connection,
+) -> None:
+    tool_rows = await (
+        await conn.execute("PRAGMA index_list(tool_invocations)")
+    ).fetchall()
+    tool_indexes = {
+        str(row[1]): (int(row[2]), int(row[4]))
+        for row in tool_rows
+    }
+    if "uq_tool_invocations_call_context" in tool_indexes:
+        raise OperationalMigrationError(
+            "obsolete session-global tool-call index is still installed"
+        )
+    message_rows = await (
+        await conn.execute("PRAGMA index_list(session_messages)")
+    ).fetchall()
+    message_indexes = {
+        str(row[1]): (int(row[2]), int(row[4]))
+        for row in message_rows
+    }
+    expected = {
+        "uq_tool_invocations_session_run_call_context": (
+            tool_indexes,
+            1,
+            ("session_run_id", "tool_call_id"),
+            "where root_kind = 'session' and session_run_id is not null "
+            "and tool_call_id is not null",
+        ),
+        "uq_tool_invocations_session_root_call_context": (
+            tool_indexes,
+            1,
+            ("root_kind", "root_id", "tool_call_id"),
+            "where root_kind = 'session' and session_run_id is null "
+            "and tool_call_id is not null",
+        ),
+        "uq_tool_invocations_non_session_call_context": (
+            tool_indexes,
+            1,
+            ("root_kind", "root_id", "tool_call_id"),
+            "where root_kind <> 'session' and tool_call_id is not null",
+        ),
+        "idx_session_messages_run_tool_call": (
+            message_indexes,
+            0,
+            ("session_id", "run_id", "tool_call_id"),
+            "where run_id is not null and tool_call_id is not null",
+        ),
+    }
+    definitions = {
+        str(row[0]): " ".join(str(row[1] or "").lower().split())
+        for row in await (
+            await conn.execute(
+                "SELECT name, sql FROM sqlite_schema WHERE type='index' "
+                f"AND name IN ({','.join('?' for _ in expected)})",
+                tuple(expected),
+            )
+        ).fetchall()
+    }
+    for name, (indexes, expected_unique, expected_columns, predicate) in expected.items():
+        if name not in indexes:
+            raise OperationalMigrationError(
+                f"tool-call context repair is missing index {name}"
+            )
+        unique, partial = indexes[name]
+        if unique != expected_unique or partial != 1:
+            raise OperationalMigrationError(
+                f"tool-call context repair index {name} has invalid flags"
+            )
+        columns = await (
+            await conn.execute(f"PRAGMA index_info({name})")
+        ).fetchall()
+        actual = tuple(str(row[2]) for row in columns)
+        if actual != expected_columns:
+            raise OperationalMigrationError(
+                f"tool-call context repair index {name} has columns {actual!r}"
+            )
+        if predicate not in definitions.get(name, ""):
+            raise OperationalMigrationError(
+                f"tool-call context repair index {name} has an invalid predicate"
+            )
+
+
+async def _tool_call_context_repair_row(
+    conn: aiosqlite.Connection,
+) -> tuple[str, str] | None:
+    checksum = tool_call_context_repair_checksum()
+    existing = await (
+        await conn.execute(
+            "SELECT checksum, status FROM schema_migrations WHERE migration_id=?",
+            (TOOL_CALL_CONTEXT_REPAIR_MIGRATION_ID,),
+        )
+    ).fetchone()
+    if existing is not None and str(existing[0]) != checksum:
+        raise OperationalMigrationError(
+            "operational-tool-call-context-v1 checksum differs from the migration ledger"
+        )
+    if existing is None:
+        return None
+    return str(existing[0]), str(existing[1])
+
+
+async def _mark_tool_call_context_repair_failed(
+    conn: aiosqlite.Connection,
+    exc: BaseException,
+) -> None:
+    try:
+        existing = await (
+            await conn.execute(
+                "SELECT status FROM schema_migrations WHERE migration_id=?",
+                (TOOL_CALL_CONTEXT_REPAIR_MIGRATION_ID,),
+            )
+        ).fetchone()
+        if existing is None or str(existing[0]) == "complete":
+            return
+        now_ms = int(time.time() * 1000)
+        await conn.execute(
+            "UPDATE schema_migrations SET status='failed', completed_at_ms=?, "
+            "error_class=?, updated_at_ms=? WHERE migration_id=?",
+            (
+                now_ms,
+                type(exc).__name__[:200],
+                now_ms,
+                TOOL_CALL_CONTEXT_REPAIR_MIGRATION_ID,
+            ),
+        )
+        await conn.commit()
+    except Exception:
+        await conn.rollback()
+
+
+async def _ensure_tool_call_context_repair(
+    conn: aiosqlite.Connection,
+    *,
+    app_version: str,
+) -> bool:
+    """Apply the post-v2 repair without mutating the v2 SQL checksum.
+
+    Returns ``True`` only when this invocation completed or resumed the repair.
+    The DDL and retry queue update own one SQLite transaction; a crash leaves a
+    resumable ``running`` ledger row and never changes ``sessions.runs``.
+    """
+
+    existing = await _tool_call_context_repair_row(conn)
+    if existing is not None and existing[1] == "complete":
+        await _verify_tool_call_context_repair(conn)
+        return False
+
+    now_ms = int(time.time() * 1000)
+    checksum = tool_call_context_repair_checksum()
+    if existing is None:
+        await conn.execute(
+            "INSERT INTO schema_migrations "
+            "(migration_id, checksum, description, status, started_at_ms, "
+            "completed_at_ms, app_version, runner_id, error_class, "
+            "created_at_ms, updated_at_ms) "
+            "VALUES (?, ?, ?, 'running', ?, NULL, ?, ?, NULL, ?, ?)",
+            (
+                TOOL_CALL_CONTEXT_REPAIR_MIGRATION_ID,
+                checksum,
+                TOOL_CALL_CONTEXT_REPAIR_DESCRIPTION,
+                now_ms,
+                app_version,
+                f"pid:{os.getpid()}",
+                now_ms,
+                now_ms,
+            ),
+        )
+    else:
+        await conn.execute(
+            "UPDATE schema_migrations SET status='running', "
+            "started_at_ms=COALESCE(started_at_ms, ?), completed_at_ms=NULL, "
+            "app_version=?, runner_id=?, error_class=NULL, updated_at_ms=? "
+            "WHERE migration_id=? AND status!='complete'",
+            (
+                now_ms,
+                app_version,
+                f"pid:{os.getpid()}",
+                now_ms,
+                TOOL_CALL_CONTEXT_REPAIR_MIGRATION_ID,
+            ),
+        )
+    await conn.commit()
+
+    try:
+        await conn.executescript(tool_call_context_repair_sql())
+        await _verify_tool_call_context_repair(conn)
+        completed_at_ms = int(time.time() * 1000)
+        await conn.execute(
+            "UPDATE schema_migrations SET status='complete', completed_at_ms=?, "
+            "error_class=NULL, updated_at_ms=? "
+            "WHERE migration_id=? AND status!='complete'",
+            (
+                completed_at_ms,
+                completed_at_ms,
+                TOOL_CALL_CONTEXT_REPAIR_MIGRATION_ID,
+            ),
+        )
+        await conn.commit()
+        return True
+    except Exception as exc:
+        await conn.rollback()
+        await _mark_tool_call_context_repair_failed(conn, exc)
+        raise
+
+
 async def _begin_or_resume_migration(
     conn: aiosqlite.Connection,
     *,
@@ -661,6 +881,10 @@ async def ensure_operational_storage(
         if await _automation_bridge_compatible(conn):
             await conn.executescript(automation_bridge_sql())
         await _complete_migration(
+            conn,
+            app_version=app_version,
+        )
+        await _ensure_tool_call_context_repair(
             conn,
             app_version=app_version,
         )
