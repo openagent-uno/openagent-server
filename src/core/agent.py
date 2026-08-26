@@ -603,8 +603,15 @@ def _origin_of(session_id: str | None) -> str:
     return session_id.split(":", 1)[0].strip()
 
 
-def _recall_scoping(origin: str) -> tuple[str, list[str], list[str], str]:
+def _recall_scoping(origin: str) -> tuple[str, list[str], list[str], list[str]]:
     """Per-origin recall-corpus config: ``(scope, include, exclude, reserve)``.
+
+    ``reserve`` e' una LISTA di prefissi, non uno solo. Con un posto riservato
+    unico due sottoalberi autorevoli si contendono lo stesso slot e a ogni
+    turno uno dei due sparisce in silenzio — il caso misurato: le procedure di
+    customer-response e le regole permanenti rispecchiate dal supporto sono
+    entrambe autorevoli, e servono insieme. La forma a stringa singola resta
+    valida e diventa una lista di un elemento.
 
     Each knob reads an ORIGIN-suffixed env var first (e.g.
     ``OPENAGENT_AUTO_RECALL_EXCLUDE_PATHS_EVENT``) and falls back to the
@@ -629,7 +636,7 @@ def _recall_scoping(origin: str) -> tuple[str, list[str], list[str], str]:
     return (scope,
             prefixes("OPENAGENT_AUTO_RECALL_INCLUDE_PATHS"),
             prefixes("OPENAGENT_AUTO_RECALL_EXCLUDE_PATHS"),
-            pick("OPENAGENT_AUTO_RECALL_RESERVE_PREFIX").lstrip("/"))
+            prefixes("OPENAGENT_AUTO_RECALL_RESERVE_PREFIX"))
 
 
 def _path_allowed(path: str, include: list[str], exclude: list[str]) -> bool:
@@ -904,20 +911,28 @@ def _recall_block(agent: Any, query: str, session_id: str | None = None) -> str:
     # always surfaces ALONGSIDE near-duplicate precedent (which by sheer volume
     # otherwise buries it). No-op unless configured, semantic is live, and no
     # reserved-prefix note is already in the set.
-    if reserve and semantic_active and hits and not any(
-            (h.get("path") or "").lstrip("/").startswith(reserve) for h in hits):
-        try:
-            res = idx.search(query, scope="vault", limit=1, min_score=0.0,
-                             include_prefixes=[reserve])
-        except Exception:  # noqa: BLE001 — reserve is best-effort, never fatal
-            res = []
-        if res:
-            # Prepend the reserved playbook WITHOUT evicting a real hit — grow the
-            # block by one rather than dropping precedent to make room (the block
-            # is still bounded by _format_recall_block's char cap). Data-safe: the
-            # authoritative rule is ADDED alongside the precedent, never instead.
-            hits = [res[0]] + [h for h in hits
-                               if (h.get("path") or "") != (res[0].get("path") or "")]
+    # Un posto per OGNI sottoalbero riservato. Con uno solo, due corpora
+    # autorevoli si contendono lo stesso slot e il perdente non compare — e
+    # non lo dice nessuno. Misurato: le regole permanenti rispecchiate stanno
+    # a 0,36-0,50 di similarita' (sotto il floor di 0,75) e fuori dai primi
+    # 200 risultati FTS su un vault di 4.700 note: senza un posto proprio non
+    # escono MAI, per nessuna delle due gambe.
+    if reserve and semantic_active and hits:
+        for _pre in reserve:
+            if any((h.get("path") or "").lstrip("/").startswith(_pre) for h in hits):
+                continue  # gia' rappresentato: non si duplica
+            try:
+                res = idx.search(query, scope="vault", limit=1, min_score=0.0,
+                                 include_prefixes=[_pre])
+            except Exception:  # noqa: BLE001 — reserve is best-effort, never fatal
+                res = []
+            if res:
+                # Si PREPONE senza sfrattare un risultato vero: il blocco cresce
+                # di uno invece di perdere un precedente (resta comunque limitato
+                # dal cap sui caratteri in _format_recall_block). La regola
+                # autorevole si AGGIUNGE al precedente, mai al suo posto.
+                hits = [res[0]] + [h for h in hits
+                                   if (h.get("path") or "") != (res[0].get("path") or "")]
     # Skills leg (Layer C): surface the single most relevant WRITTEN skill by
     # MEANING, so a distilled skill is discoverable per turn — not only via the
     # static index the model has to think to consult. A separate query over the

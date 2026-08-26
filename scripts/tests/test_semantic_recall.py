@@ -727,7 +727,10 @@ async def t_recall_scoping_helpers(ctx: TestContext) -> None:
     _clear_recall_env()
     try:
         # unconfigured = identity (byte-identical to pre-scoping behaviour)
-        assert _recall_scoping("event") == ("all", [], [], "")
+        # `reserve` e' una LISTA dal 26-ago-2026: due sottoalberi autorevoli
+        # non possono contendersi un posto solo, o a ogni turno uno dei due
+        # sparisce in silenzio. Il default resta l'identita'.
+        assert _recall_scoping("event") == ("all", [], [], [])
         # default applies to every origin
         os.environ["OPENAGENT_AUTO_RECALL_EXCLUDE_PATHS"] = "devops/, arc/"
         assert _recall_scoping("chat")[2] == ["devops/", "arc/"]
