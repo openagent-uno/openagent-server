@@ -69,6 +69,22 @@ logger = logging.getLogger(__name__)
 _DEFAULT_MAX_TOOL_CALLS_PER_RUN = 60
 
 
+def _repeat_guard_hook(name, next_func, arguments=None):
+    """Ponte verso ``src.core.tool_repeat``, sincrono o asincrono.
+
+    La catena dei tool del runtime ha due varianti e l'hook deve stare in
+    entrambe: se ``next_func`` e' una coroutine si restituisce la coroutine
+    della guardia asincrona, cosi' il chiamante la attende come si aspetta.
+    """
+    import inspect
+
+    from src.core.tool_repeat import repeat_guard, repeat_guard_async
+
+    if inspect.iscoroutinefunction(next_func):
+        return repeat_guard_async(name, next_func, arguments)
+    return repeat_guard(name, next_func, arguments)
+
+
 def _max_tool_calls_per_run() -> Optional[int]:
     from src.core.execution_profile import lean_local_event_active
 
@@ -1373,6 +1389,10 @@ class NativeProvider(BaseModel):
             # re-sends the whole context, so an unbounded loop pays for the
             # history again on each one.
             tool_call_limit=_max_tool_calls_per_run(),
+            # Il tetto non ha visto il caso vero: docs-keeper e' arrivato a
+            # 46 chiamate — sotto il tetto — bruciando 857k token perche' i
+            # giri erano lo stesso giro. Questo li riconosce.
+            tool_hooks=[_repeat_guard_hook],
             markdown=False,
         )
         self._agno_agents[sys_key] = agent
@@ -1460,6 +1480,7 @@ class NativeProvider(BaseModel):
                 name=f"{family}_specialist",
                 role=member_role,
                 tool_call_limit=_max_tool_calls_per_run(),
+                tool_hooks=[_repeat_guard_hook],
                 markdown=False,
             )
             members.append(member)
@@ -1492,6 +1513,7 @@ class NativeProvider(BaseModel):
                 add_session_summary_to_context=True,
                 enable_agentic_memory=False,
                 tool_call_limit=_max_tool_calls_per_run(),
+                tool_hooks=[_repeat_guard_hook],
                 markdown=False,
             )
         except Exception as exc:
@@ -1620,6 +1642,14 @@ class NativeProvider(BaseModel):
         so the runtime's native multimodal handling applies (Team
         propagates them to members during ``delegate_task_to_member``).
         """
+        # I contatori delle ripetizioni vivono per ESECUZIONE, non per
+        # agent: gli agent sono in cache e riusati fra turni, e un
+        # contatore appiccicato li' rifiuterebbe domani una lettura
+        # legittima perche' e' gia' stata fatta ieri.
+        from src.core.tool_repeat import begin_run as _begin_repeat_run
+
+        _begin_repeat_run()
+
         prompt = self._flatten_messages(messages)
         sid = session_id or "default"
         # Prefer a Team when the caller supplied a system prompt AND we
