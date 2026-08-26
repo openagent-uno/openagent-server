@@ -341,6 +341,82 @@ class StreamSession:
         except Exception as e:  # noqa: BLE001
             logger.debug("session journal append failed (%s): %s", event_type, e)
 
+    async def _maybe_review_turn(self, reason: str) -> None:
+        """Hand the turn that just ended to the review fork, if it is on.
+
+        The transcript comes from the journal — the events written DURING the
+        turn — rather than from ``sessions.runs``. Two reasons. The journal is
+        already the record of what happened, so the reviewer reads the same
+        thing a person investigating would read; and ``runs`` is the model's
+        surface, which the runtime is rewriting at exactly this moment.
+
+        Everything here is swallowed. The turn is over and the user is reading
+        the answer: a reviewer that breaks the next turn would have traded the
+        product for the library.
+        """
+        try:
+            from src.core.config import skills_settings
+            from src.core.skill_review import schedule_review, should_review
+
+            settings = skills_settings(getattr(self._agent, "config", None) or {})
+            if not should_review(settings, reason=reason):
+                return
+
+            db = (
+                getattr(self._agent, "memory_db", None)
+                or getattr(self._agent, "db", None)
+            )
+            transcript = await self._turn_transcript(db)
+            if not transcript.strip():
+                return
+
+            schedule_review(
+                agent=self._agent,
+                db=db,
+                parent_session_id=self.session_id,
+                transcript=transcript,
+                settings=settings,
+                parent_model=getattr(self._agent, "current_model_id", None),
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("skill review scheduling failed: %s", e)
+
+    async def _turn_transcript(self, db) -> str:
+        """The journal of the turn that just ended, rendered as plain text.
+
+        Walks back to the previous ``turn/end`` and takes everything after it:
+        that is this turn and no more. Sending the whole session would make
+        every review of a long conversation re-read the same history, and the
+        question being asked ("did THIS turn teach anything") is about the
+        last stretch, not the whole thread.
+        """
+        listing = getattr(db, "list_session_events", None)
+        if listing is None:
+            return ""
+        events = await listing(self.session_id, limit=400)
+        if not events:
+            return ""
+
+        start = 0
+        for i in range(len(events) - 2, -1, -1):
+            if events[i].get("type") == "turn/end":
+                start = i + 1
+                break
+
+        parts: list[str] = []
+        for e in events[start:]:
+            kind = e.get("type")
+            data = e.get("data") or {}
+            if kind == "user/message":
+                parts.append("UTENTE: " + str(data.get("text") or ""))
+            elif kind == "assistant/message":
+                parts.append("AGENT: " + str(data.get("text") or ""))
+            elif kind == "tool/status":
+                parts.append("TOOL: " + str(data.get("text") or "")[:1200])
+            elif kind == "error":
+                parts.append("ERRORE: " + str(data.get("text") or ""))
+        return "\n\n".join(p for p in parts if p.strip())
+
     def has_active_turn(self) -> bool:
         """True iff a turn is running or a burst is buffered to dispatch.
 
@@ -394,6 +470,7 @@ class StreamSession:
                 "reason": evt.reason,
                 "error": (evt.error or "")[:500],
             })
+            await self._maybe_review_turn(evt.reason)
         elif isinstance(evt, OutToolStatus):
             await self._journal("tool/status", {"text": (evt.text or "")[:4000]})
         elif isinstance(evt, OutError):

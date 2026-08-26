@@ -26,6 +26,13 @@ import contextvars
 # watching.
 FOREGROUND = "foreground"
 BACKGROUND = "background"
+# "propose" — the post-turn review fork on its first setting: it reads the
+# conversation and says what it WOULD change, and cannot change anything. The
+# order matters and is deliberate. A reviewer that writes from day one gets to
+# rewrite the library before anyone has seen what it wants to write; a
+# reviewer that only proposes can be watched for a week at the cost of reading
+# its notes. Promotion to BACKGROUND is a config change, not a code change.
+PROPOSE = "propose"
 
 _write_origin: contextvars.ContextVar[str] = contextvars.ContextVar(
     "openagent_skill_write_origin", default=FOREGROUND,
@@ -34,7 +41,9 @@ _write_origin: contextvars.ContextVar[str] = contextvars.ContextVar(
 
 def set_write_origin(origin: str) -> contextvars.Token:
     """Mark the current context as ``origin``. Returns a token for reset()."""
-    return _write_origin.set(origin if origin in (FOREGROUND, BACKGROUND) else FOREGROUND)
+    return _write_origin.set(
+        origin if origin in (FOREGROUND, BACKGROUND, PROPOSE) else FOREGROUND,
+    )
 
 
 def reset_write_origin(token: contextvars.Token) -> None:
@@ -51,7 +60,12 @@ def current_write_origin() -> str:
 
 
 def is_background() -> bool:
-    return current_write_origin() == BACKGROUND
+    """True for any autonomous origin — the ones a mutation is checked against."""
+    return current_write_origin() in (BACKGROUND, PROPOSE)
+
+
+def is_propose_only() -> bool:
+    return current_write_origin() == PROPOSE
 
 
 def mutation_refusal(
@@ -69,6 +83,17 @@ def mutation_refusal(
     """
     if not is_background():
         return None  # a human asked; their library, their call
+    if is_propose_only():
+        # The reviewer's whole value in this mode is that its judgement is
+        # visible before it is applied. Refusing here rather than in a prompt
+        # is what makes "propose only" a property of the system instead of a
+        # request the model usually honours.
+        return (
+            f"This pass is proposal-only: it may not {action} {name!r}, or "
+            "anything else. Write what you would change and why — the name, "
+            "what is wrong with it now, and the exact replacement text — and "
+            "stop there. A person decides whether it lands."
+        )
     if pinned:
         return (
             f"{name!r} is pinned. A pin blocks autonomous writes — including "
