@@ -66,6 +66,7 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_builtin_task_parked",
     "test_skill_review",
     "test_think_stream",
+    "test_run_evidence",
     "test_config_patch_merge",
     "test_rest_skills",
     "test_setup",

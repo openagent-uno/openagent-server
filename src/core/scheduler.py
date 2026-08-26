@@ -1194,6 +1194,30 @@ class Scheduler:
                 "failed",
                 f"Child session {session_id} ended without a completed runtime run: {status}",
             )
+        # Prove, non solo esito. Un'esecuzione che dichiara successo senza
+        # aver chiamato un solo tool non ha letto, scritto o mandato niente:
+        # il resoconto e' un'affermazione, non un risultato. Non la si declassa
+        # — un compito che legittimamente non usa tool esiste — ma la si DICE,
+        # perche' nell'archivio e' indistinguibile da un lavoro fatto, ed e'
+        # cosi' che un compito rotto resta vivo per settimane.
+        try:
+            from src.core.run_evidence import unevidenced_reason
+
+            reason = unevidenced_reason(
+                status="success",
+                run=latest,
+                output=_string_preview(latest.get("content")),
+            )
+            if reason:
+                elog(
+                    "task_run.unevidenced",
+                    level="warning",
+                    session_id=session_id,
+                    detail=reason,
+                )
+        except Exception as e:  # noqa: BLE001 — un testimone non rompe cio' che osserva
+            elog("task_run.evidence_check_failed", level="warning", error=str(e))
+
         if _run_was_truncated(latest):
             # Completed, but only because the budget stopped it. Say so: a run
             # that never reached its work is not a success, and reading it as
