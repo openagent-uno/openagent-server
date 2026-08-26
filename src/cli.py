@@ -525,6 +525,24 @@ def serve(ctx, agent_dir: str | None, channel: tuple[str, ...], no_auto_init: bo
     if active_dir is not None:
         kill_stale_serve_processes(active_dir)
 
+    # Igiene del disco, accanto a quella dei processi. Ogni invocazione del
+    # binario si estrae in /tmp/_MEI* e ripulisce uscendo; una uccisa prima
+    # (timeout, exec interrotto) lascia la cartella, e pesa centinaia di MB.
+    # Misurato in produzione: 351 estrazioni orfane su tre agent, 129 GB, con
+    # un overlay arrivato al 100% — e nessun allarme, perche' il pieno era
+    # dentro il container e non sul nodo.
+    try:
+        from src.core.bundle_sweep import sweep as _sweep_bundles
+
+        _esito = _sweep_bundles()
+        if _esito.get("rimosse"):
+            from src.core.logging import elog as _elog
+
+            _elog("bundle.sweep", removed=_esito["rimosse"],
+                  gb=round(_esito["byte"] / 1e9, 2), found=_esito["trovate"])
+    except Exception:  # noqa: BLE001 — la pulizia non fa mai fallire un avvio
+        pass
+
     config = dict(ctx.obj["config"])
     config["_config_path"] = str(Path(ctx.obj["config_path"]).resolve())
     only = list(channel) if channel else None

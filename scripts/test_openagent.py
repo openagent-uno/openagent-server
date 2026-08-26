@@ -72,6 +72,7 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_skills_semantic_leg",
     "test_task_prompts_indexed",
     "test_recall_reserve_multi",
+    "test_bundle_sweep",
     "test_config_patch_merge",
     "test_rest_skills",
     "test_setup",
