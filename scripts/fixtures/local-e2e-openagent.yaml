@@ -1,0 +1,40 @@
+name: my-agent-local-e2e
+
+# The CLI refuses --local-e2e unless this explicit marker is present and the
+# agent directory lives under the OS temporary directory.  This keeps the
+# hermetic startup path impossible to enable accidentally on a real agent.
+local_e2e_fixture: true
+
+# Hermetic local client/gateway fixture.  The database is a disposable clone;
+# every background writer or external integration stays disabled so browsing,
+# history and search tests cannot trigger real-world side effects.
+auto_update:
+  enabled: false
+
+dream_mode:
+  enabled: false
+
+self_improvement:
+  enabled: false
+
+skills:
+  enabled: false
+  curator_enabled: false
+  distiller_enabled: false
+  review_enabled: false
+
+memory:
+  vault_reminder:
+    enabled: false
+  auto_recall:
+    enabled: false
+
+channels: {}
+
+safety:
+  approvals:
+    enabled: true
+
+mcps:
+  install_policy:
+    enabled: true

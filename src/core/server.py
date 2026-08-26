@@ -1756,6 +1756,7 @@ class AgentServer:
     async def start(self) -> None:
         """Start agent, gateway, scheduler, and bridges."""
         self._stop_event = asyncio.Event()
+        local_e2e = self.config.get("_local_e2e") is True
         elog("server.start", agent=self.agent.name)
 
         # 0. Apply anyio cancel-scope guard BEFORE any MCP operations.
@@ -1773,23 +1774,25 @@ class AgentServer:
         #      boot, not one turn late). Off by default: with no rules the guard
         #      finds nothing and changes nothing. Never fatal — a budget must
         #      never block the agent from coming up.
-        try:
-            _guard = getattr(getattr(self.agent, "model", None), "budget_guard", None)
-            if _guard is not None:
-                await _guard.warm()
-        except Exception as e:  # noqa: BLE001
-            elog("budget.warm_error", level="warning", error=str(e))
+        if not local_e2e:
+            try:
+                _guard = getattr(getattr(self.agent, "model", None), "budget_guard", None)
+                if _guard is not None:
+                    await _guard.warm()
+            except Exception as e:  # noqa: BLE001
+                elog("budget.warm_error", level="warning", error=str(e))
 
         # 1.2. Warm the OpenRouter pricing cache so ``compute_cost`` is accurate
         #      from the FIRST billed call, not the second. Without this the first
         #      DeepSeek call of each boot logs ``$0`` (cold cache) and a cost cap
         #      undercounts it — a per-boot blind spot in the brake. Awaited here
         #      (never fatal) so the price is hot before any turn or scheduled fire.
-        try:
-            from src.models.catalog import warm_pricing_cache
-            await warm_pricing_cache()
-        except Exception as e:  # noqa: BLE001 — pricing warm must never block boot
-            elog("catalog.pricing_warm_error", level="warning", error=str(e))
+        if not local_e2e:
+            try:
+                from src.models.catalog import warm_pricing_cache
+                await warm_pricing_cache()
+            except Exception as e:  # noqa: BLE001 — pricing warm must never block boot
+                elog("catalog.pricing_warm_error", level="warning", error=str(e))
 
         # 1.5. Reap any ``workflow_runs`` still in ``running`` state —
         #      they're zombies from the prior process that we have no
@@ -1849,7 +1852,15 @@ class AgentServer:
             #      bridges a ``gateway_url`` that's wire-compatible
             #      with the legacy ``ws://localhost:8765/ws`` they
             #      were built against.
-            await self._build_bridge_session_and_bridges()
+            if not local_e2e:
+                await self._build_bridge_session_and_bridges()
+
+        # The gateway above is the production transport and API surface; the
+        # remaining services are writers or external integrations and are
+        # deliberately excluded from a disposable browsing/search fixture.
+        if local_e2e:
+            elog("server.local_e2e.ready", agent=self.agent.name)
+            return
 
         # 3. Scheduler (with dream mode + auto-update hooks)
         await self._start_scheduler()

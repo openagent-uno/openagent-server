@@ -44,6 +44,74 @@ _STALE_TEMP_ARTIFACT_MAX_AGE_S = 12 * 60 * 60
 _STALE_FROZEN_EXTRACT_MAX_AGE_S = 60 * 60
 
 
+def _enable_local_e2e(config: dict, agent_dir: Path | None) -> None:
+    """Enable the hermetic gateway fixture used by local client QA.
+
+    This intentionally has two independent guards: an explicit marker in the
+    fixture config and an agent directory contained by the OS temp directory.
+    The mode mutates its SQLite database (network bootstrap, auth and search
+    migrations), so accepting a normal agent directory here would be unsafe.
+    """
+    if config.get("local_e2e_fixture") is not True:
+        raise click.ClickException(
+            "--local-e2e requires `local_e2e_fixture: true` in the selected config"
+        )
+    if agent_dir is None:
+        raise click.ClickException("--local-e2e requires an explicit --agent-dir")
+
+    expanded = agent_dir.expanduser()
+    if not expanded.exists() or not expanded.is_dir() or expanded.is_symlink():
+        raise click.ClickException(
+            "--local-e2e requires an existing, non-symlink agent directory"
+        )
+    resolved = expanded.resolve()
+    # ``tempfile.gettempdir()`` is commonly a per-user ``/var/folders`` path
+    # on macOS, while operators and CI routinely create explicit fixtures in
+    # ``/tmp`` (which resolves to ``/private/tmp`` there).  Both are genuine
+    # OS temp roots and neither admits a normal agent directory.
+    temp_roots = {Path(tempfile.gettempdir()).resolve(), Path("/tmp").resolve()}
+    contained_by = next(
+        (root for root in temp_roots if resolved == root or resolved.is_relative_to(root)),
+        None,
+    )
+    if contained_by is None:
+        allowed = ", ".join(str(root) for root in sorted(temp_roots, key=str))
+        raise click.ClickException(
+            f"--local-e2e only accepts disposable agent directories under: {allowed}"
+        )
+    if resolved in temp_roots:
+        raise click.ClickException("--local-e2e requires a child directory under the temp root")
+
+    config_path_raw = config.get("_config_path")
+    if not isinstance(config_path_raw, str) or not config_path_raw.strip():
+        raise click.ClickException("--local-e2e requires an explicit fixture config path")
+    config_path = Path(config_path_raw).expanduser()
+    if (
+        not config_path.exists()
+        or not config_path.is_file()
+        or config_path.is_symlink()
+        or not config_path.resolve().is_relative_to(resolved)
+    ):
+        raise click.ClickException(
+            "--local-e2e requires a regular fixture config inside the agent directory"
+        )
+
+    # SQLite follows filesystem symlinks.  Reject every link in the fixture,
+    # including a dangling one, before opening the DB so a disposable-looking
+    # path cannot redirect writes into a real agent directory.
+    for current, directories, files in os.walk(resolved, followlinks=False):
+        for name in (*directories, *files):
+            if (Path(current) / name).is_symlink():
+                raise click.ClickException(
+                    "--local-e2e fixture must not contain filesystem symlinks"
+                )
+
+    config["_local_e2e"] = True
+    # The iroh ticket carries direct loopback/LAN addresses, so discovery is
+    # unnecessary for a same-machine test and would make the run non-hermetic.
+    os.environ["OPENAGENT_IROH_DISCOVERY"] = "none"
+
+
 def _setup_agent_dir(agent_dir: str | None) -> None:
     """Configure the active agent directory and ensure it exists."""
     if agent_dir is None:
@@ -532,8 +600,19 @@ def update(ctx, yes: bool, no_restart: bool) -> None:
 )
 @click.option("--no-auto-init", is_flag=True,
               help="Don't auto-create a network on first run; require explicit `network init`.")
+@click.option(
+    "--local-e2e",
+    is_flag=True,
+    help="Hermetic local client QA (marked disposable fixtures under the OS temp dir only).",
+)
 @click.pass_context
-def serve(ctx, agent_dir: str | None, channel: tuple[str, ...], no_auto_init: bool):
+def serve(
+    ctx,
+    agent_dir: str | None,
+    channel: tuple[str, ...],
+    no_auto_init: bool,
+    local_e2e: bool,
+):
     """Start the OpenAgent server for an agent directory.
 
     On first run this also bootstraps the agent: creates the directory
@@ -553,6 +632,8 @@ def serve(ctx, agent_dir: str | None, channel: tuple[str, ...], no_auto_init: bo
 
     config = dict(ctx.obj["config"])
     config["_config_path"] = str(Path(ctx.obj["config_path"]).resolve())
+    if local_e2e:
+        _enable_local_e2e(config, active_dir)
     only = list(channel) if channel else None
 
     async def _serve():

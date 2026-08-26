@@ -1334,6 +1334,20 @@ class Agent:
         if self._db:
             await self._db.connect()
 
+        # A local E2E fixture exercises the real DB, authenticated iroh
+        # gateway and client APIs, but must never start model runtimes, MCP
+        # subprocesses or network-backed warmups.  The CLI only sets this
+        # private flag after validating an explicitly marked disposable
+        # directory under the OS temp root (see ``_enable_local_e2e``).
+        if self.config.get("_local_e2e") is True:
+            self._initialized = True
+            elog(
+                "agent.initialize.local_e2e",
+                agent=self.name,
+                has_db=bool(self._db),
+            )
+            return
+
         # Hydrate providers/models from the DB and swap to the DB-backed
         # MCP pool. Skipped when there is no DB (pure in-memory tests);
         # in that case we fall back to whatever pool the caller passed in.

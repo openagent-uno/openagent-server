@@ -50,6 +50,8 @@ from scripts.tests._setup import build_test_config, cleanup_extras  # noqa: E402
 _TEST_MODULES: tuple[str, ...] = (
     # 1. Lightweight / pure-unit (no fixtures needed)
     "test_imports",
+    "test_iroh_discovery",
+    "test_local_e2e",
     # REST surfaces added alongside the accounts / skills / session-pin work.
     "test_semantic_lock",
     "test_semantic_oversized",
