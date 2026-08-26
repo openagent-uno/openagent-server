@@ -17,6 +17,10 @@ Two modes:
         --handle <handle> \\
         --password <pw>
 
+For unattended runs, prefer ``OPENAGENT_SMOKE_TICKET`` and
+``OPENAGENT_SMOKE_PASSWORD`` so credentials never appear in the process
+arguments. Compatibility flags remain available but are never echoed.
+
 Exit code: 0 = success, 1 = failure.
 """
 from __future__ import annotations
@@ -24,6 +28,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 import time
 import uuid
@@ -98,9 +103,7 @@ async def _do_register(
 
     print(f"  coordinator : {coord}", flush=True)
     print(f"  network     : {ut.network_name} / {ut.network_id}", flush=True)
-    print(f"  invite code : {ut.code}", flush=True)
     print(f"  handle      : {handle}", flush=True)
-    print(f"  password    : {password}", flush=True)
 
     dev = Identity.generate()
     node = IrohNode(dev)
@@ -119,7 +122,7 @@ async def _do_register(
                 label=f"smoke-register",
             )
         except LoginError as e:
-            print(f"  ✗ register failed: {e}", flush=True)
+            print(f"  ✗ register failed ({type(e).__name__})", flush=True)
             return 1
         cert = verify_cert(
             cert_wire,
@@ -139,7 +142,7 @@ async def _do_register(
                 network_id=ut.network_id,
             )
         except LoginError as e:
-            print(f"  ✗ returning-device login failed: {e}", flush=True)
+            print(f"  ✗ returning-device login failed ({type(e).__name__})", flush=True)
             return 1
         verify_cert(
             cert_wire2,
@@ -155,7 +158,7 @@ async def _do_register(
                 node=node, coordinator_node_id=coord,
             )
         except Exception as e:  # noqa: BLE001
-            print(f"  ✗ list_agents failed: {e}", flush=True)
+            print(f"  ✗ list_agents failed ({type(e).__name__})", flush=True)
             return 1
         if not agents:
             print("  ✗ no agents registered in network", flush=True)
@@ -184,12 +187,15 @@ async def _do_register(
         dialer = SessionDialer(node=node, binding=binding, cert_wire=cert_wire2)
         try:
             auth_ok_payload = await _gateway_ws_handshake(node, dialer, agent_node_id)
+            auth_ok = json.loads(auth_ok_payload)
+            if auth_ok.get("type") != "auth_ok":
+                raise RuntimeError("gateway did not return auth_ok")
         except Exception as e:  # noqa: BLE001
-            print(f"  ✗ gateway WS handshake failed: {type(e).__name__}: {e}",
+            print(f"  ✗ gateway WS handshake failed ({type(e).__name__})",
                   flush=True)
             await dialer.close()
             return 1
-        print(f"  ✓ AUTH_OK received: {auth_ok_payload[:120]}…", flush=True)
+        print("  ✓ AUTH_OK received", flush=True)
 
         # ── 4. /api/network/* — members & invitations through the gateway ──
         print("\n[4/4] /api/network/* (members + mint via gateway HTTP)",
@@ -197,7 +203,7 @@ async def _do_register(
         try:
             await _exercise_network_api(dialer, agent_node_id)
         except Exception as e:  # noqa: BLE001
-            print(f"  ✗ network api failed: {type(e).__name__}: {e}",
+            print(f"  ✗ network api failed ({type(e).__name__})",
                   flush=True)
             await dialer.close()
             return 1
@@ -214,7 +220,7 @@ async def _do_register(
                 )
             except Exception as e:  # noqa: BLE001
                 print(
-                    f"  ✗ operational api failed: {type(e).__name__}: {e}",
+                    f"  ✗ operational api failed ({type(e).__name__})",
                     flush=True,
                 )
                 await dialer.close()
@@ -266,14 +272,12 @@ async def _exercise_network_api(dialer, target_node_id: str) -> None:
                 f"{base}/api/network/invitations",
                 json={"handle": "smoke-friend"},
             ) as r:
-                assert r.status == 201, \
-                    f"POST /invitations → {r.status}: {await r.text()}"
+                assert r.status == 201, f"POST /invitations → {r.status}"
                 minted = await r.json()
-                assert minted["role"] == "user", minted
-                assert minted["ticket"].startswith("oa1"), minted
+                assert minted["role"] == "user"
+                assert minted["ticket"].startswith("oa1")
                 print(f"  ✓ POST /invitations → role={minted['role']}, "
-                      f"code={minted['code']}, intent={minted['intent']!r}",
-                      flush=True)
+                      f"intent={minted['intent']!r}", flush=True)
 
             # Idempotent revoke.
             async with s.delete(
@@ -281,9 +285,8 @@ async def _exercise_network_api(dialer, target_node_id: str) -> None:
             ) as r:
                 assert r.status == 200, f"DELETE → {r.status}"
                 payload = await r.json()
-                assert payload.get("revoked") is True, payload
-                print(f"  ✓ DELETE /invitations/{minted['code'][:10]}… "
-                      f"→ revoked=True", flush=True)
+                assert payload.get("revoked") is True
+                print("  ✓ DELETE /invitations/<redacted> → revoked=True", flush=True)
 
             # PATCH /agents — relabel the coordinator's own agent and
             # immediately revert. Cosmetic-only so this is safe to
@@ -294,7 +297,7 @@ async def _exercise_network_api(dialer, target_node_id: str) -> None:
                 f"{base}/api/network/agents/{agents_first['handle']}",
                 json={"label": f"{original_label} (smoked)"},
             ) as r:
-                assert r.status == 200, f"PATCH → {r.status}: {await r.text()}"
+                assert r.status == 200, f"PATCH → {r.status}"
                 print(f"  ✓ PATCH /agents/{agents_first['handle']} → label updated",
                       flush=True)
             async with s.patch(
@@ -730,6 +733,21 @@ async def _exercise_operational_api(
                 tool = await response.json()
             assert tool["session_id"] == ids["session"]
 
+            detail_routes = (
+                (f"/api/workflows/{ids['workflow']}", ids["workflow"]),
+                (f"/api/workflow-runs/{ids['workflow_run']}", ids["workflow_run"]),
+                (f"/api/scheduled-tasks/{ids['scheduled']}", ids["scheduled"]),
+                (f"/api/scheduled-runs/{ids['scheduled_run']}", ids["scheduled_run"]),
+                (f"/api/events/{ids['event']}", ids["event"]),
+                (f"/api/event-deliveries/{ids['event_delivery']}", ids["event_delivery"]),
+            )
+            for route, expected_id in detail_routes:
+                async with session.get(f"{base}{route}") as response:
+                    assert response.status == 200, f"detail resolver → {response.status}"
+                    detail = await response.json()
+                assert detail.get("id") == expected_id
+            print("  ✓ all workflow/scheduled/event detail resolvers", flush=True)
+
             async with session.post(
                 f"{base}/api/search",
                 json={
@@ -777,18 +795,25 @@ async def _exercise_operational_api(
                 await _remove_operational_canary_sources(db_path, fixture)
                 sources_removed = True
             except Exception as cleanup_error:  # noqa: BLE001
-                print(f"  ! source cleanup failed: {cleanup_error}", flush=True)
+                print(f"  ! source cleanup failed ({type(cleanup_error).__name__})", flush=True)
         if sources_removed and not cleanup_consumed:
             try:
                 await _wait_operational_canary_cleanup(db_path, fixture)
                 cleanup_consumed = True
             except Exception as cleanup_error:  # noqa: BLE001
-                print(f"  ! cleanup drain incomplete; metadata retained safely: {cleanup_error}", flush=True)
+                print(
+                    f"  ! cleanup drain incomplete; metadata retained safely "
+                    f"({type(cleanup_error).__name__})",
+                    flush=True,
+                )
         if cleanup_consumed:
             try:
                 await _purge_operational_canary_metadata(db_path, fixture)
             except Exception as cleanup_error:  # noqa: BLE001
-                print(f"  ! normalized canary cleanup failed: {cleanup_error}", flush=True)
+                print(
+                    f"  ! normalized canary cleanup failed ({type(cleanup_error).__name__})",
+                    flush=True,
+                )
         await proxy.stop()
 
 
@@ -813,7 +838,6 @@ async def _do_pair(ticket_str: str, handle: str, password: str) -> int:
     coord_pub = coordinator_node_id_to_pubkey_bytes(coord)
     print(f"  coordinator : {coord}", flush=True)
     print(f"  network     : {dt.network_name} / {dt.network_id}", flush=True)
-    print(f"  invite code : {dt.code} (bind_to={dt.bind_to!r})", flush=True)
     print(f"  handle      : {handle}", flush=True)
 
     new_dev = Identity.generate()  # fresh device pubkey
@@ -833,7 +857,7 @@ async def _do_pair(ticket_str: str, handle: str, password: str) -> int:
                 label="smoke-pair",
             )
         except LoginError as e:
-            print(f"  ✗ device pair failed: {e}", flush=True)
+            print(f"  ✗ device pair failed ({type(e).__name__})", flush=True)
             return 1
         verify_cert(
             cert_wire,
@@ -852,8 +876,8 @@ def main() -> None:
     sub = p.add_subparsers(dest="mode", required=True)
 
     pr = sub.add_parser("register", help="Register a smoke user (consumes user invite)")
-    pr.add_argument("--ticket", required=True)
-    pr.add_argument("--password", required=True)
+    pr.add_argument("--ticket", default=os.environ.get("OPENAGENT_SMOKE_TICKET"))
+    pr.add_argument("--password", default=os.environ.get("OPENAGENT_SMOKE_PASSWORD"))
     pr.add_argument(
         "--operational-db",
         help="Opt in to history/search canaries using the selected agent's local SQLite DB",
@@ -864,11 +888,16 @@ def main() -> None:
     )
 
     pp = sub.add_parser("pair", help="Pair a new device for an existing user (consumes device invite)")
-    pp.add_argument("--ticket", required=True)
+    pp.add_argument("--ticket", default=os.environ.get("OPENAGENT_SMOKE_TICKET"))
     pp.add_argument("--handle", required=True)
-    pp.add_argument("--password", required=True)
+    pp.add_argument("--password", default=os.environ.get("OPENAGENT_SMOKE_PASSWORD"))
 
     args = p.parse_args()
+    if not args.ticket or not args.password:
+        p.error(
+            "provide ticket/password through OPENAGENT_SMOKE_TICKET and "
+            "OPENAGENT_SMOKE_PASSWORD (or the compatibility flags)"
+        )
     if args.mode == "register":
         rc = asyncio.run(_do_register(
             args.ticket,
