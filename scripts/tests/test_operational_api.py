@@ -948,6 +948,11 @@ async def t_persistent_search_consumer(_ctx: TestContext) -> None:
             # consumer loop's sequence.  The request must refresh before returning
             # a false warming response.
             gateway._operational_search_status = dict(before)
+            refreshed = await operational._current_search_status(
+                db, db._conn, gateway=gateway
+            )
+            assert refreshed["ready"] is True
+            assert int(refreshed["seq"]) >= outbox_head
             search = await operational.handle_search(_Request(
                 gateway, tenant=tenant, handle="alice", device="alice-device",
                 body={
