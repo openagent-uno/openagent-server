@@ -650,7 +650,8 @@ def tombstone_session(
         return ProjectionWrite(session_id, False, True, None, None, None)
     cursor = conn.execute(
         "SELECT tenant_id, owner_principal_id, visibility, acl_version, "
-        "source_version, deleted_at_ms, created_at_ms FROM sessions_v2 WHERE id=?",
+        "source_version, deleted_at_ms, created_at_ms, updated_at_ms, "
+        "last_activity_at_ms FROM sessions_v2 WHERE id=?",
         (session_id,),
     )
     raw = cursor.fetchone()
@@ -669,7 +670,18 @@ def tombstone_session(
         )
 
     source_version = int(row["source_version"]) + 1
-    deleted_at = max(effective_now, int(row["created_at_ms"]))
+    activity_boundary = conn.execute(
+        "SELECT MAX(occurred_at_ms) FROM activity_items WHERE tenant_id=? "
+        "AND resource_type='session' AND resource_id=?",
+        (row["tenant_id"], session_id),
+    ).fetchone()
+    deleted_at = max(
+        effective_now,
+        int(row["created_at_ms"]),
+        int(row["updated_at_ms"]),
+        int(row["last_activity_at_ms"]),
+        int(activity_boundary[0]) if activity_boundary and activity_boundary[0] is not None else 0,
+    )
     old_messages, old_tools = _old_resource_ids(conn, session_id)
     revision = _allocate_revision(conn, effective_now)
     conn.execute(

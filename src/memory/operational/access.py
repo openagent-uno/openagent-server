@@ -32,28 +32,22 @@ class AccessContext:
         capabilities = set(getattr(cert, "capabilities", ()) or ())
         principal_type = "agent" if "agent" in capabilities else "user"
         principal_id = f"{principal_type}:{handle}"
-        # ``user:<device>`` and raw handle/device identities preserve access to
-        # rows written before handle-scoped ownership shipped.  They are
-        # server-derived compatibility aliases, never caller-selected values.
+        # Compatibility aliases retain their principal type. Coordinator
+        # storage permits a human and an agent to have the same handle, so an
+        # ambiguous raw handle can never be an authorization identity.
+        typed_handle = f"{principal_type}:{handle}"
+        typed_device = f"{principal_type}:{device}"
         ids = frozenset(
             {
-                principal_id,
-                f"user:{handle}",
-                f"agent:{handle}",
+                typed_handle,
+                typed_device,
                 f"device:{device}",
-                f"user:{device}",
-                handle,
-                device,
             }
         )
         grants = frozenset(
             {
                 (principal_type, handle),
-                (principal_type, principal_id),
-                ("user", handle),
-                ("user", f"user:{handle}"),
-                ("agent", handle),
-                ("agent", f"agent:{handle}"),
+                (principal_type, typed_handle),
                 ("device", device),
                 ("device", f"device:{device}"),
                 ("installation", tenant),

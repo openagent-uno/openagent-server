@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -57,6 +58,45 @@ async def t_gateway_only_channel_filter(_ctx: TestContext) -> None:
     assert _selected_bridge_names(config, []) == []
 
 
+@test("operational_api", "user and agent principals with the same handle never alias")
+async def t_principal_type_isolation(_ctx: TestContext) -> None:
+    from src.memory.operational.access import AccessContext, row_is_visible_without_grant
+
+    gateway = SimpleNamespace()
+    user = AccessContext.from_request(
+        _Request(gateway, tenant="same-network", handle="same-handle", device="user-device")
+    )
+    agent_request = _Request(
+        gateway, tenant="same-network", handle="same-handle", device="agent-device"
+    )
+    agent_request["device_cert"].capabilities = ["agent"]
+    agent = AccessContext.from_request(agent_request)
+    base = {"tenant_id": "same-network", "visibility": "private"}
+
+    assert row_is_visible_without_grant(
+        {**base, "owner_principal_id": "user:same-handle"}, user
+    )
+    assert not row_is_visible_without_grant(
+        {**base, "owner_principal_id": "agent:same-handle"}, user
+    )
+    assert row_is_visible_without_grant(
+        {**base, "owner_principal_id": "agent:same-handle"}, agent
+    )
+    assert not row_is_visible_without_grant(
+        {**base, "owner_principal_id": "user:same-handle"}, agent
+    )
+    # Legacy untyped owner values are ambiguous when both principal classes
+    # exist and therefore cannot authorize either caller.
+    assert not row_is_visible_without_grant(
+        {**base, "owner_principal_id": "same-handle"}, user
+    )
+    assert not row_is_visible_without_grant(
+        {**base, "owner_principal_id": "same-handle"}, agent
+    )
+    assert ("agent", "same-handle") not in user.grant_identities
+    assert ("user", "same-handle") not in agent.grant_identities
+
+
 async def _ready_capabilities(operational, request: _Request) -> dict:
     payload = _payload(await operational.handle_capabilities(request))
     if not payload.get("storage", {}).get("search_ready"):
@@ -82,7 +122,15 @@ async def _seed_complete_fixture(db) -> tuple[str, object]:
                 {
                     "id": "orchid-user", "role": "user",
                     "content": "orchid message before Bearer NEVER_INDEX_CHAT_BEARER "
-                    "opaque AbCdEf0123456789AbCdEf0123456789AbCdEf01",
+                    "opaque AbCdEf0123456789AbCdEf0123456789AbCdEf01\n"
+                    '{"api_key":"NEVER_INDEX_JSON_SHORT"}\n'
+                    "OPENAGENT_CREDENTIAL=NEVER_INDEX_ENV_CREDENTIAL\n"
+                    "private_key=NEVER_INDEX_PRIVATE_KEY\n"
+                    '{"headers":{"X-Custom":"NEVER_INDEX_HEADER_CONTAINER",'
+                    '"Accept":"text/plain"}}\n'
+                    "Cookie: session=public; auth=NEVER_INDEX_COOKIE_SECRET\n"
+                    "local path /Users/private-user/NEVER_INDEX_PRIVATE_PATH/file.txt\n"
+                    "Authorization: Basic NEVER_INDEX_BASIC_SHORT",
                     "redacted_reasoning_content": "NEVER_INDEX_REDACTED_THINKING",
                 },
                 {"id": "orchid-tool-message", "role": "tool", "tool_call_id": "orchid-call", "content": "orchid tool visible"},
@@ -113,7 +161,7 @@ async def _seed_complete_fixture(db) -> tuple[str, object]:
     c = db._conn
     graph = {
         "version": 1,
-        "nodes": [{"id": "node-1", "type": "tool", "data": {"label": "Orchid step", "prompt": "orchid workflow prompt sk-ant-NEVER_INDEX_WORKFLOW_TOKEN123456789"}}],
+        "nodes": [{"id": "node-1", "type": "tool", "config": {"label": "Orchid step", "prompt": "orchid workflowconfigneedle prompt sk-ant-NEVER_INDEX_WORKFLOW_TOKEN123456789"}}],
         "edges": [],
     }
     await c.execute(
@@ -224,6 +272,29 @@ async def t_capability_and_all_targets(_ctx: TestContext) -> None:
             assert "node_id" not in definition_target and "field" not in definition_target
             assert page["items"] and page["snapshot"]["indexed_seq"] >= 1
 
+            config_search = await operational.handle_search(
+                _Request(
+                    gateway,
+                    tenant=tenant,
+                    handle="alice",
+                    device="alice-device",
+                    body={
+                        "query": "workflowconfigneedle",
+                        "scopes": ["workflows"],
+                        "filters": {},
+                        "sort": "relevance",
+                        "grouping": "match",
+                        "limit": 10,
+                        "cursor": None,
+                    },
+                )
+            )
+            assert config_search.status == 200, config_search.text
+            assert {
+                item["target"]["kind"]
+                for item in _payload(config_search)["items"]
+            } == {"workflow_definition"}
+
             search_path = operational_search_path(path)
             assert search_path not in {vault, transcript}
             raw = search_path.read_bytes()
@@ -236,6 +307,13 @@ async def t_capability_and_all_targets(_ctx: TestContext) -> None:
                 b"NEVER_INDEX_REDACTED_THINKING",
                 b"NEVER_INDEX_WORKFLOW_TOKEN", b"NEVERINDEXSCHEDULEDPAYLOAD",
                 b"NEVER_INDEX_SIGNED_URL",
+                b"NEVER_INDEX_JSON_SHORT",
+                b"NEVER_INDEX_BASIC_SHORT",
+                b"NEVER_INDEX_ENV_CREDENTIAL",
+                b"NEVER_INDEX_PRIVATE_KEY",
+                b"NEVER_INDEX_HEADER_CONTAINER",
+                b"NEVER_INDEX_COOKIE_SECRET",
+                b"NEVER_INDEX_PRIVATE_PATH",
             ):
                 assert forbidden not in raw, forbidden.decode()
             physical = [
@@ -260,6 +338,98 @@ async def t_capability_and_all_targets(_ctx: TestContext) -> None:
             if "gateway" in locals():
                 await operational.stop_background_maintenance(gateway)
             await db.close()
+
+
+@test("operational_api", "a ready index from another canonical database is rebuilt")
+async def t_foreign_ready_index_is_rebuilt(_ctx: TestContext) -> None:
+    from src.gateway.api import operational
+    from src.memory.db import MemoryDB
+    from src.memory.operational.search import operational_search_path, sync_operational_search
+
+    with TemporaryDirectory(prefix="openagent-operational-replacement-") as directory:
+        path = Path(directory) / "openagent.db"
+        old_db = MemoryDB(str(path))
+        await old_db.connect()
+        await old_db._conn.execute(
+            "INSERT INTO network(singleton,role,network_id,name,created_at) "
+            "VALUES(1,'coordinator','replacement-network','old',0)"
+        )
+        await old_db._conn.commit()
+        await old_db.upsert_session(
+            "same-resource", client_id="alice", title="oldrestoreleakneedle"
+        )
+        old_status = await sync_operational_search(old_db, limit=1000)
+        assert old_status.ready
+        search_path = operational_search_path(path)
+        await old_db.close()
+        os.replace(path, path.with_name("old-canonical.db"))
+
+        new_db = MemoryDB(str(path))
+        await new_db.connect()
+        gateway = SimpleNamespace(agent=SimpleNamespace(memory_db=new_db))
+        try:
+            await new_db._conn.execute(
+                "INSERT INTO network(singleton,role,network_id,name,created_at) "
+                "VALUES(1,'coordinator','replacement-network','new',0)"
+            )
+            await new_db._conn.commit()
+            await new_db.upsert_session(
+                "same-resource", client_id="alice", title="newcanonicalneedle"
+            )
+            request = _Request(
+                gateway,
+                tenant="replacement-network",
+                handle="alice",
+                device="alice-device",
+            )
+            await _ready_capabilities(operational, request)
+            old_result = _payload(
+                await operational.handle_search(
+                    _Request(
+                        gateway,
+                        tenant="replacement-network",
+                        handle="alice",
+                        device="alice-device",
+                        body={
+                            "query": "oldrestoreleakneedle",
+                            "scopes": ["chats"],
+                            "filters": {},
+                            "sort": "relevance",
+                            "grouping": "match",
+                            "limit": 10,
+                            "cursor": None,
+                        },
+                    )
+                )
+            )
+            assert old_result["items"] == []
+            new_result = _payload(
+                await operational.handle_search(
+                    _Request(
+                        gateway,
+                        tenant="replacement-network",
+                        handle="alice",
+                        device="alice-device",
+                        body={
+                            "query": "newcanonicalneedle",
+                            "scopes": ["chats"],
+                            "filters": {},
+                            "sort": "relevance",
+                            "grouping": "match",
+                            "limit": 10,
+                            "cursor": None,
+                        },
+                    )
+                )
+            )
+            assert len(new_result["items"]) == 1
+            assert search_path.is_file()
+            for physical in search_path.parent.glob(f"{search_path.name}*"):
+                if physical.is_file():
+                    assert b"oldrestoreleakneedle" not in physical.read_bytes(), physical.name
+        finally:
+            await operational.stop_background_maintenance(gateway)
+            await new_db.close()
 
 
 @test("operational_api", "history/messages/search enforce ACL and stable snapshots")
@@ -319,6 +489,33 @@ async def t_acl_history_messages_and_snapshot(_ctx: TestContext) -> None:
             assert len(_payload(await operational.handle_search(alice(body=private_search)))["items"]) == 1
             assert _payload(await operational.handle_search(bob(body=private_search)))["items"] == []
 
+            tool_search = {
+                "query": "orchid_tool", "scopes": ["tools"], "filters": {},
+                "sort": "relevance", "grouping": "match", "limit": 10, "cursor": None,
+            }
+            assert _payload(await operational.handle_search(bob(body=tool_search)))["items"] == []
+            await db._conn.execute(
+                "INSERT INTO resource_acl "
+                "(tenant_id,resource_type,resource_id,principal_type,principal_id,"
+                "permission,acl_version,granted_by_principal_id,granted_at_ms) "
+                "VALUES(?,?,?,?,?,'admin',1,?,?)",
+                (
+                    tenant,
+                    "session",
+                    "orchid-chat",
+                    "user",
+                    "bob",
+                    "user:alice",
+                    int(time.time() * 1000),
+                ),
+            )
+            await db._conn.commit()
+            granted_tools = _payload(
+                await operational.handle_search(bob(body=tool_search))
+            )["items"]
+            assert len(granted_tools) == 1
+            assert granted_tools[0]["target"]["kind"] == "chat_tool"
+
             revocation_query = {
                 "query": "revocationcanary", "scopes": ["chats"], "filters": {},
                 "sort": "relevance", "grouping": "match", "limit": 1, "cursor": None,
@@ -371,6 +568,163 @@ async def t_acl_history_messages_and_snapshot(_ctx: TestContext) -> None:
             assert second["snapshot"]["search_session_id"] == first["snapshot"]["search_session_id"]
         finally:
             await operational.stop_background_maintenance(gateway)
+            await db.close()
+
+
+@test("operational_api", "deleted session immediately revokes tool search and detail")
+async def t_deleted_session_revokes_tool(_ctx: TestContext) -> None:
+    from src.gateway.api import operational
+    from src.memory.db import MemoryDB
+    from src.memory.operational.access import AccessContext
+    from src.memory.operational.repository import project_legacy_session_async
+
+    with TemporaryDirectory(prefix="openagent-operational-tool-revoke-") as directory:
+        db = MemoryDB(str(Path(directory) / "openagent.db"))
+        await db.connect()
+        tenant, gateway = await _seed_complete_fixture(db)
+        request = lambda **kwargs: _Request(
+            gateway,
+            tenant=tenant,
+            handle="alice",
+            device="alice-device",
+            **kwargs,
+        )
+        try:
+            await _ready_capabilities(operational, request())
+            await operational.stop_background_maintenance(gateway)
+            response = await operational.handle_search(
+                request(
+                    body={
+                        "query": "orchid_tool",
+                        "scopes": ["tools"],
+                        "filters": {},
+                        "sort": "relevance",
+                        "grouping": "match",
+                        "limit": 10,
+                        "cursor": None,
+                    }
+                )
+            )
+            assert response.status == 200, response.text
+            snapshot = next(iter(gateway._operational_cursor_state.search.values()))
+            tool_row = next(row for row in snapshot.rows if row["target_kind"] == "chat_tool")
+
+            activity_time = int(
+                (
+                    await (
+                        await db._conn.execute(
+                            "SELECT occurred_at_ms FROM activity_items "
+                            "WHERE resource_type='session' AND resource_id='orchid-chat'"
+                        )
+                    ).fetchone()
+                )[0]
+            )
+            await db._conn.execute("DELETE FROM sessions WHERE session_id='orchid-chat'")
+            await project_legacy_session_async(
+                db._conn, "orchid-chat", now_ms=activity_time + 1
+            )
+            await db._conn.commit()
+
+            access = AccessContext.from_request(request())
+            assert not await operational._search_row_visible(db._conn, tool_row, access)
+            detail = await operational.handle_tool_invocation(
+                request(match={"tool_id": str(tool_row["resource_id"])})
+            )
+            assert detail.status == 404, detail.text
+        finally:
+            await operational.stop_background_maintenance(gateway)
+            await db.close()
+
+
+@test("operational_api", "history candidate limit is applied after canonical ACL prefilter")
+async def t_history_limit_after_acl(_ctx: TestContext) -> None:
+    from src.gateway.api import operational
+    from src.memory.db import MemoryDB
+    from src.memory.operational.access import AccessContext
+
+    with TemporaryDirectory(prefix="openagent-operational-history-acl-") as directory:
+        db = MemoryDB(str(Path(directory) / "openagent.db"))
+        await db.connect()
+        try:
+            for index in range(3):
+                await db.upsert_session(
+                    f"bob-history-{index}", client_id="bob", title="Bob"
+                )
+            await db.upsert_session("alice-history", client_id="alice", title="Alice")
+            tenant = str(
+                (await (await db._conn.execute("SELECT tenant_id FROM sessions_v2 LIMIT 1")).fetchone())[0]
+            )
+            access = AccessContext.from_request(
+                _Request(
+                    SimpleNamespace(),
+                    tenant=tenant,
+                    handle="alice",
+                    device="alice-device",
+                )
+            )
+            filters = {
+                "kinds": [],
+                "status": [],
+                "origin": None,
+                "parent_type": None,
+                "parent_id": None,
+                "from": None,
+                "to": None,
+                "include_children": False,
+            }
+            old_limit = operational._MAX_SNAPSHOT_ITEMS
+            operational._MAX_SNAPSHOT_ITEMS = 2
+            try:
+                rows = await operational._activity_rows(db._conn, access, filters)
+            finally:
+                operational._MAX_SNAPSHOT_ITEMS = old_limit
+            assert [str(row["resource_id"]) for row in rows] == ["alice-history"]
+        finally:
+            await db.close()
+
+
+@test("operational_api", "future source timestamps cannot poison session tombstones")
+async def t_future_timestamp_tombstone(_ctx: TestContext) -> None:
+    from src.memory.db import MemoryDB
+    from src.memory.operational.repository import projection_coverage_async
+
+    with TemporaryDirectory(prefix="openagent-operational-future-delete-") as directory:
+        db = MemoryDB(str(Path(directory) / "openagent.db"))
+        await db.connect()
+        try:
+            now = time.time()
+            await db.upsert_session("future-delete", client_id="alice", title="Future")
+            runs = [
+                {
+                    "run_id": "future-run",
+                    "status": "COMPLETED",
+                    "created_at": now + 86_400,
+                    "messages": [{"id": "future-message", "role": "user", "content": "future"}],
+                }
+            ]
+            await db._conn.execute(
+                "UPDATE sessions SET runs=?, updated_at=? WHERE session_id='future-delete'",
+                (json.dumps(runs), int(now + 86_400)),
+            )
+            await db._project_operational_session("future-delete")
+            await db._conn.commit()
+            await db.delete_session("future-delete")
+
+            legacy = await (
+                await db._conn.execute(
+                    "SELECT 1 FROM sessions WHERE session_id='future-delete'"
+                )
+            ).fetchone()
+            canonical = await (
+                await db._conn.execute(
+                    "SELECT deleted_at_ms FROM sessions_v2 WHERE id='future-delete'"
+                )
+            ).fetchone()
+            coverage = await projection_coverage_async(db._conn)
+            assert legacy is None
+            assert canonical is not None and canonical[0] is not None
+            assert int(coverage["pending_sessions"]) == 0
+        finally:
             await db.close()
 
 
@@ -480,6 +834,113 @@ async def t_persistent_search_consumer(_ctx: TestContext) -> None:
             await db.close()
 
 
+@test("operational_api", "consumed outbox keeps only the replayable latest resource rows")
+async def t_search_outbox_compaction(_ctx: TestContext) -> None:
+    from src.memory.db import MemoryDB
+    from src.memory.operational.search import sync_operational_search
+
+    with TemporaryDirectory(prefix="openagent-operational-outbox-") as directory:
+        db = MemoryDB(str(Path(directory) / "openagent.db"))
+        await db.connect()
+        try:
+            now = time.time()
+            await db.upsert_session("outbox-chat", client_id="alice", title="Outbox")
+            for turn in range(1, 6):
+                messages = [
+                    {"id": f"message-{index}", "role": "user", "content": f"turn {index}"}
+                    for index in range(turn)
+                ]
+                runs = [
+                    {
+                        "run_id": "outbox-run",
+                        "status": "COMPLETED",
+                        "created_at": now,
+                        "messages": messages,
+                    }
+                ]
+                await db._conn.execute(
+                    "UPDATE sessions SET runs=?, updated_at=? WHERE session_id='outbox-chat'",
+                    (json.dumps(runs), int(now) + turn),
+                )
+                await db._project_operational_session("outbox-chat")
+                await db._conn.commit()
+
+            before = int(
+                (await (await db._conn.execute("SELECT COUNT(*) FROM search_outbox")).fetchone())[0]
+            )
+            assert before == 21
+            status = await sync_operational_search(db, limit=1000)
+            assert status.ready
+            after = int(
+                (await (await db._conn.execute("SELECT COUNT(*) FROM search_outbox")).fetchone())[0]
+            )
+            # One replayable upsert for the session and each of its five messages.
+            assert after == 6
+        finally:
+            await db.close()
+
+
+@test("operational_api", "extractor version changes purge and replay the derived index")
+async def t_search_version_boundary_rebuild(_ctx: TestContext) -> None:
+    from src.memory.db import MemoryDB
+    from src.memory.operational.search import (
+        _open_index,
+        operational_search_path,
+        operational_search_status,
+        sync_operational_search,
+    )
+
+    with TemporaryDirectory(prefix="openagent-operational-index-version-") as directory:
+        path = Path(directory) / "openagent.db"
+        db = MemoryDB(str(path))
+        await db.connect()
+        try:
+            await db.upsert_session(
+                "version-replay-chat",
+                client_id="alice",
+                title="currentreplayneedle",
+            )
+            initial = await sync_operational_search(db, limit=1000)
+            assert initial.ready
+
+            search_path = operational_search_path(path)
+            index = _open_index(search_path)
+            try:
+                index.execute(
+                    "UPDATE search_fts SET body_safe='staleversionleakneedle'"
+                )
+                index.execute(
+                    "UPDATE search_index_state SET redaction_version='obsolete' "
+                    "WHERE singleton_id=1"
+                )
+                index.commit()
+            finally:
+                index.close()
+
+            incompatible = await operational_search_status(db)
+            assert incompatible["ready"] is False
+            rebuilt = await sync_operational_search(db, limit=1000)
+            assert rebuilt.ready
+
+            index = _open_index(search_path)
+            try:
+                assert index.execute(
+                    "SELECT COUNT(*) FROM search_fts "
+                    "WHERE search_fts MATCH 'currentreplayneedle'"
+                ).fetchone()[0] == 1
+                assert index.execute(
+                    "SELECT COUNT(*) FROM search_fts "
+                    "WHERE search_fts MATCH 'staleversionleakneedle'"
+                ).fetchone()[0] == 0
+            finally:
+                index.close()
+            for physical in search_path.parent.glob(f"{search_path.name}*"):
+                if physical.is_file():
+                    assert b"staleversionleakneedle" not in physical.read_bytes(), physical.name
+        finally:
+            await db.close()
+
+
 @test("operational_api", "large session backfill is background-only and hot history is read-only")
 async def t_large_backfill_and_hot_history(_ctx: TestContext) -> None:
     from src.gateway.api import operational
@@ -576,8 +1037,10 @@ async def t_search_validation_is_strict(_ctx: TestContext) -> None:
             invalid = [
                 {**base, "scopes": [{}]},
                 {**base, "filters": {"status": "running"}},
+                {**base, "filters": {"status": ["running"] * 100}},
                 {**base, "filters": {"root": []}},
                 {**base, "filters": {"parent_type": "workflow"}},
+                {**base, "filters": {"parent_type": {"bad": True}, "parent_id": "x"}},
                 {**base, "filters": {"origin": "x" * 129}},
                 {**base, "filters": {"from": "2026-01-02T00:00:00Z", "to": "2026-01-01T00:00:00Z"}},
                 {**base, "filters": {"from": 42}},
@@ -595,6 +1058,16 @@ async def t_search_validation_is_strict(_ctx: TestContext) -> None:
                     )
                     assert response.status == 400, response.text
                     assert "PRIVATE_BODY_CANARY" not in response.text
+                punctuation = await operational.handle_search(
+                    _Request(
+                        gateway,
+                        tenant=tenant,
+                        handle="alice",
+                        device="alice-device",
+                        body={**base, "query": "... --- !!!"},
+                    )
+                )
+                assert punctuation.status == 422, punctuation.text
             finally:
                 logger.removeHandler(handler)
             assert all("PRIVATE_BODY_CANARY" not in record.getMessage() for record in captured)
@@ -704,6 +1177,41 @@ async def t_search_snapshot_quota(_ctx: TestContext) -> None:
             if "gateway" in locals():
                 await operational.stop_background_maintenance(gateway)
             await db.close()
+
+
+@test("operational_api", "root-grouped matches count against snapshot row quota")
+async def t_grouped_snapshot_match_quota(_ctx: TestContext) -> None:
+    from src.gateway.api import operational
+
+    state = operational._CursorState()
+    old_limit = operational._MAX_SNAPSHOT_ROWS_GLOBAL
+    operational._MAX_SNAPSHOT_ROWS_GLOBAL = 3
+    try:
+        first = operational._SearchSnapshot(
+            "first",
+            "tenant",
+            "user:alice",
+            "request",
+            "generation",
+            1,
+            ({"_matches": [{"id": 1}, {"id": 2}]},),
+            int(time.time() * 1000) + 10_000,
+        )
+        second = operational._SearchSnapshot(
+            "second",
+            "tenant",
+            "user:alice",
+            "request",
+            "generation",
+            1,
+            ({"_matches": [{"id": 3}, {"id": 4}]},),
+            int(time.time() * 1000) + 10_000,
+        )
+        state.put_search(first)
+        state.put_search(second)
+        assert set(state.search) == {"second"}
+    finally:
+        operational._MAX_SNAPSHOT_ROWS_GLOBAL = old_limit
 
 
 @test("operational_api", "detail resolvers keep legacy epochs and canonical deep-link ids")

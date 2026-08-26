@@ -23,13 +23,36 @@ from .schema import operational_search_schema_sql
 
 
 CONSUMER_ID = "operational-fts-v1"
-EXTRACTOR_VERSION = "operational-extractor-v1"
-REDACTION_VERSION = "fail-closed-redaction-v1"
-ACL_PROJECTION_VERSION = "canonical-recheck-v1"
+EXTRACTOR_VERSION = "operational-extractor-v2"
+REDACTION_VERSION = "fail-closed-redaction-v2"
+ACL_PROJECTION_VERSION = "canonical-recheck-v2"
+TOKENIZER_VERSION = "unicode61-v1"
 _TERM_RE = re.compile(r"[^\W_]+", re.UNICODE)
+_SECRET_LABEL = (
+    r"api[_-]?key|authorization|secret|token|access[_-]?token|refresh[_-]?token|"
+    r"password|passwd|client[_-]?secret|signature|cookies?|set[_-]?cookie|"
+    r"headers?|credentials?|private[_-]?key"
+)
 _LABELED_SECRET_RE = re.compile(
-    r"(?i)\b(api[_-]?key|authorization|secret|token|access[_-]?token|refresh[_-]?token|password|passwd|client[_-]?secret|signature|sig)\b"
-    r"(\s*[:=]\s*)(?:[\"']?)([^\s,;\"']+)"
+    rf"(?P<prefix>[\"']?(?<![\w-])(?:[A-Za-z0-9_-]*(?:{_SECRET_LABEL})"
+    r"[A-Za-z0-9_-]*|sig)[\"']?\s*[:=]\s*)"
+    r"(?P<value>(?!\s*\[REDACTED\])(?:\"(?:\\.|[^\"\\])*\"|"
+    r"'(?:\\.|[^'\\])*'|[^\r\n,;}\]]+))",
+    re.IGNORECASE,
+)
+_SENSITIVE_CONTAINER_RE = re.compile(
+    r"(?P<prefix>[\"']?(?<![\w-])(?:headers?|cookies?)[\"']?\s*[:=]\s*)"
+    r"\{[^{}\r\n]{0,16384}\}",
+    re.IGNORECASE,
+)
+_SENSITIVE_HEADER_RE = re.compile(
+    r"(?P<prefix>(?<![\w-])(?:authorization|proxy-authorization|cookie|set-cookie|"
+    r"x-api-key|x-auth-token)\s*:\s*)[^\r\n]*",
+    re.IGNORECASE,
+)
+_PRIVATE_PATH_RE = re.compile(
+    r"(?i)(?:file://)?(?:/Users/[^/\s\"'<>]+|/home/[^/\s\"'<>]+|/root(?:/|\b)|"
+    r"[A-Z]:\\Users\\[^\\\s\"'<>]+)(?:[/\\][^\s\"'<>]*)?"
 )
 _BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}")
 _JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")
@@ -110,6 +133,114 @@ def _open_index(path: Path) -> sqlite3.Connection:
     return conn
 
 
+def _source_fingerprint(instance_id: str, schema_version: int) -> str:
+    return hashlib.sha256(f"{instance_id}:{schema_version}".encode()).hexdigest()
+
+
+def _index_is_incompatible(
+    state: sqlite3.Row,
+    *,
+    instance_id: str,
+    schema_version: int,
+    fingerprint: str,
+    outbox_head: int,
+) -> bool:
+    """Reject a ready generation that belongs to different canonical bytes.
+
+    ``None`` compatibility fields are valid only for a brand-new, uninitialized
+    index. Once a source fingerprint exists, every versioned extractor boundary
+    and the monotonic outbox position must agree before any old content is read.
+    """
+
+    existing = state["source_fingerprint"]
+    if existing is None:
+        return False
+    expected = {
+        "source_db_instance_id": instance_id,
+        "source_schema_version": schema_version,
+        "source_fingerprint": fingerprint,
+        "extractor_version": EXTRACTOR_VERSION,
+        "redaction_version": REDACTION_VERSION,
+        "acl_projection_version": ACL_PROJECTION_VERSION,
+        "tokenizer_version": TOKENIZER_VERSION,
+    }
+    for field, value in expected.items():
+        if str(state[field]) != str(value):
+            return True
+    # A restored canonical backup can carry the same logical instance id but a
+    # shorter outbox. Never let a later derived snapshot survive that rewind.
+    return int(state["last_indexed_seq"]) > int(outbox_head)
+
+
+def _index_has_rowid_mismatch(conn: sqlite3.Connection) -> bool:
+    """Verify that chunk metadata and contentful FTS expose identical rowids."""
+
+    missing_fts = conn.execute(
+        "SELECT 1 FROM search_chunks c WHERE NOT EXISTS ("
+        "SELECT 1 FROM search_fts f WHERE f.rowid=c.chunk_rowid) LIMIT 1"
+    ).fetchone()
+    if missing_fts is not None:
+        return True
+    orphan_fts = conn.execute(
+        "SELECT 1 FROM search_fts f WHERE NOT EXISTS ("
+        "SELECT 1 FROM search_chunks c WHERE c.chunk_rowid=f.rowid) LIMIT 1"
+    ).fetchone()
+    return orphan_fts is not None
+
+
+def _reset_index_generation(
+    conn: sqlite3.Connection,
+    path: Path,
+    *,
+    instance_id: str,
+    schema_version: int,
+    fingerprint: str,
+) -> None:
+    """Physically purge an incompatible derived generation before replay."""
+
+    now_ms = int(time.time() * 1000)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # FTS5 delete markers can retain the old term bytes in live segment
+        # pages even after VACUUM. Drop the virtual table (and its shadow
+        # tables) before compacting so a redaction/extractor boundary is also
+        # a physical confidentiality boundary.
+        conn.execute("DROP TABLE search_fts")
+        conn.execute("DELETE FROM search_documents")
+        conn.execute("DELETE FROM query_snapshots")
+        conn.execute(
+            "UPDATE search_index_state SET source_db_instance_id=?, "
+            "source_schema_version=?, source_fingerprint=?, index_generation=lower(hex(randomblob(16))), "
+            "extractor_version=?, redaction_version=?, acl_projection_version=?, "
+            "tokenizer_version=?, coverage_state='building', last_indexed_seq=0, "
+            "indexed_documents=0, indexed_chunks=0, pending_estimate=NULL, "
+            "indexed_through_ms=NULL, build_started_at_ms=?, build_completed_at_ms=NULL, "
+            "last_error_class=NULL, updated_at_ms=? WHERE singleton_id=1",
+            (
+                instance_id,
+                schema_version,
+                fingerprint,
+                EXTRACTOR_VERSION,
+                REDACTION_VERSION,
+                ACL_PROJECTION_VERSION,
+                TOKENIZER_VERSION,
+                now_ms,
+                now_ms,
+            ),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    # DELETE alone can leave old redacted-version bytes in freelist/WAL pages.
+    # This derived database is small enough to compact only on incompatible
+    # generations; normal incremental batches never pay this cost.
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    conn.execute("VACUUM")
+    conn.executescript(operational_search_schema_sql())
+    _harden_index_files(path)
+
+
 def _safe_structure_tokens(raw: str | None) -> str:
     """Describe keys/types/sizes without retaining scalar values."""
 
@@ -165,6 +296,15 @@ def _looks_high_entropy(token: str) -> bool:
     return classes >= 2
 
 
+def _replace_labeled_secret(match: re.Match[str]) -> str:
+    value = match.group("value")
+    if len(value) >= 2 and value[0] in {"\"", "'"} and value[-1] == value[0]:
+        replacement = f"{value[0]}[REDACTED]{value[0]}"
+    else:
+        replacement = "[REDACTED]"
+    return f"{match.group('prefix')}{replacement}"
+
+
 def redact_search_text(value: Any, *, limit: int = 98_304) -> str:
     """Single fail-closed redactor used by every operational extractor."""
 
@@ -174,9 +314,14 @@ def redact_search_text(value: Any, *, limit: int = 98_304) -> str:
     text = _JWT_RE.sub("[REDACTED_JWT]", text)
     text = _PROVIDER_TOKEN_RE.sub("[REDACTED_TOKEN]", text)
     text = _SIGNED_QUERY_RE.sub(lambda match: f"{match.group(1)}[REDACTED]", text)
-    text = _LABELED_SECRET_RE.sub(
-        lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]", text
+    text = _SENSITIVE_CONTAINER_RE.sub(
+        lambda match: f"{match.group('prefix')}[REDACTED]", text
     )
+    text = _SENSITIVE_HEADER_RE.sub(
+        lambda match: f"{match.group('prefix')}[REDACTED]", text
+    )
+    text = _LABELED_SECRET_RE.sub(_replace_labeled_secret, text)
+    text = _PRIVATE_PATH_RE.sub("[REDACTED_PATH]", text)
     text = _OPAQUE_TOKEN_RE.sub(
         lambda match: "[REDACTED_OPAQUE]" if _looks_high_entropy(match.group(1)) else match.group(1),
         text,
@@ -202,7 +347,13 @@ def _workflow_definition_text(raw: str | None) -> tuple[str, str | None]:
         node_id = str(node.get("id") or "")
         first_node = first_node or node_id or None
         parts.extend((f"node {node_id}", f"type {node.get('type') or ''}"))
-        data = node.get("data") if isinstance(node.get("data"), dict) else {}
+        # Runtime-authored graphs use ``config``. ``data`` remains a read-only
+        # compatibility fallback for early client prototypes.
+        data: dict[str, Any] = {}
+        if isinstance(node.get("data"), dict):
+            data.update(node["data"])
+        if isinstance(node.get("config"), dict):
+            data.update(node["config"])
         for key in safe_fields:
             value = data.get(key, node.get(key))
             if isinstance(value, (str, int, float, bool)) and value not in {"", None}:
@@ -690,14 +841,39 @@ async def sync_operational_search(
     if source_state is None:
         raise RuntimeError("operational storage is unavailable")
     instance_id, schema_version = str(source_state[0]), int(source_state[1])
-    fingerprint = hashlib.sha256(f"{instance_id}:{schema_version}".encode()).hexdigest()
+    fingerprint = _source_fingerprint(instance_id, schema_version)
+    outbox_head = int(
+        (
+            await (
+                await source.execute("SELECT COALESCE(MAX(seq), 0) FROM search_outbox")
+            ).fetchone()
+        )[0]
+    )
     index = await asyncio.to_thread(_open_index, target)
     try:
         state = index.execute("SELECT * FROM search_index_state WHERE singleton_id=1").fetchone()
+        if (
+            _index_is_incompatible(
+                state,
+                instance_id=instance_id,
+                schema_version=schema_version,
+                fingerprint=fingerprint,
+                outbox_head=outbox_head,
+            )
+            or _index_has_rowid_mismatch(index)
+        ):
+            await asyncio.to_thread(
+                _reset_index_generation,
+                index,
+                target,
+                instance_id=instance_id,
+                schema_version=schema_version,
+                fingerprint=fingerprint,
+            )
+            state = index.execute(
+                "SELECT * FROM search_index_state WHERE singleton_id=1"
+            ).fetchone()
         generation = str(state["index_generation"])
-        existing_fingerprint = state["source_fingerprint"]
-        if existing_fingerprint not in {None, fingerprint}:
-            raise RuntimeError("operational index belongs to another canonical database")
         last_seq = int(state["last_indexed_seq"])
         outbox = await (
             await source.execute(
@@ -748,17 +924,23 @@ async def sync_operational_search(
             documents = int(index.execute("SELECT COUNT(*) FROM search_documents WHERE deleted_at_ms IS NULL").fetchone()[0])
             chunks = int(index.execute("SELECT COUNT(*) FROM search_chunks").fetchone()[0])
             fts_rows = int(index.execute("SELECT COUNT(*) FROM search_fts").fetchone()[0])
-            coverage = "ready" if remaining == 0 and chunks == fts_rows else "building"
+            rowids_match = not _index_has_rowid_mismatch(index)
+            coverage = (
+                "ready"
+                if remaining == 0 and chunks == fts_rows and rowids_match
+                else ("invalid" if chunks != fts_rows or not rowids_match else "building")
+            )
             completed = now_ms if coverage == "ready" else None
             index.execute(
                 "UPDATE search_index_state SET source_db_instance_id=?, source_schema_version=?, "
                 "source_fingerprint=?, extractor_version=?, redaction_version=?, acl_projection_version=?, "
-                "coverage_state=?, last_indexed_seq=?, indexed_documents=?, indexed_chunks=?, "
+                "tokenizer_version=?, coverage_state=?, last_indexed_seq=?, indexed_documents=?, indexed_chunks=?, "
                 "pending_estimate=?, indexed_through_ms=?, build_started_at_ms=COALESCE(build_started_at_ms, ?), "
                 "build_completed_at_ms=?, last_error_class=NULL, updated_at_ms=? WHERE singleton_id=1",
                 (
                     instance_id, schema_version, fingerprint, EXTRACTOR_VERSION,
-                    REDACTION_VERSION, ACL_PROJECTION_VERSION, coverage, last_seq,
+                    REDACTION_VERSION, ACL_PROJECTION_VERSION, TOKENIZER_VERSION,
+                    coverage, last_seq,
                     documents, chunks, remaining,
                     max((int(row[4]) for row in outbox), default=state["indexed_through_ms"]),
                     now_ms, completed, now_ms,
@@ -776,6 +958,26 @@ async def sync_operational_search(
             "last_error_class=NULL, updated_at_ms=excluded.updated_at_ms",
             (CONSUMER_ID, last_seq, generation, now_ms),
         )
+        checkpoint = await (
+            await source.execute(
+                "SELECT MIN(last_seq) FROM search_outbox_consumers"
+            )
+        ).fetchone()
+        if checkpoint is not None and checkpoint[0] is not None:
+            through = int(checkpoint[0])
+            # Retain exactly the latest consumed row for each source. That row
+            # is sufficient to replay a brand-new generation, while removing
+            # the quadratic history produced by full legacy-session snapshots.
+            await source.execute(
+                "DELETE FROM search_outbox WHERE seq IN ("
+                "SELECT old.seq FROM search_outbox AS old "
+                "WHERE old.seq<=? AND EXISTS ("
+                "SELECT 1 FROM search_outbox AS newer WHERE "
+                "newer.tenant_id=old.tenant_id AND newer.source_kind=old.source_kind "
+                "AND newer.source_id=old.source_id AND newer.seq>old.seq AND newer.seq<=?"
+                "))",
+                (through, through),
+            )
         await source.commit()
         return _status_from_conn(index, target)
     finally:
@@ -802,10 +1004,51 @@ async def operational_search_status(db: Any) -> dict[str, Any]:
     path = operational_search_path(db.db_path)
     if not path.exists():
         return {"ready": False, "state": "unavailable", "generation": "unavailable", "seq": 0, "documents": 0, "pending": 0, "path": str(path)}
+    source = await db._ensure_connected()
+    source_state = await (
+        await source.execute(
+            "SELECT db_instance_id, schema_version FROM operational_storage_state WHERE singleton_id=1"
+        )
+    ).fetchone()
+    if source_state is None:
+        return {"ready": False, "state": "unavailable", "generation": "unavailable", "seq": 0, "documents": 0, "pending": 0, "path": str(path)}
+    instance_id, schema_version = str(source_state[0]), int(source_state[1])
+    fingerprint = _source_fingerprint(instance_id, schema_version)
+    outbox_head = int(
+        (
+            await (
+                await source.execute("SELECT COALESCE(MAX(seq), 0) FROM search_outbox")
+            ).fetchone()
+        )[0]
+    )
     conn = await asyncio.to_thread(_open_index, path)
     try:
+        state = conn.execute(
+            "SELECT * FROM search_index_state WHERE singleton_id=1"
+        ).fetchone()
         status = _status_from_conn(conn, path)
-        return status.__dict__
+        payload = dict(status.__dict__)
+        incompatible = _index_is_incompatible(
+            state,
+            instance_id=instance_id,
+            schema_version=schema_version,
+            fingerprint=fingerprint,
+            outbox_head=outbox_head,
+        )
+        rowid_mismatch = _index_has_rowid_mismatch(conn)
+        if incompatible:
+            payload.update(
+                ready=False,
+                state="warming",
+                pending=max(int(payload.get("pending") or 0), 1),
+            )
+        elif rowid_mismatch:
+            payload.update(
+                ready=False,
+                state="degraded",
+                pending=max(int(payload.get("pending") or 0), 1),
+            )
+        return payload
     finally:
         conn.close()
 
@@ -880,7 +1123,9 @@ def read_search_rows(
             "OR EXISTS (SELECT 1 FROM request_search_owners o "
             "WHERE o.principal_id=d.owner_principal_id) "
             "OR EXISTS (SELECT 1 FROM request_search_grants g "
-            "WHERE g.resource_type=d.resource_type AND g.resource_id=d.resource_id "
+            "WHERE ((g.resource_type=d.resource_type AND g.resource_id=d.resource_id) "
+            "OR (d.document_kind='tool_invocation' AND g.resource_type='session' "
+            "AND g.resource_id=d.session_id)) "
             "AND g.acl_version=d.acl_version))",
         ]
         params: list[Any] = [tenant_id, *kinds]

@@ -419,7 +419,14 @@ class _CursorState:
 
     @staticmethod
     def _rows(kind: str, snapshot: Any) -> int:
-        return len(snapshot.activity_ids) if kind == "history" else len(snapshot.rows)
+        if kind == "history":
+            return len(snapshot.activity_ids)
+        # Root grouping stores compact match rows below each root. Count those
+        # actual allocations, not only the number of outer roots, or one chat
+        # with tens of thousands of matches bypasses the global memory quota.
+        return sum(
+            max(1, len(row.get("_matches") or ())) for row in snapshot.rows
+        )
 
     def _enforce_quotas(self, principal_id: str) -> None:
         while True:
@@ -529,8 +536,33 @@ def _digest(value: Any) -> str:
 
 
 async def _activity_rows(conn: Any, access: AccessContext, filters: dict[str, Any]) -> list[Any]:
-    clauses = ["a.tenant_id=?", "a.deleted_at_ms IS NULL"]
+    clauses = [
+        "a.tenant_id=?",
+        "a.deleted_at_ms IS NULL",
+        "a.visibility<>'quarantined'",
+    ]
     params: list[Any] = [access.tenant_id]
+    owners = sorted(access.principal_ids)
+    identities = sorted(access.grant_identities)
+    authorization = ["a.visibility IN ('installation_shared','public')"]
+    if owners:
+        authorization.append(
+            f"a.owner_principal_id IN ({','.join('?' for _ in owners)})"
+        )
+        params.extend(owners)
+    if identities:
+        identity_sql = " OR ".join(
+            "(r.principal_type=? AND r.principal_id=?)" for _ in identities
+        )
+        authorization.append(
+            "EXISTS (SELECT 1 FROM resource_acl r WHERE r.tenant_id=a.tenant_id "
+            "AND r.resource_type=a.resource_type AND r.resource_id=a.resource_id "
+            "AND r.permission IN ('view','admin') AND r.acl_version=a.acl_version "
+            f"AND ({identity_sql}))"
+        )
+        for principal_type, principal_id in identities:
+            params.extend((principal_type, principal_id))
+    clauses.append(f"({' OR '.join(authorization)})")
     if filters["kinds"]:
         clauses.append(f"a.kind IN ({','.join('?' for _ in filters['kinds'])})")
         params.extend(filters["kinds"])
@@ -932,13 +964,27 @@ async def handle_tool_invocation(request: web.Request) -> web.Response:
         row = await (
             await conn.execute(
                 "SELECT t.*, 'tool_invocation' AS resource_type, t.id AS resource_id, "
+                "s.tenant_id AS parent_tenant_id, "
+                "s.owner_principal_id AS parent_owner_principal_id, "
+                "s.visibility AS parent_visibility, s.acl_version AS parent_acl_version, "
                 "(SELECT m.id FROM session_messages m WHERE m.session_id=t.session_id "
                 "AND m.tool_call_id=t.tool_call_id LIMIT 1) AS message_id "
-                "FROM tool_invocations t WHERE t.id=?",
+                "FROM tool_invocations t JOIN sessions_v2 s ON s.id=t.session_id "
+                "AND s.tenant_id=t.tenant_id WHERE t.id=? AND s.deleted_at_ms IS NULL",
                 (tool_id,),
             )
         ).fetchone()
-        if row is None or not await resource_is_visible(conn, row, access):
+        parent_acl = None
+        if row is not None:
+            parent_acl = {
+                "tenant_id": row["parent_tenant_id"],
+                "owner_principal_id": row["parent_owner_principal_id"],
+                "visibility": row["parent_visibility"],
+                "acl_version": row["parent_acl_version"],
+                "resource_type": "session",
+                "resource_id": row["session_id"],
+            }
+        if row is None or not await resource_is_visible(conn, parent_acl, access):
             raise ApiProblem(404, "target_not_found", "This result is no longer available")
         root_kind = "delegated_session" if row["root_kind"] == "session" and row["child_session_id"] else ("chat" if row["root_kind"] == "session" else str(row["root_kind"]))
         artifacts = await (
@@ -1138,14 +1184,28 @@ async def _search_row_visible(conn: Any, row: dict[str, Any], access: AccessCont
     elif resource_type == "tool_invocation":
         canonical = await (
             await conn.execute(
-                "SELECT tenant_id, owner_principal_id, visibility, acl_version, "
-                "'tool_invocation' AS resource_type, id AS resource_id, source_version "
-                "FROM tool_invocations WHERE id=?",
+                "SELECT s.tenant_id, s.owner_principal_id, s.visibility, s.acl_version, "
+                "'session' AS resource_type, s.id AS resource_id, "
+                "t.source_version AS source_version "
+                "FROM tool_invocations t JOIN sessions_v2 s ON s.id=t.session_id "
+                "AND s.tenant_id=t.tenant_id WHERE t.id=? AND s.deleted_at_ms IS NULL",
                 (resource_id,),
             )
         ).fetchone()
         if canonical is not None:
             canonical_source_version = int(canonical["source_version"])
+            message = await (
+                await conn.execute(
+                    "SELECT 1 FROM session_messages WHERE id=? AND session_id=? "
+                    "AND visibility='user_visible' LIMIT 1",
+                    (
+                        str(row.get("message_id") or ""),
+                        str(row.get("session_id") or ""),
+                    ),
+                )
+            ).fetchone()
+            if message is None:
+                return False
     else:
         tables = {
             "workflow_definition": "workflow_tasks",
@@ -1259,13 +1319,20 @@ async def handle_search(request: web.Request) -> web.Response:
         raw_statuses = filters.get("status")
         if raw_statuses is not None and (
             not isinstance(raw_statuses, list)
+            or len(raw_statuses) > len(_RUN_STATUSES)
             or any(not isinstance(value, str) or value not in _RUN_STATUSES for value in raw_statuses)
         ):
             raise ApiProblem(400, "invalid_request", "filters.status must be an array of run statuses")
+        if raw_statuses is not None:
+            filters = dict(filters)
+            filters["status"] = sorted(set(raw_statuses))
         parent_type, parent_id = filters.get("parent_type"), filters.get("parent_id")
-        if bool(parent_type) != bool(parent_id):
+        if (parent_type is None) != (parent_id is None):
             raise ApiProblem(400, "invalid_request", "filters.parent_type and filters.parent_id must be used together")
-        if parent_type is not None and parent_type not in {"session", "workflow", "scheduled_task", "event"}:
+        if parent_type is not None and (
+            not isinstance(parent_type, str)
+            or parent_type not in {"session", "workflow", "scheduled_task", "event"}
+        ):
             raise ApiProblem(400, "invalid_request", "filters.parent_type is invalid")
         if parent_id is not None and (not isinstance(parent_id, str) or not 1 <= len(parent_id) <= 512):
             raise ApiProblem(400, "invalid_request", "filters.parent_id is invalid")
@@ -1310,6 +1377,12 @@ async def handle_search(request: web.Request) -> web.Response:
             fts_query = literal_fts_query(query)
         except ValueError as exc:
             raise ApiProblem(422, "unprocessable_query", "The query exceeds the supported complexity") from exc
+        if sort == "relevance" and not fts_query:
+            raise ApiProblem(
+                422,
+                "unprocessable_query",
+                "The query must contain at least one searchable term",
+            )
         db, conn = await _canonical_conn(request)
         cursor_token = body.get("cursor")
         try:
@@ -1441,8 +1514,16 @@ async def handle_search(request: web.Request) -> web.Response:
             row = snapshot.rows[next_offset]
             next_offset += 1
             current_matches: list[tuple[dict[str, Any], dict[str, Any]]] = []
+            visible_match_count = 0
             for match_row in row["_matches"]:
                 if not await _search_row_visible(conn, match_row, access):
+                    continue
+                visible_match_count += 1
+                # The wire contract exposes at most two snippets per root. Keep
+                # counting authorized matches for an exact match_count, but do
+                # not open/highlight the FTS database tens of thousands of times
+                # for content that will never be serialized.
+                if len(current_matches) >= 2:
                     continue
                 highlighted = await asyncio.to_thread(
                     read_authorized_highlight,
@@ -1475,7 +1556,7 @@ async def handle_search(request: web.Request) -> web.Response:
                     "result_id": f"{root_row['root_kind']}:{root_row['root_id']}" if grouping == "root" else str(root_row["chunk_id"]),
                     "root": root,
                     "matches": matches,
-                    "match_count": len(current_matches),
+                    "match_count": visible_match_count,
                     "target": matches[0]["target"],
                     "caused_by": None,
                 }
