@@ -264,6 +264,16 @@ export function createServer(vaultPath: string, options: CreateServerOptions = {
           }
           if (quality && quality.warnings.length > 0) {
             text += `\nStill needs you: ${quality.warnings.map((w) => w.message).join('; ')}.`;
+            // ...and HOW. Saying what is missing without saying how to supply
+            // it sends the caller guessing at the repair tool's shape: the
+            // measured loop was write_note -> "missing 'summary'" ->
+            // update_frontmatter with the field passed at the top level ->
+            // "frontmatter is required" -> retry. Three round trips, on every
+            // note written without a summary, on every agent, every night.
+            // The fix is one line: name the call, with the path already in it.
+            text += `\nFix with: update_frontmatter({"path": ${JSON.stringify(trimmedArgs.path)}, `
+              + `"frontmatter": {"summary": "<one sentence>"}, "merge": true}) `
+              + `— the fields go INSIDE \`frontmatter\`, and \`merge: true\` keeps the rest.`;
           }
           return { content: [{ type: "text", text }] };
         }
@@ -426,7 +436,21 @@ export function createServer(vaultPath: string, options: CreateServerOptions = {
         case "update_frontmatter": {
           const fm = parseFrontmatter(trimmedArgs.frontmatter);
           if (!fm) {
-            throw new Error('frontmatter is required');
+            // A bare "required" is the least useful thing to say to a caller
+            // that DID send something — it just sent it in the wrong place.
+            // The usual mistake is passing the fields at the top level
+            // (`{path, summary}`) instead of nested, so name that.
+            const stray = Object.keys(trimmedArgs || {})
+              .filter((k) => !["path", "frontmatter", "merge"].includes(k));
+            const strayNote = stray.length > 0
+              ? ` Received ${stray.map((k) => `\`${k}\``).join(', ')} at the top level — `
+                + `those belong inside \`frontmatter\`.`
+              : '';
+            throw new Error(
+              'frontmatter is required: pass the fields as an object, e.g. '
+              + '{"path": "notes/x.md", "frontmatter": {"summary": "..."}, "merge": true}.'
+              + strayNote,
+            );
           }
           await fileSystem.updateFrontmatter({
             path: trimmedArgs.path,
