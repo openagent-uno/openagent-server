@@ -1157,9 +1157,10 @@ class Gateway:
             ("POST", "/api/scheduled-tasks/{id}/stop", scheduled_tasks.handle_stop),
             ("PATCH", "/api/scheduled-tasks/{id}", scheduled_tasks.handle_update),
             ("DELETE", "/api/scheduled-tasks/{id}", scheduled_tasks.handle_delete),
-            # Workflow engine (n8n-style multi-block pipelines). Same
-            # scheduler 503 invariant as scheduled-tasks — handlers
-            # return 503 when no Scheduler is attached.
+            # Workflow engine (n8n-style multi-block pipelines). Durable GETs
+            # remain available while background workers are parked; mutations
+            # and execution return 503 when no Scheduler is attached, matching
+            # the scheduled-task surface.
             ("GET", "/api/workflows", workflow_tasks.handle_list),
             ("POST", "/api/workflows", workflow_tasks.handle_create),
             ("GET", "/api/workflows/{id}", workflow_tasks.handle_get),

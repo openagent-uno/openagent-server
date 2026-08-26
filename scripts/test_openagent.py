@@ -52,6 +52,7 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_imports",
     "test_iroh_discovery",
     "test_local_e2e",
+    "test_local_e2e_automation_reads",
     # REST surfaces added alongside the accounts / skills / session-pin work.
     "test_semantic_lock",
     "test_semantic_oversized",
