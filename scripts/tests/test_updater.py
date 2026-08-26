@@ -963,3 +963,76 @@ async def t_updater_captures_digest(ctx: TestContext) -> None:
         info = updater.check_for_update()
     assert info is not None
     assert info.expected_digest == "sha256:" + "b" * 64, info.expected_digest
+
+
+@test("updater", "release verifier accepts GNU Windows binary checksum markers")
+async def t_release_verifier_accepts_windows_binary_marker(ctx: TestContext) -> None:
+    import hashlib
+    import subprocess
+    import sys
+    import tempfile
+    from pathlib import Path
+
+    version = "9.8.7-beta.6"
+    base = f"openagent-{version}"
+    archive_names = (
+        f"{base}-linux-x64.tar.gz",
+        f"{base}-macos-arm64.pkg",
+        f"{base}-windows-x64.zip",
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        for index, name in enumerate(archive_names):
+            archive = root / name
+            archive.write_bytes(f"fixture-{index}".encode())
+            digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+            marker = "*" if name.endswith("windows-x64.zip") else " "
+            # Pin CRLF too: Windows-produced checksum assets must remain valid.
+            (root / f"{name}.sha256").write_bytes(
+                f"{digest} {marker}{name}\r\n".encode(),
+            )
+
+        result = subprocess.run(
+            [sys.executable, "scripts/verify-release-assets.py", str(root), version],
+            cwd=Path(__file__).resolve().parents[2],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr or result.stdout
+        assert "verified 6 immutable release assets" in result.stdout
+
+
+@test("updater", "release verifier rejects a checksum target hidden in a path")
+async def t_release_verifier_rejects_nested_checksum_target(ctx: TestContext) -> None:
+    import hashlib
+    import subprocess
+    import sys
+    import tempfile
+    from pathlib import Path
+
+    version = "9.8.7-beta.6"
+    base = f"openagent-{version}"
+    archive_names = (
+        f"{base}-linux-x64.tar.gz",
+        f"{base}-macos-arm64.pkg",
+        f"{base}-windows-x64.zip",
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        for index, name in enumerate(archive_names):
+            archive = root / name
+            archive.write_bytes(f"fixture-{index}".encode())
+            digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+            listed = f"subdir/{name}" if name.endswith("windows-x64.zip") else name
+            (root / f"{name}.sha256").write_text(f"{digest}  {listed}\n")
+
+        result = subprocess.run(
+            [sys.executable, "scripts/verify-release-assets.py", str(root), version],
+            cwd=Path(__file__).resolve().parents[2],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert result.returncode != 0
+        assert "invalid checksum sidecar" in result.stderr

@@ -42,7 +42,7 @@ case "$ARCH_RAW" in
     *) ARCH="$ARCH_RAW" ;;
 esac
 
-# Distribution metadata normalizes ``0.20.0-beta.1`` to ``0.20.0b1``. Release
+# Distribution metadata normalizes ``X.Y.Z-beta.N`` to ``X.Y.ZbN``. Release
 # tags, updater lookup, checksums, and filenames use the external SemVer form,
 # so read the deliberately lightweight source constant instead. This runs in
 # the repo root, before ``cd dist``, and cannot be shadowed by PyInstaller.

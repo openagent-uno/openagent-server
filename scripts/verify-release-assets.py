@@ -58,7 +58,14 @@ for checksum_name in sorted(name for name in expected if name.endswith(".sha256"
     checksum_path = next(path for path in files if path.name == checksum_name)
     parts = checksum_path.read_text(encoding="utf-8").strip().split()
     target = checksum_name.removesuffix(".sha256")
-    if len(parts) != 2 or parts[0] != local[target]["digest"] or Path(parts[1]).name != target:
+    # GNU checksum files encode text mode as ``<hash>  <name>`` and binary
+    # mode as ``<hash> *<name>``. Git Bash uses the latter on Windows; its
+    # own ``sha256sum -c`` accepts it, so the cross-platform release merger
+    # must parse the same standard marker. Keep the asset name exact after
+    # removing only that marker: accepting a basename from a nested path
+    # would hide a malformed or substituted sidecar.
+    listed_target = parts[1].removeprefix("*") if len(parts) == 2 else ""
+    if len(parts) != 2 or parts[0] != local[target]["digest"] or listed_target != target:
         raise SystemExit(f"invalid checksum sidecar: {checksum_name}")
 
 if args.release_json:
