@@ -175,75 +175,37 @@ async def t_async_chain_too(ctx: TestContext) -> None:
     assert len(esecuzioni) == 2
 
 
-# ── il contratto con il runtime ─────────────────────────────────────────────
+# ── il contratto con il runtime: cosa servira' per ricablare ───────────────
 #
-# I test qui sopra provano la GUARDIA. Non provano che il runtime sappia
-# CHIAMARLA — e in produzione e' li' che si e' rotto: il parametro si chiamava
-# `next_func`, `_build_hook_args` riempie solo i nomi che riconosce
-# (`name`, `func`/`function`/`function_call`, `args`/`arguments`), quindi non
-# lo riempiva mai e ogni tool dell'agent moriva con
+# La guardia NON e' cablata. Cablarla ha rotto i tool in produzione due volte
+# in un giorno, e i test qui sopra — che provano la guardia e passavano tutti —
+# non hanno visto niente, perche' provavano il pezzo e non l'aggancio.
 #
-#     _repeat_guard_hook() missing 1 required positional argument: 'next_func'
+# Il contratto vero, da `src/mcp/_runtime/function.py`:
+#   * `_build_hook_args` riempie SOLO i nomi che riconosce: `name`,
+#     `func`/`function`/`function_call`, `args`/`arguments`. Un parametro con
+#     un altro nome non viene mai riempito e la chiamata muore.
+#   * catena SINCRONA: gli hook `async def` vengono scartati con un warning.
+#   * catena ASINCRONA: `next_func` e' SEMPRE una coroutine, e l'hook viene
+#     atteso SOLO se e' `async def`. Un hook sincuro li' dentro restituisce una
+#     coroutine che nessuno attende, e ogni tool torna un oggetto coroutine.
 #
-# Un hook giusto invocato in modo impossibile e' un hook rotto. Questo test
-# chiama il costruttore di argomenti VERO del runtime.
-
-@test("tool_repeat", "il runtime sa costruire la chiamata all'hook")
-async def t_hook_signature_matches_runtime(ctx: TestContext) -> None:
-    import inspect
-
-    from src.models.native_provider import _repeat_guard_hook
-
-    parametri = set(inspect.signature(_repeat_guard_hook).parameters)
-    riconosciuti = {"agent", "team", "run_context", "name", "function_name",
-                    "function", "func", "function_call", "args", "arguments"}
-    ignoti = parametri - riconosciuti
-    assert not ignoti, (
-        "questi parametri il runtime non li riempie mai, e la chiamata "
-        "morira' con 'missing positional argument': %s" % sorted(ignoti))
-
-    # E la funzione deve poter ricevere davvero un next-callable e degli
-    # argomenti: un hook che accetta solo `name` passerebbe il controllo sopra
-    # e non potrebbe eseguire niente.
-    assert parametri & {"function", "func", "function_call"}, parametri
-    assert parametri & {"args", "arguments"}, parametri
+# Quindi l'hook dovra' essere `async def`, e il test che manca dovra'
+# percorrere la catena VERA del runtime — non una sua imitazione scritta da me,
+# che e' esattamente il modo in cui mi sono sfuggite entrambe le rotture.
 
 
-@test("tool_repeat", "invocato come lo invoca il runtime, funziona")
-async def t_hook_called_the_runtime_way(ctx: TestContext) -> None:
-    import inspect
+@test("tool_repeat", "la guardia NON e' cablata, e il perche' e' scritto")
+async def t_guard_is_unwired_on_purpose(ctx: TestContext) -> None:
+    import pathlib
 
-    from src.core.tool_repeat import begin_run
-    from src.models.native_provider import _repeat_guard_hook
+    src = (pathlib.Path(__file__).resolve().parents[2]
+           / "src" / "models" / "native_provider.py").read_text()
 
-    # Replica di `_build_hook_args`: si riempie per NOME, come fa il runtime.
-    def chiama_come_il_runtime(hook, name, next_callable, args):
-        params = inspect.signature(hook).parameters
-        kw = {}
-        if "name" in params:
-            kw["name"] = name
-        for k in ("function", "func", "function_call"):
-            if k in params:
-                kw[k] = next_callable
-        for k in ("args", "arguments"):
-            if k in params:
-                kw[k] = args
-        return hook(**kw)
-
-    eseguito = []
-
-    def finto_tool(**kwargs):
-        eseguito.append(kwargs)
-        return "risultato"
-
-    begin_run()
-    for _ in range(2):
-        out = chiama_come_il_runtime(
-            _repeat_guard_hook, "read_file", finto_tool, {"path": "a.md"})
-        assert out == "risultato", out
-    assert len(eseguito) == 2
-
-    bloccato = chiama_come_il_runtime(
-        _repeat_guard_hook, "read_file", finto_tool, {"path": "a.md"})
-    assert "chiamata ripetuta" in bloccato
-    assert len(eseguito) == 2
+    # Se qualcuno la ricabla senza il test end-to-end, questo lo ferma.
+    assert "tool_hooks=[" not in src, (
+        "la guardia e' stata ricablata: serve prima un test che percorra la "
+        "catena vera del runtime, sincrona e asincrona")
+    # E la ragione deve restare leggibile accanto al codice, non solo qui.
+    assert "e' STACCATA" in src
+    assert "async def" in src

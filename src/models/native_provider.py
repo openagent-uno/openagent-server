@@ -69,30 +69,30 @@ logger = logging.getLogger(__name__)
 _DEFAULT_MAX_TOOL_CALLS_PER_RUN = 60
 
 
-def _repeat_guard_hook(name, func, arguments=None):
-    """Ponte verso ``src.core.tool_repeat``, sincrono o asincrono.
-
-    I NOMI DEI PARAMETRI SONO IL CONTRATTO. ``_build_hook_args`` costruisce la
-    chiamata ispezionando la firma e riempie solo i nomi che riconosce:
-    ``name``, ``func``/``function``/``function_call``, ``args``/``arguments``.
-    Un parametro che si chiama diversamente non viene MAI riempito, e la
-    chiamata muore con "missing 1 required positional argument" — cioe' ogni
-    tool dell'agent smette di funzionare.
-
-    E' successo: chiamai il parametro ``next_func``, che e' il nome giusto per
-    un lettore e sbagliato per il runtime, e i tool sono rimasti bloccati
-    finche' un compito schedulato non ha riportato l'errore. Il test
-    ``tool_repeat_hook_contract`` chiama ``_build_hook_args`` con questa
-    funzione proprio perche' provare la guardia da sola non prova che il
-    runtime sappia invocarla.
-    """
-    import inspect
-
-    from src.core.tool_repeat import repeat_guard, repeat_guard_async
-
-    if inspect.iscoroutinefunction(func):
-        return repeat_guard_async(name, func, arguments)
-    return repeat_guard(name, func, arguments)
+# ── la guardia sulle chiamate ripetute e' STACCATA ────────────────────────
+#
+# `src/core/tool_repeat.py` c'e', e' provato (11 test) e funziona. Non e'
+# cablato, e la ragione va scritta qui perche' non venga ricablato d'istinto.
+#
+# Cablarlo come `tool_hooks` ha rotto i tool in produzione DUE volte lo stesso
+# giorno:
+#   1. parametro chiamato `next_func` — `_build_hook_args` riempie solo i nomi
+#      che riconosce, quindi non lo riempiva mai: "missing 1 required
+#      positional argument";
+#   2. corretto il nome, l'hook sincrono nella catena ASINCRONA restituiva una
+#      coroutine che nessuno attendeva, e ogni tool tornava un oggetto
+#      coroutine invece del risultato.
+#
+# Il contratto vero, letto alla fine in `src/mcp/_runtime/function.py`:
+#   * catena sincrona  -> gli hook async vengono SCARTATI con un warning;
+#   * catena asincrona -> `next_func` e' SEMPRE una coroutine, e l'hook viene
+#     atteso SOLO se e' `async def`.
+# Quindi serve un hook `async def` (che la catena sincrona scartera'), non uno
+# sincuro. E serve un test che percorra la catena VERA del runtime: i miei
+# undici test provavano la guardia e nessuno provava che il runtime sapesse
+# invocarla, che e' l'unica cosa che poi si e' rotta.
+#
+# Si ricabla quando quel test esiste ed e' verde. Non prima.
 
 
 def _max_tool_calls_per_run() -> Optional[int]:
@@ -1399,10 +1399,6 @@ class NativeProvider(BaseModel):
             # re-sends the whole context, so an unbounded loop pays for the
             # history again on each one.
             tool_call_limit=_max_tool_calls_per_run(),
-            # Il tetto non ha visto il caso vero: docs-keeper e' arrivato a
-            # 46 chiamate — sotto il tetto — bruciando 857k token perche' i
-            # giri erano lo stesso giro. Questo li riconosce.
-            tool_hooks=[_repeat_guard_hook],
             markdown=False,
         )
         self._agno_agents[sys_key] = agent
@@ -1490,7 +1486,6 @@ class NativeProvider(BaseModel):
                 name=f"{family}_specialist",
                 role=member_role,
                 tool_call_limit=_max_tool_calls_per_run(),
-                tool_hooks=[_repeat_guard_hook],
                 markdown=False,
             )
             members.append(member)
@@ -1523,7 +1518,6 @@ class NativeProvider(BaseModel):
                 add_session_summary_to_context=True,
                 enable_agentic_memory=False,
                 tool_call_limit=_max_tool_calls_per_run(),
-                tool_hooks=[_repeat_guard_hook],
                 markdown=False,
             )
         except Exception as exc:
@@ -1652,14 +1646,6 @@ class NativeProvider(BaseModel):
         so the runtime's native multimodal handling applies (Team
         propagates them to members during ``delegate_task_to_member``).
         """
-        # I contatori delle ripetizioni vivono per ESECUZIONE, non per
-        # agent: gli agent sono in cache e riusati fra turni, e un
-        # contatore appiccicato li' rifiuterebbe domani una lettura
-        # legittima perche' e' gia' stata fatta ieri.
-        from src.core.tool_repeat import begin_run as _begin_repeat_run
-
-        _begin_repeat_run()
-
         prompt = self._flatten_messages(messages)
         sid = session_id or "default"
         # Prefer a Team when the caller supplied a system prompt AND we
