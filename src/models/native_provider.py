@@ -69,20 +69,30 @@ logger = logging.getLogger(__name__)
 _DEFAULT_MAX_TOOL_CALLS_PER_RUN = 60
 
 
-def _repeat_guard_hook(name, next_func, arguments=None):
+def _repeat_guard_hook(name, func, arguments=None):
     """Ponte verso ``src.core.tool_repeat``, sincrono o asincrono.
 
-    La catena dei tool del runtime ha due varianti e l'hook deve stare in
-    entrambe: se ``next_func`` e' una coroutine si restituisce la coroutine
-    della guardia asincrona, cosi' il chiamante la attende come si aspetta.
+    I NOMI DEI PARAMETRI SONO IL CONTRATTO. ``_build_hook_args`` costruisce la
+    chiamata ispezionando la firma e riempie solo i nomi che riconosce:
+    ``name``, ``func``/``function``/``function_call``, ``args``/``arguments``.
+    Un parametro che si chiama diversamente non viene MAI riempito, e la
+    chiamata muore con "missing 1 required positional argument" — cioe' ogni
+    tool dell'agent smette di funzionare.
+
+    E' successo: chiamai il parametro ``next_func``, che e' il nome giusto per
+    un lettore e sbagliato per il runtime, e i tool sono rimasti bloccati
+    finche' un compito schedulato non ha riportato l'errore. Il test
+    ``tool_repeat_hook_contract`` chiama ``_build_hook_args`` con questa
+    funzione proprio perche' provare la guardia da sola non prova che il
+    runtime sappia invocarla.
     """
     import inspect
 
     from src.core.tool_repeat import repeat_guard, repeat_guard_async
 
-    if inspect.iscoroutinefunction(next_func):
-        return repeat_guard_async(name, next_func, arguments)
-    return repeat_guard(name, next_func, arguments)
+    if inspect.iscoroutinefunction(func):
+        return repeat_guard_async(name, func, arguments)
+    return repeat_guard(name, func, arguments)
 
 
 def _max_tool_calls_per_run() -> Optional[int]:

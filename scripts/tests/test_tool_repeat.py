@@ -173,3 +173,77 @@ async def t_async_chain_too(ctx: TestContext) -> None:
     blocked = await repeat_guard_async("search_notes", finto_tool, {"q": "x"})
     assert "chiamata ripetuta" in blocked
     assert len(esecuzioni) == 2
+
+
+# ── il contratto con il runtime ─────────────────────────────────────────────
+#
+# I test qui sopra provano la GUARDIA. Non provano che il runtime sappia
+# CHIAMARLA — e in produzione e' li' che si e' rotto: il parametro si chiamava
+# `next_func`, `_build_hook_args` riempie solo i nomi che riconosce
+# (`name`, `func`/`function`/`function_call`, `args`/`arguments`), quindi non
+# lo riempiva mai e ogni tool dell'agent moriva con
+#
+#     _repeat_guard_hook() missing 1 required positional argument: 'next_func'
+#
+# Un hook giusto invocato in modo impossibile e' un hook rotto. Questo test
+# chiama il costruttore di argomenti VERO del runtime.
+
+@test("tool_repeat", "il runtime sa costruire la chiamata all'hook")
+async def t_hook_signature_matches_runtime(ctx: TestContext) -> None:
+    import inspect
+
+    from src.models.native_provider import _repeat_guard_hook
+
+    parametri = set(inspect.signature(_repeat_guard_hook).parameters)
+    riconosciuti = {"agent", "team", "run_context", "name", "function_name",
+                    "function", "func", "function_call", "args", "arguments"}
+    ignoti = parametri - riconosciuti
+    assert not ignoti, (
+        "questi parametri il runtime non li riempie mai, e la chiamata "
+        "morira' con 'missing positional argument': %s" % sorted(ignoti))
+
+    # E la funzione deve poter ricevere davvero un next-callable e degli
+    # argomenti: un hook che accetta solo `name` passerebbe il controllo sopra
+    # e non potrebbe eseguire niente.
+    assert parametri & {"function", "func", "function_call"}, parametri
+    assert parametri & {"args", "arguments"}, parametri
+
+
+@test("tool_repeat", "invocato come lo invoca il runtime, funziona")
+async def t_hook_called_the_runtime_way(ctx: TestContext) -> None:
+    import inspect
+
+    from src.core.tool_repeat import begin_run
+    from src.models.native_provider import _repeat_guard_hook
+
+    # Replica di `_build_hook_args`: si riempie per NOME, come fa il runtime.
+    def chiama_come_il_runtime(hook, name, next_callable, args):
+        params = inspect.signature(hook).parameters
+        kw = {}
+        if "name" in params:
+            kw["name"] = name
+        for k in ("function", "func", "function_call"):
+            if k in params:
+                kw[k] = next_callable
+        for k in ("args", "arguments"):
+            if k in params:
+                kw[k] = args
+        return hook(**kw)
+
+    eseguito = []
+
+    def finto_tool(**kwargs):
+        eseguito.append(kwargs)
+        return "risultato"
+
+    begin_run()
+    for _ in range(2):
+        out = chiama_come_il_runtime(
+            _repeat_guard_hook, "read_file", finto_tool, {"path": "a.md"})
+        assert out == "risultato", out
+    assert len(eseguito) == 2
+
+    bloccato = chiama_come_il_runtime(
+        _repeat_guard_hook, "read_file", finto_tool, {"path": "a.md"})
+    assert "chiamata ripetuta" in bloccato
+    assert len(eseguito) == 2
