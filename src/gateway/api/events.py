@@ -184,6 +184,9 @@ async def handle_create(request):
         enabled=bool(body.get("enabled", True)),
     )
     ev = await db.get_event(event_id)
+    from .operational import claim_created_resource
+
+    await claim_created_resource(request, "event_definition", event_id)
     elog("event.create", id=event_id, name=name, type=event_type, action=action_kind)
     await request.app["gateway"].broadcast_resource("event", "created", event_id)
     out = _serialize_event(request, ev)
@@ -380,7 +383,12 @@ async def handle_delivery_get(request):
     row = await db.get_event_delivery(request.match_info["id"])
     if row is None:
         return web.json_response({"error": "Delivery not found"}, status=404)
-    return web.json_response(row)
+    from .operational import decorate_event_delivery_detail
+
+    detail = await decorate_event_delivery_detail(request, row)
+    if detail is None:
+        return web.json_response({"error": "This result is no longer available"}, status=404)
+    return web.json_response(detail, headers={"Cache-Control": "no-store"})
 
 
 async def handle_types(request):

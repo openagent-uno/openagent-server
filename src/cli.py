@@ -426,6 +426,25 @@ def selfcheck(quiet: bool, expect: str | None) -> None:
     """
     import src as _src
     version = getattr(_src, "__version__", "unknown")
+    # These SQL resources are imported through importlib.resources at runtime.
+    # Loading and checking their identity here makes a frozen/package-data
+    # omission fail before an updater swaps the live server binary.
+    try:
+        from src.memory.operational.schema import (
+            operational_schema_sql,
+            operational_search_schema_sql,
+        )
+
+        canonical_sql = operational_schema_sql()
+        search_sql = operational_search_schema_sql()
+        if "CREATE TABLE IF NOT EXISTS operational_storage_state" not in canonical_sql:
+            raise RuntimeError("canonical operational schema resource is invalid")
+        if "CREATE VIRTUAL TABLE IF NOT EXISTS search_fts" not in search_sql:
+            raise RuntimeError("operational search schema resource is invalid")
+    except Exception as exc:
+        if not quiet:
+            console.print("[red]selfcheck failed:[/red] operational SQL resources unavailable")
+        raise SystemExit(4) from exc
     if expect is not None and version != expect:
         if not quiet:
             console.print(f"[red]version mismatch:[/red] running {version}, expected {expect}")
@@ -503,7 +522,10 @@ def update(ctx, yes: bool, no_restart: bool) -> None:
 
 @main.command()
 @click.argument("agent_dir", required=False, default=None)
-@click.option("--channel", "-ch", multiple=True, help="Channels to start (telegram, discord, whatsapp)")
+@click.option(
+    "--channel", "-ch", multiple=True,
+    help="Channels to start (gateway, telegram, discord, whatsapp); gateway starts no chat bridge.",
+)
 @click.option("--no-auto-init", is_flag=True,
               help="Don't auto-create a network on first run; require explicit `network init`.")
 @click.pass_context

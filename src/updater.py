@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 # agent from receiving updates with no surfaced error.
 GITHUB_REPO = "openagent-uno/openagent-server"
 GITHUB_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+GITHUB_RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=30"
 
 
 def _ssl_context():
@@ -107,30 +108,10 @@ def _select_release_assets(
 
     if download_url:
         return download_url, checksum_url, digest
-
-    # Backward-compatible fallback for older release layouts: keep the server
-    # prefix explicit so ``openagent-cli`` / ``openagent-app`` are ignored.
-    suffix = _asset_suffix()
-    server_prefix = "openagent-"
-    excluded_prefixes = ("openagent-cli-", "openagent-app-")
-    for asset in assets:
-        name = str(asset.get("name", ""))
-        url = str(asset.get("browser_download_url", ""))
-        if (
-            name.startswith(server_prefix)
-            and not name.startswith(excluded_prefixes)
-            and name.endswith(suffix)
-        ):
-            download_url = url
-            digest = str(asset.get("digest") or "") or None
-        elif (
-            name.startswith(server_prefix)
-            and not name.startswith(excluded_prefixes)
-            and name.endswith(f"{suffix}.sha256")
-        ):
-            checksum_url = url
-
-    return download_url, checksum_url, digest
+    # Release metadata and downloaded bytes must agree on one exact version.
+    # A same-platform fallback could silently install an older/newer sibling
+    # archive when a release was assembled incompletely, so fail closed.
+    return None, None, None
 
 
 def _asset_suffix() -> str:
@@ -181,7 +162,61 @@ def _try_elog(event: str, level: str = "info", **data) -> None:
         pass
 
 
-def check_for_update() -> UpdateInfo | None:
+def _effective_update_channel(current: str, configured: str | None) -> str:
+    """Return stable/beta without ever opting a stable build into prereleases."""
+
+    from packaging.version import InvalidVersion, Version
+
+    explicit = (configured or os.environ.get("OPENAGENT_UPDATE_CHANNEL", "")).strip().lower()
+    if explicit:
+        if explicit not in {"stable", "beta"}:
+            logger.warning("Unknown update channel %r; defaulting to stable", explicit)
+            return "stable"
+        return explicit
+    try:
+        parsed = Version(current)
+    except InvalidVersion:
+        return "stable"
+    raw_pre = "".join(str(part).lower() for part in (parsed.pre or ()))
+    return "beta" if parsed.is_prerelease and ("b" in raw_pre or "beta" in current.lower()) else "stable"
+
+
+def _select_channel_release(payload: object, *, current: str, channel: str) -> dict | None:
+    """Select the newest allowed release from a synthetic/GitHub feed."""
+
+    from packaging.version import InvalidVersion, Version
+
+    releases = payload if isinstance(payload, list) else [payload]
+    try:
+        current_version = Version(current)
+    except InvalidVersion:
+        return None
+    candidates: list[tuple[Version, dict]] = []
+    for raw in releases:
+        if not isinstance(raw, dict) or raw.get("draft"):
+            continue
+        tag = str(raw.get("tag_name") or "")
+        try:
+            parsed = Version(tag.lstrip("v"))
+        except InvalidVersion:
+            continue
+        if parsed <= current_version:
+            continue
+        prerelease = bool(raw.get("prerelease")) or parsed.is_prerelease
+        if prerelease:
+            if channel != "beta":
+                continue
+            # Beta means beta — never silently consume alpha/rc/nightly. Keep
+            # prereleases on the current major/minor compatibility line; a
+            # semantically newer stable is allowed independently below.
+            pre_name = str((parsed.pre or ("",))[0]).lower()
+            if pre_name not in {"b", "beta"} or parsed.release[:2] != current_version.release[:2]:
+                continue
+        candidates.append((parsed, raw))
+    return max(candidates, key=lambda item: item[0])[1] if candidates else None
+
+
+def check_for_update(channel: str | None = None) -> UpdateInfo | None:
     """Query GitHub Releases for a newer version.
 
     Returns UpdateInfo if a newer version is available, else None.
@@ -196,24 +231,35 @@ def check_for_update() -> UpdateInfo | None:
 
     current = getattr(src, "__version__", "0.0.0")
 
+    effective_channel = _effective_update_channel(current, channel)
+    api_url = GITHUB_RELEASES_API if effective_channel == "beta" else GITHUB_API
     try:
-        req = Request(GITHUB_API, headers={"Accept": "application/vnd.github+json"})
+        req = Request(api_url, headers={"Accept": "application/vnd.github+json"})
         with urlopen(req, timeout=15, context=_ssl_context()) as resp:
-            data = json.loads(resp.read())
+            payload = json.loads(resp.read())
     except Exception as e:
         logger.error("Failed to check for updates: %s", e)
         _try_elog("update.check_failed", level="warning", error=str(e) or type(e).__name__)
         return None
 
-    # Defence-in-depth: GitHub's ``/releases/latest`` filters prereleases
-    # server-side, but a future migration to ``/releases`` (or someone
-    # marking a release as ``latest=true`` manually) would otherwise
-    # auto-deploy an RC build to every production agent on the next 6 h
-    # check.
-    if data.get("prerelease"):
-        tag = data.get("tag_name", "")
-        logger.info("Skipping prerelease %s", tag)
-        _try_elog("update.skipped_prerelease", tag=tag)
+    data = _select_channel_release(payload, current=current, channel=effective_channel)
+    if data is None:
+        if effective_channel == "stable" and isinstance(payload, dict) and payload.get("prerelease"):
+            tag = payload.get("tag_name", "")
+            logger.info("Skipping prerelease %s", tag)
+            _try_elog("update.skipped_prerelease", tag=tag)
+        elif isinstance(payload, dict) and payload.get("tag_name"):
+            from packaging.version import InvalidVersion, Version
+
+            tag = str(payload.get("tag_name") or "")
+            try:
+                Version(tag.lstrip("v"))
+            except InvalidVersion as exc:
+                logger.warning("Could not parse release tag %r: %s", tag, exc)
+                _try_elog(
+                    "update.tag_parse_failed", level="warning", tag=tag,
+                    error=str(exc) or type(exc).__name__,
+                )
         return None
 
     tag = data.get("tag_name", "")
@@ -673,6 +719,34 @@ def verify_new_binary(new_exe: Path, expected_version: str | None = None) -> Non
     (:mod:`src.update_guard`) catches "starts here but unhealthy under
     the supervisor". The two layers are complementary.
     """
+    if expected_version:
+        try:
+            proc = subprocess.run(
+                [
+                    str(new_exe),
+                    "selfcheck",
+                    "--quiet",
+                    "--expect",
+                    expected_version,
+                ],
+                capture_output=True,
+                timeout=_SELFCHECK_TIMEOUT_S,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"Downloaded binary is not executable: {exc}") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("Downloaded binary version self-check timed out") from exc
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError("Downloaded binary version self-check could not run") from exc
+        reported = proc.stdout.decode("utf-8", "replace").strip().splitlines()
+        reported_version = reported[-1].strip() if reported else ""
+        if proc.returncode != 0 or reported_version != expected_version:
+            raise RuntimeError(
+                "Downloaded binary version does not exactly match the selected release"
+            )
+        logger.info("Pre-swap version self-check passed")
+        return
+
     # Probes from strongest to weakest. The FIRST one that exits cleanly
     # proves the binary can start, and we accept. We deliberately do NOT
     # hard-fail on an individual probe's non-zero exit: ``selfcheck`` can
@@ -707,16 +781,6 @@ def verify_new_binary(new_exe: Path, expected_version: str | None = None) -> Non
             errors.append(f"`{' '.join(args)}` exit {proc.returncode}: {out.strip()[:200]}")
             continue
 
-        if expected_version and args in (["selfcheck"], ["--version"]) \
-                and expected_version not in out:
-            # Clean exit but a different version than the release we think
-            # we downloaded. Log it; a clean start is the primary signal
-            # and version-string formats vary, so don't reject on this
-            # alone.
-            logger.warning(
-                "Self-check version mismatch: expected %s, output was %r",
-                expected_version, out.strip()[:200],
-            )
         logger.info("Pre-swap self-check passed (`%s`)", " ".join(args))
         return
 
@@ -726,7 +790,7 @@ def verify_new_binary(new_exe: Path, expected_version: str | None = None) -> Non
     )
 
 
-def perform_self_update_sync() -> tuple[str, str]:
+def perform_self_update_sync(channel: str | None = None) -> tuple[str, str]:
     """Synchronous self-update: check → download → verify → apply.
 
     Returns (old_version, new_version). If already up-to-date,
@@ -738,7 +802,7 @@ def perform_self_update_sync() -> tuple[str, str]:
     update journal so the post-restart boot guard can roll back if the
     new binary turns out to be unhealthy under the supervisor.
     """
-    info = check_for_update()
+    info = check_for_update(channel=channel)
     if info is None:
         import src
         v = getattr(src, "__version__", "unknown")

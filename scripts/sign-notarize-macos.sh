@@ -115,6 +115,9 @@ if [ "$WANT_PKG" = true ]; then
     # ``import openagent.app`` tries to resolve a non-existent
     # ``openagent.app`` submodule and the build fails.
     PKG_BASE="${BINARY_NAME%.app}"
+    RELEASE_VERSION="$(python -c "from src import __version__; print(__version__)")"
+    # pkgbuild receives the PEP 440-normalized distribution version; the
+    # external filename keeps the exact SemVer release/tag spelling.
     PKG_VERSION="$(python -c "from importlib.metadata import version; print(version('openagent-framework'))")"
     PKG_ARCH_RAW="$(uname -m)"
     case "$PKG_ARCH_RAW" in
@@ -122,7 +125,7 @@ if [ "$WANT_PKG" = true ]; then
         aarch64|arm64) PKG_ARCH="arm64" ;;
         *) PKG_ARCH="$PKG_ARCH_RAW" ;;
     esac
-    PKG_OUTPUT="${BINARY_DIR}/${PKG_BASE}-${PKG_VERSION}-macos-${PKG_ARCH}.pkg"
+    PKG_OUTPUT="${BINARY_DIR}/${PKG_BASE}-${RELEASE_VERSION}-macos-${PKG_ARCH}.pkg"
 fi
 
 # ── Skip cleanly when the binary-signing secrets are missing ──────────

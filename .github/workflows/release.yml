@@ -10,10 +10,29 @@ permissions:
   id-token: write
 
 jobs:
+  verify-tag:
+    name: verify tag and source version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Require an exact SemVer tag matching pyproject.toml
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(python -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')
+          source_version=$(python -c 'from src import __version__; print(__version__)')
+          [[ "$version" == "$source_version" ]]
+          [[ "$GITHUB_REF_NAME" == "v$version" ]]
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+)?$ ]]
+
   # Gate the whole release on the end-to-end suite: no executable is built
   # and nothing is published unless the tests pass on the tagged commit.
   test:
     name: end-to-end test suite
+    needs: verify-tag
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -34,6 +53,7 @@ jobs:
         run: bash scripts/test_openagent.sh
 
   computer-control-binary:
+    needs: verify-tag
     strategy:
       fail-fast: false
       matrix:
@@ -203,8 +223,23 @@ jobs:
           merge-multiple: true
       - name: List artifacts
         run: find artifacts -type f | head -40
+      - name: Refuse to overwrite an existing GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+              >existing-release.json 2>release-guard-error.log; then
+            echo "::error::Release $GITHUB_REF_NAME already exists; refusing to overwrite it"
+            exit 1
+          fi
+          if ! grep -q '(HTTP 404)' release-guard-error.log; then
+            echo "::error::Could not prove that release $GITHUB_REF_NAME is absent"
+            exit 1
+          fi
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v2.6.2
         with:
           files: |
             artifacts/**/*.tar.gz
@@ -216,3 +251,6 @@ jobs:
             artifacts/**/*.deb
             artifacts/**/*.pkg
           generate_release_notes: true
+          overwrite_files: false
+          prerelease: ${{ contains(github.ref_name, '-beta.') }}
+          make_latest: ${{ contains(github.ref_name, '-beta.') && 'false' || 'true' }}
