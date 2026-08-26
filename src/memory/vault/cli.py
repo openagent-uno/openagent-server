@@ -31,6 +31,56 @@ def _service(explicit: str | None):
     return VaultService(_resolve_root(explicit))
 
 
+def _warn_if_index_is_not_the_agents(svc, results) -> None:
+    """Un risultato vuoto puo' voler dire due cose molto diverse.
+
+    "Non c'e' niente che corrisponda" e "sto guardando l'indice sbagliato" si
+    stampano identici — cioe' non si stampano affatto — e il secondo caso e'
+    reale: l'indice vive sotto ``data_dir()``, che per il PROCESSO DELL'AGENT
+    e' la sua agent-dir e per la CLI nuda e' il percorso XDG. Misurato su un
+    agent in produzione: ``openagent vault search`` leggeva un indice da 69 KB
+    mentre quello vivo, accanto al database dell'agent, ne pesava 63 MB — e
+    rispondeva a OGNI query con il silenzio.
+
+    Un silenzio che significa "non lo so" deve dirlo.
+    """
+    if results:
+        return
+    import sqlite3
+
+    try:
+        note_su_disco = sum(1 for _ in svc.vault_root.rglob("*.md"))
+    except OSError:
+        return
+    if note_su_disco == 0:
+        return  # il vault e' davvero vuoto: il silenzio e' corretto
+
+    indicizzate = 0
+    try:
+        if svc.index_path.exists():
+            conn = sqlite3.connect(f"file:{svc.index_path}?mode=ro", uri=True)
+            try:
+                indicizzate = conn.execute("SELECT count(*) FROM notes").fetchone()[0]
+            finally:
+                conn.close()
+    except sqlite3.Error:
+        indicizzate = 0
+
+    if indicizzate >= note_su_disco / 2:
+        return  # l'indice e' popolato: nessun risultato vuol dire nessun risultato
+
+    click.echo(click.style(
+        f"\n(nessun risultato — ma l'indice consultato conosce {indicizzate} note "
+        f"mentre in {svc.vault_root} ce ne sono {note_su_disco}.",
+        fg="yellow"), err=True)
+    click.echo(click.style(
+        f" Indice letto: {svc.index_path}\n"
+        " Un agent tiene il suo indice nella PROPRIA agent-dir: prova a\n"
+        " ripetere il comando con -d/--agent-dir, p.es.\n"
+        "   openagent -d /percorso/agent vault search ...)",
+        fg="yellow"), err=True)
+
+
 def _print_report(rep) -> None:
     click.echo(click.style(rep.summary_line(),
                            fg="green" if rep.ok else "red", bold=True))
@@ -206,6 +256,8 @@ def cmd_search(query, vault_path, limit, files_only):
             res = await svc.search(query, limit=limit)
         await svc.close()
         return res
-    for r in asyncio.run(_run()):
+    risultati = asyncio.run(_run())
+    for r in risultati:
         tags = f" [{', '.join(r['tags'])}]" if r.get("tags") else ""
         click.echo(f"{r['path']}  —  {r.get('title','')}{tags}")
+    _warn_if_index_is_not_the_agents(_service(vault_path), risultati)
