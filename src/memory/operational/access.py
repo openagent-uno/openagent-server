@@ -55,6 +55,52 @@ class AccessContext:
         )
         return cls(tenant, principal_id, principal_type, handle, device, ids, grants)
 
+    @classmethod
+    def from_on_behalf_identity(cls, identity: Any) -> "AccessContext":
+        """Build the same ACL identity from a server-bound turn context.
+
+        The operational-search MCP deliberately exposes no identity fields in
+        its tool schema.  Its in-process adapter reads an
+        :class:`~src.core.on_behalf_context.OnBehalfIdentity` that the gateway
+        copied from the verified certificate and converts it here, preserving
+        exact parity with REST authorization.
+        """
+
+        if identity is None:
+            raise PermissionError("authenticated on-behalf-of context is required")
+        tenant = str(getattr(identity, "tenant_id", "") or "").strip()
+        handle = str(getattr(identity, "handle", "") or "").strip()
+        device = str(getattr(identity, "device_id", "") or "").strip()
+        principal_type = str(getattr(identity, "principal_type", "") or "").strip()
+        if principal_type not in {"user", "agent"} or not tenant or not handle or not device:
+            raise PermissionError("authenticated on-behalf-of context is incomplete")
+        principal_id = f"{principal_type}:{handle}"
+        ids = frozenset(
+            {
+                principal_id,
+                f"{principal_type}:{device}",
+                f"device:{device}",
+            }
+        )
+        grants = frozenset(
+            {
+                (principal_type, handle),
+                (principal_type, principal_id),
+                ("device", device),
+                ("device", f"device:{device}"),
+                ("installation", tenant),
+            }
+        )
+        return cls(
+            tenant,
+            principal_id,
+            principal_type,
+            handle,
+            device,
+            ids,
+            grants,
+        )
+
 
 def row_is_visible_without_grant(row: Any, access: AccessContext) -> bool:
     if str(row["tenant_id"]) != access.tenant_id:

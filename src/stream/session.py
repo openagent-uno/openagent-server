@@ -28,6 +28,7 @@ from src.channels.base import is_reasoning_status, parse_compaction_status
 from src.channels.stt_base import BaseSTT, resolve_stt
 from src.channels.tts_base import BaseTTS, resolve_tts
 from src.core.identity_context import human_author
+from src.core.on_behalf_context import OnBehalfIdentity
 from src.core.logging import elog
 from src.stream.events import (
     Attachment,
@@ -116,6 +117,7 @@ class StreamSession:
         coalesce_window_ms: int | None = None,
         speak_enabled: bool = True,
         handle: str | None = None,
+        on_behalf_identity: OnBehalfIdentity | None = None,
     ):
         self._agent = agent
         self._db = getattr(agent, "db", None)
@@ -127,6 +129,11 @@ class StreamSession:
         # bridge sessions attribute each message. ``None`` on handle-less
         # deployments → author stays unset (today's generic rendering).
         self.handle = handle
+        # Authorization is intentionally not reconstructed from ``handle`` or
+        # from a TextFinal author.  Only the gateway can supply this value,
+        # after verifying the device certificate.  In-process operational
+        # search fails closed when it is absent (ACP/local system runs).
+        self.on_behalf_identity = on_behalf_identity
         self.profile = profile
         self.language = language
         # ``0`` disables coalescing (legacy preempt-on-each-message);
@@ -1153,7 +1160,12 @@ class StreamTurnRunner:
         from src.stream.child_stream import (
             child_frame_to_event, install_child_stream_emitter, reset_child_stream_emitter,
         )
+        from src.core.on_behalf_context import (
+            install_on_behalf_identity,
+            reset_on_behalf_identity,
+        )
         _child_emit_tok = install_child_stream_emitter(child_emit)
+        _on_behalf_tok = install_on_behalf_identity(sess.on_behalf_identity)
 
         try:
             try:
@@ -1226,6 +1238,7 @@ class StreamTurnRunner:
                     await text_q.put(None)
                 logger.warning("stream turn failed: %s", e)
         finally:
+            reset_on_behalf_identity(_on_behalf_tok)
             reset_child_stream_emitter(_child_emit_tok)
             if speaker is not None:
                 if cancelled:

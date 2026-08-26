@@ -62,6 +62,7 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_session_journal",
     "test_operational_storage",
     "test_operational_api",
+    "test_agent_operational_search",
     "test_ghost_skill",
     "test_skill_provenance",
     "test_skill_body_drop",

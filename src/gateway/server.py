@@ -1759,8 +1759,14 @@ class Gateway:
                     P.AUDIO_CHUNK_IN, P.AUDIO_END_IN,
                     P.VIDEO_FRAME_IN, P.ATTACHMENT_IN, P.INTERRUPT,
                 ):
+                    from src.core.on_behalf_context import OnBehalfIdentity
+
                     await self._handle_stream_frame(
-                        ws, client_id, data, handle=cert.handle,
+                        ws,
+                        client_id,
+                        data,
+                        handle=cert.handle,
+                        on_behalf_identity=OnBehalfIdentity.from_certificate(cert),
                     )
 
                 # Interactive terminals — PTY frames from the desktop
@@ -2341,6 +2347,7 @@ class Gateway:
     async def _handle_stream_frame(
         self, ws, client_id: str, frame: dict,
         *, handle: str | None = None,
+        on_behalf_identity=None,
     ) -> None:
         """Decode a stream-protocol wire frame and dispatch into the
         matching :class:`StreamSession`.
@@ -2389,6 +2396,11 @@ class Gateway:
         ):
             await self._close_stream_session(key)
             holder = None
+        if holder is not None:
+            # Rebind authorization on every authenticated frame/reconnect.
+            # A long-lived StreamSession must never keep a stale principal
+            # merely because its transport was cached.
+            holder.session.on_behalf_identity = on_behalf_identity
 
         if isinstance(evt, TextFinal):
             self._record_live_input(sid, event_to_wire(evt), owner=owner)
@@ -2417,6 +2429,7 @@ class Gateway:
                 coalesce_window_ms=coalesce_window_ms,
                 speak_enabled=speak_enabled,
                 handle=handle,
+                on_behalf_identity=on_behalf_identity,
             )
             # Install gateway hooks: pre-dispatch enforces the same
             # "no enabled models" + "history-mode binding" guards the

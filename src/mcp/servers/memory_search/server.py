@@ -1,4 +1,11 @@
-"""Memory-search MCP server — full-text recall over the session transcript.
+"""Legacy memory-search subprocess used by transcript compatibility tests.
+
+The production builtin is now the in-process adapter in ``adapters.py``.  It
+searches the redacted operational index with an authenticated on-behalf-of
+principal.  This module retains the pre-v2 TranscriptIndex bridge for direct
+legacy installations and migration tests; it is not registered by
+``BUILTIN_MCP_SPECS`` because a subprocess cannot safely receive the current
+turn's principal.
 
 Exposes ``search_past_conversations``: "remember when we discussed X?" across
 every session this agent has stored. The index lives in

@@ -523,75 +523,42 @@ async def t_auto_recall_cache_safe(ctx: TestContext) -> None:
         _cleanup(db, idx_path, vault)
 
 
-# ── the plumbing: env forwarding to the memory-search subprocess ──────
+# ── the production memory-search boundary ──────────────────────────────
 
 
-@test("semantic_recall", "resolve_default_entry forwards embedding + DB/vault env to memory-search")
-async def t_memory_search_env_forwarded(ctx: TestContext) -> None:
-    """The MCP SDK spawns a subprocess with a minimal env, so an operator's
-    ``OPENAGENT_EMBEDDING_MODEL`` does NOT inherit — ``resolve_default_entry``
-    must inject it (alongside DB_PATH for sessions and VAULT_PATH for notes),
-    or ``semantic_recall`` stays inert in the subprocess even when configured.
-    This locks that wiring so it can't silently regress to keyword-only."""
+@test("semantic_recall", "memory-search is in-process and principal-bound")
+async def t_memory_search_is_in_process(ctx: TestContext) -> None:
+    """Operational recall cannot cross a subprocess boundary safely.
+
+    The model never receives a principal argument or reusable system token;
+    the adapter reads the authenticated turn ContextVar and the pool supplies
+    the canonical DB object directly.
+    """
     from src.mcp.builtins import resolve_default_entry
 
-    saved = {k: os.environ.get(k) for k in (
-        "OPENAGENT_EMBEDDING_MODEL", "OPENAGENT_EMBEDDING_BASE_URL",
-        "OPENAGENT_EMBEDDING_API_KEY")}
-    try:
-        os.environ["OPENAGENT_EMBEDDING_MODEL"] = "local:nomic-embed-text"
-        os.environ["OPENAGENT_EMBEDDING_BASE_URL"] = "http://localhost:11434/v1"
-        os.environ.pop("OPENAGENT_EMBEDDING_API_KEY", None)  # unset must NOT forward
-
-        resolved = resolve_default_entry({"builtin": "memory-search"}, db_path="/tmp/x.db")
-        assert resolved is not None, "memory-search resolved to None (Node/deps missing?)"
-        env = resolved.get("env") or {}
-
-        assert env.get("OPENAGENT_EMBEDDING_MODEL") == "local:nomic-embed-text", (
-            "embedding model not forwarded — semantic_recall would be inert in the subprocess")
-        assert env.get("OPENAGENT_EMBEDDING_BASE_URL") == "http://localhost:11434/v1", (
-            "embedding base_url not forwarded — the ONLY channel that reaches the subprocess")
-        assert "OPENAGENT_EMBEDDING_API_KEY" not in env, (
-            "an unset embedding var must not be forwarded as empty")
-        assert os.path.basename(env.get("OPENAGENT_DB_PATH", "")) == "x.db", (
-            "DB_PATH not forwarded — semantic index over sessions can't find the DB")
-        assert env.get("OPENAGENT_VAULT_PATH"), (
-            "VAULT_PATH not forwarded — semantic index over notes can't find the vault")
-    finally:
-        for k, v in saved.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
+    resolved = resolve_default_entry(
+        {"builtin": "memory-search"},
+        db_path="/tmp/x.db",
+    )
+    assert resolved is not None
+    assert resolved["in_process"] is True
+    assert resolved["adapter_module"] == "src.mcp.servers.memory_search.adapters"
+    assert "command" not in resolved and "env" not in resolved
 
 
-@test("semantic_recall", "unconfigured embedding env is NOT forwarded (subprocess stays inert)")
-async def t_memory_search_env_absent_when_unset(ctx: TestContext) -> None:
-    """The inverse guard: with no embedding model configured, nothing embedding-
-    related is forwarded, so the subprocess resolves ``None`` and degrades to
-    keyword-only — the proven self-hosted default (§17), not a half-wired state."""
+@test("semantic_recall", "operational memory-search does not inherit vault/embedder env")
+async def t_memory_search_has_no_cross_corpus_env(ctx: TestContext) -> None:
+    """Vault and semantic recall remain separate services/corpora."""
     from src.mcp.builtins import resolve_default_entry
 
-    saved = {k: os.environ.get(k) for k in (
-        "OPENAGENT_EMBEDDING_MODEL", "OPENAGENT_EMBEDDING_BASE_URL")}
-    try:
-        os.environ.pop("OPENAGENT_EMBEDDING_MODEL", None)
-        os.environ.pop("OPENAGENT_EMBEDDING_BASE_URL", None)
-
-        resolved = resolve_default_entry({"builtin": "memory-search"}, db_path="/tmp/x.db")
-        assert resolved is not None
-        env = resolved.get("env") or {}
-        assert "OPENAGENT_EMBEDDING_MODEL" not in env
-        assert "OPENAGENT_EMBEDDING_BASE_URL" not in env
-        # DB/VAULT are unconditional (FTS needs them); only embedding is gated.
-        assert env.get("OPENAGENT_DB_PATH"), "DB_PATH must still forward for FTS"
-        assert env.get("OPENAGENT_VAULT_PATH"), "VAULT_PATH must still forward for FTS"
-    finally:
-        for k, v in saved.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
+    resolved = resolve_default_entry(
+        {"builtin": "memory-search"},
+        db_path="/tmp/x.db",
+    )
+    assert resolved is not None
+    rendered = repr(resolved)
+    assert "OPENAGENT_VAULT_PATH" not in rendered
+    assert "OPENAGENT_EMBEDDING" not in rendered
 
 
 @test("semantic_recall", "the numpy-FREE fallback finds the same matches (bundle-proof)")

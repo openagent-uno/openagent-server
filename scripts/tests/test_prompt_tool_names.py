@@ -195,7 +195,9 @@ _NON_TOOL_TOKENS: frozenset[str] = frozenset({
     # ``search_past_conversations`` params, and the ``index`` field of its
     # reply — the prompt names that field because an empty result must be
     # read as "those words are absent", never as "we never discussed it".
-    "limit", "offset", "index",
+    "limit", "offset", "index", "scopes",
+    # Operational-search scope enum values, not callable tools.
+    "chats", "scheduled",
     # ``ok_rate`` is a RESULT FIELD of vault_recall_stats. DREAM_MODE_PROMPT
     # names it repeatedly and on purpose: the number points at a note to
     # READ, it is not a verdict on it (association, not causation), and the

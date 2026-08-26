@@ -67,6 +67,7 @@ _SIGNED_QUERY_RE = re.compile(
     r"(?i)([?&](?:token|api[_-]?key|key|signature|sig|x-amz-signature|x-goog-signature|access_token)=)[^&#\s]+"
 )
 _OPAQUE_TOKEN_RE = re.compile(r"(?<![\w])([A-Za-z0-9_+/=-]{32,})(?![\w])")
+_SYNC_LOCKS: dict[str, asyncio.Lock] = {}
 
 
 @dataclass(frozen=True)
@@ -827,7 +828,7 @@ async def _source_row(conn: Any, source_kind: str, source_id: str) -> tuple[dict
     return None
 
 
-async def sync_operational_search(
+async def _sync_operational_search_unlocked(
     db: Any,
     *,
     limit: int = 10_000,
@@ -986,6 +987,29 @@ async def sync_operational_search(
     finally:
         _harden_index_files(target)
         index.close()
+
+
+async def sync_operational_search(
+    db: Any,
+    *,
+    limit: int = 10_000,
+    source_conn: Any | None = None,
+) -> SearchIndexStatus:
+    """Serialize every index consumer for one canonical database path.
+
+    Gateway warm-up, the persistent consumer, and the in-process agent tool
+    can all request freshness.  They share one owner lock so two stale state
+    reads cannot race into independent FTS transactions.
+    """
+
+    key = str(Path(str(db.db_path)).resolve())
+    lock = _SYNC_LOCKS.setdefault(key, asyncio.Lock())
+    async with lock:
+        return await _sync_operational_search_unlocked(
+            db,
+            limit=limit,
+            source_conn=source_conn,
+        )
 
 
 def _status_from_conn(conn: sqlite3.Connection, path: Path) -> SearchIndexStatus:
@@ -1147,6 +1171,9 @@ def read_search_rows(
             if effective_filters.get(field) is not None:
                 clauses.append(f"d.{field}=?")
                 params.append(str(effective_filters[field]))
+        if effective_filters.get("session_id") is not None:
+            clauses.append("d.session_id=?")
+            params.append(str(effective_filters["session_id"]))
         root = effective_filters.get("root")
         if root:
             clauses.extend(("d.root_kind=?", "d.root_id=?"))

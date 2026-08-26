@@ -1051,55 +1051,16 @@ async def handle_tool_invocation(request: web.Request) -> web.Response:
 
 
 def _search_target(row: dict[str, Any]) -> dict[str, Any]:
-    kind = str(row["target_kind"])
-    if kind == "chat":
-        return {"kind": kind, "session_id": str(row["session_id"])}
-    if kind == "chat_message":
-        return {"kind": kind, "session_id": str(row["session_id"]), "message_id": str(row["message_id"])}
-    if kind == "chat_tool":
-        return {
-            "kind": kind,
-            "session_id": str(row["session_id"]),
-            "message_id": str(row["message_id"]),
-            "tool_invocation_id": str(row["tool_invocation_id"]),
-        }
-    if kind == "workflow_definition":
-        target = {"kind": kind, "workflow_id": str(row["workflow_id"])}
-        if row.get("workflow_node_id"):
-            target["node_id"] = str(row["workflow_node_id"])
-        if row.get("definition_field"):
-            target["field"] = str(row["definition_field"])
-        return target
-    if kind == "workflow_run":
-        target = {"kind": kind, "run_id": str(row["workflow_run_id"]), "workflow_id": str(row["workflow_id"])}
-        if row.get("workflow_trace_step_id"):
-            target["trace_step_id"] = str(row["workflow_trace_step_id"])
-        if row.get("tool_invocation_id"):
-            target["tool_invocation_id"] = str(row["tool_invocation_id"])
-        return target
-    if kind == "scheduled_definition":
-        target = {"kind": kind, "task_id": str(row["scheduled_task_id"])}
-        if row.get("definition_field"):
-            target["field"] = str(row["definition_field"])
-        return target
-    if kind == "scheduled_run":
-        target = {"kind": kind, "run_id": str(row["scheduled_run_id"]), "task_id": str(row["scheduled_task_id"])}
-        for source, wire in (("session_id", "session_id"), ("message_id", "message_id"), ("tool_invocation_id", "tool_invocation_id")):
-            if row.get(source):
-                target[wire] = str(row[source])
-        return target
-    if kind == "event_definition":
-        target = {"kind": kind, "event_id": str(row["event_id"])}
-        if row.get("definition_field"):
-            target["field"] = str(row["definition_field"])
-        return target
-    if kind == "event_delivery":
-        target = {"kind": kind, "delivery_id": str(row["event_delivery_id"]), "event_id": str(row["event_id"])}
-        for source in ("session_id", "message_id", "tool_invocation_id"):
-            if row.get(source):
-                target[source] = str(row[source])
-        return target
-    raise ApiProblem(500, "internal_error", "Search target is unavailable")
+    from src.memory.operational.service import search_target
+
+    try:
+        return search_target(row)
+    except RuntimeError as exc:
+        raise ApiProblem(
+            500,
+            "internal_error",
+            "Search target is unavailable",
+        ) from exc
 
 
 def _fragments(highlighted: str) -> list[dict[str, Any]]:
@@ -1163,135 +1124,17 @@ def _compact_search_row(row: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _search_row_visible(conn: Any, row: dict[str, Any], access: AccessContext) -> bool:
-    """Rehydrate canonical existence/ACL before counts, snippets, or output.
+    from src.memory.operational.service import search_row_visible
 
-    The derived index and an in-memory snapshot may lag an owner change,
-    revocation, or delete.  Never use their owner/visibility fast path as an
-    authorization decision.
-    """
-
-    resource_type = str(row.get("resource_type") or "")
-    resource_id = str(row.get("resource_id") or "")
-    target_kind = str(row.get("target_kind") or "")
-    canonical: Any | None = None
-    canonical_source_version: int | None = None
-    if resource_type == "session":
-        canonical = await (
-            await conn.execute(
-                "SELECT tenant_id, owner_principal_id, visibility, acl_version, "
-                "'session' AS resource_type, id AS resource_id, source_version "
-                "FROM sessions_v2 WHERE id=? AND deleted_at_ms IS NULL",
-                (resource_id,),
-            )
-        ).fetchone()
-        if canonical is not None:
-            canonical_source_version = int(canonical["source_version"])
-        if canonical is not None and target_kind == "chat_message":
-            message = await (
-                await conn.execute(
-                    "SELECT source_version FROM session_messages WHERE id=? AND session_id=? "
-                    "AND visibility='user_visible'",
-                    (str(row.get("message_id") or ""), resource_id),
-                )
-            ).fetchone()
-            if message is None:
-                return False
-            canonical_source_version = int(message[0])
-    elif resource_type == "tool_invocation":
-        canonical = await (
-            await conn.execute(
-                "SELECT s.tenant_id, s.owner_principal_id, s.visibility, s.acl_version, "
-                "'session' AS resource_type, s.id AS resource_id, "
-                "t.source_version AS source_version "
-                "FROM tool_invocations t JOIN sessions_v2 s ON s.id=t.session_id "
-                "AND s.tenant_id=t.tenant_id WHERE t.id=? AND s.deleted_at_ms IS NULL",
-                (resource_id,),
-            )
-        ).fetchone()
-        if canonical is not None:
-            canonical_source_version = int(canonical["source_version"])
-            message = await (
-                await conn.execute(
-                    "SELECT 1 FROM session_messages WHERE id=? AND session_id=? "
-                    "AND visibility='user_visible' LIMIT 1",
-                    (
-                        str(row.get("message_id") or ""),
-                        str(row.get("session_id") or ""),
-                    ),
-                )
-            ).fetchone()
-            if message is None:
-                return False
-    else:
-        tables = {
-            "workflow_definition": "workflow_tasks",
-            "workflow_run": "workflow_runs",
-            "scheduled_definition": "scheduled_tasks",
-            "scheduled_run": "task_runs",
-            "event_definition": "events",
-            "event_delivery": "event_deliveries",
-        }
-        table = tables.get(resource_type)
-        if table is not None:
-            exists = await (
-                await conn.execute(f"SELECT 1 FROM {table} WHERE id=?", (resource_id,))
-            ).fetchone()
-            if exists is not None:
-                parents = {
-                    "workflow_run": ("workflow_definition", str(row.get("workflow_id") or "")),
-                    "scheduled_run": ("scheduled_definition", str(row.get("scheduled_task_id") or "")),
-                    "event_delivery": ("event_definition", str(row.get("event_id") or "")),
-                }
-                canonical = await _automation_acl_row(
-                    conn,
-                    access,
-                    resource_type,
-                    resource_id,
-                    parents.get(resource_type),
-                )
-                ledger = await (
-                    await conn.execute(
-                        "SELECT source_version FROM operational_automation_projection "
-                        "WHERE resource_type=? AND resource_id=?",
-                        (resource_type, resource_id),
-                    )
-                ).fetchone()
-                if ledger is None:
-                    return False
-                canonical_source_version = int(ledger[0])
-    if canonical is None:
-        return False
-    try:
-        if int(canonical["acl_version"]) != int(row.get("acl_version") or 0):
-            return False
-        if canonical_source_version != int(row.get("source_version") or 0):
-            return False
-    except (KeyError, TypeError, ValueError):
-        return False
-    return await resource_is_visible(conn, canonical, access, permission="search")
+    return await search_row_visible(conn, row, access)
 
 
 async def _granted_search_resources(
     conn: Any, access: AccessContext
 ) -> tuple[tuple[str, str, int], ...]:
-    """Canonical grant set used only as a pre-LIMIT derived-index filter."""
+    from src.memory.operational.service import granted_search_resources
 
-    identities = sorted(access.grant_identities)
-    if not identities:
-        return ()
-    identity_sql = " OR ".join("(principal_type=? AND principal_id=?)" for _ in identities)
-    params: list[Any] = [access.tenant_id]
-    for principal_type, principal_id in identities:
-        params.extend((principal_type, principal_id))
-    rows = await (
-        await conn.execute(
-            "SELECT resource_type, resource_id, acl_version FROM resource_acl "
-            "WHERE tenant_id=? AND permission IN ('search','admin') "
-            f"AND ({identity_sql})",
-            tuple(params),
-        )
-    ).fetchall()
-    return tuple((str(row[0]), str(row[1]), int(row[2])) for row in rows)
+    return await granted_search_resources(conn, access)
 
 
 async def handle_search(request: web.Request) -> web.Response:
