@@ -42,10 +42,28 @@ case "${RUNNER_OS:-$(uname -s)}" in
     Windows|MINGW*|CYGWIN*|MSYS*)
         PACKAGE="openagent-${VERSION}-windows-x64.zip"
         (cd "$DIST" && sha256sum -c "${PACKAGE}.sha256")
-        tar -tf "$DIST/$PACKAGE" | sed 's#\\#/#g' | sort > "$TMP_ROOT/archive-files.txt"
-        printf '%s\n' openagent.exe openagent-computer-control.exe | sort > "$TMP_ROOT/expected-files.txt"
-        diff -u "$TMP_ROOT/expected-files.txt" "$TMP_ROOT/archive-files.txt"
-        tar -xf "$DIST/$PACKAGE" -C "$TMP_ROOT"
+        python - "$DIST/$PACKAGE" "$TMP_ROOT" <<'PY'
+import sys
+import zipfile
+from pathlib import PurePosixPath
+
+archive_path, destination = sys.argv[1:]
+expected = {"openagent.exe", "openagent-computer-control.exe"}
+with zipfile.ZipFile(archive_path) as archive:
+    names = []
+    for entry in archive.infolist():
+        if entry.is_dir():
+            continue
+        normalized = entry.filename.replace("\\", "/")
+        path = PurePosixPath(normalized)
+        if path.is_absolute() or ".." in path.parts:
+            raise SystemExit(f"unsafe ZIP entry: {entry.filename!r}")
+        names.append(normalized)
+    if set(names) != expected or len(names) != len(expected):
+        raise SystemExit(f"unexpected ZIP entries: {sorted(names)!r}")
+    archive.extractall(destination)
+PY
+        chmod +x "$TMP_ROOT/openagent.exe"
         BINARY="$TMP_ROOT/openagent.exe"
         ;;
     *)
