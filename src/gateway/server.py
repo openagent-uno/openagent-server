@@ -21,7 +21,7 @@ from src.gateway import protocol as P
 from src.gateway.commands import command_help_text
 from src.gateway.sessions import SessionManager
 from src.gateway.terminals import TerminalManager
-from src.gateway.api import vault, config, health, logs, control, usage, providers, models, scheduled_tasks, workflow_tasks, mcps, marketplace, sessions as sessions_api, system as system_api, network as network_api, chat as chat_api, terminals as terminals_api, commands as commands_api, events as events_api, budgets as budgets_api, quality as quality_api, llm as llm_api, skills as skills_api, accounts as accounts_api
+from src.gateway.api import vault, config, health, logs, control, usage, providers, models, scheduled_tasks, workflow_tasks, mcps, marketplace, sessions as sessions_api, system as system_api, network as network_api, chat as chat_api, terminals as terminals_api, commands as commands_api, events as events_api, budgets as budgets_api, quality as quality_api, llm as llm_api, skills as skills_api, accounts as accounts_api, operational as operational_api
 from src.network import peers as peers_api
 from src.network.auth.middleware import make_auth_middleware
 from src.network.transport.aiohttp_iroh_site import IrohSite
@@ -850,6 +850,10 @@ class Gateway:
         app["gateway"] = self  # accessible in handlers via request.app["gateway"]
         self.sessions.set_db(self.agent.memory_db)
         self._register_routes(app)
+        # Operational migration/backfill/search warming is lifecycle-owned.
+        # REST discovery stays status-only and never performs an unbounded
+        # parse/index pass inside a client's timeout budget.
+        operational_api.start_background_maintenance(self)
 
         runner = web.AppRunner(app)
         await runner.setup()
@@ -1021,6 +1025,7 @@ class Gateway:
                  error=str(exc))
 
     async def stop(self) -> None:
+        await operational_api.stop_background_maintenance(self)
         if self._webhook_site is not None:
             try:
                 await self._webhook_site.stop()
@@ -1114,6 +1119,12 @@ class Gateway:
 
         routes = (
             ("GET", "/api/health", health.handle_health),
+            ("GET", "/api/capabilities", operational_api.handle_capabilities),
+            ("GET", "/api/history", operational_api.handle_history),
+            ("POST", "/api/search", operational_api.handle_search),
+            ("GET", "/api/sessions/{session_id}/messages", operational_api.handle_session_messages),
+            ("GET", "/api/tool-invocations/{tool_id}", operational_api.handle_tool_invocation),
+            ("GET", "/api/scheduled-runs/{run_id}", operational_api.handle_scheduled_run),
             ("GET", "/api/vault/notes", vault.handle_list),
             ("GET", "/api/vault/graph", vault.handle_graph),
             ("GET", "/api/vault/search", vault.handle_search),

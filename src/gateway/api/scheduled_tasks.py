@@ -394,6 +394,9 @@ async def handle_create(request):
         await scheduler.disable_task(task_id)
 
     row = await scheduler.db.get_task(task_id)
+    from .operational import claim_created_resource
+
+    await claim_created_resource(request, "scheduled_definition", task_id)
     elog("scheduled_task.create", id=task_id, name=name)
     gw = request.app["gateway"]
     await gw.broadcast_resource("scheduled_task", "created", task_id)

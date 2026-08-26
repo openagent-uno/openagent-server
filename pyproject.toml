@@ -157,6 +157,7 @@ include = ["src*"]
 
 [tool.setuptools.package-data]
 src = [
+    "memory/operational/sql/*.sql",
     "mcp/servers/**/*.ts",
     "mcp/servers/**/*.json",
     "mcp/servers/**/*.py",

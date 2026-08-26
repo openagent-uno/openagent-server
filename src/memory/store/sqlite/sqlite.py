@@ -77,8 +77,8 @@ def _make_session_store_engine(url: str) -> "Engine":
 
     On (the default, SQLite URLs only): set a per-connection ``busy_timeout``
     (so a step commit WAITS for the writer to free instead of raising
-    immediately), ``journal_mode=WAL`` and ``synchronous=NORMAL`` so this
-    engine and MemoryDB coexist on one file with far fewer lock errors. The
+    immediately), ``journal_mode=WAL`` and ``synchronous=FULL`` so this
+    engine and MemoryDB coexist on one file with committed-turn durability. The
     wait defaults to the SAME budget every other writer uses
     (``sqlite_busy_timeout_ms``) — a shorter one here is exactly how this
     engine used to lose races it should have won. Passes
@@ -111,11 +111,46 @@ def _make_session_store_engine(url: str) -> "Engine":
         try:
             cur.execute(f"PRAGMA busy_timeout = {int(timeout * 1000)}")
             cur.execute("PRAGMA journal_mode=WAL")
-            cur.execute("PRAGMA synchronous=NORMAL")
+            cur.execute("PRAGMA foreign_keys=ON")
+            # This engine mutates the same canonical DB as MemoryDB.  NORMAL
+            # is suitable for rebuildable indexes, not for accepted turns.
+            cur.execute("PRAGMA synchronous=FULL")
         finally:
             cur.close()
 
     return engine
+
+
+def _project_operational_session_in_transaction(sess: Any, session_id: str) -> None:
+    """Project a reviewed runtime write while its legacy transaction is open.
+
+    The legacy trigger entry is created before this savepoint. If v2 projection
+    fails, only the projection is rolled back and that durable entry remains for
+    the request-time reconciler; the accepted legacy transcript is not lost.
+    """
+
+    if not session_id:
+        return
+    from uuid import uuid4 as _uuid4
+
+    from src.memory.operational.repository import (
+        project_legacy_session,
+        sqlalchemy_driver_connection,
+    )
+
+    conn = sqlalchemy_driver_connection(sess)
+    savepoint = f"operational_projection_{_uuid4().hex}"
+    conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        project_legacy_session(conn, session_id)
+        conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+    except Exception as exc:  # legacy write + trigger journal remain authoritative
+        conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+        conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        log_warning(
+            f"Operational projection deferred for session {session_id}: "
+            f"{type(exc).__name__}"
+        )
 
 
 class SqliteDb(BaseDb):
@@ -752,6 +787,7 @@ class SqliteDb(BaseDb):
                     log_debug(f"No session found to delete with session_id: {session_id}")
                     return False
                 else:
+                    _project_operational_session_in_transaction(sess, session_id)
                     log_debug(f"Successfully deleted session with session_id: {session_id}")
                     return True
 
@@ -780,6 +816,8 @@ class SqliteDb(BaseDb):
                 if user_id is not None:
                     delete_stmt = delete_stmt.where(table.c.user_id == user_id)
                 result = sess.execute(delete_stmt)
+                for session_id in session_ids:
+                    _project_operational_session_in_transaction(sess, session_id)
 
             log_debug(f"Successfully deleted {result.rowcount} sessions")
 
@@ -1058,6 +1096,11 @@ class SqliteDb(BaseDb):
                     result = sess.execute(stmt)
                     row = result.fetchone()
 
+                    if row is not None:
+                        _project_operational_session_in_transaction(
+                            sess, str(row._mapping["session_id"])
+                        )
+
                     session_raw = deserialize_session_json_fields(dict(row._mapping)) if row else None
                     if session_raw is None or not deserialize:
                         return session_raw
@@ -1097,6 +1140,11 @@ class SqliteDb(BaseDb):
                     result = sess.execute(stmt)
                     row = result.fetchone()
 
+                    if row is not None:
+                        _project_operational_session_in_transaction(
+                            sess, str(row._mapping["session_id"])
+                        )
+
                     session_raw = deserialize_session_json_fields(dict(row._mapping)) if row else None
                     if session_raw is None or not deserialize:
                         return session_raw
@@ -1134,6 +1182,11 @@ class SqliteDb(BaseDb):
                     stmt = stmt.returning(*table.columns)  # type: ignore
                     result = sess.execute(stmt)
                     row = result.fetchone()
+
+                    if row is not None:
+                        _project_operational_session_in_transaction(
+                            sess, str(row._mapping["session_id"])
+                        )
 
                     session_raw = deserialize_session_json_fields(dict(row._mapping)) if row else None
                     if session_raw is None or not deserialize:
@@ -1235,6 +1288,15 @@ class SqliteDb(BaseDb):
                         )
                         sess.execute(stmt, agent_data)
 
+                        for session_id in (
+                            str(item["session_id"])
+                            for item in agent_data
+                            if item.get("session_id")
+                        ):
+                            _project_operational_session_in_transaction(
+                                sess, session_id
+                            )
+
                         # Fetch the results for agent sessions
                         agent_ids = [session.session_id for session in agent_sessions]
                         select_stmt = select(table).where(table.c.session_id.in_(agent_ids))
@@ -1290,6 +1352,15 @@ class SqliteDb(BaseDb):
                         )
                         sess.execute(stmt, team_data)
 
+                        for session_id in (
+                            str(item["session_id"])
+                            for item in team_data
+                            if item.get("session_id")
+                        ):
+                            _project_operational_session_in_transaction(
+                                sess, session_id
+                            )
+
                         # Fetch the results for team sessions
                         team_ids = [session.session_id for session in team_sessions]
                         select_stmt = select(table).where(table.c.session_id.in_(team_ids))
@@ -1344,6 +1415,15 @@ class SqliteDb(BaseDb):
                             ),
                         )
                         sess.execute(stmt, workflow_data)
+
+                        for session_id in (
+                            str(item["session_id"])
+                            for item in workflow_data
+                            if item.get("session_id")
+                        ):
+                            _project_operational_session_in_transaction(
+                                sess, session_id
+                            )
 
                         # Fetch the results for workflow sessions
                         workflow_ids = [session.session_id for session in workflow_sessions]
