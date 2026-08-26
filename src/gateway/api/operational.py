@@ -336,6 +336,17 @@ async def _current_search_status(
         )[0]
     )
     indexed_seq = int(status.get("seq") or 0)
+    # The persistent consumer commits the derived index before publishing its
+    # latest in-memory status.  A request can therefore observe a newer outbox
+    # head while holding the previous loop's cache entry.  Refresh that stale
+    # entry from the authoritative derived-index metadata before deciding that
+    # search is warming; keep the caught-up cache as the hot path.
+    if isinstance(cached, dict) and (
+        not bool(status.get("ready"))
+        or (require_outbox_head and indexed_seq < outbox_head)
+    ):
+        status = dict(await operational_search_status(db))
+        indexed_seq = int(status.get("seq") or 0)
     if status.get("state") == "unavailable":
         status.update(ready=False, state="warming")
     if require_outbox_head and indexed_seq < outbox_head:

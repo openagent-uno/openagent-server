@@ -943,6 +943,11 @@ async def t_persistent_search_consumer(_ctx: TestContext) -> None:
                     raise AssertionError("persistent search consumer did not catch up")
                 await asyncio.sleep(0.05)
             assert int(status["seq"]) > int(before["seq"])
+            # Reproduce the commit-to-cache publication window deterministically:
+            # the index is current, but the gateway still advertises the previous
+            # consumer loop's sequence.  The request must refresh before returning
+            # a false warming response.
+            gateway._operational_search_status = dict(before)
             search = await operational.handle_search(_Request(
                 gateway, tenant=tenant, handle="alice", device="alice-device",
                 body={
