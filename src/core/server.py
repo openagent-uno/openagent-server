@@ -2312,6 +2312,28 @@ class AgentServer:
             elif "cron_expression" in updates or "timezone" in updates:
                 await scheduler.reschedule_task(existing["id"])
         elif existing["enabled"]:
+            # Un built-in acceso a mano muore al PRIMO riavvio, e finora
+            # moriva in silenzio. Misurato su SpicySparks: quality-scorer,
+            # quality-digest, cost-observability ed escalation-audit erano
+            # stati creati il 21-22 luglio con enabled=1 — la config non li
+            # ha mai chiesti (``self_improvement`` non compare in nessun
+            # backup del file) — e hanno funzionato fino all'11-12 agosto,
+            # cioe' fino al riavvio successivo. Poi questo ramo li ha
+            # riparcheggiati e nessuno lo ha saputo: undici giorni di
+            # sorveglianza spenta scoperti per caso il 26 agosto, dal
+            # distiller, mentre cercava altro.
+            #
+            # Riparcheggiarli e' giusto — la config e' la fonte di verita' —
+            # ma farlo zitti no: chi lo aveva acceso merita di sapere sia che
+            # e' stato spento sia quale chiave lo riaccende.
+            elog(
+                "builtin_task.parked",
+                level="warning",
+                name=name,
+                reason="config gate is off",
+                hint=f"set the config flag that governs {name!r} to re-enable it; "
+                     "enabling the row alone does not survive a restart",
+            )
             await scheduler.disable_task(existing["id"])
 
     @staticmethod
