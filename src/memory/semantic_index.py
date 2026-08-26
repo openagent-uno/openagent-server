@@ -389,6 +389,26 @@ CREATE TABLE IF NOT EXISTS skill_vectors (
     vec         BLOB NOT NULL,
     embedded_at REAL NOT NULL
 );
+
+-- One row per SCHEDULED TASK prompt. The fourth source, and the one that was
+-- invisible longest: a task prompt IS a procedure — the F-gates, the refund
+-- criteria, the escalation thresholds — and on a real agent they came to
+-- 77,923 characters across 34 tasks that no search could reach. They were
+-- findable only by accident, when a firing's child session happened to
+-- survive pruning: measured, one task's prompt appeared in 23 stored
+-- sessions and two others in none at all.
+-- Invalidated on ``(updated_at, byte_size)`` like the others. A deleted task
+-- drops its vector, so a retired procedure stops answering.
+CREATE TABLE IF NOT EXISTS task_vectors (
+    task_id     TEXT PRIMARY KEY,
+    updated_at  REAL,
+    byte_size   INTEGER,
+    name        TEXT,
+    enabled     INTEGER,
+    dim         INTEGER NOT NULL,
+    vec         BLOB NOT NULL,
+    embedded_at REAL NOT NULL
+);
 """
 
 
@@ -508,7 +528,7 @@ class SemanticIndex:
                     or meta.get("embed_model") != model):
                 self._conn.executescript(
                     "DELETE FROM vault_vectors; DELETE FROM session_vectors; "
-                    "DELETE FROM skill_vectors;"
+                    "DELETE FROM skill_vectors; DELETE FROM task_vectors;"
                 )
                 for k, v in (("source_db", src), ("schema", _SCHEMA_VERSION),
                              ("embed_model", model)):
@@ -875,6 +895,136 @@ class SemanticIndex:
         stats.elapsed_ms = int((time.monotonic() - t0) * 1000)
         return stats
 
+    # ── sync: scheduled-task prompts ──────────────────────────────────
+
+    def sync_tasks(self, *, force: bool = False,
+                   max_items: int = _MAX_ITEMS_PER_SYNC) -> SyncStats:
+        """Reconcile the task-prompt vectors with ``scheduled_tasks``.
+
+        FOURTH source. A task prompt is a PROCEDURE — the anti-fabrication
+        gates, the refund criteria, the escalation thresholds — and until now
+        no search could reach one. They were findable only by accident, when a
+        firing's child session happened to survive pruning: measured on a live
+        agent, one task's prompt appeared in 23 stored sessions and two others
+        in none at all, so whether a procedure answered a question depended on
+        retention.
+
+        Reads the agent database (same connection discipline as
+        ``sync_sessions``), embeds ``name + prompt``, and gates re-embedding on
+        ``(updated_at, byte_size)``. A deleted task drops its vector so a
+        retired procedure stops answering. Disabled tasks ARE indexed — a
+        switched-off task still documents how the thing is done, and hiding it
+        would lose the procedure along with the schedule — but the row carries
+        ``enabled`` so a caller can tell a live rule from a parked one.
+        """
+        t0 = time.monotonic()
+        stats = SyncStats()
+        if not self.active:
+            stats.elapsed_ms = int((time.monotonic() - t0) * 1000)
+            return stats
+
+        with self._lock:
+            src = self._open_source()
+            if src is None:
+                stats.elapsed_ms = int((time.monotonic() - t0) * 1000)
+                return stats
+            try:
+                try:
+                    live = {
+                        r["id"]: (float(r["updated_at"] or 0),
+                                  int(r["plen"] or 0),
+                                  str(r["name"] or ""),
+                                  int(r["enabled"] or 0))
+                        for r in src.execute(
+                            "SELECT id, name, enabled, updated_at, "
+                            "COALESCE(length(prompt),0) AS plen FROM scheduled_tasks")
+                    }
+                except sqlite3.Error:
+                    # No scheduled_tasks table (an older DB): stay inert rather
+                    # than fail the whole sync round.
+                    stats.elapsed_ms = int((time.monotonic() - t0) * 1000)
+                    return stats
+
+                existing = {
+                    r["task_id"]: (float(r["updated_at"] or 0), int(r["byte_size"] or 0))
+                    for r in self._conn.execute(
+                        "SELECT task_id, updated_at, byte_size FROM task_vectors")
+                }
+
+                for tid in existing.keys() - live.keys():
+                    self._conn.execute(
+                        "DELETE FROM task_vectors WHERE task_id = ?", (tid,))
+                    stats.deleted += 1
+
+                stale: list[str] = []
+                for tid, (upd, plen, _name, _en) in live.items():
+                    if plen == 0:
+                        continue  # niente prompt, niente procedura
+                    if not force and existing.get(tid) == (upd, plen):
+                        stats.unchanged += 1
+                    else:
+                        stale.append(tid)
+                stale.sort(key=lambda t: live[t][0], reverse=True)
+                if len(stale) > max_items:
+                    stats.pending = len(stale) - max_items
+                    stale = stale[:max_items]
+
+                texts: list[str] = []
+                metas: list[tuple[str, float, int, str, int]] = []
+                for tid in stale:
+                    row = src.execute(
+                        "SELECT prompt FROM scheduled_tasks WHERE id = ?",
+                        (tid,)).fetchone()
+                    if row is None:
+                        continue
+                    upd, plen, name, enabled = live[tid]
+                    digest = _prep_text(f"{name}\n\n{row['prompt'] or ''}")
+                    if not digest:
+                        continue
+                    texts.append(digest)
+                    metas.append((tid, upd, plen, name[:200], enabled))
+
+                self._commit()
+            finally:
+                try:
+                    src.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        # L'andata e ritorno dell'embedding sta FUORI dal lock, per la stessa
+        # ragione di note e sessioni: un batch tenuto sotto lock blocca ogni
+        # recall concorrente per tutta la sua durata.
+        blobs = None
+        if texts:
+            try:
+                blobs = self._embed_batch(texts)
+            except EmbeddingError as exc:
+                self._log_embed_error("tasks", exc)
+                stats.errored = True
+                stats.elapsed_ms = int((time.monotonic() - t0) * 1000)
+                return stats
+
+        with self._lock:
+            if blobs:
+                for (tid, upd, plen, name, enabled), (blob, dim) in zip(metas, blobs):
+                    self._conn.execute(
+                        "INSERT INTO task_vectors "
+                        "(task_id, updated_at, byte_size, name, enabled, dim, "
+                        " vec, embedded_at) VALUES (?,?,?,?,?,?,?,?) "
+                        "ON CONFLICT(task_id) DO UPDATE SET "
+                        "  updated_at=excluded.updated_at, byte_size=excluded.byte_size, "
+                        "  name=excluded.name, enabled=excluded.enabled, "
+                        "  dim=excluded.dim, vec=excluded.vec, "
+                        "  embedded_at=excluded.embedded_at",
+                        (tid, upd, plen, name, enabled, dim, blob, time.time()),
+                    )
+                    stats.embedded += 1
+                    stats.added += 1 if tid not in existing else 0
+                    stats.updated += 1 if tid in existing else 0
+            self._commit()
+        stats.elapsed_ms = int((time.monotonic() - t0) * 1000)
+        return stats
+
     # ── sync: skills ──────────────────────────────────────────────────
 
     def sync_skills(self, *, force: bool = False,
@@ -1023,6 +1173,11 @@ class SemanticIndex:
         }
         if self.skills_root:
             out["skills"] = self.sync_skills(force=force, max_items=max_items)
+        # I compiti vivono nello stesso database delle sessioni: se quella
+        # sorgente e' apribile lo sono anche loro, quindi non serve una radice
+        # da configurare. Su un database senza `scheduled_tasks` la gamba resta
+        # inerte da sola.
+        out["tasks"] = self.sync_tasks(force=force, max_items=max_items)
         return out
 
     def _log_embed_error(self, source: str, exc: Exception) -> None:
@@ -1074,10 +1229,11 @@ class SemanticIndex:
                ) -> list[dict[str, Any]]:
         """Cosine-nearest vault notes / sessions / skills to ``query``, best first.
 
-        ``scope`` is ``"all"`` | ``"vault"`` | ``"sessions"`` | ``"skills"``.
-        ``"all"`` covers vault + sessions ONLY (byte-identical to before skills
-        existed); ``"skills"`` is an explicit, separate leg over the SKILL.md
-        index so wiring skills in never perturbs note/session recall. Returns
+        ``scope`` is ``"all"`` | ``"vault"`` | ``"sessions"`` | ``"skills"`` |
+        ``"tasks"``. ``"all"`` covers vault + sessions ONLY (byte-identical to
+        before skills existed); ``"skills"`` and ``"tasks"`` are explicit,
+        separate legs — over the SKILL.md index and over the scheduled-task
+        prompts — so wiring either in never perturbs note/session recall. Returns
         ``[]`` when inert, on an empty query, or when nothing clears
         ``min_score`` — a weak match is NO match, which is what keeps auto-recall
         from injecting noise. Each hit carries a ``score`` (cosine, 0..1) so the
@@ -1111,6 +1267,17 @@ class SemanticIndex:
                             "kind": "skill", "score": round(float(s), 4),
                             "name": r["name"] or "", "category": r["category"] or "",
                             "path": r["path"],
+                        })
+            if "tasks" in want:
+                # ``enabled`` viaggia col risultato: un compito spento
+                # documenta ancora COME si fa la cosa, ma chi legge deve poter
+                # distinguere una regola in vigore da una parcheggiata.
+                for r, s in self._sims_for("task_vectors", qunit):
+                    if float(s) >= min_score:
+                        hits.append({
+                            "kind": "task", "score": round(float(s), 4),
+                            "name": r["name"] or "", "task_id": r["task_id"],
+                            "enabled": bool(r["enabled"]),
                         })
             if "vault" in want:
                 inc = tuple(p for p in (include_prefixes or ()) if p)

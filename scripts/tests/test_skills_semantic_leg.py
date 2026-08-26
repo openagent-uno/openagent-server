@@ -72,10 +72,13 @@ async def t_no_root_no_leg(ctx: TestContext) -> None:
     idx.sync_vault = lambda **kw: chiamate.append("vault") or _stat()
     idx.sync_sessions = lambda **kw: chiamate.append("sessions") or _stat()
     idx.sync_skills = lambda **kw: chiamate.append("skills") or _stat()
+    # La quarta gamba (prompt dei compiti) non c'entra con questo test ma
+    # `sync` la chiama: stubbarla tiene la prova sulla domanda che pone.
+    idx.sync_tasks = lambda **kw: chiamate.append("tasks") or _stat()
 
     out = SemanticIndex.sync(idx)
     assert "skills" not in out
-    assert chiamate == ["vault", "sessions"]
+    assert chiamate == ["vault", "sessions", "tasks"]
 
 
 @test("skills_semantic_leg", "con la radice la gamba c'e'")
@@ -91,10 +94,11 @@ async def t_root_enables_leg(ctx: TestContext) -> None:
     idx.sync_vault = lambda **kw: chiamate.append("vault") or _stat()
     idx.sync_sessions = lambda **kw: chiamate.append("sessions") or _stat()
     idx.sync_skills = lambda **kw: chiamate.append("skills") or _stat()
+    idx.sync_tasks = lambda **kw: chiamate.append("tasks") or _stat()
 
     out = SemanticIndex.sync(idx)
     assert "skills" in out, "la terza sorgente non viene sincronizzata"
-    assert chiamate == ["vault", "sessions", "skills"]
+    assert chiamate == ["vault", "sessions", "skills", "tasks"]
 
 
 @test("skills_semantic_leg", "il server risolve la radice e la passa, dietro il cancello")
