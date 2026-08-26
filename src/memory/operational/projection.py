@@ -184,7 +184,7 @@ def _missing_run_status_inference(run: dict[str, Any]) -> tuple[str, str] | None
     the untouched raw envelope remains the fidelity source.
     """
 
-    content_text = _text(run.get("content"))
+    content_text = _text(run.get("content")).strip()
     messages = run.get("messages") if isinstance(run.get("messages"), list) else []
     tools = run.get("tools") if isinstance(run.get("tools"), list) else []
 
@@ -198,7 +198,7 @@ def _missing_run_status_inference(run: dict[str, Any]) -> tuple[str, str] | None
             in {"system", "developer"}
         )
         and bool(
-            _text(message.get("content"))
+            _text(message.get("content")).strip()
             or message.get("tool_call_id")
             or message.get("tool_calls")
             or message.get("reasoning_content")
@@ -221,10 +221,18 @@ def _missing_run_status_inference(run: dict[str, Any]) -> tuple[str, str] | None
     if not content_text and not materialized_messages and not materialized_tools:
         return None
 
-    tool_failed = any(tool.get("tool_call_error") is True for tool in materialized_tools)
+    tool_states = {
+        str(tool.get("status") or tool.get("state") or "").strip().upper()
+        for tool in materialized_tools
+    }
+    tool_failed = any(tool.get("tool_call_error") is True for tool in materialized_tools) or bool(
+        tool_states & {"FAILED", "ERROR", "DENIED"}
+    )
+    tool_cancelled = bool(tool_states & {"CANCELLED", "CANCELED"})
+    tool_interrupted = "INTERRUPTED" in tool_states
     assistant_output = any(
         _message_role(message.get("role")) == "assistant"
-        and bool(_text(message.get("content")))
+        and bool(_text(message.get("content")).strip())
         for message in materialized_messages
     )
     tool_finished = any(
@@ -235,6 +243,10 @@ def _missing_run_status_inference(run: dict[str, Any]) -> tuple[str, str] | None
     )
     if tool_failed:
         inferred = "failed"
+    elif tool_interrupted:
+        inferred = "interrupted"
+    elif tool_cancelled:
+        inferred = "cancelled"
     elif content_text or assistant_output or tool_finished:
         inferred = "success"
     else:
@@ -363,7 +375,7 @@ def build_session_projection(
                 run_completeness = "partial"
                 if partial is None:
                     partial = (
-                        f"run {run_ordinal} status missing; inferred success "
+                        f"run {run_ordinal} status missing; inferred {status} "
                         "for normalized transcript indexing"
                     )
             source_run_id = str(run.get("run_id") or run.get("id") or "").strip()

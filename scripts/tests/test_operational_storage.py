@@ -597,6 +597,8 @@ async def t_legacy_empty_and_statusless_projection(_ctx: TestContext) -> None:
 
 @test("operational_storage", "ambiguous status aliases and empty evidence fail closed")
 async def t_legacy_status_aliases_fail_closed(_ctx: TestContext) -> None:
+    import json
+
     from src.memory.operational.projection import build_session_projection
 
     common = {
@@ -627,13 +629,58 @@ async def t_legacy_status_aliases_fail_closed(_ctx: TestContext) -> None:
         tenant_id="tenant-canary",
         now_ms=1_700_000_002_000,
     )
+    whitespace = build_session_projection(
+        {
+            **common,
+            "session_id": "whitespace-evidence-canary",
+            "runs": [{
+                "content": "   ",
+                "messages": [{"role": "assistant", "content": " \n "}],
+            }],
+        },
+        tenant_id="tenant-canary",
+        now_ms=1_700_000_002_000,
+    )
 
-    for projection in (ambiguous, empty):
+    for projection in (ambiguous, empty, whitespace):
         assert projection.session["completeness"] == "malformed_source"
         assert projection.malformed_error
         assert projection.runs == ()
         assert projection.messages == ()
         assert projection.tools == ()
+
+    inference_cases = (
+        (
+            "success",
+            {"content": "final answer"},
+            "legacy_missing_inferred_success",
+        ),
+        (
+            "failed",
+            {"tools": [{"name": "broken", "status": "FAILED"}]},
+            "legacy_missing_inferred_failed",
+        ),
+        (
+            "running",
+            {"messages": [{"role": "user", "content": "question"}]},
+            "legacy_missing_inferred_running",
+        ),
+    )
+    for expected_status, run, expected_raw in inference_cases:
+        projection = build_session_projection(
+            {
+                **common,
+                "session_id": f"inferred-{expected_status}-canary",
+                "runs": [run],
+            },
+            tenant_id="tenant-canary",
+            now_ms=1_700_000_002_000,
+        )
+        assert projection.session["completeness"] == "partial"
+        assert projection.runs[0]["status"] == expected_status
+        assert projection.runs[0]["status_raw"] == expected_raw
+        metadata = json.loads(str(projection.session["metadata_json"]))
+        assert f"inferred {expected_status}" in metadata["projection_error"]
 
 
 @test("operational_storage", "tool_call_id reuse is isolated by run and search message")
