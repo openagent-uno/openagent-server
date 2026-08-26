@@ -559,7 +559,8 @@ async def t_legacy_empty_and_statusless_projection(_ctx: TestContext) -> None:
             ).fetchone()
             normalized_run = await (
                 await conn.execute(
-                    "SELECT status, status_raw, completeness, raw_envelope_json "
+                    "SELECT status, status_raw, completeness, raw_envelope_json, "
+                    "finished_at_ms "
                     "FROM session_runs WHERE session_id='statusless-canary'"
                 )
             ).fetchone()
@@ -587,10 +588,52 @@ async def t_legacy_empty_and_statusless_projection(_ctx: TestContext) -> None:
         )
         raw_envelope = json.loads(str(normalized_run[3]))
         assert "status" not in raw_envelope
+        assert normalized_run[4] is None
         assert [tuple(row) for row in messages] == [
             ("user", "durable question"),
             ("assistant", "durable final answer"),
         ]
+
+
+@test("operational_storage", "ambiguous status aliases and empty evidence fail closed")
+async def t_legacy_status_aliases_fail_closed(_ctx: TestContext) -> None:
+    from src.memory.operational.projection import build_session_projection
+
+    common = {
+        "session_type": "agent",
+        "metadata": {"client_id": "alice"},
+        "created_at": 1_700_000_000,
+        "updated_at": 1_700_000_001,
+    }
+    ambiguous = build_session_projection(
+        {
+            **common,
+            "session_id": "ambiguous-status-canary",
+            "runs": [{
+                "status": "   ",
+                "run_status": "NOT_A_STATUS",
+                "content": "must not hide the unknown alias",
+            }],
+        },
+        tenant_id="tenant-canary",
+        now_ms=1_700_000_002_000,
+    )
+    empty = build_session_projection(
+        {
+            **common,
+            "session_id": "empty-evidence-canary",
+            "runs": [{"messages": [{}]}],
+        },
+        tenant_id="tenant-canary",
+        now_ms=1_700_000_002_000,
+    )
+
+    for projection in (ambiguous, empty):
+        assert projection.session["completeness"] == "malformed_source"
+        assert projection.malformed_error
+        assert projection.runs == ()
+        assert projection.messages == ()
+        assert projection.tools == ()
 
 
 @test("operational_storage", "tool_call_id reuse is isolated by run and search message")

@@ -176,6 +176,72 @@ def _message_fingerprint(message: dict[str, Any], role: str) -> str:
     )
 
 
+def _missing_run_status_inference(run: dict[str, Any]) -> tuple[str, str] | None:
+    """Infer only enough lifecycle state to index a legacy transcript safely.
+
+    The enclosing session remains ``partial`` and therefore cannot become a
+    v2 runtime read.  This mapping only keeps durable evidence discoverable;
+    the untouched raw envelope remains the fidelity source.
+    """
+
+    content_text = _text(run.get("content"))
+    messages = run.get("messages") if isinstance(run.get("messages"), list) else []
+    tools = run.get("tools") if isinstance(run.get("tools"), list) else []
+
+    materialized_messages = [
+        message
+        for message in messages
+        if isinstance(message, dict)
+        and (
+            _message_role(message.get("role")) is not None
+            or str(message.get("role") or "").strip().lower()
+            in {"system", "developer"}
+        )
+        and bool(
+            _text(message.get("content"))
+            or message.get("tool_call_id")
+            or message.get("tool_calls")
+            or message.get("reasoning_content")
+        )
+    ]
+    materialized_tools = [
+        tool
+        for tool in tools
+        if isinstance(tool, dict)
+        and bool(
+            tool.get("tool_name")
+            or tool.get("name")
+            or tool.get("tool_call_id")
+            or tool.get("tool_use_id")
+            or tool.get("tool_args") is not None
+            or tool.get("result") is not None
+            or tool.get("tool_call_error")
+        )
+    ]
+    if not content_text and not materialized_messages and not materialized_tools:
+        return None
+
+    tool_failed = any(tool.get("tool_call_error") is True for tool in materialized_tools)
+    assistant_output = any(
+        _message_role(message.get("role")) == "assistant"
+        and bool(_text(message.get("content")))
+        for message in materialized_messages
+    )
+    tool_finished = any(
+        tool.get("result") is not None
+        or str(tool.get("status") or tool.get("state") or "").strip().upper()
+        in {"COMPLETED", "SUCCEEDED", "SUCCESS", "FAILED", "ERROR"}
+        for tool in materialized_tools
+    )
+    if tool_failed:
+        inferred = "failed"
+    elif content_text or assistant_output or tool_finished:
+        inferred = "success"
+    else:
+        inferred = "running"
+    return inferred, f"legacy_missing_inferred_{inferred}"
+
+
 @dataclass(frozen=True)
 class SessionProjection:
     session: dict[str, Any]
@@ -257,14 +323,29 @@ def build_session_projection(
         for run_ordinal, run in enumerate(runs_raw):
             if not isinstance(run, dict):
                 raise UnmappedStatusError(f"run {run_ordinal} is not an object")
-            source_status = (
-                run.get("status") or run.get("run_status") or run.get("state")
-            )
-            if str(getattr(source_status, "value", source_status) or "").strip():
+            source_statuses = [
+                value
+                for value in (
+                    run.get("status"),
+                    run.get("run_status"),
+                    run.get("state"),
+                )
+                if str(getattr(value, "value", value) or "").strip()
+            ]
+            if source_statuses:
                 # A non-empty status must have an explicit reviewed mapping.
                 # Unknown values remain fail-closed and quarantine the whole
                 # projection rather than inventing lifecycle semantics.
-                status, status_raw = normalize_run_status(source_status)
+                normalized_statuses = [
+                    normalize_run_status(value) for value in source_statuses
+                ]
+                canonical_statuses = {value[0] for value in normalized_statuses}
+                if len(canonical_statuses) != 1:
+                    raise UnmappedStatusError(
+                        f"run {run_ordinal} has conflicting lifecycle statuses"
+                    )
+                status, status_raw = normalized_statuses[0]
+                status_inferred = False
                 run_completeness = "complete"
             else:
                 # A small number of old SDK rows omitted status even though a
@@ -272,23 +353,13 @@ def build_session_projection(
                 # that evidence searchable, but mark it partial so prefer_v2
                 # continues to read the canonical legacy blob.  The untouched
                 # raw envelope preserves the missing source field exactly.
-                has_durable_transcript = bool(
-                    _text(run.get("content"))
-                    or (
-                        isinstance(run.get("messages"), list)
-                        and len(run["messages"]) > 0
-                    )
-                    or (
-                        isinstance(run.get("tools"), list)
-                        and len(run["tools"]) > 0
-                    )
-                )
-                if not has_durable_transcript:
+                inferred_status = _missing_run_status_inference(run)
+                if inferred_status is None:
                     raise UnmappedStatusError(
                         f"run {run_ordinal} has no status or durable transcript"
                     )
-                status = "success"
-                status_raw = "legacy_missing_inferred_success"
+                status, status_raw = inferred_status
+                status_inferred = True
                 run_completeness = "partial"
                 if partial is None:
                     partial = (
@@ -303,7 +374,12 @@ def build_session_projection(
             )
             run_created = _ms(run.get("created_at") or run.get("started_at"), updated_ms)
             terminal = status not in {"pending", "queued", "received", "running"}
-            finished = _ms(run.get("finished_at") or run.get("completed_at"), run_created) if terminal else None
+            finished_source = run.get("finished_at") or run.get("completed_at")
+            finished = (
+                _ms(finished_source, run_created)
+                if terminal and (finished_source is not None or not status_inferred)
+                else None
+            )
             bounded_envelope = _bounded_run_envelope(run)
             run_rows.append(
                 {
