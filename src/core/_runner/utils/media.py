@@ -344,16 +344,23 @@ def reconstruct_file_from_dict(file_data):
     """
     try:
         if isinstance(file_data, dict):
-            # If content is base64 string, decode it back to bytes
+            # ``File.to_dict`` keeps text/* content as readable UTF-8 while
+            # base64-encoding binary MIME types. Treating a text string that
+            # happens to be valid base64 (for example ``file``) as encoded
+            # bytes silently corrupts typed MCP file outputs on event replay.
             if "content" in file_data and isinstance(file_data["content"], str):
-                file_obj = File.from_base64(
-                    file_data["content"],
-                    id=file_data.get("id"),
-                    mime_type=file_data.get("mime_type"),
-                    filename=file_data.get("filename"),
-                    name=file_data.get("name"),
-                    format=file_data.get("format"),
-                )
+                mime = str(file_data.get("mime_type") or "").lower()
+                common = {
+                    "id": file_data.get("id"),
+                    "mime_type": file_data.get("mime_type"),
+                    "filename": file_data.get("filename"),
+                    "name": file_data.get("name"),
+                    "format": file_data.get("format"),
+                }
+                if mime.startswith("text/"):
+                    file_obj = File(content=file_data["content"], **common)
+                else:
+                    file_obj = File.from_base64(file_data["content"], **common)
                 # Preserve additional fields that from_base64 doesn't handle
                 if file_data.get("size") is not None:
                     file_obj.size = file_data.get("size")

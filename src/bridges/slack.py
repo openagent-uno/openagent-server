@@ -28,11 +28,22 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import shutil
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from src.bridges.base import BaseBridge
-from src.channels.formatting import markdown_to_telegram_html
+from src.channels.base import is_blocked_attachment
+from src.channels.voice import is_audio_file
 from src.core.logging import elog
+from src.memory.artifacts import (
+    attachment_limit_bytes,
+    safe_attachment_filename,
+    safe_attachment_staging_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +51,14 @@ logger = logging.getLogger(__name__)
 # but the practical formatting limit is much lower — long replies are
 # split via BaseBridge.message_limit + send_text_chunk.
 SLACK_MSG_LIMIT = 3500
+_SLACK_MEDIA_DOWNLOAD_TIMEOUT = 120.0
+
+
+@dataclass(frozen=True)
+class _SlackDownloadOutcome:
+    path: str | None
+    error: str | None = None
+    size_bytes: int = 0
 
 
 def _build_picker_blocks(picker: dict | None) -> list | None:
@@ -129,6 +148,22 @@ class SlackBridge(BaseBridge):
             return False
         return channel_id in self.listen_channels
 
+    @staticmethod
+    def _is_dm_channel(channel_id: str, channel_type: str = "") -> bool:
+        return channel_type == "im" or channel_id.startswith("D")
+
+    @classmethod
+    def _session_id(
+        cls,
+        user_id: str,
+        channel_id: str,
+        *,
+        channel_type: str = "",
+    ) -> str:
+        if not channel_id or cls._is_dm_channel(channel_id, channel_type):
+            return f"sl:{user_id}"
+        return f"sl:channel:{channel_id}"
+
     async def _run(self) -> None:
         try:
             from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
@@ -151,12 +186,13 @@ class SlackBridge(BaseBridge):
         @app.event("message")  # type: ignore[misc]
         async def _on_message(event, say, body, client):  # noqa: ANN001
             # Filter out bot echo, edits, joins, etc.
-            if event.get("bot_id") or event.get("subtype"):
+            subtype = event.get("subtype")
+            if event.get("bot_id") or subtype not in {None, "file_share"}:
                 return
             user_id = event.get("user")
             channel_id = event.get("channel")
             channel_type = event.get("channel_type") or ""
-            is_dm = channel_type == "im"
+            is_dm = self._is_dm_channel(str(channel_id or ""), channel_type)
             text = (event.get("text") or "").strip()
             if not user_id or not channel_id:
                 return
@@ -166,8 +202,6 @@ class SlackBridge(BaseBridge):
                 return
             if not self._channel_listened(str(channel_id), is_dm):
                 return
-            if not text:
-                return
             # Strip a leading <@BOTID> mention so the model doesn't see
             # the noise; for DMs the mention isn't usually present.
             if self._bot_user_id:
@@ -175,15 +209,130 @@ class SlackBridge(BaseBridge):
                 if text.startswith(mention):
                     text = text[len(mention):].lstrip(": ").strip()
 
-            # Bridge target carries the SDK client + channel for status
-            # message edits below.
-            target = _SlackTarget(client=client, channel=channel_id, user=user_id)
-            session_id = f"sl:{user_id}"
+            tmp = tempfile.mkdtemp(prefix="oa_sl_")
+            attachments: list[dict] = []
+            voice_detected = False
+            session_id = self._session_id(
+                str(user_id), str(channel_id), channel_type=channel_type,
+            )
             try:
-                await self.dispatch_turn(target, session_id, text)
+                async def _notify_attachment(message: str) -> None:
+                    kwargs = {"channel": channel_id, "text": message}
+                    if event.get("thread_ts"):
+                        kwargs["thread_ts"] = event["thread_ts"]
+                    with contextlib.suppress(Exception):
+                        await client.chat_postMessage(**kwargs)
+
+                for file_info in event.get("files") or ():
+                    if not isinstance(file_info, dict):
+                        continue
+                    filename = safe_attachment_filename(
+                        file_info.get("name")
+                        or file_info.get("title")
+                        or f"slack-{file_info.get('id') or 'file'}"
+                    )
+                    if is_blocked_attachment(filename):
+                        with contextlib.suppress(Exception):
+                            await client.chat_postMessage(
+                                channel=channel_id,
+                                text=f"⚠️ Blocked: {filename}",
+                            )
+                        continue
+                    url = str(
+                        file_info.get("url_private_download")
+                        or file_info.get("url_private")
+                        or ""
+                    )
+                    if not url:
+                        await _notify_attachment(
+                            f"⚠️ Impossibile scaricare {filename}. Riprova più tardi."
+                        )
+                        continue
+                    raw_outcome = await self._download_file(
+                        url,
+                        tmp,
+                        filename,
+                        declared_size=int(file_info.get("size") or 0),
+                    )
+                    # Private method compatibility for bridge subclasses/tests
+                    # written before structured failure reasons were added.
+                    if isinstance(raw_outcome, str):
+                        outcome = _SlackDownloadOutcome(path=raw_outcome)
+                    elif isinstance(raw_outcome, _SlackDownloadOutcome):
+                        outcome = raw_outcome
+                    else:
+                        outcome = _SlackDownloadOutcome(
+                            path=None,
+                            error="download_failed",
+                        )
+                    if outcome.path is None:
+                        if outcome.error == "too_large":
+                            limit = attachment_limit_bytes(direction="input")
+                            elog(
+                                "bridge.slack.attachment_rejected",
+                                level="warning",
+                                filename=filename,
+                                size_bytes=outcome.size_bytes,
+                                limit_bytes=limit,
+                            )
+                            await _notify_attachment(
+                                f"⚠️ File troppo grande: {filename} "
+                                f"({outcome.size_bytes} byte; limite {limit} byte)."
+                            )
+                        else:
+                            await _notify_attachment(
+                                f"⚠️ Impossibile scaricare {filename}. Riprova più tardi."
+                            )
+                        continue
+                    path = outcome.path
+                    mime = str(file_info.get("mimetype") or "") or None
+                    voice = is_audio_file(filename, mime)
+                    kind = (
+                        "voice" if voice
+                        else "image" if str(mime or "").startswith("image/")
+                        else "video" if str(mime or "").startswith("video/")
+                        else "file"
+                    )
+                    attachments.append({
+                        "type": kind,
+                        "kind": kind,
+                        "path": path,
+                        "filename": filename,
+                        "mime_type": mime,
+                        "size_bytes": Path(path).stat().st_size,
+                    })
+                    if voice:
+                        voice_detected = True
+                        transcript = await self.transcribe_with_fallback(path)
+                        text = f"{text}\n{transcript}" if text else transcript
+
+                if not text and not attachments:
+                    return
+                # Bridge target carries the SDK client + channel for platform
+                # primitives.  Keep replies in an existing Slack thread.
+                target = _SlackTarget(
+                    client=client,
+                    channel=channel_id,
+                    user=user_id,
+                    thread_ts=event.get("thread_ts"),
+                )
+                await self.dispatch_turn(
+                    target,
+                    session_id,
+                    text,
+                    voice_detected=voice_detected,
+                    attachments=attachments,
+                    author={
+                        "kind": "human",
+                        "handle": f"slack:{user_id}",
+                        "display": str(user_id),
+                    },
+                )
             except Exception as e:  # noqa: BLE001
                 logger.exception("slack dispatch failed: %s", e)
                 elog("bridge.error", name="slack", session_id=session_id, error=str(e)[:200])
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
 
         # Native Slack slash commands, delivered over socket mode (no
         # public request URL needed). Mirrors Telegram's bot commands and
@@ -209,8 +358,16 @@ class SlackBridge(BaseBridge):
                     # Slack puts any text after the command name in
                     # command["text"] (e.g. "/model gpt-4o" → "gpt-4o").
                     slack_arg = (command.get("text") or "").strip() or None
+                    channel_id = str(command.get("channel_id") or "")
+                    channel_type = (
+                        "im" if str(command.get("channel_name") or "") == "directmessage"
+                        else ""
+                    )
+                    session_id = self._session_id(
+                        uid, channel_id, channel_type=channel_type,
+                    )
                     result = await self.send_command_full(
-                        command_name, session_id=f"sl:{uid}", arg=slack_arg,
+                        command_name, session_id=session_id, arg=slack_arg,
                     )
                 except Exception as e:  # noqa: BLE001
                     logger.warning("slack /%s failed: %s", command_name, e)
@@ -245,8 +402,16 @@ class SlackBridge(BaseBridge):
             if not command or not value:
                 return
             try:
+                channel = body.get("channel") or {}
+                container = body.get("container") or {}
+                channel_id = str(
+                    channel.get("id")
+                    or container.get("channel_id")
+                    or ""
+                )
+                session_id = self._session_id(uid, channel_id)
                 result = await self.send_command(
-                    command, session_id=f"sl:{uid}", arg=value,
+                    command, session_id=session_id, arg=value,
                 )
             except Exception as e:  # noqa: BLE001
                 logger.warning("slack picker /%s failed: %s", command, e)
@@ -307,9 +472,10 @@ class SlackBridge(BaseBridge):
         # telegram HTML renderer would over-quote things. Send raw text
         # — Slack auto-linkifies URLs and respects \n for paragraphs.
         try:
-            await target.client.chat_postMessage(
-                channel=target.channel, text=chunk
-            )
+            kwargs = {"channel": target.channel, "text": chunk}
+            if target.thread_ts:
+                kwargs["thread_ts"] = target.thread_ts
+            await target.client.chat_postMessage(**kwargs)
         except Exception as e:  # noqa: BLE001
             logger.warning("slack send_text_chunk failed: %s", e)
 
@@ -323,13 +489,96 @@ class SlackBridge(BaseBridge):
         if not p.exists() or not p.is_file():
             return
         try:
-            await target.client.files_upload_v2(
-                channel=target.channel,
-                file=str(p),
-                filename=p.name,
-            )
+            kwargs = {
+                "channel": target.channel,
+                "file": str(p),
+                "filename": getattr(att, "filename", None) or p.name,
+            }
+            if getattr(att, "caption", None):
+                kwargs["initial_comment"] = att.caption
+            if target.thread_ts:
+                kwargs["thread_ts"] = target.thread_ts
+            await target.client.files_upload_v2(**kwargs)
         except Exception as e:  # noqa: BLE001
             logger.warning("slack send_attachment failed: %s", e)
+
+    async def _download_file(
+        self,
+        url: str,
+        tmp: str,
+        filename: str,
+        *,
+        declared_size: int = 0,
+    ) -> _SlackDownloadOutcome:
+        """Fetch a private Slack file using bot auth and a strict byte cap."""
+
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or not (
+            parsed.hostname == "slack.com"
+            or str(parsed.hostname or "").endswith(".slack.com")
+        ):
+            elog(
+                "bridge.slack.attachment_rejected",
+                level="warning",
+                reason="unexpected_host",
+            )
+            return _SlackDownloadOutcome(path=None, error="download_failed")
+        limit = attachment_limit_bytes(direction="input")
+        if limit and declared_size > limit:
+            return _SlackDownloadOutcome(
+                path=None, error="too_large", size_bytes=declared_size,
+            )
+        session = await self._audio_session()
+        if session is None:
+            return _SlackDownloadOutcome(path=None, error="download_failed")
+        target = Path(tmp) / safe_attachment_staging_name(
+            safe_attachment_filename(Path(parsed.path).stem, fallback="slack"),
+            filename,
+        )
+        copied = 0
+        try:
+            import aiohttp
+
+            timeout = aiohttp.ClientTimeout(total=_SLACK_MEDIA_DOWNLOAD_TIMEOUT)
+            async with session.get(
+                url,
+                headers={"Authorization": f"Bearer {self.bot_token}"},
+                timeout=timeout,
+            ) as response:
+                if response.status != 200:
+                    return _SlackDownloadOutcome(path=None, error="download_failed")
+                header_size = int(response.headers.get("Content-Length") or 0)
+                if limit and header_size > limit:
+                    return _SlackDownloadOutcome(
+                        path=None, error="too_large", size_bytes=header_size,
+                    )
+                exceeded_size = 0
+                with target.open("wb") as out:
+                    async for chunk in response.content.iter_chunked(1024 * 1024):
+                        copied += len(chunk)
+                        if limit and copied > limit:
+                            exceeded_size = copied
+                            break
+                        out.write(chunk)
+                if exceeded_size:
+                    with contextlib.suppress(OSError):
+                        target.unlink()
+                    return _SlackDownloadOutcome(
+                        path=None, error="too_large", size_bytes=exceeded_size,
+                    )
+            return _SlackDownloadOutcome(
+                path=str(target.resolve()), size_bytes=copied,
+            )
+        except Exception as exc:  # noqa: BLE001
+            with contextlib.suppress(OSError):
+                target.unlink()
+            elog(
+                "bridge.slack.attachment_download_failed",
+                level="warning",
+                filename=filename,
+                error=str(exc) or type(exc).__name__,
+            )
+            return _SlackDownloadOutcome(path=None, error="download_failed")
 
 
 class _SlackTarget:
@@ -341,9 +590,12 @@ class _SlackTarget:
     Bolt ``event`` payload through dispatch.
     """
 
-    __slots__ = ("client", "channel", "user")
+    __slots__ = ("client", "channel", "user", "thread_ts")
 
-    def __init__(self, client, channel: str, user: str):
+    def __init__(
+        self, client, channel: str, user: str, thread_ts: str | None = None,
+    ):
         self.client = client
         self.channel = channel
         self.user = user
+        self.thread_ts = thread_ts

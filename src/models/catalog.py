@@ -184,7 +184,15 @@ def _entry_model_id(entry: Any) -> str:
 
 def _entry_metadata(entry: Any) -> dict[str, Any]:
     if isinstance(entry, dict):
-        return dict(entry)
+        # DB hydration keeps user-editable model metadata under ``metadata``
+        # while legacy yaml/tests put those keys directly on the model entry.
+        # Merge both shapes so ``CatalogModel.metadata`` always exposes the
+        # persisted ``models.metadata_json`` fields (notably
+        # ``input_modalities``) to the dispatcher.
+        nested = entry.get("metadata")
+        merged = dict(nested) if isinstance(nested, dict) else {}
+        merged.update(entry)
+        return merged
     return {}
 
 

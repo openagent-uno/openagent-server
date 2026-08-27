@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Awaitable
 
 from src.channels.base import (
+    Attachment,
     parse_response_markers,
     split_preserving_code_blocks,
 )
@@ -680,6 +681,8 @@ class BaseBridge:
         on_compaction: Callable[[dict], Awaitable[None]] | None = None,
         input_was_voice: bool = False,
         source: str = "user_typed",
+        attachments: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
+        author: dict[str, Any] | None = None,
     ) -> dict:
         """Push ``text`` into the user's stream session and await the reply.
 
@@ -711,6 +714,13 @@ class BaseBridge:
                 profile="batched",
                 speak=False,
                 client_kind=self.name,
+                client_capabilities={
+                    "attachments": True,
+                    "ordered_parts": False,
+                    "inline_ui": False,
+                    "sidebar_ui": False,
+                    "custom_ui_version": 0,
+                },
                 coalesce_window_ms=BRIDGE_COALESCE_WINDOW_MS,
             )))
             self._stream_opened.add(session_id)
@@ -746,6 +756,8 @@ class BaseBridge:
                 ts_ms=now_ms(),
                 text=text,
                 source=source,  # type: ignore[arg-type]
+                attachments=tuple(attachments or ()),
+                author=author,
             )))
         except Exception:
             if is_owner and self._stream_pending.get(session_id) is collector:
@@ -912,6 +924,8 @@ class BaseBridge:
         text: str,
         *,
         voice_detected: bool = False,
+        attachments: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
+        author: dict[str, Any] | None = None,
     ) -> None:
         """Shared orchestration: post status → send_message → render reply.
 
@@ -1090,6 +1104,8 @@ class BaseBridge:
                 # Voice notes bypass the typed-burst coalescence window
                 # for instant barge-in (StreamSession STT-bypass path).
                 source="stt" if voice_detected else "user_typed",
+                attachments=attachments,
+                author=author,
             )
         except Exception as e:  # noqa: BLE001
             # Hard failure of the gateway round-trip (network drop,
@@ -1158,6 +1174,11 @@ class BaseBridge:
         # collector; the owner's reply now reads back the latest.
         post_target = response.get("target") or target
 
+        outbound_attachments = self._coerce_response_attachments(
+            response.get("attachments") or (),
+        )
+        marker_attachments: list[Attachment] = []
+
         if live is not None and live.posted_any:
             # Live mode already streamed the tool calls + narration as
             # their own messages. Post ONLY the still-unposted tail (the
@@ -1173,7 +1194,7 @@ class BaseBridge:
                 remainder_raw = accumulated[live.posted_chars:]
             else:
                 remainder_raw = ""
-            clean, _atts = parse_response_markers(remainder_raw)
+            clean, marker_attachments = parse_response_markers(remainder_raw)
             clean = clean.strip()
             if clean:
                 clean = self.append_model_feedback(clean, response.get("model"))
@@ -1182,17 +1203,27 @@ class BaseBridge:
             response_text = response.get("text", "") or ""
             response_text = await self.maybe_prepend_voice_reply(response_text, voice_detected)
 
-            clean, attachments = parse_response_markers(response_text)
-            for att in attachments:
-                try:
-                    await self.send_attachment(post_target, att)
-                except Exception as e:  # noqa: BLE001
-                    logger.error("%s attachment send error: %s", self.name, e)
-                finally:
-                    self._cleanup_owned_temp_artifact(att.path)
+            clean, marker_attachments = parse_response_markers(response_text)
 
             clean = self.append_model_feedback(clean, response.get("model"))
             await self.send_response_text(post_target, clean)
+
+        # Native ``OutTextFinal.attachments`` is now the canonical path.  The
+        # marker list remains as a compatibility fallback and for the locally
+        # synthesised voice reply.  Send in stable order, de-duplicating a
+        # marker already represented by its persisted AttachmentRef.
+        seen: set[tuple[str, str]] = set()
+        for att in [*outbound_attachments, *marker_attachments]:
+            identity = (att.type, os.path.realpath(att.path))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            try:
+                await self.send_attachment(post_target, att)
+            except Exception as e:  # noqa: BLE001
+                logger.error("%s attachment send error: %s", self.name, e)
+            finally:
+                self._cleanup_owned_temp_artifact(att.path)
 
         # Fire turn_end hook if registered. Fire-and-forget; never
         # blocks the response path. ``response_chars`` is a coarse
@@ -1238,6 +1269,37 @@ class BaseBridge:
             return
         except OSError as e:
             logger.debug("bridge temp cleanup skipped for %s: %s", candidate, e)
+
+    @staticmethod
+    def _coerce_response_attachments(raw_items: Any) -> list[Attachment]:
+        """Translate wire AttachmentRefs into the channel adapter shape."""
+
+        out: list[Attachment] = []
+        if not isinstance(raw_items, (list, tuple)):
+            return out
+        for raw in raw_items:
+            if isinstance(raw, Attachment):
+                out.append(raw)
+                continue
+            if not isinstance(raw, dict):
+                continue
+            path = str(raw.get("path") or "").strip()
+            if not path:
+                # External bridges run beside the gateway and therefore use
+                # the canonical local CAS path. A URL-only ref is useful to a
+                # remote app but cannot be handed to a platform SDK as a file.
+                continue
+            kind = str(raw.get("type") or raw.get("kind") or "file").lower()
+            if kind not in {"image", "file", "voice", "video"}:
+                kind = "file"
+            out.append(Attachment(
+                type=kind,
+                path=path,
+                filename=str(raw.get("filename") or Path(path).name),
+                mime_type=raw.get("mime_type") or raw.get("mime"),
+                caption=raw.get("caption"),
+            ))
+        return out
 
     async def send_response_text(self, target, text: str) -> None:
         """Split ``text`` at ``message_limit`` and send each chunk.

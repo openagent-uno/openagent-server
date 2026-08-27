@@ -41,6 +41,7 @@ async def handle_catalog(request: web.Request) -> web.Response:
     """GET /api/models/catalog?provider=openai — configured models with live pricing."""
     from aiohttp import web as _web
     from src.models.catalog import get_model_pricing, iter_configured_models
+    from src.models.media_capabilities import input_modalities_for
 
     provider_filter = request.query.get("provider", "")
     db = _db(request)
@@ -60,6 +61,7 @@ async def handle_catalog(request: web.Request) -> web.Response:
                 "runtime_id": entry.runtime_id,
                 "history_mode": entry.history_mode,
                 "tier_hint": entry.tier_hint,
+                "input_modalities": sorted(input_modalities_for(entry)),
                 "input_cost_per_million": round(float(pricing["input_cost_per_million"] or 0.0), 4),
                 "output_cost_per_million": round(float(pricing["output_cost_per_million"] or 0.0), 4),
             }
@@ -256,6 +258,12 @@ async def handle_create_db(request: web.Request) -> web.Response:
     kind = (body.get("kind") or "llm").strip()
     if kind not in ("llm", "tts", "stt"):
         return _web.json_response({"error": "kind must be llm/tts/stt"}, status=400)
+    raw_metadata = body.get("metadata")
+    if raw_metadata is not None and not isinstance(raw_metadata, dict):
+        return _web.json_response({"error": "metadata must be an object"}, status=400)
+    metadata = dict(raw_metadata or {})
+    if "input_modalities" in body:
+        metadata["input_modalities"] = body.get("input_modalities")
     try:
         mid = await db.upsert_model(
             provider_id=provider_id,
@@ -264,7 +272,7 @@ async def handle_create_db(request: web.Request) -> web.Response:
             tier_hint=body.get("tier_hint") or body.get("notes"),
             enabled=bool(body.get("enabled", True)),
             is_classifier=bool(body.get("is_classifier", False)),
-            metadata=body.get("metadata") or None,
+            metadata=metadata or None,
             kind=kind,
         )
     except ValueError as e:
@@ -293,6 +301,12 @@ async def handle_update_db(request: web.Request) -> web.Response:
     # can omit the field (preserve existing value) or pass a bool to
     # toggle it on this row only — never touches other rows.
     desired_classifier = body.get("is_classifier")
+    raw_metadata = body.get("metadata", existing.get("metadata") or {})
+    if raw_metadata is not None and not isinstance(raw_metadata, dict):
+        return _web.json_response({"error": "metadata must be an object"}, status=400)
+    metadata = dict(raw_metadata or {})
+    if "input_modalities" in body:
+        metadata["input_modalities"] = body.get("input_modalities")
     try:
         await db.upsert_model(
             provider_id=existing["provider_id"],
@@ -305,7 +319,7 @@ async def handle_update_db(request: web.Request) -> web.Response:
                 if desired_classifier is not None
                 else bool(existing.get("is_classifier", False))
             ),
-            metadata=body.get("metadata", existing.get("metadata") or None),
+            metadata=metadata or None,
             kind=existing.get("kind", "llm"),
         )
     except ValueError as e:
