@@ -70,13 +70,14 @@ class _FakeMessage:
         guild=None,
         mentions=None,
         content: str = "hello",
+        attachments=None,
     ):
         self.author = _FakeUser(author_id)
         self.channel = channel
         self.guild = guild
         self.mentions = mentions or []
         self.content = content
-        self.attachments = []
+        self.attachments = attachments or []
 
 
 def _install_fake_discord_modules():
@@ -255,7 +256,7 @@ async def t_discord_listened_channel_accepts_every_user(ctx: TestContext) -> Non
             await on_message(msg)
 
         assert dispatched == [
-            ("dc:999", "hi from a shared channel member"),
+            ("dc:guild:42:channel:555", "hi from a shared channel member"),
         ], (
             f"every user in an explicitly listened channel should dispatch; "
             f"got {dispatched}. Events: {[e for e, _ in events]}"
@@ -269,6 +270,102 @@ async def t_discord_listened_channel_accepts_every_user(ctx: TestContext) -> Non
         assert any(e == "bridge.message" for e, _ in events), (
             f"expected bridge.message event; got {[e for e, _ in events]}"
         )
+    finally:
+        restore()
+
+
+@test("bridges", "discord guild slash command and picker share channel session")
+async def t_discord_slash_picker_shared_scope(ctx: TestContext) -> None:
+    import src.bridges.discord as dc_mod
+    from src.bridges.discord import DiscordBridge
+
+    bridge = DiscordBridge(
+        token="fake",
+        allowed_users=["123"],
+        listen_channels=["555"],
+    )
+    command_sessions: list[str] = []
+    picker_sessions: list[str] = []
+
+    async def _command(cmd, *, session_id, arg=None):
+        command_sessions.append(session_id)
+        return {
+            "text": "pick",
+            "picker": {
+                "command": "model",
+                "prompt": "Choose",
+                "options": [{"label": "One", "value": "one"}],
+            },
+        }
+
+    class _Response:
+        async def defer(self, **kwargs):
+            return None
+
+        async def send_message(self, *args, **kwargs):
+            raise AssertionError((args, kwargs))
+
+    class _Followup:
+        async def send(self, *args, **kwargs):
+            return None
+
+    interaction = types.SimpleNamespace(
+        user=_FakeUser(999),
+        channel_id=555,
+        guild_id=42,
+        response=_Response(),
+        followup=_Followup(),
+    )
+
+    def _picker(_bridge, session_id, picker):
+        picker_sessions.append(session_id)
+        return object()
+
+    bridge.send_command_full = _command  # type: ignore[method-assign]
+    with patch.object(dc_mod, "_build_picker_view", side_effect=_picker):
+        await bridge._handle_slash(interaction, "model")
+
+    expected = "dc:guild:42:channel:555"
+    assert command_sessions == [expected], command_sessions
+    assert picker_sessions == [expected], picker_sessions
+
+    assert DiscordBridge._session_id(
+        "123", "777", None, is_dm=True,
+    ) == "dc:123"
+
+
+@test("bridges", "discord attachment staging basename stays below NAME_MAX")
+async def t_discord_attachment_staging_name_max(ctx: TestContext) -> None:
+    from pathlib import Path
+
+    on_message, bridge, restore = await _capture_on_message()
+    try:
+        class _Attachment:
+            id = "📎" * 200
+            filename = ("界" * 200) + ".pdf"
+            content_type = "application/pdf"
+            size = 2
+
+            async def save(self, path):
+                Path(path).write_bytes(b"ok")
+
+        captured: list[dict] = []
+
+        async def _dispatch(channel, session_id, content, **kwargs):
+            captured.extend(kwargs["attachments"])
+            for attachment in kwargs["attachments"]:
+                assert len(Path(attachment["path"]).name.encode("utf-8")) <= 240
+                assert Path(attachment["path"]).read_bytes() == b"ok"
+
+        bridge.dispatch_turn = _dispatch  # type: ignore[method-assign]
+        await on_message(_FakeMessage(
+            author_id=999,
+            channel=_FakeGuildChannel(channel_id=555),
+            guild=_FakeGuild(guild_id=42),
+            content="inspect",
+            attachments=[_Attachment()],
+        ))
+        assert len(captured) == 1
     finally:
         restore()
 

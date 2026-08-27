@@ -345,11 +345,40 @@ async def _seed_complete_fixture(db) -> tuple[str, object]:
     )
     await project_automation(c)
     await c.commit()
+    # Custom Views join the same global corpus through a dedicated canonical
+    # ACL/revision check; dynamic data, scripts, and source configs remain out
+    # of FTS. Seed one private static definition to pin that tenth target.
+    from src.custom_views.repository import CustomViewRepository
+    from src.memory.operational.access import AccessContext
+
+    await CustomViewRepository(db).create(
+        AccessContext(
+            tenant_id=tenant,
+            principal_id="user:alice",
+            principal_type="user",
+            handle="alice",
+            device_id="alice-device",
+            principal_ids=frozenset({
+                "user:alice", "user:alice-device", "device:alice-device",
+            }),
+            grant_identities=frozenset({
+                ("user", "alice"), ("device", "alice-device"),
+            }),
+        ),
+        surface="sidebar",
+        title="Dashboard",
+        description="static view summary",
+        spec={
+            "schemaVersion": 1,
+            "root": {"type": "text", "props": {"text": "orchid"}},
+        },
+        initial_data={"never_index_dynamic": "NEVER_INDEX_VIEW_DATA"},
+    )
     gateway = SimpleNamespace(agent=SimpleNamespace(memory_db=db))
     return tenant, gateway
 
 
-@test("operational_api", "fresh capability warms index and all nine targets are searchable")
+@test("operational_api", "fresh capability warms index and all ten targets are searchable")
 async def t_capability_and_all_targets(_ctx: TestContext) -> None:
     from src.gateway.api import operational
     from src.memory.db import MemoryDB
@@ -378,7 +407,7 @@ async def t_capability_and_all_targets(_ctx: TestContext) -> None:
             assert caps["storage"]["search_ready"] is True
 
             search_body = {
-                "query": "orchid", "scopes": ["chats", "tools", "workflows", "scheduled", "events"],
+                "query": "orchid", "scopes": ["chats", "tools", "workflows", "scheduled", "events", "views"],
                 "filters": {}, "sort": "relevance", "grouping": "match", "limit": 100, "cursor": None,
             }
             response = await operational.handle_search(
@@ -390,6 +419,7 @@ async def t_capability_and_all_targets(_ctx: TestContext) -> None:
             assert targets == {
                 "chat", "chat_message", "chat_tool", "workflow_definition", "workflow_run",
                 "scheduled_definition", "scheduled_run", "event_definition", "event_delivery",
+                "ui_view",
             }, targets
             from src.memory.operational.access import AccessContext
             from src.memory.operational.service import search_rows_visible
@@ -439,6 +469,7 @@ async def t_capability_and_all_targets(_ctx: TestContext) -> None:
                 "scheduled_run": ("scheduled_run_id", "scheduled_task_id"),
                 "event_definition": ("event_id",),
                 "event_delivery": ("event_delivery_id", "event_id"),
+                "ui_view": ("resource_id",),
             }
             forged_rows: list[dict] = []
             for canonical_row in canonical_rows:
@@ -595,6 +626,25 @@ async def t_capability_and_all_targets(_ctx: TestContext) -> None:
             assert "trace_step_id" not in workflow_target
             assert "node_id" not in definition_target and "field" not in definition_target
             assert page["items"] and page["snapshot"]["indexed_seq"] >= 1
+
+            dynamic_view_search = await operational.handle_search(
+                _Request(
+                    gateway,
+                    tenant=tenant,
+                    handle="alice",
+                    device="alice-device",
+                    body={
+                        "query": "NEVER_INDEX_VIEW_DATA",
+                        "scopes": ["views"],
+                        "filters": {},
+                        "sort": "relevance",
+                        "grouping": "match",
+                        "limit": 20,
+                        "cursor": None,
+                    },
+                )
+            )
+            assert _payload(dynamic_view_search)["items"] == []
 
             config_search = await operational.handle_search(
                 _Request(

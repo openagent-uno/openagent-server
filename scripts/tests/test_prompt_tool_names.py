@@ -45,12 +45,27 @@ def _safe_prefix(name: str) -> str:
     return "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in name)
 
 
+class _StubCanonicalDB:
+    """Construction-only DB stub for in-process tool registration.
+
+    ``ui-manager`` binds its repository to the canonical DB while building
+    the toolkit, but it does not open the database until a tool is called.
+    Keeping the in-memory path here lets this test inspect the real toolkit
+    registration without creating files or weakening the production guard.
+    """
+
+    db_path = ":memory:"
+
+
 class _StubPool:
     """Minimal duck-typed pool for factories that take a ``pool`` kwarg
     (``tool-search``). We only ever read the registered tool NAMES, so
     the factory never dispatches through it."""
 
     _toolkit_by_name: dict = {}
+
+    def __init__(self) -> None:
+        self._db = _StubCanonicalDB()
 
     def toolkit_by_name(self, _name):  # noqa: D102
         return None
@@ -198,6 +213,10 @@ _NON_TOOL_TOKENS: frozenset[str] = frozenset({
     "limit", "offset", "index", "scopes",
     # Operational-search scope enum values, not callable tools.
     "chats", "scheduled",
+    # -- Custom View surfaces, drivers, policies, parts, and parameters --
+    "inline", "sidebar", "ui_view", "static", "push", "file_watch",
+    "command_poll", "command_stream", "while_visible", "always", "manual",
+    "expected_revision",
     # ``ok_rate`` is a RESULT FIELD of vault_recall_stats. DREAM_MODE_PROMPT
     # names it repeatedly and on purpose: the number points at a note to
     # READ, it is not a verdict on it (association, not causation), and the

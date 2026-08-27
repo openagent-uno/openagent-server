@@ -64,6 +64,10 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_mcp_db_path",
     "test_session_journal",
     "test_operational_storage",
+    "test_artifacts",
+    "test_custom_views",
+    "test_custom_ui_content_parts",
+    "test_message_parts",
     "test_operational_api",
     "test_agent_operational_search",
     "test_ghost_skill",
@@ -586,6 +590,7 @@ _TEST_MODULES: tuple[str, ...] = (
     # ``_runner.team._messages`` directly, no pool/gateway.
     "test_member_tools_cap",
     "test_bridges",
+    "test_channel_attachments",
     # Spam coalescing end-to-end: real StreamSession against a slow
     # fake agent (every turn takes real time, mirroring LLM latency),
     # 20-message bursts, bridge owner/follower under 20 concurrent
@@ -659,6 +664,7 @@ _TEST_MODULES: tuple[str, ...] = (
     # DeepSeekInlineFiles subclass handles attachments via
     # _format_message override.
     "test_deepseek_file_inlining",
+    "test_model_media_capabilities",
     # Discord on_message receive-path tests — pin the
     # allowed-users-bypass-mention gate behaviour and confirm silent
     # drops emit a diagnostic event.

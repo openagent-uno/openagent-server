@@ -29,7 +29,7 @@ from ._framework import TestContext, test
 @test("stream", "events round-trip the wire codec verbatim")
 async def t_wire_round_trip(ctx: TestContext) -> None:
     from src.stream.events import (
-        AudioChunk, Interrupt, OutAudioChunk, OutAudioEnd, OutAudioStart,
+        Attachment, AudioChunk, Interrupt, OutAudioChunk, OutAudioEnd, OutAudioStart,
         OutReasoning, OutTextDelta, OutTextFinal, OutToolStatus, OutVideoFrame,
         SessionOpen, TextDelta, TextFinal, TurnComplete, VideoFrame,
     )
@@ -38,7 +38,10 @@ async def t_wire_round_trip(ctx: TestContext) -> None:
 
     cases = [
         OutTextDelta(session_id="s", seq=1, ts_ms=10, text="hi"),
-        OutTextFinal(session_id="s", seq=2, ts_ms=20, text="done", model="m"),
+        OutTextFinal(
+            session_id="s", seq=2, ts_ms=20, text="done", model="m",
+            parts=({"kind": "text", "text": "done"},),
+        ),
         OutAudioStart(session_id="s", seq=3, ts_ms=30, format="mp3", mime="audio/mpeg"),
         OutAudioChunk(session_id="s", seq=4, ts_ms=40, data=b"\x00\x01"),
         OutAudioEnd(session_id="s", seq=5, ts_ms=50, total_chunks=1),
@@ -54,9 +57,16 @@ async def t_wire_round_trip(ctx: TestContext) -> None:
                    end_of_speech=True, sample_rate=16000, encoding="pcm16"),
         VideoFrame(session_id="s", seq=12, ts_ms=120, stream="screen",
                    image_bytes=b"frame", width=1024, height=768, keyframe=True),
+        Attachment(
+            session_id="s", seq=18, ts_ms=180, kind="image",
+            path="/internal/cas", filename="photo.png", mime_type="image/png",
+            artifact_id="art_1", artifact_link_id="alink_1", size_bytes=4,
+            sha256="a" * 64, url="/api/artifacts/art_1/content",
+        ),
         Interrupt(session_id="s", seq=13, ts_ms=130, reason="user_speech"),
         SessionOpen(session_id="s", seq=14, ts_ms=140, profile="realtime",
-                    language="en", client_kind="webapp"),
+                    language="en", client_kind="webapp",
+                    client_capabilities={"attachments": True, "inline_ui": True}),
         OutError(session_id="s", seq=15, ts_ms=150, text="boom"),
     ]
     for evt in cases:
@@ -74,6 +84,36 @@ async def t_legacy_message_decodes(ctx: TestContext) -> None:
     assert isinstance(evt, TextFinal)
     assert evt.text == "hey"
     assert evt.source == "user_typed"
+
+
+@test("stream", "outbound AttachmentRefs hide local CAS paths except for trusted bridges")
+async def t_outbound_attachment_paths_are_internal(ctx: TestContext) -> None:
+    from src.stream.events import OutTextFinal
+    from src.stream.wire import event_to_wire
+
+    ref = {
+        "type": "file",
+        "kind": "file",
+        "path": "/private/agent/artifacts/sha256/aa/hash",
+        "filename": "report.pdf",
+        "mime_type": "application/pdf",
+        "size_bytes": 4,
+        "sha256": "a" * 64,
+        "artifact_id": "art_1",
+        "url": "/api/artifacts/art_1/content",
+    }
+    event = OutTextFinal(
+        session_id="s",
+        text="done",
+        attachments=(ref,),
+        parts=({"kind": "attachment", "attachment": ref},),
+    )
+    public = event_to_wire(event)
+    assert "path" not in public["attachments"][0]
+    assert "path" not in public["parts"][0]["attachment"]
+    assert public["attachments"][0]["artifact_id"] == "art_1"
+    internal = event_to_wire(event, include_local_attachment_paths=True)
+    assert internal["attachments"][0]["path"].startswith("/private/")
 
 
 @test("stream", "unknown wire types decode to None")
@@ -257,6 +297,145 @@ async def t_run_one_shot(ctx: TestContext) -> None:
     assert finals[-1].model == "fake-model"
     assert completes, "expected a TurnComplete event"
     assert isinstance(out[-1], TurnComplete), f"TurnComplete must be last; got {out[-1]!r}"
+
+
+@test("stream", "OA-UI marker is hidden across deltas and emitted as an ordered part")
+async def t_ui_marker_stream_parts(ctx: TestContext) -> None:
+    import tempfile
+    from pathlib import Path
+
+    from src.core.on_behalf_context import OnBehalfIdentity
+    from src.custom_views.repository import CustomViewRepository
+    from src.memory.db import MemoryDB
+    from src.memory.operational.access import AccessContext
+    from src.stream.events import OutTextDelta, OutTextFinal
+    from src.stream.session import StreamSession
+
+    # A syntactically valid marker is not sufficient: the StreamSession must
+    # resolve an authorized, revision-pinned inline View for this exact
+    # session before emitting a structured part.
+    with tempfile.TemporaryDirectory(prefix="oa-ui-stream-") as raw:
+        db = MemoryDB(str(Path(raw) / "agent.db"))
+        await db.connect()
+        try:
+            access = AccessContext(
+                tenant_id="tenant-a",
+                principal_id="user:alice",
+                principal_type="user",
+                handle="alice",
+                device_id="device-a",
+                principal_ids=frozenset({"user:alice", "user:device-a", "device:device-a"}),
+                grant_identities=frozenset({("user", "alice"), ("device", "device-a")}),
+            )
+            view = await CustomViewRepository(db).create(
+                access,
+                surface="inline",
+                title="Status board",
+                session_id="s",
+                spec={
+                    "schemaVersion": 1,
+                    "root": {"type": "text", "props": {"text": "Ready"}},
+                },
+            )
+            marker = f"AGENT_UI:{view['id']}@1] now."
+            agent = _FakeAgent(["Dashboard ready [OPEN", marker])
+            agent.db = db
+            sess = StreamSession(
+                agent,
+                client_id="c",
+                session_id="s",
+                client_kind="app",
+                client_capabilities={"inline_ui": True, "ordered_parts": True},
+                on_behalf_identity=OnBehalfIdentity(
+                    "tenant-a", "user", "alice", "device-a"
+                ),
+            )
+            summary = await sess.run_one_shot("build it", speak=False)
+            assert summary["text"] == "Dashboard ready  now.", summary
+
+            out = await _drain(sess)
+            deltas = "".join(e.text for e in out if isinstance(e, OutTextDelta))
+            final = next(e for e in out if isinstance(e, OutTextFinal))
+            assert "OPENAGENT_UI" not in deltas, deltas
+            assert [p["kind"] for p in final.parts] == ["text", "ui_view", "text"]
+            assert final.parts[1]["view_id"] == view["id"]
+        finally:
+            await db.close()
+
+
+@test("stream", "text-only client strips OA-UI marker without receiving a UI part")
+async def t_ui_marker_text_only_client(ctx: TestContext) -> None:
+    from src.stream.events import OutTextDelta, OutTextFinal
+    from src.stream.session import StreamSession
+
+    sess = StreamSession(
+        _FakeAgent(["Created [OPENAGENT_UI:board@1]"]),
+        client_id="c",
+        session_id="s",
+        client_kind="cli",
+        client_capabilities={"attachments": True, "inline_ui": False},
+    )
+    await sess.run_one_shot("build it", speak=False)
+    out = await _drain(sess)
+    assert all("OPENAGENT_UI" not in e.text for e in out if isinstance(e, OutTextDelta))
+    final = next(e for e in out if isinstance(e, OutTextFinal))
+    assert all(p["kind"] != "ui_view" for p in final.parts)
+
+
+@test("stream", "split UI and attachment carriers never reach live text or TTS")
+async def t_all_content_markers_hidden_from_stream_and_tts(ctx: TestContext) -> None:
+    from src.channels.tts_base import BaseTTS
+    from src.stream.events import OutTextDelta
+    from src.stream.session import StreamSession
+
+    spoken: list[str] = []
+
+    class _RecordingTTS(BaseTTS):
+        @property
+        def audio_format(self):
+            return "wav", "audio/wav"
+
+        @property
+        def voice_id(self):
+            return "test"
+
+        async def synthesize_full(self, text, *, language=None):
+            return b""
+
+        async def synthesize_stream(self, text_chunks, *, language=None):
+            async for piece in text_chunks:
+                spoken.append(piece)
+            if False:  # keep this an async generator without emitting audio
+                yield b""
+
+    async def _tts_factory(_db):
+        return _RecordingTTS()
+
+    async def _stt_factory(_db):
+        return None
+
+    agent = _FakeAgent([
+        "Before [FI",
+        "LE:/tmp/report.pdf] [IM",
+        "AGE:/tmp/photo.png] [VO",
+        "ICE:/tmp/reply.ogg] [VID",
+        "EO:/tmp/demo.mp4] [OPEN",
+        "AGENT_UI:board@1] after",
+    ])
+    sess = StreamSession(agent, client_id="c", session_id="s", language=None)
+    await sess.start(stt_factory=_stt_factory, tts_factory=_tts_factory)
+    try:
+        summary = await sess.run_one_shot("show it", speak=True)
+    finally:
+        await sess.close()
+
+    out = await _drain(sess)
+    visible = "".join(e.text for e in out if isinstance(e, OutTextDelta))
+    for value in (visible, "".join(spoken), summary["text"]):
+        assert "Before" in value and "after" in value, value
+        assert "/tmp/" not in value, value
+        assert "OPENAGENT_UI" not in value, value
+        assert "[FILE:" not in value, value
 
 
 # ── Reasoning flag (server emits a boolean, never a "Thinking…" string) ─
@@ -2369,6 +2548,7 @@ async def t_gateway_context_report_after_turn_complete_stays_settled(ctx: TestCo
         frame.get("session_id") != "old" for frame in ws.sent
     ), ws.sent
     assert "old" not in gw._live_replays
+    await gw._close_stream_session(("alice", "new"))
 
 
 @test("stream", "Gateway reattach retires stale holder before stale frame flush")
@@ -2475,6 +2655,7 @@ async def t_gateway_adopt_retires_db_terminal_before_rebind_flush(ctx: TestConte
     assert "s1" not in gw._live_replays
     assert ("alice", "s2") in gw._stream_sessions
     assert channel._pump_task is None or channel._pump_task.done()
+    await gw._close_stream_session(("alice", "s2"))
 
 
 @test("stream", "RealtimeChannel.rebind preserves frame ordering across the swap")
