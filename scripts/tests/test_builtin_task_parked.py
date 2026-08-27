@@ -95,7 +95,16 @@ class _CapturedEvents:
         self._target = Path(self._tmp.name) / "events.jsonl"
         self._previous = getattr(core_logging, "_event_file_path", None)
         core_logging.setup_logging()
-        core_logging._reopen_event_file(self._target)
+        # Riaprire il log degli eventi tocca uno stato GLOBALE: se un altro
+        # test ha lasciato il puntatore su una temporanea gia' cancellata,
+        # l'apertura esplode e questo test fallisce per colpa di un altro. Un
+        # test che fallisce a caso e' peggio di un test assente: insegna a
+        # ignorare il rosso.
+        try:
+            core_logging._reopen_event_file(self._target)
+        except OSError:
+            self._target.parent.mkdir(parents=True, exist_ok=True)
+            core_logging._reopen_event_file(self._target)
         return self
 
     def __exit__(self, *exc):
@@ -107,8 +116,14 @@ class _CapturedEvents:
         # colpa della pulizia di un altro.
         previous = self._previous
         if previous is not None and previous.parent.is_dir():
-            core_logging._reopen_event_file(previous)
-        self._tmp.cleanup()
+            try:
+                core_logging._reopen_event_file(previous)
+            except OSError:
+                pass  # il ripristino non deve poter far fallire cio' che ha osservato
+        try:
+            self._tmp.cleanup()
+        except OSError:
+            pass
         return False
 
     def of_type(self, event: str) -> list[dict]:
