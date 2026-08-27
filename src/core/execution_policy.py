@@ -120,6 +120,42 @@ def task_execution_policy(task: Mapping[str, Any]) -> dict[str, Any]:
     return normalize_execution_policy(task.get("execution_policy_json"))
 
 
+def narrow_execution_policy(
+    parent: Mapping[str, Any] | None,
+    child: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Compose nested envelopes without allowing the child to expand them."""
+    outer = normalize_execution_policy(parent)
+    inner = normalize_execution_policy(child)
+    out: dict[str, Any] = {}
+    for key in ("max_tool_calls", "timeout_seconds"):
+        values = [policy[key] for policy in (outer, inner) if key in policy]
+        if values:
+            out[key] = min(values)
+
+    outer_tools = outer.get("allowed_tool_families")
+    inner_tools = inner.get("allowed_tool_families")
+    if outer_tools is not None and inner_tools is not None:
+        from src.core.tool_scope import normalize_family
+
+        inner_set = {normalize_family(item) for item in inner_tools}
+        out["allowed_tool_families"] = [
+            item for item in outer_tools
+            if normalize_family(item) in inner_set
+        ]
+    elif outer_tools is not None:
+        out["allowed_tool_families"] = list(outer_tools)
+    elif inner_tools is not None:
+        out["allowed_tool_families"] = list(inner_tools)
+    return out
+
+
+def event_execution_policy(event: Mapping[str, Any]) -> dict[str, Any]:
+    if "execution_policy" in event:
+        return normalize_execution_policy(event.get("execution_policy"))
+    return normalize_execution_policy(event.get("execution_policy_json"))
+
+
 def current_execution_policy() -> dict[str, Any] | None:
     policy = _policy_var.get()
     return dict(policy) if policy is not None else None

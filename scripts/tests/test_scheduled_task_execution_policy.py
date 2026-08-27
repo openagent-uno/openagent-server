@@ -6,7 +6,10 @@ from ._framework import TestContext, test
 
 @test("scheduled_task_execution_policy", "validation is strict and canonical")
 async def t_policy_validation(_ctx: TestContext) -> None:
-    from src.core.execution_policy import normalize_execution_policy
+    from src.core.execution_policy import (
+        narrow_execution_policy,
+        normalize_execution_policy,
+    )
 
     assert normalize_execution_policy({
         "max_tool_calls": "6",
@@ -32,6 +35,23 @@ async def t_policy_validation(_ctx: TestContext) -> None:
             pass
         else:
             raise AssertionError(f"invalid policy accepted: {bad!r}")
+
+    assert narrow_execution_policy(
+        {
+            "max_tool_calls": 4,
+            "timeout_seconds": 60,
+            "allowed_tool_families": ["replio", "events-manager"],
+        },
+        {
+            "max_tool_calls": 10,
+            "timeout_seconds": 30,
+            "allowed_tool_families": ["replio", "billingbear"],
+        },
+    ) == {
+        "max_tool_calls": 4,
+        "timeout_seconds": 30.0,
+        "allowed_tool_families": ["replio"],
+    }
 
 
 @test("scheduled_task_execution_policy", "DB round-trip and clearing preserve defaults")

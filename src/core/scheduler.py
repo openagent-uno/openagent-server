@@ -794,8 +794,14 @@ class Scheduler:
             should_use_lean_local_scheduled_task,
             strict_local_only_scope,
         )
-        from src.core.tool_scope import reset_tool_allowlist, set_tool_allowlist
+        from src.core.tool_scope import (
+            current_tool_allowlist,
+            reset_tool_allowlist,
+            set_tool_allowlist,
+        )
         from src.core.execution_policy import (
+            current_execution_policy,
+            narrow_execution_policy,
             reset_execution_policy,
             set_execution_policy,
             task_execution_policy,
@@ -818,7 +824,9 @@ class Scheduler:
             or prompt_head.startswith("dry run")
             or prompt_head.startswith("dry-run")
         )
-        execution_policy = task_execution_policy(task)
+        execution_policy = narrow_execution_policy(
+            current_execution_policy(), task_execution_policy(task),
+        )
         if execution_policy.get("timeout_seconds") is not None:
             run_timeout_s = float(execution_policy["timeout_seconds"])
         elif use_lean_local:
@@ -840,6 +848,14 @@ class Scheduler:
         allowed_families: list[str] | None = execution_policy.get(
             "allowed_tool_families"
         )
+        ambient_families = current_tool_allowlist()
+        if allowed_families is not None and ambient_families is not None:
+            from src.core.tool_scope import normalize_family
+
+            allowed_families = [
+                item for item in allowed_families
+                if normalize_family(item) in ambient_families
+            ]
         if use_lean_local:
             pool = getattr(self.agent, "_mcp", None)
             available = list(getattr(pool, "_toolkit_by_name", {}) or {})

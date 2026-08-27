@@ -26,6 +26,7 @@ from src.core.event_secret import (
     make_secret_material, slugify, random_slug_suffix,
 )
 from src.core.event_types import is_valid_type, public_types, DEFAULT_TYPE
+from src.core.execution_policy import encode_execution_policy, normalize_execution_policy
 from src.core.logging import elog
 
 _VALID_ACTION_KINDS = ("workflow", "scheduled_task", "prompt")
@@ -155,6 +156,10 @@ async def handle_create(request):
     binding_enabled, binding_path, berr = _validate_session_binding(body)
     if berr:
         return web.json_response({"error": berr}, status=400)
+    try:
+        execution_policy = normalize_execution_policy(body.get("execution_policy"))
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
 
     # Referenced workflow / task must exist so a broken binding can't be saved.
     if action_kind == "workflow" and await db.get_workflow(action_ref) is None:
@@ -179,6 +184,7 @@ async def handle_create(request):
         model=(body.get("model") or "").strip() or None,
         session_binding_enabled=bool(binding_enabled),
         session_binding_path=binding_path,
+        execution_policy=execution_policy,
         rate_limit_per_min=int(body.get("rate_limit_per_min", 60)),
         max_payload_bytes=int(body.get("max_payload_bytes", 262144)),
         enabled=bool(body.get("enabled", True)),
@@ -217,6 +223,13 @@ async def handle_update(request):
         updates["enabled"] = bool(body["enabled"])
     if "input_schema" in body:
         updates["input_schema"] = body["input_schema"] or []
+    if "execution_policy" in body:
+        try:
+            updates["execution_policy_json"] = encode_execution_policy(
+                body.get("execution_policy")
+            )
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
     if any(k in body for k in ("session_binding_enabled", "session_binding_path")):
         merged_binding = {
             "session_binding_enabled": body.get(

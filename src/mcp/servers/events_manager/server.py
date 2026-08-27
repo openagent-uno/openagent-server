@@ -33,6 +33,7 @@ from mcp.server.fastmcp import FastMCP
 from src.memory.db import SCHEMA_SQL, sqlite_busy_timeout_ms, sqlite_busy_timeout_s
 from src.core.event_secret import make_secret_material, slugify, random_slug_suffix
 from src.core.event_types import EVENT_TYPES, DEFAULT_TYPE, is_valid_type, public_types
+from src.core.execution_policy import encode_execution_policy, normalize_execution_policy
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,8 @@ async def _ensure_event_session_binding_schema(conn: aiosqlite.Connection) -> No
         )
     if "session_binding_path" not in cols:
         await conn.execute("ALTER TABLE events ADD COLUMN session_binding_path TEXT")
+    if "execution_policy_json" not in cols:
+        await conn.execute("ALTER TABLE events ADD COLUMN execution_policy_json TEXT")
     await conn.execute(
         """
         CREATE TABLE IF NOT EXISTS event_session_bindings (
@@ -108,6 +111,9 @@ def _public_event(row: aiosqlite.Row) -> dict[str, Any]:
         d["input_schema"] = []
     d["enabled"] = bool(d.get("enabled"))
     d["session_binding_enabled"] = bool(d.get("session_binding_enabled"))
+    d["execution_policy"] = normalize_execution_policy(
+        d.pop("execution_policy_json", None)
+    )
     d["webhook_path"] = f"/hooks/{d.get('slug')}"
     return d
 
@@ -200,6 +206,7 @@ async def create_event(
     model: str | None = None,
     session_binding_enabled: bool = False,
     session_binding_path: str | None = None,
+    execution_policy: dict[str, Any] | None = None,
     enabled: bool = True,
 ) -> dict[str, Any]:
     """Create a webhook event and return it WITH its one-time clear secret.
@@ -221,6 +228,8 @@ async def create_event(
             run session.
         session_binding_path: dot-path in the payload to use as the binding
             key, e.g. "id" or "ticket.id". Required when binding is enabled.
+        execution_policy: enforced provider-neutral envelope with optional
+            max_tool_calls, timeout_seconds, and allowed_tool_families.
         enabled: whether the event accepts deliveries immediately.
 
     Returns the event plus ``secret`` (the clear per-event secret) — shown
@@ -262,20 +271,21 @@ async def create_event(
 
     slug = await _unique_slug(conn, name, None)
     clear, secret_enc, hint = make_secret_material(db_path=_db_path())
+    policy_json = encode_execution_policy(execution_policy)
     event_id = str(uuid.uuid4())
     now = time.time()
     await conn.execute(
         "INSERT INTO events "
         "(id, name, slug, description, type, enabled, secret_enc, secret_hint, "
         " input_schema_json, action_kind, action_ref, prompt_template, model, "
-        " session_binding_enabled, session_binding_path, "
+        " session_binding_enabled, session_binding_path, execution_policy_json, "
         " rate_limit_per_min, max_payload_bytes, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 60, 262144, ?, ?)",
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 60, 262144, ?, ?)",
         (
             event_id, name, slug, description or None, type, 1 if enabled else 0,
             secret_enc, hint, json.dumps(input_schema or []), action_kind,
             action_ref or None, prompt_template or None, model or None,
-            1 if session_binding_enabled else 0, binding_path, now, now,
+            1 if session_binding_enabled else 0, binding_path, policy_json, now, now,
         ),
     )
     await conn.commit()
@@ -299,8 +309,9 @@ async def update_event(
     model: str | None = None,
     session_binding_enabled: bool | None = None,
     session_binding_path: str | None = None,
+    execution_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Update an event's fields (only the ones you pass). Returns the event."""
+    """Update an event's fields. Pass execution_policy={} to clear its envelope."""
     conn = await _get_conn()
     eid = await _resolve_event_id(conn, id_or_slug)
     sets: dict[str, Any] = {}
@@ -324,6 +335,8 @@ async def update_event(
         sets["prompt_template"] = prompt_template or None
     if model is not None:
         sets["model"] = model or None
+    if execution_policy is not None:
+        sets["execution_policy_json"] = encode_execution_policy(execution_policy)
     if session_binding_enabled is not None or session_binding_path is not None:
         current_enabled, current_path = await _current_session_binding(conn, eid)
         effective_enabled = (

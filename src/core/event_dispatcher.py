@@ -428,6 +428,45 @@ async def dispatch_event(
     # A frozen turn stops beating → the lease lapses → the reaper re-enqueues it.
     heartbeat = _start_lease_heartbeat(db, delivery_id)
 
+    from src.core.execution_policy import (
+        current_execution_policy,
+        event_execution_policy,
+        narrow_execution_policy,
+        reset_execution_policy,
+        set_execution_policy,
+    )
+    from src.core.tool_scope import (
+        current_tool_allowlist,
+        normalize_family,
+        reset_tool_allowlist,
+        set_tool_allowlist,
+    )
+
+    execution_policy = narrow_execution_policy(
+        current_execution_policy(), event_execution_policy(event),
+    )
+    allowed_families = execution_policy.get("allowed_tool_families")
+    ambient_families = current_tool_allowlist()
+    if allowed_families is not None and ambient_families is not None:
+        allowed_families = [
+            item for item in allowed_families
+            if normalize_family(item) in ambient_families
+        ]
+    scope_token = (
+        set_tool_allowlist(allowed_families)
+        if allowed_families is not None else None
+    )
+    policy_token = set_execution_policy(execution_policy)
+    event_timeout_s = execution_policy.get("timeout_seconds")
+    if execution_policy:
+        elog(
+            "event.execution_policy",
+            id=event_id,
+            max_tool_calls=execution_policy.get("max_tool_calls"),
+            timeout_seconds=event_timeout_s,
+            tool_families=allowed_families,
+        )
+
     async def _record_breaker_failure(err: Any) -> None:
         """Move the per-event breaker only for a PERMANENT failure; a transient
         (rate-limit-storm) failure is released without a count. No-op unless the
@@ -441,17 +480,23 @@ async def dispatch_event(
 
     try:
         try:
-            if action_kind == "workflow":
-                result = await _dispatch_workflow(scheduler=scheduler, db=db, event=event, payload=payload, delivery_id=delivery_id)
-            elif action_kind == "scheduled_task":
-                result = await _dispatch_task(scheduler=scheduler, db=db, event=event, payload=payload, delivery_id=delivery_id)
-            elif action_kind == "prompt":
-                result = await _dispatch_prompt(
-                    agent=agent, db=db, event=event, payload=payload,
-                    delivery_id=delivery_id, source=source, on_link=_emit,
-                )
-            else:
+            async def _run_action() -> dict[str, Any]:
+                if action_kind == "workflow":
+                    return await _dispatch_workflow(scheduler=scheduler, db=db, event=event, payload=payload, delivery_id=delivery_id)
+                if action_kind == "scheduled_task":
+                    return await _dispatch_task(scheduler=scheduler, db=db, event=event, payload=payload, delivery_id=delivery_id)
+                if action_kind == "prompt":
+                    return await _dispatch_prompt(
+                        agent=agent, db=db, event=event, payload=payload,
+                        delivery_id=delivery_id, source=source, on_link=_emit,
+                    )
                 raise EventDispatchError(f"unknown action_kind {action_kind!r}")
+
+            action_run = _run_action()
+            if event_timeout_s is not None:
+                result = await asyncio.wait_for(action_run, timeout=event_timeout_s)
+            else:
+                result = await action_run
         except asyncio.CancelledError:
             # A cancelled delivery is NOT a failure, and calling it one poisons
             # the log the agent reads to diagnose itself.
@@ -535,6 +580,9 @@ async def dispatch_event(
         elog("event.done", id=event_id, delivery=delivery_id, action=action_kind)
         return result
     finally:
+        reset_execution_policy(policy_token)
+        if scope_token is not None:
+            reset_tool_allowlist(scope_token)
         await _stop_lease_heartbeat(heartbeat)
 
 
