@@ -162,6 +162,7 @@ async def t_policy_cache_key(_ctx: TestContext) -> None:
 @test("scheduled_task_execution_policy", "scheduler installs and then resets the envelope")
 async def t_scheduler_policy_scope(ctx: TestContext) -> None:
     import uuid
+    from unittest.mock import AsyncMock, patch
 
     from src.core.execution_policy import current_execution_policy
     from src.core.scheduler import Scheduler
@@ -204,7 +205,20 @@ async def t_scheduler_policy_scope(ctx: TestContext) -> None:
         )
         task = await db.get_task(task_id)
         spy = SpyAgent()
-        await Scheduler(db=db, agent=spy).run_task(task)  # type: ignore[arg-type]
+        # An explicit operator policy is authoritative. The lean-local prompt
+        # heuristic may under-detect a server (the scorer names tool methods,
+        # not the word "replio") and must not intersect the grant down to zero.
+        with (
+            patch(
+                "src.core.execution_profile.should_use_lean_local_scheduled_task",
+                AsyncMock(return_value=True),
+            ),
+            patch(
+                "src.core.execution_profile.lean_local_tool_families",
+                return_value=["vault", "tool-search"],
+            ),
+        ):
+            await Scheduler(db=db, agent=spy).run_task(task)  # type: ignore[arg-type]
         assert spy.seen_policy == {
             "max_tool_calls": 6,
             "timeout_seconds": 30.0,

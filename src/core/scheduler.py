@@ -856,20 +856,11 @@ class Scheduler:
                 item for item in allowed_families
                 if normalize_family(item) in ambient_families
             ]
-        if use_lean_local:
+        if use_lean_local and allowed_families is None:
             pool = getattr(self.agent, "_mcp", None)
             available = list(getattr(pool, "_toolkit_by_name", {}) or {})
             lean_families = lean_local_tool_families(effective_prompt, available)
-            if allowed_families is None:
-                allowed_families = lean_families or None
-            elif lean_families:
-                from src.core.tool_scope import normalize_family
-
-                lean_set = {normalize_family(item) for item in lean_families}
-                allowed_families = [
-                    item for item in allowed_families
-                    if normalize_family(item) in lean_set
-                ]
+            allowed_families = lean_families or None
             if allowed_families is not None:
                 elog(
                     "task.lean_local_tool_scope",
@@ -888,7 +879,7 @@ class Scheduler:
                 name=task_name,
                 max_tool_calls=execution_policy.get("max_tool_calls"),
                 timeout_seconds=execution_policy.get("timeout_seconds"),
-                tool_families=execution_policy.get("allowed_tool_families"),
+                tool_families=allowed_families,
             )
         # The two self-improvement passes run with nobody watching, so they
         # declare themselves: the skill tool then refuses, in code, any write
