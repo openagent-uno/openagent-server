@@ -26,7 +26,7 @@ from .search import (
 )
 
 
-SUPPORTED_SCOPES = frozenset({"chats", "tools", "workflows", "scheduled", "events"})
+SUPPORTED_SCOPES = frozenset({"chats", "tools", "workflows", "scheduled", "events", "views"})
 _DOCUMENT_SCOPE = {
     "session_metadata": "chats",
     "message": "chats",
@@ -38,6 +38,7 @@ _DOCUMENT_SCOPE = {
     "scheduled_run": "scheduled",
     "event_definition": "events",
     "event_delivery": "events",
+    "artifact_text": "views",
 }
 _MAX_CANDIDATES = 5_000
 _MAX_OFFSET = _MAX_CANDIDATES - 1
@@ -53,6 +54,8 @@ def search_target(row: dict[str, Any]) -> dict[str, str]:
     """Return the typed canonical resolver target for one authorized hit."""
 
     kind = str(row.get("target_kind") or "")
+    if str(row.get("resource_type") or "") == "ui_view" or kind == "ui_view":
+        return {"kind": "ui_view", "view_id": str(row["resource_id"])}
     if kind == "chat":
         return {"kind": kind, "session_id": str(row["session_id"])}
     if kind == "chat_message":
@@ -555,6 +558,97 @@ async def search_rows_visible(
     candidates = tuple(rows)
     if not candidates:
         return ()
+    # ``operational_search_v1`` shipped before Custom Views.  View search
+    # candidates deliberately use its generic artifact slot, then receive a
+    # dedicated canonical ACL/version check here.  Keeping that check outside
+    # the immutable SQL statement avoids weakening any existing resource
+    # branch and lets mixed-scope searches preserve their original order.
+    view_positions = [
+        index for index, row in enumerate(candidates)
+        if str(row.get("resource_type") or "") == "ui_view"
+    ]
+    if view_positions:
+        decisions = [False] * len(candidates)
+        view_position_set = set(view_positions)
+        ordinary_positions = [
+            index for index in range(len(candidates)) if index not in view_position_set
+        ]
+        if ordinary_positions:
+            ordinary = tuple(candidates[index] for index in ordinary_positions)
+            ordinary_decisions = await search_rows_visible(conn, ordinary, access)
+            for index, allowed in zip(ordinary_positions, ordinary_decisions):
+                decisions[index] = allowed
+        from .access import resource_is_visible
+
+        # Fetch canonical rows in bounded chunks, then require exact tenant,
+        # ACL and revision parity with the derived candidate before checking
+        # owner/grants.  A stale index can therefore only hide a result.
+        by_id: dict[str, Any] = {}
+        view_ids = sorted({str(candidates[index].get("resource_id") or "") for index in view_positions})
+        for start in range(0, len(view_ids), 400):
+            chunk = view_ids[start : start + 400]
+            if not chunk:
+                continue
+            placeholders = ",".join("?" for _ in chunk)
+            fetched = await (
+                await conn.execute(
+                    "SELECT id, tenant_id, owner_principal_id, visibility, "
+                    "acl_version, latest_revision, status, deleted_at_ms "
+                    f"FROM ui_views WHERE id IN ({placeholders})",
+                    tuple(chunk),
+                )
+            ).fetchall()
+            by_id.update({str(item["id"]): item for item in fetched})
+        visibility_cache: dict[tuple[str, int], bool] = {}
+        for index in view_positions:
+            candidate = candidates[index]
+            view_id = str(candidate.get("resource_id") or "")
+            canonical = by_id.get(view_id)
+            if canonical is None:
+                continue
+            if (
+                # The derived v1 index stores Views in legacy generic slots,
+                # but ``read_search_rows`` must have restored this exact typed
+                # hierarchy before anything reaches the canonical boundary.
+                # Checking it here prevents a forged deep-link/root from being
+                # authorized merely because its view id and ACL are valid.
+                str(candidate.get("resource_type") or "") != "ui_view"
+                or str(candidate.get("target_kind") or "") != "ui_view"
+                or str(candidate.get("root_kind") or "") != "ui_view"
+                or str(candidate.get("root_id") or "") != view_id
+                or candidate.get("parent_type") is not None
+                or candidate.get("parent_id") is not None
+                or candidate.get("session_id") is not None
+                or candidate.get("message_id") is not None
+                or candidate.get("tool_invocation_id") is not None
+                or candidate.get("workflow_id") is not None
+                or candidate.get("workflow_run_id") is not None
+                or candidate.get("scheduled_task_id") is not None
+                or candidate.get("scheduled_run_id") is not None
+                or candidate.get("event_id") is not None
+                or candidate.get("event_delivery_id") is not None
+                or str(canonical["tenant_id"]) != access.tenant_id
+                or str(candidate.get("tenant_id") or "") != access.tenant_id
+                or canonical["deleted_at_ms"] is not None
+                or str(canonical["status"]) == "deleted"
+                or int(candidate.get("acl_version") or 0) != int(canonical["acl_version"])
+                or int(candidate.get("source_version") or 0) != int(canonical["latest_revision"])
+            ):
+                continue
+            cache_key = (view_id, int(canonical["acl_version"]))
+            allowed = visibility_cache.get(cache_key)
+            if allowed is None:
+                resource_row = dict(canonical)
+                resource_row.update(resource_type="ui_view", resource_id=view_id)
+                allowed = await resource_is_visible(
+                    conn,
+                    resource_row,
+                    access,
+                    permission="search",
+                )
+                visibility_cache[cache_key] = allowed
+            decisions[index] = allowed
+        return tuple(decisions)
     principal_json = json.dumps(sorted(access.principal_ids), separators=(",", ":"))
     identities_json = json.dumps(
         [

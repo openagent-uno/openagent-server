@@ -121,12 +121,24 @@ async def resource_is_visible(
     *,
     permission: str = "view",
 ) -> bool:
-    """Recheck one canonical resource, including explicit ACL grants."""
+    """Recheck one canonical resource, including explicit ACL grants.
 
-    if row_is_visible_without_grant(row, access):
-        return True
+    Installation/public visibility grants read/search access only.  Mutating
+    permissions such as ``admin`` still require ownership or an explicit ACL;
+    otherwise a readable shared dashboard would also be writable/executable by
+    every principal in the tenant.
+    """
+
     if str(row["tenant_id"]) != access.tenant_id or str(row["visibility"]) == "quarantined":
         return False
+    owner = row["owner_principal_id"]
+    if owner is not None and str(owner) in access.principal_ids:
+        return True
+    if (
+        permission in {"view", "search"}
+        and str(row["visibility"]) in {"installation_shared", "public"}
+    ):
+        return True
     for principal_type, principal_id in access.grant_identities:
         match = await (
             await conn.execute(

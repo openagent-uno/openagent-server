@@ -23,7 +23,7 @@ from .schema import operational_search_schema_sql
 
 
 CONSUMER_ID = "operational-fts-v1"
-EXTRACTOR_VERSION = "operational-extractor-v2"
+EXTRACTOR_VERSION = "operational-extractor-v3"
 REDACTION_VERSION = "fail-closed-redaction-v2"
 ACL_PROJECTION_VERSION = "canonical-recheck-v2"
 TOKENIZER_VERSION = "unicode61-v1"
@@ -825,6 +825,61 @@ async def _source_row(conn: Any, source_kind: str, source_id: str) -> tuple[dict
             "completeness": completeness,
         }
         return metadata, "message", "output", body, source_id
+    if source_kind == "ui_view":
+        # Custom Views are canonical in ui_views + file-backed revision
+        # bundles.  Search receives only the explicitly extracted static text
+        # stored on ui_views; realtime values, source/action configuration,
+        # scripts and bundle assets never cross this boundary.
+        row = await (
+            await conn.execute(
+                "SELECT id, tenant_id, owner_principal_id, visibility, "
+                "acl_version, surface, title, description, search_text, "
+                "status, latest_revision, created_at_ms, updated_at_ms, "
+                "deleted_at_ms FROM ui_views WHERE id=?",
+                (source_id,),
+            )
+        ).fetchone()
+        if row is None or row["deleted_at_ms"] is not None or str(row["status"]) == "deleted":
+            return None
+        title = _redact_text(row["title"], limit=4096)
+        description = _redact_text(row["description"] or "", limit=16_384)
+        static_text = _redact_text(row["search_text"] or "", limit=65_536)
+        metadata = {
+            "doc_id": f"ui_view:{source_id}",
+            "tenant_id": str(row["tenant_id"]),
+            "owner_principal_id": str(row["owner_principal_id"]),
+            "visibility": str(row["visibility"]),
+            "acl_version": int(row["acl_version"]),
+            # ``artifact_text`` is the shipped generic static-artifact slot in
+            # operational_search_v1.  The read boundary restores the typed
+            # ui_view target after the CHECK-constrained derived row is read.
+            "document_kind": "artifact_text",
+            "resource_type": "ui_view",
+            "resource_id": source_id,
+            "root_kind": "chat",
+            "root_id": source_id,
+            "session_id": source_id,
+            "target_kind": "chat",
+            "status": str(row["status"]),
+            "origin": f"custom_view:{row['surface']}",
+            "title_safe": title,
+            "author_display_safe": "",
+            "occurred_at_ms": int(row["created_at_ms"]),
+            "updated_at_ms": max(int(row["created_at_ms"]), int(row["updated_at_ms"])),
+            "source_version": int(row["latest_revision"]),
+            "sensitivity": "safe",
+            "completeness": "complete",
+        }
+        return (
+            metadata,
+            # Reuse the shipped generic description match slot; the typed
+            # target/resource remain ui_view and are restored/re-authorized at
+            # the read boundary. No derived-schema migration is needed.
+            "description",
+            "view",
+            "\n".join(part for part in (title, description, static_text) if part),
+            source_id,
+        )
     return None
 
 
@@ -901,6 +956,7 @@ async def _sync_operational_search_unlocked(
                     "scheduled_run": "scheduled_run",
                     "event_definition": "event_definition",
                     "event_delivery": "event_delivery",
+                    "ui_view": "ui_view",
                 }.get(kind)
                 if doc_prefix:
                     _delete_doc(index, f"{doc_prefix}:{source_id}")
@@ -1136,6 +1192,11 @@ def read_search_rows(
             "workflows": {"workflow_definition", "workflow_run", "workflow_step"},
             "scheduled": {"scheduled_definition", "scheduled_run"},
             "events": {"event_definition", "event_delivery"},
+            # Custom Views reuse the already-shipped generic ``artifact_text``
+            # document kind.  ``resource_type`` remains ``ui_view`` and is
+            # re-authorized against the canonical ui_views row before any
+            # snippet is returned.
+            "views": {"artifact_text"},
         }
         kinds = sorted(set().union(*(scope_kinds.get(scope, set()) for scope in scopes)))
         if not kinds:
@@ -1176,8 +1237,12 @@ def read_search_rows(
             params.append(str(effective_filters["session_id"]))
         root = effective_filters.get("root")
         if root:
-            clauses.extend(("d.root_kind=?", "d.root_id=?"))
-            params.extend((str(root["kind"]), str(root["id"])))
+            if str(root.get("kind") or "") == "ui_view":
+                clauses.extend(("d.resource_type='ui_view'", "d.resource_id=?"))
+                params.append(str(root["id"]))
+            else:
+                clauses.extend(("d.root_kind=?", "d.root_id=?"))
+                params.extend((str(root["kind"]), str(root["id"])))
         where = " AND ".join(clauses)
         if fts_query:
             order = (
@@ -1200,7 +1265,20 @@ def read_search_rows(
                 f"WHERE {where} ORDER BY d.occurred_at_ms DESC, d.document_rowid DESC LIMIT ?",
                 (*params, max_candidates),
             ).fetchall()
-        return [dict(row) for row in rows]
+        output = [dict(row) for row in rows]
+        # operational_search_v1 predates Custom Views and its CHECK domains are
+        # immutable.  Store view documents under the generic artifact/search
+        # slots, then restore the typed resolver on the read boundary.  No view
+        # data, script, source configuration, or secret enters this index.
+        for row in output:
+            if row.get("resource_type") == "ui_view":
+                row.update(
+                    root_kind="ui_view",
+                    root_id=str(row["resource_id"]),
+                    target_kind="ui_view",
+                    session_id=None,
+                )
+        return output
     finally:
         conn.close()
 

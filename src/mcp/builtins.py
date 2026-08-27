@@ -436,6 +436,20 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
             "vault; matches redacted words, not meaning"
         ),
     },
+    "ui-manager": {
+        # In-process is an authorization boundary.  Mutations are performed on
+        # behalf of the authenticated turn principal and refresh/action calls
+        # need the live view runtime; neither can be delegated safely to a
+        # reusable-credential subprocess.
+        "in_process": True,
+        "adapter_module": "src.mcp.servers.ui_manager.adapters",
+        "runtime_toolkit_factory": "build_runtime_toolkit",
+        "description": (
+            "create and manage safe OA-UI Custom Views — durable sidebar "
+            "dashboards or revision-pinned inline chat artifacts, with "
+            "dynamic data sources and typed server-side actions"
+        ),
+    },
     "delegation": {
         "dir": "delegation",
         "in_process": True,
@@ -489,6 +503,7 @@ DEFAULT_MCPS: list[dict[str, Any]] = [
     #
     # In-process registration is effectively free until tool discovery/use.
     {"builtin": "memory-search", "_default": True},
+    {"builtin": "ui-manager", "_default": True},
     {"builtin": "computer-control", "_default": True},
     {"builtin": "agent-in-chrome", "_default": True},
     {"builtin": "messaging", "_default": True},
