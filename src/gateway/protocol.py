@@ -15,7 +15,9 @@ Client → Server::
     # Stream protocol (one long-lived StreamSession per session_id):
     {"type": "session_open", "session_id": "...", "profile": "batched|realtime",
                               "language": "...", "speak": true|false,
-                              "coalesce_window_ms": N, "client_kind": "..."}
+                              "coalesce_window_ms": N, "client_kind": "...",
+                              "client_capabilities": {"attachments": true,
+                                "ordered_parts": true, "inline_ui": true}}
     {"type": "session_close","session_id": "..."}
     {"type": "text_final",   "session_id": "...", "text": "...", "source": "user_typed|stt|system"}
     {"type": "audio_chunk_in","session_id": "...", "data": "<base64>",
@@ -40,7 +42,8 @@ Server → Client::
     {"type": "auth_error",     "reason": "..."}
     {"type": "status",         "text": "...",  "session_id": "..."}
     {"type": "delta",          "text": "...",  "session_id": "..."}
-    {"type": "response",       "text": "...",  "session_id": "...", "attachments": [...], "model": "..."}
+    {"type": "response",       "text": "...",  "session_id": "...", "attachments": [...],
+                                  "parts": [...], "model": "..."}
     {"type": "live_state",     "session_id": "...", "active": true, "frames": [...]}
     {"type": "audio_start",    "session_id": "...", "format": "mp3", "voice_id": "...", "mime": "audio/mpeg"}
     {"type": "audio_chunk",    "session_id": "...", "seq": N, "data": "<base64>"}
