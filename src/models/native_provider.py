@@ -26,6 +26,7 @@ import contextvars
 import functools
 import importlib
 import inspect
+import json
 import logging
 import os
 import re
@@ -96,6 +97,11 @@ _DEFAULT_MAX_TOOL_CALLS_PER_RUN = 60
 
 
 def _max_tool_calls_per_run() -> Optional[int]:
+    from src.core.execution_policy import current_max_tool_calls
+
+    policy_limit = current_max_tool_calls()
+    if policy_limit is not None:
+        return policy_limit
     from src.core.execution_profile import lean_local_event_active
 
     if lean_local_event_active():
@@ -114,6 +120,31 @@ def _max_tool_calls_per_run() -> Optional[int]:
         return _DEFAULT_MAX_TOOL_CALLS_PER_RUN
     # 0 / negative = explicitly unbounded, for an operator who knows why.
     return val if val > 0 else None
+
+
+def _execution_cache_key(system: str | None) -> tuple[str, str]:
+    """Return (cache key, real system message) for the current envelope.
+
+    Runtime agents capture tools and ``tool_call_limit`` at construction. A
+    policy change on a reused session therefore needs a distinct cached runner,
+    while the synthetic cache suffix must never leak into the model prompt.
+    """
+    system_text = (system or "").strip()
+    from src.core.execution_policy import current_execution_policy
+
+    policy = current_execution_policy()
+    allow = current_tool_allowlist()
+    if not policy and allow is None:
+        return system_text, system_text
+    marker = json.dumps(
+        {
+            "policy": policy or {},
+            "tool_families": None if allow is None else sorted(allow),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"{system_text}\0{marker}", system_text
 
 
 # Per-coroutine sink for runtime ERROR log capture. The previous
@@ -1338,10 +1369,10 @@ class NativeProvider(BaseModel):
         memory growth; eviction is enforced here AND in close_session
         so long-running deployments don't leak Agents per dead session.
         """
-        sys_key = (system or "").strip()
-        cached = self._agno_agents.get(sys_key)
+        cache_key, sys_key = _execution_cache_key(system)
+        cached = self._agno_agents.get(cache_key)
         if cached is not None:
-            self._agno_agents.move_to_end(sys_key)
+            self._agno_agents.move_to_end(cache_key)
             return cached
         try:
             from src.core._runner.agent import Agent as RuntimeAgent
@@ -1401,7 +1432,7 @@ class NativeProvider(BaseModel):
             tool_call_limit=_max_tool_calls_per_run(),
             markdown=False,
         )
-        self._agno_agents[sys_key] = agent
+        self._agno_agents[cache_key] = agent
         _evict_oldest(self._agno_agents, _AGENT_CACHE_MAX)
         return agent
 
@@ -1435,12 +1466,12 @@ class NativeProvider(BaseModel):
         framework prompt too so when the leader synthesises their
         output the persona is preserved.
         """
-        sys_key = (system or "").strip()
+        cache_key, sys_key = _execution_cache_key(system)
         if not sys_key:
             return None
-        cached = self._agno_teams.get(sys_key)
+        cached = self._agno_teams.get(cache_key)
         if cached is not None:
-            self._agno_teams.move_to_end(sys_key)
+            self._agno_teams.move_to_end(cache_key)
             return cached
 
         compatible_toolkits, filtered_families = self._compatible_mcp_toolkits()
@@ -1537,7 +1568,7 @@ class NativeProvider(BaseModel):
             families=sorted(families.keys()),
             member_count=len(members),
         )
-        self._agno_teams[sys_key] = team
+        self._agno_teams[cache_key] = team
         _evict_oldest(self._agno_teams, _AGENT_CACHE_MAX)
         return team
 

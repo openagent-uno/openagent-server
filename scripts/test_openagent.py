@@ -451,6 +451,10 @@ _TEST_MODULES: tuple[str, ...] = (
     # round-trip + idempotent ALTER migration) and delegate_task's now-optional
     # model_id (omit → default/router model; pass one → override threaded in).
     "test_scheduled_task_model",
+    # Provider-neutral enforcement for unattended tasks: strict policy JSON,
+    # additive DB migration, surfaced round-trip, tool-call context override,
+    # and runner-cache separation across capability envelopes.
+    "test_scheduled_task_execution_policy",
     # Webhook Events channel: DB + secret hygiene, webhook auth (github HMAC /
     # generic bearer), listener isolation (/hooks yes, /api never), the three
     # dispatch action kinds, and resource-event surfacing.

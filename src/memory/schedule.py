@@ -283,6 +283,11 @@ def epoch_to_iso(epoch: float, timezone: str | None = None) -> str:
 
 def decorate_scheduled_task(row: Mapping[str, Any] | dict[str, Any]) -> dict[str, Any]:
     task = dict(row)
+    from src.core.execution_policy import normalize_execution_policy
+
+    task["execution_policy"] = normalize_execution_policy(
+        task.pop("execution_policy_json", None)
+    )
     task["enabled"] = bool(task.get("enabled"))
     task["run_once"] = is_one_shot_expression(task.get("cron_expression"))
     # Surface the zone even on rows that predate the column, so a reader
