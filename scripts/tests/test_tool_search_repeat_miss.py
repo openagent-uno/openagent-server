@@ -108,6 +108,44 @@ async def t_success_resets(ctx: TestContext) -> None:
     assert "STOP" not in again, again
 
 
+@test("tool_search_repeat_miss", "execution scope filters discovery and invocation")
+async def t_execution_scope_enforced(_ctx: TestContext) -> None:
+    from src.core import tool_scope
+    from src.mcp.servers.tool_search import adapters
+
+    async def _ok(**_kwargs):
+        return "done"
+
+    pool = _Pool({
+        "replio": _Toolkit({"replio_read": _ok}),
+        "shell": _Toolkit({"shell_exec": _ok}),
+    })
+    token = tool_scope.set_tool_allowlist(["replio"])
+    try:
+        assert [row["name"] for row in adapters._list_servers_impl(pool)] == ["replio"]
+        assert await adapters._call_tool_impl(
+            pool, "replio", "replio_read", {},
+        ) == "done"
+        for operation in (
+            lambda: adapters._list_tools_impl(pool, "shell"),
+            lambda: adapters._describe_tool_impl(pool, "shell", "shell_exec"),
+        ):
+            try:
+                operation()
+            except PermissionError:
+                pass
+            else:
+                raise AssertionError("out-of-scope discovery was allowed")
+        try:
+            await adapters._call_tool_impl(pool, "shell", "shell_exec", {})
+        except PermissionError:
+            pass
+        else:
+            raise AssertionError("out-of-scope call was allowed")
+    finally:
+        tool_scope.reset_tool_allowlist(token)
+
+
 @test("tool_search_repeat_miss", "the miss table cannot grow without bound")
 async def t_bounded(ctx: TestContext) -> None:
     from src.mcp.servers.tool_search import adapters

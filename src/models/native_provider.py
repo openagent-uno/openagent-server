@@ -1014,7 +1014,14 @@ class NativeProvider(BaseModel):
         base, filtered = self._base_compatible_mcp_toolkits()
         restricted = [
             tk for tk in base
-            if normalize_family(self._toolkit_family_name(tk)) in allow
+            if (
+                normalize_family(self._toolkit_family_name(tk)) in allow
+                # The model sees only this broker in normal OpenAgent wiring.
+                # Its target-server calls are scope-checked inside the adapter;
+                # removing it here would turn a restricted run into a tool-less
+                # run instead of a run with the intended restricted tools.
+                or normalize_family(self._toolkit_family_name(tk)) == "tool_search"
+            )
         ]
         return restricted, list(filtered)
 
