@@ -1089,6 +1089,22 @@ def _build_agent(config: dict) -> Agent:
         os.environ["OPENAGENT_EMBEDDING_BASE_URL"] = str(memory_cfg["embedding_base_url"]).strip()
     if memory_cfg.get("embedding_api_key"):
         os.environ["OPENAGENT_EMBEDDING_API_KEY"] = str(memory_cfg["embedding_api_key"]).strip()
+    # The search-time corpus filters below do not prevent the background builder
+    # from embedding excluded receipt/log trees. On support agents those files are
+    # most of the vault and churn on every reply, starving the live query at the
+    # shared embedding endpoint. This separate, explicit cache-corpus config keeps
+    # authoritative notes indexed while omitting only operator-selected derived
+    # paths. Defaults preserve the historical all-notes + sessions index.
+    _si_cfg = (memory_cfg.get("semantic_index") or {})
+    if "exclude_path_prefixes" in _si_cfg:
+        _si_excludes = _si_cfg.get("exclude_path_prefixes") or []
+        if not isinstance(_si_excludes, (list, tuple)):
+            _si_excludes = str(_si_excludes).split(",")
+        os.environ["OPENAGENT_SEMANTIC_INDEX_EXCLUDE_PATHS"] = ",".join(
+            str(x).strip() for x in _si_excludes if str(x).strip())
+    if "sessions" in _si_cfg:
+        os.environ["OPENAGENT_SEMANTIC_INDEX_SESSIONS"] = (
+            "1" if bool(_si_cfg["sessions"]) else "0")
     _ar_cfg = (memory_cfg.get("auto_recall") or {})
     if "enabled" in _ar_cfg:
         os.environ["OPENAGENT_AUTO_RECALL_ENABLED"] = "1" if bool(_ar_cfg["enabled"]) else "0"

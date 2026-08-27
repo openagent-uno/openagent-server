@@ -452,13 +452,31 @@ class SemanticIndex:
                  vault_root: str | Path | None = None,
                  skills_root: str | Path | None = None,
                  index_path: str | Path | None = None,
-                 embedder: Optional[Embedder] = None):
+                 embedder: Optional[Embedder] = None,
+                 index_exclude_prefixes: Optional[Sequence[str]] = None,
+                 index_sessions: Optional[bool] = None):
         self.db_path = str(Path(db_path).expanduser())
         self.vault_root = Path(vault_root).expanduser() if vault_root else None
         self.skills_root = Path(skills_root).expanduser() if skills_root else None
         self.index_path = (Path(index_path) if index_path
                            else default_semantic_index_path(self.db_path))
         self.embedder = embedder
+        if index_exclude_prefixes is None:
+            index_exclude_prefixes = (
+                os.environ.get("OPENAGENT_SEMANTIC_INDEX_EXCLUDE_PATHS", "")
+                .split(",")
+            )
+        self.index_exclude_prefixes = tuple(
+            p.strip().lstrip("/")
+            for p in index_exclude_prefixes
+            if p and p.strip().lstrip("/")
+        )
+        if index_sessions is None:
+            raw_sessions = os.environ.get("OPENAGENT_SEMANTIC_INDEX_SESSIONS", "1")
+            index_sessions = raw_sessions.strip().lower() not in (
+                "0", "false", "no", "off"
+            )
+        self.index_sessions = bool(index_sessions)
         self._lock = threading.RLock()
         # Matrice impilata per tabella, tenuta in RAM fra una query e l'altra.
         # Senza, ogni search() rifa` `SELECT *` su TUTTI i vettori (16 MB su un
@@ -653,7 +671,12 @@ class SemanticIndex:
             dirnames[:] = [d for d in dirnames if d not in _PRUNE_DIRS]
             for fn in filenames:
                 if fn.lower().endswith(".md"):
-                    out.append(Path(dirpath) / fn)
+                    path = Path(dirpath) / fn
+                    rel = path.relative_to(self.vault_root).as_posix()
+                    if (self.index_exclude_prefixes
+                            and rel.startswith(self.index_exclude_prefixes)):
+                        continue
+                    out.append(path)
         return out
 
     def sync_vault(self, *, force: bool = False,
@@ -776,6 +799,22 @@ class SemanticIndex:
         t0 = time.monotonic()
         stats = SyncStats()
         if not self.active:
+            stats.elapsed_ms = int((time.monotonic() - t0) * 1000)
+            return stats
+
+        # Support/event deployments recall only the curated Markdown vault. Their
+        # transcript rows change on every turn but are never searched, so embedding
+        # them competes with the live query on the same endpoint for no benefit.
+        # When explicitly disabled, remove any old derived rows as well: this is a
+        # rebuildable cache, and a disabled corpus must not remain accidentally
+        # searchable.
+        if not self.index_sessions:
+            with self._lock:
+                stats.deleted = int(self._conn.execute(
+                    "SELECT COUNT(*) FROM session_vectors").fetchone()[0])
+                if stats.deleted:
+                    self._conn.execute("DELETE FROM session_vectors")
+                    self._commit()
             stats.elapsed_ms = int((time.monotonic() - t0) * 1000)
             return stats
 

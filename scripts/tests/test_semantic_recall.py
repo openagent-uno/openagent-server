@@ -655,6 +655,52 @@ async def t_background_builder(ctx: TestContext) -> None:
         _cleanup(db, idx_path, vault)
 
 
+@test("semantic_recall", "builder corpus excludes derived paths and can omit sessions")
+async def t_builder_corpus_controls(ctx: TestContext) -> None:
+    """Search-time excludes were too late: receipts were still embedded and could
+    saturate the endpoint. The builder must skip them, purge old cached vectors,
+    and optionally avoid transcript churn while retaining curated notes."""
+    from src.memory.semantic_index import SemanticIndex
+
+    db, idx_path, vault = _paths(ctx, "corpus-controls")
+    try:
+        _write_note_at(vault, "product/procedures/refunds.md", "Refund policy",
+                       "customer refund eligibility and verified receipt")
+        _write_note_at(vault, "product/receipts/thread-1.md", "Thread receipt",
+                       "customer refund transcript receipt")
+        d = await _open_db(db)
+        await _seed_session(d, "event:one", [
+            ("user", "refund please"), ("assistant", "I will verify the receipt")
+        ])
+        await d.close()
+
+        # Prove these rows existed before the operator narrows the cache corpus.
+        wide = SemanticIndex(db, vault_root=vault, index_path=idx_path,
+                             embedder=ConceptEmbedder())
+        wide.sync()
+        assert wide.stats()["notes"] == 2
+        assert wide.stats()["sessions"] == 1
+        wide.close()
+
+        narrow = SemanticIndex(
+            db, vault_root=vault, index_path=idx_path,
+            embedder=ConceptEmbedder(),
+            index_exclude_prefixes=["product/receipts/"],
+            index_sessions=False,
+        )
+        stats = narrow.sync()
+        assert stats["vault"].deleted == 1, "excluded cached receipt was not purged"
+        assert stats["sessions"].deleted == 1, "disabled session cache was not purged"
+        assert narrow.stats()["notes"] == 1
+        assert narrow.stats()["sessions"] == 0
+        hits = narrow.search("customer refund", scope="vault", min_score=0.1)
+        assert hits and hits[0]["path"] == "product/procedures/refunds.md"
+        assert all("receipts/" not in h.get("path", "") for h in hits)
+        narrow.close()
+    finally:
+        _cleanup(db, idx_path, vault)
+
+
 # ── Hybrid recall (FTS ∪ semantic) ────────────────────────────────────
 # The eval finding: semantic cosine bands overlap (nomic ~0.59–0.83) so no
 # min_score cleanly separates relevant from noise — a refund-policy note scored

@@ -376,6 +376,17 @@ memory:
   # embedding_base_url: http://localhost:11434/v1  # the ONLY channel that reaches the memory-search subprocess
   # embedding_api_key: ""                     # optional; a local server needs none
 
+  # Optional BUILD-time corpus controls. These reduce embedding load; they are
+  # separate from auto_recall's search-time filters. Use them only for derived,
+  # high-churn trees such as per-thread receipts/logs, never for procedures or
+  # factual knowledge. A support-only agent can also skip transcript vectors when
+  # its event recall is vault-only. Defaults index every note and every session.
+  # semantic_index:
+  #   exclude_path_prefixes:
+  #     - product/receipts
+  #     - support/cycle-logs
+  #   sessions: false
+
   # Automatic recall: before each turn, silently retrieve the top matches and
   # inject a bounded, VERIFY-FRAMED reminder (never asserted as fact — the agent
   # is told to confirm with vault_read_note). Prepended to the USER message, so
