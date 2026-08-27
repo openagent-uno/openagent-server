@@ -112,6 +112,54 @@ def _enable_local_e2e(config: dict, agent_dir: Path | None) -> None:
     os.environ["OPENAGENT_IROH_DISCOVERY"] = "none"
 
 
+async def _repack_serve_invites_after_start(
+    *,
+    agent_dir: Path,
+    config: dict,
+    network_row: dict,
+    require_address_hints: bool = False,
+) -> tuple[tuple[str, dict] | None, list[dict]]:
+    """Serialize startup invites after the coordinator published NodeAddr.
+
+    The invitation rows are durable capabilities; the ``oa1...`` strings are
+    only envelopes around those rows plus the coordinator's current address
+    hints. Calling ``mint_first_user_invite`` again is deliberately idempotent:
+    it reuses the unspent ``auto-bootstrap`` row instead of creating a second
+    invitation, then both the bootstrap and every active invite are packed from
+    the freshly-written ``coordinator_addr.json`` cache.
+    """
+
+    from src.network.cli_commands import (
+        list_active_invite_tickets,
+        mint_first_user_invite,
+    )
+
+    bootstrap_invite = await mint_first_user_invite(
+        agent_dir=agent_dir,
+        config=config,
+        network_row=network_row,
+    )
+    active_invites = await list_active_invite_tickets(
+        agent_dir=agent_dir,
+        config=config,
+        network_row=network_row,
+    )
+    if require_address_hints:
+        from src.network.ticket import InviteTicket
+
+        packed = [item["ticket"] for item in active_invites]
+        if bootstrap_invite is not None:
+            packed.append(bootstrap_invite[0])
+        if any(
+            not (ticket.relay_url or ticket.addresses)
+            for ticket in map(InviteTicket.decode, packed)
+        ):
+            raise click.ClickException(
+                "local E2E coordinator did not publish address hints before invite output"
+            )
+    return bootstrap_invite, active_invites
+
+
 def _setup_agent_dir(agent_dir: str | None) -> None:
     """Configure the active agent directory and ensure it exists."""
     if agent_dir is None:
@@ -596,7 +644,7 @@ def update(ctx, yes: bool, no_restart: bool) -> None:
 @click.argument("agent_dir", required=False, default=None)
 @click.option(
     "--channel", "-ch", multiple=True,
-    help="Channels to start (gateway, telegram, discord, whatsapp); gateway starts no chat bridge.",
+    help="Channels to start (gateway, telegram, discord, whatsapp, slack); gateway starts no chat bridge.",
 )
 @click.option("--no-auto-init", is_flag=True,
               help="Don't auto-create a network on first run; require explicit `network init`.")
@@ -636,17 +684,18 @@ def serve(
     # Misurato in produzione: 351 estrazioni orfane su tre agent, 129 GB, con
     # un overlay arrivato al 100% — e nessun allarme, perche' il pieno era
     # dentro il container e non sul nodo.
-    try:
-        from src.core.bundle_sweep import sweep as _sweep_bundles
+    if not local_e2e:
+        try:
+            from src.core.bundle_sweep import sweep as _sweep_bundles
 
-        _esito = _sweep_bundles()
-        if _esito.get("rimosse"):
-            from src.core.logging import elog as _elog
+            _esito = _sweep_bundles()
+            if _esito.get("rimosse"):
+                from src.core.logging import elog as _elog
 
-            _elog("bundle.sweep", removed=_esito["rimosse"],
-                  gb=round(_esito["byte"] / 1e9, 2), found=_esito["trovate"])
-    except Exception:  # noqa: BLE001 — la pulizia non fa mai fallire un avvio
-        pass
+                _elog("bundle.sweep", removed=_esito["rimosse"],
+                      gb=round(_esito["byte"] / 1e9, 2), found=_esito["trovate"])
+        except Exception:  # noqa: BLE001 — la pulizia non fa mai fallire un avvio
+            pass
 
     config = dict(ctx.obj["config"])
     config["_config_path"] = str(Path(ctx.obj["config_path"]).resolve())
@@ -657,7 +706,6 @@ def serve(
     async def _serve():
         from src.network.cli_commands import (
             auto_init_if_standalone,
-            list_active_invite_tickets,
             mint_first_user_invite,
         )
 
@@ -665,15 +713,13 @@ def serve(
         # first run. The user only ever needs ``openagent serve <dir>``.
         bootstrap_invite: tuple[str, dict] | None = None
         active_invites: list[dict] = []
+        network_row: dict | None = None
         if active_dir is not None and not no_auto_init:
             network_row = await auto_init_if_standalone(
                 agent_dir=active_dir, config=config,
             )
             if network_row is not None and network_row["role"] == "coordinator":
                 bootstrap_invite = await mint_first_user_invite(
-                    agent_dir=active_dir, config=config, network_row=network_row,
-                )
-                active_invites = await list_active_invite_tickets(
                     agent_dir=active_dir, config=config, network_row=network_row,
                 )
 
@@ -700,6 +746,27 @@ def serve(
 
                 served = True
                 console.print(Panel(f"[bold]Serving[/bold]: {', '.join(active)}", border_style="green"))
+
+                # ``AgentServer.start`` has now started the iroh node and
+                # atomically published coordinator_addr.json. Re-pack every
+                # ticket at this point: the pre-flight bootstrap string was
+                # serialized before those hints existed and is not safe to
+                # print when discovery is disabled (local E2E). The helper
+                # reuses the same durable invitation code, so this never mints
+                # a duplicate row.
+                if (
+                    active_dir is not None
+                    and network_row is not None
+                    and network_row.get("role") == "coordinator"
+                ):
+                    bootstrap_invite, active_invites = (
+                        await _repack_serve_invites_after_start(
+                            agent_dir=active_dir,
+                            config=config,
+                            network_row=network_row,
+                            require_address_hints=local_e2e,
+                        )
+                    )
 
                 # Reaching "serving" is the health milestone that confirms
                 # a pending self-update: gateway bound, scheduler up,

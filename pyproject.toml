@@ -50,6 +50,14 @@ dependencies = [
     # recall (auto-recall + the semantic_recall MCP tool) silently goes inert
     # with "No module named 'numpy'" (the import sits behind a try/except).
     "numpy>=1.24",
+    # Bounded local PDF text extraction for text-only LLMs. The media
+    # dispatcher uses it only when a configured model lacks native file input;
+    # PDFs are capped by bytes/pages/chars before their text reaches context.
+    "pypdf>=5.0.0",
+    # OA-UI data-source and action input contracts use Draft 2020-12 JSON
+    # Schema validation. Declare it directly (rather than relying on an MCP
+    # transitive) so frozen/server-only builds keep the validation boundary.
+    "jsonschema>=4.20.0",
     # Groq SDK: imported by src.models.providers.groq when a groq-based
     # provider is selected. Declaring it here ensures it is installed in
     # the build environment so PyInstaller bundles it

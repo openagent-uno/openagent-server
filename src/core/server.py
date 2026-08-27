@@ -1630,7 +1630,7 @@ def _selected_bridge_names(
     """Resolve the explicit CLI bridge filter; ``gateway`` means none."""
 
     channels_config = config.get("channels") or {}
-    supported = ("telegram", "discord", "whatsapp")
+    supported = ("telegram", "discord", "whatsapp", "slack")
     if only_channels is None:
         return [name for name in supported if channels_config.get(name)]
     selected = {str(name).strip().lower() for name in only_channels}

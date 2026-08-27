@@ -694,10 +694,19 @@ async def handle_capabilities(request: web.Request) -> web.Response:
                 "definition_field_anchors": False,
                 },
             })
+            from src.custom_views.service import service_for_gateway
+
+            features["custom_views"] = {
+                **service_for_gateway(request.app["gateway"]).capabilities,
+                "version": 1,
+                "inlineUi": True,
+                "sidebarUi": True,
+                "orderedParts": True,
+            }
         if canonical_ready and search_status["ready"]:
             features["global_search"] = {
                 "version": 1,
-                "scopes": ["chats", "tools", "workflows", "scheduled", "events"],
+                "scopes": ["chats", "tools", "workflows", "scheduled", "events", "views"],
                 "sorts": ["relevance", "recent"],
                 "query_modes": ["keyword"],
                 "tool_content": "redacted",
@@ -705,6 +714,7 @@ async def handle_capabilities(request: web.Request) -> web.Response:
                     "chat", "chat_message", "chat_tool", "workflow_definition",
                     "workflow_run", "scheduled_definition", "scheduled_run",
                     "event_definition", "event_delivery",
+                    "ui_view",
                 ],
                 "snapshot_pagination": True,
                 "max_page_size": 100,
@@ -829,7 +839,111 @@ async def _session_acl_row(conn: Any, session_id: str):
     ).fetchone()
 
 
-def _message_json(row: Any) -> dict[str, Any]:
+def _message_json(
+    row: Any,
+    *,
+    attachments: list[dict[str, Any]] | None = None,
+    ui_parts: list[dict[str, Any]] | None = None,
+    canonical_parts: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Serialize one normalized message with canonical ordered content.
+
+    Marker paths in the legacy provider text are never returned.  They only
+    supply ordering hints for the durable CAS/message and UI/message links;
+    any unlinked marker is dropped rather than becoming an authorization
+    bypass or resurrecting a temporary path.
+    """
+
+    from src.stream.content_parts import parse_response_content
+
+    parsed = parse_response_content(str(row["text"] or ""), allow_inline_ui=True)
+    if canonical_parts is not None:
+        ordered = [dict(part) for part in canonical_parts]
+        canonical_attachments = [
+            dict(part["attachment"])
+            for part in ordered
+            if part.get("kind") == "attachment"
+            and isinstance(part.get("attachment"), dict)
+        ]
+        public_text = "".join(
+            str(part.get("text") or "")
+            for part in ordered
+            if part.get("kind") == "text"
+        ).strip()
+        return {
+            "id": str(row["id"]),
+            "session_id": str(row["session_id"]),
+            "run_id": str(row["run_id"]) if row["run_id"] else None,
+            "ordinal": int(row["sequence"]),
+            "role": str(row["role"]),
+            "status": str(row["status"]),
+            "author": {
+                "kind": str(row["author_kind"]),
+                "principal_id": str(row["author_principal_id"])
+                if row["author_principal_id"]
+                else None,
+                "handle": str(row["author_handle_snapshot"])
+                if row["author_handle_snapshot"]
+                else None,
+                "display": str(row["author_display"])
+                if row["author_display"]
+                else None,
+            },
+            "text": public_text,
+            "visible_reasoning": None,
+            "tool_invocation_id": str(row["resolved_tool_id"])
+            if row["resolved_tool_id"]
+            else None,
+            "attachments": canonical_attachments,
+            "parts": ordered,
+            "created_at": _iso(row["created_at_ms"]),
+            "completeness": str(row["completeness"]),
+        }
+    canonical_attachments = list(attachments or [])
+    canonical_ui = list(ui_parts or [])
+    attachments_iter = iter(canonical_attachments)
+    ui_by_ref = {
+        (str(part.get("view_id") or ""), int(part.get("revision") or 0)): part
+        for part in canonical_ui
+    }
+    ordered: list[dict[str, Any]] = []
+    used_attachment_ids: set[str] = set()
+    used_ui_refs: set[tuple[str, int]] = set()
+    for part in parsed.parts:
+        kind = part.get("kind")
+        if kind == "text":
+            value = str(part.get("text") or "")
+            if value:
+                ordered.append({"kind": "text", "text": value})
+            continue
+        if kind == "attachment":
+            canonical = next(attachments_iter, None)
+            if canonical is not None:
+                ordered.append({"kind": "attachment", "attachment": canonical})
+                used_attachment_ids.add(str(canonical.get("artifact_link_id") or ""))
+            continue
+        if kind == "ui_view":
+            key = (str(part.get("view_id") or ""), int(part.get("revision") or 0))
+            canonical = ui_by_ref.get(key)
+            if canonical is not None:
+                ordered.append(canonical)
+                used_ui_refs.add(key)
+
+    # User uploads do not have a textual marker, and very early beta rows may
+    # have committed a link after the projection normalized the text. Preserve
+    # those canonical objects after the textual content in deterministic link
+    # order; no path-bearing parser fallback is ever used.
+    for attachment in canonical_attachments:
+        link_id = str(attachment.get("artifact_link_id") or "")
+        if link_id not in used_attachment_ids:
+            ordered.append({"kind": "attachment", "attachment": attachment})
+            used_attachment_ids.add(link_id)
+    for part in canonical_ui:
+        key = (str(part.get("view_id") or ""), int(part.get("revision") or 0))
+        if key not in used_ui_refs:
+            ordered.append(part)
+            used_ui_refs.add(key)
+
     return {
         "id": str(row["id"]),
         "session_id": str(row["session_id"]),
@@ -843,16 +957,72 @@ def _message_json(row: Any) -> dict[str, Any]:
             "handle": str(row["author_handle_snapshot"]) if row["author_handle_snapshot"] else None,
             "display": str(row["author_display"]) if row["author_display"] else None,
         },
-        "text": str(row["text"] or ""),
+        "text": parsed.text,
         # Provider ``redacted_thinking`` is opaque/provider-private. There is
         # currently no explicitly public reasoning column in the canonical
         # projection, so fail closed rather than mislabeling that blob.
         "visible_reasoning": None,
         "tool_invocation_id": str(row["resolved_tool_id"]) if row["resolved_tool_id"] else None,
-        "attachments": [],
+        "attachments": canonical_attachments,
+        "parts": ordered,
         "created_at": _iso(row["created_at_ms"]),
         "completeness": str(row["completeness"]),
     }
+
+
+async def _ui_parts_for_messages(
+    conn: Any,
+    *,
+    access: AccessContext,
+    session_id: str,
+    message_ids: list[str],
+) -> dict[str, list[dict[str, Any]]]:
+    """Batch-hydrate revision-pinned inline Views and recheck current ACLs."""
+
+    if not message_ids:
+        return {}
+    result: dict[str, list[dict[str, Any]]] = {}
+    visibility: dict[str, bool] = {}
+    for start in range(0, len(message_ids), 400):
+        chunk = message_ids[start : start + 400]
+        placeholders = ",".join("?" for _ in chunk)
+        rows = await (
+            await conn.execute(
+                "SELECT l.message_id, l.view_id, l.revision, l.linked_at_ms, "
+                "v.tenant_id, v.owner_principal_id, v.visibility, v.acl_version, "
+                "v.title, v.status, v.frozen, v.expires_at_ms, "
+                "v.id AS resource_id, 'ui_view' AS resource_type "
+                "FROM ui_message_links l JOIN ui_views v "
+                "ON v.id=l.view_id AND v.tenant_id=l.tenant_id "
+                "JOIN ui_view_revisions r ON r.view_id=l.view_id "
+                "AND r.revision=l.revision "
+                "WHERE l.tenant_id=? AND l.session_id=? "
+                f"AND l.message_id IN ({placeholders}) "
+                "ORDER BY l.message_id, l.linked_at_ms, l.id",
+                (access.tenant_id, session_id, *chunk),
+            )
+        ).fetchall()
+        for linked in rows:
+            view_id = str(linked["view_id"])
+            allowed = visibility.get(view_id)
+            if allowed is None:
+                allowed = await resource_is_visible(conn, linked, access)
+                visibility[view_id] = allowed
+            if not allowed:
+                continue
+            status = "stale" if bool(linked["frozen"]) else str(linked["status"])
+            result.setdefault(str(linked["message_id"]), []).append(
+                {
+                    "kind": "ui_view",
+                    "view_id": view_id,
+                    "revision": int(linked["revision"]),
+                    "title": str(linked["title"]),
+                    "status": status,
+                    "expires_at": int(linked["expires_at_ms"])
+                    if linked["expires_at_ms"] is not None else None,
+                }
+            )
+    return result
 
 
 async def handle_session_messages(request: web.Request) -> web.Response:
@@ -924,10 +1094,37 @@ async def handle_session_messages(request: web.Request) -> web.Response:
         before_cursor = state.encode({"k": "messages", "s": session_id, "p": access.principal_id, "q": min_seq}) if has_before else None
         after_cursor = state.encode({"k": "messages", "s": session_id, "p": access.principal_id, "q": max_seq}) if has_after else None
         revision = await (await conn.execute("SELECT history_revision FROM operational_storage_state WHERE singleton_id=1")).fetchone()
+        message_ids = [str(row["id"]) for row in rows]
+        from src.memory.artifacts import attachment_refs_for_messages_on_connection
+
+        from src.memory.message_parts import canonical_parts_for_messages_on_connection
+
+        attachment_map, ui_part_map, canonical_part_map = await asyncio.gather(
+            attachment_refs_for_messages_on_connection(conn, message_ids),
+            _ui_parts_for_messages(
+                conn,
+                access=access,
+                session_id=session_id,
+                message_ids=message_ids,
+            ),
+            canonical_parts_for_messages_on_connection(
+                conn,
+                message_ids,
+                access=access,
+            ),
+        )
         return _json(
             {
                 "session_id": session_id,
-                "messages": [_message_json(row) for row in rows],
+                "messages": [
+                    _message_json(
+                        row,
+                        attachments=attachment_map.get(str(row["id"]), []),
+                        ui_parts=ui_part_map.get(str(row["id"]), []),
+                        canonical_parts=canonical_part_map.get(str(row["id"])),
+                    )
+                    for row in rows
+                ],
                 "anchor_found": anchor_found,
                 "anchor_message_id": anchor_id,
                 "before_cursor": before_cursor,
@@ -1172,9 +1369,9 @@ async def handle_search(request: web.Request) -> web.Response:
             raise ApiProblem(400, "invalid_request", "Search query must be a string")
         query = body.get("query", "")
         scopes = body.get("scopes")
-        if not isinstance(scopes, list) or not scopes or len(scopes) > 5 or any(
+        if not isinstance(scopes, list) or not scopes or len(scopes) > 6 or any(
             not isinstance(scope, str)
-            or scope not in {"chats", "tools", "workflows", "scheduled", "events"}
+            or scope not in {"chats", "tools", "workflows", "scheduled", "events", "views"}
             for scope in scopes
         ):
             raise ApiProblem(400, "invalid_request", "At least one supported search scope is required")
@@ -1221,6 +1418,7 @@ async def handle_search(request: web.Request) -> web.Response:
                 or root_filter.get("kind") not in {
                     "chat", "delegated_session", "workflow_definition", "workflow_run",
                     "scheduled_definition", "scheduled_run", "event_definition", "event_delivery",
+                    "ui_view",
                 }
                 or not isinstance(root_filter.get("id"), str)
                 or not 1 <= len(root_filter["id"]) <= 512
@@ -1469,7 +1667,14 @@ async def handle_search(request: web.Request) -> web.Response:
             )
         has_more = next_offset < len(snapshot.rows)
         next_cursor = state.encode({"k": "search", "s": snapshot.snapshot_id, "o": next_offset}) if has_more else None
-        corpus_map = {"chats": {"session_metadata", "message"}, "tools": {"tool_invocation"}, "workflows": {"workflow_definition", "workflow_run", "workflow_step"}, "scheduled": {"scheduled_definition", "scheduled_run"}, "events": {"event_definition", "event_delivery"}}
+        corpus_map = {
+            "chats": {"session_metadata", "message"},
+            "tools": {"tool_invocation"},
+            "workflows": {"workflow_definition", "workflow_run", "workflow_step"},
+            "scheduled": {"scheduled_definition", "scheduled_run"},
+            "events": {"event_definition", "event_delivery"},
+            "views": {"artifact_text"},
+        }
         per_corpus: dict[str, Any] = {}
         truncated = any(bool(row.get("_candidate_truncated")) for row in visible_page_matches)
         for scope in scopes:
