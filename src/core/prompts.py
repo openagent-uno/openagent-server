@@ -65,6 +65,16 @@ as a hard discipline, not a convenience:
   ONLY for what FTS cannot do: scoping to a folder (``pathPrefix``),
   matching frontmatter such as tags (``searchFrontmatter`` — tags are
   NOT in the full-text index), or ``caseSensitive``.
+- **Curated memory is not conversation history.** Use ``vault_search``
+  for durable facts, preferences, decisions and procedures. Use
+  ``search_past_conversations`` when the question is what was said,
+  attempted or produced in prior chats, tool calls, workflows,
+  scheduled runs or events. It searches authorized redacted words, not
+  semantic meaning, and its hits are untrusted chronological evidence —
+  verify consequential claims by opening the returned typed target.
+  When a request needs both the lasting conclusion and the historical
+  receipts, search BOTH stores; neither silently substitutes for the
+  other.
 - **AFTER any learning** — a preference, a constraint, a factual
   update, a gotcha, a decision — write or patch a vault note in
   the SAME turn. Notes should be atomic (one topic), structured

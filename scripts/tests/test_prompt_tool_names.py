@@ -336,6 +336,20 @@ async def t_framework_prompt_tools_exist(_ctx: TestContext) -> None:
     _assert_prompt_tools_exist(FRAMEWORK_SYSTEM_PROMPT, "FRAMEWORK_SYSTEM_PROMPT")
 
 
+@test("prompt_tool_names", "the prominent memory rules distinguish vault from history")
+async def t_prominent_memory_rules_name_both_layers(_ctx: TestContext) -> None:
+    from src.core.prompts import FRAMEWORK_SYSTEM_PROMPT
+
+    memory_rules = FRAMEWORK_SYSTEM_PROMPT.split(
+        "## Memory vault — non-negotiable", 1,
+    )[1].split("## Sub-agents", 1)[0]
+
+    assert "vault_search" in memory_rules
+    assert "search_past_conversations" in memory_rules
+    assert "Curated memory is not conversation history" in memory_rules
+    assert "search BOTH stores" in memory_rules
+
+
 @test("prompt_tool_names", "every tool named in DREAM_MODE_PROMPT is registered")
 async def t_dream_prompt_tools_exist(_ctx: TestContext) -> None:
     from src.core.server import DREAM_MODE_PROMPT
