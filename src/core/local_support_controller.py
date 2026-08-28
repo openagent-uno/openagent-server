@@ -663,7 +663,7 @@ _COMPLAINT = re.compile(
 
 
 _ADS_COMPLAINT = re.compile(
-    r"\b(?:ads?|advertis\w*|pubblicit\w*|annunci?\w*|publicidad\w*|"
+    r"\b(?:ads?|advertis\w*|pubblicit\w*|publicit\w*|pubs?\b|annunci?\w*|publicidad\w*|"
     r"anuncios?\w*|reklam\w*|iklan\w*)\b|広告|광고|广告|廣告|реклам\w*",
     re.IGNORECASE,
 )
@@ -676,14 +676,6 @@ _PAID_ADS_CLAIM = re.compile(
     r"\b(?:app\s*user\s*id|appuserid|entitlement|subscription id)\b",
     re.IGNORECASE,
 )
-_FREE_ADS_CONTEXT = re.compile(
-    r"\b(?:too many|so many|exhausting|annoying|fastidios\w*|troppe|"
-    r"non voglio pagare|non posso pagare|cannot pay|can't pay|do not want to pay|"
-    r"don't want to pay|for free|free ways?|gratis|gratuit\w*|senza pagare)\b",
-    re.IGNORECASE,
-)
-
-
 def _is_ads_policy_complaint(text: str) -> bool:
     """An ads complaint is not automatically a missing-Premium claim.
 
@@ -693,9 +685,16 @@ def _is_ads_policy_complaint(text: str) -> bool:
     keeps the existing verified BillingBear route.
     """
     value = str(text or "")
-    return bool(
-        _ADS_COMPLAINT.search(value) and _FREE_ADS_CONTEXT.search(value)
-    ) and not bool(_PAID_ADS_CLAIM.search(value))
+    # Every ad complaint with no purchase/account-state claim is a product
+    # policy question. Requiring an extra phrase such as "too many" or
+    # "cannot pay" missed real reviews like "ads pop up frequently" and
+    # French "la pub rend l'app invivable": both were routed into billing and
+    # either asked for a receipt or merely acknowledged the complaint. The
+    # paid-state regex remains the hard boundary; those cases still go through
+    # BillingBear because free routes do not answer "I paid and still see ads".
+    return bool(_ADS_COMPLAINT.search(value)) and not bool(
+        _PAID_ADS_CLAIM.search(value)
+    )
 
 
 _ACKNOWLEDGEMENT = re.compile(
@@ -838,12 +837,17 @@ def _identifier_only(text: str) -> bool:
     """
     body = _FORM_FIELD.sub("", str(text or ""))
     body = re.split(r"\n?---", body)[0]
+    has_identifier = bool(
+        re.search(r"[\w.+-]+@[\w-]+\.[\w.]+", body)
+        or re.search(r"\b[0-9a-f]{16,}\b", body, flags=re.IGNORECASE)
+        or re.search(r"\b\d{4,}\b", body)
+    )
     body = re.sub(r"[\w.+-]+@[\w-]+\.[\w.]+", " ", body)
     body = re.sub(r"\b[0-9a-f]{16,}\b", " ", body, flags=re.IGNORECASE)
     body = re.sub(r"\b\d{4,}\b", " ", body)
     left = re.sub(r"(?:re|fwd)\s*:", " ", body, flags=re.IGNORECASE)
     left = re.sub(r"[^\w]+", " ", left).strip()
-    return len(left) <= 12 and body.strip() != _FORM_FIELD.sub("", str(text or "")).strip()
+    return has_identifier and len(left) <= 12
 
 
 def _intent(text: str, channel: str = "") -> str:
@@ -1022,7 +1026,10 @@ def _intent(text: str, channel: str = "") -> str:
         "closes itself", "kicks me out",
         "error*", "bug*", "glitch*",
         # Italian
-        "si blocca", "non funziona", "non si apre", "si chiude da sol*",
+        "si blocca", "si è blocc*", "si e blocc*", "si è fermat*",
+        "si e fermat*", "si è interrott*", "si e interrott*",
+        "ha smesso di funzionare", "non funziona", "non si apre",
+        "si chiude da sol*",
         # Spanish - measured on live threads: "se sale de la aplicacion",
         # "fallas en la aplicacion" were landing in the generic bucket.
         "se cierra", "se sale", "no funciona", "no abre", "fallas", "falla",
@@ -3026,9 +3033,11 @@ def _fallback_reply(state: SupportState) -> str:
             )
         if state.outcome.endswith("_human"):
             return (
-                "Ho ricevuto il tuo aggiornamento, ma la raccolta diagnostica richiede una verifica manuale prima di poter confermare altro."
+                "Grazie per la segnalazione. Serve una verifica manuale prima "
+                "di poter confermare la causa o una correzione."
                 if italian else
-                "I received your update, but the diagnostic capture needs a manual check before I can confirm anything else."
+                "Thanks for the report. It needs manual review before we can "
+                "confirm a cause or a fix."
             )
         if state.outcome == "bug_created":
             task = state.facts.get("clickup_task") or {}
@@ -3108,6 +3117,16 @@ def _fallback_reply(state: SupportState) -> str:
             "La segnalazione richiede una revisione umana specializzata."
             if italian else
             "This report requires specialist human review."
+        )
+    if state.outcome == "general_needs_detail" and state.facts.get(
+        "already_known_from_form"
+    ):
+        return (
+            "Ho già dispositivo, sistema operativo e versione dell’app. Dimmi "
+            "cosa succede esattamente e in quale passaggio."
+            if italian else
+            "I already have the device, OS, and app version. Tell me exactly "
+            "what happens and at which step."
         )
     return (
         "Mi servono più dettagli sul comportamento, sul dispositivo e sulla versione dell’app."
@@ -3635,6 +3654,19 @@ async def _compose_local(
             return _fallback_reply(state)
         return await _fallback_in_language(
             agent, event, state, session_id, "product_policy",
+        )
+    if state.outcome == "general_needs_detail":
+        # A generic route has no verified product fact at all. Letting the
+        # composer fill that vacuum produced a real reply which asserted both
+        # a catalogue cause and a playback behaviour without a task, log or
+        # documentation receipt. The safe answer is a precise clarification;
+        # non-English text may be translated, but never freely completed.
+        state.facts["reply_source"] = "deterministic:clarification"
+        language = str(state.facts.get("language") or "en")
+        if language in {"en", "it"}:
+            return _fallback_reply(state)
+        return await _fallback_in_language(
+            agent, event, state, session_id, "clarification",
         )
     if not _model_may_compose(state):
         # A refund, a cancellation, a created task or a handoff still may not

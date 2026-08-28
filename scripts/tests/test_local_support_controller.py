@@ -127,6 +127,9 @@ async def t_offline_route(_ctx: TestContext) -> None:
 
     assert _intent("The download button is not working offline") == "offline"
     assert _intent("The player crashes whenever I tap Play") == "bug"
+    assert _intent(
+        "Ho importato una playlist e la riproduzione si è bloccata al terzo brano"
+    ) == "bug"
     assert _intent("I see two charges; refund the duplicate") == "duplicate_charge"
     assert _intent("I confirm cancellation of subscription sub-1") == "cancel_subscription"
     assert _intent("Thanks, it works now!") == "resolved_confirmation"
@@ -331,6 +334,12 @@ async def t_ads_policy_routes(_ctx: TestContext) -> None:
     assert not _is_ads_policy_complaint(
         "I paid for Premium but still see ads"
     )
+    assert _is_ads_policy_complaint(
+        "Amazing app, but ads pop up frequently while I use it."
+    )
+    assert _is_ads_policy_complaint(
+        "L'introduction de la publicité rend l'application invivable."
+    )
 
     calls: list[str] = []
 
@@ -385,6 +394,14 @@ async def t_ads_policy_routes(_ctx: TestContext) -> None:
     low = lyra["reply"].lower()
     assert all(term in low for term in ("referral", "video", "creator", "premium")), lyra
     assert not any(call.startswith("billing:") for call in calls), calls
+
+    implicit = await one(
+        "esound",
+        "Amazing app, but ads pop up frequently while I use it.",
+    )
+    assert implicit["outcome"] == "ads_policy_explained", implicit
+    implicit_reply = implicit["reply"].lower()
+    assert "friends" in implicit_reply and "video" in implicit_reply, implicit
 
 
 @test("local_support_controller", "diagnostic proof is PII-free and dry runs never authorize a claim")
@@ -463,7 +480,7 @@ async def t_already_answered(_ctx: TestContext) -> None:
     assert model.saw_empty_tools is False
 
 
-@test("local_support_controller", "ambiguous general reply uses tool-less strict-local composer")
+@test("local_support_controller", "ambiguous general reply cannot invent a product explanation")
 async def t_general_local_composer(_ctx: TestContext) -> None:
     from src.core.local_support_controller import run
 
@@ -490,8 +507,32 @@ async def t_general_local_composer(_ctx: TestContext) -> None:
     )
     output = json.loads(result.text)
     assert output["outcome"] == "general_needs_detail", output
+    assert output["facts"]["reply_source"] == "deterministic:clarification", output
+    # The bounded fallback classifier may still use the model to choose the
+    # fixed `general` label; reply_source proves it did not author the answer.
     assert model.saw_empty_tools is True
     assert model.saw_strict_local is True
+    assert "premium is active" not in output["reply"].lower(), output
+    assert "more detail" in output["reply"].lower(), output
+
+    known_result = await run(
+        agent=SimpleNamespace(_mcp=pool, model=model),
+        event={"slug": "replio-thread", "model": ""},
+        payload={"payload": {
+            "thread_id": "thread-general-known",
+            "message": {"body_text": (
+                "Music\n---\napp_version: 5.2.0\ndevice: realme RMX3231\n"
+                "os: Android 11\nplatform: android"
+            )},
+        }},
+        session_id="test-general-known",
+        delivery_id="test-general-known-delivery",
+    )
+    known_output = json.loads(known_result.text)
+    known_reply = known_output["reply"].lower()
+    assert known_output["outcome"] == "general_needs_detail", known_output
+    assert "already have" in known_reply, known_output
+    assert "tell me exactly what happens" in known_reply, known_output
 
 
 class _Doubles:

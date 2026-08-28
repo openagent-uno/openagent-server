@@ -65,6 +65,14 @@ CASES = (
         forbidden_reply=("email", "ricevuta", "ordine", "sempre avuto pubblicità"),
     ),
     OperationalCase(
+        "ads-complaint-without-free-keyword-still-gets-free-routes",
+        "Thread sim-ads-frequent: Amazing app, but ads pop up frequently while I use it.",
+        "self_help",
+        forbidden_tools=("billingbear_", "clickup_", "mark_for_human"),
+        reply_all=("friends", "video", "premium"),
+        forbidden_reply=("email", "receipt", "order id"),
+    ),
+    OperationalCase(
         "lyra-ads-complaint-includes-product-specific-free-routes",
         "Thread sim-lyra-ads-policy: The ads are exhausting, but I cannot pay. What free ways can remove them?",
         "self_help",
@@ -298,6 +306,19 @@ CASES = (
         forbidden_reply=("next update", "fixed", "released"),
     ),
     OperationalCase(
+        "italian-past-bug-dedup-existing-task",
+        "Thread sim-bug-match-it: su iPhone 17 con iOS 20 ed eSound 5.1.1, ogni volta che ho premuto Play la riproduzione si è bloccata sul caricamento infinito e non è mai partita.",
+        "bug_existing_task",
+        language="it",
+        expected_tools=(
+            "clickup_get_workspace_tasks", "clickup_create_task_comment",
+            "replio_thread_link_task",
+        ),
+        forbidden_tools=("clickup_create_task", "mark_for_human"),
+        reply_any=("86-local-existing",),
+        forbidden_reply=("prossimo aggiornamento", "risolto", "rilasciato"),
+    ),
+    OperationalCase(
         "intermittent-bug-enables-receipt-backed-esound-diagnostics",
         "Thread sim-bug-diag: account diag@example.com, on iPhone 17 with iOS 20 and eSound 5.1.1, sometimes when I tap Play the track stays on infinite loading and never starts.",
         "bug_existing_task",
@@ -478,6 +499,17 @@ CASES = (
             "detail", "device", "version", "behavior", "error", "steps", "expected",
         ),
         forbidden_reply=("known issue", "tracking", "team will", "fixed"),
+    ),
+    OperationalCase(
+        "general-ambiguous-known-form-fields",
+        "Thread sim-general-known-fields: Music\n---\napp_version: 5.1.1\nos: Android 14\ndevice: Pixel 8",
+        "ask_information",
+        forbidden_tools=("billingbear_", "clickup_", "mark_for_human"),
+        reply_any=("exact behavior", "what happens", "step"),
+        forbidden_reply=(
+            "known issue", "tracking", "team will", "fixed",
+            "send your device", "send your app version",
+        ),
     ),
     OperationalCase(
         "italian-premium-active-answers-in-italian",
@@ -961,6 +993,10 @@ def _clone_and_patch_db(
                 "SELECT id FROM providers WHERE name = 'windows-local'"
             ).fetchone()
         provider_id = row[0]
+        dst.execute(
+            "UPDATE providers SET enabled=1, base_url=?, updated_at=? WHERE id=?",
+            ("http://100.89.54.20:8099/v1", now, provider_id),
+        )
         if dst.execute(
             "SELECT 1 FROM models WHERE model = 'qwen3-moe-local'"
         ).fetchone() is None:
@@ -970,6 +1006,15 @@ def _clone_and_patch_db(
                 "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (provider_id, "qwen3-moe-local", "Qwen3-30B-A3B (MoE locale)",
                  "benchmark only", "", 1, 0, "{}", "llm", now, now),
+            )
+        else:
+            # Production may deliberately keep this provider/model disabled
+            # while the event uses another composer. The throwaway benchmark
+            # explicitly selected it, so enable only the cloned row.
+            dst.execute(
+                "UPDATE models SET provider_id=?, enabled=1, updated_at=? "
+                "WHERE model='qwen3-moe-local'",
+                (provider_id, now),
             )
         profile = SAMPLING_PROFILES.get(sampling, SAMPLING_PROFILES["bench"])
         if profile is not None:

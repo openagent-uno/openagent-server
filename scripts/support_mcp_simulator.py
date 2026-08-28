@@ -711,7 +711,10 @@ if ROLE == "clickup":
     ) -> dict[str, Any]:
         """Read-only simulated semantic task search."""
         low = query.lower()
-        matched = any(term in low for term in ("playback", "endless", "infinite", "loading"))
+        matched = any(term in low for term in (
+            "playback", "endless", "infinite", "loading",
+            "riproduzione", "caricamento",
+        ))
         tasks = []
         if matched and listId == "901512182215":
             tasks.append({
