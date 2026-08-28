@@ -393,18 +393,39 @@ def _succeeded(result: Any) -> bool:
     if result is None:
         return False
     if isinstance(result, dict):
-        if (
-            result.get("ok") is False
-            or result.get("success") is False
-            or result.get("isError") is True
-            or result.get("is_error") is True
-        ):
-            return False
-        try:
-            if int(result.get("status", 200)) >= 400:
+        # MCP transport success is not business-action success.  Replio's
+        # reply guard deliberately returns a valid tool result with
+        # ``sent=false, blocked=true`` so the caller can rewrite immediately.
+        # Counting that envelope as a sent customer reply is worse than a
+        # visible failure: lifecycle patches then claim the thread was handled.
+        protocol_objects: list[dict[str, Any]] = [result]
+        structured = result.get("structuredContent")
+        if isinstance(structured, dict):
+            protocol_objects.append(structured)
+        for item in result.get("content") or []:
+            if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+                continue
+            try:
+                decoded = json.loads(item["text"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(decoded, dict):
+                protocol_objects.append(decoded)
+        for protocol in protocol_objects:
+            if (
+                protocol.get("ok") is False
+                or protocol.get("success") is False
+                or protocol.get("sent") is False
+                or protocol.get("blocked") is True
+                or protocol.get("isError") is True
+                or protocol.get("is_error") is True
+            ):
                 return False
-        except (TypeError, ValueError):
-            pass
+            try:
+                if int(protocol.get("status", 200)) >= 400:
+                    return False
+            except (TypeError, ValueError):
+                pass
         # Structured MCP reads often have no explicit ``ok`` field (vault
         # returns ``fm`` + ``content``). Words such as "error" inside the
         # document are data, not protocol failure markers.
@@ -1612,6 +1633,34 @@ def _review_send_unrepliable(receipt: Any) -> bool:
     """
     text = receipt if isinstance(receipt, str) else json.dumps(receipt, default=str)
     return bool(_REVIEW_NOT_FOUND.search(text))
+
+
+def _retryable_reply_guard(receipt: Any) -> dict[str, Any] | None:
+    """Return Replio's retry envelope, including string-wrapped MCP results."""
+    value = receipt
+    for _ in range(3):
+        if isinstance(value, dict):
+            if value.get("blocked") is True and value.get("retry_now") is True:
+                return value
+            structured = value.get("structuredContent")
+            if isinstance(structured, dict):
+                value = structured
+                continue
+            content = value.get("content")
+            if isinstance(content, list) and content:
+                first = content[0]
+                if isinstance(first, dict) and isinstance(first.get("text"), str):
+                    value = first["text"]
+                    continue
+            return None
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return None
+            continue
+        return None
+    return None
 
 
 def _review_window_expired(thread: Any, channel: str) -> bool:
@@ -4604,9 +4653,27 @@ async def run(
             state.customer_message = recovered
             state.facts["language_signal"] = recovered
             state.facts["message_source"] = "thread_brief"
-            detected = _language_hint(recovered)
-            if detected != "und" or state.facts.get("language") == "und":
-                state.facts["language"] = detected
+            recovered_fields = _form_fields(recovered)
+            recovered_declared = str(
+                recovered_fields.get("reviewer_language") or ""
+            ).strip().lower()
+            if recovered_declared[:2] in _LANGUAGE_MARKERS or (
+                recovered_declared[:2]
+                in {code for code, _low, _high in _SCRIPT_RANGES}
+                | {"ja", "zh", "ko"}
+            ):
+                state.facts["language"] = recovered_declared[:2]
+                state.facts["language_source"] = "reviewer_language"
+            else:
+                detected = _language_hint(recovered)
+                if detected != "und" or state.facts.get("language") == "und":
+                    state.facts["language"] = detected
+                country = str(
+                    recovered_fields.get("store_country") or ""
+                ).strip().upper()[:3]
+                if detected == "und" and _COUNTRY_LANGUAGE.get(country):
+                    state.facts["language"] = _COUNTRY_LANGUAGE[country]
+                    state.facts["language_source"] = "store_country"
             break
     state.corrections = await _load_corrections(pool, state)
     name = _customer_first_name(thread, payload)
@@ -5449,6 +5516,32 @@ async def run(
         agent, event, state, f"{session_id}:{delivery_id}",
     )
     await _apply_lifecycle(pool, state, reply)
+    # A reply guard block is an instruction to rewrite in the SAME turn.  The
+    # first text never reached the customer, so one bounded retry cannot create
+    # a duplicate.  Replio clears its safety-net human flag when the corrected
+    # outbound lands; if the retry is also held, the case remains visible to a
+    # person and this controller stops rather than looping.
+    blocked: dict[str, Any] | None = None
+    for action in reversed(state.actions):
+        if action.get("kind") != "customer_reply" or action.get("success"):
+            continue
+        blocked = _retryable_reply_guard(action.get("receipt"))
+        if blocked is not None:
+            break
+    if blocked is not None:
+        category = str(blocked.get("category") or "reply_guard")[:80]
+        reason = str(blocked.get("reason") or "")[:500]
+        state.facts["delivery_guard_retry"] = category
+        state.instructions.append(
+            "Replio held the first reply before delivery. Rewrite it now and "
+            f"fix this exact guard category: {category}. {reason}"
+        )
+        retry_reply = await _compose_local(
+            agent, event, state, f"{session_id}:{delivery_id}:guard-retry",
+        )
+        if retry_reply:
+            await _apply_lifecycle(pool, state, retry_reply)
+            reply = retry_reply
     output = {
         "thread_id": state.thread_id,
         "outcome": state.outcome,

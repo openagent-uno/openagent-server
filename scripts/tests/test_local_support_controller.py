@@ -511,6 +511,7 @@ class _Doubles:
         create_id: str = "86-created",
         create_ok: bool = True,
         link_ok: bool = True,
+        respond_results: list[dict[str, Any]] | None = None,
     ) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self._thread = thread or {}
@@ -520,6 +521,7 @@ class _Doubles:
         self._create_id = create_id
         self._create_ok = create_ok
         self._link_ok = link_ok
+        self._respond_results = list(respond_results or [])
         self._links: dict[str, str] = {}
 
     def _log(self, tool: str, **args: Any) -> None:
@@ -559,6 +561,8 @@ class _Doubles:
                 expected_last_inbound_message_id=expected_last_inbound_message_id,
                 reply_to_message_id=reply_to_message_id,
             )
+            if self._respond_results:
+                return self._respond_results.pop(0)
             return {"ok": True, "success": True, "simulated": True}
 
         async def threads_tags_add(thread_id: str, tags: Any) -> dict[str, Any]:
@@ -721,6 +725,69 @@ async def t_reconcile_recovers_customer_message(_ctx: TestContext) -> None:
     sent = doubles.args_for("replio_threads_respond")
     assert len(sent) == 1, sent
     assert sent[0]["expected_last_inbound_message_id"] == "latest-inbound-7", sent
+
+
+@test(
+    "local_support_controller",
+    "a guarded reply is not success and is rewritten once in the same turn",
+)
+async def t_reply_guard_retries_once(_ctx: TestContext) -> None:
+    doubles = _Doubles(
+        thread={"reply_contract": {
+            "expected_last_inbound_message_id": "latest-inbound-8",
+        }},
+        respond_results=[
+            {
+                "sent": False,
+                "blocked": True,
+                "retry_now": True,
+                "category": "canned_opening",
+                "reason": "open directly on the issue",
+            },
+            {"sent": True, "blocked": False},
+        ],
+    )
+
+    output = await _drive(
+        doubles, "Could you explain how this option works?",
+        thread_id="t-guard-retry",
+    )
+
+    replies = [
+        action for action in output["actions"]
+        if action.get("kind") == "customer_reply"
+    ]
+    assert [action["success"] for action in replies] == [False, True], replies
+    assert len(doubles.args_for("replio_threads_respond")) == 2
+    assert output["facts"]["delivery_guard_retry"] == "canned_opening"
+
+
+@test(
+    "local_support_controller",
+    "a reconciled store review keeps its declared reviewer language",
+)
+async def t_reconcile_recovers_reviewer_language(_ctx: TestContext) -> None:
+    doubles = _Doubles(thread={
+        "messages": [{
+            "direction": "inbound",
+            "body_text": (
+                "The app no longer opens.\n"
+                "reviewer_language: es\nstore_country: ESP"
+            ),
+        }],
+        "reply_contract": {
+            "expected_last_inbound_message_id": "review-9",
+        },
+    })
+
+    output = await _drive(
+        doubles, "", thread_id="t-review-language",
+        payload_extra={"channel_kind": "playstore_reviews"},
+    )
+
+    assert output["facts"]["message_source"] == "thread_brief", output
+    assert output["facts"]["language"] == "es", output
+    assert output["facts"]["language_source"] == "reviewer_language", output
 
 
 @test("local_support_controller", "resolved confirmation closes the thread without replying")
