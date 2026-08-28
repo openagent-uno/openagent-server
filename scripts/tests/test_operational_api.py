@@ -215,6 +215,8 @@ async def t_run_local_tool_deep_links(_ctx: TestContext) -> None:
                     "tool_call_id": "reused-call",
                     "tool_server": "shell",
                     "tool_name": "shell_execute",
+                    "effective_tool_server": None,
+                    "effective_tool_name": None,
                     "status": "success",
                     "child_run_id": None,
                     "child_session_id": None,
@@ -224,6 +226,20 @@ async def t_run_local_tool_deep_links(_ctx: TestContext) -> None:
                 # arguments/results remain on the authorized detail endpoint.
                 assert "args" not in summary
                 assert "result" not in summary
+
+            assert operational._effective_tool_identity(
+                "tool_search_call_tool",
+                json.dumps(
+                    {
+                        "server": "vault",
+                        "tool": "read_note",
+                        "args": {"path": "private/note.md", "secret": "never-return"},
+                    }
+                ),
+            ) == ("vault", "read_note")
+            assert operational._effective_tool_identity(
+                "tool_search_call_tool", "not-json"
+            ) == (None, None)
 
             for index, tool in enumerate(tools):
                 detail_response = await operational.handle_tool_invocation(

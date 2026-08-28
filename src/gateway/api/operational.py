@@ -839,6 +839,39 @@ async def _session_acl_row(conn: Any, session_id: str):
     ).fetchone()
 
 
+def _effective_tool_identity(
+    tool_name: str,
+    raw_args: str | None,
+) -> tuple[str | None, str | None]:
+    """Return the safe inner identity for the deferred-tool dispatcher.
+
+    Transcript pages intentionally do not carry invocation arguments or
+    results.  ``tool_search_call_tool`` is only an envelope, though: without
+    its two routing strings the client cannot render memory, delegation, or
+    run-launch cards.  Extract only the bounded server/tool names and discard
+    every argument value.
+    """
+
+    if tool_name != "tool_search_call_tool" or not raw_args:
+        return None, None
+    try:
+        payload = json.loads(raw_args)
+    except (TypeError, ValueError):
+        return None, None
+    if not isinstance(payload, dict):
+        return None, None
+
+    raw_server = payload.get("server")
+    raw_tool = payload.get("tool")
+    server = raw_server.strip() if isinstance(raw_server, str) else ""
+    inner_tool = raw_tool.strip() if isinstance(raw_tool, str) else ""
+    if not 1 <= len(server) <= 256:
+        server = ""
+    if not 1 <= len(inner_tool) <= 256:
+        inner_tool = ""
+    return server or None, inner_tool or None
+
+
 def _message_json(
     row: Any,
     *,
@@ -866,6 +899,10 @@ def _message_json(
         # transcript page self-contained with a deliberately compact summary;
         # arguments/results stay behind the separately-authorized detail
         # endpoint and are never duplicated into the message envelope.
+        effective_server, effective_name = _effective_tool_identity(
+            str(row["resolved_tool_name"]),
+            row["resolved_tool_args_json"],
+        )
         tool_summary = {
             "id": str(row["resolved_tool_id"]),
             "tool_call_id": str(row["resolved_tool_call_id"])
@@ -875,6 +912,8 @@ def _message_json(
             if row["resolved_tool_server"]
             else None,
             "tool_name": str(row["resolved_tool_name"]),
+            "effective_tool_server": effective_server,
+            "effective_tool_name": effective_name,
             "status": str(row["resolved_tool_status"]),
             "child_run_id": str(row["resolved_child_run_id"])
             if row["resolved_child_run_id"]
@@ -1079,6 +1118,7 @@ async def handle_session_messages(request: web.Request) -> web.Response:
             "t.tool_call_id AS resolved_tool_call_id, "
             "t.tool_server AS resolved_tool_server, "
             "t.tool_name AS resolved_tool_name, "
+            "t.args_json AS resolved_tool_args_json, "
             "t.status AS resolved_tool_status, "
             "t.child_run_id AS resolved_child_run_id, "
             "t.child_session_id AS resolved_child_session_id, "
