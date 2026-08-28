@@ -735,6 +735,7 @@ async def t_session_descendants_and_nested_related_runs(_ctx: TestContext) -> No
             level_1 = "orchid-child"
             level_2 = "orchid-hidden-level-2"
             level_3 = "orchid-visible-level-3"
+            visible_level_2 = "orchid-visible-level-2"
             await db.upsert_session(
                 level_2,
                 client_id="bob",
@@ -748,6 +749,14 @@ async def t_session_descendants_and_nested_related_runs(_ctx: TestContext) -> No
                 client_id="alice",
                 title="Visible grandchild",
                 parent_session_id=level_2,
+                origin="delegation",
+                kind="subagent",
+            )
+            await db.upsert_session(
+                visible_level_2,
+                client_id="alice",
+                title="Visible direct grandchild",
+                parent_session_id=level_1,
                 origin="delegation",
                 kind="subagent",
             )
@@ -850,6 +859,22 @@ async def t_session_descendants_and_nested_related_runs(_ctx: TestContext) -> No
             first = _payload(first_response)
             assert first["has_more"] and first["next_cursor"]
             descendants = list(first["items"])
+            # Revoke the direct parent's visibility after the snapshot's first
+            # page. Later pages must keep their stable membership/order while
+            # redacting that now-hidden parent id from an independently visible
+            # child.
+            original_level_1_acl = await (
+                await db._conn.execute(
+                    "SELECT owner_principal_id, visibility FROM sessions_v2 WHERE id=?",
+                    (level_1,),
+                )
+            ).fetchone()
+            await db._conn.execute(
+                "UPDATE sessions_v2 SET owner_principal_id='user:bob', "
+                "visibility='private', acl_version=acl_version+1 WHERE id=?",
+                (level_1,),
+            )
+            await db._conn.commit()
             cursor = first["next_cursor"]
             while cursor:
                 page = _payload(
@@ -867,15 +892,28 @@ async def t_session_descendants_and_nested_related_runs(_ctx: TestContext) -> No
                 cursor = page["next_cursor"]
 
             by_id = {row["session_id"]: row for row in descendants}
-            assert set(by_id) == {level_1, level_3}, by_id
+            assert set(by_id) == {level_1, visible_level_2, level_3}, by_id
             assert len(descendants) == len(by_id)
             assert by_id[level_1]["depth"] == 1
             assert by_id[level_1]["parent_session_id"] == "orchid-chat"
             assert by_id[level_3]["depth"] == 3
             assert by_id[level_3]["parent_session_id"] is None
             assert by_id[level_3]["lineage_redacted"] is True
+            assert by_id[visible_level_2]["parent_session_id"] is None
+            assert by_id[visible_level_2]["lineage_redacted"] is True
             assert "orchid-chat" not in by_id
             assert level_2 not in first_response.text
+
+            await db._conn.execute(
+                "UPDATE sessions_v2 SET owner_principal_id=?, visibility=?, "
+                "acl_version=acl_version+1 WHERE id=?",
+                (
+                    original_level_1_acl["owner_principal_id"],
+                    original_level_1_acl["visibility"],
+                    level_1,
+                ),
+            )
+            await db._conn.commit()
 
             too_large = await operational.handle_session_descendants(
                 alice(

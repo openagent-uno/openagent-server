@@ -1132,7 +1132,20 @@ async def handle_session_descendants(request: web.Request) -> web.Response:
         for row in selected:
             acl = await _session_acl_row(conn, str(row["session_id"]))
             if acl is not None and await resource_is_visible(conn, acl, access):
-                visible.append(dict(row))
+                serialized = dict(row)
+                parent_id = serialized.get("parent_session_id")
+                if parent_id and parent_id != session_id:
+                    parent_acl = await _session_acl_row(conn, str(parent_id))
+                    if parent_acl is None or not await resource_is_visible(
+                        conn, parent_acl, access
+                    ):
+                        # Snapshot membership/order stays stable, but an ACL
+                        # revoked after page one must take effect immediately.
+                        # Never leak the now-hidden parent id from the cached
+                        # lineage carried into a later page.
+                        serialized["parent_session_id"] = None
+                        serialized["lineage_redacted"] = True
+                visible.append(serialized)
         next_offset = offset + len(selected)
         has_more = next_offset < len(snapshot.rows)
         next_cursor = (
