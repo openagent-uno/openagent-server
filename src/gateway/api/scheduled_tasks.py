@@ -26,6 +26,10 @@ import asyncio
 import time
 
 from src.core.builtin_tasks import BUILTIN_TASK_NAMES
+from src.core.execution_policy import (
+    encode_execution_policy,
+    normalize_execution_policy,
+)
 from src.core.logging import elog
 from src.memory.schedule import decorate_scheduled_task, epoch_to_iso
 
@@ -382,6 +386,10 @@ async def handle_create(request):
     prompt = (body.get("prompt") or "").strip()
     # Optional per-task model pin (a runtime_id). Empty/absent → default model.
     model = (body.get("model") or "").strip() or None
+    try:
+        execution_policy = normalize_execution_policy(body.get("execution_policy"))
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
 
     if not name:
         return web.json_response({"error": "name is required"}, status=400)
@@ -415,6 +423,7 @@ async def handle_create(request):
 
     task_id = await scheduler.add_task(
         name, cron_expression, prompt, model=model, timezone=timezone,
+        execution_policy=execution_policy,
     )
 
     # add_task enables by default; honour an explicit enabled=false.
@@ -469,6 +478,14 @@ async def handle_update(request):
         # it (firing reverts to the default/router model); a runtime_id sets it.
         updates["model"] = (body["model"] or "").strip() or None
 
+    if "execution_policy" in body:
+        try:
+            updates["execution_policy_json"] = encode_execution_policy(
+                body.get("execution_policy")
+            )
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+
     # Fall back to the task's stored zone so a cron edit keeps the zone and
     # a zone edit re-reads the stored cron.
     effective_tz = existing.get("timezone") or None
@@ -504,7 +521,7 @@ async def handle_update(request):
 
     if not updates and enabled_change is None:
         return web.json_response(
-            {"error": "No fields to update. Pass name, cron_expression, prompt, model, timezone, or enabled."},
+            {"error": "No fields to update. Pass name, cron_expression, prompt, model, timezone, execution_policy, or enabled."},
             status=400,
         )
 

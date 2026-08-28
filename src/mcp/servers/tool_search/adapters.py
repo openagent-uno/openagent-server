@@ -209,17 +209,34 @@ async def _ensure_functions_loaded(toolkit: Any, server: str) -> dict[str, Any]:
     return _functions_dict(toolkit)
 
 
+def _require_server_allowed(server: str) -> None:
+    """Fail closed when a broker call targets a family outside this run."""
+    from src.core.tool_scope import current_tool_allowlist, normalize_family
+
+    allow = current_tool_allowlist()
+    if allow is not None and normalize_family(server) not in allow:
+        raise PermissionError(
+            f"MCP server {server!r} is outside this run's allowed tool families"
+        )
+
+
 def _list_servers_impl(pool: Any) -> list[dict[str, Any]]:
+    from src.core.tool_scope import current_tool_allowlist, normalize_family
+
+    allow = current_tool_allowlist()
     out: list[dict[str, Any]] = []
     for name, toolkit in pool._toolkit_by_name.items():
         if name == "tool-search":
             continue  # never list ourselves — would be infinite-mirror noise
+        if allow is not None and normalize_family(name) not in allow:
+            continue
         out.append({"name": name, "tool_count": len(_functions_dict(toolkit))})
     out.sort(key=lambda x: x["name"])
     return out
 
 
 def _list_tools_impl(pool: Any, server: str) -> list[dict[str, Any]]:
+    _require_server_allowed(server)
     toolkit = pool.toolkit_by_name(server)
     if toolkit is None:
         raise ValueError(
@@ -259,6 +276,7 @@ def _list_tools_impl(pool: Any, server: str) -> list[dict[str, Any]]:
 
 
 def _describe_tool_impl(pool: Any, server: str, tool: str) -> dict[str, Any]:
+    _require_server_allowed(server)
     toolkit = pool.toolkit_by_name(server)
     if toolkit is None:
         raise ValueError(f"MCP {server!r} is not loaded.")
@@ -309,8 +327,13 @@ async def _resolve_tool(
             if cand in fns:
                 return fns[cand], server
 
+    from src.core.tool_scope import current_tool_allowlist, normalize_family
+
+    allow = current_tool_allowlist()
     for _name, _tk in pool._toolkit_by_name.items():
         if _name == server:
+            continue
+        if allow is not None and normalize_family(_name) not in allow:
             continue
         try:
             _fns = await _ensure_functions_loaded(_tk, _name)
@@ -326,7 +349,11 @@ async def _resolve_tool(
 async def _call_tool_impl(
     pool: Any, server: str, tool: str, args: dict | str | None,
 ) -> Any:
+    _require_server_allowed(server)
     fn, _resolved_server = await _resolve_tool(pool, server, tool)
+
+    if _resolved_server is not None:
+        _require_server_allowed(_resolved_server)
 
     if fn is None:
         misses = _note_miss(server, tool)

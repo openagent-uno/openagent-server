@@ -794,7 +794,18 @@ class Scheduler:
             should_use_lean_local_scheduled_task,
             strict_local_only_scope,
         )
-        from src.core.tool_scope import reset_tool_allowlist, set_tool_allowlist
+        from src.core.tool_scope import (
+            current_tool_allowlist,
+            reset_tool_allowlist,
+            set_tool_allowlist,
+        )
+        from src.core.execution_policy import (
+            current_execution_policy,
+            narrow_execution_policy,
+            reset_execution_policy,
+            set_execution_policy,
+            task_execution_policy,
+        )
         from src.core.dry_run import dry_run_scope
 
         use_lean_local = await should_use_lean_local_scheduled_task(task, self.db)
@@ -813,6 +824,15 @@ class Scheduler:
             or prompt_head.startswith("dry run")
             or prompt_head.startswith("dry-run")
         )
+        execution_policy = narrow_execution_policy(
+            current_execution_policy(), task_execution_policy(task),
+        )
+        if execution_policy.get("timeout_seconds") is not None:
+            run_timeout_s = float(execution_policy["timeout_seconds"])
+        elif use_lean_local:
+            run_timeout_s = max(5.0, float(os.environ.get(
+                "OPENAGENT_LOCAL_SCHEDULED_TASK_TIMEOUT_SECONDS", "120",
+            )))
         durable = _durable_child_sessions()
         # Per-run id (durable) so each firing is its own navigable session;
         # legacy mode reuses one per-task id wiped after every fire.
@@ -825,19 +845,42 @@ class Scheduler:
             mint_child_session_id("scheduler", {"task_id": task["id"], "run_id": run_id})
             if durable else f"scheduler:{task['id']}"
         )
-        allowed_families: list[str] | None = None
-        if use_lean_local:
+        allowed_families: list[str] | None = execution_policy.get(
+            "allowed_tool_families"
+        )
+        ambient_families = current_tool_allowlist()
+        if allowed_families is not None and ambient_families is not None:
+            from src.core.tool_scope import normalize_family
+
+            allowed_families = [
+                item for item in allowed_families
+                if normalize_family(item) in ambient_families
+            ]
+        if use_lean_local and allowed_families is None:
             pool = getattr(self.agent, "_mcp", None)
             available = list(getattr(pool, "_toolkit_by_name", {}) or {})
-            allowed_families = lean_local_tool_families(effective_prompt, available)
-            if allowed_families:
+            lean_families = lean_local_tool_families(effective_prompt, available)
+            allowed_families = lean_families or None
+            if allowed_families is not None:
                 elog(
                     "task.lean_local_tool_scope",
                     name=task_name,
                     families=",".join(allowed_families),
                     dropped=max(0, len(available) - len(allowed_families)),
                 )
-        scope_token = set_tool_allowlist(allowed_families) if allowed_families else None
+        scope_token = (
+            set_tool_allowlist(allowed_families)
+            if allowed_families is not None else None
+        )
+        policy_token = set_execution_policy(execution_policy)
+        if execution_policy:
+            elog(
+                "task.execution_policy",
+                name=task_name,
+                max_tool_calls=execution_policy.get("max_tool_calls"),
+                timeout_seconds=execution_policy.get("timeout_seconds"),
+                tool_families=allowed_families,
+            )
         # The two self-improvement passes run with nobody watching, so they
         # declare themselves: the skill tool then refuses, in code, any write
         # outside their lane (someone else's skill, or a pinned one). Every
@@ -1029,12 +1072,8 @@ class Scheduler:
                         # token-by-token like any interactive session.
                         stream=True,
                     )
-                    if use_lean_local:
-                        timeout = max(5.0, float(os.environ.get(
-                            "OPENAGENT_LOCAL_SCHEDULED_TASK_TIMEOUT_SECONDS", "120",
-                        )))
-                        run_timeout_s = timeout
-                        result = await asyncio.wait_for(run, timeout=timeout)
+                    if run_timeout_s is not None:
+                        result = await asyncio.wait_for(run, timeout=run_timeout_s)
                     else:
                         result = await run
                 response = result.text
@@ -1053,12 +1092,8 @@ class Scheduler:
                         user_id="scheduler",
                         session_id=session_id,
                     )
-                    if use_lean_local:
-                        timeout = max(5.0, float(os.environ.get(
-                            "OPENAGENT_LOCAL_SCHEDULED_TASK_TIMEOUT_SECONDS", "120",
-                        )))
-                        run_timeout_s = timeout
-                        response = await asyncio.wait_for(run, timeout=timeout)
+                    if run_timeout_s is not None:
+                        response = await asyncio.wait_for(run, timeout=run_timeout_s)
                     else:
                         response = await run
                 # The non-streaming branch used to skip the check entirely, so a
@@ -1124,6 +1159,7 @@ class Scheduler:
                 finish_run_id, task, status="failed", error=detail,
             )
         finally:
+            reset_execution_policy(policy_token)
             if origin_token is not None:
                 reset_write_origin(origin_token)
             if scope_token is not None:
@@ -1514,6 +1550,7 @@ class Scheduler:
         prompt: str,
         model: str | None = None,
         timezone: str | None = None,
+        execution_policy: dict | None = None,
     ) -> str:
         """Add a new scheduled task. ``model`` is an optional runtime_id the
         firing runs on (NULL = the agent's default/router model).
@@ -1527,7 +1564,7 @@ class Scheduler:
         return await self.db.add_task(
             name, cron_expression, prompt,
             self._next_run(cron_expression, now, timezone), model=model,
-            timezone=timezone,
+            timezone=timezone, execution_policy=execution_policy,
         )
 
     async def list_tasks(self) -> list[dict]:

@@ -145,6 +145,10 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
     -- ``src/memory/schedule.py`` for the DST rules that follow from it.
     -- Added by ``_migrate_scheduled_tasks_timezone_column`` on old DBs.
     timezone TEXT,
+    -- Provider-neutral unattended-run envelope. JSON fields currently:
+    -- max_tool_calls, timeout_seconds, allowed_tool_families. NULL preserves
+    -- the historical global defaults. Migrated additively on old DBs.
+    execution_policy_json TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -876,6 +880,9 @@ CREATE TABLE IF NOT EXISTS events (
     -- moved on since it was enqueued; this settles "is there still work here?"
     -- with one HTTP call instead of a model turn. NULL → always run.
     precondition_json  TEXT,
+    -- Provider-neutral capability/resource envelope for every delivery.
+    -- A nested task can only narrow this envelope, never expand it.
+    execution_policy_json TEXT,
     -- Guardrails (the webhook is the first cert-less inbound surface, and
     -- every delivery is a paid LLM run): requests over the cap are 413'd,
     -- more than ``rate_limit_per_min`` deliveries in a rolling minute are
@@ -1351,8 +1358,10 @@ class MemoryDB:
         await self._migrate_task_runs_session_id()
         await self._migrate_scheduled_tasks_model_column()
         await self._migrate_scheduled_tasks_timezone_column()
+        await self._migrate_scheduled_tasks_execution_policy_column()
         await self._migrate_events_session_binding()
         await self._migrate_events_precondition()
+        await self._migrate_events_execution_policy_column()
         await self._migrate_event_deliveries_reenqueue_count()
         await self._migrate_event_deliveries_lease()
         await self._migrate_events_breaker()
@@ -1644,6 +1653,17 @@ class MemoryDB:
             )
             await self._conn.commit()
 
+    async def _migrate_scheduled_tasks_execution_policy_column(self) -> None:
+        """Add the generic unattended-run envelope without changing old tasks."""
+        assert self._conn is not None
+        cursor = await self._conn.execute("PRAGMA table_info(scheduled_tasks)")
+        cols = {row[1] for row in await cursor.fetchall()}
+        if "execution_policy_json" not in cols:
+            await self._conn.execute(
+                "ALTER TABLE scheduled_tasks ADD COLUMN execution_policy_json TEXT"
+            )
+            await self._conn.commit()
+
     async def _migrate_events_precondition(self) -> None:
         """An event can declare a cheap check that runs BEFORE the delivery does.
 
@@ -1664,6 +1684,17 @@ class MemoryDB:
         if "precondition_json" not in cols:
             await self._conn.execute(
                 "ALTER TABLE events ADD COLUMN precondition_json TEXT"
+            )
+            await self._conn.commit()
+
+    async def _migrate_events_execution_policy_column(self) -> None:
+        """Add per-event resource/capability bounds without changing old events."""
+        assert self._conn is not None
+        cursor = await self._conn.execute("PRAGMA table_info(events)")
+        cols = {row[1] for row in await cursor.fetchall()}
+        if "execution_policy_json" not in cols:
+            await self._conn.execute(
+                "ALTER TABLE events ADD COLUMN execution_policy_json TEXT"
             )
             await self._conn.commit()
 
@@ -2376,6 +2407,7 @@ class MemoryDB:
         next_run: float | None = None,
         model: str | None = None,
         timezone: str | None = None,
+        execution_policy: Any = None,
     ) -> str:
         """``timezone`` is an IANA name the cron is read in; None = UTC (the
         pre-timezone behaviour). Validated here so a typo can't reach the
@@ -2384,14 +2416,17 @@ class MemoryDB:
         from src.memory.schedule import validate_timezone
 
         validate_timezone(timezone)
+        from src.core.execution_policy import encode_execution_policy
+
+        execution_policy_json = encode_execution_policy(execution_policy)
         conn = await self._ensure_connected()
         task_id = str(uuid.uuid4())
         now = time.time()
         await conn.execute(
-            "INSERT INTO scheduled_tasks (id, name, cron_expression, prompt, enabled, next_run, model, timezone, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?)",
+            "INSERT INTO scheduled_tasks (id, name, cron_expression, prompt, enabled, next_run, model, timezone, execution_policy_json, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)",
             (task_id, name, cron_expression, prompt, next_run or now, model or None,
-             (timezone or None), now, now),
+             (timezone or None), execution_policy_json, now, now),
         )
         await conn.commit()
         return task_id
@@ -2415,7 +2450,7 @@ class MemoryDB:
         conn = await self._ensure_connected()
         allowed = {
             "name", "cron_expression", "prompt", "enabled", "last_run",
-            "next_run", "model", "timezone",
+            "next_run", "model", "timezone", "execution_policy_json",
         }
         updates = {k: v for k, v in kwargs.items() if k in allowed}
         if not updates:
@@ -2429,6 +2464,12 @@ class MemoryDB:
             # every 30 s instead of failing visibly.
             validate_timezone(updates["timezone"])
             updates["timezone"] = updates["timezone"] or None
+        if "execution_policy_json" in updates:
+            from src.core.execution_policy import encode_execution_policy
+
+            updates["execution_policy_json"] = encode_execution_policy(
+                updates["execution_policy_json"]
+            )
         updates["updated_at"] = time.time()
         set_clause = ", ".join(f"{k} = ?" for k in updates)
         values = list(updates.values()) + [task_id]
@@ -2734,6 +2775,11 @@ class MemoryDB:
             d["input_schema"] = []
         d["enabled"] = bool(d.get("enabled"))
         d["session_binding_enabled"] = bool(d.get("session_binding_enabled"))
+        from src.core.execution_policy import normalize_execution_policy
+
+        d["execution_policy"] = normalize_execution_policy(
+            d.pop("execution_policy_json", None)
+        )
         if not include_secret:
             d.pop("secret_enc", None)
         return d
@@ -2754,10 +2800,13 @@ class MemoryDB:
         model: str | None = None,
         session_binding_enabled: bool = False,
         session_binding_path: str | None = None,
+        execution_policy: Any = None,
         rate_limit_per_min: int = 60,
         max_payload_bytes: int = 262144,
         enabled: bool = True,
     ) -> str:
+        from src.core.execution_policy import encode_execution_policy
+
         conn = await self._ensure_connected()
         event_id = str(uuid.uuid4())
         now = time.time()
@@ -2765,9 +2814,9 @@ class MemoryDB:
             "INSERT INTO events "
             "(id, name, slug, description, type, enabled, secret_enc, "
             " secret_hint, input_schema_json, action_kind, action_ref, prompt_template, "
-            " model, session_binding_enabled, session_binding_path, "
+            " model, session_binding_enabled, session_binding_path, execution_policy_json, "
             " rate_limit_per_min, max_payload_bytes, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 event_id, name, slug, description or None, event_type,
                 1 if enabled else 0, secret_enc, secret_hint,
@@ -2775,6 +2824,7 @@ class MemoryDB:
                 prompt_template or None, model or None,
                 1 if session_binding_enabled else 0,
                 (session_binding_path or "").strip() or None,
+                encode_execution_policy(execution_policy),
                 int(rate_limit_per_min), int(max_payload_bytes), now, now,
             ),
         )
@@ -2815,7 +2865,7 @@ class MemoryDB:
             "action_ref", "prompt_template", "model", "rate_limit_per_min",
             "max_payload_bytes", "last_triggered_at",
             "session_binding_enabled", "session_binding_path",
-            "precondition_json",
+            "precondition_json", "execution_policy_json",
             # Secret rotation goes through ``rotate_event_secret``; these are
             # accepted here too so that path can reuse the same UPDATE.
             "secret_enc", "secret_hint",
@@ -2832,6 +2882,10 @@ class MemoryDB:
                 # Accept the spec as a dict from callers that build it in code;
                 # store the canonical JSON either way.
                 v = json.dumps(v)
+            if k == "execution_policy_json":
+                from src.core.execution_policy import encode_execution_policy
+
+                v = encode_execution_policy(v)
             updates[k] = v
         # ``input_schema`` is passed as a list and serialised here.
         if "input_schema" in kwargs:
