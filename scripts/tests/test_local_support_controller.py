@@ -2357,6 +2357,7 @@ class _FakeEmbedder:
             sorted(sem.INTENT_EXEMPLARS)
             + sorted(sem.SIGNAL_EXEMPLARS)
             + [f"not_{name}" for name in sorted(sem.SIGNAL_NEGATIVE_EXEMPLARS)]
+            + [f"not_{name}" for name in sorted(sem.INTENT_NEGATIVE_EXEMPLARS)]
         )
 
     def embed(self, texts):
@@ -2380,7 +2381,10 @@ class _FakeEmbedder:
                 # on its own label's axis - a signal's near misses on their
                 # own, so the two-class comparison has something to lose to.
                 if label.startswith("not_"):
-                    pool = sem.SIGNAL_NEGATIVE_EXEMPLARS.get(label[4:], ())
+                    pool = (
+                        sem.SIGNAL_NEGATIVE_EXEMPLARS.get(label[4:], ())
+                        or sem.INTENT_NEGATIVE_EXEMPLARS.get(label[4:], ())
+                    )
                 else:
                     pool = (
                         sem.INTENT_EXEMPLARS.get(label)
@@ -2662,3 +2666,53 @@ async def t_other_store_subscription(_ctx: TestContext) -> None:
     # ...nor two rows from the same provider.
     same = {**paddle_yearly, "productId": "pro_other"}
     assert _other_store_active_subscription([paddle_yearly, same], "paddle") == {}
+
+
+@test("support_semantics", "a written-down near miss beats the label it sits next to")
+async def t_intent_negative_exemplars(_ctx: TestContext) -> None:
+    """Sharpening a label's own exemplars is not enough. Measured on real
+    traffic: "I can't find your app on google play store" scored 0.646 on
+    ios_availability, and rewriting every exemplar to name Apple explicitly
+    pushed it to 0.726 — the embedder matches "I cannot find your app in a
+    store", not the store's name. The neighbour has to be lost to."""
+    from src.core import support_semantics as sem
+
+    try:
+        _install_fake_embedder()
+        # On the label's own axis: accepted.
+        own = await sem.classify_intent("<<ios_availability>> iPhone version?")
+        assert own is not None and own.label == "ios_availability", own
+
+        # On the neighbour's axis, and still closest to that label overall:
+        # refused, so the caller keeps its own route.
+        near = await sem.classify_intent(
+            "<<ios_availability>> <<not_ios_availability>> where is the app",
+        )
+        assert near is None, near
+
+        # Every negative bank names a label the intent bank actually serves,
+        # or it silences a route nothing can reach.
+        assert set(sem.INTENT_NEGATIVE_EXEMPLARS) <= set(sem.INTENT_EXEMPLARS)
+    finally:
+        sem.reset_for_tests()
+
+
+@test("local_support_controller", "an empty form body is not classified from its trailer")
+async def t_thin_body_is_not_classified(_ctx: TestContext) -> None:
+    """A web-form body is mostly metadata. Measured on 198 real threads:
+    bodies reading "Aditya", "Music" and "Help me" all landed on `offline` at
+    0.55-0.58, because the trailer looks like an app problem to an embedder.
+    Those people have not said anything yet; asking is the right answer."""
+    from src.core import local_support_controller as lsc
+
+    trailer = (
+        "\n---\naccount_email: n/a\naccount_user_id: n/a\napp_version: 5.2.0\n"
+        "device: realme RMX3830\nos: Android 14\npremium: no\n"
+    )
+    for body in ("Aditya", "Music", "Help me"):
+        own = lsc._FORM_FIELD.sub("", body + trailer).replace("---", " ").strip()
+        assert len(own) < lsc._SEMANTIC_MIN_OWN_WORDS, (body, own)
+
+    real = "My downloaded songs all disappeared after the update" + trailer
+    own = lsc._FORM_FIELD.sub("", real).replace("---", " ").strip()
+    assert len(own) >= lsc._SEMANTIC_MIN_OWN_WORDS, own

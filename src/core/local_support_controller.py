@@ -2198,6 +2198,12 @@ _FORM_FIELD = re.compile(
 )
 _FORM_EMPTY = {"", "n/a", "na", "none", "null", "unknown", "-", "?"}
 
+# Below this many characters of the customer's OWN text there is nothing to
+# classify, and an embedder asked anyway answers from the form trailer. 25 is
+# the length of a short but real sentence ("my songs disappeared"); the bodies
+# that misrouted in the measurement were 4-13.
+_SEMANTIC_MIN_OWN_WORDS = 25
+
 
 def _form_fields(text: str) -> dict[str, str]:
     """Parse the structured block the eSound web form and store reviews append.
@@ -5245,10 +5251,22 @@ async def run(
             )
 
         if state.intent == "general" and message.strip():
-            semantic = await support_semantics.classify_intent(
-                f"{state.subject}\n{message}".strip(),
-                allowed=_MODEL_LABELS,
-            )
+            # Classify the customer's OWN words. A web-form body is mostly the
+            # metadata trailer (account_email, app_version, device, os), and
+            # measured on 198 real threads that trailer dominates the vector:
+            # bodies reading "Aditya", "Music" and "Help me" all landed on
+            # `offline` at 0.55-0.58, because the trailer looks like an app
+            # problem to an embedder. Those messages say nothing yet, and
+            # asking what is wrong is the correct answer for them.
+            own_words = _FORM_FIELD.sub("", message).replace("---", " ").strip()
+            semantic = None
+            if len(own_words) >= _SEMANTIC_MIN_OWN_WORDS:
+                semantic = await support_semantics.classify_intent(
+                    f"{state.subject}\n{own_words}".strip(),
+                    allowed=_MODEL_LABELS,
+                )
+            else:
+                state.facts["semantic_skipped_thin_body"] = True
             if semantic is not None and _silencing_label_rejected(semantic.label):
                 semantic = None
             if semantic is not None and semantic.label != "general":

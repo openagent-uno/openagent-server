@@ -171,9 +171,14 @@ INTENT_EXEMPLARS: dict[str, tuple[str, ...]] = {
         "can you add a way to sort my playlists",
     ),
     "ios_availability": (
+        # Deliberately never a bare "App Store": measured on real traffic,
+        # "I can't find your app on google play store" landed here at 0.646
+        # and would have been answered about iPhone. Every exemplar names
+        # Apple or iOS explicitly, so a Play Store question stays below the
+        # margin and gets a clarification instead of a wrong answer.
         "when will the app be available on iPhone",
-        "I cannot find the app in the App Store",
-        "is there an iOS version of this app",
+        "I cannot find the app in the Apple App Store on my iPhone",
+        "is there an iOS version of this app for my iPad",
     ),
     "account_delete": (
         "please delete my account and all my personal data",
@@ -200,6 +205,26 @@ INTENT_EXEMPLARS: dict[str, tuple[str, ...]] = {
         "understood, thank you for the answer",
     ),
 }
+
+# Near misses that must NOT be read as the label they sit next to. Sharpening
+# a label's own exemplars is not enough: "I can't find your app on google play
+# store" scored 0.646 on `ios_availability`, and rewriting every exemplar to
+# name Apple explicitly pushed it to 0.726, because what the embedder actually
+# matches is "I cannot find your app in a store". The neighbour has to be
+# written down and lost to, exactly like a signal's negatives.
+#
+# A message that lands here keeps the caller's own route - for these labels
+# that means `general`, i.e. ask what they need. That is the correct answer:
+# there is no route for "the app is gone from Play", and answering it with
+# iPhone availability is worse than asking.
+INTENT_NEGATIVE_EXEMPLARS: dict[str, tuple[str, ...]] = {
+    "ios_availability": (
+        "I cannot find your app on the Google Play store any more",
+        "the app was removed from Google Play, why",
+        "your app is not found on Play, what happened",
+    ),
+}
+
 
 # Binary signals.  Each one replaces a regex that could only see the phrasings
 # somebody thought of, in the languages somebody added.
@@ -455,7 +480,23 @@ async def classify_intent(
         return None
     if margin < _float_env(_MIN_MARGIN_ENV, _DEFAULT_MIN_MARGIN):
         return None
+    if await _loses_to_near_miss(top_label, top_score, query[0]):
+        return None
     return SemanticMatch(top_label, top_score, margin, runner_up)
+
+
+async def _loses_to_near_miss(
+    label: str, score: float, query: Sequence[float],
+) -> bool:
+    """Whether the winning label is beaten by one of its written-down neighbours."""
+    negatives = INTENT_NEGATIVE_EXEMPLARS.get(label)
+    if not negatives:
+        return False
+    bank = await _bank(f"intent_not:{label}", {label: negatives})
+    if bank is None:
+        return False
+    _labels, vectors = bank
+    return max(_cosine(query, vector) for vector in vectors) >= score
 
 
 async def signal_present(name: str, text: str) -> Optional[SemanticMatch]:
