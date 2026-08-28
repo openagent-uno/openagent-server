@@ -46,6 +46,12 @@ class OperationalCase:
     author_name: str = ""
 
 
+# A `decision="human"` case asserts TWO things, and the second one is the point:
+# the handoff tools really ran, and the sentence the customer reads says a
+# person is taking it over. It used to assert the words "human" and "review",
+# which pinned the internal verdict "This report requires specialist human
+# review." - a triage line that was sent verbatim to a customer on
+# 28-Aug-2026. That phrasing is now forbidden here.
 CASES = (
     OperationalCase(
         "social-premium-missing-id",
@@ -318,8 +324,8 @@ CASES = (
         "human",
         expected_tools=("replio_threads_mark_for_human", "replio_threads_tags_add"),
         forbidden_tools=("billingbear_",),
-        reply_any=("security", "human", "review"),
-        forbidden_reply=("security@lyramusic.app",),
+        reply_any=("colleague",),
+        forbidden_reply=("specialist human review", "security@lyramusic.app",),
     ),
     OperationalCase(
         "offline-is-not-bug",
@@ -640,8 +646,8 @@ CASES = (
         "human",
         expected_tools=("replio_threads_mark_for_human", "replio_threads_tags_add"),
         forbidden_tools=("clickup_", "billingbear_"),
-        reply_any=("human", "review"),
-        forbidden_reply=("account was deleted", "we deleted"),
+        reply_any=("colleague",),
+        forbidden_reply=("specialist human review", "account was deleted", "we deleted"),
     ),
     OperationalCase(
         "formal-gdpr-human",
@@ -649,8 +655,8 @@ CASES = (
         "human",
         expected_tools=("replio_threads_mark_for_human", "replio_threads_tags_add"),
         forbidden_tools=("clickup_", "billingbear_"),
-        reply_any=("human", "review"),
-        forbidden_reply=("account was deleted", "legal advice"),
+        reply_any=("colleague",),
+        forbidden_reply=("specialist human review", "account was deleted", "legal advice"),
     ),
     OperationalCase(
         "refund-apple-goes-to-apple",
@@ -676,8 +682,8 @@ CASES = (
         "human",
         expected_tools=("billingbear_get_v1_customers_by_appUserId",),
         forbidden_tools=("subscriptions_by_subscr_4",),
-        reply_any=("human", "review"),
-        forbidden_reply=("we refunded", "has been processed", "refund is granted"),
+        reply_any=("colleague",),
+        forbidden_reply=("specialist human review", "we refunded", "has been processed", "refund is granted"),
     ),
     OperationalCase(
         "refund-web-anomalous-amount-human",
@@ -685,8 +691,8 @@ CASES = (
         "human",
         expected_tools=("billingbear_get_v1_customers_by_appUserId",),
         forbidden_tools=("subscriptions_by_subscr_4",),
-        reply_any=("human", "review"),
-        forbidden_reply=("we refunded", "149.99", "has been processed"),
+        reply_any=("colleague",),
+        forbidden_reply=("specialist human review", "we refunded", "149.99", "has been processed"),
     ),
     OperationalCase(
         "refund-web-brl-is-a-normal-plan",
@@ -773,8 +779,8 @@ CASES = (
         "human",
         expected_tools=("replio_threads_mark_for_human", "replio_threads_tags_add"),
         forbidden_tools=("clickup_", "billingbear_"),
-        reply_any=("human", "review"),
-        forbidden_reply=("password was reset",),
+        reply_any=("colleague",),
+        forbidden_reply=("specialist human review", "password was reset",),
     ),
     OperationalCase(
         "billing-dispute-human",
@@ -782,8 +788,8 @@ CASES = (
         "human",
         expected_tools=("replio_threads_mark_for_human", "replio_threads_tags_add"),
         forbidden_tools=("clickup_", "refund_duplicate"),
-        reply_any=("human", "review"),
-        forbidden_reply=("refund completed",),
+        reply_any=("colleague",),
+        forbidden_reply=("specialist human review", "refund completed",),
     ),
     OperationalCase(
         "business-partnership-human",
@@ -791,7 +797,8 @@ CASES = (
         "human",
         expected_tools=("replio_threads_mark_for_human", "replio_threads_tags_add"),
         forbidden_tools=("clickup_", "billingbear_"),
-        reply_any=("human", "review"),
+        reply_any=("colleague",),
+        forbidden_reply=("specialist human review",),
     ),
     OperationalCase(
         "a-bare-email-is-not-a-new-conversation",
