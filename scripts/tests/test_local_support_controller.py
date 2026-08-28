@@ -10,6 +10,46 @@ from typing import Any
 from ._framework import TestContext, test
 
 
+@test("local_support_controller", "support model calls share one bounded lane")
+async def t_support_model_calls_are_serialized(_ctx: TestContext) -> None:
+    import asyncio
+    from types import SimpleNamespace
+
+    from src.core import local_support_controller as controller
+
+    class SlowModel:
+        def __init__(self):
+            self.active = 0
+            self.max_active = 0
+
+        async def generate(self, **_kwargs):
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            try:
+                await asyncio.sleep(0.02)
+                return SimpleNamespace(content='{"reply":"ok"}')
+            finally:
+                self.active -= 1
+
+    model = SlowModel()
+
+    async def one(index: int):
+        return await controller._generate_support_model(
+            model,
+            messages=[{"role": "user", "content": str(index)}],
+            system="test",
+            session_id=f"test:{index}",
+            timeout_env="OPENAGENT_TEST_SUPPORT_MODEL_TIMEOUT",
+            default_timeout="1",
+        )
+
+    await asyncio.gather(*(one(index) for index in range(4)))
+    assert model.max_active == controller._SUPPORT_MODEL_CONCURRENCY == 1, (
+        model.max_active,
+        controller._SUPPORT_MODEL_CONCURRENCY,
+    )
+
+
 class _Toolkit:
     def __init__(self, functions: dict[str, Any]) -> None:
         self.functions = {

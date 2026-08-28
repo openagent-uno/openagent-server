@@ -108,6 +108,30 @@ async def t_success_resets(ctx: TestContext) -> None:
     assert "STOP" not in again, again
 
 
+@test("tool_search_repeat_miss", "vault keyword search compatibility alias is read-only and exact")
+async def t_vault_search_compatibility_alias(_ctx: TestContext) -> None:
+    from src.mcp.servers.tool_search import adapters
+
+    calls: list[dict] = []
+
+    async def _search_notes(query: str, limit: int = 20):
+        calls.append({"query": query, "limit": limit})
+        return {"results": []}
+
+    pool = _Pool({
+        "vault": _Toolkit({"vault_search_notes": _search_notes}),
+    })
+    result = await adapters._call_tool_impl(
+        pool, "vault", "vault_search", {"query": "refund policy", "limit": 7},
+    )
+
+    assert result == {"results": []}, result
+    assert calls == [{"query": "refund policy", "limit": 7}], calls
+    assert adapters._candidate_names("vault", "vault_write") == [
+        "vault_write", "vault_vault_write", "write",
+    ], "mutations must never gain an equivalent-name alias"
+
+
 @test("tool_search_repeat_miss", "execution scope filters discovery and invocation")
 async def t_execution_scope_enforced(_ctx: TestContext) -> None:
     from src.core import tool_scope

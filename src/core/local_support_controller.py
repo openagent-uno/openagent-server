@@ -47,6 +47,39 @@ _CLICKUP_LISTS = {
     "esound": "901512182215",
 }
 
+# One support turn can do deterministic I/O alongside the others, but the
+# final classifier/composer model is a scarce single lane on production.  Four
+# simultaneous generations made 76/100 real-corpus replies hit the eight-second
+# fallback, while the identical corpus at concurrency one composed 14/16
+# eligible replies successfully.  Queue only the short model leg; ClickUp,
+# diagnostics and account lookups remain concurrent and the outer 600-second
+# event deadline still bounds the whole turn.
+_SUPPORT_MODEL_CONCURRENCY = max(
+    1, int(os.environ.get("OPENAGENT_ESOUND_MODEL_CONCURRENCY", "1")),
+)
+_SUPPORT_MODEL_GATE = asyncio.Semaphore(_SUPPORT_MODEL_CONCURRENCY)
+
+
+async def _generate_support_model(
+    model: Any,
+    *,
+    messages: list[dict[str, str]],
+    system: str,
+    session_id: str,
+    timeout_env: str,
+    default_timeout: str = "12",
+) -> Any:
+    """Run one tool-less support model call through the bounded local lane."""
+    async with _SUPPORT_MODEL_GATE:
+        return await asyncio.wait_for(
+            model.generate(
+                messages=messages,
+                system=system,
+                session_id=session_id,
+            ),
+            timeout=max(1.0, float(os.environ.get(timeout_env, default_timeout))),
+        )
+
 
 @dataclass(frozen=True)
 class Tenant:
@@ -1103,18 +1136,15 @@ async def _classify_with_model(
     token = set_tool_allowlist([])
     try:
         with strict_local_only_scope(True), stateless_completion_scope(True):
-            response = await asyncio.wait_for(
-                model.generate(
-                    messages=[{
-                        "role": "user",
-                        "content": json.dumps(packet, ensure_ascii=False),
-                    }],
-                    system=_CLASSIFIER_SYSTEM,
-                    session_id=f"{session_id}:local-support-classify",
-                ),
-                timeout=max(1.0, float(os.environ.get(
-                    "OPENAGENT_ESOUND_CLASSIFIER_TIMEOUT_SECONDS", "8",
-                ))),
+            response = await _generate_support_model(
+                model,
+                messages=[{
+                    "role": "user",
+                    "content": json.dumps(packet, ensure_ascii=False),
+                }],
+                system=_CLASSIFIER_SYSTEM,
+                session_id=f"{session_id}:local-support-classify",
+                timeout_env="OPENAGENT_ESOUND_CLASSIFIER_TIMEOUT_SECONDS",
             )
     except Exception as exc:  # noqa: BLE001 - the deterministic label stands
         elog("support_controller.classify_failed", level="warning",
@@ -3393,17 +3423,14 @@ async def _fallback_in_language(
     token = set_tool_allowlist([])
     try:
         with strict_local_only_scope(True), stateless_completion_scope(True):
-            response = await asyncio.wait_for(
-                model.generate(
-                    messages=[{"role": "user", "content": json.dumps(
-                        {"language": language, "text": base}, ensure_ascii=False,
-                    )}],
-                    system=system,
-                    session_id=f"{session_id}:local-support-translate",
-                ),
-                timeout=max(1.0, float(os.environ.get(
-                    "OPENAGENT_ESOUND_COMPOSER_TIMEOUT_SECONDS", "8",
-                ))),
+            response = await _generate_support_model(
+                model,
+                messages=[{"role": "user", "content": json.dumps(
+                    {"language": language, "text": base}, ensure_ascii=False,
+                )}],
+                system=system,
+                session_id=f"{session_id}:local-support-translate",
+                timeout_env="OPENAGENT_ESOUND_COMPOSER_TIMEOUT_SECONDS",
             )
     except Exception as exc:  # noqa: BLE001 - English text beats no text
         elog("support_controller.translate_failed", level="warning",
@@ -3473,19 +3500,16 @@ async def _rephrase_from_receipt(
     token = set_tool_allowlist([])
     try:
         with strict_local_only_scope(True), stateless_completion_scope(True):
-            response = await asyncio.wait_for(
-                model.generate(
-                    messages=[{"role": "user", "content": json.dumps({
-                        "must_convey": base,
-                        "reply_language": language,
-                        "customer_message": state.customer_message[:600],
-                    }, ensure_ascii=False, default=str)}],
-                    system=system,
-                    session_id=f"{session_id}:local-support-rephrase",
-                ),
-                timeout=max(1.0, float(os.environ.get(
-                    "OPENAGENT_ESOUND_COMPOSER_TIMEOUT_SECONDS", "8",
-                ))),
+            response = await _generate_support_model(
+                model,
+                messages=[{"role": "user", "content": json.dumps({
+                    "must_convey": base,
+                    "reply_language": language,
+                    "customer_message": state.customer_message[:600],
+                }, ensure_ascii=False, default=str)}],
+                system=system,
+                session_id=f"{session_id}:local-support-rephrase",
+                timeout_env="OPENAGENT_ESOUND_COMPOSER_TIMEOUT_SECONDS",
             )
     except Exception as exc:  # noqa: BLE001 - the receipt sentence is the fallback
         elog("support_controller.rephrase_failed", level="warning", error=str(exc)[:300])
@@ -3662,18 +3686,15 @@ async def _compose_local(
     token = set_tool_allowlist([])
     try:
         with strict_local_only_scope(True), stateless_completion_scope(True):
-            response = await asyncio.wait_for(
-                model.generate(
-                    messages=[{
-                        "role": "user",
-                        "content": json.dumps(packet, ensure_ascii=False, default=str),
-                    }],
-                    system=system,
-                    session_id=f"{session_id}:local-support-compose",
-                ),
-                timeout=max(1.0, float(os.environ.get(
-                    "OPENAGENT_ESOUND_COMPOSER_TIMEOUT_SECONDS", "8",
-                ))),
+            response = await _generate_support_model(
+                model,
+                messages=[{
+                    "role": "user",
+                    "content": json.dumps(packet, ensure_ascii=False, default=str),
+                }],
+                system=system,
+                session_id=f"{session_id}:local-support-compose",
+                timeout_env="OPENAGENT_ESOUND_COMPOSER_TIMEOUT_SECONDS",
             )
     except Exception as exc:  # noqa: BLE001 - deterministic reply is the fallback
         elog("support_controller.compose_failed", level="warning", error=str(exc)[:300])

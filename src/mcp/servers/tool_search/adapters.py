@@ -106,6 +106,19 @@ def _candidate_names(server: str, tool: str) -> list[str]:
         add(f"{pfx}{tool}")          # bare leaf → add the server prefix
         if tool.startswith(pfx):
             add(tool[len(pfx):])     # doubled prefix → drop one copy
+    # Explicit, read-only compatibility aliases.  These are deliberately not
+    # fuzzy matches: both names mean the same keyword search, but the lean
+    # support profile exposes the ordinary ``vault`` server (whose registered
+    # key is ``vault_search_notes``) while older prompts and the vault-gate
+    # surface taught models to call ``vault_search``.  Letting that harmless
+    # vocabulary drift fail costs a complete model turn and can leave support
+    # without its policy lookup.  Keep this list tiny and never put mutations
+    # here: an alias may only select a known equivalent read operation.
+    safe_aliases = {
+        ("vault", "vault_search"): ("vault_search_notes",),
+    }
+    for alias in safe_aliases.get((server, tool), ()):
+        add(alias)
     return out
 
 
