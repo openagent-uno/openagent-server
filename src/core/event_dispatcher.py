@@ -691,15 +691,17 @@ async def _dispatch_prompt(*, agent, db, event, payload, delivery_id, source, on
 
     async def _run_bound_turn():
         with dry_run_scope(is_dry), lean_local_event_scope(use_lean_local):
-            # Opt-in deterministic eSound lane. It performs policy/tool routing
-            # itself and uses the pinned local model only as a tool-less final
-            # composer. Disabled by default; copied agents can exercise it
-            # against simulators without changing ordinary prompt events.
+            # Opt-in deterministic support lane. It performs policy/tool
+            # routing itself and uses the event's pinned model only as a
+            # tool-less final composer. Do NOT couple this explicit controller
+            # gate to ``use_lean_local``: our production Replio event is pinned
+            # to ``local:claude-haiku-4-5`` (a cloud-family model behind our
+            # local proxy), so the lean-profile detector correctly returns
+            # false. Requiring both flags silently bypassed the controller and
+            # sent real eSound/Lyra threads through the generic tool-using
+            # agent even while execute+drafts was configured.
             from src.core import local_support_controller
-            if (
-                use_lean_local
-                and local_support_controller.enabled(event)
-            ):
+            if local_support_controller.enabled(event):
                 return await asyncio.wait_for(
                     local_support_controller.run(
                         agent=agent,

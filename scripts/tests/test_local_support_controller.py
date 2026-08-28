@@ -165,6 +165,57 @@ async def t_controller_gate(_ctx: TestContext) -> None:
             os.environ["OPENAGENT_ESOUND_SUPPORT_CONTROLLER"] = old
 
 
+@test(
+    "local_support_controller",
+    "explicit Replio controller is not bypassed by a cloud-family composer",
+)
+async def t_controller_outranks_lean_profile(ctx: TestContext) -> None:
+    """The controller owns support even when the composer is cloud-family."""
+    from src.core import local_support_controller as controller
+    from src.core.event_dispatcher import _dispatch_prompt
+    from src.memory.db import MemoryDB
+
+    class _Agent:
+        name = "support-test"
+        model = None
+
+    called: list[str] = []
+    original_run = controller.run
+    previous = os.environ.get("OPENAGENT_ESOUND_SUPPORT_CONTROLLER")
+
+    async def fake_controller_run(**kwargs):
+        called.append(str(kwargs["event"].get("model") or ""))
+        return controller.ControllerResult(
+            session_id=kwargs["session_id"], text='{"controller":"test"}',
+        )
+
+    db = MemoryDB(str(ctx.db_path))
+    await db.connect()
+    controller.run = fake_controller_run
+    os.environ["OPENAGENT_ESOUND_SUPPORT_CONTROLLER"] = "execute"
+    try:
+        result = await _dispatch_prompt(
+            agent=_Agent(), db=db,
+            event={
+                "id": "ev-replio", "name": "Replio support",
+                "slug": "replio-thread", "model": "local:claude-haiku-4-5",
+                "prompt_template": "support",
+            },
+            payload={"thread_id": "thread-test"},
+            delivery_id="delivery-test", source="webhook",
+        )
+        assert result["status"] == "success", result
+        assert called == ["local:claude-haiku-4-5"], called
+        assert '"controller":"test"' in result["output"], result
+    finally:
+        controller.run = original_run
+        if previous is None:
+            os.environ.pop("OPENAGENT_ESOUND_SUPPORT_CONTROLLER", None)
+        else:
+            os.environ["OPENAGENT_ESOUND_SUPPORT_CONTROLLER"] = previous
+        await db.close()
+
+
 @test("local_support_controller", "active Premium uses BillingBear and deterministic policy wording")
 async def t_active_premium(_ctx: TestContext) -> None:
     from src.core.local_support_controller import run
