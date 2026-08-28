@@ -2632,3 +2632,315 @@ async def t_detail_resolver_contract(_ctx: TestContext) -> None:
             if "gateway" in locals():
                 await operational.stop_background_maintenance(gateway)
             await db.close()
+
+
+@test(
+    "operational_api",
+    "detail resolver deep-links require independent target visibility",
+)
+async def t_detail_resolver_deep_link_acl(_ctx: TestContext) -> None:
+    from src.gateway.api import operational
+    from src.memory.db import MemoryDB
+    from src.memory.operational.automation import claim_resource, project_automation
+
+    with TemporaryDirectory(prefix="openagent-operational-detail-links-") as directory:
+        db = MemoryDB(str(Path(directory) / "openagent.db"))
+        await db.connect()
+        gateway = None
+        try:
+            tenant, gateway = await _seed_complete_fixture(db)
+            conn = db._conn
+            assert conn is not None
+            request = _Request(
+                gateway,
+                tenant=tenant,
+                handle="alice",
+                device="alice-device",
+            )
+            await _ready_capabilities(operational, request)
+
+            async def settle_automation_changes() -> None:
+                await project_automation(conn)
+                await conn.commit()
+
+            async def grant_view(
+                resource_type: str,
+                resource_id: str,
+                acl_version: int,
+            ) -> None:
+                await conn.execute(
+                    "INSERT INTO resource_acl "
+                    "(tenant_id,resource_type,resource_id,principal_type,"
+                    "principal_id,permission,acl_version,"
+                    "granted_by_principal_id,granted_at_ms) "
+                    "VALUES(?,?,?,?,?,'view',?,?,?)",
+                    (
+                        tenant,
+                        resource_type,
+                        resource_id,
+                        "user",
+                        "alice",
+                        acl_version,
+                        "user:bob",
+                        int(time.time() * 1000),
+                    ),
+                )
+                await conn.commit()
+
+            # The workflow itself is installation-visible, but its two child
+            # sessions have independent ACLs. Both the canonical trace_steps
+            # and compatibility trace must redact Bob's child without hiding
+            # Alice's child from the same response.
+            trace = [
+                {
+                    "node_id": "visible-child",
+                    "type": "agent",
+                    "status": "success",
+                    "child_session_id": "orchid-child",
+                    "started_at": time.time(),
+                },
+                {
+                    "node_id": "hidden-child",
+                    "type": "agent",
+                    "status": "success",
+                    "child_session_id": "forbidden-chat",
+                    "started_at": time.time(),
+                },
+            ]
+            await conn.execute(
+                "UPDATE workflow_runs SET trace_json=? WHERE id=?",
+                (json.dumps(trace), "orchid-workflow-run"),
+            )
+            await settle_automation_changes()
+            workflow = await db.get_workflow_run("orchid-workflow-run")
+            workflow_detail = await operational.decorate_workflow_run_detail(
+                request, workflow
+            )
+            assert workflow_detail is not None
+            assert [
+                step["child_session_id"]
+                for step in workflow_detail["trace_steps"]
+            ] == ["orchid-child", None]
+            assert [
+                step["child_session_id"] for step in workflow_detail["trace"]
+            ] == ["orchid-child", None]
+            assert "forbidden-chat" not in json.dumps(workflow_detail)
+
+            # Scheduled-run navigation is equally independent from the run's
+            # own ACL: an allowed run cannot disclose a guessed child session.
+            await conn.execute(
+                "UPDATE task_runs SET session_id=? WHERE id=?",
+                ("orchid-child", "orchid-task-run"),
+            )
+            await settle_automation_changes()
+            scheduled_visible = await operational.handle_scheduled_run(
+                _Request(
+                    gateway,
+                    tenant=tenant,
+                    handle="alice",
+                    device="alice-device",
+                    match={"run_id": "orchid-task-run"},
+                )
+            )
+            assert scheduled_visible.status == 200, scheduled_visible.text
+            assert _payload(scheduled_visible)["session_id"] == "orchid-child"
+            await conn.execute(
+                "UPDATE task_runs SET session_id=? WHERE id=?",
+                ("forbidden-chat", "orchid-task-run"),
+            )
+            await settle_automation_changes()
+            scheduled_hidden = await operational.handle_scheduled_run(
+                _Request(
+                    gateway,
+                    tenant=tenant,
+                    handle="alice",
+                    device="alice-device",
+                    match={"run_id": "orchid-task-run"},
+                )
+            )
+            assert scheduled_hidden.status == 200, scheduled_hidden.text
+            assert _payload(scheduled_hidden)["session_id"] is None
+            assert "forbidden-chat" not in scheduled_hidden.text
+
+            # Event detail keeps both its legacy link columns and canonical
+            # downstream_target in sync with the linked target's ACL.
+            await conn.execute(
+                "UPDATE event_deliveries SET session_id=?, "
+                "workflow_run_id=NULL, task_run_id=NULL WHERE id=?",
+                ("orchid-child", "orchid-delivery"),
+            )
+            await settle_automation_changes()
+            event = await db.get_event_delivery("orchid-delivery")
+            event_visible = await operational.decorate_event_delivery_detail(
+                request, event
+            )
+            assert event_visible is not None
+            assert event_visible["session_id"] == "orchid-child"
+            assert event_visible["downstream_target"] == {
+                "kind": "chat",
+                "session_id": "orchid-child",
+            }
+            await conn.execute(
+                "UPDATE event_deliveries SET session_id=? WHERE id=?",
+                ("forbidden-chat", "orchid-delivery"),
+            )
+            await settle_automation_changes()
+            event = await db.get_event_delivery("orchid-delivery")
+            event_hidden = await operational.decorate_event_delivery_detail(
+                request, event
+            )
+            assert event_hidden is not None
+            assert event_hidden["session_id"] is None
+            assert event_hidden["downstream_target"] is None
+            assert "forbidden-chat" not in json.dumps(event_hidden)
+
+            # A current explicit grant admits the previously hidden session
+            # everywhere without changing ownership of either parent run.
+            session_acl_version = int(
+                (
+                    await (
+                        await conn.execute(
+                            "SELECT acl_version FROM sessions_v2 WHERE id=?",
+                            ("forbidden-chat",),
+                        )
+                    ).fetchone()
+                )[0]
+            )
+            await grant_view("session", "forbidden-chat", session_acl_version)
+            workflow = await db.get_workflow_run("orchid-workflow-run")
+            workflow_granted = await operational.decorate_workflow_run_detail(
+                request, workflow
+            )
+            assert workflow_granted is not None
+            assert workflow_granted["trace_steps"][1]["child_session_id"] == (
+                "forbidden-chat"
+            )
+            assert workflow_granted["trace"][1]["child_session_id"] == (
+                "forbidden-chat"
+            )
+            scheduled_granted = await operational.handle_scheduled_run(
+                _Request(
+                    gateway,
+                    tenant=tenant,
+                    handle="alice",
+                    device="alice-device",
+                    match={"run_id": "orchid-task-run"},
+                )
+            )
+            assert _payload(scheduled_granted)["session_id"] == "forbidden-chat"
+            event = await db.get_event_delivery("orchid-delivery")
+            event_granted = await operational.decorate_event_delivery_detail(
+                request, event
+            )
+            assert event_granted is not None
+            assert event_granted["session_id"] == "forbidden-chat"
+            assert event_granted["downstream_target"]["session_id"] == (
+                "forbidden-chat"
+            )
+
+            # Event deliveries can point at separate automation-run resources.
+            # Directly owning the event does not reveal a Bob-owned workflow
+            # or scheduled run; a view grant on that exact run does.
+            await claim_resource(
+                conn,
+                tenant_id=tenant,
+                resource_type="workflow_run",
+                resource_id="orchid-workflow-run",
+                owner_principal_id="user:bob",
+            )
+            await conn.execute(
+                "UPDATE event_deliveries SET session_id=NULL, "
+                "workflow_run_id=?, task_run_id=NULL WHERE id=?",
+                ("orchid-workflow-run", "orchid-delivery"),
+            )
+            await settle_automation_changes()
+            event = await db.get_event_delivery("orchid-delivery")
+            hidden_workflow = await operational.decorate_event_delivery_detail(
+                request, event
+            )
+            assert hidden_workflow is not None
+            assert hidden_workflow["workflow_run_id"] is None
+            assert hidden_workflow["downstream_target"] is None
+            assert "orchid-workflow-run" not in json.dumps(hidden_workflow)
+            workflow_acl_version = int(
+                (
+                    await (
+                        await conn.execute(
+                            "SELECT acl_version FROM operational_resource_owners "
+                            "WHERE tenant_id=? AND resource_type='workflow_run' "
+                            "AND resource_id=?",
+                            (tenant, "orchid-workflow-run"),
+                        )
+                    ).fetchone()
+                )[0]
+            )
+            await grant_view(
+                "workflow_run",
+                "orchid-workflow-run",
+                workflow_acl_version,
+            )
+            event = await db.get_event_delivery("orchid-delivery")
+            granted_workflow = await operational.decorate_event_delivery_detail(
+                request, event
+            )
+            assert granted_workflow is not None
+            assert granted_workflow["workflow_run_id"] == "orchid-workflow-run"
+            assert granted_workflow["downstream_target"] == {
+                "kind": "workflow_run",
+                "run_id": "orchid-workflow-run",
+                "workflow_id": "orchid-workflow",
+            }
+
+            await claim_resource(
+                conn,
+                tenant_id=tenant,
+                resource_type="scheduled_run",
+                resource_id="orchid-task-run",
+                owner_principal_id="user:bob",
+            )
+            await conn.execute(
+                "UPDATE event_deliveries SET workflow_run_id=NULL, task_run_id=? "
+                "WHERE id=?",
+                ("orchid-task-run", "orchid-delivery"),
+            )
+            await settle_automation_changes()
+            event = await db.get_event_delivery("orchid-delivery")
+            hidden_task = await operational.decorate_event_delivery_detail(
+                request, event
+            )
+            assert hidden_task is not None
+            assert hidden_task["task_run_id"] is None
+            assert hidden_task["downstream_target"] is None
+            assert "orchid-task-run" not in json.dumps(hidden_task)
+            task_acl_version = int(
+                (
+                    await (
+                        await conn.execute(
+                            "SELECT acl_version FROM operational_resource_owners "
+                            "WHERE tenant_id=? AND resource_type='scheduled_run' "
+                            "AND resource_id=?",
+                            (tenant, "orchid-task-run"),
+                        )
+                    ).fetchone()
+                )[0]
+            )
+            await grant_view(
+                "scheduled_run",
+                "orchid-task-run",
+                task_acl_version,
+            )
+            event = await db.get_event_delivery("orchid-delivery")
+            granted_task = await operational.decorate_event_delivery_detail(
+                request, event
+            )
+            assert granted_task is not None
+            assert granted_task["task_run_id"] == "orchid-task-run"
+            assert granted_task["downstream_target"] == {
+                "kind": "scheduled_run",
+                "run_id": "orchid-task-run",
+                "task_id": "orchid-task",
+            }
+        finally:
+            if gateway is not None:
+                await operational.stop_background_maintenance(gateway)
+            await db.close()

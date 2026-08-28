@@ -925,6 +925,22 @@ async def _session_acl_row(conn: Any, session_id: str):
     ).fetchone()
 
 
+async def _visible_session_link(
+    conn: Any,
+    access: AccessContext,
+    value: Any,
+) -> str | None:
+    """Return a session id only when this caller may currently view it."""
+
+    if value is None:
+        return None
+    session_id = str(value)
+    acl = await _session_acl_row(conn, session_id)
+    if acl is None or not await resource_is_visible(conn, acl, access):
+        return None
+    return session_id
+
+
 _MAX_SESSION_TREE_DEPTH = 128
 
 
@@ -3024,7 +3040,7 @@ async def decorate_workflow_run_detail(request: web.Request, row: dict[str, Any]
         await conn.execute("SELECT name FROM workflow_tasks WHERE id=?", (row["workflow_id"],))
     ).fetchone()
     status, mapped = _normalize_public_status(row.get("status"))
-    out = dict(row)  # legacy ``trace``/inputs/outputs remain additive-compatible
+    out = dict(row)  # legacy inputs/outputs remain additive-compatible
     started_ms = int(float(row["started_at"]) * 1000)
     finished_ms = int(float(row["finished_at"]) * 1000) if row.get("finished_at") else None
     out["started_at_epoch"] = row["started_at"]
@@ -3032,7 +3048,32 @@ async def decorate_workflow_run_detail(request: web.Request, row: dict[str, Any]
     out["status_raw"] = row.get("status")
     out["status"] = status
     out["title"] = str(workflow[0] if workflow else f"Workflow run {str(row['id'])[:8]}")
-    out["trace_steps"] = _workflow_trace_steps(str(row["id"]), row.get("trace"), run_started_ms=started_ms)
+    trace_steps = _workflow_trace_steps(
+        str(row["id"]), row.get("trace"), run_started_ms=started_ms
+    )
+    visible_child_ids: set[str] = set()
+    for step in trace_steps:
+        child_id = step.get("child_session_id")
+        visible_id = await _visible_session_link(conn, access, child_id)
+        step["child_session_id"] = visible_id
+        if visible_id:
+            visible_child_ids.add(visible_id)
+    # Stable clients still inspect the legacy trace. Preserve its shape but
+    # redact the same unauthorized links as the canonical trace_steps array.
+    raw_trace = row.get("trace")
+    if isinstance(raw_trace, list):
+        safe_trace: list[Any] = []
+        for raw_step in raw_trace:
+            if not isinstance(raw_step, dict):
+                safe_trace.append(raw_step)
+                continue
+            safe_step = dict(raw_step)
+            child_id = safe_step.get("child_session_id")
+            if child_id and str(child_id) not in visible_child_ids:
+                safe_step["child_session_id"] = None
+            safe_trace.append(safe_step)
+        out["trace"] = safe_trace
+    out["trace_steps"] = trace_steps
     # Existing app releases do numeric duration arithmetic on the base epoch
     # keys. Keep them stable and expose canonical ISO mirrors additively.
     out["started_at_iso"] = _iso(started_ms)
@@ -3061,6 +3102,9 @@ async def handle_scheduled_run(request: web.Request) -> web.Response:
         if not await resource_is_visible(conn, acl, access):
             raise ApiProblem(404, "target_not_found", "This result is no longer available")
         status, mapped = _normalize_public_status(row["status"])
+        visible_session_id = await _visible_session_link(
+            conn, access, row["session_id"]
+        )
         return _json(
             {
                 "id": run_id,
@@ -3068,7 +3112,7 @@ async def handle_scheduled_run(request: web.Request) -> web.Response:
                 "title": str(row["name"]),
                 "status": status,
                 "trigger": str(row["trigger"]) if row["trigger"] else None,
-                "session_id": str(row["session_id"]) if row["session_id"] else None,
+                "session_id": visible_session_id,
                 "output_summary_safe": _redacted_summary(row["output"]),
                 "error_safe": "Scheduled execution failed; sensitive details are redacted" if row["error"] else None,
                 "caused_by": None,
@@ -3106,21 +3150,57 @@ async def decorate_event_delivery_detail(request: web.Request, row: dict[str, An
     event = await (await conn.execute("SELECT name FROM events WHERE id=?", (row["event_id"],))).fetchone()
     status, mapped = _normalize_public_status(row.get("status"))
     downstream = None
+    visible_session_id = await _visible_session_link(
+        conn, access, row.get("session_id")
+    )
+    visible_workflow_run_id = None
+    visible_task_run_id = None
     if row.get("workflow_run_id"):
         workflow_id = await (
             await conn.execute("SELECT workflow_id FROM workflow_runs WHERE id=?", (row["workflow_run_id"],))
         ).fetchone()
         if workflow_id:
-            downstream = {"kind": "workflow_run", "run_id": str(row["workflow_run_id"]), "workflow_id": str(workflow_id[0])}
+            run_acl = await _automation_acl_row(
+                conn,
+                access,
+                "workflow_run",
+                str(row["workflow_run_id"]),
+                ("workflow_definition", str(workflow_id[0])),
+            )
+            if await resource_is_visible(conn, run_acl, access):
+                visible_workflow_run_id = str(row["workflow_run_id"])
+                downstream = {
+                    "kind": "workflow_run",
+                    "run_id": visible_workflow_run_id,
+                    "workflow_id": str(workflow_id[0]),
+                }
     elif row.get("task_run_id"):
         task_id = await (
             await conn.execute("SELECT task_id FROM task_runs WHERE id=?", (row["task_run_id"],))
         ).fetchone()
         if task_id:
-            downstream = {"kind": "scheduled_run", "run_id": str(row["task_run_id"]), "task_id": str(task_id[0])}
-    elif row.get("session_id"):
-        downstream = {"kind": "chat", "session_id": str(row["session_id"])}
-    out = dict(row)  # authorized legacy callers retain payload_json and links
+            run_acl = await _automation_acl_row(
+                conn,
+                access,
+                "scheduled_run",
+                str(row["task_run_id"]),
+                ("scheduled_definition", str(task_id[0])),
+            )
+            if await resource_is_visible(conn, run_acl, access):
+                visible_task_run_id = str(row["task_run_id"])
+                downstream = {
+                    "kind": "scheduled_run",
+                    "run_id": visible_task_run_id,
+                    "task_id": str(task_id[0]),
+                }
+    elif visible_session_id:
+        downstream = {"kind": "chat", "session_id": visible_session_id}
+    # Preserve authorized legacy payload fields, then replace every linked id
+    # with its independently-authorized value before serialization.
+    out = dict(row)
+    out["session_id"] = visible_session_id
+    out["workflow_run_id"] = visible_workflow_run_id
+    out["task_run_id"] = visible_task_run_id
     out["started_at_epoch"] = row["started_at"]
     out["finished_at_epoch"] = row.get("finished_at")
     out["status_raw"] = row.get("status")
