@@ -2623,3 +2623,42 @@ async def t_signal_is_two_class(_ctx: TestContext) -> None:
         assert set(sem.SIGNAL_NEGATIVE_EXEMPLARS) == set(sem.SIGNAL_EXEMPLARS)
     finally:
         sem.reset_for_tests()
+
+
+@test("local_support_controller", "a live store subscription beside a web one is named")
+async def t_other_store_subscription(_ctx: TestContext) -> None:
+    """The real 28-Aug-2026 account: a yearly Paddle plan bought on the web
+    while the old Google Play monthly kept renewing. The duplicate detector
+    reports nothing - it needs the SAME product on both providers - so without
+    this the customer is asked for more details about a charge we can already
+    see and explain."""
+    from src.core.local_support_controller import _other_store_active_subscription
+
+    paddle_yearly = {
+        "provider": "Paddle", "productId": "pro_01hqrb13tttrfgcfyy9eqykmpm",
+        "status": "Active", "isActive": True, "willRenew": True,
+        "expiresAt": "2027-07-27T14:59:31+00:00",
+        "renewsAt": "2027-07-27T14:59:31+00:00",
+    }
+    play_monthly = {
+        "provider": "Google", "productId": "esoundpremium_m:p1m",
+        "status": "Active", "isActive": True, "willRenew": True,
+        "expiresAt": "2027-01-29T14:48:23+00:00",
+        "renewsAt": "2027-01-29T14:48:23+00:00",
+    }
+
+    found = _other_store_active_subscription(
+        [paddle_yearly, play_monthly], "paddle",
+    )
+    assert found.get("store") == "google", found
+    assert found.get("productId") == "esoundpremium_m:p1m", found
+
+    # One subscription is not a second one, whatever the store says.
+    assert _other_store_active_subscription([paddle_yearly], "paddle") == {}
+    # Neither is an expired leftover: telling somebody to cancel a plan that
+    # already ended is a wrong instruction, not a harmless one.
+    expired = {**play_monthly, "expiresAt": "2020-01-01T00:00:00+00:00"}
+    assert _other_store_active_subscription([paddle_yearly, expired], "paddle") == {}
+    # ...nor two rows from the same provider.
+    same = {**paddle_yearly, "productId": "pro_other"}
+    assert _other_store_active_subscription([paddle_yearly, same], "paddle") == {}

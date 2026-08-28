@@ -1817,6 +1817,48 @@ def _subscriptions_of(result: Any) -> list[dict[str, Any]]:
     ]
 
 
+def _other_store_active_subscription(
+    subscriptions: list[dict[str, Any]], premium_store: str,
+) -> dict[str, Any]:
+    """An active subscription billed by a DIFFERENT store than the one the
+    account's premium comes from, as a PII-free summary.
+
+    This is the shape of "I bought the yearly plan and the old monthly one is
+    still charging me": two live subscriptions, two providers, and the one
+    that is still taking money is not the one we can see in the app.
+    """
+    if not subscriptions:
+        return {}
+    current = str(premium_store or "").strip().lower()
+    live: list[dict[str, Any]] = []
+    for item in subscriptions:
+        if item.get("isActive") is False:
+            continue
+        status = str(item.get("status") or "").strip().lower()
+        if status and status != "active":
+            continue
+        if not status and item.get("isActive") is not True:
+            continue
+        expires = _expires_at(item.get("expiresAt") or item.get("expires_at"))
+        if expires is not None and expires <= datetime.now(timezone.utc):
+            continue
+        live.append(item)
+    if len(live) < 2:
+        return {}
+    for item in live:
+        store = str(
+            item.get("provider") or item.get("store") or "",
+        ).strip().lower()
+        if store and current and store != current:
+            return {
+                "store": store,
+                "productId": str(item.get("productId") or ""),
+                "renewsAt": str(item.get("renewsAt") or item.get("expiresAt") or ""),
+                "willRenew": bool(item.get("willRenew")),
+            }
+    return {}
+
+
 def _expires_at(value: Any) -> datetime | None:
     """Parse an entitlement expiry, or None when it cannot be read.
 
@@ -5678,8 +5720,40 @@ async def run(
                                 "state an amount or a date the receipt does not carry."
                             )
                     else:
-                        state.decision = "ask_information"
-                        state.outcome = "duplicate_not_verified"
+                        # "No refundable duplicate" is not "nothing is wrong".
+                        # The detector needs the SAME product on two providers;
+                        # the common real case is a store subscription still
+                        # running next to a web one - a different product id,
+                        # so it is invisible to that check while the customer
+                        # is genuinely paying twice. Measured 28-Aug-2026: a
+                        # yearly Paddle plan alongside a live Google Play
+                        # monthly, which is where her bank's failed charge
+                        # came from. We cannot cancel a store subscription;
+                        # naming it and where to stop it is the whole answer.
+                        other = _other_store_active_subscription(
+                            subscriptions, store,
+                        )
+                        if other:
+                            state.facts["other_store_subscription"] = other
+                            state.decision = "self_help"
+                            state.outcome = "duplicate_other_store_active"
+                            state.instructions.append(
+                                "A second subscription from another store is "
+                                "still active on this account, which is where "
+                                "the extra charge comes from. Name that store "
+                                "and "
+                                + _STORE_CANCEL_INSTRUCTION.get(
+                                    str(other.get("store") or "").lower(),
+                                    _STORE_CANCEL_FALLBACK,
+                                )
+                                + " Reassure them that cancelling it does not "
+                                "affect the subscription they are keeping. Do "
+                                "not state an amount or a date that is not in "
+                                "verified_facts, and do not promise a refund."
+                            )
+                        else:
+                            state.decision = "ask_information"
+                            state.outcome = "duplicate_not_verified"
                 elif state.intent == "cancel_subscription":
                     # Rule 2: cancellation is always granted. No "why", no
                     # retention offer. The only questions are WHERE it was
