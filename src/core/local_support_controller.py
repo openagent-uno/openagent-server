@@ -2207,6 +2207,12 @@ _BUG_SURFACES: tuple[tuple[str, str, str, str], ...] = (
     (r"\bsync\b|\bserver\b|\bapi\b|timeout|\b5\d\d\b", "the backend sync", "backend", "esound/backend-core"),
     (r"search|ricerca|buscar", "search", "client", "esound/client-core"),
     (r"download|offline|scarica", "downloads", "client", "esound/client-core"),
+    # An incidental playlist mention must not steal a playback failure. A live
+    # PC report said songs outside a playlist were unable to play and rapidly
+    # skipped; the generic playlist row filed it under library ownership.
+    (r"unable to play|can'?t play|won'?t play|not playing|play(?:ing)? (?:a )?(?:song|track)|"
+     r"skip(?:s|ping)? (?:songs?|tracks?)|riprodurre (?:un )?(?:brano|canzone)",
+     "playback", "client", "esound/client-core"),
     (r"playlist|library|folder|libreria|cartell", "the library", "client", "esound/client-core"),
     (r"play(?:back|er|ing)?\b|track|song|queue|riproduzione|brano", "playback", "client", "esound/client-core"),
 )
@@ -2315,13 +2321,42 @@ _MATCH_STOPWORDS = frozenset({
 })
 
 
-def _content_words(text: str) -> set[str]:
+_TASK_CONCEPTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("import", ("import", "importare", "importato", "importada", "importar")),
+    ("song", ("song", "songs", "track", "tracks", "canzone", "canzoni", "brano", "brani", "cancion", "canciones", "musica", "music")),
+    ("playlist", ("playlist", "playlists", "lista", "liste")),
+    ("playback", ("playback", "playing", "riproduzione", "reproduccion", "reproducción", "reproducir", "tocando")),
+    ("failure", ("broken", "failure", "fails", "failed", "error", "errore", "non funziona", "no funciona", "nao funciona", "não funciona", "ne fonctionne pas")),
+    ("loading", ("loading", "buffering", "caricamento", "cargando", "chargement")),
+    ("freeze", ("freeze", "frozen", "stuck", "bloccato", "bloccata", "si blocca", "congelado")),
+    ("crash", ("crash", "crashes", "crashing", "si chiude", "se cierra", "fecha sozinho")),
+    ("skip", ("skip", "skips", "skipping", "salta", "saltano", "saltar")),
+    ("library", ("library", "libreria", "biblioteca")),
+    ("search", ("search", "ricerca", "buscar", "busqueda", "búsqueda")),
+    ("login", ("login", "signin", "sign-in", "accesso", "accedere", "ingresar")),
+    ("download", ("download", "downloads", "scaricare", "scarica", "descargar", "baixar")),
+)
+
+
+def _task_content_words(text: str) -> set[str]:
+    """Distinctive words plus a small multilingual concept layer for dedup.
+
+    ClickUp titles are intentionally terse English while customer reports are
+    often inflected Italian/Spanish/Portuguese. Exact stems therefore miss the
+    very duplicate the search is meant to find. This is deterministic concept
+    normalization, not a root-cause guess: it only equates support vocabulary.
+    """
     body = _FORM_FIELD.sub("", str(text or ""))
     body = re.split(r"\n?---", body)[0]
-    return {
+    low = _normalise(body).lower()
+    words = {
         word for word in re.findall(r"[a-z]{4,}", body.lower())
         if word not in _MATCH_STOPWORDS
     }
+    for concept, variants in _TASK_CONCEPTS:
+        if any(variant in low for variant in variants):
+            words.add(concept)
+    return words
 
 
 def _task_shares_subject(task: Any, message: str) -> int:
@@ -2338,8 +2373,8 @@ def _task_shares_subject(task: Any, message: str) -> int:
     # Compare on stems: a task titled "Fix CarPlay disconnect" and a customer
     # writing "CarPlay disconnects" are the same defect, and exact word
     # equality would have filed a duplicate for the plural.
-    stems = {word[:5] for word in _content_words(title)}
-    shared = {word[:5] for word in _content_words(message)} & stems
+    stems = {word[:5] for word in _task_content_words(title)}
+    shared = {word[:5] for word in _task_content_words(message)} & stems
     return 3 if len(shared) >= 2 else 0
 
 
@@ -2649,14 +2684,29 @@ async def _route_bug(pool: Any, state: SupportState) -> None:
             "reproduce the problem, and never say it is already fixed."
         )
         missing = []
-    if missing and not urgent:
+    route_from_report = _bug_symptom_route(state.customer_message, state.tenant)
+    if missing:
+        state.facts["missing_evidence"] = missing
+    if missing and not urgent and route_from_report is None:
         state.decision = "ask_information"
         state.outcome = "bug_needs_evidence"
-        state.facts["missing_evidence"] = missing
         state.instructions.append(
             "Ask only for the missing bug evidence; do not say the bug is tracked."
         )
         return
+    if missing and route_from_report is not None:
+        # A deterministic symptom + owning surface is already actionable even
+        # when version/device metadata is incomplete. Search/link/create now,
+        # record unknown fields honestly, and ask for the missing metadata in
+        # the same reply. Returning before the dedup search left real bugs in
+        # support limbo and guaranteed that repeat reporters could not enrich
+        # an existing canonical task.
+        state.facts["partial_bug_evidence"] = True
+        state.instructions.append(
+            "The observed symptom and owning surface are actionable. Track it "
+            "now, keep absent metadata as unknown, and ask only for the fields "
+            "listed in missing_evidence after the receipt-backed tracking statement."
+        )
 
     # A sufficiently evidenced signal may reach ClickUp.  Load the complete
     # mandatory decision, format, dedup and component-routing policy before
@@ -2822,6 +2872,19 @@ def _diagnostic_reply_suffix(state: SupportState, italian: bool) -> str:
         f" Ho attivato la diagnostica {category}: riproduci il problema una volta e rispondi qui, così possiamo leggere i log raccolti."
         if italian else
         f" I enabled {category} diagnostics. Reproduce the issue once and reply here so we can read the captured logs."
+    )
+
+
+def _missing_bug_evidence_suffix(state: SupportState, italian: bool) -> str:
+    """Ask for metadata that can enrich an already tracked partial report."""
+    missing = [str(item) for item in (state.facts.get("missing_evidence") or []) if item]
+    if not missing:
+        return ""
+    joined = ", ".join(missing)
+    return (
+        f" Per completare il task, inviami anche: {joined}."
+        if italian else
+        f" To complete the task, please also send: {joined}."
     )
 
 
@@ -3054,7 +3117,11 @@ def _fallback_reply(state: SupportState) -> str:
                     if italian else
                     f"I opened and linked task {task_id} with your evidence. I can’t give a release date yet."
                 )
-            return base + _diagnostic_reply_suffix(state, italian)
+            return (
+                base
+                + _missing_bug_evidence_suffix(state, italian)
+                + _diagnostic_reply_suffix(state, italian)
+            )
         if state.outcome == "bug_already_reported":
             return (
                 "La tua segnalazione è già allegata al problema che stiamo seguendo: non serve rimandarla. Non posso indicare tempi di risoluzione."
@@ -3091,7 +3158,11 @@ def _fallback_reply(state: SupportState) -> str:
                     if italian else
                     f"I added the new evidence to existing task {task_id} and linked this report."
                 )
-            return base + _diagnostic_reply_suffix(state, italian)
+            return (
+                base
+                + _missing_bug_evidence_suffix(state, italian)
+                + _diagnostic_reply_suffix(state, italian)
+            )
         # `missing_evidence` vuoto significa "non manca niente", NON "non lo so":
         # l'`or` di prima lo scambiava per il secondo e faceva chiedere di nuovo
         # versione, dispositivo e passi a chi li aveva gia' scritti nel modulo.

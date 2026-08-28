@@ -1075,6 +1075,32 @@ async def t_bug_create_and_link(_ctx: TestContext) -> None:
     assert "release" not in output["reply"].lower() or "can’t" in output["reply"], output["reply"]
 
 
+@test("local_support_controller", "an actionable partial bug is tracked before asking for metadata")
+async def t_partial_bug_tracks_then_enriches(_ctx: TestContext) -> None:
+    """Version/OS enrich a clear bug; their absence must not discard it."""
+    doubles = _Doubles(create_id="86-pc-playback")
+    output = await _drive(
+        doubles,
+        "On the PC app, when I play a song outside my playlist it says unable "
+        "to play and rapidly skips songs in the background. My friend sees it too.",
+        thread_id="t-pc-partial",
+    )
+
+    assert output["outcome"] == "bug_created", output
+    assert output["decision"] == "bug_new_task", output
+    assert output["facts"]["partial_bug_evidence"] is True, output
+    assert output["facts"]["missing_evidence"] == ["app version", "device and OS"], output
+    assert "clickup_get_workspace_tasks" in doubles.names, doubles.names
+    assert "clickup_create_task" in doubles.names, doubles.names
+    assert "replio_thread_link_task" in doubles.names, doubles.names
+    created = doubles.args_for("clickup_create_task")[0]
+    assert created["name"] == "Fix blocked action in playback", created
+    reply = output["reply"].lower()
+    assert "86-pc-playback" in reply, output["reply"]
+    assert "app version" in reply, output["reply"]
+    assert "release date" in reply, output["reply"]
+
+
 @test("local_support_controller", "an unverifiable Replio link never becomes a tracked claim")
 async def t_bug_link_verification_failure(_ctx: TestContext) -> None:
     doubles = _Doubles(create_id="86-new-esound", link_ok=False)
@@ -1984,6 +2010,11 @@ async def t_dedup_is_judged(_ctx: TestContext) -> None:
         [{"name": "Fix crash in the library", "listId": "L1"}],
         "", "", "", "the sleep timer never stops the music",
     ) is None
+    # Customer language and terse ClickUp title language may differ.
+    translated = {"name": "Fix failed song import from playlist", "listId": "L1"}
+    assert lsc._best_task_match(
+        [translated], "", "", "", "importare canzoni dalla playlist non funziona",
+    ) is translated
 
 
 @test("local_support_controller", "the classifier covers what real threads actually say")

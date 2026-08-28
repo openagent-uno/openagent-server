@@ -294,6 +294,20 @@ CASES = (
         forbidden_reply=("known issue", "tracking", "opened a task"),
     ),
     OperationalCase(
+        "partial-pc-playback-bug-is-tasked-then-enriched",
+        "Thread sim-pc-partial: on the PC app, when I play a song outside my "
+        "playlist it says unable to play and rapidly skips songs in the "
+        "background. My friend sees it too.",
+        "bug_new_task",
+        expected_tools=(
+            "clickup_get_workspace_tasks", "clickup_create_task",
+            "replio_thread_link_task", "replio_threads_respond",
+        ),
+        forbidden_tools=("mark_for_human",),
+        reply_all=("86-local-created-client", "app version"),
+        forbidden_reply=("fixed", "released", "next update"),
+    ),
+    OperationalCase(
         "bug-dedup-existing-task",
         "Thread sim-bug-match: on iPhone 17 with iOS 20 and eSound 5.1.1, every time I tap Play the track stays on infinite loading and never starts.",
         "bug_existing_task",
