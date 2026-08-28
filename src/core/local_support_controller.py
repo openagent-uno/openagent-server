@@ -3051,6 +3051,49 @@ def _fallback_reply(state: SupportState) -> str:
             if italian else
             "Premium is active. Tell me where you purchased — App Store, Google Play, or the website — so I can give you the right step to recover it."
         )
+    if state.outcome == "duplicate_other_store_active":
+        # Deterministic on purpose, and not only as a fallback: the composer
+        # runs on a single local endpoint, and while it is down EVERY reply is
+        # this text. A customer told "I need more detail about the behavior,
+        # device and app version" in answer to "why is my old plan still
+        # charging me" is the worst possible reading of a question we have
+        # already answered from her account.
+        other = state.facts.get("other_store_subscription") or {}
+        store = str(other.get("store") or "").lower()
+        where = {
+            "google": ("dal Play Store: play.google.com/store/account/subscriptions",
+                       "in the Play Store: play.google.com/store/account/subscriptions"),
+            "apple": ("da Impostazioni > il tuo nome > Abbonamenti sul dispositivo",
+                      "in Settings > your name > Subscriptions on your device"),
+        }.get(store)
+        if where is None:
+            return (
+                "Sul tuo account risultano due abbonamenti attivi: quello che "
+                "stai usando e uno precedente, preso da un altro store, che non "
+                "e' mai stato disdetto — l'addebito arriva da li'. Va fermato "
+                "nello store dove l'hai preso, perche' noi non possiamo "
+                "disdirlo al posto tuo. Farlo non tocca l'abbonamento che tieni."
+                if italian else
+                "There are two active subscriptions on your account: the one "
+                "you are using and an earlier one from another store that was "
+                "never cancelled — that is where the charge comes from. It has "
+                "to be stopped in the store where it was bought, because we "
+                "cannot cancel it for you. Doing that does not affect the "
+                "subscription you are keeping."
+            )
+        return (
+            f"Sul tuo account risultano due abbonamenti attivi: quello che stai "
+            f"usando e il precedente, mai disdetto — l'addebito arriva da li'. "
+            f"Disdicilo {where[0]}, con lo stesso account con cui l'hai preso: "
+            f"noi non possiamo disdirlo al posto tuo. Non tocca l'abbonamento "
+            f"che tieni."
+            if italian else
+            f"There are two active subscriptions on your account: the one you "
+            f"are using and the earlier one, never cancelled — that is where "
+            f"the charge comes from. Cancel it {where[1]}, with the same "
+            f"account that bought it: we cannot cancel it for you. It does not "
+            f"affect the subscription you are keeping."
+        )
     if state.outcome == "premium_unverified_paddle_scope":
         return (
             "Sul canale di acquisto web non risulta nulla con questa email, ma non copre gli acquisti da App Store o Google Play. Inviami la ricevuta o l’ID ordine dello store e verifico."
@@ -3847,6 +3890,19 @@ async def _compose_local(
         # Store-specific recovery is policy, not prose: a measured composer
         # changed "close and reopen the app" into "close your browser" for a
         # web subscription. Keep the verified store branch deterministic.
+        state.facts["reply_source"] = "deterministic:billing_policy"
+        language = str(state.facts.get("language") or "en")
+        if language in {"en", "it"}:
+            return _fallback_reply(state)
+        return await _fallback_in_language(
+            agent, event, state, session_id, "billing_policy",
+        )
+    if state.outcome == "duplicate_other_store_active":
+        # Which store, and that we cannot cancel there ourselves, is policy in
+        # the same way the recovery step above is. A composer that softens
+        # "we cannot cancel it for you" into an offer to do it is a promise we
+        # cannot keep, and one that renames the store sends the customer to a
+        # settings screen that does not hold their subscription.
         state.facts["reply_source"] = "deterministic:billing_policy"
         language = str(state.facts.get("language") or "en")
         if language in {"en", "it"}:

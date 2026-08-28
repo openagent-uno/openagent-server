@@ -108,6 +108,26 @@ if ROLE == "billingbear":
                 ],
                 "entitlements": [{"id": "premium", "status": "active"}],
             },
+            # A yearly web plan with the OLD store subscription still live.
+            # Different product ids, so the duplicate detector reports nothing
+            # while the customer really is paying twice - the shape behind the
+            # Spanish "Cobro denegado" thread of 28-Aug-2026.
+            "test-other-store": {
+                "isPremium": True,
+                "store": "paddle",
+                "clientVersion": "5.2.2",
+                "subscriptions": [
+                    {"id": "sub-web-yearly", "provider": "Paddle",
+                     "productId": "pro_yearly", "status": "active",
+                     "isActive": True, "willRenew": True,
+                     "expiresAt": "2027-07-27T14:59:31+00:00"},
+                    {"id": "sub-play-monthly", "provider": "Google",
+                     "productId": "esoundpremium_m:p1m", "status": "active",
+                     "isActive": True, "willRenew": True,
+                     "expiresAt": "2027-01-29T14:48:23+00:00"},
+                ],
+                "entitlements": [{"id": "premium", "status": "active"}],
+            },
             "test-refund": {
                 "isPremium": True,
                 "store": "paddle",

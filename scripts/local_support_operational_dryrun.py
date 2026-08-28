@@ -151,6 +151,50 @@ CASES = (
         forbidden_reply=("team will", "i've refunded", "we refunded"),
     ),
     OperationalCase(
+        # The 28-Aug-2026 Spanish thread, word for word. No term list contains
+        # `cobro`, so before the semantic router this reached the model
+        # classifier and was handed to a person with an internal English
+        # sentence, before the account was ever read. What she actually has is
+        # a live Google Play monthly next to the web yearly she just bought -
+        # a different product id, so the duplicate detector reports nothing.
+        "es-old-store-subscription-still-charging",
+        "Thread sim-other-store: appUserId test-other-store escribe: Cobro "
+        "denegado. Antes en mi cuenta tenia un plan que pagaba mensualmente, y "
+        "recientemente pague por un plan de 1 anio. Hoy me llego una "
+        "notificacion de mi banco de que un cobro de 55 pesos no se pudo hacer "
+        "por saldo insuficiente. Mi pregunta es porque sigue queriendose "
+        "cobrar mi anterior plan mensual.",
+        "self_help",
+        expected_tools=(
+            "billingbear_get_v1_customers_by_appUserId",
+            "billingbear_detect_duplicate_subscriptions",
+        ),
+        forbidden_tools=(
+            "billingbear_refund_duplicate_subscriptions", "mark_for_human",
+        ),
+        reply_any=("google play", "play store", "google"),
+        forbidden_reply=("refunded", "we refunded", "reembolsado", "team will"),
+        language="es",
+    ),
+    OperationalCase(
+        # "got Premium" matches no paid-claim phrasing anybody wrote down, so a
+        # paying subscriber was told how to EARN Premium for free. Deliberately
+        # written WITHOUT the word appUserId: that token is itself a paid-claim
+        # marker, so a case that carries it would pass on the old regex alone
+        # and prove nothing. Only the address identifies the account here, the
+        # same way a real support mail does.
+        "paying-customer-is-not-offered-the-free-routes",
+        "Thread sim-paid-ads: the customer writes from premium@example.com. "
+        "Subject Premium and Advertisement? Hi, got Premium and new Altstore "
+        "Update bit get Ads? Please see pictures.",
+        "self_help",
+        forbidden_tools=("mark_for_human",),
+        forbidden_reply=(
+            "invite", "referral", "reward video", "rewarded", "for free",
+            "free premium",
+        ),
+    ),
+    OperationalCase(
         # A confirmation ALONE no longer cancels: policy needs the pending tag
         # and a previous outbound that asked, or this is still phase 1.
         "a-confirmation-alone-does-not-cancel",
