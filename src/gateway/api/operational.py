@@ -857,6 +857,33 @@ def _message_json(
     from src.stream.content_parts import parse_response_content
 
     parsed = parse_response_content(str(row["text"] or ""), allow_inline_ui=True)
+    tool_summary = None
+    if row["resolved_tool_id"]:
+        # A normalized ``role=tool`` message stores the provider/tool result in
+        # ``text`` while the invocation identity and lifecycle live in the
+        # canonical tool_invocations row.  Returning only the result text made
+        # clients fall back to rendering an enormous raw JSON block.  Keep the
+        # transcript page self-contained with a deliberately compact summary;
+        # arguments/results stay behind the separately-authorized detail
+        # endpoint and are never duplicated into the message envelope.
+        tool_summary = {
+            "id": str(row["resolved_tool_id"]),
+            "tool_call_id": str(row["resolved_tool_call_id"])
+            if row["resolved_tool_call_id"]
+            else None,
+            "tool_server": str(row["resolved_tool_server"])
+            if row["resolved_tool_server"]
+            else None,
+            "tool_name": str(row["resolved_tool_name"]),
+            "status": str(row["resolved_tool_status"]),
+            "child_run_id": str(row["resolved_child_run_id"])
+            if row["resolved_child_run_id"]
+            else None,
+            "child_session_id": str(row["resolved_child_session_id"])
+            if row["resolved_child_session_id"]
+            else None,
+            "completeness": str(row["resolved_tool_completeness"]),
+        }
     if canonical_parts is not None:
         ordered = [dict(part) for part in canonical_parts]
         canonical_attachments = [
@@ -894,6 +921,7 @@ def _message_json(
             "tool_invocation_id": str(row["resolved_tool_id"])
             if row["resolved_tool_id"]
             else None,
+            "tool_summary": tool_summary,
             "attachments": canonical_attachments,
             "parts": ordered,
             "created_at": _iso(row["created_at_ms"]),
@@ -963,6 +991,7 @@ def _message_json(
         # projection, so fail closed rather than mislabeling that blob.
         "visible_reasoning": None,
         "tool_invocation_id": str(row["resolved_tool_id"]) if row["resolved_tool_id"] else None,
+        "tool_summary": tool_summary,
         "attachments": canonical_attachments,
         "parts": ordered,
         "created_at": _iso(row["created_at_ms"]),
@@ -1046,11 +1075,18 @@ async def handle_session_messages(request: web.Request) -> web.Response:
             raise ApiProblem(400, "invalid_request", "before and after require around")
         state = _state(request)
         base_select = (
-            "SELECT m.*, (SELECT t.id FROM tool_invocations t "
-            "WHERE t.root_kind='session' AND t.session_id=m.session_id "
+            "SELECT m.*, t.id AS resolved_tool_id, "
+            "t.tool_call_id AS resolved_tool_call_id, "
+            "t.tool_server AS resolved_tool_server, "
+            "t.tool_name AS resolved_tool_name, "
+            "t.status AS resolved_tool_status, "
+            "t.child_run_id AS resolved_child_run_id, "
+            "t.child_session_id AS resolved_child_session_id, "
+            "t.completeness AS resolved_tool_completeness "
+            "FROM session_messages m LEFT JOIN tool_invocations t "
+            "ON t.root_kind='session' AND t.session_id=m.session_id "
             "AND t.session_run_id=m.run_id AND t.tool_call_id=m.tool_call_id "
-            "LIMIT 1) AS resolved_tool_id "
-            "FROM session_messages m WHERE m.session_id=? AND m.visibility='user_visible' "
+            "WHERE m.session_id=? AND m.visibility='user_visible' "
         )
         anchor_found: bool | None = None
         anchor_id: str | None = None

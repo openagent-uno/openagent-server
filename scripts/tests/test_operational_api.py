@@ -174,8 +174,8 @@ async def t_run_local_tool_deep_links(_ctx: TestContext) -> None:
                 )
             )
             assert messages_response.status == 200, messages_response.text
-            messages = {
-                item["id"]: item["tool_invocation_id"]
+            message_rows = {
+                item["id"]: item
                 for item in _payload(messages_response)["messages"]
             }
             tools = await (
@@ -205,7 +205,25 @@ async def t_run_local_tool_deep_links(_ctx: TestContext) -> None:
                 "msg:run-local-tools:tool-message-a": str(tools[0][0]),
                 "msg:run-local-tools:tool-message-b": str(tools[1][0]),
             }
-            assert {key: messages[key] for key in expected} == expected
+            assert {
+                key: message_rows[key]["tool_invocation_id"] for key in expected
+            } == expected
+            for key, expected_tool_id in expected.items():
+                summary = message_rows[key]["tool_summary"]
+                assert summary == {
+                    "id": expected_tool_id,
+                    "tool_call_id": "reused-call",
+                    "tool_server": "shell",
+                    "tool_name": "shell_execute",
+                    "status": "success",
+                    "child_run_id": None,
+                    "child_session_id": None,
+                    "completeness": "complete",
+                }
+                # The page contract is intentionally compact: raw invocation
+                # arguments/results remain on the authorized detail endpoint.
+                assert "args" not in summary
+                assert "result" not in summary
 
             for index, tool in enumerate(tools):
                 detail_response = await operational.handle_tool_invocation(
