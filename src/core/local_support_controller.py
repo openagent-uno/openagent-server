@@ -172,6 +172,12 @@ class SupportState:
     recent_exchange: list[dict[str, str]] = field(default_factory=list)
     corrections: list[str] = field(default_factory=list)
     tenant: Tenant = field(default_factory=lambda: _TENANTS[_DEFAULT_TENANT])
+    # Sensitive routing material stays out of ``facts`` (which is handed to
+    # the reply composer and returned in the run report).  Deterministic admin
+    # tools may use it, but the model never sees or repeats it.
+    account_ref: str = ""
+    account_email: str = ""
+    linked_task_id: str = ""
 
 
 def enabled(event: dict[str, Any] | None = None) -> bool:
@@ -564,7 +570,7 @@ def _any_term(text: str, terms: tuple[str, ...]) -> bool:
 # with "could you clarify?" is the single most common way the agent reads as
 # stupid - it asks a question of someone who is waiting for an answer.
 _PRAISE = re.compile(
-    r"\b(?:great|awesome|amazing|excellent|perfect|love (?:it|this)|best app|"
+    r"\b(?:great|awesome|amazing|excellent|perfect|love (?:it|this)|best (?:music )?app|"
     r"so much fun|very good|works fine|works great|good app|nice app|"
     r"ottima|ottimo|bellissim\w*|fantastic\w*|perfetta|perfetto|"
     r"excelente|muy buen\w*|me encanta|genial|"
@@ -597,6 +603,42 @@ _COMPLAINT = re.compile(
     r"m[üu]ll|schrott|mist)\b",
     re.IGNORECASE,
 )
+
+
+_ADS_COMPLAINT = re.compile(
+    r"\b(?:ads?|advertis\w*|pubblicit\w*|annunci?\w*|publicidad\w*|"
+    r"anuncios?\w*|reklam\w*|iklan\w*)\b|広告|광고|广告|廣告|реклам\w*",
+    re.IGNORECASE,
+)
+_PAID_ADS_CLAIM = re.compile(
+    r"\b(?:paid|paying|bought|purchased|subscribed|charged|restore purchases?|"
+    r"ho pagato|pagato il premium|acquistato|abbonat\w*|"
+    r"pagu[eé]|compr[eé]|suscrit\w*|assinante|assinei)\b|"
+    r"\b(?:my|il mio|mi|meu|i am|sono|has|have)\s+"
+    r"(?:premium|subscription|abbonamento|suscripci[oó]n|assinatura)\b|"
+    r"\b(?:app\s*user\s*id|appuserid|entitlement|subscription id)\b",
+    re.IGNORECASE,
+)
+_FREE_ADS_CONTEXT = re.compile(
+    r"\b(?:too many|so many|exhausting|annoying|fastidios\w*|troppe|"
+    r"non voglio pagare|non posso pagare|cannot pay|can't pay|do not want to pay|"
+    r"don't want to pay|for free|free ways?|gratis|gratuit\w*|senza pagare)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_ads_policy_complaint(text: str) -> bool:
+    """An ads complaint is not automatically a missing-Premium claim.
+
+    This distinction is operationally important: asking a free user for an
+    email and receipt because they said "too many ads" ignores the question
+    and starts an unnecessary billing investigation. A purchase/state signal
+    keeps the existing verified BillingBear route.
+    """
+    value = str(text or "")
+    return bool(
+        _ADS_COMPLAINT.search(value) and _FREE_ADS_CONTEXT.search(value)
+    ) and not bool(_PAID_ADS_CLAIM.search(value))
 
 
 _ACKNOWLEDGEMENT = re.compile(
@@ -979,6 +1021,11 @@ def _intent(text: str, channel: str = "") -> str:
         "sync problem", "sincronizzazione", "sincronizacion", "sincronización",
         "canzone sbagliata", "artista sbagliato", "otra canción",
         "otra cancion", "no es la canción", "musica errada", "música errada",
+        # Stateful UI/device failures: deterministic when the customer says the
+        # setting resets or the integration disconnects. These were needlessly
+        # delegated to the fallback classifier and failed whenever the local
+        # composer was saturated during a support batch.
+        "reset*", "disconnect*", "keeps disconnecting", "si disconnette",
     )):
         return "bug"
     return "general"
@@ -1399,6 +1446,8 @@ def _customer_first_name(thread: Any, payload: Any = None) -> str:
 
 def _thread_tags(thread: Any) -> set[str]:
     raw = (thread or {}).get("tags") if isinstance(thread, dict) else None
+    if raw is None and isinstance(thread, dict) and isinstance(thread.get("thread"), dict):
+        raw = thread["thread"].get("tags")
     return {str(tag).strip().lower() for tag in raw or [] if str(tag).strip()}
 
 
@@ -2669,12 +2718,42 @@ def _mutation_note(state: SupportState, italian: bool) -> str:
     return "." if italian else "."
 
 
+def _diagnostic_reply_suffix(state: SupportState, italian: bool) -> str:
+    capture = state.facts.get("diagnostic_capture")
+    if not isinstance(capture, dict):
+        return ""
+    category = str(capture.get("category") or "general")
+    if _simulated(state):
+        return (
+            f" La simulazione ha verificato anche l’attivazione della diagnostica {category}; in produzione si chiederebbe ora di riprodurre il problema una volta."
+            if italian else
+            f" The simulation also verified enabling {category} diagnostics; in production the customer would now be asked to reproduce the issue once."
+        )
+    return (
+        f" Ho attivato la diagnostica {category}: riproduci il problema una volta e rispondi qui, così possiamo leggere i log raccolti."
+        if italian else
+        f" I enabled {category} diagnostics. Reproduce the issue once and reply here so we can read the captured logs."
+    )
+
+
 def _fallback_reply(state: SupportState) -> str:
     # One shared language decision: a composed reply and this deterministic
     # fallback must never disagree about which language the customer wrote in.
     italian = (
         state.facts.get("language") or _language_hint(state.customer_message)
     ) == "it"
+    if state.outcome == "ads_policy_explained":
+        if state.tenant.key == "lyra":
+            return (
+                "Capisco che la pubblicità sia fastidiosa. Gratis puoi ottenere Premium con i referral; se nell’app vedi l’opzione video premio, puoi usarla per il periodo senza ads indicato. Per chi è idoneo c’è anche il percorso Creator. In alternativa, Premium rimuove gli ads."
+                if italian else
+                "I understand the ads are frustrating. Free options include earning Premium through referrals and, when your app shows the reward-video offer, using it for the displayed ad-free period. Eligible users can also use Lyra's Creator route. Otherwise, Premium removes ads."
+            )
+        return (
+            "Capisco che la pubblicità sia fastidiosa. Gratis puoi ottenere Premium invitando amici; se nell’app vedi l’opzione video premio, puoi usarla per il periodo senza ads indicato. In alternativa, Premium rimuove gli ads."
+            if italian else
+            "I understand the ads are frustrating. You can earn Premium for free by inviting friends and, when your app shows the reward-video offer, use it for the displayed ad-free period. Otherwise, Premium removes ads."
+        )
     if state.outcome == "premium_active":
         family = state.facts.get("store_family") or _store_family(
             str(state.facts.get("store") or "")
@@ -2841,14 +2920,50 @@ def _fallback_reply(state: SupportState) -> str:
              "The cancellation dry run succeeded; no real subscription was changed.")
         )
     if state.outcome.startswith("bug_"):
+        if state.outcome == "bug_diagnostics_collected":
+            category = str(
+                (state.facts.get("diagnostic_capture") or {}).get("category")
+                or "general"
+            )
+            if _simulated(state):
+                return (
+                    f"Il dry run ha simulato la lettura dei log {category}, l’aggiunta al task e la successiva disattivazione e pulizia; nessuna modifica reale è stata eseguita."
+                    if italian else
+                    f"The dry run simulated reading the {category} logs, adding them to the task, then disabling and clearing capture; no real change was made."
+                )
+            return (
+                f"Ho letto i log diagnostici {category}, li ho aggiunti al problema già tracciato, poi ho disattivato e pulito la raccolta. Non posso ancora confermare una causa o una correzione."
+                if italian else
+                f"I read the {category} diagnostic logs, added them to the tracked issue, then disabled and cleared the capture. I can’t confirm a cause or fix yet."
+            )
+        if state.outcome == "bug_diagnostics_not_captured":
+            return (
+                "Non è ancora arrivato alcun log. Riproduci il problema un’altra volta con l’app online e rispondi qui; la diagnostica resta attiva."
+                if italian else
+                "No diagnostic log has arrived yet. Reproduce the issue once more while the app is online and reply here; diagnostics remain active."
+            )
+        if state.outcome.endswith("_human"):
+            return (
+                "Ho ricevuto il tuo aggiornamento, ma la raccolta diagnostica richiede una verifica manuale prima di poter confermare altro."
+                if italian else
+                "I received your update, but the diagnostic capture needs a manual check before I can confirm anything else."
+            )
         if state.outcome == "bug_created":
             task = state.facts.get("clickup_task") or {}
             task_id = str(task.get("id") or "the new task")
-            return (
-                f"Il dry run ha simulato l’apertura del task {task_id} con le tue evidenze e il collegamento al thread; nessuna modifica reale è stata eseguita e non posso indicare tempi di rilascio."
-                if italian else
-                f"The dry run simulated opening task {task_id} with your evidence and linking it to this thread; no real change was made and I can’t give a release date."
-            )
+            if _simulated(state):
+                base = (
+                    f"Il dry run ha simulato l’apertura del task {task_id} con le tue evidenze e il collegamento al thread; nessuna modifica reale è stata eseguita e non posso indicare tempi di rilascio."
+                    if italian else
+                    f"The dry run simulated opening task {task_id} with your evidence and linking it to this thread; no real change was made and I can’t give a release date."
+                )
+            else:
+                base = (
+                    f"Ho aperto e collegato il task {task_id} con le tue evidenze. Non posso ancora indicare tempi di rilascio."
+                    if italian else
+                    f"I opened and linked task {task_id} with your evidence. I can’t give a release date yet."
+                )
+            return base + _diagnostic_reply_suffix(state, italian)
         if state.outcome == "bug_already_reported":
             return (
                 "La tua segnalazione è già allegata al problema che stiamo seguendo: non serve rimandarla. Non posso indicare tempi di risoluzione."
@@ -2873,11 +2988,19 @@ def _fallback_reply(state: SupportState) -> str:
         if state.outcome == "bug_deduplicated":
             task = state.facts.get("clickup_task") or {}
             task_id = str(task.get("id") or "the existing task")
-            return (
-                f"Il dry run ha trovato il task esistente {task_id} e simulato l’aggiunta delle nuove evidenze e il collegamento al thread; nessuna modifica reale è stata eseguita."
-                if italian else
-                f"The dry run found existing task {task_id} and simulated adding this evidence and linking the thread; no real change was made."
-            )
+            if _simulated(state):
+                base = (
+                    f"Il dry run ha trovato il task esistente {task_id} e simulato l’aggiunta delle nuove evidenze e il collegamento al thread; nessuna modifica reale è stata eseguita."
+                    if italian else
+                    f"The dry run found existing task {task_id} and simulated adding this evidence and linking the thread; no real change was made."
+                )
+            else:
+                base = (
+                    f"Ho aggiunto le nuove evidenze al task esistente {task_id} e collegato questa segnalazione."
+                    if italian else
+                    f"I added the new evidence to existing task {task_id} and linked this report."
+                )
+            return base + _diagnostic_reply_suffix(state, italian)
         # `missing_evidence` vuoto significa "non manca niente", NON "non lo so":
         # l'`or` di prima lo scambiava per il secondo e faceva chiedere di nuovo
         # versione, dispositivo e passi a chi li aveva gia' scritti nel modulo.
@@ -3132,6 +3255,7 @@ _MUTATION_KINDS = frozenset({
     "refund_link", "task_create", "task_comment", "task_link", "task_reopen",
     "owner_notified",
     "human_handoff",
+    "diagnostic_enable", "diagnostic_read", "diagnostic_disable", "diagnostic_clear",
 })
 
 
@@ -3412,6 +3536,30 @@ async def _compose_local(
     session_id: str,
 ) -> str:
     state.facts["reply_source"] = "deterministic"
+    if state.outcome == "premium_active":
+        # Store-specific recovery is policy, not prose: a measured composer
+        # changed "close and reopen the app" into "close your browser" for a
+        # web subscription. Keep the verified store branch deterministic.
+        state.facts["reply_source"] = "deterministic:billing_policy"
+        language = str(state.facts.get("language") or "en")
+        if language in {"en", "it"}:
+            return _fallback_reply(state)
+        return await _fallback_in_language(
+            agent, event, state, session_id, "billing_policy",
+        )
+    if state.outcome == "ads_policy_explained":
+        # Product mechanics here are both factual and remotely configurable.
+        # Measured in the operational dry-run: a composer given the verified
+        # routes invented that a reward video grants "credits". Keep the
+        # sentence receipt-derived; a non-English customer may receive a
+        # constrained translation, never free composition of the mechanics.
+        state.facts["reply_source"] = "deterministic:product_policy"
+        language = str(state.facts.get("language") or "en")
+        if language in {"en", "it"}:
+            return _fallback_reply(state)
+        return await _fallback_in_language(
+            agent, event, state, session_id, "product_policy",
+        )
     if not _model_may_compose(state):
         # A refund, a cancellation, a created task or a handoff still may not
         # be described freely. The model may only rephrase the receipt-derived
@@ -3789,6 +3937,309 @@ async def _execute_bug_receipts(pool: Any, state: SupportState) -> None:
         state.outcome = "bug_link_failed"
 
 
+_INTERMITTENT_BUG = re.compile(
+    r"\b(?:sometimes|random(?:ly)?|intermittent(?:ly)?|occasionally|"
+    r"sporadic(?:ally)?|no (?:clear )?pattern|hard to reproduce|"
+    r"a volte|ogni tanto|casual(?:e|mente)|intermittent(?:e|emente)|"
+    r"senza (?:uno schema|un motivo)|difficile da riprodurre|"
+    r"a veces|de vez en cuando|aleatoriamente|intermitente|"
+    r"parfois|de temps en temps|al[ée]atoire(?:ment)?|intermittent)\b",
+    re.IGNORECASE,
+)
+
+
+def _diagnostic_category(message: str) -> str:
+    """Pick one narrow, product-supported capture category from the symptom."""
+    low = str(message or "").lower()
+    routes = (
+        (("ad ", "ads", "advert", "pubblicit", "annunci"), "ads"),
+        (("play", "player", "buffer", "audio", "track", "brano"), "playback"),
+        (("playlist",), "playlists"),
+        (("library", "libreria", "biblioteca"), "library"),
+        (("login", "sign in", "auth", "accesso"), "auth"),
+        (("search", "ricerca", "buscar"), "search"),
+        (("sync", "sincron"), "sync"),
+        (("network", "rete", "connession"), "network"),
+        (("purchase", "premium", "acquist", "abbonament"), "purchases"),
+    )
+    for terms, category in routes:
+        if any(term in low for term in terms):
+            return category
+    return "general"
+
+
+def _result_items(result: Any) -> list[Any]:
+    if isinstance(result, list):
+        return result
+    if not isinstance(result, dict):
+        return []
+    for key in (
+        "users", "results", "items", "categories", "streams", "logs", "data",
+    ):
+        value = result.get(key)
+        if isinstance(value, list):
+            return value
+    return []
+
+
+async def _resolve_diagnostic_identity(
+    pool: Any, state: SupportState,
+) -> tuple[str, dict[str, Any]]:
+    server = "lyra-admin" if state.tenant.key == "lyra" else "esound-admin"
+    lookup_query = state.account_email or state.account_ref
+    if not lookup_query:
+        return server, {}
+    _tool, lookup = await _call_first(
+        pool, server,
+        (f"{server.replace('-', '_')}_search_users", "search_users"),
+        {"query": lookup_query}, required=False,
+    )
+    users = [item for item in _result_items(lookup) if isinstance(item, dict)]
+    if not users:
+        return server, {}
+    user = users[0]
+    if state.tenant.key == "lyra":
+        identity = str(
+            user.get("identityId") or user.get("identity_id")
+            or user.get("authId") or user.get("id") or ""
+        ).strip()
+        return server, ({"identityId": identity} if identity else {})
+    raw_id = user.get("userId") or user.get("user_id") or user.get("id")
+    try:
+        return server, {"userId": int(raw_id)}
+    except (TypeError, ValueError):
+        return server, {}
+
+
+async def _maybe_enable_bug_diagnostics(pool: Any, state: SupportState) -> None:
+    """Enable one receipt-backed capture for a hard-to-reproduce tracked bug.
+
+    Diagnostics are never guessed and never enabled merely because a report is
+    a bug.  The report must be intermittent, already have a verified ClickUp
+    task/link, and identify an account that the product admin can resolve.
+    """
+    if not _INTERMITTENT_BUG.search(state.customer_message):
+        return
+    if not (state.facts.get("clickup_task") and state.account_ref):
+        state.facts["diagnostics_skipped"] = "account_identity_required"
+        state.instructions.append(
+            "This looks intermittent, but diagnostics were not enabled because "
+            "the account could not be resolved. Ask only for the account email."
+        )
+        return
+
+    server, identity_args = await _resolve_diagnostic_identity(pool, state)
+    if not identity_args:
+        state.facts["diagnostics_skipped"] = "account_not_found"
+        return
+
+    _tool, categories_result = await _call_first(
+        pool, server,
+        (f"{server.replace('-', '_')}_list_diagnostic_categories",
+         "list_diagnostic_categories"),
+        {}, required=False,
+    )
+    available = {
+        str(item.get("name") if isinstance(item, dict) else item).strip().lower()
+        for item in _result_items(categories_result)
+        if str(item.get("name") if isinstance(item, dict) else item).strip()
+    }
+    requested = _diagnostic_category(state.customer_message)
+    category = requested if requested in available else (
+        "general" if "general" in available else ""
+    )
+    if not category:
+        state.facts["diagnostics_skipped"] = "no_supported_category"
+        return
+
+    enabled = await _record_action(
+        state, pool, server,
+        (f"{server.replace('-', '_')}_enable_diagnostics", "enable_diagnostics"),
+        {**identity_args, "categories": [category]},
+        "diagnostic_enable",
+    )
+    if not enabled:
+        state.facts["diagnostics_skipped"] = "enable_failed"
+        return
+    _scrub_latest_diagnostic_receipt(state)
+    # Only non-sensitive facts reach the composer/report. The actual account id
+    # remains inside the admin action receipt and is never copied into prose.
+    state.facts["diagnostic_capture"] = {
+        "category": category,
+        "status": "simulated" if _simulated(state) else "enabled",
+    }
+    await _record_tags(state, pool, ["diagnostics-active"])
+    state.instructions.append(
+        "Diagnostic capture is active only because the product-admin receipt "
+        "succeeded. Ask the customer to reproduce the issue once and reply; do "
+        "not claim that logs have already been captured or analysed."
+    )
+
+
+def _diagnostic_log_excerpt(result: Any) -> str:
+    """Bounded, scrubbed evidence for an internal ClickUp comment."""
+    if isinstance(result, dict):
+        raw = result.get("content") or result.get("log") or result.get("text")
+        if raw is None:
+            raw = json.dumps(result, ensure_ascii=False, default=str)
+    else:
+        raw = str(result or "")
+    text = str(raw)[:6000]
+    text = re.sub(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", "[email-redacted]", text)
+    text = re.sub(
+        r"(?i)\b(?:bearer|authorization|api[_ -]?key|token)\s*[:=]\s*\S+",
+        "[credential-redacted]", text,
+    )
+    return text[:4000]
+
+
+def _scrub_latest_diagnostic_receipt(state: SupportState) -> None:
+    """Keep proof metadata while dropping account identifiers from run output."""
+    if not state.actions:
+        return
+    action = state.actions[-1]
+    receipt = action.get("receipt")
+    if not isinstance(receipt, dict):
+        return
+    categories = receipt.get("categories")
+    action["receipt"] = {
+        "ok": bool(_succeeded(receipt)),
+        "simulated": bool(receipt.get("simulated") or receipt.get("dryRun")),
+        "categories": list(categories) if isinstance(categories, list) else None,
+        "externalMutation": receipt.get("externalMutation"),
+    }
+
+
+async def _collect_bug_diagnostics(pool: Any, state: SupportState) -> None:
+    """Read, attach, stop and clear a capture after the customer reproduced."""
+    if not state.linked_task_id:
+        state.decision = "human"
+        state.outcome = "bug_diagnostics_missing_task_human"
+        state.human_reason = "diagnostics-active thread has no linked ClickUp task"
+        return
+    server, identity_args = await _resolve_diagnostic_identity(pool, state)
+    if not identity_args:
+        state.decision = "human"
+        state.outcome = "bug_diagnostics_identity_human"
+        state.human_reason = "diagnostics-active account could not be resolved"
+        return
+
+    list_candidates = (
+        ("lyra_admin_list_diagnostic_logs", "list_diagnostic_logs")
+        if state.tenant.key == "lyra" else
+        ("esound_admin_list_diagnostic_streams", "list_diagnostic_streams")
+    )
+    _tool, listing = await _call_first(
+        pool, server, list_candidates, identity_args, required=False,
+    )
+    streams = [item for item in _result_items(listing)]
+    names: list[str] = []
+    for item in streams:
+        if isinstance(item, dict):
+            name = item.get("category") or item.get("name") or item.get("stream")
+        else:
+            name = item
+        if str(name or "").strip():
+            names.append(str(name).strip())
+    if not names:
+        state.decision = "ask_information"
+        state.outcome = "bug_diagnostics_not_captured"
+        state.instructions.append(
+            "No diagnostic stream exists yet. Ask the customer to reproduce "
+            "once more while the app is online; do not claim logs were read."
+        )
+        return
+
+    category = names[0]
+    if state.tenant.key == "lyra":
+        read_candidates = ("lyra_admin_read_diagnostic_log", "read_diagnostic_log")
+        read_args = {**identity_args, "category": category, "tailBytes": 12000}
+    else:
+        read_candidates = (
+            "esound_admin_read_diagnostic_stream", "read_diagnostic_stream",
+        )
+        read_args = {**identity_args, "category": category, "tailBytes": 12000}
+    tool, log_result = await _call_first(
+        pool, server, read_candidates, read_args, required=False,
+    )
+    if tool is None or not _succeeded(log_result):
+        state.decision = "human"
+        state.outcome = "bug_diagnostics_read_failed_human"
+        state.human_reason = "diagnostic stream exists but could not be read"
+        return
+    state.actions.append({
+        "kind": "diagnostic_read", "tool": tool, "success": True,
+        # Do not return raw customer logs to the model/report.
+        "receipt": {"ok": True, "category": category, "captured": True},
+    })
+    excerpt = _diagnostic_log_excerpt(log_result)
+    commented = await _record_action(
+        state, pool, "clickup",
+        ("clickup_create_task_comment", "create_task_comment"),
+        {
+            "task_id": state.linked_task_id,
+            "comment_text": (
+                f"{_source_marker(state)}\n\nDiagnostic capture ({category}) "
+                f"after customer reproduction:\n\n```text\n{excerpt}\n```"
+            ),
+        },
+        "task_comment",
+    )
+    if not commented:
+        state.decision = "human"
+        state.outcome = "bug_diagnostics_attach_failed_human"
+        state.human_reason = "diagnostic log read but ClickUp evidence comment failed"
+        return
+
+    disabled = await _record_action(
+        state, pool, server,
+        (f"{server.replace('-', '_')}_enable_diagnostics", "enable_diagnostics"),
+        {**identity_args, "categories": []},
+        "diagnostic_disable",
+    )
+    if disabled:
+        _scrub_latest_diagnostic_receipt(state)
+    clear_candidates = (
+        ("lyra_admin_clear_diagnostic_logs", "clear_diagnostic_logs")
+        if state.tenant.key == "lyra" else
+        ("esound_admin_clear_diagnostic_streams", "clear_diagnostic_streams")
+    )
+    cleared = await _record_action(
+        state, pool, server, clear_candidates, identity_args, "diagnostic_clear",
+    ) if disabled else False
+    if cleared:
+        _scrub_latest_diagnostic_receipt(state)
+    if not (disabled and cleared):
+        state.decision = "human"
+        state.outcome = "bug_diagnostics_cleanup_human"
+        state.human_reason = "diagnostic evidence attached but capture cleanup failed"
+        return
+    untagged = await _record_action(
+        state, pool, "replio",
+        ("replio_threads_tags_remove", "threads_tags_remove"),
+        {"thread_id": state.thread_id, "tags": ["diagnostics-active"]},
+        "thread_tag",
+    )
+    if not untagged:
+        state.decision = "human"
+        state.outcome = "bug_diagnostics_tag_cleanup_human"
+        state.human_reason = (
+            "diagnostic evidence attached and capture cleared, but the active "
+            "tag could not be removed"
+        )
+        return
+    state.decision = "bug_existing_task"
+    state.outcome = "bug_diagnostics_collected"
+    state.facts["diagnostic_capture"] = {
+        "category": category, "status": "collected_and_cleared",
+    }
+    state.instructions.append(
+        "The log was read, attached to the linked ClickUp task, capture was "
+        "disabled, and server-side diagnostic data was cleared. State only "
+        "those receipt-backed facts; do not claim a cause or fix."
+    )
+
+
 async def _notify_owner_legal(pool: Any, state: SupportState) -> None:
     """Tell the owner, and nothing else.
 
@@ -3846,6 +4297,38 @@ _TERMINAL_NO_REPLY: dict[str, str] = {
 }
 
 
+def _reply_verified_actions(state: SupportState) -> list[dict[str, Any]]:
+    """Return a PII-free proof envelope for Replio's outbound guard."""
+    out: list[dict[str, Any]] = []
+    for action in state.actions:
+        if action.get("kind") != "diagnostic_enable" or not action.get("success"):
+            continue
+        receipt = action.get("receipt")
+        simulated = bool(
+            state.facts.get("simulation_only")
+            or (isinstance(receipt, dict) and (
+                receipt.get("simulated") or receipt.get("dryRun")
+            ))
+        )
+        capture = state.facts.get("diagnostic_capture") or {}
+        out.append({
+            "kind": "diagnostic_enable",
+            "tool": str(action.get("tool") or ""),
+            "success": True,
+            "simulated": simulated,
+            "category": str(capture.get("category") or ""),
+        })
+    return out
+
+
+def _reply_args(state: SupportState, reply: str) -> dict[str, Any]:
+    args: dict[str, Any] = {"thread_id": state.thread_id, "body_text": reply}
+    verified = _reply_verified_actions(state)
+    if verified:
+        args["verified_actions"] = verified
+    return args
+
+
 async def _apply_lifecycle(pool: Any, state: SupportState, reply: str) -> None:
     if state.outcome == "legal_silence":
         # No customer reply, ever. The written note says the thread stays
@@ -3901,7 +4384,7 @@ async def _apply_lifecycle(pool: Any, state: SupportState, reply: str) -> None:
         # reply, and the customer is left staring at silence otherwise.
         await _record_action(
             state, pool, "replio", ("replio_threads_respond", "threads_respond"),
-            {"thread_id": state.thread_id, "body_text": reply}, "customer_reply",
+            _reply_args(state, reply), "customer_reply",
         )
         tags = ["team-decision", "needs-human"]
         if state.intent == "security_legal":
@@ -3952,7 +4435,7 @@ async def _apply_lifecycle(pool: Any, state: SupportState, reply: str) -> None:
         return
     sent = await _record_action(
         state, pool, "replio", ("replio_threads_respond", "threads_respond"),
-        {"thread_id": state.thread_id, "body_text": reply}, "customer_reply",
+        _reply_args(state, reply), "customer_reply",
     )
     if not sent:
         receipt = state.actions[-1].get("receipt") if state.actions else None
@@ -4040,6 +4523,21 @@ async def run(
         state.channel = str(thread.get("channel") or "")
     state.tenant = _tenant_for(payload, thread)
     state.facts["tenant"] = state.tenant.key
+    if isinstance(thread, dict):
+        summary = thread.get("thread") if isinstance(thread.get("thread"), dict) else thread
+        state.linked_task_id = str(summary.get("external_task_id") or "").strip()
+    if "diagnostics-active" in _thread_tags(thread) and not state.linked_task_id:
+        _tool, full_thread = await _call_first(
+            pool, "replio", ("replio_threads_get", "threads_get"),
+            {"thread_id": thread_id}, required=False,
+        )
+        if isinstance(full_thread, dict):
+            state.linked_task_id = str(
+                full_thread.get("external_task_id") or ""
+            ).strip()
+            # Keep the richer object for sender identity and lifecycle gates.
+            if state.linked_task_id:
+                thread = full_thread
     state.recent_exchange = _recent_exchange(thread)
     state.corrections = await _load_corrections(pool, state)
     name = _customer_first_name(thread, payload)
@@ -4227,6 +4725,8 @@ async def run(
         app_user_id = _extract_app_user_id({"payload": payload, "thread": thread}, message)
         email = _extract_email({"payload": payload, "thread": thread}, message)
         sender_email = _extract_verified_sender_email({"payload": payload, "thread": thread})
+        state.account_ref = app_user_id or email
+        state.account_email = email
         state.facts.update({
             "intent": state.intent,
             "appUserId_present": bool(app_user_id),
@@ -4252,7 +4752,11 @@ async def run(
 
         # A money or deletion route the MODEL guessed is classified, never
         # executed: it goes to a person, with the guess stated as a guess.
-        if state.facts.get("model_label_needs_human"):
+        if "diagnostics-active" in _thread_tags(thread):
+            state.intent = "diagnostic_followup"
+            state.facts["intent"] = state.intent
+            await _collect_bug_diagnostics(pool, state)
+        elif state.facts.get("model_label_needs_human"):
             await _read_policy(
                 pool, state,
                 "esound/procedures/customer-response/anti-fabrication.md",
@@ -4391,7 +4895,32 @@ async def run(
                 "Explain streaming catalog plus offline import of the customer's own audio files. Do not create a bug task."
             )
         elif state.intent in {"premium", "duplicate_charge", "cancel_subscription", "refund"}:
-            if not app_user_id and not email:
+            if state.intent == "premium" and _is_ads_policy_complaint(message):
+                # "Too many ads" is a product-policy complaint, not evidence
+                # that this person bought Premium. Give the verified exits
+                # instead of mechanically asking for an account and receipt.
+                if state.tenant.key == "lyra":
+                    await _read_policy(pool, state, "lyra/features/ads.md")
+                    await _read_policy(pool, state, "lyra/features/referral-system.md")
+                else:
+                    await _read_policy(pool, state, "esound/features/_index.md")
+                state.decision = "self_help"
+                state.outcome = "ads_policy_explained"
+                state.facts["ads_policy_complaint"] = True
+                state.facts["free_ad_routes"] = [
+                    "referral",
+                    "reward_video_if_customer_visible",
+                    *(["creator_if_eligible"] if state.tenant.key == "lyra" else []),
+                ]
+                state.instructions.append(
+                    "Acknowledge the frustration. Mention every free route in "
+                    "free_ad_routes before paid Premium. The reward-video route "
+                    "is conditional: mention it only as an option when the app "
+                    "shows that offer, and never invent a duration, threshold, "
+                    "price, device availability, or ad frequency. Do not ask for "
+                    "account or receipt details: no purchase was claimed."
+                )
+            elif not app_user_id and not email:
                 state.decision = "ask_information"
                 state.outcome = (
                     "refund_identity_required"
@@ -4837,6 +5366,11 @@ async def run(
                 and state.outcome != "bug_already_reported"
             ):
                 await _execute_bug_receipts(pool, state)
+            if (
+                state.decision in {"bug_existing_task", "bug_new_task"}
+                and state.outcome != "bug_already_reported"
+            ):
+                await _maybe_enable_bug_diagnostics(pool, state)
         else:
             state.decision = "ask_information"
             state.outcome = "general_needs_detail"

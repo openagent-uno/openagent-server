@@ -16,9 +16,12 @@ from mcp.server.fastmcp import FastMCP
 
 
 ROLE = (sys.argv[1] if len(sys.argv) > 1 else "").strip().lower()
-if ROLE not in {"billingbear", "replio", "clickup", "messaging", "esound-admin"}:
+if ROLE not in {
+    "billingbear", "replio", "clickup", "messaging", "esound-admin", "lyra-admin",
+}:
     raise SystemExit(
-        "usage: support_mcp_simulator.py billingbear|replio|clickup|messaging|esound-admin"
+        "usage: support_mcp_simulator.py "
+        "billingbear|replio|clickup|messaging|esound-admin|lyra-admin"
     )
 
 mcp = FastMCP(ROLE)
@@ -330,6 +333,15 @@ if ROLE == "replio":
             result["author_email"] = "premium@example.com"
         if thread_id == "sim-email-expired":
             result["author_email"] = "expired@example.com"
+        if thread_id == "sim-diag-followup":
+            result["author_email"] = "diag@example.com"
+            result["tags"] = ["bug", "diagnostics-active"]
+            result["external_task_id"] = "86-local-existing"
+        if thread_id == "sim-lyra-diag-followup":
+            result["author_email"] = "diaglyra@example.com"
+            result["product"] = "lyra"
+            result["tags"] = ["bug", "diagnostics-active"]
+            result["external_task_id"] = "86-local-created-lyra"
         if thread_id == "sim-identity":
             result["messages"] = [
                 {"direction": "outbound",
@@ -522,14 +534,19 @@ if ROLE == "replio":
                 "thread_id": thread_id, "kind": kind, "externalMutation": False}
 
     @mcp.tool()
-    async def threads_respond(thread_id: str, body_text: str) -> dict[str, Any]:
+    async def threads_respond(
+        thread_id: str,
+        body_text: str,
+        verified_actions: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         """SIMULATOR ONLY. Captures a response; never sends to a customer."""
         if thread_id == "sim-review-old":
             # The store refuses: it cannot retrieve this review any more.
             return {"ok": False, "success": False, "status": 404,
                     "error": "Could not find review", "simulated": True}
         return {"ok": True, "success": True, "dryRun": True, "simulated": True,
-                "thread_id": thread_id, "captured_chars": len(body_text), "externalMutation": False}
+                "thread_id": thread_id, "captured_chars": len(body_text),
+                "verified_actions": verified_actions or [], "externalMutation": False}
 
     @mcp.tool()
     async def threads_mark_for_human(thread_id: str, reason: str) -> dict[str, Any]:
@@ -540,6 +557,12 @@ if ROLE == "replio":
     @mcp.tool()
     async def threads_tags_add(thread_id: str, tags: list[str]) -> dict[str, Any]:
         """SIMULATOR ONLY. Captures tags without changing a real thread."""
+        return {"ok": True, "success": True, "dryRun": True, "simulated": True,
+                "thread_id": thread_id, "tags": tags, "externalMutation": False}
+
+    @mcp.tool()
+    async def threads_tags_remove(thread_id: str, tags: list[str]) -> dict[str, Any]:
+        """SIMULATOR ONLY. Captures tag removal without changing a real thread."""
         return {"ok": True, "success": True, "dryRun": True, "simulated": True,
                 "thread_id": thread_id, "tags": tags, "externalMutation": False}
 
@@ -572,10 +595,112 @@ if ROLE == "esound-admin":
                 "id": 7900276, "authId": "5f8349b40a31dbebd7063a5d",
                 "email": "cancel@example.com", "isPremium": True,
             },
+            "diag@example.com": {
+                "id": 7900999, "authId": "test-diag-auth",
+                "email": "diag@example.com", "isPremium": False,
+            },
         }
         user = known.get(str(query or "").strip().lower())
         return {"ok": True, "status": 200, "users": [user] if user else [],
                 "simulated": True}
+
+    @mcp.tool()
+    async def list_diagnostic_categories() -> dict[str, Any]:
+        """SIMULATOR ONLY. Product-supported diagnostic category names."""
+        return {"ok": True, "categories": [
+            "ads", "auth", "general", "library", "network", "playback",
+            "playlists", "purchases", "search", "sync",
+        ], "simulated": True}
+
+    @mcp.tool()
+    async def enable_diagnostics(
+        userId: int, categories: list[str],
+    ) -> dict[str, Any]:
+        """SIMULATOR ONLY. Captures enable intent without changing an account."""
+        return {
+            "ok": True, "success": True, "userId": userId,
+            "categories": categories, "dryRun": True, "simulated": True,
+            "externalMutation": False,
+        }
+
+    @mcp.tool()
+    async def list_diagnostic_streams(userId: int) -> dict[str, Any]:
+        """SIMULATOR ONLY. One captured playback stream after reproduction."""
+        return {"ok": True, "streams": [
+            {"category": "playback", "sizeBytes": 512},
+        ], "userId": userId, "simulated": True}
+
+    @mcp.tool()
+    async def read_diagnostic_stream(
+        userId: int, category: str, tailBytes: int | None = None,
+    ) -> dict[str, Any]:
+        """SIMULATOR ONLY. Synthetic diagnostic evidence."""
+        return {"ok": True, "userId": userId, "category": category,
+                "content": "player state=buffering source=remote retry=3",
+                "tailBytes": tailBytes, "simulated": True}
+
+    @mcp.tool()
+    async def clear_diagnostic_streams(userId: int) -> dict[str, Any]:
+        """SIMULATOR ONLY. Captures cleanup without deleting anything."""
+        return {"ok": True, "success": True, "userId": userId,
+                "dryRun": True, "simulated": True, "externalMutation": False}
+
+
+if ROLE == "lyra-admin":
+
+    @mcp.tool()
+    async def search_users(query: str) -> dict[str, Any]:
+        """SIMULATOR ONLY. Read-only Lyra identity lookup."""
+        known = {
+            "diaglyra@example.com": {
+                "identityId": "lyra-diag-identity",
+                "email": "diaglyra@example.com",
+            },
+        }
+        user = known.get(str(query or "").strip().lower())
+        return {"ok": True, "status": 200, "users": [user] if user else [],
+                "simulated": True}
+
+    @mcp.tool()
+    async def list_diagnostic_categories() -> dict[str, Any]:
+        """SIMULATOR ONLY. Product-supported diagnostic category names."""
+        return {"ok": True, "categories": [
+            "auth", "general", "library", "network", "playback",
+            "playlists", "purchases", "search", "sync",
+        ], "simulated": True}
+
+    @mcp.tool()
+    async def enable_diagnostics(
+        identityId: str, categories: list[str],
+    ) -> dict[str, Any]:
+        """SIMULATOR ONLY. Captures enable intent without changing an account."""
+        return {
+            "ok": True, "success": True, "identityId": identityId,
+            "categories": categories, "dryRun": True, "simulated": True,
+            "externalMutation": False,
+        }
+
+    @mcp.tool()
+    async def list_diagnostic_logs(identityId: str) -> dict[str, Any]:
+        """SIMULATOR ONLY. One captured general log after reproduction."""
+        return {"ok": True, "items": [
+            {"category": "general", "sizeBytes": 512},
+        ], "identityId": identityId, "simulated": True}
+
+    @mcp.tool()
+    async def read_diagnostic_log(
+        identityId: str, category: str, tailBytes: int | None = None,
+    ) -> dict[str, Any]:
+        """SIMULATOR ONLY. Synthetic diagnostic evidence."""
+        return {"ok": True, "identityId": identityId, "category": category,
+                "content": "theme screen event=open result=crash code=simulated",
+                "tailBytes": tailBytes, "simulated": True}
+
+    @mcp.tool()
+    async def clear_diagnostic_logs(identityId: str) -> dict[str, Any]:
+        """SIMULATOR ONLY. Captures cleanup without deleting anything."""
+        return {"ok": True, "success": True, "identityId": identityId,
+                "dryRun": True, "simulated": True, "externalMutation": False}
 
 
 if ROLE == "clickup":
@@ -709,4 +834,3 @@ if ROLE == "messaging":
 
 if __name__ == "__main__":
     mcp.run()
-

@@ -32,6 +32,7 @@ class OperationalCase:
     expected_tools: tuple[str, ...] = ()
     forbidden_tools: tuple[str, ...] = ()
     reply_any: tuple[str, ...] = ()
+    reply_all: tuple[str, ...] = ()
     forbidden_reply: tuple[str, ...] = ()
     attachments: tuple[dict[str, Any], ...] = ()
     language: str = "en"
@@ -53,6 +54,24 @@ CASES = (
         forbidden_tools=("billingbear_", "mark_for_human"),
         reply_any=("email", "order"),
         forbidden_reply=("team", "active", "refunded", "reactivated"),
+    ),
+    OperationalCase(
+        "ads-complaint-offers-free-routes-before-billing",
+        "Thread sim-ads-policy: Ci sono troppe pubblicità, non voglio pagare per Premium. Come posso toglierle gratis?",
+        "self_help",
+        language="it",
+        forbidden_tools=("billingbear_", "clickup_", "mark_for_human"),
+        reply_all=("invita", "video", "premium"),
+        forbidden_reply=("email", "ricevuta", "ordine", "sempre avuto pubblicità"),
+    ),
+    OperationalCase(
+        "lyra-ads-complaint-includes-product-specific-free-routes",
+        "Thread sim-lyra-ads-policy: The ads are exhausting, but I cannot pay. What free ways can remove them?",
+        "self_help",
+        product="lyra",
+        forbidden_tools=("billingbear_", "clickup_", "mark_for_human"),
+        reply_all=("referral", "video", "creator", "premium"),
+        forbidden_reply=("email", "receipt", "order id", "always had ads"),
     ),
     OperationalCase(
         "premium-active-self-help",
@@ -279,6 +298,34 @@ CASES = (
         forbidden_reply=("next update", "fixed", "released"),
     ),
     OperationalCase(
+        "intermittent-bug-enables-receipt-backed-esound-diagnostics",
+        "Thread sim-bug-diag: account diag@example.com, on iPhone 17 with iOS 20 and eSound 5.1.1, sometimes when I tap Play the track stays on infinite loading and never starts.",
+        "bug_existing_task",
+        expected_tools=(
+            "clickup_get_workspace_tasks", "clickup_create_task_comment",
+            "esound_admin_search_users", "list_diagnostic_categories",
+            "enable_diagnostics", "replio_threads_respond",
+        ),
+        forbidden_tools=("clickup_create_task", "mark_for_human"),
+        reply_all=("diagnostic", "reproduce"),
+        forbidden_reply=("already captured", "analysed the logs", "fixed", "released"),
+    ),
+    OperationalCase(
+        "diagnostic-followup-attaches-and-cleans-esound-capture",
+        "Thread sim-diag-followup: I reproduced the playback freeze again just now.",
+        "bug_existing_task",
+        expected_tools=(
+            "esound_admin_list_diagnostic_streams",
+            "esound_admin_read_diagnostic_stream",
+            "clickup_create_task_comment", "esound_admin_enable_diagnostics",
+            "esound_admin_clear_diagnostic_streams",
+            "replio_threads_tags_remove", "replio_threads_respond",
+        ),
+        forbidden_tools=("clickup_create_task", "mark_for_human"),
+        reply_all=("logs", "task", "disabling", "clearing"),
+        forbidden_reply=("root cause", "fixed", "released"),
+    ),
+    OperationalCase(
         "bug-create-esound-app-component",
         "Thread sim-bug-new-theme: on iPhone 16 with iOS 19 and eSound 5.1.2, every time I open theme settings the app crashes immediately.",
         "bug_new_task",
@@ -343,6 +390,34 @@ CASES = (
         forbidden_tools=("mark_for_human", "billingbear_"),
         reply_any=("86-local-created-lyra",),
         forbidden_reply=("next update", "fixed", "released"),
+    ),
+    OperationalCase(
+        "intermittent-lyra-bug-enables-lyra-diagnostics",
+        "Thread sim-lyra-diag: account diaglyra@example.com, on iPhone 16 with iOS 19 and Lyra 1.4.11, the theme settings sometimes crash immediately when opened.",
+        "bug_new_task",
+        product="lyra",
+        expected_tools=(
+            "clickup_create_task", "lyra_admin_search_users",
+            "list_diagnostic_categories", "enable_diagnostics",
+            "replio_threads_respond",
+        ),
+        forbidden_tools=("mark_for_human", "billingbear_"),
+        reply_all=("diagnostic", "reproduce"),
+        forbidden_reply=("already captured", "analysed the logs", "fixed", "released"),
+    ),
+    OperationalCase(
+        "diagnostic-followup-attaches-and-cleans-lyra-capture",
+        "Thread sim-lyra-diag-followup: I reproduced the theme crash again just now.",
+        "bug_existing_task",
+        product="lyra",
+        expected_tools=(
+            "lyra_admin_list_diagnostic_logs", "lyra_admin_read_diagnostic_log",
+            "clickup_create_task_comment", "lyra_admin_enable_diagnostics",
+            "lyra_admin_clear_diagnostic_logs", "replio_threads_tags_remove",
+        ),
+        forbidden_tools=("clickup_create_task", "mark_for_human"),
+        reply_all=("logs", "task", "disabling", "clearing"),
+        forbidden_reply=("root cause", "fixed", "released"),
     ),
     OperationalCase(
         "lyra-shared-component-stays-in-client-core",
@@ -804,6 +879,9 @@ def _score(
             errors.append("missing_policy_route")
     if case.reply_any and not any(term in low_reply for term in case.reply_any):
         errors.append("missing_reply_signal")
+    for term in case.reply_all:
+        if term not in low_reply:
+            errors.append("missing_reply_signal:" + term)
     for term in case.forbidden_reply:
         if term in low_reply:
             errors.append("forbidden_reply:" + term)
@@ -843,7 +921,10 @@ def _clone_and_patch_db(
         src.backup(dst)
         now = time.time()
         simulator = Path(__file__).resolve().with_name("support_mcp_simulator.py")
-        for name in ("billingbear", "replio", "clickup", "messaging", "esound-admin"):
+        for name in (
+            "billingbear", "replio", "clickup", "messaging",
+            "esound-admin", "lyra-admin",
+        ):
             dst.execute(
                 """
                 INSERT INTO mcps(name,kind,builtin_name,command,args_json,url,env_json,
@@ -1122,6 +1203,16 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                         if not args.controller:
                             trace_rows = list(tool_trace.peek(sid) or [])
                         passed, errors, payload = _score(case, output, trace_rows)
+                        reply_source = str(
+                            ((payload or {}).get("facts") or {}).get("reply_source") or ""
+                        )
+                        if (
+                            args.controller
+                            and getattr(args, "require_composer", False)
+                            and not reply_source.startswith("model")
+                        ):
+                            errors.append("composer_not_used:" + (reply_source or "unknown"))
+                            passed = False
                         if error:
                             errors.insert(0, error)
                             passed = False
@@ -1130,9 +1221,10 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                             "passed": passed, "errors": errors,
                             "elapsed_seconds": round(elapsed, 3),
                             "model": (
-                                "windows-local:qwen3-moe-local"
-                                if args.controller else agent.last_response_meta(sid).get("model")
+                                composer if args.controller
+                                else agent.last_response_meta(sid).get("model")
                             ),
+                            "reply_source": reply_source,
                             "output": output, "payload": payload,
                             "tool_trace": trace_rows,
                         })
@@ -1179,6 +1271,13 @@ def main() -> int:
                         help="how many cases to run at the same time")
     parser.add_argument("--composer-model", default="",
                         help="model that writes the reply (default: the local one)")
+    parser.add_argument(
+        "--require-composer", action="store_true",
+        help=(
+            "fail controller cases when the selected composer was not used "
+            "because a deterministic fallback ran"
+        ),
+    )
     parser.add_argument("--corpus-channel", default="",
                         help="keep only threads whose channel matches")
     parser.add_argument(
