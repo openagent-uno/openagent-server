@@ -305,6 +305,7 @@ async def stop_background_maintenance(gateway: Any) -> None:
     if state is not None:
         state.history.clear()
         state.search.clear()
+        state.related_runs.clear()
     setattr(gateway, "_operational_cursor_state", None)
 
 
@@ -402,16 +403,36 @@ class _SearchSnapshot:
     expires_at_ms: int
 
 
+@dataclass
+class _RelatedRunsSnapshot:
+    snapshot_id: str
+    tenant_id: str
+    principal_id: str
+    session_id: str
+    revision: str
+    rows: tuple[dict[str, Any], ...]
+    expires_at_ms: int
+
+
 class _CursorState:
     def __init__(self) -> None:
         self.secret = secrets.token_bytes(32)
         self.history: dict[str, _HistorySnapshot] = {}
         self.search: dict[str, _SearchSnapshot] = {}
+        self.related_runs: dict[str, _RelatedRunsSnapshot] = {}
         self._serial = 0
         self._order: dict[tuple[str, str], int] = {}
 
-    def _put(self, kind: str, snapshot: _HistorySnapshot | _SearchSnapshot) -> None:
-        target = self.history if kind == "history" else self.search
+    def _put(
+        self,
+        kind: str,
+        snapshot: _HistorySnapshot | _SearchSnapshot | _RelatedRunsSnapshot,
+    ) -> None:
+        target = {
+            "history": self.history,
+            "search": self.search,
+            "related_runs": self.related_runs,
+        }[kind]
         target[snapshot.snapshot_id] = snapshot  # type: ignore[assignment]
         self._serial += 1
         self._order[(kind, snapshot.snapshot_id)] = self._serial
@@ -423,16 +444,22 @@ class _CursorState:
     def put_search(self, snapshot: _SearchSnapshot) -> None:
         self._put("search", snapshot)
 
+    def put_related_runs(self, snapshot: _RelatedRunsSnapshot) -> None:
+        self._put("related_runs", snapshot)
+
     def _entries(self) -> list[tuple[str, str, Any]]:
         return [
             *(("history", key, value) for key, value in self.history.items()),
             *(("search", key, value) for key, value in self.search.items()),
+            *(("related_runs", key, value) for key, value in self.related_runs.items()),
         ]
 
     @staticmethod
     def _rows(kind: str, snapshot: Any) -> int:
         if kind == "history":
             return len(snapshot.activity_ids)
+        if kind == "related_runs":
+            return len(snapshot.rows)
         # Root grouping stores compact match rows below each root. Count those
         # actual allocations, not only the number of outer roots, or one chat
         # with tens of thousands of matches bypasses the global memory quota.
@@ -463,7 +490,11 @@ class _CursorState:
                 eligible,
                 key=lambda entry: self._order.get((entry[0], entry[1]), 0),
             )
-            (self.history if kind == "history" else self.search).pop(key, None)
+            {
+                "history": self.history,
+                "search": self.search,
+                "related_runs": self.related_runs,
+            }[kind].pop(key, None)
             self._order.pop((kind, key), None)
 
     def encode(self, payload: dict[str, Any]) -> str:
@@ -498,9 +529,15 @@ class _CursorState:
         self.search = {
             key: value for key, value in self.search.items() if value.expires_at_ms > now_ms
         }
+        self.related_runs = {
+            key: value
+            for key, value in self.related_runs.items()
+            if value.expires_at_ms > now_ms
+        }
         live = {
             *(("history", key) for key in self.history),
             *(("search", key) for key in self.search),
+            *(("related_runs", key) for key in self.related_runs),
         }
         self._order = {key: value for key, value in self._order.items() if key in live}
 
@@ -679,19 +716,30 @@ async def handle_capabilities(request: web.Request) -> web.Response:
         if canonical_ready:
             features.update({
                 "history": {
-                "version": 2,
-                "kinds": sorted(_HISTORY_KINDS),
-                "snapshot_pagination": True,
-                "max_page_size": 100,
+                    "version": 2,
+                    "kinds": sorted(_HISTORY_KINDS),
+                    "snapshot_pagination": True,
+                    "max_page_size": 100,
                 },
-                "session_messages": {"version": 1, "around": True, "bidirectional": True, "max_page_size": 100},
+                "session_messages": {
+                    "version": 1,
+                    "around": True,
+                    "bidirectional": True,
+                    "max_page_size": 100,
+                },
+                "session_related_runs": {
+                    "version": 1,
+                    "kinds": ["event_delivery", "scheduled_run", "workflow_run"],
+                    "snapshot_pagination": True,
+                    "max_page_size": 100,
+                },
                 "detail_resolvers": {
-                "version": 1,
-                "tool_invocation": True,
-                "workflow_run": True,
-                "scheduled_run": True,
-                "event_delivery": True,
-                "definition_field_anchors": False,
+                    "version": 1,
+                    "tool_invocation": True,
+                    "workflow_run": True,
+                    "scheduled_run": True,
+                    "event_delivery": True,
+                    "definition_field_anchors": False,
                 },
             })
             from src.custom_views.service import service_for_gateway
@@ -839,6 +887,606 @@ async def _session_acl_row(conn: Any, session_id: str):
     ).fetchone()
 
 
+_MAX_RUN_TARGET_ENVELOPE_CHARS = 128 * 1024
+_MAX_RUN_TARGET_ID_CHARS = 512
+
+
+def _bounded_run_target_id(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not 1 <= len(normalized) <= _MAX_RUN_TARGET_ID_CHARS:
+        return None
+    if any(ord(char) < 32 or ord(char) == 127 for char in normalized):
+        return None
+    return normalized
+
+
+def _bounded_result_object(result_json: str | None, result_text: str | None) -> dict[str, Any] | None:
+    """Decode only a small JSON object from a known run-launch tool result."""
+
+    for raw in (result_json, result_text):
+        if not isinstance(raw, str) or not raw or len(raw) > _MAX_RUN_TARGET_ENVELOPE_CHARS:
+            continue
+        try:
+            value: Any = json.loads(raw)
+            # Some providers preserve an already-serialized JSON object as a
+            # JSON string. Permit one bounded unwrap, never recursive parsing.
+            if isinstance(value, str) and len(value) <= _MAX_RUN_TARGET_ENVELOPE_CHARS:
+                value = json.loads(value)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(value, dict):
+            nested = value.get("result")
+            return nested if isinstance(nested, dict) else value
+    return None
+
+
+def _safe_tool_run_targets(
+    *,
+    tool_server: Any,
+    tool_name: Any,
+    args_json: str | None,
+    result_json: str | None,
+    result_text: str | None,
+    workflow_run_id: Any = None,
+    task_run_id: Any = None,
+    event_delivery_id: Any = None,
+) -> list[dict[str, str | None]]:
+    """Extract bounded run links without exposing the tool result envelope.
+
+    Canonical relational columns always win.  Older beta projections left
+    those columns NULL for the three built-in launch tools, so a tightly
+    whitelisted fallback reads only ``id``/``run_id`` plus the expected parent
+    definition id from a bounded JSON object.  The caller must still validate
+    every extracted id against the canonical run/definition tables and ACL.
+    """
+
+    targets: dict[str, dict[str, str | None]] = {}
+    explicit = (
+        ("workflow_run", workflow_run_id),
+        ("scheduled_run", task_run_id),
+        ("event_delivery", event_delivery_id),
+    )
+    for kind, raw_id in explicit:
+        resource_id = _bounded_run_target_id(raw_id)
+        if resource_id:
+            targets[kind] = {
+                "kind": kind,
+                "resource_id": resource_id,
+                "expected_parent_id": None,
+            }
+
+    raw_name = str(tool_name or "").strip()
+    raw_server = str(tool_server or "").strip()
+    effective_server, effective_name = _effective_tool_identity(raw_name, args_json)
+    server = (effective_server or raw_server).lower().replace("-", "_")
+    name = (effective_name or raw_name).lower().replace("-", "_")
+    full_name = raw_name.lower().replace("-", "_")
+    raw_server_name = raw_server.lower().replace("-", "_")
+    deferred = raw_name == "tool_search_call_tool"
+
+    def matches(full: str, server_name: str, direct_prefix: str, leaf: str) -> bool:
+        return (
+            (deferred and name == full)
+            or (full_name == full and raw_server_name in {server_name, direct_prefix})
+            or (server == server_name and name == leaf)
+        )
+
+    fallback_kind: str | None = None
+    parent_field: str | None = None
+    if matches(
+        "workflow_manager_run_workflow",
+        "workflow_manager",
+        "workflow",
+        "run_workflow",
+    ):
+        fallback_kind, parent_field = "workflow_run", "workflow_id"
+    elif matches(
+        "scheduler_run_scheduled_task_now",
+        "scheduler",
+        "scheduler",
+        "run_scheduled_task_now",
+    ):
+        fallback_kind, parent_field = "scheduled_run", "task_id"
+    elif matches(
+        "events_manager_trigger_event",
+        "events_manager",
+        "events",
+        "trigger_event",
+    ):
+        fallback_kind, parent_field = "event_delivery", "event_id"
+
+    if fallback_kind is not None and fallback_kind not in targets:
+        payload = _bounded_result_object(result_json, result_text)
+        if payload is not None:
+            resource_id = _bounded_run_target_id(
+                payload.get("delivery_id")
+                if fallback_kind == "event_delivery" and payload.get("delivery_id")
+                else payload.get("run_id") or payload.get("id")
+            )
+            if resource_id:
+                targets[fallback_kind] = {
+                    "kind": fallback_kind,
+                    "resource_id": resource_id,
+                    "expected_parent_id": _bounded_run_target_id(payload.get(parent_field)),
+                }
+    return list(targets.values())
+
+
+async def _related_run_candidates(
+    conn: Any,
+    *,
+    access: AccessContext,
+    session_id: str,
+) -> list[dict[str, Any]]:
+    """Snapshot the run identities causally linked from one chat session.
+
+    The automation run tables remain canonical during the additive beta, while
+    ``activity_items`` carries their normalized status, revision, and effective
+    ACL projection.  Only identifier/name columns participate in this query;
+    tool args/results and automation payload/output fields are never selected.
+    """
+
+    tool_rows = await (
+        await conn.execute(
+            "SELECT id, workflow_run_id, task_run_id, event_delivery_id, "
+            "tool_server, tool_name, args_json, result_json, result_text, "
+            "created_at_ms, ordinal "
+            "FROM tool_invocations WHERE tenant_id=? AND session_id=? "
+            "AND root_kind='session' AND root_id=? "
+            "ORDER BY created_at_ms, ordinal, id LIMIT ?",
+            (
+                access.tenant_id,
+                session_id,
+                session_id,
+                _MAX_SNAPSHOT_ITEMS + 1,
+            ),
+        )
+    ).fetchall()
+    if len(tool_rows) > _MAX_SNAPSHOT_ITEMS:
+        raise ApiProblem(503, "degraded", "Related-run snapshot is temporarily too large")
+
+    # A single tool may expose at most one target of each supported kind. Keep
+    # individual causes until after canonical parent validation so a malformed
+    # earlier envelope cannot shadow a later valid link to the same run.
+    linked: list[dict[str, Any]] = []
+    for tool in tool_rows:
+        targets = _safe_tool_run_targets(
+            tool_server=tool["tool_server"],
+            tool_name=tool["tool_name"],
+            args_json=tool["args_json"],
+            result_json=tool["result_json"],
+            result_text=tool["result_text"],
+            workflow_run_id=tool["workflow_run_id"],
+            task_run_id=tool["task_run_id"],
+            event_delivery_id=tool["event_delivery_id"],
+        )
+        for target in targets:
+            linked.append(
+                {
+                    "position": len(linked),
+                    "kind": str(target["kind"]),
+                    "resource_id": str(target["resource_id"]),
+                    "tool_invocation_id": str(tool["id"]),
+                    "expected_parent_id": target["expected_parent_id"],
+                }
+            )
+    if len(linked) > _MAX_SNAPSHOT_ITEMS:
+        raise ApiProblem(503, "degraded", "Related-run snapshot is temporarily too large")
+    if not linked:
+        return []
+
+    owners = sorted(access.principal_ids)
+    identities = sorted(access.grant_identities)
+    params: list[Any] = [
+        json.dumps(linked, separators=(",", ":")),
+        access.tenant_id,
+    ]
+    authorization = ["a.visibility IN ('installation_shared','public')"]
+    if owners:
+        authorization.append(
+            f"a.owner_principal_id IN ({','.join('?' for _ in owners)})"
+        )
+        params.extend(owners)
+    if identities:
+        identity_sql = " OR ".join(
+            "(acl.principal_type=? AND acl.principal_id=?)" for _ in identities
+        )
+        authorization.append(
+            "EXISTS (SELECT 1 FROM resource_acl acl "
+            "WHERE acl.tenant_id=a.tenant_id "
+            "AND acl.resource_type=a.resource_type "
+            "AND acl.resource_id=a.resource_id "
+            "AND acl.permission IN ('view','admin') "
+            "AND acl.acl_version=a.acl_version "
+            f"AND ({identity_sql}))"
+        )
+        for principal_type, principal_id in identities:
+            params.extend((principal_type, principal_id))
+    params.append(_MAX_SNAPSHOT_ITEMS + 1)
+    rows = await (
+        await conn.execute(
+            "WITH requested AS ("
+            " SELECT CAST(json_extract(value,'$.position') AS INTEGER) AS position, "
+            "        CAST(json_extract(value,'$.kind') AS TEXT) AS kind, "
+            "        CAST(json_extract(value,'$.resource_id') AS TEXT) AS resource_id, "
+            "        CAST(json_extract(value,'$.tool_invocation_id') AS TEXT) "
+            "          AS tool_invocation_id, "
+            "        CAST(json_extract(value,'$.expected_parent_id') AS TEXT) "
+            "          AS expected_parent_id "
+            " FROM json_each(?)"
+            "), valid AS ("
+            " SELECT q.position, q.kind, q.resource_id, q.tool_invocation_id, "
+            "        a.occurred_at_ms "
+            "FROM requested q JOIN activity_items a "
+            "ON a.tenant_id=? AND a.kind=q.kind AND a.resource_type=q.kind "
+            "AND a.resource_id=q.resource_id "
+            "LEFT JOIN workflow_runs wr "
+            "ON q.kind='workflow_run' AND wr.id=q.resource_id "
+            "LEFT JOIN workflow_tasks wd ON wd.id=wr.workflow_id "
+            "LEFT JOIN task_runs sr "
+            "ON q.kind='scheduled_run' AND sr.id=q.resource_id "
+            "LEFT JOIN scheduled_tasks sd ON sd.id=sr.task_id "
+            "LEFT JOIN event_deliveries ed "
+            "ON q.kind='event_delivery' AND ed.id=q.resource_id "
+            "LEFT JOIN events ev ON ev.id=ed.event_id "
+            "WHERE a.deleted_at_ms IS NULL AND a.visibility<>'quarantined' "
+            "AND ((q.kind='workflow_run' AND wr.id IS NOT NULL AND wd.id IS NOT NULL "
+            "      AND (q.expected_parent_id IS NULL OR q.expected_parent_id=wr.workflow_id)) "
+            " OR (q.kind='scheduled_run' AND sr.id IS NOT NULL AND sd.id IS NOT NULL "
+            "      AND (q.expected_parent_id IS NULL OR q.expected_parent_id=sr.task_id)) "
+            " OR (q.kind='event_delivery' AND ed.id IS NOT NULL AND ev.id IS NOT NULL "
+            "      AND (q.expected_parent_id IS NULL OR q.expected_parent_id=ed.event_id))) "
+            f"AND ({' OR '.join(authorization)}) "
+            "), ranked AS ("
+            " SELECT *, ROW_NUMBER() OVER ("
+            "   PARTITION BY kind, resource_id ORDER BY position"
+            " ) AS cause_rank, COUNT(*) OVER ("
+            "   PARTITION BY kind, resource_id"
+            " ) AS cause_count FROM valid"
+            ") "
+            "SELECT kind, resource_id, tool_invocation_id, cause_count "
+            "FROM ranked WHERE cause_rank=1 "
+            "ORDER BY occurred_at_ms DESC, kind, resource_id LIMIT ?",
+            params,
+        )
+    ).fetchall()
+    if len(rows) > _MAX_SNAPSHOT_ITEMS:
+        raise ApiProblem(503, "degraded", "Related-run snapshot is temporarily too large")
+    return [
+        {
+            "kind": str(row["kind"]),
+            "resource_id": str(row["resource_id"]),
+            "tool_invocation_id": str(row["tool_invocation_id"]),
+            "cause_count": int(row["cause_count"]),
+        }
+        for row in rows
+    ]
+
+
+async def _related_run_details(
+    conn: Any,
+    *,
+    access: AccessContext,
+    session_id: str,
+    candidates: tuple[dict[str, Any], ...],
+) -> list[Any]:
+    """Resolve one bounded snapshot page and recheck every current ACL."""
+
+    if not candidates:
+        return []
+    values = ",".join("(?,?,?,?,?)" for _ in candidates)
+    params: list[Any] = []
+    for position, candidate in enumerate(candidates):
+        params.extend(
+            (
+                position,
+                candidate["kind"],
+                candidate["resource_id"],
+                candidate["tool_invocation_id"],
+                candidate["cause_count"],
+            )
+        )
+    params.extend((access.tenant_id, access.tenant_id, session_id))
+    rows = await (
+        await conn.execute(
+            "WITH requested(position, kind, resource_id, tool_invocation_id, cause_count) "
+            f"AS (VALUES {values}) "
+            "SELECT q.position, q.kind, q.cause_count, a.activity_id, "
+            "a.resource_type, a.resource_id, a.tenant_id, a.owner_principal_id, "
+            "a.visibility, a.acl_version, a.status, a.title AS activity_title, "
+            "a.origin, a.occurred_at_ms, a.updated_at_ms, "
+            "cause.id AS tool_invocation_id, cause.tool_call_id, "
+            "cause.tool_server, cause.tool_name, cause.status AS tool_status, "
+            "cause.args_json AS tool_args_json, "
+            "cause.result_json AS tool_result_json, "
+            "cause.result_text AS tool_result_text, "
+            "cause.workflow_run_id AS tool_workflow_run_id, "
+            "cause.task_run_id AS tool_task_run_id, "
+            "cause.event_delivery_id AS tool_event_delivery_id, "
+            "cause.created_at_ms AS tool_created_at_ms, "
+            "CASE q.kind "
+            " WHEN 'workflow_run' THEN wr.workflow_id "
+            " WHEN 'scheduled_run' THEN sr.task_id "
+            " WHEN 'event_delivery' THEN ed.event_id END AS parent_id, "
+            "CASE q.kind "
+            " WHEN 'workflow_run' THEN wd.name "
+            " WHEN 'scheduled_run' THEN sd.name "
+            " WHEN 'event_delivery' THEN ev.name END AS definition_title, "
+            "CASE q.kind "
+            " WHEN 'workflow_run' THEN wr.finished_at "
+            " WHEN 'scheduled_run' THEN sr.finished_at "
+            " WHEN 'event_delivery' THEN ed.finished_at END AS finished_at_epoch, "
+            "CASE q.kind "
+            " WHEN 'scheduled_run' THEN sr.session_id "
+            " WHEN 'event_delivery' THEN ed.session_id END AS detail_session_id, "
+            "ed.workflow_run_id AS downstream_workflow_run_id, "
+            "ed.task_run_id AS downstream_task_run_id "
+            "FROM requested q "
+            "JOIN activity_items a ON a.kind=q.kind AND a.resource_type=q.kind "
+            "AND a.resource_id=q.resource_id AND a.tenant_id=? "
+            "JOIN tool_invocations cause ON cause.id=q.tool_invocation_id "
+            "AND cause.tenant_id=? AND cause.session_id=? "
+            "AND cause.root_kind='session' AND cause.root_id=cause.session_id "
+            "LEFT JOIN workflow_runs wr "
+            "ON q.kind='workflow_run' AND wr.id=q.resource_id "
+            "LEFT JOIN workflow_tasks wd ON wd.id=wr.workflow_id "
+            "LEFT JOIN task_runs sr "
+            "ON q.kind='scheduled_run' AND sr.id=q.resource_id "
+            "LEFT JOIN scheduled_tasks sd ON sd.id=sr.task_id "
+            "LEFT JOIN event_deliveries ed "
+            "ON q.kind='event_delivery' AND ed.id=q.resource_id "
+            "LEFT JOIN events ev ON ev.id=ed.event_id "
+            "WHERE a.deleted_at_ms IS NULL "
+            "AND ((q.kind='workflow_run' AND wr.id IS NOT NULL AND wd.id IS NOT NULL) "
+            " OR (q.kind='scheduled_run' AND sr.id IS NOT NULL AND sd.id IS NOT NULL) "
+            " OR (q.kind='event_delivery' AND ed.id IS NOT NULL AND ev.id IS NOT NULL)) "
+            "ORDER BY q.position",
+            params,
+        )
+    ).fetchall()
+    visible: list[Any] = []
+    for row in rows:
+        current_targets = {
+            (str(target["kind"]), str(target["resource_id"]))
+            for target in _safe_tool_run_targets(
+                tool_server=row["tool_server"],
+                tool_name=row["tool_name"],
+                args_json=row["tool_args_json"],
+                result_json=row["tool_result_json"],
+                result_text=row["tool_result_text"],
+                workflow_run_id=row["tool_workflow_run_id"],
+                task_run_id=row["tool_task_run_id"],
+                event_delivery_id=row["tool_event_delivery_id"],
+            )
+        }
+        if (
+            (str(row["kind"]), str(row["resource_id"])) in current_targets
+            and await resource_is_visible(conn, row, access)
+        ):
+            visible.append(row)
+    return visible
+
+
+def _related_run_json(row: Any) -> dict[str, Any]:
+    kind = str(row["kind"])
+    parent_kind = {
+        "workflow_run": "workflow",
+        "scheduled_run": "scheduled_task",
+        "event_delivery": "event",
+    }[kind]
+    definition_title = str(row["definition_title"] or row["activity_title"] or "Untitled run")
+    finished_at = None
+    if row["finished_at_epoch"] is not None:
+        try:
+            finished_at = _iso(int(float(row["finished_at_epoch"]) * 1000))
+        except (TypeError, ValueError, OverflowError):
+            finished_at = None
+    downstream = None
+    if kind == "event_delivery" and any(
+        row[key]
+        for key in (
+            "detail_session_id",
+            "downstream_workflow_run_id",
+            "downstream_task_run_id",
+        )
+    ):
+        downstream = {
+            "session_id": str(row["detail_session_id"])
+            if row["detail_session_id"]
+            else None,
+            "workflow_run_id": str(row["downstream_workflow_run_id"])
+            if row["downstream_workflow_run_id"]
+            else None,
+            "scheduled_run_id": str(row["downstream_task_run_id"])
+            if row["downstream_task_run_id"]
+            else None,
+        }
+    status = str(row["status"]) if row["status"] is not None else None
+    return {
+        "id": str(row["activity_id"]),
+        "kind": kind,
+        "resource_id": str(row["resource_id"]),
+        "title": definition_title,
+        "status": status,
+        "origin": str(row["origin"]) if row["origin"] is not None else None,
+        "occurred_at": _iso(row["occurred_at_ms"]),
+        "started_at": _iso(row["occurred_at_ms"]),
+        "finished_at": finished_at,
+        "updated_at": _iso(row["updated_at_ms"]),
+        "parent": {
+            "kind": parent_kind,
+            "id": str(row["parent_id"]),
+            "title": definition_title,
+        },
+        "session_id": str(row["detail_session_id"])
+        if row["detail_session_id"]
+        else None,
+        "downstream": downstream,
+        "live": status in {"pending", "queued", "received", "running"},
+        "completeness": "unknown",
+        "caused_by": {
+            "tool_invocation_id": str(row["tool_invocation_id"]),
+            "tool_call_id": str(row["tool_call_id"])
+            if row["tool_call_id"]
+            else None,
+            "tool_server": str(row["tool_server"]),
+            "tool_name": str(row["tool_name"]),
+            "status": str(row["tool_status"]),
+            "created_at": _iso(row["tool_created_at_ms"]),
+            "count": int(row["cause_count"]),
+        },
+    }
+
+
+async def handle_session_related_runs(request: web.Request) -> web.Response:
+    """GET /api/sessions/{id}/related-runs — safe causal automation links."""
+
+    try:
+        access = AccessContext.from_request(request)
+        _db, conn = await _canonical_conn(request)
+        session_id = str(
+            request.match_info.get("session_id")
+            or request.match_info.get("sessionId")
+            or ""
+        )
+        session = await _session_acl_row(conn, session_id)
+        if session is None or not await resource_is_visible(conn, session, access):
+            raise ApiProblem(404, "target_not_found", "This result is no longer available")
+
+        limit = _bounded_int(
+            request.query.get("limit"),
+            name="limit",
+            default=50,
+            minimum=1,
+            maximum=100,
+        )
+        state = _state(request)
+        now_ms = int(time.time() * 1000)
+        state.prune(now_ms)
+        cursor_token = request.query.get("cursor")
+        if cursor_token:
+            cursor = state.decode(cursor_token)
+            if cursor.get("k") != "related_runs":
+                raise ApiProblem(
+                    409,
+                    "cursor_stale",
+                    "The related-run cursor is invalid",
+                    reason="invalid_signature",
+                )
+            snapshot = state.related_runs.get(str(cursor.get("s", "")))
+            if snapshot is None:
+                raise ApiProblem(
+                    409,
+                    "cursor_stale",
+                    "The related-run snapshot expired; refresh to continue",
+                    reason="snapshot_missing",
+                )
+            if snapshot.expires_at_ms <= now_ms:
+                state.related_runs.pop(snapshot.snapshot_id, None)
+                raise ApiProblem(
+                    409,
+                    "cursor_stale",
+                    "The related-run snapshot expired; refresh to continue",
+                    reason="expired",
+                )
+            if (
+                snapshot.tenant_id != access.tenant_id
+                or snapshot.principal_id != access.principal_id
+                or snapshot.session_id != session_id
+            ):
+                raise ApiProblem(
+                    409,
+                    "cursor_stale",
+                    "The related-run cursor is not valid for this account",
+                    reason="acl_changed",
+                )
+            try:
+                offset = int(cursor.get("o", -1))
+            except (TypeError, ValueError) as exc:
+                raise ApiProblem(
+                    409,
+                    "cursor_stale",
+                    "The related-run cursor is invalid",
+                    reason="invalid_signature",
+                ) from exc
+            if offset < 0 or offset > len(snapshot.rows):
+                raise ApiProblem(
+                    409,
+                    "cursor_stale",
+                    "The related-run cursor is invalid",
+                    reason="invalid_signature",
+                )
+        else:
+            rows = await _related_run_candidates(
+                conn,
+                access=access,
+                session_id=session_id,
+            )
+            revision_row = await (
+                await conn.execute(
+                    "SELECT history_revision FROM operational_storage_state "
+                    "WHERE singleton_id=1"
+                )
+            ).fetchone()
+            snapshot = _RelatedRunsSnapshot(
+                snapshot_id=secrets.token_hex(16),
+                tenant_id=access.tenant_id,
+                principal_id=access.principal_id,
+                session_id=session_id,
+                revision=str(int(revision_row[0] if revision_row else 0)),
+                rows=tuple(rows),
+                expires_at_ms=now_ms + _SNAPSHOT_TTL_MS,
+            )
+            state.put_related_runs(snapshot)
+            offset = 0
+
+        selected = snapshot.rows[offset : offset + limit]
+        detail_rows = await _related_run_details(
+            conn,
+            access=access,
+            session_id=session_id,
+            candidates=selected,
+        )
+        next_offset = offset + len(selected)
+        has_more = next_offset < len(snapshot.rows)
+        next_cursor = (
+            state.encode(
+                {
+                    "k": "related_runs",
+                    "s": snapshot.snapshot_id,
+                    "o": next_offset,
+                }
+            )
+            if has_more
+            else None
+        )
+        return _json(
+            {
+                "session_id": session_id,
+                "items": [_related_run_json(row) for row in detail_rows],
+                "next_cursor": next_cursor,
+                "has_more": has_more,
+                "revision": snapshot.revision,
+                "snapshot": {
+                    "snapshot_id": snapshot.snapshot_id,
+                    "revision": snapshot.revision,
+                    "expires_at": _iso(snapshot.expires_at_ms),
+                },
+            }
+        )
+    except PermissionError:
+        return _problem(ApiProblem(401, "unauthorized", "Authentication required"))
+    except ApiProblem as exc:
+        return _problem(exc)
+    except Exception:
+        logger.error("session related-runs failed (details suppressed)")
+        return _problem(
+            ApiProblem(500, "internal_error", "Related runs are temporarily unavailable")
+        )
+
+
 def _effective_tool_identity(
     tool_name: str,
     raw_args: str | None,
@@ -852,7 +1500,11 @@ def _effective_tool_identity(
     every argument value.
     """
 
-    if tool_name != "tool_search_call_tool" or not raw_args:
+    if (
+        tool_name != "tool_search_call_tool"
+        or not raw_args
+        or len(raw_args) > _MAX_RUN_TARGET_ENVELOPE_CHARS
+    ):
         return None, None
     try:
         payload = json.loads(raw_args)
@@ -872,12 +1524,130 @@ def _effective_tool_identity(
     return server or None, inner_tool or None
 
 
+async def _validated_message_run_targets(
+    conn: Any,
+    *,
+    access: AccessContext,
+    rows: list[Any],
+) -> dict[str, dict[str, str]]:
+    """Return one canonical, currently visible launch target per tool card."""
+
+    candidates: list[dict[str, Any]] = []
+    for row in rows:
+        if not row["resolved_tool_id"]:
+            continue
+        for target in _safe_tool_run_targets(
+            tool_server=row["resolved_tool_server"],
+            tool_name=row["resolved_tool_name"],
+            args_json=row["resolved_tool_args_json"],
+            result_json=row["resolved_tool_result_json"],
+            result_text=row["resolved_tool_result_text"],
+            workflow_run_id=row["resolved_workflow_run_id"],
+            task_run_id=row["resolved_task_run_id"],
+            event_delivery_id=row["resolved_event_delivery_id"],
+        ):
+            candidates.append(
+                {
+                    "position": len(candidates),
+                    "tool_invocation_id": str(row["resolved_tool_id"]),
+                    **target,
+                }
+            )
+    if not candidates:
+        return {}
+
+    owners = sorted(access.principal_ids)
+    identities = sorted(access.grant_identities)
+    params: list[Any] = [
+        json.dumps(candidates, separators=(",", ":")),
+        access.tenant_id,
+    ]
+    authorization = ["a.visibility IN ('installation_shared','public')"]
+    if owners:
+        authorization.append(
+            f"a.owner_principal_id IN ({','.join('?' for _ in owners)})"
+        )
+        params.extend(owners)
+    if identities:
+        identity_sql = " OR ".join(
+            "(acl.principal_type=? AND acl.principal_id=?)" for _ in identities
+        )
+        authorization.append(
+            "EXISTS (SELECT 1 FROM resource_acl acl "
+            "WHERE acl.tenant_id=a.tenant_id "
+            "AND acl.resource_type=a.resource_type "
+            "AND acl.resource_id=a.resource_id "
+            "AND acl.permission IN ('view','admin') "
+            "AND acl.acl_version=a.acl_version "
+            f"AND ({identity_sql}))"
+        )
+        for principal_type, principal_id in identities:
+            params.extend((principal_type, principal_id))
+    validated = await (
+        await conn.execute(
+            "WITH requested AS ("
+            " SELECT CAST(json_extract(value,'$.position') AS INTEGER) AS position, "
+            "        CAST(json_extract(value,'$.tool_invocation_id') AS TEXT) "
+            "          AS tool_invocation_id, "
+            "        CAST(json_extract(value,'$.kind') AS TEXT) AS kind, "
+            "        CAST(json_extract(value,'$.resource_id') AS TEXT) AS resource_id, "
+            "        CAST(json_extract(value,'$.expected_parent_id') AS TEXT) "
+            "          AS expected_parent_id "
+            " FROM json_each(?)"
+            ") "
+            "SELECT q.position, q.tool_invocation_id, q.kind, q.resource_id, "
+            "CASE q.kind "
+            " WHEN 'workflow_run' THEN wr.workflow_id "
+            " WHEN 'scheduled_run' THEN sr.task_id "
+            " WHEN 'event_delivery' THEN ed.event_id END AS parent_id "
+            "FROM requested q JOIN activity_items a "
+            "ON a.tenant_id=? AND a.kind=q.kind AND a.resource_type=q.kind "
+            "AND a.resource_id=q.resource_id "
+            "LEFT JOIN workflow_runs wr "
+            "ON q.kind='workflow_run' AND wr.id=q.resource_id "
+            "LEFT JOIN workflow_tasks wd ON wd.id=wr.workflow_id "
+            "LEFT JOIN task_runs sr "
+            "ON q.kind='scheduled_run' AND sr.id=q.resource_id "
+            "LEFT JOIN scheduled_tasks sd ON sd.id=sr.task_id "
+            "LEFT JOIN event_deliveries ed "
+            "ON q.kind='event_delivery' AND ed.id=q.resource_id "
+            "LEFT JOIN events ev ON ev.id=ed.event_id "
+            "WHERE a.deleted_at_ms IS NULL AND a.visibility<>'quarantined' "
+            "AND ((q.kind='workflow_run' AND wr.id IS NOT NULL AND wd.id IS NOT NULL "
+            "      AND (q.expected_parent_id IS NULL OR q.expected_parent_id=wr.workflow_id)) "
+            " OR (q.kind='scheduled_run' AND sr.id IS NOT NULL AND sd.id IS NOT NULL "
+            "      AND (q.expected_parent_id IS NULL OR q.expected_parent_id=sr.task_id)) "
+            " OR (q.kind='event_delivery' AND ed.id IS NOT NULL AND ev.id IS NOT NULL "
+            "      AND (q.expected_parent_id IS NULL OR q.expected_parent_id=ed.event_id))) "
+            f"AND ({' OR '.join(authorization)}) "
+            "ORDER BY q.position",
+            params,
+        )
+    ).fetchall()
+    public_kind = {
+        "workflow_run": "workflow",
+        "scheduled_run": "task",
+        "event_delivery": "event",
+    }
+    result: dict[str, dict[str, str]] = {}
+    for row in validated:
+        tool_id = str(row["tool_invocation_id"])
+        if tool_id not in result:
+            result[tool_id] = {
+                "kind": public_kind[str(row["kind"])],
+                "run_id": str(row["resource_id"]),
+                "parent_id": str(row["parent_id"]),
+            }
+    return result
+
+
 def _message_json(
     row: Any,
     *,
     attachments: list[dict[str, Any]] | None = None,
     ui_parts: list[dict[str, Any]] | None = None,
     canonical_parts: list[dict[str, Any]] | None = None,
+    run_target: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Serialize one normalized message with canonical ordered content.
 
@@ -921,6 +1691,7 @@ def _message_json(
             "child_session_id": str(row["resolved_child_session_id"])
             if row["resolved_child_session_id"]
             else None,
+            "run_target": dict(run_target) if run_target is not None else None,
             "completeness": str(row["resolved_tool_completeness"]),
         }
     if canonical_parts is not None:
@@ -1119,6 +1890,11 @@ async def handle_session_messages(request: web.Request) -> web.Response:
             "t.tool_server AS resolved_tool_server, "
             "t.tool_name AS resolved_tool_name, "
             "t.args_json AS resolved_tool_args_json, "
+            "t.result_json AS resolved_tool_result_json, "
+            "t.result_text AS resolved_tool_result_text, "
+            "t.workflow_run_id AS resolved_workflow_run_id, "
+            "t.task_run_id AS resolved_task_run_id, "
+            "t.event_delivery_id AS resolved_event_delivery_id, "
             "t.status AS resolved_tool_status, "
             "t.child_run_id AS resolved_child_run_id, "
             "t.child_session_id AS resolved_child_session_id, "
@@ -1171,6 +1947,11 @@ async def handle_session_messages(request: web.Request) -> web.Response:
         after_cursor = state.encode({"k": "messages", "s": session_id, "p": access.principal_id, "q": max_seq}) if has_after else None
         revision = await (await conn.execute("SELECT history_revision FROM operational_storage_state WHERE singleton_id=1")).fetchone()
         message_ids = [str(row["id"]) for row in rows]
+        run_target_map = await _validated_message_run_targets(
+            conn,
+            access=access,
+            rows=rows,
+        )
         from src.memory.artifacts import attachment_refs_for_messages_on_connection
 
         from src.memory.message_parts import canonical_parts_for_messages_on_connection
@@ -1198,6 +1979,7 @@ async def handle_session_messages(request: web.Request) -> web.Response:
                         attachments=attachment_map.get(str(row["id"]), []),
                         ui_parts=ui_part_map.get(str(row["id"]), []),
                         canonical_parts=canonical_part_map.get(str(row["id"])),
+                        run_target=run_target_map.get(str(row["resolved_tool_id"])),
                     )
                     for row in rows
                 ],

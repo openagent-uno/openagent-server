@@ -220,6 +220,7 @@ async def t_run_local_tool_deep_links(_ctx: TestContext) -> None:
                     "status": "success",
                     "child_run_id": None,
                     "child_session_id": None,
+                    "run_target": None,
                     "completeness": "complete",
                 }
                 # The page contract is intentionally compact: raw invocation
@@ -410,6 +411,307 @@ async def _seed_complete_fixture(db) -> tuple[str, object]:
     )
     gateway = SimpleNamespace(agent=SimpleNamespace(memory_db=db))
     return tenant, gateway
+
+
+@test(
+    "operational_api",
+    "related runs recover bounded historical launch targets with independent ACLs",
+)
+async def t_session_related_runs_historical_fallback(_ctx: TestContext) -> None:
+    from src.gateway.api import operational
+    from src.memory.db import MemoryDB
+    from src.memory.operational.automation import claim_resource, project_automation
+
+    with TemporaryDirectory(prefix="openagent-related-runs-") as directory:
+        db = MemoryDB(str(Path(directory) / "openagent.db"))
+        await db.connect()
+        gateway = None
+        try:
+            tenant, gateway = await _seed_complete_fixture(db)
+            now = time.time() + 10
+            launches = [
+                (
+                    "scheduled",
+                    "scheduler_run_scheduled_task_now",
+                    {
+                        "id": "orchid-task-run",
+                        "task_id": "orchid-task",
+                        "status": "success",
+                        "session_id": "scheduler-child",
+                        "output": "NEVER_RELATED_SCHEDULED_OUTPUT",
+                    },
+                ),
+                (
+                    "workflow",
+                    "workflow_manager_run_workflow",
+                    {
+                        "id": "orchid-workflow-run",
+                        "workflow_id": "orchid-workflow",
+                        "status": "success",
+                        "output": "NEVER_RELATED_WORKFLOW_OUTPUT",
+                    },
+                ),
+                (
+                    "event",
+                    "events_manager_trigger_event",
+                    {
+                        "id": "orchid-delivery",
+                        "event_id": "orchid-event",
+                        "status": "success",
+                        "payload": "NEVER_RELATED_EVENT_PAYLOAD",
+                    },
+                ),
+                (
+                    "workflow-duplicate",
+                    "workflow_manager_run_workflow",
+                    {
+                        "run_id": "orchid-workflow-run",
+                        "workflow_id": "orchid-workflow",
+                        "status": "success",
+                    },
+                ),
+            ]
+            run = {
+                "run_id": "historical-launchers",
+                "status": "COMPLETED",
+                "created_at": now,
+                "messages": [
+                    {
+                        "id": f"related-message-{label}",
+                        "role": "tool",
+                        "tool_call_id": f"related-call-{index}",
+                        "content": f"{label} launcher completed",
+                    }
+                    for index, (label, _tool, _result) in enumerate(launches)
+                ],
+                "tools": [
+                    {
+                        "tool_call_id": f"related-call-{index}",
+                        "tool_name": "tool_search_call_tool",
+                        "tool_args": {
+                            "server": "tool-search",
+                            "tool": tool,
+                            "args": {"secret": "NEVER_RELATED_TOOL_ARGUMENT"},
+                        },
+                        # Old projections persist this serialized object only
+                        # in result_text and leave all three relational links NULL.
+                        "result": json.dumps(result),
+                        "status": "completed",
+                    }
+                    for index, (_label, tool, result) in enumerate(launches)
+                ],
+            }
+            await db._conn.execute(
+                "UPDATE sessions SET runs=?, updated_at=? WHERE session_id='orchid-chat'",
+                (json.dumps([run]), int(now) + 1),
+            )
+            await db._project_operational_session("orchid-chat")
+            await db._conn.commit()
+
+            link_state = await (
+                await db._conn.execute(
+                    "SELECT COUNT(*), "
+                    "SUM(workflow_run_id IS NOT NULL), "
+                    "SUM(task_run_id IS NOT NULL), "
+                    "SUM(event_delivery_id IS NOT NULL) "
+                    "FROM tool_invocations WHERE session_id='orchid-chat'"
+                )
+            ).fetchone()
+            assert tuple(int(value or 0) for value in link_state) == (4, 0, 0, 0)
+
+            alice = lambda **kwargs: _Request(
+                gateway,
+                tenant=tenant,
+                handle="alice",
+                device="alice-device",
+                **kwargs,
+            )
+            charlie = lambda **kwargs: _Request(
+                gateway,
+                tenant=tenant,
+                handle="charlie",
+                device="charlie-device",
+                **kwargs,
+            )
+            await _ready_capabilities(operational, alice())
+            assert _payload(await operational.handle_capabilities(alice()))[
+                "features"
+            ]["session_related_runs"]["max_page_size"] == 100
+
+            response = await operational.handle_session_related_runs(
+                alice(match={"session_id": "orchid-chat"}, query={"limit": "100"})
+            )
+            assert response.status == 200, response.text
+            related = _payload(response)
+            assert set(related) == {
+                "session_id",
+                "items",
+                "next_cursor",
+                "has_more",
+                "revision",
+                "snapshot",
+            }
+            assert {item["kind"] for item in related["items"]} == {
+                "workflow_run",
+                "scheduled_run",
+                "event_delivery",
+            }
+            by_kind = {item["kind"]: item for item in related["items"]}
+            assert by_kind["workflow_run"]["resource_id"] == "orchid-workflow-run"
+            assert by_kind["workflow_run"]["parent"]["id"] == "orchid-workflow"
+            assert by_kind["workflow_run"]["caused_by"]["count"] == 2
+            assert by_kind["scheduled_run"]["resource_id"] == "orchid-task-run"
+            assert by_kind["scheduled_run"]["parent"]["id"] == "orchid-task"
+            assert by_kind["event_delivery"]["resource_id"] == "orchid-delivery"
+            assert by_kind["event_delivery"]["parent"]["id"] == "orchid-event"
+            serialized = response.text
+            assert "NEVER_RELATED_" not in serialized
+            assert "payload_json" not in serialized
+            assert "trace_json" not in serialized
+            assert "output" not in serialized
+
+            messages_response = await operational.handle_session_messages(
+                alice(match={"session_id": "orchid-chat"}, query={"limit": "100"})
+            )
+            assert messages_response.status == 200, messages_response.text
+            summaries = [
+                message["tool_summary"]
+                for message in _payload(messages_response)["messages"]
+                if message["tool_summary"] is not None
+            ]
+            assert [summary["run_target"]["kind"] for summary in summaries] == [
+                "task",
+                "workflow",
+                "event",
+                "workflow",
+            ]
+            assert summaries[0]["run_target"] == {
+                "kind": "task",
+                "run_id": "orchid-task-run",
+                "parent_id": "orchid-task",
+            }
+            assert "NEVER_RELATED_" not in json.dumps(summaries)
+
+            # Cursors are signed, account-bound snapshots. Grant Charlie the
+            # parent session so this check reaches cursor authorization rather
+            # than failing earlier at the session boundary.
+            await db._conn.execute(
+                "INSERT INTO resource_acl "
+                "(tenant_id,resource_type,resource_id,principal_type,principal_id,"
+                "permission,acl_version,granted_by_principal_id,granted_at_ms) "
+                "VALUES(?,?,?,?,?,'view',1,?,?)",
+                (
+                    tenant,
+                    "session",
+                    "orchid-chat",
+                    "user",
+                    "charlie",
+                    "user:alice",
+                    int(time.time() * 1000),
+                ),
+            )
+            await db._conn.commit()
+            first = _payload(
+                await operational.handle_session_related_runs(
+                    alice(match={"session_id": "orchid-chat"}, query={"limit": "1"})
+                )
+            )
+            assert first["has_more"] and first["next_cursor"]
+            paged_kinds = {first["items"][0]["kind"]}
+            cursor = first["next_cursor"]
+            while cursor:
+                page = _payload(
+                    await operational.handle_session_related_runs(
+                        alice(
+                            match={"session_id": "orchid-chat"},
+                            query={"limit": "1", "cursor": cursor},
+                        )
+                    )
+                )
+                assert page["snapshot"]["snapshot_id"] == first["snapshot"]["snapshot_id"]
+                assert len(page["items"]) <= 1
+                paged_kinds.update(item["kind"] for item in page["items"])
+                cursor = page["next_cursor"]
+            assert paged_kinds == {
+                "workflow_run",
+                "scheduled_run",
+                "event_delivery",
+            }
+            wrong_account = await operational.handle_session_related_runs(
+                charlie(
+                    match={"session_id": "orchid-chat"},
+                    query={"limit": "1", "cursor": first["next_cursor"]},
+                )
+            )
+            assert wrong_account.status == 409
+
+            too_large = await operational.handle_session_related_runs(
+                alice(match={"session_id": "orchid-chat"}, query={"limit": "101"})
+            )
+            assert too_large.status == 400
+
+            # A visible chat never grants visibility to a private downstream
+            # run. Both the drawer endpoint and compact card target recheck it.
+            await claim_resource(
+                db._conn,
+                tenant_id=tenant,
+                resource_type="scheduled_run",
+                resource_id="orchid-task-run",
+                owner_principal_id="user:bob",
+            )
+            await project_automation(db._conn)
+            await db._conn.commit()
+            hidden = _payload(
+                await operational.handle_session_related_runs(
+                    alice(match={"session_id": "orchid-chat"}, query={"limit": "100"})
+                )
+            )
+            assert {item["kind"] for item in hidden["items"]} == {
+                "workflow_run",
+                "event_delivery",
+            }
+            hidden_messages = _payload(
+                await operational.handle_session_messages(
+                    alice(match={"session_id": "orchid-chat"}, query={"limit": "100"})
+                )
+            )["messages"]
+            scheduled_summary = next(
+                message["tool_summary"]
+                for message in hidden_messages
+                if message["id"].endswith("related-message-scheduled")
+            )
+            assert scheduled_summary["run_target"] is None
+
+            assert operational._safe_tool_run_targets(
+                tool_server="tool",
+                tool_name="tool_search_call_tool",
+                args_json=json.dumps(
+                    {
+                        "server": "tool-search",
+                        "tool": "workflow_manager_run_workflow",
+                    }
+                ),
+                result_json=None,
+                result_text="{" + '"padding":"' + ("x" * 140_000) + '"}',
+            ) == []
+            assert operational._safe_tool_run_targets(
+                tool_server="unknown",
+                tool_name="unknown",
+                args_json=None,
+                result_json=None,
+                result_text='{"id":"untrusted-result-id"}',
+                workflow_run_id="canonical-workflow-run",
+            ) == [
+                {
+                    "kind": "workflow_run",
+                    "resource_id": "canonical-workflow-run",
+                    "expected_parent_id": None,
+                }
+            ]
+        finally:
+            if gateway is not None:
+                await operational.stop_background_maintenance(gateway)
+            await db.close()
 
 
 @test("operational_api", "fresh capability warms index and all ten targets are searchable")
