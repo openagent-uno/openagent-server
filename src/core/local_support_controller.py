@@ -2191,9 +2191,13 @@ def _bug_query(text: str) -> str:
 
 
 _FORM_FIELD = re.compile(
+    # `install_source` and `package` arrive on every Play-installed web-form
+    # message and were not stripped, so a body whose only human text was a
+    # first name still read as 40+ characters of "customer words".
     r"^\s*(app_version|native_version|device|os|platform|premium|guest|tablet|"
     r"account_email|account_user_id|app_version_code|device_class|"
-    r"reviewer_language|ram_mb|store_country)\s*[:=]\s*(.*?)\s*$",
+    r"reviewer_language|ram_mb|store_country|install_source|package)"
+    r"\s*[:=]\s*(.*?)\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
 _FORM_EMPTY = {"", "n/a", "na", "none", "null", "unknown", "-", "?"}

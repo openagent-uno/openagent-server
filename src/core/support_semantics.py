@@ -155,20 +155,34 @@ INTENT_EXEMPLARS: dict[str, tuple[str, ...]] = {
         "how do I restore my purchase",
     ),
     "offline": (
+        # Every exemplar says DOWNLOAD. "my downloaded music disappeared"
+        # used to be here and pulled "I lost all my playlists after the
+        # update" to 0.728 - a library bug answered as a downloads question.
         "I cannot download songs to listen offline",
-        "the download button does nothing",
-        "my downloaded music disappeared when I lost connection",
+        "the download button does nothing when I press it",
+        "I want to save music on the phone and play it without internet",
     ),
     "bug": (
         "the app crashes as soon as I open it",
         "songs stop playing after a few seconds",
         "the app freezes and I have to restart it",
         "the wrong song plays when I press a track",
+        # A sign-in BUTTON that does nothing is a client defect, not a
+        # forgotten password. Measured: without this, "I tap login via
+        # Facebook and nothing happens" sat at 0.629 on `offline` and 0.626
+        # on `account_change` and was refused for want of a margin.
+        "I tap the sign in button and nothing happens",
+        "logging in with Google fails with an error every time",
     ),
     "feature_request": (
-        "please add a sleep timer to the app",
-        "it would be great if you could support lyrics",
-        "can you add a way to sort my playlists",
+        # What makes this label is ASKING FOR SOMETHING THAT IS NOT THERE, not
+        # the feature named. "please add a sleep timer" used to be here and
+        # captured "the sleep timer never stops the music" at 0.596 - a defect
+        # in a feature that exists, filed as a request for one that does not.
+        "would you consider adding something the app cannot do yet",
+        "it would be great if a future version could do this",
+        "I would like to suggest an improvement for the next release",
+        "is there any plan to support this, it is missing today",
     ),
     "ios_availability": (
         # Deliberately never a bare "App Store": measured on real traffic,
@@ -180,16 +194,23 @@ INTENT_EXEMPLARS: dict[str, tuple[str, ...]] = {
         "I cannot find the app in the Apple App Store on my iPhone",
         "is there an iOS version of this app for my iPad",
     ),
+    # These two are the closest pair in the bank and they mean opposite
+    # things: one ends the account, the other keeps it. Measured: an Italian
+    # erasure request scored 0.76 here against 0.73 on `account_change` and
+    # was refused for want of a margin, so a GDPR request was answered with
+    # "tell me more". Each side names what happens to the account.
     "account_delete": (
         "please delete my account and all my personal data",
         "I want you to erase everything you have about me",
-        "remove my profile permanently",
+        "remove my profile permanently, I do not want it any more",
+        "close my account for good and delete the data linked to my address",
+        "I ask you to cancel my account and every piece of data about me",
     ),
     "account_change": (
-        "I cannot log in, please reset my password",
-        "I want to change the email address on my account",
+        "I forgot my password, please send me a reset link",
+        "I want to change the email address on my account and keep my playlists",
         "I never received the recovery email",
-        "I need to merge two accounts into one",
+        "I need to merge two accounts into one and keep the music",
     ),
     "business_request": (
         "we would like to discuss a partnership with your company",
@@ -218,6 +239,14 @@ INTENT_EXEMPLARS: dict[str, tuple[str, ...]] = {
 # there is no route for "the app is gone from Play", and answering it with
 # iPhone availability is worse than asking.
 INTENT_NEGATIVE_EXEMPLARS: dict[str, tuple[str, ...]] = {
+    "offline": (
+        "I lost all my playlists after the update",
+        "my library is empty, the songs I saved are gone",
+    ),
+    "feature_request": (
+        "the feature does not work properly when I use it",
+        "the option is there but it behaves wrongly",
+    ),
     "ios_availability": (
         "I cannot find your app on the Google Play store any more",
         "the app was removed from Google Play, why",
@@ -267,6 +296,11 @@ SIGNAL_NEGATIVE_EXEMPLARS: dict[str, tuple[str, ...]] = {
         "how much does Premium cost and what do I get",
         "is there a free way to listen without advertisements",
         "I have never bought anything from you",
+        # Saying you do NOT want to pay names paying and Premium in one
+        # sentence, which read as a paid claim at 0.73 and sent a free user
+        # into a billing lookup instead of the free routes.
+        "I do not want to pay for Premium, how can I remove the ads for free",
+        "I cannot afford a subscription, is there another way",
     ),
     "previous_advice_ineffective": (
         "hello, the app crashes when I open my library",
