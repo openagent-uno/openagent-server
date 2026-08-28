@@ -56,6 +56,13 @@ Server → Client::
     {"type": "resource_event", "resource": "...", "action": "...", "id": "..."}
     {"type": "system_snapshot", "snapshot": {host, cpu, memory, swap, disks, network, processes, timestamp}}
 
+The gateway also uses one private WebSocket close code.  When a freshly
+authenticated transport takes over the same device identity, the superseded
+socket is closed with ``WS_CLOSE_CONNECTION_REPLACED_CODE`` and
+``WS_CLOSE_CONNECTION_REPLACED_REASON``.  Clients must not reconnect that
+specific socket: doing so would replace the fresh transport in turn and create
+an endless reconnect/replacement loop.
+
 A turn lifecycle: ``status`` (any number, "Using bash...") + ``delta``
 (any number, streamed tokens) + ``response`` (one canonical text +
 model + attachments) + optionally ``audio_start`` / ``audio_chunk`` ×N /
@@ -127,6 +134,13 @@ bridge can attribute each multiplexed user.
 """
 
 # Message type constants
+# Private WebSocket close contract for two transports presenting the same
+# device certificate.  4000-4999 are application-defined by RFC 6455.  Keep
+# both values stable: first-party clients use the code as the authoritative
+# discriminator and retain the reason for diagnostics.
+WS_CLOSE_CONNECTION_REPLACED_CODE = 4009
+WS_CLOSE_CONNECTION_REPLACED_REASON = "connection_replaced"
+
 AUTH = "auth"
 AUTH_OK = "auth_ok"
 AUTH_ERROR = "auth_error"

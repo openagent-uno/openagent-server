@@ -1703,6 +1703,24 @@ class Gateway:
         from aiohttp import web
         return web.Response(status=204)
 
+    @staticmethod
+    async def _close_replaced_websocket(old_ws: Any) -> None:
+        """Retire a superseded device transport without inviting a reconnect.
+
+        A normal ``1000`` close is indistinguishable from a transient gateway
+        restart to first-party clients, which intentionally auto-reconnect.
+        If two transports present the same device identity that behaviour
+        makes them replace one another forever.  The private close contract
+        tells only the old transport to stay down; the new one remains in the
+        client registry and continues normally.
+        """
+        if getattr(old_ws, "closed", True):
+            return
+        await old_ws.close(
+            code=P.WS_CLOSE_CONNECTION_REPLACED_CODE,
+            message=P.WS_CLOSE_CONNECTION_REPLACED_REASON.encode("utf-8"),
+        )
+
     async def _handle_ws(self, request):
         from aiohttp import web, WSMsgType
 
@@ -1739,11 +1757,10 @@ class Gateway:
         await self._adopt_sessions_to_ws(client_id, ws, handle=cert.handle)
         if old_ws is not None and old_ws is not ws:
             elog("gateway.client_reconnect", client_id=client_id)
-            if not getattr(old_ws, "closed", True):
-                try:
-                    await old_ws.close()
-                except Exception as e:  # noqa: BLE001
-                    logger.debug("old ws close failed: %s", e)
+            try:
+                await self._close_replaced_websocket(old_ws)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("old ws close failed: %s", e)
 
         # Greet the client. Old clients sent an AUTH frame and waited
         # for AUTH_OK; the new wire skips the AUTH frame but keeps the

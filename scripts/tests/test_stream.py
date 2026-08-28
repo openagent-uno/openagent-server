@@ -2175,6 +2175,40 @@ async def t_gateway_adopt_sessions_to_ws(ctx: TestContext) -> None:
         await ch_c.close()
 
 
+@test("stream", "Gateway marks a superseded websocket as connection_replaced")
+async def t_gateway_replaced_websocket_close_contract(ctx: TestContext) -> None:
+    """The old half of a same-device reconnect must never receive a normal
+    close, because first-party clients retry normal transport drops.  Pin the
+    private code and UTF-8 reason that stop only the superseded socket."""
+    from src.gateway import protocol as P
+    from src.gateway.server import Gateway
+
+    class _FakeWS:
+        closed = False
+
+        def __init__(self) -> None:
+            self.close_calls: list[dict] = []
+
+        async def close(self, **kwargs) -> None:
+            self.close_calls.append(kwargs)
+            self.closed = True
+
+    old_ws = _FakeWS()
+    await Gateway._close_replaced_websocket(old_ws)
+
+    assert old_ws.close_calls == [{
+        "code": P.WS_CLOSE_CONNECTION_REPLACED_CODE,
+        "message": P.WS_CLOSE_CONNECTION_REPLACED_REASON.encode("utf-8"),
+    }], old_ws.close_calls
+    assert P.WS_CLOSE_CONNECTION_REPLACED_CODE == 4009
+    assert P.WS_CLOSE_CONNECTION_REPLACED_REASON == "connection_replaced"
+
+    # Cleanup may race with another reconnect.  Once aiohttp reports the old
+    # socket closed, the helper is deliberately idempotent.
+    await Gateway._close_replaced_websocket(old_ws)
+    assert len(old_ws.close_calls) == 1, old_ws.close_calls
+
+
 @test("stream", "Gateway live_state rehydrates an active turn for the same owner")
 async def t_gateway_live_state_rehydrates_active_turn(ctx: TestContext) -> None:
     """Closing the app must not make an in-flight turn invisible. The gateway
