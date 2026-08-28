@@ -4587,6 +4587,27 @@ async def run(
             if state.linked_task_id:
                 thread = full_thread
     state.recent_exchange = _recent_exchange(thread)
+    # Replio's realtime webhook includes ``payload.message``, but its guarded
+    # reconciliation sweep intentionally rebuilds an event from the thread
+    # row and therefore carries no message body.  The thread brief is the
+    # authoritative fallback in that path.  Without this recovery every
+    # genuinely missed reply was re-fired only to become ``no_content`` and
+    # stay unanswered forever.
+    if not message.strip():
+        for turn in reversed(state.recent_exchange):
+            if turn.get("from") != "customer":
+                continue
+            recovered = str(turn.get("text") or "").strip()
+            if not recovered:
+                continue
+            message = recovered
+            state.customer_message = recovered
+            state.facts["language_signal"] = recovered
+            state.facts["message_source"] = "thread_brief"
+            detected = _language_hint(recovered)
+            if detected != "und" or state.facts.get("language") == "und":
+                state.facts["language"] = detected
+            break
     state.corrections = await _load_corrections(pool, state)
     name = _customer_first_name(thread, payload)
     if name:

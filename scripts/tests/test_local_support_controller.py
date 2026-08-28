@@ -697,6 +697,32 @@ async def t_reply_contract_reaches_send(_ctx: TestContext) -> None:
     assert sent[0]["reply_to_message_id"] == "reddit-comment-42", sent
 
 
+@test(
+    "local_support_controller",
+    "a Replio reconciliation event recovers the latest inbound from the brief",
+)
+async def t_reconcile_recovers_customer_message(_ctx: TestContext) -> None:
+    doubles = _Doubles(thread={
+        "messages": [{
+            "direction": "inbound",
+            "body_text": "Could you explain how this option works?",
+        }],
+        "reply_contract": {
+            "expected_last_inbound_message_id": "latest-inbound-7",
+        },
+    })
+
+    # The worker's safety-net event has a thread id but no payload.message.
+    output = await _drive(doubles, "", thread_id="t-reconcile")
+
+    assert output["outcome"] == "general_needs_detail", output
+    assert output["facts"]["message_source"] == "thread_brief", output
+    assert "customer_reply" in _succeeded_kinds(output), output
+    sent = doubles.args_for("replio_threads_respond")
+    assert len(sent) == 1, sent
+    assert sent[0]["expected_last_inbound_message_id"] == "latest-inbound-7", sent
+
+
 @test("local_support_controller", "resolved confirmation closes the thread without replying")
 async def t_resolved_confirmation(_ctx: TestContext) -> None:
     doubles = _Doubles()
