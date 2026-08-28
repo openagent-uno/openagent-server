@@ -2294,16 +2294,22 @@ def _task_matches_route(task: Any, symptom: str, noun: str, list_id: str) -> int
     title = str(task.get("name") or task.get("title") or "").lower()
     if not title:
         return 0
-    score = 0
-    if symptom and symptom.lower() in title:
-        score += 2
+    symptom_hit = bool(symptom and symptom.lower() in title)
+    noun_hit = False
     if noun:
         # "the embed player" -> require the distinctive word, not "the".
         words = [w for w in re.findall(r"[a-z]{4,}", noun.lower()) if w != "the"]
         if words and all(w in title for w in words):
-            score += 2
+            noun_hit = True
         elif any(w in title for w in words):
-            score += 1
+            noun_hit = True
+    # The contract says BOTH halves. The previous arithmetic let "same
+    # component + same list" reach the viable threshold with no symptom hit,
+    # so a playback-skip report could attach to a different playlist-import
+    # fault merely because both lived in Client Core.
+    if not symptom_hit or not noun_hit:
+        return 0
+    score = 4
     # Same list means the same owning component under clickup-routing.md.
     if list_id and str(task.get("listId") or task.get("list_id") or "") == list_id:
         score += 1
@@ -2326,16 +2332,24 @@ _TASK_CONCEPTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("song", ("song", "songs", "track", "tracks", "canzone", "canzoni", "brano", "brani", "cancion", "canciones", "musica", "music")),
     ("playlist", ("playlist", "playlists", "lista", "liste")),
     ("playback", ("playback", "playing", "riproduzione", "reproduccion", "reproducción", "reproducir", "tocando")),
-    ("failure", ("broken", "failure", "fails", "failed", "error", "errore", "non funziona", "no funciona", "nao funciona", "não funciona", "ne fonctionne pas")),
+    ("failure", ("broken", "failure", "fails", "failed", "error", "errore", "unable to", "can't", "cannot", "won't", "non funziona", "no funciona", "nao funciona", "não funziona", "ne fonctionne pas")),
     ("loading", ("loading", "buffering", "caricamento", "cargando", "chargement")),
     ("freeze", ("freeze", "frozen", "stuck", "bloccato", "bloccata", "si blocca", "congelado")),
     ("crash", ("crash", "crashes", "crashing", "si chiude", "se cierra", "fecha sozinho")),
     ("skip", ("skip", "skips", "skipping", "salta", "saltano", "saltar")),
+    ("stop", ("stop", "stops", "stopped", "stopping", "si ferma", "si interrompe", "se detiene")),
     ("library", ("library", "libreria", "biblioteca")),
     ("search", ("search", "ricerca", "buscar", "busqueda", "búsqueda")),
     ("login", ("login", "signin", "sign-in", "accesso", "accedere", "ingresar")),
     ("download", ("download", "downloads", "scaricare", "scarica", "descargar", "baixar")),
 )
+_TASK_SYMPTOM_CONCEPTS = frozenset({
+    "failure", "loading", "freeze", "crash", "skip", "stop",
+})
+_TASK_DISTINCTIVE_COMPONENTS = frozenset({
+    "airplay", "carplay", "chromecast", "spotify", "youtube", "iframe",
+    "wc014", "wc037",
+})
 
 
 def _task_content_words(text: str) -> set[str]:
@@ -2373,9 +2387,19 @@ def _task_shares_subject(task: Any, message: str) -> int:
     # Compare on stems: a task titled "Fix CarPlay disconnect" and a customer
     # writing "CarPlay disconnects" are the same defect, and exact word
     # equality would have filed a duplicate for the plural.
-    stems = {word[:5] for word in _task_content_words(title)}
-    shared = {word[:5] for word in _task_content_words(message)} & stems
-    return 3 if len(shared) >= 2 else 0
+    title_words = _task_content_words(title)
+    message_words = _task_content_words(message)
+    shared_words = title_words & message_words
+    shared_stems = {word[:5] for word in title_words} & {
+        word[:5] for word in message_words
+    }
+    has_shared_symptom = bool(shared_words & _TASK_SYMPTOM_CONCEPTS)
+    has_distinctive_component = bool(
+        shared_words & _TASK_DISTINCTIVE_COMPONENTS
+    )
+    return 3 if len(shared_stems) >= 2 and (
+        has_shared_symptom or has_distinctive_component
+    ) else 0
 
 
 def _best_task_match(

@@ -2015,6 +2015,16 @@ async def t_dedup_is_judged(_ctx: TestContext) -> None:
     assert lsc._best_task_match(
         [translated], "", "", "", "importare canzoni dalla playlist non funziona",
     ) is translated
+    # Same component/list is not the same symptom. This search result is
+    # plausible-looking but describes import playback stopping, not songs
+    # being unable to play and rapidly skipped outside a playlist.
+    wrong_same_component = {
+        "name": "Playback stops after playlist import", "listId": "L1",
+    }
+    assert lsc._best_task_match(
+        [wrong_same_component], "blocked action", "playback", "L1",
+        "unable to play a song outside my playlist; it rapidly skips tracks",
+    ) is None
 
 
 @test("local_support_controller", "the classifier covers what real threads actually say")
