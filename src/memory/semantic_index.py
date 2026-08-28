@@ -1222,10 +1222,29 @@ class SemanticIndex:
         return [(r, math.fsum(a * b for a, b in zip(v, q)))
                 for r, v in zip(keep, mat)]
 
+    def embed_query(self, query: str) -> list[float]:
+        """Embed one search query once so callers can reuse it across scopes.
+
+        Auto-recall searches the same customer sentence in the main vault,
+        reserved policy subtrees, and the skills leg. Re-embedding that identical
+        text for every leg multiplies endpoint latency and can turn one slow
+        10-second request into a 60-second timeout. An empty vector is the same
+        fail-open signal that :meth:`search` historically returned as ``[]``.
+        """
+        q = (query or "").strip()
+        if not self.active or not q:
+            return []
+        try:
+            return list(self.embedder.embed([_prep_text(q)])[0])  # type: ignore[union-attr]
+        except EmbeddingError as exc:
+            self._log_embed_error("query", exc)
+            return []
+
     def search(self, query: str, *, scope: str = "all", limit: int = 5,
                min_score: float = 0.0,
                include_prefixes: Optional[Sequence[str]] = None,
-               exclude_prefixes: Optional[Sequence[str]] = None
+               exclude_prefixes: Optional[Sequence[str]] = None,
+               query_vector: Optional[Sequence[float]] = None,
                ) -> list[dict[str, Any]]:
         """Cosine-nearest vault notes / sessions / skills to ``query``, best first.
 
@@ -1248,10 +1267,8 @@ class SemanticIndex:
         q = (query or "").strip()
         if not self.active or not q:
             return []
-        try:
-            qv = self.embedder.embed([_prep_text(q)])[0]  # type: ignore[union-attr]
-        except EmbeddingError as exc:
-            self._log_embed_error("query", exc)
+        qv = list(query_vector) if query_vector is not None else self.embed_query(q)
+        if not qv:
             return []
         qunit = list(_unit(qv))  # unit float list — numpy-free, works for both paths
 
