@@ -867,6 +867,11 @@ def _recall_block(agent: Any, query: str, session_id: str | None = None) -> str:
     idx = _get_recall_index(agent)
     semantic_active = idx is not None and idx.active
     sem_hits: list[dict] = []
+    # One customer sentence fans out to the main semantic search, every reserved
+    # policy subtree, and the skills leg. Embed it ONCE: production Lyra had two
+    # reserves + skills, so the old path made four identical endpoint calls and
+    # stretched a ~10s query to 30-63s, regularly crossing the 60s fail-open cap.
+    query_vector: list[float] = []
     if semantic_active:
         # Warm a bounded number of changed items so a cold index becomes useful
         # over the first few turns without an unbounded burst of embedding calls.
@@ -877,9 +882,11 @@ def _recall_block(agent: Any, query: str, session_id: str | None = None) -> str:
                 idx.sync(max_items=warm)
             except Exception:  # noqa: BLE001 — a warm failure must not block recall
                 pass
+        query_vector = idx.embed_query(query)
         sem_hits = idx.search(query, scope=scope, limit=k, min_score=floor,
                               include_prefixes=incl or None,
-                              exclude_prefixes=excl or None)
+                              exclude_prefixes=excl or None,
+                              query_vector=query_vector)
     hits = sem_hits
     # FTS side (Layer A) — fuse in exact-term keyword hits so a note the semantic
     # floor dropped still surfaces. Independent of the embedder: this is what
@@ -923,7 +930,8 @@ def _recall_block(agent: Any, query: str, session_id: str | None = None) -> str:
                 continue  # gia' rappresentato: non si duplica
             try:
                 res = idx.search(query, scope="vault", limit=1, min_score=0.0,
-                                 include_prefixes=[_pre])
+                                 include_prefixes=[_pre],
+                                 query_vector=query_vector)
             except Exception:  # noqa: BLE001 — reserve is best-effort, never fatal
                 res = []
             if res:
@@ -942,7 +950,9 @@ def _recall_block(agent: Any, query: str, session_id: str | None = None) -> str:
     # verify-framed "load it with skill_view" one-liner in the block below.
     if semantic_active:
         try:
-            skill_hits = idx.search(query, scope="skills", limit=1, min_score=floor)
+            skill_hits = idx.search(query, scope="skills", limit=1,
+                                    min_score=floor,
+                                    query_vector=query_vector)
         except Exception:  # noqa: BLE001 — a skills miss must not block recall
             skill_hits = []
         if skill_hits:

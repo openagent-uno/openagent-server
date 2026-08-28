@@ -32,6 +32,7 @@ class OperationalCase:
     expected_tools: tuple[str, ...] = ()
     forbidden_tools: tuple[str, ...] = ()
     reply_any: tuple[str, ...] = ()
+    reply_all: tuple[str, ...] = ()
     forbidden_reply: tuple[str, ...] = ()
     attachments: tuple[dict[str, Any], ...] = ()
     language: str = "en"
@@ -53,6 +54,24 @@ CASES = (
         forbidden_tools=("billingbear_", "mark_for_human"),
         reply_any=("email", "order"),
         forbidden_reply=("team", "active", "refunded", "reactivated"),
+    ),
+    OperationalCase(
+        "ads-complaint-offers-free-routes-before-billing",
+        "Thread sim-ads-policy: Ci sono troppe pubblicità, non voglio pagare per Premium. Come posso toglierle gratis?",
+        "self_help",
+        language="it",
+        forbidden_tools=("billingbear_", "clickup_", "mark_for_human"),
+        reply_all=("invita", "video", "premium"),
+        forbidden_reply=("email", "ricevuta", "ordine", "sempre avuto pubblicità"),
+    ),
+    OperationalCase(
+        "lyra-ads-complaint-includes-product-specific-free-routes",
+        "Thread sim-lyra-ads-policy: The ads are exhausting, but I cannot pay. What free ways can remove them?",
+        "self_help",
+        product="lyra",
+        forbidden_tools=("billingbear_", "clickup_", "mark_for_human"),
+        reply_all=("referral", "video", "creator", "premium"),
+        forbidden_reply=("email", "receipt", "order id", "always had ads"),
     ),
     OperationalCase(
         "premium-active-self-help",
@@ -279,6 +298,34 @@ CASES = (
         forbidden_reply=("next update", "fixed", "released"),
     ),
     OperationalCase(
+        "intermittent-bug-enables-receipt-backed-esound-diagnostics",
+        "Thread sim-bug-diag: account diag@example.com, on iPhone 17 with iOS 20 and eSound 5.1.1, sometimes when I tap Play the track stays on infinite loading and never starts.",
+        "bug_existing_task",
+        expected_tools=(
+            "clickup_get_workspace_tasks", "clickup_create_task_comment",
+            "esound_admin_search_users", "list_diagnostic_categories",
+            "enable_diagnostics", "replio_threads_respond",
+        ),
+        forbidden_tools=("clickup_create_task", "mark_for_human"),
+        reply_all=("diagnostic", "reproduce"),
+        forbidden_reply=("already captured", "analysed the logs", "fixed", "released"),
+    ),
+    OperationalCase(
+        "diagnostic-followup-attaches-and-cleans-esound-capture",
+        "Thread sim-diag-followup: I reproduced the playback freeze again just now.",
+        "bug_existing_task",
+        expected_tools=(
+            "esound_admin_list_diagnostic_streams",
+            "esound_admin_read_diagnostic_stream",
+            "clickup_create_task_comment", "esound_admin_enable_diagnostics",
+            "esound_admin_clear_diagnostic_streams",
+            "replio_threads_tags_remove", "replio_threads_respond",
+        ),
+        forbidden_tools=("clickup_create_task", "mark_for_human"),
+        reply_all=("logs", "task", "disabling", "clearing"),
+        forbidden_reply=("root cause", "fixed", "released"),
+    ),
+    OperationalCase(
         "bug-create-esound-app-component",
         "Thread sim-bug-new-theme: on iPhone 16 with iOS 19 and eSound 5.1.2, every time I open theme settings the app crashes immediately.",
         "bug_new_task",
@@ -343,6 +390,34 @@ CASES = (
         forbidden_tools=("mark_for_human", "billingbear_"),
         reply_any=("86-local-created-lyra",),
         forbidden_reply=("next update", "fixed", "released"),
+    ),
+    OperationalCase(
+        "intermittent-lyra-bug-enables-lyra-diagnostics",
+        "Thread sim-lyra-diag: account diaglyra@example.com, on iPhone 16 with iOS 19 and Lyra 1.4.11, the theme settings sometimes crash immediately when opened.",
+        "bug_new_task",
+        product="lyra",
+        expected_tools=(
+            "clickup_create_task", "lyra_admin_search_users",
+            "list_diagnostic_categories", "enable_diagnostics",
+            "replio_threads_respond",
+        ),
+        forbidden_tools=("mark_for_human", "billingbear_"),
+        reply_all=("diagnostic", "reproduce"),
+        forbidden_reply=("already captured", "analysed the logs", "fixed", "released"),
+    ),
+    OperationalCase(
+        "diagnostic-followup-attaches-and-cleans-lyra-capture",
+        "Thread sim-lyra-diag-followup: I reproduced the theme crash again just now.",
+        "bug_existing_task",
+        product="lyra",
+        expected_tools=(
+            "lyra_admin_list_diagnostic_logs", "lyra_admin_read_diagnostic_log",
+            "clickup_create_task_comment", "lyra_admin_enable_diagnostics",
+            "lyra_admin_clear_diagnostic_logs", "replio_threads_tags_remove",
+        ),
+        forbidden_tools=("clickup_create_task", "mark_for_human"),
+        reply_all=("logs", "task", "disabling", "clearing"),
+        forbidden_reply=("root cause", "fixed", "released"),
     ),
     OperationalCase(
         "lyra-shared-component-stays-in-client-core",
@@ -804,6 +879,9 @@ def _score(
             errors.append("missing_policy_route")
     if case.reply_any and not any(term in low_reply for term in case.reply_any):
         errors.append("missing_reply_signal")
+    for term in case.reply_all:
+        if term not in low_reply:
+            errors.append("missing_reply_signal:" + term)
     for term in case.forbidden_reply:
         if term in low_reply:
             errors.append("forbidden_reply:" + term)
@@ -843,7 +921,10 @@ def _clone_and_patch_db(
         src.backup(dst)
         now = time.time()
         simulator = Path(__file__).resolve().with_name("support_mcp_simulator.py")
-        for name in ("billingbear", "replio", "clickup", "messaging", "esound-admin"):
+        for name in (
+            "billingbear", "replio", "clickup", "messaging",
+            "esound-admin", "lyra-admin",
+        ):
             dst.execute(
                 """
                 INSERT INTO mcps(name,kind,builtin_name,command,args_json,url,env_json,
@@ -913,6 +994,77 @@ def _clone_and_patch_db(
         dst.close()
 
 
+def _cases_from_corpus(
+    corpus: Any,
+    *,
+    sample: int,
+    seed: int,
+    product: str = "",
+    channel: str = "",
+) -> list[OperationalCase]:
+    """Build expectation-free cases without losing tenant or channel identity.
+
+    A corpus row is already labelled by Replio. Overwriting that label with
+    ``--product`` made a product-specific run silently feed Lyra messages to
+    the eSound policy (and vice versa). The option is a filter, never a
+    relabelling operation.
+    """
+    import random as _random
+
+    wanted_product = product.strip().lower()
+    wanted_channel = channel.strip().lower()
+    # body, channel, author, attachments, product
+    bodies: list[tuple[str, str, str, list[Any], str]] = []
+    for thread in corpus if isinstance(corpus, list) else []:
+        if not isinstance(thread, dict):
+            continue
+        thread_product = str(thread.get("product") or "esound").strip().lower()
+        if wanted_product and thread_product != wanted_product:
+            continue
+        thread_channel = str(
+            thread.get("channel_kind") or thread.get("channel") or "email"
+        )
+        if wanted_channel and wanted_channel not in thread_channel.lower():
+            continue
+        # Carry the real channel, author and attachment presence so channel
+        # mechanics and human-addressing paths are actually exercised.
+        author = ""
+        attachments: list[Any] = []
+        body = ""
+        for item in (thread.get("messages") or []):
+            if not isinstance(item, dict) or str(
+                item.get("direction") or ""
+            ).lower() != "inbound":
+                continue
+            author = str(item.get("author_name") or "")
+            attachments = list(item.get("attachments") or [])
+            body = str(item.get("body_text") or "").strip()
+            break
+        author = author or str(thread.get("author_name") or "")
+        if not body:
+            body = str(thread.get("subject") or "").strip()
+        if len(body) >= 15:
+            bodies.append((
+                body[:1500], thread_channel, author, attachments, thread_product,
+            ))
+
+    _random.Random(seed).shuffle(bodies)
+    return [
+        OperationalCase(
+            f"real-{index:03d}", f"Thread sim-real: {body}", "",
+            channel=thread_channel,
+            product=thread_product,
+            author_name=author,
+            attachments=tuple(
+                a.get("filename", "attachment") if isinstance(a, dict) else str(a)
+                for a in attachments
+            ),
+        )
+        for index, (body, thread_channel, author, attachments, thread_product)
+        in enumerate(bodies[:sample])
+    ]
+
+
 async def _run(args: argparse.Namespace) -> dict[str, Any]:
     os.environ["OPENAGENT_FORCE_DRY_RUN"] = "1"
     # A/B: the controller stays identical and only the COMPOSER changes, so
@@ -938,74 +1090,14 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         # Real customer messages instead of the fixture matrix. There is
         # nothing to assert here: the point is what it answers and how long it
         # takes, so every case is expectation-free and simply recorded.
-        import random as _random
-
         corpus = json.loads(Path(args.from_corpus).expanduser().read_text())
-        # Carry the REAL channel. Forcing every corpus case to "email" meant
-        # the store-review path - reviewer language, stars, the reply window -
-        # was never exercised on the 220 review threads in the eSound corpus.
-        bodies: list[tuple[str, str]] = []
-        for thread in corpus:
-            if not isinstance(thread, dict):
-                continue
-            channel = str(
-                thread.get("channel_kind") or thread.get("channel") or "email"
-            )
-            # Replio attaches the sender's display name to the message; the
-            # corpus mode was dropping it, so the "greet them by name" path
-            # was never exercised on a single real thread.
-            author = ""
-            for item in (thread.get("messages") or []):
-                if isinstance(item, dict) and str(
-                    item.get("direction") or ""
-                ).lower() == "inbound":
-                    author = str(item.get("author_name") or "")
-                    break
-            author = author or str(thread.get("author_name") or "")
-            # The attachment list is what tells the controller an image
-            # exists at all. Dropping it meant the screenshot path - 46 of the
-            # 150 most recent eSound threads - was never exercised on real data.
-            attachments = []
-            for item in (thread.get("messages") or []):
-                if isinstance(item, dict) and str(
-                    item.get("direction") or ""
-                ).lower() == "inbound":
-                    attachments = list(item.get("attachments") or [])
-                    break
-            messages = thread.get("messages") or []
-            body = ""
-            for item in messages:
-                if not isinstance(item, dict):
-                    continue
-                if str(item.get("direction") or "").lower() == "inbound":
-                    body = str(item.get("body_text") or "").strip()
-                    break
-            if not body:
-                body = str(thread.get("subject") or "").strip()
-            if len(body) >= 15:
-                bodies.append((body[:1500], channel, author, attachments))
-        _random.Random(args.corpus_seed).shuffle(bodies)
-        if args.corpus_channel:
-            wanted = args.corpus_channel.strip().lower()
-            bodies = [row for row in bodies if wanted in row[1].lower()]
-        selected = [
-            OperationalCase(
-                f"real-{index:03d}", f"Thread sim-real: {body}", "",
-                channel=channel,
-                # Without this the corpus cases defaulted to the eSound
-                # tenant, so a Lyra corpus was routed through eSound policy
-                # paths that do not exist in the Lyra vault: every case died
-                # on the first policy read.
-                product=(args.product or "esound").strip().lower(),
-                author_name=author,
-                attachments=tuple(
-                    a.get("filename", "attachment") if isinstance(a, dict) else str(a)
-                    for a in attachments
-                ),
-            )
-            for index, (body, channel, author, attachments) in enumerate(
-                bodies[: args.corpus_sample])
-        ]
+        selected = _cases_from_corpus(
+            corpus,
+            sample=args.corpus_sample,
+            seed=args.corpus_seed,
+            product=args.product,
+            channel=args.corpus_channel,
+        )
     if args.product and not args.from_corpus:
         # A tenant's policy notes live in ITS vault, so a run must pair the
         # cases of one brand with that brand's agent copy.
@@ -1122,6 +1214,16 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                         if not args.controller:
                             trace_rows = list(tool_trace.peek(sid) or [])
                         passed, errors, payload = _score(case, output, trace_rows)
+                        reply_source = str(
+                            ((payload or {}).get("facts") or {}).get("reply_source") or ""
+                        )
+                        if (
+                            args.controller
+                            and getattr(args, "require_composer", False)
+                            and not reply_source.startswith("model")
+                        ):
+                            errors.append("composer_not_used:" + (reply_source or "unknown"))
+                            passed = False
                         if error:
                             errors.insert(0, error)
                             passed = False
@@ -1130,9 +1232,10 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                             "passed": passed, "errors": errors,
                             "elapsed_seconds": round(elapsed, 3),
                             "model": (
-                                "windows-local:qwen3-moe-local"
-                                if args.controller else agent.last_response_meta(sid).get("model")
+                                composer if args.controller
+                                else agent.last_response_meta(sid).get("model")
                             ),
+                            "reply_source": reply_source,
                             "output": output, "payload": payload,
                             "tool_trace": trace_rows,
                         })
@@ -1179,6 +1282,13 @@ def main() -> int:
                         help="how many cases to run at the same time")
     parser.add_argument("--composer-model", default="",
                         help="model that writes the reply (default: the local one)")
+    parser.add_argument(
+        "--require-composer", action="store_true",
+        help=(
+            "fail controller cases when the selected composer was not used "
+            "because a deterministic fallback ran"
+        ),
+    )
     parser.add_argument("--corpus-channel", default="",
                         help="keep only threads whose channel matches")
     parser.add_argument(

@@ -10,6 +10,77 @@ from typing import Any
 from ._framework import TestContext, test
 
 
+@test("local_support_controller", "support model calls share one bounded lane")
+async def t_support_model_calls_are_serialized(_ctx: TestContext) -> None:
+    import asyncio
+    from types import SimpleNamespace
+
+    from src.core import local_support_controller as controller
+
+    class SlowModel:
+        def __init__(self):
+            self.active = 0
+            self.max_active = 0
+
+        async def generate(self, **_kwargs):
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            try:
+                await asyncio.sleep(0.02)
+                return SimpleNamespace(content='{"reply":"ok"}')
+            finally:
+                self.active -= 1
+
+    model = SlowModel()
+
+    async def one(index: int):
+        return await controller._generate_support_model(
+            model,
+            messages=[{"role": "user", "content": str(index)}],
+            system="test",
+            session_id=f"test:{index}",
+            timeout_env="OPENAGENT_TEST_SUPPORT_MODEL_TIMEOUT",
+            default_timeout="1",
+        )
+
+    await asyncio.gather(*(one(index) for index in range(4)))
+    assert model.max_active == controller._SUPPORT_MODEL_CONCURRENCY == 1, (
+        model.max_active,
+        controller._SUPPORT_MODEL_CONCURRENCY,
+    )
+
+
+@test("local_support_controller", "real corpus preserves and filters product labels")
+async def t_real_corpus_product_filter(_ctx: TestContext) -> None:
+    from scripts.local_support_operational_dryrun import _cases_from_corpus
+
+    corpus = [
+        {
+            "product": "esound", "channel_kind": "reddit",
+            "messages": [{"direction": "inbound", "body_text": "eSound issue long enough"}],
+        },
+        {
+            "product": "lyra", "channel_kind": "reddit",
+            "messages": [{"direction": "inbound", "body_text": "Lyra issue long enough"}],
+        },
+        {
+            "product": "lyra", "channel_kind": "email_imap",
+            "messages": [{"direction": "inbound", "body_text": "Lyra email long enough"}],
+        },
+    ]
+
+    esound = _cases_from_corpus(
+        corpus, sample=20, seed=1, product="esound", channel="reddit",
+    )
+    lyra = _cases_from_corpus(
+        corpus, sample=20, seed=1, product="lyra", channel="reddit",
+    )
+
+    assert len(esound) == 1 and esound[0].product == "esound", esound
+    assert len(lyra) == 1 and lyra[0].product == "lyra", lyra
+    assert esound[0].channel == lyra[0].channel == "reddit"
+
+
 class _Toolkit:
     def __init__(self, functions: dict[str, Any]) -> None:
         self.functions = {
@@ -153,10 +224,10 @@ async def t_active_premium(_ctx: TestContext) -> None:
         "vault:esound/procedures/customer-response/_routing.md",
         "billing:test-active",
     ], calls
-    # The model now writes this reply, but only inside the controller's box:
-    # no tools at all, and a hard local-only boundary.
-    assert model.saw_empty_tools is True
-    assert model.saw_strict_local is True
+    # Store-specific recovery is policy, so the model is intentionally not
+    # called: it previously changed "reopen the app" into "reopen browser".
+    assert output["facts"]["reply_source"] == "deterministic:billing_policy"
+    assert model.saw_empty_tools is False
     assert not any("human" in call for call in calls)
 
 
@@ -197,6 +268,112 @@ async def t_missing_identity(_ctx: TestContext) -> None:
     assert calls == ["replio_get", "vault", "vault"], calls
     assert not any(action.get("success") for action in output["actions"]), output
     assert "email" in output["reply"].lower()
+
+
+@test("local_support_controller", "an ads complaint gets free routes instead of a billing interrogation")
+async def t_ads_policy_routes(_ctx: TestContext) -> None:
+    from src.core.local_support_controller import _is_ads_policy_complaint, run
+
+    assert not _is_ads_policy_complaint(
+        "appUserId test-active: I am Premium but ads are still showing"
+    )
+    assert not _is_ads_policy_complaint(
+        "I paid for Premium but still see ads"
+    )
+
+    calls: list[str] = []
+
+    async def threads_get(thread_id: str) -> dict[str, Any]:
+        calls.append("replio_get")
+        return {"ok": True, "id": thread_id, "messages": []}
+
+    async def vault_read_note(path: str) -> dict[str, Any]:
+        calls.append("vault:" + path)
+        return {"ok": True, "content": "current same-product rule"}
+
+    pool = _Pool({
+        "replio": _Toolkit({"replio_threads_get": threads_get}),
+        "vault": _Toolkit({"vault_read_note": vault_read_note}),
+    })
+
+    async def one(product: str, text: str) -> dict[str, Any]:
+        result = await run(
+            agent=SimpleNamespace(_mcp=pool, model=_Model()),
+            event={"slug": "replio-thread", "model": ""},
+            payload={"payload": {
+                "thread_id": "ads-" + product,
+                "product": product,
+                "message": {"body_text": text},
+            }},
+            session_id="ads-session-" + product,
+            delivery_id="ads-delivery-" + product,
+        )
+        return json.loads(result.text)
+
+    esound = await one(
+        "esound",
+        "Ci sono troppe pubblicità e non voglio pagare. Come le tolgo gratis?",
+    )
+    assert esound["outcome"] == "ads_policy_explained", esound
+    assert esound["decision"] == "self_help", esound
+    assert esound["facts"]["free_ad_routes"] == [
+        "referral", "reward_video_if_customer_visible",
+    ]
+    assert "invita" in esound["reply"].lower(), esound["reply"]
+    assert "video" in esound["reply"].lower(), esound["reply"]
+    assert "ricevuta" not in esound["reply"].lower(), esound["reply"]
+
+    lyra = await one(
+        "lyra",
+        "The ads are exhausting, but I cannot pay. What free options remove them?",
+    )
+    assert lyra["outcome"] == "ads_policy_explained", lyra
+    assert lyra["facts"]["free_ad_routes"] == [
+        "referral", "reward_video_if_customer_visible", "creator_if_eligible",
+    ]
+    low = lyra["reply"].lower()
+    assert all(term in low for term in ("referral", "video", "creator", "premium")), lyra
+    assert not any(call.startswith("billing:") for call in calls), calls
+
+
+@test("local_support_controller", "diagnostic proof is PII-free and dry runs never authorize a claim")
+async def t_diagnostic_proof_envelope(_ctx: TestContext) -> None:
+    from src.core.local_support_controller import (
+        SupportState,
+        _diagnostic_log_excerpt,
+        _reply_verified_actions,
+    )
+
+    state = SupportState(thread_id="thread-1", customer_message="intermittent bug")
+    state.account_email = "customer@example.com"
+    state.facts["diagnostic_capture"] = {
+        "category": "playback", "status": "enabled",
+    }
+    state.actions.append({
+        "kind": "diagnostic_enable",
+        "tool": "esound_admin_enable_diagnostics",
+        "success": True,
+        "receipt": {"ok": True, "simulated": False},
+    })
+    assert _reply_verified_actions(state) == [{
+        "kind": "diagnostic_enable",
+        "tool": "esound_admin_enable_diagnostics",
+        "success": True,
+        "simulated": False,
+        "category": "playback",
+    }]
+    assert "customer@example.com" not in json.dumps(_reply_verified_actions(state))
+
+    state.facts["simulation_only"] = True
+    assert _reply_verified_actions(state)[0]["simulated"] is True
+
+    excerpt = _diagnostic_log_excerpt({
+        "content": "user=customer@example.com Authorization: Bearer-secret",
+    })
+    assert "customer@example.com" not in excerpt
+    assert "Bearer-secret" not in excerpt
+    assert "[email-redacted]" in excerpt
+    assert "[credential-redacted]" in excerpt
 
 
 @test("local_support_controller", "last outbound activates idempotency before vault/model")
@@ -1292,8 +1469,8 @@ async def t_iap_premium_guidance(_ctx: TestContext) -> None:
     ] = SimpleNamespace(entrypoint=customer,
                         parameters={"type": "object", "properties": {}})
 
-    # The model is a stub returning English web-style wording; the guard must
-    # fall back to the store-correct deterministic text rather than ship it.
+    # Store recovery is deterministic; a web-style model answer must never be
+    # consulted for an in-app purchase.
     output = json.loads((await run(
         agent=SimpleNamespace(_mcp=pool, model=_Model()),
         event={"slug": "replio-thread", "model": ""},
@@ -1307,9 +1484,7 @@ async def t_iap_premium_guidance(_ctx: TestContext) -> None:
 
     assert output["outcome"] == "premium_active", output
     assert output["facts"]["store_family"] == "iap", output["facts"]
-    # The stub model answers with the WEB step. For a store purchase that step
-    # cannot work, so the guard must reject it and fall back to the IAP text.
-    assert output["facts"]["reply_source"] == "deterministic:guard", output["facts"]
+    assert output["facts"]["reply_source"] == "deterministic:billing_policy", output["facts"]
     low = output["reply"].lower()
     assert "restore purchases" in low, output["reply"]
     assert "purchase email" not in low, output["reply"]
@@ -1606,6 +1781,8 @@ async def t_classifier_real_shapes(_ctx: TestContext) -> None:
         ("Hey! I think your Server is down... it doesnt work", "bug"),
         ("mi viene segnalato canzone non trovata", "bug"),
         ("nothing is syncing from PC to phone", "bug"),
+        ("Every time I open the equalizer the preset resets", "bug"),
+        ("Every time I connect CarPlay the app disconnects again", "bug"),
         # A support code is the most precise routing signal we ever get.
         ("Re: Dysfonctionnements et erreur [WC014] Compte payant", "bug"),
         ("ci sono problemi con il server (wc037) cosa significa?", "bug"),
@@ -1625,6 +1802,7 @@ async def t_classifier_real_shapes(_ctx: TestContext) -> None:
         ("phenomenal", "praise"),
         ("Highly recommended", "praise"),
         ("Superb and commercial-free", "praise"),
+        ("Best music app I have ever used, thank you", "praise"),
         # The owner wants these in front of a person, never answered.
         ("We'd love to explore a partnership with your app", "business_request"),
         ("we are interested in a sponsorship for our media kit", "business_request"),

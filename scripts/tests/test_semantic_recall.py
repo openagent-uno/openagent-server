@@ -66,6 +66,17 @@ class ConceptEmbedder:
         return out
 
 
+class CountingConceptEmbedder(ConceptEmbedder):
+    """Concept embedder that records endpoint-equivalent batch calls."""
+
+    def __init__(self):
+        self.calls: list[list[str]] = []
+
+    def embed(self, texts):
+        self.calls.append(list(texts))
+        return super().embed(texts)
+
+
 class _OtherModelEmbedder(ConceptEmbedder):
     """Same vectors, different ``model_id`` — used to prove a model change wipes
     the cache (vectors from two models are incomparable)."""
@@ -808,6 +819,51 @@ async def t_reserve_prefix(ctx: TestContext) -> None:
                 f"reserve failed to surface the playbook: {withres!r}"
             assert "thread-1.md" in withres, \
                 f"reserve must keep the precedent ALONGSIDE the playbook: {withres!r}"
+        finally:
+            _clear_recall_env()
+        idx.close()
+    finally:
+        agent_mod._RECALL_INDEX_CACHE.pop(str(db), None)
+        _cleanup(db, idx_path, vault)
+
+
+@test("semantic_recall", "one query embedding is reused across main and reserved searches")
+async def t_query_vector_reused_across_recall_legs(ctx: TestContext) -> None:
+    """A turn must pay for one query embedding, not one per corpus leg."""
+    import src.core.agent as agent_mod
+    from src.memory.semantic_index import SemanticIndex
+
+    db, idx_path, vault = _paths(ctx, "one-query-vector")
+    emb = CountingConceptEmbedder()
+    try:
+        _write_note_at(vault, "precedent/refund.md", "Prior complaint",
+                       "customer complained and demanded a refund")
+        _write_note_at(vault, "policy/legal/refund.md", "Legal policy",
+                       "quarterly dashboard configuration")
+        _write_note_at(vault, "policy/support/refund.md", "Support policy",
+                       "unrelated release operations")
+        d = await _open_db(db)
+        await d.close()
+        idx = SemanticIndex(db, vault_root=vault, embedder=emb)
+        idx.sync()
+        emb.calls.clear()  # count only the live turn, not index construction
+        agent_mod._RECALL_INDEX_CACHE[str(db)] = idx
+        _clear_recall_env()
+        try:
+            os.environ["OPENAGENT_AUTO_RECALL_ENABLED"] = "1"
+            os.environ["OPENAGENT_AUTO_RECALL_WARM_BUDGET"] = "0"
+            os.environ["OPENAGENT_AUTO_RECALL_MIN_SCORE"] = "0.5"
+            os.environ["OPENAGENT_AUTO_RECALL_HYBRID"] = "0"
+            os.environ["OPENAGENT_AUTO_RECALL_RESERVE_PREFIX"] = \
+                "policy/legal/,policy/support/"
+            query = "customer complained and demanded a refund"
+            out = await agent_mod._with_recall(
+                _fake_agent(db, vault), "event:one", query, "MSG")
+            assert "precedent/refund.md" in out, out
+            assert "policy/legal/refund.md" in out, out
+            assert "policy/support/refund.md" in out, out
+            assert len(emb.calls) == 1, (
+                f"same query was embedded {len(emb.calls)} times: {emb.calls}")
         finally:
             _clear_recall_env()
         idx.close()
