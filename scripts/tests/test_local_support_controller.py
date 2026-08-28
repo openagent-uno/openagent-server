@@ -545,8 +545,20 @@ class _Doubles:
             self._log("vault_read_note", path=path)
             return {"ok": True, "content": path}
 
-        async def threads_respond(thread_id: str, body_text: str) -> dict[str, Any]:
-            self._log("replio_threads_respond", thread_id=thread_id, body_text=body_text)
+        async def threads_respond(
+            thread_id: str,
+            body_text: str,
+            expected_last_inbound_message_id: str | None = None,
+            reply_to_message_id: str | None = None,
+            **_kwargs: Any,
+        ) -> dict[str, Any]:
+            self._log(
+                "replio_threads_respond",
+                thread_id=thread_id,
+                body_text=body_text,
+                expected_last_inbound_message_id=expected_last_inbound_message_id,
+                reply_to_message_id=reply_to_message_id,
+            )
             return {"ok": True, "success": True, "simulated": True}
 
         async def threads_tags_add(thread_id: str, tags: Any) -> dict[str, Any]:
@@ -660,6 +672,29 @@ def _succeeded_kinds(output: dict[str, Any]) -> set[str]:
         action["kind"] for action in output["actions"]
         if action.get("success")
     }
+
+
+@test(
+    "local_support_controller",
+    "an operational reply carries Replio freshness and pins a Reddit comment",
+)
+async def t_reply_contract_reaches_send(_ctx: TestContext) -> None:
+    doubles = _Doubles(thread={
+        "channel": "reddit",
+        "reply_contract": {
+            "expected_last_inbound_message_id": "reddit-comment-42",
+        },
+    })
+    output = await _drive(
+        doubles,
+        "Could you explain how this option works?",
+        payload_extra={"channel_kind": "reddit"},
+    )
+    assert "customer_reply" in _succeeded_kinds(output), output
+    sent = doubles.args_for("replio_threads_respond")
+    assert len(sent) == 1, sent
+    assert sent[0]["expected_last_inbound_message_id"] == "reddit-comment-42", sent
+    assert sent[0]["reply_to_message_id"] == "reddit-comment-42", sent
 
 
 @test("local_support_controller", "resolved confirmation closes the thread without replying")

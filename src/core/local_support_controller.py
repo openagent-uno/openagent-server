@@ -211,6 +211,9 @@ class SupportState:
     account_ref: str = ""
     account_email: str = ""
     linked_task_id: str = ""
+    # Replio issues this opaque freshness token from ``thread_brief``.  Keep it
+    # outside ``facts`` so the composer never sees or repeats routing material.
+    expected_last_inbound_message_id: str = ""
 
 
 def enabled(event: dict[str, Any] | None = None) -> bool:
@@ -4344,6 +4347,15 @@ def _reply_verified_actions(state: SupportState) -> list[dict[str, Any]]:
 
 def _reply_args(state: SupportState, reply: str) -> dict[str, Any]:
     args: dict[str, Any] = {"thread_id": state.thread_id, "body_text": reply}
+    if state.expected_last_inbound_message_id:
+        args["expected_last_inbound_message_id"] = (
+            state.expected_last_inbound_message_id
+        )
+        # A Replio Reddit thread can contain several public branches.  Pin the
+        # reply to the same inbound comment we composed against; one-to-one
+        # channels intentionally omit this and use their newest inbound.
+        if "reddit" in state.channel.strip().lower():
+            args["reply_to_message_id"] = state.expected_last_inbound_message_id
     verified = _reply_verified_actions(state)
     if verified:
         args["verified_actions"] = verified
@@ -4540,8 +4552,23 @@ async def run(
         ("replio_thread_brief", "thread_brief", "replio_threads_get", "threads_get"),
         {"thread_id": thread_id},
     )
+    if isinstance(thread, dict):
+        reply_contract = thread.get("reply_contract")
+        if isinstance(reply_contract, dict):
+            state.expected_last_inbound_message_id = str(
+                reply_contract.get("expected_last_inbound_message_id") or ""
+            ).strip()
     if isinstance(thread, dict) and not state.channel:
-        state.channel = str(thread.get("channel") or "")
+        brief_thread = (
+            thread.get("thread")
+            if isinstance(thread.get("thread"), dict)
+            else thread
+        )
+        state.channel = str(
+            brief_thread.get("channel_kind")
+            or brief_thread.get("channel")
+            or ""
+        )
     state.tenant = _tenant_for(payload, thread)
     state.facts["tenant"] = state.tenant.key
     if isinstance(thread, dict):
