@@ -50,6 +50,37 @@ async def t_support_model_calls_are_serialized(_ctx: TestContext) -> None:
     )
 
 
+@test("local_support_controller", "real corpus preserves and filters product labels")
+async def t_real_corpus_product_filter(_ctx: TestContext) -> None:
+    from scripts.local_support_operational_dryrun import _cases_from_corpus
+
+    corpus = [
+        {
+            "product": "esound", "channel_kind": "reddit",
+            "messages": [{"direction": "inbound", "body_text": "eSound issue long enough"}],
+        },
+        {
+            "product": "lyra", "channel_kind": "reddit",
+            "messages": [{"direction": "inbound", "body_text": "Lyra issue long enough"}],
+        },
+        {
+            "product": "lyra", "channel_kind": "email_imap",
+            "messages": [{"direction": "inbound", "body_text": "Lyra email long enough"}],
+        },
+    ]
+
+    esound = _cases_from_corpus(
+        corpus, sample=20, seed=1, product="esound", channel="reddit",
+    )
+    lyra = _cases_from_corpus(
+        corpus, sample=20, seed=1, product="lyra", channel="reddit",
+    )
+
+    assert len(esound) == 1 and esound[0].product == "esound", esound
+    assert len(lyra) == 1 and lyra[0].product == "lyra", lyra
+    assert esound[0].channel == lyra[0].channel == "reddit"
+
+
 class _Toolkit:
     def __init__(self, functions: dict[str, Any]) -> None:
         self.functions = {

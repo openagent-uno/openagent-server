@@ -994,6 +994,77 @@ def _clone_and_patch_db(
         dst.close()
 
 
+def _cases_from_corpus(
+    corpus: Any,
+    *,
+    sample: int,
+    seed: int,
+    product: str = "",
+    channel: str = "",
+) -> list[OperationalCase]:
+    """Build expectation-free cases without losing tenant or channel identity.
+
+    A corpus row is already labelled by Replio. Overwriting that label with
+    ``--product`` made a product-specific run silently feed Lyra messages to
+    the eSound policy (and vice versa). The option is a filter, never a
+    relabelling operation.
+    """
+    import random as _random
+
+    wanted_product = product.strip().lower()
+    wanted_channel = channel.strip().lower()
+    # body, channel, author, attachments, product
+    bodies: list[tuple[str, str, str, list[Any], str]] = []
+    for thread in corpus if isinstance(corpus, list) else []:
+        if not isinstance(thread, dict):
+            continue
+        thread_product = str(thread.get("product") or "esound").strip().lower()
+        if wanted_product and thread_product != wanted_product:
+            continue
+        thread_channel = str(
+            thread.get("channel_kind") or thread.get("channel") or "email"
+        )
+        if wanted_channel and wanted_channel not in thread_channel.lower():
+            continue
+        # Carry the real channel, author and attachment presence so channel
+        # mechanics and human-addressing paths are actually exercised.
+        author = ""
+        attachments: list[Any] = []
+        body = ""
+        for item in (thread.get("messages") or []):
+            if not isinstance(item, dict) or str(
+                item.get("direction") or ""
+            ).lower() != "inbound":
+                continue
+            author = str(item.get("author_name") or "")
+            attachments = list(item.get("attachments") or [])
+            body = str(item.get("body_text") or "").strip()
+            break
+        author = author or str(thread.get("author_name") or "")
+        if not body:
+            body = str(thread.get("subject") or "").strip()
+        if len(body) >= 15:
+            bodies.append((
+                body[:1500], thread_channel, author, attachments, thread_product,
+            ))
+
+    _random.Random(seed).shuffle(bodies)
+    return [
+        OperationalCase(
+            f"real-{index:03d}", f"Thread sim-real: {body}", "",
+            channel=thread_channel,
+            product=thread_product,
+            author_name=author,
+            attachments=tuple(
+                a.get("filename", "attachment") if isinstance(a, dict) else str(a)
+                for a in attachments
+            ),
+        )
+        for index, (body, thread_channel, author, attachments, thread_product)
+        in enumerate(bodies[:sample])
+    ]
+
+
 async def _run(args: argparse.Namespace) -> dict[str, Any]:
     os.environ["OPENAGENT_FORCE_DRY_RUN"] = "1"
     # A/B: the controller stays identical and only the COMPOSER changes, so
@@ -1019,74 +1090,14 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         # Real customer messages instead of the fixture matrix. There is
         # nothing to assert here: the point is what it answers and how long it
         # takes, so every case is expectation-free and simply recorded.
-        import random as _random
-
         corpus = json.loads(Path(args.from_corpus).expanduser().read_text())
-        # Carry the REAL channel. Forcing every corpus case to "email" meant
-        # the store-review path - reviewer language, stars, the reply window -
-        # was never exercised on the 220 review threads in the eSound corpus.
-        bodies: list[tuple[str, str]] = []
-        for thread in corpus:
-            if not isinstance(thread, dict):
-                continue
-            channel = str(
-                thread.get("channel_kind") or thread.get("channel") or "email"
-            )
-            # Replio attaches the sender's display name to the message; the
-            # corpus mode was dropping it, so the "greet them by name" path
-            # was never exercised on a single real thread.
-            author = ""
-            for item in (thread.get("messages") or []):
-                if isinstance(item, dict) and str(
-                    item.get("direction") or ""
-                ).lower() == "inbound":
-                    author = str(item.get("author_name") or "")
-                    break
-            author = author or str(thread.get("author_name") or "")
-            # The attachment list is what tells the controller an image
-            # exists at all. Dropping it meant the screenshot path - 46 of the
-            # 150 most recent eSound threads - was never exercised on real data.
-            attachments = []
-            for item in (thread.get("messages") or []):
-                if isinstance(item, dict) and str(
-                    item.get("direction") or ""
-                ).lower() == "inbound":
-                    attachments = list(item.get("attachments") or [])
-                    break
-            messages = thread.get("messages") or []
-            body = ""
-            for item in messages:
-                if not isinstance(item, dict):
-                    continue
-                if str(item.get("direction") or "").lower() == "inbound":
-                    body = str(item.get("body_text") or "").strip()
-                    break
-            if not body:
-                body = str(thread.get("subject") or "").strip()
-            if len(body) >= 15:
-                bodies.append((body[:1500], channel, author, attachments))
-        _random.Random(args.corpus_seed).shuffle(bodies)
-        if args.corpus_channel:
-            wanted = args.corpus_channel.strip().lower()
-            bodies = [row for row in bodies if wanted in row[1].lower()]
-        selected = [
-            OperationalCase(
-                f"real-{index:03d}", f"Thread sim-real: {body}", "",
-                channel=channel,
-                # Without this the corpus cases defaulted to the eSound
-                # tenant, so a Lyra corpus was routed through eSound policy
-                # paths that do not exist in the Lyra vault: every case died
-                # on the first policy read.
-                product=(args.product or "esound").strip().lower(),
-                author_name=author,
-                attachments=tuple(
-                    a.get("filename", "attachment") if isinstance(a, dict) else str(a)
-                    for a in attachments
-                ),
-            )
-            for index, (body, channel, author, attachments) in enumerate(
-                bodies[: args.corpus_sample])
-        ]
+        selected = _cases_from_corpus(
+            corpus,
+            sample=args.corpus_sample,
+            seed=args.corpus_seed,
+            product=args.product,
+            channel=args.corpus_channel,
+        )
     if args.product and not args.from_corpus:
         # A tenant's policy notes live in ITS vault, so a run must pair the
         # cases of one brand with that brand's agent copy.
