@@ -1770,7 +1770,8 @@ async def t_no_unbacked_refund_claim(_ctx: TestContext) -> None:
         "Request the Apple refund at reportaproblem.apple.com; Apple manages the transaction directly.",
         "To process your refund, please provide the payment date for the subscription.",
         "Let's try to fix it first. Send me device, OS and app version.",
-        "This report requires specialist human review.",
+        "Thanks for writing. A colleague is taking this over and will answer "
+        "you here in this conversation, so there is no need to write again.",
     ):
         assert not reply_guard.claims_completed_action(safe), safe
         assert not reply_guard.promises_commercial_value(safe), safe
@@ -2323,3 +2324,302 @@ async def t_correction_for(_ctx: TestContext) -> None:
     invented = {**good, "grounding": 0.0}
     assert verdict_for(weighted_score(invented), invented) == "BAD"
     assert correction_for(invented)[0] == "correction: grounding"
+
+
+# ─── semantic routing ────────────────────────────────────────────────────
+#
+# The embedder is faked so these tests prove the plumbing, the thresholds and
+# the controller wiring with no network. The multilingual QUALITY of the real
+# model is a separate, measured claim (see the module docstring) and cannot be
+# asserted against a fake.
+
+
+class _FakeEmbedder:
+    """Maps a text onto the basis vector of whichever concept it names.
+
+    Concepts are the exemplar labels themselves: a text is embedded as the
+    label whose name is written into it (``"<<duplicate_charge>>"``), or as a
+    blend of two labels when both are named. That makes similarity, margin and
+    the repeat threshold exactly predictable.
+    """
+
+    model_id = "fake-embed"
+
+    def __init__(self, mapping: dict[str, list[float]] | None = None) -> None:
+        self.mapping = mapping or {}
+        self.calls = 0
+        self.fail = False
+
+    def _labels(self) -> list[str]:
+        from src.core import support_semantics as sem
+
+        return (
+            sorted(sem.INTENT_EXEMPLARS)
+            + sorted(sem.SIGNAL_EXEMPLARS)
+            + [f"not_{name}" for name in sorted(sem.SIGNAL_NEGATIVE_EXEMPLARS)]
+        )
+
+    def embed(self, texts):
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError("embedding endpoint down")
+        from src.core import support_semantics as sem
+
+        labels = self._labels()
+        out = []
+        for text in texts:
+            if text in self.mapping:
+                out.append(list(self.mapping[text]))
+                continue
+            vector = [0.0] * len(labels)
+            for index, label in enumerate(labels):
+                if f"<<{label}>>" in text:
+                    vector[index] = 1.0
+                    continue
+                # The real exemplar strings carry no marker, so place each one
+                # on its own label's axis - a signal's near misses on their
+                # own, so the two-class comparison has something to lose to.
+                if label.startswith("not_"):
+                    pool = sem.SIGNAL_NEGATIVE_EXEMPLARS.get(label[4:], ())
+                else:
+                    pool = (
+                        sem.INTENT_EXEMPLARS.get(label)
+                        or sem.SIGNAL_EXEMPLARS.get(label, ())
+                    )
+                if text in pool:
+                    vector[index] = 1.0
+            if not any(vector):
+                vector = [1.0] * len(labels)
+            out.append(vector)
+        return out
+
+
+def _install_fake_embedder(mapping=None) -> _FakeEmbedder:
+    from src.core import support_semantics as sem
+
+    sem.reset_for_tests()
+    fake = _FakeEmbedder(mapping)
+    sem._embedder = fake
+    sem._embedder_resolved = True
+    return fake
+
+
+@test("support_semantics", "a label is accepted only when it is clearly ahead")
+async def t_semantic_intent_thresholds(_ctx: TestContext) -> None:
+    from src.core import support_semantics as sem
+
+    try:
+        _install_fake_embedder()
+        # Unambiguous: the text sits exactly on one label's axis.
+        match = await sem.classify_intent("<<duplicate_charge>> charged again")
+        assert match is not None and match.label == "duplicate_charge", match
+        assert match.margin > 0, match
+
+        # Ambiguous: equally close to two labels that route in opposite
+        # directions (an account lookup versus a human policy decision). No
+        # opinion is the right answer, and the caller keeps its own route.
+        both = "<<duplicate_charge>> <<billing_dispute>> money problem"
+        assert await sem.classify_intent(both) is None
+
+        # A caller that cannot serve a label never receives it.
+        limited = await sem.classify_intent(
+            "<<duplicate_charge>> charged again", allowed=("bug", "offline"),
+        )
+        assert limited is None or limited.label in ("bug", "offline"), limited
+    finally:
+        sem.reset_for_tests()
+
+
+@test("support_semantics", "an unreachable embedder is silent, once")
+async def t_semantic_degrades_closed(_ctx: TestContext) -> None:
+    from src.core import support_semantics as sem
+
+    try:
+        fake = _install_fake_embedder()
+        fake.fail = True
+        assert await sem.classify_intent("<<bug>> the app crashes") is None
+        calls = fake.calls
+        # A dead endpoint must not be re-dialled on every message of every
+        # thread: the cooldown is what keeps one outage from becoming a
+        # per-message timeout on the support path.
+        assert await sem.classify_intent("<<bug>> the app crashes again") is None
+        assert fake.calls == calls, fake.calls
+    finally:
+        sem.reset_for_tests()
+
+
+@test("support_semantics", "the same answer twice is recognised across languages")
+async def t_semantic_repeat_detection(_ctx: TestContext) -> None:
+    from src.core import support_semantics as sem
+
+    german = "Premium ist aktiv. Melden Sie sich mit der Kauf-E-Mail an."
+    english = "Premium is active. Sign in with the purchase email."
+    other = "Send me the device, the OS and the app version."
+    try:
+        _install_fake_embedder({
+            german: [1.0, 0.0], english: [0.99, 0.14], other: [0.0, 1.0],
+        })
+        repeat = await sem.matches_previous(english, [other, german])
+        assert repeat is not None and repeat.score >= 0.9, repeat
+        assert await sem.matches_previous(other, [german]) is None
+    finally:
+        sem.reset_for_tests()
+
+
+@test("local_support_controller", "an inferred money label is served but never spent")
+async def t_inferred_money_label_is_served(_ctx: TestContext) -> None:
+    """The Spanish duplicate-charge mail of 28-Aug-2026.
+
+    The term lists knew no Spanish for a charge, so the case was handed over
+    with an internal English sentence before the account was ever looked at.
+    Semantics now reach the route; the payment provider still is not called on
+    an inference.
+    """
+    from src.core import local_support_controller as lsc
+    from src.core import support_semantics as sem
+
+    state = lsc.SupportState(
+        thread_id="t", channel="email_imap", customer_message="",
+    )
+    assert lsc._money_execution_blocked(state) is False
+    state.facts["money_execution_requires_human"] = True
+    assert lsc._money_execution_blocked(state) is True
+
+    # The sentence a customer receives on a handoff must not be triage
+    # language, and must not claim a person is on it unless one really is.
+    state.decision = "human"
+    state.facts["language"] = "en"
+    without_receipt = lsc._fallback_reply(state)
+    assert "specialist human review" not in without_receipt.lower(), without_receipt
+    state.facts["human_handoff_confirmed"] = True
+    with_receipt = lsc._fallback_reply(state)
+    assert "colleague" in with_receipt.lower(), with_receipt
+    assert with_receipt != without_receipt
+
+    assert "duplicate_charge" in sem.INTENT_EXEMPLARS
+    assert "billing_dispute" in sem.INTENT_EXEMPLARS
+
+
+@test("local_support_controller", "the queue is written before the reply promises it")
+async def t_handoff_precedes_reply(_ctx: TestContext) -> None:
+    """Replio's F9 guard reads waiting_for_team at SEND time, and an outbound
+    message clears it. So the order is: queue, reply, re-queue."""
+    from src.core import local_support_controller as lsc
+
+    previous = os.environ.get(lsc._WRITES_ENV)
+    os.environ[lsc._WRITES_ENV] = "1"
+    try:
+        doubles = _Doubles()
+        output = json.loads((await lsc.run(
+            agent=SimpleNamespace(_mcp=doubles.pool(), model=_Model()),
+            event={"slug": "replio-thread", "model": ""},
+            payload={"payload": {"thread_id": "t-partner", "message": {
+                "body_text": "Hello, we are a marketing agency and we would "
+                             "like to propose a partnership with your app.",
+            }}},
+            session_id="s", delivery_id="d",
+        )).text)
+        assert output["decision"] == "human", output
+        names = doubles.names
+        handoff = names.index("replio_threads_mark_for_human")
+        respond = names.index("replio_threads_respond")
+        assert handoff < respond, names
+        # ...and the flag is put back after the send that cleared it: an
+        # outbound message clears waiting_for_team, so the LAST write on the
+        # thread has to be the one that queues it again.
+        requeues = [
+            index for index, name in enumerate(names)
+            if name == "replio_threads_patch"
+        ]
+        assert requeues and requeues[-1] > respond, names
+        assert doubles.args_for("replio_threads_patch")[-1]["patch"][
+            "waiting_for_team"
+        ] is True, doubles.args_for("replio_threads_patch")
+    finally:
+        if previous is None:
+            os.environ.pop(lsc._WRITES_ENV, None)
+        else:
+            os.environ[lsc._WRITES_ENV] = previous
+
+
+@test("local_support_controller", "an answer already given is escalated, not repeated")
+async def t_repeat_is_escalated(_ctx: TestContext) -> None:
+    """The German/English Premium loop of 28-Aug-2026: the same instruction
+    three times, the third after the customer wrote that it had arrived twice
+    already and changed nothing."""
+    from src.core import local_support_controller as lsc
+    from src.core import support_semantics as sem
+
+    previous = os.environ.get(lsc._WRITES_ENV)
+    os.environ[lsc._WRITES_ENV] = "1"
+    original_matches = sem.matches_previous
+    original_signal = sem.signal_present
+
+    async def always_repeat(candidate, previous_replies):
+        if not previous_replies:
+            return None
+        return sem.SemanticMatch("repeat", 0.97, 0.0, previous_replies[0][:40])
+
+    async def no_signal(_name, _text):
+        return None
+
+    sem.matches_previous = always_repeat
+    sem.signal_present = no_signal
+    try:
+        doubles = _Doubles(thread={"messages": [
+            {"direction": "outbound",
+             "body_text": "Premium ist aktiv. Melden Sie sich an."},
+            {"direction": "inbound",
+             "body_text": "Habe ich gemacht und keine Verbesserung."},
+        ]})
+        output = json.loads((await lsc.run(
+            agent=SimpleNamespace(_mcp=doubles.pool(), model=_Model()),
+            event={"slug": "replio-thread", "model": ""},
+            payload={"payload": {"thread_id": "t-loop", "message": {
+                "body_text": "I do have premium and i pay for it, still ads. "
+                             "You already sent me this same answer.",
+            }}},
+            session_id="s", delivery_id="d",
+        )).text)
+        assert output["outcome"] == "repeated_advice_human", output["outcome"]
+        assert output["decision"] == "human", output["decision"]
+        assert "replio_threads_mark_for_human" in doubles.names, doubles.names
+        sent = doubles.args_for("replio_threads_respond")
+        assert sent, doubles.names
+        assert "melden sie sich an" not in sent[-1]["body_text"].lower(), sent[-1]
+    finally:
+        sem.matches_previous = original_matches
+        sem.signal_present = original_signal
+        if previous is None:
+            os.environ.pop(lsc._WRITES_ENV, None)
+        else:
+            os.environ[lsc._WRITES_ENV] = previous
+
+
+@test("support_semantics", "a signal must beat its near misses, not a threshold")
+async def t_signal_is_two_class(_ctx: TestContext) -> None:
+    """An ads complaint sits very close to "I pay and still see ads". Firing
+    the paid-entitlement signal on a FREE user sends them into a billing
+    lookup and asks them for a receipt, which is exactly what the ads-policy
+    branch exists to avoid."""
+    from src.core import support_semantics as sem
+
+    try:
+        _install_fake_embedder()
+        fired = await sem.signal_present(
+            "paid_entitlement_claim",
+            "<<paid_entitlement_claim>> I pay for this every month",
+        )
+        assert fired is not None and fired.margin > 0, fired
+
+        near_miss = await sem.signal_present(
+            "paid_entitlement_claim",
+            "<<not_paid_entitlement_claim>> far too many ads in this app",
+        )
+        assert near_miss is None, near_miss
+
+        # Every signal carries its own near misses, or the comparison this
+        # test pins would silently become a bare threshold again.
+        assert set(sem.SIGNAL_NEGATIVE_EXEMPLARS) == set(sem.SIGNAL_EXEMPLARS)
+    finally:
+        sem.reset_for_tests()

@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
-from src.core import reply_guard, tool_trace
+from src.core import reply_guard, support_semantics, tool_trace
 from src.core.dry_run import is_dry_run
 from src.core.execution_profile import (
     stateless_completion_scope,
@@ -203,6 +203,9 @@ class SupportState:
     policy_paths: list[str] = field(default_factory=list)
     human_reason: str = ""
     recent_exchange: list[dict[str, str]] = field(default_factory=list)
+    # Everything this side already said on the thread, oldest first. Used to
+    # refuse to send the same answer a second time in any language.
+    prior_support_replies: list[str] = field(default_factory=list)
     corrections: list[str] = field(default_factory=list)
     tenant: Tenant = field(default_factory=lambda: _TENANTS[_DEFAULT_TENANT])
     # Sensitive routing material stays out of ``facts`` (which is handed to
@@ -676,6 +679,19 @@ _PAID_ADS_CLAIM = re.compile(
     r"\b(?:app\s*user\s*id|appuserid|entitlement|subscription id)\b",
     re.IGNORECASE,
 )
+
+
+def _money_execution_blocked(state: "SupportState") -> bool:
+    """Whether this turn may call a tool that moves the customer's money.
+
+    An intent the customer stated in their own words carries the authority to
+    execute it.  An intent inferred - semantically or by the fallback
+    classifier - carries the authority to look it up and explain it, and
+    stops one step short of the payment provider.
+    """
+    return bool(state.facts.get("money_execution_requires_human"))
+
+
 def _is_ads_policy_complaint(text: str) -> bool:
     """An ads complaint is not automatically a missing-Premium claim.
 
@@ -1586,6 +1602,48 @@ def _recent_exchange(thread: Any, limit: int = 4) -> list[dict[str, str]]:
             "text": text[:400],
         })
     return out
+
+
+def _support_replies(thread: Any, limit: int = 6) -> list[str]:
+    """The outbound bodies already sent on this thread, oldest first.
+
+    Quoted history and the legal footer are cut: two different replies quoting
+    the same customer mail would otherwise look like the same reply.
+    """
+    messages = (thread or {}).get("messages") if isinstance(thread, dict) else None
+    if not isinstance(messages, list):
+        return []
+    out: list[str] = []
+    for item in messages:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("direction") or "").lower() != "outbound":
+            continue
+        text = ""
+        for key in ("body_text", "text", "body", "content"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                text = value
+                break
+        text = _strip_quoted_history(text)
+        if text:
+            out.append(text[:600])
+    return out[-limit:]
+
+
+_QUOTE_MARKERS = (
+    "\nOn ", "\n>", "\n-----Original", "\nThe information transmitted",
+    "\nSollte die E-Mail", "\nMit freundlichen",
+)
+
+
+def _strip_quoted_history(text: str) -> str:
+    body = str(text or "").replace("\r\n", "\n")
+    for marker in _QUOTE_MARKERS:
+        index = body.find(marker)
+        if index > 0:
+            body = body[:index]
+    return body.strip()
 
 
 def _thread_already_answered(thread: Any) -> bool:
@@ -3154,9 +3212,11 @@ def _fallback_reply(state: SupportState) -> str:
             )
         if state.outcome == "bug_reopen_failed_human":
             return (
-                "La segnalazione richiede una revisione umana specializzata."
+                "Grazie per la segnalazione. La sta guardando un collega, che "
+                "risponde qui: non serve rimandarla."
                 if italian else
-                "This report requires specialist human review."
+                "Thanks for the report. A colleague is looking at it and will "
+                "answer here, so there is no need to send it again."
             )
         if state.outcome == "bug_no_grounded_match":
             # Evidence was sufficient but no verified task and no deterministic
@@ -3208,10 +3268,25 @@ def _fallback_reply(state: SupportState) -> str:
             f"To investigate this accurately, please send: {missing}. I won’t claim or open a task until there is sufficient evidence."
         )
     if state.decision == "human":
+        # Never the internal verdict. "This report requires specialist human
+        # review." is triage language: it was sent verbatim to a customer who
+        # had asked a plain billing question, and it tells her nothing about
+        # what happens next. The handoff has already been recorded by the
+        # time this is composed, so the sentence can state a verified fact.
+        if state.facts.get("human_handoff_confirmed"):
+            return (
+                "Grazie del messaggio. Se ne sta occupando un collega, che ti "
+                "risponde qui in questa conversazione: non serve che tu "
+                "riscriva."
+                if italian else
+                "Thanks for writing. A colleague is taking this over and will "
+                "answer you here in this conversation, so there is no need to "
+                "write again."
+            )
         return (
-            "La segnalazione richiede una revisione umana specializzata."
+            "Grazie del messaggio. Lo stiamo guardando e ti rispondiamo qui."
             if italian else
-            "This report requires specialist human review."
+            "Thanks for writing. We are looking at this and will answer you here."
         )
     if state.outcome == "general_needs_detail" and state.facts.get(
         "already_known_from_form"
@@ -4538,6 +4613,111 @@ def _reply_args(state: SupportState, reply: str) -> dict[str, Any]:
     return args
 
 
+async def _refuse_to_repeat(
+    pool: Any,
+    agent: Any,
+    event: dict[str, Any],
+    state: SupportState,
+    reply: str,
+    session_id: str,
+) -> str:
+    """Escalate instead of sending an answer this thread already received.
+
+    Measured on 28-Aug-2026: a paying customer was told three times to sign in
+    with the purchase email and reopen the app - once in German, twice in
+    English - including after he wrote "Ok you have sent the same mail twice.
+    No changes after this Procedere." Nothing in the controller could see it:
+    the outcome was recomputed from scratch each turn and the texts were not
+    byte-identical, so only meaning could catch the loop.
+
+    A second identical answer is never the right move. Either the advice was
+    wrong or the customer cannot apply it, and both are a person's call.
+    """
+    if not reply or state.decision in {"noop", "human"}:
+        return reply
+    if state.outcome in _TERMINAL_NO_REPLY or not state.prior_support_replies:
+        return reply
+    repeat = await support_semantics.matches_previous(
+        reply, state.prior_support_replies,
+    )
+    if repeat is None:
+        return reply
+    ineffective = await support_semantics.signal_present(
+        "previous_advice_ineffective", state.customer_message,
+    )
+    state.facts["repeated_reply_semantic"] = repeat.as_facts()
+    state.facts["previous_advice_ineffective"] = (
+        ineffective.as_facts() if ineffective is not None else None
+    )
+    repeated_outcome = state.outcome
+    state.decision = "human"
+    state.outcome = "repeated_advice_human"
+    state.human_reason = (
+        f"the same answer was already sent on this thread ({repeated_outcome}); "
+        "repeating it would not help the customer"
+    )
+    state.instructions.append(
+        "Do not restate the advice already given on this thread."
+    )
+    elog(
+        "support_controller.repeat_blocked",
+        thread_id=state.thread_id, similarity=round(repeat.score, 3),
+        ineffective=bool(ineffective),
+    )
+    state.facts["human_handoff_confirmed"] = await _queue_for_human(pool, state)
+    return await _compose_local(
+        agent, event, state, f"{session_id}:repeat-escalation",
+    )
+
+
+async def _queue_for_human(pool: Any, state: SupportState) -> bool:
+    """Tag the thread and put it in the human queue. Idempotent per turn.
+
+    Deliberately runs BEFORE the reply is composed. The customer-facing
+    sentence for a handoff is only allowed to say that a person is taking
+    over once a handoff receipt exists - the guard that enforces this reads
+    ``state.actions``. Queueing afterwards left the controller with only one
+    legal sentence, the internal "This report requires specialist human
+    review.", which is what a Spanish-speaking customer actually received on
+    28-Aug-2026.
+    """
+    if any(
+        action.get("kind") == "human_handoff" for action in state.actions
+    ):
+        return any(
+            action.get("kind") == "human_handoff" and action.get("success")
+            for action in state.actions
+        )
+    tags = ["team-decision", "needs-human"]
+    if state.intent == "security_legal":
+        tags.insert(0, "security")
+    elif state.intent in {"account_delete", "account_change"}:
+        tags.insert(0, "account")
+    elif state.intent in {"billing_dispute", "duplicate_charge", "refund"}:
+        tags.insert(0, "billing")
+    elif state.intent == "business_request":
+        tags.insert(0, "business")
+    await _record_tags(state, pool, tags)
+    handed = await _record_action(
+        state, pool, "replio",
+        ("replio_threads_mark_for_human", "threads_mark_for_human", "mark_for_human"),
+        {"thread_id": state.thread_id, "reason": state.human_reason},
+        "human_handoff",
+    )
+    if handed:
+        # mark_for_human sets status=closed + waiting_for_team=false, so
+        # without this the case vanishes from the human queue entirely.
+        await _record_action(
+            state, pool, "replio", ("replio_threads_patch", "threads_patch"),
+            {"thread_id": state.thread_id,
+             "patch": {"status": "open", "waiting_for_team": True}},
+            "thread_patch",
+        )
+        # A patch can clear the tag array as a side effect, so re-apply.
+        await _record_tags(state, pool, tags)
+    return bool(handed)
+
+
 async def _apply_lifecycle(pool: Any, state: SupportState, reply: str) -> None:
     if state.outcome == "legal_silence":
         # No customer reply, ever. The written note says the thread stays
@@ -4587,43 +4767,29 @@ async def _apply_lifecycle(pool: Any, state: SupportState, reply: str) -> None:
     }:
         return
     if state.decision == "human":
-        # Policy order: answer the customer FIRST, then queue the thread.
-        # "VIETATO lasciare un inbound cliente senza risposta E con
-        # waiting_for_team=true" - the human queue is not a substitute for a
-        # reply, and the customer is left staring at silence otherwise.
+        # The queue write already happened, before the reply was composed
+        # (see _queue_for_human). The customer still gets an answer in the
+        # same turn: "VIETATO lasciare un inbound cliente senza risposta E
+        # con waiting_for_team=true" - the human queue is not a substitute
+        # for a reply.
+        handed = await _queue_for_human(pool, state)
         await _record_action(
             state, pool, "replio", ("replio_threads_respond", "threads_respond"),
             _reply_args(state, reply), "customer_reply",
         )
-        tags = ["team-decision", "needs-human"]
-        if state.intent == "security_legal":
-            tags.insert(0, "security")
-        elif state.intent == "account_delete":
-            tags.insert(0, "account")
-        elif state.intent == "account_change":
-            tags.insert(0, "account")
-        elif state.intent == "billing_dispute":
-            tags.insert(0, "billing")
-        elif state.intent == "business_request":
-            tags.insert(0, "business")
-        await _record_tags(state, pool, tags)
-        handed = await _record_action(
-            state, pool, "replio",
-            ("replio_threads_mark_for_human", "threads_mark_for_human", "mark_for_human"),
-            {"thread_id": state.thread_id, "reason": state.human_reason},
-            "human_handoff",
-        )
         if handed:
-            # mark_for_human sets status=closed + waiting_for_team=false, so
-            # without this the case vanishes from the human queue entirely.
+            # An outbound message clears ``waiting_for_team`` (Replio
+            # ``insert_outbound_message``; only its social auto-ack passes
+            # ``keep_waiting_for_team``). Queueing before the reply is what
+            # makes the handoff sentence pass Replio's F9 guard - which reads
+            # the flag at send time - so the flag has to be put back
+            # afterwards or the case silently leaves the human queue.
             await _record_action(
                 state, pool, "replio", ("replio_threads_patch", "threads_patch"),
                 {"thread_id": state.thread_id,
                  "patch": {"status": "open", "waiting_for_team": True}},
                 "thread_patch",
             )
-            # A patch can clear the tag array as a side effect, so re-apply.
-            await _record_tags(state, pool, tags)
         return
 
     if drafts_enabled() and os.environ.get(
@@ -4763,6 +4929,7 @@ async def run(
             if state.linked_task_id:
                 thread = full_thread
     state.recent_exchange = _recent_exchange(thread)
+    state.prior_support_replies = _support_replies(thread)
     # Replio's realtime webhook includes ``payload.message``, but its guarded
     # reconciliation sweep intentionally rebuilds an event from the thread
     # row and therefore carries no message body.  The thread brief is the
@@ -4949,6 +5116,53 @@ async def run(
             )
             state.facts["intent_from_identifier_reply"] = True
 
+        # Meaning, before guessing. A term list only knows the languages
+        # somebody remembered to add: "Cobro denegado ... sigue queriendose
+        # cobrar mi anterior plan mensual" carries every duplicate-charge
+        # signal there is and matched none of them, so a case the controller
+        # can serve end to end was escalated with an internal sentence.
+        # The embedding bank is written in English and matched cross-lingually,
+        # so the same mail routes identically in any language.
+        def _silencing_label_rejected(label: str) -> bool:
+            """Whether an inferred praise/acknowledgement must be refused.
+
+            Both labels end the thread without a reply, so an inferred one is
+            the only misclassification that can lose a real request in
+            silence. The three measured ways it happened are checked here for
+            every inferred source, semantic and model alike.
+            """
+            if label not in ("acknowledgement", "praise"):
+                return False
+            if len(_FORM_FIELD.sub("", message).strip()) > 140:
+                return True
+            # An insult read as praise is never something to close in silence.
+            if _COMPLAINT.search(message):
+                return True
+            # A bare email or account id is an answer to a question we asked.
+            return bool(
+                _extract_email({"payload": payload, "thread": thread}, message)
+                or _extract_app_user_id(
+                    {"payload": payload, "thread": thread}, message
+                )
+            )
+
+        if state.intent == "general" and message.strip():
+            semantic = await support_semantics.classify_intent(
+                f"{state.subject}\n{message}".strip(),
+                allowed=_MODEL_LABELS,
+            )
+            if semantic is not None and _silencing_label_rejected(semantic.label):
+                semantic = None
+            if semantic is not None and semantic.label != "general":
+                state.intent = semantic.label
+                state.facts["intent_source"] = "semantic"
+                state.facts["intent_semantic"] = semantic.as_facts()
+                if semantic.label in _MODEL_LABELS_NEEDING_HUMAN:
+                    # Reaching the route is not authority to spend money on
+                    # it. The lookup and the explanation happen; the refund
+                    # call does not. See _money_execution_blocked.
+                    state.facts["money_execution_requires_human"] = True
+
         # Last resort, and only for the tail the term lists cannot reach.
         if state.intent == "general" and message.strip():
             guessed = await _classify_with_model(
@@ -4961,27 +5175,36 @@ async def run(
             # A long message says something. Measured: a review reading "the
             # moderators gave up and let it die" was labelled praise and
             # answered with silence.
-            if guessed in ("acknowledgement", "praise") and (
-                len(_FORM_FIELD.sub("", message).strip()) > 140
-                # The model called an insult "praise". A message carrying
-                # hostility is never something to close in silence.
-                or _COMPLAINT.search(message)
-            ):
-                guessed = "general"
-            if guessed in ("acknowledgement", "praise") and (
-                _extract_email({"payload": payload, "thread": thread}, message)
-                or _extract_app_user_id(
-                    {"payload": payload, "thread": thread}, message
-                )
-            ):
+            # A long message says something. Measured: a review reading "the
+            # moderators gave up and let it die" was labelled praise and
+            # answered with silence.
+            if _silencing_label_rejected(guessed):
                 guessed = "general"
             if guessed != "general":
                 state.intent = guessed
                 state.facts["intent_source"] = "model"
                 if guessed in _MODEL_LABELS_NEEDING_HUMAN:
-                    # Never let a guessed label move money or delete an
-                    # account. Classified, not executed.
-                    state.facts["model_label_needs_human"] = True
+                    # Never let a guessed label MOVE money or delete an
+                    # account. Until 28-Aug-2026 this also stopped the guessed
+                    # label from being *served*: the thread was handed over
+                    # before the account was ever looked up, which turned a
+                    # question the controller can answer into an escalation
+                    # with an internal sentence. Read, explain, and stop at
+                    # the mutation instead.
+                    state.facts["money_execution_requires_human"] = True
+        if state.facts.get("money_execution_requires_human"):
+            # The label was inferred, not stated. The route may be served, but
+            # nothing about their money may be asserted or spent on an
+            # inference.
+            await _read_policy(
+                pool, state,
+                "esound/procedures/customer-response/anti-fabrication.md",
+            )
+            state.instructions.append(
+                "The topic was inferred, not stated by the customer: do not "
+                "assert what will happen to their money or account."
+            )
+
         # The web form asks "have you bought Premium?" and the customer
         # answers. Asking that person for a purchase receipt is the clearest
         # way to look like nobody read what they wrote.
@@ -5019,21 +5242,6 @@ async def run(
             state.intent = "diagnostic_followup"
             state.facts["intent"] = state.intent
             await _collect_bug_diagnostics(pool, state)
-        elif state.facts.get("model_label_needs_human"):
-            await _read_policy(
-                pool, state,
-                "esound/procedures/customer-response/anti-fabrication.md",
-            )
-            state.decision = "human"
-            state.outcome = "human_required"
-            state.human_reason = (
-                f"classified as {state.intent} by the fallback classifier, not "
-                "by an explicit customer term: a person confirms before any "
-                "money or account action"
-            )
-            state.instructions.append(
-                "Do not state what will happen to their money or account."
-            )
         elif state.intent == "resolved_confirmation":
             await _read_policy(
                 pool, state,
@@ -5158,7 +5366,20 @@ async def run(
                 "Explain streaming catalog plus offline import of the customer's own audio files. Do not create a bug task."
             )
         elif state.intent in {"premium", "duplicate_charge", "cancel_subscription", "refund"}:
-            if state.intent == "premium" and _is_ads_policy_complaint(message):
+            ads_policy_only = _is_ads_policy_complaint(message)
+            if ads_policy_only:
+                # The paid-claim regex knows the phrasings somebody wrote
+                # down. Measured: "got Premium and new Altstore Update bit
+                # get Ads?" has neither "have premium" nor "my premium", so a
+                # paying subscriber was told how to earn Premium for free.
+                # Meaning, not spelling, decides who is already paying.
+                paid_claim = await support_semantics.signal_present(
+                    "paid_entitlement_claim", f"{state.subject}\n{message}",
+                )
+                if paid_claim is not None:
+                    ads_policy_only = False
+                    state.facts["paid_claim_semantic"] = paid_claim.as_facts()
+            if state.intent == "premium" and ads_policy_only:
                 # "Too many ads" is a product-policy complaint, not evidence
                 # that this person bought Premium. Give the verified exits
                 # instead of mechanically asking for an account and receipt.
@@ -5330,6 +5551,14 @@ async def run(
                             state.decision = "human"
                             state.outcome = "refund_out_of_policy_human"
                             state.human_reason = "web refund outside autonomous 14-day/value policy"
+                        elif _money_execution_blocked(state):
+                            state.decision = "human"
+                            state.outcome = "refund_inferred_intent_human"
+                            state.human_reason = (
+                                "an eligible web refund, but the refund request was "
+                                "inferred from the wording rather than stated: a "
+                                "person confirms before money moves"
+                            )
                         else:
                             success = await _record_action(
                                 state, pool, "billingbear",
@@ -5387,6 +5616,18 @@ async def run(
                         state.human_reason = (
                             "duplicate charges found but the plan is outside the "
                             "value cap, so it is not a clean duplicate"
+                        )
+                        state.instructions.append(
+                            "Say the duplicate charges were found and a person is "
+                            "reviewing them. Do NOT say anything has been refunded."
+                        )
+                    elif found and _money_execution_blocked(state):
+                        state.decision = "human"
+                        state.outcome = "duplicate_inferred_intent_human"
+                        state.human_reason = (
+                            "duplicate charges found within the value cap, but the "
+                            "request was inferred from the wording rather than "
+                            "stated: a person confirms before money moves"
                         )
                         state.instructions.append(
                             "Say the duplicate charges were found and a person is "
@@ -5639,9 +5880,15 @@ async def run(
             state.outcome = "general_needs_detail"
             state.instructions.append("Ask a precise clarification; do not invent a product behavior or task.")
 
+    if state.decision == "human" and state.outcome != "legal_silence":
+        # Queue first, answer second: the handoff receipt is what makes the
+        # sentence "a person is taking this over" a verified claim instead of
+        # a promise the guard has to strip.
+        state.facts["human_handoff_confirmed"] = await _queue_for_human(pool, state)
     reply = "" if state.decision == "noop" else await _compose_local(
         agent, event, state, f"{session_id}:{delivery_id}",
     )
+    reply = await _refuse_to_repeat(pool, agent, event, state, reply, session_id)
     await _apply_lifecycle(pool, state, reply)
     # A reply guard block is an instruction to rewrite in the SAME turn.  The
     # first text never reached the customer, so one bounded retry cannot create
