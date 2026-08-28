@@ -1,6 +1,7 @@
 """REST for per-session model pinning and session lifecycle.
 
-``GET /api/sessions`` — list persisted chat sessions (query: ``?client_id=...``).
+``GET /api/sessions`` — list persisted chat sessions for the authenticated
+    certificate (legacy ``?client_id=...`` is ignored).
 ``GET /api/sessions/{session_id}/model`` — current pin, side binding,
     and resolved runtime_id.
 ``PUT /api/sessions/{session_id}/model`` body ``{"runtime_id": "..."}`` —
@@ -29,13 +30,68 @@ from src.core.child_session import HIDDEN_CHILD_ORIGINS  # noqa: E402
 from src.gateway.api._common import gateway_db as _db  # noqa: E402
 
 
+async def _authenticated_access(request, db):
+    """Resolve a certificate-backed principal and canonical connection."""
+    from aiohttp import web
+    from src.memory.operational.access import AccessContext
+
+    try:
+        access = AccessContext.from_request(request)
+    except PermissionError:
+        return None, None, web.json_response(
+            {"error": "authentication required"}, status=401
+        )
+    return await db._ensure_connected(), access, None
+
+
+async def _authorized_session(
+    request,
+    db,
+    session_id: str,
+    *,
+    permission: str = "view",
+    allow_missing: bool = False,
+):
+    """Return ``(connection, access, acl_row, problem_response)``.
+
+    Session payloads still come from the compatibility store while the beta
+    migrates reads, but authorization always comes from the normalized,
+    certificate-owned resource row.  Missing and invisible ids intentionally
+    share the same 404 response so guessing a session cannot confirm it.
+    """
+    from aiohttp import web
+    from src.memory.operational.access import resource_is_visible
+
+    conn, access, problem = await _authenticated_access(request, db)
+    if problem is not None:
+        return conn, access, None, problem
+    acl = await (
+        await conn.execute(
+            "SELECT id AS resource_id, 'session' AS resource_type, tenant_id, "
+            "owner_principal_id, visibility, acl_version FROM sessions_v2 "
+            "WHERE id=? AND deleted_at_ms IS NULL",
+            (session_id,),
+        )
+    ).fetchone()
+    if acl is None:
+        if allow_missing:
+            return conn, access, None, None
+        return conn, access, None, web.json_response(
+            {"error": "session not found"}, status=404
+        )
+    if not await resource_is_visible(conn, acl, access, permission=permission):
+        return conn, access, acl, web.json_response(
+            {"error": "session not found"}, status=404
+        )
+    return conn, access, acl, None
+
+
 async def handle_list(request):
     """GET /api/sessions — list persisted sessions.
 
     Query params:
-      ``client_id`` — filter to one client's sessions. When omitted,
-      the handler infers it from the authenticated device cert so the
-      caller always sees only its own sessions.
+      ``client_id`` — deprecated and ignored; the authenticated certificate
+      always determines the caller's session candidates.
       ``limit`` — max results (default 50).
     """
     from aiohttp import web
@@ -44,16 +100,14 @@ async def handle_list(request):
     if db is None:
         return web.json_response({"error": "memory DB not available"}, status=500)
 
-    # Caller-supplied ``?client_id=`` still wins (power-user / debug
-    # listing). When absent, default to the authenticated user handle
-    # so the list is cross-device — every device the user has paired
-    # with this network sees the same sessions. The legacy device
-    # pubkey is kept available via ``request['client_id']`` for the
-    # RAM enrichment below (which is naturally per-device, since
-    # ``SessionManager`` keys by the live WS's client_id).
-    client_id = (request.query.get("client_id") or "").strip() or None
-    if not client_id:
-        client_id = request.get("user_handle") or request.get("client_id")
+    conn, access, problem = await _authenticated_access(request, db)
+    if problem is not None:
+        return problem
+
+    # The candidate filter is always certificate-derived.  ``client_id`` is
+    # retained as an ignored compatibility query parameter; accepting it as
+    # an authorization identity let one member list another member's chats.
+    client_id = access.handle if access.principal_type == "user" else access.principal_id
 
     try:
         limit = min(int(request.query.get("limit", "50")), 200)
@@ -69,7 +123,45 @@ async def handle_list(request):
     # show an origin chip and a navigable breadcrumb.
     parent = (request.query.get("parent") or "").strip()
     if parent:
-        rows = await db.list_child_sessions(parent, limit=limit)
+        # ``sessions.metadata.parent_session_id`` is a legacy discovery
+        # index, not an authorization boundary.  Resolve the caller from the
+        # verified device certificate, require the canonical parent to be
+        # visible, then independently authorize every child against its own
+        # normalized ACL.  This also makes a guessed parent id fail closed and
+        # ensures ``?client_id=<someone-else>`` can never widen this query.
+        from src.memory.operational.access import resource_is_visible
+
+        conn, access, _parent_acl, problem = await _authorized_session(
+            request, db, parent
+        )
+        if problem is not None:
+            return problem
+
+        discovered = await db.list_child_sessions(parent, limit=limit)
+        child_ids = [str(row.get("session_id") or "") for row in discovered]
+        canonical_by_id = {}
+        if child_ids:
+            placeholders = ",".join("?" for _ in child_ids)
+            canonical_rows = await (
+                await conn.execute(
+                    "SELECT id AS resource_id, 'session' AS resource_type, tenant_id, "
+                    "owner_principal_id, visibility, acl_version, parent_session_id "
+                    f"FROM sessions_v2 WHERE id IN ({placeholders}) "
+                    "AND parent_session_id=? AND deleted_at_ms IS NULL",
+                    (*child_ids, parent),
+                )
+            ).fetchall()
+            canonical_by_id = {
+                str(row["resource_id"]): row for row in canonical_rows
+            }
+
+        rows = []
+        for row in discovered:
+            child_acl = canonical_by_id.get(str(row.get("session_id") or ""))
+            if child_acl is not None and await resource_is_visible(
+                conn, child_acl, access
+            ):
+                rows.append(row)
     else:
         # The flat history hides every spawned child session — delegated
         # sub-agents, scheduled firings, and workflow nodes alike. Each is
@@ -79,6 +171,30 @@ async def handle_list(request):
         rows = await db.list_all_sessions(
             client_id, limit=limit, exclude_child_origins=HIDDEN_CHILD_ORIGINS,
         )
+
+        # Legacy ownership filtering is only candidate discovery.  Recheck
+        # every row against the current canonical ACL before serialization.
+        from src.memory.operational.access import resource_is_visible
+
+        session_ids = [str(row.get("session_id") or "") for row in rows]
+        acl_by_id = {}
+        if session_ids:
+            placeholders = ",".join("?" for _ in session_ids)
+            acl_rows = await (
+                await conn.execute(
+                    "SELECT id AS resource_id, 'session' AS resource_type, tenant_id, "
+                    "owner_principal_id, visibility, acl_version FROM sessions_v2 "
+                    f"WHERE id IN ({placeholders}) AND deleted_at_ms IS NULL",
+                    tuple(session_ids),
+                )
+            ).fetchall()
+            acl_by_id = {str(row["resource_id"]): row for row in acl_rows}
+        visible_rows = []
+        for row in rows:
+            acl = acl_by_id.get(str(row.get("session_id") or ""))
+            if acl is not None and await resource_is_visible(conn, acl, access):
+                visible_rows.append(row)
+        rows = visible_rows
 
     # Enrich with true live-turn state from the stream registry. The legacy
     # SessionManager's RAM list only means "session metadata is attached", not
@@ -166,19 +282,18 @@ async def handle_delete(request):
 
     gateway = request.app.get("gateway")
 
-    row = await db.get_session(session_id)
+    _conn, _access, _acl, problem = await _authorized_session(
+        request, db, session_id, permission="admin"
+    )
+    if problem is not None:
+        return problem
 
-    # Authz: in a multi-user / federated deploy one user must not be able to
-    # delete (and now cascade-purge) another's chat by guessing its id. Enforce
-    # only when we can resolve BOTH a caller handle and a stamped owner — a
-    # trusted-proxy / single-owner / legacy un-owned row has no handle or no
-    # owner to compare and falls through unchanged (matching the prior
-    # behaviour and the sibling list/runs endpoints). A non-owner gets 404 so
-    # the endpoint never confirms the id exists.
-    caller = request.get("user_handle") or request.get("client_id")
-    if row is not None and caller and (row.get("client_id") or ""):
-        if not await db.is_session_owned_by(session_id, caller, row=row):
-            return web.json_response({"error": "session not found"}, status=404)
+    row = await db.get_session(session_id)
+    if row is None:
+        # The normalized row was visible a moment ago but its compatibility
+        # source disappeared concurrently.  Fail closed instead of turning a
+        # guessed id into a successful no-op delete.
+        return web.json_response({"error": "session not found"}, status=404)
 
     # Guard: refuse to delete a run / sub-agent session. A missing row means a
     # never-persisted RAM-only chat (or one already gone) — fall through and
@@ -199,8 +314,16 @@ async def handle_delete(request):
             )
 
     # Collect the whole sub-agent lineage spawned by this chat, then tear down
-    # children first and the parent last.
+    # children first and the parent last.  Every descendant is a distinct ACL
+    # resource: parent ownership alone cannot authorize deleting a child that
+    # belongs to another member.
     descendants = await db.list_descendant_sessions(session_id)
+    for child_sid in descendants:
+        _c, _a, _child_acl, child_problem = await _authorized_session(
+            request, db, child_sid, permission="admin"
+        )
+        if child_problem is not None:
+            return web.json_response({"error": "session not found"}, status=404)
     for child_sid in descendants:
         await _teardown_session(gateway, db, child_sid)
     await _teardown_session(gateway, db, session_id)
@@ -593,6 +716,14 @@ async def handle_get_context(request):
         return web.json_response({"error": "agent not available"}, status=500)
 
     session_id = request.match_info["session_id"]
+    db = _db(request)
+    if db is None:
+        return web.json_response({"error": "memory DB not available"}, status=500)
+    _conn, _access, _acl, problem = await _authorized_session(
+        request, db, session_id
+    )
+    if problem is not None:
+        return problem
     try:
         from src.core.context_report import build_context_report
 
@@ -627,6 +758,11 @@ async def handle_get_runs(request):
         return web.json_response({"error": "memory DB not available"}, status=500)
 
     session_id = request.match_info["session_id"]
+    _conn, _access, _acl, problem = await _authorized_session(
+        request, db, session_id
+    )
+    if problem is not None:
+        return problem
     try:
         limit = min(int(request.query.get("limit", "20")), 100)
     except (TypeError, ValueError):
@@ -644,6 +780,11 @@ async def handle_get_runs(request):
     child_by_run_id: dict[str, str] = {}
     try:
         for c in await db.list_child_sessions(session_id):
+            _c, _a, _child_acl, child_problem = await _authorized_session(
+                request, db, str(c.get("session_id") or "")
+            )
+            if child_problem is not None:
+                continue
             crid = c.get("child_run_id")
             if crid:
                 child_by_run_id[str(crid)] = c["session_id"]
@@ -687,6 +828,11 @@ async def handle_get_events(request):
     session_id = request.match_info["session_id"]
     if not session_id:
         return web.json_response({"error": "session_id is required"}, status=400)
+    _conn, _access, _acl, problem = await _authorized_session(
+        request, db, session_id
+    )
+    if problem is not None:
+        return problem
     try:
         after = int(request.query.get("after", "0"))
     except (TypeError, ValueError):
@@ -772,18 +918,41 @@ async def handle_patch_metadata(request):
     if not session_id:
         return web.json_response({"error": "session_id is required"}, status=400)
 
+    # PATCH is also the create-on-first-message path.  Existing rows require
+    # canonical admin permission; a genuinely new id may be claimed only by
+    # the authenticated certificate identity.  A legacy row lacking its v2
+    # projection is not "new" and therefore cannot be claimed through this
+    # compatibility endpoint.
+    _conn, access, acl, problem = await _authorized_session(
+        request,
+        db,
+        session_id,
+        permission="admin",
+        allow_missing=True,
+    )
+    if problem is not None:
+        return problem
+    legacy_row = await db.get_session(session_id)
+    if legacy_row is not None and acl is None:
+        return web.json_response({"error": "session not found"}, status=404)
+
     body = await request.json() if request.can_read_body else {}
     title = str(body.get("title") or "").strip() or None
     model = str(body.get("model") or "").strip() or None
     if not title and not model:
         return web.json_response({"error": "title or model is required"}, status=400)
 
-    # Prefer the user handle (same across their devices, which is what makes
-    # the chat list cross-device); fall back to the device pubkey. Both can be
-    # absent on a trusted-proxy / single-owner deploy, and then this behaves
-    # exactly as before.
-    owner = request.get("user_handle") or request.get("client_id") or None
-    await db.upsert_session(session_id, client_id=owner, title=title, model=model)
+    # Derive ownership exclusively from the verified certificate.  Human
+    # handles stay cross-device; agent principals remain explicitly typed.
+    owner = access.handle if access.principal_type == "user" else access.principal_id
+    await db.upsert_session(
+        session_id,
+        # An admin grant authorizes editing; it does not transfer ownership.
+        # Stamp the certificate principal only on genuine first creation.
+        client_id=owner if legacy_row is None else None,
+        title=title,
+        model=model,
+    )
     return web.json_response({"session_id": session_id, "ok": True})
 
 
@@ -794,6 +963,11 @@ async def handle_get(request):
     if db is None:
         return web.json_response({"error": "memory DB not available"}, status=500)
     session_id = request.match_info["session_id"]
+    _conn, _access, _acl, problem = await _authorized_session(
+        request, db, session_id
+    )
+    if problem is not None:
+        return problem
     pin = await db.get_session_pin(session_id)
     return web.json_response({
         "session_id": session_id,
@@ -813,6 +987,11 @@ async def handle_pin(request):
     if db is None:
         return web.json_response({"error": "memory DB not available"}, status=500)
     session_id = request.match_info["session_id"]
+    _conn, _access, _acl, problem = await _authorized_session(
+        request, db, session_id, permission="admin"
+    )
+    if problem is not None:
+        return problem
     body = await request.json() if request.can_read_body else {}
     runtime_id = str(body.get("runtime_id") or "").strip()
     if not runtime_id:
@@ -863,6 +1042,11 @@ async def handle_unpin(request):
     if db is None:
         return web.json_response({"error": "memory DB not available"}, status=500)
     session_id = request.match_info["session_id"]
+    _conn, _access, _acl, problem = await _authorized_session(
+        request, db, session_id, permission="admin"
+    )
+    if problem is not None:
+        return problem
     await db.unpin_session_model(session_id)
     return web.json_response({
         "session_id": session_id,

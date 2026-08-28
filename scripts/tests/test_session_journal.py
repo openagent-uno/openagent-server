@@ -14,6 +14,7 @@ riderivabili dal messaggio finale e sarebbero il grosso del volume.
 from __future__ import annotations
 
 import uuid
+from types import SimpleNamespace
 
 from ._framework import TestContext, test
 
@@ -192,8 +193,43 @@ async def t_endpoint_diagnostics(ctx: TestContext) -> None:
         async def list_session_events(self, session_id, *, after_seq=0, limit=500):
             return [e for e in self._events if e["seq"] > after_seq][:limit]
 
-    class _Req:
+        async def _ensure_connected(self):
+            return _FakeConnection()
+
+    class _FakeCursor:
+        def __init__(self, row):
+            self.row = row
+
+        async def fetchone(self):
+            return self.row
+
+    class _FakeConnection:
+        async def execute(self, statement, _params=()):
+            if "FROM sessions_v2" in statement:
+                return _FakeCursor({
+                    "resource_id": "s1",
+                    "resource_type": "session",
+                    "tenant_id": "test-network",
+                    "owner_principal_id": "user:alice",
+                    "visibility": "private",
+                    "acl_version": 1,
+                })
+            return _FakeCursor(None)
+
+    class _Req(dict):
         def __init__(self, db):
+            cert = SimpleNamespace(
+                network_id="test-network",
+                handle="alice",
+                device_pubkey_hex="alice-device",
+                capabilities=[],
+            )
+            super().__init__(
+                device_cert=cert,
+                network_id="test-network",
+                user_handle="alice",
+                client_id="alice-device",
+            )
             class _H:
                 pass
             agent = _H(); agent.memory_db = db
@@ -201,9 +237,6 @@ async def t_endpoint_diagnostics(ctx: TestContext) -> None:
             self.app = {"gateway": gw}
             self.match_info = {"session_id": "s1"}
             self.query = {}
-
-        def get(self, key, default=None):
-            return default
 
     def ev(seq, typ, data=None):
         return {"seq": seq, "ts_ms": seq, "type": typ, "data": data or {}}

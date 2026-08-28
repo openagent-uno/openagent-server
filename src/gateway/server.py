@@ -1169,6 +1169,7 @@ class Gateway:
             ("POST", "/api/search", operational_api.handle_search),
             ("GET", "/api/sessions/{session_id}/messages", operational_api.handle_session_messages),
             ("GET", "/api/sessions/{session_id}/related-runs", operational_api.handle_session_related_runs),
+            ("GET", "/api/sessions/{session_id}/descendants", operational_api.handle_session_descendants),
             ("GET", "/api/tool-invocations/{tool_id}", operational_api.handle_tool_invocation),
             ("GET", "/api/scheduled-runs/{run_id}", operational_api.handle_scheduled_run),
             ("GET", "/api/vault/notes", vault.handle_list),

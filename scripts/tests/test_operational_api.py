@@ -545,12 +545,14 @@ async def t_session_related_runs_historical_fallback(_ctx: TestContext) -> None:
             related = _payload(response)
             assert set(related) == {
                 "session_id",
+                "include_descendants",
                 "items",
                 "next_cursor",
                 "has_more",
                 "revision",
                 "snapshot",
             }
+            assert related["include_descendants"] is False
             assert {item["kind"] for item in related["items"]} == {
                 "workflow_run",
                 "scheduled_run",
@@ -560,6 +562,8 @@ async def t_session_related_runs_historical_fallback(_ctx: TestContext) -> None:
             assert by_kind["workflow_run"]["resource_id"] == "orchid-workflow-run"
             assert by_kind["workflow_run"]["parent"]["id"] == "orchid-workflow"
             assert by_kind["workflow_run"]["caused_by"]["count"] == 2
+            assert by_kind["workflow_run"]["caused_by"]["session_id"] == "orchid-chat"
+            assert by_kind["workflow_run"]["caused_by"]["session_depth"] == 0
             assert by_kind["scheduled_run"]["resource_id"] == "orchid-task-run"
             assert by_kind["scheduled_run"]["parent"]["id"] == "orchid-task"
             assert by_kind["event_delivery"]["resource_id"] == "orchid-delivery"
@@ -708,6 +712,265 @@ async def t_session_related_runs_historical_fallback(_ctx: TestContext) -> None:
                     "expected_parent_id": None,
                 }
             ]
+        finally:
+            if gateway is not None:
+                await operational.stop_background_maintenance(gateway)
+            await db.close()
+
+
+@test(
+    "operational_api",
+    "session subtree is cycle-safe, paginated, and feeds descendant runs",
+)
+async def t_session_descendants_and_nested_related_runs(_ctx: TestContext) -> None:
+    from src.gateway.api import operational
+    from src.memory.db import MemoryDB
+
+    with TemporaryDirectory(prefix="openagent-session-tree-") as directory:
+        db = MemoryDB(str(Path(directory) / "openagent.db"))
+        await db.connect()
+        gateway = None
+        try:
+            tenant, gateway = await _seed_complete_fixture(db)
+            level_1 = "orchid-child"
+            level_2 = "orchid-hidden-level-2"
+            level_3 = "orchid-visible-level-3"
+            await db.upsert_session(
+                level_2,
+                client_id="bob",
+                title="Hidden middle",
+                parent_session_id=level_1,
+                origin="delegation",
+                kind="subagent",
+            )
+            await db.upsert_session(
+                level_3,
+                client_id="alice",
+                title="Visible grandchild",
+                parent_session_id=level_2,
+                origin="delegation",
+                kind="subagent",
+            )
+
+            async def _launch(session_id: str, label: str, tool: str, result: dict):
+                now = time.time()
+                run = {
+                    "run_id": f"tree-run-{label}",
+                    "status": "COMPLETED",
+                    "created_at": now,
+                    "messages": [
+                        {
+                            "id": f"tree-message-{label}",
+                            "role": "tool",
+                            "tool_call_id": f"tree-call-{label}",
+                            "content": f"{label} finished",
+                        }
+                    ],
+                    "tools": [
+                        {
+                            "tool_call_id": f"tree-call-{label}",
+                            "tool_name": "tool_search_call_tool",
+                            "tool_args": {
+                                "server": "tool-search",
+                                "tool": tool,
+                                "args": {"secret": f"NEVER_TREE_{label}"},
+                            },
+                            "result": json.dumps(result),
+                            "status": "completed",
+                        }
+                    ],
+                }
+                await db._conn.execute(
+                    "UPDATE sessions SET runs=?, updated_at=? WHERE session_id=?",
+                    (json.dumps([run]), int(now) + 1, session_id),
+                )
+                await db._project_operational_session(session_id)
+                await db._conn.commit()
+
+            await _launch(
+                level_1,
+                "scheduled",
+                "scheduler_run_scheduled_task_now",
+                {"id": "orchid-task-run", "task_id": "orchid-task"},
+            )
+            await _launch(
+                level_2,
+                "event-hidden",
+                "events_manager_trigger_event",
+                {"id": "orchid-delivery", "event_id": "orchid-event"},
+            )
+            await _launch(
+                level_3,
+                "workflow",
+                "workflow_manager_run_workflow",
+                {"id": "orchid-workflow-run", "workflow_id": "orchid-workflow"},
+            )
+
+            # Close a malformed root→child→child→child→root cycle directly in
+            # normalized storage.  The endpoint must never emit the root as
+            # its own descendant or recurse forever.
+            await db._conn.execute(
+                "UPDATE sessions_v2 SET parent_session_id=? WHERE id='orchid-chat'",
+                (level_3,),
+            )
+            await db._conn.commit()
+
+            alice = lambda **kwargs: _Request(
+                gateway,
+                tenant=tenant,
+                handle="alice",
+                device="alice-device",
+                **kwargs,
+            )
+            bob = lambda **kwargs: _Request(
+                gateway,
+                tenant=tenant,
+                handle="bob",
+                device="bob-device",
+                **kwargs,
+            )
+            capabilities = await _ready_capabilities(operational, alice())
+            assert capabilities["features"]["session_descendants"] == {
+                "version": 1,
+                "max_depth": 128,
+                "snapshot_pagination": True,
+                "max_page_size": 100,
+            }
+            assert capabilities["features"]["session_related_runs"][
+                "include_descendants"
+            ] is True
+
+            first_response = await operational.handle_session_descendants(
+                alice(
+                    match={"session_id": "orchid-chat"},
+                    query={"limit": "1"},
+                )
+            )
+            assert first_response.status == 200, first_response.text
+            first = _payload(first_response)
+            assert first["has_more"] and first["next_cursor"]
+            descendants = list(first["items"])
+            cursor = first["next_cursor"]
+            while cursor:
+                page = _payload(
+                    await operational.handle_session_descendants(
+                        alice(
+                            match={"session_id": "orchid-chat"},
+                            query={"limit": "1", "cursor": cursor},
+                        )
+                    )
+                )
+                assert page["snapshot"]["snapshot_id"] == first["snapshot"][
+                    "snapshot_id"
+                ]
+                descendants.extend(page["items"])
+                cursor = page["next_cursor"]
+
+            by_id = {row["session_id"]: row for row in descendants}
+            assert set(by_id) == {level_1, level_3}, by_id
+            assert len(descendants) == len(by_id)
+            assert by_id[level_1]["depth"] == 1
+            assert by_id[level_1]["parent_session_id"] == "orchid-chat"
+            assert by_id[level_3]["depth"] == 3
+            assert by_id[level_3]["parent_session_id"] is None
+            assert by_id[level_3]["lineage_redacted"] is True
+            assert "orchid-chat" not in by_id
+            assert level_2 not in first_response.text
+
+            too_large = await operational.handle_session_descendants(
+                alice(
+                    match={"session_id": "orchid-chat"},
+                    query={"limit": "101"},
+                )
+            )
+            assert too_large.status == 400
+
+            # A cursor is signed and principal-bound even after Bob receives a
+            # legitimate view grant on the root.
+            await db._conn.execute(
+                "INSERT INTO resource_acl "
+                "(tenant_id,resource_type,resource_id,principal_type,principal_id,"
+                "permission,acl_version,granted_by_principal_id,granted_at_ms) "
+                "VALUES(?,?,?,?,?,'view',1,?,?)",
+                (
+                    tenant,
+                    "session",
+                    "orchid-chat",
+                    "user",
+                    "bob",
+                    "user:alice",
+                    int(time.time() * 1000),
+                ),
+            )
+            await db._conn.commit()
+            wrong_account = await operational.handle_session_descendants(
+                bob(
+                    match={"session_id": "orchid-chat"},
+                    query={"limit": "1", "cursor": first["next_cursor"]},
+                )
+            )
+            assert wrong_account.status == 409
+
+            direct = _payload(
+                await operational.handle_session_related_runs(
+                    alice(
+                        match={"session_id": "orchid-chat"},
+                        query={"limit": "100"},
+                    )
+                )
+            )
+            assert direct["include_descendants"] is False
+            assert direct["items"] == []
+
+            nested_first = _payload(
+                await operational.handle_session_related_runs(
+                    alice(
+                        match={"session_id": "orchid-chat"},
+                        query={"limit": "1", "include_descendants": "true"},
+                    )
+                )
+            )
+            assert nested_first["include_descendants"] is True
+            assert nested_first["has_more"] and nested_first["next_cursor"]
+            nested_items = list(nested_first["items"])
+            cursor = nested_first["next_cursor"]
+            while cursor:
+                page = _payload(
+                    await operational.handle_session_related_runs(
+                        alice(
+                            match={"session_id": "orchid-chat"},
+                            # The signed cursor carries the mode, so clients do
+                            # not have to repeat the flag on every page.
+                            query={"limit": "1", "cursor": cursor},
+                        )
+                    )
+                )
+                nested_items.extend(page["items"])
+                cursor = page["next_cursor"]
+            nested_by_kind = {row["kind"]: row for row in nested_items}
+            assert set(nested_by_kind) == {"scheduled_run", "workflow_run"}
+            assert nested_by_kind["scheduled_run"]["caused_by"][
+                "session_id"
+            ] == level_1
+            assert nested_by_kind["scheduled_run"]["caused_by"]["session_depth"] == 1
+            assert nested_by_kind["workflow_run"]["caused_by"][
+                "session_id"
+            ] == level_3
+            assert nested_by_kind["workflow_run"]["caused_by"]["session_depth"] == 3
+            assert "event_delivery" not in nested_by_kind
+            assert "NEVER_TREE_" not in json.dumps(nested_items)
+
+            changed_query = await operational.handle_session_related_runs(
+                alice(
+                    match={"session_id": "orchid-chat"},
+                    query={
+                        "limit": "1",
+                        "cursor": nested_first["next_cursor"],
+                        "include_descendants": "false",
+                    },
+                )
+            )
+            assert changed_query.status == 409
         finally:
             if gateway is not None:
                 await operational.stop_background_maintenance(gateway)

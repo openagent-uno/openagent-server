@@ -306,6 +306,7 @@ async def stop_background_maintenance(gateway: Any) -> None:
         state.history.clear()
         state.search.clear()
         state.related_runs.clear()
+        state.session_trees.clear()
     setattr(gateway, "_operational_cursor_state", None)
 
 
@@ -409,6 +410,18 @@ class _RelatedRunsSnapshot:
     tenant_id: str
     principal_id: str
     session_id: str
+    include_descendants: bool
+    revision: str
+    rows: tuple[dict[str, Any], ...]
+    expires_at_ms: int
+
+
+@dataclass
+class _SessionTreeSnapshot:
+    snapshot_id: str
+    tenant_id: str
+    principal_id: str
+    session_id: str
     revision: str
     rows: tuple[dict[str, Any], ...]
     expires_at_ms: int
@@ -420,18 +433,25 @@ class _CursorState:
         self.history: dict[str, _HistorySnapshot] = {}
         self.search: dict[str, _SearchSnapshot] = {}
         self.related_runs: dict[str, _RelatedRunsSnapshot] = {}
+        self.session_trees: dict[str, _SessionTreeSnapshot] = {}
         self._serial = 0
         self._order: dict[tuple[str, str], int] = {}
 
     def _put(
         self,
         kind: str,
-        snapshot: _HistorySnapshot | _SearchSnapshot | _RelatedRunsSnapshot,
+        snapshot: (
+            _HistorySnapshot
+            | _SearchSnapshot
+            | _RelatedRunsSnapshot
+            | _SessionTreeSnapshot
+        ),
     ) -> None:
         target = {
             "history": self.history,
             "search": self.search,
             "related_runs": self.related_runs,
+            "session_trees": self.session_trees,
         }[kind]
         target[snapshot.snapshot_id] = snapshot  # type: ignore[assignment]
         self._serial += 1
@@ -447,18 +467,22 @@ class _CursorState:
     def put_related_runs(self, snapshot: _RelatedRunsSnapshot) -> None:
         self._put("related_runs", snapshot)
 
+    def put_session_tree(self, snapshot: _SessionTreeSnapshot) -> None:
+        self._put("session_trees", snapshot)
+
     def _entries(self) -> list[tuple[str, str, Any]]:
         return [
             *(("history", key, value) for key, value in self.history.items()),
             *(("search", key, value) for key, value in self.search.items()),
             *(("related_runs", key, value) for key, value in self.related_runs.items()),
+            *(("session_trees", key, value) for key, value in self.session_trees.items()),
         ]
 
     @staticmethod
     def _rows(kind: str, snapshot: Any) -> int:
         if kind == "history":
             return len(snapshot.activity_ids)
-        if kind == "related_runs":
+        if kind in {"related_runs", "session_trees"}:
             return len(snapshot.rows)
         # Root grouping stores compact match rows below each root. Count those
         # actual allocations, not only the number of outer roots, or one chat
@@ -494,6 +518,7 @@ class _CursorState:
                 "history": self.history,
                 "search": self.search,
                 "related_runs": self.related_runs,
+                "session_trees": self.session_trees,
             }[kind].pop(key, None)
             self._order.pop((kind, key), None)
 
@@ -534,10 +559,16 @@ class _CursorState:
             for key, value in self.related_runs.items()
             if value.expires_at_ms > now_ms
         }
+        self.session_trees = {
+            key: value
+            for key, value in self.session_trees.items()
+            if value.expires_at_ms > now_ms
+        }
         live = {
             *(("history", key) for key in self.history),
             *(("search", key) for key in self.search),
             *(("related_runs", key) for key in self.related_runs),
+            *(("session_trees", key) for key in self.session_trees),
         }
         self._order = {key: value for key, value in self._order.items() if key in live}
 
@@ -728,8 +759,15 @@ async def handle_capabilities(request: web.Request) -> web.Response:
                     "max_page_size": 100,
                 },
                 "session_related_runs": {
-                    "version": 1,
+                    "version": 2,
                     "kinds": ["event_delivery", "scheduled_run", "workflow_run"],
+                    "include_descendants": True,
+                    "snapshot_pagination": True,
+                    "max_page_size": 100,
+                },
+                "session_descendants": {
+                    "version": 1,
+                    "max_depth": _MAX_SESSION_TREE_DEPTH,
                     "snapshot_pagination": True,
                     "max_page_size": 100,
                 },
@@ -887,6 +925,248 @@ async def _session_acl_row(conn: Any, session_id: str):
     ).fetchone()
 
 
+_MAX_SESSION_TREE_DEPTH = 128
+
+
+async def _session_tree_candidates(
+    conn: Any,
+    *,
+    access: AccessContext,
+    session_id: str,
+) -> list[dict[str, Any]]:
+    """Return the caller-visible normalized descendants of one session.
+
+    The JSON-array path makes the recursive CTE cycle-safe for arbitrary
+    opaque ids (a delimiter-based path is not safe when ids contain that
+    delimiter).  Traversal may cross an invisible intermediate resource so a
+    separately granted grandchild remains reachable, but the hidden parent's
+    id is redacted from the serialized row.
+    """
+
+    owners = sorted(access.principal_ids)
+    identities = sorted(access.grant_identities)
+    authorization = ["s.visibility IN ('installation_shared','public')"]
+    params: list[Any] = [
+        session_id,
+        access.tenant_id,
+        session_id,
+        access.tenant_id,
+        _MAX_SESSION_TREE_DEPTH,
+        access.tenant_id,
+    ]
+    if owners:
+        authorization.append(
+            f"s.owner_principal_id IN ({','.join('?' for _ in owners)})"
+        )
+        params.extend(owners)
+    if identities:
+        identity_sql = " OR ".join(
+            "(acl.principal_type=? AND acl.principal_id=?)" for _ in identities
+        )
+        authorization.append(
+            "EXISTS (SELECT 1 FROM resource_acl acl "
+            "WHERE acl.tenant_id=s.tenant_id "
+            "AND acl.resource_type='session' AND acl.resource_id=s.id "
+            "AND acl.permission IN ('view','admin') "
+            "AND acl.acl_version=s.acl_version "
+            f"AND ({identity_sql}))"
+        )
+        for principal_type, principal_id in identities:
+            params.extend((principal_type, principal_id))
+    params.append(_MAX_SNAPSHOT_ITEMS + 1)
+
+    rows = await (
+        await conn.execute(
+            "WITH RECURSIVE tree(id, parent_session_id, depth, path) AS ("
+            " SELECT s.id, s.parent_session_id, 1, json_array(?, s.id) "
+            " FROM sessions_v2 s WHERE s.tenant_id=? "
+            " AND s.parent_session_id=? AND s.deleted_at_ms IS NULL "
+            " UNION ALL "
+            " SELECT c.id, c.parent_session_id, t.depth + 1, "
+            "        json_insert(t.path, '$[#]', c.id) "
+            " FROM sessions_v2 c JOIN tree t "
+            " ON c.tenant_id=? AND c.parent_session_id=t.id "
+            " WHERE c.deleted_at_ms IS NULL AND t.depth < ? "
+            " AND NOT EXISTS (SELECT 1 FROM json_each(t.path) p "
+            "                 WHERE CAST(p.value AS TEXT)=c.id)"
+            ") "
+            "SELECT s.id AS resource_id, 'session' AS resource_type, "
+            "s.tenant_id, s.owner_principal_id, s.visibility, s.acl_version, "
+            "s.title, s.session_type, s.kind, s.origin, t.parent_session_id, "
+            "t.depth, s.model, s.framework, s.status, s.completeness, "
+            "s.created_at_ms, s.updated_at_ms, s.last_activity_at_ms "
+            "FROM tree t JOIN sessions_v2 s ON s.id=t.id AND s.tenant_id=? "
+            "WHERE s.visibility<>'quarantined' "
+            f"AND ({' OR '.join(authorization)}) "
+            "ORDER BY t.depth, s.last_activity_at_ms DESC, s.id LIMIT ?",
+            params,
+        )
+    ).fetchall()
+    if len(rows) > _MAX_SNAPSHOT_ITEMS:
+        raise ApiProblem(503, "degraded", "Session subtree is temporarily too large")
+
+    visible_ids = {str(row["resource_id"]) for row in rows}
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        parent_id = str(row["parent_session_id"]) if row["parent_session_id"] else None
+        parent_visible = parent_id == session_id or parent_id in visible_ids
+        result.append(
+            {
+                "session_id": str(row["resource_id"]),
+                "parent_session_id": parent_id if parent_visible else None,
+                "lineage_redacted": bool(parent_id and not parent_visible),
+                "depth": int(row["depth"]),
+                "title": str(row["title"]) if row["title"] is not None else None,
+                "session_type": str(row["session_type"]),
+                "kind": str(row["kind"]),
+                "origin": str(row["origin"]) if row["origin"] is not None else None,
+                "model": str(row["model"]) if row["model"] is not None else None,
+                "framework": str(row["framework"])
+                if row["framework"] is not None
+                else None,
+                "status": str(row["status"]),
+                "completeness": str(row["completeness"]),
+                "created_at": _iso(row["created_at_ms"]),
+                "updated_at": _iso(row["updated_at_ms"]),
+                "last_active_at": _iso(row["last_activity_at_ms"]),
+            }
+        )
+    return result
+
+
+async def handle_session_descendants(request: web.Request) -> web.Response:
+    """GET /api/sessions/{id}/descendants — ACL-safe flattened subtree."""
+
+    try:
+        access = AccessContext.from_request(request)
+        _db, conn = await _canonical_conn(request)
+        session_id = str(
+            request.match_info.get("session_id")
+            or request.match_info.get("sessionId")
+            or ""
+        )
+        session = await _session_acl_row(conn, session_id)
+        if session is None or not await resource_is_visible(conn, session, access):
+            raise ApiProblem(404, "target_not_found", "This result is no longer available")
+        limit = _bounded_int(
+            request.query.get("limit"),
+            name="limit",
+            default=50,
+            minimum=1,
+            maximum=100,
+        )
+        state = _state(request)
+        now_ms = int(time.time() * 1000)
+        state.prune(now_ms)
+        cursor_token = request.query.get("cursor")
+        if cursor_token:
+            cursor = state.decode(cursor_token)
+            if cursor.get("k") != "session_tree":
+                raise ApiProblem(
+                    409,
+                    "cursor_stale",
+                    "The session-tree cursor is invalid",
+                    reason="invalid_signature",
+                )
+            snapshot = state.session_trees.get(str(cursor.get("s", "")))
+            if snapshot is None:
+                raise ApiProblem(
+                    409,
+                    "cursor_stale",
+                    "The session-tree snapshot expired; refresh to continue",
+                    reason="snapshot_missing",
+                )
+            if (
+                snapshot.tenant_id != access.tenant_id
+                or snapshot.principal_id != access.principal_id
+                or snapshot.session_id != session_id
+            ):
+                raise ApiProblem(
+                    409,
+                    "cursor_stale",
+                    "The session-tree cursor is not valid for this account",
+                    reason="acl_changed",
+                )
+            try:
+                offset = int(cursor.get("o", -1))
+            except (TypeError, ValueError) as exc:
+                raise ApiProblem(
+                    409,
+                    "cursor_stale",
+                    "The session-tree cursor is invalid",
+                    reason="invalid_signature",
+                ) from exc
+            if offset < 0 or offset > len(snapshot.rows):
+                raise ApiProblem(
+                    409,
+                    "cursor_stale",
+                    "The session-tree cursor is invalid",
+                    reason="invalid_signature",
+                )
+        else:
+            rows = await _session_tree_candidates(
+                conn,
+                access=access,
+                session_id=session_id,
+            )
+            revision_row = await (
+                await conn.execute(
+                    "SELECT history_revision FROM operational_storage_state "
+                    "WHERE singleton_id=1"
+                )
+            ).fetchone()
+            snapshot = _SessionTreeSnapshot(
+                snapshot_id=secrets.token_hex(16),
+                tenant_id=access.tenant_id,
+                principal_id=access.principal_id,
+                session_id=session_id,
+                revision=str(int(revision_row[0] if revision_row else 0)),
+                rows=tuple(rows),
+                expires_at_ms=now_ms + _SNAPSHOT_TTL_MS,
+            )
+            state.put_session_tree(snapshot)
+            offset = 0
+
+        selected = snapshot.rows[offset : offset + limit]
+        visible: list[dict[str, Any]] = []
+        for row in selected:
+            acl = await _session_acl_row(conn, str(row["session_id"]))
+            if acl is not None and await resource_is_visible(conn, acl, access):
+                visible.append(dict(row))
+        next_offset = offset + len(selected)
+        has_more = next_offset < len(snapshot.rows)
+        next_cursor = (
+            state.encode(
+                {"k": "session_tree", "s": snapshot.snapshot_id, "o": next_offset}
+            )
+            if has_more
+            else None
+        )
+        return _json(
+            {
+                "session_id": session_id,
+                "items": visible,
+                "next_cursor": next_cursor,
+                "has_more": has_more,
+                "revision": snapshot.revision,
+                "snapshot": {
+                    "snapshot_id": snapshot.snapshot_id,
+                    "revision": snapshot.revision,
+                    "expires_at": _iso(snapshot.expires_at_ms),
+                },
+            }
+        )
+    except PermissionError:
+        return _problem(ApiProblem(401, "unauthorized", "Authentication required"))
+    except ApiProblem as exc:
+        return _problem(exc)
+    except Exception:
+        logger.error("session descendants failed (details suppressed)")
+        return _problem(
+            ApiProblem(500, "internal_error", "Session descendants are temporarily unavailable")
+        )
+
+
 _MAX_RUN_TARGET_ENVELOPE_CHARS = 128 * 1024
 _MAX_RUN_TARGET_ID_CHARS = 512
 
@@ -1018,7 +1298,7 @@ async def _related_run_candidates(
     conn: Any,
     *,
     access: AccessContext,
-    session_id: str,
+    session_scopes: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """Snapshot the run identities causally linked from one chat session.
 
@@ -1028,18 +1308,27 @@ async def _related_run_candidates(
     tool args/results and automation payload/output fields are never selected.
     """
 
+    if not session_scopes:
+        return []
     tool_rows = await (
         await conn.execute(
-            "SELECT id, workflow_run_id, task_run_id, event_delivery_id, "
-            "tool_server, tool_name, args_json, result_json, result_text, "
-            "created_at_ms, ordinal "
-            "FROM tool_invocations WHERE tenant_id=? AND session_id=? "
-            "AND root_kind='session' AND root_id=? "
-            "ORDER BY created_at_ms, ordinal, id LIMIT ?",
+            "WITH source_sessions AS ("
+            " SELECT CAST(json_extract(value,'$.session_id') AS TEXT) session_id, "
+            "        CAST(json_extract(value,'$.depth') AS INTEGER) depth "
+            " FROM json_each(?)"
+            ") "
+            "SELECT t.id, t.workflow_run_id, t.task_run_id, t.event_delivery_id, "
+            "t.tool_server, t.tool_name, t.args_json, t.result_json, t.result_text, "
+            "t.created_at_ms, t.ordinal, t.session_id AS source_session_id, "
+            "ss.depth AS source_session_depth "
+            "FROM tool_invocations t JOIN source_sessions ss "
+            "ON ss.session_id=t.session_id "
+            "WHERE t.tenant_id=? AND t.root_kind='session' "
+            "AND t.root_id=t.session_id "
+            "ORDER BY t.created_at_ms, t.ordinal, t.id LIMIT ?",
             (
+                json.dumps(session_scopes, separators=(",", ":")),
                 access.tenant_id,
-                session_id,
-                session_id,
                 _MAX_SNAPSHOT_ITEMS + 1,
             ),
         )
@@ -1070,6 +1359,8 @@ async def _related_run_candidates(
                     "resource_id": str(target["resource_id"]),
                     "tool_invocation_id": str(tool["id"]),
                     "expected_parent_id": target["expected_parent_id"],
+                    "source_session_id": str(tool["source_session_id"]),
+                    "source_session_depth": int(tool["source_session_depth"]),
                 }
             )
     if len(linked) > _MAX_SNAPSHOT_ITEMS:
@@ -1114,11 +1405,15 @@ async def _related_run_candidates(
             "        CAST(json_extract(value,'$.tool_invocation_id') AS TEXT) "
             "          AS tool_invocation_id, "
             "        CAST(json_extract(value,'$.expected_parent_id') AS TEXT) "
-            "          AS expected_parent_id "
+            "          AS expected_parent_id, "
+            "        CAST(json_extract(value,'$.source_session_id') AS TEXT) "
+            "          AS source_session_id, "
+            "        CAST(json_extract(value,'$.source_session_depth') AS INTEGER) "
+            "          AS source_session_depth "
             " FROM json_each(?)"
             "), valid AS ("
             " SELECT q.position, q.kind, q.resource_id, q.tool_invocation_id, "
-            "        a.occurred_at_ms "
+            "        q.source_session_id, q.source_session_depth, a.occurred_at_ms "
             "FROM requested q JOIN activity_items a "
             "ON a.tenant_id=? AND a.kind=q.kind AND a.resource_type=q.kind "
             "AND a.resource_id=q.resource_id "
@@ -1146,7 +1441,8 @@ async def _related_run_candidates(
             "   PARTITION BY kind, resource_id"
             " ) AS cause_count FROM valid"
             ") "
-            "SELECT kind, resource_id, tool_invocation_id, cause_count "
+            "SELECT kind, resource_id, tool_invocation_id, cause_count, "
+            "source_session_id, source_session_depth "
             "FROM ranked WHERE cause_rank=1 "
             "ORDER BY occurred_at_ms DESC, kind, resource_id LIMIT ?",
             params,
@@ -1160,6 +1456,8 @@ async def _related_run_candidates(
             "resource_id": str(row["resource_id"]),
             "tool_invocation_id": str(row["tool_invocation_id"]),
             "cause_count": int(row["cause_count"]),
+            "source_session_id": str(row["source_session_id"]),
+            "source_session_depth": int(row["source_session_depth"]),
         }
         for row in rows
     ]
@@ -1169,14 +1467,13 @@ async def _related_run_details(
     conn: Any,
     *,
     access: AccessContext,
-    session_id: str,
     candidates: tuple[dict[str, Any], ...],
 ) -> list[Any]:
     """Resolve one bounded snapshot page and recheck every current ACL."""
 
     if not candidates:
         return []
-    values = ",".join("(?,?,?,?,?)" for _ in candidates)
+    values = ",".join("(?,?,?,?,?,?,?)" for _ in candidates)
     params: list[Any] = []
     for position, candidate in enumerate(candidates):
         params.extend(
@@ -1186,12 +1483,15 @@ async def _related_run_details(
                 candidate["resource_id"],
                 candidate["tool_invocation_id"],
                 candidate["cause_count"],
+                candidate["source_session_id"],
+                candidate["source_session_depth"],
             )
         )
-    params.extend((access.tenant_id, access.tenant_id, session_id))
+    params.extend((access.tenant_id, access.tenant_id, access.tenant_id))
     rows = await (
         await conn.execute(
-            "WITH requested(position, kind, resource_id, tool_invocation_id, cause_count) "
+            "WITH requested(position, kind, resource_id, tool_invocation_id, "
+            "cause_count, source_session_id, source_session_depth) "
             f"AS (VALUES {values}) "
             "SELECT q.position, q.kind, q.cause_count, a.activity_id, "
             "a.resource_type, a.resource_id, a.tenant_id, a.owner_principal_id, "
@@ -1206,6 +1506,11 @@ async def _related_run_details(
             "cause.task_run_id AS tool_task_run_id, "
             "cause.event_delivery_id AS tool_event_delivery_id, "
             "cause.created_at_ms AS tool_created_at_ms, "
+            "q.source_session_id, q.source_session_depth, "
+            "source.tenant_id AS source_tenant_id, "
+            "source.owner_principal_id AS source_owner_principal_id, "
+            "source.visibility AS source_visibility, "
+            "source.acl_version AS source_acl_version, "
             "CASE q.kind "
             " WHEN 'workflow_run' THEN wr.workflow_id "
             " WHEN 'scheduled_run' THEN sr.task_id "
@@ -1227,8 +1532,10 @@ async def _related_run_details(
             "JOIN activity_items a ON a.kind=q.kind AND a.resource_type=q.kind "
             "AND a.resource_id=q.resource_id AND a.tenant_id=? "
             "JOIN tool_invocations cause ON cause.id=q.tool_invocation_id "
-            "AND cause.tenant_id=? AND cause.session_id=? "
+            "AND cause.tenant_id=? AND cause.session_id=q.source_session_id "
             "AND cause.root_kind='session' AND cause.root_id=cause.session_id "
+            "JOIN sessions_v2 source ON source.id=q.source_session_id "
+            "AND source.tenant_id=? AND source.deleted_at_ms IS NULL "
             "LEFT JOIN workflow_runs wr "
             "ON q.kind='workflow_run' AND wr.id=q.resource_id "
             "LEFT JOIN workflow_tasks wd ON wd.id=wr.workflow_id "
@@ -1261,8 +1568,17 @@ async def _related_run_details(
                 event_delivery_id=row["tool_event_delivery_id"],
             )
         }
+        source_acl = {
+            "resource_id": str(row["source_session_id"]),
+            "resource_type": "session",
+            "tenant_id": row["source_tenant_id"],
+            "owner_principal_id": row["source_owner_principal_id"],
+            "visibility": row["source_visibility"],
+            "acl_version": row["source_acl_version"],
+        }
         if (
             (str(row["kind"]), str(row["resource_id"])) in current_targets
+            and await resource_is_visible(conn, source_acl, access)
             and await resource_is_visible(conn, row, access)
         ):
             visible.append(row)
@@ -1328,6 +1644,8 @@ def _related_run_json(row: Any) -> dict[str, Any]:
         "completeness": "unknown",
         "caused_by": {
             "tool_invocation_id": str(row["tool_invocation_id"]),
+            "session_id": str(row["source_session_id"]),
+            "session_depth": int(row["source_session_depth"]),
             "tool_call_id": str(row["tool_call_id"])
             if row["tool_call_id"]
             else None,
@@ -1366,6 +1684,7 @@ async def handle_session_related_runs(request: web.Request) -> web.Response:
         now_ms = int(time.time() * 1000)
         state.prune(now_ms)
         cursor_token = request.query.get("cursor")
+        include_param = request.query.get("include_descendants")
         if cursor_token:
             cursor = state.decode(cursor_token)
             if cursor.get("k") != "related_runs":
@@ -1374,6 +1693,17 @@ async def handle_session_related_runs(request: web.Request) -> web.Response:
                     "cursor_stale",
                     "The related-run cursor is invalid",
                     reason="invalid_signature",
+                )
+            include_descendants = bool(cursor.get("d", False))
+            if (
+                include_param is not None
+                and _bool(include_param) != include_descendants
+            ):
+                raise ApiProblem(
+                    409,
+                    "cursor_stale",
+                    "The related-run cursor does not match this query",
+                    reason="request_changed",
                 )
             snapshot = state.related_runs.get(str(cursor.get("s", "")))
             if snapshot is None:
@@ -1395,6 +1725,7 @@ async def handle_session_related_runs(request: web.Request) -> web.Response:
                 snapshot.tenant_id != access.tenant_id
                 or snapshot.principal_id != access.principal_id
                 or snapshot.session_id != session_id
+                or snapshot.include_descendants != include_descendants
             ):
                 raise ApiProblem(
                     409,
@@ -1419,10 +1750,24 @@ async def handle_session_related_runs(request: web.Request) -> web.Response:
                     reason="invalid_signature",
                 )
         else:
+            include_descendants = _bool(include_param, False)
+            session_scopes = [{"session_id": session_id, "depth": 0}]
+            if include_descendants:
+                session_scopes.extend(
+                    {
+                        "session_id": row["session_id"],
+                        "depth": row["depth"],
+                    }
+                    for row in await _session_tree_candidates(
+                        conn,
+                        access=access,
+                        session_id=session_id,
+                    )
+                )
             rows = await _related_run_candidates(
                 conn,
                 access=access,
-                session_id=session_id,
+                session_scopes=session_scopes,
             )
             revision_row = await (
                 await conn.execute(
@@ -1435,6 +1780,7 @@ async def handle_session_related_runs(request: web.Request) -> web.Response:
                 tenant_id=access.tenant_id,
                 principal_id=access.principal_id,
                 session_id=session_id,
+                include_descendants=include_descendants,
                 revision=str(int(revision_row[0] if revision_row else 0)),
                 rows=tuple(rows),
                 expires_at_ms=now_ms + _SNAPSHOT_TTL_MS,
@@ -1446,7 +1792,6 @@ async def handle_session_related_runs(request: web.Request) -> web.Response:
         detail_rows = await _related_run_details(
             conn,
             access=access,
-            session_id=session_id,
             candidates=selected,
         )
         next_offset = offset + len(selected)
@@ -1457,6 +1802,7 @@ async def handle_session_related_runs(request: web.Request) -> web.Response:
                     "k": "related_runs",
                     "s": snapshot.snapshot_id,
                     "o": next_offset,
+                    "d": snapshot.include_descendants,
                 }
             )
             if has_more
@@ -1465,6 +1811,7 @@ async def handle_session_related_runs(request: web.Request) -> web.Response:
         return _json(
             {
                 "session_id": session_id,
+                "include_descendants": snapshot.include_descendants,
                 "items": [_related_run_json(row) for row in detail_rows],
                 "next_cursor": next_cursor,
                 "has_more": has_more,
