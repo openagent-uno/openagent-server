@@ -37,9 +37,18 @@ async def _verify(conn: Any) -> None:
     ).fetchone()
     if row is None:
         raise MessagePartsMigrationError("message-parts-v1 is missing its table")
-    foreign_keys = await (await conn.execute("PRAGMA foreign_key_check")).fetchall()
+    # Scoped to this migration's own table. See the same note in
+    # `src/custom_views/migration.py`: the unscoped form checks the WHOLE
+    # database, so one dangling `task_runs` row left by a deleted scheduled
+    # task failed this migration, and because the check runs inside
+    # `db.connect()` the agent stopped booting entirely.
+    foreign_keys = await (
+        await conn.execute(f"PRAGMA foreign_key_check({REQUIRED_TABLE})")
+    ).fetchall()
     if foreign_keys:
-        raise MessagePartsMigrationError("message-parts-v1 foreign key verification failed")
+        raise MessagePartsMigrationError(
+            f"message-parts-v1 foreign key verification failed on {REQUIRED_TABLE}"
+        )
 
 
 async def ensure_message_parts_storage(conn: Any, *, app_version: str) -> bool:

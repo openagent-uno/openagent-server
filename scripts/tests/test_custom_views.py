@@ -1695,3 +1695,40 @@ async def t_migration_fk_check_is_scoped(ctx: TestContext) -> None:
                 raise AssertionError("an orphan ui_* row must still fail verification")
         finally:
             await db.close()
+
+
+@test("custom_views", "message-parts verification is scoped to its own table too")
+async def t_message_parts_fk_check_is_scoped(ctx: TestContext) -> None:
+    """The same unscoped check, in the migration that runs right after.
+
+    Fixing only `custom-views-v1` moved the production crash one migration
+    down: the Lyra agent then died on `message-parts-v1 foreign key
+    verification failed`, from the identical whole-database PRAGMA.
+    """
+    from src.memory.message_parts_migration import (
+        MessagePartsMigrationError,
+        REQUIRED_TABLE,
+        ensure_message_parts_storage,
+    )
+
+    with tempfile.TemporaryDirectory(prefix="oa-parts-fk-") as raw:
+        root = Path(raw)
+        db = await _db(root)
+        try:
+            conn = await db._ensure_connected()
+            await conn.execute("PRAGMA foreign_keys=OFF")
+            await conn.execute(
+                "INSERT INTO task_runs (id, task_id, status, started_at) "
+                "VALUES ('run-orphan-2', 'task-that-was-deleted', 'done', 0)"
+            )
+            await conn.commit()
+            violations = await (
+                await conn.execute("PRAGMA foreign_key_check")
+            ).fetchall()
+            assert violations and all(
+                str(row[0]) != REQUIRED_TABLE for row in violations
+            ), violations
+
+            assert not await ensure_message_parts_storage(conn, app_version="test")
+        finally:
+            await db.close()
