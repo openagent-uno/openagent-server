@@ -305,15 +305,15 @@ async def _wait_for_owned_broker(server, task: asyncio.Task, *, timeout: float =
 
 @test(
     "real_iroh_client_e2e",
-    "Desktop harness gives Agent the coordinator canonical database",
+    "Desktop harness seeds one enabled model in Agent's canonical database",
 )
-async def t_desktop_harness_uses_canonical_db(_ctx: TestContext) -> None:
+async def t_desktop_harness_uses_canonical_db(ctx: TestContext) -> None:
     """Keep the cross-repo Desktop harness production-shaped.
 
     The real Playwright E2E launches this script as a child process, outside
     the server test runner.  Pin the critical constructor boundary here so a
-    future ``memory=None`` or omitted keyword cannot reach app CI and fail only
-    when Gateway registers canonical-DB-backed surfaces such as Custom Views.
+    future ``memory=None`` or empty model catalog cannot reach app CI and fail
+    only when Gateway registers Custom Views or rejects the first chat turn.
     """
 
     import ast
@@ -336,6 +336,43 @@ async def t_desktop_harness_uses_canonical_db(_ctx: TestContext) -> None:
     assert isinstance(memory, ast.Name) and memory.id == "db", (
         "Desktop harness Agent must receive the coordinator canonical db"
     )
+    seed_calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_seed_deterministic_model"
+    ]
+    assert len(seed_calls) == 1, "Desktop harness must seed its model catalog"
+    assert seed_calls[0].lineno < agent_calls[0].lineno
+    assert len(seed_calls[0].args) == 2
+    assert isinstance(seed_calls[0].args[0], ast.Name)
+    assert seed_calls[0].args[0].id == "db"
+    assert isinstance(seed_calls[0].args[1], ast.Name)
+    assert seed_calls[0].args[1].id == "model_base_url"
+
+    from scripts.desktop_real_iroh_harness import _seed_deterministic_model
+    from src.memory.db import MemoryDB
+
+    catalog_path = ctx.db_path.with_name(
+        f"desktop-harness-catalog-{uuid.uuid4().hex[:8]}.db"
+    )
+    catalog = MemoryDB(str(catalog_path))
+    await catalog.connect()
+    try:
+        await _seed_deterministic_model(catalog, "http://127.0.0.1:9/v1")
+        _, _, enabled_count, _ = await catalog.registry_status()
+        assert enabled_count == 1
+        providers = await catalog.materialise_providers_config(enabled_only=True)
+        assert len(providers) == 1
+        assert providers[0]["name"] == "local"
+        assert [model["model"] for model in providers[0]["models"]] == [
+            "deterministic-client-e2e"
+        ]
+    finally:
+        await catalog.close()
+        for suffix in ("", "-wal", "-shm"):
+            with suppress(FileNotFoundError):
+                Path(f"{catalog_path}{suffix}").unlink()
 
 
 @test(
