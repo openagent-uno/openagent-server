@@ -53,11 +53,31 @@ sed -i.bak "s/version = \"[^\"]*\"/version = \"$NEW\"/" "$ROOT/pyproject.toml"
 sed -i.bak "s/__version__ = \"[^\"]*\"/__version__ = \"$NEW\"/" "$ROOT/src/__init__.py"
 rm -f "$ROOT/pyproject.toml.bak" "$ROOT/src/__init__.py.bak"
 
+# uv.lock records the root package's own version, and the release test suite
+# asserts it matches pyproject. Bumping two files and not the third made every
+# tag fail in CI, AFTER the tag had already been pushed. Only the root package
+# block is touched: re-resolving the whole lock during a release would drag in
+# unrelated dependency updates that nothing has tested.
+python3 - "$ROOT/uv.lock" "$NEW" <<'PYBUMP'
+import pathlib, re, sys
+
+path, version = pathlib.Path(sys.argv[1]), sys.argv[2]
+text = path.read_text(encoding="utf-8")
+pattern = re.compile(
+    r'(\[\[package\]\]\nname = "openagent-framework"\nversion = ")([^"]+)(")'
+)
+if not pattern.search(text):
+    raise SystemExit("uv.lock: openagent-framework package block not found")
+path.write_text(
+    pattern.sub(rf"\g<1>{version}\g<3>", text, count=1), encoding="utf-8",
+)
+PYBUMP
+
 # ── Commit + tag + push ──
 echo ""
 echo "📤 Committing and tagging v$NEW..."
 
-git add pyproject.toml src/__init__.py
+git add pyproject.toml src/__init__.py uv.lock
 git commit -m "release: v$NEW"
 git tag "v$NEW" -m "v$NEW"
 
