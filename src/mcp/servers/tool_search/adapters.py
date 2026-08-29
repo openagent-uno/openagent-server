@@ -26,27 +26,188 @@ import asyncio
 import difflib
 import inspect
 import json
+import os
+from dataclasses import dataclass, field
 from typing import Any
+
+from src.mcp.tool_providers import (
+    SERVER_EXECUTION_HOST,
+    InteractiveClientMCPProvider,
+    ServerMCPProvider,
+    ToolCatalogProvider,
+    ToolDispatcher,
+)
 
 
 # ── Shared helpers (provider-agnostic implementation) ───────────────
 
 
+_MAX_MCP_RESULT_NESTING = 64
+_MAX_MCP_RESULT_NODES = 100_000
+# A materialised client artifact can legitimately contain 64 MiB of raw data,
+# which expands to roughly 86 MiB as base64. Keep enough headroom for its MCP
+# envelope and derived media fields while still bounding a hostile/custom MCP.
+_MAX_MCP_RESULT_JSON_BYTES = 256 * 1024 * 1024
+
+
+class MCPResultEnvelopeLimitError(ValueError):
+    """A valid-looking MCP result exceeded a lossless envelope limit."""
+
+
+@dataclass
+class _JsonCoercionState:
+    nodes: int = 0
+    active: set[int] = field(default_factory=set)
+
+    def add_node(self, depth: int) -> None:
+        if depth > _MAX_MCP_RESULT_NESTING:
+            raise MCPResultEnvelopeLimitError(
+                "MCP result exceeds the maximum nesting depth "
+                f"({_MAX_MCP_RESULT_NESTING})"
+            )
+        self.nodes += 1
+        if self.nodes > _MAX_MCP_RESULT_NODES:
+            raise MCPResultEnvelopeLimitError(
+                "MCP result exceeds the maximum structural node count "
+                f"({_MAX_MCP_RESULT_NODES})"
+            )
+
+
 def _coerce_to_jsonable(value: Any, _depth: int = 0) -> Any:
-    """Best-effort JSON-friendly coercion. Mirrors the behaviour of
-    ``openagent.workflow.executor._coerce_to_jsonable`` so results from
-    ``call_tool`` look the same as results from an ``mcp-tool`` block."""
-    if _depth > 10:
-        return str(value)
+    """Coerce an MCP result to JSON without corrupting valid JSON subtrees.
+
+    Native JSON is preserved exactly. Results outside the explicit depth,
+    structural-node, or serialised-byte budgets fail the tool call instead of
+    silently turning a valid subtree into a Python repr string.
+    """
+
+    state = _JsonCoercionState()
+    coerced = _coerce_json_value(value, _depth, state)
+    encoded_bytes = 0
+    encoder = json.JSONEncoder(
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=True,
+    )
+    for chunk in encoder.iterencode(coerced):
+        encoded_bytes += len(chunk.encode("utf-8"))
+        if encoded_bytes > _MAX_MCP_RESULT_JSON_BYTES:
+            raise MCPResultEnvelopeLimitError(
+                "MCP result exceeds the maximum serialised size "
+                f"({_MAX_MCP_RESULT_JSON_BYTES} bytes)"
+            )
+    return coerced
+
+
+def _coerce_json_value(value: Any, depth: int, state: _JsonCoercionState) -> Any:
+    state.add_node(depth)
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        import base64
+
+        return base64.b64encode(bytes(value)).decode("ascii")
     if isinstance(value, dict):
-        return {str(k): _coerce_to_jsonable(v, _depth + 1) for k, v in value.items()}
+        return _coerce_mapping(value, depth, state)
     if isinstance(value, (list, tuple)):
-        return [_coerce_to_jsonable(v, _depth + 1) for v in value]
+        return _coerce_sequence(value, depth, state)
+    # Runtime ``ToolResult`` keeps the original CallToolResult here because its
+    # display ``content`` is intentionally a string. Prefer that envelope, then
+    # enrich it with runtime-only media/child-session fields.
+    raw_mcp_result = getattr(value, "mcp_result", None)
+    if isinstance(raw_mcp_result, dict):
+        with _ActiveValue(value, state):
+            envelope = _coerce_json_value(raw_mcp_result, depth + 1, state)
+            if not isinstance(envelope, dict):
+                envelope = {"content": envelope}
+            for attr, wire_key in (
+                ("images", "images"),
+                ("audios", "audios"),
+                ("videos", "videos"),
+                ("files", "files"),
+                ("child_session_id", "child_session_id"),
+                ("child_run_id", "child_run_id"),
+            ):
+                attr_value = getattr(value, attr, None)
+                if attr_value is not None and wire_key not in envelope:
+                    envelope[wire_key] = _coerce_json_value(
+                        attr_value, depth + 1, state
+                    )
+            return envelope
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        try:
+            dumped = model_dump(by_alias=True, exclude_none=False)
+            if isinstance(dumped, dict):
+                with _ActiveValue(value, state):
+                    return _coerce_json_value(dumped, depth + 1, state)
+        except MCPResultEnvelopeLimitError:
+            raise
+        except Exception:  # noqa: BLE001 — fall through to attribute envelope
+            pass
+    # MCP CallToolResult objects carry more than ``content``. Preserve the
+    # complete envelope (structured content, error bit and provider metadata)
+    # instead of collapsing it to text/image blocks and silently losing data.
     if hasattr(value, "content"):
-        return _coerce_to_jsonable(value.content, _depth + 1)
+        with _ActiveValue(value, state):
+            envelope: dict[str, Any] = {
+                "content": _coerce_json_value(value.content, depth + 1, state),
+            }
+            for attr, wire_key in (
+                ("structuredContent", "structuredContent"),
+                ("structured_content", "structuredContent"),
+                ("isError", "isError"),
+                ("is_error", "isError"),
+                ("_meta", "_meta"),
+                ("images", "images"),
+                ("audios", "audios"),
+                ("audio", "audio"),
+                ("videos", "videos"),
+                ("files", "files"),
+                ("child_session_id", "child_session_id"),
+                ("child_run_id", "child_run_id"),
+            ):
+                if hasattr(value, attr) and wire_key not in envelope:
+                    attr_value = getattr(value, attr)
+                    if attr_value is not None:
+                        envelope[wire_key] = _coerce_json_value(
+                            attr_value, depth + 1, state
+                        )
+            return envelope
     return str(value)
+
+
+class _ActiveValue:
+    """Reject cycles while allowing the same object in separate branches."""
+
+    def __init__(self, value: Any, state: _JsonCoercionState):
+        self.identity = id(value)
+        self.state = state
+
+    def __enter__(self) -> None:
+        if self.identity in self.state.active:
+            raise MCPResultEnvelopeLimitError("MCP result contains a cyclic value")
+        self.state.active.add(self.identity)
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.state.active.discard(self.identity)
+
+
+def _coerce_mapping(
+    value: dict[Any, Any], depth: int, state: _JsonCoercionState
+) -> dict[str, Any]:
+    with _ActiveValue(value, state):
+        return {
+            str(key): _coerce_json_value(item, depth + 1, state)
+            for key, item in value.items()
+        }
+
+
+def _coerce_sequence(
+    value: list[Any] | tuple[Any, ...], depth: int, state: _JsonCoercionState
+) -> list[Any]:
+    with _ActiveValue(value, state):
+        return [_coerce_json_value(item, depth + 1, state) for item in value]
 
 
 def _functions_dict(toolkit: Any) -> dict[str, Any]:
@@ -120,6 +281,51 @@ def _candidate_names(server: str, tool: str) -> list[str]:
     for alias in safe_aliases.get((server, tool), ()):
         add(alias)
     return out
+
+
+_MCP_TOOL_DENYLIST_ENV = "OPENAGENT_MCP_TOOL_DENYLIST"
+
+
+def _denied_tool_rules() -> tuple[tuple[str, str], ...]:
+    """Return the deployment-scoped MCP tool denylist.
+
+    Rules use ``server:tool`` syntax and are comma-separated. Either side may
+    be ``*``. Tool leaves and runtime-prefixed keys are treated as aliases, so
+    ``replio:thread_create_task`` also blocks
+    ``replio_thread_create_task``. Invalid entries are ignored rather than
+    making every tool unavailable because of one malformed environment value.
+    """
+    raw = (os.environ.get(_MCP_TOOL_DENYLIST_ENV) or "").strip()
+    if not raw:
+        return ()
+    rules: list[tuple[str, str]] = []
+    for item in raw.split(","):
+        server, sep, tool = item.strip().partition(":")
+        server, tool = server.strip(), tool.strip()
+        if sep and server and tool:
+            rules.append((server, tool))
+    return tuple(rules)
+
+
+def _tool_is_denied(server: str, tool: str) -> bool:
+    """Whether ``tool`` is forbidden on ``server`` by deployment policy."""
+    server_aliases = {server, _safe_prefix(server)}
+    tool_aliases = set(_candidate_names(server, tool))
+    for denied_server, denied_tool in _denied_tool_rules():
+        if denied_server != "*" and denied_server not in server_aliases:
+            continue
+        if denied_tool == "*":
+            return True
+        if tool_aliases.intersection(_candidate_names(server, denied_tool)):
+            return True
+    return False
+
+
+def _deny_tool(server: str, tool: str) -> None:
+    raise PermissionError(
+        f"MCP tool {server}:{tool} is disabled by deployment policy "
+        f"({_MCP_TOOL_DENYLIST_ENV}). Use an allowed capability instead."
+    )
 
 
 def _did_you_mean(name: str, available: list[str]) -> str:
@@ -243,9 +449,100 @@ def _list_servers_impl(pool: Any) -> list[dict[str, Any]]:
             continue  # never list ourselves — would be infinite-mirror noise
         if allow is not None and normalize_family(name) not in allow:
             continue
-        out.append({"name": name, "tool_count": len(_functions_dict(toolkit))})
+        tool_count = sum(
+            1 for tool_name in _functions_dict(toolkit)
+            if not _tool_is_denied(name, tool_name)
+        )
+        out.append({"name": name, "tool_count": tool_count})
     out.sort(key=lambda x: x["name"])
     return out
+
+
+def _server_execution_host() -> dict[str, Any]:
+    return dict(SERVER_EXECUTION_HOST)
+
+
+def _split_server_location(server: str) -> tuple[str, str]:
+    """Return ``(location, bare_name)`` for a canonical/legacy MCP id.
+
+    Bare ids remain a compatibility alias for server MCPs. Unknown prefixes
+    are rejected rather than being stripped: location is a security boundary,
+    not a fuzzy naming hint.
+    """
+
+    value = str(server or "").strip()
+    if value.startswith("server:"):
+        return "server", value[len("server:"):]
+    if value.startswith("client:"):
+        return "client", value[len("client:"):]
+    if ":" in value:
+        raise ValueError(f"Unknown MCP execution location in {server!r}")
+    return "server", value
+
+
+def _list_scoped_servers_impl(pool: Any) -> list[dict[str, Any]]:
+    """Per-turn canonical catalog: server MCPs plus this turn's client host."""
+
+    providers: list[ToolCatalogProvider] = [ServerMCPProvider(pool)]
+    from src.core.execution_origin import current_execution_origin
+
+    origin = current_execution_origin()
+    if origin is not None:
+        providers.append(InteractiveClientMCPProvider(origin.registry))
+    out = [item for provider in providers for item in provider.list_servers()]
+    # The child-run allowlist is location-agnostic: a family omitted from a
+    # delegated child's grant must not reappear merely because the interactive
+    # client exposes another implementation of it.
+    filtered: list[dict[str, Any]] = []
+    for item in out:
+        _location, bare_server = _split_server_location(str(item.get("name", "")))
+        try:
+            _require_server_allowed(bare_server)
+        except PermissionError:
+            continue
+        filtered.append(item)
+    out = filtered
+    out.sort(key=lambda item: item["name"])
+    return out
+
+
+def _provider_for_location(pool: Any, location: str) -> Any:
+    """Build the location backend for the current turn.
+
+    This function never searches available providers: the canonical prefix is
+    the routing decision.  In particular, an unavailable client backend is an
+    explicit failure rather than a server fallback.
+    """
+
+    if location == "server":
+        return ServerMCPProvider(pool)
+    if location == "client":
+        from src.core.execution_origin import current_execution_origin
+
+        origin = current_execution_origin()
+        if origin is None:
+            raise PermissionError(
+                "Client MCPs are unavailable: this is a server-owned turn or "
+                "the originating client did not advertise local capabilities."
+            )
+        return InteractiveClientMCPProvider(origin.registry)
+    raise ValueError(f"Unknown MCP execution location {location!r}")
+
+
+def _list_scoped_tools_impl(pool: Any, server: str) -> list[dict[str, Any]]:
+    location, bare_server = _split_server_location(server)
+    _require_server_allowed(bare_server)
+    provider: ToolCatalogProvider = _provider_for_location(pool, location)
+    return provider.list_tools(bare_server)
+
+
+def _describe_scoped_tool_impl(
+    pool: Any, server: str, tool: str,
+) -> dict[str, Any]:
+    location, bare_server = _split_server_location(server)
+    _require_server_allowed(bare_server)
+    provider: ToolCatalogProvider = _provider_for_location(pool, location)
+    return provider.describe_tool(bare_server, tool)
 
 
 def _list_tools_impl(pool: Any, server: str) -> list[dict[str, Any]]:
@@ -258,11 +555,17 @@ def _list_tools_impl(pool: Any, server: str) -> list[dict[str, Any]]:
         )
     out: list[dict[str, Any]] = []
     for tool_name, fn in _functions_dict(toolkit).items():
+        if _tool_is_denied(server, tool_name):
+            continue
         # Compact 1-line description so list_tools fits a reasonable
         # token budget even on MCPs with 40+ tools (see firebase: 44).
         desc = (getattr(fn, "description", "") or "").strip()
         first_line = desc.split("\n", 1)[0][:200] if desc else ""
-        entry: dict[str, Any] = {"name": tool_name, "description": first_line}
+        entry: dict[str, Any] = {
+            "name": tool_name,
+            "description": first_line,
+            "classification": getattr(fn, "classification", "mutating"),
+        }
         # Under the lean local profile, carry each tool's signature in the
         # listing. Measured on Qwen3-30B: without it the model reached the
         # right server and then invented argument names, and a mutation that
@@ -297,6 +600,8 @@ def _describe_tool_impl(pool: Any, server: str, tool: str) -> dict[str, Any]:
     fn = None
     for cand in _candidate_names(server or "", tool):
         if cand in fns:
+            if _tool_is_denied(server, cand):
+                _deny_tool(server, cand)
             fn, tool = fns[cand], cand  # report the resolved key back
             break
     if fn is None:
@@ -309,6 +614,7 @@ def _describe_tool_impl(pool: Any, server: str, tool: str) -> dict[str, Any]:
         "name": tool,
         "description": getattr(fn, "description", "") or "",
         "input_schema": getattr(fn, "parameters", None) or {},
+        "classification": getattr(fn, "classification", "mutating"),
     }
 
 
@@ -319,15 +625,10 @@ async def _resolve_tool(
     mechanical naming slips. Returns ``(fn, resolved_server)`` or
     ``(None, None)``.
 
-    Resolution order — most-specific first so a normalised variant can
-    never shadow an exact hit:
-
-      1. every :func:`_candidate_names` variant against the NAMED server
-         (the model usually gets the server right and the key slightly
-         wrong — a missing or doubled prefix);
-      2. the same variants across every OTHER loaded MCP — covers the
-         "right key, wrong server" slip (e.g. ``run_dream_mode`` lives in
-         ``delegation`` but the model calls it on ``vault``).
+    Only the NAMED server is searched. A missing/doubled prefix inside that
+    server is still repaired, but a tool is never looked up on another MCP:
+    automatic cross-server fallback is unsafe once server and client machines
+    can expose identical tool leaves.
     """
     cands = _candidate_names(server or "", tool)
 
@@ -338,23 +639,9 @@ async def _resolve_tool(
         fns = await _ensure_functions_loaded(toolkit, server)
         for cand in cands:
             if cand in fns:
+                if _tool_is_denied(server, cand):
+                    _deny_tool(server, cand)
                 return fns[cand], server
-
-    from src.core.tool_scope import current_tool_allowlist, normalize_family
-
-    allow = current_tool_allowlist()
-    for _name, _tk in pool._toolkit_by_name.items():
-        if _name == server:
-            continue
-        if allow is not None and normalize_family(_name) not in allow:
-            continue
-        try:
-            _fns = await _ensure_functions_loaded(_tk, _name)
-        except Exception:  # noqa: BLE001 — a flaky MCP must not block the search
-            continue
-        for cand in cands:
-            if cand in _fns:
-                return _fns[cand], _name
 
     return None, None
 
@@ -363,6 +650,46 @@ async def _call_tool_impl(
     pool: Any, server: str, tool: str, args: dict | str | None,
 ) -> Any:
     _require_server_allowed(server)
+
+    # ``workflow-manager`` normally lives in a subprocess and hands durable
+    # work to the scheduler through SQLite. A synchronous wait=True invocation
+    # inside an authenticated interactive turn is different: its workflow and
+    # synchronous children belong to that same turn and must retain the exact
+    # client host. Route only that case to the process-local runner installed
+    # by Scheduler. wait=False, automatic turns and API/queue calls keep the
+    # durable server-only path below.
+    if server == "workflow-manager":
+        candidates = set(_candidate_names(server, tool))
+        if {"run_workflow", "workflow_manager_run_workflow"} & candidates:
+            if _tool_is_denied(server, tool):
+                _deny_tool(server, tool)
+            from src.core.execution_origin import current_execution_origin
+
+            call_args = _decode_tool_args(args)
+            runner = getattr(pool, "_interactive_workflow_runner", None)
+            if (
+                current_execution_origin() is not None
+                and call_args.get("wait", True) is not False
+                and callable(runner)
+            ):
+                unknown = set(call_args) - {
+                    "id_or_name", "inputs", "wait", "timeout_s",
+                }
+                if unknown:
+                    raise ValueError(
+                        f"unexpected run_workflow arguments: {sorted(unknown)}",
+                    )
+                id_or_name = str(call_args.get("id_or_name") or "").strip()
+                if not id_or_name:
+                    raise ValueError("run_workflow requires id_or_name")
+                result = await runner(
+                    id_or_name,
+                    inputs=call_args.get("inputs"),
+                    timeout_s=int(call_args.get("timeout_s", 300)),
+                )
+                _clear_misses()
+                return result
+
     fn, _resolved_server = await _resolve_tool(pool, server, tool)
 
     if _resolved_server is not None:
@@ -373,33 +700,19 @@ async def _call_tool_impl(
         toolkit = pool.toolkit_by_name(server) if server else None
         if toolkit is None:
             raise ValueError(
-                f"MCP {server!r} is not loaded, and no loaded MCP exposes a "
-                f"tool named {tool!r}. Known MCPs: {sorted(pool._toolkit_by_name)}"
+                f"MCP {server!r} is not loaded. "
+                f"Known MCPs: {sorted(pool._toolkit_by_name)}"
                 + _repeat_warning(server, tool, misses)
             )
         avail = sorted(await _ensure_functions_loaded(toolkit, server))
         raise ValueError(
-            f"No loaded MCP has a tool named {tool!r}. "
-            f"MCP {server!r} exposes: {avail}." + _did_you_mean(tool, avail)
+            f"MCP {server!r} has no tool named {tool!r}. "
+            f"It exposes: {avail}." + _did_you_mean(tool, avail)
             + _repeat_warning(server, tool, misses)
         )
     # A call that resolves means the model is back on solid ground.
     _clear_misses()
-    if isinstance(args, str):
-        # Some OpenAI-compatible models (observed: GLM-5 on ZAI) encode the
-        # nested free-form ``args`` object as a JSON string even though the
-        # outer function-call arguments are valid JSON.  Accept that harmless
-        # representation drift at the provider boundary; otherwise Pydantic
-        # rejects the call before the target tool ever sees its required
-        # arguments.
-        try:
-            args = json.loads(args)
-        except (TypeError, json.JSONDecodeError) as exc:
-            raise ValueError("args must be a JSON object or encoded JSON object") from exc
-    if args is None:
-        args = {}
-    if not isinstance(args, dict):
-        raise ValueError(f"args must decode to an object, got {type(args).__name__}")
+    args = _decode_tool_args(args)
     # The runtime's ``Function`` exposes ``entrypoint``; raw callables don't.
     # Prefer ``entrypoint`` when present (matches the test fixtures in
     # ``scripts/tests/test_mcp.py``) and fall back to direct call for
@@ -432,9 +745,22 @@ async def _call_tool_impl(
                 args = {key: value for key, value in args.items() if key in allowed}
         except (TypeError, ValueError):
             pass
-    result = callable_to_call(**args)
-    if inspect.isawaitable(result):
-        result = await result
+
+    # Runtime Functions must pass through FunctionCall so their pre/post/tool
+    # hooks, run context, media context and error semantics remain identical to
+    # a directly model-invoked tool. Lightweight adapter/test callables keep
+    # the compatibility path below.
+    from src.mcp._runtime.function import Function, FunctionCall
+
+    if isinstance(fn, Function):
+        execution = await FunctionCall(function=fn, arguments=args).aexecute()
+        if execution.status != "success":
+            raise RuntimeError(execution.error or f"MCP tool {tool!r} failed")
+        result = execution.result
+    else:
+        result = callable_to_call(**args)
+        if inspect.isawaitable(result):
+            result = await result
     result = _coerce_to_jsonable(result)
     return _with_signature_hint(fn, tool, result)
 
@@ -480,6 +806,64 @@ def _with_signature_hint(fn: Any, tool: str, result: Any) -> Any:
     return rendered + hint
 
 
+def _decode_tool_args(args: dict | str | None) -> dict[str, Any]:
+    """Normalise provider-compatible tool arguments before any dispatch.
+
+    Some OpenAI-compatible models encode the nested free-form ``args`` object
+    as a JSON string. Decoding at the scoped boundary keeps server and client
+    routing behaviour identical, while still rejecting arrays and scalars.
+    """
+
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                "args must be a JSON object or encoded JSON object"
+            ) from exc
+    if args is None:
+        return {}
+    if not isinstance(args, dict):
+        raise ValueError(
+            f"args must decode to an object, got {type(args).__name__}"
+        )
+    return args
+
+
+def _stamp_execution_host(value: Any, host: dict[str, Any]) -> dict[str, Any]:
+    """Attach an explicit host without dropping any MCP result fields."""
+
+    coerced = _coerce_to_jsonable(value)
+    if isinstance(coerced, dict):
+        meta = coerced.get("_meta")
+        meta = dict(meta) if isinstance(meta, dict) else {}
+        meta["executionHost"] = host
+        return {**coerced, "_meta": meta, "execution_host": host}
+    return {
+        "content": coerced,
+        "_meta": {"executionHost": host},
+        "execution_host": host,
+    }
+
+
+async def _call_scoped_tool_impl(
+    pool: Any, server: str, tool: str, args: dict | str | None,
+) -> dict[str, Any]:
+    location, bare_server = _split_server_location(server)
+    _require_server_allowed(bare_server)
+    args = _decode_tool_args(args)
+    dispatcher: ToolDispatcher = _provider_for_location(pool, location)
+    if location == "client":
+        from src.mcp.servers.shell.adapters import current_session_id
+
+        session_id = current_session_id()
+    else:
+        session_id = None
+    return await dispatcher.call_tool(
+        bare_server, tool, args, session_id=session_id,
+    )
+
+
 def _json_dump(value: Any) -> str:
     return json.dumps(value, indent=2, default=str)
 
@@ -507,15 +891,15 @@ def build_runtime_toolkit(*, pool: Any | None = None) -> Any:
         Start here to discover tools beyond the upfront tool list — the
         OpenAgent runtime trims MCPs above the provider's tool budget.
         """
-        return _list_servers_impl(pool)
+        return _list_scoped_servers_impl(pool)
 
     async def tool_search_list_tools(server: str) -> list[dict[str, Any]]:
         """List the tools of a single MCP (name + 1-line description)."""
-        return _list_tools_impl(pool, server)
+        return _list_scoped_tools_impl(pool, server)
 
     async def tool_search_describe_tool(server: str, tool: str) -> dict[str, Any]:
         """Return the full description and JSON schema of a specific tool."""
-        return _describe_tool_impl(pool, server, tool)
+        return _describe_scoped_tool_impl(pool, server, tool)
 
     async def tool_search_call_tool(
         server: str, tool: str, args: dict | str | None = None,
@@ -532,7 +916,7 @@ def build_runtime_toolkit(*, pool: Any | None = None) -> Any:
                 A JSON-encoded object string is also accepted for provider
                 compatibility.
         """
-        return await _call_tool_impl(pool, server, tool, args)
+        return await _call_scoped_tool_impl(pool, server, tool, args)
 
     return Toolkit(
         name="tool-search",

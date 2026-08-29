@@ -20,6 +20,7 @@ extracts into the OS temp dir (``$TMPDIR/_MEI_xxxxx``). Subsequent runs
 reuse that cache and start in under a second.
 """
 
+import os
 import sys
 from pathlib import Path
 from PyInstaller.utils.hooks import (
@@ -29,6 +30,7 @@ from PyInstaller.utils.hooks import (
     collect_submodules,
     copy_metadata,
 )
+from openagent_host_tools import sidecar_source
 
 # ── Build-environment guard ──
 # Fail loudly if a runtime-critical dependency isn't importable in the build
@@ -127,6 +129,8 @@ hiddenimports = [
     # collect_submodules("src") doesn't reach them — bundle them explicitly.
     *collect_submodules("openagent_mcp"),
     *collect_submodules("oa_agent_client"),
+    # Shared filesystem/editor core used by in-process MCPPool adapters.
+    *collect_submodules("openagent_host_tools"),
     # groq Python SDK: imported at module level by
     # src.models.providers.groq.groq — must be bundled.
     *collect_submodules("groq"),
@@ -214,8 +218,25 @@ if _vault_dir.exists():
 # bundled. CI's release.yml "Build Node MCPs" loop doesn't cover its host/ dir,
 # so install here — idempotent, best-effort; the MCP self-bootstraps at first
 # launch (resolve_builtin_entry) if this is skipped.
-_aic_dir = mcps_dir / "agent-in-chrome" / "host"
-if _aic_dir.exists() and not (_aic_dir / "node_modules").exists():
+_host_bundle = os.environ.get("OPENAGENT_HOST_TOOLS_BUNDLE", "").strip()
+_release_build = os.environ.get("OPENAGENT_RELEASE_BUILD") == "1"
+if _release_build and not _host_bundle:
+    raise RuntimeError(
+        "OPENAGENT_HOST_TOOLS_BUNDLE is required for a release server build"
+    )
+_aic_source = (
+    Path(_host_bundle).resolve() / "agent-in-chrome"
+    if _host_bundle
+    else sidecar_source("agent-in-chrome")
+)
+_aic_dir = _aic_source / "host"
+if not _aic_dir.exists():
+    raise RuntimeError(f"Agent in Chrome source is missing from host-tools: {_aic_dir}")
+if _host_bundle and not (_aic_dir / "node_modules").exists():
+    raise RuntimeError(
+        "The pinned host-tools bundle has no Agent in Chrome runtime dependencies"
+    )
+if not _host_bundle and not (_aic_dir / "node_modules").exists():
     try:
         print("openagent.spec: npm install (agent-in-chrome/host)...")
         _sp.run("npm install", cwd=str(_aic_dir), shell=True, check=True)
@@ -248,9 +269,14 @@ if mcps_dir.exists():
     # ``src/mcp/builtins.py::_resolve_native_binary`` (looks
     # for the sidecar next to ``sys.executable`` first).
     for child in mcps_dir.iterdir():
-        if child.name == "computer-control":
+        if child.name in {"computer-control", "agent-in-chrome"}:
             continue
         datas.append((str(child), f"src/mcp/servers/{child.name}"))
+
+# computer-control and Agent-in-Chrome are owned by the exact pinned
+# openagent-host-tools package.  Keep the browser source/dependencies available
+# at the same package-relative path used by sidecar_source() in a frozen build.
+datas.append((str(_aic_source), "openagent_host_tools/sidecars/agent-in-chrome"))
 
 # litellm needs its JSON data files (model prices, cost maps, etc.)
 datas += collect_data_files("litellm", includes=["**/*.json", "**/*.yaml", "**/*.yml"])
@@ -261,6 +287,7 @@ datas += collect_data_files("tiktoken_ext")
 datas += collect_data_files("certifi")
 # mcp package data
 datas += collect_data_files("mcp")
+datas += collect_data_files("openagent_host_tools")
 
 # ── Package metadata (``.dist-info``) ──
 # ``importlib.metadata.version()`` reads from ``*.dist-info/METADATA``

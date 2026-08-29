@@ -15,6 +15,7 @@ try:
         CallToolResult,
         EmbeddedResource,
         ImageContent,
+        ResourceLink,
         TextContent,
         TextResourceContents,
     )
@@ -170,12 +171,18 @@ def get_entrypoint_for_tool(
                 tool_name, kwargs, meta=call_meta()
             )  # type: ignore
 
-            # Return an error if the tool call failed
-            if result.isError:
-                error_text, _ = _bounded_mcp_text(
-                    result.content, label="MCP error result",
+            # Preserve the COMPLETE MCP envelope.  The runtime's historical
+            # path below turns content blocks into a human/model-facing string
+            # and media objects, but that representation cannot carry
+            # structuredContent, isError, _meta, ResourceLink, AudioContent or
+            # future protocol block types.  ``mode='json'`` also makes AnyUrl
+            # and other pydantic values safe for the next tool-search boundary.
+            try:
+                mcp_result = result.model_dump(
+                    mode="json", by_alias=True, exclude_none=False,
                 )
-                return ToolResult(content=f"Error from MCP tool '{tool_name}': {error_text}")
+            except Exception:
+                mcp_result = json.loads(result.model_dump_json(by_alias=True))
 
             # Process the result content
             response_str = ""
@@ -355,9 +362,26 @@ def get_entrypoint_for_tool(
                                 f"Embedded resource {uri_display or filename} has been added "
                                 "to the response.\n"
                             )
+                elif isinstance(content_item, ResourceLink):
+                    uri = str(getattr(content_item, "uri", "") or "")
+                    uri_display = (
+                        uri
+                        if len(uri) <= _MCP_URI_MAX_CHARS
+                        else uri[:_MCP_URI_MAX_CHARS] + "…"
+                    )
+                    link_name, _ = _bounded_mcp_text(
+                        getattr(content_item, "name", None) or "resource",
+                        label="MCP resource link name",
+                        max_chars=512,
+                        max_bytes=2_048,
+                    )
+                    response_str += f"[Resource link {link_name}: {uri_display}]\n"
                 else:
-                    # Handle other content types
-                    response_str += f"[Unsupported content type: {content_item.type}]\n"
+                    # Future MCP block types remain intact in ``mcp_result``.
+                    response_str += (
+                        "[Unsupported content type: "
+                        f"{getattr(content_item, 'type', type(content_item).__name__)}]\n"
+                    )
 
             if len(result.content) > len(content_items):
                 response_str += (
@@ -372,12 +396,23 @@ def get_entrypoint_for_tool(
                 max_bytes=_MCP_COMBINED_TEXT_MAX_BYTES,
             )
 
+            display_content = response_str.strip()
+            if result.isError:
+                detail = display_content or "MCP tool returned no displayable error content"
+                display_content = f"Error from MCP tool '{tool_name}': {detail}"
+                display_content, _ = _bounded_mcp_text(
+                    display_content,
+                    label="MCP combined error output",
+                    max_chars=_MCP_COMBINED_TEXT_MAX_CHARS,
+                    max_bytes=_MCP_COMBINED_TEXT_MAX_BYTES,
+                )
             return ToolResult(
-                content=response_str.strip(),
+                content=display_content,
                 images=images if images else None,
                 audios=audios if audios else None,
                 videos=videos if videos else None,
                 files=files if files else None,
+                mcp_result=mcp_result,
             )
         except Exception as e:
             log_exception(f"Failed to call MCP tool '{tool_name}': {e}")

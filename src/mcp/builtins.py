@@ -5,16 +5,27 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import socket
 import subprocess
 import sys
+import tempfile
+import threading
+import hashlib
 from pathlib import Path
 from typing import Any
 
 import platform
 
+from openagent_host_tools import sidecar_source
+
 from src._frozen import bundle_dir, is_frozen
 
 logger = logging.getLogger(__name__)
+
+_AGENT_CHROME_PORT_LOCK = threading.Lock()
+_AGENT_CHROME_PORTS: dict[str, tuple[int, Any]] = {}
+_AGENT_CHROME_PORT_MIN = 18800
+_AGENT_CHROME_PORT_COUNT = 1000
 
 if is_frozen():
     # Frozen layout: PyInstaller extracts the source tree at
@@ -44,22 +55,22 @@ else:
 
 
 def _native_binary_target() -> str:
-    """Return the friendly-name subdirectory for the host platform."""
+    """Return the canonical host-tools release platform key."""
     system = platform.system()
     machine = platform.machine().lower()
-    if system == "Darwin":
-        if machine in ("arm64", "aarch64"):
-            return "darwin-arm64"
-        raise RuntimeError(f"Unsupported macOS arch: {machine}")
-    if system == "Linux":
-        if machine in ("x86_64", "amd64"):
-            return "linux-x64"
-        raise RuntimeError(f"Unsupported Linux arch: {machine}")
-    if system == "Windows":
-        if machine in ("amd64", "x86_64"):
-            return "windows-x64"
-        raise RuntimeError(f"Unsupported Windows arch: {machine}")
-    raise RuntimeError(f"Unsupported OS: {system}")
+    os_key = {"Darwin": "darwin", "Linux": "linux", "Windows": "win32"}.get(
+        system
+    )
+    arch_key = (
+        "arm64"
+        if machine in ("arm64", "aarch64")
+        else "x64"
+        if machine in ("x86_64", "amd64")
+        else None
+    )
+    if os_key is None or arch_key is None:
+        raise RuntimeError(f"Unsupported native MCP target: {system}/{machine}")
+    return f"{os_key}-{arch_key}"
 
 
 def _resolve_native_binary(name: str) -> str:
@@ -99,11 +110,14 @@ def _resolve_native_binary(name: str) -> str:
     #     proper app bundle. A bare CLI binary, even with a reverse-DNS
     #     code-sign identifier, silently fails TCC checks when spawned
     #     by launchd and never appears in Privacy & Security settings.
-    #     Bundle layout: ``<prefix>/openagent-<name>.app/Contents/MacOS/openagent-<name>``.
+    #     Bundle layout inside the signed server app:
+    #     ``Contents/Helpers/openagent-<name>.app/Contents/MacOS/openagent-<name>``.
     try:
         if platform.system() == "Darwin":
+            executable_dir = Path(sys.executable).resolve().parent
             app_binary = (
-                Path(sys.executable).resolve().parent
+                executable_dir.parent
+                / "Helpers"
                 / f"openagent-{name}.app"
                 / "Contents"
                 / "MacOS"
@@ -111,6 +125,16 @@ def _resolve_native_binary(name: str) -> str:
             )
             if app_binary.is_file():
                 return str(app_binary)
+            # Legacy packages placed the helper app beside the main binary.
+            legacy_app_binary = (
+                executable_dir
+                / f"openagent-{name}.app"
+                / "Contents"
+                / "MacOS"
+                / f"openagent-{name}"
+            )
+            if legacy_app_binary.is_file():
+                return str(legacy_app_binary)
     except Exception:  # noqa: BLE001 — sys.executable resolution is best-effort
         pass
 
@@ -123,8 +147,18 @@ def _resolve_native_binary(name: str) -> str:
     except Exception:  # noqa: BLE001 — sys.executable resolution is best-effort
         pass
 
-    # 2. Staged under src/mcp/servers/<name>/bin/<target>/.
-    path = BUILTIN_MCPS_DIR / name / "bin" / target / bin_name
+    # 2. Staged by the versioned openagent-host-tools package.  The server and
+    # local client host must never build subtly different copies of this MCP.
+    source_root = sidecar_source(name)
+    # ``win32-*`` is the public host-tools platform vocabulary. Retain one
+    # legacy ``windows-*`` lookup for source trees staged by older builds.
+    legacy_target = target.replace("win32-", "windows-")
+    candidates = (
+        source_root / "bin" / target / bin_name,
+        source_root / "bin" / legacy_target / bin_name,
+        source_root / "target" / "release" / bin_name,
+    )
+    path = next((candidate for candidate in candidates if candidate.exists()), candidates[0])
     if path.exists():
         return str(path)
 
@@ -139,7 +173,7 @@ def _resolve_native_binary(name: str) -> str:
     # always pre-staged (step 2) or genuinely absent, so building from source
     # buys nothing — short-circuit straight to the not-found path.
     _skip_native_build = os.environ.get("OPENAGENT_SKIP_NATIVE_BUILD") or os.environ.get("CI")
-    cargo_toml = BUILTIN_MCPS_DIR / name / "Cargo.toml"
+    cargo_toml = source_root / "Cargo.toml"
     if not _skip_native_build and cargo_toml.exists() and command_exists("cargo"):
         logger.info("Native MCP '%s' binary missing — building from source...", name)
         # Non-fatal: the crate can pull system libs (e.g. enigo -> wayland /
@@ -148,7 +182,7 @@ def _resolve_native_binary(name: str) -> str:
         # — we just skip this optional MCP, exactly like the other fallbacks.
         proc = subprocess.run(
             ["cargo", "build", "--release"],
-            cwd=BUILTIN_MCPS_DIR / name,
+            cwd=source_root,
             check=False,
             capture_output=True,
             text=True,
@@ -166,7 +200,7 @@ def _resolve_native_binary(name: str) -> str:
                 f"Native MCP '{name}' build failed; skipping. "
                 f"stderr tail: {(proc.stderr or '').strip()[-300:]}"
             )
-        built = BUILTIN_MCPS_DIR / name / "target" / "release" / bin_name
+        built = source_root / "target" / "release" / bin_name
         if built.exists():
             path.parent.mkdir(parents=True, exist_ok=True)
             import shutil as _sh
@@ -298,11 +332,19 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
             "the answer depends on current information you may not have"
         ),
     },
+    "filesystem": {
+        "in_process": True,
+        "adapter_module": "src.mcp.servers.host_tools.adapters",
+        "runtime_toolkit_factory": "build_filesystem_runtime_toolkit",
+        "description": (
+            "server filesystem tools backed by the same versioned core used "
+            "by client capability hosts"
+        ),
+    },
     "editor": {
-        "dir": "editor",
-        "command": ["node", "dist/index.js"],
-        "build": ["npm", "run", "build"],
-        "install": ["npm", "install"],
+        "in_process": True,
+        "adapter_module": "src.mcp.servers.host_tools.adapters",
+        "runtime_toolkit_factory": "build_editor_runtime_toolkit",
         "description": (
             "structured file editing — read, write, patch, search. "
             "Preferred over raw shell ``cat`` / ``sed`` for code changes"
@@ -476,7 +518,7 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
 
 DEFAULT_MCPS: list[dict[str, Any]] = [
     {"builtin": "vault", "_default": True},
-    {"name": "filesystem", "command": ["npx", "-y", "@modelcontextprotocol/server-filesystem"], "args": [], "_default": True},
+    {"builtin": "filesystem", "_default": True},
     {"builtin": "editor", "_default": True},
     {"builtin": "web-search", "_default": True},
     {"builtin": "shell", "_default": True},
@@ -625,9 +667,142 @@ def command_exists(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
 
+def _try_lock_agent_chrome_port(path: Path) -> Any | None:
+    """Acquire a process-lifetime, cross-process advisory port claim."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, BlockingIOError):
+        handle.close()
+        return None
+    return handle
+
+
+def _profile_marker_claims_port(profile_dir: Path | None, port: int) -> bool:
+    """Return whether Chrome's profile-owned marker claims ``port``.
+
+    This permits a server process to adopt its dedicated browser after a
+    server restart. Endpoint/path ownership is still verified by browser.js
+    before CDP is used, so an arbitrary listener can never be adopted merely
+    because the TCP port is busy.
+    """
+
+    if profile_dir is None:
+        return False
+    try:
+        lines = (profile_dir / "DevToolsActivePort").read_text().splitlines()
+        return len(lines) >= 2 and int(lines[0].strip()) == port and (
+            lines[1].strip().startswith("/devtools/browser/")
+        )
+    except (OSError, ValueError):
+        return False
+
+
+def _claim_agent_chrome_port(
+    scope: str,
+    *,
+    profile_dir: Path | None = None,
+) -> int:
+    """Claim a free loopback CDP port deterministically for one scope.
+
+    The advisory lock prevents two OpenAgent processes owned by the same OS
+    user from selecting one port. A bind probe also skips ports held by other
+    applications. The browser side verifies ``DevToolsActivePort`` before it
+    ever reuses an endpoint, closing the remaining check/launch race safely.
+    """
+
+    with _AGENT_CHROME_PORT_LOCK:
+        existing = _AGENT_CHROME_PORTS.get(scope)
+        if existing is not None:
+            return existing[0]
+        digest = hashlib.sha256(scope.encode("utf-8")).digest()
+        offset = int.from_bytes(digest[:4], "big") % _AGENT_CHROME_PORT_COUNT
+        # ``tempfile.gettempdir()`` is normally per-user on Windows, but using
+        # the process id here would defeat cross-process exclusion. A stable
+        # home-directory digest works on every supported OS without exposing
+        # the account name in a shared temp directory.
+        user_marker = hashlib.sha256(
+            str(Path.home().resolve()).encode("utf-8")
+        ).hexdigest()[:16]
+        lock_root = (
+            Path(tempfile.gettempdir())
+            / f"openagent-agent-in-chrome-{user_marker}"
+        )
+        for step in range(_AGENT_CHROME_PORT_COUNT):
+            port = _AGENT_CHROME_PORT_MIN + (
+                (offset + step) % _AGENT_CHROME_PORT_COUNT
+            )
+            handle = _try_lock_agent_chrome_port(lock_root / f"{port}.lock")
+            if handle is None:
+                continue
+            probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+                probe.bind(("127.0.0.1", port))
+            except OSError:
+                if not _profile_marker_claims_port(profile_dir, port):
+                    handle.close()
+                    continue
+            finally:
+                probe.close()
+            handle.seek(0)
+            handle.truncate()
+            handle.write(f"pid={os.getpid()} scope={scope}\n".encode("utf-8"))
+            handle.flush()
+            _AGENT_CHROME_PORTS[scope] = (port, handle)
+            return port
+    raise RuntimeError("no collision-free Agent in Chrome CDP port is available")
+
+
+def agent_chrome_network_env(
+    network_id: str | None,
+    *,
+    db_path: str | None = None,
+) -> dict[str, str]:
+    """Return profile/extension/CDP settings isolated to one server network."""
+
+    resolved_db = str(Path(db_path).expanduser().resolve()) if db_path else ""
+    identity = str(network_id or "").strip() or f"standalone:{resolved_db}"
+    scope = hashlib.sha256(f"{identity}\0{resolved_db}".encode("utf-8")).hexdigest()
+    if db_path:
+        base = Path(db_path).expanduser().resolve().parent
+    else:
+        from src.core.paths import data_dir
+
+        base = data_dir()
+    root = base / "agent-in-chrome" / scope[:20]
+    profile_dir = root / "profile"
+    return {
+        "OPENAGENT_NETWORK_ID": identity,
+        "OPENAGENT_CHROME_PROFILE_DIR": str(profile_dir),
+        "OPENAGENT_CHROME_EXTENSIONS_DIR": str(root / "extensions"),
+        "OPENAGENT_CHROME_CDP_PORT": str(
+            _claim_agent_chrome_port(scope, profile_dir=profile_dir)
+        ),
+    }
+
+
 def _find_node_binary() -> str | None:
     """Return absolute path to a working node binary, or None."""
+    node_name = "node.exe" if platform.system() == "Windows" else "node"
     candidates = [
+        os.environ.get("OPENAGENT_NODE_BINARY", ""),
+        str(Path(sys.executable).resolve().parent / node_name),
+        str(bundle_dir() / node_name),
         "/opt/homebrew/bin/node",
         "/usr/local/bin/node",
         "/usr/bin/node",
@@ -640,7 +815,7 @@ def _find_node_binary() -> str | None:
             os.path.expandvars(r"%APPDATA%\npm\node.exe"),
         ]
     for p in candidates:
-        if os.path.isfile(p) and os.access(p, os.X_OK):
+        if p and os.path.isfile(p) and os.access(p, os.X_OK):
             return p
     # Search nvm
     nvm_dir = Path.home() / ".nvm" / "versions" / "node"
@@ -669,9 +844,14 @@ def resolve_builtin_entry(name: str, env: dict[str, str] | None = None) -> dict[
             "in_process": True,
             "adapter_module": spec["adapter_module"],
             "runtime_toolkit_factory": spec.get("runtime_toolkit_factory", "build_runtime_toolkit"),
+            "env": dict(env) if env else None,
         }
 
-    mcp_dir = BUILTIN_MCPS_DIR / spec["dir"]
+    mcp_dir = (
+        sidecar_source("agent-in-chrome") / "host"
+        if name == "agent-in-chrome"
+        else BUILTIN_MCPS_DIR / spec["dir"]
+    )
     is_native = spec.get("native", False)
 
     # Native-binary MCPs don't need a bundled directory — they ship as a

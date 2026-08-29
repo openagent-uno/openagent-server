@@ -1702,6 +1702,7 @@ dependencies = [
     { name = "litellm" },
     { name = "mcp", extra = ["cli"] },
     { name = "numpy" },
+    { name = "openagent-host-tools" },
     { name = "openai" },
     { name = "packaging" },
     { name = "piper-tts" },
@@ -1767,6 +1768,7 @@ requires-dist = [
     { name = "litellm", specifier = ">=1.50.0" },
     { name = "mcp", extras = ["cli"], specifier = ">=1.0.0,<2" },
     { name = "numpy", specifier = ">=1.24" },
+    { name = "openagent-host-tools", url = "https://github.com/openagent-uno/openagent-host-tools/releases/download/v0.1.2/openagent_host_tools-0.1.2-py3-none-any.whl" },
     { name = "openagent-mcp", marker = "extra == 'all'", git = "https://github.com/openagent-uno/openagent-mcp?rev=main" },
     { name = "openai", specifier = ">=1.0.0" },
     { name = "packaging", specifier = ">=21.0" },
@@ -1787,6 +1789,25 @@ requires-dist = [
     { name = "whatsapp-api-client-python", marker = "extra == 'whatsapp'", specifier = ">=0.0.46" },
 ]
 provides-extras = ["telegram", "discord", "whatsapp", "slack", "acp", "voice", "websocket", "all"]
+
+[[package]]
+name = "openagent-host-tools"
+version = "0.1.2"
+source = { url = "https://github.com/openagent-uno/openagent-host-tools/releases/download/v0.1.2/openagent_host_tools-0.1.2-py3-none-any.whl" }
+dependencies = [
+    { name = "mcp" },
+]
+wheels = [
+    { url = "https://github.com/openagent-uno/openagent-host-tools/releases/download/v0.1.2/openagent_host_tools-0.1.2-py3-none-any.whl", hash = "sha256:22e74b799da2bfacaa3ff7f1e473e1c8205c8b4b8c20764d09211b50f22c31e0" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "mcp", specifier = ">=1.27,<2" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
+    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
+]
+provides-extras = ["dev"]
 
 [[package]]
 name = "openagent-mcp"

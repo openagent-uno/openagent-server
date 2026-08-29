@@ -92,7 +92,20 @@ class SessionDialer:
         to the same NodeId; opens a fresh one otherwise.
         """
         connection = await self._get_or_open_connection(target_node_id)
-        bi = await connection.open_bi()
+        try:
+            bi = await connection.open_bi()
+        except Exception:
+            # A connection that dialled successfully may close later. Leaving
+            # it in the pool makes every HTTP/WebSocket reconnect reuse the
+            # same dead QUIC connection forever. Evict only this exact cached
+            # object, then make one bounded redial attempt.
+            await self._evict_connection(target_node_id, connection)
+            connection = await self._get_or_open_connection(target_node_id)
+            try:
+                bi = await connection.open_bi()
+            except Exception:
+                await self._evict_connection(target_node_id, connection)
+                raise
         send, recv = bi.send(), bi.recv()
         # Send cert prefix immediately. The gateway's IrohSite reads
         # exactly these bytes off the wire before handing the stream
@@ -119,6 +132,19 @@ class SessionDialer:
                 conn = await self._node.dial(node_id, NetworkAlpn.GATEWAY)
                 self._connections[node_id] = conn
             return conn
+
+    async def _evict_connection(self, node_id: str, connection: object) -> None:
+        """Remove only *connection*, preserving a concurrent replacement."""
+
+        async with self._connections_lock:
+            if self._connections.get(node_id) is connection:
+                self._connections.pop(node_id, None)
+        try:
+            # ``Connection.close`` is sync in iroh-py 0.35. It is harmless if
+            # open_bi failed because the connection was already closed.
+            connection.close(0, b"")
+        except Exception:
+            pass
 
     async def close(self) -> None:
         async with self._connections_lock:

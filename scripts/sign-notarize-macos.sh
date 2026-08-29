@@ -131,6 +131,10 @@ fi
 # ── Skip cleanly when the binary-signing secrets are missing ──────────
 
 if [ -z "${CSC_LINK:-}" ] || [ -z "${CSC_KEY_PASSWORD:-}" ]; then
+    if [ "${OPENAGENT_REQUIRE_SIGNING:-0}" = "1" ]; then
+        echo "ERROR: CSC_LINK / CSC_KEY_PASSWORD are required for this release" >&2
+        exit 1
+    fi
     echo "⚠️  CSC_LINK / CSC_KEY_PASSWORD not set — skipping macOS signing"
     exit 0
 fi
@@ -244,13 +248,8 @@ else
     SIGN_IDENTIFIER="com.openagent.$(basename "$BINARY" | tr -d '[:space:]' | sed 's/\.app$//')"
 fi
 
-# For an .app bundle, drop the signed Rust sidecar inside
-# ``Contents/MacOS/`` BEFORE we sign the outer bundle so ``codesign
-# --deep`` seals everything together. TCC will attribute child-process
-# requests to the outer .app's identity (it's the "responsible process"
-# in TCC terms) — we don't need a separate .app wrapper for the sidecar
-# anymore, and the outer bundle's bundle-id-keyed TCC entry survives
-# every future release as long as CFBundleIdentifier stays stable.
+# Legacy callers may still pass a bare sidecar. New server releases stage the
+# producer-signed helper app under Contents/Helpers before this script runs.
 if [ "$IS_APP_BUNDLE" = true ] && [ -n "$EXTRA_SIDECAR" ]; then
     SIDECAR_DEST="$BINARY/Contents/MacOS/$(basename "$EXTRA_SIDECAR")"
     echo "→ Copying sidecar into app bundle: $SIDECAR_DEST"
@@ -258,13 +257,69 @@ if [ "$IS_APP_BUNDLE" = true ] && [ -n "$EXTRA_SIDECAR" ]; then
     chmod +x "$SIDECAR_DEST"
 fi
 
+codesign_field() {
+    local target="$1"
+    local field="$2"
+    codesign -d --verbose=4 "$target" 2>&1 | sed -n "s/^${field}=//p" | head -1
+}
+
+assert_preserved_child() {
+    local target="$1"
+    local expected_identifier="$2"
+    codesign --verify --deep --strict --verbose=2 "$target"
+    local actual_identifier
+    actual_identifier="$(codesign_field "$target" Identifier)"
+    if [ "$actual_identifier" != "$expected_identifier" ]; then
+        echo "ERROR: unexpected nested identifier $actual_identifier for $target" >&2
+        exit 1
+    fi
+    if [ -n "${APPLE_TEAM_ID:-}" ]; then
+        local actual_team
+        actual_team="$(codesign_field "$target" TeamIdentifier)"
+        if [ "$actual_team" != "$APPLE_TEAM_ID" ]; then
+            echo "ERROR: unexpected nested TeamIdentifier $actual_team for $target" >&2
+            exit 1
+        fi
+    fi
+}
+
+PRESERVED_NODE=""
+PRESERVED_CONTROL=""
+if [ "$IS_APP_BUNDLE" = true ]; then
+    PRESERVED_NODE="$BINARY/Contents/MacOS/node"
+    PRESERVED_CONTROL="$BINARY/Contents/Helpers/openagent-computer-control.app"
+    if [ ! -f "$PRESERVED_NODE" ] || [ ! -d "$PRESERVED_CONTROL" ]; then
+        echo "ERROR: signed host-tools Node/helper are missing from the server app" >&2
+        exit 1
+    fi
+    assert_preserved_child "$PRESERVED_NODE" com.openagent.host-tools.node
+    assert_preserved_child "$PRESERVED_CONTROL" com.openagent.computer-control
+    NODE_ENTITLEMENTS="$(codesign -d --entitlements :- "$PRESERVED_NODE" 2>&1)"
+    for entitlement in \
+        com.apple.security.cs.allow-jit \
+        com.apple.security.cs.allow-unsigned-executable-memory \
+        com.apple.security.cs.disable-library-validation; do
+        echo "$NODE_ENTITLEMENTS" | grep -q "<key>$entitlement</key>" || {
+            echo "ERROR: signed Node is missing entitlement $entitlement" >&2
+            exit 1
+        }
+    done
+fi
+
 echo "→ Signing $BINARY with identifier $SIGN_IDENTIFIER"
 if [ "$IS_APP_BUNDLE" = true ]; then
-    # --deep signs every nested Mach-O in the bundle with the parent
-    # signature, which is what we want: the outer openagent binary
-    # plus the sidecar Rust binary in Contents/MacOS/ both get sealed
-    # under the same Developer ID + identifier.
-    codesign --force --deep \
+    # Never use --deep/--force on nested host-tools code: that would replace
+    # the producer signatures, identifiers and Node JIT entitlements. Sign the
+    # PyInstaller main executable, then seal the outer bundle without deep.
+    APP_EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$BINARY/Contents/Info.plist")"
+    codesign --force \
+        --sign "$APP_IDENTITY" \
+        --identifier "$SIGN_IDENTIFIER" \
+        --options runtime \
+        --timestamp \
+        --entitlements buildResources/entitlements.mac.plist \
+        "$BINARY/Contents/MacOS/$APP_EXECUTABLE"
+    codesign --force \
         --sign "$APP_IDENTITY" \
         --identifier "$SIGN_IDENTIFIER" \
         --options runtime \
@@ -280,13 +335,22 @@ else
         --entitlements buildResources/entitlements.mac.plist \
         "$BINARY"
 fi
-codesign --verify --strict --verbose=2 "$BINARY"
+codesign --verify --deep --strict --verbose=2 "$BINARY"
+if [ "$IS_APP_BUNDLE" = true ]; then
+    # Prove the outer seal did not rewrite either producer-owned child.
+    assert_preserved_child "$PRESERVED_NODE" com.openagent.host-tools.node
+    assert_preserved_child "$PRESERVED_CONTROL" com.openagent.computer-control
+fi
 codesign -dvv "$BINARY" 2>&1 | grep -E '^(Identifier|TeamIdentifier|Format)=' || true
 echo "✓ Binary signed"
 
 # ── Notarize + (for .app bundles) staple ──────────────────────────────
 
 if [ -z "${APPLE_ID:-}" ] || [ -z "${APPLE_APP_SPECIFIC_PASSWORD:-}" ] || [ -z "${APPLE_TEAM_ID:-}" ]; then
+    if [ "${OPENAGENT_REQUIRE_SIGNING:-0}" = "1" ]; then
+        echo "ERROR: APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD / APPLE_TEAM_ID are required for this release" >&2
+        exit 1
+    fi
     echo "⚠️  APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD / APPLE_TEAM_ID not set"
     echo "   — binary is signed but NOT notarized. Manual downloads will"
     echo "     still trigger Gatekeeper on first launch."

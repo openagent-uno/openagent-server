@@ -85,7 +85,10 @@ _MAX_CACHE_BREAKPOINTS = 4
 # which strip the same tag to key their Agent caches. Three copies of one
 # regex is a wart; the tag is a stable orchestrator↔provider contract, so
 # they have not drifted. Consolidate if a fourth appears.
-_SESSION_ID_TAG_RE = re.compile(r"\n*<session-id>[^<]*</session-id>\s*$")
+_SESSION_ID_TAG_RE = re.compile(
+    r"\n*(?:<execution-host>[^<]*</execution-host>\s*)?"
+    r"(?:<session-id>[^<]*</session-id>\s*)$"
+)
 
 
 def _split_session_id_tag(system_message: str) -> Tuple[str, str]:

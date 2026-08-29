@@ -7,9 +7,10 @@ non è disponibile in questa installazione", and memory writes leaked to
 the filesystem instead of the OpenAgent vault.
 
 ``vault`` is a vendored node builtin (``src/mcp/servers/vault``, run as
-``node dist/server.js`` and seeded by ``builtin_name``); ``filesystem``
-is an ``npx`` default. Both must land in the ``mcps`` table on a fresh DB
-and surface as real, executable specs through ``MCPPool.from_db``.
+``node dist/server.js`` and seeded by ``builtin_name``); ``filesystem`` is
+the in-process adapter over the versioned ``openagent-host-tools`` core. Both
+must land in the ``mcps`` table on a fresh DB and surface as executable specs
+through ``MCPPool.from_db``.
 """
 from __future__ import annotations
 
@@ -26,7 +27,7 @@ def _fresh_db_path(ctx: TestContext) -> str:
     return str(ctx.db_path.with_name(f"seed-{uuid.uuid4().hex[:8]}.db"))
 
 
-@test("bootstrap", "ensure_builtin_mcps seeds vault (node builtin) + filesystem (npx)")
+@test("bootstrap", "ensure_builtin_mcps seeds vault + shared filesystem builtin")
 async def t_seeds_memory_defaults(ctx: TestContext) -> None:
     from src.memory.bootstrap import ensure_builtin_mcps
     from src.memory.db import MemoryDB
@@ -56,11 +57,12 @@ async def t_seeds_memory_defaults(ctx: TestContext) -> None:
         assert vault["enabled"] is True
         assert vault["kind"] == "default"
 
-        # Filesystem stays an npx default: a concrete argv on the row.
+        # Filesystem now resolves through the exact same versioned in-process
+        # core as the client capability host. It must not silently fall back to
+        # the old mutable npx package.
         filesystem = next(r for r in rows if r["name"] == "filesystem")
-        assert filesystem["command"], "filesystem row must store the npx argv"
-        assert filesystem["command"][0] == "npx"
-        assert not filesystem.get("builtin_name"), "filesystem is not a builtin"
+        assert filesystem.get("builtin_name") == "filesystem"
+        assert not filesystem["command"], "shared filesystem must not launch npx"
     finally:
         await db.close()
 

@@ -64,6 +64,7 @@ def tool_exec_to_wire_json(
     """
     if tool_exec is None or not getattr(tool_exec, "tool_name", None):
         return None
+    _ensure_execution_host(tool_exec)
     payload = _to_dict(tool_exec)
     if error_text is not None:
         payload["tool_call_error"] = True
@@ -81,7 +82,10 @@ def stored_tool_to_wire(stored: dict[str, Any]) -> dict[str, Any] | None:
     """
     if not stored.get("tool_name"):
         return None
-    return dict(stored)
+    payload = dict(stored)
+    if not isinstance(payload.get("execution_host"), dict):
+        payload["execution_host"] = _default_execution_host(payload.get("tool_args"))
+    return payload
 
 
 def _to_dict(tool_exec: Any) -> dict[str, Any]:
@@ -100,7 +104,39 @@ def _to_dict(tool_exec: Any) -> dict[str, Any]:
         "tool_args": getattr(tool_exec, "tool_args", None),
         "tool_call_error": getattr(tool_exec, "tool_call_error", None),
         "result": getattr(tool_exec, "result", None),
+        "execution_host": getattr(tool_exec, "execution_host", None),
     }
+
+
+def _ensure_execution_host(tool_exec: Any) -> None:
+    """Stamp the runtime object once so persistence keeps the live host chip."""
+
+    if isinstance(getattr(tool_exec, "execution_host", None), dict):
+        return
+    host = _default_execution_host(getattr(tool_exec, "tool_args", None))
+    try:
+        tool_exec.execution_host = host
+    except Exception:  # noqa: BLE001 — duck-typed immutable fixture
+        pass
+
+
+def _default_execution_host(args: Any) -> dict[str, Any]:
+    """Infer only the safe legacy default when a persisted row predates hosts."""
+
+    server = args.get("server") if isinstance(args, dict) else None
+    if isinstance(server, str) and server.startswith("client:"):
+        try:
+            from src.core.execution_origin import current_execution_origin
+
+            origin = current_execution_origin()
+        except Exception:  # noqa: BLE001
+            origin = None
+        return (
+            origin.execution_host
+            if origin is not None
+            else {"kind": "client", "device_label": "Unavailable client"}
+        )
+    return {"kind": "server", "device_label": "Server OpenAgent"}
 
 
 __all__ = ["emit_tool_status", "tool_exec_to_wire_json", "stored_tool_to_wire"]

@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, TYPE_CHECKING
 from weakref import WeakKeyDictionary
@@ -21,6 +22,13 @@ from src.gateway import protocol as P
 from src.gateway.commands import command_help_text
 from src.gateway.sessions import SessionManager
 from src.gateway.terminals import TerminalManager
+from src.gateway.capabilities import (
+    CAPABILITY_HEARTBEAT_TIMEOUT_S,
+    CAPABILITY_PROTOCOL,
+    CapabilityConnection,
+    CapabilityRegistry,
+    ClientCapabilityError,
+)
 from src.gateway.api import vault, config, health, logs, control, usage, providers, models, scheduled_tasks, workflow_tasks, mcps, marketplace, sessions as sessions_api, system as system_api, network as network_api, chat as chat_api, terminals as terminals_api, commands as commands_api, events as events_api, budgets as budgets_api, quality as quality_api, llm as llm_api, skills as skills_api, accounts as accounts_api, operational as operational_api, artifacts as artifacts_api, custom_views as custom_views_api
 from src.network import peers as peers_api
 from src.network.auth.middleware import make_auth_middleware
@@ -161,7 +169,17 @@ class Gateway:
         # Keyed by (client_id, terminal_id); torn down per-client when a
         # websocket drops so a closed app never leaks live shells.
         self.terminals = TerminalManager()
-        self.clients: dict[str, object] = {}  # client_id → WebSocketResponse
+        # Chat sockets are keyed per *connection*, not per device. Desktop and
+        # CLI may be online under the same device certificate simultaneously;
+        # neither is allowed to evict the other. The authenticated device id is
+        # tracked separately for turn routing and revocation.
+        self.clients: dict[str, object] = {}  # connection_id → WebSocketResponse
+        self._chat_client_devices: dict[str, str] = {}
+        self._chat_client_instances: dict[str, str | None] = {}
+        self._chat_client_auth_epochs: dict[str, int] = {}
+        self.capabilities = CapabilityRegistry()
+        self._capability_reaper_task: asyncio.Task | None = None
+        self._event_loop: asyncio.AbstractEventLoop | None = None
         # Per-socket send lock: serialises EVERY write to a given WebSocket so
         # concurrent producers can't interleave frames on the wire. Without it,
         # broadcasting a child session's live deltas (the scheduler / workflow
@@ -241,6 +259,123 @@ class Gateway:
         self._config_change_callbacks: dict[
             str, Callable[[dict], Awaitable[None]]
         ] = {}
+
+        # Coordinator revocation is live: close every chat/capability socket
+        # and fail its pending calls as soon as the auth state is updated.
+        auth_state = getattr(self._network_state, "auth_state", None)
+        add_listener = getattr(auth_state, "add_revocation_listener", None)
+        if callable(add_listener):
+            add_listener(self._on_device_revoked)
+
+    def _on_device_revoked(self, device_pubkey: bytes) -> None:
+        device_id = bytes(device_pubkey).hex()
+        auth_state = getattr(self._network_state, "auth_state", None)
+        epoch_reader = getattr(auth_state, "device_epoch", None)
+        revocation_epoch = (
+            epoch_reader(device_pubkey) if callable(epoch_reader) else None
+        )
+        loop = self._event_loop
+        if loop is None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return
+        if loop.is_closed():
+            return
+
+        def _schedule_close() -> None:
+            if not loop.is_closed():
+                loop.create_task(self._close_device_connections(
+                    device_id, revocation_epoch=revocation_epoch,
+                ))
+
+        # Coordinator callbacks currently run on the gateway loop, but using
+        # the thread-safe scheduler keeps revocation immediate if a future
+        # roster watcher invokes listeners from another thread.
+        loop.call_soon_threadsafe(_schedule_close)
+
+    async def _close_device_connections(
+        self,
+        device_id: str,
+        *,
+        revocation_epoch: int | None = None,
+    ) -> None:
+        cleanup: list[Awaitable[Any]] = [self.capabilities.close_device(
+            device_id,
+            reason="device revoked",
+            revocation_epoch=revocation_epoch,
+        )]
+        # A durable session may simultaneously be open from devices A and B.
+        # Revoke only ingress-owned work from A; cancelling the holder/session
+        # wholesale would wrongly terminate B's independent turn or burst.
+        for holder in list(self._stream_sessions.values()):
+            revoke_ingress = getattr(holder.session, "revoke_ingress_device", None)
+            if callable(revoke_ingress):
+                cleanup.append(revoke_ingress(
+                    device_id, revocation_epoch=revocation_epoch,
+                ))
+
+        async def close_chat(ws: Any) -> None:
+            if ws is None or getattr(ws, "closed", False):
+                return
+            try:
+                await ws.close(code=4003, message=b"device revoked")
+            except Exception:
+                pass
+
+        for connection_id, registered_device in list(self._chat_client_devices.items()):
+            if registered_device != device_id:
+                continue
+            if (
+                revocation_epoch is not None
+                and self._chat_client_auth_epochs.get(connection_id, 0)
+                >= revocation_epoch
+            ):
+                continue
+            cleanup.append(close_chat(self.clients.get(connection_id)))
+        results = await asyncio.gather(*cleanup, return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                logger.error(
+                    "device revocation cleanup failed: device=%s error=%s",
+                    device_id,
+                    type(result).__name__,
+                )
+
+    async def _request_device_still_authorized(self, request, cert) -> bool:
+        """Revalidate a device-cert request after a suspending WS upgrade.
+
+        Middleware authentication and handler registration are separated by
+        awaits (WebSocket prepare and capability hello).  The per-device epoch
+        closes that TOCTOU window; the live roster check prevents an inactive
+        member from surviving merely because its close callback is delayed.
+        Synthetic HTTP/agent identities are deliberately outside this device
+        capability boundary.
+        """
+
+        if request.get("auth_kind") != "device_cert":
+            return True
+        auth_state = getattr(self._network_state, "auth_state", None)
+        epoch_reader = getattr(auth_state, "device_epoch", None)
+        expected_epoch = request.get("device_auth_epoch")
+        if (
+            not callable(epoch_reader)
+            or not isinstance(expected_epoch, int)
+            or epoch_reader(cert.device_pubkey) != expected_epoch
+            or cert.device_pubkey in getattr(auth_state, "revoked_pubkeys", set())
+        ):
+            return False
+        if "bridge" in (getattr(cert, "capabilities", None) or []):
+            return True
+        try:
+            active = await auth_state.device_is_active(cert.device_pubkey)
+        except Exception:  # noqa: BLE001 - authorization uncertainty is denial
+            auth_state.disconnect(cert.device_pubkey)
+            return False
+        if not active:
+            auth_state.disconnect(cert.device_pubkey)
+            return False
+        return epoch_reader(cert.device_pubkey) == expected_epoch
 
     async def _safe_ws_send_json(self, ws, payload: dict) -> bool:
         """Best-effort websocket send that tolerates closing transports.
@@ -806,6 +941,8 @@ class Gateway:
         from aiohttp import web
         from aiohttp.web import middleware
 
+        self._event_loop = asyncio.get_running_loop()
+
         # Surface freshly-spawned child sessions (delegations, scheduled
         # firings, workflow nodes) to connected clients in real time, and stream
         # a detached child run's live deltas to every client (its run screen).
@@ -1014,6 +1151,9 @@ class Gateway:
         self._system_broadcast_task = asyncio.create_task(
             self._system_broadcast_loop(), name="gateway-system-broadcast"
         )
+        self._capability_reaper_task = asyncio.create_task(
+            self._capability_reaper_loop(), name="gateway-capability-reaper",
+        )
 
     async def _maybe_start_webhook_listener(self) -> None:
         """Start the dedicated webhook listener if ``channels.webhook.enabled``.
@@ -1062,6 +1202,13 @@ class Gateway:
             await self.terminals.close_all()
         except Exception as e:  # noqa: BLE001
             logger.debug("terminal close_all on stop failed: %s", e)
+        if self._capability_reaper_task is not None:
+            self._capability_reaper_task.cancel()
+            try:
+                await self._capability_reaper_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._capability_reaper_task = None
         if self._system_broadcast_task is not None:
             self._system_broadcast_task.cancel()
             try:
@@ -1105,7 +1252,11 @@ class Gateway:
         for key in list(self._stream_sessions):
             await self._close_stream_session(key)
         self._live_replays.clear()
+        await self.capabilities.close_all()
         self.clients.clear()
+        self._chat_client_devices.clear()
+        self._chat_client_instances.clear()
+        self._event_loop = None
 
     async def _system_broadcast_loop(self) -> None:
         """Push a ``system_snapshot`` to all clients on a fixed cadence.
@@ -1133,9 +1284,30 @@ class Gateway:
             except Exception as e:  # noqa: BLE001
                 logger.debug("system broadcast skipped: %s", e)
 
+    async def _capability_reaper_loop(self) -> None:
+        """Reap half-open capability sockets that stopped heartbeating."""
+
+        interval = max(5.0, CAPABILITY_HEARTBEAT_TIMEOUT_S / 3.0)
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                stale = await self.capabilities.reap_stale()
+                for conn in stale:
+                    elog(
+                        "gateway.capability_stale",
+                        client_id=conn.device_id,
+                        client_instance_id=conn.client_instance_id,
+                        generation=conn.generation,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — keep the reap loop live
+                logger.debug("capability stale reap skipped: %s", exc)
+
     def _register_routes(self, app) -> None:
         """Register the gateway WebSocket endpoint and REST API routes."""
         app.router.add_get("/ws", self._handle_ws)
+        app.router.add_get("/ws/capabilities", self._handle_capabilities_ws)
         app.router.add_post("/api/upload", self._handle_upload)
         app.router.add_get("/api/files", self._handle_files)
         app.router.add_get("/api/agent-info", self._handle_agent_info)
@@ -1721,6 +1893,201 @@ class Gateway:
             message=P.WS_CLOSE_CONNECTION_REPLACED_REASON.encode("utf-8"),
         )
 
+    async def _handle_capabilities_ws(self, request):
+        """Serve one authenticated local capability host.
+
+        This endpoint is intentionally stricter than the general Gateway API:
+        only a real coordinator-issued device cert transported by its matching
+        Iroh peer may register machine-control tools. Shared HTTP tokens,
+        in-process bridges and agent-to-agent ALPN peers are rejected even
+        though they may access other scoped Gateway routes.
+        """
+        from aiohttp import web, WSMsgType
+        from src.network.transport.aiohttp_iroh_site import (
+            current_device_cert_wire,
+            current_is_authenticated_agent,
+        )
+
+        cert = request.get("device_cert")
+        if cert is None:
+            return web.Response(status=401, text="Unauthorized")
+        if (
+            request.get("auth_kind") != "device_cert"
+            or current_is_authenticated_agent()
+            or not current_device_cert_wire()
+            or "agent" in (getattr(cert, "capabilities", None) or [])
+            or "bridge" in (getattr(cert, "capabilities", None) or [])
+        ):
+            return web.Response(
+                status=403,
+                text="client capabilities require a proof-of-possession device connection",
+            )
+
+        ws = web.WebSocketResponse(heartbeat=30.0)
+        await ws.prepare(request)
+        conn: CapabilityConnection | None = None
+
+        async def _send_error(error: ClientCapabilityError) -> None:
+            await self._safe_ws_send_json(ws, {
+                "type": P.ERROR,
+                "error": error.as_dict(),
+            })
+
+        try:
+            try:
+                first = await asyncio.wait_for(ws.receive(), timeout=10.0)
+            except asyncio.TimeoutError:
+                await ws.close(code=4000, message=b"capability hello timeout")
+                return ws
+            if first.type != WSMsgType.TEXT:
+                await ws.close(code=4000, message=b"capability hello required")
+                return ws
+            try:
+                hello = json.loads(first.data)
+            except (TypeError, json.JSONDecodeError):
+                await ws.close(code=4000, message=b"invalid capability hello")
+                return ws
+            if hello.get("type") != P.CAPABILITY_HELLO:
+                await ws.close(code=4000, message=b"capability_hello must be first")
+                return ws
+            if hello.get("protocol") != CAPABILITY_PROTOCOL:
+                await self._safe_ws_send_json(ws, {
+                    "type": P.ERROR,
+                    "error": {
+                        "code": "UNSUPPORTED_PROTOCOL",
+                        "message": f"expected {CAPABILITY_PROTOCOL}",
+                    },
+                })
+                await ws.close(code=4000, message=b"unsupported capability protocol")
+                return ws
+            claimed_network_id = hello.get("network_id")
+            if (
+                claimed_network_id is not None
+                and str(claimed_network_id) != cert.network_id
+            ):
+                await ws.close(
+                    code=4003,
+                    message=b"capability network does not match device certificate",
+                )
+                return ws
+
+            # ``prepare`` + waiting for hello create an intentional await gap
+            # after middleware authentication. Revalidate before publishing
+            # any catalog into the registry; register also checks this epoch
+            # under its own lock to close the final race.
+            if not await self._request_device_still_authorized(request, cert):
+                await ws.close(code=4003, message=b"device authorization changed")
+                return ws
+            auth_state = self._network_state.auth_state
+            auth_epoch = int(request.get("device_auth_epoch", -1))
+
+            conn = await self.capabilities.register(
+                device_id=cert.device_pubkey_hex,
+                account_id=cert.network_id,
+                client_instance_id=hello.get("client_instance_id"),
+                generation=hello.get("generation"),
+                device_label=hello.get("device_label"),
+                ws=ws,
+                send_json=self._safe_ws_send_json,
+                servers=hello.get("servers"),
+                network_id=cert.network_id,
+                auth_epoch=auth_epoch,
+                auth_epoch_reader=lambda: auth_state.device_epoch(cert.device_pubkey),
+            )
+            await self._safe_ws_send_json(ws, {
+                "type": P.CAPABILITY_HELLO_ACK,
+                "protocol": CAPABILITY_PROTOCOL,
+                "device_id": conn.device_id,
+                "account_id": conn.account_id,
+                "network_id": conn.network_id,
+                "client_instance_id": conn.client_instance_id,
+                "generation": conn.generation,
+                "accepted": True,
+            })
+            elog(
+                "gateway.capability_connect",
+                client_id=conn.device_id,
+                client_instance_id=conn.client_instance_id,
+                generation=conn.generation,
+                servers=len(conn.catalog),
+            )
+
+            async for msg in ws:
+                if msg.type != WSMsgType.TEXT:
+                    break
+                try:
+                    frame = json.loads(msg.data)
+                except (TypeError, json.JSONDecodeError):
+                    await _send_error(ClientCapabilityError("INVALID_JSON", "invalid JSON frame"))
+                    continue
+                t = frame.get("type")
+                try:
+                    if t == P.CAPABILITY_CATALOG_UPDATE:
+                        await self.capabilities.update_catalog(
+                            conn,
+                            generation=frame.get("generation"),
+                            servers=frame.get("servers"),
+                        )
+                    elif t == P.CLIENT_TOOL_RESULT:
+                        self.capabilities.resolve_result(conn, frame)
+                    elif t == P.CLIENT_TOOL_EVENT:
+                        event_ack = self.capabilities.receive_tool_event(conn, frame)
+                        await self._safe_ws_send_json(ws, {
+                            "type": P.CLIENT_TOOL_EVENT_ACK,
+                            "generation": conn.generation,
+                            **event_ack,
+                        })
+                    elif t == P.CAPABILITY_HEARTBEAT:
+                        if int(frame.get("generation") or 0) != conn.generation:
+                            raise ClientCapabilityError(
+                                "STALE_GENERATION",
+                                "heartbeat generation does not match connection",
+                            )
+                        # Re-check coordinator membership while this long-lived
+                        # stream is open; a miss flows through the same revoke
+                        # listener that closes every sibling connection.
+                        if not await self._request_device_still_authorized(
+                            request, cert,
+                        ):
+                            break
+                        conn.last_seen_at = time.time()
+                        await self._safe_ws_send_json(ws, {
+                            "type": P.CAPABILITY_HEARTBEAT_ACK,
+                            "generation": conn.generation,
+                            "ts_ms": int(time.time() * 1000),
+                        })
+                    elif t == P.PING:
+                        await self._safe_ws_send_json(ws, {"type": P.PONG})
+                    elif t == P.CLIENT_ARTIFACT_CHUNK:
+                        self.capabilities.receive_artifact_chunk(conn, frame)
+                    else:
+                        raise ClientCapabilityError(
+                            "UNKNOWN_FRAME", f"unsupported capability frame {t!r}",
+                        )
+                except ClientCapabilityError as error:
+                    await _send_error(error)
+                    if error.code == "CLIENT_REVOKED":
+                        await ws.close(
+                            code=4003, message=b"device authorization changed",
+                        )
+                        break
+        except ClientCapabilityError as error:
+            await _send_error(error)
+            if error.code == "CLIENT_REVOKED":
+                await ws.close(
+                    code=4003, message=b"device authorization changed",
+                )
+        finally:
+            if conn is not None:
+                await self.capabilities.unregister(conn)
+                elog(
+                    "gateway.capability_disconnect",
+                    client_id=conn.device_id,
+                    client_instance_id=conn.client_instance_id,
+                    generation=conn.generation,
+                )
+        return ws
+
     async def _handle_ws(self, request):
         from aiohttp import web, WSMsgType
 
@@ -1735,6 +2102,13 @@ class Gateway:
 
         ws = web.WebSocketResponse()
         await ws.prepare(request)
+
+        # A device may be revoked while the HTTP upgrade is suspended. Do not
+        # insert a late chat socket after the revocation callback took its
+        # snapshot; the same epoch is checked again on every inbound frame.
+        if not await self._request_device_still_authorized(request, cert):
+            await ws.close(code=4003, message=b"device authorization changed")
+            return ws
 
         # ``client_id`` is bound to the device's pubkey. This means a
         # reconnect from the same device picks up its existing
@@ -1752,15 +2126,13 @@ class Gateway:
 
         ui_service = service_for_gateway(self)
         ui_access = AccessContext.from_request(request)
-        old_ws = self.clients.get(client_id)
-        self.clients[client_id] = ws
-        await self._adopt_sessions_to_ws(client_id, ws, handle=cert.handle)
-        if old_ws is not None and old_ws is not ws:
-            elog("gateway.client_reconnect", client_id=client_id)
-            try:
-                await self._close_replaced_websocket(old_ws)
-            except Exception as e:  # noqa: BLE001
-                logger.debug("old ws close failed: %s", e)
+        connection_id = uuid.uuid4().hex
+        self.clients[connection_id] = ws
+        self._chat_client_devices[connection_id] = client_id
+        self._chat_client_instances[connection_id] = None
+        self._chat_client_auth_epochs[connection_id] = int(
+            request.get("device_auth_epoch", 0),
+        )
 
         # Greet the client. Old clients sent an AUTH frame and waited
         # for AUTH_OK; the new wire skips the AUTH frame but keeps the
@@ -1789,6 +2161,16 @@ class Gateway:
         last_msg_type: str | None = None
         try:
             async for msg in ws:
+                if (
+                    request.get("auth_kind") == "device_cert"
+                    and self._network_state.auth_state.device_epoch(
+                        cert.device_pubkey,
+                    ) != request.get("device_auth_epoch")
+                ):
+                    await ws.close(
+                        code=4003, message=b"device authorization changed",
+                    )
+                    break
                 last_msg_type = msg.type.name if hasattr(msg.type, "name") else str(msg.type)
                 if msg.type != WSMsgType.TEXT:
                     break
@@ -1889,6 +2271,9 @@ class Gateway:
                         handle=cert.handle,
                         on_behalf_identity=OnBehalfIdentity.from_certificate(cert),
                         trusted_bridge="bridge" in set(cert.capabilities or ()),
+                        connection_id=connection_id,
+                        device_pubkey=cert.device_pubkey,
+                        device_auth_epoch=request.get("device_auth_epoch"),
                     )
 
                 # Interactive terminals — PTY frames from the desktop
@@ -1929,8 +2314,11 @@ class Gateway:
             # Touching ``clients[client_id]`` or
             # ``_close_stream_sessions_for`` here would tear down the
             # *new* connection's live sessions and leave its UI stuck.
-            if client_id and self.clients.get(client_id) is ws:
-                del self.clients[client_id]
+            if self.clients.get(connection_id) is ws:
+                del self.clients[connection_id]
+                self._chat_client_devices.pop(connection_id, None)
+                self._chat_client_instances.pop(connection_id, None)
+                self._chat_client_auth_epochs.pop(connection_id, None)
                 elog("gateway.client_disconnect", client_id=client_id)
                 # Stream sessions are server-owned: closing the app only
                 # detaches the transport. Any active turn keeps running and
@@ -1943,11 +2331,6 @@ class Gateway:
                         elog("terminal.client_cleanup", client_id=client_id, closed=reaped)
                 except Exception as e:  # noqa: BLE001
                     logger.debug("terminal client cleanup failed: %s", e)
-            elif client_id:
-                elog(
-                    "gateway.client_replaced",
-                    client_id=client_id,
-                )
         return ws
 
     async def _handle_command(
@@ -2477,6 +2860,9 @@ class Gateway:
         *, handle: str | None = None,
         on_behalf_identity=None,
         trusted_bridge: bool = False,
+        connection_id: str | None = None,
+        device_pubkey: bytes | None = None,
+        device_auth_epoch: int | None = None,
     ) -> None:
         """Decode a stream-protocol wire frame and dispatch into the
         matching :class:`StreamSession`.
@@ -2493,6 +2879,19 @@ class Gateway:
         from src.stream.channel import RealtimeChannel
         from src.stream.wire import event_to_wire, wire_to_event
         from src.stream.events import Attachment, SessionClose, SessionOpen, TextFinal
+        from src.core.execution_origin import TrustedIngressIdentity
+
+        def _auth_epoch_current() -> bool:
+            if device_pubkey is None or device_auth_epoch is None:
+                return True
+            auth_state = getattr(self._network_state, "auth_state", None)
+            epoch_reader = getattr(auth_state, "device_epoch", None)
+            return callable(epoch_reader) and (
+                epoch_reader(device_pubkey) == device_auth_epoch
+            )
+
+        if not _auth_epoch_current():
+            return
 
         session_id = (frame.get("session_id") or "default").strip() or "default"
         sid = self.sessions.get_or_create_session(
@@ -2588,6 +2987,34 @@ class Gateway:
                     url=ref.get("url"),
                 )
 
+        # SessionOpen is the only chat frame that selects a local capability
+        # instance. Store only the opaque instance id; every actual turn does
+        # a fresh exact registry lookup so disconnect means server-only and can
+        # never fall back to another client.
+        if isinstance(evt, SessionOpen) and connection_id is not None:
+            self._chat_client_instances[connection_id] = evt.client_instance_id
+        instance_id = (
+            self._chat_client_instances.get(connection_id)
+            if connection_id is not None
+            else None
+        )
+        capability_registry = getattr(self, "capabilities", None)
+        execution_origin = (
+            capability_registry.origin_for(client_id, instance_id)
+            if capability_registry is not None
+            else None
+        )
+        # Capability availability is optional, but authenticated ingress
+        # ownership is not. Two devices (or simultaneous Desktop/CLI sockets
+        # using one device certificate) must never share a burst, utterance or
+        # pending attachment merely because both currently have no local tools.
+        ingress_identity = TrustedIngressIdentity(
+            device_id=client_id,
+            connection_id=connection_id or f"ws:{id(ws)}",
+            client_instance_id=instance_id,
+            auth_epoch=device_auth_epoch or 0,
+        )
+
         if isinstance(evt, SessionClose):
             await self._close_stream_session(key)
             return
@@ -2608,6 +3035,9 @@ class Gateway:
                 holder.session.update_client_capabilities(
                     evt.client_kind, evt.client_capabilities,
                 )
+
+        if not _auth_epoch_current():
+            return
 
         if isinstance(evt, TextFinal):
             self._record_live_input(sid, event_to_wire(evt), owner=owner)
@@ -2665,6 +3095,10 @@ class Gateway:
                 ),
                 on_unrecoverable=self._make_unrecoverable_callback(key),
             )
+            channel.bind_transport(
+                ingress_identity,
+                lambda payload, _ws=ws: self._safe_ws_send_json(_ws, payload),
+            )
             await channel.start()
             holder = _StreamHolder(session=session, channel=channel)
             self._stream_sessions[key] = holder
@@ -2675,10 +3109,31 @@ class Gateway:
                 profile=profile,
             )
         else:
-            holder.channel.rebind(
-                lambda payload, _ws=ws: self._safe_ws_send_json(_ws, payload),
+            send_wire = (
+                lambda payload, _ws=ws: self._safe_ws_send_json(_ws, payload)
             )
+            bind_transport = getattr(holder.channel, "bind_transport", None)
+            if callable(bind_transport):
+                bind_transport(ingress_identity, send_wire)
+            else:
+                # Compatibility for injected/legacy channel adapters. The
+                # production RealtimeChannel always takes the scoped branch.
+                holder.channel.rebind(send_wire)
             await holder.channel.start()
+
+        # Any of the awaits above may have yielded to the live revocation
+        # callback. Never let the stale handler clear the session's revoked
+        # ingress marker or enqueue one final turn after that callback.
+        if not _auth_epoch_current():
+            return
+
+        # ``revoke_ingress_device`` is sticky for already-authenticated
+        # sockets. Re-admit only here, after the enclosing WS handler verified
+        # that this connection's auth epoch is still current; this also lets a
+        # legitimately reactivated device resume the same durable session.
+        allow_ingress = getattr(holder.session, "allow_ingress_device", None)
+        if callable(allow_ingress):
+            allow_ingress(client_id, auth_epoch=device_auth_epoch or 0)
 
         if isinstance(evt, SessionOpen):
             await self._send_live_snapshots(
@@ -2686,7 +3141,11 @@ class Gateway:
             )
             return  # session already created above; SessionOpen is metadata-only
 
-        await holder.session.push_in(evt)
+        await holder.session.push_in(
+            evt,
+            execution_origin=execution_origin,
+            ingress_identity=ingress_identity,
+        )
 
     async def _close_stream_session(self, key: tuple[str, str]) -> None:
         """Pop and close one stream session. Idempotent + crash-safe."""

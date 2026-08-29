@@ -175,7 +175,7 @@ async def _stand_up_coordinator(ctx: TestContext, network_name: str = "e2e-net")
         network_name=network_name,
     )
 
-    conn = InProcConnection(peer_node_id="test-client")
+    conn = InProcConnection(peer_node_id="inproc:test-client")
     server_task = asyncio.create_task(svc._on_stream(conn), name="coord-e2e-server")
 
     # Mint a coordinator-admin cert the way ``network init`` would —
@@ -219,6 +219,40 @@ async def _stand_up_coordinator(ctx: TestContext, network_name: str = "e2e-net")
 
 
 # ── Tests ────────────────────────────────────────────────────────────
+
+
+@test("coord_e2e_multi_user", "member device-status RPC observes revocation on the wire")
+async def t_member_device_status_revocation(ctx: TestContext) -> None:
+    from src.network.identity import Identity
+
+    env = await _stand_up_coordinator(ctx)
+    try:
+        # The in-proc transport still supplies a peer identity to the service;
+        # enroll that exact member node so the roster RPC is authorized.
+        await env["store"].register_agent(
+            handle="member-agent",
+            node_id="inproc:test-client",
+            owner_handle="system",
+            label="member",
+        )
+        device = Identity.generate()
+        invite = await env["mint_invite"]()
+        await _do_register_and_login(
+            env["conn"],
+            handle="alice",
+            password="passw0rd-live",
+            invite_code=invite,
+            device_pubkey=device.public_bytes,
+        )
+        assert await _client_rpc(
+            env["conn"], "device_status", {"device_pubkey": device.public_bytes},
+        ) == {"active": True}
+        assert await env["store"].revoke_device(device.public_bytes)
+        assert await _client_rpc(
+            env["conn"], "device_status", {"device_pubkey": device.public_bytes},
+        ) == {"active": False}
+    finally:
+        await env["teardown"]()
 
 
 @test("coord_e2e_multi_user", "3 users with distinct invites each get a verifiable cert")

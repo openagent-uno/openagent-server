@@ -91,7 +91,8 @@ def _atomic_write_secret(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(prefix=".identity-", dir=str(path.parent))
     try:
-        os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
+        if os.name == "posix":
+            os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
         with os.fdopen(fd, "wb") as f:
             f.write(data)
             f.flush()
@@ -105,6 +106,66 @@ def _atomic_write_secret(path: Path, data: bytes) -> None:
         raise
 
 
+def _publish_new_secret(path: Path, data: bytes) -> bool:
+    """Publish a fully-written secret only when *path* is still absent.
+
+    ``os.replace`` cannot be used for first creation: two processes which both
+    observe a missing identity would overwrite each other and return different
+    in-memory keys.  Instead, write to a unique tempfile and hard-link that
+    complete inode into place.  Creating the destination link is an atomic
+    no-replace operation on every supported local filesystem.  Exactly one
+    process wins; a loser sees ``FileExistsError`` and must read the winner.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".identity-", dir=str(path.parent))
+    try:
+        if os.name == "posix":
+            os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.link(tmp_path, path)
+        except FileExistsError:
+            return False
+        return True
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def _read_identity(path: Path) -> Identity:
+    """Read and validate one persisted identity, migrating legacy PEM once."""
+    st = path.stat()
+    # Ignore permission bits on Windows (they don't map cleanly).
+    if os.name == "posix" and (st.st_mode & 0o077) != 0:
+        raise PermissionError(
+            f"{path} has permissions {oct(st.st_mode & 0o777)}; expected 0600. "
+            "Run `chmod 600` on the file or remove it to regenerate."
+        )
+    secret = path.read_bytes()
+    if len(secret) != SECRET_KEY_LEN:
+        # PEM-format keys we wrote in an earlier draft show up here;
+        # parse them once via cryptography and migrate to raw bytes.
+        try:
+            from cryptography.hazmat.primitives.serialization import load_pem_private_key
+            priv = load_pem_private_key(secret, password=None)
+            if not isinstance(priv, Ed25519PrivateKey):
+                raise ValueError("not an Ed25519 PEM key")
+            secret = priv.private_bytes(
+                Encoding.Raw, PrivateFormat.Raw, NoEncryption(),
+            )
+            _atomic_write_secret(path, secret)
+        except Exception as e:
+            raise ValueError(
+                f"{path} is not a valid 32-byte Ed25519 seed and isn't a recognised PEM either: {e}"
+            ) from e
+    return Identity.from_secret_bytes(secret)
+
+
 def load_or_create_identity(path: Path | str) -> Identity:
     """Read or create the Ed25519 identity file at *path*.
 
@@ -113,36 +174,17 @@ def load_or_create_identity(path: Path | str) -> Identity:
     impersonates the agent on the entire network.
     """
     p = Path(path)
-    if p.exists():
-        st = p.stat()
-        # Ignore permission bits on Windows (they don't map cleanly).
-        if os.name == "posix" and (st.st_mode & 0o077) != 0:
-            raise PermissionError(
-                f"{p} has permissions {oct(st.st_mode & 0o777)}; expected 0600. "
-                "Run `chmod 600` on the file or remove it to regenerate."
-            )
-        secret = p.read_bytes()
-        if len(secret) != SECRET_KEY_LEN:
-            # PEM-format keys we wrote in an earlier draft show up here;
-            # parse them once via cryptography and migrate to raw bytes.
-            try:
-                from cryptography.hazmat.primitives.serialization import load_pem_private_key
-                priv = load_pem_private_key(secret, password=None)
-                if not isinstance(priv, Ed25519PrivateKey):
-                    raise ValueError("not an Ed25519 PEM key")
-                secret = priv.private_bytes(
-                    Encoding.Raw, PrivateFormat.Raw, NoEncryption(),
-                )
-                _atomic_write_secret(p, secret)
-            except Exception as e:
-                raise ValueError(
-                    f"{p} is not a valid 32-byte Ed25519 seed and isn't a recognised PEM either: {e}"
-                ) from e
-        return Identity.from_secret_bytes(secret)
+    try:
+        return _read_identity(p)
+    except FileNotFoundError:
+        pass
 
     identity = Identity.generate()
-    _atomic_write_secret(p, identity.secret_bytes)
-    return identity
+    if _publish_new_secret(p, identity.secret_bytes):
+        return identity
+    # Another process won first creation.  Never return our discarded
+    # candidate: both Desktop and CLI must bind Iroh to the persisted winner.
+    return _read_identity(p)
 
 
 def user_identity_path() -> Path:
@@ -153,3 +195,26 @@ def user_identity_path() -> Path:
     with the device, not the agent.
     """
     return Path.home() / ".openagent" / "user" / "identity.key"
+
+
+def iroh_node_id_public_bytes(node_id: str) -> bytes:
+    """Decode an Iroh ``NodeId`` into its raw 32-byte Ed25519 public key.
+
+    Device certificates bind that same key, so comparing this value with a
+    certificate's ``device_pubkey`` is the proof-of-possession check that ties
+    the application credential to the QUIC peer which presented it.  Keep the
+    iroh import local: identity-file operations are also used by lightweight
+    tooling that should not import the native transport until needed.
+    """
+    value = (node_id or "").strip()
+    if not value:
+        raise ValueError("missing Iroh peer node id")
+    try:
+        import iroh
+
+        raw = bytes(iroh.PublicKey.from_string(value).to_bytes())
+    except Exception as exc:  # noqa: BLE001 - normalise the FFI error surface
+        raise ValueError(f"invalid Iroh peer node id: {value!r}") from exc
+    if len(raw) != 32:
+        raise ValueError(f"Iroh peer key must be 32 bytes, got {len(raw)}")
+    return raw

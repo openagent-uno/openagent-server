@@ -70,6 +70,8 @@ import uuid
 from functools import lru_cache
 from typing import Any
 
+from src.core.execution_origin import create_server_only_task
+
 from src.core.logging import elog
 
 # ── Tunables (env-driven so test/debug paths can override cleanly) ────
@@ -1939,11 +1941,11 @@ def compact_after_turn(
     if session_id in _INFLIGHT_SESSIONS:
         return None
     try:
-        loop = asyncio.get_running_loop()
+        asyncio.get_running_loop()
     except RuntimeError:
         return None
     _INFLIGHT_SESSIONS.add(session_id)
-    task = loop.create_task(
+    task = create_server_only_task(
         _run_background_compaction(session_id, model, agent, on_status),
         name=f"compaction:{session_id}",
     )

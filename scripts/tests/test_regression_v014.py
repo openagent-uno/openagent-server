@@ -694,9 +694,9 @@ async def t_catalog_summary_edges(ctx: TestContext) -> None:
 
     text = build_mcp_catalog_summary(_RealPool())
     # Vault first.
-    vault_pos = text.find("``vault``")
-    shell_pos = text.find("``shell``")
-    web_pos = text.find("``web``")
+    vault_pos = text.find("``server:vault``")
+    shell_pos = text.find("``server:shell``")
+    web_pos = text.find("``server:web``")
     assert 0 <= vault_pos < shell_pos < web_pos, (
         f"vault must precede other servers; positions: "
         f"vault={vault_pos} shell={shell_pos} web={web_pos}"

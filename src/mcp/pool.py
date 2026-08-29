@@ -377,6 +377,8 @@ def _resolve_specs(
         if "builtin" in entry:
             try:
                 kwargs = resolve_builtin_entry(entry["builtin"], env=entry.get("env"))
+                if entry["builtin"] == "filesystem":
+                    kwargs["args"] = list(entry.get("args") or [])
                 specs.append(_spec_from_kwargs(kwargs))
             except Exception as exc:
                 logger.error("Failed to load built-in MCP '%s': %s", entry["builtin"], exc)
@@ -409,6 +411,33 @@ async def _specs_from_db(db: Any, db_path: str | None) -> list[_ServerSpec]:
     of being duplicated.
     """
     rows = await db.list_mcps(enabled_only=True)
+    chrome_scope_env: dict[str, str] = {}
+    if any(
+        (row.get("builtin_name") or row.get("name")) == "agent-in-chrome"
+        for row in rows
+    ):
+        network_id: str | None = None
+        try:
+            from src.network.coordinator.store import CoordinatorStore
+
+            network = await CoordinatorStore(db).get_network_role()
+            if network is not None:
+                network_id = str(network.get("network_id") or "").strip() or None
+        except Exception as exc:  # noqa: BLE001 - standalone/test DBs may lack network tables
+            logger.debug("Agent in Chrome network scope lookup failed: %s", exc)
+        from src.mcp.builtins import agent_chrome_network_env
+
+        chrome_scope_env = agent_chrome_network_env(network_id, db_path=db_path)
+
+    def _builtin_env(name: str, raw: Any) -> dict[str, str] | None:
+        values = dict(raw or {})
+        if name == "agent-in-chrome":
+            # Profile, extension directory and port are security boundaries,
+            # not operator hints: trusted network-derived values win over a
+            # stale/global MCP row.
+            values.update(chrome_scope_env)
+        return values or None
+
     specs: list[_ServerSpec] = []
     for row in rows:
         kind = row.get("kind")
@@ -420,7 +449,22 @@ async def _specs_from_db(db: Any, db_path: str | None) -> list[_ServerSpec]:
                 # indirection when ``builtin_name`` is set; others are raw
                 # command/args (e.g. vault, filesystem).
                 if row.get("builtin_name"):
-                    entry = {"builtin": row["builtin_name"], "env": row.get("env") or None}
+                    entry = {
+                        "builtin": row["builtin_name"],
+                        "env": _builtin_env(
+                            row["builtin_name"], row.get("env"),
+                        ),
+                        "args": row.get("args") or [],
+                    }
+                elif name == "filesystem":
+                    # Existing databases predate the shared host-tools core and
+                    # stored filesystem as a raw npx default. Route those rows
+                    # through the same in-process adapter as fresh installs.
+                    entry = {
+                        "builtin": "filesystem",
+                        "env": row.get("env") or None,
+                        "args": row.get("args") or [],
+                    }
                 else:
                     entry = {
                         "name": name,
@@ -430,10 +474,14 @@ async def _specs_from_db(db: Any, db_path: str | None) -> list[_ServerSpec]:
                         "env": row.get("env") or None,
                     }
                 kwargs = resolve_default_entry(entry, db_path=db_path)
+                if kwargs and entry.get("builtin") == "filesystem":
+                    kwargs["args"] = list(entry.get("args") or [])
                 if kwargs:
                     specs.append(_spec_from_kwargs(kwargs))
             elif kind == "builtin":
                 extra_env = dict(row.get("env") or {})
+                if row.get("builtin_name") == "agent-in-chrome":
+                    extra_env.update(chrome_scope_env)
                 if row.get("builtin_name") in ("scheduler", "mcp-manager", "model-manager"):
                     # Mirror the db-path injection that resolve_default_entry
                     # does for the scheduler so runtime-created builtin rows
@@ -444,6 +492,8 @@ async def _specs_from_db(db: Any, db_path: str | None) -> list[_ServerSpec]:
                     row["builtin_name"],
                     env=extra_env or None,
                 )
+                if row.get("builtin_name") == "filesystem":
+                    kwargs["args"] = list(row.get("args") or [])
                 specs.append(_spec_from_kwargs(kwargs))
             else:  # custom
                 specs.append(_ServerSpec(
@@ -560,12 +610,29 @@ class MCPPool:
         # ``from_config`` callers (tests) — reload is a no-op in that mode.
         self._db: Any = None
         self._db_path: str | None = None
+        # Installed by the live Scheduler.  It is deliberately an in-process
+        # callback rather than durable state: only a synchronous
+        # ``workflow-manager.run_workflow(wait=True)`` call made inside a
+        # trusted interactive turn may use it. Queue/API/schedule/event paths
+        # continue through the DB hand-off and therefore have no client host.
+        self._interactive_workflow_runner: Any | None = None
         # Cached rendered catalog summary (~16KB string injected into
         # every chat-turn's system prompt). Computed lazily on first use,
         # invalidated by ``reload()`` and ``connect_all`` because both
         # may change ``self._tool_counts``. The render is a 1-2ms walk
         # that adds up across every prompt construction.
         self._catalog_summary_cache: str | None = None
+
+    def bind_interactive_workflow_runner(self, runner: Any | None) -> None:
+        """Bind the live, non-durable workflow executor entry point.
+
+        The tool dispatcher still gates use on a trusted ambient
+        ``TurnExecutionOrigin`` and ``wait=True``.  Keeping the callback on
+        the process-owned pool makes it unavailable to the workflow-manager
+        subprocess and impossible to serialize into a queued request.
+        """
+
+        self._interactive_workflow_runner = runner
 
     @classmethod
     def from_config(
@@ -768,7 +835,14 @@ class MCPPool:
                         params = inspect.signature(factory).parameters
                     except (TypeError, ValueError):
                         return {}
-                    return {"pool": self} if "pool" in params else {}
+                    values: dict[str, Any] = {}
+                    if "pool" in params:
+                        values["pool"] = self
+                    if "args" in params:
+                        values["args"] = list(spec.args)
+                    if "env" in params:
+                        values["env"] = dict(spec.env or {})
+                    return values
 
                 try:
                     runtime_tk = runtime_factory(**_factory_kwargs(runtime_factory))

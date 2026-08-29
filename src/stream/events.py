@@ -89,6 +89,12 @@ class SessionOpen(Event):
     # support from ``client_kind``: an app must explicitly advertise it, while
     # CLI and external bridges stay attachment-only.
     client_capabilities: dict[str, Any] = field(default_factory=dict)
+    # Exact local capability-host instance attached to turns submitted over
+    # this chat socket. The gateway combines it with the authenticated device
+    # pubkey; an unknown/absent instance means server-only. It is never a
+    # persistent session preference and therefore cannot make automated turns
+    # target a device later.
+    client_instance_id: str | None = None
     # Debounce window for coalescing burst inputs into a single turn.
     # ``None`` (default) means "use the server-side default" —
     # ``StreamSession.DEFAULT_COALESCE_WINDOW_MS`` (500 ms), the OpenAI-

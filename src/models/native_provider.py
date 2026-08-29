@@ -244,7 +244,10 @@ def _model_class_accepted_params(cls: type) -> frozenset[str]:
     return frozenset(inspect.signature(cls).parameters.keys())
 
 
-_SESSION_ID_TAG_RE = re.compile(r"\n*<session-id>[^<]*</session-id>\s*$")
+_SESSION_ID_TAG_RE = re.compile(
+    r"\n*(?:<execution-host>[^<]*</execution-host>\s*)?"
+    r"(?:<session-id>[^<]*</session-id>\s*)$"
+)
 
 # Cap per-NativeProvider Agent and Team caches so a deployment with many
 # distinct session ids (each baked into the system prompt) doesn't leak

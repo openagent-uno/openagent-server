@@ -36,7 +36,11 @@ async def t_thirdparty_not_inlined(ctx: TestContext) -> None:
     try:
         keys = ["replio_threads_respond", "replio_docs_search"]
         out = _render({"replio": len(keys)}, {"replio": "org support MCP"}, {"replio": keys})
-        assert "``replio``" in out, out               # server line present
+        # New prompts advertise canonical, location-qualified IDs only. A
+        # legacy unprefixed name still means server-side at the call boundary,
+        # but must never be suggested to a model.
+        assert "``server:replio``" in out, out        # server line present
+        assert "``replio``" not in out, out
         assert "tools:" not in out, out               # but no key list
         assert "replio_docs_search" not in out, out
     finally:

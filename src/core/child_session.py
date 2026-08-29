@@ -384,6 +384,7 @@ async def run_child_session(
     stream: bool = False,
     session_id: Optional[str] = None,
     allowed_tools: Optional[Any] = None,
+    inherit_execution_origin: Optional[bool] = None,
 ) -> ChildSessionResult:
     """Spawn ``prompt`` as a full durable child session and return its result.
 
@@ -419,6 +420,11 @@ async def run_child_session(
             ``models.native_provider``). The child can therefore only ever be
             NARROWER than the parent's grant, never broader. This never changes
             what an unrestricted child receives.
+        inherit_execution_origin: whether this child is synchronous work inside
+            the current interactive turn. Defaults to true only for
+            ``origin="delegation"``. A future synchronous workflow runner may
+            pass true explicitly; durable/queued scheduler, workflow and event
+            runs must leave it false.
         stream: when True, drive ``Agent.run_stream`` and forward each content
             delta / tool status as a child-tagged frame (``emit_child_frame``),
             so a DETACHED run (a scheduled firing, a workflow node) streams live
@@ -659,6 +665,19 @@ async def run_child_session(
         ambient = current_tool_allowlist()
         effective = requested if ambient is None else (requested & ambient)
         scope_tok = set_tool_allowlist(effective)
+    # A delegated sub-agent is synchronous decomposition of the current turn
+    # and inherits that turn's exact client host. Every durable/server-owned
+    # origin explicitly clears it, even if the run happened to be spawned from
+    # inside an interactive tool call. This prevents a schedule/workflow/event
+    # from retaining a device merely because it was authored while one was
+    # online.
+    if inherit_execution_origin is None:
+        inherit_execution_origin = origin == "delegation"
+    execution_origin_tok = None
+    if not inherit_execution_origin:
+        from src.core.execution_origin import install_execution_origin
+
+        execution_origin_tok = install_execution_origin(None)
     try:
         if chain_sem is None:
             async with global_sem:
@@ -703,6 +722,10 @@ async def run_child_session(
         _root_var.reset(root_tok)
         if scope_tok is not None:
             reset_tool_allowlist(scope_tok)
+        if execution_origin_tok is not None:
+            from src.core.execution_origin import reset_execution_origin
+
+            reset_execution_origin(execution_origin_tok)
 
     return ChildSessionResult(
         session_id=child_sid,

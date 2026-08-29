@@ -525,8 +525,9 @@ async def t_auto_recall_cache_safe(ctx: TestContext) -> None:
         )
         assert "[similarity" not in system, "a recall hit line leaked into the prefix"
         _body, tag = _split_session_id_tag(system)
-        assert tag == "<session-id>tg:42</session-id>", (
-            "the session-id split broke — cache tail no longer isolates"
+        assert "<execution-host>" in tag
+        assert tag.endswith("<session-id>tg:42</session-id>"), (
+            "the runtime host/session split broke — cache tail no longer isolates"
         )
         idx.close()
     finally:

@@ -186,7 +186,9 @@ def _format_shell_reminder(events) -> str:
             detail = f"killed ({ev.signal or 'unknown'})"
         lines.append(
             f"- shell_id={ev.shell_id}: {detail}. stdout_bytes={ev.bytes_stdout}, "
-            f"stderr_bytes={ev.bytes_stderr}. Call shell_output to read."
+            f"stderr_bytes={ev.bytes_stderr}. Read it from the same host with "
+            f"tool_search_call_tool(server={ev.tool_server!r}, "
+            f"tool='shell_output', args={{'shell_id': {ev.shell_id!r}}})."
         )
     lines.append(
         "The user has not sent a new message; continue the task from where "
@@ -1832,6 +1834,18 @@ class Agent:
         settings = shell_settings(getattr(self, "config", None) or {})
         wake_window = settings.wake_wait_window_seconds
         cap = settings.autoloop_cap
+        from src.core.execution_origin import current_execution_origin
+
+        turn_origin = current_execution_origin()
+        shell_client_host = (
+            (
+                turn_origin.device_id,
+                turn_origin.client_instance_id,
+                turn_origin.generation,
+            )
+            if turn_origin is not None
+            else None
+        )
 
         active_model = self._acquire_model_slot(model_override or self.model)
 
@@ -1851,7 +1865,7 @@ class Agent:
         # below and ``src/core/compaction.py``.
         turn_registered = False
 
-        pending = hub.drain(session_id)
+        pending = hub.drain(session_id, client_host=shell_client_host)
         if pending:
             pre = _format_shell_reminder(pending)
             current_input = f"{pre}\n\n{current_input}"
@@ -1953,12 +1967,18 @@ class Agent:
                     response, session_id=session_id, iter_count=iter_count,
                 )
 
-                events = hub.drain(session_id)
+                events = hub.drain(session_id, client_host=shell_client_host)
                 if not events:
-                    if not hub.has_running(session_id):
+                    if not hub.has_running(
+                        session_id, client_host=shell_client_host,
+                    ):
                         break
                     if wake_window > 0:
-                        events = await hub.wait(session_id, timeout=wake_window)
+                        events = await hub.wait(
+                            session_id,
+                            timeout=wake_window,
+                            client_host=shell_client_host,
+                        )
                     if not events:
                         break
 
@@ -2185,6 +2205,18 @@ class Agent:
         settings = shell_settings(getattr(self, "config", None) or {})
         wake_window = settings.wake_wait_window_seconds
         cap = settings.autoloop_cap
+        from src.core.execution_origin import current_execution_origin
+
+        turn_origin = current_execution_origin()
+        shell_client_host = (
+            (
+                turn_origin.device_id,
+                turn_origin.client_instance_id,
+                turn_origin.generation,
+            )
+            if turn_origin is not None
+            else None
+        )
 
         active_model = self._acquire_model_slot(model_override or self.model)
 
@@ -2196,7 +2228,7 @@ class Agent:
         # Streaming twin of ``_run_inner``'s ``turn_registered`` — see there.
         turn_registered = False
 
-        pending = hub.drain(session_id)
+        pending = hub.drain(session_id, client_host=shell_client_host)
         if pending:
             pre = _format_shell_reminder(pending)
             current_input = f"{pre}\n\n{current_input}"
@@ -2315,12 +2347,18 @@ class Agent:
                     reset_delegation_context(delegation_tokens)
                     reset_author_context(author_token)
 
-                events = hub.drain(session_id)
+                events = hub.drain(session_id, client_host=shell_client_host)
                 if not events:
-                    if not hub.has_running(session_id):
+                    if not hub.has_running(
+                        session_id, client_host=shell_client_host,
+                    ):
                         break
                     if wake_window > 0:
-                        events = await hub.wait(session_id, timeout=wake_window)
+                        events = await hub.wait(
+                            session_id,
+                            timeout=wake_window,
+                            client_host=shell_client_host,
+                        )
                     if not events:
                         break
 
@@ -2676,6 +2714,26 @@ class Agent:
             "any absolute date you record — never guess the year from memory."
         )
         if session_id:
+            from src.core.execution_origin import current_execution_origin
+            import json as _json
+
+            origin = current_execution_origin()
+            host = (
+                {**origin.execution_host, "client_tools_available": True}
+                if origin is not None
+                else {
+                    "kind": "server",
+                    "device_label": "Server OpenAgent",
+                    "client_tools_available": False,
+                }
+            )
+            # Escape '<' so a user-controlled device label cannot close the
+            # runtime tag. This tail is deliberately uncached (see provider
+            # split regexes), while the large framework prefix stays stable.
+            host_json = _json.dumps(
+                host, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+            ).replace("<", "\\u003c")
+            combined += f"\n\n<execution-host>{host_json}</execution-host>"
             combined += f"\n\n<session-id>{session_id}</session-id>"
         return combined
 

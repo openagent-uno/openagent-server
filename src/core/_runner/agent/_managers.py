@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from asyncio import CancelledError, Task, create_task
+from asyncio import CancelledError, Task
 from concurrent.futures import Future
 from typing import (
     TYPE_CHECKING,
@@ -20,6 +20,7 @@ from src.models.providers.message import Message
 from src.core._run_state.messages import RunMessages
 from src.memory.sessions import AgentSession
 from src.core._runner.utils.log import log_debug, log_warning
+from src.core.execution_origin import create_server_only_task
 
 # ---------------------------------------------------------------------------
 # Memory
@@ -172,7 +173,10 @@ async def astart_memory_task(
         and not agent.enable_agentic_memory
     ):
         log_debug("Starting memory creation in background task.")
-        return create_task(amake_memories(agent, run_messages=run_messages, user_id=user_id))
+        return create_server_only_task(
+            amake_memories(agent, run_messages=run_messages, user_id=user_id),
+            name="agent-memory-update",
+        )
 
     return None
 
@@ -320,7 +324,10 @@ async def astart_cultural_knowledge_task(
     # Create new task if conditions are met
     if run_messages.user_message is not None and agent.culture_manager is not None and agent.update_cultural_knowledge:
         log_debug("Starting cultural knowledge creation in background task.")
-        return create_task(acreate_cultural_knowledge(agent, run_messages=run_messages))
+        return create_server_only_task(
+            acreate_cultural_knowledge(agent, run_messages=run_messages),
+            name="agent-cultural-knowledge-update",
+        )
 
     return None
 
@@ -479,13 +486,14 @@ async def astart_learning_task(
     # Create new task if learning is enabled
     if agent._learning is not None:
         log_debug("Starting learning extraction as async task.")
-        return create_task(
+        return create_server_only_task(
             aprocess_learnings(
                 agent,
                 run_messages=run_messages,
                 session=session,
                 user_id=user_id,
-            )
+            ),
+            name="agent-learning-update",
         )
 
     return None
