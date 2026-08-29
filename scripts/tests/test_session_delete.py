@@ -31,6 +31,14 @@ async def _open_db(db_path: Path):
 
     db = MemoryDB(str(db_path))
     await db.connect()
+    conn = await db._ensure_connected()
+    await conn.execute(
+        "INSERT INTO network(singleton, role, network_id, name, created_at) "
+        "VALUES(1, 'coordinator', 'test-network', 'Test', ?) "
+        "ON CONFLICT(singleton) DO UPDATE SET network_id=excluded.network_id",
+        (_time.time(),),
+    )
+    await conn.commit()
     return db
 
 
@@ -104,17 +112,22 @@ def _stub_gateway(db, broadcasts: list):
     )
 
 
-def _delete_request(db, sid: str, broadcasts: list, *, caller: str | None = None):
+def _delete_request(db, sid: str, broadcasts: list, *, caller: str = "alice"):
     fake_app = {"gateway": _stub_gateway(db, broadcasts)}
     req = make_mocked_request(
         "DELETE", f"/api/sessions/{sid}",
         match_info={"session_id": sid},
         app=fake_app,
     )
-    if caller is not None:
-        # The auth middleware stamps the authenticated user handle here; the
-        # delete authz reads it via ``request.get("user_handle")``.
-        req["user_handle"] = caller
+    req["network_id"] = "test-network"
+    req["user_handle"] = caller
+    req["client_id"] = f"{caller}-device"
+    req["device_cert"] = SimpleNamespace(
+        network_id="test-network",
+        handle=caller,
+        device_pubkey_hex=f"{caller}-device",
+        capabilities=[],
+    )
     return req
 
 
@@ -354,16 +367,49 @@ async def t_authz(ctx: TestContext) -> None:
         assert resp.status == 200, resp.status
         assert await db.get_session(owned) is None
 
-        # Fail-open: an UN-owned row (no client_id) deletes even for any caller
-        # (preserves single-owner / legacy behaviour).
+        # A legacy/unowned row has no canonical ACL identity and therefore
+        # fails closed instead of being claimable/deletable by a guessed id.
         unowned = f"chat-{uuid.uuid4().hex[:6]}"
         await _insert_double_encoded(db, unowned, {"title": "no owner"})
         b3: list = []
         resp = await sessions_api.handle_delete(
             _delete_request(db, unowned, b3, caller="bob")
         )
-        assert resp.status == 200, resp.status
-        assert await db.get_session(unowned) is None
+        assert resp.status == 404, resp.status
+        assert await db.get_session(unowned) is not None
+        await db.close()
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+@test("session_delete", "cascade cannot delete a foreign-owned descendant")
+async def t_cascade_rechecks_each_child_acl(ctx: TestContext) -> None:
+    from src.gateway.api import sessions as sessions_api
+
+    tmp = ctx.db_path.with_name(f"sd-child-acl-{uuid.uuid4().hex[:8]}.db")
+    try:
+        db = await _open_db(tmp)
+        parent = f"chat-{uuid.uuid4().hex[:6]}"
+        foreign_child = f"{parent}::sub::foreign"
+        await db.upsert_session(parent, client_id="alice", title="Alice parent")
+        await db.upsert_session(
+            foreign_child,
+            client_id="bob",
+            title="Bob child",
+            parent_session_id=parent,
+            origin="delegation",
+        )
+        broadcasts: list = []
+        response = await sessions_api.handle_delete(
+            _delete_request(db, parent, broadcasts, caller="alice")
+        )
+        assert response.status == 404
+        assert await db.get_session(parent) is not None
+        assert await db.get_session(foreign_child) is not None
+        assert broadcasts == []
         await db.close()
     finally:
         try:

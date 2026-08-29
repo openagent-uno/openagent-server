@@ -75,7 +75,10 @@ async def t_tool_search_freeform_args_schema(_ctx: TestContext) -> None:
         tool="vault_search",
         args={"query": "identity banking"},
     )
-    assert result == {"query": "identity banking"}
+    assert result["query"] == "identity banking"
+    expected_host = {"kind": "server", "device_label": "Server OpenAgent"}
+    assert result["execution_host"] == expected_host
+    assert result["_meta"]["executionHost"] == expected_host
     assert received == [{"query": "identity banking"}]
 
     # GLM-5 currently stringifies the nested object on ZAI even when the
@@ -85,7 +88,8 @@ async def t_tool_search_freeform_args_schema(_ctx: TestContext) -> None:
         tool="vault_search",
         args='{"query":"glm encoded args"}',
     )
-    assert result == {"query": "glm encoded args"}
+    assert result["query"] == "glm encoded args"
+    assert result["execution_host"] == expected_host
     assert received[-1] == {"query": "glm encoded args"}
 
 
@@ -139,7 +143,10 @@ async def t_tool_search_filters_read_only_argument_drift(_ctx: TestContext) -> N
         tool="vault_read_note",
         args={"path": "access.md", "tags": ["support"], "include": "body"},
     )
-    assert result == {"path": "access.md"}
+    assert result["path"] == "access.md"
+    expected_host = {"kind": "server", "device_label": "Server OpenAgent"}
+    assert result["execution_host"] == expected_host
+    assert result["_meta"]["executionHost"] == expected_host
     assert reads == [{"path": "access.md"}]
 
     try:

@@ -187,7 +187,9 @@ class BridgeSession:
         # exactly the same way a real SessionDialer would.
         self._cert_wire = cert_wire
         self._connection = InProcConnection(
-            peer_node_id=f"inproc:bridge:{self._bridge_name}",
+            # Match a real Iroh connection: middleware binds the cert's
+            # device key to ``remote_node_id`` before accepting the stream.
+            peer_node_id=device_pubkey.hex(),
         )
         self._dialer = InProcDialer(
             connection=self._connection,

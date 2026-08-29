@@ -275,6 +275,7 @@ class Toolkit:
             name=tool_name,
             description=function.description,
             parameters=function.parameters,
+            classification=function.classification,
             strict=function.strict,
             instructions=function.instructions,
             add_instructions=function.add_instructions,

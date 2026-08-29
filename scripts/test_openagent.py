@@ -50,6 +50,9 @@ from scripts.tests._setup import build_test_config, cleanup_extras  # noqa: E402
 _TEST_MODULES: tuple[str, ...] = (
     # 1. Lightweight / pure-unit (no fixtures needed)
     "test_imports",
+    "test_iroh_discovery",
+    "test_local_e2e",
+    "test_local_e2e_automation_reads",
     # REST surfaces added alongside the accounts / skills / session-pin work.
     "test_semantic_lock",
     "test_semantic_oversized",
@@ -60,6 +63,13 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_sqlite_busy_timeout",
     "test_mcp_db_path",
     "test_session_journal",
+    "test_operational_storage",
+    "test_artifacts",
+    "test_custom_views",
+    "test_custom_ui_content_parts",
+    "test_message_parts",
+    "test_operational_api",
+    "test_agent_operational_search",
     "test_ghost_skill",
     "test_skill_provenance",
     "test_skill_body_drop",
@@ -307,6 +317,23 @@ _TEST_MODULES: tuple[str, ...] = (
     # the REAL auth middleware + the real handler; sits by test_llm_scoped_token
     # because it pins the same middleware.
     "test_health_probe_auth",
+    "test_device_cert_pop",
+    "test_client_capabilities",
+    # Standalone host-tools supply-chain contract: consumer-owned archive and
+    # wheel digests, safe extraction, exact producer/server adapter parity and
+    # byte-identical Agent-in-Chrome assets. Pure-unit except for local Node.
+    "test_host_tools_acquisition",
+    "test_shared_host_tools_adapter",
+    # Full local-capability vertical slice over production transport: real
+    # coordinator PAKE, two real Iroh nodes, Gateway HTTP/WS bridge and an
+    # actual capability host. The deterministic model performs a client
+    # filesystem mutation without requiring a paid provider credential.
+    "test_real_iroh_client_e2e",
+    # Automatic/server-owned executions must remain server-only even while a
+    # Desktop capability host is genuinely online. Drives real scheduler,
+    # webhook/event, Telegram bridge wire and durable workflow entry points;
+    # each sees only server:* and rejects a forged client:* without fallback.
+    "test_automatic_client_isolation",
     # Cross-device chat visibility: ``upsert_session`` writes the user
     # handle as the row owner and ``list_all_sessions`` soft-falls back
     # to legacy device-pubkey rows via ``network_devices``.
@@ -584,6 +611,7 @@ _TEST_MODULES: tuple[str, ...] = (
     # ``_runner.team._messages`` directly, no pool/gateway.
     "test_member_tools_cap",
     "test_bridges",
+    "test_channel_attachments",
     # Spam coalescing end-to-end: real StreamSession against a slow
     # fake agent (every turn takes real time, mirroring LLM latency),
     # 20-message bursts, bridge owner/follower under 20 concurrent
@@ -657,6 +685,7 @@ _TEST_MODULES: tuple[str, ...] = (
     # DeepSeekInlineFiles subclass handles attachments via
     # _format_message override.
     "test_deepseek_file_inlining",
+    "test_model_media_capabilities",
     # Discord on_message receive-path tests — pin the
     # allowed-users-bypass-mention gate behaviour and confirm silent
     # drops emit a diagnostic event.
@@ -682,6 +711,9 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_peer_policy",
     # 9. Gateway /stop, /clear, /new command semantics
     "test_gateway_commands",
+    # Interactive PTYs are websocket-owned, not device-owned. Desktop and CLI
+    # may share one certificate without rebinding or closing each other's shell.
+    "test_gateway_terminals",
     # SessionManager must run sessions in parallel on one client
     # (each session has its own worker queue). Prior design funneled
     # every message from a client through one queue, serialising chat

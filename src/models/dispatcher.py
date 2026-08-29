@@ -54,6 +54,11 @@ from src.models.catalog import (
     iter_configured_models,
 )
 from src.models.runtime import wire_model_runtime
+from src.models.media_capabilities import (
+    MediaCapabilityError,
+    input_modalities_for,
+    select_media_model,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -100,12 +105,19 @@ def _runtime_db_path(db: Any) -> str | None:
     return str(path) if path else None
 
 
-_SESSION_ID_TAG_RE = re.compile(r"\n*<session-id>[^<]*</session-id>\s*$")
+_SESSION_ID_TAG_RE = re.compile(
+    r"\n*<session-id>[^<]*</session-id>\s*$"
+)
 
 
 def _system_cache_key(system: str | None) -> str:
     """Stable cache key for a system prompt that ignores the per-session
     ``<session-id>`` tag the orchestrator appends.
+
+    The adjacent ``<execution-host>`` tail is deliberately retained: Team
+    instructions are baked into the cached runtime, so sharing a Team built
+    for device A with a later turn from device B would expose A's local-tool
+    routing instructions on the wrong machine.
 
     Without this, every session generates a unique system prompt string
     — so any cache keyed on the raw system text misses on every session
@@ -319,6 +331,14 @@ async def _arun_runtime_collect(
         turn_cache_read = read_turn_cache_read()
         close_turn_cache_read(_cr_token)
     content = str(getattr(run_output, "content", "") or "")
+    # Team/Agent runtimes keep tool-produced media typed on RunOutput. Carry
+    # it through the same internal boundary NativeProvider uses; StreamSession
+    # consumes these markers into CAS-backed structured AttachmentRefs.
+    from src.models.native_provider import _output_media_markers
+
+    output_markers = _output_media_markers(run_output)
+    if output_markers:
+        content = f"{content.rstrip()}{''.join(output_markers)}"
     tools_used: list[str] = []
     for tc in getattr(run_output, "tools", None) or []:
         name = getattr(tc, "tool_name", None)
@@ -439,6 +459,11 @@ async def _arun_runtime_stream(
         _AgentToolCallErrorEvent,
         _TeamToolCallErrorEvent,
     )
+    from src.models.native_provider import (
+        _output_media_failure,
+        _output_media_markers,
+        _save_agno_output_media,
+    )
 
     async def _emit_status(
         tool: Any, *, error_text: str | None = None, phase: str | None = None,
@@ -472,6 +497,9 @@ async def _arun_runtime_stream(
             stream_kwargs["videos"] = videos
         member_sessions_on = _team_member_sessions_enabled()
         yielded_content = False
+        yielded_text = False
+        emitted_media: set[tuple[str, str]] = set()
+        completion_media: list[str] = []
         suppressed_content: list[str] = []
         # Final answer as reported by the run's own completion event. This is the
         # last-resort source of content: whatever happens to the per-delta events,
@@ -535,7 +563,26 @@ async def _arun_runtime_stream(
                 delta = event.content or ""
                 if delta:
                     yielded_content = True
+                    yielded_text = True
                     yield delta
+                image = getattr(event, "image", None)
+                if image is not None:
+                    stable_id = (
+                        getattr(image, "id", None)
+                        or getattr(image, "filepath", None)
+                        or getattr(image, "url", None)
+                        or f"object:{id(image)}"
+                    )
+                    key = ("image", str(stable_id))
+                    marker = None
+                    if key not in emitted_media:
+                        emitted_media.add(key)
+                        marker = _save_agno_output_media(image, "image")
+                        if marker is None:
+                            marker = _output_media_failure("image")
+                    if marker:
+                        yielded_content = True
+                        yield marker
             elif isinstance(event, tool_start_event_types):
                 tool = getattr(event, "tool", None)
                 if on_delegate is not None and tool is not None:
@@ -555,10 +602,21 @@ async def _arun_runtime_stream(
                 )
                 tool_trace.record_execution(tool)
                 await _emit_status(tool)
+                for marker in _output_media_markers(
+                    event, emitted=emitted_media,
+                ):
+                    yielded_content = True
+                    yield marker
             elif isinstance(event, tool_error_event_types):
                 tool = getattr(event, "tool", None)
                 err_text = getattr(event, "error", None)
                 await _emit_status(tool, error_text=err_text)
+            elif isinstance(event, run_completed_event_types):
+                # Reconcile media on the parent completion frame in case a
+                # runtime omitted the intermediate tool-completed event.
+                completion_media.extend(_output_media_markers(
+                    event, emitted=emitted_media,
+                ))
 
         # Silent-leader safety net: a turn that delegated but whose leader
         # emitted NO synthesis of its own would otherwise yield zero content
@@ -566,9 +624,10 @@ async def _arun_runtime_stream(
         # re-runs the whole turn via generate(), spawning a DUPLICATE child
         # session. Surface the member's text in that (rare) case so the turn
         # has content. The normal case (leader synthesises) never hits this.
-        if member_sessions_on and not yielded_content and suppressed_content:
+        if member_sessions_on and not yielded_text and suppressed_content:
             yield "".join(suppressed_content)
             yielded_content = True
+            yielded_text = True
 
         # Completed-run safety net: the LAST line of defence before
         # ``run_stream``'s ``no_deltas_yielded`` fallback, which re-runs the
@@ -589,13 +648,22 @@ async def _arun_runtime_stream(
         # leader ran 8 tools and emitted no prose. At ~315k cumulative tokens per run
         # against a weekly quota already ~30% short, those are the most expensive
         # duplicate calls in the system.
-        if not yielded_content and completed_content:
+        if not yielded_text and completed_content:
             elog(
                 "team_stream.completed_content_recovered",
                 session_id=session_id,
                 chars=len(completed_content),
             )
             yield completed_content
+            yielded_content = True
+            yielded_text = True
+
+        # A completion-only artifact belongs after the recovered final text.
+        # Tool-completed artifacts were already emitted at their true stream
+        # position and are removed from this list by stable-id deduplication.
+        for marker in completion_media:
+            yielded_content = True
+            yield marker
     except Exception as e:  # noqa: BLE001
         elog(error_event, session_id=session_id, error=str(e))
         raise
@@ -676,6 +744,14 @@ class TeamRouterProvider(BaseModel):
         # was built with; used to invalidate when the system prompt
         # changes (e.g. a workflow ai-prompt block with different system).
         self._session_system_key: dict[str, str] = {}
+        # Native media requirements are part of a Team's shape: an image turn
+        # must never delegate to a text-only member. Changing modalities for a
+        # session rebuilds the runtime (history remains durable in SQLite).
+        self._session_media_key: dict[str, frozenset[str]] = {}
+        # Actual leader selected for the cached runtime. It can differ from
+        # ``_entry_runtime_id`` for one media turn when a model-pinned
+        # workflow/event needs a configured multimodal fallback.
+        self._session_runtime_entry: dict[str, str] = {}
         self._session_handles: dict[str, str] = {}
         # session_id → {member_id (dash form) → runtime_id (canonical
         # colon form)}. Populated at team build time so the per-turn
@@ -694,6 +770,15 @@ class TeamRouterProvider(BaseModel):
     @property
     def model(self) -> str | None:
         return self._entry_runtime_id
+
+    def effective_model_id(self, session_id: str | None = None) -> str | None:
+        """Return the specialist/fallback that actually handled the turn."""
+        sid = session_id or "default"
+        return (
+            self._last_delegation_by_session.get(sid)
+            or self._session_runtime_entry.get(sid)
+            or self._entry_runtime_id
+        )
 
     # ── wiring ────────────────────────────────────────────────────────
 
@@ -745,13 +830,17 @@ class TeamRouterProvider(BaseModel):
         """
         self._session_runtime.clear()
         self._session_system_key.clear()
+        self._session_media_key.clear()
+        self._session_runtime_entry.clear()
         self._session_member_map.clear()
         self._last_delegation_by_session.clear()
         self._run_ids.clear()
 
     # ── catalog → runtime objects ─────────────────────────────────────
 
-    def _enabled_llm_models(self) -> list[CatalogModel]:
+    def _enabled_llm_models(
+        self, required_modalities: frozenset[str] = frozenset(),
+    ) -> list[CatalogModel]:
         """Return every enabled api-based LLM model.
 
         Each joins the Team as a runtime ``Agent`` (via ``NativeProvider``)
@@ -764,7 +853,8 @@ class TeamRouterProvider(BaseModel):
                 continue
             if framework_of(entry.runtime_id) != FRAMEWORK_API_BASED:
                 continue
-            out.append(entry)
+            if required_modalities.issubset(input_modalities_for(entry)):
+                out.append(entry)
         return self._local_fallback.filter_catalog(
             out, explicit_runtime_id=self._entry_runtime_id,
         )
@@ -845,7 +935,12 @@ class TeamRouterProvider(BaseModel):
             entry, name=name, role=role, system=system, db=db,
         )
 
-    def _ensure_runtime(self, session_id: str, system: str | None) -> Any:
+    def _ensure_runtime(
+        self,
+        session_id: str,
+        system: str | None,
+        required_modalities: frozenset[str] = frozenset(),
+    ) -> Any:
         """Return the cached Team / single-agent for ``session_id``, building
         it when absent.
 
@@ -858,10 +953,14 @@ class TeamRouterProvider(BaseModel):
         """
         sys_key = _system_cache_key(system)
         cached = self._session_runtime.get(session_id)
-        if cached is not None and self._session_system_key.get(session_id) == sys_key:
+        if (
+            cached is not None
+            and self._session_system_key.get(session_id) == sys_key
+            and self._session_media_key.get(session_id, frozenset()) == required_modalities
+        ):
             return cached
 
-        catalog = self._enabled_llm_models()
+        catalog = self._enabled_llm_models(required_modalities)
         entry_runtime = self._entry_runtime_id or (catalog[0].runtime_id if catalog else None)
         if not entry_runtime:
             raise RuntimeError(
@@ -910,6 +1009,8 @@ class TeamRouterProvider(BaseModel):
                 provider.set_db(self._db)
             self._session_runtime[session_id] = provider
             self._session_system_key[session_id] = sys_key
+            self._session_media_key[session_id] = required_modalities
+            self._session_runtime_entry[session_id] = entry.runtime_id
             elog(
                 "team_router.single_agent",
                 session_id=session_id,
@@ -1017,6 +1118,8 @@ class TeamRouterProvider(BaseModel):
         )
         self._session_runtime[session_id] = team
         self._session_system_key[session_id] = sys_key
+        self._session_media_key[session_id] = required_modalities
+        self._session_runtime_entry[session_id] = entry.runtime_id
         elog(
             "team_router.built",
             session_id=session_id,
@@ -1059,6 +1162,8 @@ class TeamRouterProvider(BaseModel):
             return
         self._session_runtime.pop(session_id, None)
         self._session_system_key.pop(session_id, None)
+        self._session_media_key.pop(session_id, None)
+        self._session_runtime_entry.pop(session_id, None)
         self._session_member_map.pop(session_id, None)
         self._last_delegation_by_session.pop(session_id, None)
         self._clear_run_id(session_id)
@@ -1148,6 +1253,7 @@ class TeamRouterProvider(BaseModel):
         outcome: str,
         input_tokens: int = 0,
         output_tokens: int = 0,
+        runtime_id: str | None = None,
     ) -> None:
         """Attribute this run's outcome to every vault note it recalled.
 
@@ -1165,22 +1271,23 @@ class TeamRouterProvider(BaseModel):
         unwinding a barge-in.
         """
         try:
+            charged_runtime = runtime_id or self._entry_runtime_id
             cost = BudgetTracker.compute_cost(
-                self._entry_runtime_id, input_tokens, output_tokens,
+                charged_runtime, input_tokens, output_tokens,
             )
             written = await vault_recall.flush(
                 self._db,
                 sink=sink,
                 session_id=session_id,
                 outcome=outcome,
-                model=self._entry_runtime_id,
+                model=charged_runtime,
                 cost=cost,
             )
             if written:
                 elog(
                     "vault.recall_attributed",
                     session_id=session_id,
-                    model=self._entry_runtime_id,
+                    model=charged_runtime,
                     outcome=outcome,
                     notes=written,
                     cost_usd=cost,
@@ -1200,6 +1307,7 @@ class TeamRouterProvider(BaseModel):
         output_tokens: int,
         session_id: str | None,
         cache_read_tokens: int = 0,
+        runtime_id: str | None = None,
     ) -> None:
         """Write one call into ``usage_log`` — the canonical cost ledger.
 
@@ -1217,7 +1325,7 @@ class TeamRouterProvider(BaseModel):
             return
         if not input_tokens and not output_tokens:
             return
-        runtime_id = self._entry_runtime_id
+        runtime_id = runtime_id or self._entry_runtime_id
         cost = BudgetTracker.compute_cost(
             runtime_id, input_tokens, output_tokens, cache_read_tokens,
         )
@@ -1267,6 +1375,58 @@ class TeamRouterProvider(BaseModel):
 
     # ── turn ──────────────────────────────────────────────────────────
 
+    async def _prepare_pinned_media(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        files: list[Any] | None,
+        images: list[Any] | None,
+        audio: list[Any] | None,
+        videos: list[Any] | None,
+        session_id: str,
+    ) -> Any:
+        """Prepare a model-pinned turn, with a per-turn compatible fallback.
+
+        ``TeamRouterProvider`` is also used directly by scheduled/event/
+        workflow model overrides, so those lanes do not pass through
+        ``ModelDispatcher._prepare_media_route``. Keep their durable model pin
+        unchanged while applying the same compatibility policy locally.
+        """
+        catalog = self._enabled_llm_models()
+        entry = next(
+            (item for item in catalog if item.runtime_id == self._entry_runtime_id),
+            None,
+        )
+        if entry is None:
+            raise MediaCapabilityError(
+                f"Configured entry model {self._entry_runtime_id!r} is unavailable"
+            )
+        selection = await select_media_model(
+            entry,
+            catalog,
+            messages=messages,
+            files=files,
+            images=images,
+            audio=audio,
+            videos=videos,
+        )
+        if selection.fell_back:
+            elog(
+                "team_router.media_fallback",
+                session_id=session_id,
+                selected=self._entry_runtime_id,
+                fallback=selection.entry.runtime_id,
+                native_modalities=sorted(selection.prepared.native_modalities),
+            )
+        if selection.prepared.extracted_files:
+            elog(
+                "team_router.media_text_extracted",
+                session_id=session_id,
+                model=selection.entry.runtime_id,
+                files=selection.prepared.extracted_files,
+            )
+        return selection
+
     async def generate(
         self,
         messages: list[dict[str, Any]],
@@ -1281,7 +1441,39 @@ class TeamRouterProvider(BaseModel):
         videos: list[Any] | None = None,
     ) -> ModelResponse:
         sid = session_id or "default"
-        runtime = self._ensure_runtime(sid, system)
+        runtime = None
+        if files or images or audio or videos:
+            try:
+                selection = await self._prepare_pinned_media(
+                    messages=messages,
+                    files=files,
+                    images=images,
+                    audio=audio,
+                    videos=videos,
+                    session_id=sid,
+                )
+            except MediaCapabilityError as exc:
+                _mark_no_capacity("media_incompatible")
+                return ModelResponse(
+                    content=f"Cannot process the attached media: {exc}",
+                    stop_reason="error",
+                    model=self._entry_runtime_id,
+                )
+            prepared = selection.prepared
+            messages = prepared.messages
+            files = prepared.files
+            images = prepared.images
+            audio = prepared.audio
+            videos = prepared.videos
+            if prepared.native_modalities:
+                runtime = self._ensure_runtime(
+                    sid, system, required_modalities=prepared.native_modalities,
+                )
+        if runtime is None:
+            runtime = self._ensure_runtime(sid, system)
+        actual_runtime_id = self._session_runtime_entry.get(
+            sid, self._entry_runtime_id,
+        )
         # Same sink + outcome pairing as ``stream`` below. ``generate`` is the
         # model-PINNED lane (an Events delivery, a scheduled task with a
         # ``model``, a workflow ai-prompt override), so skipping it here would
@@ -1325,7 +1517,7 @@ class TeamRouterProvider(BaseModel):
                     session_id=sid,
                     user_id=user_id,
                     error_event="team_router.generate_error",
-                    entry_runtime_id=self._entry_runtime_id,
+                    entry_runtime_id=actual_runtime_id,
                     on_delegate=lambda mid: self._record_delegation(sid, mid),
                     files=files, images=images, audio=audio, videos=videos,
                 )
@@ -1335,6 +1527,7 @@ class TeamRouterProvider(BaseModel):
                 output_tokens=resp.output_tokens,
                 cache_read_tokens=resp.cache_read_tokens,
                 session_id=session_id,
+                runtime_id=actual_runtime_id,
             )
             return resp
         except BaseException as exc:
@@ -1350,6 +1543,7 @@ class TeamRouterProvider(BaseModel):
                 outcome=outcome,
                 input_tokens=in_tokens,
                 output_tokens=out_tokens,
+                runtime_id=actual_runtime_id,
             )
 
     async def stream(
@@ -1366,7 +1560,36 @@ class TeamRouterProvider(BaseModel):
         videos: list[Any] | None = None,
     ) -> AsyncIterator[str]:
         sid = session_id or "default"
-        runtime = self._ensure_runtime(sid, system)
+        runtime = None
+        if files or images or audio or videos:
+            try:
+                selection = await self._prepare_pinned_media(
+                    messages=messages,
+                    files=files,
+                    images=images,
+                    audio=audio,
+                    videos=videos,
+                    session_id=sid,
+                )
+            except MediaCapabilityError as exc:
+                _mark_no_capacity("media_incompatible")
+                yield f"Cannot process the attached media: {exc}"
+                return
+            prepared = selection.prepared
+            messages = prepared.messages
+            files = prepared.files
+            images = prepared.images
+            audio = prepared.audio
+            videos = prepared.videos
+            if prepared.native_modalities:
+                runtime = self._ensure_runtime(
+                    sid, system, required_modalities=prepared.native_modalities,
+                )
+        if runtime is None:
+            runtime = self._ensure_runtime(sid, system)
+        actual_runtime_id = self._session_runtime_entry.get(
+            sid, self._entry_runtime_id,
+        )
         # Collect the streamed run's tokens. Whatever ends the stream —
         # completion, an error, a barge-in cancel — what was already spent
         # gets billed: an abandoned turn still cost its input tokens.
@@ -1439,6 +1662,7 @@ class TeamRouterProvider(BaseModel):
                 output_tokens=sink.get("output_tokens", 0),
                 cache_read_tokens=sink.get("cache_read_tokens", 0),
                 session_id=session_id,
+                runtime_id=actual_runtime_id,
             )
             await self.record_vault_recalls(
                 sink=recall_sink,
@@ -1446,6 +1670,7 @@ class TeamRouterProvider(BaseModel):
                 outcome=outcome,
                 input_tokens=sink.get("input_tokens", 0),
                 output_tokens=sink.get("output_tokens", 0),
+                runtime_id=actual_runtime_id,
             )
 
 
@@ -1890,6 +2115,59 @@ class ModelDispatcher(BaseModel):
         key = session_id or "__default__"
         self._last_pick_by_session[key] = runtime_id
 
+    async def _prepare_media_route(
+        self,
+        *,
+        selected_runtime_id: str,
+        messages: list[dict[str, Any]],
+        files: list[Any] | None,
+        images: list[Any] | None,
+        audio: list[Any] | None,
+        videos: list[Any] | None,
+        session_id: str | None,
+    ) -> Any:
+        """Resolve a compatible model and provider-ready media payload.
+
+        Manual/session pins remain the first choice. If that model cannot
+        consume the turn safely, only enabled configured models that survive
+        the ordinary budget/local gates are considered as a per-turn fallback;
+        the user's durable pin is never rewritten.
+        """
+        configured = self._configured_enabled_catalog()
+        selected = next(
+            (entry for entry in configured if entry.runtime_id == selected_runtime_id),
+            None,
+        )
+        if selected is None:
+            raise MediaCapabilityError(
+                f"Selected model {selected_runtime_id!r} is no longer configured"
+            )
+        selection = await select_media_model(
+            selected,
+            self._enabled_catalog(),
+            messages=messages,
+            files=files,
+            images=images,
+            audio=audio,
+            videos=videos,
+        )
+        if selection.fell_back:
+            elog(
+                "router.media_fallback",
+                session_id=session_id,
+                selected=selected_runtime_id,
+                fallback=selection.entry.runtime_id,
+                native_modalities=sorted(selection.prepared.native_modalities),
+            )
+        if selection.prepared.extracted_files:
+            elog(
+                "router.media_text_extracted",
+                session_id=session_id,
+                model=selection.entry.runtime_id,
+                files=selection.prepared.extracted_files,
+            )
+        return selection
+
     # ── turn ──────────────────────────────────────────────────────────
 
     async def generate(
@@ -1915,6 +2193,37 @@ class ModelDispatcher(BaseModel):
             return ModelResponse(content="No model is currently enabled.", stop_reason="error")
 
         runtime_id = decision.primary_model
+        if files or images or audio or videos:
+            try:
+                selection = await self._prepare_media_route(
+                    selected_runtime_id=runtime_id,
+                    messages=messages,
+                    files=files,
+                    images=images,
+                    audio=audio,
+                    videos=videos,
+                    session_id=session_id,
+                )
+            except MediaCapabilityError as exc:
+                elog(
+                    "router.media_error",
+                    level="warning",
+                    session_id=session_id,
+                    selected=runtime_id,
+                    error=str(exc),
+                )
+                _mark_no_capacity("media_incompatible")
+                return ModelResponse(
+                    content=f"Cannot process the attached media: {exc}",
+                    stop_reason="error",
+                    model=runtime_id,
+                )
+            runtime_id = selection.entry.runtime_id
+            messages = selection.prepared.messages
+            files = selection.prepared.files
+            images = selection.prepared.images
+            audio = selection.prepared.audio
+            videos = selection.prepared.videos
         self._remember_pick(session_id, runtime_id)
         elog(
             "router.route",
@@ -1993,6 +2302,34 @@ class ModelDispatcher(BaseModel):
             return
 
         runtime_id = decision.primary_model
+        if files or images or audio or videos:
+            try:
+                selection = await self._prepare_media_route(
+                    selected_runtime_id=runtime_id,
+                    messages=messages,
+                    files=files,
+                    images=images,
+                    audio=audio,
+                    videos=videos,
+                    session_id=session_id,
+                )
+            except MediaCapabilityError as exc:
+                elog(
+                    "router.stream.media_error",
+                    level="warning",
+                    session_id=session_id,
+                    selected=runtime_id,
+                    error=str(exc),
+                )
+                _mark_no_capacity("media_incompatible")
+                yield f"Cannot process the attached media: {exc}"
+                return
+            runtime_id = selection.entry.runtime_id
+            messages = selection.prepared.messages
+            files = selection.prepared.files
+            images = selection.prepared.images
+            audio = selection.prepared.audio
+            videos = selection.prepared.videos
         self._remember_pick(session_id, runtime_id)
         elog(
             "router.stream.route",

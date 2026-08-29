@@ -7,28 +7,31 @@ the Gateway WebSocket protocol. Authorized users only.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import shutil
 import tempfile
 from pathlib import Path
 
 from src.bridges.base import BaseBridge
-from src.channels.base import (
-    build_attachment_context,
-    is_blocked_attachment,
-    prepend_context_block,
-)
+from src.channels.base import is_blocked_attachment
 from src.channels.voice import is_audio_file
 from src.gateway.commands import BOT_COMMANDS, bridge_welcome_text
+from src.memory.artifacts import (
+    attachment_limit_bytes,
+    safe_attachment_filename,
+    safe_attachment_staging_name,
+)
 
 from src.core.logging import elog
 
 logger = logging.getLogger(__name__)
 
 DISCORD_MSG_LIMIT = 2000
+_DISCORD_MEDIA_DOWNLOAD_TIMEOUT = 120.0
 
 
-def _build_picker_view(bridge, uid: str, picker: dict):
+def _build_picker_view(bridge, session_id: str, picker: dict):
     """Build a Discord Select-menu ``View`` for a structured command picker
     (e.g. the /model chooser). Returns ``None`` when discord.ui is
     unavailable or there are no renderable options — the caller then falls
@@ -70,7 +73,7 @@ def _build_picker_view(bridge, uid: str, picker: dict):
         async def callback(self, interaction) -> None:  # noqa: ANN001
             value = self.values[0]
             result = await bridge.send_command(
-                command, session_id=f"dc:{uid}", arg=value,
+                command, session_id=session_id, arg=value,
             )
             try:
                 await interaction.response.edit_message(
@@ -144,6 +147,48 @@ class DiscordBridge(BaseBridge):
         self.dm_only = dm_only
         self._client = None
 
+    @staticmethod
+    def _session_id(
+        user_id: str,
+        channel_id: str | None,
+        guild_id: str | None,
+        *,
+        is_dm: bool,
+    ) -> str:
+        """Return a private DM scope or a shared guild-channel scope."""
+        if is_dm or not guild_id or not channel_id:
+            return f"dc:{user_id}"
+        return f"dc:guild:{guild_id}:channel:{channel_id}"
+
+    def _scope_allowed(
+        self,
+        user_id: str,
+        channel_id: str | None,
+        guild_id: str | None,
+        *,
+        is_dm: bool,
+    ) -> bool:
+        if is_dm:
+            return user_id in self.allowed_users
+        if self.dm_only:
+            return False
+        if self.allowed_guilds and guild_id not in self.allowed_guilds:
+            return False
+        return bool(channel_id and channel_id in self.listen_channels)
+
+    @staticmethod
+    def _interaction_scope(interaction) -> tuple[str, str | None, str | None, bool]:
+        uid = str(interaction.user.id)
+        channel_id = getattr(interaction, "channel_id", None)
+        if channel_id is None:
+            channel_id = getattr(getattr(interaction, "channel", None), "id", None)
+        guild_id = getattr(interaction, "guild_id", None)
+        if guild_id is None:
+            guild_id = getattr(getattr(interaction, "guild", None), "id", None)
+        cid = str(channel_id) if channel_id is not None else None
+        gid = str(guild_id) if guild_id is not None else None
+        return uid, cid, gid, gid is None
+
     async def _run(self) -> None:
         try:
             import discord
@@ -179,8 +224,8 @@ class DiscordBridge(BaseBridge):
         # BOT_COMMANDS because the gateway has no /start command; this is
         # a bridge-local convenience.
         async def _start_handler(interaction: discord.Interaction):
-            uid = str(interaction.user.id)
-            if uid not in self.allowed_users:
+            uid, cid, gid, is_dm = self._interaction_scope(interaction)
+            if not self._scope_allowed(uid, cid, gid, is_dm=is_dm):
                 await interaction.response.send_message("Unauthorized.", ephemeral=True)
                 return
             name = interaction.user.display_name or interaction.user.name
@@ -226,7 +271,7 @@ class DiscordBridge(BaseBridge):
                 # ``listen_channels`` so every member of an explicitly listed
                 # channel can talk to the agent without also being copied into
                 # a global user allowlist.
-                if uid not in self.allowed_users:
+                if not self._scope_allowed(uid, cid, gid, is_dm=True):
                     elog("bridge.discord.dropped", reason="not_allowed_user",
                          user_id=uid, channel_id=cid)
                     return
@@ -255,39 +300,90 @@ class DiscordBridge(BaseBridge):
 
             # Process attachments
             blocked = []
-            files_info = []
+            attachments: list[dict] = []
             voice_detected = False
             tmp = tempfile.mkdtemp(prefix="oa_dc_")
             try:
                 for att in message.attachments:
-                    if is_blocked_attachment(att.filename):
-                        blocked.append(att.filename)
+                    filename = safe_attachment_filename(att.filename)
+                    if is_blocked_attachment(filename):
+                        blocked.append(filename)
                         continue
                     ct = att.content_type or ""
-                    is_voice = is_audio_file(att.filename, ct)
-                    path = str(Path(tmp) / att.filename)
-                    await att.save(path)
+                    limit = attachment_limit_bytes(direction="input")
+                    declared_size = int(getattr(att, "size", 0) or 0)
+                    if limit and declared_size > limit:
+                        blocked.append(f"{filename} (too large)")
+                        continue
+                    unique = safe_attachment_filename(
+                        getattr(att, "id", None) or "discord",
+                        fallback="discord",
+                    )
+                    path = Path(tmp) / safe_attachment_staging_name(unique, filename)
+                    try:
+                        await asyncio.wait_for(
+                            att.save(str(path)),
+                            timeout=_DISCORD_MEDIA_DOWNLOAD_TIMEOUT,
+                        )
+                        actual_size = path.stat().st_size
+                        if limit and actual_size > limit:
+                            with contextlib.suppress(OSError):
+                                path.unlink()
+                            blocked.append(f"{filename} (too large)")
+                            continue
+                    except Exception as exc:  # noqa: BLE001
+                        with contextlib.suppress(OSError):
+                            path.unlink()
+                        elog(
+                            "bridge.discord.attachment_download_failed",
+                            level="warning",
+                            filename=filename,
+                            error=str(exc) or type(exc).__name__,
+                        )
+                        continue
 
+                    is_voice = is_audio_file(filename, ct)
+                    kind = (
+                        "voice" if is_voice
+                        else "image" if ct.startswith("image/")
+                        else "video" if ct.startswith("video/")
+                        else "file"
+                    )
+                    attachments.append({
+                        "type": kind,
+                        "kind": kind,
+                        "path": str(path.resolve()),
+                        "filename": filename,
+                        "mime_type": ct or None,
+                        "size_bytes": actual_size,
+                    })
                     if is_voice:
                         voice_detected = True
-                        t = await self.transcribe_with_fallback(path)
+                        t = await self.transcribe_with_fallback(str(path))
                         content = f"{content}\n{t}" if content else t
-                    elif ct.startswith("image/"):
-                        files_info.append(f"- image: {att.filename} — local path: {path}")
-                    else:
-                        files_info.append(f"- file: {att.filename} — local path: {path}")
 
                 if blocked:
                     await message.channel.send(f"⚠️ Blocked: {', '.join(blocked)}")
-                if files_info:
-                    content = prepend_context_block(content, build_attachment_context(files_info))
 
-                if not content:
+                if not content and not attachments:
                     return
 
+                display = str(
+                    getattr(message.author, "display_name", None)
+                    or getattr(message.author, "name", None)
+                    or uid
+                )
                 await self.dispatch_turn(
-                    message.channel, f"dc:{uid}", content,
+                    message.channel,
+                    self._session_id(uid, cid, gid, is_dm=is_dm),
+                    content,
                     voice_detected=voice_detected,
+                    attachments=attachments,
+                    author={
+                        "kind": "human",
+                        "handle": f"discord:{uid}",
+                        "display": display,
+                    },
                 )
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
@@ -365,18 +461,19 @@ class DiscordBridge(BaseBridge):
 
     async def _handle_slash(self, interaction, cmd: str, *, arg: str | None = None) -> None:
         """Handle a Discord slash command via the Gateway."""
-        uid = str(interaction.user.id)
-        if uid not in self.allowed_users:
+        uid, cid, gid, is_dm = self._interaction_scope(interaction)
+        if not self._scope_allowed(uid, cid, gid, is_dm=is_dm):
             await interaction.response.send_message("Unauthorized.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
-        # Scope /stop, /clear, /new, /reset, /compact, /model to THIS user's
-        # session so a command from user A doesn't wipe user B's conversation.
+        # Commands in a public guild channel operate on that channel's shared
+        # conversation; DM commands remain private to the issuing user.
         # Forward any inline argument (e.g. /model gpt-4o) via the arg field.
-        result = await self.send_command_full(cmd, session_id=f"dc:{uid}", arg=arg or None)
+        session_id = self._session_id(uid, cid, gid, is_dm=is_dm)
+        result = await self.send_command_full(cmd, session_id=session_id, arg=arg or None)
         picker = result.get("picker") if isinstance(result, dict) else None
         if isinstance(picker, dict) and picker.get("options"):
-            view = _build_picker_view(self, uid, picker)
+            view = _build_picker_view(self, session_id, picker)
             if view is not None:
                 prompt = str(picker.get("prompt") or "Choose:")
                 await interaction.followup.send(prompt, view=view, ephemeral=True)

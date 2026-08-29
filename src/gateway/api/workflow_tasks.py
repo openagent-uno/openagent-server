@@ -15,10 +15,12 @@ Endpoints:
     GET    /api/workflow-block-types            static catalog for the UI
     GET    /api/mcp-tools                       live MCP tool inventory
 
-503 is returned when the live ``Scheduler`` isn't attached (same
-invariant as /api/scheduled-tasks). Writes bypass the MCP subprocess —
-the gateway talks to the same SQLite as the workflow-manager MCP and
-the scheduler, so all three stay in sync.
+Read handlers use the agent's durable database directly, so definitions and
+run history remain inspectable while background workers are intentionally
+parked (for example in hermetic local E2E mode). Mutations and execution still
+require the live ``Scheduler`` and return 503 when it isn't attached. Writes
+bypass the MCP subprocess — the gateway talks to the same SQLite as the
+workflow-manager MCP and the scheduler, so all three stay in sync.
 """
 
 from __future__ import annotations
@@ -60,6 +62,31 @@ def _resolve_scheduler(request):
             status=503,
         )
     return scheduler, None
+
+
+def _resolve_read_db(request):
+    """Return the durable workflow DB without requiring a live worker.
+
+    Production normally reaches the same ``MemoryDB`` through the scheduler.
+    Safe/local inspection modes deliberately omit that background runtime, but
+    the gateway still owns an initialized agent DB. Keeping this resolver
+    read-only lets clients inspect durable automation state without starting a
+    scheduler (or weakening the write/run guard above).
+    """
+    from aiohttp import web
+
+    gw = request.app["gateway"]
+    scheduler = getattr(gw, "_scheduler", None)
+    db = getattr(scheduler, "db", None)
+    if db is None:
+        agent = getattr(gw, "agent", None) or getattr(gw, "_agent", None)
+        db = getattr(agent, "memory_db", None)
+    if db is None:
+        return None, web.json_response(
+            {"error": "No database configured"},
+            status=503,
+        )
+    return db, None
 
 
 def _resolve_mcp_inventory(request) -> dict[str, dict[str, Any]] | None:
@@ -137,10 +164,10 @@ def _decorate_run(row: dict) -> dict:
     return out
 
 
-async def _find_workflow(scheduler, id_or_name: str) -> dict | None:
+async def _find_workflow(db, id_or_name: str) -> dict | None:
     """Accept full id, 8-char id prefix, or unique name. Mirrors the
     MCP's ``_resolve_workflow`` for consistent UX."""
-    return await scheduler.db.get_workflow(id_or_name)
+    return await db.get_workflow(id_or_name)
 
 
 # ── list / get / create / update / delete ───────────────────────────
@@ -149,14 +176,14 @@ async def _find_workflow(scheduler, id_or_name: str) -> dict | None:
 async def handle_list(request):
     from aiohttp import web
 
-    scheduler, err = _resolve_scheduler(request)
+    db, err = _resolve_read_db(request)
     if err is not None:
         return err
 
     enabled_only = request.query.get("enabled_only", "").lower() in ("1", "true", "yes")
     has_trigger = request.query.get("has_trigger_type") or None
-    rows = await scheduler.db.list_workflows(enabled_only=enabled_only)
-    decorated = [await _decorate_workflow(scheduler.db, r) for r in rows]
+    rows = await db.list_workflows(enabled_only=enabled_only)
+    decorated = [await _decorate_workflow(db, r) for r in rows]
     if has_trigger:
         decorated = [w for w in decorated if has_trigger in w["trigger_types"]]
     return web.json_response({"workflows": decorated})
@@ -165,17 +192,17 @@ async def handle_list(request):
 async def handle_get(request):
     from aiohttp import web
 
-    scheduler, err = _resolve_scheduler(request)
+    db, err = _resolve_read_db(request)
     if err is not None:
         return err
 
-    row = await _find_workflow(scheduler, request.match_info["id"])
+    row = await _find_workflow(db, request.match_info["id"])
     if row is None:
         return web.json_response(
             {"error": f"Workflow {request.match_info['id']!r} not found"},
             status=404,
         )
-    return web.json_response(await _decorate_workflow(scheduler.db, row))
+    return web.json_response(await _decorate_workflow(db, row))
 
 
 async def handle_create(request):
@@ -250,6 +277,9 @@ async def handle_create(request):
         return web.json_response({"error": str(exc)}, status=400)
 
     row = await scheduler.db.get_workflow(workflow_id)
+    from .operational import claim_created_resource
+
+    await claim_created_resource(request, "workflow_definition", workflow_id)
     elog("workflow.create", id=workflow_id, name=name)
     await request.app["gateway"].broadcast_resource(
         "workflow", "created", workflow_id,
@@ -266,7 +296,7 @@ async def handle_update(request):
     if err is not None:
         return err
 
-    existing = await _find_workflow(scheduler, request.match_info["id"])
+    existing = await _find_workflow(scheduler.db, request.match_info["id"])
     if existing is None:
         return web.json_response(
             {"error": f"Workflow {request.match_info['id']!r} not found"},
@@ -377,7 +407,7 @@ async def handle_delete(request):
     if err is not None:
         return err
 
-    existing = await _find_workflow(scheduler, request.match_info["id"])
+    existing = await _find_workflow(scheduler.db, request.match_info["id"])
     if existing is None:
         return web.json_response(
             {"error": f"Workflow {request.match_info['id']!r} not found"},
@@ -409,7 +439,7 @@ async def handle_run(request):
     if err is not None:
         return err
 
-    existing = await _find_workflow(scheduler, request.match_info["id"])
+    existing = await _find_workflow(scheduler.db, request.match_info["id"])
     if existing is None:
         return web.json_response(
             {"error": f"Workflow {request.match_info['id']!r} not found"},
@@ -519,7 +549,7 @@ async def handle_stop(request):
     if err is not None:
         return err
 
-    existing = await _find_workflow(scheduler, request.match_info["id"])
+    existing = await _find_workflow(scheduler.db, request.match_info["id"])
     if existing is None:
         return web.json_response(
             {"error": f"Workflow {request.match_info['id']!r} not found"},
@@ -586,11 +616,11 @@ async def handle_stop(request):
 async def handle_runs_list(request):
     from aiohttp import web
 
-    scheduler, err = _resolve_scheduler(request)
+    db, err = _resolve_read_db(request)
     if err is not None:
         return err
 
-    existing = await _find_workflow(scheduler, request.match_info["id"])
+    existing = await _find_workflow(db, request.match_info["id"])
     if existing is None:
         return web.json_response(
             {"error": f"Workflow {request.match_info['id']!r} not found"},
@@ -599,7 +629,7 @@ async def handle_runs_list(request):
 
     limit = int(request.query.get("limit", 20))
     status = request.query.get("status") or None
-    runs = await scheduler.db.list_workflow_runs(
+    runs = await db.list_workflow_runs(
         existing["id"], limit=limit, status=status,
     )
     return web.json_response({"runs": [_decorate_run(r) for r in runs]})
@@ -608,15 +638,20 @@ async def handle_runs_list(request):
 async def handle_run_get(request):
     from aiohttp import web
 
-    scheduler, err = _resolve_scheduler(request)
+    db, err = _resolve_read_db(request)
     if err is not None:
         return err
 
     run_id = request.match_info["run_id"]
-    row = await scheduler.db.get_workflow_run(run_id)
+    row = await db.get_workflow_run(run_id)
     if row is None:
         return web.json_response({"error": f"run {run_id!r} not found"}, status=404)
-    return web.json_response(_decorate_run(row))
+    from .operational import decorate_workflow_run_detail
+
+    detail = await decorate_workflow_run_detail(request, _decorate_run(row))
+    if detail is None:
+        return web.json_response({"error": "This result is no longer available"}, status=404)
+    return web.json_response(detail, headers={"Cache-Control": "no-store"})
 
 
 async def handle_stats(request):
@@ -627,11 +662,11 @@ async def handle_stats(request):
     """
     from aiohttp import web
 
-    scheduler, err = _resolve_scheduler(request)
+    db, err = _resolve_read_db(request)
     if err is not None:
         return err
 
-    existing = await _find_workflow(scheduler, request.match_info["id"])
+    existing = await _find_workflow(db, request.match_info["id"])
     if existing is None:
         return web.json_response(
             {"error": f"Workflow {request.match_info['id']!r} not found"},
@@ -644,7 +679,7 @@ async def handle_stats(request):
         return web.json_response(
             {"error": "last must be a positive integer"}, status=400,
         )
-    stats = await scheduler.db.workflow_run_stats(
+    stats = await db.workflow_run_stats(
         existing["id"], sparkline_count=count,
     )
     # Decorate last[] entries with ISO timestamps for UI display.

@@ -1,20 +1,32 @@
 import json
+import base64
 from functools import partial
 from typing import TYPE_CHECKING, Optional, Union
+from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
 from src.core._runner.utils.log import log_debug, log_exception
 
 try:
     from mcp import ClientSession
-    from mcp.types import CallToolResult, EmbeddedResource, ImageContent, TextContent
+    from mcp.types import (
+        AudioContent,
+        BlobResourceContents,
+        CallToolResult,
+        EmbeddedResource,
+        ImageContent,
+        ResourceLink,
+        TextContent,
+        TextResourceContents,
+    )
     from mcp.types import Tool as MCPTool
 except (ImportError, ModuleNotFoundError):
     raise ImportError("`mcp` not installed. Please install using `pip install mcp`")
 
 
-from src.stream.media import Image
+from src.stream.media import Audio, File, Image, Video
 from src.mcp._runtime.function import ToolResult
+from src.memory.artifacts import safe_attachment_filename
 
 if TYPE_CHECKING:
     from src.core._runner.agent import Agent
@@ -22,6 +34,79 @@ if TYPE_CHECKING:
     from src.core._runner.team.team import Team
     from src.mcp._runtime.mcp.mcp import MCPTools
     from src.mcp._runtime.mcp.multi_mcp import MultiMCPTools
+
+
+# MCP payloads are already resident when the SDK hands them to us, but these
+# limits prevent a tool from multiplying memory during base64 decode or placing
+# an unbounded embedded resource in the model context. Output media has the
+# same 50 MiB ceiling at the NativeProvider/CAS boundary.
+_MCP_MEDIA_MAX_BYTES = 50 * 1024 * 1024
+_MCP_MEDIA_MAX_TOTAL_BYTES = 100 * 1024 * 1024
+_MCP_TEXT_MAX_CHARS = 100_000
+_MCP_TEXT_MAX_BYTES = 256 * 1024
+_MCP_COMBINED_TEXT_MAX_CHARS = 200_000
+_MCP_COMBINED_TEXT_MAX_BYTES = 512 * 1024
+_MCP_CONTENT_MAX_ITEMS = 32
+_MCP_URI_MAX_CHARS = 2_048
+
+
+def _decode_mcp_base64(
+    value: object,
+    *,
+    label: str,
+    remaining_bytes: int | None = None,
+) -> bytes:
+    """Strictly decode one bounded MCP base64 field."""
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{label} has no base64 data")
+    # Check before decode so an oversized text field cannot allocate another
+    # comparably large bytes object. The final decoded length remains the
+    # authoritative guard because padding can vary.
+    limit = _MCP_MEDIA_MAX_BYTES
+    if remaining_bytes is not None:
+        limit = min(limit, max(0, int(remaining_bytes)))
+    max_encoded = 4 * ((limit + 2) // 3)
+    try:
+        encoded = value.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise ValueError(f"{label} contains non-ASCII base64 data") from exc
+    if len(encoded) > max_encoded:
+        raise ValueError(
+            f"{label} exceeds the {limit}-byte remaining media limit"
+        )
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"{label} contains malformed base64 data") from exc
+    if len(decoded) > limit:
+        raise ValueError(
+            f"{label} exceeds the {limit}-byte remaining media limit"
+        )
+    return decoded
+
+
+def _bounded_mcp_text(
+    value: object,
+    *,
+    label: str,
+    max_chars: int | None = None,
+    max_bytes: int | None = None,
+) -> tuple[str, bool]:
+    """Return bounded UTF-8 text plus whether truncation was necessary."""
+    char_limit = _MCP_TEXT_MAX_CHARS if max_chars is None else max(0, int(max_chars))
+    byte_limit = _MCP_TEXT_MAX_BYTES if max_bytes is None else max(0, int(max_bytes))
+    text = str(value or "")
+    truncated = len(text) > char_limit
+    if truncated:
+        text = text[:char_limit]
+    encoded = text.encode("utf-8")
+    if len(encoded) > byte_limit:
+        encoded = encoded[:byte_limit]
+        text = encoded.decode("utf-8", errors="ignore")
+        truncated = True
+    if truncated:
+        text += f"\n[{label} truncated by OpenAgent]"
+    return text, truncated
 
 
 def get_entrypoint_for_tool(
@@ -86,21 +171,49 @@ def get_entrypoint_for_tool(
                 tool_name, kwargs, meta=call_meta()
             )  # type: ignore
 
-            # Return an error if the tool call failed
-            if result.isError:
-                return ToolResult(content=f"Error from MCP tool '{tool_name}': {result.content}")
+            # Preserve the COMPLETE MCP envelope.  The runtime's historical
+            # path below turns content blocks into a human/model-facing string
+            # and media objects, but that representation cannot carry
+            # structuredContent, isError, _meta, ResourceLink, AudioContent or
+            # future protocol block types.  ``mode='json'`` also makes AnyUrl
+            # and other pydantic values safe for the next tool-search boundary.
+            try:
+                mcp_result = result.model_dump(
+                    mode="json", by_alias=True, exclude_none=False,
+                )
+            except Exception:
+                mcp_result = json.loads(result.model_dump_json(by_alias=True))
 
             # Process the result content
             response_str = ""
             images = []
+            audios = []
+            videos = []
+            files = []
+            media_bytes_total = 0
 
-            for content_item in result.content:
+            def decode_media(value: object, *, label: str) -> bytes:
+                nonlocal media_bytes_total
+                decoded = _decode_mcp_base64(
+                    value,
+                    label=label,
+                    remaining_bytes=_MCP_MEDIA_MAX_TOTAL_BYTES - media_bytes_total,
+                )
+                media_bytes_total += len(decoded)
+                return decoded
+
+            content_items = result.content[:_MCP_CONTENT_MAX_ITEMS]
+            for content_item in content_items:
                 if isinstance(content_item, TextContent):
-                    text_content = content_item.text
+                    text_content, text_truncated = _bounded_mcp_text(
+                        content_item.text, label="MCP text content",
+                    )
 
                     # Parse as JSON to check for custom image format
                     try:
-                        parsed_json = json.loads(text_content)
+                        # A truncated payload is no longer valid JSON and must
+                        # remain visible as bounded text, not be reparsed.
+                        parsed_json = None if text_truncated else json.loads(text_content)
                         if (
                             isinstance(parsed_json, dict)
                             and parsed_json.get("type") == "image"
@@ -113,12 +226,13 @@ def get_entrypoint_for_tool(
                             mime_type = parsed_json.get("mimeType", "image/png")
 
                             if image_data and isinstance(image_data, str):
-                                import base64
-
                                 try:
-                                    image_bytes = base64.b64decode(image_data)
-                                except Exception as e:
-                                    log_debug(f"Failed to decode base64 image data: {e}")
+                                    image_bytes = decode_media(
+                                        image_data, label="MCP JSON image",
+                                    )
+                                except ValueError as e:
+                                    log_debug(str(e))
+                                    response_str += f"[Rejected MCP JSON image: {e}]\n"
                                     image_bytes = None
 
                                 if image_bytes:
@@ -141,33 +255,164 @@ def get_entrypoint_for_tool(
                     # Handle standard MCP ImageContent
                     image_data = getattr(content_item, "data", None)
 
-                    if image_data and isinstance(image_data, str):
-                        import base64
-
-                        try:
-                            image_data = base64.b64decode(image_data)
-                        except Exception as e:
-                            log_debug(f"Failed to decode base64 image data: {e}")
-                            image_data = None
+                    try:
+                        image_data = decode_media(
+                            image_data, label="MCP image",
+                        )
+                    except ValueError as e:
+                        log_debug(str(e))
+                        response_str += f"[Rejected MCP image: {e}]\n"
+                        continue
 
                     img_artifact = Image(
                         id=str(uuid4()),
-                        url=getattr(content_item, "url", None),
                         content=image_data,
                         mime_type=getattr(content_item, "mimeType", "image/png"),
                     )
                     images.append(img_artifact)
                     response_str += "Image has been generated and added to the response.\n"
+                elif isinstance(content_item, AudioContent):
+                    audio_data = getattr(content_item, "data", None)
+                    try:
+                        audio_data = decode_media(
+                            audio_data, label="MCP audio",
+                        )
+                    except ValueError as e:
+                        log_debug(str(e))
+                        response_str += f"[Rejected MCP audio: {e}]\n"
+                        continue
+                    mime = getattr(content_item, "mimeType", None) or "audio/mpeg"
+                    fmt = mime.split("/", 1)[-1].split(";", 1)[0]
+                    audios.append(Audio(
+                        id=str(uuid4()),
+                        content=audio_data,
+                        mime_type=mime,
+                        format=fmt,
+                    ))
+                    response_str += "Audio has been generated and added to the response.\n"
                 elif isinstance(content_item, EmbeddedResource):
-                    # Handle embedded resources
-                    response_str += f"[Embedded resource: {content_item.resource.model_dump_json()}]\n"
+                    resource = content_item.resource
+                    uri = str(getattr(resource, "uri", "") or "")
+                    uri_display = (
+                        uri
+                        if len(uri) <= _MCP_URI_MAX_CHARS
+                        else uri[:_MCP_URI_MAX_CHARS] + "…"
+                    )
+                    parsed_uri = urlparse(uri)
+                    filename = safe_attachment_filename(
+                        unquote(parsed_uri.path), fallback="resource",
+                    )
+                    mime = getattr(resource, "mimeType", None)
+                    if isinstance(resource, TextResourceContents):
+                        resource_text, _ = _bounded_mcp_text(
+                            resource.text, label="MCP embedded text resource",
+                        )
+                        response_str += (
+                            f"[Embedded resource {uri_display or filename}]\n"
+                            f"{resource_text}\n"
+                        )
+                    elif isinstance(resource, BlobResourceContents):
+                        try:
+                            blob = decode_media(
+                                resource.blob, label="MCP embedded resource",
+                            )
+                        except ValueError as e:
+                            log_debug(str(e))
+                            response_str += f"[Rejected MCP embedded resource: {e}]\n"
+                            blob = None
+                        if blob is not None:
+                            media_id = str(uuid4())
+                            mime = str(mime or "").split(";", 1)[0].lower()
+                            fmt = (
+                                filename.rsplit(".", 1)[-1].lower()
+                                if "." in filename else None
+                            )
+                            if mime.startswith("image/"):
+                                images.append(Image(
+                                    id=media_id,
+                                    content=blob,
+                                    mime_type=mime,
+                                    format=fmt,
+                                ))
+                            elif mime.startswith("audio/"):
+                                audios.append(Audio(
+                                    id=media_id,
+                                    content=blob,
+                                    mime_type=mime,
+                                    format=fmt,
+                                ))
+                            elif mime.startswith("video/"):
+                                videos.append(Video(
+                                    id=media_id,
+                                    content=blob,
+                                    mime_type=mime,
+                                    format=fmt,
+                                ))
+                            else:
+                                file_kwargs = {
+                                    "id": media_id,
+                                    "content": blob,
+                                    "filename": filename,
+                                    "format": fmt,
+                                }
+                                if mime in File.valid_mime_types():
+                                    file_kwargs["mime_type"] = mime
+                                files.append(File(**file_kwargs))
+                            response_str += (
+                                f"Embedded resource {uri_display or filename} has been added "
+                                "to the response.\n"
+                            )
+                elif isinstance(content_item, ResourceLink):
+                    uri = str(getattr(content_item, "uri", "") or "")
+                    uri_display = (
+                        uri
+                        if len(uri) <= _MCP_URI_MAX_CHARS
+                        else uri[:_MCP_URI_MAX_CHARS] + "…"
+                    )
+                    link_name, _ = _bounded_mcp_text(
+                        getattr(content_item, "name", None) or "resource",
+                        label="MCP resource link name",
+                        max_chars=512,
+                        max_bytes=2_048,
+                    )
+                    response_str += f"[Resource link {link_name}: {uri_display}]\n"
                 else:
-                    # Handle other content types
-                    response_str += f"[Unsupported content type: {content_item.type}]\n"
+                    # Future MCP block types remain intact in ``mcp_result``.
+                    response_str += (
+                        "[Unsupported content type: "
+                        f"{getattr(content_item, 'type', type(content_item).__name__)}]\n"
+                    )
 
+            if len(result.content) > len(content_items):
+                response_str += (
+                    f"[Omitted {len(result.content) - len(content_items)} additional "
+                    "MCP content items: payload limit reached.]\n"
+                )
+
+            response_str, _ = _bounded_mcp_text(
+                response_str,
+                label="MCP combined tool output",
+                max_chars=_MCP_COMBINED_TEXT_MAX_CHARS,
+                max_bytes=_MCP_COMBINED_TEXT_MAX_BYTES,
+            )
+
+            display_content = response_str.strip()
+            if result.isError:
+                detail = display_content or "MCP tool returned no displayable error content"
+                display_content = f"Error from MCP tool '{tool_name}': {detail}"
+                display_content, _ = _bounded_mcp_text(
+                    display_content,
+                    label="MCP combined error output",
+                    max_chars=_MCP_COMBINED_TEXT_MAX_CHARS,
+                    max_bytes=_MCP_COMBINED_TEXT_MAX_BYTES,
+                )
             return ToolResult(
-                content=response_str.strip(),
+                content=display_content,
                 images=images if images else None,
+                audios=audios if audios else None,
+                videos=videos if videos else None,
+                files=files if files else None,
+                mcp_result=mcp_result,
             )
         except Exception as e:
             log_exception(f"Failed to call MCP tool '{tool_name}': {e}")

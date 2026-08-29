@@ -22,6 +22,7 @@ on:
   push:
     branches:
       - main
+      - 'beta/**'
   workflow_dispatch:
 
 jobs:

@@ -17,13 +17,20 @@ Two modes:
         --handle <handle> \\
         --password <pw>
 
+For unattended runs, prefer ``OPENAGENT_SMOKE_TICKET`` and
+``OPENAGENT_SMOKE_PASSWORD`` so credentials never appear in the process
+arguments. Compatibility flags remain available but are never echoed.
+
 Exit code: 0 = success, 1 = failure.
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
+import os
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -69,7 +76,13 @@ async def _gateway_ws_handshake(
         await proxy.stop()
 
 
-async def _do_register(ticket_str: str, password: str) -> int:
+async def _do_register(
+    ticket_str: str,
+    password: str,
+    *,
+    operational_db: str | None = None,
+    agent_handle: str | None = None,
+) -> int:
     from src.network.auth.device_cert import verify_cert
     from src.network.client.login import LoginError, login, register
     from src.network.client.session import NetworkBinding, SessionDialer
@@ -90,9 +103,7 @@ async def _do_register(ticket_str: str, password: str) -> int:
 
     print(f"  coordinator : {coord}", flush=True)
     print(f"  network     : {ut.network_name} / {ut.network_id}", flush=True)
-    print(f"  invite code : {ut.code}", flush=True)
     print(f"  handle      : {handle}", flush=True)
-    print(f"  password    : {password}", flush=True)
 
     dev = Identity.generate()
     node = IrohNode(dev)
@@ -111,7 +122,7 @@ async def _do_register(ticket_str: str, password: str) -> int:
                 label=f"smoke-register",
             )
         except LoginError as e:
-            print(f"  ✗ register failed: {e}", flush=True)
+            print(f"  ✗ register failed ({type(e).__name__})", flush=True)
             return 1
         cert = verify_cert(
             cert_wire,
@@ -131,7 +142,7 @@ async def _do_register(ticket_str: str, password: str) -> int:
                 network_id=ut.network_id,
             )
         except LoginError as e:
-            print(f"  ✗ returning-device login failed: {e}", flush=True)
+            print(f"  ✗ returning-device login failed ({type(e).__name__})", flush=True)
             return 1
         verify_cert(
             cert_wire2,
@@ -147,13 +158,23 @@ async def _do_register(ticket_str: str, password: str) -> int:
                 node=node, coordinator_node_id=coord,
             )
         except Exception as e:  # noqa: BLE001
-            print(f"  ✗ list_agents failed: {e}", flush=True)
+            print(f"  ✗ list_agents failed ({type(e).__name__})", flush=True)
             return 1
         if not agents:
             print("  ✗ no agents registered in network", flush=True)
             return 1
-        agent_node_id = agents[0]["node_id"]
-        print(f"  agent: {agents[0].get('handle','?')} @ {agent_node_id[:24]}…",
+        selected = next(
+            (
+                agent for agent in agents
+                if agent_handle and agent.get("handle") == agent_handle
+            ),
+            None,
+        ) if agent_handle else agents[0]
+        if selected is None:
+            print(f"  ✗ agent {agent_handle!r} is not registered in this network", flush=True)
+            return 1
+        agent_node_id = selected["node_id"]
+        print(f"  agent: {selected.get('handle','?')} @ {agent_node_id[:24]}…",
               flush=True)
 
         binding = NetworkBinding(
@@ -166,12 +187,15 @@ async def _do_register(ticket_str: str, password: str) -> int:
         dialer = SessionDialer(node=node, binding=binding, cert_wire=cert_wire2)
         try:
             auth_ok_payload = await _gateway_ws_handshake(node, dialer, agent_node_id)
+            auth_ok = json.loads(auth_ok_payload)
+            if auth_ok.get("type") != "auth_ok":
+                raise RuntimeError("gateway did not return auth_ok")
         except Exception as e:  # noqa: BLE001
-            print(f"  ✗ gateway WS handshake failed: {type(e).__name__}: {e}",
+            print(f"  ✗ gateway WS handshake failed ({type(e).__name__})",
                   flush=True)
             await dialer.close()
             return 1
-        print(f"  ✓ AUTH_OK received: {auth_ok_payload[:120]}…", flush=True)
+        print("  ✓ AUTH_OK received", flush=True)
 
         # ── 4. /api/network/* — members & invitations through the gateway ──
         print("\n[4/4] /api/network/* (members + mint via gateway HTTP)",
@@ -179,10 +203,28 @@ async def _do_register(ticket_str: str, password: str) -> int:
         try:
             await _exercise_network_api(dialer, agent_node_id)
         except Exception as e:  # noqa: BLE001
-            print(f"  ✗ network api failed: {type(e).__name__}: {e}",
+            print(f"  ✗ network api failed ({type(e).__name__})",
                   flush=True)
             await dialer.close()
             return 1
+
+        if operational_db:
+            print("\n[5/5] operational history/search canary", flush=True)
+            try:
+                await _exercise_operational_api(
+                    dialer,
+                    agent_node_id,
+                    db_path=Path(operational_db).expanduser().resolve(),
+                    network_id=ut.network_id,
+                    handle=handle,
+                )
+            except Exception as e:  # noqa: BLE001
+                print(
+                    f"  ✗ operational api failed ({type(e).__name__})",
+                    flush=True,
+                )
+                await dialer.close()
+                return 1
         await dialer.close()
 
     finally:
@@ -230,14 +272,12 @@ async def _exercise_network_api(dialer, target_node_id: str) -> None:
                 f"{base}/api/network/invitations",
                 json={"handle": "smoke-friend"},
             ) as r:
-                assert r.status == 201, \
-                    f"POST /invitations → {r.status}: {await r.text()}"
+                assert r.status == 201, f"POST /invitations → {r.status}"
                 minted = await r.json()
-                assert minted["role"] == "user", minted
-                assert minted["ticket"].startswith("oa1"), minted
+                assert minted["role"] == "user"
+                assert minted["ticket"].startswith("oa1")
                 print(f"  ✓ POST /invitations → role={minted['role']}, "
-                      f"code={minted['code']}, intent={minted['intent']!r}",
-                      flush=True)
+                      f"intent={minted['intent']!r}", flush=True)
 
             # Idempotent revoke.
             async with s.delete(
@@ -245,9 +285,8 @@ async def _exercise_network_api(dialer, target_node_id: str) -> None:
             ) as r:
                 assert r.status == 200, f"DELETE → {r.status}"
                 payload = await r.json()
-                assert payload.get("revoked") is True, payload
-                print(f"  ✓ DELETE /invitations/{minted['code'][:10]}… "
-                      f"→ revoked=True", flush=True)
+                assert payload.get("revoked") is True
+                print("  ✓ DELETE /invitations/<redacted> → revoked=True", flush=True)
 
             # PATCH /agents — relabel the coordinator's own agent and
             # immediately revert. Cosmetic-only so this is safe to
@@ -258,7 +297,7 @@ async def _exercise_network_api(dialer, target_node_id: str) -> None:
                 f"{base}/api/network/agents/{agents_first['handle']}",
                 json={"label": f"{original_label} (smoked)"},
             ) as r:
-                assert r.status == 200, f"PATCH → {r.status}: {await r.text()}"
+                assert r.status == 200, f"PATCH → {r.status}"
                 print(f"  ✓ PATCH /agents/{agents_first['handle']} → label updated",
                       flush=True)
             async with s.patch(
@@ -277,6 +316,504 @@ async def _exercise_network_api(dialer, target_node_id: str) -> None:
                 print(f"  ✓ DELETE /agents/{agents_first['handle']} → 409 "
                       f"(coord agent protected)", flush=True)
     finally:
+        await proxy.stop()
+
+
+async def _seed_operational_canary(
+    db_path: Path,
+    *,
+    network_id: str,
+    handle: str,
+) -> dict[str, object]:
+    """Insert an isolated fixture through the live DB's existing journals.
+
+    This mode is intentionally opt-in because the smoke client may connect to
+    a remote agent.  The caller supplies the local DB path of the selected
+    agent; the network id is checked before any write.  Every inserted key has
+    a random prefix and cleanup only addresses those exact keys.
+    """
+    import aiosqlite
+
+    prefix = f"e2eop-{uuid.uuid4().hex[:12]}"
+    term = f"opsmoke{uuid.uuid4().hex[:12]}"
+    forbidden_term = f"forbiddensmoke{uuid.uuid4().hex[:12]}"
+    ids = {
+        "session": f"{prefix}-chat",
+        "forbidden_session": f"{prefix}-forbidden-chat",
+        "run": f"{prefix}-chat-run",
+        "user_message": f"{prefix}-user-message",
+        "tool_message": f"{prefix}-tool-message",
+        "assistant_message": f"{prefix}-assistant-message",
+        "tool_call": f"{prefix}-tool-call",
+        "workflow": f"{prefix}-workflow",
+        "workflow_run": f"{prefix}-workflow-run",
+        "scheduled": f"{prefix}-scheduled",
+        "scheduled_run": f"{prefix}-scheduled-run",
+        "event": f"{prefix}-event",
+        "event_delivery": f"{prefix}-event-delivery",
+    }
+    required_tables = {
+        "sessions", "workflow_tasks", "workflow_runs", "scheduled_tasks",
+        "task_runs", "events", "event_deliveries", "sessions_v2",
+        "legacy_session_changes", "operational_automation_changes",
+    }
+    conn = await aiosqlite.connect(db_path, timeout=10)
+    try:
+        await conn.execute("PRAGMA busy_timeout=10000")
+        tables = {
+            str(row[0])
+            for row in await (
+                await conn.execute("SELECT name FROM sqlite_schema WHERE type='table'")
+            ).fetchall()
+        }
+        missing = sorted(required_tables - tables)
+        if missing:
+            raise RuntimeError(f"selected DB lacks operational beta tables: {missing}")
+        network = await (
+            await conn.execute("SELECT network_id FROM network LIMIT 1")
+        ).fetchone()
+        if network is None or str(network[0]) != network_id:
+            raise RuntimeError("--operational-db does not belong to the ticket network")
+
+        now = int(time.time())
+        runs = [{
+            "run_id": ids["run"],
+            "status": "COMPLETED",
+            "created_at": now,
+            "messages": [
+                {
+                    "id": ids["user_message"],
+                    "role": "user",
+                    "content": f"{term} user-visible chat canary",
+                },
+                {
+                    "id": ids["tool_message"],
+                    "role": "tool",
+                    "tool_call_id": ids["tool_call"],
+                    "content": f"{term} user-visible tool canary",
+                },
+                {
+                    "id": ids["assistant_message"],
+                    "role": "assistant",
+                    "content": f"{term} assistant canary",
+                },
+            ],
+            "tools": [{
+                "tool_call_id": ids["tool_call"],
+                "tool_name": f"{term}_tool",
+                "tool_args": {"canary": term},
+                "result": {"canary": term},
+                "status": "completed",
+            }],
+        }]
+        await conn.execute(
+            "INSERT INTO sessions "
+            "(session_id,session_type,user_id,metadata,runs,created_at,updated_at) "
+            "VALUES(?, 'agent', ?, ?, ?, ?, ?)",
+            (
+                ids["session"], handle,
+                json.dumps({"client_id": handle, "title": f"{term} chat"}),
+                json.dumps(runs), now, now,
+            ),
+        )
+        await conn.execute(
+            "INSERT INTO sessions "
+            "(session_id,session_type,user_id,metadata,runs,created_at,updated_at) "
+            "VALUES(?, 'agent', 'acl-other-user', ?, '[]', ?, ?)",
+            (
+                ids["forbidden_session"],
+                json.dumps({
+                    "client_id": "acl-other-user",
+                    "title": f"{forbidden_term} private chat",
+                }),
+                now, now,
+            ),
+        )
+        graph = {
+            "version": 1,
+            "nodes": [{
+                "id": f"{prefix}-node",
+                "type": "tool",
+                "data": {"label": f"{term} workflow node"},
+            }],
+            "edges": [],
+        }
+        await conn.execute(
+            "INSERT INTO workflow_tasks(id,name,description,graph_json,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?)",
+            (
+                ids["workflow"], f"{term} workflow", f"{term} definition",
+                json.dumps(graph), now, now,
+            ),
+        )
+        await conn.execute(
+            "INSERT INTO workflow_runs"
+            "(id,workflow_id,trigger,status,started_at,finished_at,trace_json,error) "
+            "VALUES(?,?, 'manual', 'success', ?, ?, ?, NULL)",
+            (
+                ids["workflow_run"], ids["workflow"], now, now + 1,
+                json.dumps([{
+                    "node_id": f"{prefix}-node", "type": "tool",
+                    "status": "success", "tool_name": f"{term}_workflow_tool",
+                    "started_at": now, "finished_at": now + 1,
+                }]),
+            ),
+        )
+        await conn.execute(
+            "INSERT INTO scheduled_tasks"
+            "(id,name,cron_expression,prompt,enabled,created_at,updated_at) "
+            "VALUES(?,?, '0 0 1 1 *', ?, 0, ?, ?)",
+            (ids["scheduled"], f"{term} schedule", f"{term} scheduled prompt", now, now),
+        )
+        await conn.execute(
+            "INSERT INTO task_runs"
+            "(id,task_id,trigger,status,started_at,finished_at,output,error) "
+            "VALUES(?,?, 'manual', 'success', ?, ?, ?, NULL)",
+            (
+                ids["scheduled_run"], ids["scheduled"], now, now + 1,
+                f"{term} scheduled output",
+            ),
+        )
+        await conn.execute(
+            "INSERT INTO events"
+            "(id,name,slug,type,secret_enc,input_schema_json,action_kind,"
+            "description,prompt_template,enabled,created_at,updated_at) "
+            "VALUES(?,?,?, 'generic', 'smoke-secret-not-indexed', '[]', 'prompt',"
+            "?,?,0,?,?)",
+            (
+                ids["event"], f"{term} event", ids["event"],
+                f"{term} event definition", f"{term} event prompt", now, now,
+            ),
+        )
+        await conn.execute(
+            "INSERT INTO event_deliveries"
+            "(id,event_id,source,status,payload_json,started_at,finished_at,output,error) "
+            "VALUES(?,?, 'manual', 'success', '{}', ?, ?, ?, NULL)",
+            (
+                ids["event_delivery"], ids["event"], now, now + 1,
+                f"{term} event delivery output",
+            ),
+        )
+        await conn.commit()
+    except Exception:
+        await conn.rollback()
+        raise
+    finally:
+        await conn.close()
+    return {
+        "prefix": prefix,
+        "term": term,
+        "forbidden_term": forbidden_term,
+        "ids": ids,
+    }
+
+
+async def _remove_operational_canary_sources(
+    db_path: Path,
+    fixture: dict[str, object],
+) -> None:
+    import aiosqlite
+
+    ids = fixture["ids"]
+    assert isinstance(ids, dict)
+    conn = await aiosqlite.connect(db_path, timeout=10)
+    try:
+        await conn.execute("PRAGMA busy_timeout=10000")
+        for table, key in (
+            ("event_deliveries", "event_delivery"),
+            ("events", "event"),
+            ("task_runs", "scheduled_run"),
+            ("scheduled_tasks", "scheduled"),
+            ("workflow_runs", "workflow_run"),
+            ("workflow_tasks", "workflow"),
+            ("sessions", "forbidden_session"),
+            ("sessions", "session"),
+        ):
+            await conn.execute(f"DELETE FROM {table} WHERE id=?" if table != "sessions" else f"DELETE FROM {table} WHERE session_id=?", (ids[key],))
+        await conn.commit()
+    finally:
+        await conn.close()
+
+
+async def _wait_operational_canary_cleanup(
+    db_path: Path,
+    fixture: dict[str, object],
+    *,
+    timeout_s: float = 60,
+) -> int:
+    """Wait until journals projected deletes and the derived FTS consumed them."""
+    import aiosqlite
+    import sqlite3
+
+    from src.memory.operational.search import operational_search_path
+
+    ids = fixture["ids"]
+    assert isinstance(ids, dict)
+    automation_ids = tuple(
+        str(ids[key]) for key in (
+            "workflow", "workflow_run", "scheduled", "scheduled_run",
+            "event", "event_delivery",
+        )
+    )
+    deadline = time.monotonic() + timeout_s
+    conn = await aiosqlite.connect(db_path, timeout=10)
+    try:
+        await conn.execute("PRAGMA busy_timeout=10000")
+        while time.monotonic() < deadline:
+            session_pending = int((await (
+                await conn.execute(
+                    "SELECT COUNT(*) FROM legacy_session_changes "
+                    "WHERE session_id IN (?,?) AND processed_at_ms IS NULL",
+                    (ids["session"], ids["forbidden_session"]),
+                )
+            ).fetchone())[0])
+            placeholders = ",".join("?" for _ in automation_ids)
+            automation_pending = int((await (
+                await conn.execute(
+                    f"SELECT COUNT(*) FROM operational_automation_changes "
+                    f"WHERE resource_id IN ({placeholders}) AND processed_at_ms IS NULL",
+                    automation_ids,
+                )
+            ).fetchone())[0])
+            if session_pending == 0 and automation_pending == 0:
+                head = int((await (
+                    await conn.execute("SELECT COALESCE(MAX(seq),0) FROM search_outbox")
+                ).fetchone())[0])
+                index_path = operational_search_path(db_path)
+                if index_path.exists():
+                    try:
+                        index = sqlite3.connect(index_path, timeout=1)
+                        try:
+                            indexed = index.execute(
+                                "SELECT last_indexed_seq FROM search_index_state WHERE singleton_id=1"
+                            ).fetchone()
+                        finally:
+                            index.close()
+                        if indexed is not None and int(indexed[0]) >= head:
+                            return head
+                    except sqlite3.Error:
+                        pass
+            await asyncio.sleep(0.25)
+    finally:
+        await conn.close()
+    raise RuntimeError("canary delete journals/FTS did not drain within 60s")
+
+
+async def _purge_operational_canary_metadata(
+    db_path: Path,
+    fixture: dict[str, object],
+) -> None:
+    """Remove canary-only normalized/audit rows after FTS consumed deletes."""
+    import aiosqlite
+
+    ids = fixture["ids"]
+    assert isinstance(ids, dict)
+    resource_ids = tuple(str(value) for value in ids.values())
+    conn = await aiosqlite.connect(db_path, timeout=10)
+    try:
+        await conn.execute("PRAGMA foreign_keys=ON")
+        await conn.execute("PRAGMA busy_timeout=10000")
+        tool_rows = await (
+            await conn.execute(
+                "SELECT id FROM tool_invocations WHERE session_id IN (?,?)",
+                (ids["session"], ids["forbidden_session"]),
+            )
+        ).fetchall()
+        message_rows = await (
+            await conn.execute(
+                "SELECT id FROM session_messages WHERE session_id IN (?,?)",
+                (ids["session"], ids["forbidden_session"]),
+            )
+        ).fetchall()
+        indexed_ids = (*resource_ids, *(str(row[0]) for row in tool_rows), *(str(row[0]) for row in message_rows))
+        placeholders = ",".join("?" for _ in indexed_ids)
+        await conn.execute(f"DELETE FROM search_outbox WHERE source_id IN ({placeholders})", indexed_ids)
+        await conn.execute(f"DELETE FROM domain_events WHERE resource_id IN ({placeholders}) OR session_id IN (?,?)", (*indexed_ids, ids["session"], ids["forbidden_session"]))
+        await conn.execute(f"DELETE FROM activity_items WHERE resource_id IN ({placeholders})", indexed_ids)
+        await conn.execute(f"DELETE FROM resource_acl WHERE resource_id IN ({placeholders})", indexed_ids)
+        await conn.execute(f"DELETE FROM operational_resource_owners WHERE resource_id IN ({placeholders})", indexed_ids)
+        await conn.execute(f"DELETE FROM operational_automation_projection WHERE resource_id IN ({placeholders})", indexed_ids)
+        await conn.execute(f"DELETE FROM operational_automation_changes WHERE resource_id IN ({placeholders})", indexed_ids)
+        await conn.execute("DELETE FROM tool_invocations WHERE session_id IN (?,?)", (ids["session"], ids["forbidden_session"]))
+        await conn.execute("DELETE FROM session_messages WHERE session_id IN (?,?)", (ids["session"], ids["forbidden_session"]))
+        await conn.execute("DELETE FROM session_runs WHERE session_id IN (?,?)", (ids["session"], ids["forbidden_session"]))
+        await conn.execute("DELETE FROM sessions_v2 WHERE id IN (?,?)", (ids["session"], ids["forbidden_session"]))
+        await conn.execute("DELETE FROM legacy_session_changes WHERE session_id IN (?,?)", (ids["session"], ids["forbidden_session"]))
+        await conn.commit()
+    except Exception:
+        await conn.rollback()
+        raise
+    finally:
+        await conn.close()
+
+
+async def _exercise_operational_api(
+    dialer,
+    target_node_id: str,
+    *,
+    db_path: Path,
+    network_id: str,
+    handle: str,
+) -> None:
+    import aiohttp
+    from src.network.client.session import LoopbackProxy
+
+    fixture = await _seed_operational_canary(
+        db_path, network_id=network_id, handle=handle,
+    )
+    ids = fixture["ids"]
+    assert isinstance(ids, dict)
+    proxy = LoopbackProxy(dialer=dialer, target_node_id=target_node_id)
+    host, port = await proxy.start()
+    cleanup_seq = 0
+    sources_removed = False
+    cleanup_consumed = False
+    try:
+        async with aiohttp.ClientSession() as session:
+            base = f"http://{host}:{port}"
+            deadline = time.monotonic() + 60
+            found: dict | None = None
+            while time.monotonic() < deadline:
+                async with session.get(f"{base}/api/capabilities") as response:
+                    assert response.status == 200, f"capabilities → {response.status}"
+                    capabilities = await response.json()
+                search_feature = capabilities.get("features", {}).get("global_search")
+                if search_feature:
+                    async with session.post(
+                        f"{base}/api/search",
+                        json={
+                            "query": fixture["term"],
+                            "scopes": ["chats", "tools", "workflows", "scheduled", "events"],
+                            "filters": {}, "sort": "relevance", "grouping": "match",
+                            "limit": 100, "cursor": None,
+                        },
+                    ) as response:
+                        if response.status == 200:
+                            found = await response.json()
+                            kinds = {item["target"]["kind"] for item in found.get("items", [])}
+                            if kinds == {
+                                "chat", "chat_message", "chat_tool",
+                                "workflow_definition", "workflow_run",
+                                "scheduled_definition", "scheduled_run",
+                                "event_definition", "event_delivery",
+                            }:
+                                break
+                await asyncio.sleep(0.25)
+            else:
+                raise RuntimeError("operational fixture did not become searchable within 60s")
+
+            assert found is not None
+            print("  ✓ capabilities + all 5 scopes / 9 typed targets", flush=True)
+            async with session.get(f"{base}/api/history?limit=100&include_children=true") as response:
+                assert response.status == 200, f"history → {response.status}"
+                history = await response.json()
+            assert any(item.get("resource_id") == ids["session"] for item in history["items"])
+            print("  ✓ unified history contains the owned chat", flush=True)
+
+            async with session.get(
+                f"{base}/api/sessions/{ids['session']}/messages",
+                params={"around": ids["user_message"], "before": 1, "after": 2},
+            ) as response:
+                assert response.status == 200, f"messages-around → {response.status}"
+                around = await response.json()
+            assert around["anchor_found"] is True
+            assert {message["id"] for message in around["messages"]} >= {
+                ids["user_message"], ids["tool_message"], ids["assistant_message"],
+            }
+            print("  ✓ messages-around resolves the exact canary anchor", flush=True)
+
+            tool_target = next(
+                item["target"] for item in found["items"]
+                if item["target"]["kind"] == "chat_tool"
+            )
+            async with session.get(
+                f"{base}/api/tool-invocations/{tool_target['tool_invocation_id']}"
+            ) as response:
+                assert response.status == 200, f"tool detail → {response.status}"
+                tool = await response.json()
+            assert tool["session_id"] == ids["session"]
+
+            detail_routes = (
+                (f"/api/workflows/{ids['workflow']}", ids["workflow"]),
+                (f"/api/workflow-runs/{ids['workflow_run']}", ids["workflow_run"]),
+                (f"/api/scheduled-tasks/{ids['scheduled']}", ids["scheduled"]),
+                (f"/api/scheduled-runs/{ids['scheduled_run']}", ids["scheduled_run"]),
+                (f"/api/events/{ids['event']}", ids["event"]),
+                (f"/api/event-deliveries/{ids['event_delivery']}", ids["event_delivery"]),
+            )
+            for route, expected_id in detail_routes:
+                async with session.get(f"{base}{route}") as response:
+                    assert response.status == 200, f"detail resolver → {response.status}"
+                    detail = await response.json()
+                assert detail.get("id") == expected_id
+            print("  ✓ all workflow/scheduled/event detail resolvers", flush=True)
+
+            async with session.post(
+                f"{base}/api/search",
+                json={
+                    "query": fixture["forbidden_term"], "scopes": ["chats"],
+                    "filters": {}, "sort": "relevance", "grouping": "match",
+                    "limit": 10, "cursor": None,
+                },
+            ) as response:
+                assert response.status == 200, f"ACL search → {response.status}"
+                hidden = await response.json()
+            assert hidden["items"] == []
+            async with session.get(
+                f"{base}/api/sessions/{ids['forbidden_session']}/messages"
+            ) as response:
+                assert response.status == 404, f"ACL messages expected 404, got {response.status}"
+            print("  ✓ private canary owned by another principal is invisible", flush=True)
+
+            await _remove_operational_canary_sources(db_path, fixture)
+            sources_removed = True
+            cleanup_seq = await _wait_operational_canary_cleanup(db_path, fixture)
+            cleanup_consumed = True
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline:
+                async with session.get(f"{base}/api/capabilities") as response:
+                    caps = await response.json()
+                if int(caps.get("storage", {}).get("indexed_seq", 0)) >= cleanup_seq:
+                    async with session.post(
+                        f"{base}/api/search",
+                        json={
+                            "query": fixture["term"],
+                            "scopes": ["chats", "tools", "workflows", "scheduled", "events"],
+                            "filters": {}, "sort": "relevance", "grouping": "match",
+                            "limit": 10, "cursor": None,
+                        },
+                    ) as response:
+                        if response.status == 200 and not (await response.json())["items"]:
+                            break
+                await asyncio.sleep(0.25)
+            else:
+                raise RuntimeError("operational canary cleanup was not consumed within 60s")
+            print("  ✓ canary source rows removed and FTS tombstones consumed", flush=True)
+    finally:
+        if not sources_removed:
+            try:
+                await _remove_operational_canary_sources(db_path, fixture)
+                sources_removed = True
+            except Exception as cleanup_error:  # noqa: BLE001
+                print(f"  ! source cleanup failed ({type(cleanup_error).__name__})", flush=True)
+        if sources_removed and not cleanup_consumed:
+            try:
+                await _wait_operational_canary_cleanup(db_path, fixture)
+                cleanup_consumed = True
+            except Exception as cleanup_error:  # noqa: BLE001
+                print(
+                    f"  ! cleanup drain incomplete; metadata retained safely "
+                    f"({type(cleanup_error).__name__})",
+                    flush=True,
+                )
+        if cleanup_consumed:
+            try:
+                await _purge_operational_canary_metadata(db_path, fixture)
+            except Exception as cleanup_error:  # noqa: BLE001
+                print(
+                    f"  ! normalized canary cleanup failed ({type(cleanup_error).__name__})",
+                    flush=True,
+                )
         await proxy.stop()
 
 
@@ -301,7 +838,6 @@ async def _do_pair(ticket_str: str, handle: str, password: str) -> int:
     coord_pub = coordinator_node_id_to_pubkey_bytes(coord)
     print(f"  coordinator : {coord}", flush=True)
     print(f"  network     : {dt.network_name} / {dt.network_id}", flush=True)
-    print(f"  invite code : {dt.code} (bind_to={dt.bind_to!r})", flush=True)
     print(f"  handle      : {handle}", flush=True)
 
     new_dev = Identity.generate()  # fresh device pubkey
@@ -321,7 +857,7 @@ async def _do_pair(ticket_str: str, handle: str, password: str) -> int:
                 label="smoke-pair",
             )
         except LoginError as e:
-            print(f"  ✗ device pair failed: {e}", flush=True)
+            print(f"  ✗ device pair failed ({type(e).__name__})", flush=True)
             return 1
         verify_cert(
             cert_wire,
@@ -340,17 +876,35 @@ def main() -> None:
     sub = p.add_subparsers(dest="mode", required=True)
 
     pr = sub.add_parser("register", help="Register a smoke user (consumes user invite)")
-    pr.add_argument("--ticket", required=True)
-    pr.add_argument("--password", required=True)
+    pr.add_argument("--ticket", default=os.environ.get("OPENAGENT_SMOKE_TICKET"))
+    pr.add_argument("--password", default=os.environ.get("OPENAGENT_SMOKE_PASSWORD"))
+    pr.add_argument(
+        "--operational-db",
+        help="Opt in to history/search canaries using the selected agent's local SQLite DB",
+    )
+    pr.add_argument(
+        "--agent-handle",
+        help="Target this agent handle (recommended when the network has multiple agents)",
+    )
 
     pp = sub.add_parser("pair", help="Pair a new device for an existing user (consumes device invite)")
-    pp.add_argument("--ticket", required=True)
+    pp.add_argument("--ticket", default=os.environ.get("OPENAGENT_SMOKE_TICKET"))
     pp.add_argument("--handle", required=True)
-    pp.add_argument("--password", required=True)
+    pp.add_argument("--password", default=os.environ.get("OPENAGENT_SMOKE_PASSWORD"))
 
     args = p.parse_args()
+    if not args.ticket or not args.password:
+        p.error(
+            "provide ticket/password through OPENAGENT_SMOKE_TICKET and "
+            "OPENAGENT_SMOKE_PASSWORD (or the compatibility flags)"
+        )
     if args.mode == "register":
-        rc = asyncio.run(_do_register(args.ticket, args.password))
+        rc = asyncio.run(_do_register(
+            args.ticket,
+            args.password,
+            operational_db=args.operational_db,
+            agent_handle=args.agent_handle,
+        ))
     else:
         rc = asyncio.run(_do_pair(args.ticket, args.handle, args.password))
     sys.exit(rc)

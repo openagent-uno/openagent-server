@@ -1,6 +1,5 @@
 # Node dependencies (installed at build time / first launch)
 host/node_modules/
-host/package-lock.json
 
 # Local integration harness
 host/_smoke.mjs

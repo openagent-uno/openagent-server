@@ -35,6 +35,8 @@ import shlex
 import time
 from typing import Any
 
+from src.core.execution_origin import create_server_only_task
+
 from src.core.logging import elog
 
 
@@ -188,12 +190,14 @@ def fire(event_name: str, **payload: Any) -> None:
     if not cmd:
         return
     try:
-        loop = asyncio.get_running_loop()
+        asyncio.get_running_loop()
     except RuntimeError:
         # Called from a non-async context — log and skip.
         elog("hooks.skipped", hook_event=event_name, reason="no_event_loop")
         return
-    loop.create_task(_run_hook(event_name, cmd, payload))
+    create_server_only_task(
+        _run_hook(event_name, cmd, payload), name=f"hook:{event_name}",
+    )
 
 
 # Convenience accessors for tests / debug.

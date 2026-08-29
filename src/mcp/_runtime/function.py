@@ -194,6 +194,10 @@ class Function(BaseModel):
         default_factory=lambda: {"type": "object", "properties": {}, "required": []},
         description="JSON Schema object describing function parameters",
     )
+    # Internal execution semantics used by tool-search and retry policy. This
+    # deliberately stays out of ``to_dict`` because model-provider tool schemas
+    # do not accept OpenAgent-specific top-level fields.
+    classification: Literal["read_only", "idempotent", "mutating"] = "mutating"
     strict: Optional[bool] = None
 
     instructions: Optional[str] = None
@@ -279,12 +283,12 @@ class Function(BaseModel):
             name=data.get("name"),
             description=data.get("description"),
             parameters=data.get("parameters"),
+            classification=data.get("classification", "mutating"),
             strict=data.get("strict"),
             requires_confirmation=data.get("requires_confirmation", False),
             external_execution=data.get("external_execution", False),
             approval_type=data.get("approval_type"),
         )
-
     def model_copy(self, *, deep: bool = False) -> "Function":
         """
         Override model_copy to handle callable fields that can't be deep copied (pickled).
@@ -792,6 +796,29 @@ class Function(BaseModel):
                 json.dump({"timestamp": time(), "result": serializable_result}, f)
         except Exception:
             log_exception("Error writing cache")
+
+
+def classification_from_mcp_annotations(
+    annotations: Any,
+) -> Literal["read_only", "idempotent", "mutating"]:
+    """Map MCP hints to OpenAgent's conservative execution classification."""
+
+    if annotations is None:
+        return "mutating"
+
+    def value(camel: str, snake: str) -> Any:
+        if isinstance(annotations, dict):
+            return annotations.get(camel, annotations.get(snake))
+        result = getattr(annotations, camel, None)
+        if result is None:
+            result = getattr(annotations, snake, None)
+        return result
+
+    if value("readOnlyHint", "read_only_hint") is True:
+        return "read_only"
+    if value("idempotentHint", "idempotent_hint") is True:
+        return "idempotent"
+    return "mutating"
 
 
 class FunctionExecutionResult(BaseModel):
@@ -1398,3 +1425,12 @@ class ToolResult(BaseModel):
     # ``ToolExecution.child_session_id`` (see providers/base.py) so the leader
     # transcript renders a card that deep-links into the sub-agent's session.
     child_session_id: Optional[str] = None
+    # Complete MCP ``CallToolResult`` envelope when this value originated at an
+    # MCP boundary. ``content`` above deliberately stays a display/model-safe
+    # string because the provider runtime has long relied on that contract;
+    # keeping the wire envelope separately lets tool-search and workflow
+    # dispatch preserve structuredContent, isError, _meta and every content
+    # block (including media/resource types) without destabilising that
+    # contract.  Consumers that cross another MCP boundary should prefer this
+    # field over reconstructing an envelope from ``content``.
+    mcp_result: Optional[Dict[str, Any]] = None

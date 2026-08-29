@@ -54,6 +54,7 @@ import time
 from typing import Any, Optional
 from urllib import request as _urllib_request
 
+from src.core.execution_origin import create_server_only_task
 from src.core.logging import elog
 
 _ENABLED_ENV = "OPENAGENT_COST_ANOMALY_ENABLED"
@@ -234,7 +235,9 @@ def _page_webhook(session_id: Optional[str], model: Optional[str],
     except RuntimeError:
         loop = None
     if loop is not None:
-        loop.create_task(_fire_webhook(url, payload))
+        create_server_only_task(
+            _fire_webhook(url, payload), name="cost-anomaly-webhook",
+        )
     else:
         _post_webhook_sync(url, payload)
 

@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, TYPE_CHECKING
 from weakref import WeakKeyDictionary
@@ -21,7 +22,14 @@ from src.gateway import protocol as P
 from src.gateway.commands import command_help_text
 from src.gateway.sessions import SessionManager
 from src.gateway.terminals import TerminalManager
-from src.gateway.api import vault, config, health, logs, control, usage, providers, models, scheduled_tasks, workflow_tasks, mcps, marketplace, sessions as sessions_api, system as system_api, network as network_api, chat as chat_api, terminals as terminals_api, commands as commands_api, events as events_api, budgets as budgets_api, quality as quality_api, llm as llm_api, skills as skills_api, accounts as accounts_api
+from src.gateway.capabilities import (
+    CAPABILITY_HEARTBEAT_TIMEOUT_S,
+    CAPABILITY_PROTOCOL,
+    CapabilityConnection,
+    CapabilityRegistry,
+    ClientCapabilityError,
+)
+from src.gateway.api import vault, config, health, logs, control, usage, providers, models, scheduled_tasks, workflow_tasks, mcps, marketplace, sessions as sessions_api, system as system_api, network as network_api, chat as chat_api, terminals as terminals_api, commands as commands_api, events as events_api, budgets as budgets_api, quality as quality_api, llm as llm_api, skills as skills_api, accounts as accounts_api, operational as operational_api, artifacts as artifacts_api, custom_views as custom_views_api
 from src.network import peers as peers_api
 from src.network.auth.middleware import make_auth_middleware
 from src.network.transport.aiohttp_iroh_site import IrohSite
@@ -158,10 +166,24 @@ class Gateway:
         self._stop_event = stop_event
         self.sessions = SessionManager(agent_name=agent.name)
         # PTY-backed interactive terminals (the "SSH terminal" surface).
-        # Keyed by (client_id, terminal_id); torn down per-client when a
-        # websocket drops so a closed app never leaks live shells.
+        # Keyed by (connection_id, terminal_id); device identity is audit/auth
+        # metadata only. This lets Desktop and CLI share a device certificate
+        # without sharing or tearing down each other's shells.
         self.terminals = TerminalManager()
-        self.clients: dict[str, object] = {}  # client_id → WebSocketResponse
+        # Chat sockets are keyed per *connection*, not per device. Desktop and
+        # CLI may be online under the same device certificate simultaneously;
+        # neither is allowed to evict the other. The authenticated device id is
+        # tracked separately for turn routing and revocation.
+        self.clients: dict[str, object] = {}  # connection_id → WebSocketResponse
+        self._chat_client_devices: dict[str, str] = {}
+        self._chat_client_instances: dict[str, str | None] = {}
+        self._chat_client_render_contexts: dict[
+            str, tuple[str | None, tuple[tuple[str, bool | int | str], ...]]
+        ] = {}
+        self._chat_client_auth_epochs: dict[str, int] = {}
+        self.capabilities = CapabilityRegistry()
+        self._capability_reaper_task: asyncio.Task | None = None
+        self._event_loop: asyncio.AbstractEventLoop | None = None
         # Per-socket send lock: serialises EVERY write to a given WebSocket so
         # concurrent producers can't interleave frames on the wire. Without it,
         # broadcasting a child session's live deltas (the scheduler / workflow
@@ -241,6 +263,123 @@ class Gateway:
         self._config_change_callbacks: dict[
             str, Callable[[dict], Awaitable[None]]
         ] = {}
+
+        # Coordinator revocation is live: close every chat/capability socket
+        # and fail its pending calls as soon as the auth state is updated.
+        auth_state = getattr(self._network_state, "auth_state", None)
+        add_listener = getattr(auth_state, "add_revocation_listener", None)
+        if callable(add_listener):
+            add_listener(self._on_device_revoked)
+
+    def _on_device_revoked(self, device_pubkey: bytes) -> None:
+        device_id = bytes(device_pubkey).hex()
+        auth_state = getattr(self._network_state, "auth_state", None)
+        epoch_reader = getattr(auth_state, "device_epoch", None)
+        revocation_epoch = (
+            epoch_reader(device_pubkey) if callable(epoch_reader) else None
+        )
+        loop = self._event_loop
+        if loop is None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return
+        if loop.is_closed():
+            return
+
+        def _schedule_close() -> None:
+            if not loop.is_closed():
+                loop.create_task(self._close_device_connections(
+                    device_id, revocation_epoch=revocation_epoch,
+                ))
+
+        # Coordinator callbacks currently run on the gateway loop, but using
+        # the thread-safe scheduler keeps revocation immediate if a future
+        # roster watcher invokes listeners from another thread.
+        loop.call_soon_threadsafe(_schedule_close)
+
+    async def _close_device_connections(
+        self,
+        device_id: str,
+        *,
+        revocation_epoch: int | None = None,
+    ) -> None:
+        cleanup: list[Awaitable[Any]] = [self.capabilities.close_device(
+            device_id,
+            reason="device revoked",
+            revocation_epoch=revocation_epoch,
+        )]
+        # A durable session may simultaneously be open from devices A and B.
+        # Revoke only ingress-owned work from A; cancelling the holder/session
+        # wholesale would wrongly terminate B's independent turn or burst.
+        for holder in list(self._stream_sessions.values()):
+            revoke_ingress = getattr(holder.session, "revoke_ingress_device", None)
+            if callable(revoke_ingress):
+                cleanup.append(revoke_ingress(
+                    device_id, revocation_epoch=revocation_epoch,
+                ))
+
+        async def close_chat(ws: Any) -> None:
+            if ws is None or getattr(ws, "closed", False):
+                return
+            try:
+                await ws.close(code=4003, message=b"device revoked")
+            except Exception:
+                pass
+
+        for connection_id, registered_device in list(self._chat_client_devices.items()):
+            if registered_device != device_id:
+                continue
+            if (
+                revocation_epoch is not None
+                and self._chat_client_auth_epochs.get(connection_id, 0)
+                >= revocation_epoch
+            ):
+                continue
+            cleanup.append(close_chat(self.clients.get(connection_id)))
+        results = await asyncio.gather(*cleanup, return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                logger.error(
+                    "device revocation cleanup failed: device=%s error=%s",
+                    device_id,
+                    type(result).__name__,
+                )
+
+    async def _request_device_still_authorized(self, request, cert) -> bool:
+        """Revalidate a device-cert request after a suspending WS upgrade.
+
+        Middleware authentication and handler registration are separated by
+        awaits (WebSocket prepare and capability hello).  The per-device epoch
+        closes that TOCTOU window; the live roster check prevents an inactive
+        member from surviving merely because its close callback is delayed.
+        Synthetic HTTP/agent identities are deliberately outside this device
+        capability boundary.
+        """
+
+        if request.get("auth_kind") != "device_cert":
+            return True
+        auth_state = getattr(self._network_state, "auth_state", None)
+        epoch_reader = getattr(auth_state, "device_epoch", None)
+        expected_epoch = request.get("device_auth_epoch")
+        if (
+            not callable(epoch_reader)
+            or not isinstance(expected_epoch, int)
+            or epoch_reader(cert.device_pubkey) != expected_epoch
+            or cert.device_pubkey in getattr(auth_state, "revoked_pubkeys", set())
+        ):
+            return False
+        if "bridge" in (getattr(cert, "capabilities", None) or []):
+            return True
+        try:
+            active = await auth_state.device_is_active(cert.device_pubkey)
+        except Exception:  # noqa: BLE001 - authorization uncertainty is denial
+            auth_state.disconnect(cert.device_pubkey)
+            return False
+        if not active:
+            auth_state.disconnect(cert.device_pubkey)
+            return False
+        return epoch_reader(cert.device_pubkey) == expected_epoch
 
     async def _safe_ws_send_json(self, ws, payload: dict) -> bool:
         """Best-effort websocket send that tolerates closing transports.
@@ -806,6 +945,8 @@ class Gateway:
         from aiohttp import web
         from aiohttp.web import middleware
 
+        self._event_loop = asyncio.get_running_loop()
+
         # Surface freshly-spawned child sessions (delegations, scheduled
         # firings, workflow nodes) to connected clients in real time, and stream
         # a detached child run's live deltas to every client (its run screen).
@@ -839,17 +980,40 @@ class Gateway:
                     resp = web.Response(status=500, text=str(exc))
             resp.headers["Access-Control-Allow-Origin"] = "*"
             resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-            resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, If-Match"
             return resp
 
         # Order matters: cors first (handles OPTIONS preflight without
         # going through auth), then auth (every other request needs a
         # valid device cert). Both run for every route added below.
         auth_middleware = make_auth_middleware(self._network_state.auth_state)
-        app = web.Application(middlewares=[cors, auth_middleware])
+        app = web.Application(
+            middlewares=[
+                cors,
+                custom_views_api.body_limit_middleware,
+                auth_middleware,
+            ],
+        )
         app["gateway"] = self  # accessible in handlers via request.app["gateway"]
         self.sessions.set_db(self.agent.memory_db)
         self._register_routes(app)
+        # Operational migration/backfill/search warming is lifecycle-owned.
+        # REST discovery stays status-only and never performs an unbounded
+        # parse/index pass inside a client's timeout budget.
+        operational_api.start_background_maintenance(self)
+        # REST, WebSocket, and the in-process ui-manager MCP all resolve this
+        # same service instance from the canonical MemoryDB. Starting it here
+        # restores `always` sources and owns every child process until stop().
+        from src.custom_views.service import service_for_gateway
+
+        local_e2e = bool(
+            isinstance(getattr(self.agent, "config", None), dict)
+            and self.agent.config.get("_local_e2e") is True
+        )
+        # A disposable browsing fixture may contain copied source definitions.
+        # Never resume persistent commands from that copy; controlled tests can
+        # still exercise a source explicitly through refresh/action endpoints.
+        await service_for_gateway(self).start(resume_always=not local_e2e)
 
         runner = web.AppRunner(app)
         await runner.setup()
@@ -991,6 +1155,9 @@ class Gateway:
         self._system_broadcast_task = asyncio.create_task(
             self._system_broadcast_loop(), name="gateway-system-broadcast"
         )
+        self._capability_reaper_task = asyncio.create_task(
+            self._capability_reaper_loop(), name="gateway-capability-reaper",
+        )
 
     async def _maybe_start_webhook_listener(self) -> None:
         """Start the dedicated webhook listener if ``channels.webhook.enabled``.
@@ -1021,6 +1188,13 @@ class Gateway:
                  error=str(exc))
 
     async def stop(self) -> None:
+        try:
+            from src.custom_views.service import service_for_gateway
+
+            await service_for_gateway(self).close()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Custom View runtime stop failed: %s", e)
+        await operational_api.stop_background_maintenance(self)
         if self._webhook_site is not None:
             try:
                 await self._webhook_site.stop()
@@ -1032,6 +1206,13 @@ class Gateway:
             await self.terminals.close_all()
         except Exception as e:  # noqa: BLE001
             logger.debug("terminal close_all on stop failed: %s", e)
+        if self._capability_reaper_task is not None:
+            self._capability_reaper_task.cancel()
+            try:
+                await self._capability_reaper_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._capability_reaper_task = None
         if self._system_broadcast_task is not None:
             self._system_broadcast_task.cancel()
             try:
@@ -1075,7 +1256,13 @@ class Gateway:
         for key in list(self._stream_sessions):
             await self._close_stream_session(key)
         self._live_replays.clear()
+        await self.capabilities.close_all()
         self.clients.clear()
+        self._chat_client_devices.clear()
+        self._chat_client_instances.clear()
+        self._chat_client_render_contexts.clear()
+        self._chat_client_auth_epochs.clear()
+        self._event_loop = None
 
     async def _system_broadcast_loop(self) -> None:
         """Push a ``system_snapshot`` to all clients on a fixed cadence.
@@ -1103,9 +1290,30 @@ class Gateway:
             except Exception as e:  # noqa: BLE001
                 logger.debug("system broadcast skipped: %s", e)
 
+    async def _capability_reaper_loop(self) -> None:
+        """Reap half-open capability sockets that stopped heartbeating."""
+
+        interval = max(5.0, CAPABILITY_HEARTBEAT_TIMEOUT_S / 3.0)
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                stale = await self.capabilities.reap_stale()
+                for conn in stale:
+                    elog(
+                        "gateway.capability_stale",
+                        client_id=conn.device_id,
+                        client_instance_id=conn.client_instance_id,
+                        generation=conn.generation,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — keep the reap loop live
+                logger.debug("capability stale reap skipped: %s", exc)
+
     def _register_routes(self, app) -> None:
         """Register the gateway WebSocket endpoint and REST API routes."""
         app.router.add_get("/ws", self._handle_ws)
+        app.router.add_get("/ws/capabilities", self._handle_capabilities_ws)
         app.router.add_post("/api/upload", self._handle_upload)
         app.router.add_get("/api/files", self._handle_files)
         app.router.add_get("/api/agent-info", self._handle_agent_info)
@@ -1114,6 +1322,34 @@ class Gateway:
 
         routes = (
             ("GET", "/api/health", health.handle_health),
+            ("POST", "/api/artifacts", artifacts_api.handle_upload),
+            ("GET", "/api/artifacts/{artifact_id}", artifacts_api.handle_metadata),
+            ("GET", "/api/artifacts/{artifact_id}/content", artifacts_api.handle_content),
+            ("GET", "/api/capabilities", operational_api.handle_capabilities),
+            ("GET", "/api/ui/capabilities", custom_views_api.handle_capabilities),
+            ("GET", "/api/ui/views", custom_views_api.handle_list),
+            ("POST", "/api/ui/views", custom_views_api.handle_create),
+            ("GET", "/api/ui/views/{id}", custom_views_api.handle_get),
+            ("PUT", "/api/ui/views/{id}", custom_views_api.handle_update),
+            ("DELETE", "/api/ui/views/{id}", custom_views_api.handle_delete),
+            ("POST", "/api/ui/views/{id}/reactivate", custom_views_api.handle_reactivate),
+            ("PUT", "/api/ui/views/{id}/data/{key}", custom_views_api.handle_set_data),
+            ("POST", "/api/ui/views/{id}/data/{key}", custom_views_api.handle_set_data),
+            ("PUT", "/api/ui/views/{id}/sources/{key}", custom_views_api.handle_configure_source),
+            ("DELETE", "/api/ui/views/{id}/sources/{key}", custom_views_api.handle_delete_source),
+            ("POST", "/api/ui/views/{id}/sources/{key}/refresh", custom_views_api.handle_refresh_source),
+            ("POST", "/api/ui/views/{id}/actions/{action_id}", custom_views_api.handle_action),
+            ("GET", "/api/ui/views/{id}/grants", custom_views_api.handle_list_grants),
+            ("PUT", "/api/ui/views/{id}/grants", custom_views_api.handle_set_grant),
+            ("DELETE", "/api/ui/views/{id}/grants", custom_views_api.handle_delete_grant),
+            ("GET", "/api/ui/views/{id}/revisions/{revision}/assets/{path:.+}", custom_views_api.handle_asset),
+            ("GET", "/api/history", operational_api.handle_history),
+            ("POST", "/api/search", operational_api.handle_search),
+            ("GET", "/api/sessions/{session_id}/messages", operational_api.handle_session_messages),
+            ("GET", "/api/sessions/{session_id}/related-runs", operational_api.handle_session_related_runs),
+            ("GET", "/api/sessions/{session_id}/descendants", operational_api.handle_session_descendants),
+            ("GET", "/api/tool-invocations/{tool_id}", operational_api.handle_tool_invocation),
+            ("GET", "/api/scheduled-runs/{run_id}", operational_api.handle_scheduled_run),
             ("GET", "/api/vault/notes", vault.handle_list),
             ("GET", "/api/vault/graph", vault.handle_graph),
             ("GET", "/api/vault/search", vault.handle_search),
@@ -1146,9 +1382,10 @@ class Gateway:
             ("POST", "/api/scheduled-tasks/{id}/stop", scheduled_tasks.handle_stop),
             ("PATCH", "/api/scheduled-tasks/{id}", scheduled_tasks.handle_update),
             ("DELETE", "/api/scheduled-tasks/{id}", scheduled_tasks.handle_delete),
-            # Workflow engine (n8n-style multi-block pipelines). Same
-            # scheduler 503 invariant as scheduled-tasks — handlers
-            # return 503 when no Scheduler is attached.
+            # Workflow engine (n8n-style multi-block pipelines). Durable GETs
+            # remain available while background workers are parked; mutations
+            # and execution return 503 when no Scheduler is attached, matching
+            # the scheduled-task surface.
             ("GET", "/api/workflows", workflow_tasks.handle_list),
             ("POST", "/api/workflows", workflow_tasks.handle_create),
             ("GET", "/api/workflows/{id}", workflow_tasks.handle_get),
@@ -1345,42 +1582,78 @@ class Gateway:
     # ── File upload ──
 
     async def _handle_upload(self, request):
-        """POST /api/upload — save file, auto-transcribe if audio.
+        """POST /api/upload — persist a file, auto-transcribe if audio.
 
-        Returns {path, filename, transcription?}. If the file is audio
-        (webm, ogg, mp3, wav, m4a), it's transcribed via faster-whisper
-        or OpenAI Whisper and the text is returned in `transcription`.
+        This is the backward-compatible flat response used by released app
+        versions.  New clients may use ``POST /api/artifacts`` directly; both
+        routes store identical CAS metadata and return the same AttachmentRef
+        fields.  If the file is audio it is transcribed best-effort.
         """
         from aiohttp import web
-        import os
-        import tempfile
+        from contextlib import suppress
+        from src.gateway.api.artifacts import _read_form
+        from src.memory.artifacts import (
+            ArtifactNotFound,
+            AttachmentTooLarge,
+            normalize_inbound_attachments,
+            safe_attachment_filename,
+        )
+        from src.memory.operational.access import AccessContext
 
-        reader = await request.multipart()
-        field = await reader.next()
-        if not field:
-            return web.json_response({"error": "No file"}, status=400)
-
-        filename = field.filename or "upload"
-        elog("upload.received", filename=filename)
-        tmp = tempfile.mkdtemp(prefix="oa_upload_")
-        path = f"{tmp}/{filename}"
-        with open(path, "wb") as f:
-            while True:
-                chunk = await field.read_chunk()
-                if not chunk:
-                    break
-                f.write(chunk)
-
-        # On macOS ``tempfile.mkdtemp()`` returns a path under
-        # ``/var/folders/...`` — a symlink to ``/private/var/folders/...``.
-        # The reference ``@modelcontextprotocol/server-filesystem`` compares
-        # tool-call paths to its allowlist by string-prefix against
-        # realpaths, so a caller who hands the logical ``/var/folders/...``
-        # path to ``read_text_file`` gets "Access denied — path outside
-        # allowed directories" even though the realpath IS allowed. Resolve
-        # here so the returned path matches what filesystem MCP will accept.
-        path = os.path.realpath(path)
-        result: dict = {"path": path, "filename": filename}
+        staged = None
+        try:
+            access = AccessContext.from_request(request)
+            staged, metadata = await _read_form(request)
+            filename = safe_attachment_filename(
+                metadata.get("filename") or staged.name,
+            )
+            elog("upload.received", filename=filename)
+            session_id = str(
+                metadata.get("session_id")
+                or request.query.get("session_id")
+                or ""
+            ).strip()
+            refs = await normalize_inbound_attachments(
+                self.agent.memory_db,
+                ({
+                    "path": str(staged),
+                    "filename": filename,
+                    "mime_type": metadata.get("mime_type") or None,
+                    "kind": metadata.get("kind") or "file",
+                },),
+                session_id=session_id,
+                principal=access,
+                # The path is the private multipart staging file created by
+                # ``_read_form``, never a host path supplied in JSON/WS data.
+                allow_local_paths=True,
+            )
+            if not refs:
+                return web.json_response({"error": "No file"}, status=400)
+            result: dict = dict(refs[0])
+            path = str(result["path"])
+            # Keep the suffixed staging name through optional STT. CAS paths
+            # are digest-only, while ffmpeg/Whisper still use the extension as
+            # a container hint. The durable path returned to the client is
+            # already ``path`` above; staging is removed before responding.
+            transcribe_path = str(staged)
+        except AttachmentTooLarge as exc:
+            if staged is not None:
+                with suppress(OSError):
+                    staged.unlink()
+            return web.json_response(
+                {"error": str(exc), "limit_bytes": exc.limit_bytes},
+                status=413,
+            )
+        except (ArtifactNotFound, OSError, PermissionError, ValueError) as exc:
+            if staged is not None:
+                with suppress(OSError):
+                    staged.unlink()
+            return web.json_response({"error": str(exc) or "Invalid upload"}, status=400)
+        except Exception:
+            if staged is not None:
+                with suppress(OSError):
+                    staged.unlink()
+            raise
 
         # Auto-transcribe audio files
         from src.channels.voice import is_audio_file
@@ -1400,7 +1673,7 @@ class Gateway:
             try:
                 from src.channels.voice import transcribe
                 text = await transcribe(
-                    path,
+                    transcribe_path,
                     db=getattr(self.agent, "db", None),
                     language=lang,
                 )
@@ -1425,6 +1698,9 @@ class Gateway:
                 )
 
         elog("upload.saved", filename=filename, path=path, transcribed=bool(result.get("transcription")))
+        if staged is not None:
+            with suppress(OSError):
+                staged.unlink()
         return web.json_response(result)
 
     def _check_bearer_token(self, request) -> bool:
@@ -1514,115 +1790,88 @@ class Gateway:
     # ── File serving (agent → client) ──
 
     async def _handle_files(self, request):
-        """GET /api/files?path=<abs>&token=<gateway-token>
+        """Deprecated path compatibility for authorized CAS attachments.
 
-        Serve a local file off the agent server's filesystem so remote
-        clients (desktop app, CLI) can fetch attachments the agent
-        emitted via ``[IMAGE:/path]`` / ``[FILE:/path]`` / ``[VOICE:/path]``
-        / ``[VIDEO:/path]`` markers in a response.
-
-        The agent runs with broad filesystem access and already returns
-        the absolute path to the client in the WS ``response`` message's
-        ``attachments`` array. For local installs the client can read
-        the path directly; for remote installs (app on your laptop,
-        agent on a VPS) this endpoint ferries the bytes over HTTP.
-
-        **Authentication**: requires ``token`` query param matching the
-        gateway token (same token clients use for WS auth). Without a
-        configured token, reads are unauthenticated — this matches the
-        existing ``/api/*`` endpoints which also rely on the gateway
-        binding to localhost for single-user deploys.
-
-        **Path safety**: we use ``os.path.realpath`` before checking
-        ``isfile`` so symlinks resolve, and we reject paths that don't
-        resolve to an actual file. Since the gateway token is required,
-        we don't further restrict to specific directories — the agent
-        has full FS access anyway, so any allow-listing would be
-        theater against a caller who already holds the token.
+        New clients use ``/api/artifacts/{id}/content``.  A legacy ``path``
+        is accepted only when it resolves to this agent's canonical CAS and
+        the authenticated principal can still view an active linked resource.
+        Authentication is not authority to read arbitrary host files.
         """
         from aiohttp import web
-        import os
+        from aiohttp.helpers import content_disposition_header
+        import hashlib
         import mimetypes
 
-        # Auth is enforced by ``make_auth_middleware`` for every
-        # ``/api/*`` route — by the time the handler runs the cert is
-        # already verified. Defensive sanity check kept so a misrouted
-        # request without a cert can't bypass FS access.
-        if request.get("device_cert") is None:
+        from src.memory.artifacts import (
+            ArtifactIntegrityError,
+            ArtifactNotFound,
+            artifact_for_legacy_path,
+            attachment_limit_bytes,
+            safe_attachment_filename,
+        )
+        from src.memory.operational.access import AccessContext
+
+        try:
+            access = AccessContext.from_request(request)
+        except PermissionError:
             return web.Response(status=401, text="Unauthorized")
 
         path = request.query.get("path", "")
         if not path:
             return web.Response(status=400, text="path required")
-
-        real = os.path.realpath(path)
-        if not os.path.isfile(real):
+        db = getattr(self.agent, "memory_db", None)
+        if db is None:
+            return web.Response(status=404, text="not found")
+        try:
+            artifact, real = await artifact_for_legacy_path(db, path, access)
+        except ArtifactIntegrityError:
+            return web.Response(status=503, text="artifact unavailable")
+        except ArtifactNotFound:
             return web.Response(status=404, text="not found")
 
-        # IMPORTANT: do NOT use ``web.FileResponse`` here. The gateway serves
-        # HTTP over a custom asyncio transport (``IrohSite`` → QUIC), which has
-        # no real socket, so ``FileResponse``'s zero-copy ``sendfile`` path is
-        # unavailable and its fallback interacts badly with our fire-and-forget
-        # ``IrohStreamWriter`` — the client got 200 + Content-Length but ZERO
-        # body bytes ("transfer closed with N bytes remaining"), i.e. a blank
-        # image in the app and broken downloads, both locally and (always) for
-        # remote clients which reach the gateway exclusively over this
-        # transport. Reading the bytes and returning them as a plain
-        # ``web.Response`` uses the exact same write+drain path as every JSON
-        # response (which works), so the body is delivered in full. See
-        # ``IrohStreamWriter._drain_then_finish`` for the transport-side flush.
-        # Size cap: the whole body is buffered here AND again by the
-        # fire-and-forget Iroh writer, so an unbounded read can OOM the gateway
-        # (which also serves every WS stream). Streaming wouldn't help — the
-        # transport has no working backpressure, so it buffers each chunk
-        # anyway. Reject oversized files instead. Configurable; 0 disables.
-        try:
-            max_mb = int(os.environ.get("OPENAGENT_MAX_ATTACHMENT_MB", "256") or "256")
-        except ValueError:
-            max_mb = 256
-        try:
-            size = os.path.getsize(real)
-        except OSError:
-            return web.Response(status=404, text="not found")
-        if max_mb > 0 and size > max_mb * 1024 * 1024:
-            return web.Response(status=413, text=f"file too large ({size} bytes; cap {max_mb} MB)")
+        size = int(artifact["size_bytes"])
+        limit = attachment_limit_bytes(direction="output")
+        if limit and size > limit:
+            return web.Response(
+                status=413,
+                text=f"file too large ({size} bytes; cap {limit} bytes)",
+            )
 
         try:
-            with open(real, "rb") as fh:
-                data = fh.read()
+            data = await asyncio.to_thread(real.read_bytes)
         except MemoryError:
             return web.Response(status=503, text="file too large to serve")
         except OSError:
             return web.Response(status=404, text="not found")
+        if len(data) != size or hashlib.sha256(data).hexdigest() != str(artifact["sha256"]):
+            return web.Response(status=503, text="artifact unavailable")
 
-        # Content-Type: prefer the stdlib guess, but fall back to an explicit
-        # map for the media/doc types we attach. A slim container may ship no
-        # ``/etc/mime.types``, and ``application/octet-stream`` would stop
-        # ``<video>``/``<audio>`` from playing inline in the app.
-        ctype = mimetypes.guess_type(real)[0]
+        canonical_name = safe_attachment_filename(
+            artifact["authorized_filename"] or artifact["id"]
+        )
+        ctype = str(artifact["mime"] or "") or mimetypes.guess_type(canonical_name)[0]
         if not ctype:
-            ext = os.path.splitext(real)[1].lower().lstrip(".")
+            ext = canonical_name.rsplit(".", 1)[-1].lower() if "." in canonical_name else ""
             ctype = _ATTACHMENT_MIME_FALLBACK.get(ext, "application/octet-stream")
 
-        # Sanitize the filename for the header so a crafted name can't inject
-        # CR/LF or break out of the quoted value; the exact UTF-8 name still
-        # rides in ``filename*`` (RFC 5987).
-        from urllib.parse import quote as _urlquote
-        raw_name = os.path.basename(real)
-        safe_name = raw_name.replace("\\", "_").replace('"', "").replace("\r", "").replace("\n", "")
-        # ``?inline=1`` lets a client embed the file for preview (e.g. a PDF in
-        # an <iframe>) instead of forcing a download; default stays
-        # ``attachment``. Inline media (<img>/<video>/<audio>) ignores it anyway.
         disposition = "inline" if request.query.get("inline") in ("1", "true") else "attachment"
-        content_disposition = (
-            f"{disposition}; filename=\"{safe_name}\"; filename*=UTF-8''{_urlquote(raw_name)}"
+        content_disposition = content_disposition_header(
+            disposition,
+            filename=canonical_name,
         )
         return web.Response(
             body=data,
             content_type=ctype,
             headers={
                 "Content-Disposition": content_disposition,
-                "Cache-Control": "private, max-age=60",
+                # Revalidate on every request so a link ACL change takes
+                # effect immediately even for legacy clients.
+                "Cache-Control": "private, no-store",
+                "Deprecation": "true",
+                "Link": (
+                    f"</api/artifacts/{artifact['id']}/content>; rel=\"alternate\""
+                ),
+                "X-Content-Type-Options": "nosniff",
             },
         )
 
@@ -1631,6 +1880,219 @@ class Gateway:
     async def _handle_options(self, request):
         from aiohttp import web
         return web.Response(status=204)
+
+    @staticmethod
+    async def _close_replaced_websocket(old_ws: Any) -> None:
+        """Retire a superseded device transport without inviting a reconnect.
+
+        A normal ``1000`` close is indistinguishable from a transient gateway
+        restart to first-party clients, which intentionally auto-reconnect.
+        If two transports present the same device identity that behaviour
+        makes them replace one another forever.  The private close contract
+        tells only the old transport to stay down; the new one remains in the
+        client registry and continues normally.
+        """
+        if getattr(old_ws, "closed", True):
+            return
+        await old_ws.close(
+            code=P.WS_CLOSE_CONNECTION_REPLACED_CODE,
+            message=P.WS_CLOSE_CONNECTION_REPLACED_REASON.encode("utf-8"),
+        )
+
+    async def _handle_capabilities_ws(self, request):
+        """Serve one authenticated local capability host.
+
+        This endpoint is intentionally stricter than the general Gateway API:
+        only a real coordinator-issued device cert transported by its matching
+        Iroh peer may register machine-control tools. Shared HTTP tokens,
+        in-process bridges and agent-to-agent ALPN peers are rejected even
+        though they may access other scoped Gateway routes.
+        """
+        from aiohttp import web, WSMsgType
+        from src.network.transport.aiohttp_iroh_site import (
+            current_device_cert_wire,
+            current_is_authenticated_agent,
+        )
+
+        cert = request.get("device_cert")
+        if cert is None:
+            return web.Response(status=401, text="Unauthorized")
+        if (
+            request.get("auth_kind") != "device_cert"
+            or current_is_authenticated_agent()
+            or not current_device_cert_wire()
+            or "agent" in (getattr(cert, "capabilities", None) or [])
+            or "bridge" in (getattr(cert, "capabilities", None) or [])
+        ):
+            return web.Response(
+                status=403,
+                text="client capabilities require a proof-of-possession device connection",
+            )
+
+        ws = web.WebSocketResponse(heartbeat=30.0)
+        await ws.prepare(request)
+        conn: CapabilityConnection | None = None
+
+        async def _send_error(error: ClientCapabilityError) -> None:
+            await self._safe_ws_send_json(ws, {
+                "type": P.ERROR,
+                "error": error.as_dict(),
+            })
+
+        try:
+            try:
+                first = await asyncio.wait_for(ws.receive(), timeout=10.0)
+            except asyncio.TimeoutError:
+                await ws.close(code=4000, message=b"capability hello timeout")
+                return ws
+            if first.type != WSMsgType.TEXT:
+                await ws.close(code=4000, message=b"capability hello required")
+                return ws
+            try:
+                hello = json.loads(first.data)
+            except (TypeError, json.JSONDecodeError):
+                await ws.close(code=4000, message=b"invalid capability hello")
+                return ws
+            if hello.get("type") != P.CAPABILITY_HELLO:
+                await ws.close(code=4000, message=b"capability_hello must be first")
+                return ws
+            if hello.get("protocol") != CAPABILITY_PROTOCOL:
+                await self._safe_ws_send_json(ws, {
+                    "type": P.ERROR,
+                    "error": {
+                        "code": "UNSUPPORTED_PROTOCOL",
+                        "message": f"expected {CAPABILITY_PROTOCOL}",
+                    },
+                })
+                await ws.close(code=4000, message=b"unsupported capability protocol")
+                return ws
+            claimed_network_id = hello.get("network_id")
+            if (
+                claimed_network_id is not None
+                and str(claimed_network_id) != cert.network_id
+            ):
+                await ws.close(
+                    code=4003,
+                    message=b"capability network does not match device certificate",
+                )
+                return ws
+
+            # ``prepare`` + waiting for hello create an intentional await gap
+            # after middleware authentication. Revalidate before publishing
+            # any catalog into the registry; register also checks this epoch
+            # under its own lock to close the final race.
+            if not await self._request_device_still_authorized(request, cert):
+                await ws.close(code=4003, message=b"device authorization changed")
+                return ws
+            auth_state = self._network_state.auth_state
+            auth_epoch = int(request.get("device_auth_epoch", -1))
+
+            conn = await self.capabilities.register(
+                device_id=cert.device_pubkey_hex,
+                account_id=cert.network_id,
+                client_instance_id=hello.get("client_instance_id"),
+                generation=hello.get("generation"),
+                device_label=hello.get("device_label"),
+                ws=ws,
+                send_json=self._safe_ws_send_json,
+                servers=hello.get("servers"),
+                network_id=cert.network_id,
+                auth_epoch=auth_epoch,
+                auth_epoch_reader=lambda: auth_state.device_epoch(cert.device_pubkey),
+            )
+            await self._safe_ws_send_json(ws, {
+                "type": P.CAPABILITY_HELLO_ACK,
+                "protocol": CAPABILITY_PROTOCOL,
+                "device_id": conn.device_id,
+                "account_id": conn.account_id,
+                "network_id": conn.network_id,
+                "client_instance_id": conn.client_instance_id,
+                "generation": conn.generation,
+                "accepted": True,
+            })
+            elog(
+                "gateway.capability_connect",
+                client_id=conn.device_id,
+                client_instance_id=conn.client_instance_id,
+                generation=conn.generation,
+                servers=len(conn.catalog),
+            )
+
+            async for msg in ws:
+                if msg.type != WSMsgType.TEXT:
+                    break
+                try:
+                    frame = json.loads(msg.data)
+                except (TypeError, json.JSONDecodeError):
+                    await _send_error(ClientCapabilityError("INVALID_JSON", "invalid JSON frame"))
+                    continue
+                t = frame.get("type")
+                try:
+                    if t == P.CAPABILITY_CATALOG_UPDATE:
+                        await self.capabilities.update_catalog(
+                            conn,
+                            generation=frame.get("generation"),
+                            servers=frame.get("servers"),
+                        )
+                    elif t == P.CLIENT_TOOL_RESULT:
+                        self.capabilities.resolve_result(conn, frame)
+                    elif t == P.CLIENT_TOOL_EVENT:
+                        event_ack = self.capabilities.receive_tool_event(conn, frame)
+                        await self._safe_ws_send_json(ws, {
+                            "type": P.CLIENT_TOOL_EVENT_ACK,
+                            "generation": conn.generation,
+                            **event_ack,
+                        })
+                    elif t == P.CAPABILITY_HEARTBEAT:
+                        if int(frame.get("generation") or 0) != conn.generation:
+                            raise ClientCapabilityError(
+                                "STALE_GENERATION",
+                                "heartbeat generation does not match connection",
+                            )
+                        # Re-check coordinator membership while this long-lived
+                        # stream is open; a miss flows through the same revoke
+                        # listener that closes every sibling connection.
+                        if not await self._request_device_still_authorized(
+                            request, cert,
+                        ):
+                            break
+                        conn.last_seen_at = time.time()
+                        await self._safe_ws_send_json(ws, {
+                            "type": P.CAPABILITY_HEARTBEAT_ACK,
+                            "generation": conn.generation,
+                            "ts_ms": int(time.time() * 1000),
+                        })
+                    elif t == P.PING:
+                        await self._safe_ws_send_json(ws, {"type": P.PONG})
+                    elif t == P.CLIENT_ARTIFACT_CHUNK:
+                        self.capabilities.receive_artifact_chunk(conn, frame)
+                    else:
+                        raise ClientCapabilityError(
+                            "UNKNOWN_FRAME", f"unsupported capability frame {t!r}",
+                        )
+                except ClientCapabilityError as error:
+                    await _send_error(error)
+                    if error.code == "CLIENT_REVOKED":
+                        await ws.close(
+                            code=4003, message=b"device authorization changed",
+                        )
+                        break
+        except ClientCapabilityError as error:
+            await _send_error(error)
+            if error.code == "CLIENT_REVOKED":
+                await ws.close(
+                    code=4003, message=b"device authorization changed",
+                )
+        finally:
+            if conn is not None:
+                await self.capabilities.unregister(conn)
+                elog(
+                    "gateway.capability_disconnect",
+                    client_id=conn.device_id,
+                    client_instance_id=conn.client_instance_id,
+                    generation=conn.generation,
+                )
+        return ws
 
     async def _handle_ws(self, request):
         from aiohttp import web, WSMsgType
@@ -1647,6 +2109,13 @@ class Gateway:
         ws = web.WebSocketResponse()
         await ws.prepare(request)
 
+        # A device may be revoked while the HTTP upgrade is suspended. Do not
+        # insert a late chat socket after the revocation callback took its
+        # snapshot; the same epoch is checked again on every inbound frame.
+        if not await self._request_device_still_authorized(request, cert):
+            await ws.close(code=4003, message=b"device authorization changed")
+            return ws
+
         # ``client_id`` is bound to the device's pubkey. This means a
         # reconnect from the same device picks up its existing
         # StreamSessions; a different device gets a fresh slot. The
@@ -1658,16 +2127,19 @@ class Gateway:
         # instead of ``client_id``.
         client_id: str = cert.device_pubkey_hex
         request["user_handle"] = cert.handle
-        old_ws = self.clients.get(client_id)
-        self.clients[client_id] = ws
-        await self._adopt_sessions_to_ws(client_id, ws, handle=cert.handle)
-        if old_ws is not None and old_ws is not ws:
-            elog("gateway.client_reconnect", client_id=client_id)
-            if not getattr(old_ws, "closed", True):
-                try:
-                    await old_ws.close()
-                except Exception as e:  # noqa: BLE001
-                    logger.debug("old ws close failed: %s", e)
+        from src.custom_views.service import service_for_gateway
+        from src.memory.operational.access import AccessContext
+
+        ui_service = service_for_gateway(self)
+        ui_access = AccessContext.from_request(request)
+        connection_id = uuid.uuid4().hex
+        self.clients[connection_id] = ws
+        self._chat_client_devices[connection_id] = client_id
+        self._chat_client_instances[connection_id] = None
+        self._chat_client_render_contexts[connection_id] = (None, ())
+        self._chat_client_auth_epochs[connection_id] = int(
+            request.get("device_auth_epoch", 0),
+        )
 
         # Greet the client. Old clients sent an AUTH frame and waited
         # for AUTH_OK; the new wire skips the AUTH frame but keeps the
@@ -1680,6 +2152,10 @@ class Gateway:
             "agent_name": self.agent.name,
             "version": getattr(src, "__version__", "?"),
             "handle": cert.handle,
+            # Opaque, websocket-scoped owner token for auxiliary REST reads
+            # such as GET /api/terminals. It is never accepted as identity;
+            # the device certificate remains the authentication boundary.
+            "connection_id": connection_id,
             # Human-readable name (``agent-personal``) so the renderer
             # can pass it back through as the ``network`` segment of
             # ``handle@network`` on re-login. ``network_id`` is the
@@ -1696,6 +2172,16 @@ class Gateway:
         last_msg_type: str | None = None
         try:
             async for msg in ws:
+                if (
+                    request.get("auth_kind") == "device_cert"
+                    and self._network_state.auth_state.device_epoch(
+                        cert.device_pubkey,
+                    ) != request.get("device_auth_epoch")
+                ):
+                    await ws.close(
+                        code=4003, message=b"device authorization changed",
+                    )
+                    break
                 last_msg_type = msg.type.name if hasattr(msg.type, "name") else str(msg.type)
                 if msg.type != WSMsgType.TEXT:
                     break
@@ -1707,6 +2193,45 @@ class Gateway:
                     continue
 
                 t = data.get("type", "")
+
+                # Custom View subscriptions/actions share this authenticated
+                # socket with chat but remain a separate protocol domain. A
+                # malformed UI frame is isolated to its subscription and must
+                # never tear down the user's live chat session.
+                if isinstance(t, str) and t.startswith("ui_"):
+                    try:
+                        if await ui_service.handle_ws_frame(ws, data, ui_access):
+                            continue
+                    except Exception as exc:  # handler boundary redacts internals
+                        from src.custom_views.repository import (
+                            CustomViewConflict,
+                            CustomViewError,
+                            CustomViewInputError,
+                            CustomViewNotFound,
+                            CustomViewRateLimited,
+                        )
+
+                        if isinstance(exc, CustomViewRateLimited):
+                            code, message = "rate_limited", str(exc)
+                        elif isinstance(exc, CustomViewConflict):
+                            code, message = "revision_conflict", str(exc)
+                        elif isinstance(exc, CustomViewNotFound):
+                            code, message = "not_found", "Custom View is not available"
+                        elif isinstance(exc, CustomViewInputError):
+                            code, message = "invalid_request", str(exc)
+                        elif isinstance(exc, (CustomViewError, PermissionError)):
+                            code, message = "operation_failed", "Custom View operation failed"
+                        else:
+                            code, message = "runtime_error", "Custom View runtime is unavailable"
+                            logger.exception("Custom View WS frame failed")
+                        await self._safe_ws_send_json(ws, {
+                            "type": "ui_error",
+                            "code": code,
+                            "message": message,
+                            "viewId": data.get("viewId"),
+                            "subscriptionId": data.get("subscriptionId"),
+                        })
+                        continue
 
                 # Legacy AUTH frame: ignored — the middleware already
                 # authenticated us. Tolerate it for old clients that
@@ -1748,8 +2273,18 @@ class Gateway:
                     P.AUDIO_CHUNK_IN, P.AUDIO_END_IN,
                     P.VIDEO_FRAME_IN, P.ATTACHMENT_IN, P.INTERRUPT,
                 ):
+                    from src.core.on_behalf_context import OnBehalfIdentity
+
                     await self._handle_stream_frame(
-                        ws, client_id, data, handle=cert.handle,
+                        ws,
+                        client_id,
+                        data,
+                        handle=cert.handle,
+                        on_behalf_identity=OnBehalfIdentity.from_certificate(cert),
+                        trusted_bridge="bridge" in set(cert.capabilities or ()),
+                        connection_id=connection_id,
+                        device_pubkey=cert.device_pubkey,
+                        device_auth_epoch=request.get("device_auth_epoch"),
                     )
 
                 # Interactive terminals — PTY frames from the desktop
@@ -1760,7 +2295,12 @@ class Gateway:
                     P.TERMINAL_OPEN, P.TERMINAL_INPUT, P.TERMINAL_RESIZE,
                     P.TERMINAL_SIGNAL, P.TERMINAL_CLOSE,
                 ):
-                    await self._handle_terminal_frame(ws, client_id, data)
+                    await self._handle_terminal_frame(
+                        ws,
+                        connection_id,
+                        data,
+                        device_id=client_id,
+                    )
 
         except Exception as e:
             # Capture exception TYPE + traceback in addition to the bare
@@ -1781,30 +2321,39 @@ class Gateway:
                 frames_seen=frames_seen, last_msg_type=last_msg_type,
             )
         finally:
+            try:
+                await ui_service.disconnect(ws)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("Custom View client cleanup failed: %s", e)
             # Identity-aware cleanup: a reconnected ws may have already
             # taken this client_id's slot via ``_adopt_sessions_to_ws``.
             # Touching ``clients[client_id]`` or
             # ``_close_stream_sessions_for`` here would tear down the
             # *new* connection's live sessions and leave its UI stuck.
-            if client_id and self.clients.get(client_id) is ws:
-                del self.clients[client_id]
+            if self.clients.get(connection_id) is ws:
+                del self.clients[connection_id]
+                self._chat_client_devices.pop(connection_id, None)
+                self._chat_client_instances.pop(connection_id, None)
+                self._chat_client_render_contexts.pop(connection_id, None)
+                self._chat_client_auth_epochs.pop(connection_id, None)
                 elog("gateway.client_disconnect", client_id=client_id)
                 # Stream sessions are server-owned: closing the app only
                 # detaches the transport. Any active turn keeps running and
                 # rehydrates through live_state on the next attachment.
-                # And kill any PTYs this client opened — a closed app or
-                # dropped link must not leave shells running on the host.
+                # Kill only the PTYs this exact websocket opened. Desktop and
+                # CLI can share ``client_id`` (one device certificate), so
+                # device-wide cleanup would terminate the surviving sibling.
                 try:
-                    reaped = await self.terminals.close_for_client(client_id)
+                    reaped = await self.terminals.close_for_connection(connection_id)
                     if reaped:
-                        elog("terminal.client_cleanup", client_id=client_id, closed=reaped)
+                        elog(
+                            "terminal.client_cleanup",
+                            client_id=client_id,
+                            connection_id=connection_id,
+                            closed=reaped,
+                        )
                 except Exception as e:  # noqa: BLE001
-                    logger.debug("terminal client cleanup failed: %s", e)
-            elif client_id:
-                elog(
-                    "gateway.client_replaced",
-                    client_id=client_id,
-                )
+                    logger.debug("terminal connection cleanup failed: %s", e)
         return ws
 
     async def _handle_command(
@@ -2145,10 +2694,12 @@ class Gateway:
     #   - bridges/telegram.py: ``f"tg:{uid}"``
     #   - bridges/discord.py: ``f"dc:{uid}"``
     #   - bridges/whatsapp.py: ``f"wa:{uid}"``
+    #   - bridges/slack.py: ``f"sl:{uid}"``
     _BRIDGE_SESSION_PREFIXES: dict[str, str] = {
         "bridge:telegram": "tg:",
         "bridge:discord": "dc:",
         "bridge:whatsapp": "wa:",
+        "bridge:slack": "sl:",
     }
 
     async def _forget_one_session(self, session_id: str) -> int:
@@ -2202,7 +2753,12 @@ class Gateway:
         return forgotten
 
     async def _handle_terminal_frame(
-        self, ws, client_id: str, frame: dict,
+        self,
+        ws,
+        connection_id: str,
+        frame: dict,
+        *,
+        device_id: str,
     ) -> None:
         """Dispatch a PTY terminal frame (open/input/resize/signal/close).
 
@@ -2210,7 +2766,8 @@ class Gateway:
         opened the terminal — the callbacks below close over it. A
         terminal is bound to its websocket: when the connection drops,
         the ``finally`` in :meth:`_handle_ws` calls
-        ``terminals.close_for_client`` so no shell outlives its client.
+        ``terminals.close_for_connection`` so no shell outlives its socket or
+        collides with a sibling client using the same device certificate.
         """
         t = frame.get("type", "")
         terminal_id = (frame.get("terminal_id") or "").strip()
@@ -2259,7 +2816,8 @@ class Gateway:
 
             try:
                 session = await self.terminals.open(
-                    client_id=client_id,
+                    connection_id=connection_id,
+                    device_id=device_id,
                     terminal_id=terminal_id,
                     on_output=_on_output,
                     on_exit=_on_exit,
@@ -2273,7 +2831,8 @@ class Gateway:
                     "terminal.open_failed",
                     level="error",
                     terminal_id=terminal_id,
-                    client_id=client_id,
+                    client_id=device_id,
+                    connection_id=connection_id,
                     error=str(e),
                 )
                 await self._safe_ws_send_json(ws, {
@@ -2300,12 +2859,12 @@ class Gateway:
                 data = base64.b64decode(raw)
             except Exception:  # noqa: BLE001 — malformed client frame
                 return
-            self.terminals.write(client_id, terminal_id, data)
+            self.terminals.write(connection_id, terminal_id, data)
             return
 
         if t == P.TERMINAL_RESIZE:
             self.terminals.resize(
-                client_id, terminal_id,
+                connection_id, terminal_id,
                 int(frame.get("cols") or 80),
                 int(frame.get("rows") or 24),
             )
@@ -2313,12 +2872,12 @@ class Gateway:
 
         if t == P.TERMINAL_SIGNAL:
             self.terminals.signal(
-                client_id, terminal_id, str(frame.get("signal") or "INT"),
+                connection_id, terminal_id, str(frame.get("signal") or "INT"),
             )
             return
 
         if t == P.TERMINAL_CLOSE:
-            await self.terminals.close(client_id, terminal_id)
+            await self.terminals.close(connection_id, terminal_id)
             await self._safe_ws_send_json(ws, {
                 "type": P.TERMINAL_EXIT,
                 "terminal_id": terminal_id,
@@ -2330,6 +2889,11 @@ class Gateway:
     async def _handle_stream_frame(
         self, ws, client_id: str, frame: dict,
         *, handle: str | None = None,
+        on_behalf_identity=None,
+        trusted_bridge: bool = False,
+        connection_id: str | None = None,
+        device_pubkey: bytes | None = None,
+        device_auth_epoch: int | None = None,
     ) -> None:
         """Decode a stream-protocol wire frame and dispatch into the
         matching :class:`StreamSession`.
@@ -2345,7 +2909,23 @@ class Gateway:
         from src.stream.session import StreamSession
         from src.stream.channel import RealtimeChannel
         from src.stream.wire import event_to_wire, wire_to_event
-        from src.stream.events import SessionClose, SessionOpen, TextFinal
+        from src.stream.events import Attachment, SessionClose, SessionOpen, TextFinal
+        from src.core.execution_origin import (
+            TrustedIngressIdentity,
+            TrustedTurnContext,
+        )
+
+        def _auth_epoch_current() -> bool:
+            if device_pubkey is None or device_auth_epoch is None:
+                return True
+            auth_state = getattr(self._network_state, "auth_state", None)
+            epoch_reader = getattr(auth_state, "device_epoch", None)
+            return callable(epoch_reader) and (
+                epoch_reader(device_pubkey) == device_auth_epoch
+            )
+
+        if not _auth_epoch_current():
+            return
 
         session_id = (frame.get("session_id") or "default").strip() or "default"
         sid = self.sessions.get_or_create_session(
@@ -2368,6 +2948,138 @@ class Gateway:
         if evt is None:
             return
 
+        # Every input surface converges on durable AttachmentRefs before the
+        # turn reaches the agent.  An absolute host path is accepted only from
+        # a certificate carrying the internal ``bridge`` capability; ordinary
+        # clients upload bytes first and send the returned artifact_id.  This
+        # check happens before either TextFinal or a standalone Attachment can
+        # reach StreamSession/model code.
+        attachment_values = None
+        if isinstance(evt, TextFinal) and evt.attachments:
+            attachment_values = evt.attachments
+        elif isinstance(evt, Attachment):
+            attachment_values = ({
+                "type": evt.kind,
+                "path": evt.path,
+                "filename": evt.filename,
+                "mime_type": evt.mime_type,
+                "artifact_id": evt.artifact_id,
+                "artifact_link_id": evt.artifact_link_id,
+                "size_bytes": evt.size_bytes,
+                "sha256": evt.sha256,
+                "url": evt.url,
+            },)
+        if attachment_values is not None:
+            from dataclasses import replace
+            from src.memory.artifacts import (
+                ArtifactError,
+                ArtifactNotFound,
+                normalize_inbound_attachments,
+            )
+
+            artifact_db = (
+                getattr(self.agent, "memory_db", None)
+                or getattr(self.agent, "db", None)
+            )
+            try:
+                normalized = await normalize_inbound_attachments(
+                    artifact_db,
+                    attachment_values,
+                    session_id=sid,
+                    principal=on_behalf_identity,
+                    allow_local_paths=bool(trusted_bridge),
+                )
+                if not normalized:
+                    raise ArtifactNotFound("attachment")
+            except ArtifactError as exc:
+                await self._safe_ws_send_json(ws, {
+                    "type": P.ERROR,
+                    "session_id": sid,
+                    "text": str(exc),
+                })
+                await self._safe_ws_send_json(ws, {
+                    "type": "turn_complete",
+                    "session_id": sid,
+                    "reason": "error",
+                    "error": type(exc).__name__,
+                })
+                return
+            if isinstance(evt, TextFinal):
+                evt = replace(evt, attachments=normalized)
+            else:
+                ref = normalized[0]
+                evt = replace(
+                    evt,
+                    kind=ref.get("kind") or ref.get("type") or "file",
+                    path=ref.get("path"),
+                    filename=str(ref.get("filename") or ""),
+                    mime_type=ref.get("mime_type"),
+                    artifact_id=ref.get("artifact_id"),
+                    artifact_link_id=ref.get("artifact_link_id"),
+                    size_bytes=ref.get("size_bytes"),
+                    sha256=ref.get("sha256"),
+                    url=ref.get("url"),
+                )
+
+        # Attachment normalization may read/copy bytes and therefore yield to
+        # live device revocation.  Revalidate before changing any per-socket or
+        # shared-session state.
+        if not _auth_epoch_current():
+            return
+
+        # SessionOpen is the only chat frame that selects a local capability
+        # instance. Store only the opaque instance id; every actual turn does
+        # a fresh exact registry lookup so disconnect means server-only and can
+        # never fall back to another client.
+        if isinstance(evt, SessionOpen) and connection_id is not None:
+            self._chat_client_instances[connection_id] = evt.client_instance_id
+            render_contexts = getattr(
+                self, "_chat_client_render_contexts", None,
+            )
+            if render_contexts is None:
+                render_contexts = {}
+                self._chat_client_render_contexts = render_contexts
+            render_contexts[connection_id] = (
+                evt.client_kind,
+                tuple(sorted(evt.client_capabilities.items())),
+            )
+        instance_id = (
+            self._chat_client_instances.get(connection_id)
+            if connection_id is not None
+            else None
+        )
+        if isinstance(evt, SessionOpen):
+            client_kind = evt.client_kind
+            frozen_client_capabilities = tuple(
+                sorted(evt.client_capabilities.items())
+            )
+        else:
+            client_kind, frozen_client_capabilities = getattr(
+                self, "_chat_client_render_contexts", {},
+            ).get(connection_id, (None, ()))
+        capability_registry = getattr(self, "capabilities", None)
+        execution_origin = (
+            capability_registry.origin_for(client_id, instance_id)
+            if capability_registry is not None
+            else None
+        )
+        # Capability availability is optional, but authenticated ingress
+        # ownership is not. Two devices (or simultaneous Desktop/CLI sockets
+        # using one device certificate) must never share a burst, utterance or
+        # pending attachment merely because both currently have no local tools.
+        ingress_identity = TrustedIngressIdentity(
+            device_id=client_id,
+            connection_id=connection_id or f"ws:{id(ws)}",
+            client_instance_id=instance_id,
+            auth_epoch=device_auth_epoch or 0,
+            turn_context=TrustedTurnContext(
+                on_behalf_identity=on_behalf_identity,
+                client_kind=client_kind,
+                client_capabilities=frozen_client_capabilities,
+                allow_local_attachment_paths=bool(trusted_bridge),
+            ),
+        )
+
         if isinstance(evt, SessionClose):
             await self._close_stream_session(key)
             return
@@ -2378,6 +3090,9 @@ class Gateway:
         ):
             await self._close_stream_session(key)
             holder = None
+
+        if not _auth_epoch_current():
+            return
 
         if isinstance(evt, TextFinal):
             self._record_live_input(sid, event_to_wire(evt), owner=owner)
@@ -2406,6 +3121,10 @@ class Gateway:
                 coalesce_window_ms=coalesce_window_ms,
                 speak_enabled=speak_enabled,
                 handle=handle,
+                on_behalf_identity=on_behalf_identity,
+                client_kind=client_kind,
+                client_capabilities=dict(frozen_client_capabilities),
+                allow_local_attachment_paths=trusted_bridge,
             )
             # Install gateway hooks: pre-dispatch enforces the same
             # "no enabled models" + "history-mode binding" guards the
@@ -2418,6 +3137,9 @@ class Gateway:
             )
             session.post_turn_hook = self._make_stream_post_turn_hook()
             await session.start()
+            if not _auth_epoch_current():
+                await session.close()
+                return
             channel = RealtimeChannel(
                 session,
                 lambda payload, _ws=ws: self._safe_ws_send_json(_ws, payload),
@@ -2427,7 +3149,14 @@ class Gateway:
                 ),
                 on_unrecoverable=self._make_unrecoverable_callback(key),
             )
+            channel.bind_transport(
+                ingress_identity,
+                lambda payload, _ws=ws: self._safe_ws_send_json(_ws, payload),
+            )
             await channel.start()
+            if not _auth_epoch_current():
+                await channel.close()
+                return
             holder = _StreamHolder(session=session, channel=channel)
             self._stream_sessions[key] = holder
             elog(
@@ -2437,10 +3166,31 @@ class Gateway:
                 profile=profile,
             )
         else:
-            holder.channel.rebind(
-                lambda payload, _ws=ws: self._safe_ws_send_json(_ws, payload),
+            send_wire = (
+                lambda payload, _ws=ws: self._safe_ws_send_json(_ws, payload)
             )
+            bind_transport = getattr(holder.channel, "bind_transport", None)
+            if callable(bind_transport):
+                bind_transport(ingress_identity, send_wire)
+            else:
+                # Compatibility for injected/legacy channel adapters. The
+                # production RealtimeChannel always takes the scoped branch.
+                holder.channel.rebind(send_wire)
             await holder.channel.start()
+
+        # Any of the awaits above may have yielded to the live revocation
+        # callback. Never let the stale handler clear the session's revoked
+        # ingress marker or enqueue one final turn after that callback.
+        if not _auth_epoch_current():
+            return
+
+        # ``revoke_ingress_device`` is sticky for already-authenticated
+        # sockets. Re-admit only here, after the enclosing WS handler verified
+        # that this connection's auth epoch is still current; this also lets a
+        # legitimately reactivated device resume the same durable session.
+        allow_ingress = getattr(holder.session, "allow_ingress_device", None)
+        if callable(allow_ingress):
+            allow_ingress(client_id, auth_epoch=device_auth_epoch or 0)
 
         if isinstance(evt, SessionOpen):
             await self._send_live_snapshots(
@@ -2448,7 +3198,11 @@ class Gateway:
             )
             return  # session already created above; SessionOpen is metadata-only
 
-        await holder.session.push_in(evt)
+        await holder.session.push_in(
+            evt,
+            execution_origin=execution_origin,
+            ingress_identity=ingress_identity,
+        )
 
     async def _close_stream_session(self, key: tuple[str, str]) -> None:
         """Pop and close one stream session. Idempotent + crash-safe."""

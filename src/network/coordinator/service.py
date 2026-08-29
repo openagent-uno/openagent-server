@@ -42,6 +42,8 @@ import sqlite3
 import time
 import uuid
 from dataclasses import dataclass
+from inspect import isawaitable
+from typing import Any, Callable
 
 import cbor2
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -63,6 +65,7 @@ from src.network.coordinator.store import (
     InvitationRow,
 )
 from src.network.iroh_node import IrohNode, NetworkAlpn
+from src.network.identity import iroh_node_id_public_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +105,7 @@ class CoordinatorService:
         network_id: str,
         network_name: str,
         pake_backend: PakeBackend | None = None,
+        on_device_revoked: Callable[[bytes], Any] | None = None,
     ) -> None:
         self._store = store
         self._cfg = _ServiceConfig(
@@ -112,6 +116,14 @@ class CoordinatorService:
         self._pake: PakeBackend = pake_backend or Srp6aBackend()
         self._logins: dict[str, LoginInProgress] = {}
         self._gc_task: asyncio.Task | None = None
+        self._on_device_revoked = on_device_revoked
+
+    async def _notify_device_revoked(self, device_pubkey: bytes) -> None:
+        if self._on_device_revoked is None:
+            return
+        result = self._on_device_revoked(bytes(device_pubkey))
+        if isawaitable(result):
+            await result
 
     # ── Lifecycle ────────────────────────────────────────────────
 
@@ -273,6 +285,23 @@ class CoordinatorService:
         label = params.get("label")
         invite_code = params.get("invite")  # optional — only needed for first-device pairings
 
+        # SRP proves the password; the QUIC handshake proves possession of the
+        # device key.  Both are required before a cert can bind that key.  The
+        # ``inproc:`` escape hatch is limited to the coordinator's process-local
+        # test transport, whose synthetic connection has no Iroh keypair.
+        if not peer_node_id.startswith("inproc:"):
+            try:
+                peer_pubkey = iroh_node_id_public_bytes(peer_node_id)
+            except ValueError as exc:
+                raise _CoordinatorRpcError(
+                    "unauthorized", "login stream has no valid Iroh peer identity",
+                ) from exc
+            if peer_pubkey != device_pubkey:
+                raise _CoordinatorRpcError(
+                    "unauthorized",
+                    "device_pubkey does not match the authenticated Iroh peer",
+                )
+
         state = self._logins.pop(state_id, None)
         if state is None:
             raise _CoordinatorRpcError("expired", "login state not found or expired")
@@ -357,6 +386,27 @@ class CoordinatorService:
                 for r in rows
             ],
         }
+
+    async def _m_device_status(self, params: dict, *, peer_node_id: str) -> dict:
+        """Return authoritative device liveness to an enrolled member gateway.
+
+        Member gateways can verify the coordinator signature locally but do
+        not own its roster. Checking this RPC on new and existing streams makes
+        revocation and account suspension network-wide instead of coordinator-
+        gateway-only. Iroh peer ownership plus enrollment authorizes the call.
+        """
+        if not await self._store.agent_is_registered(peer_node_id):
+            raise _CoordinatorRpcError(
+                "unauthorized",
+                "device status is available only to enrolled agents",
+            )
+        device_pubkey = _required(params, "device_pubkey", bytes)
+        if len(device_pubkey) != 32:
+            raise _CoordinatorRpcError(
+                "bad_request", "device_pubkey must be 32 bytes",
+            )
+        row = await self._store.get_active_device(device_pubkey)
+        return {"active": row is not None}
 
     async def _m_add_agent(self, params: dict, *, peer_node_id: str) -> dict:
         # Two paths: (a) admin caller with a valid ``coordinator_admin``
@@ -463,6 +513,8 @@ class CoordinatorService:
         cert = self._verify_admin_cert(_required(params, "cert", bytes))
         device_pubkey = _required(params, "device_pubkey", bytes)
         ok = await self._store.revoke_device(device_pubkey)
+        if ok:
+            await self._notify_device_revoked(device_pubkey)
         return {"ok": ok, "revoked_by": cert.handle}
 
     async def _m_create_invitation(self, params: dict, *, peer_node_id: str) -> dict:
@@ -520,6 +572,7 @@ CoordinatorService._METHODS = {
     "login_init": CoordinatorService._m_login_init,
     "login_finish": CoordinatorService._m_login_finish,
     "list_agents": CoordinatorService._m_list_agents,
+    "device_status": CoordinatorService._m_device_status,
     "add_agent": CoordinatorService._m_add_agent,
     "agent_login": CoordinatorService._m_agent_login,
     "remove_agent": CoordinatorService._m_remove_agent,

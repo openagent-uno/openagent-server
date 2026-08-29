@@ -14,6 +14,7 @@ the old lookup fails here rather than in front of a user.
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 from ._framework import TestContext, test
 
@@ -46,9 +47,48 @@ class _FakeDB:
     async def unpin_session_model(self, session_id):
         self.pinned.pop(session_id, None)
 
+    async def _ensure_connected(self):
+        return _FakeConnection()
 
-class _FakeRequest:
+
+class _FakeCursor:
+    def __init__(self, row):
+        self.row = row
+
+    async def fetchone(self):
+        return self.row
+
+
+class _FakeConnection:
+    async def execute(self, statement, _params=()):
+        if "FROM sessions_v2" in statement:
+            return _FakeCursor(
+                {
+                    "resource_id": "s1",
+                    "resource_type": "session",
+                    "tenant_id": "test-network",
+                    "owner_principal_id": "user:alice",
+                    "visibility": "private",
+                    "acl_version": 1,
+                }
+            )
+        return _FakeCursor(None)
+
+
+class _FakeRequest(dict):
     def __init__(self, db, body=None, session_id="s1"):
+        cert = SimpleNamespace(
+            network_id="test-network",
+            handle="alice",
+            device_pubkey_hex="alice-device",
+            capabilities=[],
+        )
+        super().__init__(
+            device_cert=cert,
+            network_id="test-network",
+            user_handle="alice",
+            client_id="alice-device",
+        )
         class _Holder:
             pass
 

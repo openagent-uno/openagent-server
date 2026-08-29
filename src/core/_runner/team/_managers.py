@@ -19,6 +19,7 @@ from src.memory.store.base import UserMemory
 from src.core._run_state.messages import RunMessages
 from src.memory.sessions import TeamSession
 from src.core._runner.utils.log import log_debug, log_warning
+from src.core.execution_origin import create_server_only_task
 
 # ---------------------------------------------------------------------------
 # Memory
@@ -107,7 +108,10 @@ async def _astart_memory_task(
         and not team.enable_agentic_memory
     ):
         log_debug("Starting memory creation in background task.")
-        return asyncio.create_task(_amake_memories(team, run_messages=run_messages, user_id=user_id))
+        return create_server_only_task(
+            _amake_memories(team, run_messages=run_messages, user_id=user_id),
+            name="team-memory-update",
+        )
 
     return None
 
@@ -309,13 +313,14 @@ async def _astart_learning_task(
 
     if team._learning is not None:
         log_debug("Starting learning extraction as async task.")
-        return asyncio.create_task(
+        return create_server_only_task(
             _aprocess_learnings(
                 team,
                 run_messages=run_messages,
                 session=session,
                 user_id=user_id,
-            )
+            ),
+            name="team-learning-update",
         )
 
     return None

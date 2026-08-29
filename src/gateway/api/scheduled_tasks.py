@@ -12,10 +12,12 @@ reads from, so changes take effect within the scheduler's next tick
 by openagent.mcp.servers.scheduler so the app, the CLI, and the agent's
 own scheduler MCP all see identical data.
 
-503 is returned when there is no live Scheduler instance (e.g. when
-the agent was constructed without a DB). In that case there's nothing
-to recompute next_run / reconcile enable-flips against, so the safe
-thing is to reject writes rather than silently let rows drift.
+Read handlers use the agent's durable database directly, so definitions and
+run history remain inspectable while background workers are intentionally
+parked (for example in hermetic local E2E mode). Mutations and execution still
+require the live ``Scheduler``: without it there is nothing to recompute
+``next_run`` or reconcile enable-flips against, so the safe thing is to reject
+writes rather than silently let rows drift.
 """
 
 from __future__ import annotations
@@ -44,6 +46,30 @@ def _resolve_scheduler(request):
             status=503,
         )
     return scheduler, None
+
+
+def _resolve_read_db(request):
+    """Return the durable task DB without requiring a live scheduler.
+
+    The scheduler and agent normally share one ``MemoryDB``. Safe/local
+    inspection modes intentionally omit the worker while retaining the DB, so
+    GET endpoints must not infer that durable task state is unavailable merely
+    because nothing is currently executing it.
+    """
+    from aiohttp import web
+
+    gw = request.app["gateway"]
+    scheduler = getattr(gw, "_scheduler", None)
+    db = getattr(scheduler, "db", None)
+    if db is None:
+        agent = getattr(gw, "agent", None) or getattr(gw, "_agent", None)
+        db = getattr(agent, "memory_db", None)
+    if db is None:
+        return None, web.json_response(
+            {"error": "No database configured"},
+            status=503,
+        )
+    return db, None
 
 
 def _is_builtin(row: dict | None) -> bool:
@@ -97,7 +123,7 @@ def _serialize_run(row: dict) -> dict:
 async def handle_list(request):
     from aiohttp import web
 
-    scheduler, err = _resolve_scheduler(request)
+    db, err = _resolve_read_db(request)
     if err is not None:
         return err
 
@@ -110,12 +136,13 @@ async def handle_list(request):
     # are recorded in the same run history (vision §7/§12). Opt-in exposes
     # READ only; mutations still 403 via ``_reject_if_builtin``.
     include_builtin = request.query.get("include_builtin", "").lower() in ("1", "true", "yes")
-    rows = await scheduler.db.get_tasks(enabled_only=enabled_only)
+    rows = await db.get_tasks(enabled_only=enabled_only)
     if not include_builtin:
         rows = [r for r in rows if not _is_builtin(r)]
     # One query for the whole list tells each tile whether a firing is in
     # flight (so it can show a Stop control instead of Run now).
-    running = await scheduler.db.running_task_ids()
+    scheduler = getattr(request.app["gateway"], "_scheduler", None)
+    running = await db.running_task_ids() if scheduler is not None else set()
     return web.json_response(
         {"tasks": [_serialize(r, running=r["id"] in running) for r in rows]}
     )
@@ -124,18 +151,19 @@ async def handle_list(request):
 async def handle_get(request):
     from aiohttp import web
 
-    scheduler, err = _resolve_scheduler(request)
+    db, err = _resolve_read_db(request)
     if err is not None:
         return err
 
     task_id = request.match_info["id"]
-    row = await scheduler.db.get_task(task_id)
+    row = await db.get_task(task_id)
     if row is None:
         return web.json_response({"error": f"Task {task_id!r} not found"}, status=404)
     # Built-ins are READABLE by id — the activity feed's run screen and the
     # run-history title fetch resolve them here — but stay non-editable
     # (mutations 403 via ``_reject_if_builtin``).
-    running = await scheduler.db.running_task_ids()
+    scheduler = getattr(request.app["gateway"], "_scheduler", None)
+    running = await db.running_task_ids() if scheduler is not None else set()
     return web.json_response(_serialize(row, running=row["id"] in running))
 
 
@@ -145,12 +173,12 @@ async def handle_runs_list(request):
     ``/api/workflows/{id}/runs``."""
     from aiohttp import web
 
-    scheduler, err = _resolve_scheduler(request)
+    db, err = _resolve_read_db(request)
     if err is not None:
         return err
 
     task_id = request.match_info["id"]
-    row = await scheduler.db.get_task(task_id)
+    row = await db.get_task(task_id)
     if row is None:
         return web.json_response({"error": f"Task {task_id!r} not found"}, status=404)
     # A built-in's run history is readable — dream-mode firings are recorded in
@@ -159,7 +187,7 @@ async def handle_runs_list(request):
 
     limit = int(request.query.get("limit", 20))
     status = request.query.get("status") or None
-    runs = await scheduler.db.list_task_runs(task_id, limit=limit, status=status)
+    runs = await db.list_task_runs(task_id, limit=limit, status=status)
     return web.json_response({"runs": [_serialize_run(r) for r in runs]})
 
 
@@ -403,6 +431,9 @@ async def handle_create(request):
         await scheduler.disable_task(task_id)
 
     row = await scheduler.db.get_task(task_id)
+    from .operational import claim_created_resource
+
+    await claim_created_resource(request, "scheduled_definition", task_id)
     elog("scheduled_task.create", id=task_id, name=name)
     gw = request.app["gateway"]
     await gw.broadcast_resource("scheduled_task", "created", task_id)

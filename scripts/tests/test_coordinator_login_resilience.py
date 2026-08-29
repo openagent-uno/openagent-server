@@ -132,7 +132,7 @@ async def t_touch_device_locked_login_still_succeeds(ctx: TestContext) -> None:
         "ke3": b"\x00" * 64,
         "device_pubkey": device_pubkey,
     }
-    result = await svc._m_login_finish(params, peer_node_id="peer-1")
+    result = await svc._m_login_finish(params, peer_node_id="inproc:test")
 
     assert store.touch_device_called, "touch_device should have been attempted"
     assert "cert" in result, "no cert returned despite touch_device being non-critical"
@@ -173,7 +173,7 @@ async def t_add_device_locked_login_fails(ctx: TestContext) -> None:
     }
     raised: Exception | None = None
     try:
-        await svc._m_login_finish(params, peer_node_id="peer-1")
+        await svc._m_login_finish(params, peer_node_id="inproc:test")
     except sqlite3.OperationalError as e:
         raised = e
     assert raised is not None, "add_device lock error must propagate"

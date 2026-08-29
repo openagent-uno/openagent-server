@@ -173,12 +173,11 @@ async def t_encoder_error_path(ctx: TestContext) -> None:
     assert stored["result"] is None
 
 
-@test("rehydration_parity", "stored_tool_to_wire is exact pass-through of the runtime-native dict")
+@test("rehydration_parity", "stored_tool_to_wire preserves fields and stamps legacy host")
 async def t_stored_pass_through(ctx: TestContext) -> None:
-    """The rehydration encoder MUST NOT translate field names or drop
-    keys — the UI consumes the runtime's ``ToolExecution.to_dict()`` shape
-    verbatim, including fields we don't render today (metrics,
-    child_run_id, etc.). This locks the contract.
+    """The encoder never translates or drops native runtime fields. Rows from
+    before execution-host attribution receive the only safe legacy default,
+    while an already persisted client host remains byte-identical.
     """
     from src.models._tool_status import stored_tool_to_wire
 
@@ -192,7 +191,21 @@ async def t_stored_pass_through(ctx: TestContext) -> None:
         "child_run_id": "haiku-r1",
     }
     wire = stored_tool_to_wire(stored)
-    assert wire == stored, (wire, stored)  # exact pass-through
+    assert wire is not None
+    assert {key: wire[key] for key in stored} == stored
+    assert wire["execution_host"] == {
+        "kind": "server",
+        "device_label": "Server OpenAgent",
+    }
+
+    client_host = {
+        "kind": "client",
+        "device_label": "Laptop",
+        "device_id": "dev-1",
+        "client_instance_id": "desktop",
+    }
+    client = {**stored, "execution_host": client_host}
+    assert stored_tool_to_wire(client) == client
 
 
 @test("rehydration_parity", "_arun_runtime_stream emits JSON status for tool start + completion + error")

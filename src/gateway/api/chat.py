@@ -48,6 +48,7 @@ async def _get_or_create_session(
     client_id: str,
     session_id: str,
     handle: str | None = None,
+    on_behalf_identity=None,
 ):
     """Return the cached StreamSession for this (client_id, session_id).
 
@@ -69,6 +70,7 @@ async def _get_or_create_session(
                 profile="batched",
                 speak_enabled=False,
                 handle=handle,
+                on_behalf_identity=on_behalf_identity,
             )
             # Wire gateway hooks so MCP resource broadcasts and model
             # guards work the same as for WebSocket sessions.
@@ -81,6 +83,11 @@ async def _get_or_create_session(
             _sessions[key] = (session, lock)
             logger.debug("chat: created session %s/%s", client_id, session_id)
             return session, lock
+        # Refresh the short-lived authorization subject from this verified
+        # request instead of trusting the value captured when the cached
+        # session was first created.  This also fails closed if an internal
+        # caller reaches the handler without an authenticated context.
+        entry[0].on_behalf_identity = on_behalf_identity
         return entry
 
 
@@ -165,9 +172,20 @@ async def handle_chat(request: web.Request) -> web.Response:
         session_id = raw_sid or "default"
 
     # ── Get or create StreamSession ──────────────────────────────────────────
+    from src.core.on_behalf_context import OnBehalfIdentity
+
+    try:
+        on_behalf_identity = OnBehalfIdentity.from_certificate(device_cert)
+    except PermissionError:
+        # The auth middleware normally makes this impossible.  Keeping the
+        # missing value is safer than manufacturing a local superuser: the
+        # operational-search tool will fail closed for this turn.
+        on_behalf_identity = None
+
     session, turn_lock = await _get_or_create_session(
         gateway, client_id, session_id,
         handle=user_handle,
+        on_behalf_identity=on_behalf_identity,
     )
 
     # If a previous (long-running) turn is still in flight for this session, a

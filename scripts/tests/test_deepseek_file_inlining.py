@@ -46,11 +46,17 @@ def _make_audio(*, content: bytes, fmt: str = "wav"):
     return _RuntimeAudio(content=content, format=fmt, mime_type=f"audio/{fmt}")
 
 
+def _make_video(*, content: bytes, fmt: str = "mp4"):
+    from src.stream.media import Video as _RuntimeVideo
+    return _RuntimeVideo(content=content, format=fmt, mime_type=f"video/{fmt}")
+
+
 def _make_message(*, content: str, files: list | None = None,
-                  images: list | None = None, audios: list | None = None):
+                  images: list | None = None, audios: list | None = None,
+                  videos: list | None = None):
     from src.models.providers.message import Message
     return Message(role="user", content=content, files=files,
-                   images=images, audio=audios)
+                   images=images, audio=audios, videos=videos)
 
 
 def _format(message):
@@ -161,6 +167,20 @@ async def t_audio_stripped(ctx: TestContext) -> None:
     assert "media-omitted" in text_blob, \
         f"audio should be stripped to media-omitted block, got: {text_blob!r}"
     assert "audio" in text_blob.lower(), f"audio label missing: {text_blob!r}"
+
+
+@test("deepseek_file_inlining", "video attachment stripped → media-omitted placeholder")
+async def t_video_stripped(ctx: TestContext) -> None:
+    video = _make_video(content=b"fake-mp4", fmt="mp4")
+    message = _make_message(content="Inspect this clip.", videos=[video])
+
+    serialized = _format(message)
+    _assert_no_disallowed_parts(serialized.get("content"))
+    text_blob = _content_text(serialized)
+
+    assert "media-omitted" in text_blob, text_blob
+    assert "video" in text_blob.lower(), text_blob
+    assert message.videos is not None, "message.videos was not restored"
 
 
 @test("deepseek_file_inlining", "mixed files + images coexist in one prefix")

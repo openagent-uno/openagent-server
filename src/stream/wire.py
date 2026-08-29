@@ -92,7 +92,11 @@ def _b64decode(s: str | None) -> bytes:
         return b""
 
 
-def event_to_wire(evt: Event) -> dict[str, Any]:
+def event_to_wire(
+    evt: Event,
+    *,
+    include_local_attachment_paths: bool = False,
+) -> dict[str, Any]:
     """Serialise an event to a JSON-friendly dict.
 
     Legacy frames are emitted unchanged so older clients (universal app
@@ -107,11 +111,23 @@ def event_to_wire(evt: Event) -> dict[str, Any]:
     if isinstance(evt, OutTextDelta):
         return {**base, "type": P.DELTA, "text": evt.text}
     if isinstance(evt, OutTextFinal):
+        attachments = [dict(item) for item in evt.attachments]
+        parts = [dict(item) for item in evt.parts]
+        if not include_local_attachment_paths:
+            from src.memory.artifacts import public_attachment_ref
+
+            attachments = [public_attachment_ref(item) for item in attachments]
+            for part in parts:
+                if part.get("kind") == "attachment" and isinstance(
+                    part.get("attachment"), dict,
+                ):
+                    part["attachment"] = public_attachment_ref(part["attachment"])
         return {
             **base,
             "type": P.RESPONSE,
             "text": evt.text,
-            "attachments": list(evt.attachments) or None,
+            "attachments": attachments or None,
+            "parts": parts or None,
             "model": evt.model,
         }
     if isinstance(evt, OutAudioStart):
@@ -173,6 +189,7 @@ def event_to_wire(evt: Event) -> dict[str, Any]:
             "text": evt.text,
             "source": evt.source,
             "attachments": list(evt.attachments) or None,
+            "author": evt.author,
         }
     if isinstance(evt, AudioChunk):
         return {
@@ -201,6 +218,11 @@ def event_to_wire(evt: Event) -> dict[str, Any]:
             "path": evt.path,
             "filename": evt.filename,
             "mime_type": evt.mime_type,
+            "artifact_id": evt.artifact_id,
+            "artifact_link_id": evt.artifact_link_id,
+            "size_bytes": evt.size_bytes,
+            "sha256": evt.sha256,
+            "url": evt.url,
         }
     if isinstance(evt, Interrupt):
         return {**base, "type": INTERRUPT, "reason": evt.reason}
@@ -214,6 +236,8 @@ def event_to_wire(evt: Event) -> dict[str, Any]:
             "tts_pin": evt.tts_pin,
             "language": evt.language,
             "client_kind": evt.client_kind,
+            "client_capabilities": dict(evt.client_capabilities) or None,
+            "client_instance_id": evt.client_instance_id,
             # Only emit the coalesce field when the caller set it
             # explicitly. ``None`` round-trips as "use the server
             # default"; an explicit ``0`` round-trips as "opt out".
@@ -299,6 +323,15 @@ def wire_to_event(frame: dict[str, Any]) -> Event | None:
             path=frame.get("path"),
             filename=str(frame.get("filename") or ""),
             mime_type=frame.get("mime_type"),
+            artifact_id=str(frame.get("artifact_id") or "") or None,
+            artifact_link_id=str(frame.get("artifact_link_id") or "") or None,
+            size_bytes=(
+                int(frame["size_bytes"])
+                if frame.get("size_bytes") is not None
+                else None
+            ),
+            sha256=str(frame.get("sha256") or "") or None,
+            url=str(frame.get("url") or "") or None,
         )
     if t == INTERRUPT:
         return Interrupt(
@@ -332,6 +365,20 @@ def wire_to_event(frame: dict[str, Any]) -> Event | None:
             tts_pin=frame.get("tts_pin"),
             language=frame.get("language"),
             client_kind=frame.get("client_kind"),
+            client_capabilities=(
+                {
+                    str(key)[:64]: value
+                    for key, value in frame.get("client_capabilities", {}).items()
+                    if isinstance(key, str) and isinstance(value, (bool, int, str))
+                }
+                if isinstance(frame.get("client_capabilities"), dict)
+                else {}
+            ),
+            client_instance_id=(
+                str(frame.get("client_instance_id")).strip()
+                if frame.get("client_instance_id")
+                else None
+            ),
             coalesce_window_ms=coalesce,
             speak=speak,
         )
@@ -351,6 +398,7 @@ def wire_to_event(frame: dict[str, Any]) -> Event | None:
             session_id=sid, seq=seq, ts_ms=ts,
             text=str(frame.get("text") or ""),
             attachments=tuple(frame.get("attachments") or ()),
+            parts=tuple(frame.get("parts") or ()),
             model=frame.get("model"),
         )
     if t == P.AUDIO_START:

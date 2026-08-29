@@ -29,7 +29,8 @@ from ._framework import TestContext, test
 def _make_request(memory_db, *, method: str = "GET", path: str = "/x",
                   body: bytes | None = None,
                   user_handle: str = "alessandro",
-                  match_info: dict | None = None):
+                  match_info: dict | None = None,
+                  auth_state=None):
     """Build a minimal aiohttp request the handlers can read from.
 
     Handlers only look at ``request.app['gateway'].agent.memory_db``
@@ -48,6 +49,7 @@ def _make_request(memory_db, *, method: str = "GET", path: str = "/x",
     fake_app = {
         "gateway": SimpleNamespace(
             agent=SimpleNamespace(memory_db=memory_db),
+            _network_state=SimpleNamespace(auth_state=auth_state),
         ),
     }
 
@@ -404,10 +406,22 @@ async def t_patch_user_status(ctx: TestContext) -> None:
 
     db = await _open_db(db_path)
     try:
+        store = CoordinatorStore(db)
+        device_key = b"\x22" * 32
+        await store.add_device(
+            device_pubkey=device_key,
+            user_handle="alessandro",
+            label="workstation",
+        )
+        assert await store.get_active_device(device_key) is not None
+        disconnected: list[bytes] = []
+        auth_state = SimpleNamespace(disconnect=disconnected.append)
+
         req = _make_request(
             db, method="PATCH", path="/api/network/users/alessandro",
             body=b'{"status":"suspended"}',
             match_info={"handle": "alessandro"},
+            auth_state=auth_state,
         )
         resp = await handle_patch_user(req)
         import json
@@ -415,10 +429,12 @@ async def t_patch_user_status(ctx: TestContext) -> None:
         assert json.loads(resp.body)["status"] == "suspended"
 
         # Verify it landed in the DB.
-        store = CoordinatorStore(db)
         user = await store.get_user("alessandro")
         assert user is not None
         assert user.status == "suspended"
+        assert await store.get_device(device_key) is not None
+        assert await store.get_active_device(device_key) is None
+        assert disconnected == [device_key]
 
         # Back to active.
         req2 = _make_request(
@@ -430,6 +446,7 @@ async def t_patch_user_status(ctx: TestContext) -> None:
         assert resp2.status == 200
         user = await store.get_user("alessandro")
         assert user.status == "active"
+        assert await store.get_active_device(device_key) is not None
     finally:
         await db.close()
 
@@ -487,9 +504,11 @@ async def t_delete_user(ctx: TestContext) -> None:
         assert resp.status == 200, f"got {resp.status}: {resp.body!r}"
         assert json.loads(resp.body)["deleted"] is True
 
-        # User + their devices are gone.
+        # User + their devices are gone; live auth state retains revocation for
+        # existing sockets and roster lookup rejects future streams.
         assert await store.get_user("alessandro") is None
         assert not await store.user_has_devices("alessandro")
+        assert await store.get_device(b"\x11" * 32) is None
         # Marco is untouched.
         assert await store.get_user("marco") is not None
     finally:

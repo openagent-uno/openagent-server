@@ -67,6 +67,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone as _timezone
 from typing import Any
 
+from src.core.execution_origin import create_server_only_task
+
 from src.core.logging import elog
 
 # The router gate acts on these only. ``task`` scopes and the ``per_run`` window
@@ -655,13 +657,15 @@ class BudgetGuard:
         arriving during an in-flight refresh sets a pending flag so exactly one
         more runs afterwards (picking up the latest DB state)."""
         try:
-            loop = asyncio.get_running_loop()
+            asyncio.get_running_loop()
         except RuntimeError:
             return  # no loop (sync/boot context) — a later hot-path call retries
         if self._refresh_task is not None and not self._refresh_task.done():
             self._refresh_pending = True
             return
-        self._refresh_task = loop.create_task(self._refresh_runner())
+        self._refresh_task = create_server_only_task(
+            self._refresh_runner(), name="budget-refresh",
+        )
 
     async def _refresh_runner(self) -> None:
         try:
@@ -760,10 +764,13 @@ class BudgetGuard:
             "capped": capped,
         }
         try:
-            loop = asyncio.get_running_loop()
+            asyncio.get_running_loop()
         except RuntimeError:
             return
-        loop.create_task(self._fire_webhook(st.webhook_url, payload))
+        create_server_only_task(
+            self._fire_webhook(st.webhook_url, payload),
+            name="budget-alert-webhook",
+        )
 
     async def _fire_webhook(self, url: str | None, payload: dict) -> None:
         if not url:

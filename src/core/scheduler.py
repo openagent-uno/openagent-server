@@ -251,6 +251,10 @@ class Scheduler:
         # interval AFTER boot (the startup reap already covers t=0), then gated
         # to at most once per STALE_SWEEP_INTERVAL.
         self._last_stale_sweep: float = 0.0
+        pool = getattr(agent, "_mcp", None)
+        bind_interactive = getattr(pool, "bind_interactive_workflow_runner", None)
+        if callable(bind_interactive):
+            bind_interactive(self.run_interactive_workflow)
 
     def _next_run(
         self,
@@ -300,6 +304,10 @@ class Scheduler:
         # transcripts mid-stream.
         if self._workflow_tasks:
             await asyncio.gather(*self._workflow_tasks, return_exceptions=True)
+        pool = getattr(self.agent, "_mcp", None)
+        bind_interactive = getattr(pool, "bind_interactive_workflow_runner", None)
+        if callable(bind_interactive):
+            bind_interactive(None)
         elog("scheduler.stop")
 
     def _spawn_workflow(self, coro) -> asyncio.Task:
@@ -1081,7 +1089,14 @@ class Scheduler:
                     result.session_id,
                 )
             else:
+                # Legacy (non-durable) scheduled turns bypass
+                # ``run_child_session``. Clear explicitly here as well: a
+                # run-now call may be spawned while an interactive agent tool
+                # still has a client execution origin in its ContextVar.
+                from src.core.execution_origin import execution_origin_scope
+
                 with (
+                    execution_origin_scope(None),
                     dry_run_scope(task_dry_run),
                     lean_local_event_scope(use_lean_local),
                     lean_local_task_scope(use_lean_local),
@@ -1446,6 +1461,95 @@ class Scheduler:
             )
         return self._workflow_executor
 
+    async def run_interactive_workflow(
+        self,
+        id_or_name: str,
+        *,
+        inputs: dict | None = None,
+        timeout_s: int = 300,
+    ) -> dict:
+        """Run one workflow synchronously inside the trusted client turn.
+
+        This entry point is bound only into the process-local MCP pool.  It
+        never writes ``workflow_run_requests`` and therefore cannot outlive or
+        migrate away from the turn's exact execution origin. All queued,
+        scheduled, event, webhook and API execution continues through
+        :meth:`_run_workflow`, which explicitly clears the origin.
+        """
+
+        from src.core.execution_origin import current_execution_origin
+
+        if current_execution_origin() is None:
+            raise PermissionError(
+                "interactive workflow execution requires a trusted client turn",
+            )
+        if not isinstance(inputs or {}, dict):
+            raise ValueError("workflow inputs must be an object")
+        workflow = await self.db.get_workflow(str(id_or_name))
+        if workflow is None:
+            raise ValueError(f"workflow {id_or_name!r} not found")
+
+        import uuid
+
+        run_id = str(uuid.uuid4())
+        timeout = max(1.0, min(float(timeout_s), 3600.0))
+        self._register_run(self._workflow_run_tasks, run_id)
+        elog(
+            "workflow.run",
+            name=workflow.get("name"),
+            run_id=run_id,
+            trigger="ai-interactive",
+            execution_origin="client",
+        )
+        try:
+            refresh = getattr(self.agent, "refresh_registries", None)
+            if callable(refresh):
+                await refresh()
+            try:
+                from src.memory.vault.vault_origin import note_activity
+
+                note_activity(
+                    kind="workflow", workflow=workflow.get("id"), run=run_id,
+                )
+            except Exception:  # noqa: BLE001 - optional provenance metadata
+                pass
+            executor = self._get_workflow_executor()
+            async with asyncio.timeout(timeout):
+                final = await executor.run(
+                    workflow,
+                    trigger="ai",
+                    inputs=dict(inputs or {}),
+                    run_id=run_id,
+                )
+            elog(
+                "workflow.done",
+                name=workflow.get("name"),
+                run_id=run_id,
+                status=final.get("status"),
+                execution_origin="client",
+            )
+            return final
+        except asyncio.TimeoutError:
+            await self.db.update_workflow_run(
+                run_id,
+                status="failed",
+                finished_at=time.time(),
+                error=f"Interactive workflow timed out after {timeout:g}s",
+            )
+            self._broadcast("workflow", "updated", workflow.get("id"))
+            raise
+        except asyncio.CancelledError:
+            await self.db.update_workflow_run(
+                run_id,
+                status="cancelled",
+                finished_at=time.time(),
+                error="Interactive workflow was cancelled",
+            )
+            self._broadcast("workflow", "updated", workflow.get("id"))
+            raise
+        finally:
+            self._unregister_run(self._workflow_run_tasks, run_id)
+
     async def _run_workflow(
         self,
         wf: dict,
@@ -1508,10 +1612,18 @@ class Scheduler:
             except Exception:  # noqa: BLE001
                 pass
             executor = self._get_workflow_executor()
-            final = await executor.run(
-                wf, trigger=trigger, inputs=inputs, run_id=run_id,
-                entry_node_id=entry_node_id,
-            )
+            # Every scheduler/API/event workflow is a detached durable run.
+            # It must never inherit a client host merely because the coroutine
+            # was created from an interactive request task. A future genuinely
+            # synchronous in-turn workflow can call WorkflowExecutor directly
+            # under the ambient origin instead of this detached entry point.
+            from src.core.execution_origin import execution_origin_scope
+
+            with execution_origin_scope(None):
+                final = await executor.run(
+                    wf, trigger=trigger, inputs=inputs, run_id=run_id,
+                    entry_node_id=entry_node_id,
+                )
             elog(
                 "workflow.done",
                 name=wf_name,

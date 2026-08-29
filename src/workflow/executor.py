@@ -892,6 +892,7 @@ async def _h_ai_prompt(
     # ``shared`` runs every node on one ``workflow:{wf}:{run}`` session so
     # successive nodes chain thought through the persisted history.
     from src.core.child_session import run_child_session
+    from src.core.execution_origin import current_execution_origin
     from src.core.identity_context import agent_author
 
     db = getattr(exe.agent, "_db", None) or exe.db
@@ -917,6 +918,11 @@ async def _h_ai_prompt(
         owner_client_id=owner,
         model_id=override_id,
         author=agent_author(label, agent_name=getattr(exe.agent, "name", None)),
+        # A synchronous workflow invoked by the current interactive turn is
+        # still part of that turn. Its AI node keeps the exact authenticated
+        # client host. Durable scheduler/API/event workflows enter with an
+        # explicitly-cleared origin and therefore remain server-only.
+        inherit_execution_origin=current_execution_origin() is not None,
         # Stream the node live so its inline transcript on the run screen fills
         # in token-by-token like any interactive session.
         stream=True,
@@ -1153,13 +1159,18 @@ def _extract_body_subgraph(graph: dict, loop_id: str) -> dict:
 
 
 def _coerce_to_jsonable(value: Any) -> Any:
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    if isinstance(value, dict):
-        return {str(k): _coerce_to_jsonable(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [_coerce_to_jsonable(v) for v in value]
-    try:
-        return json.loads(json.dumps(value, default=str))
-    except Exception:  # noqa: BLE001
-        return repr(value)
+    """Preserve the complete MCP result envelope in workflow outputs.
+
+    Keep the import lazy: the workflow executor is part of agent startup while
+    tool-search is an MCP adapter wired later by the pool.  The dependency is
+    therefore one-way at execution time and cannot turn either module's import
+    graph into a cycle.  More importantly, workflows now cross the exact same
+    bounded, lossless JSON boundary as direct tool-search calls instead of
+    reducing runtime ``ToolResult`` objects to their string representation.
+    """
+
+    from src.mcp.servers.tool_search.adapters import (
+        coerce_mcp_result_to_jsonable,
+    )
+
+    return coerce_mcp_result_to_jsonable(value)

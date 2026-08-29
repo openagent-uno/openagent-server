@@ -27,6 +27,7 @@ from src.core.runtime_errors import (
     OutputCheckError,
     RunCancelledException,
 )
+from src.core.execution_origin import create_server_only_task
 from src.core._runner._stubs import FilterExpr
 from src.stream.media import Audio, File, Image, Video
 from src.models.providers.base import Model
@@ -3261,7 +3262,9 @@ async def _arun_background(
                 log_error(f"Failed to persist error state for background run {run_response.run_id}: {str(e)}")
             # Note: acleanup_run is already called by _arun's finally block
 
-    task = asyncio.create_task(_background_task())
+    task = create_server_only_task(
+        _background_task(), name=f"team-background-run:{run_response.run_id}",
+    )
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
 
@@ -4144,6 +4147,9 @@ def _cleanup_and_store(
     # mutated so the caller always sees generated media regardless of store_media.
     storage_copy = copy.copy(run_response)
     scrub_run_output_for_storage(team, storage_copy)
+    from src.stream.content_parts import scrub_run_output_carriers_for_storage
+
+    scrub_run_output_carriers_for_storage(storage_copy)
 
     # Stop the timer for the Run duration
     if run_response.metrics:
@@ -4190,6 +4196,9 @@ async def _acleanup_and_store(
     # mutated so the caller always sees generated media regardless of store_media.
     storage_copy = copy.copy(run_response)
     scrub_run_output_for_storage(team, storage_copy)
+    from src.stream.content_parts import scrub_run_output_carriers_for_storage
+
+    scrub_run_output_carriers_for_storage(storage_copy)
 
     # Stop the timer for the Run duration
     if run_response.metrics:

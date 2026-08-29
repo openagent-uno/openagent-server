@@ -191,22 +191,19 @@ class CoordinatorStore:
         return (cur.rowcount or 0) > 0
 
     async def delete_user(self, handle: str) -> bool:
-        """Hard-delete a user + cascade their device rows.
+        """Hard-delete a user and cascade their device rows.
 
         Any cert previously issued to one of those devices still
-        verifies cryptographically (it's an Ed25519 sig over a payload
-        that doesn't know the row exists), but the auth middleware
-        also looks up the device in ``network_devices`` at request
-        time — once the row is gone, the cert is dead.
+        verifies cryptographically, but the coordinator auth middleware checks
+        live roster membership on every new stream; an absent row is rejected.
 
         ``network_invitations.bind_to_handle`` is left intact even if
         it pointed at this user: the consume path checks the user
         exists at redeem time, so a stale bind is just a no-op invite,
         not a security hole.
         """
-        # Deletes are in two statements rather than relying on FK
-        # CASCADE because the schema was created without ON DELETE
-        # CASCADE and adding it now would need a table rebuild.
+        # Delete explicitly as well as relying on the schema FK so upgraded
+        # databases created before the cascade was added behave identically.
         await self._conn.execute(
             "DELETE FROM network_devices WHERE user_handle=?",
             (handle,),
@@ -250,10 +247,38 @@ class CoordinatorStore:
         )
         return await cur.fetchone() is not None
 
+    async def list_device_pubkeys_for_user(self, user_handle: str) -> set[bytes]:
+        """Return device keys historically bound to ``user_handle``."""
+        cur = await self._conn.execute(
+            "SELECT device_pubkey FROM network_devices WHERE user_handle=?",
+            (user_handle,),
+        )
+        return {bytes(row[0]) for row in await cur.fetchall()}
+
     async def get_device(self, device_pubkey: bytes) -> DeviceRow | None:
         cur = await self._conn.execute(
             "SELECT device_pubkey, user_handle, label, status, added_at, last_seen "
             "FROM network_devices WHERE device_pubkey=?",
+            (device_pubkey,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        return DeviceRow(**dict(row))
+
+    async def get_active_device(self, device_pubkey: bytes) -> DeviceRow | None:
+        """Return a device only while both it and its owner are active.
+
+        ``get_device`` remains the raw administrative/pairing lookup. Keeping
+        the live-auth view separate means suspending an account cannot make an
+        already-paired computer look like a new device on reactivation.
+        """
+        cur = await self._conn.execute(
+            "SELECT d.device_pubkey, d.user_handle, d.label, d.status, "
+            "d.added_at, d.last_seen "
+            "FROM network_devices AS d "
+            "JOIN network_users AS u ON u.handle=d.user_handle "
+            "WHERE d.device_pubkey=? AND d.status='active' AND u.status='active'",
             (device_pubkey,),
         )
         row = await cur.fetchone()
@@ -324,6 +349,14 @@ class CoordinatorStore:
             (coord_node_id,),
         )
         return [AgentRow(**dict(row)) for row in await cur.fetchall()]
+
+    async def agent_is_registered(self, node_id: str) -> bool:
+        """Return whether ``node_id`` is an enrolled network agent."""
+        cur = await self._conn.execute(
+            "SELECT 1 FROM network_agents WHERE node_id = ? COLLATE NOCASE LIMIT 1",
+            (node_id,),
+        )
+        return await cur.fetchone() is not None
 
     async def update_agent(
         self,

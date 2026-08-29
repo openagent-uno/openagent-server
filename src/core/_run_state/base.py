@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Type, Union
 from pydantic import BaseModel
 
 from src.core._runner._stubs import FilterExpr
-from src.stream.media import Audio, Image, Video
+from src.stream.media import Audio, File, Image, Video
 from src.models.providers.message import Citations, Message, MessageReferences
 from src.models.providers.metrics import RunMetrics
 from src.core._runner._stubs import ReasoningStep
@@ -55,6 +55,7 @@ class BaseRunOutputEvent:
                 "images",
                 "videos",
                 "audio",
+                "files",
                 "response_audio",
                 "citations",
                 "member_responses",
@@ -116,6 +117,14 @@ class BaseRunOutputEvent:
                     _dict["audio"].append(aud.to_dict())
                 else:
                     _dict["audio"].append(aud)
+
+        if hasattr(self, "files") and self.files is not None:
+            _dict["files"] = []
+            for file in self.files:
+                if isinstance(file, File):
+                    _dict["files"].append(file.to_dict())
+                else:
+                    _dict["files"].append(file)
 
         if hasattr(self, "response_audio") and self.response_audio is not None:
             if isinstance(self.response_audio, Audio):
@@ -211,6 +220,12 @@ class BaseRunOutputEvent:
         audio = data.pop("audio", None)
         if audio:
             data["audio"] = [Audio.model_validate(audio) for audio in audio]
+
+        files = data.pop("files", None)
+        if files:
+            from src.core._runner.utils.media import reconstruct_files
+
+            data["files"] = reconstruct_files(files)
 
         response_audio = data.pop("response_audio", None)
         if response_audio:

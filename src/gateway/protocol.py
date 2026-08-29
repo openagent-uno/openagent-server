@@ -15,7 +15,9 @@ Client → Server::
     # Stream protocol (one long-lived StreamSession per session_id):
     {"type": "session_open", "session_id": "...", "profile": "batched|realtime",
                               "language": "...", "speak": true|false,
-                              "coalesce_window_ms": N, "client_kind": "..."}
+                              "coalesce_window_ms": N, "client_kind": "...",
+                              "client_capabilities": {"attachments": true,
+                                "ordered_parts": true, "inline_ui": true}}
     {"type": "session_close","session_id": "..."}
     {"type": "text_final",   "session_id": "...", "text": "...", "source": "user_typed|stt|system"}
     {"type": "audio_chunk_in","session_id": "...", "data": "<base64>",
@@ -25,6 +27,35 @@ Client → Server::
     {"type": "video_frame",  "session_id": "...", "stream": "webcam|screen|...", "data": "<base64>"}
     {"type": "attachment",   "session_id": "...", "kind": "image|file|voice|video", "path": "..."}
     {"type": "interrupt",    "session_id": "...", "reason": "..."}
+
+The privileged client-machine tool plane uses a separate authenticated
+``/ws/capabilities`` socket and protocol ``client-capabilities/1``.  It never
+shares chat frames and cannot be opened by HTTP-token or federated-agent auth::
+
+    {"type":"capability_hello", "protocol":"client-capabilities/1",
+     "client_instance_id":"...", "generation":1, "device_label":"...",
+     "servers":[...]}
+    {"type":"capability_catalog_update", "generation":1, "servers":[...]}
+    {"type":"client_tool_result", "call_id":"...", "generation":1,
+     "result":{"content":[...], "structuredContent":{...}, "isError":false}}
+    {"type":"client_tool_event", "generation":1,
+     "event":{"type":"shell_completed", "server":"shell",
+              "shell_id":"...", "status":"exited", "exit_code":0}}
+    {"type":"client_artifact_chunk", "call_id":"...", "generation":1,
+     "transfer_id":"...", "seq":0, "data":"<base64>", "eof":true,
+     "size":123, "sha256":"...", "mime_type":"image/png"}
+    {"type":"capability_heartbeat", "generation":1, "ts_ms":123}
+
+Server → capability host::
+
+    {"type":"capability_hello_ack", "protocol":"client-capabilities/1", ...}
+    {"type":"client_tool_call", "call_id":"...", "generation":1,
+     "server":"filesystem", "tool":"read_file", "args":{},
+     "account_id":"<trusted cert network>", "arguments_sha256":"...", ...}
+    {"type":"client_tool_cancel", "call_id":"...", "generation":1, ...}
+    {"type":"client_tool_event_ack", "generation":1,
+     "shell_id":"...", "accepted":true, "duplicate":false}
+    {"type":"capability_heartbeat_ack", "generation":1, "ts_ms":123}
 
 ``session_id`` on a ``command`` is optional but strongly recommended for any
 client that multiplexes multiple independent conversations onto a single
@@ -40,7 +71,8 @@ Server → Client::
     {"type": "auth_error",     "reason": "..."}
     {"type": "status",         "text": "...",  "session_id": "..."}
     {"type": "delta",          "text": "...",  "session_id": "..."}
-    {"type": "response",       "text": "...",  "session_id": "...", "attachments": [...], "model": "..."}
+    {"type": "response",       "text": "...",  "session_id": "...", "attachments": [...],
+                                  "parts": [...], "model": "..."}
     {"type": "live_state",     "session_id": "...", "active": true, "frames": [...]}
     {"type": "audio_start",    "session_id": "...", "format": "mp3", "voice_id": "...", "mime": "audio/mpeg"}
     {"type": "audio_chunk",    "session_id": "...", "seq": N, "data": "<base64>"}
@@ -52,6 +84,13 @@ Server → Client::
     {"type": "pong"}
     {"type": "resource_event", "resource": "...", "action": "...", "id": "..."}
     {"type": "system_snapshot", "snapshot": {host, cpu, memory, swap, disks, network, processes, timestamp}}
+
+The gateway also uses one private WebSocket close code.  When a freshly
+authenticated transport takes over the same device identity, the superseded
+socket is closed with ``WS_CLOSE_CONNECTION_REPLACED_CODE`` and
+``WS_CLOSE_CONNECTION_REPLACED_REASON``.  Clients must not reconnect that
+specific socket: doing so would replace the fresh transport in turn and create
+an endless reconnect/replacement loop.
 
 A turn lifecycle: ``status`` (any number, "Using bash...") + ``delta``
 (any number, streamed tokens) + ``response`` (one canonical text +
@@ -124,6 +163,13 @@ bridge can attribute each multiplexed user.
 """
 
 # Message type constants
+# Private WebSocket close contract for two transports presenting the same
+# device certificate.  4000-4999 are application-defined by RFC 6455.  Keep
+# both values stable: first-party clients use the code as the authoritative
+# discriminator and retain the reason for diagnostics.
+WS_CLOSE_CONNECTION_REPLACED_CODE = 4009
+WS_CLOSE_CONNECTION_REPLACED_REASON = "connection_replaced"
+
 AUTH = "auth"
 AUTH_OK = "auth_ok"
 AUTH_ERROR = "auth_error"
@@ -175,6 +221,20 @@ SESSION_OPEN = "session_open"
 SESSION_CLOSE = "session_close"
 VIDEO_FRAME_OUT = "video_frame_out"
 TURN_COMPLETE = "turn_complete"
+
+# Client-machine capability plane (GET /ws/capabilities).
+CAPABILITY_PROTOCOL = "client-capabilities/1"
+CAPABILITY_HELLO = "capability_hello"
+CAPABILITY_HELLO_ACK = "capability_hello_ack"
+CAPABILITY_CATALOG_UPDATE = "capability_catalog_update"
+CAPABILITY_HEARTBEAT = "capability_heartbeat"
+CAPABILITY_HEARTBEAT_ACK = "capability_heartbeat_ack"
+CLIENT_TOOL_CALL = "client_tool_call"
+CLIENT_TOOL_RESULT = "client_tool_result"
+CLIENT_TOOL_CANCEL = "client_tool_cancel"
+CLIENT_TOOL_EVENT = "client_tool_event"
+CLIENT_TOOL_EVENT_ACK = "client_tool_event_ack"
+CLIENT_ARTIFACT_CHUNK = "client_artifact_chunk"
 
 # Interactive terminals — a PTY on the host the gateway runs on, driven
 # live by a client (desktop app System tab, CLI ``terminal`` command).

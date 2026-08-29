@@ -71,6 +71,114 @@ async def t_inproc_close_wakes_accept(ctx: TestContext) -> None:
     assert result is None, f"close should yield None, got {result!r}"
 
 
+class _ReconnectSend:
+    def __init__(self) -> None:
+        self.writes: list[bytes] = []
+
+    async def write_all(self, value: bytes) -> None:
+        self.writes.append(bytes(value))
+
+
+class _ReconnectBi:
+    def __init__(self) -> None:
+        self._send = _ReconnectSend()
+        self._recv = object()
+
+    def send(self):
+        return self._send
+
+    def recv(self):
+        return self._recv
+
+
+class _ReconnectConnection:
+    def __init__(self, failure: str | None = None) -> None:
+        self.failure = failure
+        self.open_count = 0
+        self.closed = False
+        self.streams: list[_ReconnectBi] = []
+
+    async def open_bi(self):
+        self.open_count += 1
+        if self.failure is not None:
+            raise RuntimeError(self.failure)
+        stream = _ReconnectBi()
+        self.streams.append(stream)
+        return stream
+
+    def close(self, _code, _reason) -> None:
+        self.closed = True
+
+
+class _ReconnectNode:
+    def __init__(self, connections: list[_ReconnectConnection]) -> None:
+        self.connections = list(connections)
+        self.dials: list[tuple[str, bytes]] = []
+
+    async def dial(self, node_id: str, alpn: bytes):
+        self.dials.append((node_id, alpn))
+        if not self.connections:
+            raise AssertionError("unexpected extra redial")
+        return self.connections.pop(0)
+
+
+def _reconnect_dialer(node):
+    from src.network.client.session import NetworkBinding, SessionDialer
+
+    return SessionDialer(
+        node=node,
+        binding=NetworkBinding(
+            network_id="network-1",
+            network_name="test",
+            coordinator_node_id="b" * 64,
+            coordinator_pubkey_bytes=b"c" * 32,
+            our_handle="alice",
+        ),
+        cert_wire=b"CERT",
+    )
+
+
+@test("bridge_session", "SessionDialer redials once after a cached Iroh connection drops")
+async def t_session_dialer_recovers_dropped_connection(ctx: TestContext) -> None:
+    del ctx
+    target = "a" * 64
+    dropped = _ReconnectConnection("connection lost")
+    replacement = _ReconnectConnection()
+    node = _ReconnectNode([dropped, replacement])
+    dialer = _reconnect_dialer(node)
+
+    stream = await dialer.open_gateway_stream(target)
+    assert stream.target_node_id == target
+    assert len(node.dials) == 2
+    assert dropped.open_count == 1 and dropped.closed
+    assert replacement.open_count == 1
+    assert replacement.streams[0]._send.writes == [
+        len(b"CERT").to_bytes(4, "big") + b"CERT"
+    ]
+
+    await dialer.open_gateway_stream(target)
+    assert len(node.dials) == 2, "healthy replacement should remain pooled"
+    assert replacement.open_count == 2
+    await dialer.close()
+
+
+@test("bridge_session", "SessionDialer bounds replacement failure to one redial")
+async def t_session_dialer_bounds_failed_replacement(ctx: TestContext) -> None:
+    del ctx
+    first = _ReconnectConnection("first connection lost")
+    second = _ReconnectConnection("replacement also lost")
+    node = _ReconnectNode([first, second])
+    dialer = _reconnect_dialer(node)
+
+    try:
+        await dialer.open_gateway_stream("a" * 64)
+        raise AssertionError("failed replacement unexpectedly opened")
+    except RuntimeError as exc:
+        assert "replacement also lost" in str(exc)
+    assert len(node.dials) == 2
+    assert first.closed and second.closed
+
+
 @test("bridge_session", "BridgeSession rejects member-mode")
 async def t_bridge_rejects_member(ctx: TestContext) -> None:
     from src.network.bridge_session import (

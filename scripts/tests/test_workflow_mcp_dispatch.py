@@ -16,6 +16,7 @@ instead of mid-DAG.
 """
 from __future__ import annotations
 
+import base64
 from typing import Any
 
 from ._framework import TestContext, test
@@ -246,6 +247,108 @@ async def t_sync_callable_no_await(ctx: TestContext) -> None:
     )
 
     assert result == {"result": {"echo": {"a": 1}}}, result
+
+
+@test(
+    "workflow_mcp_dispatch",
+    "mcp-tool preserves the complete rich runtime result envelope",
+)
+async def t_rich_runtime_result_is_lossless(ctx: TestContext) -> None:
+    """A subprocess MCP is exposed to the executor as a runtime
+    ``ToolResult``.  Its display ``content`` is intentionally only a string;
+    the original CallToolResult envelope and media live on separate fields.
+    Serialising that model with ``default=str`` therefore discarded protocol
+    content, structured data, error/meta fields, artifacts and child lineage.
+    """
+    from src.mcp._runtime.function import ToolResult
+    from src.stream.media import Audio, File, Image, Video
+    from src.workflow.executor import (
+        WorkflowExecutor, _RunCtx, _h_mcp_tool,
+    )
+
+    wire_content = [
+        {"type": "text", "text": "hello"},
+        {
+            "type": "image",
+            "data": base64.b64encode(b"wire-image").decode("ascii"),
+            "mimeType": "image/png",
+        },
+        {
+            "type": "audio",
+            "data": base64.b64encode(b"wire-audio").decode("ascii"),
+            "mimeType": "audio/mpeg",
+        },
+        {
+            "type": "resource_link",
+            "name": "report",
+            "uri": "https://example.test/report.pdf",
+            "mimeType": "application/pdf",
+            "size": 321,
+        },
+    ]
+    runtime_result = ToolResult(
+        content="display-only summary",
+        mcp_result={
+            "content": wire_content,
+            "structuredContent": {
+                "rows": [{"id": 1, "active": True}],
+                "nullable": None,
+            },
+            "isError": False,
+            "_meta": {"vendor": "rich-test", "requestId": "req-1"},
+        },
+        images=[Image(id="image-1", content=b"runtime-image", mime_type="image/png")],
+        audios=[Audio(id="audio-1", content=b"runtime-audio", mime_type="audio/mpeg")],
+        videos=[Video(id="video-1", content=b"runtime-video", mime_type="video/mp4")],
+        files=[File(
+            id="file-1", content=b"runtime-file", mime_type="application/pdf",
+            filename="report.pdf",
+        )],
+        child_session_id="session:child-1",
+    )
+    # Some runtime result types also carry the team member run identifier.  It
+    # is not yet a declared ToolResult field, but the shared envelope codec
+    # deliberately preserves it when present for forward compatibility.
+    object.__setattr__(runtime_result, "child_run_id", "run:child-1")
+
+    async def rich_tool() -> ToolResult:
+        return runtime_result
+
+    toolkit = _ToolkitStub(async_functions={"rich_tool": rich_tool})
+    pool = _make_pool({"rich": toolkit})
+    executor = WorkflowExecutor(agent=_RecordingAgent(pool=pool), db=_StubDB())  # type: ignore[arg-type]
+    run_ctx = _RunCtx(run_id="r", workflow_id="w", inputs={}, vars={})
+
+    output = await _h_mcp_tool(
+        executor,
+        {"id": "n-rich", "type": "mcp-tool"},
+        {"mcp_name": "rich", "tool_name": "rich_tool", "args": {}},
+        run_ctx,
+    )
+    envelope = output["result"]
+
+    assert envelope["content"] == wire_content, envelope
+    assert envelope["structuredContent"] == {
+        "rows": [{"id": 1, "active": True}], "nullable": None,
+    }, envelope
+    assert envelope["isError"] is False, envelope
+    assert envelope["_meta"] == {
+        "vendor": "rich-test", "requestId": "req-1",
+    }, envelope
+    assert envelope["images"][0]["content"] == base64.b64encode(
+        b"runtime-image",
+    ).decode("ascii"), envelope
+    assert envelope["audios"][0]["content"] == base64.b64encode(
+        b"runtime-audio",
+    ).decode("ascii"), envelope
+    assert envelope["videos"][0]["content"] == base64.b64encode(
+        b"runtime-video",
+    ).decode("ascii"), envelope
+    assert envelope["files"][0]["content"] == base64.b64encode(
+        b"runtime-file",
+    ).decode("ascii"), envelope
+    assert envelope["child_session_id"] == "session:child-1", envelope
+    assert envelope["child_run_id"] == "run:child-1", envelope
 
 
 # ── Validator tests ─────────────────────────────────────────────────

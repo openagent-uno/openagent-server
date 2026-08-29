@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openagent-framework"
-version = "0.19.49"
+version = "0.20.0"
 description = "Simplified LLM agent framework with MCP, memory, and multi-channel support"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -50,6 +50,14 @@ dependencies = [
     # recall (auto-recall + the semantic_recall MCP tool) silently goes inert
     # with "No module named 'numpy'" (the import sits behind a try/except).
     "numpy>=1.24",
+    # Bounded local PDF text extraction for text-only LLMs. The media
+    # dispatcher uses it only when a configured model lacks native file input;
+    # PDFs are capped by bytes/pages/chars before their text reaches context.
+    "pypdf>=5.0.0",
+    # OA-UI data-source and action input contracts use Draft 2020-12 JSON
+    # Schema validation. Declare it directly (rather than relying on an MCP
+    # transitive) so frozen/server-only builds keep the validation boundary.
+    "jsonschema>=4.20.0",
     # Groq SDK: imported by src.models.providers.groq when a groq-based
     # provider is selected. Declaring it here ensures it is installed in
     # the build environment so PyInstaller bundles it
@@ -118,6 +126,9 @@ dependencies = [
     # it explicit so the CI build is reproducible (v0.13.2 release run
     # failed with ModuleNotFoundError when the cache miss occurred).
     "email-validator>=2.0",
+    # Shared, versioned filesystem/editor implementation used by both the
+    # server MCPPool adapters and client capability hosts.
+    "openagent-host-tools @ https://github.com/openagent-uno/openagent-host-tools/releases/download/v0.1.2/openagent_host_tools-0.1.2-py3-none-any.whl#sha256=22e74b799da2bfacaa3ff7f1e473e1c8205c8b4b8c20764d09211b50f22c31e0",
 ]
 
 [project.optional-dependencies]
@@ -157,6 +168,7 @@ include = ["src*"]
 
 [tool.setuptools.package-data]
 src = [
+    "memory/operational/sql/*.sql",
     "mcp/servers/**/*.ts",
     "mcp/servers/**/*.json",
     "mcp/servers/**/*.py",

@@ -29,7 +29,7 @@ from ._framework import TestContext, test
 @test("stream", "events round-trip the wire codec verbatim")
 async def t_wire_round_trip(ctx: TestContext) -> None:
     from src.stream.events import (
-        AudioChunk, Interrupt, OutAudioChunk, OutAudioEnd, OutAudioStart,
+        Attachment, AudioChunk, Interrupt, OutAudioChunk, OutAudioEnd, OutAudioStart,
         OutReasoning, OutTextDelta, OutTextFinal, OutToolStatus, OutVideoFrame,
         SessionOpen, TextDelta, TextFinal, TurnComplete, VideoFrame,
     )
@@ -38,7 +38,10 @@ async def t_wire_round_trip(ctx: TestContext) -> None:
 
     cases = [
         OutTextDelta(session_id="s", seq=1, ts_ms=10, text="hi"),
-        OutTextFinal(session_id="s", seq=2, ts_ms=20, text="done", model="m"),
+        OutTextFinal(
+            session_id="s", seq=2, ts_ms=20, text="done", model="m",
+            parts=({"kind": "text", "text": "done"},),
+        ),
         OutAudioStart(session_id="s", seq=3, ts_ms=30, format="mp3", mime="audio/mpeg"),
         OutAudioChunk(session_id="s", seq=4, ts_ms=40, data=b"\x00\x01"),
         OutAudioEnd(session_id="s", seq=5, ts_ms=50, total_chunks=1),
@@ -54,9 +57,16 @@ async def t_wire_round_trip(ctx: TestContext) -> None:
                    end_of_speech=True, sample_rate=16000, encoding="pcm16"),
         VideoFrame(session_id="s", seq=12, ts_ms=120, stream="screen",
                    image_bytes=b"frame", width=1024, height=768, keyframe=True),
+        Attachment(
+            session_id="s", seq=18, ts_ms=180, kind="image",
+            path="/internal/cas", filename="photo.png", mime_type="image/png",
+            artifact_id="art_1", artifact_link_id="alink_1", size_bytes=4,
+            sha256="a" * 64, url="/api/artifacts/art_1/content",
+        ),
         Interrupt(session_id="s", seq=13, ts_ms=130, reason="user_speech"),
         SessionOpen(session_id="s", seq=14, ts_ms=140, profile="realtime",
-                    language="en", client_kind="webapp"),
+                    language="en", client_kind="webapp",
+                    client_capabilities={"attachments": True, "inline_ui": True}),
         OutError(session_id="s", seq=15, ts_ms=150, text="boom"),
     ]
     for evt in cases:
@@ -74,6 +84,36 @@ async def t_legacy_message_decodes(ctx: TestContext) -> None:
     assert isinstance(evt, TextFinal)
     assert evt.text == "hey"
     assert evt.source == "user_typed"
+
+
+@test("stream", "outbound AttachmentRefs hide local CAS paths except for trusted bridges")
+async def t_outbound_attachment_paths_are_internal(ctx: TestContext) -> None:
+    from src.stream.events import OutTextFinal
+    from src.stream.wire import event_to_wire
+
+    ref = {
+        "type": "file",
+        "kind": "file",
+        "path": "/private/agent/artifacts/sha256/aa/hash",
+        "filename": "report.pdf",
+        "mime_type": "application/pdf",
+        "size_bytes": 4,
+        "sha256": "a" * 64,
+        "artifact_id": "art_1",
+        "url": "/api/artifacts/art_1/content",
+    }
+    event = OutTextFinal(
+        session_id="s",
+        text="done",
+        attachments=(ref,),
+        parts=({"kind": "attachment", "attachment": ref},),
+    )
+    public = event_to_wire(event)
+    assert "path" not in public["attachments"][0]
+    assert "path" not in public["parts"][0]["attachment"]
+    assert public["attachments"][0]["artifact_id"] == "art_1"
+    internal = event_to_wire(event, include_local_attachment_paths=True)
+    assert internal["attachments"][0]["path"].startswith("/private/")
 
 
 @test("stream", "unknown wire types decode to None")
@@ -257,6 +297,145 @@ async def t_run_one_shot(ctx: TestContext) -> None:
     assert finals[-1].model == "fake-model"
     assert completes, "expected a TurnComplete event"
     assert isinstance(out[-1], TurnComplete), f"TurnComplete must be last; got {out[-1]!r}"
+
+
+@test("stream", "OA-UI marker is hidden across deltas and emitted as an ordered part")
+async def t_ui_marker_stream_parts(ctx: TestContext) -> None:
+    import tempfile
+    from pathlib import Path
+
+    from src.core.on_behalf_context import OnBehalfIdentity
+    from src.custom_views.repository import CustomViewRepository
+    from src.memory.db import MemoryDB
+    from src.memory.operational.access import AccessContext
+    from src.stream.events import OutTextDelta, OutTextFinal
+    from src.stream.session import StreamSession
+
+    # A syntactically valid marker is not sufficient: the StreamSession must
+    # resolve an authorized, revision-pinned inline View for this exact
+    # session before emitting a structured part.
+    with tempfile.TemporaryDirectory(prefix="oa-ui-stream-") as raw:
+        db = MemoryDB(str(Path(raw) / "agent.db"))
+        await db.connect()
+        try:
+            access = AccessContext(
+                tenant_id="tenant-a",
+                principal_id="user:alice",
+                principal_type="user",
+                handle="alice",
+                device_id="device-a",
+                principal_ids=frozenset({"user:alice", "user:device-a", "device:device-a"}),
+                grant_identities=frozenset({("user", "alice"), ("device", "device-a")}),
+            )
+            view = await CustomViewRepository(db).create(
+                access,
+                surface="inline",
+                title="Status board",
+                session_id="s",
+                spec={
+                    "schemaVersion": 1,
+                    "root": {"type": "text", "props": {"text": "Ready"}},
+                },
+            )
+            marker = f"AGENT_UI:{view['id']}@1] now."
+            agent = _FakeAgent(["Dashboard ready [OPEN", marker])
+            agent.db = db
+            sess = StreamSession(
+                agent,
+                client_id="c",
+                session_id="s",
+                client_kind="app",
+                client_capabilities={"inline_ui": True, "ordered_parts": True},
+                on_behalf_identity=OnBehalfIdentity(
+                    "tenant-a", "user", "alice", "device-a"
+                ),
+            )
+            summary = await sess.run_one_shot("build it", speak=False)
+            assert summary["text"] == "Dashboard ready  now.", summary
+
+            out = await _drain(sess)
+            deltas = "".join(e.text for e in out if isinstance(e, OutTextDelta))
+            final = next(e for e in out if isinstance(e, OutTextFinal))
+            assert "OPENAGENT_UI" not in deltas, deltas
+            assert [p["kind"] for p in final.parts] == ["text", "ui_view", "text"]
+            assert final.parts[1]["view_id"] == view["id"]
+        finally:
+            await db.close()
+
+
+@test("stream", "text-only client strips OA-UI marker without receiving a UI part")
+async def t_ui_marker_text_only_client(ctx: TestContext) -> None:
+    from src.stream.events import OutTextDelta, OutTextFinal
+    from src.stream.session import StreamSession
+
+    sess = StreamSession(
+        _FakeAgent(["Created [OPENAGENT_UI:board@1]"]),
+        client_id="c",
+        session_id="s",
+        client_kind="cli",
+        client_capabilities={"attachments": True, "inline_ui": False},
+    )
+    await sess.run_one_shot("build it", speak=False)
+    out = await _drain(sess)
+    assert all("OPENAGENT_UI" not in e.text for e in out if isinstance(e, OutTextDelta))
+    final = next(e for e in out if isinstance(e, OutTextFinal))
+    assert all(p["kind"] != "ui_view" for p in final.parts)
+
+
+@test("stream", "split UI and attachment carriers never reach live text or TTS")
+async def t_all_content_markers_hidden_from_stream_and_tts(ctx: TestContext) -> None:
+    from src.channels.tts_base import BaseTTS
+    from src.stream.events import OutTextDelta
+    from src.stream.session import StreamSession
+
+    spoken: list[str] = []
+
+    class _RecordingTTS(BaseTTS):
+        @property
+        def audio_format(self):
+            return "wav", "audio/wav"
+
+        @property
+        def voice_id(self):
+            return "test"
+
+        async def synthesize_full(self, text, *, language=None):
+            return b""
+
+        async def synthesize_stream(self, text_chunks, *, language=None):
+            async for piece in text_chunks:
+                spoken.append(piece)
+            if False:  # keep this an async generator without emitting audio
+                yield b""
+
+    async def _tts_factory(_db):
+        return _RecordingTTS()
+
+    async def _stt_factory(_db):
+        return None
+
+    agent = _FakeAgent([
+        "Before [FI",
+        "LE:/tmp/report.pdf] [IM",
+        "AGE:/tmp/photo.png] [VO",
+        "ICE:/tmp/reply.ogg] [VID",
+        "EO:/tmp/demo.mp4] [OPEN",
+        "AGENT_UI:board@1] after",
+    ])
+    sess = StreamSession(agent, client_id="c", session_id="s", language=None)
+    await sess.start(stt_factory=_stt_factory, tts_factory=_tts_factory)
+    try:
+        summary = await sess.run_one_shot("show it", speak=True)
+    finally:
+        await sess.close()
+
+    out = await _drain(sess)
+    visible = "".join(e.text for e in out if isinstance(e, OutTextDelta))
+    for value in (visible, "".join(spoken), summary["text"]):
+        assert "Before" in value and "after" in value, value
+        assert "/tmp/" not in value, value
+        assert "OPENAGENT_UI" not in value, value
+        assert "[FILE:" not in value, value
 
 
 # ── Reasoning flag (server emits a boolean, never a "Thinking…" string) ─
@@ -714,6 +893,124 @@ async def t_dispatch_pcm_propagation(ctx: TestContext) -> None:
     assert seen.get("sample_rate") == 16000, seen
 
 
+@test("stream", "STT utterances never mix or retag authenticated client origins")
+async def t_stt_origin_is_per_utterance(ctx: TestContext) -> None:
+    from src.channels.stt_base import BaseSTT, STTEvent
+    from src.core.execution_origin import TrustedIngressIdentity, TurnExecutionOrigin
+    from src.stream.events import AudioChunk, now_ms
+    from src.stream.session import StreamSession
+
+    transcripts: list[tuple[str, object]] = []
+    audio_seen: list[bytes] = []
+
+    class _StubSTT(BaseSTT):
+        supports_streaming = True
+
+        async def transcribe_file(self, path, *, language=None):
+            return None
+
+        async def stream(self, audio_in, *, language=None, encoding="webm",
+                         sample_rate=None):
+            chunks = []
+            async for chunk in audio_in:
+                chunks.append(chunk)
+            payload = b"".join(chunks)
+            audio_seen.append(payload)
+            yield STTEvent(kind="final", text=payload.decode("ascii"))
+
+    class _FakeAgent:
+        name = "fake"
+        db = None
+
+    class _CaptureSession(StreamSession):
+        async def _on_user_turn_complete(
+            self, msg, *, execution_origin=None, ingress_identity=None,
+        ):
+            transcripts.append((msg.text, execution_origin))
+
+    async def _stt_factory(_db):
+        return _StubSTT()
+
+    async def _null(_db):
+        return None
+
+    registry = object()
+    origin_a = TurnExecutionOrigin(
+        "device-a", "desktop-a", 1, "A", registry,
+    )
+    origin_b = TurnExecutionOrigin(
+        "device-b", "desktop-b", 1, "B", registry,
+    )
+    ingress_a = TrustedIngressIdentity("device-a", "connection-a", "desktop-a")
+    ingress_b = TrustedIngressIdentity("device-b", "connection-b", "desktop-b")
+    ingress_c = TrustedIngressIdentity("device-c", "connection-c")
+    ingress_d = TrustedIngressIdentity("device-d", "connection-d")
+    sess = _CaptureSession(_FakeAgent(), client_id="c", session_id="shared")
+    await sess.start(stt_factory=_stt_factory, tts_factory=_null)
+    try:
+        # B cannot append to or terminate A's in-progress utterance. A's own
+        # EOS remains required and the resulting command retains A's host.
+        await sess.push_in(AudioChunk(
+            session_id="shared", seq=1, ts_ms=now_ms(), data=b"from-a",
+            encoding="webm",
+        ), execution_origin=origin_a, ingress_identity=ingress_a)
+        await sess.push_in(AudioChunk(
+            session_id="shared", seq=2, ts_ms=now_ms(), data=b"-from-b",
+            encoding="webm",
+        ), execution_origin=origin_b, ingress_identity=ingress_b)
+        await sess.push_in(AudioChunk(
+            session_id="shared", seq=3, ts_ms=now_ms(), data=b"",
+            end_of_speech=True,
+        ), execution_origin=origin_b, ingress_identity=ingress_b)
+        await sess.push_in(AudioChunk(
+            session_id="shared", seq=4, ts_ms=now_ms(), data=b"",
+            end_of_speech=True,
+        ), execution_origin=origin_a, ingress_identity=ingress_a)
+
+        # After A closes, B may begin a separate utterance with its own exact
+        # origin; this proves the rejection did not poison future audio.
+        await sess.push_in(AudioChunk(
+            session_id="shared", seq=5, ts_ms=now_ms(), data=b"from-b",
+            end_of_speech=True, encoding="webm",
+        ), execution_origin=origin_b, ingress_identity=ingress_b)
+
+        # Ingress isolation is independent of local-tool availability. C and D
+        # both have execution_origin=None, yet D still cannot append/end C.
+        await sess.push_in(AudioChunk(
+            session_id="shared", seq=6, ts_ms=now_ms(), data=b"from-c",
+            encoding="webm",
+        ), ingress_identity=ingress_c)
+        await sess.push_in(AudioChunk(
+            session_id="shared", seq=7, ts_ms=now_ms(), data=b"-from-d",
+            encoding="webm",
+        ), ingress_identity=ingress_d)
+        await sess.push_in(AudioChunk(
+            session_id="shared", seq=8, ts_ms=now_ms(), data=b"",
+            end_of_speech=True,
+        ), ingress_identity=ingress_d)
+        await sess.push_in(AudioChunk(
+            session_id="shared", seq=9, ts_ms=now_ms(), data=b"",
+            end_of_speech=True,
+        ), ingress_identity=ingress_c)
+        await sess.push_in(AudioChunk(
+            session_id="shared", seq=10, ts_ms=now_ms(), data=b"from-d",
+            end_of_speech=True, encoding="webm",
+        ), ingress_identity=ingress_d)
+
+        for _ in range(100):
+            if len(transcripts) == 4:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        await sess.close()
+
+    assert audio_seen == [b"from-a", b"from-b", b"from-c", b"from-d"], audio_seen
+    assert transcripts == [
+        ("from-a", origin_a), ("from-b", origin_b),
+        ("from-c", None), ("from-d", None),
+    ]
+
+
 # ── input coalescence (debounce) ───────────────────────────────────
 
 
@@ -777,6 +1074,374 @@ async def _wait_for(condition, *, timeout: float = 1.0, step: float = 0.01):
 def _make_session(agent, **kwargs):
     from src.stream.session import StreamSession
     return StreamSession(agent, client_id="c", session_id="s", **kwargs)
+
+
+@test("stream", "capability-free device ingresses never merge bursts or steal pending media")
+async def t_ingress_isolates_bursts_and_media_without_capabilities(ctx: TestContext) -> None:
+    import os
+
+    from src.core.execution_origin import TrustedIngressIdentity
+    from src.stream.events import Attachment, TextFinal, VideoFrame, now_ms
+
+    agent = _RecordingAgent(block_first=False)
+    sess = _make_session(agent, coalesce_window_ms=80)
+    ingress_a = TrustedIngressIdentity("device-a", "connection-a")
+    ingress_b = TrustedIngressIdentity("device-b", "connection-b")
+
+    async def _null(_db):
+        return None
+
+    await sess.start(stt_factory=_null, tts_factory=_null)
+    try:
+        await sess.push_in(Attachment(
+            session_id="s", seq=1, ts_ms=now_ms(), kind="file",
+            artifact_id="art_client_a", filename="private.txt",
+            mime_type="text/plain",
+        ), ingress_identity=ingress_a)
+        await sess.push_in(VideoFrame(
+            session_id="s", seq=2, ts_ms=now_ms(), stream="screen",
+            image_bytes=b"client-a-screen", width=16, height=9,
+        ), ingress_identity=ingress_a)
+        await sess.push_in(TextFinal(
+            session_id="s", seq=3, ts_ms=now_ms(), text="from B",
+            source="user_typed",
+        ), execution_origin=None, ingress_identity=ingress_b)
+        await sess.push_in(TextFinal(
+            session_id="s", seq=4, ts_ms=now_ms(), text="from A",
+            source="user_typed",
+        ), execution_origin=None, ingress_identity=ingress_a)
+        await _wait_for(lambda: len(agent.calls) >= 2, timeout=2.0)
+    finally:
+        await sess.close()
+
+    assert [call["message"] for call in agent.calls] == ["from B", "from A"]
+    assert agent.calls[0]["attachments"] == [], (
+        "device B consumed media queued by device A"
+    )
+    a_attachments = agent.calls[1]["attachments"]
+    assert [item.get("filename") for item in a_attachments] == [
+        "private.txt", "screen-snapshot.jpg",
+    ]
+    snapshot_paths = [
+        item.get("path") for item in a_attachments
+        if item.get("filename") == "screen-snapshot.jpg"
+    ]
+    for snapshot_path in snapshot_paths:
+        if snapshot_path:
+            try:
+                os.unlink(snapshot_path)
+            except FileNotFoundError:
+                pass
+
+
+@test("stream", "Gateway stamps trusted ingress even when no capability host is online")
+async def t_gateway_stamps_capability_free_ingress(ctx: TestContext) -> None:
+    from src.gateway.server import Gateway, _StreamHolder
+    from src.gateway.sessions import SessionManager
+
+    class _Capabilities:
+        def origin_for(self, _device, _instance):
+            return None
+
+    class _Session:
+        def __init__(self):
+            self.received = []
+
+        async def push_in(self, event, **trusted):
+            self.received.append((event, trusted))
+
+    class _Channel:
+        def rebind(self, _send):
+            return None
+
+        async def start(self):
+            return None
+
+    class _WS:
+        closed = False
+
+        async def send_json(self, _payload):
+            return None
+
+    class _Agent:
+        name = "test"
+        model = None
+
+    gw = Gateway.__new__(Gateway)
+    gw.agent = _Agent()
+    gw.sessions = SessionManager(agent_name="test")
+    gw.capabilities = _Capabilities()
+    gw._chat_client_instances = {"connection-a": None, "connection-b": None}
+    gw._live_replays = {}
+    captured = _Session()
+    gw._stream_sessions = {
+        ("alice", "shared"): _StreamHolder(session=captured, channel=_Channel()),
+    }
+
+    async def _not_stale(_key, _holder):
+        return False
+
+    gw._stream_holder_is_stale_for_attach = _not_stale
+    for device, connection, text in (
+        ("device-a", "connection-a", "A"),
+        ("device-b", "connection-b", "B"),
+    ):
+        await gw._handle_stream_frame(
+            _WS(), device,
+            {"type": "text_final", "session_id": "shared", "text": text},
+            handle="alice", connection_id=connection,
+        )
+
+    assert len(captured.received) == 2
+    first = captured.received[0][1]
+    second = captured.received[1][1]
+    assert first["execution_origin"] is None and second["execution_origin"] is None
+    assert first["ingress_identity"].device_id == "device-a"
+    assert first["ingress_identity"].connection_id == "connection-a"
+    assert second["ingress_identity"].device_id == "device-b"
+    assert second["ingress_identity"].connection_id == "connection-b"
+    assert first["ingress_identity"] != second["ingress_identity"]
+
+
+@test("stream", "Gateway keeps each running turn on its authenticated websocket")
+async def t_gateway_turn_output_is_ingress_scoped(ctx: TestContext) -> None:
+    """Opening one shared session on B must not steal A's live output.
+
+    The durable session is account-scoped, while transport ownership is
+    per-turn. After A completes, B's own next turn must route only to B.
+    """
+    from src.core.execution_origin import TrustedIngressIdentity
+    from src.gateway.server import Gateway, _StreamHolder
+    from src.gateway.sessions import SessionManager
+    from src.stream.channel import RealtimeChannel
+    from src.stream.session import StreamSession
+
+    class _Capabilities:
+        def origin_for(self, _device, _instance):
+            return None
+
+    class _Agent:
+        name = "test"
+        model = None
+        db = None
+
+        def __init__(self):
+            self.calls = 0
+            self.first_started = asyncio.Event()
+            self.release_first = asyncio.Event()
+
+        async def run_stream(self, **_kwargs):
+            self.calls += 1
+            call = self.calls
+            if call == 1:
+                self.first_started.set()
+                await self.release_first.wait()
+            yield {"kind": "delta", "text": f"private-{call}"}
+            yield {"kind": "done"}
+
+        def last_response_meta(self, _session_id):
+            return {}
+
+    class _WS:
+        closed = False
+
+        def __init__(self):
+            self.sent: list[dict] = []
+
+        async def send_json(self, payload):
+            self.sent.append(payload)
+
+    agent = _Agent()
+    gw = Gateway.__new__(Gateway)
+    gw.agent = agent
+    gw.sessions = SessionManager(agent_name="test")
+    gw.capabilities = _Capabilities()
+    gw._chat_client_instances = {}
+    gw._live_replays = {}
+    gw._stream_sessions = {}
+
+    async def _safe_send(ws, payload):
+        await ws.send_json(payload)
+        return True
+
+    async def _not_stale(_key, _holder):
+        return False
+
+    async def _no_snapshots(*_args, **_kwargs):
+        return None
+
+    gw._safe_ws_send_json = _safe_send
+    gw._stream_holder_is_stale_for_attach = _not_stale
+    gw._send_live_snapshots = _no_snapshots
+
+    ws_a = _WS()
+    ws_b = _WS()
+    session = StreamSession(
+        agent, client_id="device-a", session_id="shared",
+        coalesce_window_ms=0,
+    )
+
+    async def _null(_db):
+        return None
+
+    await session.start(stt_factory=_null, tts_factory=_null)
+    channel = RealtimeChannel(
+        session, lambda payload: _safe_send(ws_a, payload),
+    )
+    channel.bind_transport(
+        TrustedIngressIdentity("device-a", "connection-a", "desktop-a"),
+        lambda payload: _safe_send(ws_a, payload),
+    )
+    await channel.start()
+    gw._stream_sessions[("alice", "shared")] = _StreamHolder(
+        session=session, channel=channel,
+    )
+
+    try:
+        await gw._handle_stream_frame(
+            ws_a, "device-a",
+            {
+                "type": "session_open", "session_id": "shared",
+                "client_instance_id": "desktop-a", "coalesce_window_ms": 0,
+            },
+            handle="alice", connection_id="connection-a",
+        )
+        await gw._handle_stream_frame(
+            ws_a, "device-a",
+            {"type": "text_final", "session_id": "shared", "text": "from A"},
+            handle="alice", connection_id="connection-a",
+        )
+        await asyncio.wait_for(agent.first_started.wait(), timeout=2.0)
+
+        # Merely opening/resuming on B used to rebind the single mutable send
+        # callback and leak all remaining A deltas/results to B.
+        await gw._handle_stream_frame(
+            ws_b, "device-b",
+            {
+                "type": "session_open", "session_id": "shared",
+                "client_instance_id": "desktop-b", "coalesce_window_ms": 0,
+            },
+            handle="alice", connection_id="connection-b",
+        )
+        agent.release_first.set()
+        await _wait_for(
+            lambda: any(p.get("type") == "turn_complete" for p in ws_a.sent),
+            timeout=2.0,
+        )
+        assert any(p.get("text") == "private-1" for p in ws_a.sent)
+        assert not any(p.get("text") == "private-1" for p in ws_b.sent)
+        assert not any(p.get("type") == "turn_complete" for p in ws_b.sent)
+
+        a_count = len(ws_a.sent)
+        await gw._handle_stream_frame(
+            ws_b, "device-b",
+            {"type": "text_final", "session_id": "shared", "text": "from B"},
+            handle="alice", connection_id="connection-b",
+        )
+        await _wait_for(
+            lambda: any(p.get("type") == "turn_complete" for p in ws_b.sent),
+            timeout=2.0,
+        )
+        assert any(p.get("text") == "private-2" for p in ws_b.sent)
+        assert len(ws_a.sent) == a_count, "B's next turn leaked back to A"
+    finally:
+        await channel.close()
+
+
+@test("stream", "detached zombie turns cannot inherit a replacement device route")
+async def t_zombie_turn_keeps_immutable_ingress(ctx: TestContext) -> None:
+    """A provider swallowing cancellation must not publish through B's route."""
+    import src.stream.session as session_module
+    from src.core.execution_origin import TrustedIngressIdentity
+    from src.stream.channel import RealtimeChannel
+    from src.stream.events import TextFinal, now_ms
+    from src.stream.session import StreamSession
+
+    class _Agent:
+        name = "zombie"
+        db = None
+
+        def __init__(self):
+            self.calls = 0
+            self.first_started = asyncio.Event()
+            self.first_cancelled = asyncio.Event()
+            self.release_zombie = asyncio.Event()
+
+        async def request_cancel(self, _session_id):
+            return False
+
+        async def run_stream(self, **_kwargs):
+            self.calls += 1
+            call = self.calls
+            if call == 1:
+                self.first_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    # Simulate a broken provider that consumes cancellation and
+                    # resumes producing after the session has moved on to B.
+                    self.first_cancelled.set()
+                    await self.release_zombie.wait()
+                yield {"kind": "delta", "text": "A-SECRET"}
+                yield {"kind": "done"}
+                return
+            yield {"kind": "delta", "text": "B-OK"}
+            yield {"kind": "done"}
+
+        def last_response_meta(self, _session_id):
+            return {}
+
+    agent = _Agent()
+    session = StreamSession(
+        agent, client_id="device-a", session_id="shared",
+        coalesce_window_ms=0,
+    )
+    ingress_a = TrustedIngressIdentity("device-a", "connection-a", "desktop-a")
+    ingress_b = TrustedIngressIdentity("device-b", "connection-b", "desktop-b")
+    sent_a: list[dict] = []
+    sent_b: list[dict] = []
+
+    async def send_a(payload):
+        sent_a.append(payload)
+        return True
+
+    async def send_b(payload):
+        sent_b.append(payload)
+        return True
+
+    async def _null(_db):
+        return None
+
+    await session.start(stt_factory=_null, tts_factory=_null)
+    channel = RealtimeChannel(session, send_a)
+    channel.bind_transport(ingress_a, send_a)
+    channel.bind_transport(ingress_b, send_b)
+    await channel.start()
+    old_timeout = session_module.BARGE_IN_DRAIN_TIMEOUT
+    session_module.BARGE_IN_DRAIN_TIMEOUT = 0.05
+    try:
+        await session.push_in(TextFinal(
+            session_id="shared", seq=1, ts_ms=now_ms(), text="A",
+            source="user_typed",
+        ), ingress_identity=ingress_a)
+        await asyncio.wait_for(agent.first_started.wait(), timeout=2.0)
+        await session.push_in(TextFinal(
+            session_id="shared", seq=2, ts_ms=now_ms(), text="B",
+            source="user_typed",
+        ), ingress_identity=ingress_b)
+        await asyncio.wait_for(agent.first_cancelled.wait(), timeout=2.0)
+        await _wait_for(lambda: agent.calls >= 2, timeout=2.0)
+        await _wait_for(
+            lambda: any(p.get("text") == "B-OK" for p in sent_b), timeout=2.0,
+        )
+        agent.release_zombie.set()
+        await _wait_for(lambda: not session._detached_turns, timeout=2.0)
+        assert not any(p.get("text") == "A-SECRET" for p in sent_b), sent_b
+        assert not any(p.get("text") == "B-OK" for p in sent_a), sent_a
+    finally:
+        session_module.BARGE_IN_DRAIN_TIMEOUT = old_timeout
+        agent.release_zombie.set()
+        await channel.close()
 
 
 @test("stream", "coalesce explicitly off preserves preempt-on-each-message")
@@ -1996,6 +2661,40 @@ async def t_gateway_adopt_sessions_to_ws(ctx: TestContext) -> None:
         await ch_c.close()
 
 
+@test("stream", "Gateway marks a superseded websocket as connection_replaced")
+async def t_gateway_replaced_websocket_close_contract(ctx: TestContext) -> None:
+    """The old half of a same-device reconnect must never receive a normal
+    close, because first-party clients retry normal transport drops.  Pin the
+    private code and UTF-8 reason that stop only the superseded socket."""
+    from src.gateway import protocol as P
+    from src.gateway.server import Gateway
+
+    class _FakeWS:
+        closed = False
+
+        def __init__(self) -> None:
+            self.close_calls: list[dict] = []
+
+        async def close(self, **kwargs) -> None:
+            self.close_calls.append(kwargs)
+            self.closed = True
+
+    old_ws = _FakeWS()
+    await Gateway._close_replaced_websocket(old_ws)
+
+    assert old_ws.close_calls == [{
+        "code": P.WS_CLOSE_CONNECTION_REPLACED_CODE,
+        "message": P.WS_CLOSE_CONNECTION_REPLACED_REASON.encode("utf-8"),
+    }], old_ws.close_calls
+    assert P.WS_CLOSE_CONNECTION_REPLACED_CODE == 4009
+    assert P.WS_CLOSE_CONNECTION_REPLACED_REASON == "connection_replaced"
+
+    # Cleanup may race with another reconnect.  Once aiohttp reports the old
+    # socket closed, the helper is deliberately idempotent.
+    await Gateway._close_replaced_websocket(old_ws)
+    assert len(old_ws.close_calls) == 1, old_ws.close_calls
+
+
 @test("stream", "Gateway live_state rehydrates an active turn for the same owner")
 async def t_gateway_live_state_rehydrates_active_turn(ctx: TestContext) -> None:
     """Closing the app must not make an in-flight turn invisible. The gateway
@@ -2369,6 +3068,7 @@ async def t_gateway_context_report_after_turn_complete_stays_settled(ctx: TestCo
         frame.get("session_id") != "old" for frame in ws.sent
     ), ws.sent
     assert "old" not in gw._live_replays
+    await gw._close_stream_session(("alice", "new"))
 
 
 @test("stream", "Gateway reattach retires stale holder before stale frame flush")
@@ -2475,6 +3175,7 @@ async def t_gateway_adopt_retires_db_terminal_before_rebind_flush(ctx: TestConte
     assert "s1" not in gw._live_replays
     assert ("alice", "s2") in gw._stream_sessions
     assert channel._pump_task is None or channel._pump_task.done()
+    await gw._close_stream_session(("alice", "s2"))
 
 
 @test("stream", "RealtimeChannel.rebind preserves frame ordering across the swap")

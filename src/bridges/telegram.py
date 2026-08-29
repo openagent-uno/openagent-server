@@ -11,15 +11,17 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from src.bridges.base import BaseBridge
 from src.channels.formatting import markdown_to_telegram_html
-from src.channels.base import (
-    build_attachment_context,
-    is_blocked_attachment,
-    prepend_context_block,
-)
+from src.channels.base import is_blocked_attachment
 from src.gateway.commands import BOT_COMMANDS, BRIDGE_COMMANDS, bridge_welcome_text
+from src.memory.artifacts import (
+    attachment_limit_bytes,
+    safe_attachment_filename,
+    safe_attachment_staging_name,
+)
 
 from src.core.logging import elog
 
@@ -39,6 +41,7 @@ class _Extracted:
     """Output of :meth:`TelegramBridge._extract_files` for one Telegram message."""
     text_addition: str = ""
     files_info: list[str] = field(default_factory=list)
+    attachments: list[dict] = field(default_factory=list)
     voice_detected: bool = False
 
 # Hard shutdown deadlines for the python-telegram-bot library calls. These
@@ -77,6 +80,7 @@ _SEEN_UPDATE_IDS_MAX = 256
 # Telegram's own client cadence and is robust to slow uplinks where
 # the last sibling lags by several hundred ms.
 _MEDIA_GROUP_FLUSH_DELAY = 1.0
+_TG_MEDIA_DOWNLOAD_TIMEOUT = 120.0
 
 
 class _TypingAnimator:
@@ -268,11 +272,15 @@ class TelegramBridge(BaseBridge):
         # while the set gives O(1) membership; they're kept in lockstep.
         self._seen_update_ids: set[int] = set()
         self._seen_update_ids_order: deque[int] = deque(maxlen=_SEEN_UPDATE_IDS_MAX)
-        # Buffer for media-group siblings keyed by (uid, media_group_id).
+        # Buffer for media-group siblings keyed by (session_id, media_group_id).
         # Each entry is ``{"messages": [Message...], "timer": Task}``. The
         # lock guards the dict against races where two updates land on
         # different worker threads inside python-telegram-bot.
         self._media_groups: dict[tuple[str, str], dict] = {}
+        # Keep every debounce task (including a just-cancelled timer that has
+        # not observed cancellation yet) so shutdown can cancel *and await*
+        # all of them before the Telegram application is torn down.
+        self._media_group_tasks: set[asyncio.Task] = set()
         self._media_group_lock = asyncio.Lock()
 
     def _is_authorized(self, uid: str) -> bool:
@@ -312,7 +320,7 @@ class TelegramBridge(BaseBridge):
         # Messages (text, photo, voice, audio, documents, video)
         self._app.add_handler(MessageHandler(
             filters.TEXT | filters.PHOTO | filters.VOICE | filters.AUDIO |
-            filters.Document.ALL | filters.VIDEO,
+            filters.Document.ALL | filters.VIDEO | filters.VIDEO_NOTE,
             self._on_message,
         ))
 
@@ -581,10 +589,12 @@ class TelegramBridge(BaseBridge):
                     )
 
     async def _on_gateway_lost(self) -> None:
+        await self._cancel_media_group_timers()
         await self._shutdown_app(flush_offset=False)
 
     async def stop(self) -> None:
         self._should_stop = True
+        await self._cancel_media_group_timers()
         await self._shutdown_app(flush_offset=True)
         try:
             await super().stop()
@@ -899,55 +909,249 @@ class TelegramBridge(BaseBridge):
                     except Exception:
                         pass
 
-    async def _extract_files(self, msg, tmp: str) -> _Extracted:
-        """Download every attachment on a single Telegram ``Message`` to ``tmp``.
+    async def _download_media(
+        self,
+        msg,
+        media,
+        tmp: str,
+        *,
+        filename: str,
+        kind: str,
+        mime_type: str | None,
+    ) -> dict | None:
+        """Download one Telegram file with pre/post size and timeout checks."""
 
-        Returns an :class:`_Extracted` carrying the voice-transcription
-        text (if any), the per-file ``build_attachment_context`` lines,
-        and a flag set when the user sent a voice note (so the caller
-        can mirror the modality on reply).
+        filename = safe_attachment_filename(filename)
+        if is_blocked_attachment(filename):
+            try:
+                await msg.reply_text(f"⚠️ Blocked: {filename}")
+            except Exception:
+                pass
+            return None
+        limit = attachment_limit_bytes(direction="input")
+        declared_size = int(getattr(media, "file_size", 0) or 0)
+        if limit and declared_size > limit:
+            try:
+                await msg.reply_text(
+                    f"⚠️ File troppo grande: {filename} "
+                    f"({declared_size} byte; limite {limit} byte)."
+                )
+            except Exception:
+                pass
+            elog(
+                "bridge.telegram.attachment_rejected",
+                level="warning",
+                filename=filename,
+                size_bytes=declared_size,
+                limit_bytes=limit,
+            )
+            return None
+
+        unique = safe_attachment_filename(
+            getattr(media, "file_unique_id", None)
+            or getattr(media, "file_id", None)
+            or "telegram",
+            fallback="telegram",
+        )
+        # Prefixing with Telegram's stable unique id prevents two album
+        # documents called report.pdf from overwriting each other in the same
+        # staging directory; the user-facing filename remains unchanged.
+        path = Path(tmp) / safe_attachment_staging_name(unique, filename)
+        # ``file_unique_id`` is normally present, but forwarded/mocked updates
+        # and future Telegram media shapes are not allowed to make two
+        # same-name documents overwrite one another.  Album extraction is
+        # sequential, so a bounded numeric suffix is enough to reserve a
+        # distinct staging path without changing the user-facing filename.
+        duplicate = 1
+        while path.exists():
+            duplicate += 1
+            path = Path(tmp) / safe_attachment_staging_name(
+                # Put the discriminator first: NAME_MAX truncation preserves
+                # the leading bytes, while a trailing suffix could be cut off
+                # and repeatedly resolve to the same occupied basename.
+                f"{duplicate}-{unique}", filename,
+            )
+        try:
+            remote = await asyncio.wait_for(
+                media.get_file(), timeout=_TG_MEDIA_DOWNLOAD_TIMEOUT,
+            )
+            await asyncio.wait_for(
+                remote.download_to_drive(str(path)),
+                timeout=_TG_MEDIA_DOWNLOAD_TIMEOUT,
+            )
+            actual_size = path.stat().st_size
+            if limit and actual_size > limit:
+                with contextlib.suppress(OSError):
+                    path.unlink()
+                try:
+                    await msg.reply_text(
+                        f"⚠️ File troppo grande: {filename} "
+                        f"({actual_size} byte; limite {limit} byte)."
+                    )
+                except Exception:
+                    pass
+                elog(
+                    "bridge.telegram.attachment_rejected",
+                    level="warning",
+                    filename=filename,
+                    size_bytes=actual_size,
+                    limit_bytes=limit,
+                    phase="post_download",
+                )
+                return None
+        except Exception as exc:  # noqa: BLE001
+            with contextlib.suppress(OSError):
+                path.unlink()
+            elog(
+                "bridge.telegram.attachment_download_failed",
+                level="warning",
+                filename=filename,
+                error=str(exc) or type(exc).__name__,
+            )
+            try:
+                await msg.reply_text(
+                    f"⚠️ Impossibile scaricare {filename}. Riprova più tardi."
+                )
+            except Exception:
+                pass
+            return None
+        return {
+            "type": kind,
+            "kind": kind,
+            "path": str(path.resolve()),
+            "filename": filename,
+            "mime_type": mime_type,
+            "size_bytes": actual_size,
+        }
+
+    @staticmethod
+    def _message_author(msg) -> dict | None:
+        user = getattr(msg, "from_user", None)
+        uid = getattr(user, "id", None)
+        if uid is None:
+            return None
+        username = str(getattr(user, "username", None) or "").strip()
+        full_name = str(getattr(user, "full_name", None) or "").strip()
+        display = full_name or (f"@{username}" if username else str(uid))
+        return {
+            "kind": "human",
+            "handle": f"telegram:{uid}",
+            "display": display,
+        }
+
+    async def _extract_files(self, msg, tmp: str) -> _Extracted:
+        """Download one message's media and produce typed AttachmentRefs.
+
+        The paths remain alive until ``dispatch_turn`` returns.  The gateway
+        copies them into durable CAS storage before the turn is queued, so
+        Telegram temp cleanup can never invalidate history or model input.
         """
+
         out = _Extracted()
 
-        if msg.photo:
+        if getattr(msg, "photo", None):
             photo = msg.photo[-1]
-            f = await photo.get_file()
-            path = str(Path(tmp) / f"photo_{photo.file_unique_id}.jpg")
-            await f.download_to_drive(path)
-            out.files_info.append(f"- image: photo.jpg — local path: {path}")
+            fname = f"photo_{getattr(photo, 'file_unique_id', 'telegram')}.jpg"
+            ref = await self._download_media(
+                msg, photo, tmp,
+                filename=fname,
+                kind="image",
+                mime_type="image/jpeg",
+            )
+            if ref:
+                out.attachments.append(ref)
+                out.files_info.append(
+                    f"- image: {ref['filename']} — local path: {ref['path']}"
+                )
 
-        if msg.voice:
+        if getattr(msg, "voice", None):
             out.voice_detected = True
-            f = await msg.voice.get_file()
-            path = str(Path(tmp) / f"voice_{msg.voice.file_unique_id}.ogg")
-            await f.download_to_drive(path)
-            out.text_addition = await self.transcribe_with_fallback(path)
+            voice = msg.voice
+            fname = f"voice_{getattr(voice, 'file_unique_id', 'telegram')}.ogg"
+            ref = await self._download_media(
+                msg, voice, tmp,
+                filename=fname,
+                kind="voice",
+                mime_type=getattr(voice, "mime_type", None) or "audio/ogg",
+            )
+            if ref:
+                out.attachments.append(ref)
+                out.text_addition = await self.transcribe_with_fallback(ref["path"])
 
-        if msg.audio:
-            fname = msg.audio.file_name or f"audio_{msg.audio.file_unique_id}"
-            if not is_blocked_attachment(fname):
-                f = await msg.audio.get_file()
-                path = str(Path(tmp) / fname)
-                await f.download_to_drive(path)
-                out.files_info.append(f"- file: {fname} — local path: {path}")
+        if getattr(msg, "audio", None):
+            audio = msg.audio
+            fname = getattr(audio, "file_name", None) or (
+                f"audio_{getattr(audio, 'file_unique_id', 'telegram')}"
+            )
+            ref = await self._download_media(
+                msg, audio, tmp,
+                filename=fname,
+                kind="voice",
+                mime_type=getattr(audio, "mime_type", None),
+            )
+            if ref:
+                out.attachments.append(ref)
+                out.files_info.append(
+                    f"- audio: {ref['filename']} — local path: {ref['path']}"
+                )
 
-        if msg.document:
-            fname = msg.document.file_name or f"doc_{msg.document.file_unique_id}"
-            if is_blocked_attachment(fname):
-                await msg.reply_text(f"⚠️ Blocked: {fname}")
-            else:
-                f = await msg.document.get_file()
-                path = str(Path(tmp) / fname)
-                await f.download_to_drive(path)
-                out.files_info.append(f"- file: {fname} — local path: {path}")
+        if getattr(msg, "document", None):
+            document = msg.document
+            document_id = (
+                getattr(document, "file_unique_id", None)
+                or getattr(document, "file_id", None)
+                or "telegram"
+            )
+            fname = getattr(document, "file_name", None) or (
+                f"document_{document_id}"
+            )
+            declared_mime = getattr(document, "mime_type", None)
+            declared_kind = (
+                "image" if str(declared_mime or "").startswith("image/") else "file"
+            )
+            ref = await self._download_media(
+                msg, document, tmp,
+                filename=fname,
+                kind=declared_kind,
+                mime_type=declared_mime,
+            )
+            if ref:
+                out.attachments.append(ref)
+                out.files_info.append(
+                    f"- {ref['type']}: {ref['filename']} — local path: {ref['path']}"
+                )
 
-        if msg.video:
-            fname = msg.video.file_name or f"video_{msg.video.file_unique_id}.mp4"
-            if not is_blocked_attachment(fname):
-                f = await msg.video.get_file()
-                path = str(Path(tmp) / fname)
-                await f.download_to_drive(path)
-                out.files_info.append(f"- video: {fname} — local path: {path}")
+        if getattr(msg, "video", None):
+            video = msg.video
+            fname = getattr(video, "file_name", None) or (
+                f"video_{getattr(video, 'file_unique_id', 'telegram')}.mp4"
+            )
+            ref = await self._download_media(
+                msg, video, tmp,
+                filename=fname,
+                kind="video",
+                mime_type=getattr(video, "mime_type", None) or "video/mp4",
+            )
+            if ref:
+                out.attachments.append(ref)
+                out.files_info.append(
+                    f"- video: {ref['filename']} — local path: {ref['path']}"
+                )
+
+        if getattr(msg, "video_note", None):
+            video_note = msg.video_note
+            fname = f"video_note_{getattr(video_note, 'file_unique_id', 'telegram')}.mp4"
+            ref = await self._download_media(
+                msg, video_note, tmp,
+                filename=fname,
+                kind="video",
+                mime_type="video/mp4",
+            )
+            if ref:
+                out.attachments.append(ref)
+                out.files_info.append(
+                    f"- video: {ref['filename']} — local path: {ref['path']}"
+                )
 
         return out
 
@@ -972,6 +1176,7 @@ class TelegramBridge(BaseBridge):
         if chat_type == "channel":
             return
         if is_group:
+            session_id = f"tg:group:{chat_id}"
             if (
                 self.allowed_chats is not None
                 and chat_id not in self.allowed_chats
@@ -986,6 +1191,17 @@ class TelegramBridge(BaseBridge):
                     self._bot_username = (me.username or "").lower()
                 except Exception:
                     self._bot_username = ""
+
+        # Albums must be buffered before the group mention gate: only one
+        # sibling normally carries the caption/@mention, and Telegram does not
+        # guarantee that sibling arrives first. The flush performs the gate on
+        # the aggregate and keeps the group-scoped session id.
+        group_id = getattr(msg, "media_group_id", None)
+        if group_id:
+            await self._enqueue_media_group(session_id, group_id, msg)
+            return
+
+        if is_group:
             text_for_mention = (msg.text or msg.caption or "").lower()
             mentioned = bool(
                 self._bot_username
@@ -998,23 +1214,6 @@ class TelegramBridge(BaseBridge):
             )
             if not (mentioned or replied_to_bot):
                 return
-            # Strip the @mention from the prompt so the model doesn't
-            # waste tokens on it.
-            session_id = f"tg:group:{chat_id}"
-            if mentioned and self._bot_username:
-                # Mutate-safe: we re-read .text below from msg, so
-                # update the local handle the rest of the function uses.
-                pass  # actual strip happens after ``text`` is read below
-
-        # Coalesce media groups: Telegram delivers each attachment in a
-        # multi-file message as its own Update sharing ``media_group_id``,
-        # so without buffering each file would start its own agent turn.
-        # Stash and let ``_flush_media_group`` dispatch one combined
-        # message after the rolling debounce expires.
-        group_id = getattr(msg, "media_group_id", None)
-        if group_id:
-            await self._enqueue_media_group(uid, group_id, msg)
-            return
 
         elog("bridge.message", bridge="telegram", user_id=uid)
         text = msg.caption or msg.text or ""
@@ -1042,7 +1241,7 @@ class TelegramBridge(BaseBridge):
         # is deleted as soon as ``_extract_files`` returns so the
         # following typing-indicator + reply flow stays clean.
         transcribing_msg = None
-        if msg.voice is not None:
+        if getattr(msg, "voice", None) is not None:
             try:
                 transcribing_msg = await msg.reply_text("🎤 Trascrivo...")
             except Exception:
@@ -1059,10 +1258,7 @@ class TelegramBridge(BaseBridge):
             if extracted.text_addition:
                 text = f"{text}\n{extracted.text_addition}" if text else extracted.text_addition
 
-            if extracted.files_info:
-                text = prepend_context_block(text, build_attachment_context(extracted.files_info))
-
-            if not text:
+            if not text and not extracted.attachments:
                 return
 
             # Strip ``@bot_username`` from the text when this is a
@@ -1078,14 +1274,23 @@ class TelegramBridge(BaseBridge):
                     text = (text[:idx] + text[idx + len(mention_token):]).strip()
             await self.dispatch_turn(
                 msg, session_id, text, voice_detected=extracted.voice_detected,
+                attachments=extracted.attachments,
+                author=self._message_author(msg),
             )
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
-    async def _enqueue_media_group(self, uid: str, group_id: str, msg) -> None:
+    async def _enqueue_media_group(
+        self, session_id: str, group_id: str, msg,
+    ) -> None:
         """Buffer a media-group sibling and (re)arm the flush timer."""
-        key = (uid, group_id)
+        key = (session_id, group_id)
         async with self._media_group_lock:
+            gateway_lost = getattr(self, "_gateway_lost", None)
+            if getattr(self, "_should_stop", False) or (
+                gateway_lost is not None and gateway_lost.is_set()
+            ):
+                return
             entry = self._media_groups.get(key)
             if entry is None:
                 entry = {"messages": [msg], "timer": None}
@@ -1097,9 +1302,31 @@ class TelegramBridge(BaseBridge):
                 prior = entry.get("timer")
                 if prior is not None and not prior.done():
                     prior.cancel()
-            entry["timer"] = asyncio.create_task(
-                self._media_group_timer(key)
-            )
+            task = asyncio.create_task(self._media_group_timer(key))
+            task_set = getattr(self, "_media_group_tasks", None)
+            if task_set is None:
+                task_set = self._media_group_tasks = set()
+            task_set.add(task)
+            task.add_done_callback(task_set.discard)
+            entry["timer"] = task
+
+    async def _cancel_media_group_timers(self) -> None:
+        """Cancel and join every pending album debounce task.
+
+        Merely cancelling the task leaves it runnable until the event loop
+        observes cancellation.  Joining here prevents an album flush from
+        racing with PTB shutdown or a gateway reconnect and dispatching a
+        half-torn-down turn.
+        """
+        async with self._media_group_lock:
+            self._media_groups.clear()
+            tasks = list(getattr(self, "_media_group_tasks", ()))
+        current = asyncio.current_task()
+        pending = [task for task in tasks if task is not current and not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     async def _media_group_timer(self, key: tuple[str, str]) -> None:
         try:
@@ -1125,7 +1352,9 @@ class TelegramBridge(BaseBridge):
         if not messages:
             return
 
-        uid, _group_id = key
+        session_id, _group_id = key
+        first_user = getattr(messages[0], "from_user", None)
+        uid = str(getattr(first_user, "id", ""))
         elog(
             "bridge.media_group_flush",
             bridge="telegram",
@@ -1146,9 +1375,44 @@ class TelegramBridge(BaseBridge):
                 captions.append(cap)
         text = "\n".join(captions)
 
+        first_chat = getattr(messages[0], "chat", None)
+        first_chat_type = str(getattr(first_chat, "type", "") or "").lower()
+        if first_chat_type in {"group", "supergroup"}:
+            mention_token = f"@{self._bot_username}" if self._bot_username else ""
+            mentioned = bool(
+                mention_token
+                and any(
+                    mention_token in (
+                        getattr(m, "caption", None)
+                        or getattr(m, "text", None)
+                        or ""
+                    ).lower()
+                    for m in messages
+                )
+            )
+            replied_to_bot = any(
+                getattr(getattr(m, "reply_to_message", None), "from_user", None)
+                is not None
+                and bool(
+                    getattr(
+                        getattr(m.reply_to_message, "from_user", None),
+                        "is_bot",
+                        False,
+                    )
+                )
+                for m in messages
+            )
+            if not (mentioned or replied_to_bot):
+                return
+            if mentioned:
+                lower = text.lower()
+                idx = lower.find(mention_token)
+                if idx != -1:
+                    text = (text[:idx] + text[idx + len(mention_token):]).strip()
+
         tmp = tempfile.mkdtemp(prefix="oa_tg_")
         try:
-            all_files: list[str] = []
+            all_attachments: list[dict] = []
             any_voice = False
             for m in messages:
                 try:
@@ -1163,20 +1427,19 @@ class TelegramBridge(BaseBridge):
                     continue
                 if extracted.text_addition:
                     text = f"{text}\n{extracted.text_addition}" if text else extracted.text_addition
-                all_files.extend(extracted.files_info)
+                all_attachments.extend(extracted.attachments)
                 if extracted.voice_detected:
                     any_voice = True
 
-            if all_files:
-                text = prepend_context_block(text, build_attachment_context(all_files))
-
-            if not text:
+            if not text and not all_attachments:
                 return
 
             # Anchor the status reply on the first sibling so the user sees
             # a single in-flight indicator next to the group.
             await self.dispatch_turn(
-                messages[0], f"tg:{uid}", text, voice_detected=any_voice,
+                messages[0], session_id, text, voice_detected=any_voice,
+                attachments=all_attachments,
+                author=self._message_author(messages[0]),
             )
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
@@ -1359,7 +1622,8 @@ class TelegramBridge(BaseBridge):
                 # Telegram's reply_voice requires OGG/Opus; MP3 (the
                 # LiteLLM default) ships via reply_audio instead —
                 # renders as a music-player bubble.
-                if p.suffix.lower() in (".ogg", ".oga", ".opus"):
+                suffix = Path(getattr(att, "filename", "") or p.name).suffix.lower()
+                if suffix in (".ogg", ".oga", ".opus"):
                     await msg.reply_voice(voice=f)
                 else:
                     await msg.reply_audio(audio=f)

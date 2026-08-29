@@ -116,6 +116,64 @@ async def t_local_spawn_spec_identical(ctx: TestContext) -> None:
     assert spec2.env.get("PATH") == os.environ.get("PATH"), "host env must still be inherited"
 
 
+@test("sandbox", "server local Windows shell preserves the command-line string")
+async def t_local_windows_shell_avoids_argv_requoting(ctx: TestContext) -> None:
+    from src.mcp.servers.shell import backends, shells
+
+    command = '"C:\\Program Files\\Python\\python.exe" -c "print(\'quoted value\')"'
+    sentinel = object()
+    captured: dict[str, object] = {}
+
+    class FakeLocal:
+        name = "local"
+
+        async def prepare(self) -> None:
+            return None
+
+        def build_spawn(self, *, command, cwd, env):
+            return backends.SpawnSpec(
+                argv=["C:\\Windows\\System32\\cmd.exe", "/c", command],
+                env={"OPENAGENT_TEST": "1"},
+                cwd="C:\\work tree",
+            )
+
+    async def fake_shell(value, **kwargs):
+        captured["command"] = value
+        captured.update(kwargs)
+        return sentinel
+
+    async def reject_exec(*_args, **_kwargs):
+        raise AssertionError("Windows local commands must not be argv-requoted")
+
+    original_backend = shells.get_exec_backend
+    original_system = shells.platform.system
+    original_shell = shells.asyncio.create_subprocess_shell
+    original_exec = shells.asyncio.create_subprocess_exec
+    try:
+        shells.get_exec_backend = lambda: FakeLocal()
+        shells.platform.system = lambda: "Windows"
+        shells.asyncio.create_subprocess_shell = fake_shell
+        shells.asyncio.create_subprocess_exec = reject_exec
+        process = await shells.BackgroundShell(
+            shell_id="windows-quoted",
+            command=command,
+            cwd="C:\\ignored",
+            env=None,
+        )._spawn_process()
+    finally:
+        shells.get_exec_backend = original_backend
+        shells.platform.system = original_system
+        shells.asyncio.create_subprocess_shell = original_shell
+        shells.asyncio.create_subprocess_exec = original_exec
+
+    assert process is sentinel
+    assert captured["command"] == command
+    assert "executable" not in captured
+    assert captured["cwd"] == "C:\\work tree"
+    assert captured["env"] == {"OPENAGENT_TEST": "1"}
+    assert "start_new_session" not in captured
+
+
 # ── The docker path: routing (fake) + a pure real build_spawn ───────
 
 

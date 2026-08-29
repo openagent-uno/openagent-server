@@ -1,0 +1,46 @@
+{
+  "bundle_manifest_version": 1,
+  "host_tools_version": "0.1.2",
+  "manifest_version": 1,
+  "platforms": {
+    "darwin-arm64": {
+      "archive_sha256": "d15bbc6f8e1d1fad16664ea2cac97bb0e05ed042afd724a2e6ef6c52ff1fc2ca",
+      "asset": "openagent-host-tools-darwin-arm64.tar.gz",
+      "bundle_manifest_sha256": "1a724c9e1d22ae71f364694fdddc919579c9a6ae9bc1e11389a258e9c26e1f54"
+    },
+    "darwin-x64": {
+      "archive_sha256": "02f3faf7f9e3064aeb588969c947d4334516ebf69c85265418eeb49cc17c3a03",
+      "asset": "openagent-host-tools-darwin-x64.tar.gz",
+      "bundle_manifest_sha256": "9bd556795dc293ee7a36e6544f4f3161a69effc6324aaad209d1a3e0ccc8ee33"
+    },
+    "linux-arm64": {
+      "archive_sha256": "cbc83fead5e3c1b22805bb8c2598ff221b214f3ffbdff626dd5ed2daba161056",
+      "asset": "openagent-host-tools-linux-arm64.tar.gz",
+      "bundle_manifest_sha256": "5f3d326e78b83e3501e9d2249a1af0fddf4e820f49979d7d6b31e5cfd94eb787"
+    },
+    "linux-x64": {
+      "archive_sha256": "c36a4489f0bd07481604778f56789be32f522d62df87f5c801380f42bad603e6",
+      "asset": "openagent-host-tools-linux-x64.tar.gz",
+      "bundle_manifest_sha256": "14e4c9860b6f3f25bde0b2981cb19444522a1a9c4f429b343efbf0835d731976"
+    },
+    "win32-arm64": {
+      "archive_sha256": "5efe499bde2b23ed9f29192ffd992982e1712a396ac3e70a7b59205a17d24ce4",
+      "asset": "openagent-host-tools-win32-arm64.tar.gz",
+      "bundle_manifest_sha256": "f86f06b06564db8f3815d413f693039e2e22a0b208e152373a460b536741f48e"
+    },
+    "win32-x64": {
+      "archive_sha256": "d9333b3636ddea1465004b78c26ad79145e41a981ea5e51169e7a928f1ca8f05",
+      "asset": "openagent-host-tools-win32-x64.tar.gz",
+      "bundle_manifest_sha256": "7432bae5f945aea5ac31f1dc77fea2d88961655b29aa3ed28da17a8f699f4f18"
+    }
+  },
+  "python_wheel": {
+    "asset": "openagent_host_tools-0.1.2-py3-none-any.whl",
+    "sha256": "22e74b799da2bfacaa3ff7f1e473e1c8205c8b4b8c20764d09211b50f22c31e0"
+  },
+  "schema": 1,
+  "source_commit": "af6ad6871d4d1208874bf79735710d089f59b959",
+  "source_ref": "v0.1.2",
+  "source_repository": "openagent-uno/openagent-host-tools",
+  "version": "0.1.2"
+}

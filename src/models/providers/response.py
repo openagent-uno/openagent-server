@@ -33,6 +33,10 @@ class ToolExecution:
     tool_args: Optional[Dict[str, Any]] = None
     tool_call_error: Optional[bool] = None
     result: Optional[str] = None
+    # Explicit execution location for tools reachable through tool-search.
+    # Persisted with the ToolExecution so live status and rehydrated history
+    # render the same "Server OpenAgent" / client-device chip.
+    execution_host: Optional[Dict[str, Any]] = None
     metrics: Optional[ToolCallMetrics] = None
 
     # In the case where a tool call creates a run of an agent/team/workflow
@@ -93,6 +97,7 @@ class ToolExecution:
             tool_args=data.get("tool_args"),
             tool_call_error=data.get("tool_call_error"),
             result=data.get("result"),
+            execution_host=data.get("execution_host"),
             child_run_id=data.get("child_run_id"),
             child_session_id=data.get("child_session_id"),
             stop_after_tool_call=data.get("stop_after_tool_call", False),
