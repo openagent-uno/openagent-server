@@ -5,8 +5,8 @@ parts — it rejects ``{type:"file"}`` with
 ``Failed to deserialize the JSON body into the target type: messages[N]:
 unknown variant 'file', expected 'text'`` and rejects ``image_url`` /
 ``input_audio`` parts the same way. The runtime's default ``DeepSeek``
-class still emits all three when ``message.files`` / ``message.images`` /
-``message.audio`` is populated, so any session that ever stored a
+class still emits them when ``message.files`` / ``message.images`` /
+``message.audio`` / ``message.videos`` is populated, so any session that ever stored a
 multimodal artifact (user upload, MCP-tool screenshot, prior turn from
 a multimodal model) crashes the turn — and every subsequent turn until
 the artifact scrolls out of history.
@@ -19,7 +19,7 @@ request:
   ``application/x-python``, …) get their full UTF-8 content inlined
   in an ``<attachment>`` block.
 * Binary files (``application/pdf``, office docs, …) and all images /
-  audio get a placeholder line that names what was omitted and tells
+  audio/video get a placeholder line that names what was omitted and tells
   the user to switch to a multimodal model.
 
 The mutation is local to the serialization call — the original
@@ -190,8 +190,12 @@ def _audio_label(audio: Any) -> str:
     return label
 
 
-def _media_placeholder(images: list[Any] | None, audios: list[Any] | None) -> str:
-    """Render image/audio attachments as a single ``<media-omitted>`` block.
+def _media_placeholder(
+    images: list[Any] | None,
+    audios: list[Any] | None,
+    videos: list[Any] | None = None,
+) -> str:
+    """Render binary modalities as a single ``<media-omitted>`` block.
 
     Returns an empty string when nothing was attached. Kept compact —
     DeepSeek doesn't need a per-item block, just a note that the user
@@ -202,11 +206,15 @@ def _media_placeholder(images: list[Any] | None, audios: list[Any] | None) -> st
         lines.append(f"- {_image_label(img)}")
     for au in audios or []:
         lines.append(f"- {_audio_label(au)}")
+    for video in videos or []:
+        mime = getattr(video, "mime_type", None) or "video/*"
+        name = getattr(video, "filename", None) or getattr(video, "id", None) or ""
+        lines.append(f"- video ({mime})" + (f": {name}" if name else ""))
     if not lines:
         return ""
     return (
         "<media-omitted>\n"
-        "DeepSeek can't read images or audio. The following attachments "
+        "DeepSeek can't read images, audio, or video. The following attachments "
         "were stripped from this turn — switch to a multimodal model "
         "(e.g. anthropic / openai / google) to analyze them:\n"
         + "\n".join(lines)
@@ -219,7 +227,7 @@ def _media_placeholder(images: list[Any] | None, audios: list[Any] | None) -> st
 
 @dataclass
 class DeepSeekTextOnly(DeepSeek):
-    """DeepSeek subclass that strips files / images / audio to text.
+    """DeepSeek subclass that strips files / images / audio / video to text.
 
     Overrides ``_format_message`` to translate ``message.files`` into
     inline ``<attachment>`` blocks and replace ``message.images`` /
@@ -239,7 +247,8 @@ class DeepSeekTextOnly(DeepSeek):
         has_files = bool(getattr(message, "files", None))
         has_images = bool(getattr(message, "images", None))
         has_audio = bool(getattr(message, "audio", None))
-        if not (has_files or has_images or has_audio):
+        has_videos = bool(getattr(message, "videos", None))
+        if not (has_files or has_images or has_audio or has_videos):
             return super()._format_message(message, compress_tool_results)
 
         inlined_files = _files_to_inline_text(message.files) if has_files else ""
@@ -247,8 +256,9 @@ class DeepSeekTextOnly(DeepSeek):
             _media_placeholder(
                 message.images if has_images else None,
                 message.audio if has_audio else None,
+                message.videos if has_videos else None,
             )
-            if (has_images or has_audio) else ""
+            if (has_images or has_audio or has_videos) else ""
         )
 
         prefix_parts = [p for p in (inlined_files, media_block) if p]
@@ -257,11 +267,13 @@ class DeepSeekTextOnly(DeepSeek):
         original_files = message.files
         original_images = message.images
         original_audio = message.audio
+        original_videos = message.videos
         original_content = message.content
         try:
             message.files = None
             message.images = None
             message.audio = None
+            message.videos = None
             if prefix:
                 if isinstance(message.content, str) and message.content:
                     message.content = (prefix + "\n\n" + message.content).strip()
@@ -272,6 +284,7 @@ class DeepSeekTextOnly(DeepSeek):
             message.files = original_files
             message.images = original_images
             message.audio = original_audio
+            message.videos = original_videos
             message.content = original_content
 
 

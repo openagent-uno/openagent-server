@@ -59,6 +59,7 @@ class BatchedReply:
     audio_mime: str | None = None
     voice_id: str | None = None
     attachments: list[dict] = field(default_factory=list)
+    parts: list[dict] = field(default_factory=list)
     model: str | None = None
     errored: bool = False
     error_text: str | None = None
@@ -130,7 +131,16 @@ class RealtimeChannel:
             while True:
                 evt = await self._session.outbound.get()
                 try:
-                    payload = event_to_wire(evt)
+                    payload = event_to_wire(
+                        evt,
+                        include_local_attachment_paths=bool(
+                            getattr(
+                                self._session,
+                                "allow_local_attachment_paths",
+                                False,
+                            )
+                        ),
+                    )
                 except TypeError as e:
                     logger.debug("realtime: drop unwireable event: %s", e)
                     continue
@@ -227,6 +237,7 @@ class BatchedChannel:
             elif isinstance(evt, OutTextFinal):
                 reply.text = evt.text
                 reply.attachments = list(evt.attachments)
+                reply.parts = list(evt.parts)
                 reply.model = evt.model
             elif isinstance(evt, OutAudioStart):
                 audio_started = True

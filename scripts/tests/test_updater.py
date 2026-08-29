@@ -119,6 +119,19 @@ async def t_updater_prefers_server_asset(ctx: TestContext) -> None:
     assert info.checksum_url and info.checksum_url.endswith("/openagent.tgz.sha256"), info
 
 
+@test("updater", "release asset must exactly match the selected version")
+async def t_updater_rejects_cross_version_asset(ctx: TestContext) -> None:
+    import src.updater as updater
+
+    assets = [{
+        "name": "openagent-0.19.23-linux-x64.tar.gz",
+        "browser_download_url": "https://example.invalid/wrong-version.tgz",
+    }]
+    with patch.object(updater, "_asset_suffix", return_value="linux-x64.tar.gz"):
+        selected = updater._select_release_assets(assets, version="0.19.24")
+    assert selected == (None, None, None)
+
+
 @test("updater", "apply_update uses bundle swap when executable is inside .app bundle")
 async def t_apply_update_bundle_swap(ctx: TestContext) -> None:
     import shutil
@@ -327,6 +340,94 @@ async def t_updater_skips_prerelease(ctx: TestContext) -> None:
     ):
         info = updater.check_for_update()
     assert info is None, "prerelease should not be installed"
+
+
+def _release(tag: str, *, prerelease: bool) -> dict:
+    version = tag.lstrip("v")
+    return {
+        "tag_name": tag,
+        "prerelease": prerelease,
+        "draft": False,
+        "assets": [
+            {
+                "name": f"openagent-{version}-linux-x64.tar.gz",
+                "browser_download_url": f"https://example.invalid/{version}.tgz",
+            }
+        ],
+    }
+
+
+@test("updater", "stable channel ignores every prerelease in a synthetic feed")
+async def t_updater_stable_feed_isolation(ctx: TestContext) -> None:
+    import src
+    import src.updater as updater
+
+    feed = [_release("v0.19.23-beta.2", prerelease=True)]
+    with (
+        patch.object(src, "__version__", "0.19.22"),
+        patch.object(updater, "_asset_suffix", return_value="linux-x64.tar.gz"),
+        patch.object(updater, "_ssl_context", return_value=None),
+        patch.object(updater, "urlopen", return_value=_FakeHTTPResponse(json.dumps(feed).encode())),
+    ):
+        assert updater.check_for_update(channel="stable") is None
+
+
+@test("updater", "beta channel accepts only compatible beta prereleases")
+async def t_updater_beta_feed_isolation(ctx: TestContext) -> None:
+    import src
+    import src.updater as updater
+
+    feed = [
+        _release("v0.20.0-beta.1", prerelease=True),
+        _release("v0.19.23-rc.1", prerelease=True),
+        _release("v0.19.23-beta.2", prerelease=True),
+    ]
+    with (
+        patch.object(src, "__version__", "0.19.23-beta.1"),
+        patch.object(updater, "_asset_suffix", return_value="linux-x64.tar.gz"),
+        patch.object(updater, "_ssl_context", return_value=None),
+        patch.object(updater, "urlopen", return_value=_FakeHTTPResponse(json.dumps(feed).encode())),
+    ):
+        info = updater.check_for_update()
+    assert info is not None
+    assert info.new_version == "0.19.23-beta.2"
+
+
+@test("updater", "beta channel may promote to a semantically newer stable")
+async def t_updater_beta_promotes_to_stable(ctx: TestContext) -> None:
+    import src
+    import src.updater as updater
+
+    feed = [
+        _release("v0.19.23-beta.3", prerelease=True),
+        _release("v0.19.23", prerelease=False),
+    ]
+    with (
+        patch.object(src, "__version__", "0.19.23-beta.2"),
+        patch.object(updater, "_asset_suffix", return_value="linux-x64.tar.gz"),
+        patch.object(updater, "_ssl_context", return_value=None),
+        patch.object(updater, "urlopen", return_value=_FakeHTTPResponse(json.dumps(feed).encode())),
+    ):
+        info = updater.check_for_update()
+    assert info is not None
+    assert info.new_version == "0.19.23"
+
+
+@test("updater", "explicit beta channel opts a stable build into compatible betas")
+async def t_updater_explicit_beta_channel(ctx: TestContext) -> None:
+    import src
+    import src.updater as updater
+
+    feed = [_release("v0.19.23-beta.1", prerelease=True)]
+    with (
+        patch.object(src, "__version__", "0.19.22"),
+        patch.object(updater, "_asset_suffix", return_value="linux-x64.tar.gz"),
+        patch.object(updater, "_ssl_context", return_value=None),
+        patch.object(updater, "urlopen", return_value=_FakeHTTPResponse(json.dumps(feed).encode())),
+    ):
+        info = updater.check_for_update(channel="beta")
+    assert info is not None
+    assert info.new_version == "0.19.23-beta.1"
 
 
 @test("updater", "check_for_update returns None and logs when the tag is unparseable")
@@ -724,6 +825,18 @@ async def t_verify_new_binary(ctx: TestContext) -> None:
         # Should not raise.
         updater.verify_new_binary(good, expected_version="9.9.9")
 
+        mismatch = tmp / "mismatch"
+        mismatch.write_text(
+            '#!/bin/sh\nif [ "$1" = "selfcheck" ]; then echo "8.8.8"; exit 0; fi\nexit 0\n'
+        )
+        mismatch.chmod(0o755)
+        try:
+            updater.verify_new_binary(mismatch, expected_version="9.9.9")
+        except RuntimeError as exc:
+            assert "exactly match" in str(exc).lower(), exc
+        else:
+            raise AssertionError("a runnable binary reporting another version must be rejected")
+
         bad = tmp / "bad"
         bad.write_text('#!/bin/sh\nexit 1\n')
         bad.chmod(0o755)
@@ -733,6 +846,20 @@ async def t_verify_new_binary(ctx: TestContext) -> None:
             assert "self-check" in str(exc).lower() or "exit" in str(exc).lower(), exc
         else:
             raise AssertionError("a binary that fails selfcheck must be rejected")
+
+
+@test("updater", "selfcheck validates packaged operational SQL resources")
+async def t_selfcheck_loads_operational_resources(ctx: TestContext) -> None:
+    import src
+    from click.testing import CliRunner
+    from src.cli import main
+
+    result = CliRunner().invoke(
+        main,
+        ["selfcheck", "--quiet", "--expect", src.__version__],
+    )
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == src.__version__
 
 
 @test("updater", "perform_self_update_sync cleans up its temp dir and records the pending update")
@@ -836,3 +963,76 @@ async def t_updater_captures_digest(ctx: TestContext) -> None:
         info = updater.check_for_update()
     assert info is not None
     assert info.expected_digest == "sha256:" + "b" * 64, info.expected_digest
+
+
+@test("updater", "release verifier accepts GNU Windows binary checksum markers")
+async def t_release_verifier_accepts_windows_binary_marker(ctx: TestContext) -> None:
+    import hashlib
+    import subprocess
+    import sys
+    import tempfile
+    from pathlib import Path
+
+    version = "9.8.7-beta.6"
+    base = f"openagent-{version}"
+    archive_names = (
+        f"{base}-linux-x64.tar.gz",
+        f"{base}-macos-arm64.pkg",
+        f"{base}-windows-x64.zip",
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        for index, name in enumerate(archive_names):
+            archive = root / name
+            archive.write_bytes(f"fixture-{index}".encode())
+            digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+            marker = "*" if name.endswith("windows-x64.zip") else " "
+            # Pin CRLF too: Windows-produced checksum assets must remain valid.
+            (root / f"{name}.sha256").write_bytes(
+                f"{digest} {marker}{name}\r\n".encode(),
+            )
+
+        result = subprocess.run(
+            [sys.executable, "scripts/verify-release-assets.py", str(root), version],
+            cwd=Path(__file__).resolve().parents[2],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr or result.stdout
+        assert "verified 6 immutable release assets" in result.stdout
+
+
+@test("updater", "release verifier rejects a checksum target hidden in a path")
+async def t_release_verifier_rejects_nested_checksum_target(ctx: TestContext) -> None:
+    import hashlib
+    import subprocess
+    import sys
+    import tempfile
+    from pathlib import Path
+
+    version = "9.8.7-beta.6"
+    base = f"openagent-{version}"
+    archive_names = (
+        f"{base}-linux-x64.tar.gz",
+        f"{base}-macos-arm64.pkg",
+        f"{base}-windows-x64.zip",
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        for index, name in enumerate(archive_names):
+            archive = root / name
+            archive.write_bytes(f"fixture-{index}".encode())
+            digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+            listed = f"subdir/{name}" if name.endswith("windows-x64.zip") else name
+            (root / f"{name}.sha256").write_text(f"{digest}  {listed}\n")
+
+        result = subprocess.run(
+            [sys.executable, "scripts/verify-release-assets.py", str(root), version],
+            cwd=Path(__file__).resolve().parents[2],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert result.returncode != 0
+        assert "invalid checksum sidecar" in result.stderr

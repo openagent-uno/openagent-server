@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import tempfile
 from collections import defaultdict, deque
 from typing import Any, Awaitable, Callable
@@ -28,6 +27,7 @@ from src.channels.base import is_reasoning_status, parse_compaction_status
 from src.channels.stt_base import BaseSTT, resolve_stt
 from src.channels.tts_base import BaseTTS, resolve_tts
 from src.core.identity_context import human_author
+from src.core.on_behalf_context import OnBehalfIdentity
 from src.core.logging import elog
 from src.stream.events import (
     Attachment,
@@ -116,6 +116,10 @@ class StreamSession:
         coalesce_window_ms: int | None = None,
         speak_enabled: bool = True,
         handle: str | None = None,
+        on_behalf_identity: OnBehalfIdentity | None = None,
+        client_kind: str | None = None,
+        client_capabilities: dict[str, Any] | None = None,
+        allow_local_attachment_paths: bool = False,
     ):
         self._agent = agent
         self._db = getattr(agent, "db", None)
@@ -127,6 +131,16 @@ class StreamSession:
         # bridge sessions attribute each message. ``None`` on handle-less
         # deployments → author stays unset (today's generic rendering).
         self.handle = handle
+        # Authorization is intentionally not reconstructed from ``handle`` or
+        # from a TextFinal author.  Only the gateway can supply this value,
+        # after verifying the device certificate.  In-process operational
+        # search fails closed when it is absent (ACP/local system runs).
+        self.on_behalf_identity = on_behalf_identity
+        self.client_kind = client_kind
+        self.client_capabilities: dict[str, Any] = dict(client_capabilities or {})
+        # Set only by the gateway from a verified internal bridge certificate;
+        # never derived from the client-advertised capability map.
+        self.allow_local_attachment_paths = bool(allow_local_attachment_paths)
         self.profile = profile
         self.language = language
         # ``0`` disables coalescing (legacy preempt-on-each-message);
@@ -207,6 +221,21 @@ class StreamSession:
             Callable[[set[str]], Awaitable[None]] | None
         ) = None
         self._turn_resources: set[str] = set()
+
+    def update_client_capabilities(
+        self, client_kind: str | None, capabilities: dict[str, Any] | None,
+    ) -> None:
+        """Refresh additive rendering capabilities on reconnect/session-open."""
+        self.client_kind = client_kind
+        self.client_capabilities = dict(capabilities or {})
+
+    def supports_client_capability(self, name: str, *, version: int = 1) -> bool:
+        value = self.client_capabilities.get(name)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int):
+            return value >= version
+        return False
 
     # ── lifecycle ────────────────────────────────────────────────────
 
@@ -460,10 +489,26 @@ class StreamSession:
         # — they are re-derivable from the final message and would be the bulk
         # of the volume.
         if isinstance(evt, OutTextFinal):
+            from src.memory.artifacts import public_attachment_ref
+
             await self._journal("assistant/message", {
                 "text": (evt.text or "")[:8000],
                 "model": getattr(evt, "model", None) or "",
-                "attachments": [dict(a) for a in (evt.attachments or ())][:20],
+                "attachments": [
+                    public_attachment_ref(a) for a in (evt.attachments or ())
+                ][:20],
+                "parts": [
+                    (
+                        {
+                            **dict(part),
+                            "attachment": public_attachment_ref(part["attachment"]),
+                        }
+                        if part.get("kind") == "attachment"
+                        and isinstance(part.get("attachment"), dict)
+                        else dict(part)
+                    )
+                    for part in (evt.parts or ())
+                ][:100],
             })
         elif isinstance(evt, TurnComplete):
             await self._journal("turn/end", {
@@ -577,11 +622,34 @@ class StreamSession:
             return
 
         if isinstance(evt, Attachment):
-            self._pending_attachments.append({
+            attachment = {
                 "type": evt.kind,
                 "path": evt.path,
                 "filename": evt.filename,
                 "mime_type": evt.mime_type,
+                "artifact_id": evt.artifact_id,
+                "artifact_link_id": evt.artifact_link_id,
+                "size_bytes": evt.size_bytes,
+                "sha256": evt.sha256,
+                "url": evt.url,
+            }
+            if (
+                attachment["path"]
+                and not attachment["artifact_id"]
+                and not self.allow_local_attachment_paths
+            ):
+                # Defence in depth for callers that bypass Gateway dispatch
+                # (tests/custom adapters).  The gateway normally either
+                # rejects this path or replaces it with a CAS ref first.
+                await self.outbound.put(OutError(
+                    session_id=self.session_id,
+                    seq=self.next_seq(),
+                    ts_ms=now_ms(),
+                    text="Local attachment paths require a trusted bridge or upload",
+                ))
+                return
+            self._pending_attachments.append({
+                key: value for key, value in attachment.items() if value is not None
             })
             return
 
@@ -834,6 +902,7 @@ class StreamSession:
             text="\n\n".join(texts),
             source=msgs[-1].source if msgs else "user_typed",
             attachments=tuple(merged_atts),
+            author=msgs[-1].author if msgs else None,
         )
 
     async def _cancel_active_turn(
@@ -999,7 +1068,31 @@ class StreamTurnRunner:
     ) -> dict[str, Any]:
         sess = self._session
         publish = sess._publish
+        artifact_db = (
+            getattr(self._agent, "memory_db", None)
+            or getattr(self._agent, "db", None)
+        )
+        sequence_floor = {"user": -1, "assistant": -1}
+        if artifact_db is not None:
+            try:
+                from src.memory.artifacts import latest_message_sequence
+
+                user_floor, assistant_floor = await asyncio.gather(
+                    latest_message_sequence(artifact_db, session_id, role="user"),
+                    latest_message_sequence(artifact_db, session_id, role="assistant"),
+                )
+                sequence_floor = {
+                    "user": user_floor,
+                    "assistant": assistant_floor,
+                }
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "message sequence boundary unavailable (%s)",
+                    type(exc).__name__,
+                )
         accumulated: list[str] = []
+        from src.stream.content_parts import ContentMarkerStreamFilter
+        content_stream_filter = ContentMarkerStreamFilter()
         audio_started = False
         audio_chunks = 0
         stream_error: BaseException | None = None
@@ -1153,7 +1246,12 @@ class StreamTurnRunner:
         from src.stream.child_stream import (
             child_frame_to_event, install_child_stream_emitter, reset_child_stream_emitter,
         )
+        from src.core.on_behalf_context import (
+            install_on_behalf_identity,
+            reset_on_behalf_identity,
+        )
         _child_emit_tok = install_child_stream_emitter(child_emit)
+        _on_behalf_tok = install_on_behalf_identity(sess.on_behalf_identity)
 
         try:
             try:
@@ -1174,17 +1272,19 @@ class StreamTurnRunner:
                         delta = event.get("text") or ""
                         if not delta:
                             continue
-                        # Visible output has started — reasoning is over.
-                        await _end_reasoning()
                         accumulated.append(delta)
-                        await publish(OutTextDelta(
-                            session_id=session_id,
-                            seq=sess.next_seq(),
-                            ts_ms=now_ms(),
-                            text=delta,
-                        ))
-                        if speaker is not None:
-                            await text_q.put(delta)
+                        visible_delta = content_stream_filter.feed(delta)
+                        if visible_delta:
+                            # Visible output has started — reasoning is over.
+                            await _end_reasoning()
+                            await publish(OutTextDelta(
+                                session_id=session_id,
+                                seq=sess.next_seq(),
+                                ts_ms=now_ms(),
+                                text=visible_delta,
+                            ))
+                            if speaker is not None:
+                                await text_q.put(visible_delta)
                     elif kind == "iteration_break":
                         # Synthetic newline forces SentenceChunker to
                         # flush the partial sentence (hard break).
@@ -1194,15 +1294,27 @@ class StreamTurnRunner:
                         if event.get("text") and not accumulated:
                             tail = event["text"]
                             accumulated.append(tail)
-                            await publish(OutTextDelta(
-                                session_id=session_id,
-                                seq=sess.next_seq(),
-                                ts_ms=now_ms(),
-                                text=tail,
-                            ))
-                            if speaker is not None:
-                                await text_q.put(tail)
+                            visible_tail = content_stream_filter.feed(tail)
+                            if visible_tail:
+                                await publish(OutTextDelta(
+                                    session_id=session_id,
+                                    seq=sess.next_seq(),
+                                    ts_ms=now_ms(),
+                                    text=visible_tail,
+                                ))
+                                if speaker is not None:
+                                    await text_q.put(visible_tail)
                         break
+                visible_tail = content_stream_filter.finish()
+                if visible_tail:
+                    await publish(OutTextDelta(
+                        session_id=session_id,
+                        seq=sess.next_seq(),
+                        ts_ms=now_ms(),
+                        text=visible_tail,
+                    ))
+                    if speaker is not None:
+                        await text_q.put(visible_tail)
                 if speaker is not None:
                     await text_q.put(None)
             except asyncio.CancelledError:
@@ -1226,6 +1338,7 @@ class StreamTurnRunner:
                     await text_q.put(None)
                 logger.warning("stream turn failed: %s", e)
         finally:
+            reset_on_behalf_identity(_on_behalf_tok)
             reset_child_stream_emitter(_child_emit_tok)
             if speaker is not None:
                 if cancelled:
@@ -1280,12 +1393,175 @@ class StreamTurnRunner:
                     speak=speak,
                 )
 
-            from src.channels.base import parse_response_markers
-            clean, attachments_out = parse_response_markers(full_text)
-            att_list = [
-                {"type": a.type, "path": a.path, "filename": a.filename}
-                for a in attachments_out
-            ]
+            from src.stream.content_parts import parse_response_content
+            parsed_content = parse_response_content(
+                full_text,
+                allow_inline_ui=sess.supports_client_capability("inline_ui"),
+            )
+            clean = parsed_content.text
+            att_list = [dict(a) for a in parsed_content.attachments]
+            content_parts = [dict(part) for part in parsed_content.parts]
+            if att_list:
+                from src.memory.artifacts import ArtifactError, persist_output_attachments
+
+                try:
+                    persisted = await persist_output_attachments(
+                        artifact_db,
+                        session_id,
+                        att_list,
+                        principal=sess.on_behalf_identity,
+                    )
+                    att_list = [dict(item) for item in persisted]
+                    attachment_iter = iter(att_list)
+                    for part in content_parts:
+                        if part.get("kind") == "attachment":
+                            try:
+                                part["attachment"] = next(attachment_iter)
+                            except StopIteration:
+                                part["attachment"] = None
+                    content_parts = [
+                        part for part in content_parts
+                        if part.get("kind") != "attachment" or part.get("attachment")
+                    ]
+                except ArtifactError as exc:
+                    # Never expose a stale arbitrary path if persistence failed.
+                    logger.warning(
+                        "output attachment persistence failed (%s)",
+                        type(exc).__name__,
+                    )
+                    att_list = []
+                    content_parts = [
+                        part for part in content_parts
+                        if part.get("kind") != "attachment"
+                    ]
+                    suffix = "An attachment could not be saved."
+                    clean = f"{clean}\n\n({suffix})" if clean else f"({suffix})"
+                    content_parts.append({"kind": "text", "text": f"\n\n({suffix})"})
+
+            # Syntactic markers are only carriers.  Recheck the referenced
+            # immutable inline revision against the authenticated turn and
+            # current session before it reaches the wire, then persist the
+            # message-level link used by transcript rehydration. A guessed or
+            # cross-session id is simply omitted; the surrounding text remains
+            # the backwards-compatible fallback.
+            if any(part.get("kind") == "ui_view" for part in content_parts):
+                validated_parts: list[dict[str, Any]] = []
+                access = None
+                if sess.on_behalf_identity is not None:
+                    try:
+                        from src.memory.operational.access import AccessContext
+
+                        access = AccessContext.from_on_behalf_identity(
+                            sess.on_behalf_identity
+                        )
+                    except PermissionError:
+                        access = None
+                repository = None
+                if access is not None and artifact_db is not None:
+                    from src.custom_views.repository import CustomViewRepository
+
+                    repository = CustomViewRepository(artifact_db)
+                for part in content_parts:
+                    if part.get("kind") != "ui_view":
+                        validated_parts.append(part)
+                        continue
+                    if repository is None or access is None:
+                        continue
+                    view_id = str(part.get("view_id") or "")
+                    revision = int(part.get("revision") or 0)
+                    # Validate the immutable inline reference without writing
+                    # its message link yet.  The canonical part transaction
+                    # below owns that write; otherwise a conflicting retry
+                    # could leave an unreferenced UI link behind.
+                    linked = await repository.resolve_inline_ref(
+                        view_id,
+                        revision,
+                        session_id=session_id,
+                        access=access,
+                    )
+                    if linked is None:
+                        continue
+                    validated_parts.append(
+                        {
+                            "kind": "ui_view",
+                            "view_id": view_id,
+                            "revision": revision,
+                            "title": linked.get("title"),
+                            "status": linked.get("status"),
+                            "expires_at": linked.get("expiresAt"),
+                        }
+                    )
+                content_parts = validated_parts
+
+            # Upgrade coarse session links to precise normalized-message links
+            # after the provider run has been persisted/projected. New history
+            # responses can now hydrate path-free AttachmentRefs in their
+            # original message rather than reparsing temporary paths.
+            if artifact_db is not None and (attachments or att_list):
+                try:
+                    from src.memory.artifacts import link_attachments_to_latest_message
+
+                    await link_attachments_to_latest_message(
+                        artifact_db,
+                        session_id,
+                        attachments,
+                        role="user",
+                        principal=sess.on_behalf_identity,
+                        after_sequence=sequence_floor["user"],
+                    )
+                    await link_attachments_to_latest_message(
+                        artifact_db,
+                        session_id,
+                        att_list,
+                        role="assistant",
+                        principal=sess.on_behalf_identity,
+                        after_sequence=sequence_floor["assistant"],
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "message attachment linking failed (%s)",
+                        type(exc).__name__,
+                    )
+
+            # Persist the exact mixed-content order independently of provider
+            # JSON and carrier markers.  The helper waits for normalized v2
+            # projection beyond the captured sequence boundary, so a slow
+            # projection cannot attach these parts to the preceding turn.
+            if artifact_db is not None:
+                try:
+                    from src.memory.message_parts import persist_parts_for_latest_message
+
+                    user_parts: list[dict[str, Any]] = []
+                    if text:
+                        user_parts.append({"kind": "text", "text": text})
+                    user_parts.extend(
+                        {"kind": "attachment", "attachment": dict(item)}
+                        for item in (attachments or ())
+                        if isinstance(item, dict)
+                    )
+                    await persist_parts_for_latest_message(
+                        artifact_db,
+                        session_id,
+                        role="user",
+                        parts=user_parts,
+                        principal=sess.on_behalf_identity,
+                        after_sequence=sequence_floor["user"],
+                    )
+                    await persist_parts_for_latest_message(
+                        artifact_db,
+                        session_id,
+                        role="assistant",
+                        parts=content_parts,
+                        principal=sess.on_behalf_identity,
+                        after_sequence=sequence_floor["assistant"],
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    # The live answer remains usable and legacy rows remain
+                    # readable, but make projection failures diagnosable.
+                    logger.warning(
+                        "canonical message part persistence failed (%s)",
+                        type(exc).__name__,
+                    )
             meta_fn = getattr(self._agent, "last_response_meta", None)
             meta: dict = {}
             try:
@@ -1308,6 +1584,7 @@ class StreamTurnRunner:
                 ts_ms=now_ms(),
                 text=clean,
                 attachments=tuple(att_list),
+                parts=tuple(content_parts),
                 model=meta.get("model"),
             ))
             # How it ended, not just that it did. All three facts are already
@@ -1322,7 +1599,7 @@ class StreamTurnRunner:
             elif stream_error is not None:
                 turn_reason = TURN_END_ERROR
                 turn_error = str(stream_error)
-            elif not clean:
+            elif not clean and not content_parts:
                 turn_reason = TURN_END_EMPTY
                 turn_error = ""
             else:
@@ -1368,6 +1645,7 @@ class StreamTurnRunner:
         return {
             "text": clean,
             "attachments": att_list,
+            "parts": content_parts,
             "audio_chunks": audio_chunks,
             "errored": stream_error is not None,
         }

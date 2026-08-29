@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import Awaitable, Callable
 
 import iroh
@@ -36,6 +37,20 @@ from src.network.identity import Identity
 logger = logging.getLogger(__name__)
 
 IROH_VERSION = "0.35"
+
+
+def _discovery_config() -> "iroh.NodeDiscoveryConfig":
+    """Resolve the Iroh discovery policy.
+
+    Production keeps Iroh's default peer discovery.  Hermetic local E2E runs
+    can set ``OPENAGENT_IROH_DISCOVERY=none`` and rely exclusively on the
+    direct addresses embedded in invite tickets, avoiding DNS/pkarr and mDNS
+    traffic while exercising the real authenticated transport.
+    """
+    value = os.environ.get("OPENAGENT_IROH_DISCOVERY", "").strip().lower()
+    if value in {"none", "off", "disabled"}:
+        return iroh.NodeDiscoveryConfig.NONE
+    return iroh.NodeDiscoveryConfig.DEFAULT
 
 
 class NetworkAlpn:
@@ -158,7 +173,7 @@ class IrohNode:
         opts = iroh.NodeOptions(
             secret_key=self.identity.secret_bytes,
             protocols=creators or None,
-            node_discovery=iroh.NodeDiscoveryConfig.DEFAULT,
+            node_discovery=_discovery_config(),
             enable_docs=False,
         )
         self._node = await iroh.Iroh.memory_with_options(opts)

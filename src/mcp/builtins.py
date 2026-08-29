@@ -423,18 +423,31 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
         ),
     },
     "memory-search": {
-        "dir": "memory_search",
-        "command": ["python", "-m", "src.mcp.servers.memory_search.server"],
-        "python": True,
-        # Says "full-text" rather than the old "semantic": tool-search shows
-        # this line as the MCP's one-line pitch, and the model picks tools off
-        # it. It matches words, not meaning — promising semantics would send
-        # the model here with a paraphrase and let the miss read as "never
-        # discussed". Same failure the phantom "audio" claim on media-gen had.
+        # In-process is a security boundary, not an optimization. The tool
+        # reads the authenticated on-behalf-of ContextVar and calls the same
+        # redacted operational search layer as the gateway. A subprocess
+        # would need a reusable principal-bearing token and could not safely
+        # recheck canonical ACLs for the current turn.
+        "in_process": True,
+        "adapter_module": "src.mcp.servers.memory_search.adapters",
         "description": (
-            "full-text search over what was SAID in past conversations. "
-            "Complements vault: vault is your curated notes, this is the "
-            "raw transcript. Matches words, not meaning"
+            "authorized full-text search across chats, tools, workflows, "
+            "scheduled runs and events. Complements the separate Markdown "
+            "vault; matches redacted words, not meaning"
+        ),
+    },
+    "ui-manager": {
+        # In-process is an authorization boundary.  Mutations are performed on
+        # behalf of the authenticated turn principal and refresh/action calls
+        # need the live view runtime; neither can be delegated safely to a
+        # reusable-credential subprocess.
+        "in_process": True,
+        "adapter_module": "src.mcp.servers.ui_manager.adapters",
+        "runtime_toolkit_factory": "build_runtime_toolkit",
+        "description": (
+            "create and manage safe OA-UI Custom Views — durable sidebar "
+            "dashboards or revision-pinned inline chat artifacts, with "
+            "dynamic data sources and typed server-side actions"
         ),
     },
     "delegation": {
@@ -478,22 +491,19 @@ DEFAULT_MCPS: list[dict[str, Any]] = [
     # list, so three more tools cost 0 prompt tokens until actually used.
     # Dream mode's log-triage mission also depends on it being present.
     {"builtin": "logs", "_default": True},
-    # On by default as of the FTS rewrite. It was opt-in while it was an
-    # OpenAI-pinned embedding index whose only writer had zero callers — i.e.
-    # it could never return a row, and enabling it bought nothing. It is now
-    # FTS5 over ``sessions.runs`` (``src/memory/transcript_index.py``): no key,
-    # no provider, no vendor, and a rebuildable cache rather than a store.
+    # On by default. It now calls the redacted operational FTS5 service in
+    # process, so it can use the authenticated turn principal and canonical
+    # ACL recheck without a reusable bearer credential. The old TranscriptIndex
+    # remains only as a shadow/compatibility bridge for direct legacy tests.
     #
     # It has to be default-on because ``prompts.py`` tells the model this tool
     # exists and when to reach for it. A described tool that isn't registered
     # is the same defect as a prompt naming a tool that doesn't exist — the
     # model burns a turn on "Function not found" and learns nothing.
     #
-    # Cost is one more Python subprocess at boot, the sixth of an identical
-    # kind (scheduler, mcp-manager, model-manager, workflow-manager,
-    # events-manager). Making it in-process would make this free and is the
-    # better end state; it is not worth blocking the capability on.
+    # In-process registration is effectively free until tool discovery/use.
     {"builtin": "memory-search", "_default": True},
+    {"builtin": "ui-manager", "_default": True},
     {"builtin": "computer-control", "_default": True},
     {"builtin": "agent-in-chrome", "_default": True},
     {"builtin": "messaging", "_default": True},
@@ -784,28 +794,12 @@ def resolve_default_entry(entry: dict[str, Any], db_path: str | None = None) -> 
         # The vault MCP needs to know which folder is the vault. It reads
         # OPENAGENT_VAULT_PATH (server.ts), so the subprocess lands on the
         # same notes directory as the rest of OpenAgent instead of its CWD.
-        # memory-search reads the same folder for its semantic index over
-        # notes, so it gets OPENAGENT_VAULT_PATH too.
-        if entry["builtin"] in ("vault", "memory-search") and "OPENAGENT_VAULT_PATH" not in extra_env:
+        # Operational memory-search is deliberately separate and in-process;
+        # it never opens the Markdown vault or its index.
+        if entry["builtin"] == "vault" and "OPENAGENT_VAULT_PATH" not in extra_env:
             from src.core.paths import default_vault_path
 
             extra_env["OPENAGENT_VAULT_PATH"] = str(default_vault_path())
-
-        # memory-search's semantic_recall tool builds an embedder from the
-        # providers config the operator named (OPENAGENT_EMBEDDING_MODEL, etc.).
-        # The MCP SDK spawns the subprocess with a minimal env, so these do NOT
-        # inherit automatically — forward them when the operator set them.
-        # Unset upstream => nothing forwarded => the tool degrades to inert and
-        # reports {active:false} rather than half-working. See semantic_index.py.
-        if entry["builtin"] == "memory-search":
-            for _var in (
-                "OPENAGENT_EMBEDDING_MODEL",
-                "OPENAGENT_EMBEDDING_BASE_URL",
-                "OPENAGENT_EMBEDDING_API_KEY",
-            ):
-                _val = os.environ.get(_var)
-                if _val and _var not in extra_env:
-                    extra_env[_var] = _val
 
         try:
             return resolve_builtin_entry(entry["builtin"], env=extra_env or None)

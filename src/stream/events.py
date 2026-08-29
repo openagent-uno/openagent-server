@@ -85,6 +85,10 @@ class SessionOpen(Event):
     tts_pin: str | None = None
     language: str | None = None
     client_kind: str | None = None
+    # Additive client feature negotiation.  The gateway never infers rich UI
+    # support from ``client_kind``: an app must explicitly advertise it, while
+    # CLI and external bridges stay attachment-only.
+    client_capabilities: dict[str, Any] = field(default_factory=dict)
     # Debounce window for coalescing burst inputs into a single turn.
     # ``None`` (default) means "use the server-side default" —
     # ``StreamSession.DEFAULT_COALESCE_WINDOW_MS`` (500 ms), the OpenAI-
@@ -171,12 +175,22 @@ class VideoFrame(Event):
 
 @dataclass(frozen=True)
 class Attachment(Event):
-    """A file reference uploaded out-of-band (e.g. via /api/upload)."""
+    """A durable file reference uploaded out-of-band.
+
+    ``path`` is internal compatibility state and is accepted from the wire
+    only for a gateway-verified bridge.  First-party remote clients send the
+    ``artifact_id`` returned by the upload endpoint.
+    """
 
     kind: Literal["image", "file", "voice", "video"] = "file"
     path: str | None = None
     filename: str = ""
     mime_type: str | None = None
+    artifact_id: str | None = None
+    artifact_link_id: str | None = None
+    size_bytes: int | None = None
+    sha256: str | None = None
+    url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -198,10 +212,13 @@ class OutTextDelta(Event):
 
 @dataclass(frozen=True)
 class OutTextFinal(Event):
-    """Committed assistant reply (full text + attachments + model)."""
+    """Committed assistant reply with ordered, backward-compatible content."""
 
     text: str = ""
     attachments: tuple[dict[str, Any], ...] = ()
+    # Ordered rich content.  Legacy clients continue reading ``text`` and
+    # ``attachments``; v1 parts are ``text``, ``attachment`` and ``ui_view``.
+    parts: tuple[dict[str, Any], ...] = ()
     model: str | None = None
 
 

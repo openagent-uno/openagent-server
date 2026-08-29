@@ -15,7 +15,9 @@ Client → Server::
     # Stream protocol (one long-lived StreamSession per session_id):
     {"type": "session_open", "session_id": "...", "profile": "batched|realtime",
                               "language": "...", "speak": true|false,
-                              "coalesce_window_ms": N, "client_kind": "..."}
+                              "coalesce_window_ms": N, "client_kind": "...",
+                              "client_capabilities": {"attachments": true,
+                                "ordered_parts": true, "inline_ui": true}}
     {"type": "session_close","session_id": "..."}
     {"type": "text_final",   "session_id": "...", "text": "...", "source": "user_typed|stt|system"}
     {"type": "audio_chunk_in","session_id": "...", "data": "<base64>",
@@ -40,7 +42,8 @@ Server → Client::
     {"type": "auth_error",     "reason": "..."}
     {"type": "status",         "text": "...",  "session_id": "..."}
     {"type": "delta",          "text": "...",  "session_id": "..."}
-    {"type": "response",       "text": "...",  "session_id": "...", "attachments": [...], "model": "..."}
+    {"type": "response",       "text": "...",  "session_id": "...", "attachments": [...],
+                                  "parts": [...], "model": "..."}
     {"type": "live_state",     "session_id": "...", "active": true, "frames": [...]}
     {"type": "audio_start",    "session_id": "...", "format": "mp3", "voice_id": "...", "mime": "audio/mpeg"}
     {"type": "audio_chunk",    "session_id": "...", "seq": N, "data": "<base64>"}
@@ -52,6 +55,13 @@ Server → Client::
     {"type": "pong"}
     {"type": "resource_event", "resource": "...", "action": "...", "id": "..."}
     {"type": "system_snapshot", "snapshot": {host, cpu, memory, swap, disks, network, processes, timestamp}}
+
+The gateway also uses one private WebSocket close code.  When a freshly
+authenticated transport takes over the same device identity, the superseded
+socket is closed with ``WS_CLOSE_CONNECTION_REPLACED_CODE`` and
+``WS_CLOSE_CONNECTION_REPLACED_REASON``.  Clients must not reconnect that
+specific socket: doing so would replace the fresh transport in turn and create
+an endless reconnect/replacement loop.
 
 A turn lifecycle: ``status`` (any number, "Using bash...") + ``delta``
 (any number, streamed tokens) + ``response`` (one canonical text +
@@ -124,6 +134,13 @@ bridge can attribute each multiplexed user.
 """
 
 # Message type constants
+# Private WebSocket close contract for two transports presenting the same
+# device certificate.  4000-4999 are application-defined by RFC 6455.  Keep
+# both values stable: first-party clients use the code as the authoritative
+# discriminator and retain the reason for diagnostics.
+WS_CLOSE_CONNECTION_REPLACED_CODE = 4009
+WS_CLOSE_CONNECTION_REPLACED_REASON = "connection_replaced"
+
 AUTH = "auth"
 AUTH_OK = "auth_ok"
 AUTH_ERROR = "auth_error"

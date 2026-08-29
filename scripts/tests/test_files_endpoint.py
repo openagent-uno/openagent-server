@@ -1,95 +1,177 @@
-"""GET /api/files endpoint tests.
+"""Fail-closed compatibility tests for deprecated ``GET /api/files``."""
 
-Covers the outbound-file serving path the agent uses to hand local
-attachments back to remote clients (desktop app, CLI).
-
-When the agent includes ``[IMAGE:/tmp/foo.png]`` / ``[FILE:/path]`` in
-its response, the gateway strips the marker and delivers
-``{path, filename, type}`` to the client via the WS ``response``
-message. For a local install the client can read ``path`` directly;
-for a remote install (app on laptop, agent on VPS) it fetches the
-bytes via ``GET /api/files?path=<abs>`` — the endpoint these tests
-lock down.
-
-Tests:
-
-1. **Happy path** — serve an on-disk file with the expected bytes and
-   Content-Disposition filename.
-2. **Missing path param** — 400.
-3. **File not found** — 404.
-4. **Symlink resolves through realpath** — a symlink to a real file
-   serves the file rather than 404'ing.
-"""
 from __future__ import annotations
 
 import os
-import pathlib
+import sqlite3
 import tempfile
+from contextlib import asynccontextmanager
+from pathlib import Path
+from types import SimpleNamespace
 
-from ._framework import TestContext, TestSkip, test
-
-
-async def _get_file(port: int, path: str) -> tuple[int, bytes, dict[str, str]]:
-    import aiohttp
-    async with aiohttp.ClientSession() as http:
-        async with http.get(f"http://127.0.0.1:{port}/api/files", params={"path": path}) as r:
-            body = await r.read()
-            return r.status, body, dict(r.headers)
+from ._framework import TestContext, test
 
 
-@test("files_endpoint", "GET /api/files returns the file bytes + Content-Disposition")
-async def t_files_happy(ctx: TestContext) -> None:
-    port = ctx.extras.get("gateway_port")
-    if not port:
-        raise TestSkip("gateway not running")
-
-    tmp_dir = tempfile.mkdtemp(prefix="oa_files_test_")
-    fpath = pathlib.Path(tmp_dir) / "agent-report.txt"
-    payload = b"hello from the agent's filesystem"
-    fpath.write_bytes(payload)
-
-    status, body, headers = await _get_file(port, str(fpath))
-    assert status == 200, f"expected 200, got {status}: {body[:200]!r}"
-    assert body == payload, "body bytes don't match the on-disk file"
-    # aiohttp FileResponse should advertise the filename so browsers save
-    # with the original name rather than a random URL slug.
-    disp = headers.get("Content-Disposition", "")
-    assert "agent-report.txt" in disp, f"unexpected Content-Disposition: {disp!r}"
+class _DiskDB:
+    def __init__(self, path: Path) -> None:
+        self.db_path = str(path)
 
 
-@test("files_endpoint", "GET /api/files without path returns 400")
-async def t_files_missing_path(ctx: TestContext) -> None:
-    port = ctx.extras.get("gateway_port")
-    if not port:
-        raise TestSkip("gateway not running")
-    import aiohttp
-    async with aiohttp.ClientSession() as http:
-        async with http.get(f"http://127.0.0.1:{port}/api/files") as r:
-            assert r.status == 400, f"expected 400, got {r.status}"
+def _database(root: Path) -> tuple[_DiskDB, str]:
+    db_path = root / "agent.db"
+    schema = (
+        Path(__file__).parents[2]
+        / "src/memory/operational/sql/operational_storage_v2.sql"
+    ).read_text(encoding="utf-8")
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(schema)
+        state = conn.execute(
+            "SELECT db_instance_id FROM operational_storage_state WHERE singleton_id=1"
+        ).fetchone()
+        assert state is not None
+        tenant = f"installation:{state[0]}"
+        now = 1_700_000_000_000
+        conn.execute(
+            "INSERT INTO sessions_v2 "
+            "(id,tenant_id,owner_principal_id,owner_handle_snapshot,visibility,acl_version,"
+            "session_type,kind,status,completeness,source_version,metadata_json,created_at_ms,"
+            "updated_at_ms,last_activity_at_ms) VALUES "
+            "('legacy-file-session',?,'user:alice','alice','public',1,'agent','chat',"
+            "'active','complete',1,'{}',?,?,?)",
+            (tenant, now, now, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return _DiskDB(db_path), tenant
 
 
-@test("files_endpoint", "GET /api/files for a nonexistent path returns 404")
-async def t_files_not_found(ctx: TestContext) -> None:
-    port = ctx.extras.get("gateway_port")
-    if not port:
-        raise TestSkip("gateway not running")
-    status, body, _ = await _get_file(port, "/tmp/openagent-does-not-exist-xyz123.bin")
-    assert status == 404, f"expected 404, got {status}: {body[:200]!r}"
+def _access(tenant: str, handle: str):
+    from src.memory.operational.access import AccessContext
+
+    return AccessContext(
+        tenant_id=tenant,
+        principal_id=f"user:{handle}",
+        principal_type="user",
+        handle=handle,
+        device_id=f"device-{handle}",
+        principal_ids=frozenset(
+            {f"user:{handle}", f"user:device-{handle}", f"device:device-{handle}"}
+        ),
+        grant_identities=frozenset({("user", handle)}),
+    )
 
 
-@test("files_endpoint", "GET /api/files resolves symlinks via realpath")
-async def t_files_symlink(ctx: TestContext) -> None:
-    port = ctx.extras.get("gateway_port")
-    if not port:
-        raise TestSkip("gateway not running")
+@asynccontextmanager
+async def _legacy_server(root: Path):
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
 
-    tmp_dir = tempfile.mkdtemp(prefix="oa_files_symlink_")
-    real = pathlib.Path(tmp_dir) / "real.bin"
-    payload = b"real-file-content-42"
-    real.write_bytes(payload)
-    link = pathlib.Path(tmp_dir) / "link.bin"
-    os.symlink(real, link)
+    from src.gateway.server import Gateway
+    from src.memory.artifacts import normalize_inbound_attachments
 
-    status, body, _ = await _get_file(port, str(link))
-    assert status == 200, f"expected 200 following symlink, got {status}"
-    assert body == payload, "symlink target served wrong bytes"
+    db, tenant = _database(root)
+    source = root / "agent-report.txt"
+    payload = b"authorized legacy attachment bytes"
+    source.write_bytes(payload)
+    ref = (
+        await normalize_inbound_attachments(
+            db,
+            ({"path": str(source), "filename": "agent-report.txt"},),
+            session_id="legacy-file-session",
+            principal=_access(tenant, "alice"),
+            allow_local_paths=True,
+        )
+    )[0]
+
+    @web.middleware
+    async def _identity(request, handler):
+        handle = request.headers.get("X-Test-Handle", "bob")
+        cert = SimpleNamespace(
+            network_id=tenant,
+            handle=handle,
+            device_pubkey_hex=f"device-{handle}",
+            capabilities=[],
+        )
+        request["device_cert"] = cert
+        request["network_id"] = tenant
+        request["user_handle"] = handle
+        request["client_id"] = cert.device_pubkey_hex
+        return await handler(request)
+
+    fake_gateway = SimpleNamespace(agent=SimpleNamespace(memory_db=db))
+
+    async def _handle(request):
+        return await Gateway._handle_files(fake_gateway, request)
+
+    app = web.Application(middlewares=[_identity])
+    app.router.add_get("/api/files", _handle)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        yield client, db, tenant, ref, payload
+    finally:
+        await client.close()
+
+
+@test("files_endpoint", "legacy path serves only a currently visible CAS link")
+async def t_files_authorized_cas(ctx: TestContext) -> None:
+    with tempfile.TemporaryDirectory(prefix="oa-files-authorized-") as raw:
+        root = Path(raw)
+        async with _legacy_server(root) as (client, db, _tenant, ref, payload):
+            response = await client.get("/api/files", params={"path": ref["path"]})
+            assert response.status == 200, await response.text()
+            assert await response.read() == payload
+            assert "agent-report.txt" in response.headers["Content-Disposition"]
+            assert response.headers["Cache-Control"] == "private, no-store"
+            assert response.headers["Deprecation"] == "true"
+            assert ref["artifact_id"] in response.headers["Link"]
+
+            # Resolving a symlink to the same authorized immutable CAS object is
+            # compatible; authorization is still based on the canonical row.
+            alias = root / "legacy-alias"
+            os.symlink(ref["path"], alias)
+            symlinked = await client.get("/api/files", params={"path": str(alias)})
+            assert symlinked.status == 200
+            assert await symlinked.read() == payload
+
+            conn = sqlite3.connect(db.db_path)
+            try:
+                conn.execute(
+                    "UPDATE sessions_v2 SET visibility='private', "
+                    "updated_at_ms=updated_at_ms+1 WHERE id='legacy-file-session'"
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            revoked = await client.get("/api/files", params={"path": ref["path"]})
+            assert revoked.status == 404
+
+
+@test("files_endpoint", "legacy path never reads arbitrary host files")
+async def t_files_arbitrary_paths_fail_closed(ctx: TestContext) -> None:
+    with tempfile.TemporaryDirectory(prefix="oa-files-denied-") as raw:
+        root = Path(raw)
+        async with _legacy_server(root) as (client, db, _tenant, _ref, _payload):
+            secret = root / "config-secret.yaml"
+            secret.write_text("api_key: should-never-leave-host", encoding="utf-8")
+            targets = [str(secret), db.db_path, "/etc/passwd"]
+            for target in targets:
+                response = await client.get("/api/files", params={"path": target})
+                body = await response.read()
+                assert response.status == 404, (target, response.status, body[:100])
+                assert b"should-never-leave-host" not in body
+
+
+@test("files_endpoint", "legacy path validates required and missing targets")
+async def t_files_invalid_requests(ctx: TestContext) -> None:
+    with tempfile.TemporaryDirectory(prefix="oa-files-invalid-") as raw:
+        async with _legacy_server(Path(raw)) as (client, *_rest):
+            missing = await client.get("/api/files")
+            assert missing.status == 400
+            absent = await client.get(
+                "/api/files",
+                params={"path": "/tmp/openagent-does-not-exist-xyz123.bin"},
+            )
+            assert absent.status == 404

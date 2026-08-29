@@ -352,55 +352,181 @@ def _agno_image_tmpdir() -> str:
     return _AGNO_IMAGE_TMPDIR
 
 
-def _save_agno_image_to_disk(image: Any) -> tuple[str | None, str | None]:
-    """Persist a runtime ``Image`` to a temp file. Returns ``(path, filename)``.
+_OUTPUT_MEDIA_MAX_BYTES = 50 * 1024 * 1024
+_OUTPUT_MEDIA_MARKERS = {
+    "image": "IMAGE",
+    "audio": "VOICE",
+    "video": "VIDEO",
+    "file": "FILE",
+}
 
-    Tries ``content`` (bytes) first, then ``filepath``, then ``url``.
-    Returns ``(None, None)`` when no bytes can be resolved synchronously.
-    Files land in a single process-wide tempdir so a vision-heavy
-    session doesn't leak one tempdir per image.
+
+def _output_media_filename(media: Any, kind: str) -> str:
+    """Choose a safe display filename for a runtime output-media object."""
+    import mimetypes
+    import os
+    import re
+
+    mime = str(getattr(media, "mime_type", None) or "").split(";", 1)[0]
+    fmt = str(getattr(media, "format", None) or "").strip().lower().lstrip(".")
+    raw = (
+        getattr(media, "filename", None)
+        or getattr(media, "name", None)
+        or getattr(media, "id", None)
+        or kind
+    )
+    name = os.path.basename(str(raw).replace("\x00", "")) or kind
+    name = re.sub(r"[^A-Za-z0-9._ -]+", "_", name)[:180].strip(". ") or kind
+    if "." not in name:
+        if not fmt and mime:
+            fmt = (mimetypes.guess_extension(mime) or "").lstrip(".")
+        if not fmt:
+            fmt = {"image": "png", "audio": "mp3", "video": "mp4", "file": "bin"}[kind]
+        if fmt == "jpeg":
+            fmt = "jpg"
+        name = f"{name}.{fmt}"
+    return name
+
+
+def _output_media_bytes(media: Any) -> bytes | None:
+    """Resolve an output artifact without allowing an unbounded read.
+
+    URL-only media is deliberately not downloaded here.  These objects can
+    originate in an untrusted MCP result, so an implicit server-side fetch
+    would turn a tool response into an SSRF primitive (including through HTTP
+    redirects or DNS rebinding).  Providers/MCPs must return bytes or a local
+    runtime-owned file; remote resources remain text links unless an explicit,
+    policy-aware downloader ingests them elsewhere.
+    """
+    content = getattr(media, "content", None)
+    if isinstance(content, str):
+        data = content.encode("utf-8")
+    elif isinstance(content, (bytes, bytearray, memoryview)):
+        data = bytes(content)
+    elif getattr(media, "filepath", None):
+        from pathlib import Path
+
+        path = Path(str(media.filepath))
+        try:
+            if path.stat().st_size > _OUTPUT_MEDIA_MAX_BYTES:
+                return None
+            data = path.read_bytes()
+        except OSError:
+            return None
+    elif getattr(media, "url", None):
+        return None
+    else:
+        return None
+    if not data or len(data) > _OUTPUT_MEDIA_MAX_BYTES:
+        return None
+    return data
+
+
+def _save_agno_output_media(media: Any, kind: str) -> str | None:
+    """Persist typed runtime output and return its internal marker carrier.
+
+    The stream layer immediately parses this marker, stores the bytes in CAS,
+    and emits a structured ``AttachmentRef``. It never reaches modern clients
+    as raw text; markers remain only the compatibility seam for older provider
+    adapters.
     """
     import os
     from uuid import uuid4
 
-    mime_type = getattr(image, "mime_type", None) or "image/png"
-    fmt = getattr(image, "format", None)
-    if not fmt:
-        fmt = mime_type.split("/")[-1] if "/" in mime_type else "png"
-    if fmt == "jpeg":
-        fmt = "jpg"
-    filename = getattr(image, "id", None) or f"image.{fmt}"
-    if not filename.endswith(f".{fmt}"):
-        filename = f"{filename}.{fmt}"
-
-    content = getattr(image, "content", None)
-    if content is not None:
-        if isinstance(content, str):
-            content = content.encode("utf-8")
-    elif getattr(image, "filepath", None):
-        fp = str(image.filepath)
+    marker_name = _OUTPUT_MEDIA_MARKERS.get(kind)
+    if marker_name is None:
+        return None
+    data = _output_media_bytes(media)
+    if data is None:
+        return None
+    directory = _agno_image_tmpdir()
+    filename = _output_media_filename(media, kind)
+    prefix = f"{uuid4().hex[:8]}-"
+    try:
+        name_max = int(os.pathconf(directory, "PC_NAME_MAX"))
+    except (OSError, ValueError):
+        name_max = 255
+    # ``_output_media_filename`` is ASCII-sanitised, but enforce the actual
+    # filesystem component limit at the final join too.  Keep the extension
+    # when a long tool-provided id/name needs truncating.
+    name_budget = max(1, name_max - len(prefix.encode("utf-8")))
+    encoded = filename.encode("utf-8")
+    if len(encoded) > name_budget:
+        stem, extension = os.path.splitext(filename)
+        extension_bytes = extension.encode("utf-8")[: min(24, name_budget - 1)]
+        stem_budget = max(1, name_budget - len(extension_bytes))
+        filename = (
+            stem.encode("utf-8")[:stem_budget].decode("utf-8", errors="ignore")
+            + extension_bytes.decode("utf-8", errors="ignore")
+        )
+    path = os.path.join(directory, f"{prefix}{filename}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd: int | None = None
+    try:
+        fd = os.open(path, flags, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            fd = None  # ownership transferred to the file object
+            handle.write(data)
+    except OSError:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         try:
-            with open(fp, "rb") as f:
-                content = f.read()
-        except Exception:
+            os.unlink(path)
+        except OSError:
             pass
-    elif getattr(image, "url", None):
-        try:
-            import httpx
-            content = httpx.get(str(image.url)).content
-        except Exception:
-            pass
+        return None
+    return f"\n[{marker_name}:{os.path.realpath(path)}]\n"
 
-    if not content:
-        return None, None
 
-    # Disambiguate per-image with a uuid prefix so two images named
-    # ``image.png`` in the same tempdir don't clobber each other.
-    safe_name = f"{uuid4().hex[:8]}-{filename}"
-    path = os.path.join(_agno_image_tmpdir(), safe_name)
-    with open(path, "wb") as f:
-        f.write(content)
-    return os.path.realpath(path), filename
+def _output_media_failure(kind: str) -> str:
+    return f"\n(Output {kind} could not be saved as an attachment.)\n"
+
+
+def _output_media_markers(
+    source: Any,
+    *,
+    emitted: set[tuple[str, str]] | None = None,
+) -> list[str]:
+    """Convert every typed response artifact to a marker exactly once."""
+    seen = emitted if emitted is not None else set()
+    fields = (
+        ("image", "images"),
+        ("video", "videos"),
+        ("audio", "audio"),
+        ("audio", "audios"),
+        ("file", "files"),
+    )
+    markers: list[str] = []
+    for kind, field in fields:
+        values = getattr(source, field, None) or []
+        if not isinstance(values, (list, tuple)):
+            values = [values]
+        for media in values:
+            stable_id = (
+                getattr(media, "id", None)
+                or getattr(media, "filepath", None)
+                or getattr(media, "url", None)
+                or f"object:{id(media)}"
+            )
+            key = (kind, str(stable_id))
+            if key in seen:
+                continue
+            # Failed/unsafe media must not be retried at every reconciliation
+            # event (or silently disappear). Mark the identity consumed before
+            # resolving bytes, then surface a text fallback if persistence is
+            # impossible.
+            seen.add(key)
+            marker = _save_agno_output_media(media, kind)
+            if marker:
+                markers.append(marker)
+            else:
+                markers.append(_output_media_failure(kind))
+    return markers
 
 
 def _is_error_status(status_obj: Any) -> bool:
@@ -1838,6 +1964,14 @@ class NativeProvider(BaseModel):
             )
             content = "(Done — no final message was returned.)"
 
+        # MCP results stay typed through the runtime (Image/Audio/Video/File).
+        # Convert them only at OpenAgent's final response boundary; the stream
+        # parser turns these internal carriers into CAS-backed AttachmentRefs.
+        output_markers = _output_media_markers(response)
+        if output_markers:
+            base_content = content.rstrip() if isinstance(content, str) else str(content)
+            content = f"{base_content}{''.join(output_markers)}"
+
         if on_status:
             tools = getattr(response, "tools", None) or []
             # Symmetric with the streaming path: emit a (started, completed)
@@ -1928,18 +2062,6 @@ class NativeProvider(BaseModel):
             on_status, tool_exec, error_text=error_text, phase=phase,
         )
 
-    @staticmethod
-    def _save_image(image: Any) -> str | None:
-        """Write a runtime ``Image`` (from stream content or tool result) to a
-        temp file. Returns a ``[IMAGE:/path]`` marker that
-        ``parse_response_markers`` extracts downstream, or ``None`` when
-        the image has no bytes.
-        """
-        path, _filename = _save_agno_image_to_disk(image)
-        if path is None:
-            return None
-        return f"\n[IMAGE:{path}]\n"
-
     async def stream(
         self,
         messages: list[dict[str, Any]],
@@ -1988,6 +2110,7 @@ class NativeProvider(BaseModel):
         tool_completed_types = event_types["tool_completed"]
         tool_error_types = event_types["tool_error"]
         run_completed_types = event_types["run_completed"]
+        emitted_media: set[tuple[str, str]] = set()
 
         try:
             stream_kwargs: dict[str, Any] = {
@@ -2016,8 +2139,21 @@ class NativeProvider(BaseModel):
                             yield text
                         image = getattr(event, "image", None)
                         if image is not None:
-                            marker = self._save_image(image)
+                            stable_id = (
+                                getattr(image, "id", None)
+                                or getattr(image, "filepath", None)
+                                or getattr(image, "url", None)
+                                or f"object:{id(image)}"
+                            )
+                            key = ("image", str(stable_id))
+                            marker = None
+                            if key not in emitted_media:
+                                emitted_media.add(key)
+                                marker = _save_agno_output_media(image, "image")
+                                if marker is None:
+                                    marker = _output_media_failure("image")
                             if marker:
+                                emitted += len(marker)
                                 yield marker
                         continue
                     if isinstance(event, tool_started_types):
@@ -2040,10 +2176,11 @@ class NativeProvider(BaseModel):
                             await self._emit_agno_tool_status(
                                 on_status, tool_exec,
                             )
-                        for img in getattr(event, "images", None) or []:
-                            marker = self._save_image(img)
-                            if marker:
-                                yield marker
+                        for marker in _output_media_markers(
+                            event, emitted=emitted_media,
+                        ):
+                            emitted += len(marker)
+                            yield marker
                     elif isinstance(event, tool_error_types):
                         if on_status is not None:
                             await self._emit_agno_tool_status(
@@ -2063,6 +2200,15 @@ class NativeProvider(BaseModel):
                             input_tokens=inp, output_tokens=out, model=self.model,
                             cache_read_tokens=cr,
                         )
+                        # Completion is the reconciliation snapshot: provider-
+                        # generated media and any tool media whose intermediate
+                        # event was skipped still surface here. Object-id dedup
+                        # prevents a tool artifact being emitted twice.
+                        for marker in _output_media_markers(
+                            event, emitted=emitted_media,
+                        ):
+                            emitted += len(marker)
+                            yield marker
             finally:
                 self._clear_run_id(sid)
                 aclose = getattr(stream, "aclose", None)

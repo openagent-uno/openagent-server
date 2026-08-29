@@ -1049,6 +1049,10 @@ class MemoryDB:
         # `session_retention`, che convive con lo stesso scrittore.
         await self._conn.execute(f"PRAGMA busy_timeout = {sqlite_busy_timeout_ms()}")
         await self._conn.execute("PRAGMA journal_mode=WAL")
+        # Canonical history must survive an OS/power loss once SQLite reports
+        # the transaction committed.  Rebuildable FTS indexes may use NORMAL;
+        # the canonical operational database may not.
+        await self._conn.execute("PRAGMA synchronous=FULL")
         # Enable FK constraints per-connection. SQLite's default is OFF,
         # so without this the ON DELETE CASCADE on models.provider_id is
         # silently a no-op and deleting a provider orphans its models.
@@ -1067,6 +1071,96 @@ class MemoryDB:
         # runs again. See ``upsert_session`` and ``RUNTIME_SESSION_USER_ID``.
         await self._migrate_reclaim_session_owners()
         await self._conn.commit()
+        # Additive only: takes a verified SQLite backup before the first v2
+        # DDL, installs the downgrade journal, and enters shadow.  Legacy
+        # ``sessions.runs`` remains intact and canonical until parity gates
+        # promote individual reads.
+        from src import __version__
+        from src.memory.operational.schema import ensure_operational_storage
+
+        # Capture downgrade-trigger evidence before the additive migrator
+        # reinstalls any missing trigger.  A clean promoted boot can trust the
+        # append-only change journal and avoid reparsing the whole transcript;
+        # a table replacement/old binary that dropped a trigger forces the
+        # expensive exact audit once.
+        required_legacy_triggers = {
+            "trg_legacy_sessions_insert_journal",
+            "trg_legacy_sessions_update_journal",
+            "trg_legacy_sessions_delete_journal",
+        }
+        trigger_rows = await (
+            await self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' "
+                "AND name IN (?,?,?)",
+                tuple(sorted(required_legacy_triggers)),
+            )
+        ).fetchall()
+        legacy_triggers_intact = {
+            str(row[0]) for row in trigger_rows
+        } == required_legacy_triggers
+        await ensure_operational_storage(
+            self._conn,
+            self.db_path,
+            app_version=__version__,
+        )
+        # Artifact metadata is always owner-private.  Sharing is inherited
+        # from live resource links so later ACL revocation/deletion is honored;
+        # keep this normalization outside the shipped v2 schema checksum.
+        from src.memory.artifact_acl_migration import ensure_artifact_acl_storage
+
+        await ensure_artifact_acl_storage(
+            self._conn,
+            app_version=__version__,
+        )
+        # Custom Views is a separate, additive checksummed migration.  Never
+        # append its DDL to operational_storage_v2.sql: completed v2 ledgers
+        # intentionally reject checksum drift on already-shipped databases.
+        from src.custom_views.migration import ensure_custom_views_storage
+
+        await ensure_custom_views_storage(
+            self._conn,
+            app_version=__version__,
+        )
+        # Ordered content is independent from the provider's legacy message
+        # JSON and from the UI definition schema.  Install it last because its
+        # foreign keys target both operational v2 and Custom Views tables.
+        from src.memory.message_parts_migration import ensure_message_parts_storage
+
+        await ensure_message_parts_storage(
+            self._conn,
+            app_version=__version__,
+        )
+        # A pre-v2 binary may have written the compatibility table while this
+        # build was offline.  Its durable triggers leave pending journal rows;
+        # promoted reads must fall back to shadow *before* any runtime writer or
+        # scheduler becomes visible, then normal reconciliation can catch up.
+        from src.memory.operational.phase import guard_storage_phase_atomic_async
+
+        await guard_storage_phase_atomic_async(
+            self._conn,
+            writer_version=__version__,
+            audit_content=not legacy_triggers_intact,
+        )
+        # Drain a bounded page before the connection becomes visible to the
+        # agent/scheduler. Larger legacy datasets continue through the durable
+        # trigger journal and API/search reconciliation; startup never parses
+        # the entire historical runs corpus in one blocking transaction.
+        try:
+            from src.memory.operational.repository import (
+                backfill_batch_async,
+                reconcile_pending_async,
+            )
+
+            await reconcile_pending_async(
+                self._conn,
+                limit=250,
+                worker_id=f"startup:{WORKER_ID}",
+            )
+            await backfill_batch_async(self._conn, limit=250)
+            await self._conn.commit()
+        except Exception as exc:  # shadow reads remain legacy-safe
+            await self._conn.rollback()
+            logger.warning("operational storage startup reconciliation failed: %s", exc)
 
     async def _migrate_reclaim_session_owners(self) -> None:
         """One-shot UPDATE: NULL any ``sessions.user_id`` the runtime won't
@@ -1236,6 +1330,12 @@ class MemoryDB:
             "CREATE INDEX IF NOT EXISTS idx_models_kind ON models(kind)"
         )
         await self._migrate_models_description_column()
+        # Media routing reads capabilities from models.metadata_json. Legacy
+        # rows predate that declaration, so give each LLM a conservative,
+        # persisted default (text-only unless its provider/model family is a
+        # well-known multimodal one). Idempotent and tiny: this table contains
+        # configured models, not conversation/event data.
+        await self._migrate_model_input_modalities_metadata()
         await self._migrate_legacy_tables_to_sessions()
         await self._migrate_peer_networks_join_type()
         # v0.14+: fold any legacy ``session_bindings`` rows (which used
@@ -1980,6 +2080,49 @@ class MemoryDB:
             )
             await self._conn.commit()
 
+    async def _migrate_model_input_modalities_metadata(self) -> None:
+        """Backfill/repair ``metadata_json.input_modalities`` for LLM rows.
+
+        The field lives in the existing JSON column, so this is additive and
+        requires no schema rewrite. Explicit valid declarations are preserved;
+        missing or malformed legacy declarations receive conservative defaults.
+        ``updated_at`` is intentionally left untouched so a normal boot does not
+        masquerade as a user catalog edit to the hot-reload watcher.
+        """
+        assert self._conn is not None
+        from src.models.media_capabilities import normalize_model_metadata
+
+        cursor = await self._conn.execute(
+            "SELECT m.id, m.model, m.metadata_json, p.name AS provider_name "
+            "FROM models m JOIN providers p ON p.id = m.provider_id "
+            "WHERE m.kind = 'llm'"
+        )
+        for row in await cursor.fetchall():
+            raw = row["metadata_json"] or "{}"
+            try:
+                metadata = json.loads(raw) if isinstance(raw, str) else {}
+            except (TypeError, ValueError):
+                metadata = {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            normalized = normalize_model_metadata(
+                metadata,
+                provider=str(row["provider_name"] or ""),
+                model=str(row["model"] or ""),
+                strict=False,
+            )
+            encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+            try:
+                existing = json.dumps(metadata, sort_keys=True, separators=(",", ":"))
+            except (TypeError, ValueError):
+                existing = ""
+            if encoded == existing:
+                continue
+            await self._conn.execute(
+                "UPDATE models SET metadata_json = ? WHERE id = ?",
+                (encoded, int(row["id"])),
+            )
+
     async def _migrate_providers_kind_column(self) -> None:
         """Add ``kind`` to ``providers`` and lift the ``framework`` CHECK.
 
@@ -2183,6 +2326,54 @@ class MemoryDB:
         if self._conn is None:
             await self.connect()
         return self._conn
+
+    async def _project_operational_session(self, session_id: str) -> None:
+        """Best-effort same-transaction v2 projection for reviewed writers.
+
+        The legacy change trigger is outside this savepoint, so a projection
+        bug rolls back only v2 mutations while the durable pending journal row
+        survives with the accepted legacy write for later reconciliation.
+        """
+
+        if not session_id or self._conn is None:
+            return
+        savepoint = f"operational_projection_{uuid.uuid4().hex}"
+        await self._conn.execute(f"SAVEPOINT {savepoint}")
+        try:
+            from src.memory.operational.repository import (
+                project_legacy_session_async,
+            )
+
+            await project_legacy_session_async(self._conn, session_id)
+            await self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        except Exception as exc:
+            await self._conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            await self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            logger.warning(
+                "operational session projection deferred for %s: %s",
+                session_id,
+                exc,
+            )
+
+    async def set_operational_storage_phase(self, phase: str):
+        """Explicitly promote or roll back normalized runtime reads.
+
+        Promotion performs full parity verification in the caller's
+        transaction.  The default boot path never invokes it automatically;
+        beta operators/tests must opt in after backfill is complete.
+        """
+
+        conn = await self._ensure_connected()
+        from src import __version__
+        from src.memory.operational.phase import (
+            transition_storage_phase_atomic_async,
+        )
+
+        return await transition_storage_phase_atomic_async(
+            conn,
+            phase,
+            writer_version=__version__,
+        )
 
     async def _write_with_retry(self, do_write, *, attempts: int = 3):
         """Run an idempotent single-row write, retrying on "database is locked".
@@ -4535,6 +4726,7 @@ class MemoryDB:
             "UPDATE sessions SET metadata = ?, updated_at = ? WHERE session_id = ?",
             (json.dumps(meta), int(time.time()), session_id),
         )
+        await self._project_operational_session(session_id)
         await conn.commit()
 
     # ── MCP Registry ──
@@ -5043,7 +5235,8 @@ class MemoryDB:
                    m.id AS m_id, m.model AS m_model, m.display_name AS m_display_name,
                    m.tier_hint AS m_tier_hint, m.description AS m_description,
                    m.enabled AS m_enabled,
-                   m.is_classifier AS m_is_classifier
+                   m.is_classifier AS m_is_classifier,
+                   m.metadata_json AS m_metadata_json
             FROM providers p
             LEFT JOIN models m ON p.id = m.provider_id{join_filter}
             {where}
@@ -5074,6 +5267,12 @@ class MemoryDB:
                 }
                 by_id[pid] = bucket
             if r["m_id"] is not None:
+                try:
+                    model_metadata = json.loads(r["m_metadata_json"] or "{}")
+                except (TypeError, ValueError):
+                    model_metadata = {}
+                if not isinstance(model_metadata, dict):
+                    model_metadata = {}
                 bucket["models"].append({
                     "id": int(r["m_id"]),
                     "model": r["m_model"],
@@ -5081,6 +5280,7 @@ class MemoryDB:
                     "tier_hint": r["m_tier_hint"],
                     "enabled": bool(r["m_enabled"]),
                     "is_classifier": bool(r["m_is_classifier"]),
+                    "metadata": model_metadata,
                 })
         return list(by_id.values())
 
@@ -5154,11 +5354,20 @@ class MemoryDB:
         # generic "FOREIGN KEY constraint failed".
         prov_row = await (
             await conn.execute(
-                "SELECT 1 FROM providers WHERE id = ?", (int(provider_id),),
+                "SELECT name FROM providers WHERE id = ?", (int(provider_id),),
             )
         ).fetchone()
         if prov_row is None:
             raise ValueError(f"Provider id={provider_id!r} does not exist")
+        stored_metadata = dict(metadata or {})
+        if kind == "llm":
+            from src.models.media_capabilities import normalize_model_metadata
+
+            stored_metadata = normalize_model_metadata(
+                stored_metadata,
+                provider=str(prov_row["name"] or ""),
+                model=str(model).strip(),
+            )
         now = time.time()
         await conn.execute(
             """
@@ -5182,7 +5391,7 @@ class MemoryDB:
                 tier_hint,
                 1 if enabled else 0,
                 1 if is_classifier else 0,
-                json.dumps(dict(metadata or {})),
+                json.dumps(stored_metadata, sort_keys=True, separators=(",", ":")),
                 kind,
                 now,
                 now,
@@ -5503,6 +5712,7 @@ class MemoryDB:
         stale = sids[keep:]
         for sid in stale:
             await conn.execute("DELETE FROM sessions WHERE session_id = ?", (sid,))
+            await self._project_operational_session(sid)
         if stale:
             await conn.commit()
         return len(stale)
@@ -5644,6 +5854,7 @@ class MemoryDB:
                 "VALUES (?, 'agent', NULL, ?, ?, ?)",
                 (session_id, json.dumps(meta), now, now),
             )
+        await self._project_operational_session(session_id)
         await conn.commit()
 
     async def delete_session(self, session_id: str) -> None:
@@ -5652,6 +5863,7 @@ class MemoryDB:
             "DELETE FROM sessions WHERE session_id = ?",
             (session_id,),
         )
+        await self._project_operational_session(session_id)
         await conn.commit()
 
     async def get_session(self, session_id: str) -> dict | None:
@@ -5781,6 +5993,7 @@ class MemoryDB:
         caller via :meth:`list_descendant_sessions`."""
         conn = await self._ensure_connected()
         await conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+        await self._project_operational_session(session_id)
         for table in self._SESSION_SATELLITE_TABLES:
             try:
                 await conn.execute(

@@ -21,7 +21,7 @@ from src.gateway import protocol as P
 from src.gateway.commands import command_help_text
 from src.gateway.sessions import SessionManager
 from src.gateway.terminals import TerminalManager
-from src.gateway.api import vault, config, health, logs, control, usage, providers, models, scheduled_tasks, workflow_tasks, mcps, marketplace, sessions as sessions_api, system as system_api, network as network_api, chat as chat_api, terminals as terminals_api, commands as commands_api, events as events_api, budgets as budgets_api, quality as quality_api, llm as llm_api, skills as skills_api, accounts as accounts_api
+from src.gateway.api import vault, config, health, logs, control, usage, providers, models, scheduled_tasks, workflow_tasks, mcps, marketplace, sessions as sessions_api, system as system_api, network as network_api, chat as chat_api, terminals as terminals_api, commands as commands_api, events as events_api, budgets as budgets_api, quality as quality_api, llm as llm_api, skills as skills_api, accounts as accounts_api, operational as operational_api, artifacts as artifacts_api, custom_views as custom_views_api
 from src.network import peers as peers_api
 from src.network.auth.middleware import make_auth_middleware
 from src.network.transport.aiohttp_iroh_site import IrohSite
@@ -839,17 +839,40 @@ class Gateway:
                     resp = web.Response(status=500, text=str(exc))
             resp.headers["Access-Control-Allow-Origin"] = "*"
             resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-            resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, If-Match"
             return resp
 
         # Order matters: cors first (handles OPTIONS preflight without
         # going through auth), then auth (every other request needs a
         # valid device cert). Both run for every route added below.
         auth_middleware = make_auth_middleware(self._network_state.auth_state)
-        app = web.Application(middlewares=[cors, auth_middleware])
+        app = web.Application(
+            middlewares=[
+                cors,
+                custom_views_api.body_limit_middleware,
+                auth_middleware,
+            ],
+        )
         app["gateway"] = self  # accessible in handlers via request.app["gateway"]
         self.sessions.set_db(self.agent.memory_db)
         self._register_routes(app)
+        # Operational migration/backfill/search warming is lifecycle-owned.
+        # REST discovery stays status-only and never performs an unbounded
+        # parse/index pass inside a client's timeout budget.
+        operational_api.start_background_maintenance(self)
+        # REST, WebSocket, and the in-process ui-manager MCP all resolve this
+        # same service instance from the canonical MemoryDB. Starting it here
+        # restores `always` sources and owns every child process until stop().
+        from src.custom_views.service import service_for_gateway
+
+        local_e2e = bool(
+            isinstance(getattr(self.agent, "config", None), dict)
+            and self.agent.config.get("_local_e2e") is True
+        )
+        # A disposable browsing fixture may contain copied source definitions.
+        # Never resume persistent commands from that copy; controlled tests can
+        # still exercise a source explicitly through refresh/action endpoints.
+        await service_for_gateway(self).start(resume_always=not local_e2e)
 
         runner = web.AppRunner(app)
         await runner.setup()
@@ -1021,6 +1044,13 @@ class Gateway:
                  error=str(exc))
 
     async def stop(self) -> None:
+        try:
+            from src.custom_views.service import service_for_gateway
+
+            await service_for_gateway(self).close()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Custom View runtime stop failed: %s", e)
+        await operational_api.stop_background_maintenance(self)
         if self._webhook_site is not None:
             try:
                 await self._webhook_site.stop()
@@ -1114,6 +1144,34 @@ class Gateway:
 
         routes = (
             ("GET", "/api/health", health.handle_health),
+            ("POST", "/api/artifacts", artifacts_api.handle_upload),
+            ("GET", "/api/artifacts/{artifact_id}", artifacts_api.handle_metadata),
+            ("GET", "/api/artifacts/{artifact_id}/content", artifacts_api.handle_content),
+            ("GET", "/api/capabilities", operational_api.handle_capabilities),
+            ("GET", "/api/ui/capabilities", custom_views_api.handle_capabilities),
+            ("GET", "/api/ui/views", custom_views_api.handle_list),
+            ("POST", "/api/ui/views", custom_views_api.handle_create),
+            ("GET", "/api/ui/views/{id}", custom_views_api.handle_get),
+            ("PUT", "/api/ui/views/{id}", custom_views_api.handle_update),
+            ("DELETE", "/api/ui/views/{id}", custom_views_api.handle_delete),
+            ("POST", "/api/ui/views/{id}/reactivate", custom_views_api.handle_reactivate),
+            ("PUT", "/api/ui/views/{id}/data/{key}", custom_views_api.handle_set_data),
+            ("POST", "/api/ui/views/{id}/data/{key}", custom_views_api.handle_set_data),
+            ("PUT", "/api/ui/views/{id}/sources/{key}", custom_views_api.handle_configure_source),
+            ("DELETE", "/api/ui/views/{id}/sources/{key}", custom_views_api.handle_delete_source),
+            ("POST", "/api/ui/views/{id}/sources/{key}/refresh", custom_views_api.handle_refresh_source),
+            ("POST", "/api/ui/views/{id}/actions/{action_id}", custom_views_api.handle_action),
+            ("GET", "/api/ui/views/{id}/grants", custom_views_api.handle_list_grants),
+            ("PUT", "/api/ui/views/{id}/grants", custom_views_api.handle_set_grant),
+            ("DELETE", "/api/ui/views/{id}/grants", custom_views_api.handle_delete_grant),
+            ("GET", "/api/ui/views/{id}/revisions/{revision}/assets/{path:.+}", custom_views_api.handle_asset),
+            ("GET", "/api/history", operational_api.handle_history),
+            ("POST", "/api/search", operational_api.handle_search),
+            ("GET", "/api/sessions/{session_id}/messages", operational_api.handle_session_messages),
+            ("GET", "/api/sessions/{session_id}/related-runs", operational_api.handle_session_related_runs),
+            ("GET", "/api/sessions/{session_id}/descendants", operational_api.handle_session_descendants),
+            ("GET", "/api/tool-invocations/{tool_id}", operational_api.handle_tool_invocation),
+            ("GET", "/api/scheduled-runs/{run_id}", operational_api.handle_scheduled_run),
             ("GET", "/api/vault/notes", vault.handle_list),
             ("GET", "/api/vault/graph", vault.handle_graph),
             ("GET", "/api/vault/search", vault.handle_search),
@@ -1146,9 +1204,10 @@ class Gateway:
             ("POST", "/api/scheduled-tasks/{id}/stop", scheduled_tasks.handle_stop),
             ("PATCH", "/api/scheduled-tasks/{id}", scheduled_tasks.handle_update),
             ("DELETE", "/api/scheduled-tasks/{id}", scheduled_tasks.handle_delete),
-            # Workflow engine (n8n-style multi-block pipelines). Same
-            # scheduler 503 invariant as scheduled-tasks — handlers
-            # return 503 when no Scheduler is attached.
+            # Workflow engine (n8n-style multi-block pipelines). Durable GETs
+            # remain available while background workers are parked; mutations
+            # and execution return 503 when no Scheduler is attached, matching
+            # the scheduled-task surface.
             ("GET", "/api/workflows", workflow_tasks.handle_list),
             ("POST", "/api/workflows", workflow_tasks.handle_create),
             ("GET", "/api/workflows/{id}", workflow_tasks.handle_get),
@@ -1345,42 +1404,78 @@ class Gateway:
     # ── File upload ──
 
     async def _handle_upload(self, request):
-        """POST /api/upload — save file, auto-transcribe if audio.
+        """POST /api/upload — persist a file, auto-transcribe if audio.
 
-        Returns {path, filename, transcription?}. If the file is audio
-        (webm, ogg, mp3, wav, m4a), it's transcribed via faster-whisper
-        or OpenAI Whisper and the text is returned in `transcription`.
+        This is the backward-compatible flat response used by released app
+        versions.  New clients may use ``POST /api/artifacts`` directly; both
+        routes store identical CAS metadata and return the same AttachmentRef
+        fields.  If the file is audio it is transcribed best-effort.
         """
         from aiohttp import web
-        import os
-        import tempfile
+        from contextlib import suppress
+        from src.gateway.api.artifacts import _read_form
+        from src.memory.artifacts import (
+            ArtifactNotFound,
+            AttachmentTooLarge,
+            normalize_inbound_attachments,
+            safe_attachment_filename,
+        )
+        from src.memory.operational.access import AccessContext
 
-        reader = await request.multipart()
-        field = await reader.next()
-        if not field:
-            return web.json_response({"error": "No file"}, status=400)
-
-        filename = field.filename or "upload"
-        elog("upload.received", filename=filename)
-        tmp = tempfile.mkdtemp(prefix="oa_upload_")
-        path = f"{tmp}/{filename}"
-        with open(path, "wb") as f:
-            while True:
-                chunk = await field.read_chunk()
-                if not chunk:
-                    break
-                f.write(chunk)
-
-        # On macOS ``tempfile.mkdtemp()`` returns a path under
-        # ``/var/folders/...`` — a symlink to ``/private/var/folders/...``.
-        # The reference ``@modelcontextprotocol/server-filesystem`` compares
-        # tool-call paths to its allowlist by string-prefix against
-        # realpaths, so a caller who hands the logical ``/var/folders/...``
-        # path to ``read_text_file`` gets "Access denied — path outside
-        # allowed directories" even though the realpath IS allowed. Resolve
-        # here so the returned path matches what filesystem MCP will accept.
-        path = os.path.realpath(path)
-        result: dict = {"path": path, "filename": filename}
+        staged = None
+        try:
+            access = AccessContext.from_request(request)
+            staged, metadata = await _read_form(request)
+            filename = safe_attachment_filename(
+                metadata.get("filename") or staged.name,
+            )
+            elog("upload.received", filename=filename)
+            session_id = str(
+                metadata.get("session_id")
+                or request.query.get("session_id")
+                or ""
+            ).strip()
+            refs = await normalize_inbound_attachments(
+                self.agent.memory_db,
+                ({
+                    "path": str(staged),
+                    "filename": filename,
+                    "mime_type": metadata.get("mime_type") or None,
+                    "kind": metadata.get("kind") or "file",
+                },),
+                session_id=session_id,
+                principal=access,
+                # The path is the private multipart staging file created by
+                # ``_read_form``, never a host path supplied in JSON/WS data.
+                allow_local_paths=True,
+            )
+            if not refs:
+                return web.json_response({"error": "No file"}, status=400)
+            result: dict = dict(refs[0])
+            path = str(result["path"])
+            # Keep the suffixed staging name through optional STT. CAS paths
+            # are digest-only, while ffmpeg/Whisper still use the extension as
+            # a container hint. The durable path returned to the client is
+            # already ``path`` above; staging is removed before responding.
+            transcribe_path = str(staged)
+        except AttachmentTooLarge as exc:
+            if staged is not None:
+                with suppress(OSError):
+                    staged.unlink()
+            return web.json_response(
+                {"error": str(exc), "limit_bytes": exc.limit_bytes},
+                status=413,
+            )
+        except (ArtifactNotFound, OSError, PermissionError, ValueError) as exc:
+            if staged is not None:
+                with suppress(OSError):
+                    staged.unlink()
+            return web.json_response({"error": str(exc) or "Invalid upload"}, status=400)
+        except Exception:
+            if staged is not None:
+                with suppress(OSError):
+                    staged.unlink()
+            raise
 
         # Auto-transcribe audio files
         from src.channels.voice import is_audio_file
@@ -1400,7 +1495,7 @@ class Gateway:
             try:
                 from src.channels.voice import transcribe
                 text = await transcribe(
-                    path,
+                    transcribe_path,
                     db=getattr(self.agent, "db", None),
                     language=lang,
                 )
@@ -1425,6 +1520,9 @@ class Gateway:
                 )
 
         elog("upload.saved", filename=filename, path=path, transcribed=bool(result.get("transcription")))
+        if staged is not None:
+            with suppress(OSError):
+                staged.unlink()
         return web.json_response(result)
 
     def _check_bearer_token(self, request) -> bool:
@@ -1514,115 +1612,88 @@ class Gateway:
     # ── File serving (agent → client) ──
 
     async def _handle_files(self, request):
-        """GET /api/files?path=<abs>&token=<gateway-token>
+        """Deprecated path compatibility for authorized CAS attachments.
 
-        Serve a local file off the agent server's filesystem so remote
-        clients (desktop app, CLI) can fetch attachments the agent
-        emitted via ``[IMAGE:/path]`` / ``[FILE:/path]`` / ``[VOICE:/path]``
-        / ``[VIDEO:/path]`` markers in a response.
-
-        The agent runs with broad filesystem access and already returns
-        the absolute path to the client in the WS ``response`` message's
-        ``attachments`` array. For local installs the client can read
-        the path directly; for remote installs (app on your laptop,
-        agent on a VPS) this endpoint ferries the bytes over HTTP.
-
-        **Authentication**: requires ``token`` query param matching the
-        gateway token (same token clients use for WS auth). Without a
-        configured token, reads are unauthenticated — this matches the
-        existing ``/api/*`` endpoints which also rely on the gateway
-        binding to localhost for single-user deploys.
-
-        **Path safety**: we use ``os.path.realpath`` before checking
-        ``isfile`` so symlinks resolve, and we reject paths that don't
-        resolve to an actual file. Since the gateway token is required,
-        we don't further restrict to specific directories — the agent
-        has full FS access anyway, so any allow-listing would be
-        theater against a caller who already holds the token.
+        New clients use ``/api/artifacts/{id}/content``.  A legacy ``path``
+        is accepted only when it resolves to this agent's canonical CAS and
+        the authenticated principal can still view an active linked resource.
+        Authentication is not authority to read arbitrary host files.
         """
         from aiohttp import web
-        import os
+        from aiohttp.helpers import content_disposition_header
+        import hashlib
         import mimetypes
 
-        # Auth is enforced by ``make_auth_middleware`` for every
-        # ``/api/*`` route — by the time the handler runs the cert is
-        # already verified. Defensive sanity check kept so a misrouted
-        # request without a cert can't bypass FS access.
-        if request.get("device_cert") is None:
+        from src.memory.artifacts import (
+            ArtifactIntegrityError,
+            ArtifactNotFound,
+            artifact_for_legacy_path,
+            attachment_limit_bytes,
+            safe_attachment_filename,
+        )
+        from src.memory.operational.access import AccessContext
+
+        try:
+            access = AccessContext.from_request(request)
+        except PermissionError:
             return web.Response(status=401, text="Unauthorized")
 
         path = request.query.get("path", "")
         if not path:
             return web.Response(status=400, text="path required")
-
-        real = os.path.realpath(path)
-        if not os.path.isfile(real):
+        db = getattr(self.agent, "memory_db", None)
+        if db is None:
+            return web.Response(status=404, text="not found")
+        try:
+            artifact, real = await artifact_for_legacy_path(db, path, access)
+        except ArtifactIntegrityError:
+            return web.Response(status=503, text="artifact unavailable")
+        except ArtifactNotFound:
             return web.Response(status=404, text="not found")
 
-        # IMPORTANT: do NOT use ``web.FileResponse`` here. The gateway serves
-        # HTTP over a custom asyncio transport (``IrohSite`` → QUIC), which has
-        # no real socket, so ``FileResponse``'s zero-copy ``sendfile`` path is
-        # unavailable and its fallback interacts badly with our fire-and-forget
-        # ``IrohStreamWriter`` — the client got 200 + Content-Length but ZERO
-        # body bytes ("transfer closed with N bytes remaining"), i.e. a blank
-        # image in the app and broken downloads, both locally and (always) for
-        # remote clients which reach the gateway exclusively over this
-        # transport. Reading the bytes and returning them as a plain
-        # ``web.Response`` uses the exact same write+drain path as every JSON
-        # response (which works), so the body is delivered in full. See
-        # ``IrohStreamWriter._drain_then_finish`` for the transport-side flush.
-        # Size cap: the whole body is buffered here AND again by the
-        # fire-and-forget Iroh writer, so an unbounded read can OOM the gateway
-        # (which also serves every WS stream). Streaming wouldn't help — the
-        # transport has no working backpressure, so it buffers each chunk
-        # anyway. Reject oversized files instead. Configurable; 0 disables.
-        try:
-            max_mb = int(os.environ.get("OPENAGENT_MAX_ATTACHMENT_MB", "256") or "256")
-        except ValueError:
-            max_mb = 256
-        try:
-            size = os.path.getsize(real)
-        except OSError:
-            return web.Response(status=404, text="not found")
-        if max_mb > 0 and size > max_mb * 1024 * 1024:
-            return web.Response(status=413, text=f"file too large ({size} bytes; cap {max_mb} MB)")
+        size = int(artifact["size_bytes"])
+        limit = attachment_limit_bytes(direction="output")
+        if limit and size > limit:
+            return web.Response(
+                status=413,
+                text=f"file too large ({size} bytes; cap {limit} bytes)",
+            )
 
         try:
-            with open(real, "rb") as fh:
-                data = fh.read()
+            data = await asyncio.to_thread(real.read_bytes)
         except MemoryError:
             return web.Response(status=503, text="file too large to serve")
         except OSError:
             return web.Response(status=404, text="not found")
+        if len(data) != size or hashlib.sha256(data).hexdigest() != str(artifact["sha256"]):
+            return web.Response(status=503, text="artifact unavailable")
 
-        # Content-Type: prefer the stdlib guess, but fall back to an explicit
-        # map for the media/doc types we attach. A slim container may ship no
-        # ``/etc/mime.types``, and ``application/octet-stream`` would stop
-        # ``<video>``/``<audio>`` from playing inline in the app.
-        ctype = mimetypes.guess_type(real)[0]
+        canonical_name = safe_attachment_filename(
+            artifact["authorized_filename"] or artifact["id"]
+        )
+        ctype = str(artifact["mime"] or "") or mimetypes.guess_type(canonical_name)[0]
         if not ctype:
-            ext = os.path.splitext(real)[1].lower().lstrip(".")
+            ext = canonical_name.rsplit(".", 1)[-1].lower() if "." in canonical_name else ""
             ctype = _ATTACHMENT_MIME_FALLBACK.get(ext, "application/octet-stream")
 
-        # Sanitize the filename for the header so a crafted name can't inject
-        # CR/LF or break out of the quoted value; the exact UTF-8 name still
-        # rides in ``filename*`` (RFC 5987).
-        from urllib.parse import quote as _urlquote
-        raw_name = os.path.basename(real)
-        safe_name = raw_name.replace("\\", "_").replace('"', "").replace("\r", "").replace("\n", "")
-        # ``?inline=1`` lets a client embed the file for preview (e.g. a PDF in
-        # an <iframe>) instead of forcing a download; default stays
-        # ``attachment``. Inline media (<img>/<video>/<audio>) ignores it anyway.
         disposition = "inline" if request.query.get("inline") in ("1", "true") else "attachment"
-        content_disposition = (
-            f"{disposition}; filename=\"{safe_name}\"; filename*=UTF-8''{_urlquote(raw_name)}"
+        content_disposition = content_disposition_header(
+            disposition,
+            filename=canonical_name,
         )
         return web.Response(
             body=data,
             content_type=ctype,
             headers={
                 "Content-Disposition": content_disposition,
-                "Cache-Control": "private, max-age=60",
+                # Revalidate on every request so a link ACL change takes
+                # effect immediately even for legacy clients.
+                "Cache-Control": "private, no-store",
+                "Deprecation": "true",
+                "Link": (
+                    f"</api/artifacts/{artifact['id']}/content>; rel=\"alternate\""
+                ),
+                "X-Content-Type-Options": "nosniff",
             },
         )
 
@@ -1631,6 +1702,24 @@ class Gateway:
     async def _handle_options(self, request):
         from aiohttp import web
         return web.Response(status=204)
+
+    @staticmethod
+    async def _close_replaced_websocket(old_ws: Any) -> None:
+        """Retire a superseded device transport without inviting a reconnect.
+
+        A normal ``1000`` close is indistinguishable from a transient gateway
+        restart to first-party clients, which intentionally auto-reconnect.
+        If two transports present the same device identity that behaviour
+        makes them replace one another forever.  The private close contract
+        tells only the old transport to stay down; the new one remains in the
+        client registry and continues normally.
+        """
+        if getattr(old_ws, "closed", True):
+            return
+        await old_ws.close(
+            code=P.WS_CLOSE_CONNECTION_REPLACED_CODE,
+            message=P.WS_CLOSE_CONNECTION_REPLACED_REASON.encode("utf-8"),
+        )
 
     async def _handle_ws(self, request):
         from aiohttp import web, WSMsgType
@@ -1658,16 +1747,20 @@ class Gateway:
         # instead of ``client_id``.
         client_id: str = cert.device_pubkey_hex
         request["user_handle"] = cert.handle
+        from src.custom_views.service import service_for_gateway
+        from src.memory.operational.access import AccessContext
+
+        ui_service = service_for_gateway(self)
+        ui_access = AccessContext.from_request(request)
         old_ws = self.clients.get(client_id)
         self.clients[client_id] = ws
         await self._adopt_sessions_to_ws(client_id, ws, handle=cert.handle)
         if old_ws is not None and old_ws is not ws:
             elog("gateway.client_reconnect", client_id=client_id)
-            if not getattr(old_ws, "closed", True):
-                try:
-                    await old_ws.close()
-                except Exception as e:  # noqa: BLE001
-                    logger.debug("old ws close failed: %s", e)
+            try:
+                await self._close_replaced_websocket(old_ws)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("old ws close failed: %s", e)
 
         # Greet the client. Old clients sent an AUTH frame and waited
         # for AUTH_OK; the new wire skips the AUTH frame but keeps the
@@ -1707,6 +1800,45 @@ class Gateway:
                     continue
 
                 t = data.get("type", "")
+
+                # Custom View subscriptions/actions share this authenticated
+                # socket with chat but remain a separate protocol domain. A
+                # malformed UI frame is isolated to its subscription and must
+                # never tear down the user's live chat session.
+                if isinstance(t, str) and t.startswith("ui_"):
+                    try:
+                        if await ui_service.handle_ws_frame(ws, data, ui_access):
+                            continue
+                    except Exception as exc:  # handler boundary redacts internals
+                        from src.custom_views.repository import (
+                            CustomViewConflict,
+                            CustomViewError,
+                            CustomViewInputError,
+                            CustomViewNotFound,
+                            CustomViewRateLimited,
+                        )
+
+                        if isinstance(exc, CustomViewRateLimited):
+                            code, message = "rate_limited", str(exc)
+                        elif isinstance(exc, CustomViewConflict):
+                            code, message = "revision_conflict", str(exc)
+                        elif isinstance(exc, CustomViewNotFound):
+                            code, message = "not_found", "Custom View is not available"
+                        elif isinstance(exc, CustomViewInputError):
+                            code, message = "invalid_request", str(exc)
+                        elif isinstance(exc, (CustomViewError, PermissionError)):
+                            code, message = "operation_failed", "Custom View operation failed"
+                        else:
+                            code, message = "runtime_error", "Custom View runtime is unavailable"
+                            logger.exception("Custom View WS frame failed")
+                        await self._safe_ws_send_json(ws, {
+                            "type": "ui_error",
+                            "code": code,
+                            "message": message,
+                            "viewId": data.get("viewId"),
+                            "subscriptionId": data.get("subscriptionId"),
+                        })
+                        continue
 
                 # Legacy AUTH frame: ignored — the middleware already
                 # authenticated us. Tolerate it for old clients that
@@ -1748,8 +1880,15 @@ class Gateway:
                     P.AUDIO_CHUNK_IN, P.AUDIO_END_IN,
                     P.VIDEO_FRAME_IN, P.ATTACHMENT_IN, P.INTERRUPT,
                 ):
+                    from src.core.on_behalf_context import OnBehalfIdentity
+
                     await self._handle_stream_frame(
-                        ws, client_id, data, handle=cert.handle,
+                        ws,
+                        client_id,
+                        data,
+                        handle=cert.handle,
+                        on_behalf_identity=OnBehalfIdentity.from_certificate(cert),
+                        trusted_bridge="bridge" in set(cert.capabilities or ()),
                     )
 
                 # Interactive terminals — PTY frames from the desktop
@@ -1781,6 +1920,10 @@ class Gateway:
                 frames_seen=frames_seen, last_msg_type=last_msg_type,
             )
         finally:
+            try:
+                await ui_service.disconnect(ws)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("Custom View client cleanup failed: %s", e)
             # Identity-aware cleanup: a reconnected ws may have already
             # taken this client_id's slot via ``_adopt_sessions_to_ws``.
             # Touching ``clients[client_id]`` or
@@ -2145,10 +2288,12 @@ class Gateway:
     #   - bridges/telegram.py: ``f"tg:{uid}"``
     #   - bridges/discord.py: ``f"dc:{uid}"``
     #   - bridges/whatsapp.py: ``f"wa:{uid}"``
+    #   - bridges/slack.py: ``f"sl:{uid}"``
     _BRIDGE_SESSION_PREFIXES: dict[str, str] = {
         "bridge:telegram": "tg:",
         "bridge:discord": "dc:",
         "bridge:whatsapp": "wa:",
+        "bridge:slack": "sl:",
     }
 
     async def _forget_one_session(self, session_id: str) -> int:
@@ -2330,6 +2475,8 @@ class Gateway:
     async def _handle_stream_frame(
         self, ws, client_id: str, frame: dict,
         *, handle: str | None = None,
+        on_behalf_identity=None,
+        trusted_bridge: bool = False,
     ) -> None:
         """Decode a stream-protocol wire frame and dispatch into the
         matching :class:`StreamSession`.
@@ -2345,7 +2492,7 @@ class Gateway:
         from src.stream.session import StreamSession
         from src.stream.channel import RealtimeChannel
         from src.stream.wire import event_to_wire, wire_to_event
-        from src.stream.events import SessionClose, SessionOpen, TextFinal
+        from src.stream.events import Attachment, SessionClose, SessionOpen, TextFinal
 
         session_id = (frame.get("session_id") or "default").strip() or "default"
         sid = self.sessions.get_or_create_session(
@@ -2368,6 +2515,79 @@ class Gateway:
         if evt is None:
             return
 
+        # Every input surface converges on durable AttachmentRefs before the
+        # turn reaches the agent.  An absolute host path is accepted only from
+        # a certificate carrying the internal ``bridge`` capability; ordinary
+        # clients upload bytes first and send the returned artifact_id.  This
+        # check happens before either TextFinal or a standalone Attachment can
+        # reach StreamSession/model code.
+        attachment_values = None
+        if isinstance(evt, TextFinal) and evt.attachments:
+            attachment_values = evt.attachments
+        elif isinstance(evt, Attachment):
+            attachment_values = ({
+                "type": evt.kind,
+                "path": evt.path,
+                "filename": evt.filename,
+                "mime_type": evt.mime_type,
+                "artifact_id": evt.artifact_id,
+                "artifact_link_id": evt.artifact_link_id,
+                "size_bytes": evt.size_bytes,
+                "sha256": evt.sha256,
+                "url": evt.url,
+            },)
+        if attachment_values is not None:
+            from dataclasses import replace
+            from src.memory.artifacts import (
+                ArtifactError,
+                ArtifactNotFound,
+                normalize_inbound_attachments,
+            )
+
+            artifact_db = (
+                getattr(self.agent, "memory_db", None)
+                or getattr(self.agent, "db", None)
+            )
+            try:
+                normalized = await normalize_inbound_attachments(
+                    artifact_db,
+                    attachment_values,
+                    session_id=sid,
+                    principal=on_behalf_identity,
+                    allow_local_paths=bool(trusted_bridge),
+                )
+                if not normalized:
+                    raise ArtifactNotFound("attachment")
+            except ArtifactError as exc:
+                await self._safe_ws_send_json(ws, {
+                    "type": P.ERROR,
+                    "session_id": sid,
+                    "text": str(exc),
+                })
+                await self._safe_ws_send_json(ws, {
+                    "type": "turn_complete",
+                    "session_id": sid,
+                    "reason": "error",
+                    "error": type(exc).__name__,
+                })
+                return
+            if isinstance(evt, TextFinal):
+                evt = replace(evt, attachments=normalized)
+            else:
+                ref = normalized[0]
+                evt = replace(
+                    evt,
+                    kind=ref.get("kind") or ref.get("type") or "file",
+                    path=ref.get("path"),
+                    filename=str(ref.get("filename") or ""),
+                    mime_type=ref.get("mime_type"),
+                    artifact_id=ref.get("artifact_id"),
+                    artifact_link_id=ref.get("artifact_link_id"),
+                    size_bytes=ref.get("size_bytes"),
+                    sha256=ref.get("sha256"),
+                    url=ref.get("url"),
+                )
+
         if isinstance(evt, SessionClose):
             await self._close_stream_session(key)
             return
@@ -2378,6 +2598,16 @@ class Gateway:
         ):
             await self._close_stream_session(key)
             holder = None
+        if holder is not None:
+            # Rebind authorization on every authenticated frame/reconnect.
+            # A long-lived StreamSession must never keep a stale principal
+            # merely because its transport was cached.
+            holder.session.on_behalf_identity = on_behalf_identity
+            holder.session.allow_local_attachment_paths = bool(trusted_bridge)
+            if isinstance(evt, SessionOpen):
+                holder.session.update_client_capabilities(
+                    evt.client_kind, evt.client_capabilities,
+                )
 
         if isinstance(evt, TextFinal):
             self._record_live_input(sid, event_to_wire(evt), owner=owner)
@@ -2392,11 +2622,15 @@ class Gateway:
             # client opted out.
             coalesce_window_ms: int | None = None
             speak_enabled = True
+            client_kind: str | None = None
+            client_capabilities: dict = {}
             if isinstance(evt, SessionOpen):
                 language = evt.language
                 profile = evt.profile
                 coalesce_window_ms = evt.coalesce_window_ms
                 speak_enabled = bool(evt.speak)
+                client_kind = evt.client_kind
+                client_capabilities = evt.client_capabilities
             session = StreamSession(
                 self.agent,
                 client_id=client_id,
@@ -2406,6 +2640,10 @@ class Gateway:
                 coalesce_window_ms=coalesce_window_ms,
                 speak_enabled=speak_enabled,
                 handle=handle,
+                on_behalf_identity=on_behalf_identity,
+                client_kind=client_kind,
+                client_capabilities=client_capabilities,
+                allow_local_attachment_paths=trusted_bridge,
             )
             # Install gateway hooks: pre-dispatch enforces the same
             # "no enabled models" + "history-mode binding" guards the

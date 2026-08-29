@@ -280,6 +280,7 @@ async def add_model(
     tier_hint: str | None = None,
     enabled: bool = True,
     is_classifier: bool = False,
+    input_modalities: list[str] | None = None,
 ) -> dict[str, Any]:
     """Register a new LLM model row under a provider.
 
@@ -300,6 +301,10 @@ async def add_model(
       the team leader. Entry resolution per turn is: session pin →
       first flagged row in catalog order → first enabled. Multiple
       rows may carry the flag; the first in catalog order wins.
+    - ``input_modalities`` declares what the provider accepts natively:
+      ``text``, ``image``, ``audio``, ``video`` and/or ``file``. Text is
+      required. If omitted, OpenAgent stores a conservative provider/model
+      default; unknown/local models default to text-only.
 
     Pricing is resolved live from OpenRouter on every billing event,
     so there is no cost field to set here. Returns the enriched row.
@@ -312,6 +317,10 @@ async def add_model(
         tier_hint=tier_hint,
         enabled=enabled,
         is_classifier=bool(is_classifier),
+        metadata=(
+            {"input_modalities": input_modalities}
+            if input_modalities is not None else None
+        ),
     )
     return await _require_enriched(mid)
 
@@ -323,6 +332,7 @@ async def update_model(
     tier_hint: str | None = None,
     enabled: bool | None = None,
     is_classifier: bool | None = None,
+    input_modalities: list[str] | None = None,
 ) -> dict[str, Any]:
     """Partially update a model row (only fields you pass are changed).
 
@@ -350,7 +360,13 @@ async def update_model(
             if is_classifier is not None
             else bool(existing.get("is_classifier", False))
         ),
-        metadata=existing.get("metadata") or None,
+        metadata={
+            **dict(existing.get("metadata") or {}),
+            **(
+                {"input_modalities": input_modalities}
+                if input_modalities is not None else {}
+            ),
+        },
     )
     return await _require_enriched(int(model_id))
 

@@ -8,12 +8,36 @@ on:
 permissions:
   contents: write
   id-token: write
+  attestations: write
+
+concurrency:
+  group: release-${{ github.repository }}-${{ github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
+  verify-tag:
+    name: verify tag and source version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Require an exact SemVer tag matching pyproject.toml
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(python -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')
+          source_version=$(python -c 'from src import __version__; print(__version__)')
+          [[ "$version" == "$source_version" ]]
+          [[ "$GITHUB_REF_NAME" == "v$version" ]]
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+)?$ ]]
+
   # Gate the whole release on the end-to-end suite: no executable is built
   # and nothing is published unless the tests pass on the tagged commit.
   test:
     name: end-to-end test suite
+    needs: verify-tag
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -34,6 +58,7 @@ jobs:
         run: bash scripts/test_openagent.sh
 
   computer-control-binary:
+    needs: verify-tag
     strategy:
       fail-fast: false
       matrix:
@@ -147,12 +172,12 @@ jobs:
       - name: Build Node MCPs
         shell: bash
         run: |
-          for mcp_dir in src/mcp/servers/shell src/mcp/servers/web-search src/mcp/servers/editor src/mcp/servers/chrome-devtools src/mcp/servers/messaging; do
-            if [ -d "$mcp_dir" ]; then
-              echo "Building $mcp_dir..."
-              (cd "$mcp_dir" && npm install --silent && npm run build --silent 2>/dev/null || true)
-            fi
+          set -euo pipefail
+          for mcp_dir in src/mcp/servers/web-search src/mcp/servers/editor src/mcp/servers/messaging src/mcp/servers/vault; do
+            echo "Building $mcp_dir..."
+            (cd "$mcp_dir" && npm ci --silent && npm run build --silent)
           done
+          (cd src/mcp/servers/agent-in-chrome/host && npm ci --silent)
       - name: Build executable
         run: pyinstaller openagent.spec --clean --noconfirm
       - name: Stage computer-control sidecar next to dist/openagent
@@ -183,6 +208,9 @@ jobs:
       - name: Package + checksum
         shell: bash
         run: bash scripts/package-release.sh openagent dist
+      - name: Smoke-test the packaged release
+        shell: bash
+        run: bash scripts/test-release-package.sh dist
       - uses: actions/upload-artifact@v4
         with:
           name: executable-${{ matrix.os }}
@@ -197,22 +225,91 @@ jobs:
     if: always() && needs.executable.result == 'success'
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
+          pattern: executable-*
           path: artifacts
           merge-multiple: true
-      - name: List artifacts
-        run: find artifacts -type f | head -40
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+      - uses: actions/setup-python@v5
         with:
+          python-version: "3.12"
+      - name: Verify the exact local release set
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          python scripts/verify-release-assets.py artifacts "$version"
+      - name: Refuse to overwrite an existing GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+              >existing-release.json 2>release-guard-error.log; then
+            echo "::error::Release $GITHUB_REF_NAME already exists; refusing to overwrite it"
+            exit 1
+          fi
+          if ! grep -q '(HTTP 404)' release-guard-error.log; then
+            echo "::error::Could not prove that release $GITHUB_REF_NAME is absent"
+            exit 1
+          fi
+      - name: Attest release archives and installer
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+        with:
+          subject-path: |
+            artifacts/openagent-*-linux-x64.tar.gz
+            artifacts/openagent-*-macos-arm64.pkg
+            artifacts/openagent-*-windows-x64.zip
+      - name: Upload an unpublished draft release
+        id: draft
+        uses: softprops/action-gh-release@v2.6.2
+        with:
+          draft: true
           files: |
-            artifacts/**/*.tar.gz
-            artifacts/**/*.zip
-            artifacts/**/*.sha256
-            artifacts/**/*.dmg
-            artifacts/**/*.exe
-            artifacts/**/*.AppImage
-            artifacts/**/*.deb
-            artifacts/**/*.pkg
+            artifacts/openagent-*-linux-x64.tar.gz
+            artifacts/openagent-*-linux-x64.tar.gz.sha256
+            artifacts/openagent-*-macos-arm64.pkg
+            artifacts/openagent-*-macos-arm64.pkg.sha256
+            artifacts/openagent-*-windows-x64.zip
+            artifacts/openagent-*-windows-x64.zip.sha256
           generate_release_notes: true
+          overwrite_files: false
+          fail_on_unmatched_files: true
+          prerelease: ${{ contains(github.ref_name, '-beta.') }}
+          make_latest: ${{ contains(github.ref_name, '-beta.') && 'false' || 'true' }}
+      - name: Verify uploaded bytes, then publish atomically
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.draft.outputs.id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          is_beta=false
+          make_latest=true
+          if [[ "$version" == *-beta.* ]]; then
+            is_beta=true
+            make_latest=false
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > release-draft.json
+          python scripts/verify-release-assets.py artifacts "$version" \
+            --release-json release-draft.json \
+            --expect-draft true \
+            --expect-prerelease "$is_beta"
+          python - "$is_beta" "$make_latest" > publish.json <<'PY'
+          import json, sys
+          json.dump({
+              "draft": False,
+              "prerelease": sys.argv[1] == "true",
+              "make_latest": sys.argv[2],
+          }, sys.stdout)
+          PY
+          gh api --method PATCH \
+            "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            --input publish.json > release-published.json
+          python scripts/verify-release-assets.py artifacts "$version" \
+            --release-json release-published.json \
+            --expect-draft false \
+            --expect-prerelease "$is_beta"

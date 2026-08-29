@@ -4812,6 +4812,9 @@ def cleanup_and_store(
     # mutated so the caller always sees generated media regardless of store_media.
     storage_copy = copy.copy(run_response)
     scrub_run_output_for_storage(agent, storage_copy)
+    from src.stream.content_parts import scrub_run_output_carriers_for_storage
+
+    scrub_run_output_carriers_for_storage(storage_copy)
 
     # Stop the timer for the Run duration
     if run_response.metrics:
@@ -4870,6 +4873,9 @@ async def acleanup_and_store(
     # mutated so the caller always sees generated media regardless of store_media.
     storage_copy = copy.copy(run_response)
     scrub_run_output_for_storage(agent, storage_copy)
+    from src.stream.content_parts import scrub_run_output_carriers_for_storage
+
+    scrub_run_output_carriers_for_storage(storage_copy)
 
     # Stop the timer for the Run duration
     if run_response.metrics:

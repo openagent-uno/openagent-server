@@ -77,8 +77,8 @@ def _make_session_store_engine(url: str) -> "Engine":
 
     On (the default, SQLite URLs only): set a per-connection ``busy_timeout``
     (so a step commit WAITS for the writer to free instead of raising
-    immediately), ``journal_mode=WAL`` and ``synchronous=NORMAL`` so this
-    engine and MemoryDB coexist on one file with far fewer lock errors. The
+    immediately), ``journal_mode=WAL`` and ``synchronous=FULL`` so this
+    engine and MemoryDB coexist on one file with committed-turn durability. The
     wait defaults to the SAME budget every other writer uses
     (``sqlite_busy_timeout_ms``) — a shorter one here is exactly how this
     engine used to lose races it should have won. Passes
@@ -111,11 +111,51 @@ def _make_session_store_engine(url: str) -> "Engine":
         try:
             cur.execute(f"PRAGMA busy_timeout = {int(timeout * 1000)}")
             cur.execute("PRAGMA journal_mode=WAL")
-            cur.execute("PRAGMA synchronous=NORMAL")
+            cur.execute("PRAGMA foreign_keys=ON")
+            # This engine mutates the same canonical DB as MemoryDB.  NORMAL
+            # is suitable for rebuildable indexes, not for accepted turns.
+            cur.execute("PRAGMA synchronous=FULL")
         finally:
             cur.close()
 
     return engine
+
+
+def _project_operational_session_in_transaction(
+    sess: Any,
+    session_id: str,
+    *,
+    source_row: dict[str, Any] | None = None,
+) -> None:
+    """Project a reviewed runtime write while its legacy transaction is open.
+
+    The legacy trigger entry is created before this savepoint. If v2 projection
+    fails, only the projection is rolled back and that durable entry remains for
+    the request-time reconciler; the accepted legacy transcript is not lost.
+    """
+
+    if not session_id:
+        return
+    from uuid import uuid4 as _uuid4
+
+    from src.memory.operational.repository import (
+        project_legacy_session,
+        sqlalchemy_driver_connection,
+    )
+
+    conn = sqlalchemy_driver_connection(sess)
+    savepoint = f"operational_projection_{_uuid4().hex}"
+    conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        project_legacy_session(conn, session_id, source_row=source_row)
+        conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+    except Exception as exc:  # legacy write + trigger journal remain authoritative
+        conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+        conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        log_warning(
+            f"Operational projection deferred for session {session_id}: "
+            f"{type(exc).__name__}"
+        )
 
 
 class SqliteDb(BaseDb):
@@ -752,6 +792,7 @@ class SqliteDb(BaseDb):
                     log_debug(f"No session found to delete with session_id: {session_id}")
                     return False
                 else:
+                    _project_operational_session_in_transaction(sess, session_id)
                     log_debug(f"Successfully deleted session with session_id: {session_id}")
                     return True
 
@@ -780,6 +821,8 @@ class SqliteDb(BaseDb):
                 if user_id is not None:
                     delete_stmt = delete_stmt.where(table.c.user_id == user_id)
                 result = sess.execute(delete_stmt)
+                for session_id in session_ids:
+                    _project_operational_session_in_transaction(sess, session_id)
 
             log_debug(f"Successfully deleted {result.rowcount} sessions")
 
@@ -817,6 +860,29 @@ class SqliteDb(BaseDb):
                 return None
 
             with self.Session() as sess, sess.begin():
+                # In prefer_v2/v2, a verified session is rehydrated from the
+                # normalized run envelopes.  This avoids selecting/parsing the
+                # ever-growing ``sessions.runs`` blob while preserving the
+                # runtime's existing in-memory Session contract.  Per-session
+                # fallback is mandatory: any pending downgrade/direct write is
+                # served from legacy until reconciliation verifies it again.
+                from src.memory.operational.phase import preferred_session_source
+                from src.memory.operational.repository import (
+                    load_v2_legacy_session,
+                    sqlalchemy_driver_connection,
+                )
+
+                driver = sqlalchemy_driver_connection(sess)
+                if preferred_session_source(driver, session_id) == "v2":
+                    v2_raw = load_v2_legacy_session(driver, session_id)
+                    if v2_raw is not None:
+                        stored_user = v2_raw.get("user_id")
+                        if user_id is None or stored_user in {None, user_id}:
+                            session_raw = deserialize_session_json_fields(v2_raw)
+                            if not deserialize:
+                                return session_raw
+                            return deserialize_session(session_type, session_raw)
+
                 stmt = select(table).where(table.c.session_id == session_id)
 
                 # Filtering. ``user_id IS NULL`` is included as a soft
@@ -1058,6 +1124,13 @@ class SqliteDb(BaseDb):
                     result = sess.execute(stmt)
                     row = result.fetchone()
 
+                    if row is not None:
+                        _project_operational_session_in_transaction(
+                            sess,
+                            str(row._mapping["session_id"]),
+                            source_row=dict(row._mapping),
+                        )
+
                     session_raw = deserialize_session_json_fields(dict(row._mapping)) if row else None
                     if session_raw is None or not deserialize:
                         return session_raw
@@ -1097,6 +1170,13 @@ class SqliteDb(BaseDb):
                     result = sess.execute(stmt)
                     row = result.fetchone()
 
+                    if row is not None:
+                        _project_operational_session_in_transaction(
+                            sess,
+                            str(row._mapping["session_id"]),
+                            source_row=dict(row._mapping),
+                        )
+
                     session_raw = deserialize_session_json_fields(dict(row._mapping)) if row else None
                     if session_raw is None or not deserialize:
                         return session_raw
@@ -1134,6 +1214,13 @@ class SqliteDb(BaseDb):
                     stmt = stmt.returning(*table.columns)  # type: ignore
                     result = sess.execute(stmt)
                     row = result.fetchone()
+
+                    if row is not None:
+                        _project_operational_session_in_transaction(
+                            sess,
+                            str(row._mapping["session_id"]),
+                            source_row=dict(row._mapping),
+                        )
 
                     session_raw = deserialize_session_json_fields(dict(row._mapping)) if row else None
                     if session_raw is None or not deserialize:
@@ -1235,12 +1322,20 @@ class SqliteDb(BaseDb):
                         )
                         sess.execute(stmt, agent_data)
 
-                        # Fetch the results for agent sessions
+                        # Fetch once for both projection and return values.  In
+                        # particular, use the rows that actually won each
+                        # conflict: ``created_at`` and any columns intentionally
+                        # preserved by the UPSERT may differ from the input.
                         agent_ids = [session.session_id for session in agent_sessions]
                         select_stmt = select(table).where(table.c.session_id.in_(agent_ids))
                         result = sess.execute(select_stmt).fetchall()
 
                         for row in result:
+                            _project_operational_session_in_transaction(
+                                sess,
+                                str(row._mapping["session_id"]),
+                                source_row=dict(row._mapping),
+                            )
                             session_dict = deserialize_session_json_fields(dict(row._mapping))
                             if deserialize:
                                 deserialized_agent_session = AgentSession.from_dict(session_dict)
@@ -1290,12 +1385,18 @@ class SqliteDb(BaseDb):
                         )
                         sess.execute(stmt, team_data)
 
-                        # Fetch the results for team sessions
+                        # Read the canonical conflict results once, then reuse
+                        # them for projection and the public return value.
                         team_ids = [session.session_id for session in team_sessions]
                         select_stmt = select(table).where(table.c.session_id.in_(team_ids))
                         result = sess.execute(select_stmt).fetchall()
 
                         for row in result:
+                            _project_operational_session_in_transaction(
+                                sess,
+                                str(row._mapping["session_id"]),
+                                source_row=dict(row._mapping),
+                            )
                             session_dict = deserialize_session_json_fields(dict(row._mapping))
                             if deserialize:
                                 deserialized_team_session = TeamSession.from_dict(session_dict)
@@ -1345,12 +1446,18 @@ class SqliteDb(BaseDb):
                         )
                         sess.execute(stmt, workflow_data)
 
-                        # Fetch the results for workflow sessions
+                        # Read the canonical conflict results once, then reuse
+                        # them for projection and the public return value.
                         workflow_ids = [session.session_id for session in workflow_sessions]
                         select_stmt = select(table).where(table.c.session_id.in_(workflow_ids))
                         result = sess.execute(select_stmt).fetchall()
 
                         for row in result:
+                            _project_operational_session_in_transaction(
+                                sess,
+                                str(row._mapping["session_id"]),
+                                source_row=dict(row._mapping),
+                            )
                             session_dict = deserialize_session_json_fields(dict(row._mapping))
                             if deserialize:
                                 deserialized_workflow_session = WorkflowSession.from_dict(session_dict)
