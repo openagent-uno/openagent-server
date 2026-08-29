@@ -8,6 +8,7 @@ PATCH /api/config/{section}    → update one section
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from src.core.logging import elog
 from .vault import _sanitize  # reuse datetime sanitizer
@@ -76,6 +77,27 @@ async def handle_put(request):
     return web.json_response({"ok": True, "restart_required": True})
 
 
+def _merge_section(existing: Any, patch: Any) -> Any:
+    """RFC 7386 merge of ``patch`` into ``existing``.
+
+    ``null`` deletes a key (the only way to remove one, now that omission
+    means "leave it alone"); dicts merge recursively; everything else
+    replaces. A non-dict patch replaces outright — that is what a caller
+    sending a scalar or a list can only mean.
+    """
+    if not isinstance(patch, dict):
+        return patch
+    out = dict(existing) if isinstance(existing, dict) else {}
+    for key, value in patch.items():
+        if value is None:
+            out.pop(key, None)
+        elif isinstance(value, dict):
+            out[key] = _merge_section(out.get(key), value)
+        else:
+            out[key] = value
+    return out
+
+
 async def handle_patch(request):
     from aiohttp import web
     section = request.match_info["section"]
@@ -92,7 +114,15 @@ async def handle_patch(request):
         )
     patch = await request.json()
     config = _read_raw(request)
-    config[section] = patch
+    # MERGE, don't replace. This endpoint is a PATCH and was assigning the
+    # body over the whole section: sending ``{"distiller_schedule": "..."}``
+    # to ``/api/config/skills`` took ``enabled``, ``path`` and both toggles
+    # with it — silently turning the skills subsystem off on a live agent
+    # (found exactly that way, 2026-08-25). Merge semantics per RFC 7386: a
+    # key set to ``null`` is a deletion, everything else is an upsert, and
+    # nested objects merge instead of clobbering.
+    merged = _merge_section(config.get(section), patch)
+    config[section] = merged
     _write_raw(request, config)
     elog("config.update", section=section)
 
@@ -103,7 +133,7 @@ async def handle_patch(request):
     gw = request.app.get("gateway")
     handled_live = False
     if gw is not None and section in getattr(gw, "_config_change_callbacks", {}):
-        await gw.on_config_change(section, patch)
+        await gw.on_config_change(section, merged)
         handled_live = True
     # Other resource screens may want to refresh derived values.
     if gw is not None:

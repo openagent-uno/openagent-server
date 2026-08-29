@@ -583,3 +583,80 @@ async def t_default_falls_back_when_no_deepseek(ctx: TestContext) -> None:
     judge_id = getattr(judge, "model", None)
     assert judge_id == "local:claude-sub", f"expected cheapest-enabled fallback, got {judge_id!r}"
     assert judge_id is not None and not judge_id.startswith("anthropic:"), judge_id
+
+
+@test("quality", "session_scope classifies the id shapes the runtime emits")
+async def t_session_scope_classifies(ctx: TestContext) -> None:
+    """The four audiences, keyed off the ids production actually produced."""
+    from src.core import quality_monitor as qm
+    assert qm.session_scope(
+        "event:fe4d5c37-ef40-410c-bfd8-03e3d022f084:f7e34886-1750") == qm.SCOPE_CUSTOMER
+    assert qm.session_scope(
+        "scheduler:aafb8e0c-b5d2-4cb4:6eabc30e-ebb5") == qm.SCOPE_SCHEDULED
+    # Real ids from the production log — a sub-agent, and a per-model child.
+    assert qm.session_scope("7e::sub::local:claude-opus-5::84851e72") == qm.SCOPE_INTERNAL
+    assert qm.session_scope("nnet-5::4de52e03::sub::model::ed4d3e8f") == qm.SCOPE_INTERNAL
+    assert qm.session_scope("plain-chat-session") == qm.SCOPE_INTERACTIVE
+    assert qm.session_scope(None) == qm.SCOPE_INTERACTIVE
+
+
+@test("quality", "the judge skips the agent's own sub-agent sessions by default")
+async def t_internal_scope_not_judged(ctx: TestContext) -> None:
+    """The production failure this closes: the judge graded a sub-agent whose
+    output was itself a grading rubric, then flagged it as a bad customer
+    reply. Internal child sessions are out of scope unless asked for."""
+    from src.core import quality_monitor as qm
+    fm = _FakeModel('{"score":0.9,"verdict":"good"}')
+    reply = "a sufficiently long assistant reply here to clear the min-len gate"
+    with _env(OPENAGENT_QUALITY_MONITOR_ENABLED="1",
+              OPENAGENT_QUALITY_MONITOR_SAMPLE_RATE="1",
+              OPENAGENT_QUALITY_MONITOR_SCOPES=None,
+              OPENAGENT_QUALITY_MONITOR_MODEL=None,
+              OPENAGENT_COMPACTION_MODEL=None):
+        await qm.maybe_score_turn(_agent(fm), "7e::sub::local:claude-opus-5::84851e72",
+                                  "compress this rule", reply)
+        assert fm.calls == [], "a sub-agent session must not reach the judge"
+        # A customer thread on the same settings still gets graded.
+        await qm.maybe_score_turn(_agent(fm),
+                                  "event:fe4d5c37:f7e34886", "no music plays", reply)
+        assert len(fm.calls) == 1, "a customer thread must still be judged"
+        # Opting internal back in is one env away.
+        with _env(OPENAGENT_QUALITY_MONITOR_SCOPES="customer,internal"):
+            await qm.maybe_score_turn(_agent(fm),
+                                      "7e::sub::local:claude-opus-5::84851e72",
+                                      "compress this rule", reply)
+            assert len(fm.calls) == 2, "explicit opt-in must judge internal again"
+
+
+@test("quality", "aggregate splits the score by audience instead of blending it")
+async def t_aggregate_by_scope(ctx: TestContext) -> None:
+    """A blended average hides a customer regression behind healthy internal
+    work. Also pins that events written before the scope stamp are classified
+    from their session id, so a window spanning an upgrade still splits."""
+    from src.core import quality_monitor as qm
+    now = time.time()
+    rows = [
+        # Customer replies: bad. Stamped (post-upgrade).
+        {"ts": now, "event": "quality.score", "score": 0.2, "verdict": "bad",
+         "fabrication": True, "scope": "customer", "session_id": "event:a:b"},
+        {"ts": now, "event": "quality.score", "score": 0.4, "verdict": "bad",
+         "scope": "customer", "session_id": "event:a:c"},
+        # Internal sub-agent: good, and UNstamped (pre-upgrade event).
+        {"ts": now, "event": "quality.score", "score": 1.0, "verdict": "good",
+         "session_id": "7e::sub::local:claude-opus-5::84851e72"},
+    ]
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "events.jsonl"
+        p.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        out = qm.aggregate(window_seconds=3600, path=p)
+    q = out["quality"]
+    assert q["judged"] == 3, q
+    # The blended figure is the misleading one the operator used to read.
+    assert q["avg_score"] == round((0.2 + 0.4 + 1.0) / 3, 3), q
+    # The one that matters is separated out, and the pre-upgrade row landed in
+    # the right bucket from its id alone.
+    assert q["customer_avg_score"] == 0.3, q
+    by = q["by_scope"]
+    assert by["customer"]["judged"] == 2 and by["customer"]["verdicts"]["bad"] == 2, by
+    assert by["customer"]["fabrication_flagged"] == 1, by
+    assert by["internal"]["judged"] == 1 and by["internal"]["avg_score"] == 1.0, by

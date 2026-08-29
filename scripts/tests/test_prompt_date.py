@@ -102,3 +102,49 @@ async def t_no_session(ctx: TestContext) -> None:
     # what actually gets emitted as an uncached per-session block.
     _body, tag = _split_session_id_tag(out)
     assert tag == "", f"a trailing session-id tag appeared with no session: {tag!r}"
+
+
+@test("prompt_date", "lean local event gets the compact prompt and full persona")
+async def t_lean_local_prompt(ctx: TestContext) -> None:
+    from src.core.execution_profile import lean_local_event_scope
+
+    persona = "PRODUCT_RULE_SENTINEL: never promise a future release."
+    normal = _combined(persona=persona)
+    with lean_local_event_scope(True):
+        lean = _combined(persona=persona)
+
+    assert persona in lean
+    assert "Work as a single agent" in lean
+    assert "Sub-agents — ALWAYS" not in lean
+    assert len(lean) < len(normal) * 0.35, (len(lean), len(normal))
+
+
+@test("prompt_date", "lean event profile activates only for private self-hosted URLs")
+async def t_lean_local_detection(ctx: TestContext) -> None:
+    from src.core.execution_profile import (
+        should_use_lean_local_event,
+        should_use_lean_local_scheduled_task,
+    )
+
+    class FakeDb:
+        def __init__(self, url: str) -> None:
+            self.url = url
+
+        async def get_provider_by_name(self, name: str, framework: str):  # noqa: ANN001
+            assert framework == "api-based"
+            return {"name": name, "base_url": self.url}
+
+    event = {"model": "windows-local:qwen-local"}
+    assert await should_use_lean_local_event(event, FakeDb("http://192.168.22.145:8099/v1"))
+    assert await should_use_lean_local_scheduled_task(
+        {"model": "windows-local:qwen-local"},
+        FakeDb("http://192.168.22.145:8099/v1"),
+    )
+    assert not await should_use_lean_local_event(event, FakeDb("https://api.example.com/v1"))
+    assert not await should_use_lean_local_scheduled_task(
+        {"model": "cloud:model"}, FakeDb("https://api.example.com/v1"),
+    )
+    assert not await should_use_lean_local_event({"model": ""}, FakeDb("http://127.0.0.1:8099/v1"))
+    assert not await should_use_lean_local_scheduled_task(
+        {"model": ""}, FakeDb("http://127.0.0.1:8099/v1"),
+    )

@@ -38,6 +38,11 @@ async def t_event_db_roundtrip(ctx: TestContext) -> None:
             input_schema=[{"name": "pusher", "path": "pusher.name"}],
             session_binding_enabled=True,
             session_binding_path="repository.id",
+            execution_policy={
+                "max_tool_calls": 5,
+                "timeout_seconds": 45,
+                "allowed_tool_families": ["replio"],
+            },
         )
         # A public read never returns the encrypted secret.
         pub = await db.get_event(eid)
@@ -47,6 +52,11 @@ async def t_event_db_roundtrip(ctx: TestContext) -> None:
         assert pub["enabled"] is True
         assert pub["session_binding_enabled"] is True
         assert pub["session_binding_path"] == "repository.id"
+        assert pub["execution_policy"] == {
+            "max_tool_calls": 5,
+            "timeout_seconds": 45.0,
+            "allowed_tool_families": ["replio"],
+        }
         # The private read (webhook-auth path) does — and it decrypts back.
         priv = await db.get_event(eid, include_secret=True)
         assert decrypt_secret(priv["secret_enc"], db_path=str(ctx.db_path)) == clear
@@ -294,13 +304,20 @@ class _SpyAgent:
 
     def __init__(self):
         self.prompts: list[str] = []
+        self.policies: list[dict | None] = []
+        self.tool_scopes: list[frozenset[str] | None] = []
 
     async def refresh_registries(self):
         return None
 
     async def run(self, *, message, user_id, session_id, model_override=None,
                   author=None, on_status=None):
+        from src.core.execution_policy import current_execution_policy
+        from src.core.tool_scope import current_tool_allowlist
+
         self.prompts.append(message)
+        self.policies.append(current_execution_policy())
+        self.tool_scopes.append(current_tool_allowlist())
         return "done"
 
     async def release_session(self, session_id, *, model_override=None):
@@ -327,6 +344,11 @@ async def t_dispatch_prompt(ctx: TestContext) -> None:
             name="Notify", action_kind="prompt", slug="notify",
             secret_enc=enc, secret_hint=hint,
             prompt_template="Handle push by {{payload.pusher.name}}",
+            execution_policy={
+                "max_tool_calls": 5,
+                "timeout_seconds": 45,
+                "allowed_tool_families": ["replio"],
+            },
         )
         ev = await db.get_event(eid)
         did = await db.add_event_delivery(event_id=eid, payload={"pusher": {"name": "ale"}})
@@ -338,6 +360,8 @@ async def t_dispatch_prompt(ctx: TestContext) -> None:
         # The rendered payload reached the agent (injection-guarded but present).
         assert any("ale" in p for p in agent.prompts), agent.prompts
         assert any("untrusted" in p.lower() for p in agent.prompts), "missing injection guard"
+        assert agent.policies[-1]["max_tool_calls"] == 5
+        assert agent.tool_scopes[-1] == frozenset({"replio"})
         # The delivery links the produced child session.
         row = await db.get_event_delivery(did)
         assert row["status"] == "success" and row["session_id"], row
@@ -431,11 +455,23 @@ async def t_dispatch_task_context(ctx: TestContext) -> None:
     try:
         agent = _SpyAgent()
         scheduler = Scheduler(db=db, agent=agent)  # type: ignore[arg-type]
-        tid = await db.add_task("responder", "0 9 * * *", "Respond to the ticket")
+        tid = await db.add_task(
+            "responder", "0 9 * * *", "Respond to the ticket",
+            execution_policy={
+                "max_tool_calls": 10,
+                "timeout_seconds": 90,
+                "allowed_tool_families": ["replio", "billingbear"],
+            },
+        )
         clear, enc, hint = make_secret_material(db_path=str(ctx.db_path))
         eid = await db.add_event(
             name="Ticket", action_kind="scheduled_task", slug="ticket",
             secret_enc=enc, secret_hint=hint, action_ref=tid,
+            execution_policy={
+                "max_tool_calls": 4,
+                "timeout_seconds": 60,
+                "allowed_tool_families": ["replio", "events-manager"],
+            },
         )
         ev = await db.get_event(eid)
         did = await db.add_event_delivery(event_id=eid, payload={"subject": "urgent"})
@@ -448,6 +484,12 @@ async def t_dispatch_task_context(ctx: TestContext) -> None:
         fired = agent.prompts[-1]
         assert "Respond to the ticket" in fired
         assert "Event payload" in fired and "urgent" in fired, fired
+        assert agent.policies[-1] == {
+            "max_tool_calls": 4,
+            "timeout_seconds": 60.0,
+            "allowed_tool_families": ["replio"],
+        }
+        assert agent.tool_scopes[-1] == frozenset({"replio"})
         row = await db.get_event_delivery(did)
         assert row["task_run_id"], row
     finally:

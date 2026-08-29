@@ -133,6 +133,23 @@ _CHILD_FAILURE_STATUSES = {"ERROR", "FAILED"}
 _CHILD_CANCELLED_STATUSES = {"CANCELLED"}
 _CHILD_INCOMPLETE_STATUSES = {"PAUSED", "PENDING", "RUNNING"}
 
+# The runtime does not raise when a run exhausts its tool-call budget: it feeds
+# the model "Tool call limit reached" and lets it write a final answer. The run
+# then ends COMPLETED, so the task recorded `success` — while having done
+# nothing. Measured on clickup-task-quality-audit: three runs in a row reported
+# success with 0/4 lists audited, 0 tasks checked and 0 mutations, and only
+# firing the task by hand revealed it. A budget that truncates the work must
+# leave a mark in the run history, exactly as the timeout budget does.
+_TOOL_LIMIT_MARKER = "Tool call limit reached"
+
+
+def _run_was_truncated(run: dict) -> bool:
+    """True when the stored child run shows the tool-call budget cut it short."""
+    try:
+        return _TOOL_LIMIT_MARKER in json.dumps(run, default=str)
+    except Exception:  # noqa: BLE001 — detection must never fail a run
+        return False
+
 
 def _status_name(status: object) -> str:
     """Normalize runtime RunStatus enum/string values from session JSON."""
@@ -595,6 +612,16 @@ class Scheduler:
         # this tick — the queued ``received`` rows wait in the DB for a slot.
         free = self._event_dispatch_concurrency() - self._event_dispatch_in_flight
         if free <= 0:
+            # Say so. A saturated dispatcher and an empty queue look identical
+            # from outside — nothing runs, nothing is logged — and an in-flight
+            # counter that never came back down stalls the agent in silence.
+            # Throttled so a legitimately busy runtime doesn't spam the log.
+            now = time.time()
+            if now - getattr(self, "_last_saturation_log", 0.0) >= 60.0:
+                self._last_saturation_log = now
+                elog("scheduler.event_dispatch_saturated", level="warning",
+                     in_flight=self._event_dispatch_in_flight,
+                     concurrency=self._event_dispatch_concurrency())
             return
         try:
             deliveries = await self.db.claim_pending_event_deliveries(
@@ -768,6 +795,52 @@ class Scheduler:
         if context:
             from src.core.event_dispatcher import render_payload_block
             effective_prompt = effective_prompt + render_payload_block(context)
+        from src.core.execution_profile import (
+            lean_local_event_scope,
+            lean_local_task_scope,
+            lean_local_tool_families,
+            should_use_lean_local_scheduled_task,
+            strict_local_only_scope,
+        )
+        from src.core.tool_scope import (
+            current_tool_allowlist,
+            reset_tool_allowlist,
+            set_tool_allowlist,
+        )
+        from src.core.execution_policy import (
+            current_execution_policy,
+            narrow_execution_policy,
+            reset_execution_policy,
+            set_execution_policy,
+            task_execution_policy,
+        )
+        from src.core.dry_run import dry_run_scope
+
+        use_lean_local = await should_use_lean_local_scheduled_task(task, self.db)
+        # Always bound: the error handler below reads it, and it is only
+        # assigned inside the lean-local branch. Leaving it unbound would
+        # raise NameError from the handler and bury the real failure.
+        run_timeout_s: float | None = None
+        # Existing dry-run evaluation tasks predate a schema-level flag.  Make
+        # their long-standing, explicit naming/prompt convention an execution
+        # boundary as well as prose.  Ordinary tasks remain byte-identical.
+        task_name_low = str(task.get("name") or "").strip().lower()
+        prompt_head = str(task.get("prompt") or "").lstrip()[:80].lower()
+        task_dry_run = (
+            "dryrun" in task_name_low
+            or "dry-run" in task_name_low
+            or prompt_head.startswith("dry run")
+            or prompt_head.startswith("dry-run")
+        )
+        execution_policy = narrow_execution_policy(
+            current_execution_policy(), task_execution_policy(task),
+        )
+        if execution_policy.get("timeout_seconds") is not None:
+            run_timeout_s = float(execution_policy["timeout_seconds"])
+        elif use_lean_local:
+            run_timeout_s = max(5.0, float(os.environ.get(
+                "OPENAGENT_LOCAL_SCHEDULED_TASK_TIMEOUT_SECONDS", "120",
+            )))
         durable = _durable_child_sessions()
         # Per-run id (durable) so each firing is its own navigable session;
         # legacy mode reuses one per-task id wiped after every fire.
@@ -780,6 +853,58 @@ class Scheduler:
             mint_child_session_id("scheduler", {"task_id": task["id"], "run_id": run_id})
             if durable else f"scheduler:{task['id']}"
         )
+        allowed_families: list[str] | None = execution_policy.get(
+            "allowed_tool_families"
+        )
+        ambient_families = current_tool_allowlist()
+        if allowed_families is not None and ambient_families is not None:
+            from src.core.tool_scope import normalize_family
+
+            allowed_families = [
+                item for item in allowed_families
+                if normalize_family(item) in ambient_families
+            ]
+        if use_lean_local and allowed_families is None:
+            pool = getattr(self.agent, "_mcp", None)
+            available = list(getattr(pool, "_toolkit_by_name", {}) or {})
+            lean_families = lean_local_tool_families(effective_prompt, available)
+            allowed_families = lean_families or None
+            if allowed_families is not None:
+                elog(
+                    "task.lean_local_tool_scope",
+                    name=task_name,
+                    families=",".join(allowed_families),
+                    dropped=max(0, len(available) - len(allowed_families)),
+                )
+        scope_token = (
+            set_tool_allowlist(allowed_families)
+            if allowed_families is not None else None
+        )
+        policy_token = set_execution_policy(execution_policy)
+        if execution_policy:
+            elog(
+                "task.execution_policy",
+                name=task_name,
+                max_tool_calls=execution_policy.get("max_tool_calls"),
+                timeout_seconds=execution_policy.get("timeout_seconds"),
+                tool_families=allowed_families,
+            )
+        # The two self-improvement passes run with nobody watching, so they
+        # declare themselves: the skill tool then refuses, in code, any write
+        # outside their lane (someone else's skill, or a pinned one). Every
+        # other task keeps the foreground default — a scheduled report that
+        # happens to write a skill is doing it because a human asked for that
+        # task, and is not the autonomous curator.
+        from src.core.builtin_tasks import (
+            SKILL_CURATOR_TASK_NAME, SKILL_DISTILLER_TASK_NAME,
+        )
+        from src.mcp.servers.skills.provenance import (
+            BACKGROUND, reset_write_origin, set_write_origin,
+        )
+
+        origin_token = None
+        if task_name in (SKILL_CURATOR_TASK_NAME, SKILL_DISTILLER_TASK_NAME):
+            origin_token = set_write_origin(BACKGROUND)
         elog("task.run", name=task_name)
         # Record this firing in ``task_runs`` so the dashboard can show a
         # per-task execution history (status / output preview / timing) —
@@ -841,6 +966,81 @@ class Scheduler:
                               run=run_id, session=session_id)
             except Exception:  # noqa: BLE001
                 pass
+            # An operator-approved execution block runs deterministically and
+            # skips the model entirely. It is checked here, inside the try, so
+            # the task_runs row records the outcome exactly like any firing.
+            from src.core import task_directive
+
+            # A quality run is judgement plus bookkeeping, and only the first
+            # half is the model's job. Measured against this scheduler, the
+            # model-driven version skipped the recording step in two firings
+            # out of three and once reported a refused write as "ok". So the
+            # code fetches, computes and records; the model only supplies the
+            # six sub-scores.
+            if "[[quality-digest]]" in effective_prompt:
+                from src.core import local_quality_scorer
+
+                pool = getattr(self.agent, "_mcp", None)
+                if pool is None:
+                    raise RuntimeError("quality digest needs an MCP pool")
+                product = "lyra" if "lyra" in task_name.lower() else "esound"
+                result = await local_quality_scorer.digest(pool, product=product)
+                elog("task.quality_digest", name=task_name,
+                     systemic=len(result.get("systemic") or []))
+                await self._record_task_finish(
+                    finish_run_id, task, status="success",
+                    output=json.dumps(result, ensure_ascii=False, default=str),
+                    error=None,
+                )
+                return
+
+            if "[[quality-scorer]]" in effective_prompt:
+                from src.core import local_quality_scorer
+
+                pool = getattr(self.agent, "_mcp", None)
+                if pool is None:
+                    raise RuntimeError("quality scorer needs an MCP pool")
+                product = "lyra" if "lyra" in task_name.lower() else "esound"
+                with (
+                    dry_run_scope(task_dry_run),
+                    lean_local_event_scope(use_lean_local),
+                    lean_local_task_scope(use_lean_local),
+                    strict_local_only_scope(use_lean_local),
+                ):
+                    result = await local_quality_scorer.run(
+                        self.agent, {"model": task.get("model") or ""}, pool,
+                        f"scheduler:{task['id']}", product=product,
+                    )
+                elog("task.quality_scored", name=task_name,
+                     scored=result.get("scored"), bad=result.get("bad"))
+                await self._record_task_finish(
+                    finish_run_id, task, status="success",
+                    output=json.dumps(result, ensure_ascii=False, default=str),
+                    error=None,
+                )
+                return
+
+            directives = task_directive.parse(effective_prompt)
+            if directives:
+                pool = getattr(self.agent, "_mcp", None)
+                if pool is None:
+                    raise RuntimeError("execute block needs an MCP pool")
+                ok, receipts = await task_directive.execute(pool, directives)
+                summary = json.dumps(
+                    {"executed": len(receipts), "ok": ok, "receipts": receipts},
+                    ensure_ascii=False, default=str,
+                )
+                elog(
+                    "task.directive_executed",
+                    name=task_name, count=len(receipts), ok=ok,
+                )
+                await self._record_task_finish(
+                    finish_run_id, task,
+                    status="success" if ok else "failed",
+                    output=summary,
+                    error=None if ok else "execute block failed",
+                )
+                return
             if durable:
                 # A scheduled firing is the agent acting on a mission it gave
                 # itself: spawn a full child session under a per-task root,
@@ -855,25 +1055,35 @@ class Scheduler:
                         owner = await self.db.primary_owner_handle()
                     except Exception:  # noqa: BLE001
                         owner = None
-                result = await run_child_session(
-                    agent=self.agent,
-                    db=self.db,
-                    parent_session_id=f"scheduler:{task['id']}",
-                    origin="scheduler",
-                    origin_ref={"task_id": task["id"], "run_id": run_id},
-                    title=task_name,
-                    prompt=effective_prompt,
-                    owner_client_id=owner,
-                    # Optional per-task model pin: run the firing on the model
-                    # the task was configured with. NULL falls back to the
-                    # agent's default/router pick inside run_child_session,
-                    # exactly like a chat turn with no session pin.
-                    model_id=task.get("model") or None,
-                    author=agent_author(task_name, agent_name=getattr(self.agent, "name", None)),
-                    # Stream the firing live so its run screen fills in
-                    # token-by-token like any interactive session.
-                    stream=True,
-                )
+                with (
+                    dry_run_scope(task_dry_run),
+                    lean_local_event_scope(use_lean_local),
+                    lean_local_task_scope(use_lean_local),
+                    strict_local_only_scope(use_lean_local),
+                ):
+                    run = run_child_session(
+                        agent=self.agent,
+                        db=self.db,
+                        parent_session_id=f"scheduler:{task['id']}",
+                        origin="scheduler",
+                        origin_ref={"task_id": task["id"], "run_id": run_id},
+                        title=task_name,
+                        prompt=effective_prompt,
+                        owner_client_id=owner,
+                        # Optional per-task model pin: run the firing on the model
+                        # the task was configured with. NULL falls back to the
+                        # agent's default/router pick inside run_child_session,
+                        # exactly like a chat turn with no session pin.
+                        model_id=task.get("model") or None,
+                        author=agent_author(task_name, agent_name=getattr(self.agent, "name", None)),
+                        # Stream the firing live so its run screen fills in
+                        # token-by-token like any interactive session.
+                        stream=True,
+                    )
+                    if run_timeout_s is not None:
+                        result = await asyncio.wait_for(run, timeout=run_timeout_s)
+                    else:
+                        result = await run
                 response = result.text
                 child_issue = await self._child_session_terminal_issue(
                     result.session_id,
@@ -885,13 +1095,25 @@ class Scheduler:
                 # still has a client execution origin in its ContextVar.
                 from src.core.execution_origin import execution_origin_scope
 
-                with execution_origin_scope(None):
-                    response = await self.agent.run(
+                with (
+                    execution_origin_scope(None),
+                    dry_run_scope(task_dry_run),
+                    lean_local_event_scope(use_lean_local),
+                    lean_local_task_scope(use_lean_local),
+                    strict_local_only_scope(use_lean_local),
+                ):
+                    run = self.agent.run(
                         message=effective_prompt,
                         user_id="scheduler",
                         session_id=session_id,
                     )
-                child_issue = None
+                    if run_timeout_s is not None:
+                        response = await asyncio.wait_for(run, timeout=run_timeout_s)
+                    else:
+                        response = await run
+                # The non-streaming branch used to skip the check entirely, so a
+                # truncated run here looked like a clean success.
+                child_issue = await self._child_session_terminal_issue(session_id)
             elog("task.done", name=task_name, preview=str(response)[:100])
             if child_issue is not None:
                 final_status, final_error = child_issue
@@ -926,11 +1148,37 @@ class Scheduler:
             )
             raise
         except Exception as e:
-            elog("task.error", level="error", name=task_name, error=str(e))
+            # ``str(e)`` is EMPTY for an exception raised without a message,
+            # and several are. That produced `task.error … error=""` — an
+            # error event that does not say what went wrong, which is the one
+            # thing it exists to do. Keep the type so an argument-less
+            # exception still identifies itself, in the log and on the run row
+            # the dashboard reads.
+            # Keep the CAUSE too. The informative half is usually the wrapped
+            # original — a read timeout on the upstream call surfacing as a
+            # provider error, say — and it is what tells a timeout on the
+            # socket apart from a budget the scheduler itself imposed. Only
+            # the lean-local path imposes one, so it is absent for most tasks
+            # and must not be implied when it is.
+            detail = str(e).strip()
+            detail = f"{type(e).__name__}: {detail}" if detail else type(e).__name__
+            cause = e.__cause__ or e.__context__
+            if cause is not None and type(cause) is not type(e):
+                cause_txt = str(cause).strip() or type(cause).__name__
+                detail = f"{detail} (caused by {type(cause).__name__}: {cause_txt})"
+            if run_timeout_s and isinstance(e, asyncio.TimeoutError):
+                detail = f"{detail} — scheduler budget was {run_timeout_s:.0f}s"
+            elog("task.error", level="error", name=task_name,
+                 error=detail, error_type=type(e).__name__)
             await self._record_task_finish(
-                finish_run_id, task, status="failed", error=str(e),
+                finish_run_id, task, status="failed", error=detail,
             )
         finally:
+            reset_execution_policy(policy_token)
+            if origin_token is not None:
+                reset_write_origin(origin_token)
+            if scope_token is not None:
+                reset_tool_allowlist(scope_token)
             if recorded:
                 self._unregister_run(self._scheduled_run_tasks, run_id)
             if not durable:
@@ -996,6 +1244,40 @@ class Scheduler:
             return (
                 "failed",
                 f"Child session {session_id} ended without a completed runtime run: {status}",
+            )
+        # Prove, non solo esito. Un'esecuzione che dichiara successo senza
+        # aver chiamato un solo tool non ha letto, scritto o mandato niente:
+        # il resoconto e' un'affermazione, non un risultato. Non la si declassa
+        # — un compito che legittimamente non usa tool esiste — ma la si DICE,
+        # perche' nell'archivio e' indistinguibile da un lavoro fatto, ed e'
+        # cosi' che un compito rotto resta vivo per settimane.
+        try:
+            from src.core.run_evidence import unevidenced_reason
+
+            reason = unevidenced_reason(
+                status="success",
+                run=latest,
+                output=_string_preview(latest.get("content")),
+            )
+            if reason:
+                elog(
+                    "task_run.unevidenced",
+                    level="warning",
+                    session_id=session_id,
+                    detail=reason,
+                )
+        except Exception as e:  # noqa: BLE001 — un testimone non rompe cio' che osserva
+            elog("task_run.evidence_check_failed", level="warning", error=str(e))
+
+        if _run_was_truncated(latest):
+            # Completed, but only because the budget stopped it. Say so: a run
+            # that never reached its work is not a success, and reading it as
+            # one is how this task stayed broken unnoticed.
+            return (
+                "failed",
+                "Run truncated: the tool-call budget was exhausted before the "
+                "task finished its work. Raise OPENAGENT_LEAN_EVENT_MAX_TOOL_CALLS "
+                "(lean profile) or OPENAGENT_MAX_TOOL_CALLS_PER_RUN.",
             )
         return None
 
@@ -1380,6 +1662,7 @@ class Scheduler:
         prompt: str,
         model: str | None = None,
         timezone: str | None = None,
+        execution_policy: dict | None = None,
     ) -> str:
         """Add a new scheduled task. ``model`` is an optional runtime_id the
         firing runs on (NULL = the agent's default/router model).
@@ -1393,7 +1676,7 @@ class Scheduler:
         return await self.db.add_task(
             name, cron_expression, prompt,
             self._next_run(cron_expression, now, timezone), model=model,
-            timezone=timezone,
+            timezone=timezone, execution_policy=execution_policy,
         )
 
     async def list_tasks(self) -> list[dict]:

@@ -38,6 +38,45 @@ logger = logging.getLogger(__name__)
 WORKER_ID = str(uuid.uuid4())
 WORKER_PID = os.getpid()
 
+
+# ── One busy timeout for everything that writes this file ────────────────────
+#
+# SQLite in WAL mode has exactly ONE writer, and this agent has many: the
+# gateway, the scheduler, the workflow executor, compaction, the runtime's own
+# session store, and every in-tree MCP subprocess — several of them in separate
+# processes, so Python-level serialisation buys nothing. A writer that waits
+# gets its turn; a writer that gives up early raises "database is locked" and
+# leaves work half-done (a workflow_run stranded in 'running', a compaction
+# thrown away, an event lease unreaped).
+#
+# The failures we kept seeing were never "the lock was held forever" — they
+# were connections that had been given a *different*, shorter patience than
+# everyone else: 10s here, 5s there, none at all in the runtime store. So the
+# number lives here, once, and every writer reads it. Tunable per deployment
+# via ``OPENAGENT_SQLITE_BUSY_TIMEOUT_MS`` for the rare host that needs it.
+_DEFAULT_SQLITE_BUSY_TIMEOUT_MS = 60_000
+
+
+def sqlite_busy_timeout_ms() -> int:
+    """Milliseconds every connection to the agent DB should wait for the
+    writer before giving up. Read live so a redeploy is not needed to retune."""
+    raw = os.environ.get("OPENAGENT_SQLITE_BUSY_TIMEOUT_MS")
+    if raw is None:
+        return _DEFAULT_SQLITE_BUSY_TIMEOUT_MS
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError):
+        return _DEFAULT_SQLITE_BUSY_TIMEOUT_MS
+    # A zero/negative timeout would mean "fail instantly", which is the bug
+    # this constant exists to remove. Treat it as "use the default".
+    return value if value > 0 else _DEFAULT_SQLITE_BUSY_TIMEOUT_MS
+
+
+def sqlite_busy_timeout_s() -> float:
+    """The same budget in seconds, for ``sqlite3.connect(timeout=...)`` — which
+    covers the window BEFORE the first PRAGMA can run on a new connection."""
+    return sqlite_busy_timeout_ms() / 1000.0
+
 # Lease defaults. The lease is SHORT so a frozen turn is reclaimed in ~LEASE_TTL
 # rather than the coarse 30-min stale-sweep age; the heartbeat (a tiny single-row
 # write that survives writer contention) keeps a legitimately-running turn's
@@ -106,6 +145,10 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
     -- ``src/memory/schedule.py`` for the DST rules that follow from it.
     -- Added by ``_migrate_scheduled_tasks_timezone_column`` on old DBs.
     timezone TEXT,
+    -- Provider-neutral unattended-run envelope. JSON fields currently:
+    -- max_tool_calls, timeout_seconds, allowed_tool_families. NULL preserves
+    -- the historical global defaults. Migrated additively on old DBs.
+    execution_policy_json TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -456,6 +499,41 @@ CREATE TABLE IF NOT EXISTS config_state (
 -- a framework lock on top of the pin). With history unified in
 -- the runtime's ``sessions`` across every framework, the lock is no longer
 -- needed — only the pin value itself survives.
+-- ── Session journal: what happened, written while it happened ──
+--
+-- ``sessions.runs`` is the surface the MODEL sees, and the runtime writes it
+-- when a turn ENDS. That is a fine contract for the model and a terrible one
+-- for everybody else: a turn interrupted before it closes leaves no trace at
+-- all, so an app that was mid-conversation has nothing to reconcile against
+-- and a support question about "what did it do at 14:32" has no answer.
+--
+-- This table is the other half — an append-only journal of the facts of a
+-- turn, written as they occur: the user's message, the assistant's message,
+-- tool status, compaction, errors, and how the turn ended. Borrowed from
+-- DeepSeek Harness's session log, minus what does not apply to us (we do not
+-- journal every stream delta: they are re-derivable from the final message and
+-- would be the bulk of the volume).
+--
+-- Rules that make it worth having:
+--   * append-only — rows are never updated, only inserted;
+--   * ``seq`` is monotonic per session, so a client can ask "what happened
+--     after 41" and get an answer instead of inferring from silence;
+--   * ``data`` is JSON and may grow new keys; a reader that meets an unknown
+--     ``type`` skips it rather than failing (nothing here is load-bearing for
+--     reconstruction yet — when something becomes so, it gets an explicit
+--     non-ignorable marker, as dsh does).
+CREATE TABLE IF NOT EXISTS session_events (
+    session_id TEXT NOT NULL,
+    seq        INTEGER NOT NULL,
+    ts_ms      INTEGER NOT NULL,
+    type       TEXT NOT NULL,
+    data       TEXT,
+    PRIMARY KEY (session_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_events_session
+    ON session_events(session_id, seq);
+
 CREATE TABLE IF NOT EXISTS pinned_sessions (
     session_id TEXT PRIMARY KEY,
     runtime_id TEXT NOT NULL,
@@ -802,6 +880,9 @@ CREATE TABLE IF NOT EXISTS events (
     -- moved on since it was enqueued; this settles "is there still work here?"
     -- with one HTTP call instead of a model turn. NULL → always run.
     precondition_json  TEXT,
+    -- Provider-neutral capability/resource envelope for every delivery.
+    -- A nested task can only narrow this envelope, never expand it.
+    execution_policy_json TEXT,
     -- Guardrails (the webhook is the first cert-less inbound surface, and
     -- every delivery is a paid LLM run): requests over the cap are 413'd,
     -- more than ``rate_limit_per_min`` deliveries in a rolling minute are
@@ -901,6 +982,33 @@ CREATE INDEX IF NOT EXISTS idx_evdel_unclaimed ON event_deliveries(claimed_at);
 """
 
 
+def _as_epoch(value: Any) -> float:
+    """Epoch da una colonna ``updated_at`` che DOVREBBE essere REAL.
+
+    Il 24-ago-2026 un `update ... set updated_at=datetime('now')` fatto a mano
+    ha scritto TEXT in tre righe di ``models``. In SQLite il testo ordina SOPRA
+    i numeri, quindi ``MAX(updated_at)`` restituiva quella stringa,
+    ``float()`` alzava ValueError e l'idratazione del catalogo moriva li':
+    il dispatcher restava con providers_config VUOTO e ogni turno di supporto
+    rispondeva "No model is currently enabled." per 17 minuti, con la delivery
+    chiusa `success`. Una riga scritta male e' un bug di chi la scrive; farne
+    morire il catalogo e' un bug di chi la legge.
+    """
+    if value is None:
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            import datetime as _dt
+            return _dt.datetime.strptime(str(value).strip()[:19], fmt).timestamp()
+        except ValueError:
+            continue
+    return 0.0
+
+
 class MemoryDB:
     """SQLite storage for OpenAgent's runtime state."""
 
@@ -923,11 +1031,23 @@ class MemoryDB:
         # MCP subprocess + a fresh per-test MemoryDB all pointing at the same
         # file), two DDL calls can race. Raise the timeout so the second
         # connect waits a few seconds instead of deadlocking the event loop.
-        self._conn = await aiosqlite.connect(self.db_path, timeout=10.0)
+        self._conn = await aiosqlite.connect(
+            self.db_path, timeout=sqlite_busy_timeout_s(),
+        )
         self._conn.row_factory = aiosqlite.Row
         # ``busy_timeout`` gives the same guarantee at every subsequent
         # statement on this connection — not just the initial open.
-        await self._conn.execute("PRAGMA busy_timeout = 10000")
+        #
+        # 23-ago-2026: alzato da 10s a 60s. Con il solo scrittore WAL occupato
+        # da una transazione lunga, il ciclo dello scheduler falliva
+        # `_reap_expired_event_leases` con `database is locked` centinaia di
+        # volte al giorno (836 in un'ora sola) — e proprio quel reaper e' la
+        # via di recupero delle consegne bloccate, quindi si arrendeva quando
+        # sarebbe servito di piu'. Il reaper non e' il colpevole della contesa:
+        # misurato, aveva ZERO righe da toccare. Aspettare e' corretto,
+        # arrendersi no. Il valore alto e' gia' quello usato da
+        # `session_retention`, che convive con lo stesso scrittore.
+        await self._conn.execute(f"PRAGMA busy_timeout = {sqlite_busy_timeout_ms()}")
         await self._conn.execute("PRAGMA journal_mode=WAL")
         # Enable FK constraints per-connection. SQLite's default is OFF,
         # so without this the ON DELETE CASCADE on models.provider_id is
@@ -1138,8 +1258,10 @@ class MemoryDB:
         await self._migrate_task_runs_session_id()
         await self._migrate_scheduled_tasks_model_column()
         await self._migrate_scheduled_tasks_timezone_column()
+        await self._migrate_scheduled_tasks_execution_policy_column()
         await self._migrate_events_session_binding()
         await self._migrate_events_precondition()
+        await self._migrate_events_execution_policy_column()
         await self._migrate_event_deliveries_reenqueue_count()
         await self._migrate_event_deliveries_lease()
         await self._migrate_events_breaker()
@@ -1431,6 +1553,17 @@ class MemoryDB:
             )
             await self._conn.commit()
 
+    async def _migrate_scheduled_tasks_execution_policy_column(self) -> None:
+        """Add the generic unattended-run envelope without changing old tasks."""
+        assert self._conn is not None
+        cursor = await self._conn.execute("PRAGMA table_info(scheduled_tasks)")
+        cols = {row[1] for row in await cursor.fetchall()}
+        if "execution_policy_json" not in cols:
+            await self._conn.execute(
+                "ALTER TABLE scheduled_tasks ADD COLUMN execution_policy_json TEXT"
+            )
+            await self._conn.commit()
+
     async def _migrate_events_precondition(self) -> None:
         """An event can declare a cheap check that runs BEFORE the delivery does.
 
@@ -1451,6 +1584,17 @@ class MemoryDB:
         if "precondition_json" not in cols:
             await self._conn.execute(
                 "ALTER TABLE events ADD COLUMN precondition_json TEXT"
+            )
+            await self._conn.commit()
+
+    async def _migrate_events_execution_policy_column(self) -> None:
+        """Add per-event resource/capability bounds without changing old events."""
+        assert self._conn is not None
+        cursor = await self._conn.execute("PRAGMA table_info(events)")
+        cols = {row[1] for row in await cursor.fetchall()}
+        if "execution_policy_json" not in cols:
+            await self._conn.execute(
+                "ALTER TABLE events ADD COLUMN execution_policy_json TEXT"
             )
             await self._conn.commit()
 
@@ -2072,6 +2216,7 @@ class MemoryDB:
         next_run: float | None = None,
         model: str | None = None,
         timezone: str | None = None,
+        execution_policy: Any = None,
     ) -> str:
         """``timezone`` is an IANA name the cron is read in; None = UTC (the
         pre-timezone behaviour). Validated here so a typo can't reach the
@@ -2080,14 +2225,17 @@ class MemoryDB:
         from src.memory.schedule import validate_timezone
 
         validate_timezone(timezone)
+        from src.core.execution_policy import encode_execution_policy
+
+        execution_policy_json = encode_execution_policy(execution_policy)
         conn = await self._ensure_connected()
         task_id = str(uuid.uuid4())
         now = time.time()
         await conn.execute(
-            "INSERT INTO scheduled_tasks (id, name, cron_expression, prompt, enabled, next_run, model, timezone, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?)",
+            "INSERT INTO scheduled_tasks (id, name, cron_expression, prompt, enabled, next_run, model, timezone, execution_policy_json, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)",
             (task_id, name, cron_expression, prompt, next_run or now, model or None,
-             (timezone or None), now, now),
+             (timezone or None), execution_policy_json, now, now),
         )
         await conn.commit()
         return task_id
@@ -2111,7 +2259,7 @@ class MemoryDB:
         conn = await self._ensure_connected()
         allowed = {
             "name", "cron_expression", "prompt", "enabled", "last_run",
-            "next_run", "model", "timezone",
+            "next_run", "model", "timezone", "execution_policy_json",
         }
         updates = {k: v for k, v in kwargs.items() if k in allowed}
         if not updates:
@@ -2125,6 +2273,12 @@ class MemoryDB:
             # every 30 s instead of failing visibly.
             validate_timezone(updates["timezone"])
             updates["timezone"] = updates["timezone"] or None
+        if "execution_policy_json" in updates:
+            from src.core.execution_policy import encode_execution_policy
+
+            updates["execution_policy_json"] = encode_execution_policy(
+                updates["execution_policy_json"]
+            )
         updates["updated_at"] = time.time()
         set_clause = ", ".join(f"{k} = ?" for k in updates)
         values = list(updates.values()) + [task_id]
@@ -2430,6 +2584,11 @@ class MemoryDB:
             d["input_schema"] = []
         d["enabled"] = bool(d.get("enabled"))
         d["session_binding_enabled"] = bool(d.get("session_binding_enabled"))
+        from src.core.execution_policy import normalize_execution_policy
+
+        d["execution_policy"] = normalize_execution_policy(
+            d.pop("execution_policy_json", None)
+        )
         if not include_secret:
             d.pop("secret_enc", None)
         return d
@@ -2450,10 +2609,13 @@ class MemoryDB:
         model: str | None = None,
         session_binding_enabled: bool = False,
         session_binding_path: str | None = None,
+        execution_policy: Any = None,
         rate_limit_per_min: int = 60,
         max_payload_bytes: int = 262144,
         enabled: bool = True,
     ) -> str:
+        from src.core.execution_policy import encode_execution_policy
+
         conn = await self._ensure_connected()
         event_id = str(uuid.uuid4())
         now = time.time()
@@ -2461,9 +2623,9 @@ class MemoryDB:
             "INSERT INTO events "
             "(id, name, slug, description, type, enabled, secret_enc, "
             " secret_hint, input_schema_json, action_kind, action_ref, prompt_template, "
-            " model, session_binding_enabled, session_binding_path, "
+            " model, session_binding_enabled, session_binding_path, execution_policy_json, "
             " rate_limit_per_min, max_payload_bytes, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 event_id, name, slug, description or None, event_type,
                 1 if enabled else 0, secret_enc, secret_hint,
@@ -2471,6 +2633,7 @@ class MemoryDB:
                 prompt_template or None, model or None,
                 1 if session_binding_enabled else 0,
                 (session_binding_path or "").strip() or None,
+                encode_execution_policy(execution_policy),
                 int(rate_limit_per_min), int(max_payload_bytes), now, now,
             ),
         )
@@ -2511,7 +2674,7 @@ class MemoryDB:
             "action_ref", "prompt_template", "model", "rate_limit_per_min",
             "max_payload_bytes", "last_triggered_at",
             "session_binding_enabled", "session_binding_path",
-            "precondition_json",
+            "precondition_json", "execution_policy_json",
             # Secret rotation goes through ``rotate_event_secret``; these are
             # accepted here too so that path can reuse the same UPDATE.
             "secret_enc", "secret_hint",
@@ -2528,6 +2691,10 @@ class MemoryDB:
                 # Accept the spec as a dict from callers that build it in code;
                 # store the canonical JSON either way.
                 v = json.dumps(v)
+            if k == "execution_policy_json":
+                from src.core.execution_policy import encode_execution_policy
+
+                v = encode_execution_policy(v)
             updates[k] = v
         # ``input_schema`` is passed as a list and serialised here.
         if "input_schema" in kwargs:
@@ -2743,8 +2910,17 @@ class MemoryDB:
         now = time.time()
         claim_expires = now + _lease_ttl_seconds()
         cursor = await conn.execute(
+            # ``finished_at IS NULL`` is load-bearing, not tidiness. The claim
+            # orders by ``started_at ASC`` and does NOT look at status, so a row
+            # that finished without ever being claimed — cancelled out of band,
+            # imported, or written by a tool that set an outcome directly — sits
+            # at the head of the queue forever and is re-claimed on every tick,
+            # spending the whole batch. Measured 19-ago-2026 on a cloned agent:
+            # 1057 such rows starved every genuinely pending delivery behind
+            # them, and from the outside it looked exactly like "no work".
             "SELECT * FROM event_deliveries "
-            "WHERE claimed_at IS NULL ORDER BY started_at ASC LIMIT ?",
+            "WHERE claimed_at IS NULL AND finished_at IS NULL "
+            "ORDER BY started_at ASC LIMIT ?",
             (int(limit),),
         )
         rows = await cursor.fetchall()
@@ -2985,6 +3161,13 @@ class MemoryDB:
     # resurrected. The re-enqueue path never re-writes this phrase, so it
     # only ever marks the pre-fix historical rows.
     _REAP_ORPHAN_MARK = "reaped: orphan from prior process"
+    # Un turno che muore senza capacita' di modello (nessun account,
+    # 429 ovunque, timeout del provider) chiude la delivery `failed` ma
+    # NON e' un evento difettoso: e' lo stesso messaggio del cliente che
+    # va riprovato quando la capacita' torna. Marcato a parte dagli
+    # orfani del reaper perche' i due casi hanno interruttori diversi:
+    # BACKFILL riguarda la storia vecchia, questo il go-forward.
+    _RETRYABLE_TURN_MARK = "retryable: turn died without model capacity"
 
     async def reap_orphan_event_deliveries(
         self,
@@ -3055,6 +3238,10 @@ class MemoryDB:
             enabled = _flag("OPENAGENT_EVENT_REENQUEUE_ENABLED", True)
         if recover_failed is None:
             recover_failed = _flag("OPENAGENT_EVENT_REENQUEUE_BACKFILL", True)
+        # Separato da BACKFILL apposta: sui tre agent in produzione BACKFILL e'
+        # a 0 (non si resuscita la storia vecchia), ma un turno morto adesso per
+        # mancanza di capacita' va ritentato lo stesso.
+        recover_transient = _flag("OPENAGENT_EVENT_REENQUEUE_TRANSIENT", True)
         if max_attempts is None:
             try:
                 max_attempts = int(
@@ -3111,6 +3298,9 @@ class MemoryDB:
         if recover_failed:
             where += " OR (status='failed' AND error LIKE ?)"
             params.append(f"%{self._REAP_ORPHAN_MARK}%")
+        if recover_transient:
+            where += " OR (status='failed' AND error LIKE ?)"
+            params.append(f"%{self._RETRYABLE_TURN_MARK}%")
         where += ")"
         requeue_cur = await conn.execute(
             "UPDATE event_deliveries "
@@ -3247,15 +3437,45 @@ class MemoryDB:
         )
         requeued = requeue_cur.rowcount or 0
 
+        # 3. E le delivery morte per MANCANZA DI CAPACITA'. Sono terminali
+        #    (``failed``), quindi qui non c'e' nessun turno vivo da duplicare e
+        #    il cancello dell'eta' non serve a quello: serve a non rilanciarle
+        #    dentro lo stesso blackout che le ha uccise, cioe' a dare al pool il
+        #    tempo di tornare. Senza questo passaggio sarebbero ripescate solo
+        #    dal reap di avvio, cioe' al prossimo riavvio: ore, per il messaggio
+        #    di un cliente. Il marcatore lo mette il dispatcher SOLO quando la
+        #    morte e' transitoria (un guasto permanente non finisce mai qui) e il
+        #    tetto dei tentativi resta quello di sempre.
+        try:
+            retry_delay = max(0.0, float(
+                os.environ.get("OPENAGENT_EVENT_RETRY_DELAY_SECONDS", "300")))
+        except (TypeError, ValueError):
+            retry_delay = 300.0
+        retried = 0
+        if _flag("OPENAGENT_EVENT_REENQUEUE_TRANSIENT", True):
+            retry_cur = await conn.execute(
+                "UPDATE event_deliveries "
+                "SET status='received', claimed_at=NULL, finished_at=NULL, "
+                "    reenqueue_count = reenqueue_count + 1, "
+                "    error='re-enqueued: no model capacity (attempt ' "
+                "          || (reenqueue_count + 1) || ')' "
+                "WHERE status='failed' AND error LIKE ? "
+                "  AND reenqueue_count < ? "
+                "  AND finished_at IS NOT NULL AND finished_at <= ?",
+                (f"%{self._RETRYABLE_TURN_MARK}%", max_attempts, now - retry_delay),
+            )
+            retried = retry_cur.rowcount or 0
+
         await conn.commit()
-        if requeued or parked:
+        if requeued or parked or retried:
             from src.core.logging import elog
             elog(
                 "event.orphan_reaped", mode="stale-sweep",
-                requeued=requeued, parked=parked, max_attempts=max_attempts,
+                requeued=requeued, parked=parked, retried=retried,
+                max_attempts=max_attempts,
                 min_claim_age_seconds=min_claim_age_seconds,
             )
-        return requeued + parked
+        return requeued + parked + retried
 
     # ── Workflow Tasks ──
 
@@ -4444,9 +4664,9 @@ class MemoryDB:
         a bump to the bootstrap write and reload once, which is fine.
         """
         conn = await self._ensure_connected()
-        cursor = await conn.execute("SELECT MAX(updated_at) FROM mcps")
+        cursor = await conn.execute("SELECT MAX(CAST(updated_at AS REAL)) FROM mcps")
         row = await cursor.fetchone()
-        return float(row[0] or 0.0) if row else 0.0
+        return _as_epoch(row[0]) if row else 0.0
 
     # ── Providers (v0.12: one row per (name, framework) pair) ──
 
@@ -4618,9 +4838,9 @@ class MemoryDB:
 
     async def providers_max_updated(self) -> float:
         conn = await self._ensure_connected()
-        cursor = await conn.execute("SELECT MAX(updated_at) FROM providers")
+        cursor = await conn.execute("SELECT MAX(CAST(updated_at AS REAL)) FROM providers")
         row = await cursor.fetchone()
-        return float(row[0] or 0.0) if row else 0.0
+        return _as_epoch(row[0]) if row else 0.0
 
     # ── Models (v0.12: provider_id FK, no runtime_id column) ──
 
@@ -5014,9 +5234,9 @@ class MemoryDB:
 
     async def models_max_updated(self) -> float:
         conn = await self._ensure_connected()
-        cursor = await conn.execute("SELECT MAX(updated_at) FROM models")
+        cursor = await conn.execute("SELECT MAX(CAST(updated_at AS REAL)) FROM models")
         row = await cursor.fetchone()
-        return float(row[0] or 0.0) if row else 0.0
+        return _as_epoch(row[0]) if row else 0.0
 
     async def registry_status(self) -> tuple[float, float, int, float]:
         """One-shot probe used by the gateway's per-message hot-reload loop.
@@ -5032,21 +5252,21 @@ class MemoryDB:
         conn = await self._ensure_connected()
         cursor = await conn.execute(
             "SELECT "
-            "  COALESCE((SELECT MAX(updated_at) FROM mcps), 0), "
-            "  COALESCE((SELECT MAX(updated_at) FROM models), 0), "
+            "  COALESCE((SELECT MAX(CAST(updated_at AS REAL)) FROM mcps), 0), "
+            "  COALESCE((SELECT MAX(CAST(updated_at AS REAL)) FROM models), 0), "
             "  COALESCE(("
             "    SELECT COUNT(*) FROM models m "
             "    JOIN providers p ON p.id = m.provider_id "
             "    WHERE m.enabled = 1 AND p.enabled = 1"
             "  ), 0), "
-            "  COALESCE((SELECT MAX(updated_at) FROM providers), 0)"
+            "  COALESCE((SELECT MAX(CAST(updated_at AS REAL)) FROM providers), 0)"
         )
         row = await cursor.fetchone()
         if not row:
             return 0.0, 0.0, 0, 0.0
         return (
-            float(row[0] or 0.0), float(row[1] or 0.0),
-            int(row[2] or 0), float(row[3] or 0.0),
+            _as_epoch(row[0]), _as_epoch(row[1]),
+            int(row[2] or 0), _as_epoch(row[3]),
         )
 
     # ── Per-Session Pin ──
@@ -5541,6 +5761,7 @@ class MemoryDB:
     # is permanently deleted — most importantly ``conversation_embeddings``, or
     # a deleted chat would keep resurfacing through memory-search.
     _SESSION_SATELLITE_TABLES: tuple[str, ...] = (
+        "session_events",
         "pinned_sessions",
         "conversation_embeddings",
         "user_profiles",
@@ -5571,6 +5792,99 @@ class MemoryDB:
                     table, session_id, e,
                 )
         await conn.commit()
+
+    # ── Session journal (append-only) ──
+    #
+    # Which types this build knows, and which of them are merely informational.
+    # Taken from dsh's ``ignorable`` flag and the rule that goes with it: a
+    # reader that meets an unknown type which is NOT ignorable must refuse to
+    # reconstruct rather than quietly skip it and hand back a plausible,
+    # incomplete history. Nothing reconstructs from this journal yet — but the
+    # rule has to exist before the first consumer does, not after it has
+    # already guessed.
+    JOURNAL_KNOWN_TYPES: frozenset[str] = frozenset({
+        "user/message", "assistant/message", "tool/status",
+        "turn/end", "error", "compaction",
+    })
+    JOURNAL_IGNORABLE_TYPES: frozenset[str] = frozenset({
+        # Progress chatter and accounting: losing one cannot change what the
+        # conversation WAS.
+        "tool/status", "compaction",
+    })
+
+
+    async def append_session_event(
+        self, session_id: str, event_type: str, data: dict | None = None,
+    ) -> int:
+        """Append one fact to a session's journal and return its ``seq``.
+
+        Best-effort by contract: journalling must never be the reason a turn
+        fails, so a write error is logged and swallowed (returning 0). The
+        journal is a witness, not a participant.
+
+        ``seq`` is allocated as ``max(seq) + 1`` for the session inside the
+        same statement, so two writers cannot mint the same number — the
+        PRIMARY KEY would reject the loser anyway, and the retry lands on a
+        fresh value.
+        """
+        if not session_id or not event_type:
+            return 0
+        payload = "{}"
+        if data:
+            try:
+                payload = json.dumps(data, default=str)
+            except (TypeError, ValueError):
+                payload = json.dumps({"unserializable": True})
+        conn = await self._ensure_connected()
+        for _attempt in range(3):
+            try:
+                cursor = await conn.execute(
+                    "INSERT INTO session_events (session_id, seq, ts_ms, type, data) "
+                    "VALUES (?, COALESCE((SELECT MAX(seq) FROM session_events "
+                    "WHERE session_id = ?), 0) + 1, ?, ?, ?) RETURNING seq",
+                    (session_id, session_id, int(time.time() * 1000), event_type, payload),
+                )
+                row = await cursor.fetchone()
+                await conn.commit()
+                return int(row[0]) if row else 0
+            except sqlite3.IntegrityError:
+                continue  # lost the seq race — take the next number
+            except Exception as e:  # noqa: BLE001
+                logger.debug("session journal write failed (%s): %s", event_type, e)
+                return 0
+        return 0
+
+    async def list_session_events(
+        self, session_id: str, *, after_seq: int = 0, limit: int = 500,
+    ) -> list[dict]:
+        """Read a session's journal in order, from ``after_seq`` exclusive.
+
+        This is what lets a client ask "what happened while I was away" and
+        get facts instead of inferring from silence."""
+        conn = await self._ensure_connected()
+        try:
+            cursor = await conn.execute(
+                "SELECT seq, ts_ms, type, data FROM session_events "
+                "WHERE session_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?",
+                (session_id, int(after_seq), max(1, min(int(limit), 2000))),
+            )
+            rows = await cursor.fetchall()
+        except Exception as e:  # noqa: BLE001 — older DB without the table
+            logger.debug("session journal read failed: %s", e)
+            return []
+        out: list[dict] = []
+        for row in rows:
+            try:
+                data = json.loads(row["data"] or "{}")
+            except (TypeError, ValueError):
+                data = {}
+            out.append({
+                "seq": int(row["seq"]),
+                "ts_ms": int(row["ts_ms"]),
+                "type": str(row["type"]),
+                "data": data if isinstance(data, dict) else {},
+            })
+        return out
 
     # ── Session runs (the runtime SqliteDb owns writes) ──
     #

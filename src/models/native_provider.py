@@ -26,6 +26,7 @@ import contextvars
 import functools
 import importlib
 import inspect
+import json
 import logging
 import os
 import re
@@ -69,7 +70,47 @@ logger = logging.getLogger(__name__)
 _DEFAULT_MAX_TOOL_CALLS_PER_RUN = 60
 
 
+# ── la guardia sulle chiamate ripetute e' STACCATA ────────────────────────
+#
+# `src/core/tool_repeat.py` c'e', e' provato (11 test) e funziona. Non e'
+# cablato, e la ragione va scritta qui perche' non venga ricablato d'istinto.
+#
+# Cablarlo come `tool_hooks` ha rotto i tool in produzione DUE volte lo stesso
+# giorno:
+#   1. parametro chiamato `next_func` — `_build_hook_args` riempie solo i nomi
+#      che riconosce, quindi non lo riempiva mai: "missing 1 required
+#      positional argument";
+#   2. corretto il nome, l'hook sincrono nella catena ASINCRONA restituiva una
+#      coroutine che nessuno attendeva, e ogni tool tornava un oggetto
+#      coroutine invece del risultato.
+#
+# Il contratto vero, letto alla fine in `src/mcp/_runtime/function.py`:
+#   * catena sincrona  -> gli hook async vengono SCARTATI con un warning;
+#   * catena asincrona -> `next_func` e' SEMPRE una coroutine, e l'hook viene
+#     atteso SOLO se e' `async def`.
+# Quindi serve un hook `async def` (che la catena sincrona scartera'), non uno
+# sincuro. E serve un test che percorra la catena VERA del runtime: i miei
+# undici test provavano la guardia e nessuno provava che il runtime sapesse
+# invocarla, che e' l'unica cosa che poi si e' rotta.
+#
+# Si ricabla quando quel test esiste ed e' verde. Non prima.
+
+
 def _max_tool_calls_per_run() -> Optional[int]:
+    from src.core.execution_policy import current_max_tool_calls
+
+    policy_limit = current_max_tool_calls()
+    if policy_limit is not None:
+        return policy_limit
+    from src.core.execution_profile import lean_local_event_active
+
+    if lean_local_event_active():
+        raw = os.environ.get("OPENAGENT_LEAN_EVENT_MAX_TOOL_CALLS", "10").strip()
+        try:
+            value = int(raw)
+        except ValueError:
+            value = 10
+        return value if value > 0 else 10
     raw = os.environ.get("OPENAGENT_MAX_TOOL_CALLS_PER_RUN", "").strip()
     if not raw:
         return _DEFAULT_MAX_TOOL_CALLS_PER_RUN
@@ -79,6 +120,31 @@ def _max_tool_calls_per_run() -> Optional[int]:
         return _DEFAULT_MAX_TOOL_CALLS_PER_RUN
     # 0 / negative = explicitly unbounded, for an operator who knows why.
     return val if val > 0 else None
+
+
+def _execution_cache_key(system: str | None) -> tuple[str, str]:
+    """Return (cache key, real system message) for the current envelope.
+
+    Runtime agents capture tools and ``tool_call_limit`` at construction. A
+    policy change on a reused session therefore needs a distinct cached runner,
+    while the synthetic cache suffix must never leak into the model prompt.
+    """
+    system_text = (system or "").strip()
+    from src.core.execution_policy import current_execution_policy
+
+    policy = current_execution_policy()
+    allow = current_tool_allowlist()
+    if not policy and allow is None:
+        return system_text, system_text
+    marker = json.dumps(
+        {
+            "policy": policy or {},
+            "tool_families": None if allow is None else sorted(allow),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"{system_text}\0{marker}", system_text
 
 
 # Per-coroutine sink for runtime ERROR log capture. The previous
@@ -857,8 +923,13 @@ class NativeProvider(BaseModel):
             _set_env_key_once("OPENAI_BASE_URL", self._base_url)
 
     def _runtime_db_path(self) -> str:
-        if self._db_path:
-            return str(self._db_path)
+        # ``getattr``, not attribute access: the per-model sampling lookup now
+        # runs inside ``build_runtime_model``, which some callers reach on an
+        # instance built without ``__init__``. A missing path means "no row
+        # override", never a crash on the build path.
+        db_path = getattr(self, "_db_path", None)
+        if db_path:
+            return str(db_path)
         from src.core.paths import default_db_path
 
         return str(default_db_path())
@@ -946,7 +1017,14 @@ class NativeProvider(BaseModel):
         base, filtered = self._base_compatible_mcp_toolkits()
         restricted = [
             tk for tk in base
-            if normalize_family(self._toolkit_family_name(tk)) in allow
+            if (
+                normalize_family(self._toolkit_family_name(tk)) in allow
+                # The model sees only this broker in normal OpenAgent wiring.
+                # Its target-server calls are scope-checked inside the adapter;
+                # removing it here would turn a restricted run into a tool-less
+                # run instead of a run with the intended restricted tools.
+                or normalize_family(self._toolkit_family_name(tk)) == "tool_search"
+            )
         ]
         return restricted, list(filtered)
 
@@ -1030,12 +1108,15 @@ class NativeProvider(BaseModel):
         if explicit:
             return explicit
         provider_name, _ = self._runtime_parts()
-        if provider_name in PROVIDER_REQUIRES_BASE_URL:
-            # Local servers (Ollama / vLLM / LM Studio) ignore the key, but the
-            # OpenAI SDK client refuses to initialise without one — supply a
-            # harmless placeholder so a keyless local setup still works. A real
-            # key (e.g. a vLLM ``--api-key``) configured on the provider wins
-            # above via ``explicit``.
+        if provider_name in PROVIDER_REQUIRES_BASE_URL or self._self_hosted_spec(provider_name):
+            # Local servers (Ollama / vLLM / LM Studio / llama.cpp) ignore the
+            # key, but the OpenAI SDK client refuses to initialise without one —
+            # supply a harmless placeholder so a keyless local setup still
+            # works. A real key (e.g. a vLLM ``--api-key``) configured on the
+            # provider wins above via ``explicit``. This covers BOTH the
+            # reserved ``local`` name and any other operator-registered
+            # self-hosted server (see ``_self_hosted_spec``): the second one
+            # would otherwise build a client with no credential at all.
             return "local"
         return explicit
 
@@ -1047,7 +1128,8 @@ class NativeProvider(BaseModel):
         default = PROVIDER_DEFAULT_BASE_URLS.get(provider_name)
         if default is not None:
             return configured or default
-        if not configured and provider_name in PROVIDER_REQUIRES_BASE_URL:
+        known = provider_name in RUNTIME_PROVIDER_CLASSES
+        if not configured and (provider_name in PROVIDER_REQUIRES_BASE_URL or not known):
             raise ValueError(
                 f"The '{provider_name}' provider requires a base_url pointing "
                 "at your OpenAI-compatible server's /v1 root — e.g. "
@@ -1057,6 +1139,62 @@ class NativeProvider(BaseModel):
                 "Providers UI."
             )
         return configured
+
+    # Parametri di campionamento che un operatore puo' scrivere sulla riga del
+    # modello (``models.metadata_json``). Whitelist stretta: qui passa solo cio'
+    # che e' campionamento, mai credenziali o url.
+    _SAMPLING_KEYS = ("temperature", "top_p", "top_k", "min_p", "max_tokens",
+                      "presence_penalty", "frequency_penalty", "repeat_penalty", "seed")
+
+    def _sampling_from_model_row(self) -> dict[str, Any]:
+        """Sampling params declared on the model row, or ``{}``.
+
+        Before this, ``RUNTIME_PROVIDER_CLASSES``' ``extra_kwargs`` was the only
+        channel into a provider constructor, and it is keyed by PROVIDER — so
+        two models on the same provider could not differ, and nothing could be
+        changed without a release. For a self-hosted server that gap is not
+        cosmetic: llama.cpp defaults to ``temperature 0.8``, and a provider that
+        sends no temperature (this one does not — ``OpenAIChat.temperature`` is
+        ``Optional[float] = None``) inherits it silently. A support agent was
+        therefore running far hotter than anyone had chosen, which is exactly
+        the setting that turns "I cannot verify that" into an invented answer.
+
+        Read from the DB row rather than yaml so it can be tuned per model with
+        one UPDATE, and re-read per build so a change needs a reload, not a
+        release.
+        """
+        raw = (self._model_row_metadata() or {})
+        out: dict[str, Any] = {}
+        for key in self._SAMPLING_KEYS:
+            if key in raw and raw[key] is not None:
+                out[key] = raw[key]
+        return out
+
+    def _model_row_metadata(self) -> dict[str, Any]:
+        import json as _json
+        import sqlite3 as _sqlite3
+
+        db_path = self._runtime_db_path() if hasattr(self, "_runtime_db_path") else self._db_path
+        if not db_path:
+            return {}
+        _, model_id = self._runtime_parts()
+        try:
+            con = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
+            try:
+                row = con.execute(
+                    "select metadata_json from models where model=? limit 1", (model_id,)
+                ).fetchone()
+            finally:
+                con.close()
+        except Exception:  # noqa: BLE001 — una config illeggibile non deve fermare un turno
+            return {}
+        if not row or not row[0]:
+            return {}
+        try:
+            data = _json.loads(row[0])
+        except Exception:  # noqa: BLE001
+            return {}
+        return data if isinstance(data, dict) else {}
 
     def _construct_model(self, cls: type, **kwargs: Any) -> Any:
         accepted = _model_class_accepted_params(cls)
@@ -1084,10 +1222,40 @@ class NativeProvider(BaseModel):
     def _load_runtime_model_class(self, provider_name: str) -> tuple[type | None, dict[str, Any]]:
         spec = RUNTIME_PROVIDER_CLASSES.get(provider_name)
         if not spec:
+            spec = self._self_hosted_spec(provider_name)
+        if not spec:
             return None, {}
         module_name, class_name, extra_kwargs = spec
         module = importlib.import_module(module_name)
         return getattr(module, class_name), dict(extra_kwargs)
+
+    def _self_hosted_spec(self, provider_name: str) -> tuple[str, str, dict[str, Any]] | None:
+        """Driver for an operator-registered OpenAI-compatible server.
+
+        ``RUNTIME_PROVIDER_CLASSES`` keys the driver off the provider NAME, so
+        ``local`` — the entry meant for self-hosted servers — is a single slot.
+        An operator who already spends it (a subscription proxy, say) and then
+        registers a second server gets ``Model provider 'x' is not supported``,
+        with a suggestion list naming only hosted vendors. Nothing about the
+        second server is unsupported: it speaks the same OpenAI schema the
+        first one does. The name was never the driver — it is an identity.
+
+        So: a provider row the operator created WITH a ``base_url`` is treated
+        as self-hosted and built through ``OpenAILike``, exactly like ``local``.
+        The base_url is the discriminator on purpose — it is what an operator
+        must supply for a self-hosted endpoint and what no typo produces. A
+        misspelled vendor (``anthropci:...``) has no row and no base_url, so it
+        still raises, which is the property the strict map was protecting.
+        """
+        if not provider_name:
+            return None
+        try:
+            configured = (self._provider_setting("base_url") or "").strip()
+        except Exception:  # noqa: BLE001 — a missing/odd config must not break the build
+            return None
+        if not configured:
+            return None
+        return ("src.models.providers.openai.like", "OpenAILike", {"name": provider_name})
 
     def build_runtime_model(self) -> Any:
         """Construct the underlying ``Model`` instance for this runtime.
@@ -1104,6 +1272,53 @@ class NativeProvider(BaseModel):
                 **extra_kwargs,
                 **_thinking_kwarg(provider_name, model_id),
             }
+            # Qwen's llama.cpp template defaults to extended thinking. On a
+            # tool loop that means paying a fresh hidden essay before every
+            # vault read; measured on Qwen3.5, even "reply exactly OK" exhausted
+            # a 32-token cap without producing visible text. The local-event
+            # profile values short, evidence-backed execution, so request the
+            # model's native non-thinking mode. ``extra_body`` is accepted by
+            # OpenAILike and forwarded as ``chat_template_kwargs`` by
+            # llama.cpp. Scope it narrowly to self-hosted Qwen aliases so cloud
+            # providers and non-Qwen local templates stay untouched.
+            from src.core.execution_profile import lean_local_event_active
+            if (
+                lean_local_event_active()
+                and self._self_hosted_spec(provider_name) is not None
+                and "qwen" in model_id.lower()
+            ):
+                extra_kwargs["extra_body"] = {
+                    "chat_template_kwargs": {"enable_thinking": False}
+                }
+                # A self-hosted support turn must have a finite completion
+                # budget. llama.cpp otherwise reports ``n_predict=-1`` and a
+                # malformed/tool-loop response can occupy the only useful slot
+                # indefinitely. Operators can raise this for broader local
+                # workloads without changing cloud behaviour.
+                # A scheduled task writes a report and calls tools with long
+                # argument objects; a support reply is a few sentences. One
+                # budget for both truncated a tool call mid-JSON, and the run
+                # died on a parse error rather than on anything it did wrong.
+                from src.core.execution_profile import lean_local_task_active
+
+                is_task = lean_local_task_active()
+                # 2500, not 1200: a tool call carrying an object argument
+                # (a quality row with its six sub-scores) was being cut off
+                # mid-JSON and the whole run died on a parse error. The budget
+                # is still finite, which is what protects the single slot; a
+                # support reply never approaches either number.
+                env_key, default = (
+                    ("OPENAGENT_LEAN_TASK_MAX_TOKENS", "4000") if is_task
+                    else ("OPENAGENT_LEAN_EVENT_MAX_TOKENS", "2500")
+                )
+                try:
+                    lean_max_tokens = int(os.environ.get(env_key, default))
+                except (TypeError, ValueError):
+                    lean_max_tokens = int(default)
+                extra_kwargs["max_tokens"] = max(128, lean_max_tokens)
+            # I parametri di campionamento della riga del modello vincono sui
+            # default del provider: sono la scelta esplicita di un operatore.
+            extra_kwargs = {**extra_kwargs, **self._sampling_from_model_row()}
             model = self._construct_model(
                 model_class,
                 id=model_id,
@@ -1111,6 +1326,18 @@ class NativeProvider(BaseModel):
                 base_url=base_url,
                 **extra_kwargs,
             )
+            # A self-hosted server's context window is a CAPABILITY, not a
+            # sampling parameter, so it does not belong in _SAMPLING_KEYS.
+            # Publish it on the model object instead, where compaction's
+            # _resolve_max_context already looks first. Without this the qwen
+            # row declared 40960 and compaction still budgeted against the
+            # 200k default, so history overflowed before it ever compacted.
+            declared_context = (self._model_row_metadata() or {}).get("context")
+            if isinstance(declared_context, (int, float)) and declared_context > 0:
+                try:
+                    model.context_window = int(declared_context)
+                except Exception:  # noqa: BLE001 - never fail a build over a hint
+                    pass
             # Credential pool — inert unless this provider has >= 2 accounts
             # configured (metadata.accounts). When present, seed the model's
             # initial credential from the pool and stash it so the fallback
@@ -1152,10 +1379,10 @@ class NativeProvider(BaseModel):
         memory growth; eviction is enforced here AND in close_session
         so long-running deployments don't leak Agents per dead session.
         """
-        sys_key = (system or "").strip()
-        cached = self._agno_agents.get(sys_key)
+        cache_key, sys_key = _execution_cache_key(system)
+        cached = self._agno_agents.get(cache_key)
         if cached is not None:
-            self._agno_agents.move_to_end(sys_key)
+            self._agno_agents.move_to_end(cache_key)
             return cached
         try:
             from src.core._runner.agent import Agent as RuntimeAgent
@@ -1172,13 +1399,28 @@ class NativeProvider(BaseModel):
                 runner="agent",
             )
         agent_tools: list[Any] = list(compatible_toolkits)
+        from src.core.execution_profile import lean_local_event_active
+        summaries_enabled = not lean_local_event_active()
+        from src.core.execution_profile import strict_local_only_active
+
+        from src.core.execution_profile import stateless_completion_active
+
+        stateless = stateless_completion_active()
         agent = RuntimeAgent(
             model=self._build_runtime_model(),
-            fallback_config=self._fallback_config,
-            db=SqliteDb(db_file=str(db_path)),
+            # Controller-owned support composition is explicitly local-only.
+            # A local outage must fail closed, never spill customer data or an
+            # operational decision into a configured cloud fallback.
+            fallback_config=(
+                None if strict_local_only_active() else self._fallback_config
+            ),
+            # A stateless completion writes nothing: no session row, no
+            # history replay, no summary. That removes the only writer in the
+            # composer path and with it the lock contention above.
+            db=None if stateless else SqliteDb(db_file=str(db_path)),
             tools=agent_tools,
             system_message=sys_key or None,
-            add_history_to_context=True,
+            add_history_to_context=not stateless,
             # Replay the ENTIRE stored transcript for this session, not a
             # trailing window (vision §16). ``_history_runs`` defaults to
             # ``FULL_SESSION_HISTORY_RUNS`` so the runtime's ``runs[-N:]``
@@ -1188,8 +1430,8 @@ class NativeProvider(BaseModel):
             num_history_runs=self._history_runs,
             # The runtime also maintains a rolling summary of older turns in
             # the same SqliteDb and injects it into context on each call.
-            enable_session_summaries=True,
-            add_session_summary_to_context=True,
+            enable_session_summaries=summaries_enabled and not stateless,
+            add_session_summary_to_context=summaries_enabled and not stateless,
             # Agentic memory is disabled — OpenAgent uses the vault for
             # user-scoped persistence. Keeping it off avoids the legacy agno_memories
             # table creation and keeps all state in the sessions table.
@@ -1200,7 +1442,7 @@ class NativeProvider(BaseModel):
             tool_call_limit=_max_tool_calls_per_run(),
             markdown=False,
         )
-        self._agno_agents[sys_key] = agent
+        self._agno_agents[cache_key] = agent
         _evict_oldest(self._agno_agents, _AGENT_CACHE_MAX)
         return agent
 
@@ -1234,12 +1476,12 @@ class NativeProvider(BaseModel):
         framework prompt too so when the leader synthesises their
         output the persona is preserved.
         """
-        sys_key = (system or "").strip()
+        cache_key, sys_key = _execution_cache_key(system)
         if not sys_key:
             return None
-        cached = self._agno_teams.get(sys_key)
+        cached = self._agno_teams.get(cache_key)
         if cached is not None:
-            self._agno_teams.move_to_end(sys_key)
+            self._agno_teams.move_to_end(cache_key)
             return cached
 
         compatible_toolkits, filtered_families = self._compatible_mcp_toolkits()
@@ -1336,7 +1578,7 @@ class NativeProvider(BaseModel):
             families=sorted(families.keys()),
             member_count=len(members),
         )
-        self._agno_teams[sys_key] = team
+        self._agno_teams[cache_key] = team
         _evict_oldest(self._agno_teams, _AGENT_CACHE_MAX)
         return team
 

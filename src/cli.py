@@ -285,6 +285,122 @@ def main(ctx, config: str, agent_dir: str | None, verbose: bool):
     _reload_context_config(ctx, config)
 
 
+@main.command("config")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
+@click.option("--show-env", is_flag=True, default=True,
+              help="Include the OPENAGENT_* variables set in this environment.")
+@click.pass_context
+def config_cmd(ctx, as_json: bool, show_env: bool) -> None:
+    """Show the configuration this agent would actually run with.
+
+    Configuration arrives from three places — the YAML file, the environment,
+    and the database — and the precedence between them has cost real hours
+    more than once (an env var set on a Deployment quietly outranking what the
+    file said). Reading three sources by hand to answer "what is actually in
+    effect here" is how the wrong answer gets believed. This prints the
+    resolved picture instead: which file was loaded, which OPENAGENT_*
+    variables are set in THIS process, and where the paths landed.
+
+    Values of variables whose name looks like a credential are never printed —
+    only that they are set, and how long they are.
+    """
+    import json as _json
+    import os as _os
+
+    from src.core import paths as _paths
+
+    config_path = ctx.obj.get("config_path") if ctx.obj else None
+    cfg = ctx.obj.get("config") if ctx.obj else None
+    if cfg is None:
+        cfg = load_config(config_path)
+
+    resolved_file = None
+    for candidate in ([Path(config_path)] if config_path else []) + [
+        Path("openagent.yaml"), _paths.default_config_path(),
+    ]:
+        if candidate and candidate.exists():
+            resolved_file = candidate.resolve()
+            break
+
+    secretish = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASS", "CREDENTIAL", "AUTHKEY")
+    env: dict[str, str] = {}
+    if show_env:
+        for name, value in sorted(_os.environ.items()):
+            if not name.startswith("OPENAGENT_") and name not in (
+                "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY",
+            ):
+                continue
+            # Redact by name AND shape. Matching the name alone hid
+            # ``OPENAGENT_COMPACTION_MAX_HISTORY_TOKENS=100000`` — a plain
+            # number, censored because the word "TOKENS" appears in it — which
+            # makes the output less useful without making anything safer. A
+            # value that is purely numeric (or trivially short) cannot be the
+            # credential the marker is warning about.
+            looks_named = any(marker in name.upper() for marker in secretish)
+            could_be_secret = len(value) >= 8 and not value.isdigit()
+            if looks_named and could_be_secret:
+                env[name] = f"<set, {len(value)} chars>"
+            else:
+                env[name] = value
+
+    # The database is the case that taught us to print the CHAIN and not a
+    # value. For this process the yaml key wins; ``OPENAGENT_DB_PATH`` is a
+    # different thing entirely — it is what gets injected into the MCP
+    # subprocesses — and a line that said "database: X" without saying which
+    # of the two it meant would be the very lie this command exists to stop.
+    yaml_db = ((cfg or {}).get("memory") or {}).get("db_path") if isinstance(cfg, dict) else None
+    db_chain = []
+    if yaml_db:
+        db_chain.append(("memory.db_path (yaml)", str(Path(yaml_db).expanduser())))
+    db_chain.append(("default", str(_paths.default_db_path())))
+    env_db = _os.environ.get("OPENAGENT_DB_PATH")
+
+    agent_dir = _paths.get_agent_dir()
+    payload = {
+        "agent_dir": str(agent_dir) if agent_dir else None,
+        "config_file": str(resolved_file) if resolved_file else None,
+        "config_file_exists": resolved_file is not None,
+        "db_effective": db_chain[0][1],
+        "db_chain": [{"source": src, "path": val} for src, val in db_chain],
+        "db_env_for_subprocesses": env_db,
+        "vault_path": str(_paths.default_vault_path()),
+        "config_keys": sorted(cfg.keys()) if isinstance(cfg, dict) else [],
+        "env": env,
+    }
+
+    if as_json:
+        console.print_json(_json.dumps(payload))
+        return
+
+    console.print(
+        f"[bold]agent dir[/bold]   {payload['agent_dir'] or '[dim](non impostata: valgono i percorsi di default)[/dim]'}"
+    )
+    if resolved_file:
+        console.print(f"[bold]config file[/bold] {resolved_file}")
+    else:
+        console.print("[bold]config file[/bold] [yellow]nessuno trovato — valgono i default[/yellow]")
+    console.print(f"[bold]database[/bold]    {payload['db_effective']}  [dim]({db_chain[0][0]})[/dim]")
+    for src, val in db_chain[1:]:
+        console.print(f"              [dim]{val}  ({src}, non in uso)[/dim]")
+    if env_db and env_db != payload["db_effective"]:
+        console.print(
+            f"              [dim]OPENAGENT_DB_PATH={env_db} — vale per i sottoprocessi MCP, "
+            f"non per questo processo[/dim]"
+        )
+    console.print(f"[bold]vault[/bold]       {payload['vault_path']}")
+    if payload["config_keys"]:
+        console.print(f"[bold]yaml keys[/bold]   {', '.join(payload['config_keys'])}")
+    if show_env:
+        console.print()
+        if env:
+            console.print(f"[bold]environment[/bold] ({len(env)} variabili in effetto adesso)")
+            for name, value in env.items():
+                shown = value if len(value) <= 96 else value[:93] + "…"
+                console.print(f"  {name} = {shown}")
+        else:
+            console.print("[bold]environment[/bold] nessuna OPENAGENT_* impostata")
+
+
 @main.command()
 @click.argument("agent_dir")
 def init(agent_dir: str):
@@ -408,6 +524,24 @@ def serve(ctx, agent_dir: str | None, channel: tuple[str, ...], no_auto_init: bo
     active_dir = paths.get_agent_dir()
     if active_dir is not None:
         kill_stale_serve_processes(active_dir)
+
+    # Igiene del disco, accanto a quella dei processi. Ogni invocazione del
+    # binario si estrae in /tmp/_MEI* e ripulisce uscendo; una uccisa prima
+    # (timeout, exec interrotto) lascia la cartella, e pesa centinaia di MB.
+    # Misurato in produzione: 351 estrazioni orfane su tre agent, 129 GB, con
+    # un overlay arrivato al 100% — e nessun allarme, perche' il pieno era
+    # dentro il container e non sul nodo.
+    try:
+        from src.core.bundle_sweep import sweep as _sweep_bundles
+
+        _esito = _sweep_bundles()
+        if _esito.get("rimosse"):
+            from src.core.logging import elog as _elog
+
+            _elog("bundle.sweep", removed=_esito["rimosse"],
+                  gb=round(_esito["byte"] / 1e9, 2), found=_esito["trovate"])
+    except Exception:  # noqa: BLE001 — la pulizia non fa mai fallire un avvio
+        pass
 
     config = dict(ctx.obj["config"])
     config["_config_path"] = str(Path(ctx.obj["config_path"]).resolve())

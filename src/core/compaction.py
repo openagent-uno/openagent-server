@@ -461,6 +461,57 @@ def _extract_run_text(run: dict[str, Any]) -> str:
     return "\n".join(chunks)
 
 
+# ── Skills that the summariser is about to make invisible ────────────────────
+#
+# A ``skill_view`` result is instructions: while it sits verbatim in history the
+# model behaves as if it has read them. Fold it into a recap and the model still
+# BELIEVES it has them — the tool call is right there in the summarised past —
+# but the steps are gone, paraphrased into a sentence. It then improvises, with
+# the confidence of someone following a procedure.
+#
+# The elision path already handles this (``_tool_result_pointer`` names the
+# exact re-run). The summariser path cannot: we hand the runs to a model and
+# get prose back, and no instruction reliably survives being summarised. So we
+# do what dsh/Hermes do — extract the fact BEFORE the call and re-inject it
+# deterministically AFTER, rather than hoping the model kept it.
+def _skills_loaded_in(runs: list[dict[str, Any]]) -> list[str]:
+    """Names of skills whose body was read in the runs about to be folded."""
+    seen: list[str] = []
+    for run in runs or []:
+        for message in (run.get("messages") or []):
+            for call in (message.get("tool_calls") or []):
+                fn = (call or {}).get("function") or {}
+                if "skill_view" not in str(fn.get("name") or ""):
+                    continue
+                raw = fn.get("arguments")
+                name = ""
+                if isinstance(raw, str):
+                    try:
+                        name = str((json.loads(raw) or {}).get("name") or "")
+                    except (TypeError, ValueError):
+                        name = ""
+                elif isinstance(raw, dict):
+                    name = str(raw.get("name") or "")
+                if name and name not in seen:
+                    seen.append(name)
+    return seen
+
+
+def _reinject_skill_notice(summary: str, skill_names: list[str]) -> str:
+    """Append the reload notice unless the summary already carries it."""
+    if not skill_names:
+        return summary
+    if "skill_view" in summary:
+        return summary  # the model kept it; adding ours twice would be noise
+    listed = ", ".join(f"`{n}`" for n in skill_names[:8])
+    return summary.rstrip() + (
+        "\n\n[Skills read earlier in this conversation are NO LONGER in "
+        f"context verbatim: {listed}. What is above is a summary, not their "
+        "instructions. Before following any procedure from one of them, "
+        "re-read it with `skill_view`.]"
+    )
+
+
 def _tool_result_pointer(tool_name: Any, orig_len: int, cap: int) -> str:
     """The data-safe placeholder that replaces an elided tool result in history.
 
@@ -687,7 +738,13 @@ def _save_runs(db_path: str, session_id: str, runs: list[dict[str, Any]]) -> Non
     rewriting a phantom row would resurrect deleted history.
     """
     try:
-        conn = sqlite3.connect(db_path, timeout=5.0)
+        # A read-then-write on one connection: the SELECT below opens the
+        # transaction and the UPDATE upgrades it, which is precisely the shape
+        # that needs the full shared patience rather than a private 5s.
+        from src.memory.db import sqlite_busy_timeout_ms, sqlite_busy_timeout_s
+
+        conn = sqlite3.connect(db_path, timeout=sqlite_busy_timeout_s())
+        conn.execute(f"PRAGMA busy_timeout = {sqlite_busy_timeout_ms()}")
     except sqlite3.Error as exc:
         elog("compaction.save_open_failed", level="warning",
              session_id=session_id, error=str(exc))
@@ -1379,16 +1436,26 @@ def _summary_fallback_model(agent: Any, *, exclude_provider: str | None) -> Any:
                     reason="configured",
                 )
                 return _mk(m.runtime_id)
-        # 2) distinct-provider rows, DeepSeek first (never OAuth-limited)
+        # 2) distinct-provider rows. A self-hosted row comes FIRST: it is off
+        # every subscription and every rate limit, which is the property this
+        # step was reaching for when it named DeepSeek. DeepSeek stays second.
+        from src.core.execution_profile import _is_cloud_model_id
+
         distinct = [e for e in enabled if e.provider != exclude_provider]
         if not distinct:
             return None
-        pref = next((e for e in distinct if e.provider == "deepseek"), None)
+        pref = next(
+            (e for e in distinct if not _is_cloud_model_id(e.runtime_id)), None,
+        )
+        reason = "self_hosted_first"
+        if pref is None:
+            pref = next((e for e in distinct if e.provider == "deepseek"), None)
+            reason = "deepseek_default"
         if pref is not None:
             elog(
                 "runtime.compaction.summary_fallback_model",
                 model=pref.runtime_id,
-                reason="deepseek_default",
+                reason=reason,
             )
             return _mk(pref.runtime_id)
         # 3) cheapest distinct row otherwise
@@ -1535,7 +1602,10 @@ async def compact(
         "tokens_before": tokens_before,
     })
 
+    skills_folded = _skills_loaded_in(old_runs)
     summary = await _summarize_runs(old_runs, model, agent)
+    if summary:
+        summary = _reinject_skill_notice(summary, skills_folded)
     if not summary:
         elog(
             "runtime.compaction.skipped",
@@ -1615,12 +1685,40 @@ async def compact(
         "tokens_after": tokens_after,
     })
 
+    # WHICH runs the recap now stands for. ``tokens_before`` already prices
+    # exactly the folded range, so the cost side was honest; what was missing
+    # is the identity — with only a count, nobody can check afterwards whether
+    # a particular exchange was folded, dropped, or never existed. dsh states
+    # this as ``sourceEventSeqs`` on the replacement; ours are run ids, and
+    # they go in the journal rather than the UI frame because this is an audit
+    # fact, not something to render.
+    replaced_ids = [
+        str(r.get("run_id") or "") for r in old_runs if r.get("run_id")
+    ][:200]
+    journal = getattr(getattr(agent, "memory_db", None), "append_session_event", None)
+    if journal is not None:
+        try:
+            await journal(session_id, "compaction", {
+                "phase": "done",
+                "folded_runs": len(old_runs),
+                "kept_runs": len(kept),
+                "replaced_run_ids": replaced_ids,
+                "replaced_run_ids_truncated": len(old_runs) > len(replaced_ids),
+                "tokens_replaced": tokens_before,
+                "tokens_after": tokens_after,
+                "recap_run_id": recap_run.get("run_id"),
+            })
+        except Exception as e:  # noqa: BLE001 — auditing never breaks a fold
+            elog("runtime.compaction.journal_failed", level="debug",
+                 session_id=session_id, error=str(e))
+
     return {
         "folded_runs": len(old_runs),
         "kept_runs": len(kept),
         "summary_chars": len(summary),
         "tokens_before": tokens_before,
         "tokens_after": tokens_after,
+        "replaced_run_ids": replaced_ids,
     }
 
 

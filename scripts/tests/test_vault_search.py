@@ -390,3 +390,25 @@ async def t_builder_unit(_ctx: TestContext) -> None:
             pass
         else:
             raise AssertionError(f"{junk!r} should raise ValueError, not build a query")
+
+
+@test("vault_search", "lean support ranking promotes canonical evidence over receipts")
+async def t_canonical_first_ranking(_ctx: TestContext) -> None:
+    from src.mcp.servers.vault_gate.handlers import _canonical_first
+
+    raw = [
+        {"path": "esound/receipts/support-triage-a.md", "title": "receipt A"},
+        {"path": "briefings/today.md", "title": "briefing"},
+        {"path": "esound/dev/bug-analysis-wrong-audio.md", "title": "analysis"},
+        {"path": "esound/receipts/support-grounding-sort.md", "title": "grounding"},
+        {"path": "esound/procedures/triage.receipts-archive.md", "title": "archive"},
+        {"path": "esound/receipts/support-triage-b.md", "title": "receipt B"},
+    ]
+    ranked = _canonical_first(raw, 4)
+    assert [item["title"] for item in ranked[:2]] == ["analysis", "grounding"]
+    assert all(item["evidence_class"] == "canonical_candidate" for item in ranked[:2])
+    receipt = next(item for item in ranked if item["title"] == "receipt A")
+    assert receipt["evidence_class"] == "historical_receipt"
+    archive = _canonical_first(raw, 6)[-2]
+    assert archive["title"] == "archive"
+    assert archive["evidence_class"] == "historical_receipt"

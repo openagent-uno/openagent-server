@@ -243,6 +243,10 @@ def _preserved_provenance(existing) -> dict[str, str]:
         out["created_by"] = existing.created_by
     if existing.status:
         out["status"] = existing.status
+    # The pin must survive a rewrite for the same reason ``created_by`` must:
+    # a lock that a legitimate edit silently drops is not a lock.
+    if getattr(existing, "pinned", False):
+        out["pinned"] = "true"
     return out
 
 
@@ -264,6 +268,26 @@ async def skill_manage(
     skills index on the next boot/reload, not mid-session."""
     action = (action or "").strip().lower()
     root = _skills_root()
+
+    # The provenance boundary, enforced HERE and not only in the curator's
+    # prompt. An autonomous pass may create freely, but every mutation of an
+    # existing skill is checked against who owns it and whether it is pinned.
+    # A prompt is guidance a model follows most of the time; this decides
+    # whether a scheduled job can rewrite the playbook eSound answers
+    # customers with.
+    if action in ("update", "archive", "remove"):
+        from src.mcp.servers.skills.provenance import mutation_refusal
+
+        target_skill = _registry().get(name)
+        if target_skill is not None:
+            refusal = mutation_refusal(
+                action, name,
+                created_by=getattr(target_skill, "created_by", None),
+                pinned=bool(getattr(target_skill, "pinned", False)),
+            )
+            if refusal:
+                return {"ok": False, "action": action, "name": name,
+                        "error": refusal, "refused": "provenance"}
 
     if action == "remove":
         existing = _registry().get(name)
@@ -313,6 +337,45 @@ async def skill_manage(
                 "ok": False,
                 "error": f"No skill named {name!r} to update — use action='create'.",
             }
+
+        # A skill whose body never arrived. Both halves of this were real, and
+        # both were silent: on 2026-08-05 five of six skills written by an
+        # autonomous pass ended up as frontmatter and nothing else, were
+        # reported back as written, and were then cited approvingly in the
+        # vault for three weeks as if they held playbooks. A playbook that
+        # does not exist is worse than no playbook: it is a promise the next
+        # reader acts on.
+        #
+        # create: no body means nothing was authored. Refuse — do not leave a
+        # named, indexed, empty skill behind.
+        # update: ``body=None`` means "not supplied", which is NOT the same as
+        # "make it empty". It used to blank the file — so a pass touching only
+        # the description destroyed the instructions. Now an omitted body
+        # keeps what is on disk; an explicitly empty one is refused, because
+        # emptying a skill is never what someone means by editing it.
+        supplied_body = body if body is not None else None
+        if supplied_body is not None and not supplied_body.strip():
+            return {
+                "ok": False, "action": action, "name": name,
+                "error": (
+                    "Refusing to write an empty body. A skill with no "
+                    "instructions is indistinguishable from a missing one, "
+                    "but it advertises itself in the skills index. Send the "
+                    "instructions, or use action='archive' to retire it."
+                ),
+                "refused": "empty_body",
+            }
+        if action == "create" and supplied_body is None:
+            return {
+                "ok": False, "action": action, "name": name,
+                "error": (
+                    "Refusing to create a skill with no body. Pass the "
+                    "markdown instructions in `body` — a frontmatter-only "
+                    "skill is a promise with nothing behind it."
+                ),
+                "refused": "empty_body",
+            }
+
         skill_dir = existing.directory if existing else (root / _slug(name))
         skill_dir.mkdir(parents=True, exist_ok=True)
         md_path = skill_dir / "SKILL.md"
@@ -324,20 +387,39 @@ async def skill_manage(
             extra = {"created_by": AGENT_PROVENANCE}
         else:
             extra = _preserved_provenance(existing)
+
+        # On update, the fields nobody sent keep their current values instead
+        # of being overwritten with blanks — the same reason ``created_by``
+        # survives a rewrite. An edit is an edit, not a re-creation.
+        if action == "update":
+            current = existing.path.read_text(errors="replace")
+            _fm, current_body = split_frontmatter(current)
+            final_body = supplied_body if supplied_body is not None else (current_body or "")
+            final_desc = (description if description is not None else existing.description) or ""
+            final_cat = (category if category is not None else existing.category) or ""
+        else:
+            final_body = supplied_body or ""
+            final_desc = description or ""
+            final_cat = category or ""
+
         md_path.write_text(_skill_markdown(
             name=name,
-            description=(description or "").strip(),
-            category=(category or "").strip() or "general",
-            body=body or "",
+            description=final_desc.strip(),
+            category=final_cat.strip() or "general",
+            body=final_body,
             extra=extra,
         ))
-        # Re-parse to confirm the written file is valid (defensive).
+        # Re-parse to confirm the written file is valid, and confirm the body
+        # actually landed. "ok" used to mean "the frontmatter parses", which
+        # is exactly the check an empty skill passes.
         meta = parse_skill_file(md_path)
+        _fm, written_body = split_frontmatter(md_path.read_text(errors="replace"))
         return {
-            "ok": meta is not None,
+            "ok": meta is not None and bool((written_body or "").strip()),
             "action": action,
             "name": name,
             "path": str(md_path),
+            "body_chars": len((written_body or "").strip()),
         }
 
     return {

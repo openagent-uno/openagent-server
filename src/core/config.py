@@ -142,6 +142,29 @@ class SkillsSettings:
         patterns on a shorter cadence than the weekly curator that consolidates
         them.
 
+    review_enabled:
+        Master switch for the post-turn review fork — a child session spawned
+        after each COMPLETED turn that asks whether the turn contained a
+        procedure worth keeping. Reads ``skills.review_enabled`` (default
+        ``False``). SECOND gate on top of ``enabled``, like the curator and
+        the distiller, and distinct from both: the distiller mines yesterday's
+        sessions in bulk, the fork looks at one turn while it is still warm.
+
+    review_mode:
+        ``propose`` (default) or ``write``. In ``propose`` the fork CANNOT
+        mutate the library — refused in
+        ``src.mcp.servers.skills.provenance``, not merely discouraged in a
+        prompt — and reports what it would change instead. Any value other
+        than exactly ``write`` means propose, so a typo can never be what
+        grants an autonomous writer.
+
+    review_model:
+        Optional runtime id for the fork. ``None`` (default) runs it on the
+        turn's own model, where the transcript is still warm in the prefix
+        cache and replaying it whole is priced as cache reads. Point it at a
+        cheaper model and the fork gets a compact digest instead, because
+        there is no cache there to reuse.
+
     hub_enabled:
         Master switch for the Skills-Hub (pull SKILL.md skills from a shared
         git tap). Reads ``skills.hub.enabled`` (default ``False``). SECOND gate
@@ -164,6 +187,9 @@ class SkillsSettings:
     distiller_schedule: str | None = None
     hub_enabled: bool = False
     hub_taps: tuple[str, ...] = ()
+    review_enabled: bool = False
+    review_mode: str = "propose"
+    review_model: str | None = None
 
 
 def skills_settings(config: dict) -> SkillsSettings:
@@ -178,6 +204,7 @@ def skills_settings(config: dict) -> SkillsSettings:
     path = raw.get("path")
     schedule = raw.get("curator_schedule")
     distiller_schedule = raw.get("distiller_schedule")
+    review_model = raw.get("review_model")
     hub_raw = raw.get("hub") or {}
     if not isinstance(hub_raw, dict):
         hub_raw = {}
@@ -192,6 +219,12 @@ def skills_settings(config: dict) -> SkillsSettings:
         distiller_schedule=str(distiller_schedule) if distiller_schedule else None,
         hub_enabled=bool(hub_raw.get("enabled", False)),
         hub_taps=hub_taps,
+        review_enabled=bool(raw.get("review_enabled", False)),
+        # Anything that is not exactly "write" means propose. A typo in the
+        # config must never be the thing that grants an autonomous writer.
+        review_mode=("write" if str(raw.get("review_mode", "")).strip().lower()
+                     == "write" else "propose"),
+        review_model=(str(review_model) if review_model else None),
     )
 
 

@@ -50,6 +50,31 @@ from scripts.tests._setup import build_test_config, cleanup_extras  # noqa: E402
 _TEST_MODULES: tuple[str, ...] = (
     # 1. Lightweight / pure-unit (no fixtures needed)
     "test_imports",
+    # REST surfaces added alongside the accounts / skills / session-pin work.
+    "test_semantic_lock",
+    "test_semantic_oversized",
+    "test_rest_accounts",
+    "test_rest_session_pin",
+    "test_session_patch_owner",
+    "test_tool_search_repeat_miss",
+    "test_sqlite_busy_timeout",
+    "test_mcp_db_path",
+    "test_session_journal",
+    "test_ghost_skill",
+    "test_skill_provenance",
+    "test_skill_body_drop",
+    "test_builtin_task_parked",
+    "test_skill_review",
+    "test_think_stream",
+    "test_run_evidence",
+    "test_tool_repeat",
+    "test_vault_search_wrong_index",
+    "test_skills_semantic_leg",
+    "test_task_prompts_indexed",
+    "test_recall_reserve_multi",
+    "test_bundle_sweep",
+    "test_config_patch_merge",
+    "test_rest_skills",
     "test_setup",
     "test_serve_singleton",
     "test_cli_cleanup",
@@ -135,6 +160,16 @@ _TEST_MODULES: tuple[str, ...] = (
     # because it is the other half of the self-improvement story.
     "test_self_improvement",
     "test_model_fallback",
+    # Breaker half-open sui gradini della catena: chi fallisce scivola in fondo,
+    # chi torna a rispondere rientra subito. Nasce dal 24-ago-2026, quando un
+    # modello parcheggiato veniva ripagato a ogni turno e la sua ripresa era
+    # solo lo scadere di un timer da 3 ore. Fake Model, nessun LLM vero. Sta
+    # accanto a test_model_fallback perche' guarda lo stesso punto di fallback.py.
+    "test_fallback_breaker",
+    # Un turno che muore rende l'errore come TESTO invece di alzare, quindi
+    # la sua delivery finiva chiusa `success`: terminale, mai ritentata,
+    # messaggio del cliente perso in silenzio (12 casi il 23-ago-2026).
+    "test_event_failed_turn",
     # Additive multi-account credential pool: a native provider rotates across
     # N accounts on 429/529 BEFORE the turn spills to DeepSeek. Pins the
     # inert-by-default gate, the pool strategies/cooldown, and the fallback.py
@@ -363,6 +398,9 @@ _TEST_MODULES: tuple[str, ...] = (
     # blocked scope), never-empty, window rollover, alert de-dupe, usage view,
     # and yaml seed reconcile.
     "test_budget_guard",
+    # Hybrid local standby: explicit event/scheduler pins must remain valid
+    # even while standby routing hides the local model from ordinary traffic.
+    "test_local_fallback",
     # Quality monitor — the correctness half beside budget's cost half:
     # OFF no-op, deterministic sampling, judge parse/emit, gating, aggregate.
     "test_quality_monitor",
@@ -380,6 +418,8 @@ _TEST_MODULES: tuple[str, ...] = (
     # promise before send; fail-open on disabled / no-promise / backed / no
     # tool visibility / regeneration failure. Pure-unit (fake model + trace).
     "test_reply_guard",
+    "test_local_support_controller",
+    "test_task_directive",
     # Quality digest — the scheduled push side: summary + flagged-session review
     # list + threshold alerts (incl. embedder-down via embed-error spikes).
     "test_quality_digest",
@@ -421,11 +461,17 @@ _TEST_MODULES: tuple[str, ...] = (
     # Scheduled-task execution history (task_runs) — DB layer + the
     # Scheduler recording each firing's status/output preview, mirroring
     # workflow_runs. Backs GET /api/scheduled-tasks/{id}/runs.
+    "test_manual_run_no_cancel",
+    "test_run_truncation",
     "test_task_runs",
     # Optional per-run model selection: scheduled_tasks.model column (DB
     # round-trip + idempotent ALTER migration) and delegate_task's now-optional
     # model_id (omit → default/router model; pass one → override threaded in).
     "test_scheduled_task_model",
+    # Provider-neutral enforcement for unattended tasks: strict policy JSON,
+    # additive DB migration, surfaced round-trip, tool-call context override,
+    # and runner-cache separation across capability envelopes.
+    "test_scheduled_task_execution_policy",
     # Webhook Events channel: DB + secret hygiene, webhook auth (github HMAC /
     # generic bearer), listener isolation (/hooks yes, /api never), the three
     # dispatch action kinds, and resource-event surfacing.
@@ -456,6 +502,27 @@ _TEST_MODULES: tuple[str, ...] = (
     # stay ``received`` (unclaimed) in the DB queue and drain as slots free, and
     # a hanging turn holds its slot without blocking the drain loop.
     "test_event_dispatch_concurrency",
+    # OPENAGENT_EVENT_STREAM: an unattended event turn need not be streamed.
+    # Streaming it costs a second, tool-less generate() whenever the turn ends
+    # in tool calls with no closing sentence — 83% of support firings measured.
+    # Opt-out, read per turn so it flips with a reload instead of a release.
+    "test_event_stream_knob",
+    # Un secondo server OpenAI-compatibile self-hosted: il driver si sceglieva
+    # dal NOME del provider, e lo slot "local" e' uno solo. Il base_url e' il
+    # discriminante; un vendor scritto male deve continuare a fallire.
+    "test_self_hosted_provider",
+    # Sampling params (temperature & co.) dalla riga del modello: senza, un server
+    # self-hosted gira col suo default (llama.cpp: 0.8) e nessuno se ne accorge.
+    "test_model_sampling_params",
+    # Una chiamata a tool malformata deve tornare al modello con nome, tipi e un
+    # esempio: il messaggio di Python nomina una closure e non insegna niente.
+    "test_tool_signature_help",
+    # Il freno del clone: un gemello eredita le credenziali vere della produzione,
+    # quindi il dry-run deve poter essere inchiodato al processo, non al payload.
+    "test_force_dry_run",
+    # La coda delle delivery: una riga conclusa ma mai rivendicata resta in testa
+    # per sempre e affama tutto il resto (1057 righe su un agent clonato).
+    "test_delivery_queue_starvation",
     # Claim-lease + heartbeat: a FROZEN in-flight delivery (the WAL-writer
     # wedge — heartbeat stops) is reclaimed in ~LEASE_TTL by
     # ``reap_expired_event_leases`` on the fast loop, instead of the 30-min

@@ -21,6 +21,7 @@ These tests run without spawning the real ``claude`` binary.
 from __future__ import annotations
 
 import os
+import uuid
 
 from ._framework import TestContext, test
 
@@ -126,3 +127,64 @@ async def t_run_task_legacy_forget(ctx: TestContext) -> None:
         assert agent.release_calls == [], agent.release_calls
     finally:
         os.environ.pop("OPENAGENT_SCHEDULER_DURABLE_SESSIONS", None)
+
+
+@test(
+    "scheduler_fresh_session",
+    "self-hosted scheduled task is lean, strict-local and execution-level dry-run",
+)
+async def t_local_task_execution_profile(ctx: TestContext) -> None:
+    from src.core.dry_run import is_dry_run
+    from src.core.execution_profile import (
+        lean_local_event_active,
+        strict_local_only_active,
+    )
+    from src.core.scheduler import Scheduler
+    from src.memory.db import MemoryDB
+
+    tmp_db = ctx.db_path.with_name(f"sched-local-{uuid.uuid4().hex[:8]}.db")
+
+    class _ProfileAgent(_SpyAgent):
+        def __init__(self) -> None:
+            super().__init__()
+            class _Model:
+                @staticmethod
+                def build_override_model(runtime_id: str) -> object:
+                    assert runtime_id == "windows-local:qwen3-moe-local"
+                    return object()
+
+            self.model = _Model()
+            self.profile: tuple[bool, bool, bool] | None = None
+
+        async def run(self, *, message: str, user_id: str, session_id: str,
+                      model_override=None, author=None, on_status=None) -> str:
+            self.run_calls.append((session_id, message))
+            self.profile = (
+                lean_local_event_active(),
+                strict_local_only_active(),
+                is_dry_run(),
+            )
+            return "ok"
+
+    db = MemoryDB(str(tmp_db))
+    await db.connect()
+    try:
+        await db.upsert_provider(
+            name="windows-local",
+            framework="api-based",
+            base_url="http://192.168.22.145:8099/v1",
+        )
+        task_id = await db.add_task(
+            "gemello-dryrun-test", "* * * * *", "DRY RUN - read only",
+            model="windows-local:qwen3-moe-local",
+        )
+        task = await db.get_task(task_id)
+        agent = _ProfileAgent()
+        await Scheduler(db=db, agent=agent).run_task(task)  # type: ignore[arg-type]
+        assert agent.profile == (True, True, True), agent.profile
+    finally:
+        await db.close()
+        try:
+            tmp_db.unlink()
+        except FileNotFoundError:
+            pass

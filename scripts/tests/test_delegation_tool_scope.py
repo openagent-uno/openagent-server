@@ -312,6 +312,22 @@ async def t_np_restricted(ctx: TestContext) -> None:
 
 
 @test("delegation_tool_scope",
+      "native provider keeps the scoped tool-search broker, but not other families")
+async def t_np_restricted_broker(ctx: TestContext) -> None:
+    from src.core import tool_scope
+
+    p = _make_provider([
+        _FakeToolkit("tool-search"), _FakeToolkit("vault"), _FakeToolkit("shell"),
+    ])
+    tok = tool_scope.set_tool_allowlist(["vault"])
+    try:
+        allowed, _ = p._compatible_mcp_toolkits()
+    finally:
+        tool_scope.reset_tool_allowlist(tok)
+    assert [t.tool_name_prefix for t in allowed] == ["tool-search", "vault"]
+
+
+@test("delegation_tool_scope",
       "native provider: family names normalise, so 'computer-control' matches the 'computer_control' toolkit")
 async def t_np_normalises(ctx: TestContext) -> None:
     from src.core import tool_scope

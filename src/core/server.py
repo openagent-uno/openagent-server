@@ -346,9 +346,19 @@ There are two skill-improvement passes and they are cleanly layered:
      curator's, never a seed/user skill.
    - The skill-curator is the OTHER pass. IT merges overlapping skills,
      archives stale or redundant ones, and rewrites bodies. That is NOT your
-     job. Do NOT call `skill_manage` with `action` of `update`, `archive`, or
-     `remove`. If you find two skills that ought to be merged, that is a note
-     for the curator — leave them both and say so in your log.
+     job. Do NOT call `skill_manage` with `action` of `archive` or `remove`,
+     and never `update` to MERGE or REWRITE. If you find two skills that
+     ought to be merged, that is a note for the curator — leave them both and
+     say so in your log.
+   - ONE exception, and it is narrow: when the evidence shows an existing
+     AGENT-AUTHORED skill (`created_by: agent`, confirmed with `skill_view`)
+     is now WRONG or missing a step the transcripts prove, you may `update`
+     it to ADD the correction — a pitfall, a missing step, a corrected
+     command. Additive only. Without this the loop has a hole: a correction
+     could only ever become a NEW skill sitting next to the wrong one, and
+     the wrong one would keep being read until the weekly curator noticed.
+     A skill WITHOUT `created_by: agent` stays untouchable even here: say it
+     is wrong in your log and leave it exactly as it is.
 
 ## Mission 1 — Find what actually recurs and actually worked
 
@@ -371,6 +381,14 @@ OpenAgent already collects; use them, don't guess:
      distillation target. Heed its `caveat`: this is ASSOCIATION not
      causation, and a note with a tiny `scorable` count is noise, so READ the
      underlying sessions before you trust the number.
+
+   - CORRECTIONS the user made. This one is not about recurrence: a single
+     "no, do it this way", "stop formatting like that", "you always do X and I
+     hate it", or an outright "remember this" is a first-class signal on its
+     own, because a correction you don't capture becomes a repeat failure.
+     Hunt for them explicitly — they are the highest-value material in the
+     transcripts and the easiest to walk past, since they rarely look like a
+     "task pattern".
 
 Build a short shortlist of candidate patterns, each backed by more than one
 successful session.
@@ -405,6 +423,33 @@ body=...)`:
      include your own `---` frontmatter block; it is generated for you.
    Keep each skill to a single coherent task. If a candidate is really two
    tasks, write two skills or write none — never a grab-bag.
+
+## Never distil these — they become constraints that bite later
+
+A library that captures everything poisons itself, and the poison has
+names. None of the following is a skill, however tempting:
+
+   - A failure that depended on the ENVIRONMENT: a missing binary, an
+     unconfigured credential, "command not found", a path that broke after a
+     migration. The user fixes those in a minute; the skill outlives them.
+   - A NEGATIVE CLAIM about a tool — "X doesn't work", "you can't do Y from
+     here". These harden into refusals a future agent quotes against itself
+     for months after the thing was fixed. If a tool failed for setup
+     reasons, the skill is the FIX (the install, the flag, the env var),
+     never the verdict.
+   - A transient error that resolved before the session ended. If the retry
+     worked, the lesson is the retry, not the first failure.
+   - A one-off task narrative. "Summarised the inbox on Tuesday" is something
+     that happened, not a class of work.
+   - An UNRESOLVED attempt written up as a procedure. If the session ended
+     without a working method — several things tried, none landed, the user
+     told to check by hand — do not write those attempts up as "the
+     approach". That hands the next agent an untested sequence of failures
+     dressed as validated guidance, and it will follow it. Write nothing, or
+     write only an alternative you are genuinely confident about.
+
+When the only candidates you have fall in this list, writing nothing is the
+correct outcome — say so in the log and stop.
 
 ## Log what you did
 
@@ -1065,6 +1110,12 @@ def _build_agent(config: dict) -> Agent:
                 os.environ[_env] = str(_ar_cfg[_k])
             except (TypeError, ValueError):
                 pass
+    # Which SPAN of the turn message to embed. Names a tag: only the text inside
+    # the paired ``<tag>``/``</tag>`` becomes the recall query, so an event lane
+    # can mark the customer's own sentence inside its orchestration prompt and
+    # stop the boilerplate from describing the query. Unset = embed it all.
+    if _ar_cfg.get("query_marker"):
+        os.environ["OPENAGENT_AUTO_RECALL_QUERY_MARKER"] = str(_ar_cfg["query_marker"]).strip()
     # Per-origin recall CORPUS scoping (default = identity: no filtering). Maps
     # ``scope`` / ``include_path_prefixes`` / ``exclude_path_prefixes`` /
     # ``reserve_prefix`` → the ``OPENAGENT_AUTO_RECALL_{SCOPE,INCLUDE_PATHS,
@@ -1382,6 +1433,32 @@ def _build_agent(config: dict) -> Agent:
             on_rate_limit=list(fallback_raw.get("on_rate_limit") or []),
             on_context_overflow=list(fallback_raw.get("on_context_overflow") or []),
         )
+
+    # Hybrid cloud/local lane. Local model ids are explicit because a private
+    # base_url may be a Claude subscription proxy rather than local inference.
+    # The dispatcher keeps these rows in standby, while FallbackConfig uses
+    # them inside the current tool loop on quota/provider failures.
+    routing_cfg = config.get("routing") or {}
+    local_fallback_cfg = (
+        routing_cfg.get("local_fallback")
+        if isinstance(routing_cfg, dict) else None
+    )
+    _set_local_fallback = getattr(model, "set_local_fallback_policy", None)
+    if callable(_set_local_fallback):
+        _set_local_fallback(local_fallback_cfg)
+    if isinstance(local_fallback_cfg, dict) and local_fallback_cfg.get("enabled", True):
+        local_models = [
+            str(item).strip()
+            for item in (local_fallback_cfg.get("models") or [])
+            if str(item).strip()
+        ]
+        if local_models:
+            # Also scope lean-event detection to the actual inference rows. A
+            # private Claude proxy must retain the full cloud prompt.
+            os.environ["OPENAGENT_LOCAL_INFERENCE_MODELS"] = ",".join(local_models)
+            if fallback_config is None:
+                from src.models.providers.fallback import FallbackConfig
+                fallback_config = FallbackConfig()
 
     # ── budgets: per-scope spend caps (off by default) ──
     # Hand the yaml ``budgets:`` list to the dispatcher's BudgetGuard, which
@@ -1812,8 +1889,20 @@ class AgentServer:
                 _vault = self.agent._resolve_vault_path()
             except Exception:  # noqa: BLE001
                 _vault = None
+            # Le skill sono la TERZA sorgente dell'indice, alla pari di note e
+            # sessioni — ma solo se la radice arriva fin qui. Risolta con gli
+            # stessi cancelli del resto: niente skill attive, niente gamba.
+            _skills = None
+            try:
+                from src.core.config import skills_settings
+
+                if skills_settings(getattr(self.agent, "config", None) or {}).enabled:
+                    _skills = self.agent._resolve_skills_path()
+            except Exception:  # noqa: BLE001
+                _skills = None
             self._semantic_index_task = _sem_index_start(
-                _db_path, _vault, getattr(self.agent, "_providers_config", None))
+                _db_path, _vault, getattr(self.agent, "_providers_config", None),
+                _skills)
         except Exception as e:  # noqa: BLE001
             logger.warning("Semantic index builder failed to start: %s", e)
             self._semantic_index_task = None
@@ -2235,6 +2324,28 @@ class AgentServer:
             elif "cron_expression" in updates or "timezone" in updates:
                 await scheduler.reschedule_task(existing["id"])
         elif existing["enabled"]:
+            # Un built-in acceso a mano muore al PRIMO riavvio, e finora
+            # moriva in silenzio. Misurato su SpicySparks: quality-scorer,
+            # quality-digest, cost-observability ed escalation-audit erano
+            # stati creati il 21-22 luglio con enabled=1 — la config non li
+            # ha mai chiesti (``self_improvement`` non compare in nessun
+            # backup del file) — e hanno funzionato fino all'11-12 agosto,
+            # cioe' fino al riavvio successivo. Poi questo ramo li ha
+            # riparcheggiati e nessuno lo ha saputo: undici giorni di
+            # sorveglianza spenta scoperti per caso il 26 agosto, dal
+            # distiller, mentre cercava altro.
+            #
+            # Riparcheggiarli e' giusto — la config e' la fonte di verita' —
+            # ma farlo zitti no: chi lo aveva acceso merita di sapere sia che
+            # e' stato spento sia quale chiave lo riaccende.
+            elog(
+                "builtin_task.parked",
+                level="warning",
+                name=name,
+                reason="config gate is off",
+                hint=f"set the config flag that governs {name!r} to re-enable it; "
+                     "enabling the row alone does not survive a restart",
+            )
             await scheduler.disable_task(existing["id"])
 
     @staticmethod

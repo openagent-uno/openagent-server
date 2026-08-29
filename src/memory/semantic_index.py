@@ -105,6 +105,15 @@ _EMBED_BATCH = 32
 # head, the rest is one open away).
 _MAX_EMBED_CHARS = 6_000
 
+# How many halvings before an item is given up on. Six takes 6,000 chars down
+# to under 100 — far past any real window — so the loop always terminates well
+# before it stops being useful.
+_SHRINK_ATTEMPTS = 6
+
+# Never shrink below this: under it the head no longer identifies the note, so
+# an embedding of it would be worse than none.
+_MIN_EMBED_CHARS = 200
+
 # Directory names never descended into when walking the vault — copied from
 # ``vault/index.py._PRUNE_DIRS`` so this cache and the FTS cache agree on what
 # "the vault" is (indexing ``_showcase`` would embed a derived artifact).
@@ -380,6 +389,26 @@ CREATE TABLE IF NOT EXISTS skill_vectors (
     vec         BLOB NOT NULL,
     embedded_at REAL NOT NULL
 );
+
+-- One row per SCHEDULED TASK prompt. The fourth source, and the one that was
+-- invisible longest: a task prompt IS a procedure — the F-gates, the refund
+-- criteria, the escalation thresholds — and on a real agent they came to
+-- 77,923 characters across 34 tasks that no search could reach. They were
+-- findable only by accident, when a firing's child session happened to
+-- survive pruning: measured, one task's prompt appeared in 23 stored
+-- sessions and two others in none at all.
+-- Invalidated on ``(updated_at, byte_size)`` like the others. A deleted task
+-- drops its vector, so a retired procedure stops answering.
+CREATE TABLE IF NOT EXISTS task_vectors (
+    task_id     TEXT PRIMARY KEY,
+    updated_at  REAL,
+    byte_size   INTEGER,
+    name        TEXT,
+    enabled     INTEGER,
+    dim         INTEGER NOT NULL,
+    vec         BLOB NOT NULL,
+    embedded_at REAL NOT NULL
+);
 """
 
 
@@ -499,7 +528,7 @@ class SemanticIndex:
                     or meta.get("embed_model") != model):
                 self._conn.executescript(
                     "DELETE FROM vault_vectors; DELETE FROM session_vectors; "
-                    "DELETE FROM skill_vectors;"
+                    "DELETE FROM skill_vectors; DELETE FROM task_vectors;"
                 )
                 for k, v in (("source_db", src), ("schema", _SCHEMA_VERSION),
                              ("embed_model", model)):
@@ -522,15 +551,96 @@ class SemanticIndex:
 
     def _embed_batch(self, texts: list[str]) -> list[tuple[bytes, int]]:
         """Embed ``texts`` (already truncated) into ``(blob, dim)`` pairs.
-        Raises ``EmbeddingError`` on any endpoint failure; callers catch it and
-        mark the sync errored rather than letting it reach the turn path."""
+
+        ``_MAX_EMBED_CHARS`` caps the text in CHARACTERS, but an embedding
+        model's window is measured in TOKENS — and the exchange rate is not a
+        constant. It depends on the model's tokenizer and on the LANGUAGE:
+        Italian costs meaningfully more tokens per character than English, so
+        a note that fits the cap can still overflow the window. Measured on
+        the eSound vault against ``snowflake-arctic-embed2``: a 5,871-char
+        Italian note (under the 6,000 cap) returns
+        ``the input length exceeds the context length``.
+
+        The damage was not the rejected note, it was the BATCH. One oversized
+        item raised, and all 32 texts in that request went unindexed — 1,589
+        such failures on that vault, so large parts of it silently never made
+        it into the index the agent recalls from. An agent that cannot find
+        what it knows answers from nothing, which is the expensive failure.
+
+        So a failed batch is retried one item at a time, and an item that is
+        still too long is halved until it fits or is given up on alone. The
+        common path is unchanged — one request per batch — and the fallback
+        only costs anything on the rare batch that actually contains an
+        oversized item.
+        """
         assert self.embedder is not None
         out: list[tuple[bytes, int]] = []
         for i in range(0, len(texts), _EMBED_BATCH):
             chunk = texts[i:i + _EMBED_BATCH]
-            for vec in self.embedder.embed(chunk):
-                out.append(_to_blob(vec))
+            try:
+                for vec in self.embedder.embed(chunk):
+                    if not getattr(self, "_dim_cache", None):
+                        self._dim_cache = len(vec)
+                    out.append(_to_blob(vec))
+                continue
+            except EmbeddingError:
+                if len(chunk) == 1:
+                    out.append(self._embed_one_shrinking(chunk[0]))
+                    continue
+                from src.core.logging import elog as _elog
+
+                _elog(
+                    "semantic.batch_split",
+                    level="warning",
+                    items=len(chunk),
+                )
+            for text in chunk:
+                out.append(self._embed_one_shrinking(text))
         return out
+
+    def _embed_one_shrinking(self, text: str) -> tuple[bytes, int]:
+        """Embed one text, halving it until the endpoint accepts it.
+
+        Returns a zero vector only when even a very short head is refused —
+        which means the endpoint is broken rather than the text oversized. A
+        zero vector scores 0 against every query, so a note that cannot be
+        embedded is invisible to recall rather than poisoning it.
+        """
+        assert self.embedder is not None
+        candidate = text
+        for _ in range(_SHRINK_ATTEMPTS):
+            try:
+                return _to_blob(self.embedder.embed([candidate])[0])
+            except EmbeddingError:
+                if len(candidate) <= _MIN_EMBED_CHARS:
+                    break
+                candidate = candidate[: max(_MIN_EMBED_CHARS, len(candidate) // 2)]
+        from src.core.logging import elog as _elog
+
+        _elog(
+            "semantic.embed_skipped",
+            level="warning",
+            chars=len(text),
+            head=text[:80],
+        )
+        # One blob per text is the caller's contract — the vectors are zipped
+        # back onto the items — so a skipped note still needs a placeholder of
+        # the RIGHT width, or the matrix is ragged. The width is learned from
+        # a vector this endpoint actually produced, never guessed.
+        return _to_blob([0.0] * self._embedding_dim())
+
+    def _embedding_dim(self) -> int:
+        """Vector width of the configured endpoint, learned once and cached."""
+        cached = getattr(self, "_dim_cache", None)
+        if cached:
+            return int(cached)
+        assert self.embedder is not None
+        try:
+            dim = len(self.embedder.embed(["x"])[0])
+        except EmbeddingError:
+            dim = 1
+        self._dim_cache = dim
+        return dim
 
     # ── sync: vault notes ─────────────────────────────────────────────
 
@@ -609,15 +719,29 @@ class SemanticIndex:
                 texts.append(_prep_text(digest))
                 rows.append((rel, mtime, size, note.title or "", note.updated or ""))
 
-            if texts:
-                try:
-                    blobs = self._embed_batch(texts)
-                except EmbeddingError as exc:
-                    self._log_embed_error("vault", exc)
-                    stats.errored = True
-                    self._commit()
-                    stats.elapsed_ms = int((time.monotonic() - t0) * 1000)
-                    return stats
+            self._commit()
+
+        # ── the embedding round trip happens OUTSIDE the lock ─────────────
+        # ``search`` takes the same lock, so embedding under it made every
+        # recall that landed mid-sync wait for the whole batch to come back
+        # from the embedder. Measured on lyra-agent: query embedding 342ms and
+        # the vector scan 420ms, yet recall ran to a 7.4s median, 25.6s p90 and
+        # 56.6s max — the remainder was purely this wait, and 5 turns in 76
+        # blew the 30s ceiling and answered the customer with NO vault rules.
+        # The network call needs no lock: it touches neither the connection nor
+        # the matrix cache. Re-take the lock only to write the rows.
+        blobs = None
+        if texts:
+            try:
+                blobs = self._embed_batch(texts)
+            except EmbeddingError as exc:
+                self._log_embed_error("vault", exc)
+                stats.errored = True
+                stats.elapsed_ms = int((time.monotonic() - t0) * 1000)
+                return stats
+
+        with self._lock:
+            if blobs:
                 for (rel, mtime, size, title, updated), (blob, dim) in zip(rows, blobs):
                     self._conn.execute(
                         "INSERT INTO vault_vectors "
@@ -723,36 +847,181 @@ class SemanticIndex:
                     metas.append((sid, live[sid][0], live[sid][1], title[:200],
                                   str(meta.get("origin") or "")[:40]))
 
-                if texts:
-                    try:
-                        blobs = self._embed_batch(texts)
-                    except EmbeddingError as exc:
-                        self._log_embed_error("sessions", exc)
-                        stats.errored = True
-                        self._commit()
-                        stats.elapsed_ms = int((time.monotonic() - t0) * 1000)
-                        return stats
-                    for (sid, upd, rlen, title, origin), (blob, dim) in zip(metas, blobs):
-                        self._conn.execute(
-                            "INSERT INTO session_vectors "
-                            "(session_id, updated_at, runs_len, title, origin, dim, "
-                            " vec, embedded_at) VALUES (?,?,?,?,?,?,?,?) "
-                            "ON CONFLICT(session_id) DO UPDATE SET "
-                            "  updated_at=excluded.updated_at, runs_len=excluded.runs_len, "
-                            "  title=excluded.title, origin=excluded.origin, "
-                            "  dim=excluded.dim, vec=excluded.vec, "
-                            "  embedded_at=excluded.embedded_at",
-                            (sid, upd, rlen, title, origin, dim, blob, time.time()),
-                        )
-                        stats.embedded += 1
-                        stats.added += 1 if sid not in existing else 0
-                        stats.updated += 1 if sid in existing else 0
                 self._commit()
             finally:
                 try:
                     src.close()
                 except Exception:
                     pass
+
+        # ── the embedding round trip happens OUTSIDE the lock ─────────────
+        # Same defect, and the WORSE half: session digests carry a whole run,
+        # so they are far bigger than a note. Measured against the live
+        # embedder — one query 362ms, one note 774ms, one session digest
+        # 1037ms, but a batch of 32 notes 15.2s and a batch of 32 sessions
+        # 22.7s. Held under the lock, one such batch stalled every concurrent
+        # recall for that long, which is what put lyra-agent's recall p90 at
+        # 66.9s and its max at 128.7s. Sessions churn far faster than notes
+        # (50 re-embeds an hour against 6), so this is the path that actually
+        # hurt. See the matching fix in ``sync_vault``.
+        blobs = None
+        if texts:
+            try:
+                blobs = self._embed_batch(texts)
+            except EmbeddingError as exc:
+                self._log_embed_error("sessions", exc)
+                stats.errored = True
+                stats.elapsed_ms = int((time.monotonic() - t0) * 1000)
+                return stats
+
+        with self._lock:
+            if blobs:
+                for (sid, upd, rlen, title, origin), (blob, dim) in zip(metas, blobs):
+                    self._conn.execute(
+                        "INSERT INTO session_vectors "
+                        "(session_id, updated_at, runs_len, title, origin, dim, "
+                        " vec, embedded_at) VALUES (?,?,?,?,?,?,?,?) "
+                        "ON CONFLICT(session_id) DO UPDATE SET "
+                        "  updated_at=excluded.updated_at, runs_len=excluded.runs_len, "
+                        "  title=excluded.title, origin=excluded.origin, "
+                        "  dim=excluded.dim, vec=excluded.vec, "
+                        "  embedded_at=excluded.embedded_at",
+                        (sid, upd, rlen, title, origin, dim, blob, time.time()),
+                    )
+                    stats.embedded += 1
+                    stats.added += 1 if sid not in existing else 0
+                    stats.updated += 1 if sid in existing else 0
+            self._commit()
+        stats.elapsed_ms = int((time.monotonic() - t0) * 1000)
+        return stats
+
+    # ── sync: scheduled-task prompts ──────────────────────────────────
+
+    def sync_tasks(self, *, force: bool = False,
+                   max_items: int = _MAX_ITEMS_PER_SYNC) -> SyncStats:
+        """Reconcile the task-prompt vectors with ``scheduled_tasks``.
+
+        FOURTH source. A task prompt is a PROCEDURE — the anti-fabrication
+        gates, the refund criteria, the escalation thresholds — and until now
+        no search could reach one. They were findable only by accident, when a
+        firing's child session happened to survive pruning: measured on a live
+        agent, one task's prompt appeared in 23 stored sessions and two others
+        in none at all, so whether a procedure answered a question depended on
+        retention.
+
+        Reads the agent database (same connection discipline as
+        ``sync_sessions``), embeds ``name + prompt``, and gates re-embedding on
+        ``(updated_at, byte_size)``. A deleted task drops its vector so a
+        retired procedure stops answering. Disabled tasks ARE indexed — a
+        switched-off task still documents how the thing is done, and hiding it
+        would lose the procedure along with the schedule — but the row carries
+        ``enabled`` so a caller can tell a live rule from a parked one.
+        """
+        t0 = time.monotonic()
+        stats = SyncStats()
+        if not self.active:
+            stats.elapsed_ms = int((time.monotonic() - t0) * 1000)
+            return stats
+
+        with self._lock:
+            src = self._open_source()
+            if src is None:
+                stats.elapsed_ms = int((time.monotonic() - t0) * 1000)
+                return stats
+            try:
+                try:
+                    live = {
+                        r["id"]: (float(r["updated_at"] or 0),
+                                  int(r["plen"] or 0),
+                                  str(r["name"] or ""),
+                                  int(r["enabled"] or 0))
+                        for r in src.execute(
+                            "SELECT id, name, enabled, updated_at, "
+                            "COALESCE(length(prompt),0) AS plen FROM scheduled_tasks")
+                    }
+                except sqlite3.Error:
+                    # No scheduled_tasks table (an older DB): stay inert rather
+                    # than fail the whole sync round.
+                    stats.elapsed_ms = int((time.monotonic() - t0) * 1000)
+                    return stats
+
+                existing = {
+                    r["task_id"]: (float(r["updated_at"] or 0), int(r["byte_size"] or 0))
+                    for r in self._conn.execute(
+                        "SELECT task_id, updated_at, byte_size FROM task_vectors")
+                }
+
+                for tid in existing.keys() - live.keys():
+                    self._conn.execute(
+                        "DELETE FROM task_vectors WHERE task_id = ?", (tid,))
+                    stats.deleted += 1
+
+                stale: list[str] = []
+                for tid, (upd, plen, _name, _en) in live.items():
+                    if plen == 0:
+                        continue  # niente prompt, niente procedura
+                    if not force and existing.get(tid) == (upd, plen):
+                        stats.unchanged += 1
+                    else:
+                        stale.append(tid)
+                stale.sort(key=lambda t: live[t][0], reverse=True)
+                if len(stale) > max_items:
+                    stats.pending = len(stale) - max_items
+                    stale = stale[:max_items]
+
+                texts: list[str] = []
+                metas: list[tuple[str, float, int, str, int]] = []
+                for tid in stale:
+                    row = src.execute(
+                        "SELECT prompt FROM scheduled_tasks WHERE id = ?",
+                        (tid,)).fetchone()
+                    if row is None:
+                        continue
+                    upd, plen, name, enabled = live[tid]
+                    digest = _prep_text(f"{name}\n\n{row['prompt'] or ''}")
+                    if not digest:
+                        continue
+                    texts.append(digest)
+                    metas.append((tid, upd, plen, name[:200], enabled))
+
+                self._commit()
+            finally:
+                try:
+                    src.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        # L'andata e ritorno dell'embedding sta FUORI dal lock, per la stessa
+        # ragione di note e sessioni: un batch tenuto sotto lock blocca ogni
+        # recall concorrente per tutta la sua durata.
+        blobs = None
+        if texts:
+            try:
+                blobs = self._embed_batch(texts)
+            except EmbeddingError as exc:
+                self._log_embed_error("tasks", exc)
+                stats.errored = True
+                stats.elapsed_ms = int((time.monotonic() - t0) * 1000)
+                return stats
+
+        with self._lock:
+            if blobs:
+                for (tid, upd, plen, name, enabled), (blob, dim) in zip(metas, blobs):
+                    self._conn.execute(
+                        "INSERT INTO task_vectors "
+                        "(task_id, updated_at, byte_size, name, enabled, dim, "
+                        " vec, embedded_at) VALUES (?,?,?,?,?,?,?,?) "
+                        "ON CONFLICT(task_id) DO UPDATE SET "
+                        "  updated_at=excluded.updated_at, byte_size=excluded.byte_size, "
+                        "  name=excluded.name, enabled=excluded.enabled, "
+                        "  dim=excluded.dim, vec=excluded.vec, "
+                        "  embedded_at=excluded.embedded_at",
+                        (tid, upd, plen, name, enabled, dim, blob, time.time()),
+                    )
+                    stats.embedded += 1
+                    stats.added += 1 if tid not in existing else 0
+                    stats.updated += 1 if tid in existing else 0
+            self._commit()
         stats.elapsed_ms = int((time.monotonic() - t0) * 1000)
         return stats
 
@@ -904,6 +1173,11 @@ class SemanticIndex:
         }
         if self.skills_root:
             out["skills"] = self.sync_skills(force=force, max_items=max_items)
+        # I compiti vivono nello stesso database delle sessioni: se quella
+        # sorgente e' apribile lo sono anche loro, quindi non serve una radice
+        # da configurare. Su un database senza `scheduled_tasks` la gamba resta
+        # inerte da sola.
+        out["tasks"] = self.sync_tasks(force=force, max_items=max_items)
         return out
 
     def _log_embed_error(self, source: str, exc: Exception) -> None:
@@ -948,17 +1222,37 @@ class SemanticIndex:
         return [(r, math.fsum(a * b for a, b in zip(v, q)))
                 for r, v in zip(keep, mat)]
 
+    def embed_query(self, query: str) -> list[float]:
+        """Embed one search query once so callers can reuse it across scopes.
+
+        Auto-recall searches the same customer sentence in the main vault,
+        reserved policy subtrees, and the skills leg. Re-embedding that identical
+        text for every leg multiplies endpoint latency and can turn one slow
+        10-second request into a 60-second timeout. An empty vector is the same
+        fail-open signal that :meth:`search` historically returned as ``[]``.
+        """
+        q = (query or "").strip()
+        if not self.active or not q:
+            return []
+        try:
+            return list(self.embedder.embed([_prep_text(q)])[0])  # type: ignore[union-attr]
+        except EmbeddingError as exc:
+            self._log_embed_error("query", exc)
+            return []
+
     def search(self, query: str, *, scope: str = "all", limit: int = 5,
                min_score: float = 0.0,
                include_prefixes: Optional[Sequence[str]] = None,
-               exclude_prefixes: Optional[Sequence[str]] = None
+               exclude_prefixes: Optional[Sequence[str]] = None,
+               query_vector: Optional[Sequence[float]] = None,
                ) -> list[dict[str, Any]]:
         """Cosine-nearest vault notes / sessions / skills to ``query``, best first.
 
-        ``scope`` is ``"all"`` | ``"vault"`` | ``"sessions"`` | ``"skills"``.
-        ``"all"`` covers vault + sessions ONLY (byte-identical to before skills
-        existed); ``"skills"`` is an explicit, separate leg over the SKILL.md
-        index so wiring skills in never perturbs note/session recall. Returns
+        ``scope`` is ``"all"`` | ``"vault"`` | ``"sessions"`` | ``"skills"`` |
+        ``"tasks"``. ``"all"`` covers vault + sessions ONLY (byte-identical to
+        before skills existed); ``"skills"`` and ``"tasks"`` are explicit,
+        separate legs — over the SKILL.md index and over the scheduled-task
+        prompts — so wiring either in never perturbs note/session recall. Returns
         ``[]`` when inert, on an empty query, or when nothing clears
         ``min_score`` — a weak match is NO match, which is what keeps auto-recall
         from injecting noise. Each hit carries a ``score`` (cosine, 0..1) so the
@@ -973,10 +1267,8 @@ class SemanticIndex:
         q = (query or "").strip()
         if not self.active or not q:
             return []
-        try:
-            qv = self.embedder.embed([_prep_text(q)])[0]  # type: ignore[union-attr]
-        except EmbeddingError as exc:
-            self._log_embed_error("query", exc)
+        qv = list(query_vector) if query_vector is not None else self.embed_query(q)
+        if not qv:
             return []
         qunit = list(_unit(qv))  # unit float list — numpy-free, works for both paths
 
@@ -992,6 +1284,17 @@ class SemanticIndex:
                             "kind": "skill", "score": round(float(s), 4),
                             "name": r["name"] or "", "category": r["category"] or "",
                             "path": r["path"],
+                        })
+            if "tasks" in want:
+                # ``enabled`` viaggia col risultato: un compito spento
+                # documenta ancora COME si fa la cosa, ma chi legge deve poter
+                # distinguere una regola in vigore da una parcheggiata.
+                for r, s in self._sims_for("task_vectors", qunit):
+                    if float(s) >= min_score:
+                        hits.append({
+                            "kind": "task", "score": round(float(s), 4),
+                            "name": r["name"] or "", "task_id": r["task_id"],
+                            "enabled": bool(r["enabled"]),
                         })
             if "vault" in want:
                 inc = tuple(p for p in (include_prefixes or ()) if p)

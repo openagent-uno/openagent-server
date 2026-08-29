@@ -1,4 +1,4 @@
-import { join, resolve, relative, dirname } from 'path';
+import { join, resolve, relative, dirname, extname } from 'path';
 import { readdir, stat, readFile, writeFile, unlink, mkdir, access, rename, copyFile } from 'node:fs/promises';
 import { constants, realpathSync } from 'node:fs';
 import trash from 'trash';
@@ -120,7 +120,30 @@ export class FileSystemService {
     return fullPath;
   }
 
+  /**
+   * OpenAgent addition: a wikilink and a vault path differ by an extension, and
+   * the agent routinely reaches for the wikilink form. Measured in production:
+   * `read_note` failed 46 times in 300 sessions, and the two most frequent
+   * misses were the agent's own governing procedures — `triage-workflow` and
+   * `anti-fabrication`, asked for without `.md`. Those reads are the ones the
+   * REGOLA ZERO prompt requires before acting, so each silent miss let a turn
+   * proceed ungrounded. Resolving the `.md` sibling costs one stat and removes
+   * the whole class.
+   */
+  private mdFallback(path: string): string | null {
+    if (extname(path) !== '') return null;
+    if (path.endsWith('/')) return null;
+    return `${path}.md`;
+  }
+
   async readNote(path: string): Promise<ParsedNote> {
+    // An extension-less path that has an `.md` sibling is that sibling. Resolve
+    // it up front so every check below (filter, directory, read) sees the real
+    // target rather than reporting on a name that was never going to exist.
+    const alt = this.mdFallback(path);
+    if (alt !== null && !(await this.exists(path)) && await this.exists(alt)) {
+      path = alt;
+    }
     const fullPath = this.resolvePath(path);
 
     if (!this.pathFilter.isAllowed(path)) {

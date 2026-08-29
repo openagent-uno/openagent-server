@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import importlib
 import inspect
 import logging
 import os
+import re
 import threading
 from typing import Any, AsyncIterator, Callable, Awaitable
 
@@ -15,6 +17,7 @@ from src.memory.db import MemoryDB
 from src.mcp.pool import MCPPool
 from src.core.prompts import (
     FRAMEWORK_SYSTEM_PROMPT,
+    LEAN_LOCAL_EVENT_SYSTEM_PROMPT,
     build_mcp_catalog_summary,
     build_ptc_note,
     build_skills_index,
@@ -73,6 +76,50 @@ _FROZEN_RUNTIME_PRELOADS = (
 )
 
 
+# Un turno che muore NON alza: l'eccezione viene resa come testo (vedi
+# ``_format_run_error``) e diventa la risposta. Chi sta piu' in alto vede solo
+# una stringa, e per questo una delivery di supporto morta su "nessun modello
+# disponibile" finiva registrata `success`: terminale, mai ritentata, messaggio
+# del cliente bruciato in silenzio (12 casi il 23-ago-2026).
+#
+# Questa variabile e' il canale che mancava. La scrive ``_format_run_error``,
+# cioe' l'unico punto dove un errore diventa testo, e la legge chi ha bisogno
+# di distinguere "ha risposto" da "e' morto e te lo racconta". Contextvar e non
+# attributo sull'Agent perche' lo stesso Agent serve piu' turni insieme: il
+# valore deve appartenere al turno, non all'oggetto.
+#
+# ATTENZIONE al confine dei task: ``asyncio.wait_for``/``create_task`` copiano
+# il contesto, quindi la scrittura fatta dentro il task NON risale al chiamante.
+# Va letta dentro lo stesso task che ha eseguito il turno (lo fa
+# ``run_child_session``), non dal dispatcher che lo avvolge in ``wait_for``.
+_run_failure_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "openagent_run_failure", default=None,
+)
+
+
+def mark_run_failure(detail: str) -> None:
+    """Segna il turno corrente come fallito senza passare da un'eccezione.
+
+    Serve ai rami che NON alzano ma nemmeno rispondono davvero — il router
+    senza modelli abilitati e' il caso che ha bruciato 13 messaggi il
+    24-ago-2026.
+    """
+    _run_failure_var.set((detail or "unknown")[:500])
+
+
+def clear_run_failure() -> None:
+    """Azzera il marcatore prima di un turno, cosi' non eredita il precedente."""
+    _run_failure_var.set(None)
+
+
+def take_run_failure() -> str | None:
+    """Restituisce l'errore del turno appena concluso e azzera il marcatore."""
+    failure = _run_failure_var.get()
+    if failure is not None:
+        _run_failure_var.set(None)
+    return failure
+
+
 def _format_run_error(e: BaseException) -> str:
     """Produce a chat-renderable error string for any agent-run failure.
 
@@ -87,6 +134,9 @@ def _format_run_error(e: BaseException) -> str:
     """
     from src.models.native_provider import NativeProviderError
 
+    # Il marcatore vale per QUALSIASI errore di run, non solo per quelli di
+    # modello: se il turno e' morto, chi lo ha chiesto deve poterlo sapere.
+    _run_failure_var.set(f"{type(e).__name__}: {str(e) or repr(e)}"[:500])
     if isinstance(e, NativeProviderError):
         return f"⚠️ Model provider error\n\n{e}"
     msg = str(e) or repr(e)
@@ -402,7 +452,9 @@ async def _with_vault_reminder(db: Any, session_id: str | None, text: str) -> st
 
     Never raises: a memory nudge must not be able to fail a turn.
     """
-    if db is None or not session_id:
+    from src.core.execution_profile import lean_local_event_active
+
+    if lean_local_event_active() or db is None or not session_id:
         return text
     try:
         from src.learning.vault_reminder import maybe_render_reminder
@@ -509,6 +561,40 @@ def _recall_int(name: str, default: int) -> int:
         return default
 
 
+def _recall_query(message: str) -> str:
+    """The text to embed for auto-recall — by default the whole message.
+
+    When ``OPENAGENT_AUTO_RECALL_QUERY_MARKER`` names a tag and the message
+    carries the paired ``<tag>``/``</tag>`` lines, only the span between them is
+    embedded. Everything else about the turn is untouched: the model still reads
+    the full message, markers included.
+
+    Why: an event lane hands the agent an orchestration prompt with the person's
+    own sentence buried inside it, and embedding all of it dilutes the query
+    past the point of usefulness. Measured 2026-08-25 against the live
+    ``replio-thread`` prompt (12,159 chars, vault of 1,066 notes): the note that
+    answers the question ranked #244-#262 with the full prompt as the query, and
+    #1 with the customer's sentence alone. At ``top_k`` 6 that is the difference
+    between injecting the right note and injecting nothing.
+
+    Falls back to the full message whenever the markers are absent, malformed,
+    or wrap only whitespace — an unconfigured deployment is byte-identical to
+    the pre-marker behaviour.
+    """
+    tag = (os.environ.get("OPENAGENT_AUTO_RECALL_QUERY_MARKER") or "").strip()
+    if not tag or not message:
+        return message
+    # Only a plain tag name is honoured: anything else would build a bogus regex
+    # out of operator-supplied text.
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", tag):
+        return message
+    m = re.search(rf"<{tag}>(.*?)</{tag}>", message, re.DOTALL)
+    if not m:
+        return message
+    span = m.group(1).strip()
+    return span or message
+
+
 def _origin_of(session_id: str | None) -> str:
     """The origin tag of a session id — the prefix before the first ':'
     (``event``, ``scheduler``, ``chat``, …), or ``""`` for a bare/None id. Lets
@@ -519,8 +605,15 @@ def _origin_of(session_id: str | None) -> str:
     return session_id.split(":", 1)[0].strip()
 
 
-def _recall_scoping(origin: str) -> tuple[str, list[str], list[str], str]:
+def _recall_scoping(origin: str) -> tuple[str, list[str], list[str], list[str]]:
     """Per-origin recall-corpus config: ``(scope, include, exclude, reserve)``.
+
+    ``reserve`` e' una LISTA di prefissi, non uno solo. Con un posto riservato
+    unico due sottoalberi autorevoli si contendono lo stesso slot e a ogni
+    turno uno dei due sparisce in silenzio — il caso misurato: le procedure di
+    customer-response e le regole permanenti rispecchiate dal supporto sono
+    entrambe autorevoli, e servono insieme. La forma a stringa singola resta
+    valida e diventa una lista di un elemento.
 
     Each knob reads an ORIGIN-suffixed env var first (e.g.
     ``OPENAGENT_AUTO_RECALL_EXCLUDE_PATHS_EVENT``) and falls back to the
@@ -545,7 +638,7 @@ def _recall_scoping(origin: str) -> tuple[str, list[str], list[str], str]:
     return (scope,
             prefixes("OPENAGENT_AUTO_RECALL_INCLUDE_PATHS"),
             prefixes("OPENAGENT_AUTO_RECALL_EXCLUDE_PATHS"),
-            pick("OPENAGENT_AUTO_RECALL_RESERVE_PREFIX").lstrip("/"))
+            prefixes("OPENAGENT_AUTO_RECALL_RESERVE_PREFIX"))
 
 
 def _path_allowed(path: str, include: list[str], exclude: list[str]) -> bool:
@@ -776,6 +869,11 @@ def _recall_block(agent: Any, query: str, session_id: str | None = None) -> str:
     idx = _get_recall_index(agent)
     semantic_active = idx is not None and idx.active
     sem_hits: list[dict] = []
+    # One customer sentence fans out to the main semantic search, every reserved
+    # policy subtree, and the skills leg. Embed it ONCE: production Lyra had two
+    # reserves + skills, so the old path made four identical endpoint calls and
+    # stretched a ~10s query to 30-63s, regularly crossing the 60s fail-open cap.
+    query_vector: list[float] = []
     if semantic_active:
         # Warm a bounded number of changed items so a cold index becomes useful
         # over the first few turns without an unbounded burst of embedding calls.
@@ -786,9 +884,11 @@ def _recall_block(agent: Any, query: str, session_id: str | None = None) -> str:
                 idx.sync(max_items=warm)
             except Exception:  # noqa: BLE001 — a warm failure must not block recall
                 pass
+        query_vector = idx.embed_query(query)
         sem_hits = idx.search(query, scope=scope, limit=k, min_score=floor,
                               include_prefixes=incl or None,
-                              exclude_prefixes=excl or None)
+                              exclude_prefixes=excl or None,
+                              query_vector=query_vector)
     hits = sem_hits
     # FTS side (Layer A) — fuse in exact-term keyword hits so a note the semantic
     # floor dropped still surfaces. Independent of the embedder: this is what
@@ -820,20 +920,29 @@ def _recall_block(agent: Any, query: str, session_id: str | None = None) -> str:
     # always surfaces ALONGSIDE near-duplicate precedent (which by sheer volume
     # otherwise buries it). No-op unless configured, semantic is live, and no
     # reserved-prefix note is already in the set.
-    if reserve and semantic_active and hits and not any(
-            (h.get("path") or "").lstrip("/").startswith(reserve) for h in hits):
-        try:
-            res = idx.search(query, scope="vault", limit=1, min_score=0.0,
-                             include_prefixes=[reserve])
-        except Exception:  # noqa: BLE001 — reserve is best-effort, never fatal
-            res = []
-        if res:
-            # Prepend the reserved playbook WITHOUT evicting a real hit — grow the
-            # block by one rather than dropping precedent to make room (the block
-            # is still bounded by _format_recall_block's char cap). Data-safe: the
-            # authoritative rule is ADDED alongside the precedent, never instead.
-            hits = [res[0]] + [h for h in hits
-                               if (h.get("path") or "") != (res[0].get("path") or "")]
+    # Un posto per OGNI sottoalbero riservato. Con uno solo, due corpora
+    # autorevoli si contendono lo stesso slot e il perdente non compare — e
+    # non lo dice nessuno. Misurato: le regole permanenti rispecchiate stanno
+    # a 0,36-0,50 di similarita' (sotto il floor di 0,75) e fuori dai primi
+    # 200 risultati FTS su un vault di 4.700 note: senza un posto proprio non
+    # escono MAI, per nessuna delle due gambe.
+    if reserve and semantic_active and hits:
+        for _pre in reserve:
+            if any((h.get("path") or "").lstrip("/").startswith(_pre) for h in hits):
+                continue  # gia' rappresentato: non si duplica
+            try:
+                res = idx.search(query, scope="vault", limit=1, min_score=0.0,
+                                 include_prefixes=[_pre],
+                                 query_vector=query_vector)
+            except Exception:  # noqa: BLE001 — reserve is best-effort, never fatal
+                res = []
+            if res:
+                # Si PREPONE senza sfrattare un risultato vero: il blocco cresce
+                # di uno invece di perdere un precedente (resta comunque limitato
+                # dal cap sui caratteri in _format_recall_block). La regola
+                # autorevole si AGGIUNGE al precedente, mai al suo posto.
+                hits = [res[0]] + [h for h in hits
+                                   if (h.get("path") or "") != (res[0].get("path") or "")]
     # Skills leg (Layer C): surface the single most relevant WRITTEN skill by
     # MEANING, so a distilled skill is discoverable per turn — not only via the
     # static index the model has to think to consult. A separate query over the
@@ -843,7 +952,9 @@ def _recall_block(agent: Any, query: str, session_id: str | None = None) -> str:
     # verify-framed "load it with skill_view" one-liner in the block below.
     if semantic_active:
         try:
-            skill_hits = idx.search(query, scope="skills", limit=1, min_score=floor)
+            skill_hits = idx.search(query, scope="skills", limit=1,
+                                    min_score=floor,
+                                    query_vector=query_vector)
         except Exception:  # noqa: BLE001 — a skills miss must not block recall
             skill_hits = []
         if skill_hits:
@@ -886,8 +997,13 @@ async def _with_recall(agent: Any, session_id: str | None, query: str,
     event loop under ``OPENAGENT_AUTO_RECALL_TIMEOUT`` seconds. A miss, an error,
     or a slow endpoint all degrade to returning ``text`` unchanged.
     """
-    if not _recall_enabled() or not query or not query.strip():
+    from src.core.execution_profile import lean_local_event_active
+
+    if lean_local_event_active() or not _recall_enabled() or not query or not query.strip():
         return text
+    # Narrow the query to the marked span (usually the customer's own words)
+    # before embedding. ``text`` — what the model reads — is left alone.
+    query = _recall_query(query)
     try:
         timeout = _recall_float("OPENAGENT_AUTO_RECALL_TIMEOUT", 4.0)
         block = await asyncio.wait_for(
@@ -1567,7 +1683,14 @@ class Agent:
             # judge's take(). Fail-open: any failure returns `result` unchanged.
             try:
                 from src.core import reply_guard
-                result = await reply_guard.guard_reply(self, session_id, message, result)
+                # Pass the model this turn ACTUALLY ran on. Reading it off the
+                # agent gave the guard the dispatcher, so a reply produced by a
+                # locally pinned run was rewritten on the cloud router - the
+                # one path that leaked out of a strict-local turn.
+                result = await reply_guard.guard_reply(
+                    self, session_id, message, result,
+                    model_override=model_override,
+                )
             except Exception:  # noqa: BLE001 — the guard must never affect the turn
                 pass
             # Quality monitor (opt-in, sampled): grade this completed turn off
@@ -2516,26 +2639,34 @@ class Agent:
         also match this tag (to key their Agent caches), so its shape is a
         contract, not a formatting choice.
         """
-        framework = FRAMEWORK_SYSTEM_PROMPT.replace(
+        from src.core.execution_profile import lean_local_event_active
+
+        framework_template = (
+            LEAN_LOCAL_EVENT_SYSTEM_PROMPT
+            if lean_local_event_active()
+            else FRAMEWORK_SYSTEM_PROMPT
+        )
+        framework = framework_template.replace(
             "{{OPENAGENT_VAULT_PATH}}", self._resolve_vault_path()
         ).replace(
             "{{OPENAGENT_DB_PATH}}", self._resolve_db_path()
-        ).replace(
-            "{{MCP_CATALOG_SUMMARY}}",
-            build_mcp_catalog_summary(self._mcp),
-        ).replace(
-            # Skills index — "" when disabled, so the placeholder (flush
-            # against the next header) collapses to a byte-identical prompt.
-            # Frozen snapshot above <session-id>, safe for the prompt cache.
-            "{{SKILLS_INDEX}}",
-            self._render_skills_index(),
-        ).replace(
-            # PTC note — "" when ``ptc.enabled`` is unset. Same flush-placeholder
-            # discipline as SKILLS_INDEX: an empty render is byte-identical, and
-            # a static render stays cache-safe above <session-id>.
-            "{{PTC_NOTE}}",
-            self._render_ptc_note(),
         )
+        if not lean_local_event_active():
+            framework = framework.replace(
+                "{{MCP_CATALOG_SUMMARY}}",
+                build_mcp_catalog_summary(self._mcp),
+            ).replace(
+                # Skills index — "" when disabled, so the placeholder (flush
+                # against the next header) collapses to a byte-identical prompt.
+                # Frozen snapshot above <session-id>, safe for the prompt cache.
+                "{{SKILLS_INDEX}}",
+                self._render_skills_index(),
+            ).replace(
+                # PTC note — "" when ``ptc.enabled`` is unset. Same
+                # flush-placeholder discipline as SKILLS_INDEX.
+                "{{PTC_NOTE}}",
+                self._render_ptc_note(),
+            )
 
         user = (self.system_prompt or "").strip()
         if not user:

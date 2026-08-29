@@ -32,14 +32,26 @@ def _interval() -> int:
         return _RESYNC_SECONDS
 
 
-async def _loop(db_path: str, vault_root: Optional[str], providers_config: Any) -> None:
+async def _loop(db_path: str, vault_root: Optional[str], providers_config: Any,
+                skills_root: Optional[str] = None) -> None:
     from src.memory.semantic_index import SemanticIndex, resolve_embedder
 
     embedder = resolve_embedder(providers_config)
     if embedder is None:
         return  # inert — no embedding model configured, recall falls back to FTS
     try:
-        idx = SemanticIndex(db_path, vault_root=vault_root, embedder=embedder)
+        # ``skills_root`` va passato QUI, non solo al percorso di recall.
+        # ``sync_all`` indicizza la gamba delle skill solo ``if self.skills_root``,
+        # e questo loop e' l'unica cosa che SCRIVE nell'indice condiviso: il
+        # percorso di recall costruisce il suo indice con lo skills_root giusto
+        # ma legge soltanto. Senza questa riga ``skill_vectors`` resta a zero
+        # per sempre — misurato su un agent in produzione con 30 skill sul
+        # disco, 8955 note indicizzate e 0 skill — e una skill diventa
+        # trovabile solo per corrispondenza letterale di sottostringa: chi
+        # scrive "voglio indietro i soldi" non incontra mai una skill che si
+        # descrive come "refund".
+        idx = SemanticIndex(db_path, vault_root=vault_root,
+                            skills_root=skills_root, embedder=embedder)
     except Exception as exc:  # noqa: BLE001
         elog("semantic.builder_open_error", level="warning",
              error=str(exc) or type(exc).__name__)
@@ -77,7 +89,8 @@ async def _loop(db_path: str, vault_root: Optional[str], providers_config: Any) 
 
 
 def start(db_path: str, vault_root: Optional[str],
-          providers_config: Any = None) -> Optional[asyncio.Task]:
+          providers_config: Any = None,
+          skills_root: Optional[str] = None) -> Optional[asyncio.Task]:
     """Start the background index builder, or return None when the layer is inert.
 
     Cheap to call unconditionally: ``resolve_embedder`` returns None (and the loop
@@ -87,6 +100,7 @@ def start(db_path: str, vault_root: Optional[str],
     if not db_path:
         return None
     try:
-        return asyncio.create_task(_loop(db_path, vault_root, providers_config))
+        return asyncio.create_task(
+            _loop(db_path, vault_root, providers_config, skills_root))
     except RuntimeError:
         return None  # no running loop (e.g. a unit test calling start() directly)

@@ -26,7 +26,8 @@ from typing import Any
 
 import aiosqlite
 from mcp.server.fastmcp import FastMCP
-from src.memory.db import SCHEMA_SQL
+from src.core.execution_policy import encode_execution_policy
+from src.memory.db import SCHEMA_SQL, sqlite_busy_timeout_ms, sqlite_busy_timeout_s
 from src.memory.schedule import (
     build_one_shot_expression,
     decorate_scheduled_task,
@@ -51,6 +52,7 @@ _ALLOWED_UPDATE_COLUMNS = {
     "next_run",
     "model",
     "timezone",
+    "execution_policy_json",
 }
 
 
@@ -64,7 +66,11 @@ def _db_path() -> str:
          standalone `python -m openagent.mcp.servers.scheduler.server` run still
          points at the same file.
     """
-    return os.environ.get("OPENAGENT_DB_PATH") or "openagent.db"
+    # Same rule as ``_common.db_path``: never the CWD (see that docstring —
+    # under PyInstaller it means an empty database nobody notices).
+    from src.mcp.servers._common import db_path as _shared_db_path
+
+    return _shared_db_path()
 
 
 # Single shared connection per MCP process. SQLite handles this fine
@@ -79,9 +85,9 @@ async def _get_conn() -> aiosqlite.Connection:
     async with _conn_lock:
         if _conn is None:
             path = _db_path()
-            conn = await aiosqlite.connect(path)
+            conn = await aiosqlite.connect(path, timeout=sqlite_busy_timeout_s())
             conn.row_factory = aiosqlite.Row
-            await conn.execute("PRAGMA busy_timeout = 10000")
+            await conn.execute(f"PRAGMA busy_timeout = {sqlite_busy_timeout_ms()}")
             await conn.execute("PRAGMA journal_mode=WAL")
             await conn.executescript(SCHEMA_SQL)
             await conn.commit()
@@ -189,6 +195,7 @@ async def create_scheduled_task(
     prompt: str,
     model: str | None = None,
     timezone: str | None = None,
+    execution_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create a new recurring task.
 
@@ -211,6 +218,10 @@ async def create_scheduled_task(
     wrong for half the year, because it cannot follow daylight-saving.
     Omitted, the task uses the agent's configured default zone, or UTC if
     none is set.
+
+    ``execution_policy`` (optional) is an enforced, provider-neutral envelope:
+    ``max_tool_calls``, ``timeout_seconds``, and ``allowed_tool_families``.
+    These are runtime constraints, not prompt advice.
     """
     if not name or not name.strip():
         raise ValueError("name is required")
@@ -223,12 +234,14 @@ async def create_scheduled_task(
     task_id = str(uuid.uuid4())
     now = time.time()
     nr = _next_run(cron_expression, now, tz)
+    policy_json = encode_execution_policy(execution_policy)
 
     await conn.execute(
         "INSERT INTO scheduled_tasks "
-        "(id, name, cron_expression, prompt, enabled, next_run, model, timezone, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?)",
-        (task_id, name, cron_expression, prompt, nr, (model or None), tz, now, now),
+        "(id, name, cron_expression, prompt, enabled, next_run, model, timezone, execution_policy_json, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)",
+        (task_id, name, cron_expression, prompt, nr, (model or None), tz,
+         policy_json, now, now),
     )
     await conn.commit()
 
@@ -247,6 +260,7 @@ async def create_one_shot_task(
     run_at_iso: str | None = None,
     model: str | None = None,
     timezone: str | None = None,
+    execution_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create a task that runs exactly once.
 
@@ -266,6 +280,8 @@ async def create_one_shot_task(
     afterwards. An offset already in run_at_iso ('2026-04-14T09:30:00+02:00')
     wins outright, and delay_seconds is relative to now, so neither is
     affected by this argument.
+
+    ``execution_policy`` has the same enforced fields as recurring tasks.
     """
     if not name or not name.strip():
         raise ValueError("name is required")
@@ -299,11 +315,13 @@ async def create_one_shot_task(
     conn = await _get_conn()
     task_id = str(uuid.uuid4())
     cron_expression = build_one_shot_expression(run_at)
+    policy_json = encode_execution_policy(execution_policy)
     await conn.execute(
         "INSERT INTO scheduled_tasks "
-        "(id, name, cron_expression, prompt, enabled, next_run, model, timezone, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?)",
-        (task_id, name, cron_expression, prompt, run_at, (model or None), tz, now, now),
+        "(id, name, cron_expression, prompt, enabled, next_run, model, timezone, execution_policy_json, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)",
+        (task_id, name, cron_expression, prompt, run_at, (model or None), tz,
+         policy_json, now, now),
     )
     await conn.commit()
 
@@ -323,6 +341,7 @@ async def update_scheduled_task(
     enabled: bool | None = None,
     model: str | None = None,
     timezone: str | None = None,
+    execution_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Partially update a scheduled task.
 
@@ -338,6 +357,9 @@ async def update_scheduled_task(
     own clock. This moves when the task fires — the same expression under
     a new zone is a different instant — so only set it when the user is
     telling you which clock they meant.
+
+    ``execution_policy`` replaces the task's enforced execution envelope;
+    pass ``{}`` to clear it back to agent-wide defaults.
     """
     conn = await _get_conn()
     full_id = await _resolve_task_id(conn, task_id)
@@ -354,6 +376,11 @@ async def update_scheduled_task(
     if model is not None:
         # Empty string clears the pin (→ default model); any other value sets it.
         updates["model"] = model.strip() or None
+    if execution_policy is not None:
+        # Pass {} to clear the envelope back to agent-wide defaults.
+        updates["execution_policy_json"] = encode_execution_policy(
+            execution_policy
+        )
 
     # The stored row is the baseline for anything the caller didn't pass —
     # a cron edit must keep the task's existing zone, and a zone edit must
@@ -396,7 +423,7 @@ async def update_scheduled_task(
     if not updates:
         raise ValueError(
             "No fields to update. Pass at least one of: name, "
-            "cron_expression, prompt, enabled, model, timezone."
+            "cron_expression, prompt, enabled, model, timezone, execution_policy."
         )
 
     # Drop unknown columns as a safety net.

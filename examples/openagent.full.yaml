@@ -387,6 +387,9 @@ memory:
     max_tokens: 400                     # hard char cap on the injected block (chars ≈ tokens×4)
     warm_budget: 128                    # max notes/sessions embedded per background sync pass
     timeout: 4                          # seconds; a slow/unreachable endpoint degrades to no injection, never blocks the turn
+    # query_marker: customer-message   # embed only the text inside <tag>…</tag>, not the whole turn message.
+                                      # For an event lane whose prompt wraps the person's own sentence in
+                                      # orchestration prose: without it the boilerplate describes the query.
 
   # Code-enforced quality gate over the Markdown vault: atomic notes,
   # complete frontmatter, dense real wikilinks, no orphans/broken links,

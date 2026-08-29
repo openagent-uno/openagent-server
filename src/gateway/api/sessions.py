@@ -10,7 +10,11 @@
 ``DELETE /api/sessions/{session_id}/model`` — unpin. Session returns to
     normal entry-model resolution (default-leader flag → first enabled).
 ``DELETE /api/sessions/{session_id}`` — delete a session and its history.
-``GET /api/sessions/{session_id}/runs`` — turn history for a session.
+``GET /api/sessions/{session_id}/runs`` — turn history for a session (the
+    transcript the MODEL sees, written by the runtime when a turn ends).
+``GET /api/sessions/{session_id}/events`` — the session journal: the facts of
+    each turn, written WHILE it happens. A turn that dies before it closes is
+    in here and nowhere else.
 """
 
 from __future__ import annotations
@@ -662,10 +666,101 @@ async def handle_get_runs(request):
     })
 
 
+async def handle_get_events(request):
+    """GET /api/sessions/{session_id}/events?after=<seq>&limit=<n>
+
+    The session journal: what happened during the turns, in order, written as
+    it happened. ``runs`` (the sibling endpoint) is the transcript the MODEL
+    sees, assembled by the runtime when a turn ends — so a turn that died
+    before it closed appears in neither the transcript nor anywhere else. This
+    endpoint is where it does appear.
+
+    A client polls it with the last ``seq`` it saw. That is the difference
+    between "I heard nothing, so I will guess" and "the turn ended at seq 42,
+    reason: error".
+    """
+    from aiohttp import web
+
+    db = _db(request)
+    if db is None:
+        return web.json_response({"error": "memory DB not available"}, status=500)
+    session_id = request.match_info["session_id"]
+    if not session_id:
+        return web.json_response({"error": "session_id is required"}, status=400)
+    try:
+        after = int(request.query.get("after", "0"))
+    except (TypeError, ValueError):
+        after = 0
+    try:
+        limit = int(request.query.get("limit", "500"))
+    except (TypeError, ValueError):
+        limit = 500
+
+    events = await db.list_session_events(session_id, after_seq=after, limit=limit)
+
+    # Two invariants, reported rather than assumed — both borrowed from dsh.
+    #
+    # ``unknown_types``: a type this build does not know AND that is not
+    # marked ignorable. A consumer that reconstructs anything from this
+    # journal must refuse when this list is non-empty instead of skipping the
+    # row: a plausible history missing one fact is worse than an honest
+    # refusal.
+    #
+    # ``unpaired_tool_calls``: every tool that was opened and never closed in
+    # this window. It is the measure that would have counted, by itself, the
+    # 22 dead tool lookups of 2026-08-25 — instead of leaving them to be
+    # noticed by hand.
+    known = getattr(db, "JOURNAL_KNOWN_TYPES", frozenset())
+    ignorable = getattr(db, "JOURNAL_IGNORABLE_TYPES", frozenset())
+    unknown = sorted({
+        e["type"] for e in events
+        if e["type"] not in known and e["type"] not in ignorable
+    })
+
+    import json as _json
+    open_tools: dict[str, int] = {}
+    for e in events:
+        if e["type"] != "tool/status":
+            continue
+        try:
+            info = _json.loads((e.get("data") or {}).get("text") or "{}")
+        except (TypeError, ValueError):
+            continue
+        name = info.get("tool_name")
+        if not name:
+            continue
+        open_tools[name] = open_tools.get(name, 0) + (-1 if "result" in info else 1)
+
+    return web.json_response({
+        "session_id": session_id,
+        "events": events,
+        # The caller's next cursor. Absent events, it is whatever they asked
+        # from — so an idle poll is a no-op instead of a rewind.
+        "last_seq": events[-1]["seq"] if events else after,
+        "diagnostics": {
+            "unknown_types": unknown,
+            "reconstructable": not unknown,
+            "unpaired_tool_calls": sorted(n for n, c in open_tools.items() if c > 0),
+        },
+    })
+
+
 async def handle_patch_metadata(request):
     """PATCH /api/sessions/{session_id} — update session title/model.
 
     Body: ``{"title": "...", "model": "..."}``. Both fields optional.
+
+    Stamps the caller as the row's owner, because this endpoint frequently
+    *creates* the row: the app titles a chat from its first message, and that
+    PATCH can land before anything else has persisted the session. An owner is
+    not decoration — ``list_all_sessions`` filters on ``metadata.client_id``,
+    so a row written here without one is invisible in every session listing,
+    forever. That is survivable while a turn is running (the client keeps its
+    own copy in memory), and permanent once the turn dies before the runtime
+    writes its runs: the agent restarts, the chat is on disk, and the user
+    never sees it again. Ownership only ever gets *added* here —
+    ``upsert_session`` merges metadata, so a row that already has an owner
+    keeps it, and ``user_id`` stays untouched for the runtime to claim.
     """
     from aiohttp import web
 
@@ -683,7 +778,12 @@ async def handle_patch_metadata(request):
     if not title and not model:
         return web.json_response({"error": "title or model is required"}, status=400)
 
-    await db.upsert_session(session_id, title=title, model=model)
+    # Prefer the user handle (same across their devices, which is what makes
+    # the chat list cross-device); fall back to the device pubkey. Both can be
+    # absent on a trusted-proxy / single-owner deploy, and then this behaves
+    # exactly as before.
+    owner = request.get("user_handle") or request.get("client_id") or None
+    await db.upsert_session(session_id, client_id=owner, title=title, model=model)
     return web.json_response({"session_id": session_id, "ok": True})
 
 
@@ -717,7 +817,16 @@ async def handle_pin(request):
     runtime_id = str(body.get("runtime_id") or "").strip()
     if not runtime_id:
         return web.json_response({"error": "runtime_id is required"}, status=400)
-    model = await db.get_model(runtime_id)
+    # Look the model up BY RUNTIME_ID. ``get_model`` takes the surrogate
+    # row id and casts it with ``int()``, so passing a runtime_id here made
+    # every pin a 500 ("invalid literal for int()") — this endpoint had
+    # never succeeded, which is why no client called it. ``runtime_id`` is
+    # not a column: it is derived per row, so the enriched listing is the
+    # only place it can be matched.
+    model = next(
+        (m for m in await db.list_models_enriched() if m.get("runtime_id") == runtime_id),
+        None,
+    )
     if model is None:
         return web.json_response(
             {"error": f"model {runtime_id!r} is not registered"},
@@ -726,6 +835,13 @@ async def handle_pin(request):
     if not model.get("enabled"):
         return web.json_response(
             {"error": f"model {runtime_id!r} is disabled — enable it before pinning"},
+            status=400,
+        )
+    # A model whose PROVIDER is disabled cannot run either, and pinning to
+    # it would strand the session on a model the dispatcher will skip.
+    if not model.get("provider_enabled", True):
+        return web.json_response(
+            {"error": f"provider {model.get('provider_name')!r} is disabled — enable it before pinning"},
             status=400,
         )
     try:

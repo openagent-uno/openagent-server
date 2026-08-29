@@ -593,6 +593,12 @@ class OpenAIChat(Model):
         try:
             assistant_message.metrics.start_timer()
 
+            # Un solo scrubber per flusso: lo stato "sono dentro un blocco di
+            # ragionamento" e' esattamente cio' che non deve sopravvivere alla
+            # fine della risposta.
+            from src.core._runner.utils.think_stream import ThinkStreamScrubber
+
+            scrubber = ThinkStreamScrubber()
             for chunk in self.get_client().chat.completions.create(
                 model=self.id,
                 messages=self._format_all_messages(messages, compress_tool_results),  # type: ignore
@@ -602,7 +608,12 @@ class OpenAIChat(Model):
                     response_format=response_format, tools=tools, tool_choice=tool_choice, run_response=run_response
                 ),
             ):
-                yield self._parse_provider_response_delta(chunk)
+                yield self._parse_provider_response_delta(chunk, scrubber)
+            _tail = scrubber.flush()
+            if _tail:
+                _final = ModelResponse()
+                _final.content = _tail
+                yield _final
 
             assistant_message.metrics.stop_timer()
 
@@ -690,8 +701,20 @@ class OpenAIChat(Model):
                 ),
             )
 
+            # Come nella variante sincrona: uno scrubber per flusso, e la
+            # coda trattenuta emessa alla fine cosi' l'ultima parola non si
+            # perde. Questa e' la via che usa il gateway, quindi e' quella da
+            # cui il ragionamento sarebbe arrivato davvero all'utente.
+            from src.core._runner.utils.think_stream import ThinkStreamScrubber
+
+            scrubber = ThinkStreamScrubber()
             async for chunk in async_stream:
-                yield self._parse_provider_response_delta(chunk)
+                yield self._parse_provider_response_delta(chunk, scrubber)
+            tail = scrubber.flush()
+            if tail:
+                tail_response = ModelResponse()
+                tail_response.content = tail
+                yield tail_response
 
             assistant_message.metrics.stop_timer()
 
@@ -886,7 +909,7 @@ class OpenAIChat(Model):
 
         return model_response
 
-    def _parse_provider_response_delta(self, response_delta: ChatCompletionChunk) -> ModelResponse:
+    def _parse_provider_response_delta(self, response_delta: ChatCompletionChunk, scrubber=None) -> ModelResponse:
         """
         Parse the OpenAI streaming response into a ModelResponse.
 
@@ -903,7 +926,15 @@ class OpenAIChat(Model):
             if choice_delta:
                 # Add content
                 if choice_delta.content is not None:
-                    model_response.content = choice_delta.content
+                    # Il delta esce PULITO. Senza questo, un modello che mette
+                    # il ragionamento in linea nel contenuto (i Qwen locali,
+                    # MiniMax, diversi modelli aperti) lo riversa in chat: il
+                    # taglio esisteva solo sul percorso non-streaming, dove il
+                    # messaggio e' una stringa intera e il tag non e' spezzato.
+                    model_response.content = (
+                        scrubber.feed(choice_delta.content)
+                        if scrubber is not None else choice_delta.content
+                    )
 
                     # We only want to handle these if content is present
                     if model_response.provider_data is None:

@@ -267,6 +267,19 @@ def _candidate_names(server: str, tool: str) -> list[str]:
         add(f"{pfx}{tool}")          # bare leaf → add the server prefix
         if tool.startswith(pfx):
             add(tool[len(pfx):])     # doubled prefix → drop one copy
+    # Explicit, read-only compatibility aliases.  These are deliberately not
+    # fuzzy matches: both names mean the same keyword search, but the lean
+    # support profile exposes the ordinary ``vault`` server (whose registered
+    # key is ``vault_search_notes``) while older prompts and the vault-gate
+    # surface taught models to call ``vault_search``.  Letting that harmless
+    # vocabulary drift fail costs a complete model turn and can leave support
+    # without its policy lookup.  Keep this list tiny and never put mutations
+    # here: an alias may only select a known equivalent read operation.
+    safe_aliases = {
+        ("vault", "vault_search"): ("vault_search_notes",),
+    }
+    for alias in safe_aliases.get((server, tool), ()):
+        add(alias)
     return out
 
 
@@ -327,6 +340,54 @@ def _did_you_mean(name: str, available: list[str]) -> str:
     return f" Did you mean: {close}?" if close else ""
 
 
+# ── repeated-miss guard ──────────────────────────────────────────────────────
+#
+# A miss means the model invented a name, and the error above already lists the
+# real ones. What it never did was get LOUDER when the invention repeated, so a
+# model that keeps guessing turns one trivial prompt into a pile of upstream
+# calls — measured on a live agent: 22 subscription calls for "reply with the
+# word OK", spent alternating between ``file``, ``run_command`` and
+# ``shell_run_command``, none of which exist.
+#
+# The guard escalates the wording; it never refuses. A refusal that tripped on
+# a legitimate call would cost far more than the tokens it saves, and this
+# counter is deliberately process-wide (there is no turn identity down here),
+# so it must not be able to deny anyone a working tool. Any successful call
+# clears it, which is what keeps a busy agent from drifting into the loud
+# wording on unrelated work.
+_MISS_COUNTS: dict[tuple[str, str], int] = {}
+_MISS_COUNTS_MAX = 64
+_LOUD_AFTER = 2
+
+
+def _note_miss(server: str, tool: str) -> int:
+    """Record a failed lookup; return how many times this exact pair has now
+    missed in a row (a successful call resets the whole table)."""
+    key = (str(server or ""), str(tool or ""))
+    count = _MISS_COUNTS.get(key, 0) + 1
+    if len(_MISS_COUNTS) >= _MISS_COUNTS_MAX and key not in _MISS_COUNTS:
+        _MISS_COUNTS.clear()
+    _MISS_COUNTS[key] = count
+    return count
+
+
+def _clear_misses() -> None:
+    _MISS_COUNTS.clear()
+
+
+def _repeat_warning(server: str, tool: str, count: int) -> str:
+    """The escalation suffix, empty until the same call has failed enough
+    times that repeating it is clearly not a strategy."""
+    if count <= _LOUD_AFTER:
+        return ""
+    return (
+        f" STOP: {server}.{tool} has now failed {count} times — this exact call"
+        " cannot succeed, and guessing another name will not help either."
+        " List what exists (tool_search_list_servers / tool_search_list_tools)"
+        " or answer with the tools you already have."
+    )
+
+
 # Lazy-recovery timeout for ``call_tool``. Lower than the connect-time
 # recovery budget — by the time the model invokes a trimmed tool we want
 # to fail fast rather than make the user wait. One short attempt is enough
@@ -367,11 +428,27 @@ async def _ensure_functions_loaded(toolkit: Any, server: str) -> dict[str, Any]:
     return _functions_dict(toolkit)
 
 
+def _require_server_allowed(server: str) -> None:
+    """Fail closed when a broker call targets a family outside this run."""
+    from src.core.tool_scope import current_tool_allowlist, normalize_family
+
+    allow = current_tool_allowlist()
+    if allow is not None and normalize_family(server) not in allow:
+        raise PermissionError(
+            f"MCP server {server!r} is outside this run's allowed tool families"
+        )
+
+
 def _list_servers_impl(pool: Any) -> list[dict[str, Any]]:
+    from src.core.tool_scope import current_tool_allowlist, normalize_family
+
+    allow = current_tool_allowlist()
     out: list[dict[str, Any]] = []
     for name, toolkit in pool._toolkit_by_name.items():
         if name == "tool-search":
             continue  # never list ourselves — would be infinite-mirror noise
+        if allow is not None and normalize_family(name) not in allow:
+            continue
         tool_count = sum(
             1 for tool_name in _functions_dict(toolkit)
             if not _tool_is_denied(name, tool_name)
@@ -413,6 +490,18 @@ def _list_scoped_servers_impl(pool: Any) -> list[dict[str, Any]]:
     if origin is not None:
         providers.append(InteractiveClientMCPProvider(origin.registry))
     out = [item for provider in providers for item in provider.list_servers()]
+    # The child-run allowlist is location-agnostic: a family omitted from a
+    # delegated child's grant must not reappear merely because the interactive
+    # client exposes another implementation of it.
+    filtered: list[dict[str, Any]] = []
+    for item in out:
+        _location, bare_server = _split_server_location(str(item.get("name", "")))
+        try:
+            _require_server_allowed(bare_server)
+        except PermissionError:
+            continue
+        filtered.append(item)
+    out = filtered
     out.sort(key=lambda item: item["name"])
     return out
 
@@ -442,6 +531,7 @@ def _provider_for_location(pool: Any, location: str) -> Any:
 
 def _list_scoped_tools_impl(pool: Any, server: str) -> list[dict[str, Any]]:
     location, bare_server = _split_server_location(server)
+    _require_server_allowed(bare_server)
     provider: ToolCatalogProvider = _provider_for_location(pool, location)
     return provider.list_tools(bare_server)
 
@@ -450,11 +540,13 @@ def _describe_scoped_tool_impl(
     pool: Any, server: str, tool: str,
 ) -> dict[str, Any]:
     location, bare_server = _split_server_location(server)
+    _require_server_allowed(bare_server)
     provider: ToolCatalogProvider = _provider_for_location(pool, location)
     return provider.describe_tool(bare_server, tool)
 
 
 def _list_tools_impl(pool: Any, server: str) -> list[dict[str, Any]]:
+    _require_server_allowed(server)
     toolkit = pool.toolkit_by_name(server)
     if toolkit is None:
         raise ValueError(
@@ -469,18 +561,38 @@ def _list_tools_impl(pool: Any, server: str) -> list[dict[str, Any]]:
         # token budget even on MCPs with 40+ tools (see firebase: 44).
         desc = (getattr(fn, "description", "") or "").strip()
         first_line = desc.split("\n", 1)[0][:200] if desc else ""
-        out.append(
-            {
-                "name": tool_name,
-                "description": first_line,
-                "classification": getattr(fn, "classification", "mutating"),
-            }
-        )
+        entry: dict[str, Any] = {
+            "name": tool_name,
+            "description": first_line,
+            "classification": getattr(fn, "classification", "mutating"),
+        }
+        # Under the lean local profile, carry each tool's signature in the
+        # listing. Measured on Qwen3-30B: without it the model reached the
+        # right server and then invented argument names, and a mutation that
+        # fails validation is indistinguishable from one that never ran. One
+        # short line here removes a describe_tool round-trip AND the guess.
+        try:
+            from src.core.execution_profile import lean_local_event_active
+
+            if lean_local_event_active():
+                params = getattr(fn, "parameters", None) or {}
+                properties = params.get("properties") or {}
+                required = [str(name) for name in (params.get("required") or [])]
+                optional = [
+                    str(name) for name in properties if str(name) not in required
+                ]
+                if required or optional:
+                    entry["required_args"] = required
+                    entry["optional_args"] = optional[:8]
+        except Exception:  # noqa: BLE001 - a listing must never fail on metadata
+            pass
+        out.append(entry)
     out.sort(key=lambda x: x["name"])
     return out
 
 
 def _describe_tool_impl(pool: Any, server: str, tool: str) -> dict[str, Any]:
+    _require_server_allowed(server)
     toolkit = pool.toolkit_by_name(server)
     if toolkit is None:
         raise ValueError(f"MCP {server!r} is not loaded.")
@@ -535,8 +647,10 @@ async def _resolve_tool(
 
 
 async def _call_tool_impl(
-    pool: Any, server: str, tool: str, args: dict | None,
+    pool: Any, server: str, tool: str, args: dict | str | None,
 ) -> Any:
+    _require_server_allowed(server)
+
     # ``workflow-manager`` normally lives in a subprocess and hands durable
     # work to the scheduler through SQLite. A synchronous wait=True invocation
     # inside an authenticated interactive turn is different: its workflow and
@@ -544,14 +658,14 @@ async def _call_tool_impl(
     # client host. Route only that case to the process-local runner installed
     # by Scheduler. wait=False, automatic turns and API/queue calls keep the
     # durable server-only path below.
-    if server == "workflow-manager" and args is not None and not isinstance(args, dict):
-        raise ValueError(f"args must be a dict, got {type(args).__name__}")
     if server == "workflow-manager":
         candidates = set(_candidate_names(server, tool))
         if {"run_workflow", "workflow_manager_run_workflow"} & candidates:
+            if _tool_is_denied(server, tool):
+                _deny_tool(server, tool)
             from src.core.execution_origin import current_execution_origin
 
-            call_args = args or {}
+            call_args = _decode_tool_args(args)
             runner = getattr(pool, "_interactive_workflow_runner", None)
             if (
                 current_execution_origin() is not None
@@ -568,33 +682,73 @@ async def _call_tool_impl(
                 id_or_name = str(call_args.get("id_or_name") or "").strip()
                 if not id_or_name:
                     raise ValueError("run_workflow requires id_or_name")
-                return await runner(
+                result = await runner(
                     id_or_name,
                     inputs=call_args.get("inputs"),
                     timeout_s=int(call_args.get("timeout_s", 300)),
                 )
+                _clear_misses()
+                return result
 
     fn, _resolved_server = await _resolve_tool(pool, server, tool)
 
+    if _resolved_server is not None:
+        _require_server_allowed(_resolved_server)
+
     if fn is None:
+        misses = _note_miss(server, tool)
         toolkit = pool.toolkit_by_name(server) if server else None
         if toolkit is None:
             raise ValueError(
                 f"MCP {server!r} is not loaded. "
                 f"Known MCPs: {sorted(pool._toolkit_by_name)}"
+                + _repeat_warning(server, tool, misses)
             )
         avail = sorted(await _ensure_functions_loaded(toolkit, server))
         raise ValueError(
             f"MCP {server!r} has no tool named {tool!r}. "
             f"It exposes: {avail}." + _did_you_mean(tool, avail)
+            + _repeat_warning(server, tool, misses)
         )
-    if args is None:
-        args = {}
-    if not isinstance(args, dict):
-        raise ValueError(f"args must be a dict, got {type(args).__name__}")
+    # A call that resolves means the model is back on solid ground.
+    _clear_misses()
+    args = _decode_tool_args(args)
+    # The runtime's ``Function`` exposes ``entrypoint``; raw callables don't.
+    # Prefer ``entrypoint`` when present (matches the test fixtures in
+    # ``scripts/tests/test_mcp.py``) and fall back to direct call for
+    # plain functions.
+    callable_to_call = getattr(fn, "entrypoint", None) or fn
+    # Small local models sometimes copy optional filters from another search
+    # surface (observed: ``tags``/``include`` on vault_search). For a read-only
+    # tool, dropping keys that the actual callable signature does not accept is
+    # safe and avoids spending another complete model round-trip. Never do this
+    # for mutations: silently dropping ``dryRun``, confirmation, amount, or an
+    # idempotency key could change external state.
+    low_tool = str(tool or getattr(fn, "name", "") or "").lower()
+    leaf = low_tool.rsplit("_", 1)[-1]
+    read_only = (
+        any(marker in low_tool for marker in (
+            "_get_", "_list_", "_search", "_read_", "_lookup", "_detect",
+            "_describe", "_stats", "_brief",
+        ))
+        or leaf in {"get", "list", "search", "read", "lookup", "detect", "describe", "stats", "brief"}
+    )
+    if read_only and args:
+        try:
+            sig = inspect.signature(callable_to_call)
+            accepts_kwargs = any(
+                p.kind is inspect.Parameter.VAR_KEYWORD
+                for p in sig.parameters.values()
+            )
+            if not accepts_kwargs:
+                allowed = set(sig.parameters)
+                args = {key: value for key, value in args.items() if key in allowed}
+        except (TypeError, ValueError):
+            pass
+
     # Runtime Functions must pass through FunctionCall so their pre/post/tool
     # hooks, run context, media context and error semantics remain identical to
-    # a directly model-invoked tool.  Lightweight adapter/test callables keep
+    # a directly model-invoked tool. Lightweight adapter/test callables keep
     # the compatibility path below.
     from src.mcp._runtime.function import Function, FunctionCall
 
@@ -604,11 +758,76 @@ async def _call_tool_impl(
             raise RuntimeError(execution.error or f"MCP tool {tool!r} failed")
         result = execution.result
     else:
-        callable_to_call = getattr(fn, "entrypoint", None) or fn
         result = callable_to_call(**args)
         if inspect.isawaitable(result):
             result = await result
-    return _coerce_to_jsonable(result)
+    result = _coerce_to_jsonable(result)
+    return _with_signature_hint(fn, tool, result)
+
+
+_ARG_ERROR_MARKERS = (
+    "validation error", "field required", "unexpected keyword",
+    "missing 1 required", "got an unexpected",
+)
+
+
+def _with_signature_hint(fn: Any, tool: str, result: Any) -> Any:
+    """Append the real signature when a call failed on its arguments.
+
+    A raw pydantic dump tells a model that something is wrong, not what to send
+    instead. Observed on Qwen3-30B: it called ``threads_respond`` with
+    ``message`` rather than ``body_text``, read the dump, and gave up — leaving
+    an approved reply unsent while the task reported success. Naming the
+    accepted arguments turns a dead end into a retry that can work.
+    """
+    # Only a real protocol-error envelope qualifies. A vault note that happens
+    # to contain the words "validation error" is DATA: enriching it would turn
+    # a successful structured read into a string and break every caller that
+    # reads fields off it.
+    if not isinstance(result, str):
+        return result
+    low = result.lower()
+    if not low.lstrip().startswith(("error from mcp tool", "error executing tool")):
+        return result
+    if not any(marker in low for marker in _ARG_ERROR_MARKERS):
+        return result
+    rendered = result
+    params = getattr(fn, "parameters", None) or {}
+    properties = params.get("properties") or {}
+    if not properties:
+        return result
+    required = [str(name) for name in (params.get("required") or [])]
+    optional = [str(name) for name in properties if str(name) not in required]
+    hint = (
+        f"\n\n[signature] {tool} accepts: required={required or 'none'}, "
+        f"optional={optional[:8] or 'none'}. Retry with exactly these argument "
+        f"names."
+    )
+    return rendered + hint
+
+
+def _decode_tool_args(args: dict | str | None) -> dict[str, Any]:
+    """Normalise provider-compatible tool arguments before any dispatch.
+
+    Some OpenAI-compatible models encode the nested free-form ``args`` object
+    as a JSON string. Decoding at the scoped boundary keeps server and client
+    routing behaviour identical, while still rejecting arrays and scalars.
+    """
+
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                "args must be a JSON object or encoded JSON object"
+            ) from exc
+    if args is None:
+        return {}
+    if not isinstance(args, dict):
+        raise ValueError(
+            f"args must decode to an object, got {type(args).__name__}"
+        )
+    return args
 
 
 def _stamp_execution_host(value: Any, host: dict[str, Any]) -> dict[str, Any]:
@@ -628,9 +847,11 @@ def _stamp_execution_host(value: Any, host: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _call_scoped_tool_impl(
-    pool: Any, server: str, tool: str, args: dict | None,
+    pool: Any, server: str, tool: str, args: dict | str | None,
 ) -> dict[str, Any]:
     location, bare_server = _split_server_location(server)
+    _require_server_allowed(bare_server)
+    args = _decode_tool_args(args)
     dispatcher: ToolDispatcher = _provider_for_location(pool, location)
     if location == "client":
         from src.mcp.servers.shell.adapters import current_session_id
@@ -681,11 +902,19 @@ def build_runtime_toolkit(*, pool: Any | None = None) -> Any:
         return _describe_scoped_tool_impl(pool, server, tool)
 
     async def tool_search_call_tool(
-        server: str, tool: str, args: dict | None = None,
+        server: str, tool: str, args: dict | str | None = None,
     ) -> Any:
         """Invoke any tool on any connected MCP and return its result.
 
         Use this when the tool you need was trimmed from the upfront list.
+
+        Args:
+            server: Connected MCP server name.
+            tool: Exact tool name returned by list_tools.
+            args: Target tool arguments as a nested object. Copy required
+                properties from describe_tool's input_schema into this object.
+                A JSON-encoded object string is also accepted for provider
+                compatibility.
         """
         return await _call_scoped_tool_impl(pool, server, tool, args)
 

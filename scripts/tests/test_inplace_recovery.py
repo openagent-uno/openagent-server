@@ -188,6 +188,34 @@ async def t_tool_schema_recovery(_ctx: TestContext) -> None:
     assert _schema_has_key(tools, "pattern") and _schema_has_key(tools, "format")
 
 
+@test("inplace_recovery", "la formulazione vera di llama.cpp viene riconosciuta")
+async def t_tool_schema_recovery_llamacpp_wording(_ctx: TestContext) -> None:
+    # Misurato il 24-ago-2026 contro la riga Qwen self-hosted: uno schema di tool
+    # con un `pattern` per l'e-mail faceva 400 su OGNI tool call, mentre lo stesso
+    # schema senza pattern rispondeva. Il messaggio e' questo, alla lettera, e non
+    # combaciava con nessuna delle firme note: la riparazione che esiste proprio
+    # per questo caso non partiva e il turno moriva.
+    err = ModelProviderError(
+        "Failed to initialize samplers: failed to parse grammar", status_code=400)
+    model = _FakeModel(error=err)
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "billing_lookup",
+            "parameters": {
+                "type": "object",
+                "properties": {"email": {"type": "string", "pattern": r"^[^@\s]+@[^@\s]+$"}},
+            },
+        },
+    }]
+
+    with _NoFallbackGuard():
+        result = await acall_model_with_fallback(model, None, messages=[], tools=tools)
+
+    assert result.tag == "recovered"
+    assert not _schema_has_key(model.calls[1]["tools"], "pattern"), model.calls[1]["tools"]
+
+
 # ── 4. Byte-identical: an UNMATCHED 400 takes the exact existing path ─
 @test("inplace_recovery", "unmatched 400 falls through byte-identically (raises, no extra call)")
 async def t_unmatched_400_byte_identical(_ctx: TestContext) -> None:

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import threading
+import time
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable, Iterator, List, Optional, Union
@@ -188,8 +190,16 @@ def _classify_inplace_recovery(error: Exception) -> Optional[str]:
 
     # Strict json-schema-to-grammar backends (e.g. llama.cpp's OAI server)
     # reject regex escapes in tool-schema `pattern` / `format` → 400.
+    # ``failed to parse grammar`` is the wording llama.cpp actually returns
+    # today, inside "Failed to initialize samplers: failed to parse grammar":
+    # measured 24-ago-2026 against the self-hosted Qwen row, where a tool schema
+    # carrying an e-mail ``pattern`` made EVERY tool call 400 while the identical
+    # schema without it answered fine. The three signatures below did not match
+    # it, so the repair that exists for exactly this case never fired and the
+    # turn died — the one thing that broke when switching to that model.
     if status == 400 and (
         "error parsing grammar" in msg
+        or "failed to parse grammar" in msg
         or "json-schema-to-grammar" in msg
         or ("unable to generate parser" in msg and "template" in msg)
     ):
@@ -590,6 +600,96 @@ def _notify_fallback(
             pass  # Don't let callback errors break fallback flow
 
 
+# ---------------------------------------------------------------------------
+# Breaker half-open sui gradini della catena
+# ---------------------------------------------------------------------------
+# La catena era una lista statica provata sempre nello stesso ordine. Due difetti
+# misurati in produzione il 24-ago-2026:
+#
+#  1. nessuna memoria. Il codex-sub-proxy parcheggia un modello che ha preso il
+#     muro (``mark_rate_limited(..., model=...)``); finche' dura, OGNI turno
+#     pagava un viaggio a vuoto sullo stesso gradino prima di passare al
+#     successivo. L'informazione c'era gia', la riscoprivamo ogni volta a spese
+#     nostre.
+#  2. la ripresa era ad orologio. Upstream ha risposto "riprova fra 486262
+#     secondi" (5,6 giorni) e il proxy ha tenuto ``gpt-5.3-codex-spark`` fuori
+#     per il suo tetto pieno di 3 ore, senza mai verificare se nel frattempo
+#     fosse tornato.
+#
+# Qui il gradino che ha appena fallito viene SPOSTATO IN FONDO, non tolto: se
+# tutti sono in quarantena l'ordine resta quello configurato e si prova
+# comunque, perche' una lista vuota e' sempre peggio di un tentativo che forse
+# fallisce (stessa disciplina del budget guard). Scaduta la quarantena il
+# gradino torna in testa e il primo turno che passa e' la sonda: se risponde,
+# lo stato sparisce all'istante; se no, la quarantena raddoppia fino al tetto.
+# La ripresa e' quindi VERIFICATA da una richiesta vera, mai assunta da un
+# timer, che e' la stessa regola che quota-guard applica ai provider di riserva.
+#
+# Lo stato vive in memoria e muore col processo: e' un acceleratore, non una
+# fonte di verita'. Perderlo costa un viaggio a vuoto, non una risposta.
+_BREAKER_BASE_SECONDS = float(os.getenv("OPENAGENT_FALLBACK_BREAKER_SECONDS", "120"))
+_BREAKER_MAX_SECONDS = float(os.getenv("OPENAGENT_FALLBACK_BREAKER_MAX_SECONDS", "2700"))
+_breaker_lock = threading.Lock()
+# model id -> (istante in cui si puo' riprovare, fallimenti consecutivi)
+_breaker: dict[str, tuple[float, int]] = {}
+
+
+def _breaker_enabled() -> bool:
+    return os.getenv("OPENAGENT_FALLBACK_BREAKER_ENABLED", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def _breaker_quarantined(model_id: str, now: float) -> bool:
+    with _breaker_lock:
+        entry = _breaker.get(model_id)
+        return bool(entry and now < entry[0])
+
+
+def _breaker_record_failure(model_id: str) -> None:
+    if not model_id:
+        return
+    with _breaker_lock:
+        _, failures = _breaker.get(model_id, (0.0, 0))
+        failures += 1
+        delay = min(_BREAKER_BASE_SECONDS * (2 ** (failures - 1)), _BREAKER_MAX_SECONDS)
+        _breaker[model_id] = (time.monotonic() + delay, failures)
+    log_warning(f"Fallback breaker: '{model_id}' in quarantena per {delay:.0f}s (fallimento #{failures})")
+
+
+def _breaker_record_success(model_id: str) -> None:
+    if not model_id:
+        return
+    with _breaker_lock:
+        _breaker.pop(model_id, None)
+
+
+def breaker_snapshot() -> dict[str, float]:
+    """Secondi di quarantena residui per modello. Per i test e la diagnosi."""
+    now = time.monotonic()
+    with _breaker_lock:
+        return {m: max(0.0, until - now) for m, (until, _) in _breaker.items()}
+
+
+def reset_breaker() -> None:
+    """Svuota lo stato. Serve ai test, non al runtime."""
+    with _breaker_lock:
+        _breaker.clear()
+
+
+def _ordered_candidates(fallback_models: List[Model]) -> List[Model]:
+    """I candidati non in quarantena per primi, gli altri in coda.
+
+    Riordina, non filtra: nessun gradino viene mai perso.
+    """
+    if not _breaker_enabled() or len(fallback_models) < 2:
+        return list(fallback_models)
+    now = time.monotonic()
+    ready = [m for m in fallback_models if not _breaker_quarantined(str(getattr(m, "id", "")), now)]
+    held = [m for m in fallback_models if _breaker_quarantined(str(getattr(m, "id", "")), now)]
+    return ready + held
+
+
 def _try_fallback_models(
     fallback_models: List[Model],
     primary_error: Exception,
@@ -599,13 +699,16 @@ def _try_fallback_models(
     fallback_config: Optional[FallbackConfig] = None,
 ) -> ModelResponse:
     """Try each fallback model in order. Raises the primary error if all fail."""
-    for i, fallback in enumerate(fallback_models):
+    candidates = _ordered_candidates(fallback_models)
+    for i, fallback in enumerate(candidates):
         try:
-            log_warning(f"Trying fallback model {i + 1}/{len(fallback_models)}: {fallback.id}")
+            log_warning(f"Trying fallback model {i + 1}/{len(candidates)}: {fallback.id}")
             result = getattr(fallback, method_name)(**kwargs)
+            _breaker_record_success(str(fallback.id))
             _notify_fallback(fallback_config, primary_model_id, fallback.id, primary_error)
             return result
         except ModelProviderError as e:
+            _breaker_record_failure(str(fallback.id))
             log_warning(f"Fallback model '{fallback.id}' also failed: {str(e)}")
             continue
     raise primary_error
@@ -620,13 +723,16 @@ async def _atry_fallback_models(
     fallback_config: Optional[FallbackConfig] = None,
 ) -> ModelResponse:
     """Async: try each fallback model in order. Raises the primary error if all fail."""
-    for i, fallback in enumerate(fallback_models):
+    candidates = _ordered_candidates(fallback_models)
+    for i, fallback in enumerate(candidates):
         try:
-            log_warning(f"Trying fallback model {i + 1}/{len(fallback_models)}: {fallback.id}")
+            log_warning(f"Trying fallback model {i + 1}/{len(candidates)}: {fallback.id}")
             result = await getattr(fallback, method_name)(**kwargs)
+            _breaker_record_success(str(fallback.id))
             _notify_fallback(fallback_config, primary_model_id, fallback.id, primary_error)
             return result
         except ModelProviderError as e:
+            _breaker_record_failure(str(fallback.id))
             log_warning(f"Fallback model '{fallback.id}' also failed: {str(e)}")
             continue
     raise primary_error
@@ -640,13 +746,16 @@ def _try_fallback_models_stream(
     fallback_config: Optional[FallbackConfig] = None,
 ) -> Iterator[StreamEvent]:
     """Try each fallback model stream in order. Raises the primary error if all fail."""
-    for i, fallback in enumerate(fallback_models):
+    candidates = _ordered_candidates(fallback_models)
+    for i, fallback in enumerate(candidates):
         try:
-            log_warning(f"Trying fallback model {i + 1}/{len(fallback_models)}: {fallback.id}")
+            log_warning(f"Trying fallback model {i + 1}/{len(candidates)}: {fallback.id}")
             yield from fallback.response_stream(**kwargs)
+            _breaker_record_success(str(fallback.id))
             _notify_fallback(fallback_config, primary_model_id, fallback.id, primary_error)
             return
         except ModelProviderError as e:
+            _breaker_record_failure(str(fallback.id))
             log_warning(f"Fallback model '{fallback.id}' also failed: {str(e)}")
             continue
     raise primary_error
@@ -660,14 +769,17 @@ async def _atry_fallback_models_stream(
     fallback_config: Optional[FallbackConfig] = None,
 ) -> AsyncIterator[StreamEvent]:
     """Async: try each fallback model stream in order. Raises the primary error if all fail."""
-    for i, fallback in enumerate(fallback_models):
+    candidates = _ordered_candidates(fallback_models)
+    for i, fallback in enumerate(candidates):
         try:
-            log_warning(f"Trying fallback model {i + 1}/{len(fallback_models)}: {fallback.id}")
+            log_warning(f"Trying fallback model {i + 1}/{len(candidates)}: {fallback.id}")
             async for event in fallback.aresponse_stream(**kwargs):
                 yield event
+            _breaker_record_success(str(fallback.id))
             _notify_fallback(fallback_config, primary_model_id, fallback.id, primary_error)
             return
         except ModelProviderError as e:
+            _breaker_record_failure(str(fallback.id))
             log_warning(f"Fallback model '{fallback.id}' also failed: {str(e)}")
             continue
     raise primary_error

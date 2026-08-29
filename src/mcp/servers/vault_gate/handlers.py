@@ -13,6 +13,48 @@ from src.memory.vault.service import get_service
 from src.memory.vault.vault_origin import recent_origin
 
 
+_CANONICAL_PATH_MARKERS = (
+    "/procedures/", "/dev/", "/known-issues/", "/support-playbooks/",
+    "/features/", "/releases/", "/subsystems/", "support-grounding",
+)
+_RECEIPT_PATH_MARKERS = (
+    "/receipts/", "receipts-archive", "/batch-runs/", "/cycle-logs/",
+)
+
+
+def _canonical_first(results: list[dict], limit: int) -> list[dict]:
+    """Promote authoritative candidates without discarding relevant receipts.
+
+    A support vault can contain thousands of triage receipts repeating the same
+    customer vocabulary. Pure BM25 therefore returns ten historical examples
+    before the one bug analysis or procedure that determines what is true now.
+    Preserve search relevance inside each group, but put canonical candidates
+    first and label receipts explicitly so a small local model does not mistake
+    precedent for current state.
+    """
+    canonical: list[dict] = []
+    remainder: list[dict] = []
+    for item in results:
+        path = "/" + str(item.get("path") or "").lower().lstrip("/")
+        tagged = dict(item)
+        is_receipt = any(marker in path for marker in _RECEIPT_PATH_MARKERS)
+        is_grounding = "support-grounding" in path
+        is_canonical = is_grounding or (
+            not is_receipt
+            and any(marker in path for marker in _CANONICAL_PATH_MARKERS)
+        )
+        if is_canonical:
+            tagged["evidence_class"] = "canonical_candidate"
+            canonical.append(tagged)
+        else:
+            if is_receipt:
+                tagged["evidence_class"] = "historical_receipt"
+            else:
+                tagged["evidence_class"] = "supporting_context"
+            remainder.append(tagged)
+    return (canonical + remainder)[:max(1, limit)]
+
+
 def _origin(tool: str) -> dict:
     """Provenance for a tool-driven vault change: the current chat/workflow/
     task context (if any) plus the tool name."""
@@ -183,6 +225,24 @@ async def vault_search(query: str, limit: int = 20,
         return {"query": query, "count": len(matches), "results": matches,
                 "search_type": "regex", "file_path": file_path}
     # Default: full-text content search
+    from src.core.execution_profile import lean_local_event_active
+
+    if lean_local_event_active():
+        # A cold clone has no FTS rows yet. The first sync builds the disposable
+        # index; steady-state sync is incremental (measured ~250 ms / 7.5k
+        # notes). Over-fetch so a canonical analysis buried under repeated
+        # receipts remains available to the authority reranker.
+        await svc.sync(force=False)
+        requested = max(1, int(limit))
+        results = await svc.search(query, limit=min(200, requested * 10))
+        results = _canonical_first(results, requested)
+        return {
+            "query": query,
+            "count": len(results),
+            "results": results,
+            "search_type": "content",
+            "ranking_profile": "canonical_first",
+        }
     results = await svc.search(query, limit=limit)
     return {"query": query, "count": len(results), "results": results,
             "search_type": "content"}

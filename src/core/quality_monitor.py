@@ -56,6 +56,7 @@ _MODEL_ENV = "OPENAGENT_QUALITY_MONITOR_MODEL"
 _TIMEOUT_ENV = "OPENAGENT_QUALITY_MONITOR_TIMEOUT"
 _MIN_LEN_ENV = "OPENAGENT_QUALITY_MONITOR_MIN_LEN"
 _RULES_CHARS_ENV = "OPENAGENT_QUALITY_MONITOR_RULES_CHARS"
+_SCOPES_ENV = "OPENAGENT_QUALITY_MONITOR_SCOPES"
 
 # The DEFAULT judge model when no judge/compaction model is configured.
 # ``deepseek:deepseek-chat`` is cheap-but-capable AND isolated from the Claude
@@ -66,7 +67,26 @@ _RULES_CHARS_ENV = "OPENAGENT_QUALITY_MONITOR_RULES_CHARS"
 # still only a DEFAULT — ``OPENAGENT_QUALITY_MONITOR_MODEL`` (and the compaction
 # model) override it — and it is NEVER an Anthropic key: when deepseek is not an
 # enabled api-based row we fall back to the existing cheapest-enabled logic.
+# 2026-08-22: the same reasoning now points at the self-hosted row FIRST. Our
+# own GPU is off every subscription and costs nothing per call, so it beats a
+# paid api-based provider on the very grounds deepseek was chosen for. Deepseek
+# stays as the second choice when no self-hosted row is enabled.
 _DEFAULT_JUDGE_MODEL = "deepseek:deepseek-chat"
+
+
+def _preferred_judge_ids(providers_config: Any) -> list[str]:
+    """Self-hosted rows first, then the deepseek default."""
+    from src.core.execution_profile import _is_cloud_model_id
+    from src.models.catalog import FRAMEWORK_API_BASED, iter_configured_models
+
+    local = [
+        entry.runtime_id
+        for entry in iter_configured_models(providers_config)
+        if not entry.disabled
+        and entry.framework == FRAMEWORK_API_BASED
+        and not _is_cloud_model_id(entry.runtime_id)
+    ]
+    return [*local, _DEFAULT_JUDGE_MODEL]
 
 
 def _truthy(v: str) -> bool:
@@ -114,6 +134,49 @@ def _rules_chars() -> int:
         return max(0, int(os.environ.get(_RULES_CHARS_ENV, "2000")))
     except ValueError:
         return 2000
+
+
+SCOPE_CUSTOMER = "customer"
+SCOPE_SCHEDULED = "scheduled"
+SCOPE_INTERNAL = "internal"
+SCOPE_INTERACTIVE = "interactive"
+
+# Sub-agent and per-model child sessions are the agent talking to itself: a
+# rule-compression pass, a read-only audit, and — seen in production — the
+# quality judge grading another judge's rubric output. Grading those against a
+# customer-reply playbook is a category error that halved the meaning of the
+# headline score, so they are off by default.
+_DEFAULT_SCOPES = f"{SCOPE_CUSTOMER},{SCOPE_SCHEDULED},{SCOPE_INTERACTIVE}"
+
+
+def session_scope(session_id: Optional[str]) -> str:
+    """Classify a session id into the audience its reply was written for.
+
+    The id shapes are the ones the runtime already emits: ``event:<id>:<run>``
+    for an inbound customer thread, ``scheduler:<task>:<run>`` for a firing,
+    and a ``::sub::`` / ``::model::`` infix for a child session spawned by the
+    agent itself.
+    """
+    sid = str(session_id or "")
+    if "::sub::" in sid or "::model::" in sid:
+        return SCOPE_INTERNAL
+    if sid.startswith("scheduler:"):
+        return SCOPE_SCHEDULED
+    if sid.startswith("event:"):
+        return SCOPE_CUSTOMER
+    return SCOPE_INTERACTIVE
+
+
+def _judged_scopes() -> frozenset[str]:
+    """Scopes the judge is allowed to grade. Empty config means the default."""
+    raw = os.environ.get(_SCOPES_ENV, "") or _DEFAULT_SCOPES
+    picked = {item.strip().lower() for item in raw.split(",") if item.strip()}
+    return frozenset(picked or _DEFAULT_SCOPES.split(","))
+
+
+def should_judge_scope(session_id: Optional[str]) -> bool:
+    """False for a session whose audience this deployment does not grade."""
+    return session_scope(session_id) in _judged_scopes()
 
 
 def should_sample(session_id: Optional[str], response: str) -> bool:
@@ -270,11 +333,13 @@ def _default_judge_model(agent: Any) -> Any:
             from src.models.native_provider import NativeProvider
 
             providers_config = getattr(agent, "_providers_config", None) or []
+            wanted = _preferred_judge_ids(providers_config)
+            by_id = {
+                e.runtime_id: e for e in iter_configured_models(providers_config)
+                if not e.disabled and e.framework == FRAMEWORK_API_BASED
+            }
             match = next(
-                (e for e in iter_configured_models(providers_config)
-                 if e.runtime_id == _DEFAULT_JUDGE_MODEL and not e.disabled
-                 and e.framework == FRAMEWORK_API_BASED),
-                None,
+                (by_id[rid] for rid in wanted if rid in by_id), None,
             )
             if match is not None:
                 db_path = getattr(getattr(agent, "_db", None), "db_path", None)
@@ -284,7 +349,7 @@ def _default_judge_model(agent: Any) -> Any:
                     db_path=str(db_path) if db_path else None,
                 )
                 elog("quality.judge_model", model=match.runtime_id,
-                     reason="deepseek_default")
+                     reason="self_hosted_first")
                 return provider
         except Exception as exc:  # noqa: BLE001 — a default pick must never break a turn
             elog("quality.judge_model_failed", level="warning",
@@ -506,6 +571,7 @@ async def _judge(agent: Any, session_id: Optional[str],
         return
     elog("quality.score", level=("warning" if verdict["verdict"] == "bad" else "info"),
          session_id=session_id, judge_model=judge_id, grounded=bool(rules),
+         scope=session_scope(session_id),
          tool_calls=(len(tool_trace_rows) if tool_trace_rows else 0), **verdict)
 
 
@@ -527,6 +593,8 @@ async def maybe_score_turn(agent: Any, session_id: Optional[str],
         return
     resp = (response or "").strip()
     if len(resp) < _min_len():
+        return
+    if not should_judge_scope(session_id):
         return
     if not should_sample(session_id, resp):
         return
@@ -589,6 +657,7 @@ def aggregate(window_seconds: float = 86400.0, *,
     q_scores: list[float] = []
     q_verdicts: dict[str, int] = {"good": 0, "warn": 0, "bad": 0}
     q_fabrication = 0
+    q_by_scope: dict[str, dict[str, Any]] = {}
     cost_usd = 0.0
     turns = 0
     in_tok = 0
@@ -610,6 +679,23 @@ def aggregate(window_seconds: float = 86400.0, *,
                 q_verdicts[v] += 1
             if entry.get("fabrication"):
                 q_fabrication += 1
+            # Older events predate the scope stamp; classify them from the id so
+            # a window spanning an upgrade still splits cleanly.
+            sc = entry.get("scope") or session_scope(entry.get("session_id"))
+            bucket = q_by_scope.setdefault(
+                sc, {"judged": 0, "_sum": 0.0, "_n": 0,
+                     "verdicts": {"good": 0, "warn": 0, "bad": 0},
+                     "fabrication_flagged": 0})
+            bucket["judged"] += 1
+            try:
+                bucket["_sum"] += float(entry.get("score"))
+                bucket["_n"] += 1
+            except (TypeError, ValueError):
+                pass
+            if v in bucket["verdicts"]:
+                bucket["verdicts"][v] += 1
+            if entry.get("fabrication"):
+                bucket["fabrication_flagged"] += 1
         elif ev == "router.cost_recorded":
             turns += 1
             try:
@@ -630,6 +716,11 @@ def aggregate(window_seconds: float = 86400.0, *,
                 pass
 
     n = len(q_scores)
+    for bucket in q_by_scope.values():
+        cnt = bucket.pop("_n")
+        total = bucket.pop("_sum")
+        bucket["avg_score"] = round(total / cnt, 3) if cnt else None
+    customer = q_by_scope.get(SCOPE_CUSTOMER)
     return {
         "window_seconds": window_seconds,
         "quality": {
@@ -637,6 +728,12 @@ def aggregate(window_seconds: float = 86400.0, *,
             "avg_score": round(sum(q_scores) / n, 3) if n else None,
             "verdicts": q_verdicts,
             "fabrication_flagged": q_fabrication,
+            # The headline number mixes audiences. ``by_scope`` is what an
+            # operator should read: a customer-reply regression is invisible in
+            # the blended average when half the sample is the agent's own
+            # internal sub-agent work.
+            "by_scope": q_by_scope,
+            "customer_avg_score": (customer or {}).get("avg_score"),
         },
         "usage": {
             "turns": turns,

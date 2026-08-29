@@ -298,14 +298,35 @@ class OutError(Event):
     text: str = ""
 
 
+# How a turn ended. A bare "the turn is over" marker is not enough for a
+# client to act on: "answered", "the model errored", "you stopped it" and
+# "it was cut off" all used to arrive as the same empty frame, so the app had
+# to guess from what did or did not follow. Borrowed from DeepSeek Harness,
+# whose ``turn/end`` always carries a ``TurnEndReason``.
+TURN_END_COMPLETED = "completed"      # the assistant answered
+TURN_END_ERROR = "error"              # the turn raised; ``error`` carries the text
+TURN_END_CANCELLED = "cancelled"      # interrupted (user stop / barge-in)
+TURN_END_EMPTY = "empty"              # finished with nothing to say
+TURN_END_REASONS = (
+    TURN_END_COMPLETED, TURN_END_ERROR, TURN_END_CANCELLED, TURN_END_EMPTY,
+)
+
+
 @dataclass(frozen=True)
 class TurnComplete(Event):
-    """End-of-assistant-turn marker.
+    """End-of-assistant-turn marker, with HOW it ended.
 
     Realtime channels typically ignore this (they let ``OutTextFinal`` +
     ``OutAudioEnd`` drive the UI). Batched channels rely on it to know
     when to commit one finished message + one finished voice note.
+
+    ``reason`` is one of :data:`TURN_END_REASONS`; ``error`` carries the
+    message when the reason is ``error``. Old clients ignore both fields and
+    behave exactly as before.
     """
+
+    reason: str = TURN_END_COMPLETED
+    error: str = ""
 
 
 @dataclass(frozen=True)
@@ -381,6 +402,11 @@ __all__ = [
     "OutReasoning",
     "OutError",
     "TurnComplete",
+    "TURN_END_COMPLETED",
+    "TURN_END_ERROR",
+    "TURN_END_CANCELLED",
+    "TURN_END_EMPTY",
+    "TURN_END_REASONS",
     "SessionCompacted",
     "ContextReport",
     "now_ms",
