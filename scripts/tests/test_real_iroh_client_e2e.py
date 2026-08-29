@@ -93,7 +93,11 @@ async def _start_deterministic_model_endpoint(targets: dict[str, Path]):
                 "role": "assistant",
                 "content": None,
                 "tool_calls": [{
-                    "id": "call-client-desktop-offline-read",
+                    # Tool-call ids are unique within a provider run. The
+                    # runtime may ask the deterministic endpoint to recover
+                    # after an error, so include the request ordinal instead
+                    # of manufacturing a duplicate normalized tool id.
+                    "id": f"call-client-desktop-offline-read-{len(calls)}",
                     "type": "function",
                     "function": {
                         "name": tool_name,
@@ -361,6 +365,19 @@ async def t_real_iroh_client_tool_turn(ctx: TestContext) -> None:
             "cli": cli_target,
         })
     )
+    provider_id = await db.upsert_provider(
+        name="local",
+        framework="api-based",
+        api_key="local",
+        base_url=model_base_url,
+        enabled=True,
+    )
+    await db.upsert_model(
+        provider_id=provider_id,
+        model="deterministic-client-e2e",
+        display_name="Deterministic Client E2E",
+        enabled=True,
+    )
     pool = MCPPool.from_config(
         mcp_config=[{"builtin": "tool-search"}],
         include_defaults=False,
@@ -387,7 +404,11 @@ async def t_real_iroh_client_tool_turn(ctx: TestContext) -> None:
             "Client paths are never server paths."
         ),
         mcp_pool=pool,
-        memory=None,
+        # This vertical slice owns the same canonical DB used by the
+        # coordinator and Gateway.  Supplying it to Agent mirrors production
+        # wiring and lets lifecycle-owned services (operational history and
+        # Custom Views) resolve their authoritative store during startup.
+        memory=db,
     )
     state = await NetworkState.from_db(db=db, identity_path=identity_path)
     gateway = Gateway(agent=agent, network_state=state)

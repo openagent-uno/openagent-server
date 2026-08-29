@@ -25,9 +25,12 @@ Wire shape (see :mod:`src.gateway.protocol`)::
 Authentication is the gateway's existing per-device certificate — by the
 time a ``terminal_open`` frame reaches here the connection is already a
 verified member of the agent's network, so terminals inherit the same
-trust boundary as every other gateway action (vision §10, §11). A
-terminal is bound to the websocket that opened it and is torn down when
-that connection drops, matching SSH session semantics.
+trust boundary as every other gateway action (vision §10, §11). The
+authenticated device id remains audit identity, but terminal ownership is
+the gateway-generated websocket ``connection_id``. This distinction is
+load-bearing: Desktop and CLI may use the same device certificate at the
+same time and must not rebind, drive, or close each other's PTYs. A terminal
+is torn down when its exact websocket drops, matching SSH session semantics.
 
 POSIX only. The ``pty`` module is Unix-only; on Windows ``open`` returns
 a ``terminal_error`` rather than raising — the server host in every
@@ -133,7 +136,8 @@ class TerminalSession:
         self,
         *,
         terminal_id: str,
-        client_id: str,
+        connection_id: str,
+        device_id: str,
         on_output: OutputCb,
         on_exit: ExitCb,
         shell: str | None = None,
@@ -143,7 +147,8 @@ class TerminalSession:
         rows: int = DEFAULT_ROWS,
     ) -> None:
         self.terminal_id = terminal_id
-        self.client_id = client_id
+        self.connection_id = connection_id
+        self.device_id = device_id
         self._on_output = on_output
         self._on_exit = on_exit
         self.shell = shell or pick_shell()
@@ -217,7 +222,8 @@ class TerminalSession:
         elog(
             "terminal.start",
             terminal_id=self.terminal_id,
-            client_id=self.client_id,
+            client_id=self.device_id,
+            connection_id=self.connection_id,
             pid=self.pid,
             shell=self.shell,
             cwd=self.cwd,
@@ -279,6 +285,8 @@ class TerminalSession:
         elog(
             "terminal.exit",
             terminal_id=self.terminal_id,
+            client_id=self.device_id,
+            connection_id=self.connection_id,
             exit_code=exit_code,
             signal=sig,
         )
@@ -345,7 +353,12 @@ class TerminalSession:
                 pass
         await self._reap()
         await self._flush_and_stop_sender()
-        elog("terminal.close", terminal_id=self.terminal_id, client_id=self.client_id)
+        elog(
+            "terminal.close",
+            terminal_id=self.terminal_id,
+            client_id=self.device_id,
+            connection_id=self.connection_id,
+        )
 
     # ── Teardown helpers ────────────────────────────────────────────
 
@@ -414,21 +427,27 @@ _SENTINEL = object()
 
 
 class TerminalManager:
-    """Owns every live :class:`TerminalSession`, keyed by (client, id).
+    """Owns live PTYs, keyed by ``(websocket connection_id, terminal_id)``.
 
-    The gateway holds one of these. Per-client teardown
-    (:meth:`close_for_client`) runs from the websocket's ``finally`` so
-    a dropped connection never leaves orphan shells running on the host.
+    The authenticated ``device_id`` is stored on each session for audit only;
+    it is deliberately never used as an ownership key. Per-connection teardown
+    (:meth:`close_for_connection`) runs from the websocket's ``finally`` so a
+    dropped connection never leaves orphan shells or kills a sibling client's
+    terminal merely because both clients share one device certificate.
     """
 
     def __init__(self) -> None:
         self._sessions: dict[tuple[str, str], TerminalSession] = {}
 
-    def get(self, client_id: str, terminal_id: str) -> TerminalSession | None:
-        return self._sessions.get((client_id, terminal_id))
+    def get(self, connection_id: str, terminal_id: str) -> TerminalSession | None:
+        return self._sessions.get((connection_id, terminal_id))
 
-    def list_for_client(self, client_id: str) -> list[TerminalSession]:
-        return [s for (cid, _), s in self._sessions.items() if cid == client_id]
+    def list_for_connection(self, connection_id: str) -> list[TerminalSession]:
+        return [
+            session
+            for (owner_connection_id, _), session in self._sessions.items()
+            if owner_connection_id == connection_id
+        ]
 
     def count(self) -> int:
         return len(self._sessions)
@@ -436,7 +455,8 @@ class TerminalManager:
     async def open(
         self,
         *,
-        client_id: str,
+        connection_id: str,
+        device_id: str,
         terminal_id: str,
         on_output: OutputCb,
         on_exit: ExitCb,
@@ -447,13 +467,13 @@ class TerminalManager:
     ) -> TerminalSession:
         """Create + start a terminal — or re-attach to a live one.
 
-        If a session under this ``(client_id, terminal_id)`` is still
+        If a session under this ``(connection_id, terminal_id)`` is still
         running (its window was closed without an explicit
         ``terminal_close``), re-attach: rebind output to the new ws and
         resize to the new geometry rather than spawning a second shell.
         A dead session is replaced.
         """
-        key = (client_id, terminal_id)
+        key = (connection_id, terminal_id)
         existing = self._sessions.get(key)
         if existing is not None:
             if existing.is_running:
@@ -462,14 +482,16 @@ class TerminalManager:
                 elog(
                     "terminal.reattach",
                     terminal_id=terminal_id,
-                    client_id=client_id,
+                    client_id=device_id,
+                    connection_id=connection_id,
                     pid=existing.pid,
                 )
                 return existing
             await existing.close()
         session = TerminalSession(
             terminal_id=terminal_id,
-            client_id=client_id,
+            connection_id=connection_id,
+            device_id=device_id,
             on_output=on_output,
             on_exit=on_exit,
             shell=shell,
@@ -485,32 +507,32 @@ class TerminalManager:
             raise
         return session
 
-    def write(self, client_id: str, terminal_id: str, data: bytes) -> None:
-        s = self._sessions.get((client_id, terminal_id))
+    def write(self, connection_id: str, terminal_id: str, data: bytes) -> None:
+        s = self._sessions.get((connection_id, terminal_id))
         if s is not None:
             s.write(data)
 
-    def resize(self, client_id: str, terminal_id: str, cols: int, rows: int) -> None:
-        s = self._sessions.get((client_id, terminal_id))
+    def resize(self, connection_id: str, terminal_id: str, cols: int, rows: int) -> None:
+        s = self._sessions.get((connection_id, terminal_id))
         if s is not None:
             s.resize(cols, rows)
 
-    def signal(self, client_id: str, terminal_id: str, name: str) -> None:
-        s = self._sessions.get((client_id, terminal_id))
+    def signal(self, connection_id: str, terminal_id: str, name: str) -> None:
+        s = self._sessions.get((connection_id, terminal_id))
         if s is not None:
             s.send_signal(name)
 
-    async def close(self, client_id: str, terminal_id: str) -> bool:
+    async def close(self, connection_id: str, terminal_id: str) -> bool:
         """Close one terminal. Returns ``True`` if it existed."""
-        s = self._sessions.pop((client_id, terminal_id), None)
+        s = self._sessions.pop((connection_id, terminal_id), None)
         if s is None:
             return False
         await s.close()
         return True
 
-    async def close_for_client(self, client_id: str) -> int:
-        """Close every terminal a disconnecting client owned."""
-        keys = [k for k in self._sessions if k[0] == client_id]
+    async def close_for_connection(self, connection_id: str) -> int:
+        """Close only the terminals owned by one disconnecting websocket."""
+        keys = [k for k in self._sessions if k[0] == connection_id]
         for key in keys:
             s = self._sessions.pop(key, None)
             if s is not None:

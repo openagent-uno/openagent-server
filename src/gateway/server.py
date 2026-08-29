@@ -166,8 +166,9 @@ class Gateway:
         self._stop_event = stop_event
         self.sessions = SessionManager(agent_name=agent.name)
         # PTY-backed interactive terminals (the "SSH terminal" surface).
-        # Keyed by (client_id, terminal_id); torn down per-client when a
-        # websocket drops so a closed app never leaks live shells.
+        # Keyed by (connection_id, terminal_id); device identity is audit/auth
+        # metadata only. This lets Desktop and CLI share a device certificate
+        # without sharing or tearing down each other's shells.
         self.terminals = TerminalManager()
         # Chat sockets are keyed per *connection*, not per device. Desktop and
         # CLI may be online under the same device certificate simultaneously;
@@ -176,6 +177,9 @@ class Gateway:
         self.clients: dict[str, object] = {}  # connection_id → WebSocketResponse
         self._chat_client_devices: dict[str, str] = {}
         self._chat_client_instances: dict[str, str | None] = {}
+        self._chat_client_render_contexts: dict[
+            str, tuple[str | None, tuple[tuple[str, bool | int | str], ...]]
+        ] = {}
         self._chat_client_auth_epochs: dict[str, int] = {}
         self.capabilities = CapabilityRegistry()
         self._capability_reaper_task: asyncio.Task | None = None
@@ -1256,6 +1260,8 @@ class Gateway:
         self.clients.clear()
         self._chat_client_devices.clear()
         self._chat_client_instances.clear()
+        self._chat_client_render_contexts.clear()
+        self._chat_client_auth_epochs.clear()
         self._event_loop = None
 
     async def _system_broadcast_loop(self) -> None:
@@ -2130,6 +2136,7 @@ class Gateway:
         self.clients[connection_id] = ws
         self._chat_client_devices[connection_id] = client_id
         self._chat_client_instances[connection_id] = None
+        self._chat_client_render_contexts[connection_id] = (None, ())
         self._chat_client_auth_epochs[connection_id] = int(
             request.get("device_auth_epoch", 0),
         )
@@ -2145,6 +2152,10 @@ class Gateway:
             "agent_name": self.agent.name,
             "version": getattr(src, "__version__", "?"),
             "handle": cert.handle,
+            # Opaque, websocket-scoped owner token for auxiliary REST reads
+            # such as GET /api/terminals. It is never accepted as identity;
+            # the device certificate remains the authentication boundary.
+            "connection_id": connection_id,
             # Human-readable name (``agent-personal``) so the renderer
             # can pass it back through as the ``network`` segment of
             # ``handle@network`` on re-login. ``network_id`` is the
@@ -2284,7 +2295,12 @@ class Gateway:
                     P.TERMINAL_OPEN, P.TERMINAL_INPUT, P.TERMINAL_RESIZE,
                     P.TERMINAL_SIGNAL, P.TERMINAL_CLOSE,
                 ):
-                    await self._handle_terminal_frame(ws, client_id, data)
+                    await self._handle_terminal_frame(
+                        ws,
+                        connection_id,
+                        data,
+                        device_id=client_id,
+                    )
 
         except Exception as e:
             # Capture exception TYPE + traceback in addition to the bare
@@ -2318,19 +2334,26 @@ class Gateway:
                 del self.clients[connection_id]
                 self._chat_client_devices.pop(connection_id, None)
                 self._chat_client_instances.pop(connection_id, None)
+                self._chat_client_render_contexts.pop(connection_id, None)
                 self._chat_client_auth_epochs.pop(connection_id, None)
                 elog("gateway.client_disconnect", client_id=client_id)
                 # Stream sessions are server-owned: closing the app only
                 # detaches the transport. Any active turn keeps running and
                 # rehydrates through live_state on the next attachment.
-                # And kill any PTYs this client opened — a closed app or
-                # dropped link must not leave shells running on the host.
+                # Kill only the PTYs this exact websocket opened. Desktop and
+                # CLI can share ``client_id`` (one device certificate), so
+                # device-wide cleanup would terminate the surviving sibling.
                 try:
-                    reaped = await self.terminals.close_for_client(client_id)
+                    reaped = await self.terminals.close_for_connection(connection_id)
                     if reaped:
-                        elog("terminal.client_cleanup", client_id=client_id, closed=reaped)
+                        elog(
+                            "terminal.client_cleanup",
+                            client_id=client_id,
+                            connection_id=connection_id,
+                            closed=reaped,
+                        )
                 except Exception as e:  # noqa: BLE001
-                    logger.debug("terminal client cleanup failed: %s", e)
+                    logger.debug("terminal connection cleanup failed: %s", e)
         return ws
 
     async def _handle_command(
@@ -2730,7 +2753,12 @@ class Gateway:
         return forgotten
 
     async def _handle_terminal_frame(
-        self, ws, client_id: str, frame: dict,
+        self,
+        ws,
+        connection_id: str,
+        frame: dict,
+        *,
+        device_id: str,
     ) -> None:
         """Dispatch a PTY terminal frame (open/input/resize/signal/close).
 
@@ -2738,7 +2766,8 @@ class Gateway:
         opened the terminal — the callbacks below close over it. A
         terminal is bound to its websocket: when the connection drops,
         the ``finally`` in :meth:`_handle_ws` calls
-        ``terminals.close_for_client`` so no shell outlives its client.
+        ``terminals.close_for_connection`` so no shell outlives its socket or
+        collides with a sibling client using the same device certificate.
         """
         t = frame.get("type", "")
         terminal_id = (frame.get("terminal_id") or "").strip()
@@ -2787,7 +2816,8 @@ class Gateway:
 
             try:
                 session = await self.terminals.open(
-                    client_id=client_id,
+                    connection_id=connection_id,
+                    device_id=device_id,
                     terminal_id=terminal_id,
                     on_output=_on_output,
                     on_exit=_on_exit,
@@ -2801,7 +2831,8 @@ class Gateway:
                     "terminal.open_failed",
                     level="error",
                     terminal_id=terminal_id,
-                    client_id=client_id,
+                    client_id=device_id,
+                    connection_id=connection_id,
                     error=str(e),
                 )
                 await self._safe_ws_send_json(ws, {
@@ -2828,12 +2859,12 @@ class Gateway:
                 data = base64.b64decode(raw)
             except Exception:  # noqa: BLE001 — malformed client frame
                 return
-            self.terminals.write(client_id, terminal_id, data)
+            self.terminals.write(connection_id, terminal_id, data)
             return
 
         if t == P.TERMINAL_RESIZE:
             self.terminals.resize(
-                client_id, terminal_id,
+                connection_id, terminal_id,
                 int(frame.get("cols") or 80),
                 int(frame.get("rows") or 24),
             )
@@ -2841,12 +2872,12 @@ class Gateway:
 
         if t == P.TERMINAL_SIGNAL:
             self.terminals.signal(
-                client_id, terminal_id, str(frame.get("signal") or "INT"),
+                connection_id, terminal_id, str(frame.get("signal") or "INT"),
             )
             return
 
         if t == P.TERMINAL_CLOSE:
-            await self.terminals.close(client_id, terminal_id)
+            await self.terminals.close(connection_id, terminal_id)
             await self._safe_ws_send_json(ws, {
                 "type": P.TERMINAL_EXIT,
                 "terminal_id": terminal_id,
@@ -2879,7 +2910,10 @@ class Gateway:
         from src.stream.channel import RealtimeChannel
         from src.stream.wire import event_to_wire, wire_to_event
         from src.stream.events import Attachment, SessionClose, SessionOpen, TextFinal
-        from src.core.execution_origin import TrustedIngressIdentity
+        from src.core.execution_origin import (
+            TrustedIngressIdentity,
+            TrustedTurnContext,
+        )
 
         def _auth_epoch_current() -> bool:
             if device_pubkey is None or device_auth_epoch is None:
@@ -2987,17 +3021,42 @@ class Gateway:
                     url=ref.get("url"),
                 )
 
+        # Attachment normalization may read/copy bytes and therefore yield to
+        # live device revocation.  Revalidate before changing any per-socket or
+        # shared-session state.
+        if not _auth_epoch_current():
+            return
+
         # SessionOpen is the only chat frame that selects a local capability
         # instance. Store only the opaque instance id; every actual turn does
         # a fresh exact registry lookup so disconnect means server-only and can
         # never fall back to another client.
         if isinstance(evt, SessionOpen) and connection_id is not None:
             self._chat_client_instances[connection_id] = evt.client_instance_id
+            render_contexts = getattr(
+                self, "_chat_client_render_contexts", None,
+            )
+            if render_contexts is None:
+                render_contexts = {}
+                self._chat_client_render_contexts = render_contexts
+            render_contexts[connection_id] = (
+                evt.client_kind,
+                tuple(sorted(evt.client_capabilities.items())),
+            )
         instance_id = (
             self._chat_client_instances.get(connection_id)
             if connection_id is not None
             else None
         )
+        if isinstance(evt, SessionOpen):
+            client_kind = evt.client_kind
+            frozen_client_capabilities = tuple(
+                sorted(evt.client_capabilities.items())
+            )
+        else:
+            client_kind, frozen_client_capabilities = getattr(
+                self, "_chat_client_render_contexts", {},
+            ).get(connection_id, (None, ()))
         capability_registry = getattr(self, "capabilities", None)
         execution_origin = (
             capability_registry.origin_for(client_id, instance_id)
@@ -3013,6 +3072,12 @@ class Gateway:
             connection_id=connection_id or f"ws:{id(ws)}",
             client_instance_id=instance_id,
             auth_epoch=device_auth_epoch or 0,
+            turn_context=TrustedTurnContext(
+                on_behalf_identity=on_behalf_identity,
+                client_kind=client_kind,
+                client_capabilities=frozen_client_capabilities,
+                allow_local_attachment_paths=bool(trusted_bridge),
+            ),
         )
 
         if isinstance(evt, SessionClose):
@@ -3025,16 +3090,6 @@ class Gateway:
         ):
             await self._close_stream_session(key)
             holder = None
-        if holder is not None:
-            # Rebind authorization on every authenticated frame/reconnect.
-            # A long-lived StreamSession must never keep a stale principal
-            # merely because its transport was cached.
-            holder.session.on_behalf_identity = on_behalf_identity
-            holder.session.allow_local_attachment_paths = bool(trusted_bridge)
-            if isinstance(evt, SessionOpen):
-                holder.session.update_client_capabilities(
-                    evt.client_kind, evt.client_capabilities,
-                )
 
         if not _auth_epoch_current():
             return
@@ -3052,15 +3107,11 @@ class Gateway:
             # client opted out.
             coalesce_window_ms: int | None = None
             speak_enabled = True
-            client_kind: str | None = None
-            client_capabilities: dict = {}
             if isinstance(evt, SessionOpen):
                 language = evt.language
                 profile = evt.profile
                 coalesce_window_ms = evt.coalesce_window_ms
                 speak_enabled = bool(evt.speak)
-                client_kind = evt.client_kind
-                client_capabilities = evt.client_capabilities
             session = StreamSession(
                 self.agent,
                 client_id=client_id,
@@ -3072,7 +3123,7 @@ class Gateway:
                 handle=handle,
                 on_behalf_identity=on_behalf_identity,
                 client_kind=client_kind,
-                client_capabilities=client_capabilities,
+                client_capabilities=dict(frozen_client_capabilities),
                 allow_local_attachment_paths=trusted_bridge,
             )
             # Install gateway hooks: pre-dispatch enforces the same
@@ -3086,6 +3137,9 @@ class Gateway:
             )
             session.post_turn_hook = self._make_stream_post_turn_hook()
             await session.start()
+            if not _auth_epoch_current():
+                await session.close()
+                return
             channel = RealtimeChannel(
                 session,
                 lambda payload, _ws=ws: self._safe_ws_send_json(_ws, payload),
@@ -3100,6 +3154,9 @@ class Gateway:
                 lambda payload, _ws=ws: self._safe_ws_send_json(_ws, payload),
             )
             await channel.start()
+            if not _auth_epoch_current():
+                await channel.close()
+                return
             holder = _StreamHolder(session=session, channel=channel)
             self._stream_sessions[key] = holder
             elog(

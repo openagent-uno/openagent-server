@@ -1812,6 +1812,7 @@ async def t_revoke_only_matching_ingress(ctx: TestContext) -> None:
     "chat frame cannot re-admit revoked ingress after an attach await",
 )
 async def t_chat_attach_epoch_recheck(ctx: TestContext) -> None:
+    from src.core.on_behalf_context import OnBehalfIdentity
     from src.gateway.server import Gateway, _StreamHolder
     from src.stream.events import TextFinal
     from src.stream.wire import event_to_wire
@@ -1830,9 +1831,13 @@ async def t_chat_attach_epoch_recheck(ctx: TestContext) -> None:
     gateway.sessions = SimpleNamespace(
         get_or_create_session=lambda *_args, **_kwargs: "s",
     )
-    calls = {"allow": 0, "push": 0}
+    calls = {"allow": 0, "push": 0, "capabilities": 0}
 
     class Session:
+        def __init__(self):
+            self.on_behalf_identity = "original-principal"
+            self.allow_local_attachment_paths = False
+
         def has_active_turn(self):
             return False
 
@@ -1842,11 +1847,15 @@ async def t_chat_attach_epoch_recheck(ctx: TestContext) -> None:
         async def push_in(self, *_args, **_kwargs):
             calls["push"] += 1
 
+        def update_client_capabilities(self, *_args, **_kwargs):
+            calls["capabilities"] += 1
+
     class Channel:
         pass
 
+    session = Session()
     gateway._stream_sessions[("alice", "s")] = _StreamHolder(
-        session=Session(), channel=Channel(),
+        session=session, channel=Channel(),
     )
 
     async def revoke_during_attach(_key, _holder):
@@ -1863,11 +1872,17 @@ async def t_chat_attach_epoch_recheck(ctx: TestContext) -> None:
             session_id="s", seq=1, ts_ms=1, text="must be dropped",
         )),
         handle="alice",
+        on_behalf_identity=OnBehalfIdentity(
+            "network", "user", "alice", device_pubkey.hex(),
+        ),
+        trusted_bridge=True,
         connection_id="conn",
         device_pubkey=device_pubkey,
         device_auth_epoch=0,
     )
-    assert calls == {"allow": 0, "push": 0}
+    assert calls == {"allow": 0, "push": 0, "capabilities": 0}
+    assert session.on_behalf_identity == "original-principal"
+    assert session.allow_local_attachment_paths is False
     assert gateway._live_replays == {}
 
 
@@ -2391,6 +2406,91 @@ async def t_stream_turn_origin(ctx: TestContext) -> None:
     )
     assert seen == [origin]
     assert current_execution_origin() is None
+
+
+@test(
+    "client_capabilities",
+    "stream turn freezes principal and rendering policy through persistence",
+)
+async def t_stream_turn_security_context(ctx: TestContext) -> None:
+    import src.memory.artifacts as artifact_module
+    import src.stream.content_parts as content_parts_module
+    from src.core.execution_origin import TrustedTurnContext
+    from src.core.on_behalf_context import (
+        OnBehalfIdentity,
+        current_on_behalf_identity,
+    )
+    from src.stream.session import StreamSession, StreamTurnRunner
+
+    principal_a = OnBehalfIdentity("network", "user", "alice", "device-a")
+    principal_b = OnBehalfIdentity("network", "user", "alice", "device-b")
+    started = asyncio.Event()
+    release = asyncio.Event()
+    model_principals: list[object] = []
+    persisted_principals: list[object] = []
+    inline_ui_flags: list[bool] = []
+
+    class Agent:
+        memory_db = object()
+
+        async def run_stream(self, **_kwargs):
+            model_principals.append(current_on_behalf_identity())
+            started.set()
+            await release.wait()
+            yield {"kind": "done", "text": "[FILE:/tmp/frozen.txt]"}
+
+        def last_response_meta(self, _session_id):
+            return {}
+
+    original_parse = content_parts_module.parse_response_content
+    original_persist = artifact_module.persist_output_attachments
+
+    def recording_parse(text, *, allow_inline_ui=False):
+        inline_ui_flags.append(bool(allow_inline_ui))
+        return original_parse(text, allow_inline_ui=allow_inline_ui)
+
+    async def recording_persist(
+        _db, _session_id, attachments, *, principal,
+    ):
+        persisted_principals.append(principal)
+        return [dict(item) for item in attachments]
+
+    content_parts_module.parse_response_content = recording_parse
+    artifact_module.persist_output_attachments = recording_persist
+    session = StreamSession(
+        Agent(),
+        client_id="device-b",
+        session_id="shared",
+        on_behalf_identity=principal_b,
+        client_kind="cli",
+        client_capabilities={"inline_ui": False},
+    )
+    turn_context = TrustedTurnContext(
+        on_behalf_identity=principal_a,
+        client_kind="desktop",
+        client_capabilities=(("inline_ui", True),),
+    )
+    try:
+        task = asyncio.create_task(StreamTurnRunner(Agent(), session).run(
+            "hello",
+            client_id="device-a",
+            session_id="shared",
+            turn_context=turn_context,
+        ))
+        await asyncio.wait_for(started.wait(), timeout=2)
+        # Simulate another authenticated connection resuming the same durable
+        # session while A's provider call is still in flight.
+        session.on_behalf_identity = principal_b
+        session.update_client_capabilities("cli", {"inline_ui": False})
+        release.set()
+        await asyncio.wait_for(task, timeout=2)
+    finally:
+        content_parts_module.parse_response_content = original_parse
+        artifact_module.persist_output_attachments = original_persist
+
+    assert model_principals == [principal_a]
+    assert persisted_principals == [principal_a]
+    assert inline_ui_flags == [True]
 
 
 @test("client_capabilities", "session-open carries instance id and prompt tail is uncached")

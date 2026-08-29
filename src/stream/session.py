@@ -462,6 +462,17 @@ class StreamSession:
                 "source": getattr(evt, "source", "") or "",
                 "handle": self.handle or "",
             })
+            # The journal write yields. A live revocation may have installed a
+            # barrier while it was in flight, so do not enqueue trusted state
+            # from the now-stale socket afterwards.
+            if self._ingress_is_revoked(ingress_identity):
+                elog(
+                    "stream.ingress.revoked_drop",
+                    level="warning",
+                    session_id=self.session_id,
+                    device_id=ingress_device,
+                )
+                return
         if isinstance(evt, TextFinal):
             self._event_origins[id(evt)] = execution_origin
         elif isinstance(evt, TextDelta):
@@ -953,6 +964,12 @@ class StreamSession:
 
         if isinstance(evt, Attachment):
             ingress = self._event_ingresses.pop(id(evt), None)
+            turn_context = getattr(ingress, "turn_context", None)
+            allow_local_attachment_paths = (
+                bool(turn_context.allow_local_attachment_paths)
+                if turn_context is not None
+                else self.allow_local_attachment_paths
+            )
             attachment = {
                 "type": evt.kind,
                 "path": evt.path,
@@ -967,7 +984,7 @@ class StreamSession:
             if (
                 attachment["path"]
                 and not attachment["artifact_id"]
-                and not self.allow_local_attachment_paths
+                and not allow_local_attachment_paths
             ):
                 # Defence in depth for callers that bypass Gateway dispatch
                 # (tests/custom adapters).  The gateway normally either
@@ -1282,6 +1299,20 @@ class StreamSession:
             tts=self._tts,
             language=self.language,
         )
+        trusted_turn_context = getattr(ingress_identity, "turn_context", None)
+        if trusted_turn_context is None:
+            # Direct/embedded StreamSession users do not pass a Gateway ingress
+            # object. Snapshot their constructor-level policy now so even a
+            # local caller changing session metadata cannot affect this turn.
+            from src.core.execution_origin import TrustedTurnContext
+
+            trusted_turn_context = TrustedTurnContext(
+                on_behalf_identity=self.on_behalf_identity,
+                client_kind=self.client_kind,
+                client_capabilities=tuple(sorted(self.client_capabilities.items())),
+                allow_local_attachment_paths=self.allow_local_attachment_paths,
+            )
+        turn_client_id = _ingress_device_id(ingress_identity) or self.client_id
         # Reset the engagement flag — the runner flips it on the first
         # event from ``run_stream``. See ``_current_turn_msg`` field
         # comment for the salvage rationale.
@@ -1301,13 +1332,14 @@ class StreamSession:
         self._current_turn = asyncio.create_task(
             runner.run(
                 text,
-                client_id=self.client_id,
+                client_id=turn_client_id,
                 session_id=self.session_id,
                 attachments=attachments or None,
                 speak=speak,
                 author=turn_author,
                 execution_origin=execution_origin,
                 ingress_identity=ingress_identity,
+                turn_context=trusted_turn_context,
                 turn_token=turn_token,
             ),
             name=f"stream-turn:{self.session_id}",
@@ -1543,9 +1575,20 @@ class StreamTurnRunner:
         author: dict | None = None,
         execution_origin: Any = None,
         ingress_identity: Any = None,
+        turn_context: Any = None,
         turn_token: object | None = None,
     ) -> dict[str, Any]:
         sess = self._session
+        if turn_context is None:
+            from src.core.execution_origin import TrustedTurnContext
+
+            turn_context = TrustedTurnContext(
+                on_behalf_identity=sess.on_behalf_identity,
+                client_kind=sess.client_kind,
+                client_capabilities=tuple(sorted(sess.client_capabilities.items())),
+                allow_local_attachment_paths=sess.allow_local_attachment_paths,
+            )
+        turn_principal = turn_context.on_behalf_identity
         artifact_db = (
             getattr(self._agent, "memory_db", None)
             or getattr(self._agent, "db", None)
@@ -1738,7 +1781,7 @@ class StreamTurnRunner:
             reset_on_behalf_identity,
         )
         _child_emit_tok = install_child_stream_emitter(child_emit)
-        _on_behalf_tok = install_on_behalf_identity(sess.on_behalf_identity)
+        _on_behalf_tok = install_on_behalf_identity(turn_principal)
         from src.core.execution_origin import (
             install_execution_origin, reset_execution_origin,
         )
@@ -1889,7 +1932,7 @@ class StreamTurnRunner:
             from src.stream.content_parts import parse_response_content
             parsed_content = parse_response_content(
                 full_text,
-                allow_inline_ui=sess.supports_client_capability("inline_ui"),
+                allow_inline_ui=turn_context.supports_client_capability("inline_ui"),
             )
             clean = parsed_content.text
             att_list = [dict(a) for a in parsed_content.attachments]
@@ -1902,7 +1945,7 @@ class StreamTurnRunner:
                         artifact_db,
                         session_id,
                         att_list,
-                        principal=sess.on_behalf_identity,
+                        principal=turn_principal,
                     )
                     att_list = [dict(item) for item in persisted]
                     attachment_iter = iter(att_list)
@@ -1940,12 +1983,12 @@ class StreamTurnRunner:
             if any(part.get("kind") == "ui_view" for part in content_parts):
                 validated_parts: list[dict[str, Any]] = []
                 access = None
-                if sess.on_behalf_identity is not None:
+                if turn_principal is not None:
                     try:
                         from src.memory.operational.access import AccessContext
 
                         access = AccessContext.from_on_behalf_identity(
-                            sess.on_behalf_identity
+                            turn_principal
                         )
                     except PermissionError:
                         access = None
@@ -1999,7 +2042,7 @@ class StreamTurnRunner:
                         session_id,
                         attachments,
                         role="user",
-                        principal=sess.on_behalf_identity,
+                        principal=turn_principal,
                         after_sequence=sequence_floor["user"],
                     )
                     await link_attachments_to_latest_message(
@@ -2007,7 +2050,7 @@ class StreamTurnRunner:
                         session_id,
                         att_list,
                         role="assistant",
-                        principal=sess.on_behalf_identity,
+                        principal=turn_principal,
                         after_sequence=sequence_floor["assistant"],
                     )
                 except Exception as exc:  # noqa: BLE001
@@ -2037,7 +2080,7 @@ class StreamTurnRunner:
                         session_id,
                         role="user",
                         parts=user_parts,
-                        principal=sess.on_behalf_identity,
+                        principal=turn_principal,
                         after_sequence=sequence_floor["user"],
                     )
                     await persist_parts_for_latest_message(
@@ -2045,7 +2088,7 @@ class StreamTurnRunner:
                         session_id,
                         role="assistant",
                         parts=content_parts,
-                        principal=sess.on_behalf_identity,
+                        principal=turn_principal,
                         after_sequence=sequence_floor["assistant"],
                     )
                 except Exception as exc:  # noqa: BLE001

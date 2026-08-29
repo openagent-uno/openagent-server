@@ -50,6 +50,30 @@ class TurnExecutionOrigin:
 
 
 @dataclass(frozen=True, slots=True)
+class TrustedTurnContext:
+    """Immutable authorization and rendering policy for one client ingress.
+
+    The Gateway snapshots this from the authenticated connection.  It is kept
+    next to (but separate from) capability routing so a turn with no local MCP
+    host still retains its exact principal and client feature set.  Tuples make
+    the capability map immutable while it crosses debounce/STT queues.
+    """
+
+    on_behalf_identity: Any = field(repr=False, compare=False)
+    client_kind: str | None = None
+    client_capabilities: tuple[tuple[str, bool | int | str], ...] = ()
+    allow_local_attachment_paths: bool = False
+
+    def supports_client_capability(self, name: str, *, version: int = 1) -> bool:
+        value = dict(self.client_capabilities).get(name)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int):
+            return value >= version
+        return False
+
+
+@dataclass(frozen=True, slots=True)
 class TrustedIngressIdentity:
     """Authenticated chat transport that supplied one inbound event.
 
@@ -67,6 +91,12 @@ class TrustedIngressIdentity:
     # from the event wire and lets a delayed revocation callback distinguish an
     # old socket from a freshly authenticated post-reactivation socket.
     auth_epoch: int = 0
+    # Present only when the Gateway captured the connection's authenticated
+    # turn policy. ``None`` preserves the direct/legacy StreamSession API,
+    # whose constructor-level values remain the fallback for local callers.
+    turn_context: TrustedTurnContext | None = field(
+        default=None, repr=False, compare=False,
+    )
 
 
 _origin_var: ContextVar[TurnExecutionOrigin | None] = ContextVar(

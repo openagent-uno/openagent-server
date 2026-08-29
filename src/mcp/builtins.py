@@ -839,13 +839,20 @@ def resolve_builtin_entry(name: str, env: dict[str, str] | None = None) -> dict[
     # In-process specs don't need a directory, a subprocess, or Node — return
     # early with a lightweight descriptor that MCPPool knows how to consume.
     if spec.get("in_process"):
-        return {
+        resolved = {
             "name": name,
             "in_process": True,
             "adapter_module": spec["adapter_module"],
             "runtime_toolkit_factory": spec.get("runtime_toolkit_factory", "build_runtime_toolkit"),
-            "env": dict(env) if env else None,
         }
+        # In-process adapters do not inherit a manufactured subprocess
+        # environment, but some of them (notably the shared filesystem core)
+        # intentionally accept explicit operator configuration through env.
+        # Keep that configuration without adding an empty ``env`` field so
+        # principal-bound adapters such as memory-search stay ambient-free.
+        if env:
+            resolved["env"] = dict(env)
+        return resolved
 
     mcp_dir = (
         sidecar_source("agent-in-chrome") / "host"
@@ -951,6 +958,20 @@ def resolve_default_entry(entry: dict[str, Any], db_path: str | None = None) -> 
         if not is_python and not is_native and not is_in_process and not _find_node_binary():
             logger.warning("Skipping default MCP '%s': Node.js not found", name)
             return None
+
+        # In-process MCPs receive live dependencies (including the canonical
+        # DB object and authenticated turn context) from MCPPool. Do not
+        # manufacture subprocess-only values such as OPENAGENT_DB_PATH for
+        # them. Explicit adapter configuration is still preserved — e.g. an
+        # existing filesystem row may carry OPENAGENT_FILESYSTEM_ROOTS.
+        if is_in_process:
+            try:
+                return resolve_builtin_entry(
+                    entry["builtin"], env=entry.get("env") or None,
+                )
+            except Exception as exc:
+                logger.warning("Skipping default MCP '%s': %s", name, exc)
+                return None
 
         extra_env: dict[str, str] = dict(entry.get("env") or {})
         # Every builtin gets OPENAGENT_DB_PATH, whether or not it looks like

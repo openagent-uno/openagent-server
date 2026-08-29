@@ -711,6 +711,9 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_peer_policy",
     # 9. Gateway /stop, /clear, /new command semantics
     "test_gateway_commands",
+    # Interactive PTYs are websocket-owned, not device-owned. Desktop and CLI
+    # may share one certificate without rebinding or closing each other's shell.
+    "test_gateway_terminals",
     # SessionManager must run sessions in parallel on one client
     # (each session has its own worker queue). Prior design funneled
     # every message from a client through one queue, serialising chat
