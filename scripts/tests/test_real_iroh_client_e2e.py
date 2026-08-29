@@ -305,6 +305,41 @@ async def _wait_for_owned_broker(server, task: asyncio.Task, *, timeout: float =
 
 @test(
     "real_iroh_client_e2e",
+    "Desktop harness gives Agent the coordinator canonical database",
+)
+async def t_desktop_harness_uses_canonical_db(_ctx: TestContext) -> None:
+    """Keep the cross-repo Desktop harness production-shaped.
+
+    The real Playwright E2E launches this script as a child process, outside
+    the server test runner.  Pin the critical constructor boundary here so a
+    future ``memory=None`` or omitted keyword cannot reach app CI and fail only
+    when Gateway registers canonical-DB-backed surfaces such as Custom Views.
+    """
+
+    import ast
+
+    harness = Path(__file__).resolve().parents[1] / "desktop_real_iroh_harness.py"
+    tree = ast.parse(harness.read_text(encoding="utf-8"), filename=str(harness))
+    agent_calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "Agent"
+    ]
+    assert len(agent_calls) == 1, "Desktop harness must construct exactly one Agent"
+    keywords = {
+        keyword.arg: keyword.value
+        for keyword in agent_calls[0].keywords
+        if keyword.arg is not None
+    }
+    memory = keywords.get("memory")
+    assert isinstance(memory, ast.Name) and memory.id == "db", (
+        "Desktop harness Agent must receive the coordinator canonical db"
+    )
+
+
+@test(
+    "real_iroh_client_e2e",
     "real Iroh routes one session exactly across simultaneous Desktop and CLI hosts",
 )
 async def t_real_iroh_client_tool_turn(ctx: TestContext) -> None:
