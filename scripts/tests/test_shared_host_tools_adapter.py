@@ -1,10 +1,60 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
+import os
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
+from ._framework import TestContext, TestSkip, test as register_test
+
+try:
+    import pytest
+except ModuleNotFoundError:
+    # The release suite intentionally runs against production dependencies.
+    # Keep these contracts directly runnable under pytest when the dev extra is
+    # installed, while allowing the canonical decorator runner to import and
+    # execute the same functions without making pytest a runtime dependency.
+    class _Raises:
+        def __init__(self, error_type):
+            self.error_type = error_type
+            self.value = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, error_type, value, _traceback):
+            if error_type is None or not issubclass(error_type, self.error_type):
+                return False
+            self.value = value
+            return True
+
+    class _Mark:
+        def __getattr__(self, _name):
+            def mark(*args, **_kwargs):
+                if len(args) == 1 and callable(args[0]):
+                    return args[0]
+
+                def decorate(function):
+                    return function
+
+                return decorate
+
+            return mark
+
+    class _PytestCompatibility:
+        mark = _Mark()
+
+        @staticmethod
+        def raises(error_type):
+            return _Raises(error_type)
+
+        @staticmethod
+        def skip(reason):
+            raise TestSkip(reason)
+
+    pytest = _PytestCompatibility()
 
 from openagent_host_tools.builtins import EditorServer, FilesystemServer, ShellServer
 from openagent_host_tools.context import current_principal
@@ -498,3 +548,120 @@ async def test_server_shell_uses_shared_exact_contract(tmp_path: Path, monkeypat
         reset_session_context(session_token)
         current_principal.reset(principal_token)
         await local.close()
+
+
+class _CanonicalMonkeyPatch:
+    """Small reversible fixture for the repository's canonical test runner."""
+
+    def __init__(self):
+        self._undo = []
+
+    def chdir(self, path: Path) -> None:
+        previous = Path.cwd()
+        os.chdir(path)
+        self._undo.append(lambda: os.chdir(previous))
+
+    def setattr(self, target, name: str, value) -> None:
+        previous = getattr(target, name)
+        setattr(target, name, value)
+        self._undo.append(lambda: setattr(target, name, previous))
+
+    def undo(self) -> None:
+        for restore in reversed(self._undo):
+            restore()
+        self._undo.clear()
+
+
+async def _run_with_temp_path(
+    ctx: TestContext,
+    function,
+    *,
+    monkeypatch: bool = False,
+) -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="shared-host-tools-", dir=ctx.test_dir
+    ) as temporary:
+        patcher = _CanonicalMonkeyPatch()
+        try:
+            # macOS exposes /tmp through a symlink to /private/tmp; the host
+            # cores deliberately canonicalize paths, so fixtures must do the
+            # same before asserting exact configured roots/helper locations.
+            arguments = [Path(temporary).resolve()]
+            if monkeypatch:
+                arguments.append(patcher)
+            result = function(*arguments)
+            if inspect.isawaitable(result):
+                await result
+        finally:
+            patcher.undo()
+
+
+@register_test("host-tools", "server and client Agent in Chrome assets are identical")
+async def _registered_agent_in_chrome_assets(_ctx: TestContext) -> None:
+    for relative in (Path("host/browser.js"), Path("README.md")):
+        test_server_agent_in_chrome_assets_match_shared_host_tools(relative)
+
+
+@register_test("host-tools", "filesystem shared core preserves server locality")
+async def _registered_filesystem_core(ctx: TestContext) -> None:
+    await _run_with_temp_path(
+        ctx,
+        test_server_filesystem_uses_shared_core_and_preserves_server_locality,
+        monkeypatch=True,
+    )
+
+
+@register_test("host-tools", "editor shared core contract matches standalone host")
+async def _registered_editor_core(ctx: TestContext) -> None:
+    await _run_with_temp_path(
+        ctx, test_server_editor_uses_shared_core, monkeypatch=True
+    )
+
+
+@register_test("host-tools", "filesystem preserves configured and database roots")
+async def _registered_filesystem_roots(ctx: TestContext) -> None:
+    await _run_with_temp_path(
+        ctx,
+        test_server_filesystem_preserves_configured_and_db_roots,
+        monkeypatch=True,
+    )
+
+
+@register_test("host-tools", "default MCP specs use shared in-process adapters")
+async def _registered_default_adapters(_ctx: TestContext) -> None:
+    test_default_specs_route_through_shared_in_process_adapters()
+
+
+@register_test("host-tools", "Agent in Chrome profile and port are network scoped")
+async def _registered_agent_in_chrome_scope(ctx: TestContext) -> None:
+    await _run_with_temp_path(
+        ctx, test_server_agent_in_chrome_is_network_scoped_and_collision_safe
+    )
+
+
+@register_test("host-tools", "Agent in Chrome marker owns only its exact port")
+async def _registered_agent_in_chrome_marker(ctx: TestContext) -> None:
+    await _run_with_temp_path(
+        ctx, test_agent_in_chrome_profile_marker_allows_only_exact_browser_port
+    )
+
+
+@register_test("host-tools", "frozen macOS server selects signed computer helper")
+async def _registered_signed_computer_helper(ctx: TestContext) -> None:
+    await _run_with_temp_path(
+        ctx,
+        test_frozen_macos_computer_control_prefers_nested_signed_helper_app,
+        monkeypatch=True,
+    )
+
+
+@register_test("host-tools", "tool-search preserves all host tool classifications")
+async def _registered_tool_classification(_ctx: TestContext) -> None:
+    test_server_tool_search_preserves_classification_for_all_five_builtins()
+
+
+@register_test("host-tools", "shell shared core matches the standalone contract")
+async def _registered_shell_contract(ctx: TestContext) -> None:
+    await _run_with_temp_path(
+        ctx, test_server_shell_uses_shared_exact_contract, monkeypatch=True
+    )
