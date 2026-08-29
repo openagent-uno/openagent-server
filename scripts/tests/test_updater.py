@@ -976,8 +976,11 @@ async def t_release_verifier_accepts_windows_binary_marker(ctx: TestContext) -> 
     version = "9.8.7-beta.6"
     base = f"openagent-{version}"
     archive_names = (
+        f"{base}-linux-arm64.tar.gz",
         f"{base}-linux-x64.tar.gz",
         f"{base}-macos-arm64.pkg",
+        f"{base}-macos-x64.pkg",
+        f"{base}-windows-arm64.zip",
         f"{base}-windows-x64.zip",
     )
     with tempfile.TemporaryDirectory() as directory:
@@ -986,7 +989,7 @@ async def t_release_verifier_accepts_windows_binary_marker(ctx: TestContext) -> 
             archive = root / name
             archive.write_bytes(f"fixture-{index}".encode())
             digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-            marker = "*" if name.endswith("windows-x64.zip") else " "
+            marker = "*" if "-windows-" in name else " "
             # Pin CRLF too: Windows-produced checksum assets must remain valid.
             (root / f"{name}.sha256").write_bytes(
                 f"{digest} {marker}{name}\r\n".encode(),
@@ -1000,7 +1003,7 @@ async def t_release_verifier_accepts_windows_binary_marker(ctx: TestContext) -> 
             check=False,
         )
         assert result.returncode == 0, result.stderr or result.stdout
-        assert "verified 6 immutable release assets" in result.stdout
+        assert "verified 12 immutable release assets" in result.stdout
 
 
 @test("updater", "release verifier rejects a checksum target hidden in a path")
@@ -1014,8 +1017,11 @@ async def t_release_verifier_rejects_nested_checksum_target(ctx: TestContext) ->
     version = "9.8.7-beta.6"
     base = f"openagent-{version}"
     archive_names = (
+        f"{base}-linux-arm64.tar.gz",
         f"{base}-linux-x64.tar.gz",
         f"{base}-macos-arm64.pkg",
+        f"{base}-macos-x64.pkg",
+        f"{base}-windows-arm64.zip",
         f"{base}-windows-x64.zip",
     )
     with tempfile.TemporaryDirectory() as directory:

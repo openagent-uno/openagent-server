@@ -34,14 +34,19 @@ parser.add_argument("--expect-prerelease", type=parse_bool)
 args = parser.parse_args()
 
 base = f"openagent-{args.version}"
-expected = {
-    f"{base}-linux-x64.tar.gz",
-    f"{base}-linux-x64.tar.gz.sha256",
-    f"{base}-macos-arm64.pkg",
-    f"{base}-macos-arm64.pkg.sha256",
-    f"{base}-windows-x64.zip",
-    f"{base}-windows-x64.zip.sha256",
+release_targets = (
+    ("linux", "arm64", "tar.gz"),
+    ("linux", "x64", "tar.gz"),
+    ("macos", "arm64", "pkg"),
+    ("macos", "x64", "pkg"),
+    ("windows", "arm64", "zip"),
+    ("windows", "x64", "zip"),
+)
+archives = {
+    f"{base}-{system}-{arch}.{extension}"
+    for system, arch, extension in release_targets
 }
+expected = archives | {f"{name}.sha256" for name in archives}
 files = [path for path in args.artifacts.rglob("*") if path.is_file()]
 names = [path.name for path in files]
 if len(names) != len(set(names)):
@@ -74,7 +79,11 @@ if args.release_json:
         raise SystemExit(f"unexpected draft state: {release.get('draft')!r}")
     if args.expect_prerelease is not None and release.get("prerelease") is not args.expect_prerelease:
         raise SystemExit(f"unexpected prerelease state: {release.get('prerelease')!r}")
-    remote = {asset["name"]: asset for asset in release.get("assets", [])}
+    remote_assets = release.get("assets", [])
+    remote_names = [asset["name"] for asset in remote_assets]
+    if len(remote_names) != len(set(remote_names)):
+        raise SystemExit(f"duplicate uploaded asset names: {remote_names}")
+    remote = {asset["name"]: asset for asset in remote_assets}
     if set(remote) != expected:
         raise SystemExit(
             "uploaded asset mismatch\n"
