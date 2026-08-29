@@ -117,6 +117,11 @@ class ModelProviderError(OpenAgentError):
     RATE_LIMIT_MESSAGE_PATTERNS = [
         "no available claude oauth account",   # sub-proxy: all accounts exhausted
         "no available oauth account",
+        # codex-sub-proxy: all ChatGPT subscription accounts are cooling down
+        # or model-limited.  It intentionally returns 429 so the configured
+        # local fallback can keep the turn alive instead of surfacing a hard
+        # provider failure.
+        "no available chatgpt account",
     ]
 
     def __init__(

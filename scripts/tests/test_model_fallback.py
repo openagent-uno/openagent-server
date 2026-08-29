@@ -80,3 +80,19 @@ async def t_account_exhaustion_falls_back(_ctx: TestContext) -> None:
     real_404 = ModelProviderError("model `foo` not found", status_code=404)
     assert not isinstance(ModelProviderError.classify(real_404), ModelRateLimitError)
     assert get_fallback_models(fc, real_404) is None
+
+
+@test("model_fallback",
+      "codex-sub-proxy no-account error classifies as rate-limit")
+async def t_chatgpt_account_exhaustion_falls_back(_ctx: TestContext) -> None:
+    from src.core.runtime_errors import ModelProviderError, ModelRateLimitError
+    from src.models.providers.fallback import FallbackConfig, get_fallback_models
+
+    fc = FallbackConfig(on_rate_limit=["windows-local:qwen3-moe-local"])
+    exhausted = ModelProviderError(
+        "No available ChatGPT accounts. Run `codex-sub-proxy login --priority 10` "
+        "(or `codex-sub-proxy import`) to add one. Retry after about 120s.",
+        status_code=429,
+    )
+    assert isinstance(ModelProviderError.classify(exhausted), ModelRateLimitError)
+    assert get_fallback_models(fc, exhausted) == ["windows-local:qwen3-moe-local"]
