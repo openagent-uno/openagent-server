@@ -72,6 +72,15 @@ async def _start_deterministic_model_endpoint(targets: dict[str, Path]):
             message for message in messages[latest_user_index + 1:]
             if isinstance(message, dict) and message.get("role") == "tool"
         ]
+        latest_tool_result = (
+            json.dumps(tool_results[-1].get("content"), sort_keys=True)
+            if tool_results
+            else ""
+        )
+        latest_tool_failed = (
+            '"iserror": true' in latest_tool_result.lower()
+            or '"iserror":true' in latest_tool_result.lower()
+        )
         message: dict
         finish_reason: str
         if tool_name and len(tool_results) == 0 and client_kind == "desktop-offline":
@@ -115,7 +124,7 @@ async def _start_deterministic_model_endpoint(targets: dict[str, Path]):
                 }],
             }
             finish_reason = "tool_calls"
-        elif tool_name and len(tool_results) == 1:
+        elif tool_name and len(tool_results) == 1 and not latest_tool_failed:
             arguments = {
                 "server": "client:filesystem",
                 "tool": "read_text_file",
@@ -135,12 +144,21 @@ async def _start_deterministic_model_endpoint(targets: dict[str, Path]):
             }
             finish_reason = "tool_calls"
         else:
+            expected_read_content = f"{client_kind}-sentinel"
+            read_succeeded = (
+                client_kind != "desktop-offline"
+                and len(tool_results) >= 2
+                and not latest_tool_failed
+                and expected_read_content in latest_tool_result
+            )
             message = {
                 "role": "assistant",
                 "content": (
                     "desktop client unavailable"
                     if client_kind == "desktop-offline"
                     else f"{client_kind} file written"
+                    if read_succeeded
+                    else f"{client_kind} file read failed"
                 ),
             }
             finish_reason = "stop"

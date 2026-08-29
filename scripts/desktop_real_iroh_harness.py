@@ -25,6 +25,7 @@ import json
 import os
 import signal
 import sys
+import threading
 import uuid
 from contextlib import suppress
 from pathlib import Path
@@ -59,21 +60,26 @@ async def _wait_for_stop() -> None:
         with suppress(NotImplementedError, RuntimeError):
             loop.add_signal_handler(sig, stopped.set)
 
-    stdin_task = asyncio.create_task(
-        asyncio.to_thread(sys.stdin.readline),
+    # A cancelled ``asyncio.to_thread(sys.stdin.readline)`` remains inside the
+    # loop's default executor and can make ``asyncio.run`` hang forever while
+    # stdin is still open. A tiny daemon reader gives stdin EOF/"stop" the same
+    # wakeup semantics without making signal-driven shutdown wait on that OS
+    # thread (notably on Windows, where add_reader is unavailable).
+    loop = asyncio.get_running_loop()
+
+    def read_stdin() -> None:
+        try:
+            sys.stdin.readline()
+        finally:
+            with suppress(RuntimeError):
+                loop.call_soon_threadsafe(stopped.set)
+
+    threading.Thread(
+        target=read_stdin,
         name="desktop-real-iroh-harness-stdin",
-    )
-    stop_task = asyncio.create_task(
-        stopped.wait(),
-        name="desktop-real-iroh-harness-signal",
-    )
-    done, pending = await asyncio.wait(
-        {stdin_task, stop_task}, return_when=asyncio.FIRST_COMPLETED,
-    )
-    for task in pending:
-        task.cancel()
-    await asyncio.gather(*pending, return_exceptions=True)
-    await asyncio.gather(*done, return_exceptions=True)
+        daemon=True,
+    ).start()
+    await stopped.wait()
 
 
 async def _persist_model_evidence(
