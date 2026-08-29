@@ -81,6 +81,25 @@ def _safety_catalog() -> list[dict]:
     }]
 
 
+def _computer_catalog() -> list[dict]:
+    return [{
+        "name": "computer-control",
+        "version": "1.0.0",
+        "tools": [{
+            "name": "computer",
+            "description": "screen and input control",
+            "classification": "mutating",
+            "classification_by_argument": {
+                "action": {
+                    "get_screenshot": "read_only",
+                    "get_cursor_position": "read_only",
+                },
+            },
+            "input_schema": {"type": "object"},
+        }],
+    }]
+
+
 @test("client_capabilities", "registry pins exact instance and preserves MCP result")
 async def t_registry_exact_instance(ctx: TestContext) -> None:
     from src.gateway.capabilities import CapabilityRegistry, ClientCapabilityError
@@ -100,6 +119,7 @@ async def t_registry_exact_instance(ctx: TestContext) -> None:
     a = await registry.register(
         device_id="dev", account_id="network-1", client_instance_id="desktop", generation=1,
         device_label="Mac", ws=_Ws(), send_json=send_a, servers=_catalog("A"),
+        network_id="network-1",
     )
     b_ws = _Ws()
     b = await registry.register(
@@ -119,6 +139,7 @@ async def t_registry_exact_instance(ctx: TestContext) -> None:
     assert frame["type"] == "client_tool_call"
     assert frame["generation"] == 1 and frame["session_id"] == "chat:1"
     assert frame["account_id"] == "network-1"
+    assert frame["network_id"] == "network-1"
     assert sent_b == [], "an exact desktop call leaked to the CLI instance"
     registry.resolve_result(a, {
         "type": "client_tool_result",
@@ -829,6 +850,189 @@ async def t_disconnect_result_classification(ctx: TestContext) -> None:
         raise AssertionError("disconnected instance accepted a stale generation")
     except ClientCapabilityError as exc:
         assert exc.code == "STALE_GENERATION"
+
+
+@test(
+    "client_capabilities",
+    "argument-specific classification is preserved and used before dispatch",
+)
+async def t_argument_specific_classification(ctx: TestContext) -> None:
+    from src.gateway.capabilities import (
+        CapabilityRegistry,
+        ClientCapabilityError,
+        _classification_for_arguments,
+    )
+
+    arguments = {"first": "yes", "second": "yes"}
+    forward_rules = {
+        "first": {"yes": "mutating"},
+        "second": {"yes": "read_only"},
+    }
+    forward = {
+        "classification": "read_only",
+        "classification_by_argument": forward_rules,
+    }
+    reverse = {
+        **forward,
+        "classification_by_argument": dict(reversed(list(forward_rules.items()))),
+    }
+    assert _classification_for_arguments(forward, arguments) == "mutating"
+    assert _classification_for_arguments(reverse, arguments) == "mutating"
+    assert _classification_for_arguments(forward, {}) == "read_only"
+
+    registry = CapabilityRegistry()
+    sent: list[dict] = []
+
+    async def send(_ws, payload):
+        sent.append(payload)
+        return True
+
+    conn = await registry.register(
+        device_id="dev",
+        account_id="account-shared",
+        network_id="network-a",
+        client_instance_id="desktop",
+        generation=1,
+        device_label="Mac",
+        ws=_Ws(),
+        send_json=send,
+        servers=_computer_catalog(),
+    )
+    origin = registry.origin_for("dev", "desktop")
+    assert origin is not None
+    listed = registry.list_tools(origin, "computer-control")
+    assert listed[0]["classification"] == "mutating"
+    assert listed[0]["classification_by_argument"]["action"][
+        "get_screenshot"
+    ] == "read_only"
+
+    screenshot = asyncio.create_task(registry.call_tool(
+        origin,
+        "computer-control",
+        "computer",
+        {"action": "get_screenshot"},
+        timeout_s=2,
+    ))
+    await asyncio.sleep(0)
+    screenshot_frame = sent[-1]
+    assert screenshot_frame["network_id"] == "network-a"
+    assert conn.pending[screenshot_frame["call_id"]].classification == "read_only"
+    registry.resolve_result(conn, {
+        "type": "client_tool_result",
+        "call_id": screenshot_frame["call_id"],
+        "generation": 1,
+        "result": {"content": []},
+    })
+    await screenshot
+
+    click = asyncio.create_task(registry.call_tool(
+        origin,
+        "computer-control",
+        "computer",
+        {"action": "left_click"},
+        timeout_s=2,
+    ))
+    await asyncio.sleep(0)
+    click_frame = sent[-1]
+    assert conn.pending[click_frame["call_id"]].classification == "mutating"
+    registry.resolve_result(conn, {
+        "type": "client_tool_result",
+        "call_id": click_frame["call_id"],
+        "generation": 1,
+        "result": {"content": []},
+    })
+    await click
+
+    unknown = asyncio.create_task(registry.call_tool(
+        origin,
+        "computer-control",
+        "computer",
+        {"action": "future_action"},
+        timeout_s=2,
+    ))
+    await asyncio.sleep(0)
+    unknown_frame = sent[-1]
+    assert conn.pending[unknown_frame["call_id"]].classification == "mutating"
+    registry.resolve_result(conn, {
+        "type": "client_tool_result",
+        "call_id": unknown_frame["call_id"],
+        "generation": 1,
+        "result": {"content": []},
+    })
+    await unknown
+
+    # A transport loss uses the resolved operation class, not the tool's base
+    # class: screenshots retry only on the exact host, while input is terminal
+    # and indeterminate because the local effect may already have happened.
+    disconnected = CapabilityRegistry()
+    first_sent: list[dict] = []
+    first_conn = await disconnected.register(
+        device_id="dynamic-dev",
+        account_id="dynamic-network",
+        client_instance_id="desktop",
+        generation=7,
+        device_label="Mac",
+        ws=_Ws(),
+        send_json=lambda _ws, frame: _record_send(first_sent, frame),
+        servers=_computer_catalog(),
+    )
+    disconnected_origin = disconnected.origin_for("dynamic-dev", "desktop")
+    assert disconnected_origin is not None
+    retryable_screenshot = asyncio.create_task(disconnected.call_tool(
+        disconnected_origin,
+        "computer-control",
+        "computer",
+        {"action": "get_screenshot"},
+        timeout_s=2,
+    ))
+    indeterminate_click = asyncio.create_task(disconnected.call_tool(
+        disconnected_origin,
+        "computer-control",
+        "computer",
+        {"action": "left_click"},
+        timeout_s=2,
+    ))
+    await asyncio.sleep(0)
+    screenshot_call_id = next(
+        frame["call_id"] for frame in first_sent
+        if frame.get("args", {}).get("action") == "get_screenshot"
+    )
+    await disconnected.unregister(first_conn)
+    try:
+        await indeterminate_click
+        raise AssertionError("disconnected click unexpectedly succeeded")
+    except ClientCapabilityError as exc:
+        assert exc.code == "CLIENT_RESULT_INDETERMINATE"
+
+    retry_conn: dict[str, object] = {}
+
+    async def send_retry(_ws, frame):
+        if frame.get("type") == "client_tool_call":
+            assert frame["call_id"] == screenshot_call_id
+            asyncio.get_running_loop().call_soon(
+                disconnected.resolve_result,
+                retry_conn["conn"],
+                {
+                    "type": "client_tool_result",
+                    "call_id": frame["call_id"],
+                    "generation": frame["generation"],
+                    "result": {"structuredContent": {"retried": True}},
+                },
+            )
+        return True
+
+    retry_conn["conn"] = await disconnected.register(
+        device_id="dynamic-dev",
+        account_id="dynamic-network",
+        client_instance_id="desktop",
+        generation=7,
+        device_label="Mac",
+        ws=_Ws(),
+        send_json=send_retry,
+        servers=_computer_catalog(),
+    )
+    screenshot_result = await retryable_screenshot
+    assert screenshot_result["structuredContent"] == {"retried": True}
 
 
 async def _record_send(target: list[dict], frame: dict) -> bool:

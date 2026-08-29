@@ -1871,6 +1871,16 @@ class Gateway:
                 })
                 await ws.close(code=4000, message=b"unsupported capability protocol")
                 return ws
+            claimed_network_id = hello.get("network_id")
+            if (
+                claimed_network_id is not None
+                and str(claimed_network_id) != cert.network_id
+            ):
+                await ws.close(
+                    code=4003,
+                    message=b"capability network does not match device certificate",
+                )
+                return ws
 
             # ``prepare`` + waiting for hello create an intentional await gap
             # after middleware authentication. Revalidate before publishing
@@ -1891,6 +1901,7 @@ class Gateway:
                 ws=ws,
                 send_json=self._safe_ws_send_json,
                 servers=hello.get("servers"),
+                network_id=cert.network_id,
                 auth_epoch=auth_epoch,
                 auth_epoch_reader=lambda: auth_state.device_epoch(cert.device_pubkey),
             )
@@ -1899,6 +1910,7 @@ class Gateway:
                 "protocol": CAPABILITY_PROTOCOL,
                 "device_id": conn.device_id,
                 "account_id": conn.account_id,
+                "network_id": conn.network_id,
                 "client_instance_id": conn.client_instance_id,
                 "generation": conn.generation,
                 "accepted": True,

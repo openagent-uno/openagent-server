@@ -161,9 +161,92 @@ def _normalise_tools(raw: Any) -> tuple[dict[str, Any], ...]:
             "description": description,
             "input_schema": schema,
             "classification": classification,
+            "classification_by_argument": _normalise_classification_rules(
+                item.get("classification_by_argument"),
+                tool_name=name,
+            ),
         }
         tools.append(normalised)
     return tuple(tools)
+
+
+def _normalise_classification_rules(
+    raw: Any,
+    *,
+    tool_name: str,
+) -> dict[str, dict[str, str]]:
+    """Validate invocation-specific safety metadata from the host manifest.
+
+    Some canonical MCPs multiplex reads and mutations behind an ``action``
+    argument. The base classification remains the conservative fallback; a
+    rule may only select one of the three protocol classifications for an
+    exact string value.
+    """
+
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ClientCapabilityError(
+            "INVALID_CATALOG",
+            f"classification_by_argument for {tool_name!r} must be an object",
+        )
+    rules: dict[str, dict[str, str]] = {}
+    for argument, raw_options in raw.items():
+        if (
+            not isinstance(argument, str)
+            or not argument
+            or len(argument) > MAX_CAPABILITY_NAME_LENGTH
+            or not isinstance(raw_options, dict)
+        ):
+            raise ClientCapabilityError(
+                "INVALID_CATALOG",
+                f"invalid classification rule for {tool_name!r}",
+            )
+        options: dict[str, str] = {}
+        for option, raw_classification in raw_options.items():
+            if (
+                not isinstance(option, str)
+                or not option
+                or len(option) > MAX_CAPABILITY_NAME_LENGTH
+            ):
+                raise ClientCapabilityError(
+                    "INVALID_CATALOG",
+                    f"invalid classification option for {tool_name!r}",
+                )
+            classification = (
+                str(raw_classification).strip().lower().replace("-", "_")
+            )
+            if classification == "readonly":
+                classification = "read_only"
+            if classification not in {"read_only", "idempotent", "mutating"}:
+                raise ClientCapabilityError(
+                    "INVALID_CATALOG",
+                    f"unsupported classification rule for {tool_name!r}: "
+                    f"{raw_classification!r}",
+                )
+            options[option] = classification
+        rules[argument] = options
+    return rules
+
+
+def _classification_for_arguments(
+    tool_manifest: dict[str, Any],
+    args: dict[str, Any],
+) -> str:
+    classification = str(tool_manifest.get("classification") or "mutating")
+    matches: list[str] = []
+    for argument, options in (
+        tool_manifest.get("classification_by_argument") or {}
+    ).items():
+        value = args.get(argument)
+        if isinstance(value, str):
+            matched = options.get(value)
+            if matched is not None:
+                matches.append(matched)
+    if not matches:
+        return classification
+    risk = {"read_only": 0, "idempotent": 1, "mutating": 2}
+    return max(matches, key=risk.__getitem__)
 
 
 def normalise_catalog(raw: Any) -> dict[str, dict[str, Any]]:
@@ -302,6 +385,7 @@ class CapabilityConnection:
     ws: Any
     send_json: Callable[[Any, dict[str, Any]], Awaitable[bool]]
     catalog: dict[str, dict[str, Any]]
+    network_id: str | None = None
     # Snapshot from NetworkAuthState.  A disconnect advances the epoch before
     # its async close callback, making late WebSocket registration detectable.
     auth_epoch: int = 0
@@ -377,6 +461,7 @@ class CapabilityRegistry:
         ws: Any,
         send_json: Callable[[Any, dict[str, Any]], Awaitable[bool]],
         servers: Any,
+        network_id: str | None = None,
         auth_epoch: int = 0,
         auth_epoch_reader: Callable[[], int] | None = None,
     ) -> CapabilityConnection:
@@ -408,6 +493,9 @@ class CapabilityRegistry:
             ws=ws,
             send_json=send_json,
             catalog=catalog,
+            network_id=(
+                str(network_id).strip() if network_id is not None else None
+            ),
             auth_epoch=auth_epoch,
         )
         key = (device_id, client_instance_id)
@@ -742,6 +830,15 @@ class CapabilityRegistry:
                 "name": tool["name"],
                 "description": tool["description"],
                 "classification": tool["classification"],
+                **(
+                    {
+                        "classification_by_argument": tool[
+                            "classification_by_argument"
+                        ],
+                    }
+                    if tool.get("classification_by_argument")
+                    else {}
+                ),
                 "execution_host": conn.origin(self).execution_host,
             }
             for tool in server["tools"]
@@ -774,11 +871,11 @@ class CapabilityRegistry:
         conn, _server = self._require_server(origin, server_name)
         # Description lookup is also the exact-name/no-fuzzy dispatch gate.
         tool_manifest = self.describe_tool(origin, server_name, tool_name)
-        classification = str(tool_manifest.get("classification") or "mutating")
         if args is None:
             args = {}
         if not isinstance(args, dict):
             raise ClientCapabilityError("INVALID_ARGUMENTS", "args must be an object")
+        classification = _classification_for_arguments(tool_manifest, args)
         timeout_s = max(0.1, min(float(timeout_s), MAX_CALL_TIMEOUT_S))
         call_id = uuid.uuid4().hex
         try:
@@ -798,6 +895,7 @@ class CapabilityRegistry:
             "target": "client",
             "device_id": conn.device_id,
             "account_id": conn.account_id,
+            "network_id": conn.network_id,
             "device_label": conn.device_label,
             "client_instance_id": conn.client_instance_id,
             "generation": conn.generation,
@@ -853,8 +951,7 @@ class CapabilityRegistry:
             )
             if (
                 current_tool is None
-                or str(current_tool.get("classification") or "mutating")
-                != classification
+                or _classification_for_arguments(current_tool, args) != classification
             ):
                 _audit(
                     "client_tool_call.error",
@@ -910,6 +1007,7 @@ class CapabilityRegistry:
                     "session_id": session_id,
                     # Trusted principal from the coordinator-signed cert.
                     "account_id": conn.account_id,
+                    "network_id": conn.network_id,
                     "idempotency_key": call_id,
                     "arguments_sha256": arguments_sha256,
                 })

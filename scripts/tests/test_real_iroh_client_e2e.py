@@ -3,8 +3,9 @@
 This test deliberately does not use ``InProcConnection`` or the gateway's
 optional TCP listener. It boots two real Iroh nodes, enrolls the client via
 the real coordinator PAKE service, opens both gateway WebSockets through the
-real loopback-to-Iroh adapter, and lets a deterministic agent turn dispatch a
-filesystem operation through the actual single-instance local broker.
+real loopback-to-Iroh adapter, and drives the real :class:`Agent` plus its
+runtime tool loop through a deterministic OpenAI-compatible model endpoint.
+That agent writes and reads through the actual single-instance local broker.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sqlite3
 import uuid
 from contextlib import suppress
 from pathlib import Path
@@ -19,59 +21,103 @@ from pathlib import Path
 from ._framework import TestContext, test
 
 
-class _DeterministicRuntime:
-    history_mode = None
+async def _start_deterministic_model_endpoint(target: Path):
+    """Serve deterministic OpenAI chat completions that require two tools."""
 
-    def set_session_handle(self, _session_id: str, _handle: str) -> None:
-        return None
+    from aiohttp import web
 
+    calls: list[dict] = []
 
-class _DeterministicClientToolAgent:
-    """Minimal model-shaped agent that performs one trusted client call."""
-
-    name = "deterministic-client-e2e"
-    memory_db = None
-    model = _DeterministicRuntime()
-
-    def __init__(self, target: Path) -> None:
-        self.target = target
-        self.seen_origin = None
-        self.tool_result: dict | None = None
-
-    async def refresh_registries(self):
-        return False, 1
-
-    async def run_stream(
-        self,
-        *,
-        message,
-        user_id,
-        session_id,
-        attachments=None,
-        on_status=None,
-        author=None,
-    ):
-        del message, user_id, attachments, author
-        from src.core.execution_origin import current_execution_origin
-        from src.mcp.tool_providers import InteractiveClientMCPProvider
-
-        origin = current_execution_origin()
-        assert origin is not None, "interactive Iroh turn lost its client origin"
-        self.seen_origin = origin
-        if on_status is not None:
-            await on_status("Using client:filesystem.write_file")
-        provider = InteractiveClientMCPProvider(origin.registry)
-        self.tool_result = await provider.call_tool(
-            "filesystem",
-            "write_file",
-            {"path": str(self.target), "content": "real-iroh-client"},
-            session_id=session_id,
+    async def chat(request):
+        payload = await request.json()
+        calls.append(payload)
+        tools = payload.get("tools") or []
+        names = [
+            str((item.get("function") or {}).get("name") or "")
+            for item in tools
+            if isinstance(item, dict)
+        ]
+        tool_name = next(
+            (name for name in names if name.endswith("tool_search_call_tool")),
+            None,
         )
-        yield {"kind": "delta", "text": "client file written"}
-        yield {"kind": "done", "text": "client file written"}
+        messages = payload.get("messages") or []
+        tool_results = [
+            message for message in messages
+            if isinstance(message, dict) and message.get("role") == "tool"
+        ]
+        message: dict
+        finish_reason: str
+        if tool_name and len(tool_results) == 0:
+            arguments = {
+                "server": "client:filesystem",
+                "tool": "write_file",
+                "args": {
+                    "path": str(target),
+                    "content": "real-iroh-client",
+                },
+            }
+            message = {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call-client-write",
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": json.dumps(arguments, separators=(",", ":")),
+                    },
+                }],
+            }
+            finish_reason = "tool_calls"
+        elif tool_name and len(tool_results) == 1:
+            arguments = {
+                "server": "client:filesystem",
+                "tool": "read_text_file",
+                "args": {"path": str(target)},
+            }
+            message = {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call-client-read",
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": json.dumps(arguments, separators=(",", ":")),
+                    },
+                }],
+            }
+            finish_reason = "tool_calls"
+        else:
+            message = {"role": "assistant", "content": "client file written"}
+            finish_reason = "stop"
+        return web.json_response({
+            "id": f"chatcmpl-client-e2e-{len(calls)}",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "deterministic-client-e2e",
+            "choices": [{
+                "index": 0,
+                "message": message,
+                "finish_reason": finish_reason,
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+            },
+        })
 
-    def last_response_meta(self, _session_id: str) -> dict:
-        return {"model": "deterministic-e2e"}
+    app = web.Application()
+    app.router.add_post("/v1/chat/completions", chat)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    sockets = site._server.sockets  # noqa: SLF001 - bound test fixture port
+    port = sockets[0].getsockname()[1]
+    return runner, f"http://127.0.0.1:{port}/v1", calls
 
 
 async def _wait_for_direct_addresses(node, *, timeout: float = 5.0):
@@ -115,7 +161,7 @@ async def _wait_for_owned_broker(server, task: asyncio.Task, *, timeout: float =
 
 @test(
     "real_iroh_client_e2e",
-    "real coordinator + Gateway + Iroh + capability host execute one client tool turn",
+    "real coordinator + Gateway + Iroh + Agent write and read through the client host",
 )
 async def t_real_iroh_client_tool_turn(ctx: TestContext) -> None:
     import aiohttp
@@ -126,6 +172,7 @@ async def t_real_iroh_client_tool_turn(ctx: TestContext) -> None:
     )
     from openagent_host_tools.local_broker import LocalBrokerServer
 
+    from src.core.agent import Agent
     from src.core import child_session as child_session_hooks
     from src.gateway.server import Gateway
     from src.memory.db import MemoryDB
@@ -136,6 +183,8 @@ async def t_real_iroh_client_tool_turn(ctx: TestContext) -> None:
     from src.network.identity import Identity, load_or_create_identity
     from src.network.iroh_node import IrohNode
     from src.network.state import NetworkState
+    from src.mcp.pool import MCPPool
+    from src.models.native_provider import NativeProvider
     from src.stream import child_stream as child_stream_hooks
     from src.stream import resource_events as resource_event_hooks
 
@@ -162,10 +211,40 @@ async def t_real_iroh_client_tool_turn(ctx: TestContext) -> None:
         label="coordinator",
     )
 
-    state = await NetworkState.from_db(db=db, identity_path=identity_path)
     target = root / "client-machine" / "sentinel.txt"
     target.parent.mkdir(parents=True, exist_ok=True)
-    agent = _DeterministicClientToolAgent(target)
+    model_runner, model_base_url, model_calls = (
+        await _start_deterministic_model_endpoint(target)
+    )
+    pool = MCPPool.from_config(
+        mcp_config=[{"builtin": "tool-search"}],
+        include_defaults=False,
+        db_path=str(root / "runtime.db"),
+    )
+    model = NativeProvider(
+        model="local:deterministic-client-e2e",
+        api_key="local",
+        base_url=model_base_url,
+        providers_config=[{
+            "name": "local",
+            "framework": "api-based",
+            "api_key": "local",
+            "base_url": model_base_url,
+        }],
+        db_path=str(root / "runtime.db"),
+    )
+
+    agent = Agent(
+        name="deterministic-client-e2e",
+        model=model,
+        system_prompt=(
+            "You are the deterministic real-wire capability acceptance agent. "
+            "Client paths are never server paths."
+        ),
+        mcp_pool=pool,
+        memory=None,
+    )
+    state = await NetworkState.from_db(db=db, identity_path=identity_path)
     gateway = Gateway(agent=agent, network_state=state)
 
     # Gateway wiring uses process-level hooks because production has one
@@ -234,6 +313,48 @@ async def t_real_iroh_client_tool_turn(ctx: TestContext) -> None:
         proxy = LoopbackProxy(dialer=dialer, target_node_id=coordinator_node_id)
         await proxy.start()
 
+        session = aiohttp.ClientSession()
+
+        # The client may state the network it expects, but the Gateway must
+        # derive the binding from the coordinator certificate. A conflicting
+        # claim is rejected on the real Iroh stream before any catalog is
+        # registered; omitting the v1 extension remains compatible with an
+        # older client and the ACK still carries the certified network.
+        wrong_network_ws = await session.ws_connect(
+            f"{proxy.base_url}/ws/capabilities",
+        )
+        await wrong_network_ws.send_json({
+            "type": "capability_hello",
+            "protocol": "client-capabilities/1",
+            "client_instance_id": "wrong-network",
+            "generation": 1,
+            "device_label": "Wrong Network",
+            "network_id": "forged-network",
+            "servers": [],
+        })
+        wrong_close = await asyncio.wait_for(wrong_network_ws.receive(), timeout=8)
+        assert wrong_close.type in {
+            aiohttp.WSMsgType.CLOSE,
+            aiohttp.WSMsgType.CLOSED,
+        }, wrong_close
+        assert wrong_network_ws.close_code == 4003 or wrong_close.data == 4003
+
+        legacy_ws = await session.ws_connect(f"{proxy.base_url}/ws/capabilities")
+        await legacy_ws.send_json({
+            "type": "capability_hello",
+            "protocol": "client-capabilities/1",
+            "client_instance_id": "legacy-no-network-field",
+            "generation": 1,
+            "device_label": "Legacy Client",
+            "servers": [],
+        })
+        legacy_ack_message = await asyncio.wait_for(legacy_ws.receive(), timeout=8)
+        assert legacy_ack_message.type == aiohttp.WSMsgType.TEXT, legacy_ack_message
+        legacy_ack = json.loads(legacy_ack_message.data)
+        assert legacy_ack["type"] == "capability_hello_ack", legacy_ack
+        assert legacy_ack["network_id"] == network_id, legacy_ack
+        await legacy_ws.close()
+
         # The bridge talks to the real single-instance broker over its local
         # user socket/named pipe. The broker is explicitly test-owned: the
         # production client's auto-spawned broker is intentionally persistent,
@@ -252,7 +373,6 @@ async def t_real_iroh_client_tool_turn(ctx: TestContext) -> None:
         instance_id = "desktop-real-iroh"
         generation = 41
 
-        session = aiohttp.ClientSession()
         capability_ws = await session.ws_connect(
             f"{proxy.base_url}/ws/capabilities",
             autoping=True,
@@ -264,6 +384,7 @@ async def t_real_iroh_client_tool_turn(ctx: TestContext) -> None:
             generation=generation,
             device_label="Real Iroh Client",
             trusted_account_id=network_id,
+            trusted_network_id=network_id,
             trusted_device_id=client_identity.public_bytes.hex(),
             send_json=capability_ws.send_json,
         )
@@ -318,13 +439,38 @@ async def t_real_iroh_client_tool_turn(ctx: TestContext) -> None:
                 break
 
         assert target.read_text() == "real-iroh-client"
-        assert agent.seen_origin is not None
-        assert agent.seen_origin.device_id == client_identity.public_bytes.hex()
-        assert agent.seen_origin.client_instance_id == instance_id
-        assert agent.tool_result is not None
-        execution_host = agent.tool_result.get("execution_host") or {}
-        assert execution_host.get("kind") == "client", agent.tool_result
-        assert execution_host.get("client_instance_id") == instance_id
+        assert len(model_calls) >= 3, model_calls
+        model_transcript = json.dumps(model_calls, sort_keys=True)
+        assert "real-iroh-client" in model_transcript, model_transcript
+        assert "execution_host" in model_transcript, model_transcript
+        assert "'kind': 'client'" in model_transcript, model_transcript
+        assert client_identity.public_bytes.hex() in model_transcript, model_transcript
+        offered_names = {
+            str((item.get("function") or {}).get("name") or "")
+            for item in (model_calls[0].get("tools") or [])
+            if isinstance(item, dict)
+        }
+        assert any(
+            name.endswith("tool_search_call_tool") for name in offered_names
+        ), offered_names
+        assert gateway.capabilities.origin_for(
+            client_identity.public_bytes.hex(), instance_id,
+        ) is not None
+        with sqlite3.connect(host_paths.audit_db) as audit_db:
+            audit_rows = audit_db.execute(
+                "SELECT server, tool, outcome FROM audit ORDER BY seq"
+            ).fetchall()
+        successful_filesystem_tools = [
+            tool
+            for server, tool, outcome in audit_rows
+            if server == "filesystem" and outcome == "success"
+        ]
+        assert successful_filesystem_tools[-2:] == [
+            "write_file", "read_text_file",
+        ], audit_rows
+        meta = agent.last_response_meta(session_id)
+        assert meta.get("model"), meta
+        assert "deterministic-client-e2e" in str(meta["model"]), meta
         assert any(
             frame.get("type") == "delta"
             and "client file written" in str(frame.get("text"))
@@ -364,7 +510,11 @@ async def t_real_iroh_client_tool_turn(ctx: TestContext) -> None:
             with suppress(Exception):
                 await gateway.stop()
             with suppress(Exception):
+                await agent.shutdown()
+            with suppress(Exception):
                 await state.stop()
+            with suppress(Exception):
+                await model_runner.cleanup()
             with suppress(Exception):
                 await db.close()
             with suppress(Exception):
