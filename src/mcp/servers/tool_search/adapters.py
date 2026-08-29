@@ -73,7 +73,7 @@ class _JsonCoercionState:
             )
 
 
-def _coerce_to_jsonable(value: Any, _depth: int = 0) -> Any:
+def coerce_mcp_result_to_jsonable(value: Any, _depth: int = 0) -> Any:
     """Coerce an MCP result to JSON without corrupting valid JSON subtrees.
 
     Native JSON is preserved exactly. Results outside the explicit depth,
@@ -97,6 +97,12 @@ def _coerce_to_jsonable(value: Any, _depth: int = 0) -> Any:
                 f"({_MAX_MCP_RESULT_JSON_BYTES} bytes)"
             )
     return coerced
+
+
+# Backward-compatible internal name.  Workflow execution imports the public
+# contract above so every MCP boundary uses this one lossless envelope codec;
+# existing adapter callers and focused tests can keep the historical name.
+_coerce_to_jsonable = coerce_mcp_result_to_jsonable
 
 
 def _coerce_json_value(value: Any, depth: int, state: _JsonCoercionState) -> Any:

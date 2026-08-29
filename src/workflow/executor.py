@@ -1159,13 +1159,18 @@ def _extract_body_subgraph(graph: dict, loop_id: str) -> dict:
 
 
 def _coerce_to_jsonable(value: Any) -> Any:
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    if isinstance(value, dict):
-        return {str(k): _coerce_to_jsonable(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [_coerce_to_jsonable(v) for v in value]
-    try:
-        return json.loads(json.dumps(value, default=str))
-    except Exception:  # noqa: BLE001
-        return repr(value)
+    """Preserve the complete MCP result envelope in workflow outputs.
+
+    Keep the import lazy: the workflow executor is part of agent startup while
+    tool-search is an MCP adapter wired later by the pool.  The dependency is
+    therefore one-way at execution time and cannot turn either module's import
+    graph into a cycle.  More importantly, workflows now cross the exact same
+    bounded, lossless JSON boundary as direct tool-search calls instead of
+    reducing runtime ``ToolResult`` objects to their string representation.
+    """
+
+    from src.mcp.servers.tool_search.adapters import (
+        coerce_mcp_result_to_jsonable,
+    )
+
+    return coerce_mcp_result_to_jsonable(value)
