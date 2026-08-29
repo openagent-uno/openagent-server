@@ -8,8 +8,6 @@ import tarfile
 import tempfile
 from pathlib import Path
 
-import pytest
-
 from ._framework import TestContext, test as register_test
 
 
@@ -206,25 +204,26 @@ def test_server_committed_lock_and_python_dependency_are_immutable():
     assert "openagent-host-tools.whl" not in release_workflow
 
 
-@pytest.mark.parametrize(
-    ("system", "machine", "expected"),
-    (
-        ("Darwin", "arm64", "darwin-arm64"),
-        ("Darwin", "x86_64", "darwin-x64"),
-        ("Linux", "aarch64", "linux-arm64"),
-        ("Linux", "amd64", "linux-x64"),
-        ("Windows", "arm64", "win32-arm64"),
-        ("Windows", "AMD64", "win32-x64"),
-    ),
-)
-def test_server_native_target_matches_every_release_platform(
-    monkeypatch, system: str, machine: str, expected: str
-):
+def test_server_native_target_matches_every_release_platform():
     import src.mcp.builtins as builtins
 
-    monkeypatch.setattr(builtins.platform, "system", lambda: system)
-    monkeypatch.setattr(builtins.platform, "machine", lambda: machine)
-    assert builtins._native_binary_target() == expected
+    original_system = builtins.platform.system
+    original_machine = builtins.platform.machine
+    try:
+        for system, machine, expected in (
+            ("Darwin", "arm64", "darwin-arm64"),
+            ("Darwin", "x86_64", "darwin-x64"),
+            ("Linux", "aarch64", "linux-arm64"),
+            ("Linux", "amd64", "linux-x64"),
+            ("Windows", "arm64", "win32-arm64"),
+            ("Windows", "AMD64", "win32-x64"),
+        ):
+            builtins.platform.system = lambda value=system: value
+            builtins.platform.machine = lambda value=machine: value
+            assert builtins._native_binary_target() == expected
+    finally:
+        builtins.platform.system = original_system
+        builtins.platform.machine = original_machine
 
 
 # This repository's canonical suite uses an explicit decorator registry rather
