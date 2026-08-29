@@ -2935,3 +2935,42 @@ async def t_result_items_unwraps_mcp_envelope(_ctx: TestContext) -> None:
         {"content": [{"type": "text", "text": ["playback", "general"]}]},
     ) == ["playback", "general"]
     assert _result_items({"content": [{"type": "text", "text": "not json"}]}) == []
+
+
+@test("local_support_controller", "a tag the lane adds is a tag it can remove")
+async def t_tags_remove_uses_singular_tag(_ctx: TestContext) -> None:
+    """Replio's remove takes ``tag``, exactly like its add.
+
+    Adapting only the add left the diagnostics lane able to switch a capture
+    on and never switch its thread tag back off.
+    """
+    from src.core.local_support_controller import _adapt_args
+
+    singular = _Toolkit({"replio_threads_tags_add": lambda **_: None})
+    singular.functions["replio_threads_tags_add"].parameters = {
+        "type": "object", "properties": {"thread_id": {}, "tag": {}},
+    }
+    singular.functions["replio_threads_tags_remove"] = SimpleNamespace(
+        entrypoint=lambda **_: None,
+        parameters={"type": "object", "properties": {"thread_id": {}, "tag": {}}},
+    )
+    pool = _Pool({"replio": singular})
+
+    for tool in ("replio_threads_tags_add", "replio_threads_tags_remove"):
+        adapted = _adapt_args(
+            pool, "replio", tool,
+            {"thread_id": "t-1", "tags": ["diagnostics-active"]},
+        )
+        assert adapted == {
+            "thread_id": "t-1", "tag": "diagnostics-active",
+        }, (tool, adapted)
+
+    # A server that really wants a list still gets one.
+    plural = _Toolkit({"replio_threads_tags_remove": lambda **_: None})
+    plural.functions["replio_threads_tags_remove"].parameters = {
+        "type": "object", "properties": {"thread_id": {}, "tags": {}},
+    }
+    assert _adapt_args(
+        _Pool({"replio": plural}), "replio", "replio_threads_tags_remove",
+        {"thread_id": "t-1", "tags": ["diagnostics-active"]},
+    ) == {"thread_id": "t-1", "tags": ["diagnostics-active"]}

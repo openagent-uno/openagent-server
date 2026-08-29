@@ -353,7 +353,12 @@ def _adapt_args(pool: Any, server: str, tool: str, args: dict[str, Any]) -> dict
     fn = _tool_functions(pool, server).get(tool)
     props = _schema_properties(fn) if fn is not None else set()
     adapted = dict(args)
-    if tool.lower().endswith("tags_add"):
+    # Add and REMOVE both take a singular ``tag`` on Replio. Adapting only the
+    # add meant the diagnostics lane could switch a capture on and never switch
+    # its thread tag back off: the removal failed validation, the run ended in
+    # `bug_diagnostics_tag_cleanup_human`, and the stale tag sent every later
+    # message on that thread back through the collect lane.
+    if tool.lower().endswith(("tags_add", "tags_remove")):
         tags = adapted.pop("tags", None)
         if tags is not None and "tag" in props and "tags" not in props:
             adapted["tag"] = tags[0] if isinstance(tags, list) and tags else tags
