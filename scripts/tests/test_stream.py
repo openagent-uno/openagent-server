@@ -1095,7 +1095,7 @@ async def t_ingress_isolates_bursts_and_media_without_capabilities(ctx: TestCont
     try:
         await sess.push_in(Attachment(
             session_id="s", seq=1, ts_ms=now_ms(), kind="file",
-            path="/client-a/private.txt", filename="private.txt",
+            artifact_id="art_client_a", filename="private.txt",
             mime_type="text/plain",
         ), ingress_identity=ingress_a)
         await sess.push_in(VideoFrame(

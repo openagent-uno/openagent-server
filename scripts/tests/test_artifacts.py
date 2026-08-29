@@ -520,7 +520,7 @@ async def t_gateway_attachment_path_trust_boundary(ctx: TestContext) -> None:
                 self.on_behalf_identity = None
                 self.allow_local_attachment_paths = False
 
-            async def push_in(self, event) -> None:
+            async def push_in(self, event, **_trusted) -> None:
                 self.pushed.append(event)
 
             def update_client_capabilities(self, *_args) -> None:
