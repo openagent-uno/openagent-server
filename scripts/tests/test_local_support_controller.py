@@ -1030,6 +1030,25 @@ def _assert_human_tags(doubles: _Doubles, *expected: str) -> None:
     assert not missing, (missing, tags)
 
 
+@test("local_support_controller", "only eSound's own tenant reaches the deletion tool")
+async def t_deletion_is_tenant_scoped(_ctx: TestContext) -> None:
+    """The tool is eSound's IdentityServer, and the Lyra agent runs this same
+    controller. Without the guard a Lyra customer's deletion request would be
+    sent to eSound's identity store: it would either destroy the eSound account
+    that happens to share the address, or answer "you have no account" to
+    someone who does."""
+    lyra = _Doubles(thread={"author_email": "owner@example.com", "product": "lyra"})
+    output = await _drive(
+        lyra, "Please delete my account and all my data",
+        thread_id="t-del-lyra",
+        payload_extra={"product": "lyra"},
+    )
+    assert output["outcome"] == "account_delete_tenant_unsupported_human", output
+    assert output["decision"] == "human", output
+    assert "esound_identity_delete_account" not in lyra.names, lyra.names
+    assert "deleted" not in output["reply"].lower(), output["reply"]
+
+
 @test("local_support_controller", "a GDPR erasure request is served, not escalated")
 async def t_formal_gdpr(_ctx: TestContext) -> None:
     """triage-workflow.md, dated and signed by the owner:

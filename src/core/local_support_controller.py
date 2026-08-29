@@ -5719,7 +5719,23 @@ async def run(
             # / right to erasure -- NON fa scattare l'HARD STOP legale. E' una
             # B-DELETE: ESEGUI la cancellazione." Silence and hand-off were
             # both explicitly ruled out there; the controller used to do both.
-            if not sender_email:
+            if state.tenant.key != "esound":
+                # The deletion tool is eSound's IdentityServer. Lyra's accounts
+                # live in Kratos and are removed by a different process
+                # entirely, so running this for a Lyra customer would either
+                # destroy the eSound account that happens to share the address
+                # or tell them, falsely, that they have no account at all.
+                # Until the tenant has its own tool, this is a person's job.
+                state.decision = "human"
+                state.outcome = "account_delete_tenant_unsupported_human"
+                state.human_reason = (
+                    f"account deletion requested on {state.tenant.key}, whose "
+                    "identity store is not reachable from this controller"
+                )
+                state.instructions.append(
+                    "Do not state what will happen to their account."
+                )
+            elif not sender_email:
                 # Ownership is proved by the TRANSPORT-authenticated sender and
                 # by nothing else: `_extract_verified_sender_email` reads only
                 # the channel's own sender fields, so an address typed into the

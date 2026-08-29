@@ -1,0 +1,3 @@
+FROM hub.spicysparks.com/spicysparks/openagent:v29
+COPY dist/openagent /opt/openagent/bin/openagent
+RUN chmod 0755 /opt/openagent/bin/openagent

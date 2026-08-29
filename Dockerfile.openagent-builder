@@ -1,0 +1,4 @@
+FROM hub.spicysparks.com/spicysparks/openagent:v29
+RUN apt-get update -qq \
+ && apt-get install -y -qq binutils libpython3.12 \
+ && rm -rf /var/lib/apt/lists/*
