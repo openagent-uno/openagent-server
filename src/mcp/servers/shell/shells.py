@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import platform
 
 from openagent_host_tools.shell_core import (
     DEFAULT_KILL_GRACE,
@@ -27,6 +28,20 @@ class BackgroundShell(SharedBackgroundShell):
         backend = get_exec_backend()
         await backend.prepare()
         spec = backend.build_spawn(command=self.command, cwd=self.cwd, env=self.env)
+        if backend.name == "local" and platform.system().lower() == "windows":
+            # The local host-tools core uses the native shell API on Windows.
+            # Repeating cmd.exe's complete command line as an argv element
+            # applies C-runtime quoting that cmd.exe does not understand.
+            return await asyncio.create_subprocess_shell(
+                self.command,
+                executable=spec.argv[0],
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=spec.cwd,
+                env=spec.env,
+                start_new_session=False,
+            )
         return await asyncio.create_subprocess_exec(
             *spec.argv,
             stdin=asyncio.subprocess.PIPE,
