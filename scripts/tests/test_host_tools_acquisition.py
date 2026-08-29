@@ -199,6 +199,11 @@ def test_server_committed_lock_and_python_dependency_are_immutable():
     assert f"#sha256={wheel['sha256']}" in pyproject
     assert "[tool.uv.sources]" not in pyproject
     assert "../openagent-host-tools" not in pyproject
+    release_workflow = (
+        ROOT / ".github" / "workflows" / "release.yml"
+    ).read_text(encoding="utf-8")
+    assert wheel["asset"] in release_workflow
+    assert "openagent-host-tools.whl" not in release_workflow
 
 
 @pytest.mark.parametrize(

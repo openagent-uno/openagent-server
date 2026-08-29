@@ -29,11 +29,12 @@ jobs:
       - name: Create venv + install package
         run: |
           uv venv
+          HOST_TOOLS_WHEEL="$RUNNER_TEMP/openagent_host_tools-0.1.0-py3-none-any.whl"
           python scripts/acquire-host-tools.py \
             --platform linux-x64 \
             --output "$RUNNER_TEMP/openagent-host-tools" \
-            --wheel-output "$RUNNER_TEMP/openagent-host-tools.whl"
-          uv pip install "$RUNNER_TEMP/openagent-host-tools.whl"
+            --wheel-output "$HOST_TOOLS_WHEEL"
+          uv pip install "$HOST_TOOLS_WHEEL"
           uv pip install -e .
       - name: Run end-to-end suite
         run: bash scripts/test_openagent.sh
@@ -156,10 +157,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          HOST_TOOLS_WHEEL="$RUNNER_TEMP/openagent_host_tools-0.1.0-py3-none-any.whl"
           python scripts/acquire-host-tools.py \
             --platform '${{ matrix.host_platform }}' \
             --output "$RUNNER_TEMP/openagent-host-tools" \
-            --wheel-output "$RUNNER_TEMP/openagent-host-tools.whl"
+            --wheel-output "$HOST_TOOLS_WHEEL"
+          echo "OPENAGENT_HOST_TOOLS_WHEEL=$HOST_TOOLS_WHEEL" >> "$GITHUB_ENV"
           echo "OPENAGENT_HOST_TOOLS_BUNDLE=$RUNNER_TEMP/openagent-host-tools/${{ matrix.host_platform }}" >> "$GITHUB_ENV"
       - uses: actions/setup-node@v4
         with:
@@ -167,7 +170,7 @@ jobs:
       - name: Install Python deps + PyInstaller
         shell: bash
         run: |
-          pip install "$RUNNER_TEMP/openagent-host-tools.whl"
+          pip install "$OPENAGENT_HOST_TOOLS_WHEEL"
           pip install -e ".[all]" pyinstaller
       - name: Build Node MCPs
         shell: bash
