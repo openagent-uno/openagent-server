@@ -21,8 +21,13 @@ from pathlib import Path
 from ._framework import TestContext, test
 
 
-async def _start_deterministic_model_endpoint(target: Path):
-    """Serve deterministic OpenAI chat completions that require two tools."""
+async def _start_deterministic_model_endpoint(targets: dict[str, Path]):
+    """Serve deterministic completions that exercise the selected client host.
+
+    The latest user message selects either the Desktop or CLI sentinel.  Each
+    normal turn writes and then reads its host-specific file; the dedicated
+    ``desktop-offline`` turn only attempts a read after Desktop disconnects.
+    """
 
     from aiohttp import web
 
@@ -42,26 +47,66 @@ async def _start_deterministic_model_endpoint(target: Path):
             None,
         )
         messages = payload.get("messages") or []
+        latest_user_index = max(
+            (
+                index for index, item in enumerate(messages)
+                if isinstance(item, dict) and item.get("role") == "user"
+            ),
+            default=-1,
+        )
+        latest_user = (
+            json.dumps(messages[latest_user_index].get("content"), sort_keys=True)
+            if latest_user_index >= 0
+            else ""
+        ).lower()
+        if "desktop-offline" in latest_user:
+            client_kind = "desktop-offline"
+            target = targets["desktop"]
+        elif "cli" in latest_user:
+            client_kind = "cli"
+            target = targets["cli"]
+        else:
+            client_kind = "desktop"
+            target = targets["desktop"]
         tool_results = [
-            message for message in messages
+            message for message in messages[latest_user_index + 1:]
             if isinstance(message, dict) and message.get("role") == "tool"
         ]
         message: dict
         finish_reason: str
-        if tool_name and len(tool_results) == 0:
+        if tool_name and len(tool_results) == 0 and client_kind == "desktop-offline":
+            arguments = {
+                "server": "client:filesystem",
+                "tool": "read_text_file",
+                "args": {"path": str(target)},
+            }
+            message = {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call-client-desktop-offline-read",
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": json.dumps(arguments, separators=(",", ":")),
+                    },
+                }],
+            }
+            finish_reason = "tool_calls"
+        elif tool_name and len(tool_results) == 0:
             arguments = {
                 "server": "client:filesystem",
                 "tool": "write_file",
                 "args": {
                     "path": str(target),
-                    "content": "real-iroh-client",
+                    "content": f"{client_kind}-sentinel",
                 },
             }
             message = {
                 "role": "assistant",
                 "content": None,
                 "tool_calls": [{
-                    "id": "call-client-write",
+                    "id": f"call-client-{client_kind}-write",
                     "type": "function",
                     "function": {
                         "name": tool_name,
@@ -80,7 +125,7 @@ async def _start_deterministic_model_endpoint(target: Path):
                 "role": "assistant",
                 "content": None,
                 "tool_calls": [{
-                    "id": "call-client-read",
+                    "id": f"call-client-{client_kind}-read",
                     "type": "function",
                     "function": {
                         "name": tool_name,
@@ -90,7 +135,14 @@ async def _start_deterministic_model_endpoint(target: Path):
             }
             finish_reason = "tool_calls"
         else:
-            message = {"role": "assistant", "content": "client file written"}
+            message = {
+                "role": "assistant",
+                "content": (
+                    "desktop client unavailable"
+                    if client_kind == "desktop-offline"
+                    else f"{client_kind} file written"
+                ),
+            }
             finish_reason = "stop"
         completion = {
             "id": f"chatcmpl-client-e2e-{len(calls)}",
@@ -231,7 +283,7 @@ async def _wait_for_owned_broker(server, task: asyncio.Task, *, timeout: float =
 
 @test(
     "real_iroh_client_e2e",
-    "real coordinator + Gateway + Iroh + Agent write and read through the client host",
+    "real Iroh routes one session exactly across simultaneous Desktop and CLI hosts",
 )
 async def t_real_iroh_client_tool_turn(ctx: TestContext) -> None:
     import aiohttp
@@ -281,10 +333,15 @@ async def t_real_iroh_client_tool_turn(ctx: TestContext) -> None:
         label="coordinator",
     )
 
-    target = root / "client-machine" / "sentinel.txt"
-    target.parent.mkdir(parents=True, exist_ok=True)
+    desktop_target = root / "desktop-machine" / "sentinel.txt"
+    cli_target = root / "cli-machine" / "sentinel.txt"
+    desktop_target.parent.mkdir(parents=True, exist_ok=True)
+    cli_target.parent.mkdir(parents=True, exist_ok=True)
     model_runner, model_base_url, model_calls = (
-        await _start_deterministic_model_endpoint(target)
+        await _start_deterministic_model_endpoint({
+            "desktop": desktop_target,
+            "cli": cli_target,
+        })
     )
     pool = MCPPool.from_config(
         mcp_config=[{"builtin": "tool-search"}],
@@ -332,14 +389,21 @@ async def t_real_iroh_client_tool_turn(ctx: TestContext) -> None:
     client_node = IrohNode(client_identity)
     proxy = None
     dialer = None
-    host = None
-    bridge = None
-    receive_task = None
+    desktop_host = None
+    cli_host = None
+    desktop_bridge = None
+    cli_bridge = None
+    desktop_receive_task = None
+    cli_receive_task = None
     session = None
-    capability_ws = None
-    chat_ws = None
-    broker = None
-    broker_task = None
+    desktop_capability_ws = None
+    cli_capability_ws = None
+    desktop_chat_ws = None
+    cli_chat_ws = None
+    desktop_broker = None
+    cli_broker = None
+    desktop_broker_task = None
+    cli_broker_task = None
     try:
         gateway._prepare_iroh_site()
         await state.start()
@@ -425,151 +489,310 @@ async def t_real_iroh_client_tool_turn(ctx: TestContext) -> None:
         assert legacy_ack["network_id"] == network_id, legacy_ack
         await legacy_ws.close()
 
-        # The bridge talks to the real single-instance broker over its local
-        # user socket/named pipe. The broker is explicitly test-owned: the
-        # production client's auto-spawned broker is intentionally persistent,
-        # which is the wrong lifecycle for an E2E fixture.
-        host_paths = HostPaths.discover(root / "client-user")
-        broker = LocalBrokerServer(host_paths)
-        broker_task = asyncio.create_task(
-            broker.run(), name="real-iroh-local-capability-broker",
+        # Each simulated client owns a real single-instance local broker. They
+        # intentionally use separate roots so both dispatch and local audit
+        # attribution remain observable even though this test runs on one OS.
+        desktop_paths = HostPaths.discover(root / "desktop-user")
+        cli_paths = HostPaths.discover(root / "cli-user")
+        desktop_broker = LocalBrokerServer(desktop_paths)
+        cli_broker = LocalBrokerServer(cli_paths)
+        desktop_broker_task = asyncio.create_task(
+            desktop_broker.run(), name="real-iroh-desktop-capability-broker",
         )
-        await _wait_for_owned_broker(broker, broker_task)
-        host = LocalCapabilityClient(
-            paths=host_paths,
+        cli_broker_task = asyncio.create_task(
+            cli_broker.run(), name="real-iroh-cli-capability-broker",
         )
-        await host.start()
-        await host.set_consent(True)
-        instance_id = "desktop-real-iroh"
-        generation = 41
-
-        capability_ws = await session.ws_connect(
-            f"{proxy.base_url}/ws/capabilities",
-            autoping=True,
-            heartbeat=10,
+        await asyncio.gather(
+            _wait_for_owned_broker(desktop_broker, desktop_broker_task),
+            _wait_for_owned_broker(cli_broker, cli_broker_task),
         )
-        bridge = CapabilityBridge(
-            host,
-            client_instance_id=instance_id,
-            generation=generation,
-            device_label="Real Iroh Client",
-            trusted_account_id=network_id,
-            trusted_network_id=network_id,
-            trusted_device_id=client_identity.public_bytes.hex(),
-            send_json=capability_ws.send_json,
-        )
-        await bridge.hello()
-        hello_ack_msg = await asyncio.wait_for(capability_ws.receive(), timeout=8)
-        hello_ack = json.loads(hello_ack_msg.data)
-        assert hello_ack["type"] == "capability_hello_ack", hello_ack
-        await bridge.handle(hello_ack)
-        bridge.activate_events()
-
-        async def receive_capability_frames() -> None:
-            async for message in capability_ws:
-                if message.type == aiohttp.WSMsgType.TEXT:
-                    await bridge.handle(json.loads(message.data))
-                elif message.type in {
-                    aiohttp.WSMsgType.CLOSE,
-                    aiohttp.WSMsgType.CLOSED,
-                    aiohttp.WSMsgType.ERROR,
-                }:
-                    break
-
-        receive_task = asyncio.create_task(
-            receive_capability_frames(), name="real-iroh-capability-receive",
+        desktop_host = LocalCapabilityClient(paths=desktop_paths)
+        cli_host = LocalCapabilityClient(paths=cli_paths)
+        await asyncio.gather(desktop_host.start(), cli_host.start())
+        await asyncio.gather(
+            desktop_host.set_consent(True), cli_host.set_consent(True),
         )
 
-        chat_ws = await session.ws_connect(f"{proxy.base_url}/ws")
-        auth_ok = json.loads((await asyncio.wait_for(chat_ws.receive(), timeout=8)).data)
-        assert auth_ok["type"] == "auth_ok", auth_ok
-        session_id = "real-iroh-session"
-        await chat_ws.send_json({
-            "type": "session_open",
-            "session_id": session_id,
-            "client_instance_id": instance_id,
-            "coalesce_window_ms": 0,
-            "speak": False,
-        })
-        await chat_ws.send_json({
-            "type": "text_final",
-            "session_id": session_id,
-            "seq": 1,
-            "ts_ms": 1,
-            "text": "write the client sentinel",
-        })
+        device_id = client_identity.public_bytes.hex()
+        desktop_instance_id = "desktop-real-iroh"
+        cli_instance_id = "cli-real-iroh"
 
-        frames: list[dict] = []
-        while True:
-            message = await asyncio.wait_for(chat_ws.receive(), timeout=15)
-            assert message.type == aiohttp.WSMsgType.TEXT, message
-            frame = json.loads(message.data)
-            frames.append(frame)
-            if frame.get("type") == "turn_complete":
+        async def connect_capability(
+            host: LocalCapabilityClient,
+            *,
+            instance_id: str,
+            generation: int,
+            device_label: str,
+        ):
+            ws = await session.ws_connect(
+                f"{proxy.base_url}/ws/capabilities",
+                autoping=True,
+                heartbeat=10,
+            )
+            local_bridge = CapabilityBridge(
+                host,
+                client_instance_id=instance_id,
+                generation=generation,
+                device_label=device_label,
+                trusted_account_id=network_id,
+                trusted_network_id=network_id,
+                trusted_device_id=device_id,
+                send_json=ws.send_json,
+            )
+            await local_bridge.hello()
+            hello_ack_msg = await asyncio.wait_for(ws.receive(), timeout=8)
+            assert hello_ack_msg.type == aiohttp.WSMsgType.TEXT, hello_ack_msg
+            hello_ack = json.loads(hello_ack_msg.data)
+            assert hello_ack["type"] == "capability_hello_ack", hello_ack
+            assert hello_ack["client_instance_id"] == instance_id, hello_ack
+            assert hello_ack["device_id"] == device_id, hello_ack
+            await local_bridge.handle(hello_ack)
+            local_bridge.activate_events()
+
+            async def receive_capability_frames() -> None:
+                async for message in ws:
+                    if message.type == aiohttp.WSMsgType.TEXT:
+                        await local_bridge.handle(json.loads(message.data))
+                    elif message.type in {
+                        aiohttp.WSMsgType.CLOSE,
+                        aiohttp.WSMsgType.CLOSED,
+                        aiohttp.WSMsgType.ERROR,
+                    }:
+                        break
+
+            task = asyncio.create_task(
+                receive_capability_frames(),
+                name=f"real-iroh-{instance_id}-capability-receive",
+            )
+            return ws, local_bridge, task
+
+        (
+            desktop_capability_ws,
+            desktop_bridge,
+            desktop_receive_task,
+        ) = await connect_capability(
+            desktop_host,
+            instance_id=desktop_instance_id,
+            generation=41,
+            device_label="Real Iroh Desktop",
+        )
+        (
+            cli_capability_ws,
+            cli_bridge,
+            cli_receive_task,
+        ) = await connect_capability(
+            cli_host,
+            instance_id=cli_instance_id,
+            generation=73,
+            device_label="Real Iroh CLI",
+        )
+
+        # A second connection under the same certified device identity must
+        # coexist, not replace or expel the first.
+        desktop_origin = gateway.capabilities.origin_for(
+            device_id, desktop_instance_id,
+        )
+        cli_origin = gateway.capabilities.origin_for(device_id, cli_instance_id)
+        assert desktop_origin is not None
+        assert cli_origin is not None
+        assert desktop_origin.client_instance_id == desktop_instance_id
+        assert cli_origin.client_instance_id == cli_instance_id
+        assert desktop_origin.generation == 41
+        assert cli_origin.generation == 73
+        assert not desktop_capability_ws.closed
+        assert not cli_capability_ws.closed
+
+        session_id = "real-iroh-shared-session"
+
+        async def connect_chat(*, client_kind: str, instance_id: str):
+            ws = await session.ws_connect(f"{proxy.base_url}/ws")
+            auth_message = await asyncio.wait_for(ws.receive(), timeout=8)
+            assert auth_message.type == aiohttp.WSMsgType.TEXT, auth_message
+            auth_ok = json.loads(auth_message.data)
+            assert auth_ok["type"] == "auth_ok", auth_ok
+            await ws.send_json({
+                "type": "session_open",
+                "session_id": session_id,
+                "client_kind": client_kind,
+                "client_instance_id": instance_id,
+                "coalesce_window_ms": 0,
+                "speak": False,
+            })
+            return ws
+
+        desktop_chat_ws = await connect_chat(
+            client_kind="desktop", instance_id=desktop_instance_id,
+        )
+        # Avoid racing two SessionOpen frames while the shared holder is first
+        # created. The traffic itself still uses only the real Iroh sockets.
+        for _ in range(200):
+            if any(key[1] == session_id for key in gateway._stream_sessions):
                 break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("shared real-Iroh stream session was not created")
+        cli_chat_ws = await connect_chat(
+            client_kind="cli", instance_id=cli_instance_id,
+        )
 
-        assert target.read_text() == "real-iroh-client"
-        assert len(model_calls) >= 3, model_calls
-        assert all(call.get("stream") is True for call in model_calls[:3]), model_calls
-        model_transcript = json.dumps(model_calls, sort_keys=True)
-        assert "real-iroh-client" in model_transcript, model_transcript
-        assert "execution_host" in model_transcript, model_transcript
-        assert "'kind': 'client'" in model_transcript, model_transcript
-        assert client_identity.public_bytes.hex() in model_transcript, model_transcript
+        async def run_turn(ws, *, seq: int, text: str):
+            model_start = len(model_calls)
+            await ws.send_json({
+                "type": "text_final",
+                "session_id": session_id,
+                "seq": seq,
+                "ts_ms": seq,
+                "text": text,
+            })
+            frames: list[dict] = []
+            while True:
+                message = await asyncio.wait_for(ws.receive(), timeout=20)
+                assert message.type == aiohttp.WSMsgType.TEXT, message
+                frame = json.loads(message.data)
+                frames.append(frame)
+                if frame.get("type") == "turn_complete":
+                    break
+            return frames, model_calls[model_start:]
+
+        def successful_filesystem_tools(paths: HostPaths) -> list[str]:
+            with sqlite3.connect(paths.audit_db) as audit_db:
+                rows = audit_db.execute(
+                    "SELECT server, tool, outcome FROM audit ORDER BY seq"
+                ).fetchall()
+            return [
+                tool for server, tool, outcome in rows
+                if server == "filesystem" and outcome == "success"
+            ]
+
+        desktop_frames, desktop_model_calls = await run_turn(
+            desktop_chat_ws,
+            seq=1,
+            text="desktop: write and read the desktop sentinel",
+        )
+        assert desktop_target.read_text() == "desktop-sentinel"
+        assert not cli_target.exists()
+        assert successful_filesystem_tools(desktop_paths) == [
+            "write_file", "read_text_file",
+        ]
+        assert successful_filesystem_tools(cli_paths) == []
+        assert len(desktop_model_calls) >= 3, desktop_model_calls
+        assert all(
+            call.get("stream") is True for call in desktop_model_calls[:3]
+        ), desktop_model_calls
+        desktop_transcript = json.dumps(desktop_model_calls, sort_keys=True)
+        assert "desktop-sentinel" in desktop_transcript, desktop_transcript
+        assert "execution_host" in desktop_transcript, desktop_transcript
+        assert "'kind': 'client'" in desktop_transcript, desktop_transcript
+        assert desktop_instance_id in desktop_transcript, desktop_transcript
+        assert device_id in desktop_transcript, desktop_transcript
+
+        cli_frames, cli_model_calls = await run_turn(
+            cli_chat_ws,
+            seq=2,
+            text="cli: write and read the cli sentinel",
+        )
+        assert desktop_target.read_text() == "desktop-sentinel"
+        assert cli_target.read_text() == "cli-sentinel"
+        assert successful_filesystem_tools(desktop_paths) == [
+            "write_file", "read_text_file",
+        ]
+        assert successful_filesystem_tools(cli_paths) == [
+            "write_file", "read_text_file",
+        ]
+        assert len(cli_model_calls) >= 3, cli_model_calls
+        cli_transcript = json.dumps(cli_model_calls, sort_keys=True)
+        assert "cli-sentinel" in cli_transcript, cli_transcript
+        assert cli_instance_id in cli_transcript, cli_transcript
+
         offered_names = {
             str((item.get("function") or {}).get("name") or "")
-            for item in (model_calls[0].get("tools") or [])
+            for item in (desktop_model_calls[0].get("tools") or [])
             if isinstance(item, dict)
         }
         assert any(
             name.endswith("tool_search_call_tool") for name in offered_names
         ), offered_names
-        assert gateway.capabilities.origin_for(
-            client_identity.public_bytes.hex(), instance_id,
-        ) is not None
-        with sqlite3.connect(host_paths.audit_db) as audit_db:
-            audit_rows = audit_db.execute(
-                "SELECT server, tool, outcome FROM audit ORDER BY seq"
-            ).fetchall()
-        successful_filesystem_tools = [
-            tool
-            for server, tool, outcome in audit_rows
-            if server == "filesystem" and outcome == "success"
-        ]
-        assert successful_filesystem_tools[-2:] == [
-            "write_file", "read_text_file",
-        ], audit_rows
         meta = agent.last_response_meta(session_id)
         assert meta.get("model"), meta
         assert "deterministic-client-e2e" in str(meta["model"]), meta
         assert any(
             frame.get("type") == "delta"
-            and "client file written" in str(frame.get("text"))
-            for frame in frames
-        ), frames
+            and "desktop file written" in str(frame.get("text"))
+            for frame in desktop_frames
+        ), desktop_frames
+        assert any(
+            frame.get("type") == "delta"
+            and "cli file written" in str(frame.get("text"))
+            for frame in cli_frames
+        ), cli_frames
+
+        # Disconnect Desktop while CLI remains live. A new turn submitted on
+        # Desktop's still-authenticated chat socket must become server-only;
+        # its explicit client:* call fails and is never redirected to CLI.
+        desktop_audit_before = successful_filesystem_tools(desktop_paths)
+        cli_audit_before = successful_filesystem_tools(cli_paths)
+        await desktop_capability_ws.close()
+        await asyncio.wait_for(desktop_receive_task, timeout=8)
+        for _ in range(200):
+            if gateway.capabilities.origin_for(
+                device_id, desktop_instance_id,
+            ) is None:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("disconnected Desktop capability stayed registered")
+        assert gateway.capabilities.origin_for(
+            device_id, cli_instance_id,
+        ) is not None
+        assert not cli_capability_ws.closed
+
+        offline_frames, offline_model_calls = await run_turn(
+            desktop_chat_ws,
+            seq=3,
+            text="desktop-offline: read the disconnected desktop sentinel",
+        )
+        assert successful_filesystem_tools(desktop_paths) == desktop_audit_before
+        assert successful_filesystem_tools(cli_paths) == cli_audit_before
+        offline_transcript = json.dumps(offline_model_calls, sort_keys=True)
+        assert "Client MCPs are unavailable" in offline_transcript, offline_transcript
+        assert any(
+            frame.get("type") == "delta"
+            and "desktop client unavailable" in str(frame.get("text"))
+            for frame in offline_frames
+        ), offline_frames
     finally:
         try:
-            if chat_ws is not None:
+            if desktop_chat_ws is not None:
                 with suppress(Exception):
-                    await chat_ws.close()
-            if capability_ws is not None:
+                    await desktop_chat_ws.close()
+            if cli_chat_ws is not None:
                 with suppress(Exception):
-                    await capability_ws.close()
-            if receive_task is not None:
-                receive_task.cancel()
-                await asyncio.gather(receive_task, return_exceptions=True)
-            if bridge is not None:
+                    await cli_chat_ws.close()
+            if desktop_capability_ws is not None:
                 with suppress(Exception):
-                    await bridge.close()
+                    await desktop_capability_ws.close()
+            if cli_capability_ws is not None:
+                with suppress(Exception):
+                    await cli_capability_ws.close()
+            for receive_task in (desktop_receive_task, cli_receive_task):
+                if receive_task is not None:
+                    receive_task.cancel()
+                    await asyncio.gather(receive_task, return_exceptions=True)
+            for bridge in (desktop_bridge, cli_bridge):
+                if bridge is not None:
+                    with suppress(Exception):
+                        await bridge.close()
             if session is not None:
                 with suppress(Exception):
                     await session.close()
-            if host is not None:
-                with suppress(Exception):
-                    await host.close()
-            if broker_task is not None:
-                broker_task.cancel()
-                await asyncio.gather(broker_task, return_exceptions=True)
+            for host in (desktop_host, cli_host):
+                if host is not None:
+                    with suppress(Exception):
+                        await host.close()
+            for broker_task in (desktop_broker_task, cli_broker_task):
+                if broker_task is not None:
+                    broker_task.cancel()
+                    await asyncio.gather(broker_task, return_exceptions=True)
             if proxy is not None:
                 with suppress(Exception):
                     await proxy.stop()
@@ -595,12 +818,15 @@ async def t_real_iroh_client_tool_turn(ctx: TestContext) -> None:
                     else:
                         path.rmdir()
                 root.rmdir()
-            if broker is not None:
-                assert broker._lock_file is None, "test-owned broker retained its lock"
-                if os.name != "nt":
-                    assert not broker.unix_socket_path.exists(), (
-                        "test-owned broker retained its Unix socket"
+            for broker in (desktop_broker, cli_broker):
+                if broker is not None:
+                    assert broker._lock_file is None, (
+                        "test-owned broker retained its lock"
                     )
+                    if os.name != "nt":
+                        assert not broker.unix_socket_path.exists(), (
+                            "test-owned broker retained its Unix socket"
+                        )
         finally:
             (
                 previous_child_listener,
