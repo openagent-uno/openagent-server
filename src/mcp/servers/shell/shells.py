@@ -31,16 +31,17 @@ class BackgroundShell(SharedBackgroundShell):
         if backend.name == "local" and platform.system().lower() == "windows":
             # The local host-tools core uses the native shell API on Windows.
             # Repeating cmd.exe's complete command line as an argv element
-            # applies C-runtime quoting that cmd.exe does not understand.
+            # applies C-runtime quoting that cmd.exe does not understand. Let
+            # CPython resolve its hardened COMSPEC default; forwarding an
+            # explicit executable through the Proactor transport is not
+            # equivalent across the supported Windows builds.
             return await asyncio.create_subprocess_shell(
                 self.command,
-                executable=spec.argv[0],
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=spec.cwd,
                 env=spec.env,
-                start_new_session=False,
             )
         return await asyncio.create_subprocess_exec(
             *spec.argv,

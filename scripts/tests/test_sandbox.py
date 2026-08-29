@@ -168,10 +168,10 @@ async def t_local_windows_shell_avoids_argv_requoting(ctx: TestContext) -> None:
 
     assert process is sentinel
     assert captured["command"] == command
-    assert captured["executable"] == "C:\\Windows\\System32\\cmd.exe"
+    assert "executable" not in captured
     assert captured["cwd"] == "C:\\work tree"
     assert captured["env"] == {"OPENAGENT_TEST": "1"}
-    assert captured["start_new_session"] is False
+    assert "start_new_session" not in captured
 
 
 # ── The docker path: routing (fake) + a pure real build_spawn ───────

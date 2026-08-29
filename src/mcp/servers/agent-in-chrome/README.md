@@ -78,6 +78,13 @@ and complete ZIP payload. CRX2, an id mismatch, or any tampering is rejected.
 An unpacked local directory remains an explicit local install and is not
 represented as Web Store-authenticated content.
 
+Web Store CRX3 packages are unpacked in-process by the standalone sidecar using
+only the bundled Node runtime. The runtime does not require `unzip` or `tar`
+from the host OS. Extraction rejects absolute/traversal paths, aliases,
+duplicate paths, symlinks, special files, ZIP64/multi-disk archives, and
+archives outside conservative entry/size limits before writing into an atomic
+staging directory.
+
 ## Tools
 
 `tabs_context_mcp`, `tabs_create_mcp`, `navigate`, `computer` (click/type/key/

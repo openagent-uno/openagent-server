@@ -22,8 +22,9 @@ import path from "node:path";
 import http from "node:http";
 import https from "node:https";
 import crypto from "node:crypto";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { inflateRawSync } from "node:zlib";
 
 const SYSTEM = process.platform; // 'darwin' | 'linux' | 'win32'
 const HOME = os.homedir();
@@ -183,16 +184,17 @@ function httpGetJson(url, timeout = 1500) {
   });
 }
 
-export async function getWsEndpoint(port = CDP_PORT) {
-  const info = await httpGetJson(`http://127.0.0.1:${port}/json/version`);
+export async function getWsEndpoint(port = CDP_PORT, timeout = 1500) {
+  const info = await httpGetJson(`http://127.0.0.1:${port}/json/version`, timeout);
   if (info && info.webSocketDebuggerUrl && info.Browser) return info.webSocketDebuggerUrl;
   return null;
 }
 
-// Chrome writes this ownership marker inside the user-data-dir.  The TCP port
-// alone is not an identity boundary: another Chrome instance (or an unrelated
-// CDP-speaking process) may already be listening there.  Only reuse an
-// endpoint when both the marker's port and its unguessable browser path match
+// Chrome writes this ownership marker for an automatically selected debugging
+// port, but current Chromium builds do not consistently write it when given an
+// explicit port. OpenAgent writes the same marker after a launch it owns. The
+// TCP port alone is not an identity boundary: only reuse an endpoint when both
+// the profile marker's port and its unguessable browser path match
 // /json/version for this exact dedicated profile.
 function profileDevToolsMarker(profile) {
   try {
@@ -224,6 +226,34 @@ export async function getProfileWsEndpoint(profile, port = CDP_PORT) {
   } catch {
     return null;
   }
+}
+
+export async function recordProfileWsEndpoint(profile, port, wsUrl) {
+  let endpointPath;
+  try {
+    const parsed = new URL(wsUrl);
+    const wsPort = Number(parsed.port || (parsed.protocol === "wss:" ? 443 : 80));
+    if (
+      wsPort !== Number(port) ||
+      !parsed.pathname.startsWith("/devtools/browser/") ||
+      !["127.0.0.1", "localhost", "::1", "[::1]"].includes(parsed.hostname)
+    ) {
+      throw new Error("unexpected CDP endpoint identity");
+    }
+    endpointPath = parsed.pathname;
+  } catch (error) {
+    throw new Error(`invalid CDP endpoint after launch: ${error.message}`);
+  }
+  fs.writeFileSync(
+    path.join(profile, "DevToolsActivePort"),
+    `${port}\n${endpointPath}\n`,
+    { encoding: "utf-8", mode: 0o600 },
+  );
+  const owned = await getProfileWsEndpoint(profile, port);
+  if (owned !== wsUrl) {
+    throw new Error("could not establish dedicated-profile CDP ownership");
+  }
+  return owned;
 }
 
 // Running browser version (e.g. "146.0.7680.164") from its CDP /json/version,
@@ -293,6 +323,44 @@ function killGroup(pid) {
   }
 }
 
+/**
+ * Close the browser belonging to this exact dedicated profile/port.
+ *
+ * A supervised MCP generation may attach to a Chromium process launched by
+ * the generation which crashed. In that case `ownsBrowser` is false in the
+ * process-local sense, but the endpoint is still owned by this isolated
+ * OpenAgent pool. Always request Browser.close over the verified CDP
+ * connection; the PID signal remains a fallback only for the generation which
+ * launched the process. Waiting for the endpoint prevents the pool from
+ * handing out a different port while the persistent profile is still locked.
+ */
+export async function closeDedicatedBrowser(
+  connection,
+  {
+    ownsBrowser = false,
+    browserPid = null,
+    port = CDP_PORT,
+    timeoutMs = 1800,
+  } = {},
+) {
+  if (connection && !connection.closed) {
+    try {
+      const closeRequest = Promise.resolve(connection.send("Browser.close"))
+        .catch(() => undefined);
+      await Promise.race([closeRequest, sleep(500)]);
+    } catch {}
+  }
+  try { if (connection) connection.close(); } catch {}
+  if (ownsBrowser && browserPid) killGroup(browserPid);
+
+  const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
+  while (Date.now() < deadline) {
+    if (!(await getWsEndpoint(port, 100))) return true;
+    await sleep(50);
+  }
+  return !(await getWsEndpoint(port, 100));
+}
+
 // Launch one browser binary and wait for its CDP endpoint. Resolves
 // { wsUrl, pid } on success; on failure kills the process (so it doesn't hold
 // the profile lock) and throws, letting the caller try the next candidate.
@@ -300,6 +368,9 @@ async function launchAndWait(binary, profile, port, timeoutMs = 20000) {
   // A marker left by a crashed browser must never make a newly spawned process
   // appear to own an unrelated endpoint already listening on the same port.
   try { fs.rmSync(path.join(profile, "DevToolsActivePort"), { force: true }); } catch {}
+  if (await getWsEndpoint(port)) {
+    throw new Error(`refusing to launch onto an occupied CDP port :${port}`);
+  }
 
   let cmd = binary;
   let argv = launchArgs(binary, profile, port);
@@ -328,8 +399,14 @@ async function launchAndWait(binary, profile, port, timeoutMs = 20000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (exited) break;
-    const ws = await getProfileWsEndpoint(profile, port);
+    const ws = await getWsEndpoint(port);
     if (ws) {
+      try {
+        await recordProfileWsEndpoint(profile, port, ws);
+      } catch (error) {
+        killGroup(child.pid);
+        throw error;
+      }
       log(`browser ready on :${port} (pid ${child.pid})`);
       return { wsUrl: ws, pid: child.pid };
     }
@@ -411,18 +488,235 @@ function downloadTo(url, dest) {
 }
 
 // ── Extension management (install/remove from the Chrome Web Store) ─────────
-function unzipTo(zipPath, destDir) {
-  fs.rmSync(destDir, { recursive: true, force: true });
-  fs.mkdirSync(destDir, { recursive: true });
-  let r;
-  if (SYSTEM === "win32") r = spawnSync("tar", ["-xf", zipPath, "-C", destDir], { stdio: "ignore" });
-  else r = spawnSync("unzip", ["-o", "-q", zipPath, "-d", destDir], { stdio: "ignore" });
-  if ((r.status !== 0 && r.status !== 1) || !isFile(path.join(destDir, "manifest.json"))) {
-    // unzip exit 1 = warnings (e.g. _metadata) but files extracted; only fail if
-    // the manifest is missing.
-    if (!isFile(path.join(destDir, "manifest.json"))) {
-      throw new Error("could not unpack extension (is 'unzip' installed?)");
+// Extraction must not delegate a signed-but-attacker-controlled archive to an
+// OS tar/unzip binary. Parse it with bundled Node APIs and reject it before
+// decompression if its declared expansion is unsafe.
+const ZIP_MAX_ARCHIVE_BYTES = 256 * 1024 * 1024;
+const ZIP_MAX_ENTRY_BYTES = 128 * 1024 * 1024;
+const ZIP_MAX_TOTAL_BYTES = 512 * 1024 * 1024;
+const ZIP_MAX_ENTRIES = 10_000;
+const ZIP_EOCD_SIGNATURE = 0x06054b50;
+const ZIP_CENTRAL_SIGNATURE = 0x02014b50;
+const ZIP_CRC32_TABLE = Uint32Array.from({ length: 256 }, (_, index) => {
+  let value = index;
+  for (let bit = 0; bit < 8; bit += 1) {
+    value = (value & 1) ? (0xedb88320 ^ (value >>> 1)) : (value >>> 1);
+  }
+  return value >>> 0;
+});
+
+function safeArchivePath(rawName) {
+  if (typeof rawName !== "string" || rawName.length === 0 || rawName.length > 4096) {
+    throw new Error("ZIP entry has an invalid path length");
+  }
+  if (rawName.includes("\0")) throw new Error("ZIP entry path contains NUL");
+  const portable = rawName.replaceAll("\\", "/");
+  if (portable.startsWith("/") || /^[a-zA-Z]:/.test(portable)) {
+    throw new Error(`ZIP entry path is absolute: ${rawName}`);
+  }
+  const isDirectory = portable.endsWith("/");
+  const segments = portable.split("/");
+  if (isDirectory) segments.pop();
+  if (
+    segments.length === 0 ||
+    segments.some((segment) => !segment || segment === "." || segment === ".." || segment.includes(":"))
+  ) {
+    throw new Error(`ZIP entry path escapes or aliases the extension root: ${rawName}`);
+  }
+  return { name: segments.join("/"), isDirectory };
+}
+
+function findZipEocd(zip) {
+  // EOCD plus its maximum uint16 comment is the furthest legal search window.
+  const first = Math.max(0, zip.length - 65_557);
+  for (let offset = zip.length - 22; offset >= first; offset -= 1) {
+    if (zip.readUInt32LE(offset) === ZIP_EOCD_SIGNATURE) return offset;
+  }
+  throw new Error("ZIP end-of-central-directory record is missing");
+}
+
+function inspectZipArchive(input) {
+  const zip = Buffer.from(input);
+  if (zip.length > ZIP_MAX_ARCHIVE_BYTES) throw new Error("ZIP archive exceeds the size limit");
+  if (zip.length < 22) throw new Error("ZIP archive is truncated");
+  const eocd = findZipEocd(zip);
+  const commentLength = zip.readUInt16LE(eocd + 20);
+  if (eocd + 22 + commentLength !== zip.length) throw new Error("ZIP archive has trailing data");
+  const disk = zip.readUInt16LE(eocd + 4);
+  const centralDisk = zip.readUInt16LE(eocd + 6);
+  const diskEntries = zip.readUInt16LE(eocd + 8);
+  const totalEntries = zip.readUInt16LE(eocd + 10);
+  const centralSize = zip.readUInt32LE(eocd + 12);
+  const centralOffset = zip.readUInt32LE(eocd + 16);
+  if (
+    disk !== 0 || centralDisk !== 0 || diskEntries !== totalEntries ||
+    totalEntries === 0xffff || centralSize === 0xffffffff || centralOffset === 0xffffffff
+  ) {
+    throw new Error("multi-disk and ZIP64 extension archives are not supported");
+  }
+  if (totalEntries === 0 || totalEntries > ZIP_MAX_ENTRIES) {
+    throw new Error("ZIP archive has an invalid entry count");
+  }
+  if (centralOffset + centralSize !== eocd || centralOffset + centralSize > zip.length) {
+    throw new Error("ZIP central directory is out of bounds");
+  }
+
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  const entries = [];
+  const names = new Set();
+  let totalBytes = 0;
+  let offset = centralOffset;
+  for (let index = 0; index < totalEntries; index += 1) {
+    if (offset + 46 > eocd || zip.readUInt32LE(offset) !== ZIP_CENTRAL_SIGNATURE) {
+      throw new Error("ZIP central directory entry is truncated");
     }
+    const flags = zip.readUInt16LE(offset + 8);
+    const compression = zip.readUInt16LE(offset + 10);
+    const crc = zip.readUInt32LE(offset + 16);
+    const compressedSize = zip.readUInt32LE(offset + 20);
+    const uncompressedSize = zip.readUInt32LE(offset + 24);
+    const nameLength = zip.readUInt16LE(offset + 28);
+    const extraLength = zip.readUInt16LE(offset + 30);
+    const entryCommentLength = zip.readUInt16LE(offset + 32);
+    const diskStart = zip.readUInt16LE(offset + 34);
+    const externalAttributes = zip.readUInt32LE(offset + 38);
+    const localOffset = zip.readUInt32LE(offset + 42);
+    const end = offset + 46 + nameLength + extraLength + entryCommentLength;
+    if (end > eocd || nameLength === 0) throw new Error("ZIP entry metadata is out of bounds");
+    if ((flags & 1) !== 0) throw new Error("encrypted ZIP entries are not supported");
+    if (![0, 8].includes(compression)) throw new Error(`unsupported ZIP compression method ${compression}`);
+    if (
+      compressedSize === 0xffffffff || uncompressedSize === 0xffffffff ||
+      localOffset === 0xffffffff || diskStart !== 0
+    ) {
+      throw new Error("ZIP64 and multi-disk entries are not supported");
+    }
+    const encodedName = zip.subarray(offset + 46, offset + 46 + nameLength);
+    if ((flags & 0x800) === 0 && encodedName.some((byte) => byte > 0x7f)) {
+      throw new Error("non-ASCII ZIP entry path is missing the UTF-8 flag");
+    }
+    let rawName;
+    try { rawName = decoder.decode(encodedName); }
+    catch { throw new Error("ZIP entry path is not valid UTF-8"); }
+    const safe = safeArchivePath(rawName);
+    if (names.has(safe.name)) throw new Error(`duplicate ZIP entry path: ${rawName}`);
+    names.add(safe.name);
+    const unixMode = (externalAttributes >>> 16) & 0xffff;
+    const unixType = unixMode & 0o170000;
+    if (unixType === 0o120000) throw new Error(`ZIP symlink entries are forbidden: ${rawName}`);
+    if (unixType !== 0 && unixType !== 0o040000 && unixType !== 0o100000) {
+      throw new Error(`unsupported ZIP special-file entry: ${rawName}`);
+    }
+    if ((safe.isDirectory && unixType === 0o100000) || (!safe.isDirectory && unixType === 0o040000)) {
+      throw new Error(`ZIP entry type conflicts with its path: ${rawName}`);
+    }
+    if (uncompressedSize > ZIP_MAX_ENTRY_BYTES) throw new Error(`ZIP entry exceeds the size limit: ${rawName}`);
+    totalBytes += uncompressedSize;
+    if (totalBytes > ZIP_MAX_TOTAL_BYTES) throw new Error("ZIP archive exceeds the expansion limit");
+    entries.push({
+      ...safe,
+      compression,
+      compressedSize,
+      crc,
+      encodedName: Buffer.from(encodedName),
+      localOffset,
+      uncompressedSize,
+    });
+    offset = end;
+  }
+  if (offset !== eocd) throw new Error("ZIP central directory size does not match its entries");
+  return { entries, centralOffset };
+}
+
+function crc32(data) {
+  let crc = 0xffffffff;
+  for (const byte of data) {
+    crc = (crc >>> 8) ^ ZIP_CRC32_TABLE[(crc ^ byte) & 0xff];
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function decompressZipEntries(zip, entries, centralOffset) {
+  const output = new Map();
+  const occupied = [];
+  for (const entry of entries) {
+    const localOffset = entry.localOffset;
+    if (localOffset + 30 > centralOffset || zip.readUInt32LE(localOffset) !== 0x04034b50) {
+      throw new Error(`ZIP local header is missing: ${entry.name}`);
+    }
+    const localFlags = zip.readUInt16LE(localOffset + 6);
+    const localCompression = zip.readUInt16LE(localOffset + 8);
+    const localNameLength = zip.readUInt16LE(localOffset + 26);
+    const localExtraLength = zip.readUInt16LE(localOffset + 28);
+    const dataStart = localOffset + 30 + localNameLength + localExtraLength;
+    const dataEnd = dataStart + entry.compressedSize;
+    if (dataStart > centralOffset || dataEnd > centralOffset) {
+      throw new Error(`ZIP entry data is out of bounds: ${entry.name}`);
+    }
+    const localName = zip.subarray(localOffset + 30, localOffset + 30 + localNameLength);
+    if (!localName.equals(entry.encodedName)) {
+      throw new Error(`ZIP local and central paths differ: ${entry.name}`);
+    }
+    if ((localFlags & 1) !== 0 || localCompression !== entry.compression) {
+      throw new Error(`ZIP local header conflicts with its directory: ${entry.name}`);
+    }
+    occupied.push([localOffset, dataEnd, entry.name]);
+    const compressed = zip.subarray(dataStart, dataEnd);
+    let data;
+    try {
+      data = entry.compression === 0
+        ? Buffer.from(compressed)
+        : inflateRawSync(compressed, {
+          maxOutputLength: Math.max(1, entry.uncompressedSize),
+        });
+    } catch (error) {
+      throw new Error(`could not decompress ZIP entry ${entry.name}: ${error.message}`);
+    }
+    if (data.length !== entry.uncompressedSize) {
+      throw new Error(`ZIP entry size mismatch: ${entry.name}`);
+    }
+    if (crc32(data) !== entry.crc) throw new Error(`ZIP entry checksum mismatch: ${entry.name}`);
+    if (!entry.isDirectory) output.set(entry.name, data);
+  }
+  occupied.sort((left, right) => left[0] - right[0]);
+  for (let index = 1; index < occupied.length; index += 1) {
+    if (occupied[index][0] < occupied[index - 1][1]) {
+      throw new Error(`overlapping ZIP entries are forbidden: ${occupied[index][2]}`);
+    }
+  }
+  return output;
+}
+
+/** Safely extract an authenticated extension ZIP using only bundled Node APIs. */
+export function extractExtensionZip(input, destDir) {
+  const zip = Buffer.from(input);
+  const { entries, centralOffset } = inspectZipArchive(zip);
+  const extracted = decompressZipEntries(zip, entries, centralOffset);
+  const files = entries.filter((entry) => !entry.isDirectory);
+  if (files.length !== extracted.size) throw new Error("ZIP extracted file set does not match its directory");
+  if (!extracted.has("manifest.json")) throw new Error("extension ZIP has no root manifest.json");
+
+  const destination = path.resolve(destDir);
+  const parent = path.dirname(destination);
+  fs.mkdirSync(parent, { recursive: true });
+  const staging = `${destination}.install-${crypto.randomBytes(8).toString("hex")}`;
+  fs.mkdirSync(staging);
+  try {
+    for (const entry of files) {
+      const target = path.resolve(staging, ...entry.name.split("/"));
+      if (!target.startsWith(staging + path.sep)) {
+        throw new Error(`ZIP entry escapes the extraction root: ${entry.name}`);
+      }
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, extracted.get(entry.name), { flag: "wx", mode: 0o600 });
+    }
+    if (!isFile(path.join(staging, "manifest.json"))) {
+      throw new Error("extension ZIP manifest.json is not a regular file");
+    }
+    fs.rmSync(destination, { recursive: true, force: true });
+    fs.renameSync(staging, destination);
+  } finally {
+    fs.rmSync(staging, { recursive: true, force: true });
   }
 }
 
@@ -574,13 +868,11 @@ export function verifyCrx3Package(buf, expectedId) {
 }
 
 // A verified CRX3 is a signed header followed by a ZIP. Authenticate before
-// exposing any archive entry to the OS-native extractor.
+// parsing or decompressing any archive entry.
 function unpackCrx(crxPath, destDir, expectedId) {
   const buf = fs.readFileSync(crxPath);
   const zipStart = verifyCrx3Package(buf, expectedId);
-  const zipPath = crxPath + ".zip";
-  fs.writeFileSync(zipPath, buf.subarray(zipStart));
-  try { unzipTo(zipPath, destDir); } finally { try { fs.rmSync(zipPath, { force: true }); } catch {} }
+  extractExtensionZip(buf.subarray(zipStart), destDir);
 }
 
 /**
