@@ -3016,10 +3016,14 @@ def _diagnostic_reply_suffix(state: SupportState, italian: bool) -> str:
             if italian else
             f" The simulation also verified enabling {category} diagnostics; in production the customer would now be asked to reproduce the issue once."
         )
+    # The 30 seconds are not padding: the client uploads its delta every 5s and
+    # only while the app is in the foreground. Every capture that came back
+    # empty came back empty for this reason - the customer reproduced the fault
+    # and closed the app immediately, exactly as a well-behaved tester would.
     return (
-        f" Ho attivato la diagnostica {category}: riproduci il problema una volta e rispondi qui, così possiamo leggere i log raccolti."
+        f" Ho attivato la diagnostica {category}: riproduci il problema una volta, poi lascia l’app aperta e in primo piano per una trentina di secondi senza chiuderla né bloccare lo schermo, e rispondi qui."
         if italian else
-        f" I enabled {category} diagnostics. Reproduce the issue once and reply here so we can read the captured logs."
+        f" I enabled {category} diagnostics. Reproduce the issue once, then leave the app open and in the foreground for about 30 seconds without closing it or locking the screen, and reply here."
     )
 
 
@@ -3317,9 +3321,9 @@ def _fallback_reply(state: SupportState) -> str:
             )
         if state.outcome == "bug_diagnostics_not_captured":
             return (
-                "Non è ancora arrivato alcun log. Riproduci il problema un’altra volta con l’app online e rispondi qui; la diagnostica resta attiva."
+                "Non è ancora arrivato alcun log. Riproduci il problema un’altra volta con l’app online, poi lasciala aperta e in primo piano per una trentina di secondi prima di rispondere qui: l’invio parte solo mentre l’app è in primo piano. La diagnostica resta attiva."
                 if italian else
-                "No diagnostic log has arrived yet. Reproduce the issue once more while the app is online and reply here; diagnostics remain active."
+                "No diagnostic log has arrived yet. Reproduce the issue once more while the app is online, then leave it open and in the foreground for about 30 seconds before replying here - the upload only runs while the app is in front. Diagnostics remain active."
             )
         if state.outcome.endswith("_human"):
             return (
@@ -4250,6 +4254,19 @@ async def _compose_local(
         return await _fallback_in_language(
             agent, event, state, session_id, "guard",
         )
+    # A capture the customer cannot verify. Saying it was switched on, or that
+    # its logs arrived and were read, costs the customer a reproduction ritual
+    # and buys us nothing when no admin receipt backs it.
+    if reply_guard.claims_diagnostics(reply) and not any(
+        action.get("kind") in {"diagnostic_enable", "diagnostic_read"}
+        and action.get("success")
+        for action in state.actions
+    ):
+        elog("support_controller.unbacked_diagnostics_claim", level="warning",
+             thread_id=state.thread_id)
+        return await _fallback_in_language(
+            agent, event, state, session_id, "guard",
+        )
     if (
         not state.facts.get("billing_verified")
         and re.search(
@@ -4400,6 +4417,39 @@ _INTERMITTENT_BUG = re.compile(
     re.IGNORECASE,
 )
 
+# The mirror image of the pattern above, and just as good a reason to capture:
+# a fault the customer hits on demand. Requiring "sometimes" meant the reports
+# where a capture is GUARANTEED to catch something - "it fails every single
+# time" - were the ones that never got one. Measured on a real Lyra thread
+# (26-ago-2026): three consecutive messages, all "every time"/"still", and the
+# lane declined every one of them.
+_REPRODUCIBLE_BUG = re.compile(
+    r"\b(?:every\s?time|each\s?time|always|still\s+(?:not|can(?:'|no)?t|"
+    r"doesn'?t|does\s+not|happening|occurring)|keeps?\s+(?:happening|failing|"
+    r"showing|crashing)|never\s+(?:works?|plays?|loads?)|all\s+the\s+time|"
+    r"ogni\s?volta|sempre|continua\s+a|non\s+funziona\s+mai|ancora\s+non|"
+    r"cada\s+vez|siempre|sigue\s+(?:sin|pasando)|nunca\s+funciona|"
+    r"[àa]\s+chaque\s+fois|toujours|ne\s+marche\s+jamais|"
+    r"toda\s+vez|sempre\s+que)\b",
+    re.IGNORECASE,
+)
+
+
+def _symptom_context(state: SupportState) -> str:
+    """Everything the customer has said on this thread, for symptom routing.
+
+    ``customer_message`` alone is the LATEST message, and a follow-up rarely
+    repeats the symptom: "the app asked for an update, I installed it, same
+    issue" carries no subsystem word at all and routed to ``general``, losing
+    the playback capture the first message had earned.
+    """
+    return " ".join(filter(None, [
+        state.customer_message,
+        state.subject,
+        *(turn.get("text", "") for turn in state.recent_exchange
+          if turn.get("from") == "customer"),
+    ]))
+
 
 def _diagnostic_category(message: str) -> str:
     """Pick one narrow, product-supported capture category from the symptom."""
@@ -4421,6 +4471,35 @@ def _diagnostic_category(message: str) -> str:
     return "general"
 
 
+# One category is not a capture, it is a slice of one. A failure to play shows
+# up as a resolve in `playback`, a transport event in `player`, and the request
+# that carried it in `network`; reading only `playback` leaves the reader
+# guessing which of the three broke. `general` always rides along because it is
+# where the app writes its own boot/lifecycle line.
+_DIAGNOSTIC_BUNDLES: dict[str, tuple[str, ...]] = {
+    "playback": ("playback", "player", "network", "general"),
+    "ads": ("ads", "player", "general"),
+    "auth": ("auth", "network", "general"),
+    "sync": ("sync", "network", "general"),
+    "search": ("search", "catalog", "network", "general"),
+    "library": ("library", "sync", "general"),
+    "playlists": ("playlists", "sync", "general"),
+    "purchases": ("purchases", "network", "general"),
+    "network": ("network", "general"),
+    "general": ("general", "network"),
+}
+# Four files at 5s deltas is what a support turn can actually read back; more
+# than that and the upload budget goes on categories nobody opens.
+_MAX_DIAGNOSTIC_CATEGORIES = 4
+
+
+def _diagnostic_bundle(primary: str, available: set[str]) -> list[str]:
+    """The primary category plus the ones that explain it, if the server has them."""
+    wanted = _DIAGNOSTIC_BUNDLES.get(primary, (primary, "general"))
+    picked = [name for name in wanted if name in available]
+    return picked[:_MAX_DIAGNOSTIC_CATEGORIES]
+
+
 def _result_items(result: Any) -> list[Any]:
     if isinstance(result, list):
         return result
@@ -4432,6 +4511,23 @@ def _result_items(result: Any) -> list[Any]:
         value = result.get(key)
         if isinstance(value, list):
             return value
+    # An MCP server that answers with a bare JSON array arrives wrapped in the
+    # protocol's ``content`` envelope, so none of the keys above exist and the
+    # caller reads "the server offers no categories" from a perfectly good
+    # reply. That silent empty is indistinguishable from a real refusal, and it
+    # disables a capture without ever saying why.
+    content = result.get("content")
+    if isinstance(content, list):
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            inner = part.get("text")
+            if isinstance(inner, list):
+                return inner
+            if isinstance(inner, dict):
+                nested = _result_items(inner)
+                if nested:
+                    return nested
     return []
 
 
@@ -4468,10 +4564,23 @@ async def _maybe_enable_bug_diagnostics(pool: Any, state: SupportState) -> None:
     """Enable one receipt-backed capture for a hard-to-reproduce tracked bug.
 
     Diagnostics are never guessed and never enabled merely because a report is
-    a bug.  The report must be intermittent, already have a verified ClickUp
-    task/link, and identify an account that the product admin can resolve.
+    a bug.  The report must name a subsystem the app can actually capture (or
+    say the fault recurs), already have a verified ClickUp task/link, and
+    identify an account that the product admin can resolve.
     """
-    if not _INTERMITTENT_BUG.search(state.customer_message):
+    if state.facts.get("diagnostic_capture"):
+        return
+    context = _symptom_context(state)
+    primary = _diagnostic_category(context)
+    # Two independent reasons to capture, and either is enough. A named
+    # subsystem means the customer described a concrete failure we can point a
+    # category at; a recurrence marker means a capture will catch it. Requiring
+    # BOTH (in practice: requiring the word "sometimes") is what kept the lane
+    # from ever running on the reports best suited to it.
+    recurs = bool(
+        _INTERMITTENT_BUG.search(context) or _REPRODUCIBLE_BUG.search(context)
+    )
+    if primary == "general" and not recurs:
         return
     if not (state.facts.get("clickup_task") and state.account_ref):
         state.facts["diagnostics_skipped"] = "account_identity_required"
@@ -4497,18 +4606,19 @@ async def _maybe_enable_bug_diagnostics(pool: Any, state: SupportState) -> None:
         for item in _result_items(categories_result)
         if str(item.get("name") if isinstance(item, dict) else item).strip()
     }
-    requested = _diagnostic_category(state.customer_message)
-    category = requested if requested in available else (
+    requested = primary if primary in available else (
         "general" if "general" in available else ""
     )
-    if not category:
+    categories = _diagnostic_bundle(requested, available) if requested else []
+    if not categories:
         state.facts["diagnostics_skipped"] = "no_supported_category"
         return
+    category = categories[0]
 
     enabled = await _record_action(
         state, pool, server,
         (f"{server.replace('-', '_')}_enable_diagnostics", "enable_diagnostics"),
-        {**identity_args, "categories": [category]},
+        {**identity_args, "categories": categories},
         "diagnostic_enable",
     )
     if not enabled:
@@ -4519,13 +4629,17 @@ async def _maybe_enable_bug_diagnostics(pool: Any, state: SupportState) -> None:
     # remains inside the admin action receipt and is never copied into prose.
     state.facts["diagnostic_capture"] = {
         "category": category,
+        "categories": categories,
         "status": "simulated" if _simulated(state) else "enabled",
     }
     await _record_tags(state, pool, ["diagnostics-active"])
     state.instructions.append(
         "Diagnostic capture is active only because the product-admin receipt "
-        "succeeded. Ask the customer to reproduce the issue once and reply; do "
-        "not claim that logs have already been captured or analysed."
+        "succeeded. Ask the customer to reproduce the issue once AND to leave "
+        "the app open, in the foreground, for about 30 seconds afterwards - "
+        "the upload only runs while the app is in front, so an app closed "
+        "straight after the failure sends an empty file. Do not claim that "
+        "logs have already been captured or analysed."
     )
 
 
@@ -4599,7 +4713,10 @@ async def _collect_bug_diagnostics(pool: Any, state: SupportState) -> None:
         state.outcome = "bug_diagnostics_not_captured"
         state.instructions.append(
             "No diagnostic stream exists yet. Ask the customer to reproduce "
-            "once more while the app is online; do not claim logs were read."
+            "once more while the app is online AND to leave the app open, in "
+            "the foreground, for about 30 seconds afterwards - an empty stream "
+            "is what an app closed right after the failure produces. Do not "
+            "claim logs were read."
         )
         return
 

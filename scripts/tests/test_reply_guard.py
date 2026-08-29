@@ -701,3 +701,49 @@ async def t_unbacked_tracking(_ctx: TestContext) -> None:
         )
     assert "task already exists" not in cleaned.lower(), cleaned
     assert "app version" in cleaned.lower(), cleaned
+
+
+@test("reply_guard", "a claim about diagnostic logs needs a receipt behind it")
+async def t_diagnostics_claim_detected(_ctx: TestContext) -> None:
+    """The three sentences a real Lyra thread received on 26-ago-2026.
+
+    No capture had ever been switched on and no log existed; the customer
+    performed the reproduction ritual twice for nothing.
+    """
+    from src.core import reply_guard
+
+    for claimed in (
+        "I've enabled diagnostic logging on your account.",
+        "We've received your logs and created a tracking task.",
+        "From your logs, we can see the technical requests look correct.",
+        "Your logs show the requests are fine.",
+        "Diagnostics have been enabled for your account.",
+        "Ho attivato i log diagnostici sul tuo account.",
+        "Abbiamo ricevuto i tuoi log.",
+        "Dai tuoi log risulta che le richieste sono corrette.",
+    ):
+        assert reply_guard.claims_diagnostics(claimed) is True, claimed
+
+    for fine in (
+        "",
+        "Could you send a screen recording of the error?",
+        "I read your message, thanks for the detail.",
+        "We are tracking this issue.",
+        "Riproduci il problema una volta e rispondi qui.",
+    ):
+        assert reply_guard.claims_diagnostics(fine) is False, fine
+
+    # An enable receipt is what makes the sentence sayable.
+    backed = [(
+        "lyra_admin_enable_diagnostics",
+        'result={"ok": true, "categories": ["playback"]}',
+    )]
+    assert reply_guard._trace_supports_completed_action(
+        "I enabled diagnostic capture on your account.", backed,
+    ) is True
+    failed = [(
+        "lyra_admin_enable_diagnostics", 'result={"ok": false, "error": "not found"}',
+    )]
+    assert reply_guard._trace_supports_completed_action(
+        "I enabled diagnostic capture on your account.", failed,
+    ) is False

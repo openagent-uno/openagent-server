@@ -136,10 +136,41 @@ _COMPLETED_ACTION = re.compile(
     r"\b(?:i|we)(?:'ve|\s+have|\s+already)?\s+"
     r"(?:linked|attached|forwarded|escalated|flagged|submitted|opened|created|"
     r"filed|sent|notified|refunded|credited|activated|renewed|extended|updated|"
-    r"fixed|resolved|corrected|changed|marked|assigned|routed)\b"
+    r"fixed|resolved|corrected|changed|marked|assigned|routed|enabled)\b"
     r"|\b(?:ho|abbiamo)\s+(?:collegat|allegat|inoltrat|girat|segnalat|apert|"
-    r"creat|inviat|rimborsat|accreditat|attivat|rinnovat|estes|aggiornat|"
-    r"corrett|risolt|assegnat)\w*\b",
+    r"creat|inviat|rimborsat|accreditat|attivat|abilitat|rinnovat|estes|"
+    r"aggiornat|corrett|risolt|assegnat)\w*\b",
+    re.IGNORECASE,
+)
+
+# Diagnostics is the one claim family where the fabrication is not a verb the
+# generic pattern above would ever catch: "I've enabled diagnostic logging on
+# your account", then "we've received your logs" and "from your logs we can
+# see". Every one of those is a statement about OUR side of the system that the
+# customer cannot check, and each one was sent on a real Lyra thread
+# (26-ago-2026) while no capture had ever been switched on and no log existed.
+# The customer then performed the capture ritual for nothing, twice.
+_DIAGNOSTIC_SUBJECT = (
+    r"(?:diagnostic\w*|log\s?file\w*|logs?\b|telemetr\w+|"
+    r"diagnostic\w*|registri|registrazion\w+|diagnostica|"
+    r"registros?|journaux|protocolos?)"
+)
+_DIAGNOSTIC_CLAIM = re.compile(
+    # "I enabled diagnostics", "we received your logs", "I've read the logs"
+    r"\b(?:i|we)(?:'ve|'ll\s+have|\s+have|\s+already)?\s+"
+    r"(?:enabled|turned\s+on|switched\s+on|activated|started|set\s+up|"
+    r"received|got|collected|captured|pulled|read|reviewed|checked|"
+    r"analy[sz]ed|inspected|examined)\b[^.?!\n]{0,60}?" + _DIAGNOSTIC_SUBJECT
+    + r"|" + _DIAGNOSTIC_SUBJECT + r"[^.?!\n]{0,60}?\b(?:has|have|were|was|is|are)"
+    r"\s+been\s+(?:enabled|activated|received|collected|captured|read|"
+    r"reviewed|analy[sz]ed)\b"
+    # "from your logs we can see", "your logs show" - a claim to have read them.
+    + r"|\bfrom\s+(?:your|the)\s+" + _DIAGNOSTIC_SUBJECT
+    + r"|" + _DIAGNOSTIC_SUBJECT + r"\s+(?:show|shows|indicate|indicates|tell\s+us)\b"
+    r"|\b(?:ho|abbiamo)\s+(?:attivat|abilitat|acces|avviat|ricevut|ottenut|"
+    r"raccolt|lett|esaminat|analizzat|controllat|verificat)\w*\b"
+    r"[^.?!\n]{0,60}?(?:diagnostic\w*|log\b|logs\b|registri)"
+    r"|\bdai\s+(?:tuoi\s+)?log\b|\bnei\s+(?:tuoi\s+)?log\b",
     re.IGNORECASE,
 )
 
@@ -397,6 +428,16 @@ def claims_completed_action(text: Optional[str]) -> bool:
         return False
 
 
+def claims_diagnostics(text: Optional[str]) -> bool:
+    """True when *text* claims a diagnostic capture was enabled, received or read."""
+    if not text:
+        return False
+    try:
+        return bool(_DIAGNOSTIC_CLAIM.search(text))
+    except Exception:  # noqa: BLE001 — a regex miss must never break the turn
+        return False
+
+
 def quotes_money(text: Optional[str]) -> bool:
     """True when a reply names a concrete monetary amount.
 
@@ -508,6 +549,8 @@ _ACTION_FAMILIES = (
      ("forward", "escalat", "flag", "mark_for_human", "handoff")),
     (("updated", "changed", "marked", "assegnat", "aggiornat"),
      ("update", "patch", "set_", "mark", "assign", "tag")),
+    (("diagnostic", "diagnostica", "log", "registri"),
+     ("diagnostic", "diagnostics", "diagnostic_log", "diagnostic_stream")),
 )
 
 

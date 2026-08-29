@@ -2812,3 +2812,126 @@ async def t_thin_body_is_not_classified(_ctx: TestContext) -> None:
     real = "My downloaded songs all disappeared after the update" + trailer
     own = lsc._FORM_FIELD.sub("", real).replace("---", " ").strip()
     assert len(own) >= lsc._SEMANTIC_MIN_OWN_WORDS, own
+
+
+@test("local_support_controller", "a fault the customer hits every time earns a capture")
+async def t_reproducible_bug_enables_diagnostics(_ctx: TestContext) -> None:
+    """The gate used to require the word "sometimes".
+
+    A real Lyra thread (26-ago-2026) said "every time" three messages running
+    and never got a capture, so support answered it blind for three days.
+    """
+    from src.core.local_support_controller import (
+        _TENANTS,
+        SupportState,
+        _maybe_enable_bug_diagnostics,
+    )
+
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def search_users(**kwargs: Any) -> Any:
+        calls.append(("search_users", kwargs))
+        return {"users": [{"identityId": "ident-1", "email": "c@example.com"}]}
+
+    async def list_categories(**kwargs: Any) -> Any:
+        calls.append(("list_diagnostic_categories", kwargs))
+        # The server answers with a bare JSON array inside the MCP envelope.
+        return {"content": [{"type": "text", "text": [
+            "ads", "auth", "catalog", "general", "library", "network",
+            "playback", "player", "playlists", "purchases", "search", "sync",
+        ]}]}
+
+    async def enable(**kwargs: Any) -> Any:
+        calls.append(("enable_diagnostics", kwargs))
+        return {"ok": True, "categories": kwargs.get("categories")}
+
+    async def tags_add(**kwargs: Any) -> Any:
+        calls.append(("threads_tags_add", kwargs))
+        return {"ok": True}
+
+    pool = _Pool({
+        "lyra-admin": _Toolkit({
+            "lyra_admin_search_users": search_users,
+            "lyra_admin_list_diagnostic_categories": list_categories,
+            "lyra_admin_enable_diagnostics": enable,
+        }),
+        "replio": _Toolkit({"replio_threads_tags_add": tags_add}),
+    })
+
+    state = SupportState(
+        thread_id="t-1",
+        customer_message=(
+            "The app requested an update, so I installed it, but the same "
+            "issue is still occurring."
+        ),
+        subject="Music Streaming",
+        tenant=_TENANTS["lyra"],
+    )
+    # The symptom lives in the FIRST message; the latest one carries none.
+    state.recent_exchange = [{
+        "from": "customer",
+        "text": (
+            "I am trying to play music but every time it is showing that "
+            "something went wrong please try later"
+        ),
+    }]
+    state.account_email = "c@example.com"
+    state.account_ref = "c@example.com"
+    state.linked_task_id = "86cbacgj9"
+    state.facts["clickup_task"] = {"id": "86cbacgj9"}
+
+    previous = os.environ.get("OPENAGENT_ESOUND_SUPPORT_CONTROLLER_WRITES", "")
+    os.environ["OPENAGENT_ESOUND_SUPPORT_CONTROLLER_WRITES"] = "1"
+    try:
+        await _maybe_enable_bug_diagnostics(pool, state)
+    finally:
+        os.environ["OPENAGENT_ESOUND_SUPPORT_CONTROLLER_WRITES"] = previous
+
+    assert "diagnostics_skipped" not in state.facts, state.facts
+    capture = state.facts.get("diagnostic_capture")
+    assert capture and capture["category"] == "playback", capture
+    # A play failure is not readable from `playback` alone.
+    assert capture["categories"] == [
+        "playback", "player", "network", "general",
+    ], capture
+    enabled_args = [args for name, args in calls if name == "enable_diagnostics"]
+    assert enabled_args and enabled_args[0]["identityId"] == "ident-1", calls
+    assert any(
+        action.get("kind") == "diagnostic_enable" and action.get("success")
+        for action in state.actions
+    ), state.actions
+    instruction = " ".join(state.instructions).lower()
+    assert "foreground" in instruction and "30 seconds" in instruction, instruction
+
+
+@test("local_support_controller", "a vague complaint still earns no capture")
+async def t_vague_bug_skips_diagnostics(_ctx: TestContext) -> None:
+    from src.core.local_support_controller import (
+        SupportState,
+        _maybe_enable_bug_diagnostics,
+    )
+
+    async def unexpected(**_kwargs: Any) -> Any:
+        raise AssertionError("no admin call may be made for a vague report")
+
+    pool = _Pool({
+        "lyra-admin": _Toolkit({"lyra_admin_search_users": unexpected}),
+    })
+    state = SupportState(thread_id="t-2", customer_message="this app is bad")
+    state.account_ref = "c@example.com"
+    state.facts["clickup_task"] = {"id": "86cbacgj9"}
+
+    await _maybe_enable_bug_diagnostics(pool, state)
+    assert "diagnostic_capture" not in state.facts, state.facts
+
+
+@test("local_support_controller", "an MCP content envelope is still a list of items")
+async def t_result_items_unwraps_mcp_envelope(_ctx: TestContext) -> None:
+    from src.core.local_support_controller import _result_items
+
+    assert _result_items(["a", "b"]) == ["a", "b"]
+    assert _result_items({"categories": ["a"]}) == ["a"]
+    assert _result_items(
+        {"content": [{"type": "text", "text": ["playback", "general"]}]},
+    ) == ["playback", "general"]
+    assert _result_items({"content": [{"type": "text", "text": "not json"}]}) == []
