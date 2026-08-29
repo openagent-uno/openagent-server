@@ -136,8 +136,23 @@ def render_prompt_template(template: str, *, payload: dict[str, Any], event: dic
     even a template-driven prompt keeps the injection guard."""
     from src.workflow.templating import resolve_templates, TemplateError  # lazy
 
+    # Webhook callers are allowed to send either the raw payload object or an
+    # ``{"event": ..., "payload": {...}}`` envelope.  The dispatcher keeps
+    # the raw object (the normal Replio path), while older prompt templates
+    # commonly address the envelope as ``payload.payload.*``.  Expose a
+    # backwards-compatible view that preserves direct keys *and* provides the
+    # nested alias; otherwise a valid delivery dies before the agent turn with
+    # ``'dict object' has no attribute 'payload'``.  Likewise provide a stable
+    # event label for direct webhook bodies that do not carry ``event``.
+    template_payload = payload
+    if isinstance(payload, dict) and "payload" not in payload:
+        template_payload = dict(payload)
+        template_payload["payload"] = payload
+        template_payload.setdefault(
+            "event", event.get("slug") or event.get("name") or event.get("type")
+        )
     ctx = {
-        "payload": payload,
+        "payload": template_payload,
         "event": {"name": event.get("name"), "type": event.get("type"), "slug": event.get("slug")},
     }
     try:

@@ -17,6 +17,27 @@ import json
 from ._framework import TestContext, test, free_port
 
 
+@test("events", "prompt templates accept both raw webhook payloads and envelopes")
+async def t_prompt_template_payload_shapes(ctx: TestContext) -> None:
+    from src.core.event_dispatcher import render_prompt_template
+
+    # WebhookSite passes a raw JSON object, but production templates also use
+    # the historical envelope spelling payload.payload.*. Both must render.
+    direct = render_prompt_template(
+        "raw={{payload.payload.thread_id}}/{{payload.event}}/{{payload.thread_id}}",
+        payload={"thread_id": "T-raw"},
+        event={"name": "Replio inbound thread", "slug": "replio-thread", "type": "generic"},
+    )
+    assert "T-raw/replio-thread/T-raw" in direct, direct
+
+    enveloped = render_prompt_template(
+        "envelope={{payload.payload.thread_id}}/{{payload.event}}",
+        payload={"event": "thread.follow_up", "payload": {"thread_id": "T-envelope"}},
+        event={"name": "Replio inbound thread", "slug": "replio-thread", "type": "generic"},
+    )
+    assert "T-envelope/thread.follow_up" in enveloped, enveloped
+
+
 # ── DB round-trip + secret hygiene ────────────────────────────────────
 
 

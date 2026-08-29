@@ -3920,6 +3920,20 @@ async def _compose_local(
         return await _fallback_in_language(
             agent, event, state, session_id, "billing_policy",
         )
+    if state.outcome == "account_delete_confirmation_required":
+        # The one sentence that stands between a customer and a deleted
+        # account. Measured with the composer live: given this outcome the
+        # model wrote "Certo, posso aiutarti a cancellare il tuo account. Per
+        # procedere, dimmi quale email hai usato" - it dropped the explicit
+        # confirmation the policy requires and replaced it with a promise to
+        # help. The request may be translated, never re-argued.
+        state.facts["reply_source"] = "deterministic:deletion_policy"
+        language = str(state.facts.get("language") or "en")
+        if language in {"en", "it"}:
+            return _fallback_reply(state)
+        return await _fallback_in_language(
+            agent, event, state, session_id, "deletion_policy",
+        )
     if state.outcome == "ads_policy_explained":
         # Product mechanics here are both factual and remotely configurable.
         # Measured in the operational dry-run: a composer given the verified

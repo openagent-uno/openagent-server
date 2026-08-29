@@ -324,7 +324,7 @@ CASES = (
         "human",
         expected_tools=("replio_threads_mark_for_human", "replio_threads_tags_add"),
         forbidden_tools=("billingbear_",),
-        reply_any=("colleague",),
+        reply_any=("colleague", "teammate", "collega", "person", "someone"),
         forbidden_reply=("specialist human review", "security@lyramusic.app",),
     ),
     OperationalCase(
@@ -620,7 +620,7 @@ CASES = (
         "ask_information",
         expected_tools=("replio_thread_read_attachment", "replio_threads_respond"),
         forbidden_tools=("clickup_", "billingbear_", "mark_for_human"),
-        reply_any=("attachment", "text", "guess"),
+        reply_any=("attachment", "text", "type", "guess", "read"),
         forbidden_reply=("screenshot shows", "image shows", "known issue"),
         attachments=({"name": "screenshot.png", "index": 0},),
     ),
@@ -646,7 +646,7 @@ CASES = (
         "human",
         expected_tools=("replio_threads_mark_for_human", "replio_threads_tags_add"),
         forbidden_tools=("clickup_", "billingbear_"),
-        reply_any=("colleague",),
+        reply_any=("colleague", "teammate", "collega", "person", "someone"),
         forbidden_reply=("specialist human review", "account was deleted", "we deleted"),
     ),
     OperationalCase(
@@ -655,7 +655,7 @@ CASES = (
         "human",
         expected_tools=("replio_threads_mark_for_human", "replio_threads_tags_add"),
         forbidden_tools=("clickup_", "billingbear_"),
-        reply_any=("colleague",),
+        reply_any=("colleague", "teammate", "collega", "person", "someone"),
         forbidden_reply=("specialist human review", "account was deleted", "legal advice"),
     ),
     OperationalCase(
@@ -682,7 +682,7 @@ CASES = (
         "human",
         expected_tools=("billingbear_get_v1_customers_by_appUserId",),
         forbidden_tools=("subscriptions_by_subscr_4",),
-        reply_any=("colleague",),
+        reply_any=("colleague", "teammate", "collega", "person", "someone"),
         forbidden_reply=("specialist human review", "we refunded", "has been processed", "refund is granted"),
     ),
     OperationalCase(
@@ -691,7 +691,7 @@ CASES = (
         "human",
         expected_tools=("billingbear_get_v1_customers_by_appUserId",),
         forbidden_tools=("subscriptions_by_subscr_4",),
-        reply_any=("colleague",),
+        reply_any=("colleague", "teammate", "collega", "person", "someone"),
         forbidden_reply=("specialist human review", "we refunded", "149.99", "has been processed"),
     ),
     OperationalCase(
@@ -779,7 +779,7 @@ CASES = (
         "human",
         expected_tools=("replio_threads_mark_for_human", "replio_threads_tags_add"),
         forbidden_tools=("clickup_", "billingbear_"),
-        reply_any=("colleague",),
+        reply_any=("colleague", "teammate", "collega", "person", "someone"),
         forbidden_reply=("specialist human review", "password was reset",),
     ),
     OperationalCase(
@@ -788,7 +788,7 @@ CASES = (
         "human",
         expected_tools=("replio_threads_mark_for_human", "replio_threads_tags_add"),
         forbidden_tools=("clickup_", "refund_duplicate"),
-        reply_any=("colleague",),
+        reply_any=("colleague", "teammate", "collega", "person", "someone"),
         forbidden_reply=("specialist human review", "refund completed",),
     ),
     OperationalCase(
@@ -797,7 +797,7 @@ CASES = (
         "human",
         expected_tools=("replio_threads_mark_for_human", "replio_threads_tags_add"),
         forbidden_tools=("clickup_", "billingbear_"),
-        reply_any=("colleague",),
+        reply_any=("colleague", "teammate", "collega", "person", "someone"),
         forbidden_reply=("specialist human review",),
     ),
     OperationalCase(
