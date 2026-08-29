@@ -64,8 +64,13 @@ def tool_exec_to_wire_json(
     """
     if tool_exec is None or not getattr(tool_exec, "tool_name", None):
         return None
-    _ensure_execution_host(tool_exec)
+    execution_host = _ensure_execution_host(tool_exec)
     payload = _to_dict(tool_exec)
+    # Runtime ToolExecution serializers enumerate declared fields and may omit
+    # the trusted execution_host attribute stamped above.  Overlay only that
+    # field on their native envelope so live status frames cannot lose host
+    # attribution while every runtime-owned field remains byte-for-byte intact.
+    payload["execution_host"] = execution_host
     if error_text is not None:
         payload["tool_call_error"] = True
         payload["result"] = error_text
@@ -108,16 +113,18 @@ def _to_dict(tool_exec: Any) -> dict[str, Any]:
     }
 
 
-def _ensure_execution_host(tool_exec: Any) -> None:
-    """Stamp the runtime object once so persistence keeps the live host chip."""
+def _ensure_execution_host(tool_exec: Any) -> dict[str, Any]:
+    """Stamp and return the trusted host for persistence and live encoding."""
 
-    if isinstance(getattr(tool_exec, "execution_host", None), dict):
-        return
+    existing = getattr(tool_exec, "execution_host", None)
+    if isinstance(existing, dict):
+        return existing
     host = _default_execution_host(getattr(tool_exec, "tool_args", None))
     try:
         tool_exec.execution_host = host
     except Exception:  # noqa: BLE001 — duck-typed immutable fixture
         pass
+    return host
 
 
 def _default_execution_host(args: Any) -> dict[str, Any]:

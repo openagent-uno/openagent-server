@@ -89,6 +89,34 @@ class _FakeToolExec:
     tool_call_error: bool | None = None
 
 
+class _RuntimeToolExecDroppingDynamicHost:
+    """Runtime-like serializer that emits declared fields only."""
+
+    def __init__(self) -> None:
+        self.tool_name = "read_text_file"
+        self.tool_call_id = "call_client_read"
+        self.tool_args = {
+            "server": "client:filesystem",
+            "tool": "read_text_file",
+            "args": {"path": "/client/sentinel.txt"},
+        }
+        self.result = {"content": "desktop-sentinel"}
+        self.tool_call_error = False
+
+    def to_dict(self) -> dict[str, Any]:
+        # Deliberately omit attributes added dynamically after construction,
+        # matching the runtime ToolExecution serializer seen by the live E2E.
+        return {
+            "tool_name": self.tool_name,
+            "tool_call_id": self.tool_call_id,
+            "tool_args": self.tool_args,
+            "result": self.result,
+            "tool_call_error": self.tool_call_error,
+            "metrics": {"duration_ms": 17},
+            "child_session_data": {"session_id": "child-1"},
+        }
+
+
 # ── Tests ────────────────────────────────────────────────────────────────
 
 
@@ -135,6 +163,36 @@ async def t_shared_encoder_parity(ctx: TestContext) -> None:
         f"  live   : {live_payload}\n"
         f"  stored : {stored_payload}"
     )
+
+
+@test(
+    "rehydration_parity",
+    "live encoder overlays client host when runtime to_dict drops dynamic fields",
+)
+async def t_runtime_to_dict_keeps_stamped_execution_host(ctx: TestContext) -> None:
+    from src.core.execution_origin import TurnExecutionOrigin, execution_origin_scope
+    from src.models._tool_status import tool_exec_to_wire_json
+
+    origin = TurnExecutionOrigin(
+        device_id="device-a",
+        client_instance_id="desktop",
+        generation=7,
+        device_label="Alessandro's Mac",
+        registry=object(),
+    )
+    tool_exec = _RuntimeToolExecDroppingDynamicHost()
+    native_envelope = tool_exec.to_dict()
+
+    with execution_origin_scope(origin):
+        encoded = tool_exec_to_wire_json(tool_exec)
+
+    assert encoded is not None
+    payload = json.loads(encoded)
+    assert getattr(tool_exec, "execution_host") == origin.execution_host
+    assert payload == {
+        **native_envelope,
+        "execution_host": origin.execution_host,
+    }
 
 
 @test("rehydration_parity", "encoder surfaces tool_call_error+result for failed live frames")
