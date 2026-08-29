@@ -99,6 +99,24 @@ async def _persist_model_evidence(
         _atomic_json(path, calls)
 
 
+async def _seed_deterministic_model(db: Any, model_base_url: str) -> None:
+    """Register the harness provider in the canonical dispatch catalog."""
+
+    provider_id = await db.upsert_provider(
+        name="local",
+        framework="api-based",
+        api_key="local",
+        base_url=model_base_url,
+        enabled=True,
+    )
+    await db.upsert_model(
+        provider_id=provider_id,
+        model="deterministic-client-e2e",
+        display_name="Deterministic Client E2E",
+        enabled=True,
+    )
+
+
 async def run(root: Path) -> None:
     # Import after argument parsing so ``--help`` works even when this script
     # is inspected outside the server virtualenv.
@@ -154,6 +172,11 @@ async def run(root: Path) -> None:
             "cli": root / "unused-cli-machine" / "sentinel.txt",
         })
     )
+    # The canonical catalog is the dispatch authority even when the harness
+    # supplies a concrete NativeProvider instance.  Keep it in sync with that
+    # runtime provider so Gateway's pre-dispatch enabled-model gate accepts
+    # the turn and Agent hot-reload can materialise the same configuration.
+    await _seed_deterministic_model(db, model_base_url)
     model_evidence_task = asyncio.create_task(
         _persist_model_evidence(evidence_path, model_calls),
         name="desktop-real-iroh-model-evidence",
