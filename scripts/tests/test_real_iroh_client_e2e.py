@@ -92,7 +92,7 @@ async def _start_deterministic_model_endpoint(target: Path):
         else:
             message = {"role": "assistant", "content": "client file written"}
             finish_reason = "stop"
-        return web.json_response({
+        completion = {
             "id": f"chatcmpl-client-e2e-{len(calls)}",
             "object": "chat.completion",
             "created": 1,
@@ -107,7 +107,77 @@ async def _start_deterministic_model_endpoint(target: Path):
                 "completion_tokens": 5,
                 "total_tokens": 15,
             },
+        }
+        if not payload.get("stream"):
+            return web.json_response(completion)
+
+        chunk_id = completion["id"]
+        chunks: list[dict] = []
+        if message.get("tool_calls"):
+            chunks.append({
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": completion["model"],
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [{
+                            "index": 0,
+                            **message["tool_calls"][0],
+                        }],
+                    },
+                    "finish_reason": None,
+                }],
+            })
+        else:
+            chunks.append({
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": completion["model"],
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "content": message.get("content") or "",
+                    },
+                    "finish_reason": None,
+                }],
+            })
+        chunks.append({
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": completion["model"],
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": finish_reason,
+            }],
         })
+        chunks.append({
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": completion["model"],
+            "choices": [],
+            "usage": completion["usage"],
+        })
+        response = web.StreamResponse(headers={
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+        })
+        await response.prepare(request)
+        for chunk in chunks:
+            await response.write(
+                f"data: {json.dumps(chunk, separators=(',', ':'))}\n\n".encode()
+            )
+        await response.write(b"data: [DONE]\n\n")
+        await response.write_eof()
+        return response
 
     app = web.Application()
     app.router.add_post("/v1/chat/completions", chat)
@@ -440,6 +510,7 @@ async def t_real_iroh_client_tool_turn(ctx: TestContext) -> None:
 
         assert target.read_text() == "real-iroh-client"
         assert len(model_calls) >= 3, model_calls
+        assert all(call.get("stream") is True for call in model_calls[:3]), model_calls
         model_transcript = json.dumps(model_calls, sort_keys=True)
         assert "real-iroh-client" in model_transcript, model_transcript
         assert "execution_host" in model_transcript, model_transcript
