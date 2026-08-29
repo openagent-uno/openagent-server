@@ -29,7 +29,7 @@ jobs:
       - name: Create venv + install package
         run: |
           uv venv
-          HOST_TOOLS_WHEEL="$RUNNER_TEMP/openagent_host_tools-0.1.0-py3-none-any.whl"
+          HOST_TOOLS_WHEEL="$RUNNER_TEMP/openagent_host_tools-0.1.1-py3-none-any.whl"
           python scripts/acquire-host-tools.py \
             --platform linux-x64 \
             --output "$RUNNER_TEMP/openagent-host-tools" \
@@ -64,7 +64,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: openagent-uno/openagent-host-tools
-          ref: 660225c8e8bbf6488173d4e6d4d1b3ba04e8f194
+          ref: 78b31f872f30bc2a307360403857dfa58696e678
           path: .openagent-host-tools
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -157,7 +157,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          HOST_TOOLS_WHEEL="$RUNNER_TEMP/openagent_host_tools-0.1.0-py3-none-any.whl"
+          HOST_TOOLS_WHEEL="$RUNNER_TEMP/openagent_host_tools-0.1.1-py3-none-any.whl"
           python scripts/acquire-host-tools.py \
             --platform '${{ matrix.host_platform }}' \
             --output "$RUNNER_TEMP/openagent-host-tools" \

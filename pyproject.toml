@@ -120,7 +120,7 @@ dependencies = [
     "email-validator>=2.0",
     # Shared, versioned filesystem/editor implementation used by both the
     # server MCPPool adapters and client capability hosts.
-    "openagent-host-tools @ https://github.com/openagent-uno/openagent-host-tools/releases/download/v0.1.0/openagent_host_tools-0.1.0-py3-none-any.whl#sha256=415f294201edacdf5b71d635df8e4f910f60b43d4c2afb92b8bfe29a11d20a84",
+    "openagent-host-tools @ https://github.com/openagent-uno/openagent-host-tools/releases/download/v0.1.1/openagent_host_tools-0.1.1-py3-none-any.whl#sha256=74977320f43033fe18bf9bd58c710823886c0f348c94bb36766627b4037c2e88",
 ]
 
 [project.optional-dependencies]

@@ -185,8 +185,8 @@ def test_server_release_uses_consumer_lock_and_preserves_nested_macos_signatures
 def test_server_committed_lock_and_python_dependency_are_immutable():
     lock_path = ROOT / "host-tools.lock.json"
     lock = json.loads(lock_path.read_text(encoding="utf-8"))
-    assert _sha256(lock_path) == "9bbfd7a094c8d1b3238e8a580caba768af7d6b455f42a41f05dd9bfc8d7f727f"
-    assert lock["source_commit"] == "660225c8e8bbf6488173d4e6d4d1b3ba04e8f194"
+    assert _sha256(lock_path) == "4e4d16c5276e6393f6171a5670a9551773df3044f983d33d78ec7c120d351a33"
+    assert lock["source_commit"] == "78b31f872f30bc2a307360403857dfa58696e678"
     assert set(lock["platforms"]) == {
         "darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64",
         "win32-arm64", "win32-x64",
