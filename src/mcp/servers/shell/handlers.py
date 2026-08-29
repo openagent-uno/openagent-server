@@ -15,6 +15,7 @@ import shutil
 import time
 from typing import Any
 
+from openagent_host_tools.types import HostError
 from src.core.logging import elog
 from src.mcp.servers.shell.events import ShellEvent
 from src.mcp.servers.shell.hub import ShellHub
@@ -75,7 +76,7 @@ async def shell_exec(
     truncated_stderr. Background: shell_id / started_at.
     """
     if not command or not command.strip():
-        raise ValueError("command must be a non-empty string")
+        raise HostError("invalid_arguments", "command must be a non-empty string")
     # Blocklist gate (``safety.approvals`` in openagent.yaml). Off by default:
     # when the stanza is absent or false this returns before matching anything,
     # so every command runs exactly as it did pre-gate. Placed here rather than
@@ -182,7 +183,7 @@ async def shell_output(
     hub = get_hub()
     rec = hub.get(shell_id)
     if rec is None:
-        raise ValueError(f"unknown shell_id: {shell_id}")
+        raise HostError("shell_not_found", f"unknown shell id {shell_id!r}")
     bg = rec.shell
     if bg is None:
         # Race: registered without a shell (tests). Fall through as empty.
@@ -233,7 +234,10 @@ async def shell_which(command: str) -> dict[str, Any]:
         # shutil.which handles "/" / "\\" differently across platforms;
         # reject anything that looks like a path so the model gets an
         # unambiguous error.
-        raise ValueError("command must be a bare program name (no path separator)")
+        raise HostError(
+            "invalid_arguments",
+            "command must be a bare program name (no path separator)",
+        )
     path = shutil.which(command)
     if path is None:
         return {"available": False}
@@ -250,9 +254,9 @@ async def shell_input(
 ) -> dict[str, Any]:
     rec = get_hub().get(shell_id)
     if rec is None:
-        raise ValueError(f"unknown shell_id: {shell_id}")
-    if rec.shell is None:
-        raise RuntimeError(f"shell {shell_id} has no spawned process")
+        raise HostError("shell_not_found", f"unknown shell id {shell_id!r}")
+    if rec.shell is None or not rec.shell.is_running:
+        raise HostError("shell_not_running", f"shell {shell_id} is not running")
     n = await rec.shell.write_stdin(text, press_enter=press_enter)
     return {"bytes_written": n}
 
@@ -266,12 +270,12 @@ async def shell_kill(
 ) -> dict[str, Any]:
     rec = get_hub().get(shell_id)
     if rec is None:
-        raise ValueError(f"unknown shell_id: {shell_id}")
+        raise HostError("shell_not_found", f"unknown shell id {shell_id!r}")
     if rec.shell is None:
-        raise RuntimeError(f"shell {shell_id} has no spawned process")
+        raise HostError("shell_not_running", f"shell {shell_id} is not running")
     sig_name = signal.upper()
     if sig_name not in ("TERM", "INT", "KILL"):
-        raise ValueError(f"unsupported signal: {signal}")
+        raise HostError("invalid_arguments", f"unsupported signal: {signal}")
     await rec.shell.kill(signal_name=sig_name)  # type: ignore[arg-type]
     return {
         "killed": True,

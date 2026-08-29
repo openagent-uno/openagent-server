@@ -7,13 +7,20 @@ from src.core._runner.utils.log import log_debug, log_exception
 
 try:
     from mcp import ClientSession
-    from mcp.types import CallToolResult, EmbeddedResource, ImageContent, TextContent
+    from mcp.types import (
+        AudioContent,
+        CallToolResult,
+        EmbeddedResource,
+        ImageContent,
+        ResourceLink,
+        TextContent,
+    )
     from mcp.types import Tool as MCPTool
 except (ImportError, ModuleNotFoundError):
     raise ImportError("`mcp` not installed. Please install using `pip install mcp`")
 
 
-from src.stream.media import Image
+from src.stream.media import Audio, Image
 from src.mcp._runtime.function import ToolResult
 
 if TYPE_CHECKING:
@@ -86,13 +93,23 @@ def get_entrypoint_for_tool(
                 tool_name, kwargs, meta=call_meta()
             )  # type: ignore
 
-            # Return an error if the tool call failed
-            if result.isError:
-                return ToolResult(content=f"Error from MCP tool '{tool_name}': {result.content}")
+            # Preserve the COMPLETE MCP envelope.  The runtime's historical
+            # path below turns content blocks into a human/model-facing string
+            # and media objects, but that representation cannot carry
+            # structuredContent, isError, _meta, ResourceLink, AudioContent or
+            # future protocol block types.  ``mode='json'`` also makes AnyUrl
+            # and other pydantic values safe for the next tool-search boundary.
+            try:
+                mcp_result = result.model_dump(
+                    mode="json", by_alias=True, exclude_none=False,
+                )
+            except Exception:
+                mcp_result = json.loads(result.model_dump_json(by_alias=True))
 
             # Process the result content
             response_str = ""
             images = []
+            audios = []
 
             for content_item in result.content:
                 if isinstance(content_item, TextContent):
@@ -158,16 +175,44 @@ def get_entrypoint_for_tool(
                     )
                     images.append(img_artifact)
                     response_str += "Image has been generated and added to the response.\n"
+                elif isinstance(content_item, AudioContent):
+                    # Audio is a first-class MCP content block.  Lift it into
+                    # the runtime media channel while retaining the untouched
+                    # base64 block in ``mcp_result`` above.
+                    audio_data = getattr(content_item, "data", None)
+                    if audio_data and isinstance(audio_data, str):
+                        import base64
+
+                        try:
+                            audio_data = base64.b64decode(audio_data)
+                        except Exception as e:
+                            log_debug(f"Failed to decode base64 audio data: {e}")
+                            audio_data = None
+                    if audio_data:
+                        audios.append(Audio(
+                            id=str(uuid4()),
+                            content=audio_data,
+                            mime_type=getattr(content_item, "mimeType", "audio/mpeg"),
+                        ))
+                    response_str += "Audio has been generated and added to the response.\n"
                 elif isinstance(content_item, EmbeddedResource):
                     # Handle embedded resources
                     response_str += f"[Embedded resource: {content_item.resource.model_dump_json()}]\n"
+                elif isinstance(content_item, ResourceLink):
+                    response_str += f"[Resource link: {content_item.uri}]\n"
                 else:
-                    # Handle other content types
+                    # Future MCP block types remain intact in ``mcp_result``.
                     response_str += f"[Unsupported content type: {content_item.type}]\n"
 
+            display_content = response_str.strip()
+            if result.isError:
+                detail = display_content or str(result.content)
+                display_content = f"Error from MCP tool '{tool_name}': {detail}"
             return ToolResult(
-                content=response_str.strip(),
+                content=display_content,
                 images=images if images else None,
+                audios=audios if audios else None,
+                mcp_result=mcp_result,
             )
         except Exception as e:
             log_exception(f"Failed to call MCP tool '{tool_name}': {e}")

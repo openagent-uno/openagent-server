@@ -26,6 +26,26 @@ from typing import Any
 from ._framework import TestContext, test
 
 
+@test(
+    "team_router",
+    "Team cache key retains the exact execution-host while ignoring session id",
+)
+async def t_team_cache_key_execution_host(ctx: TestContext) -> None:
+    from src.models.dispatcher import _system_cache_key
+
+    base = "framework and persona"
+    host_a_s1 = (
+        f"{base}\n\n"
+        '<execution-host>{"kind":"client","device_id":"A"}</execution-host>\n\n'
+        "<session-id>s1</session-id>"
+    )
+    host_a_s2 = host_a_s1.replace("<session-id>s1", "<session-id>s2")
+    host_b_s1 = host_a_s1.replace('"device_id":"A"', '"device_id":"B"')
+
+    assert _system_cache_key(host_a_s1) == _system_cache_key(host_a_s2)
+    assert _system_cache_key(host_a_s1) != _system_cache_key(host_b_s1)
+
+
 # ── Catalog fixtures ──────────────────────────────────────────────────
 
 

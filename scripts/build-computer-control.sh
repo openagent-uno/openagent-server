@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the Rust computer-control MCP for the host platform and stage the
-# binary into bin/<target>/ for builtins.py to discover.
+# binary into the pinned openagent-host-tools package's bin/<target>/.
 #
 # Usage:
 #   ./scripts/build-computer-control.sh
@@ -11,13 +11,14 @@
 
 set -euo pipefail
 
-cd "$(dirname "$0")/../src/mcp/servers/computer-control"
+SOURCE_DIR="$(python3 -c 'from openagent_host_tools import sidecar_source; print(sidecar_source("computer-control"))')"
+cd "$SOURCE_DIR"
 
 TARGET="$(rustc -vV | sed -n 's|host: ||p')"
 case "$TARGET" in
   aarch64-apple-darwin)      OUT=darwin-arm64 ; EXT='' ;;
   x86_64-unknown-linux-gnu)  OUT=linux-x64    ; EXT='' ;;
-  x86_64-pc-windows-msvc)    OUT=windows-x64  ; EXT='.exe' ;;
+  x86_64-pc-windows-msvc)    OUT=win32-x64    ; EXT='.exe' ;;
   *) echo "Unsupported host target: $TARGET" >&2 ; exit 1 ;;
 esac
 

@@ -892,6 +892,7 @@ async def _h_ai_prompt(
     # ``shared`` runs every node on one ``workflow:{wf}:{run}`` session so
     # successive nodes chain thought through the persisted history.
     from src.core.child_session import run_child_session
+    from src.core.execution_origin import current_execution_origin
     from src.core.identity_context import agent_author
 
     db = getattr(exe.agent, "_db", None) or exe.db
@@ -917,6 +918,11 @@ async def _h_ai_prompt(
         owner_client_id=owner,
         model_id=override_id,
         author=agent_author(label, agent_name=getattr(exe.agent, "name", None)),
+        # A synchronous workflow invoked by the current interactive turn is
+        # still part of that turn. Its AI node keeps the exact authenticated
+        # client host. Durable scheduler/API/event workflows enter with an
+        # explicitly-cleared origin and therefore remain server-only.
+        inherit_execution_origin=current_execution_origin() is not None,
         # Stream the node live so its inline transcript on the run screen fills
         # in token-by-token like any interactive session.
         stream=True,

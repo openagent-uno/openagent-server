@@ -10,8 +10,9 @@
 //   * Isolated + persistent — a dedicated user-data-dir that never touches the
 //     user's real profile, and persists cookies/logins across runs so "log in
 //     to X" only has to happen once.
-//   * No download when avoidable — reuse a cached download, else any installed
-//     Chrome/Chromium/Brave/Edge; only download Chromium as a last resort.
+//   * Supply-chain safe — use an explicitly configured or OS-installed
+//     Chrome/Chromium/Brave/Edge binary. Never fetch mutable browser binaries
+//     at runtime.
 //   * No automation fingerprint — we launch the browser ourselves without
 //     --enable-automation, so navigator.webdriver stays false.
 
@@ -20,6 +21,7 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import https from "node:https";
+import crypto from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -38,7 +40,15 @@ function tabGroupExtensionDir() {
 // Agent-installed extensions live here, one unpacked extension per subdirectory
 // (named by its Web Store id). They persist across runs and are loaded at every
 // launch, so e.g. a VPN/proxy extension stays installed + configured.
-const MANAGED_EXTENSIONS_DIR = path.join(HOME, ".openagent", "chrome-extensions");
+// The local capability broker sets both paths per authenticated OpenAgent
+// network/account.  Keeping the environment override here (rather than in a
+// second browser implementation) lets the server and client hosts consume the
+// exact same MCP while guaranteeing that two networks never share cookies,
+// logins, extensions, a profile lock, or a CDP endpoint.  The legacy defaults
+// remain unchanged for the server-side MCP.
+const MANAGED_EXTENSIONS_DIR = process.env.OPENAGENT_CHROME_EXTENSIONS_DIR
+  ? path.resolve(process.env.OPENAGENT_CHROME_EXTENSIONS_DIR)
+  : path.join(HOME, ".openagent", "chrome-extensions");
 
 export function listManagedExtensions() {
   let entries;
@@ -92,19 +102,13 @@ function log(...a) {
 
 // ── Paths ────────────────────────────────────────────────────────────────
 export function profileDir() {
+  if (process.env.OPENAGENT_CHROME_PROFILE_DIR)
+    return path.resolve(process.env.OPENAGENT_CHROME_PROFILE_DIR);
   if (SYSTEM === "darwin")
     return path.join(HOME, "Library", "Application Support", "OpenAgent", "chrome-profile");
   if (SYSTEM === "win32")
     return path.join(process.env.LOCALAPPDATA || path.join(HOME, "AppData", "Local"), "OpenAgent", "chrome-profile");
   return path.join(HOME, ".config", "openagent", "chrome-profile");
-}
-
-const CHROMIUM_DIR = path.join(HOME, ".openagent", "chromium");
-
-function cachedChromiumBinary() {
-  if (SYSTEM === "darwin") return path.join(CHROMIUM_DIR, "Chromium.app", "Contents", "MacOS", "Chromium");
-  if (SYSTEM === "win32") return path.join(CHROMIUM_DIR, "chrome.exe");
-  return path.join(CHROMIUM_DIR, "chrome");
 }
 
 function isFile(p) {
@@ -125,16 +129,13 @@ function whichOnPath(name) {
 
 // Ordered, STABLE list of browser binaries to try. ensureBrowser attempts each
 // in turn and falls through to the next if one launches but never brings up its
-// CDP endpoint (e.g. a cached Chromium snapshot that's ABI-incompatible with the
-// host — observed on some Linux servers where the system google-chrome works but
-// the downloaded Chromium doesn't). Keeping the order stable means the same
-// working browser reopens the same profile every run.
+// CDP endpoint. Keeping the order stable means the same working browser reopens
+// the same profile every run.
 export function resolveBinaryCandidates() {
   const out = [];
   const add = (p) => { if (p && isFile(p) && !out.includes(p)) out.push(p); };
 
   add(process.env.OPENAGENT_CHROME_BINARY);
-  add(cachedChromiumBinary());
 
   let candidates = [];
   if (SYSTEM === "darwin") {
@@ -186,6 +187,43 @@ export async function getWsEndpoint(port = CDP_PORT) {
   const info = await httpGetJson(`http://127.0.0.1:${port}/json/version`);
   if (info && info.webSocketDebuggerUrl && info.Browser) return info.webSocketDebuggerUrl;
   return null;
+}
+
+// Chrome writes this ownership marker inside the user-data-dir.  The TCP port
+// alone is not an identity boundary: another Chrome instance (or an unrelated
+// CDP-speaking process) may already be listening there.  Only reuse an
+// endpoint when both the marker's port and its unguessable browser path match
+// /json/version for this exact dedicated profile.
+function profileDevToolsMarker(profile) {
+  try {
+    const lines = fs.readFileSync(path.join(profile, "DevToolsActivePort"), "utf-8")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+    if (lines.length < 2 || !/^\d+$/.test(lines[0])) return null;
+    const endpointPath = lines[1];
+    if (!endpointPath.startsWith("/devtools/browser/")) return null;
+    return { port: Number(lines[0]), endpointPath };
+  } catch {
+    return null;
+  }
+}
+
+export async function getProfileWsEndpoint(profile, port = CDP_PORT) {
+  const marker = profileDevToolsMarker(profile);
+  if (!marker || marker.port !== Number(port)) return null;
+
+  const wsUrl = await getWsEndpoint(port);
+  if (!wsUrl) return null;
+  try {
+    const parsed = new URL(wsUrl);
+    const wsPort = Number(parsed.port || (parsed.protocol === "wss:" ? 443 : 80));
+    if (wsPort !== Number(port) || parsed.pathname !== marker.endpointPath) return null;
+    if (!["127.0.0.1", "localhost", "::1", "[::1]"].includes(parsed.hostname)) return null;
+    return wsUrl;
+  } catch {
+    return null;
+  }
 }
 
 // Running browser version (e.g. "146.0.7680.164") from its CDP /json/version,
@@ -259,6 +297,10 @@ function killGroup(pid) {
 // { wsUrl, pid } on success; on failure kills the process (so it doesn't hold
 // the profile lock) and throws, letting the caller try the next candidate.
 async function launchAndWait(binary, profile, port, timeoutMs = 20000) {
+  // A marker left by a crashed browser must never make a newly spawned process
+  // appear to own an unrelated endpoint already listening on the same port.
+  try { fs.rmSync(path.join(profile, "DevToolsActivePort"), { force: true }); } catch {}
+
   let cmd = binary;
   let argv = launchArgs(binary, profile, port);
   // Headless Linux server with no display: render into a virtual X server so
@@ -286,7 +328,7 @@ async function launchAndWait(binary, profile, port, timeoutMs = 20000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (exited) break;
-    const ws = await getWsEndpoint(port);
+    const ws = await getProfileWsEndpoint(profile, port);
     if (ws) {
       log(`browser ready on :${port} (pid ${child.pid})`);
       return { wsUrl: ws, pid: child.pid };
@@ -302,20 +344,21 @@ async function launchAndWait(binary, profile, port, timeoutMs = 20000) {
  * Ensure a dedicated browser is running and return its CDP browser WS URL.
  * Returns { wsUrl, ownsBrowser, pid }. `ownsBrowser` is true only when this
  * call launched the process (so the caller knows whether it may kill it).
- * Tries each installed browser in turn; downloads Chromium only as a last
- * resort.
+ * Tries each explicitly configured or installed browser in turn. Browser
+ * binaries are intentionally never downloaded at runtime: consumers must
+ * obtain them through their normal OS/software supply chain.
  */
 export async function ensureBrowser({ port = CDP_PORT, onProgress } = {}) {
+  const profile = profileDir();
+  fs.mkdirSync(profile, { recursive: true });
+
   // Reuse an already-healthy instance (survived an MCP restart, or launched by
   // a previous run). Never launch a second process on the same profile+port.
-  const existing = await getWsEndpoint(port);
+  const existing = await getProfileWsEndpoint(profile, port);
   if (existing) {
     log(`reusing browser already listening on :${port}`);
     return { wsUrl: existing, ownsBrowser: false, pid: null };
   }
-
-  const profile = profileDir();
-  fs.mkdirSync(profile, { recursive: true });
 
   const candidates = resolveBinaryCandidates();
   let lastErr = null;
@@ -329,16 +372,6 @@ export async function ensureBrowser({ port = CDP_PORT, onProgress } = {}) {
     }
   }
 
-  // Nothing installed worked — download Chromium and try that.
-  try {
-    if (onProgress) onProgress("No working browser found — downloading Chromium (~150 MB, one time)…");
-    const dl = await downloadChromium(onProgress);
-    const { wsUrl, pid } = await launchAndWait(dl, profile, port, 30000);
-    return { wsUrl, ownsBrowser: true, pid };
-  } catch (e) {
-    lastErr = e;
-  }
-
   throw new Error(
     "Could not launch any Chromium-based browser (tried: " +
     (candidates.map((c) => path.basename(c)).join(", ") || "none") +
@@ -347,7 +380,7 @@ export async function ensureBrowser({ port = CDP_PORT, onProgress } = {}) {
   );
 }
 
-// ── Chromium download (last-resort fallback) ──────────────────────────────
+// ── Authenticated HTTPS download for signed Chrome extensions ─────────────
 function httpsGetFollow(url, cb, redirects = 0) {
   if (redirects > 5) return cb(new Error("too many redirects"));
   https
@@ -365,17 +398,6 @@ function httpsGetFollow(url, cb, redirects = 0) {
     .on("error", cb);
 }
 
-function fetchText(url) {
-  return new Promise((resolve, reject) => {
-    httpsGetFollow(url, (err, res) => {
-      if (err) return reject(err);
-      let body = "";
-      res.on("data", (c) => (body += c));
-      res.on("end", () => resolve(body.trim()));
-    });
-  });
-}
-
 function downloadTo(url, dest) {
   return new Promise((resolve, reject) => {
     httpsGetFollow(url, (err, res) => {
@@ -386,70 +408,6 @@ function downloadTo(url, dest) {
       out.on("error", reject);
     });
   });
-}
-
-async function downloadChromium(onProgress) {
-  const base = "https://www.googleapis.com/download/storage/v1/b/chromium-browser-snapshots/o";
-  let archPath, archiveName;
-  if (SYSTEM === "darwin") {
-    const arch = ["arm64", "aarch64"].includes(os.arch()) || process.arch === "arm64" ? "Mac_Arm" : "Mac";
-    archPath = arch; archiveName = "chrome-mac.zip";
-  } else if (SYSTEM === "linux") {
-    archPath = "Linux_x64"; archiveName = "chrome-linux.zip";
-  } else if (SYSTEM === "win32") {
-    archPath = process.arch === "arm64" ? "Win_Arm" : "Win_x64"; archiveName = "chrome-win.zip";
-  } else {
-    throw new Error(`Unsupported platform for Chromium download: ${SYSTEM}`);
-  }
-
-  const pos = await fetchText(`${base}/${encodeURIComponent(archPath + "/LAST_CHANGE")}?alt=media`);
-  const url = `${base}/${encodeURIComponent(archPath + "/" + pos + "/" + archiveName)}?alt=media`;
-
-  fs.mkdirSync(CHROMIUM_DIR, { recursive: true });
-  const zipPath = path.join(CHROMIUM_DIR, archiveName);
-  if (onProgress) onProgress("Downloading Chromium…");
-  await downloadTo(url, zipPath);
-
-  // Extract with an OS-native unzip (no npm dep).
-  if (SYSTEM === "darwin") {
-    spawnSync("ditto", ["-x", "-k", zipPath, CHROMIUM_DIR], { stdio: "ignore" });
-    const src = path.join(CHROMIUM_DIR, "chrome-mac", "Chromium.app");
-    const dst = path.join(CHROMIUM_DIR, "Chromium.app");
-    if (fs.existsSync(src)) {
-      fs.rmSync(dst, { recursive: true, force: true });
-      fs.renameSync(src, dst);
-      fs.rmSync(path.join(CHROMIUM_DIR, "chrome-mac"), { recursive: true, force: true });
-    }
-    spawnSync("xattr", ["-cr", dst], { stdio: "ignore" });
-    spawnSync("codesign", ["--force", "--deep", "--sign", "-", dst], { stdio: "ignore" });
-  } else if (SYSTEM === "linux") {
-    spawnSync("unzip", ["-q", "-o", zipPath, "-d", CHROMIUM_DIR], { stdio: "ignore" });
-    const src = path.join(CHROMIUM_DIR, "chrome-linux");
-    if (fs.existsSync(src)) {
-      for (const f of fs.readdirSync(src)) fs.renameSync(path.join(src, f), path.join(CHROMIUM_DIR, f));
-      fs.rmSync(src, { recursive: true, force: true });
-    }
-    // Chromium ships several helper executables (chrome, chrome_crashpad_handler,
-    // chrome-sandbox, nacl_helper). unzip drops the exec bit — restore it on
-    // every extensionless file in the root, or chrome aborts spawning them.
-    for (const f of fs.readdirSync(CHROMIUM_DIR)) {
-      const full = path.join(CHROMIUM_DIR, f);
-      try { if (fs.statSync(full).isFile() && !path.extname(f)) fs.chmodSync(full, 0o755); } catch {}
-    }
-  } else if (SYSTEM === "win32") {
-    spawnSync("tar", ["-xf", zipPath, "-C", CHROMIUM_DIR], { stdio: "ignore" });
-    const src = path.join(CHROMIUM_DIR, "chrome-win");
-    if (fs.existsSync(src)) {
-      for (const f of fs.readdirSync(src)) fs.renameSync(path.join(src, f), path.join(CHROMIUM_DIR, f));
-      fs.rmSync(src, { recursive: true, force: true });
-    }
-  }
-  try { fs.rmSync(zipPath, { force: true }); } catch {}
-
-  const bin = cachedChromiumBinary();
-  if (!isFile(bin)) throw new Error("Chromium download completed but the binary is missing");
-  log("Chromium downloaded to", bin);
-  return bin;
 }
 
 // ── Extension management (install/remove from the Chrome Web Store) ─────────
@@ -468,25 +426,162 @@ function unzipTo(zipPath, destDir) {
   }
 }
 
-// A .crx is a small header followed by a plain ZIP. Strip the header, unzip.
-function unpackCrx(crxPath, destDir) {
-  const buf = fs.readFileSync(crxPath);
+function readProtoVarint(buf, offset, limit) {
+  let value = 0n;
+  let shift = 0n;
+  for (let i = 0; i < 10 && offset < limit; i += 1) {
+    const byte = buf[offset++];
+    value |= BigInt(byte & 0x7f) << shift;
+    if ((byte & 0x80) === 0) {
+      if (value > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw new Error("CRX protobuf varint exceeds the safe integer range");
+      }
+      return { value: Number(value), offset };
+    }
+    shift += 7n;
+  }
+  throw new Error("invalid CRX protobuf varint");
+}
+
+// Minimal protobuf reader for the length-delimited fields in the CRX3 header.
+// Unknown fields are skipped so a future-compatible signed header remains
+// acceptable, while every length is bounded before slicing.
+function readProtoFields(buf, start = 0, end = buf.length) {
+  const fields = new Map();
+  let offset = start;
+  while (offset < end) {
+    const tag = readProtoVarint(buf, offset, end);
+    offset = tag.offset;
+    const field = Math.floor(tag.value / 8);
+    const wire = tag.value & 7;
+    if (field <= 0) throw new Error("invalid CRX protobuf field");
+    let value;
+    if (wire === 2) {
+      const size = readProtoVarint(buf, offset, end);
+      offset = size.offset;
+      if (!Number.isSafeInteger(size.value) || size.value < 0 || offset + size.value > end) {
+        throw new Error("invalid CRX protobuf length");
+      }
+      value = buf.subarray(offset, offset + size.value);
+      offset += size.value;
+    } else if (wire === 0) {
+      const scalar = readProtoVarint(buf, offset, end);
+      value = scalar.value;
+      offset = scalar.offset;
+    } else if (wire === 1) {
+      if (offset + 8 > end) throw new Error("truncated CRX protobuf field");
+      value = buf.subarray(offset, offset + 8);
+      offset += 8;
+    } else if (wire === 5) {
+      if (offset + 4 > end) throw new Error("truncated CRX protobuf field");
+      value = buf.subarray(offset, offset + 4);
+      offset += 4;
+    } else {
+      throw new Error(`unsupported CRX protobuf wire type ${wire}`);
+    }
+    const values = fields.get(field) || [];
+    values.push(value);
+    fields.set(field, values);
+  }
+  if (offset !== end) throw new Error("invalid CRX protobuf boundary");
+  return fields;
+}
+
+function extensionIdForPublicKey(publicKey) {
+  const digest = crypto.createHash("sha256").update(publicKey).digest().subarray(0, 16);
+  let id = "";
+  for (const byte of digest) id += String.fromCharCode(97 + (byte >> 4), 97 + (byte & 15));
+  return id;
+}
+
+const STORE_ID_RE = /^[a-p]{32}$/;
+
+/**
+ * Authenticate a CRX3 package against the requested Chrome Web Store ID.
+ * Returns the offset of the signed ZIP payload. CRX2 is rejected because its
+ * legacy SHA-1 container is no longer an acceptable trust boundary.
+ */
+export function verifyCrx3Package(buf, expectedId) {
+  if (!STORE_ID_RE.test(String(expectedId || ""))) {
+    throw new Error("invalid Chrome Web Store extension id");
+  }
+  if (!Buffer.isBuffer(buf) || buf.length < 13) throw new Error("truncated CRX file");
   if (buf.subarray(0, 4).toString("latin1") !== "Cr24") throw new Error("not a CRX file");
   const version = buf.readUInt32LE(4);
-  let zipStart;
-  if (version === 3) {
-    zipStart = 12 + buf.readUInt32LE(8);
-  } else if (version === 2) {
-    zipStart = 16 + buf.readUInt32LE(8) + buf.readUInt32LE(12);
-  } else {
-    throw new Error(`unsupported CRX version ${version}`);
+  if (version !== 3) throw new Error(`unsupported or insecure CRX version ${version}`);
+  const headerSize = buf.readUInt32LE(8);
+  if (headerSize === 0 || headerSize > 16 * 1024 * 1024 || 12 + headerSize >= buf.length) {
+    throw new Error("invalid CRX3 header length");
   }
+  const header = readProtoFields(buf, 12, 12 + headerSize);
+  const signedHeaders = header.get(10000) || [];
+  if (signedHeaders.length !== 1 || !Buffer.isBuffer(signedHeaders[0])) {
+    throw new Error("CRX3 signed header is missing");
+  }
+  const signedHeader = signedHeaders[0];
+  const signedFields = readProtoFields(signedHeader);
+  const crxIds = signedFields.get(1) || [];
+  if (crxIds.length !== 1 || !Buffer.isBuffer(crxIds[0]) || crxIds[0].length !== 16) {
+    throw new Error("CRX3 signed extension id is invalid");
+  }
+  const signedId = [...crxIds[0]]
+    .map((byte) => String.fromCharCode(97 + (byte >> 4), 97 + (byte & 15)))
+    .join("");
+  if (signedId !== expectedId) throw new Error("CRX3 signed extension id does not match the request");
+
+  const size = Buffer.alloc(4);
+  size.writeUInt32LE(signedHeader.length);
+  const zipStart = 12 + headerSize;
+  const signedPayload = Buffer.concat([
+    Buffer.from("CRX3 SignedData\0", "ascii"),
+    size,
+    signedHeader,
+    buf.subarray(zipStart),
+  ]);
+  let matchingKey = false;
+  let validSignature = false;
+  for (const field of [2, 3]) {
+    for (const encodedProof of header.get(field) || []) {
+      if (!Buffer.isBuffer(encodedProof)) continue;
+      const proof = readProtoFields(encodedProof);
+      const publicKeys = proof.get(1) || [];
+      const signatures = proof.get(2) || [];
+      if (publicKeys.length !== 1 || signatures.length !== 1) continue;
+      const publicKey = publicKeys[0];
+      const signature = signatures[0];
+      if (!Buffer.isBuffer(publicKey) || !Buffer.isBuffer(signature)) continue;
+      if (extensionIdForPublicKey(publicKey) !== expectedId) continue;
+      matchingKey = true;
+      try {
+        const key = crypto.createPublicKey({ key: publicKey, format: "der", type: "spki" });
+        // CRX3 field 2 is sha256_with_rsa (PKCS#1 v1.5); field 3 is
+        // sha256_with_ecdsa.  Do not let Node infer a different algorithm from
+        // an attacker-selected SPKI placed under the wrong protobuf field.
+        if (field === 2 && key.asymmetricKeyType !== "rsa") continue;
+        if (field === 3 && key.asymmetricKeyType !== "ec") continue;
+        const verificationKey = field === 2
+          ? { key, padding: crypto.constants.RSA_PKCS1_PADDING }
+          : key;
+        if (crypto.verify("sha256", signedPayload, verificationKey, signature)) {
+          validSignature = true;
+        }
+      } catch {}
+    }
+  }
+  if (!matchingKey) throw new Error("CRX3 has no public key for the requested extension id");
+  if (!validSignature) throw new Error("CRX3 signature verification failed");
+  return zipStart;
+}
+
+// A verified CRX3 is a signed header followed by a ZIP. Authenticate before
+// exposing any archive entry to the OS-native extractor.
+function unpackCrx(crxPath, destDir, expectedId) {
+  const buf = fs.readFileSync(crxPath);
+  const zipStart = verifyCrx3Package(buf, expectedId);
   const zipPath = crxPath + ".zip";
   fs.writeFileSync(zipPath, buf.subarray(zipStart));
   try { unzipTo(zipPath, destDir); } finally { try { fs.rmSync(zipPath, { force: true }); } catch {} }
 }
-
-const STORE_ID_RE = /^[a-p]{32}$/;
 
 /**
  * Install a browser extension into the managed dir. `source` is either a Chrome
@@ -516,12 +611,12 @@ export async function installExtension(source, prodversion) {
   }
   const id = source;
   const url =
-    "https://clients2.google.com/service/update2/crx?response=redirect&acceptformat=crx2,crx3" +
+    "https://clients2.google.com/service/update2/crx?response=redirect&acceptformat=crx3" +
     `&prodversion=${pv}&x=id%3D${id}%26installsource%3Dondemand%26uc`;
   const crxPath = path.join(MANAGED_EXTENSIONS_DIR, id + ".crx");
   await downloadTo(url, crxPath);
   const destDir = path.join(MANAGED_EXTENSIONS_DIR, id);
-  try { unpackCrx(crxPath, destDir); } finally { try { fs.rmSync(crxPath, { force: true }); } catch {} }
+  try { unpackCrx(crxPath, destDir, id); } finally { try { fs.rmSync(crxPath, { force: true }); } catch {} }
   let name = id;
   try { name = resolveExtName(destDir, JSON.parse(fs.readFileSync(path.join(destDir, "manifest.json"), "utf-8"))); } catch {}
   log(`installed extension ${name} (${id})`);

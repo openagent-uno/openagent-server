@@ -99,12 +99,19 @@ def _runtime_db_path(db: Any) -> str | None:
     return str(path) if path else None
 
 
-_SESSION_ID_TAG_RE = re.compile(r"\n*<session-id>[^<]*</session-id>\s*$")
+_SESSION_ID_TAG_RE = re.compile(
+    r"\n*<session-id>[^<]*</session-id>\s*$"
+)
 
 
 def _system_cache_key(system: str | None) -> str:
     """Stable cache key for a system prompt that ignores the per-session
     ``<session-id>`` tag the orchestrator appends.
+
+    The adjacent ``<execution-host>`` tail is deliberately retained: Team
+    instructions are baked into the cached runtime, so sharing a Team built
+    for device A with a later turn from device B would expose A's local-tool
+    routing instructions on the wrong machine.
 
     Without this, every session generates a unique system prompt string
     — so any cache keyed on the raw system text misses on every session

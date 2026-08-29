@@ -311,6 +311,30 @@ async def list_agents(
     return resp.get("agents") or []
 
 
+async def device_is_active(
+    *,
+    node: IrohNode,
+    coordinator_node_id: str,
+    device_pubkey: bytes,
+    timeout: float = 5.0,
+) -> bool:
+    """Ask the coordinator for authoritative live device membership.
+
+    The coordinator accepts this RPC only from an enrolled agent's Iroh
+    identity, so member gateways can fail closed without copying the roster.
+    """
+    if len(device_pubkey) != 32:
+        return False
+    result = await _rpc(
+        node=node,
+        coordinator_node_id=coordinator_node_id,
+        method="device_status",
+        params={"device_pubkey": bytes(device_pubkey)},
+        timeout=timeout,
+    )
+    return result.get("active") is True
+
+
 # ── Internals ────────────────────────────────────────────────────────
 
 

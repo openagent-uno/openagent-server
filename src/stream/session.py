@@ -20,6 +20,7 @@ import logging
 import os
 import tempfile
 from collections import defaultdict, deque
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 import json
@@ -77,6 +78,74 @@ _EMPTY_TURN_FALLBACK_TEXT = (
 _CANCELLED_TURN_FALLBACK_TEXT = (
     "(The turn was interrupted before a response was ready. Please retry.)"
 )
+_USE_CURRENT_TURN_INGRESS = object()
+
+
+@dataclass(frozen=True, slots=True)
+class _STTInput:
+    """One trusted, per-utterance item on the streaming STT queue."""
+
+    data: bytes
+    end_of_utterance: bool
+    execution_origin: Any
+    ingress_identity: Any
+    encoding: str = ""
+    sample_rate: int = 0
+
+
+def _same_execution_origin(left: Any, right: Any) -> bool:
+    """Compare exact client hosts, including the Gateway registry identity."""
+
+    if left is right:
+        return True
+    if left is None or right is None:
+        return False
+    return (
+        getattr(left, "device_id", None) == getattr(right, "device_id", None)
+        and getattr(left, "client_instance_id", None)
+        == getattr(right, "client_instance_id", None)
+        and getattr(left, "generation", None) == getattr(right, "generation", None)
+        and getattr(left, "auth_epoch", 0) == getattr(right, "auth_epoch", 0)
+        and getattr(left, "registry", None) is getattr(right, "registry", None)
+    )
+
+
+def _ingress_key(identity: Any) -> tuple[Any, ...]:
+    """Return a stable, non-wire key for trusted per-connection ownership."""
+
+    if identity is None:
+        return ("internal",)
+    device_id = getattr(identity, "device_id", None)
+    connection_id = getattr(identity, "connection_id", None)
+    if isinstance(device_id, str) and isinstance(connection_id, str):
+        return (
+            "gateway",
+            device_id,
+            connection_id,
+            getattr(identity, "client_instance_id", None),
+            getattr(identity, "auth_epoch", 0),
+        )
+    try:
+        hash(identity)
+    except (TypeError, ValueError):
+        return ("opaque", id(identity))
+    return ("value", identity)
+
+
+def _same_ingress(left: Any, right: Any) -> bool:
+    return _ingress_key(left) == _ingress_key(right)
+
+
+def _ingress_device_id(identity: Any) -> str | None:
+    """Return the authenticated device owner without trusting wire fields."""
+
+    device_id = getattr(identity, "device_id", None)
+    return device_id if isinstance(device_id, str) and device_id else None
+
+
+def _ingress_auth_epoch(identity: Any) -> int:
+    value = getattr(identity, "auth_epoch", 0)
+    return value if type(value) is int and value >= 0 else 0
 
 
 # Tool-name substring → resource category. Substring (not equality)
@@ -136,15 +205,23 @@ class StreamSession:
 
         self.inbound: asyncio.Queue[Event] = asyncio.Queue()
         self.outbound: asyncio.Queue[Event] = asyncio.Queue()
+        # Outbound frames share one session queue, but their transport owner is
+        # frozen when each frame is published.  A second authenticated device
+        # may open the same durable session while a turn is running; the
+        # channel must not infer ownership from whichever websocket touched the
+        # holder most recently.
+        self._outbound_ingresses: dict[int, Any] = {}
 
         self._stt: BaseSTT | None = None
         self._tts: BaseTTS | None = None
 
-        self._stt_in: asyncio.Queue[bytes | None] = asyncio.Queue()
-        self._stt_encoding: str = "webm"
-        # PCM needs sample_rate for the WAV header / Deepgram params;
-        # ``None`` falls through to vendor defaults (16000).
-        self._stt_sample_rate: int | None = None
+        self._stt_in: asyncio.Queue[_STTInput | None] = asyncio.Queue()
+        # Ingress ownership is per utterance, not session state. A second
+        # authenticated device sharing this durable session cannot append to
+        # or terminate the first device's audio stream.
+        self._stt_utterance_open = False
+        self._stt_ingress_origin: Any = None
+        self._stt_ingress_identity: Any = None
         self._stt_pump_task: asyncio.Task | None = None
         self._dispatch_task: asyncio.Task | None = None
         self._current_turn: asyncio.Task | None = None
@@ -153,11 +230,20 @@ class StreamSession:
         # destroyed but it is pending" warning, and don't block barge-in.
         self._detached_turns: set[asyncio.Task] = set()
 
-        self._video_buffers: dict[str, deque[VideoFrame]] = defaultdict(
+        self._video_buffers: dict[tuple[tuple[Any, ...], str], deque[VideoFrame]] = defaultdict(
             lambda: deque(maxlen=VIDEO_RING_SIZE)
         )
-        self._pending_attachments: list[dict[str, Any]] = []
+        self._pending_attachments: list[tuple[Any, dict[str, Any]]] = []
         self._pending_burst: list[TextFinal] = []
+        # Trusted gateway-origin metadata is kept out of the public Event wire.
+        # The map follows each immutable TextFinal through the debounce buffer;
+        # a newly-constructed merged event receives the common origin explicitly.
+        self._event_origins: dict[int, Any] = {}
+        self._event_ingresses: dict[int, Any] = {}
+        # Set by the Gateway's live revocation callback. Queued events are
+        # checked again at dispatch time so a frame accepted immediately
+        # before the callback cannot start work after revocation.
+        self._revoked_ingress_epochs: dict[str, int] = {}
         self._burst_timer: asyncio.Task | None = None
         # Serialises the dispatch-loop's TextFinal handler with the
         # burst-drain task. Without it, a fresh TextFinal arriving in
@@ -178,6 +264,12 @@ class StreamSession:
         # before that point salvage the input back into the burst;
         # cancels after take the partial-commit path.
         self._current_turn_msg: TextFinal | None = None
+        self._current_turn_origin: Any = None
+        self._current_turn_ingress: Any = None
+        # Process-local identity for the runner that currently owns this
+        # session. A provider may swallow cancellation and outlive a barge-in;
+        # its late frames must never inherit the replacement turn's ingress.
+        self._current_turn_token: object | None = None
         self._current_turn_started: bool = False
         # Reason for the active task cancellation currently being
         # orchestrated by ``_cancel_active_turn``. ``None`` means any
@@ -281,7 +373,11 @@ class StreamSession:
         self._closed = True
         # Drop the buffered burst — the WS is going away.
         self._cancel_burst_timer()
+        for pending in self._pending_burst:
+            self._event_origins.pop(id(pending), None)
+            self._event_ingresses.pop(id(pending), None)
         self._pending_burst = []
+        self._outbound_ingresses.clear()
         await self._cancel_active_turn()
         if self._stt_pump_task is not None:
             await self._stt_in.put(None)
@@ -301,9 +397,169 @@ class StreamSession:
 
     # ── inbound surface ─────────────────────────────────────────────
 
-    async def push_in(self, evt: Event) -> None:
-        """Append an inbound event for the dispatch loop to handle."""
+    async def push_in(
+        self,
+        evt: Event,
+        *,
+        execution_origin: Any = None,
+        ingress_identity: Any = None,
+    ) -> None:
+        """Append an inbound event, optionally with trusted gateway origin.
+
+        Neither trusted value is decoded from the wire. ``ingress_identity``
+        always names the authenticated chat connection; ``execution_origin``
+        exists only when that exact client currently advertises local tools.
+        """
+        ingress_device = _ingress_device_id(ingress_identity)
+        if self._ingress_is_revoked(ingress_identity):
+            elog(
+                "stream.ingress.revoked_drop",
+                level="warning",
+                session_id=self.session_id,
+                device_id=ingress_device,
+            )
+            return
+        if isinstance(evt, TextFinal):
+            self._event_origins[id(evt)] = execution_origin
+        elif isinstance(evt, TextDelta):
+            # A promoted final/STT transcript must retain the connection that
+            # supplied its source media.
+            self._event_origins[id(evt)] = execution_origin
+        elif isinstance(evt, AudioChunk):
+            self._event_origins[id(evt)] = execution_origin
+        if isinstance(evt, (TextFinal, TextDelta, AudioChunk, VideoFrame, Attachment, Interrupt)):
+            self._event_ingresses[id(evt)] = ingress_identity
         await self.inbound.put(evt)
+
+    def _ingress_is_revoked(self, identity: Any) -> bool:
+        device_id = _ingress_device_id(identity)
+        if device_id is None:
+            return False
+        blocked_epoch = self._revoked_ingress_epochs.get(device_id)
+        return (
+            blocked_epoch is not None
+            and _ingress_auth_epoch(identity) < blocked_epoch
+        )
+
+    def allow_ingress_device(self, device_id: str, *, auth_epoch: int = 0) -> None:
+        """Validate that a fresh ingress is newer than the revocation barrier.
+
+        The barrier is intentionally retained so already-queued frames from an
+        older socket remain denied even after a post-reactivation socket joins.
+        """
+
+        blocked_epoch = self._revoked_ingress_epochs.get(device_id)
+        if blocked_epoch is not None and auth_epoch < blocked_epoch:
+            raise PermissionError("device ingress authorization is stale")
+
+    async def revoke_ingress_device(
+        self,
+        device_id: str,
+        *,
+        revocation_epoch: int | None = None,
+    ) -> bool:
+        """Drop and cancel only work owned by one authenticated device.
+
+        A durable session can be attached by several devices. Revocation must
+        cancel A's active turn and buffered media without closing the shared
+        holder or disturbing an unrelated turn/burst owned by B.
+        """
+
+        affected = False
+        previous_epoch = self._revoked_ingress_epochs.get(device_id, -1)
+        if revocation_epoch is None:
+            revocation_epoch = max(1, previous_epoch + 1)
+            owned_epochs = [
+                _ingress_auth_epoch(identity)
+                for identity in self._event_ingresses.values()
+                if _ingress_device_id(identity) == device_id
+            ]
+            if _ingress_device_id(self._current_turn_ingress) == device_id:
+                owned_epochs.append(_ingress_auth_epoch(self._current_turn_ingress))
+            if owned_epochs:
+                revocation_epoch = max(revocation_epoch, max(owned_epochs) + 1)
+        revocation_epoch = max(previous_epoch, int(revocation_epoch))
+        self._revoked_ingress_epochs[device_id] = revocation_epoch
+
+        def is_revoked_owner(identity: Any) -> bool:
+            return (
+                _ingress_device_id(identity) == device_id
+                and _ingress_auth_epoch(identity) < revocation_epoch
+            )
+
+        async with self._dispatch_lock:
+            kept_burst: list[TextFinal] = []
+            for msg in self._pending_burst:
+                ingress = self._event_ingresses.get(id(msg))
+                if is_revoked_owner(ingress):
+                    self._event_origins.pop(id(msg), None)
+                    self._event_ingresses.pop(id(msg), None)
+                    affected = True
+                else:
+                    kept_burst.append(msg)
+            self._pending_burst = kept_burst
+            if not kept_burst:
+                self._cancel_burst_timer()
+
+            before_attachments = len(self._pending_attachments)
+            self._pending_attachments = [
+                (owner, attachment)
+                for owner, attachment in self._pending_attachments
+                if not is_revoked_owner(owner)
+            ]
+            affected = affected or len(self._pending_attachments) != before_attachments
+
+            for key in list(self._video_buffers):
+                owner_key, _stream = key
+                if (
+                    len(owner_key) > 1
+                    and owner_key[0] == "gateway"
+                    and owner_key[1] == device_id
+                    and (
+                        len(owner_key) < 5
+                        or not isinstance(owner_key[4], int)
+                        or owner_key[4] < revocation_epoch
+                    )
+                ):
+                    self._video_buffers.pop(key, None)
+                    affected = True
+
+            if is_revoked_owner(self._stt_ingress_identity):
+                self._stt_utterance_open = False
+                self._stt_ingress_origin = None
+                self._stt_ingress_identity = None
+                affected = True
+                # Abort the live transducer so chunks from another device are
+                # not consumed as the tail of the revoked utterance.
+                if self._stt_pump_task is not None and not self._stt_pump_task.done():
+                    self._stt_pump_task.cancel()
+                    try:
+                        await self._stt_pump_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    queued = getattr(self._stt_in, "_queue", None)
+                    if queued is not None:
+                        kept_audio = [
+                            item for item in queued
+                            if item is None
+                            or not is_revoked_owner(item.ingress_identity)
+                        ]
+                        queued.clear()
+                        queued.extend(kept_audio)
+                    if not self._closed and self._stt is not None:
+                        self._stt_pump_task = asyncio.create_task(
+                            self._stt_pump(),
+                            name=f"stream-stt:{self.session_id}",
+                        )
+
+            if (
+                self._current_turn is not None
+                and not self._current_turn.done()
+                and is_revoked_owner(self._current_turn_ingress)
+            ):
+                affected = True
+                await self._cancel_active_turn(reason="device_revoked")
+        return affected
 
     def has_active_turn(self) -> bool:
         """True iff a turn is running or a burst is buffered to dispatch.
@@ -323,9 +579,19 @@ class StreamSession:
         self._seq += 1
         return self._seq
 
+    def take_outbound_ingress(self, evt: Event) -> Any:
+        """Return and forget the trusted transport owner of ``evt``."""
+
+        return self._outbound_ingresses.pop(id(evt), None)
+
     # ── publishing helper for the turn runner ───────────────────────
 
-    async def _publish(self, evt: Event) -> None:
+    async def _publish(
+        self,
+        evt: Event,
+        *,
+        ingress_identity: Any = _USE_CURRENT_TURN_INGRESS,
+    ) -> None:
         # Suppress the cancelled turn's terminal frames when a
         # follow-up turn is on the way — keeps the client's
         # "Thinking…" / streaming bubble alive across the gap.
@@ -341,6 +607,10 @@ class StreamSession:
         # and can clear "Thinking..." before any follow-up callback
         # await (status tee, post_turn_hook) has a chance to trip over
         # the cancellation.
+        if ingress_identity is _USE_CURRENT_TURN_INGRESS:
+            ingress_identity = self._current_turn_ingress
+        if ingress_identity is not None:
+            self._outbound_ingresses[id(evt)] = ingress_identity
         self.outbound.put_nowait(evt)
         if isinstance(evt, OutToolStatus):
             if self.post_turn_hook is not None:
@@ -388,22 +658,68 @@ class StreamSession:
             logger.exception("stream dispatch loop crashed: %s", e)
 
     async def _dispatch(self, evt: Event) -> None:
+        ingress = self._event_ingresses.get(id(evt))
+        if self._ingress_is_revoked(ingress):
+            self._event_origins.pop(id(evt), None)
+            self._event_ingresses.pop(id(evt), None)
+            return
         if isinstance(evt, AudioChunk):
             # The STT pump promotes utterance finals to
             # ``TextFinal(source="stt")`` and re-feeds them through
             # this dispatch.
-            if self._stt is not None and evt.data:
-                if evt.encoding:
-                    self._stt_encoding = evt.encoding
-                if evt.sample_rate:
-                    self._stt_sample_rate = evt.sample_rate
-                await self._stt_in.put(evt.data)
-            if evt.end_of_speech and self._stt is not None:
-                await self._stt_in.put(b"")  # close the utterance window
+            origin = self._event_origins.pop(id(evt), None)
+            ingress = self._event_ingresses.pop(id(evt), None)
+            if self._stt is None:
+                return
+            if evt.data:
+                if not self._stt_utterance_open:
+                    self._stt_utterance_open = True
+                    self._stt_ingress_origin = origin
+                    self._stt_ingress_identity = ingress
+                elif not _same_ingress(ingress, self._stt_ingress_identity):
+                    # Never mix audio or accept EOS from another authenticated
+                    # host. The other client may start after this utterance's
+                    # legitimate owner closes it.
+                    elog(
+                        "stream.stt.origin_conflict",
+                        level="warning",
+                        session_id=self.session_id,
+                        action="chunk_rejected",
+                    )
+                    return
+                await self._stt_in.put(_STTInput(
+                    data=evt.data,
+                    end_of_utterance=False,
+                    execution_origin=self._stt_ingress_origin,
+                    ingress_identity=self._stt_ingress_identity,
+                    encoding=evt.encoding,
+                    sample_rate=evt.sample_rate,
+                ))
+            if evt.end_of_speech:
+                if not self._stt_utterance_open:
+                    return
+                if not _same_ingress(ingress, self._stt_ingress_identity):
+                    elog(
+                        "stream.stt.origin_conflict",
+                        level="warning",
+                        session_id=self.session_id,
+                        action="end_of_speech_rejected",
+                    )
+                    return
+                await self._stt_in.put(_STTInput(
+                    data=b"",
+                    end_of_utterance=True,
+                    execution_origin=self._stt_ingress_origin,
+                    ingress_identity=self._stt_ingress_identity,
+                ))
+                self._stt_utterance_open = False
+                self._stt_ingress_origin = None
+                self._stt_ingress_identity = None
             return
 
         if isinstance(evt, VideoFrame):
-            ring = self._video_buffers[evt.stream]
+            ingress = self._event_ingresses.pop(id(evt), None)
+            ring = self._video_buffers[(_ingress_key(ingress), evt.stream)]
             ring.append(evt)
             # First frame after an empty ring (initial OR post-snapshot
             # reset) — log once per visible stream activation, not per tick.
@@ -429,28 +745,49 @@ class StreamSession:
                     text=evt.text,
                     source="user_typed",
                 )
-                await self._on_user_turn_complete(promoted)
+                origin = self._event_origins.pop(id(evt), None)
+                ingress = self._event_ingresses.pop(id(evt), None)
+                self._event_origins[id(promoted)] = origin
+                self._event_ingresses[id(promoted)] = ingress
+                await self._on_user_turn_complete(
+                    promoted,
+                    execution_origin=origin,
+                    ingress_identity=ingress,
+                )
+            self._event_origins.pop(id(evt), None)
+            self._event_ingresses.pop(id(evt), None)
             return
 
         if isinstance(evt, TextFinal):
-            await self._on_user_turn_complete(evt)
+            await self._on_user_turn_complete(
+                evt, execution_origin=self._event_origins.pop(id(evt), None),
+                ingress_identity=self._event_ingresses.pop(id(evt), None),
+            )
             return
 
         if isinstance(evt, Attachment):
-            self._pending_attachments.append({
-                "type": evt.kind,
-                "path": evt.path,
-                "filename": evt.filename,
-                "mime_type": evt.mime_type,
-            })
+            ingress = self._event_ingresses.pop(id(evt), None)
+            self._pending_attachments.append((
+                ingress,
+                {
+                    "type": evt.kind,
+                    "path": evt.path,
+                    "filename": evt.filename,
+                    "mime_type": evt.mime_type,
+                },
+            ))
             return
 
         if isinstance(evt, Interrupt):
+            self._event_ingresses.pop(id(evt), None)
             # Lock matches ``_on_user_turn_complete`` — prevents the
             # burst-drain task from dispatching a stale turn during the
             # cancel. No completion-suppression: nothing follows.
             async with self._dispatch_lock:
                 self._cancel_burst_timer()
+                for pending in self._pending_burst:
+                    self._event_origins.pop(id(pending), None)
+                    self._event_ingresses.pop(id(pending), None)
                 self._pending_burst = []
                 await self._cancel_active_turn(reason=evt.reason)
             return
@@ -478,32 +815,63 @@ class StreamSession:
         last syllable. A pre-buffered iterator works too but caps
         latency at VAD silence detection.
 
-        Sentinels on ``self._stt_in``: ``None`` = close, ``b""`` =
-        end-of-utterance (from ``end_of_speech=True`` or VAD fallback).
+        ``None`` closes the pump; each ``_STTInput`` otherwise carries its
+        trusted utterance origin.  A terminal input ends only that exact
+        origin's utterance.
         """
         assert self._stt is not None
         while not self._closed:
             first = await self._stt_in.get()
             if first is None:
                 return
-            if first == b"":
+            if first.end_of_utterance:
                 continue  # stray EOS between utterances
+            if (
+                self._ingress_is_revoked(first.ingress_identity)
+            ):
+                continue
 
-            async def _live_audio(_first: bytes = first):
-                yield _first
+            utterance_origin = first.execution_origin
+            utterance_ingress = first.ingress_identity
+            utterance_encoding = first.encoding or "webm"
+            # PCM needs sample_rate for the WAV header / Deepgram params;
+            # ``None`` falls through to vendor defaults (16000).
+            utterance_sample_rate = first.sample_rate or None
+
+            async def _live_audio(_first: _STTInput = first):
+                yield _first.data
                 while True:
                     piece = await self._stt_in.get()
-                    if piece is None or piece == b"":
+                    if piece is None or piece.end_of_utterance:
                         return
-                    yield piece
+                    if (
+                        self._ingress_is_revoked(piece.ingress_identity)
+                    ):
+                        continue
+                    if not _same_ingress(piece.ingress_identity, utterance_ingress):
+                        # Ingress rejects this already; retain a defensive
+                        # boundary in the consumer so a future producer cannot
+                        # reintroduce mixed-device audio.
+                        elog(
+                            "stream.stt.origin_conflict",
+                            level="error",
+                            session_id=self.session_id,
+                            action="queued_chunk_rejected",
+                        )
+                        continue
+                    yield piece.data
 
             try:
                 async for ev in self._stt.stream(
                     _live_audio(),
                     language=self.language,
-                    encoding=self._stt_encoding,
-                    sample_rate=self._stt_sample_rate,
+                    encoding=utterance_encoding,
+                    sample_rate=utterance_sample_rate,
                 ):
+                    if (
+                        self._ingress_is_revoked(utterance_ingress)
+                    ):
+                        break
                     if ev.kind == "final" and ev.text.strip():
                         promoted = TextFinal(
                             session_id=self.session_id,
@@ -512,9 +880,13 @@ class StreamSession:
                             text=ev.text.strip(),
                             source="stt",
                         )
+                        self._event_origins[id(promoted)] = utterance_origin
+                        self._event_ingresses[id(promoted)] = utterance_ingress
                         # Tee to outbound so the universal app can show
                         # the recognised user line without a REST round-trip.
-                        await self._publish(promoted)
+                        await self._publish(
+                            promoted, ingress_identity=utterance_ingress,
+                        )
                         await self.inbound.put(promoted)
                     elif ev.kind == "partial" and ev.text:
                         await self._publish(OutTextDelta(
@@ -522,7 +894,7 @@ class StreamSession:
                             seq=self.next_seq(),
                             ts_ms=now_ms(),
                             text=f"[partial] {ev.text}",
-                        ))
+                        ), ingress_identity=utterance_ingress)
             except asyncio.CancelledError:
                 return
             except Exception as e:  # noqa: BLE001
@@ -530,7 +902,13 @@ class StreamSession:
 
     # ── turn dispatch + barge-in ────────────────────────────────────
 
-    async def _on_user_turn_complete(self, msg: TextFinal) -> None:
+    async def _on_user_turn_complete(
+        self,
+        msg: TextFinal,
+        *,
+        execution_origin: Any = None,
+        ingress_identity: Any = None,
+    ) -> None:
         # The dispatch lock serialises this with the burst-drain task —
         # see ``_dispatch_lock`` field comment.
         async with self._dispatch_lock:
@@ -542,15 +920,50 @@ class StreamSession:
             if msg.source != "user_typed":
                 self._cancel_burst_timer()
                 if self._pending_burst:
-                    merged = self._merge_burst(self._pending_burst + [msg])
+                    pending = self._pending_burst
+                    origins = [self._event_origins.pop(id(m), None) for m in pending]
+                    ingresses = [self._event_ingresses.pop(id(m), None) for m in pending]
+                    # Never merge input from two client machines/instances.
+                    # Flush the older burst first, then dispatch this voice turn
+                    # under its independently frozen origin.
+                    if any(
+                        not _same_execution_origin(origin, execution_origin)
+                        or not _same_ingress(ingress, ingress_identity)
+                        for origin, ingress in zip(origins, ingresses)
+                    ):
+                        self._pending_burst = []
+                        await self._dispatch_turn(
+                            self._merge_burst(pending),
+                            execution_origin=origins[0] if origins else None,
+                            ingress_identity=ingresses[0] if ingresses else None,
+                        )
+                        await self._dispatch_turn(
+                            msg,
+                            execution_origin=execution_origin,
+                            ingress_identity=ingress_identity,
+                        )
+                        return
+                    merged = self._merge_burst(pending + [msg])
                     self._pending_burst = []
-                    await self._dispatch_turn(merged)
+                    await self._dispatch_turn(
+                        merged,
+                        execution_origin=execution_origin,
+                        ingress_identity=ingress_identity,
+                    )
                 else:
-                    await self._dispatch_turn(msg)
+                    await self._dispatch_turn(
+                        msg,
+                        execution_origin=execution_origin,
+                        ingress_identity=ingress_identity,
+                    )
                 return
 
             if self.coalesce_window_ms <= 0:
-                await self._dispatch_turn(msg)
+                await self._dispatch_turn(
+                    msg,
+                    execution_origin=execution_origin,
+                    ingress_identity=ingress_identity,
+                )
                 return
 
             # Typed text ALWAYS funnels through the debounce buffer.
@@ -567,10 +980,38 @@ class StreamSession:
                     suppress_completion=True,
                     salvage_to_burst=True,
                 )
+            # A burst is scoped to one exact execution host. If another client
+            # instance writes into the same durable session during the debounce
+            # window, flush the first burst as its own turn rather than ever
+            # giving one model call a mixed/ambiguous machine context.
+            if self._pending_burst:
+                first_origin = self._event_origins.get(id(self._pending_burst[0]))
+                first_ingress = self._event_ingresses.get(id(self._pending_burst[0]))
+                if (
+                    not _same_execution_origin(first_origin, execution_origin)
+                    or not _same_ingress(first_ingress, ingress_identity)
+                ):
+                    pending = self._pending_burst
+                    self._pending_burst = []
+                    origins = [self._event_origins.pop(id(m), None) for m in pending]
+                    ingresses = [self._event_ingresses.pop(id(m), None) for m in pending]
+                    await self._dispatch_turn(
+                        self._merge_burst(pending),
+                        execution_origin=origins[0] if origins else None,
+                        ingress_identity=ingresses[0] if ingresses else None,
+                    )
+            self._event_origins[id(msg)] = execution_origin
+            self._event_ingresses[id(msg)] = ingress_identity
             self._pending_burst.append(msg)
             self._restart_burst_timer()
 
-    async def _dispatch_turn(self, msg: TextFinal) -> None:
+    async def _dispatch_turn(
+        self,
+        msg: TextFinal,
+        *,
+        execution_origin: Any = None,
+        ingress_identity: Any = None,
+    ) -> None:
         """Cancel any in-flight turn, gather context, start a new one."""
         if self._current_turn and not self._current_turn.done():
             # The caller is about to dispatch fresh — suppress the
@@ -591,20 +1032,25 @@ class StreamSession:
                     seq=self.next_seq(),
                     ts_ms=now_ms(),
                     text=err,
-                ))
+                ), ingress_identity=ingress_identity)
                 await self._publish(TurnComplete(
                     session_id=self.session_id,
                     seq=self.next_seq(),
                     ts_ms=now_ms(),
-                ))
+                ), ingress_identity=ingress_identity)
                 return
 
         self._turn_resources = set()
 
         attachments = list(msg.attachments)
-        attachments.extend(self._pending_attachments)
-        self._pending_attachments = []
-        attachments.extend(self._snapshot_video_frames())
+        remaining_attachments: list[tuple[Any, dict[str, Any]]] = []
+        for owner, attachment in self._pending_attachments:
+            if _same_ingress(owner, ingress_identity):
+                attachments.append(attachment)
+            else:
+                remaining_attachments.append((owner, attachment))
+        self._pending_attachments = remaining_attachments
+        attachments.extend(self._snapshot_video_frames(ingress_identity))
 
         text = msg.text
         if not text and not attachments:
@@ -625,6 +1071,10 @@ class StreamSession:
         # event from ``run_stream``. See ``_current_turn_msg`` field
         # comment for the salvage rationale.
         self._current_turn_msg = msg
+        self._current_turn_origin = execution_origin
+        self._current_turn_ingress = ingress_identity
+        turn_token = object()
+        self._current_turn_token = turn_token
         self._current_turn_started = False
         # Prefer a per-message author carried on the inbound frame (a
         # bridge multiplexing several humans onto one session sets it so
@@ -641,6 +1091,9 @@ class StreamSession:
                 attachments=attachments or None,
                 speak=speak,
                 author=turn_author,
+                execution_origin=execution_origin,
+                ingress_identity=ingress_identity,
+                turn_token=turn_token,
             ),
             name=f"stream-turn:{self.session_id}",
         )
@@ -673,7 +1126,13 @@ class StreamSession:
             msgs = self._pending_burst
             self._pending_burst = []
             self._burst_timer = None
-            await self._dispatch_turn(self._merge_burst(msgs))
+            origins = [self._event_origins.pop(id(m), None) for m in msgs]
+            ingresses = [self._event_ingresses.pop(id(m), None) for m in msgs]
+            await self._dispatch_turn(
+                self._merge_burst(msgs),
+                execution_origin=origins[0] if origins else None,
+                ingress_identity=ingresses[0] if ingresses else None,
+            )
 
     def _merge_burst(self, msgs: list[TextFinal]) -> TextFinal:
         # ``\n\n`` reads as a paragraph break to chunkers + LLMs so the
@@ -769,14 +1228,21 @@ class StreamSession:
                 pass
         self._current_turn = None
         self._current_turn_msg = None
+        salvaged_origin = self._current_turn_origin
+        salvaged_ingress = self._current_turn_ingress
+        self._current_turn_origin = None
+        self._current_turn_ingress = None
+        self._current_turn_token = None
         self._current_turn_started = False
         self._active_cancel_reason = None
         if suppress_completion:
             self._suppress_runner_completion = False
         if salvaged_msg is not None:
+            self._event_origins[id(salvaged_msg)] = salvaged_origin
+            self._event_ingresses[id(salvaged_msg)] = salvaged_ingress
             self._pending_burst.insert(0, salvaged_msg)
 
-    def _snapshot_video_frames(self) -> list[dict[str, Any]]:
+    def _snapshot_video_frames(self, ingress_identity: Any = None) -> list[dict[str, Any]]:
         """Persist the latest frame per stream as image attachments.
 
         The ``<stream>-snapshot.jpg`` filename is load-bearing — the
@@ -786,7 +1252,12 @@ class StreamSession:
         reading the attached image.
         """
         out: list[dict[str, Any]] = []
-        for stream, ring in list(self._video_buffers.items()):
+        ingress_key = _ingress_key(ingress_identity)
+        consumed: list[tuple[tuple[Any, ...], str]] = []
+        for key, ring in list(self._video_buffers.items()):
+            owner_key, stream = key
+            if owner_key != ingress_key:
+                continue
             if not ring:
                 continue
             frame = ring[-1]
@@ -817,7 +1288,9 @@ class StreamSession:
                 "path": path,
                 "filename": friendly_name,
             })
-        self._video_buffers.clear()
+            consumed.append(key)
+        for key in consumed:
+            self._video_buffers.pop(key, None)
         return out
 
 
@@ -852,9 +1325,20 @@ class StreamTurnRunner:
         attachments: list[dict] | None = None,
         speak: bool = False,
         author: dict | None = None,
+        execution_origin: Any = None,
+        ingress_identity: Any = None,
+        turn_token: object | None = None,
     ) -> dict[str, Any]:
         sess = self._session
-        publish = sess._publish
+
+        async def publish(evt: Event) -> None:
+            # A detached provider that ignored cancellation is no longer the
+            # session's active runner. Drop every late frame rather than
+            # looking at mutable session state, which may now belong to a turn
+            # from another authenticated device.
+            if turn_token is not None and sess._current_turn_token is not turn_token:
+                return
+            await sess._publish(evt, ingress_identity=ingress_identity)
         accumulated: list[str] = []
         audio_started = False
         audio_chunks = 0
@@ -1010,6 +1494,10 @@ class StreamTurnRunner:
             child_frame_to_event, install_child_stream_emitter, reset_child_stream_emitter,
         )
         _child_emit_tok = install_child_stream_emitter(child_emit)
+        from src.core.execution_origin import (
+            install_execution_origin, reset_execution_origin,
+        )
+        _execution_origin_tok = install_execution_origin(execution_origin)
 
         try:
             try:
@@ -1024,7 +1512,8 @@ class StreamTurnRunner:
                     # Engagement signal — soonest reliable indicator
                     # the prompt reached the provider. Idempotent bool,
                     # safe to set on every event. See ``_dispatch_turn``.
-                    sess._current_turn_started = True
+                    if turn_token is None or sess._current_turn_token is turn_token:
+                        sess._current_turn_started = True
                     kind = event.get("kind")
                     if kind == "delta":
                         delta = event.get("text") or ""
@@ -1082,6 +1571,7 @@ class StreamTurnRunner:
                     await text_q.put(None)
                 logger.warning("stream turn failed: %s", e)
         finally:
+            reset_execution_origin(_execution_origin_tok)
             reset_child_stream_emitter(_child_emit_tok)
             if speaker is not None:
                 if cancelled:

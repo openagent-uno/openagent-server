@@ -210,6 +210,7 @@ def event_to_wire(evt: Event) -> dict[str, Any]:
             "tts_pin": evt.tts_pin,
             "language": evt.language,
             "client_kind": evt.client_kind,
+            "client_instance_id": evt.client_instance_id,
             # Only emit the coalesce field when the caller set it
             # explicitly. ``None`` round-trips as "use the server
             # default"; an explicit ``0`` round-trips as "opt out".
@@ -328,6 +329,11 @@ def wire_to_event(frame: dict[str, Any]) -> Event | None:
             tts_pin=frame.get("tts_pin"),
             language=frame.get("language"),
             client_kind=frame.get("client_kind"),
+            client_instance_id=(
+                str(frame.get("client_instance_id")).strip()
+                if frame.get("client_instance_id")
+                else None
+            ),
             coalesce_window_ms=coalesce,
             speak=speak,
         )

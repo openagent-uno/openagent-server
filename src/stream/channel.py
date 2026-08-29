@@ -39,7 +39,7 @@ from src.stream.events import (
     TurnComplete,
     now_ms,
 )
-from src.stream.session import StreamSession
+from src.stream.session import StreamSession, _ingress_key
 from src.stream.wire import event_to_wire, wire_to_event
 
 logger = logging.getLogger(__name__)
@@ -98,6 +98,8 @@ class RealtimeChannel:
     ):
         self._session = session
         self._send = send_wire
+        self._route_sends: dict[tuple[object, ...], Callable[[dict], Awaitable[bool]]] = {}
+        self._route_identities: dict[tuple[object, ...], object] = {}
         self._pump_task: asyncio.Task | None = None
         self._on_outbound = on_outbound
         self._on_unrecoverable = on_unrecoverable
@@ -110,6 +112,40 @@ class RealtimeChannel:
         delivery on the new transport without losing the frame.
         """
         self._send = send_wire
+
+    def bind_transport(
+        self,
+        ingress_identity: object,
+        send_wire: Callable[[dict], Awaitable[bool]],
+    ) -> None:
+        """Bind one authenticated ingress without changing other devices.
+
+        A fresh connection from the same device/client instance also adopts
+        frames queued for its previous connection.  Different devices and
+        Desktop/CLI instance ids remain separate even when they share a
+        durable session and account handle.
+        """
+
+        key = _ingress_key(ingress_identity)
+        self._route_sends[key] = send_wire
+        self._route_identities[key] = ingress_identity
+        device_id = getattr(ingress_identity, "device_id", None)
+        instance_id = getattr(ingress_identity, "client_instance_id", None)
+        if not isinstance(device_id, str) or not isinstance(instance_id, str):
+            return
+        for old_key, old_identity in list(self._route_identities.items()):
+            if (
+                getattr(old_identity, "device_id", None) == device_id
+                and getattr(old_identity, "client_instance_id", None) == instance_id
+            ):
+                self._route_sends[old_key] = send_wire
+
+    def _send_for_ingress(
+        self, ingress_identity: object | None,
+    ) -> Callable[[dict], Awaitable[bool]] | None:
+        if ingress_identity is None:
+            return self._send
+        return self._route_sends.get(_ingress_key(ingress_identity))
 
     async def start(self) -> None:
         if self._pump_task is None or self._pump_task.done():
@@ -129,6 +165,7 @@ class RealtimeChannel:
         try:
             while True:
                 evt = await self._session.outbound.get()
+                ingress_identity = self._session.take_outbound_ingress(evt)
                 try:
                     payload = event_to_wire(evt)
                 except TypeError as e:
@@ -142,7 +179,8 @@ class RealtimeChannel:
                 deadline = time.monotonic() + self.UNRECOVERABLE_AFTER_S
                 while True:
                     try:
-                        ok = await self._send(payload)
+                        send = self._send_for_ingress(ingress_identity)
+                        ok = await send(payload) if send is not None else False
                     except Exception as e:  # noqa: BLE001
                         logger.debug("realtime: send raised: %s", e)
                         ok = False

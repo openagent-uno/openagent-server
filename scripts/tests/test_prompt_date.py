@@ -81,11 +81,10 @@ async def t_split_survives(ctx: TestContext) -> None:
 
     out = _combined(session_id="tg:42")
     body, tag = _split_session_id_tag(out)
-    assert tag == "<session-id>tg:42</session-id>", (
-        "the <session-id> tag is no longer the trailing token — the date "
-        "injection must go BEFORE it, or _split_session_id_tag (and its two "
-        "siblings in native_provider/dispatcher) stop finding it and the "
-        "per-session bytes fall back inside the cached prefix."
+    assert "<execution-host>" in tag
+    assert tag.endswith("<session-id>tg:42</session-id>"), (
+        "the runtime execution-host + session-id tail is no longer isolated "
+        "from the cacheable framework prefix"
     )
     # The date is deployment-wide-per-day, so it belongs in the cacheable body,
     # NOT in the per-session tail with the tag.

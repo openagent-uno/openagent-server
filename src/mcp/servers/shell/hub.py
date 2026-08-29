@@ -24,6 +24,12 @@ logger = logging.getLogger(__name__)
 # Queue cap per session — chatty or broken session can't exhaust memory.
 _MAX_QUEUED_EVENTS = 200
 
+# Exact client capability host which owns a client-local background process.
+# The generation is part of the key: a reconnect with a newer generation must
+# never inherit a process/event from the replaced capability channel.
+ClientHostKey = tuple[str, str, int]
+EventQueueKey = tuple[str, ClientHostKey | None]
+
 
 @dataclass
 class ShellRecord:
@@ -34,6 +40,9 @@ class ShellRecord:
     completed_at: float | None = None
     exit_code: int | None = None
     signal: str | None = None
+    # ``None`` is a process running on the OpenAgent server. Client-local
+    # proxy records are pinned to the exact interactive capability instance.
+    client_host: ClientHostKey | None = None
     # The BackgroundShell is attached after spawn (None while tests use
     # register() directly without spawning a real subprocess).
     shell: "BackgroundShell | None" = None
@@ -56,8 +65,8 @@ class ShellHub:
     def __init__(self) -> None:
         self._shells: dict[str, ShellRecord] = {}
         self._by_session: dict[str, set[str]] = {}
-        self._events: dict[str, asyncio.Event] = {}
-        self._queues: dict[str, deque[ShellEvent]] = {}
+        self._events: dict[EventQueueKey, asyncio.Event] = {}
+        self._queues: dict[EventQueueKey, deque[ShellEvent]] = {}
 
     # ── Registration ────────────────────────────────────────────────
 
@@ -68,12 +77,14 @@ class ShellHub:
         session_id: str | None,
         command: str,
         shell: "BackgroundShell | None" = None,
+        client_host: ClientHostKey | None = None,
     ) -> ShellRecord:
         record = ShellRecord(
             shell_id=shell_id,
             session_id=session_id,
             command=command,
             shell=shell,
+            client_host=client_host,
         )
         self._shells[shell_id] = record
         if session_id is not None:
@@ -91,9 +102,22 @@ class ShellHub:
         ids = self._by_session.get(session_id, set())
         return [self._shells[i] for i in ids if i in self._shells]
 
-    def has_running(self, session_id: str | None) -> bool:
+    def has_running(
+        self,
+        session_id: str | None,
+        *,
+        client_host: ClientHostKey | None = None,
+    ) -> bool:
+        """Return whether this turn has a relevant running shell.
+
+        Server shells are visible to every turn for their session. A client
+        proxy is visible only to the exact host which started it; in
+        particular, automated turns (``client_host=None``) cannot be woken by
+        or wait on a user's computer.
+        """
         for rec in self.list_for_session(session_id):
-            if not rec.is_completed:
+            visible = rec.client_host is None or rec.client_host == client_host
+            if visible and not rec.is_completed:
                 return True
         return False
 
@@ -113,7 +137,13 @@ class ShellHub:
 
     # ── Event queue ─────────────────────────────────────────────────
 
-    def post_event(self, session_id: str | None, event: ShellEvent) -> None:
+    def post_event(
+        self,
+        session_id: str | None,
+        event: ShellEvent,
+        *,
+        client_host: ClientHostKey | None = None,
+    ) -> None:
         """Push a terminal event into ``session_id``'s queue and wake any
         waiter. No-op when ``session_id`` is None — we only do active
         wake-up for shells that have a session.
@@ -123,27 +153,45 @@ class ShellHub:
         """
         if session_id is None:
             return
-        q = self._queues.setdefault(session_id, deque(maxlen=_MAX_QUEUED_EVENTS))
+        key = (session_id, client_host)
+        q = self._queues.setdefault(key, deque(maxlen=_MAX_QUEUED_EVENTS))
         q.append(event)
-        ev = self._events.setdefault(session_id, asyncio.Event())
+        ev = self._events.setdefault(key, asyncio.Event())
         ev.set()
 
-    def drain(self, session_id: str | None) -> list[ShellEvent]:
-        """Return every queued event for ``session_id`` and clear the queue."""
+    def drain(
+        self,
+        session_id: str | None,
+        *,
+        client_host: ClientHostKey | None = None,
+    ) -> list[ShellEvent]:
+        """Drain server events and this exact client's events for a session."""
         if session_id is None:
             return []
-        q = self._queues.get(session_id)
-        if not q:
-            return []
-        out = list(q)
-        q.clear()
-        ev = self._events.get(session_id)
-        if ev is not None:
-            ev.clear()  # Order matters: clear queue first, then Event — keeps
-                        # queue and signal in lockstep if contract ever changes.
+        keys = [(session_id, None)]
+        if client_host is not None:
+            keys.append((session_id, client_host))
+        out: list[ShellEvent] = []
+        for key in keys:
+            q = self._queues.get(key)
+            if q:
+                out.extend(q)
+                q.clear()
+            ev = self._events.get(key)
+            if ev is not None:
+                ev.clear()  # Clear queue first: queue/signal stay in lockstep.
+        # Events from the server and client have independent bounded queues.
+        # Merge them by event timestamp so reminders remain chronological.
+        out.sort(key=lambda item: item.at)
         return out
 
-    async def wait(self, session_id: str | None, timeout: float) -> list[ShellEvent]:
+    async def wait(
+        self,
+        session_id: str | None,
+        timeout: float,
+        *,
+        client_host: ClientHostKey | None = None,
+    ) -> list[ShellEvent]:
         """Await up to ``timeout`` seconds for any event on ``session_id``.
 
         Returns the drained events (possibly empty on timeout). Safe to
@@ -152,16 +200,34 @@ class ShellHub:
         drain (non-blocking poll).
         """
         if session_id is None or timeout <= 0:
-            return self.drain(session_id)
+            return self.drain(session_id, client_host=client_host)
         # Fast path — already something queued.
-        if self._queues.get(session_id):
-            return self.drain(session_id)
-        ev = self._events.setdefault(session_id, asyncio.Event())
+        keys = [(session_id, None)]
+        if client_host is not None:
+            keys.append((session_id, client_host))
+        if any(self._queues.get(key) for key in keys):
+            return self.drain(session_id, client_host=client_host)
+        waiters = [
+            asyncio.create_task(self._events.setdefault(key, asyncio.Event()).wait())
+            for key in keys
+        ]
         try:
-            await asyncio.wait_for(ev.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
+            done, pending = await asyncio.wait(
+                waiters,
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                return []
+        finally:
+            for task in waiters:
+                if not task.done():
+                    task.cancel()
+            if waiters:
+                await asyncio.gather(*waiters, return_exceptions=True)
+        if not any(self._queues.get(key) for key in keys):
             return []
-        return self.drain(session_id)
+        return self.drain(session_id, client_host=client_host)
 
     # ── Purge ───────────────────────────────────────────────────────
 
@@ -184,8 +250,10 @@ class ShellHub:
                     await rec.shell.kill(signal_name="KILL", grace_seconds=0)
                 except Exception as e:  # noqa: BLE001 — best-effort
                     logger.debug("purge_session kill failed for %s: %s", sid, e)
-        self._events.pop(session_id, None)
-        self._queues.pop(session_id, None)
+        for key in [key for key in self._events if key[0] == session_id]:
+            self._events.pop(key, None)
+        for key in [key for key in self._queues if key[0] == session_id]:
+            self._queues.pop(key, None)
         return killed
 
     # ── GC / shutdown ───────────────────────────────────────────────

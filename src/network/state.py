@@ -12,8 +12,9 @@ friendly "run `openagent network init`" message and skips the gateway.
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
@@ -52,6 +53,9 @@ class NetworkState:
     auth_state: NetworkAuthState
     coordinator_service: CoordinatorService | None = None
     coordinator_key: Ed25519PrivateKey | None = None  # only set on coordinator-mode
+    _device_revocation_task: asyncio.Task | None = field(
+        default=None, init=False, repr=False,
+    )
 
     @classmethod
     async def from_db(
@@ -89,13 +93,6 @@ class NetworkState:
             coordinator_key = Ed25519PrivateKey.from_private_bytes(
                 identity.secret_bytes,
             )
-            coordinator_service = CoordinatorService(
-                store=store,
-                coordinator_key=coordinator_key,
-                network_id=row["network_id"],
-                network_name=row["name"],
-            )
-            coordinator_service.attach(node)
             coord_pubkey_bytes = identity.public_bytes
         else:
             stored = row["coordinator_pubkey"]
@@ -108,15 +105,50 @@ class NetworkState:
 
         coordinator_pubkey = Ed25519PublicKey.from_public_bytes(coord_pubkey_bytes)
 
-        # Coordinator-mode agents need the live revocation list; member
-        # mode only knows what the coordinator told it at the last
-        # `list_agents` call (cert TTL bounds liveness either way).
+        # Coordinator gateways read the local roster. Member gateways use a
+        # peer-authenticated coordinator RPC for the same per-stream check.
         revoked = await store.list_revoked_pubkeys() if row["role"] == "coordinator" else set()
+        member_device_lookup = None
+        if row["role"] == "member":
+            coordinator_node_id = (row.get("coordinator_node_id") or "").strip()
+            if not coordinator_node_id:
+                raise ValueError(
+                    "member-mode agent missing coordinator_node_id — "
+                    "live device revocation cannot be enforced",
+                )
+
+            async def member_device_lookup(device_pubkey: bytes):
+                from types import SimpleNamespace
+
+                from src.network.client.login import device_is_active
+
+                active = await device_is_active(
+                    node=node,
+                    coordinator_node_id=coordinator_node_id,
+                    device_pubkey=device_pubkey,
+                )
+                return SimpleNamespace(status="active") if active else None
+
         auth_state = NetworkAuthState(
             coordinator_pubkey=coordinator_pubkey,
             network_id=row["network_id"],
             revoked_pubkeys=revoked,
+            device_lookup=(
+                store.get_active_device
+                if row["role"] == "coordinator"
+                else member_device_lookup
+            ),
         )
+
+        if coordinator_key is not None:
+            coordinator_service = CoordinatorService(
+                store=store,
+                coordinator_key=coordinator_key,
+                network_id=row["network_id"],
+                network_name=row["name"],
+                on_device_revoked=auth_state.revoke,
+            )
+            coordinator_service.attach(node)
 
         return cls(
             role=row["role"],
@@ -134,11 +166,38 @@ class NetworkState:
         await self.iroh_node.start()
         if self.coordinator_service is not None:
             await self.coordinator_service.start_gc()
+        # Revalidate open transports in both roles. Member agents learn live
+        # status over coordinator RPC; the coordinator catches out-of-process
+        # DB mutations such as ``openagent network revoke`` which cannot call
+        # the in-process listener directly.
+        if self._device_revocation_task is None:
+            self._device_revocation_task = asyncio.create_task(
+                self._device_revocation_loop(),
+                name="device-revocation-watcher",
+            )
 
     async def stop(self) -> None:
+        if self._device_revocation_task is not None:
+            self._device_revocation_task.cancel()
+            try:
+                await self._device_revocation_task
+            except asyncio.CancelledError:
+                pass
+            self._device_revocation_task = None
         if self.coordinator_service is not None:
             await self.coordinator_service.stop()
         await self.iroh_node.stop()
+
+    async def _device_revocation_loop(self) -> None:
+        """Poll the authoritative roster and close revoked live streams."""
+        while True:
+            try:
+                await asyncio.sleep(1.0)
+                await self.auth_state.revalidate_observed_devices()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - keep the security loop live
+                logger.warning("device revocation poll failed: %s", exc)
 
     async def node_id(self) -> str:
         return await self.iroh_node.node_id()

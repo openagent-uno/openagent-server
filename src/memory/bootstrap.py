@@ -31,14 +31,10 @@ async def ensure_builtin_mcps(db: MemoryDB, config: dict | None = None) -> int:
       * ``{"builtin": <name>, ...}`` — resolves at runtime to one of the
         in-process / ``python -m`` Python servers in ``BUILTIN_MCP_SPECS``.
         Stored with ``builtin_name`` filled.
-      * ``{"name": <name>, "command": [...], "args": [...]}`` — bare
-        subprocess MCPs (currently ``vault`` and ``filesystem``, both
-        ``npx``-launched). Stored with ``command`` / ``args`` filled and
-        ``builtin_name`` left null. Without this branch, fresh
-        ``--agent-dir`` installs come up without the vault MCP and the
-        agent has no way to write memory through ``vault_*`` tools — it
-        falls back to direct filesystem writes that bypass the OpenAgent
-        vault entirely.
+      * ``{"name": <name>, "command": [...], "args": [...]}`` — optional
+        bare subprocess MCPs. Stored with ``command`` / ``args`` filled and
+        ``builtin_name`` left null. The default filesystem/editor/shell tools
+        are now builtins over the pinned ``openagent-host-tools`` package.
 
     Existing rows — including disabled ones — are untouched (forward-
     compat for future defaults + safety net for manual deletions).

@@ -298,17 +298,29 @@ async def handle_patch_user(request: "web.Request") -> "web.Response":
     user = await store.get_user(handle)
     if user is None:
         return web.json_response({"error": f"user {handle!r} not found"}, status=404)
+    device_pubkeys = (
+        await store.list_device_pubkeys_for_user(handle)
+        if status == "suspended"
+        else set()
+    )
     updated = await store.set_user_status(handle, status)
+    if updated and status == "suspended":
+        gateway = request.app.get("gateway")
+        auth_state = getattr(
+            getattr(gateway, "_network_state", None), "auth_state", None,
+        )
+        if auth_state is not None:
+            for device_pubkey in device_pubkeys:
+                auth_state.disconnect(device_pubkey)
     return web.json_response({"handle": handle, "status": status, "updated": updated})
 
 
 async def handle_delete_user(request: "web.Request") -> "web.Response":
     """DELETE /api/network/users/{handle} — hard-delete a user + devices.
 
-    Cascades into ``network_devices`` so existing certs for this user
-    stop verifying at the auth middleware (cert sig still valid; row
-    lookup fails). Existing live WS sessions stay open until they
-    drop; new connections are rejected.
+    Device rows are removed with the account.  The live auth state is updated
+    as part of the same operation so Gateway-owned chat/capability sockets can
+    be closed immediately; future streams fail the live roster lookup.
 
     Guard: an authenticated user can't delete themselves through this
     endpoint — kicking yourself off mid-request would race the
@@ -338,9 +350,15 @@ async def handle_delete_user(request: "web.Request") -> "web.Response":
             status=409,
         )
 
+    device_pubkeys = await store.list_device_pubkeys_for_user(handle)
     deleted = await store.delete_user(handle)
     if not deleted:
         return web.json_response({"error": f"user {handle!r} not found"}, status=404)
+    gateway = request.app.get("gateway")
+    auth_state = getattr(getattr(gateway, "_network_state", None), "auth_state", None)
+    if auth_state is not None:
+        for device_pubkey in device_pubkeys:
+            auth_state.revoke(device_pubkey)
     return web.json_response({"deleted": True, "handle": handle})
 
 

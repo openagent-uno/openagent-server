@@ -98,8 +98,8 @@ Two delegation paths exist depending on how you're running:
      leader or a solo agent), you can reach ANY registered model via
      the ``delegation`` MCP server:
 
-       ``tool_search_call_tool(server="delegation", tool="list_delegatable_models", args={})``
-       ``tool_search_call_tool(server="delegation", tool="delegate_task", args={"task": "<full prompt>", "model_id": "<runtime_id>"})``
+       ``tool_search_call_tool(server="server:delegation", tool="list_delegatable_models", args={})``
+       ``tool_search_call_tool(server="server:delegation", tool="delegate_task", args={"task": "<full prompt>", "model_id": "<runtime_id>"})``
 
      Agents not running as a team leader can use this to reach a model
      that isn't in their team. ``model_id`` is OPTIONAL: pass one to route
@@ -180,13 +180,29 @@ top-level tool call: a direct ``vault_write_note`` or ``shell_exec``
 call yields ``Function X not found`` and burns a turn. Reach them
 through the wrapper.
 
+**Execution location is explicit and security-sensitive.** Discovery returns
+canonical MCP ids:
+
+  * ``server:<mcp>`` runs on the OpenAgent server.
+  * ``client:<mcp>`` runs on the exact authenticated computer that submitted
+    this interactive turn.
+
+Never treat the two locations as interchangeable. Never remove or change the
+prefix, and never retry a failed ``client:`` call as ``server:`` (or on another
+client). The dynamic ``<execution-host>`` block at the end of this prompt says
+whether this turn has a client host. Synchronous delegated work inside this
+same turn inherits that exact host. Scheduled tasks, events, webhooks, bridges,
+automatic/durable workflows, and all other server-owned turns have no client
+MCPs even when a user's computer happens to be online.
+
 **The ``tool`` argument is the tool's REGISTERED KEY, and the key
 almost always carries the server name as a prefix.** Copy it verbatim —
 do not re-prefix it, do not strip it:
 
-  * vault note-writer  → ``tool_search_call_tool(server="vault", tool="vault_write_note", args=…)``
-  * shell runner       → ``tool_search_call_tool(server="shell", tool="shell_exec", args=…)``
-  * scheduler lister   → ``tool_search_call_tool(server="scheduler", tool="scheduler_list_scheduled_tasks", args=…)``
+  * vault note-writer  → ``tool_search_call_tool(server="server:vault", tool="vault_write_note", args=…)``
+  * server shell       → ``tool_search_call_tool(server="server:shell", tool="shell_exec", args=…)``
+  * client shell       → ``tool_search_call_tool(server="client:shell", tool="shell_exec", args=…)``
+  * scheduler lister   → ``tool_search_call_tool(server="server:scheduler", tool="scheduler_list_scheduled_tasks", args=…)``
 
 Two slips waste a turn — avoid them:
   * Do NOT double the prefix. The shell runner is ``shell_exec``, never
@@ -250,7 +266,7 @@ Never treat a webhook payload id as the OpenAgent session id.
 To deliver a file in the current chat — image, document, voice note,
 video — call the ``attachments`` MCP:
 
-  ``tool_search_call_tool(server="attachments", tool="send_file_to_user", args={"path": "/abs/path"})``
+  ``tool_search_call_tool(server="server:attachments", tool="send_file_to_user", args={"path": "/abs/path"})``
 
 The tool validates the path and returns a ``marker`` field like
 ``[FILE:/abs/path]`` (or ``[IMAGE:…]``, ``[VIDEO:…]``, ``[VOICE:…]``,
@@ -855,7 +871,7 @@ def _render_catalog_summary_lines(
         count = summary[name]
         if name == "vault":
             lines.append(
-                f"- ``vault`` ({count} tools): YOUR LONG-TERM MEMORY. "
+                f"- ``server:vault`` ({count} tools): YOUR LONG-TERM MEMORY. "
                 f"READ BEFORE acting on anything that touches prior work, "
                 f"user preferences, or ongoing projects. WRITE AFTER any "
                 f"non-obvious learning."
@@ -869,9 +885,9 @@ def _render_catalog_summary_lines(
         else:
             desc = descriptions.get(name, "") or _NPX_DEFAULTS.get(name, "")
             if desc:
-                lines.append(f"- ``{name}`` ({count} tools): {desc}.")
+                lines.append(f"- ``server:{name}`` ({count} tools): {desc}.")
             else:
-                lines.append(f"- ``{name}`` ({count} tools).")
+                lines.append(f"- ``server:{name}`` ({count} tools).")
 
         # Inline the exact registered keys so the model copies one verbatim
         # instead of guessing (and mis-prefixing) it. Two sources: OpenAgent's
@@ -976,7 +992,7 @@ def build_skills_index(registry) -> str:
         "disclosure): each entry is ``name``: a one-line description, grouped "
         "by category. When a task matches one, load its full body ON DEMAND "
         "with ``skill_view`` (reached via "
-        "``tool_search_call_tool(server=\"skills\", tool=\"skill_view\", "
+        "``tool_search_call_tool(server=\"server:skills\", tool=\"skill_view\", "
         "args={\"name\": \"...\"})``) BEFORE acting, then follow it. Use "
         "``skill_search`` to find a skill you can't see, and ``skill_manage`` "
         "to create/update/remove one. Do not guess a skill's contents from "

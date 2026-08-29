@@ -20,3 +20,7 @@ class ShellEvent:
     bytes_stdout: int
     bytes_stderr: int
     at: float
+    # Canonical location-qualified MCP which owns ``shell_id``. Reminders must
+    # never make the model read a client process through the server shell (or
+    # vice versa) when both expose the same tool names.
+    tool_server: str = "server:shell"

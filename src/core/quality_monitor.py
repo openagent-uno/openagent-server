@@ -44,6 +44,8 @@ import os
 import re
 from typing import Any, Optional
 
+from src.core.execution_origin import create_server_only_task
+
 from src.core.logging import elog, iter_events_reverse
 
 # ── config (env-driven, set by ``_build_agent`` from ``quality_monitor.*``) ──
@@ -554,11 +556,13 @@ def spawn_scoring(agent: Any, session_id: Optional[str],
     except Exception:  # noqa: BLE001 — the trace is a grounding aid, never required
         tool_trace_rows = None
     try:
-        loop = asyncio.get_running_loop()
+        asyncio.get_running_loop()
     except RuntimeError:
         return
-    task = loop.create_task(
-        maybe_score_turn(agent, session_id, user_message, response, tool_trace_rows))
+    task = create_server_only_task(
+        maybe_score_turn(agent, session_id, user_message, response, tool_trace_rows),
+        name=f"quality-score:{session_id or 'unknown'}",
+    )
     # Keep a reference so the task isn't GC'd mid-flight; drop it on completion.
     _INFLIGHT.add(task)
     task.add_done_callback(_INFLIGHT.discard)

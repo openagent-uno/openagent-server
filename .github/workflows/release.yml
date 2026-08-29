@@ -29,11 +29,17 @@ jobs:
       - name: Create venv + install package
         run: |
           uv venv
+          python scripts/acquire-host-tools.py \
+            --platform linux-x64 \
+            --output "$RUNNER_TEMP/openagent-host-tools" \
+            --wheel-output "$RUNNER_TEMP/openagent-host-tools.whl"
+          uv pip install "$RUNNER_TEMP/openagent-host-tools.whl"
           uv pip install -e .
       - name: Run end-to-end suite
         run: bash scripts/test_openagent.sh
 
   computer-control-binary:
+    if: false # superseded by the signed, checksummed openagent-host-tools release bundle
     strategy:
       fail-fast: false
       matrix:
@@ -53,6 +59,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Checkout exact shared host-tools source
+        uses: actions/checkout@v4
+        with:
+          repository: openagent-uno/openagent-host-tools
+          ref: 660225c8e8bbf6488173d4e6d4d1b3ba04e8f194
+          path: .openagent-host-tools
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -67,7 +79,7 @@ jobs:
             libegl1-mesa-dev libgl1-mesa-dev libgbm-dev \
             pkg-config
       - name: Build release binary
-        working-directory: src/mcp/servers/computer-control
+        working-directory: .openagent-host-tools/sidecars/computer-control
         run: cargo build --release --target ${{ matrix.target }}
       - name: Sign Rust binary (macOS only)
         if: runner.os == 'macOS'
@@ -95,7 +107,7 @@ jobs:
           if [ -z "$IDENTITY" ]; then
             echo "No Developer ID Application identity found in CSC_LINK"; exit 1
           fi
-          BIN=src/mcp/servers/computer-control/target/${{ matrix.target }}/release/openagent-computer-control
+          BIN=.openagent-host-tools/sidecars/computer-control/target/${{ matrix.target }}/release/openagent-computer-control
           codesign --force \
             --sign "$IDENTITY" \
             --identifier com.openagent.computer-control \
@@ -108,61 +120,84 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: computer-control-${{ matrix.out_dir }}
-          path: src/mcp/servers/computer-control/target/${{ matrix.target }}/release/openagent-computer-control${{ matrix.ext }}
+          path: .openagent-host-tools/sidecars/computer-control/target/${{ matrix.target }}/release/openagent-computer-control${{ matrix.ext }}
 
   executable:
-    needs: [test, computer-control-binary]
+    needs: [test]
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
-            cc_target: darwin-arm64
+          - os: macos-15
+            host_platform: darwin-arm64
             cc_ext: ''
-          - os: ubuntu-latest
-            cc_target: linux-x64
+          - os: macos-15-intel
+            host_platform: darwin-x64
             cc_ext: ''
-          - os: windows-latest
-            cc_target: windows-x64
+          - os: ubuntu-24.04
+            host_platform: linux-x64
+            cc_ext: ''
+          - os: ubuntu-24.04-arm
+            host_platform: linux-arm64
+            cc_ext: ''
+          - os: windows-2025
+            host_platform: win32-x64
+            cc_ext: '.exe'
+          - os: windows-11-arm
+            host_platform: win32-arm64
             cc_ext: '.exe'
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Download computer-control binary
-        uses: actions/download-artifact@v4
-        with:
-          name: computer-control-${{ matrix.cc_target }}
-          path: src/mcp/servers/computer-control/bin/${{ matrix.cc_target }}/
-      - name: Make binary executable
-        if: runner.os != 'Windows'
-        run: chmod +x src/mcp/servers/computer-control/bin/${{ matrix.cc_target }}/openagent-computer-control
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Acquire consumer-pinned host-tools runtime and wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/acquire-host-tools.py \
+            --platform '${{ matrix.host_platform }}' \
+            --output "$RUNNER_TEMP/openagent-host-tools" \
+            --wheel-output "$RUNNER_TEMP/openagent-host-tools.whl"
+          echo "OPENAGENT_HOST_TOOLS_BUNDLE=$RUNNER_TEMP/openagent-host-tools/${{ matrix.host_platform }}" >> "$GITHUB_ENV"
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
       - name: Install Python deps + PyInstaller
-        run: pip install -e ".[all]" pyinstaller
+        shell: bash
+        run: |
+          pip install "$RUNNER_TEMP/openagent-host-tools.whl"
+          pip install -e ".[all]" pyinstaller
       - name: Build Node MCPs
         shell: bash
         run: |
-          for mcp_dir in src/mcp/servers/shell src/mcp/servers/web-search src/mcp/servers/editor src/mcp/servers/chrome-devtools src/mcp/servers/messaging; do
+          for mcp_dir in src/mcp/servers/web-search src/mcp/servers/chrome-devtools src/mcp/servers/messaging; do
             if [ -d "$mcp_dir" ]; then
               echo "Building $mcp_dir..."
               (cd "$mcp_dir" && npm install --silent && npm run build --silent 2>/dev/null || true)
             fi
           done
       - name: Build executable
+        env:
+          OPENAGENT_HOST_TOOLS_BUNDLE: ${{ env.OPENAGENT_HOST_TOOLS_BUNDLE }}
+          OPENAGENT_RELEASE_BUILD: '1'
         run: pyinstaller openagent.spec --clean --noconfirm
-      - name: Stage computer-control sidecar next to dist/openagent
+      - name: Stage verified Node and computer-control sidecars
         shell: bash
         run: |
           set -euo pipefail
-          src="src/mcp/servers/computer-control/bin/${{ matrix.cc_target }}/openagent-computer-control${{ matrix.cc_ext }}"
-          dst="dist/openagent-computer-control${{ matrix.cc_ext }}"
-          cp "$src" "$dst"
-          chmod +x "$dst" || true
+          runtime='${{ env.OPENAGENT_HOST_TOOLS_BUNDLE }}'
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            cp "$runtime/node" 'dist/openagent.app/Contents/MacOS/node'
+            mkdir -p 'dist/openagent.app/Contents/Helpers'
+            ditto "$runtime/openagent-computer-control.app" 'dist/openagent.app/Contents/Helpers/openagent-computer-control.app'
+            chmod +x 'dist/openagent.app/Contents/MacOS/node'
+          else
+            cp "$runtime/node${{ matrix.cc_ext }}" "dist/node${{ matrix.cc_ext }}"
+            cp "$runtime/openagent-computer-control${{ matrix.cc_ext }}" "dist/openagent-computer-control${{ matrix.cc_ext }}"
+            chmod +x "dist/node${{ matrix.cc_ext }}" "dist/openagent-computer-control${{ matrix.cc_ext }}" || true
+          fi
       - name: Sign + notarize macOS .app bundle (+ build stapled .pkg)
         if: runner.os == 'macOS'
         env:
@@ -173,13 +208,13 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          OPENAGENT_REQUIRE_SIGNING: '1'
         shell: bash
         run: |
           bash scripts/sign-notarize-macos.sh \
             dist/openagent.app \
             com.openagent.server \
-            /Applications \
-            dist/openagent-computer-control
+            /Applications
       - name: Package + checksum
         shell: bash
         run: bash scripts/package-release.sh openagent dist

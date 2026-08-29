@@ -7,10 +7,92 @@ to end, not just that they loaded.
 """
 from __future__ import annotations
 
+import os
 import time
 import uuid
+from types import SimpleNamespace
 
 from ._framework import TestContext, TestSkip, test
+
+
+@test("mcp", "tool-search denylist hides and blocks one MCP tool")
+async def t_tool_search_denylist(ctx: TestContext) -> None:
+    """A deployment can remove a dangerous write without disabling its MCP.
+
+    The policy must cover discovery, schema inspection, the normal prefixed
+    runtime key, and the bare leaf alias accepted by tool-search.
+    """
+    from src.mcp.servers.tool_search.adapters import (
+        _call_tool_impl,
+        _describe_tool_impl,
+        _list_servers_impl,
+        _list_tools_impl,
+    )
+
+    calls: list[dict] = []
+
+    async def create_task(**kwargs):
+        calls.append(kwargs)
+        return {"created": True}
+
+    async def link_task(**kwargs):
+        return {"linked": kwargs}
+
+    create_fn = SimpleNamespace(
+        entrypoint=create_task,
+        description="Create a task",
+        parameters={"type": "object"},
+    )
+    link_fn = SimpleNamespace(
+        entrypoint=link_task,
+        description="Link a task",
+        parameters={"type": "object"},
+    )
+    toolkit = SimpleNamespace(functions={
+        "replio_thread_create_task": create_fn,
+        "replio_thread_link_task": link_fn,
+    })
+
+    class Pool:
+        _toolkit_by_name = {"replio": toolkit}
+
+        def toolkit_by_name(self, name):
+            return self._toolkit_by_name.get(name)
+
+    pool = Pool()
+    env_name = "OPENAGENT_MCP_TOOL_DENYLIST"
+    previous = os.environ.get(env_name)
+    os.environ[env_name] = "replio:thread_create_task"
+    try:
+        listed = _list_tools_impl(pool, "replio")
+        assert [item["name"] for item in listed] == ["replio_thread_link_task"]
+        assert _list_servers_impl(pool) == [{"name": "replio", "tool_count": 1}]
+
+        for tool_name in ("thread_create_task", "replio_thread_create_task"):
+            try:
+                _describe_tool_impl(pool, "replio", tool_name)
+                raise AssertionError(f"denied tool {tool_name} was describable")
+            except PermissionError as exc:
+                assert env_name in str(exc)
+            try:
+                await _call_tool_impl(pool, "replio", tool_name, {"thread_id": "t1"})
+                raise AssertionError(f"denied tool {tool_name} was callable")
+            except PermissionError as exc:
+                assert env_name in str(exc)
+
+        allowed = await _call_tool_impl(
+            pool,
+            "replio",
+            "thread_link_task",
+            {"thread_id": "t1", "external_task_id": "cu1"},
+        )
+        assert allowed == {"linked": {"thread_id": "t1", "external_task_id": "cu1"}}
+        assert calls == [], "the denied task-creation function ran"
+    finally:
+        if previous is None:
+            os.environ.pop(env_name, None)
+        else:
+            os.environ[env_name] = previous
 
 
 @test("mcp", "vault MCP: write a note then read it back")

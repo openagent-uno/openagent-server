@@ -373,6 +373,7 @@ async function waitForLoad(sess, timeout = 15000) {
 
 // ── Result helpers ──────────────────────────────────────────────────────────
 function text(t) { return { content: [{ type: "text", text: t }] }; }
+function toolError(t) { return { content: [{ type: "text", text: t }], isError: true }; }
 function textImage(t, base64) {
   return { content: [{ type: "text", text: t }, { type: "image", data: base64, mimeType: "image/jpeg" }] };
 }
@@ -458,24 +459,24 @@ const tools = {
       case "right_click":
       case "double_click":
       case "triple_click": {
-        if (!coordinate) return text(`coordinate (or ref) is required for ${action}`);
+        if (!coordinate) return toolError(`coordinate (or ref) is required for ${action}`);
         const map = { left_click: {}, right_click: { button: "right" }, double_click: { clickCount: 2 }, triple_click: { clickCount: 3 } };
         await mouseClick(sess, coordinate[0], coordinate[1], { ...map[action], modifiers });
         return text(`${action.replace("_", " ")} at (${coordinate[0]}, ${coordinate[1]})`);
       }
       case "hover": {
-        if (!coordinate) return text("coordinate is required for hover");
+        if (!coordinate) return toolError("coordinate is required for hover");
         await dispatchMouse(sess, "mouseMoved", coordinate[0], coordinate[1], { modifiers });
         await sleep(150);
         return text(`Hovered at (${coordinate[0]}, ${coordinate[1]})`);
       }
       case "type": {
-        if (!args.text) return text("text is required for type");
+        if (!args.text) return toolError("text is required for type");
         await controller.send("Input.insertText", { text: args.text }, sess);
         return text(`Typed "${args.text.slice(0, 60)}${args.text.length > 60 ? "…" : ""}"`);
       }
       case "key": {
-        if (!args.text) return text("text is required for key");
+        if (!args.text) return toolError("text is required for key");
         const repeat = Math.min(args.repeat || 1, 100);
         const keys = args.text.split(" ").filter(Boolean);
         for (let r = 0; r < repeat; r++) {
@@ -495,7 +496,7 @@ const tools = {
         return text(`Pressed key(s): ${args.text}${repeat > 1 ? ` x${repeat}` : ""}`);
       }
       case "scroll": {
-        if (!coordinate) return text("coordinate is required for scroll");
+        if (!coordinate) return toolError("coordinate is required for scroll");
         const dir = args.scroll_direction || "down";
         const amount = Math.min(args.scroll_amount || 3, 10);
         const deltaX = dir === "left" ? -amount * 100 : dir === "right" ? amount * 100 : 0;
@@ -508,7 +509,7 @@ const tools = {
       case "scroll_to": {
         if (args.ref) await controller.callPageFn(sess, `window.__openagentChrome.scrollToRef(${JSON.stringify(args.ref)})`);
         else if (coordinate) await controller.evaluate(sess, `window.scrollTo(${coordinate[0]}, ${coordinate[1]})`);
-        else return text("coordinate or ref is required for scroll_to");
+        else return toolError("coordinate or ref is required for scroll_to");
         await sleep(250);
         return text("Scrolled to target.");
       }
@@ -518,7 +519,7 @@ const tools = {
         return text(`Waited ${d}s`);
       }
       case "left_click_drag": {
-        if (!args.start_coordinate || !coordinate) return text("start_coordinate and coordinate are required for left_click_drag");
+        if (!args.start_coordinate || !coordinate) return toolError("start_coordinate and coordinate are required for left_click_drag");
         const [sx, sy] = args.start_coordinate;
         const [ex, ey] = coordinate;
         await dispatchMouse(sess, "mouseMoved", sx, sy, { modifiers });
@@ -532,14 +533,14 @@ const tools = {
         return text(`Dragged from (${sx}, ${sy}) to (${ex}, ${ey})`);
       }
       case "zoom": {
-        if (!args.region || args.region.length !== 4) return text("region [x0,y0,x1,y1] is required for zoom");
+        if (!args.region || args.region.length !== 4) return toolError("region [x0,y0,x1,y1] is required for zoom");
         const [x0, y0, x1, y1] = args.region;
         const clip = { x: x0, y: y0, width: Math.max(1, x1 - x0), height: Math.max(1, y1 - y0), scale: 2 };
         const { data } = await controller.send("Page.captureScreenshot", { format: "jpeg", quality: 80, clip }, sess);
         return textImage(`Zoom region [${args.region.join(", ")}]`, data);
       }
       default:
-        return text(`Unknown computer action: ${action}`);
+        return toolError(`Unknown computer action: ${action}`);
     }
   },
 
@@ -547,7 +548,7 @@ const tools = {
     const sess = await controller.ensureAttached(args.tabId);
     const opts = { filter: args.filter, depth: args.depth, max_chars: args.max_chars, ref_id: args.ref_id };
     let tree = await controller.callPageFn(sess, `window.__openagentChrome.generateAccessibilityTree(${JSON.stringify(opts)})`);
-    if (typeof tree !== "string") tree = "Error: could not generate accessibility tree";
+    if (typeof tree !== "string") return toolError("Could not generate accessibility tree");
     const vp = await controller.evaluate(sess, "window.innerWidth + 'x' + window.innerHeight");
     if (vp.result && vp.result.value) tree += `\n\nViewport: ${vp.result.value}`;
     return text(tree);
@@ -560,7 +561,7 @@ const tools = {
       const d = JSON.parse(raw);
       return text(`Title: ${d.title}\nURL: ${d.url}\nSource: <${d.sourceTag}>\n\n${d.text}`);
     } catch {
-      return text(String(raw || "Error: could not extract page text"));
+      return toolError(String(raw || "Could not extract page text"));
     }
   },
 
@@ -579,14 +580,14 @@ const tools = {
       sess,
       `window.__openagentChrome.setFormValue(${JSON.stringify(args.ref)}, ${JSON.stringify(args.value)})`,
     );
-    if (result && result.error) return text(`Error: ${result.error}`);
+    if (result && result.error) return toolError(`Error: ${result.error}`);
     return text(`Set ${args.ref} to "${args.value}". ${JSON.stringify(result)}`);
   },
 
   async javascript_tool(args) {
     const sess = await controller.ensureAttached(args.tabId);
     const res = await controller.evaluate(sess, args.text, { returnByValue: true, awaitPromise: true, userGesture: true });
-    if (res.exceptionDetails) return text(`Error: ${res.exceptionDetails.text || JSON.stringify(res.exceptionDetails)}`);
+    if (res.exceptionDetails) return toolError(`Error: ${res.exceptionDetails.text || JSON.stringify(res.exceptionDetails)}`);
     const val = res.result;
     if (!val || val.type === "undefined") return text("undefined");
     return text(val.value !== undefined ? JSON.stringify(val.value) : val.description || String(val));
@@ -630,21 +631,21 @@ const tools = {
   },
 
   async upload_image(args) {
-    const sess = await controller.ensureAttached(args.tabId);
     const base64 = controller.screenshots.get(args.imageId);
-    if (!base64) return text(`Image ${args.imageId} not found. Take a screenshot first.`);
-    if (!args.ref) return text("A file-input `ref` is required. Use read_page/find to get the file input's ref, then call upload_image with it.");
+    if (!base64) return toolError(`Image ${args.imageId} not found. Take a screenshot first.`);
+    if (!args.ref) return toolError("A file-input `ref` is required. Use read_page/find to get the file input's ref, then call upload_image with it.");
+    const sess = await controller.ensureAttached(args.tabId);
 
     const tmp = path.join(os.tmpdir(), `openagent-upload-${Date.now()}-${args.filename || "image.png"}`);
     fs.writeFileSync(tmp, Buffer.from(base64, "base64"));
     try {
       const objRes = await controller.evaluate(sess, `window.__openagentChrome.resolveRef(${JSON.stringify(args.ref)})`, { returnByValue: false });
       const objectId = objRes.result && objRes.result.objectId;
-      if (!objectId) return text(`Could not resolve ref "${args.ref}" to an element.`);
+      if (!objectId) return toolError(`Could not resolve ref "${args.ref}" to an element.`);
       await controller.send("DOM.setFileInputFiles", { files: [tmp], objectId }, sess);
       return text(`Uploaded ${args.filename || "image.png"} to ${args.ref}.`);
     } catch (e) {
-      return text(`Upload failed: ${e.message}. The ref must point to an <input type="file"> element.`);
+      return toolError(`Upload failed: ${e.message}. The ref must point to an <input type="file"> element.`);
     } finally {
       try { fs.rmSync(tmp, { force: true }); } catch {}
     }
@@ -684,16 +685,27 @@ const tools = {
 // ───────────────────────────────────────────────────────────────────────────
 async function callTool(name, args) {
   try {
-    await controller.ensure();
     const handler = tools[name];
-    if (!handler) return text(`Unknown tool: ${name}`);
+    if (!handler) return toolError(`Unknown tool: ${name}`);
+    // Catalog inspection and deterministic upload validation do not need a
+    // browser process. Keeping them lazy makes health/error probes bounded on
+    // machines where no Chromium-family browser is installed.
+    if (name !== "list_extensions" && name !== "upload_image") {
+      await controller.ensure();
+    }
     return await handler(args || {});
   } catch (err) {
-    return text(`Error: ${err.message}`);
+    return toolError(`Error: ${err.message}`);
   }
 }
 
-const server = new McpServer({ name: "agent-in-chrome", version: "2.0.0" });
+const MCP_INSTRUCTIONS =
+  "Control OpenAgent's dedicated Chromium profile on the current client. " +
+  "Call tabs_context_mcp before tab-specific tools. This is not the server's browser.";
+const server = new McpServer(
+  { name: "agent-in-chrome", version: "2.0.0" },
+  { instructions: MCP_INSTRUCTIONS },
+);
 
 // Coerce stringly-typed args (some clients send numbers/arrays as strings).
 {

@@ -22,13 +22,16 @@ same surface the extension wrapped, minus every failure mode above.
 
 - **Lazy** — the browser launches on the *first browser tool call*, never at
   server startup. Nothing pops up until the agent decides to use it.
-- **Reuse** — if a healthy CDP endpoint already answers on the port, connect to
-  it instead of relaunching (survives MCP restarts).
+- **Owned reuse** — reconnect only when Chrome's `DevToolsActivePort` marker in
+  this exact dedicated profile matches both the port and browser WebSocket path.
+  An unrelated CDP service on the same port is never adopted.
 - **Isolated + persistent profile** — a dedicated `user-data-dir` that never
   touches the user's real browser, and keeps cookies/logins so "log in to X"
   happens once.
-- **No download when avoidable** — reuse a cached Chromium, else any installed
-  Chrome/Chromium/Brave/Edge; only download Chromium as a last resort.
+- **No runtime browser download** — use `OPENAGENT_CHROME_BINARY` or an
+  OS-installed Chrome/Chromium/Brave/Edge. Browser binaries must come from the
+  user's normal signed package/software-update channel; mutable Chromium
+  snapshots such as `LAST_CHANGE` are never fetched or executed.
 - **No automation fingerprint** — we launch the browser ourselves without
   `--enable-automation`, so `navigator.webdriver` stays `false`.
 - **Clean shutdown** — the process that launched the browser terminates it on
@@ -39,7 +42,7 @@ same surface the extension wrapped, minus every failure mode above.
 | file             | role                                                                 |
 |------------------|----------------------------------------------------------------------|
 | `mcp-server.js`  | MCP stdio server; tab/session management + all tool handlers.        |
-| `browser.js`     | binary resolution, lazy launch, CDP-endpoint discovery, download.    |
+| `browser.js`     | binary resolution, lazy launch, owned-CDP discovery, signed CRX3 verification. |
 | `cdp.js`         | minimal CDP-over-`ws` client (flattened sessions, id/event routing). |
 | `page-script.js` | in-page helpers (a11y tree, find, form_input, page text, ref map).   |
 
@@ -53,6 +56,11 @@ same surface the extension wrapped, minus every failure mode above.
   authenticated upstream with a local no-auth shim, or use a proxy *extension*
   (see below) that handles its own auth.
 
+Chrome, Chromium, Brave, or Edge must already be installed on every supported
+OS/architecture unless `OPENAGENT_CHROME_BINARY` points at another trusted
+Chromium-compatible executable. This includes Linux/Windows ARM64: Agent in
+Chrome never substitutes an x64 snapshot or downloads a mutable fallback.
+
 ## Extensions
 
 The agent's browser always loads the builtin cosmetic tab-group extension, plus
@@ -62,6 +70,13 @@ Store id or an unpacked path), `remove_extension`, `list_extensions`. Installing
 a VPN/proxy *extension* (e.g. NordVPN) is the clean way to route the browser
 through a chosen country: it handles its own proxy auth and persists its login
 in the profile — no system VPN, no shim. Builtins can't be removed.
+
+Web Store installs accept CRX3 only. Before extraction, Agent in Chrome checks
+that the signed CRX id and the SHA-256-derived public-key id both equal the
+requested store id, then verifies the RSA/ECDSA signature over the signed header
+and complete ZIP payload. CRX2, an id mismatch, or any tampering is rejected.
+An unpacked local directory remains an explicit local install and is not
+represented as Web Store-authenticated content.
 
 ## Tools
 

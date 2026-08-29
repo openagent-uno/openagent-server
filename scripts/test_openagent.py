@@ -272,6 +272,23 @@ _TEST_MODULES: tuple[str, ...] = (
     # the REAL auth middleware + the real handler; sits by test_llm_scoped_token
     # because it pins the same middleware.
     "test_health_probe_auth",
+    "test_device_cert_pop",
+    "test_client_capabilities",
+    # Standalone host-tools supply-chain contract: consumer-owned archive and
+    # wheel digests, safe extraction, exact producer/server adapter parity and
+    # byte-identical Agent-in-Chrome assets. Pure-unit except for local Node.
+    "test_host_tools_acquisition",
+    "test_shared_host_tools_adapter",
+    # Full local-capability vertical slice over production transport: real
+    # coordinator PAKE, two real Iroh nodes, Gateway HTTP/WS bridge and an
+    # actual capability host. The deterministic model performs a client
+    # filesystem mutation without requiring a paid provider credential.
+    "test_real_iroh_client_e2e",
+    # Automatic/server-owned executions must remain server-only even while a
+    # Desktop capability host is genuinely online. Drives real scheduler,
+    # webhook/event, Telegram bridge wire and durable workflow entry points;
+    # each sees only server:* and rejects a forged client:* without fallback.
+    "test_automatic_client_isolation",
     # Cross-device chat visibility: ``upsert_session`` writes the user
     # handle as the row owner and ``list_all_sessions`` soft-falls back
     # to legacy device-pubkey rows via ``network_devices``.

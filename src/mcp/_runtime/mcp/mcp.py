@@ -7,7 +7,7 @@ from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, Tuple, Union
 
 from src.mcp._runtime import Toolkit
-from src.mcp._runtime.function import Function
+from src.mcp._runtime.function import Function, classification_from_mcp_annotations
 from src.mcp._runtime.mcp.params import SSEClientParams, StreamableHTTPClientParams
 from src.core._runner.utils.log import log_debug, log_error, log_info, log_warning
 from src.core._runner.utils.mcp import get_entrypoint_for_tool, prepare_command
@@ -631,6 +631,9 @@ class MCPTools(Toolkit):
                         name=tool_name_prefix + tool_name,
                         description=tool.description,
                         parameters=tool.inputSchema,
+                        classification=classification_from_mcp_annotations(
+                            getattr(tool, "annotations", None)
+                        ),
                         entrypoint=entrypoint,
                         # Set skip_entrypoint_processing to True to avoid processing the entrypoint
                         skip_entrypoint_processing=True,

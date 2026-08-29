@@ -92,6 +92,10 @@ case "$OS" in
             chmod +x "openagent-computer-control"
             FILES+=("openagent-computer-control")
         fi
+        if [ "$APP" = "openagent" ] && [ -f "node" ]; then
+            chmod +x "node"
+            FILES+=("node")
+        fi
         ARCHIVE="${APP}-${VERSION}-${OS}-${ARCH}.tar.gz"
         tar czf "$ARCHIVE" "${FILES[@]}"
         sha256 "$ARCHIVE" > "${ARCHIVE}.sha256"
@@ -105,6 +109,9 @@ case "$OS" in
         FILES=("$BIN")
         if [ "$APP" = "openagent" ] && [ -f "openagent-computer-control.exe" ]; then
             FILES+=("openagent-computer-control.exe")
+        fi
+        if [ "$APP" = "openagent" ] && [ -f "node.exe" ]; then
+            FILES+=("node.exe")
         fi
         ARCHIVE="${APP}-${VERSION}-${OS}-${ARCH}.zip"
         # Git Bash doesn't ship a ``zip`` binary on GHA's windows-latest,
